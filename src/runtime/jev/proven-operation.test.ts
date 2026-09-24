@@ -291,3 +291,58 @@ test('a strategy thins the surface only when it covers the request, not when it 
   const today = { keywords: strategyKeywords('whats on my calendar today') };
   assert.equal(provenStrategyCoversRequest('whats in my salesforce pipeline today', today), false, 'two shared filler words are not coverage');
 });
+
+test('a proven strategy naming a native MCP read is re-attested and recorded as the source\'s proven resolution before the first frame', async () => {
+  const { createSession, appendEvent } = await import('../harness/eventlog.js');
+  const { provenCapabilityEntriesForTurn } = await import('../harness/capability-resolution.js');
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'records lookup' });
+  const accepted = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'search the records index for the quarterly inventory' } });
+  recordRunStrategy({
+    objective: 'search the records index for the quarterly inventory',
+    toolsUsed: ['records__search'],
+    workerCount: 0,
+    durationMs: 12_000,
+    learningReceipt: evaluateLearningCandidate({
+      target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'background:records-a', sourceId: 'records-a',
+      terminalSuccess: true, controllerValidation: true,
+    }).receipt!,
+  });
+  const asked: string[] = [];
+  const prepared = await prepareProvenOperationForRequest({
+    query: 'search the records index for the quarterly inventory',
+    sessionId: session.id,
+    sourceUserSeq: accepted.seq,
+    acceptedInput: 'search the records index for the quarterly inventory',
+  }, {
+    acquireLiveRead: async ({ operation, scope }) => {
+      asked.push(`${operation}|${scope === undefined ? 'unscoped' : scope === null ? 'closed' : 'scoped'}`);
+      return { status: 'installed', kind: 'mcp', operation, accountId: 'records-account', schema: { type: 'object', properties: { query: { type: 'string' } } } };
+    },
+  });
+  assert.deepEqual(asked, ['records__search|unscoped']);
+  assert.deepEqual(prepared.liveReads, [{ operation: 'records__search', kind: 'mcp', accountId: 'records-account' }]);
+  assert.match(prepared.text ?? '', /re-attested for this request/);
+  assert.match(prepared.text ?? '', /- records__search \(connected MCP server, account records-account\)/);
+  assert.match(prepared.text ?? '', /records__search schema: \{"type":"object"/);
+  const entries = provenCapabilityEntriesForTurn({ sessionId: session.id, sourceUserSeq: accepted.seq });
+  const recorded = entries.find((entry) => entry.identifier === 'records__search');
+  assert.ok(recorded, JSON.stringify(entries));
+  assert.equal(recorded.kind, 'mcp');
+  assert.equal(recorded.status, 'proven');
+  assert.equal(recorded.accountIdentity, 'records-account');
+  assert.equal(recorded.effectClass, 'read');
+
+  // A read the acquisition cannot re-attest now is neither promised nor recorded.
+  const other = createSession({ kind: 'chat', channel: 'desktop', title: 'records lookup again' });
+  const otherAccepted = appendEvent({ sessionId: other.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'search the records index for the quarterly inventory' } });
+  const blocked = await prepareProvenOperationForRequest({
+    query: 'search the records index for the quarterly inventory',
+    sessionId: other.id,
+    sourceUserSeq: otherAccepted.seq,
+    acceptedInput: 'search the records index for the quarterly inventory',
+    mcpToolScope: null,
+  }, { acquireLiveRead: async () => ({ status: 'skipped', reason: 'mcp_scope' }) });
+  assert.deepEqual(blocked.liveReads, []);
+  assert.doesNotMatch(blocked.text ?? '', /re-attested for this request/);
+  assert.equal(provenCapabilityEntriesForTurn({ sessionId: other.id, sourceUserSeq: otherAccepted.seq }).some((entry) => entry.identifier === 'records__search'), false);
+});

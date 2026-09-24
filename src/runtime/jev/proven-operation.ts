@@ -15,6 +15,7 @@ import { peekConnectedToolkits } from '../../integrations/composio/client.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
 import { classifyComposioSlugEffect } from '../../integrations/composio/slug-effect.js';
 import type { CapabilityResolutionEntry } from '../harness/capability-resolution.js';
+import type { McpToolScope } from '../mcp-tool-scope.js';
 import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-semantic-proposal.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
@@ -23,6 +24,12 @@ import { selectProvenRunStrategyWithJev } from './control-plane.js';
 
 /** Bound so a slow provider refresh cannot stall the first model step. */
 const PROVEN_PROVISION_BUDGET_MS = 10_000;
+
+export interface ProvenLiveRead {
+  operation: string;
+  kind: 'mcp' | 'cli';
+  accountId: string;
+}
 
 export interface ProvenOperationPreparation {
   text?: string;
@@ -34,6 +41,13 @@ export interface ProvenOperationPreparation {
   descriptors: HostCapabilityDescriptorV1[];
   /** Operating accounts the host already bound for the published operations. */
   boundAccounts: ProvenBoundAccount[];
+  /** Native MCP / reviewed CLI reads the host re-attested and recorded as
+   * this source's proven resolution before the first frame; callable by name. */
+  liveReads: ProvenLiveRead[];
+}
+
+export interface ProvenOperationDependencies {
+  acquireLiveRead?: typeof import('../../tools/tool-search-provider-sources.js').acquireProvenLiveReadForSource;
 }
 
 function recordedProvenDescriptors(
@@ -322,6 +336,7 @@ export function renderProvenOperationGuidance(
   schemas: Record<string, unknown>,
   invocations: readonly unknown[] = [],
   boundAccounts: readonly ProvenBoundAccount[] = [],
+  liveReads: readonly ProvenLiveRead[] = [],
 ): string {
   const tools = strategy.toolsUsed;
   const schemaLines = tools.map((name) => {
@@ -354,6 +369,12 @@ export function renderProvenOperationGuidance(
     // Live 279653: with three Outlook accounts connected, the brain spent a
     // 31 s frame on tool_search account_selection for an operation whose
     // account the host had already routed. Say so, in the brain's own terms.
+    ...(liveReads.length > 0
+      ? [
+          'Native reads the host already re-attested for this request; call each by its exact name now (no tool_search is needed to find or disclose it):',
+          ...liveReads.map((row) => `- ${row.operation} (${row.kind === 'mcp' ? 'connected MCP server' : 'reviewed CLI read'}, account ${row.accountId})`),
+        ]
+      : []),
     ...(callable && boundAccounts.length > 0
       ? [
           'Operating account already bound by the host for these operations; no account_selection and no tool_search is needed to choose or confirm it:',
@@ -462,7 +483,9 @@ export async function prepareProvenOperationForRequest(input: {
   sessionId?: string;
   sourceUserSeq?: number;
   acceptedInput?: string;
-}): Promise<ProvenOperationPreparation> {
+  /** The request's MCP scope; a proven native read outside it is not warmed. */
+  mcpToolScope?: McpToolScope | null;
+}, dependencies: ProvenOperationDependencies = {}): Promise<ProvenOperationPreparation> {
   const empty: ProvenOperationPreparation = {
     tools: [],
     nativeTools: [],
@@ -470,6 +493,7 @@ export async function prepareProvenOperationForRequest(input: {
     capabilityRefs: [],
     descriptors: [],
     boundAccounts: [],
+    liveReads: [],
   };
   void import('./active-surface-heartbeat.js')
     .then((mod) => mod.tickActiveToolSurfaceHeartbeat())
@@ -554,8 +578,64 @@ export async function prepareProvenOperationForRequest(input: {
     } catch { /* proven provision is fail-open: keep tool_search */ }
   }
 
+  // Native MCP and reviewed CLI reads are neither registry rows nor Composio
+  // slugs. Re-attest each one through the acquisition discovery would run
+  // for it and record the installed manifest as this source's proven
+  // resolution, so the brain can call it by name on its first frame.
+  const liveReads: ProvenLiveRead[] = [];
+  const liveReadIds = strategy.toolsUsed.filter((name) => {
+    const trimmed = name.trim();
+    return trimmed
+      && !TOOL_REGISTRY.some((row) => row.name === trimmed || row.name === trimmed.toLowerCase())
+      && !composioSlugs.includes(trimmed.toUpperCase());
+  });
+  if (
+    liveReadIds.length > 0
+    && input.sessionId
+    && Number.isSafeInteger(input.sourceUserSeq)
+    && (input.sourceUserSeq ?? 0) > 0
+  ) {
+    try {
+      const acquire = dependencies.acquireLiveRead
+        ?? (await import('../../tools/tool-search-provider-sources.js')).acquireProvenLiveReadForSource;
+      const identity = { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq as number };
+      const deadlineAt = Date.now() + PROVEN_PROVISION_BUDGET_MS;
+      const entries: CapabilityResolutionEntry[] = [];
+      for (const operation of liveReadIds) {
+        if (Date.now() >= deadlineAt) break;
+        const acquired = await acquire({ operation, scope: input.mcpToolScope, identity, deadlineAt });
+        if (acquired.status !== 'installed') continue;
+        liveReads.push({ operation: acquired.operation, kind: acquired.kind, accountId: acquired.accountId });
+        if (acquired.schema) schemas[operation] = acquired.schema;
+        entries.push({
+          intent: 'proven live read for this request',
+          kind: acquired.kind,
+          identifier: acquired.operation,
+          status: 'proven',
+          connection: 'active',
+          accountIdentity: acquired.accountId,
+          effectClass: 'read',
+          matchedTokens: [acquired.kind === 'mcp'
+            ? acquired.operation.slice(0, Math.max(0, acquired.operation.indexOf('__')))
+            : acquired.operation],
+        });
+      }
+      if (entries.length > 0) {
+        const { recordAdmissionCapabilityResolution } = await import('../harness/capability-resolution.js');
+        recordAdmissionCapabilityResolution({
+          sessionId: identity.sessionId,
+          sourceUserSeq: identity.sourceUserSeq,
+          acceptedInput: input.acceptedInput?.trim()
+            || acceptedTextForSource(identity.sessionId, identity.sourceUserSeq)
+            || input.query,
+          entries,
+        });
+      }
+    } catch { /* live-read warming is fail-open: tool_search remains */ }
+  }
+
   return {
-    text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts),
+    text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
     nativeTools: provenStrategyCoversRequest(input.query, strategy)
@@ -565,5 +645,6 @@ export async function prepareProvenOperationForRequest(input: {
     boundAccounts,
     capabilityRefs,
     descriptors,
+    liveReads,
   };
 }

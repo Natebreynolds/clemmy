@@ -1,6 +1,6 @@
 import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadline.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
-import { createProductionMcpReadCarrier } from '../runtime/harness/production-mcp-read-carrier.js';
+import { createProductionMcpReadCarrier, type ProductionMcpRuntime } from '../runtime/harness/production-mcp-read-carrier.js';
 import { createHash } from 'node:crypto';
 import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
@@ -1994,6 +1994,95 @@ function liveReadNominationAllowedByMcpScope(
 ): boolean {
   return nomination.carrier.kind !== 'mcp'
     || mcpToolAllowedByScope(nomination.identity.reference.identifier, scope);
+}
+
+export interface ProvenLiveReadAcquisitionDependencies {
+  /** Test-only runtime for one MCP server; production discovers the configured server. */
+  mcpRuntimeForServer?: (serverName: string) => ProductionMcpRuntime;
+}
+
+export type ProvenLiveReadAcquisition =
+  | {
+      status: 'installed';
+      kind: 'mcp' | 'cli';
+      operation: string;
+      accountId: string;
+      schema?: Readonly<Record<string, unknown>>;
+    }
+  | { status: 'skipped'; reason: string };
+
+/**
+ * Re-acquire one live read that a proven strategy names, before the model's
+ * first frame, through the SAME acquisition discovery uses for it: live
+ * tools/list (or the reviewed CLI descriptor registry), attestation against
+ * the current definition, exact materialization, and the current MCP scope.
+ * Nothing here is a grant: the caller records the installed manifest as this
+ * source's proven resolution, and every call still crosses the host boundary.
+ * Live 2026-09-24: 66 learned strategies, none warmable when they named a
+ * native MCP or reviewed CLI read, so a familiar question still paid a
+ * tool_search frame to rediscover an operation it had already proved.
+ */
+export async function acquireProvenLiveReadForSource(input: {
+  operation: string;
+  scope: McpToolScope | null | undefined;
+  identity: { sessionId: string; sourceUserSeq: number };
+  deadlineAt: number;
+  signal?: AbortSignal;
+}, dependencies: ProvenLiveReadAcquisitionDependencies = {}): Promise<ProvenLiveReadAcquisition> {
+  const guard = { signal: input.signal, deadlineAt: input.deadlineAt };
+  const requirement = (operation: string) => ({
+    requirementId: `foreground-read-native:${input.identity.sourceUserSeq}:${operation}`,
+    objective: operation,
+    effect: 'read' as const,
+  });
+  const mcpOperation = canonicalMcpToolIdentity(input.operation);
+  if (mcpOperation) {
+    if (!mcpToolAllowedByScope(mcpOperation, input.scope)) return { status: 'skipped', reason: 'mcp_scope' };
+    const serverName = mcpOperation.slice(0, mcpOperation.indexOf('__'));
+    // An undefined scope is the unrestricted default (mcpToolAllowedByScope);
+    // a present scope filters adapters and nominations exactly as discovery does.
+    const scope = input.scope;
+    const registry = createProductionLiveReadAcquisitionRegistry({
+      configuredAdapters: () => [createProductionMcpLiveReadAcquisitionAdapter({
+        serverName,
+        ...(dependencies.mcpRuntimeForServer ? { runtime: dependencies.mcpRuntimeForServer(serverName) } : {}),
+      })],
+      ...(scope
+        ? {
+            adapterAllowed: (adapter) => liveReadAdapterAllowedByMcpScope(scope, adapter),
+            nominationAllowed: (nomination) => liveReadNominationAllowedByMcpScope(scope, nomination),
+          }
+        : {}),
+    });
+    const acquired = await registry.acquire(requirement(mcpOperation), guard);
+    if (!discoveryStillActive(guard)) return { status: 'skipped', reason: 'deadline' };
+    if (acquired.status !== 'installed') return { status: 'skipped', reason: acquired.reason };
+    return {
+      status: 'installed',
+      kind: 'mcp',
+      operation: acquired.manifest.operationId,
+      accountId: acquired.manifest.accountId,
+      ...(acquired.attestation.inputSchema && typeof acquired.attestation.inputSchema === 'object'
+        ? { schema: acquired.attestation.inputSchema as Readonly<Record<string, unknown>> }
+        : {}),
+    };
+  }
+  const reviewed = listReviewedCliReadDescriptors().find((descriptor) => descriptor.operationId === input.operation);
+  if (!reviewed) return { status: 'skipped', reason: 'not_a_live_read' };
+  const registry = createReviewedCliOnlyLiveReadRegistry({});
+  if (!registry) return { status: 'skipped', reason: 'no_reviewed_cli_registry' };
+  const acquired = await registry.acquire(requirement(reviewed.operationId), guard);
+  if (!discoveryStillActive(guard)) return { status: 'skipped', reason: 'deadline' };
+  if (acquired.status !== 'installed') return { status: 'skipped', reason: acquired.reason };
+  return {
+    status: 'installed',
+    kind: 'cli',
+    operation: acquired.manifest.operationId,
+    accountId: acquired.manifest.accountId,
+    ...(acquired.attestation.inputSchema && typeof acquired.attestation.inputSchema === 'object'
+      ? { schema: acquired.attestation.inputSchema as Readonly<Record<string, unknown>> }
+      : {}),
+  };
 }
 
 export function buildAuthorizedToolSearchCandidateSources(

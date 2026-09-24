@@ -6191,6 +6191,7 @@ async function runConversationWithinRuntimeConfig(
             query: String(options.semanticTaskInput ?? options.input ?? ''),
             sessionId: options.sessionId,
             sourceUserSeq,
+            mcpToolScope: options.mcpToolScope,
           });
           if (proven.text) {
             provenOperationText = proven.text;
@@ -6208,6 +6209,7 @@ async function runConversationWithinRuntimeConfig(
                 capabilityRefs: proven.capabilityRefs,
                 descriptors: proven.descriptors,
                 boundAccounts: proven.boundAccounts,
+                liveReads: proven.liveReads,
               },
             });
           }
