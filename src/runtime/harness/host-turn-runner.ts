@@ -6472,8 +6472,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       } catch { /* steering is advisory; never let it end a turn */ }
     }
     const modelOutput = structuredToolOutputs(output) ? output : await hostModelOutputPreview(text, {
-      sessionId: exactHostIdentity().sessionId,
-      sourceUserSeq: exactHostIdentity().sourceUserSeq,
+      identity: exactHostIdentity,
       callId: call.callId,
       toolName: call.name,
       arguments: parsedArguments,

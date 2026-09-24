@@ -4568,9 +4568,7 @@ test('mixed zero-crossing reads can terminally clarify without model continuatio
     [toolCall('business-write', 'memory_remember', { content: 'must not execute' })],
     [textMsg('must not reach another model step')],
   ]);
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
+  const agent = {
       model,
       tools: [
         {
@@ -4597,7 +4595,7 @@ test('mixed zero-crossing reads can terminally clarify without model continuatio
           },
           needsApproval: async () => false,
         },
-      ],
+      ].map(entry => brackets.wrapToolForHarness(entry as never)),
       toolUseBehavior: async (
         _context: unknown,
         results: Array<{ tool: { name: string }; output: unknown }>,
@@ -4621,13 +4619,11 @@ test('mixed zero-crossing reads can terminally clarify without model continuatio
         });
         return { isFinalOutput: true, finalOutput: question };
       },
-    } as never,
-    [{ type: 'message', role: 'user', content: 'Send James Marshall a calendar invite.' }] as never,
-    {
-      maxTurns: 5,
-      context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
-    },
-  );
+    };
+  const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
+    parent: { sessionId: session.id, sourceUserSeq: source.seq, counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::turn:1` } };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 5 });
 
   assert.equal(outcome.finalOutput, 'What email address should I use for James Marshall?');
   assert.equal(model.calls(), 1, 'the terminal clarification owns the turn');
@@ -4668,23 +4664,21 @@ test('agent output guardrails still stop a secret-bearing final answer', async (
 });
 
 test('FunctionTool errors remain model-visible and post-invocation control errors become effect-unknown', async (t) => {
+  const fixture = acceptHostCanarySource('handled-provider-error', 'Read the current local result.');
   const handled = tool({
-    name: 'handled_failure',
+    name: 'read_file',
     description: 'test handled failure',
     parameters: z.object({}),
     execute: async () => { throw new Error('ordinary provider error'); },
     errorFunction: () => 'handled corrective',
   });
   const handledModel = stubModel([
-    [toolCall('handled-call', 'handled_failure', {})],
+    [toolCall('handled-call', 'read_file', {})],
     [textMsg('recovered')],
   ]);
-  const handledOutcome = await hostRunRunner(
-    throwingRunner() as never,
-    { model: handledModel, tools: [handled] } as never,
-    [] as never,
-    { maxTurns: 4 },
-  );
+  const handledAgent = { model: handledModel, tools: [brackets.wrapToolForHarness(handled as never)] };
+  bindHostCanarySurface(fixture, handledAgent, handledAgent.tools);
+  const handledOutcome = await runProductionHost(fixture, handledAgent);
   assert.equal(handledOutcome.finalOutput, 'recovered');
   assert.match(JSON.stringify(handledOutcome.history), /handled corrective/);
 
@@ -4698,20 +4692,17 @@ test('FunctionTool errors remain model-visible and post-invocation control error
     }),
   ];
   for (const fatal of fatalErrors) {
-    await t.test(fatal.name, async () => {
-      const model = stubModel([[toolCall(`fatal-${fatal.name}`, 'fatal_tool', {})]]);
-      const outcome = await hostRunRunner(
-          throwingRunner() as never,
-          {
-            model,
-            tools: [{
-              type: 'function', name: 'fatal_tool', description: 'fatal', parameters: { type: 'object', properties: {} },
-              invoke: async () => { throw fatal; }, needsApproval: async () => false,
-            }],
-          } as never,
-          [] as never,
-          { maxTurns: 2 },
-        );
+    await t.test(fatal.name, async (subtest) => {
+      const accepted = acceptHostCanarySource(`fatal-${fatal.name}`,
+        'Create one reversible draft on the controlled provider account and report its receipt.');
+      let entered = 0;
+      const writer = await transportWriteFixture(async () => { entered++; throw fatal; }, async () => 'must not run');
+      subtest.after(() => writer.restore());
+      const model = stubModel([[writer.call(`fatal-${fatal.name}`)]]);
+      const agent = { model, tools: [writer.carrier] };
+      bindHostCanarySurface(accepted, agent, agent.tools);
+      const outcome = await runProductionHost(accepted, agent, undefined, { maxTurns: 2 });
+      assert.equal(entered, 1, 'the admitted provider body must throw the tested error');
       assert.deepEqual(outcome.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' });
       assert.equal(model.calls(), 1);
       assert.deepEqual(dispositionMarkers(outcome.history), [{
@@ -5134,7 +5125,8 @@ test('independent nonapproval calls execute concurrently while result history st
 });
 
 test('an uncertain sibling drains started calls, pairs the whole frame, and starts no queued call', async () => {
-  const session = eventlog.createSession({ id: 'host-fatal-frame-drain', kind: 'chat' });
+  const fixture = acceptHostCanarySource('host-fatal-frame-drain', 'List the local files.');
+  const session = fixture.session;
   const fatal = new brackets.KillRequested('fatal sibling');
   let markSiblingStarted!: () => void;
   const siblingStarted = new Promise<void>((resolve) => { markSiblingStarted = resolve; });
@@ -5151,14 +5143,13 @@ test('an uncertain sibling drains started calls, pairs the whole frame, and star
   ]]);
   const parent = {
     sessionId: session.id,
+    sourceUserSeq: fixture.source.seq,
     counter: new brackets.ToolCallsCounter(8),
     behaviorScopeId: `${session.id}::turn:1`,
   };
-  const pending = brackets.withHarnessRunContext(parent, () => hostRunRunner(
-    throwingRunner() as never,
-    {
+  const agent = {
       model,
-      tools: [{
+      tools: [brackets.wrapToolForHarness({
         type: 'function', name: 'list_files', description: 'frame drain',
         parameters: { type: 'object', properties: { slot: { type: 'string' } } },
         needsApproval: async () => false,
@@ -5184,10 +5175,14 @@ test('an uncertain sibling drains started calls, pairs the whole frame, and star
           queuedRuns += 1;
           return 'must-not-run';
         },
-      }],
-    } as never,
-    [] as never,
-    { maxTurns: 2, toolExecution: { maxFunctionToolConcurrency: 2 } },
+      } as never)],
+    };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const pending = brackets.withHarnessRunContext(parent, () => productionHostRunRunner(
+    throwingRunner() as never,
+    agent as never,
+    [{ role: 'user', content: fixture.source.data.text }] as never,
+    { hostTurnEngine: 'host_v1', context: fixture.context, maxTurns: 2, toolExecution: { maxFunctionToolConcurrency: 2 } },
   ));
 
   await fatalObserved;
@@ -5232,7 +5227,8 @@ test('an uncertain sibling drains started calls, pairs the whole frame, and star
 test('a tool ceiling drains its started sibling before propagating the exact paired checkpoint', async () => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
-  const session = eventlog.createSession({ id: 'host-tool-ceiling-frame-drain', kind: 'chat' });
+  const fixture = acceptHostCanarySource('host-tool-ceiling-frame-drain', 'List the local files.');
+  const session = fixture.session;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
   let releaseStarted!: () => void;
@@ -5248,16 +5244,14 @@ test('a tool ceiling drains its started sibling before propagating the exact pai
   ]]);
   const parent = {
     sessionId: session.id,
+    sourceUserSeq: fixture.source.seq,
     counter: new brackets.ToolCallsCounter(1),
     behaviorScopeId: `${session.id}::turn:1`,
   };
 
-  try {
-    const pending = brackets.withHarnessRunContext(parent, () => hostRunRunner(
-      throwingRunner() as never,
-      {
+  const agent = {
         model,
-        tools: [{
+        tools: [brackets.wrapToolForHarness({
           type: 'function', name: 'list_files', description: 'ceiling frame drain',
           parameters: { type: 'object', properties: { slot: { type: 'string' } } },
           needsApproval: async () => false,
@@ -5276,10 +5270,15 @@ test('a tool ceiling drains its started sibling before propagating the exact pai
             else queuedRuns += 1;
             return 'must-not-run';
           },
-        }],
-      } as never,
-      [] as never,
-      { maxTurns: 2, toolExecution: { maxFunctionToolConcurrency: 2 } },
+        } as never)],
+      };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  try {
+    const pending = brackets.withHarnessRunContext(parent, () => productionHostRunRunner(
+      throwingRunner() as never,
+      agent as never,
+      [{ role: 'user', content: fixture.source.data.text }] as never,
+      { hostTurnEngine: 'host_v1', context: fixture.context, maxTurns: 2, toolExecution: { maxFunctionToolConcurrency: 2 } },
     )).then(
       (outcome) => ({ outcome, error: undefined as unknown }),
       (error: unknown) => ({ outcome: undefined, error }),
@@ -5620,29 +5619,25 @@ test('a rejected approval becomes a visible tool result, never an execution', as
 });
 
 test('maxTurns becomes one typed blocked checkpoint — never an ask or fake continue', async () => {
+  const fixture = acceptHostCanarySource('host-limit', 'Read the local result twice.');
   const model = stubModel([
-    [toolCall('loop-1', 'ping', {})],
-    [toolCall('loop-2', 'ping', {})],
+    [toolCall('loop-1', 'read_file', {})],
+    [toolCall('loop-2', 'read_file', {})],
   ]);
   const agent = {
     model,
-    tools: [{
-      type: 'function', name: 'ping', description: 't', parameters: { type: 'object', properties: {} },
+    tools: [brackets.wrapToolForHarness({
+      type: 'function', name: 'read_file', description: 't', parameters: { type: 'object', properties: {} },
       invoke: async () => 'pong', needsApproval: async () => false,
-    }],
+    } as never)],
   };
-  const session = eventlog.createSession({ id: 'host-limit', kind: 'chat' });
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    agent as never,
-    [] as never,
-    { maxTurns: 2, context: { sessionId: session.id } },
-  );
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 2 });
   assert.equal(outcome.terminal?.status, 'blocked');
   assert.equal(outcome.terminal?.reason, 'max_turns');
   assert.doesNotMatch(String(outcome.finalOutput), /say continue|retry/i);
   assert.equal(
-    eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length,
+    eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length,
     0,
     'a limit is host data, never a user question',
   );
