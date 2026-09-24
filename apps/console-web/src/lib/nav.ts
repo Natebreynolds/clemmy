@@ -2,7 +2,7 @@ import {
   Home, MessageCircle, Inbox, Zap, Plug, Brain, Video, LayoutDashboard,
   BarChart3, Wrench, Stethoscope, Gauge, Sliders, Sparkles,
   Settings, HelpCircle, Users, FlaskConical, Goal, Activity, GitBranch,
-  FolderOpen,
+  FolderOpen, Workflow,
   type LucideIcon,
 } from 'lucide-react';
 import { primaryHomeNavigation, type HomePreferences } from './home-prefs';
@@ -54,6 +54,7 @@ export const PRIMARY_NAV: NavDest[] = [
 export const ADVANCED_NAV: NavDest[] = [
   { path: '/advanced/usage', label: 'Usage', icon: BarChart3, hint: 'Token spend & activity', tier: 'everyday' },
   { path: '/advanced/tools', label: 'Tools', icon: Wrench, hint: 'Registered tool catalog', tier: 'everyday' },
+  { path: '/advanced/canvas', label: 'Canvas', icon: Workflow, hint: 'See a workflow as a graph & rewire its steps', tier: 'everyday' },
   { path: '/advanced/budgets', label: 'Run limits', icon: Gauge, hint: 'How far a run goes — steps, time & caps', tier: 'everyday' },
   { path: '/advanced/autonomy', label: 'Autonomy', icon: Sliders, hint: 'When Clementine acts on its own', tier: 'everyday' },
   { path: '/advanced/diagnostics', label: 'Diagnostics', icon: Stethoscope, hint: 'Health, logs & storage', tier: 'developer' },

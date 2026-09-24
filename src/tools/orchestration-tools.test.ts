@@ -1699,6 +1699,24 @@ test('workflow_create rejects malformed inputs schema JSON without creating', as
   assert.equal(readWorkflow('bad-wf'), null);
 });
 
+test('workflow_create refuses a dependency cycle, and says nothing was created', async () => {
+  // The authoring validator catches the loop before any file is written. The
+  // refusal has to name the outcome as well as the fault: "there is a loop" and
+  // "the workflow does not exist" are different things for a caller to act on,
+  // and the agent authors workflows through this tool unattended.
+  const result = await workflowCreate()({
+    name: 'cycle-wf',
+    description: 'x',
+    steps: [
+      { id: 'a', prompt: 'A', dependsOn: ['b'] },
+      { id: 'b', prompt: 'B', dependsOn: ['a'] },
+    ],
+  });
+  assert.match(resultText(result), /NOT created/i);
+  assert.match(resultText(result), /dependency loop/i);
+  assert.equal(readWorkflow('cycle-wf'), null, 'a refused create left nothing behind');
+});
+
 test('workflow_update accepts an inputs SCHEMA JSON string and updates def.inputs', async () => {
   await workflowCreate()({
     name: 'up-wf',

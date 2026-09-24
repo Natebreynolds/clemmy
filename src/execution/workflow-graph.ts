@@ -18,6 +18,7 @@ import {
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
 import { validateWorkflowTransform } from './workflow-transform.js';
+import { findCycle } from './graph-cycle.js';
 
 export type WorkflowGraphNodeType =
   | 'step'
@@ -645,28 +646,15 @@ function computeEntryNodeIds(nodes: WorkflowGraphNode[], edges: WorkflowGraphEdg
 }
 
 function graphHasCycle(nodes: WorkflowGraphNode[], edges: WorkflowGraphEdge[]): boolean {
+  const ids = new Set(nodes.map((node) => node.id));
   const adj = new Map<string, string[]>();
-  for (const node of nodes) adj.set(node.id, []);
   for (const edge of edges) {
-    if (!adj.has(edge.source) || !adj.has(edge.target)) continue;
-    adj.get(edge.source)?.push(edge.target);
+    if (!ids.has(edge.source) || !ids.has(edge.target)) continue;
+    const from = adj.get(edge.source);
+    if (from) from.push(edge.target);
+    else adj.set(edge.source, [edge.target]);
   }
-
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  function visit(id: string): boolean {
-    if (visiting.has(id)) return true;
-    if (visited.has(id)) return false;
-    visiting.add(id);
-    for (const next of adj.get(id) ?? []) {
-      if (visit(next)) return true;
-    }
-    visiting.delete(id);
-    visited.add(id);
-    return false;
-  }
-
-  return nodes.some((node) => visit(node.id));
+  return findCycle(ids, (id) => adj.get(id) ?? []) !== null;
 }
 
 function isEmptyObject(value: unknown): boolean {

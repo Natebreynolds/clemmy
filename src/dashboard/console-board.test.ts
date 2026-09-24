@@ -3799,3 +3799,135 @@ test('GET /api/console/board shows a scheduled workflow with an unbound required
     await h.close();
   }
 });
+
+/**
+ * `steps` is authoritative: a step left out of the array is deleted. That is
+ * right for an editor that shows the whole workflow, and wrong for one that
+ * edits a single facet of it.
+ *
+ * The canvas edits dependsOn and nothing else. To avoid deleting the steps it
+ * was not editing, it had to send every step on every save — which is exactly
+ * what makes a stale tab destructive: open the canvas, add a step from the
+ * drawer in another tab, save the canvas, and the new step is gone. `stepEdits`
+ * removes the delete power the canvas never wanted.
+ */
+test('PATCH /api/console/workflows stepEdits merges by id and never deletes an omitted step', async () => {
+  const workflowName = 'Step Edits Flow';
+  writeWorkflow('step-edits-flow', {
+    name: workflowName,
+    description: 'non-destructive step edits',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'research', prompt: 'Pull the metrics.', sideEffect: 'read' },
+      { id: 'draft', prompt: 'Draft the summary.', dependsOn: ['research'] },
+      { id: 'deliver', prompt: 'Send it.', dependsOn: ['draft'], sideEffect: 'send', requiresApproval: true },
+    ],
+  });
+
+  const h = await boot();
+  try {
+    // A canvas that never learned about `deliver` rewires the two it knows.
+    const patch = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        stepEdits: [
+          { id: 'research', dependsOn: [] },
+          { id: 'draft', dependsOn: [] },
+        ],
+      }),
+    });
+    assert.equal(patch.status, 200);
+
+    const res = await fetch(`${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}`);
+    const body = await res.json() as { steps: Array<Record<string, unknown>> };
+    const byId = Object.fromEntries(body.steps.map((step) => [step.id, step]));
+
+    assert.ok(byId.deliver, 'the omitted step survived');
+    assert.deepEqual(byId.deliver?.dependsOn, ['draft'], 'and kept its own wiring');
+    assert.equal(byId.deliver?.requiresApproval, true, 'and its approval gate');
+    // "depends on nothing" is canonically absent, not an empty array —
+    // optionalStringList drops an empty list on every step write, not just this
+    // one. What matters is that draft no longer waits on research.
+    assert.deepEqual(byId.draft?.dependsOn ?? [], [], 'the edited step was rewired');
+    assert.equal(byId.draft?.prompt, 'Draft the summary.', 'without touching what it did not name');
+    assert.equal(body.steps.length, 3);
+  } finally {
+    await h.close();
+  }
+});
+
+test('PATCH /api/console/workflows keeps steps authoritative, and refuses both fields at once', async () => {
+  const workflowName = 'Steps Authority Flow';
+  const seed = () => writeWorkflow('steps-authority-flow', {
+    name: workflowName,
+    description: 'steps still deletes',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'keep', prompt: 'Keep me.' },
+      { id: 'drop', prompt: 'Drop me.', dependsOn: ['keep'] },
+    ],
+  });
+  seed();
+
+  const h = await boot();
+  try {
+    const url = `${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}`;
+    const both = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ steps: [{ id: 'keep' }], stepEdits: [{ id: 'keep', dependsOn: [] }] }),
+    });
+    assert.equal(both.status, 400, 'one write cannot be authoritative and additive at once');
+
+    const authoritative = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ steps: [{ id: 'keep' }] }),
+    });
+    assert.equal(authoritative.status, 200);
+    const body = await (await fetch(url)).json() as { steps: Array<Record<string, unknown>> };
+    assert.deepEqual(body.steps.map((s) => s.id), ['keep'], 'steps still deletes what it omits');
+  } finally {
+    await h.close();
+  }
+});
+
+test('PATCH /api/console/workflows refuses a dependency loop through either step field', async () => {
+  const workflowName = 'Loop Patch Flow';
+  writeWorkflow('loop-patch-flow', {
+    name: workflowName,
+    description: 'loops are refused on the way in',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'a', prompt: 'A.' },
+      { id: 'b', prompt: 'B.', dependsOn: ['a'] },
+    ],
+  });
+
+  const h = await boot();
+  try {
+    const url = `${h.url}/api/console/workflows/${encodeURIComponent(workflowName)}`;
+    for (const field of ['steps', 'stepEdits'] as const) {
+      const res = await fetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          [field]: [{ id: 'a', dependsOn: ['b'] }, { id: 'b', dependsOn: ['a'] }],
+        }),
+      });
+      assert.equal(res.status, 400, `${field} let a loop through`);
+      const body = await res.json() as { error?: string };
+      assert.match(body.error ?? '', /dependency loop/i, `${field} did not name the loop`);
+    }
+
+    // The definition the loop tried to overwrite is still the one on disk.
+    const body = await (await fetch(url)).json() as { steps: Array<Record<string, unknown>> };
+    assert.deepEqual(body.steps.map((s) => s.dependsOn ?? []), [[], ['a']]);
+  } finally {
+    await h.close();
+  }
+});
