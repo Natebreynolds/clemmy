@@ -2298,6 +2298,56 @@ async function functionTools(
   return functions;
 }
 
+/**
+ * Advertised-surface memory per accepted source (session + source seq).
+ *
+ * Tool definitions lead every provider's cache prefix (Anthropic: tools →
+ * system → messages; OpenAI-compatible chat templates render tools into the
+ * system prefix), so a tool that JOINS, LEAVES or MOVES mid-turn re-bills the
+ * whole prompt behind it on the next frame. The first-seen wire order below
+ * already kept positions within one runner invocation; it did not survive a
+ * host re-entry on the same source, and a tool whose `isEnabled` flipped off
+ * (plan_task after activation, work_call while planning was not ready) left
+ * the surface entirely.
+ *
+ * Measured on the live home 2026-09-23 from model_request_provenance: every
+ * same-source zero-cache frame that day (45 frames, ~2.1M uncached tokens)
+ * was a frame whose catalog layer changed — plan_task joining at 9.9 KB,
+ * plan_task/work_call leaving, or the set reordering on re-entry — on the
+ * Claude host lane and the Together GLM lane alike.
+ *
+ * Within one accepted source the surface is therefore append-only: a tool the
+ * model has been shown keeps its position and its last shown schema for the
+ * rest of the source. Enablement still decides what is CALLABLE (toolByName /
+ * every authority check); this only decides what is ADVERTISED. A call to a
+ * retained tool that is no longer enabled meets a typed pre-dispatch refusal
+ * and no body runs.
+ */
+interface AdvertisedSurfaceMemory {
+  position: Map<string, number>;
+  shown: Map<string, unknown>;
+}
+const ADVERTISED_SURFACE_MEMORY_MAX = 512;
+const advertisedSurfaceMemories = new Map<string, AdvertisedSurfaceMemory>();
+function advertisedSurfaceMemoryFor(key: string): AdvertisedSurfaceMemory {
+  const existing = advertisedSurfaceMemories.get(key);
+  if (existing) {
+    advertisedSurfaceMemories.delete(key); // re-insert to keep LRU recency
+    advertisedSurfaceMemories.set(key, existing);
+    return existing;
+  }
+  const fresh: AdvertisedSurfaceMemory = { position: new Map(), shown: new Map() };
+  advertisedSurfaceMemories.set(key, fresh);
+  if (advertisedSurfaceMemories.size > ADVERTISED_SURFACE_MEMORY_MAX) {
+    const oldest = advertisedSurfaceMemories.keys().next().value;
+    if (oldest !== undefined) advertisedSurfaceMemories.delete(oldest);
+  }
+  return fresh;
+}
+export function _resetAdvertisedSurfaceMemoryForTests(): void {
+  advertisedSurfaceMemories.clear();
+}
+
 function serializedTools(tools: FunctionToolLike[]): unknown[] {
   return tools.map((tool) => ({
     type: 'function',
@@ -2689,18 +2739,45 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let toolByName = new Map<string, FunctionToolLike>();
   let configuredToolRefs = new Set<FunctionToolLike>();
   let schemas: unknown[] = [];
-  // Wire position is first-seen within this run: a tool the model has already
-  // been shown keeps its place, and a tool enabled mid-turn joins after them.
-  // The provider caches the longest identical prefix, so an insertion near the
-  // front would re-bill every schema behind it on every later frame. Authority
-  // digests sort by name and never read this order.
-  const toolWirePosition = new Map<string, number>();
+  // Names the model has been shown in this accepted source that are not
+  // enabled right now. They stay on the wire (see AdvertisedSurfaceMemory);
+  // a call to one is refused before dispatch.
+  let retainedToolNames = new Set<string>();
+  // Wire position is first-seen within the ACCEPTED SOURCE: a tool the model
+  // has already been shown keeps its place, and a tool enabled mid-turn joins
+  // after them. The provider caches the longest identical prefix, so an
+  // insertion near the front would re-bill every schema behind it on every
+  // later frame. Authority digests sort by name and never read this order.
+  // Without an exact accepted source (isolated fixtures) the memory is local
+  // to this runner invocation, which is the previous behavior.
+  const localSurfaceMemory: AdvertisedSurfaceMemory = { position: new Map(), shown: new Map() };
+  const surfaceMemory = (): AdvertisedSurfaceMemory => {
+    try {
+      const identity = exactHostIdentity();
+      return advertisedSurfaceMemoryFor(`${identity.sessionId}#${identity.sourceUserSeq}`);
+    } catch {
+      return localSurfaceMemory;
+    }
+  };
   const inFirstSeenOrder = (enabled: FunctionToolLike[]): FunctionToolLike[] => {
+    const toolWirePosition = surfaceMemory().position;
     for (const tool of enabled) {
       if (!toolWirePosition.has(tool.name)) toolWirePosition.set(tool.name, toolWirePosition.size);
     }
     return [...enabled].sort((left, right) =>
       toolWirePosition.get(left.name)! - toolWirePosition.get(right.name)!);
+  };
+  /** The wire surface for the next model request: every tool shown in this
+   *  source so far, in first-seen order, each with its last shown schema. */
+  const advertisedSchemas = (enabled: FunctionToolLike[]): unknown[] => {
+    const memory = surfaceMemory();
+    const current = serializedTools(enabled);
+    enabled.forEach((tool, index) => memory.shown.set(tool.name, current[index]));
+    const enabledNames = new Set(enabled.map((tool) => tool.name));
+    retainedToolNames = new Set([...memory.shown.keys()].filter((name) => !enabledNames.has(name)));
+    return [...memory.shown.entries()]
+      .sort(([left], [right]) => (memory.position.get(left) ?? 0) - (memory.position.get(right) ?? 0))
+      .map(([, schema]) => schema);
   };
   /** The host's conversational check-in is documented in three places as "one
    *  tool-free model request" — on RunTurnOptions.hostConversationalCheckIn,
@@ -2725,6 +2802,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       toolByName = new Map();
       configuredToolRefs = new Set();
       schemas = [];
+      retainedToolNames = new Set();
       // AN EXPLANATION MUST NOT BE REFUSED BY THE SURFACE IT IS EXPLAINING.
       //
       // This activation exists precisely BECAUSE the turn before it exhausted
@@ -2775,7 +2853,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       throw new UnsupportedHostCapabilityError('duplicate_function_name');
     }
     toolByName = new Map(tools.map((tool) => [tool.name, tool]));
-    schemas = serializedTools(tools);
+    schemas = advertisedSchemas(tools);
     armExactHostSurface();
     // A delegated worker child prepares its own item here: after the host owns
     // and arms the child's accepted source, before its first model step, the
@@ -5609,6 +5687,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // immutable capability/account binding used by this first read-only
     // surface. The host deadline now bounds them, but timing safety cannot
     // substitute for catalog provenance, so the canary remains conservative.
+    // A tool the model was shown earlier in this source and that is no longer
+    // enabled stays on the wire so the cached prefix holds; calling it is a
+    // bounded, effect-free refusal that names the current door.
+    if (!tool && retainedToolNames.has(name)) {
+      return `Tool '${name}' is not callable at this stage of the request; it stays listed only so the request's tool list does not change mid-way. No local or external effect occurred. Continue with another listed tool.${unconfiguredToolCarrierHint(name)}`;
+    }
     if (
       !harnessToolBracketsEnabled()
       || !tool

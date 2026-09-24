@@ -983,6 +983,7 @@ function commitHostSettlement(input: {
 }
 
 test('host stepping: N host steps = N getResponse; tools run on host; hooks still fire', async () => {
+  const fixture = acceptHostCanarySource('host-stepping', 'go');
   let toolRuns = 0;
   const model = stubModel([
     [toolCall('c1', 'ping', { q: 'x' })],
@@ -991,24 +992,25 @@ test('host stepping: N host steps = N getResponse; tools run on host; hooks stil
   const agent = {
     model,
     instructions: 'base system',
-    tools: [{
+    tools: [brackets.wrapToolForHarness({
       type: 'function', name: 'ping', description: 'test', parameters: { type: 'object', properties: {} },
       invoke: async () => { toolRuns += 1; return 'pong'; },
       needsApproval: async () => false,
-    }],
+    })],
   };
+  bindHostCanarySurface(fixture, agent, agent.tools);
   const runner = throwingRunner();
   const hookEvents: string[] = [];
   runner.on('agent_tool_start', () => hookEvents.push('tool_start'));
   runner.on('agent_tool_end', () => hookEvents.push('tool_end'));
   runner.on('agent_end', () => hookEvents.push('agent_end'));
 
-  const outcome = await hostRunRunner(
+  const outcome = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
     runner as never,
     agent as never,
     [{ type: 'message', role: 'user', content: 'go' }] as never,
-    { maxTurns: 6, context: { sessionId: 'host-step-1' } },
-  );
+    { maxTurns: 6, hostTurnEngine: 'host_v1', context: fixture.context } as never,
+  ));
 
   assert.equal(model.calls(), 2, 'two host steps = two getResponse, nothing more');
   assert.equal(toolRuns, 1, 'the HOST executed the tool');
@@ -1443,7 +1445,8 @@ test('consequence-free dependency lookup and bounded authority retries retain av
       sessionId: lookupFixture.session.id,
       sourceUserSeq: lookupFixture.source.seq,
       historyDelta: lookupDelta,
-    }), { status: 'ok', attemptClass: 'dependency_lookup' });
+    }), { status: 'ok', attemptClass: 'task_work' },
+    'successfully consuming a retained result is progress, not a stalled dependency lookup');
 
     const authorityFixture = acceptHostCanarySource('authority-acquisition-control-surface');
     let authorityBodies = 0;
@@ -4167,6 +4170,7 @@ test('malformed callModelInputFilter output fails closed before model dispatch',
 });
 
 test('dynamic instructions are evaluated afresh before every host model step', async () => {
+  const fixture = acceptHostCanarySource('dynamic-instructions');
   let instructionReads = 0;
   const seen: string[] = [];
   let call = 0;
@@ -4177,40 +4181,91 @@ test('dynamic instructions are evaluated afresh before every host model step', a
       return {
         usage: {},
         output: call === 1
-          ? [toolCall('dynamic-call', 'dynamic_read', {})]
+          ? [toolCall('dynamic-call', 'workspace_roots', {})]
           : [textMsg('dynamic complete')],
         responseId: `dynamic-${call}`,
       };
     },
     getStreamedResponse: testModelStream,
   };
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      instructions: () => `memory-revision-${++instructionReads}`,
-      tools: [{
-        type: 'function', name: 'dynamic_read', description: 'read', parameters: { type: 'object', properties: {} },
-        invoke: async () => 'fresh', needsApproval: async () => false,
-      }],
-    } as never,
-    [] as never,
-    { maxTurns: 4 },
-  );
+  const agent = {
+    model,
+    instructions: () => `memory-revision-${++instructionReads}`,
+    tools: [brackets.wrapToolForHarness({
+      type: 'function', name: 'workspace_roots', description: 'read', parameters: { type: 'object', properties: {} },
+      invoke: async () => 'fresh', needsApproval: async () => false,
+    })],
+  };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent);
   assert.deepEqual(seen, ['memory-revision-1', 'memory-revision-2']);
   assert.equal(outcome.finalOutput, 'dynamic complete');
 });
 
-test('host tool resolution includes enabled MCP tools through agent.getAllTools', async () => {
+test('host tool resolution includes enabled MCP tools through agent.getAllTools', async (t) => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const fixture = acceptHostCanarySource('get-all-tools-mcp');
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  t.after(() => {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    capabilityManifestStores.installCapabilityManifestStore(priorStore);
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+  });
   let toolRuns = 0;
   const schemas: string[][] = [];
   let call = 0;
-  const mcpTool = {
+  const mcpTool = brackets.wrapToolForHarness({
     type: 'function', name: 'records__search', description: 'live MCP search',
     parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
-    invoke: async () => { toolRuns += 1; return 'record'; },
+    invoke: async () => { throw new Error('the materialized MCP port must own dispatch'); },
     needsApproval: async () => false,
+  });
+  const fakeServer = {
+    async invalidateToolsCache() {},
+    async listTools() { return [{ name: mcpTool.name, description: mcpTool.description, inputSchema: mcpTool.parameters,
+      annotations: { readOnlyHint: true, destructiveHint: false } }]; },
+    async callTool(name: string, args: unknown) {
+      assert.equal(name, 'records__search');
+      assert.deepEqual(args, { query: 'current' });
+      toolRuns++;
+      return [{ type: 'text', text: JSON.stringify({ records: ['record'] }) }];
+    },
   };
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore([], { durable: true }));
+  const materialized = await productionMcp.createProductionMcpReadCarrier({ serverName: 'records', runtime: {
+    configuredServers: () => [{ name: 'records', type: 'stdio', command: '/fixture/records-mcp', args: [], enabled: true, source: 'user' }] as never,
+    serverForEnumeration: () => fakeServer as never,
+    serverForOperation: () => fakeServer as never,
+  } }).materializeExact({ operationId: 'records__search', inputSchema: mcpTool.parameters });
+  assert.equal(materialized.status, 'installed', JSON.stringify(materialized));
+  // The host's read bar is source-scoped: a tool the agent advertises through
+  // getAllTools is not a configured harness-bound object, so it descends only
+  // when THIS accepted source proved the read. Production records that proof
+  // at semantic admission / tool_search before the model can call the read;
+  // the fixture records the same proven resolution against the same accepted
+  // text. The tool stays out of agent.tools: resolution still goes through
+  // getAllTools, and the materialized port still owns dispatch.
+  capabilityResolution.recordAdmissionCapabilityResolution({
+    sessionId: fixture.session.id,
+    sourceUserSeq: fixture.source.seq,
+    acceptedInput: 'Exercise the get-all-tools-mcp host boundary.',
+    entries: [{
+      intent: 'search the current records',
+      kind: 'mcp',
+      identifier: 'records__search',
+      status: 'proven',
+      connection: 'active',
+      effectClass: 'read',
+      accountIdentity: materialized.status === 'installed' ? materialized.manifest.accountId : undefined,
+    }],
+  });
   const model = {
     async getResponse(request: { tools?: Array<{ name?: string }> }) {
       schemas.push((request.tools ?? []).map((entry) => entry.name ?? ''));
@@ -4224,33 +4279,27 @@ test('host tool resolution includes enabled MCP tools through agent.getAllTools'
     },
     getStreamedResponse: testModelStream,
   };
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      tools: [],
-      getAllTools: async () => [mcpTool],
-    } as never,
-    [] as never,
-    { maxTurns: 4 },
-  );
+  const agent = { model, tools: [], getAllTools: async () => [mcpTool] };
+  bindHostCanarySurface(fixture, agent, [mcpTool]);
+  const outcome = await runProductionHost(fixture, agent);
   assert.deepEqual(schemas, [['records__search'], ['records__search']]);
-  assert.equal(toolRuns, 1);
+  assert.equal(toolRuns, 1, JSON.stringify(outcome.history));
   assert.equal(outcome.finalOutput, 'MCP complete');
 });
 
 test('a tool enabled mid-turn joins after the tools already on the wire', async () => {
+  const fixture = acceptHostCanarySource('stable-tool-prefix');
   // The provider caches the longest identical prefix. A tool that becomes
   // enabled mid-turn must not be inserted ahead of the tools the model has
   // already been shown, or every schema behind it is re-billed each frame.
-  const inert = (name: string) => ({
+  const inert = (name: string) => brackets.wrapToolForHarness({
     type: 'function', name, description: `${name} fixture`,
     parameters: { type: 'object', properties: {} },
     invoke: async () => `${name} ran`, needsApproval: async () => false,
   });
   const gated = inert('gated_carrier');
-  const first = inert('first_read');
-  const second = inert('second_read');
+  const first = inert('workspace_roots');
+  const second = inert('task_list');
   const surfaces: string[][] = [];
   let call = 0;
   const model = {
@@ -4260,28 +4309,25 @@ test('a tool enabled mid-turn joins after the tools already on the wire', async 
       return {
         usage: {},
         output: call === 1
-          ? [toolCall('first-call', 'first_read', {})]
+          ? [toolCall('first-call', 'workspace_roots', {})]
           : call === 2
-            ? [toolCall('second-call', 'second_read', {})]
+            ? [toolCall('second-call', 'task_list', {})]
             : [textMsg('surface complete')],
       };
     },
     getStreamedResponse: testModelStream,
   };
-  const outcome = await hostRunRunner(
-    throwingRunner() as never,
-    {
-      model,
-      tools: [],
-      // The configured order lists the gated carrier first, as a registry may.
-      getAllTools: async () => (call === 0 ? [first, second] : [gated, first, second]),
-    } as never,
-    [] as never,
-    { maxTurns: 5 },
-  );
+  const agent = {
+    model,
+    tools: [],
+    // The configured order lists the gated carrier first, as a registry may.
+    getAllTools: async () => (call === 0 ? [first, second] : [gated, first, second]),
+  };
+  bindHostCanarySurface(fixture, agent, [first, second, gated]);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 5 });
   assert.equal(outcome.finalOutput, 'surface complete');
-  assert.deepEqual(surfaces[0], ['first_read', 'second_read']);
-  assert.deepEqual(surfaces[1], ['first_read', 'second_read', 'gated_carrier'],
+  assert.deepEqual(surfaces[0], ['workspace_roots', 'task_list']);
+  assert.deepEqual(surfaces[1], ['workspace_roots', 'task_list', 'gated_carrier'],
     'the first frame is still a prefix of the second');
   assert.deepEqual(surfaces[2], surfaces[1], 'and the surface then holds still');
 });
@@ -11049,13 +11095,81 @@ test('the host model request liveness clears on both a response and a rejected r
   }
 });
 
+// A declared reversible provider write gives transport tests real call authority.
+// The provider body is recording-only; no network or live-home mutation occurs.
+async function transportWriteFixture(write: () => Promise<string>, late: () => Promise<string>) {
+  const adapters = await import('./production-capability-adapter.js');
+  const observations = await import('./independent-capability-observation.js');
+  const schemas = await import('../../tools/composio-schema-cache.js');
+  const { digestSchema } = await import('../../tools/tool-contract-store.js');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  const operationId = 'TRANSPORT_CREATE_DRAFT';
+  const schema = { type: 'object', properties: { late: { type: 'boolean' } }, required: ['late'], additionalProperties: false };
+  const providerInputSchemaDigest = digestSchema(schema);
+  const definitionFingerprint = createHash('sha256').update(providerInputSchemaDigest).digest('hex');
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1, manifestId: 'cap:resolved:transport_create_draft', providerKind: 'native_mcp', operationId,
+    providerIdentity: 'native:transport-fixture', providerVersion: '1', operationVersion: '1', definitionFingerprint,
+    externalDefinition: { version: 1, providerInputSchemaDigest, semanticName: operationId,
+      behaviorHints: { readOnly: false, destructive: false, idempotent: null, openWorld: false } },
+    effect: 'external_write', accountId: 'account:transport:fixture',
+    operationSemantics: { version: 1, reversibility: 'reversible' },
+    destination: { family: 'external_resource', posture: 'create_new' },
+    idempotency: { required: true, policy: 'key_before_dispatch' },
+    reconciliation: { supported: true, policy: 'exact_artifact' },
+    outputContract: { kind: 'created_resource' }, purpose: 'invoke_live_operation',
+    acceptedInputKinds: ['arguments'], producedOutputKinds: ['result'], applicableDeliverableKinds: ['result'],
+    evidenceContract: { kinds: ['result'], readbackRequired: false },
+    provenance: { issuer: 'host:transport:test', issuedAt: '2026-09-23T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' }, invokePortId: 'host:transport:invoke', argumentCompiler: { id: 'host:json', version: '1' },
+  });
+  schemas.rememberToolSchema(operationId, schema, Date.now(), '1', { type: 'object' });
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore([manifest], { durable: true }));
+  const observation = { definitionFingerprint, providerVersion: '1', operationVersion: '1', accountId: manifest.accountId, observedAt: Date.now() };
+  assert.equal(observations.registerIndependentCapabilityObservation({ operationId, ...observation,
+    origin: 'independent', observe: () => ({ operationId, ...observation }) }).ok, true);
+  const invoke = async (request: { payload: { late: boolean }; authority?: unknown }) => {
+    assert.ok(request.authority, 'a settled fixture write must carry an exact consent grant');
+    const receipt = await (request.payload.late ? late() : write());
+    return { successful: true, data: { id: 'transport-draft', receipt } };
+  };
+  assert.equal(productionPorts.registerFixtureCapabilityPort(productionPorts.productionPortIdentityFromManifest(manifest), {
+    invoke: invoke as never, admitPreparation: () => undefined,
+    prepareInvocation: async () => ({ fixture: true }),
+    invokeWithPreparation: async (_proof: unknown, work: () => Promise<unknown>) => work(),
+  }).ok, true);
+  const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
+  factory.register(adapters.registeredCapabilityFromManifest({ manifest, observation, invoke: invoke as never }));
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+  const carrier = brackets.wrapToolForHarness({ type: 'function', name: 'call_tool', description: 'Invoke the declared reversible draft operation.',
+    parameters: { type: 'object', properties: { name: { type: 'string' }, args_json: { type: 'string' } }, required: ['name', 'args_json'] },
+    invoke: async () => { throw new Error('the exact admitted provider port must execute'); },
+  });
+  return { carrier, call: (id: string, isLate = false) => toolCall(id, 'call_tool', { name: operationId, args_json: JSON.stringify({ late: isLate }) }),
+    restore: () => {
+      if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+      else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+      capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+      capabilityManifestStores.installCapabilityManifestStore(priorStore);
+      productionPorts.clearProductionCapabilityPorts();
+      for (const prior of priorPorts) productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    },
+  };
+}
+
 for (const retries of [0, 1]) test(`mid-stream retirement preserves settled work and retries only the unadmitted model frame (${retries} retry)`, async () => {
+  const fixture = acceptHostCanarySource(`stream-retirement-${retries}`, 'Read the fixture evidence, create one reversible draft on the controlled provider account, and report its receipt.');
   const keys = ['CLEMMY_MODEL_STREAM_STALL_MS', 'CLEMMY_MODEL_FIRST_BYTE_STALL_MS', 'CLEMMY_MODEL_STREAM_STALL_RETRIES', 'CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS'];
   const prior = keys.map(key => process.env[key]);
   Object.assign(process.env, { CLEMMY_MODEL_STREAM_STALL_MS: '40', CLEMMY_MODEL_FIRST_BYTE_STALL_MS: '40',
     CLEMMY_MODEL_STREAM_STALL_RETRIES: String(retries), CLEMMY_MODEL_STALL_FALLOVER_GRACE_MS: '5000' });
   let calls = 0, reads = 0, writes = 0, lateBodies = 0;
   const requests: string[] = [];
+  const writeFixture = await transportWriteFixture(async () => { writes++; return 'saved'; }, async () => { lateBodies++; return 'must not execute'; });
   const model = {
     async getResponse(): Promise<never> { throw new Error('stream required'); },
     async *getStreamedResponse(request: { input: unknown; signal?: AbortSignal }) {
@@ -11066,22 +11180,24 @@ for (const retries of [0, 1]) test(`mid-stream retirement preserves settled work
         await new Promise<void>(resolve => request.signal!.addEventListener('abort', () => resolve(), { once: true }));
         // The real compatibility adapter manufactured a finished response on abort.
         yield { type: 'response_done', response: { usage: {}, output: [textMsg('UNACCEPTED PARTIAL save promise'),
-          toolCall('retired-late-call', 'late_mutation', {})] } } as never;
+          writeFixture.call('retired-late-call', true)] } } as never;
         return;
       }
-      const output = calls === 1 ? [toolCall('retained-read', 'read_fixture', {})]
-        : calls === 3 ? [toolCall('one-current-write', 'write_fixture', {})] : [textMsg('saved and finished')];
+      const output = calls === 1 ? [toolCall('retained-read', 'read_file', {})]
+        : calls === 3 ? [writeFixture.call('one-current-write')] : [textMsg('saved and finished')];
       yield { type: 'response_done', response: { usage: {}, output } } as never;
     },
   };
-  const fixtureTool = (name: string, invoke: () => Promise<string>) => ({ type: 'function', name, description: name,
+  // Use declared native effects so the production admission path can classify these stubs.
+  const fixtureTool = (name: string, invoke: () => Promise<string>) => brackets.wrapToolForHarness({ type: 'function', name, description: name,
     parameters: { type: 'object', properties: {} }, needsApproval: async () => false, invoke });
   try {
-    const outcome = await hostRunRunner(throwingRunner() as never, { model, tools: [
-      fixtureTool('read_fixture', async () => { reads += 1; return 'retained read evidence'; }),
-      fixtureTool('write_fixture', async () => { writes += 1; return 'saved'; }),
-      fixtureTool('late_mutation', async () => { lateBodies += 1; return 'must not execute'; }),
-    ] } as never, [] as never, { maxTurns: 6 });
+    const agent = { model, tools: [
+      fixtureTool('read_file', async () => { reads += 1; return 'retained read evidence'; }),
+      writeFixture.carrier,
+    ] };
+    bindHostCanarySurface(fixture, agent, agent.tools);
+    const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 6 });
     assert.equal(reads, 1, 'settled work is never replayed');
     assert.equal(lateBodies, 0, 'aborted model intents never enter a tool body');
     assert.doesNotMatch(JSON.stringify(outcome.history), /UNACCEPTED PARTIAL|retired-late-call/);
@@ -11097,17 +11213,20 @@ for (const retries of [0, 1]) test(`mid-stream retirement preserves settled work
       assert.equal(outcome.terminal?.reason, 'model_stalled');
     }
   } finally {
+    writeFixture.restore();
     keys.forEach((key, index) => { if (prior[index] === undefined) delete process.env[key]; else process.env[key] = prior[index]; });
   }
 });
 
 for (const failure of ['codex.transport_timeout', 'codex.sse_truncated', 'raw', 'persistent', 'cancelled', 'unknown'] as const) {
   test(`transport recovery retains completed writes and rejects partial model frames: ${failure}`, async () => {
+    const fixture = acceptHostCanarySource(`transport-recovery-${failure}`, 'Create one reversible draft on the controlled provider account and report its receipt.');
     const prior = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
     process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '1';
     const caller = new AbortController();
     let requests = 0, writes = 0, rejectedWrites = 0;
     const inputs: string[] = [];
+    const writeFixture = await transportWriteFixture(async () => { writes++; return 'SAVED_RECEIPT'; }, async () => { rejectedWrites++; return 'must not execute'; });
     const model = {
       async getResponse(): Promise<never> { throw new Error('stream required'); },
       async *getStreamedResponse(request: { input: unknown }) {
@@ -11116,7 +11235,7 @@ for (const failure of ['codex.transport_timeout', 'codex.sse_truncated', 'raw', 
         if (requests > 1 && (requests === 2 || failure === 'persistent')) {
           yield { type: 'output_text_delta', delta: 'UNACCEPTED_DRAFT' } as never;
           yield { type: 'model', event: { type: 'response.output_item.done', item: {
-            type: 'function_call', call_id: 'unaccepted-write', name: 'rejected_write', arguments: '{}',
+            type: 'function_call', call_id: 'unaccepted-write', name: 'call_tool', arguments: writeFixture.call('unaccepted-write', true).arguments,
           } } } as never;
           if (failure === 'cancelled') caller.abort(new Error('owner stopped'));
           if (failure === 'unknown') throw new Error('invalid model configuration');
@@ -11127,17 +11246,14 @@ for (const failure of ['codex.transport_timeout', 'codex.sse_truncated', 'raw', 
           });
         }
         yield { type: 'response_done', response: { usage: {}, output: requests === 1
-          ? [toolCall('settled-write', 'write_fixture', {})]
+          ? [writeFixture.call('settled-write')]
           : [textMsg('The saved work is complete.')] } } as never;
       },
     };
-    const fixtureTool = (name: string, invoke: () => Promise<string>) => ({ type: 'function', name,
-      description: name, parameters: { type: 'object', properties: {} }, needsApproval: async () => false, invoke });
     try {
-      const run = hostRunRunner(throwingRunner() as never, { model, tools: [
-        fixtureTool('write_fixture', async () => { writes++; return 'SAVED_RECEIPT'; }),
-        fixtureTool('rejected_write', async () => { rejectedWrites++; return 'must not execute'; }),
-      ] } as never, [] as never, { maxTurns: 5, signal: caller.signal });
+      const agent = { model, tools: [writeFixture.carrier] };
+      bindHostCanarySurface(fixture, agent, agent.tools);
+      const run = runProductionHost(fixture, agent, undefined, { maxTurns: 5, signal: caller.signal });
       if (failure === 'cancelled' || failure === 'unknown') {
         await assert.rejects(run);
         assert.equal(requests, 2, 'owner cancellation and permanent failures are not retried');
@@ -11157,6 +11273,7 @@ for (const failure of ['codex.transport_timeout', 'codex.sse_truncated', 'raw', 
       assert.equal(writes, 1, 'the accepted write executes only once');
       assert.equal(rejectedWrites, 0, 'an incomplete response never dispatches its tool intent');
     } finally {
+      writeFixture.restore();
       if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
       else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
     }
@@ -11232,4 +11349,65 @@ test('a result completed on the last repair receives a fresh positive verdict', 
   assert.deepEqual(verdicts.map(e => e.data.fulfills), [false, false, true]);
   assert.deepEqual(verdicts.map(e => e.data.continuationsUsed), [0, 1, 2]);
   assert.equal(verdicts[2]?.data.replyDigest, createHash('sha256').update(corrected).digest('hex'));
+});
+
+// ─── Advertised surface is append-only within one accepted source ───────────
+//
+// Live 2026-09-23 (model_request_provenance, Claude host lane and Together GLM
+// lane): every same-source zero-cache frame was a frame whose tool set changed
+// mid-turn — plan_task joining, plan_task/work_call leaving after activation,
+// or the set reordering on a host re-entry. Each re-billed the whole prompt.
+test('a tool that leaves the surface mid-turn stays advertised at its position and is refused without effect', async () => {
+  const fixture = acceptHostCanarySource('surface-retention');
+  const inert = (name: string) => brackets.wrapToolForHarness({
+    type: 'function', name, description: `${name} fixture`,
+    parameters: { type: 'object', properties: {} },
+    invoke: async () => { invoked.push(name); return `${name} ran`; }, needsApproval: async () => false,
+  });
+  const invoked: string[] = [];
+  const first = inert('workspace_roots');
+  const second = inert('task_list');
+  const gated = inert('memory_search');
+  const surfaces: string[][] = [];
+  const results: string[] = [];
+  let call = 0;
+  const model = {
+    async getResponse(request: { tools?: Array<{ name?: string }>; input?: unknown[] }) {
+      surfaces.push((request.tools ?? []).map((entry) => entry.name ?? ''));
+      for (const item of (request.input ?? []) as Array<{ type?: string; output?: unknown }>) {
+        if (item.type === 'function_call_result') results.push(JSON.stringify(item.output));
+      }
+      call += 1;
+      return {
+        usage: {},
+        output: call === 1
+          ? [toolCall('first-call', 'workspace_roots', {})]
+          : call === 2
+            ? [toolCall('gated-call', 'memory_search', {})]
+            : call === 3
+              ? [toolCall('retired-call', 'memory_search', {})]
+              : [textMsg('surface held')],
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent = {
+    model,
+    // Configured like production: every tool object is Clem's, and the SDK's
+    // getAllTools filters that set by each tool's isEnabled before a request.
+    tools: [gated, first, second],
+    // Frame 1: two reads. Frame 2: the gated carrier is enabled and used.
+    // Frame 3 onward: its isEnabled says no again — it must STAY on the wire.
+    getAllTools: async () => (call === 1 ? [gated, first, second] : [first, second]),
+  };
+  bindHostCanarySurface(fixture, agent, [first, second, gated]);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 6 });
+  assert.equal(outcome.finalOutput, 'surface held', JSON.stringify({ status: (outcome as { status?: unknown }).status, surfaces, results, history: outcome.history }).slice(0, 3000));
+  assert.deepEqual(surfaces[0], ['workspace_roots', 'task_list']);
+  assert.deepEqual(surfaces[1], ['workspace_roots', 'task_list', 'memory_search'], 'a tool enabled mid-turn joins at the tail');
+  assert.deepEqual(surfaces[2], surfaces[1], 'a tool disabled mid-turn keeps its place on the wire');
+  assert.deepEqual(surfaces[3], surfaces[1], 'and the surface holds still for the rest of the source');
+  assert.deepEqual(invoked, ['workspace_roots', 'memory_search'], 'the retired tool never ran again');
+  const refusal = results.find((text) => text.includes('not callable at this stage'));
+  assert.ok(refusal, `the retired call is a typed effect-free refusal, got ${JSON.stringify(results)}`);
 });
