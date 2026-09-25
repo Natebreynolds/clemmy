@@ -538,7 +538,11 @@ function MessageRow({
             {message.approval.preview.fields.map((field) => (
               <div key={field.name}>
                 <dt>{approvalFieldLabel(field.name)}</dt>
-                <dd>{field.value}</dd>
+                <dd>
+                  {field.label
+                    ? <>{field.label} <span class="approval-preview-id">· {field.value}</span></>
+                    : field.value}
+                </dd>
               </div>
             ))}
           </dl>

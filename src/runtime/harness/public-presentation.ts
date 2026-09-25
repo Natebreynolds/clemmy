@@ -45,17 +45,20 @@ import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMod
 
 /** The host-built approval preview (operation + argument values the owner is
  * approving), admitted only in its exact bounded shape. */
-function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: Array<{ name: string; value: string }> } } | null {
+type ApprovalPreviewField = { name: string; value: string; label?: string };
+
+function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: ApprovalPreviewField[] } } | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (typeof record.operation !== 'string' || !record.operation.trim() || record.operation.length > 80) return null;
   if (!Array.isArray(record.fields) || record.fields.length > 16) return null;
-  const fields: Array<{ name: string; value: string }> = [];
+  const fields: ApprovalPreviewField[] = [];
   for (const field of record.fields) {
     if (!field || typeof field !== 'object' || Array.isArray(field)) return null;
-    const { name, value: shown } = field as Record<string, unknown>;
+    const { name, value: shown, label } = field as Record<string, unknown>;
     if (typeof name !== 'string' || typeof shown !== 'string' || !name || name.length > 80 || shown.length > 2_100) return null;
-    fields.push({ name, value: shown });
+    if (label !== undefined && (typeof label !== 'string' || !label.trim() || label.length > 120)) return null;
+    fields.push({ name, value: shown, ...(typeof label === 'string' ? { label } : {}) });
   }
   return { preview: { operation: record.operation, fields } };
 }

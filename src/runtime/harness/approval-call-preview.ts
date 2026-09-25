@@ -1,0 +1,148 @@
+import { scanSecrets } from './guardrails.js';
+import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
+import type { InterruptionInfo } from './loop.js';
+
+/**
+ * What an approval shows a person: the operation and the exact arguments it
+ * would send. Also the small display helpers approval cards share.
+ */
+
+const APPROVAL_DISPLAY_JSON_MAX_CHARS = 256_000;
+
+export function approvalJsonRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (
+    typeof value !== 'string'
+    || !value.trim()
+    || value.length > APPROVAL_DISPLAY_JSON_MAX_CHARS
+  ) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+
+export interface ApprovalCallPreview {
+  operation: string;
+  fields: Array<{ name: string; value: string; label?: string }>;
+}
+
+const APPROVAL_PREVIEW_MAX_FIELDS = 16;
+const APPROVAL_PREVIEW_TEXT_MAX_CHARS = 2_000;
+const APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS = 600;
+
+function approvalPreviewValue(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return null;
+    return text.length > APPROVAL_PREVIEW_TEXT_MAX_CHARS
+      ? `${text.slice(0, APPROVAL_PREVIEW_TEXT_MAX_CHARS)}… (${text.length - APPROVAL_PREVIEW_TEXT_MAX_CHARS} more characters)`
+      : text;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value === null || value === undefined) return null;
+  try {
+    const json = JSON.stringify(value);
+    if (!json || json === '{}' || json === '[]') return null;
+    return json.length > APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS
+      ? `${json.slice(0, APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS)}…`
+      : json;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What an approval would actually do, from the exact frozen arguments the
+ * registry holds: the operation and each argument the provider receives.
+ * Live 2026-09-25: two Slack approvals read "Slack open dm" and "Send Slack
+ * message"; the message text sat in the arguments and never reached the
+ * card, and the owner approved without knowing what. Display only: authority
+ * and resume keep pinning the untouched arguments, and a value that looks
+ * like a secret is withheld.
+ */
+export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true): ApprovalCallPreview | null {
+  const args = (info.args ?? {}) as Record<string, unknown>;
+  // Both carriers hold the real call as { name, args_json }: work_call for
+  // planned work, call_tool for a schema-on-demand (MCP) operation.
+  if (unwrapWorkCall && (
+    isPlainOrClementineLocalTool(info.toolName, 'work_call')
+    || isPlainOrClementineLocalTool(info.toolName, 'call_tool')
+  )) {
+    const targetName = typeof args.name === 'string' ? args.name.trim() : '';
+    const targetArgs = approvalJsonRecord(args.args_json);
+    return targetName && targetArgs
+      ? approvalCallPreview({ ...info, toolName: targetName, args: targetArgs }, false)
+      : null;
+  }
+  const slug = typeof args.tool_slug === 'string' ? args.tool_slug.trim() : '';
+  const operation = truncate((slug ? humanizeComposioSlug(slug) : '') || info.toolName, 80);
+  const provider = slug ? approvalJsonRecord(args.arguments) ?? {} : args;
+  const fields: ApprovalCallPreview['fields'] = [];
+  for (const [name, raw] of Object.entries(provider)) {
+    if (fields.length >= APPROVAL_PREVIEW_MAX_FIELDS) break;
+    const value = approvalPreviewValue(raw);
+    if (value === null) continue;
+    const secret = scanSecrets(value).length > 0;
+    const label = secret ? undefined : info.previewLabels?.[value];
+    fields.push({
+      name: truncate(name, 80),
+      value: secret ? '[withheld: looks like a secret]' : value,
+      ...(label ? { label: truncate(label, 120) } : {}),
+    });
+  }
+  return { operation, fields };
+}
+
+/**
+ * Turn a Composio slug like `OUTLOOK_CALENDAR_CREATE_EVENT` into a
+ * human phrase: "Create Outlook calendar event".
+ *
+ * Heuristic: known toolkit prefixes are capitalized; known verbs are
+ * moved to the front; the rest is title-cased.
+ */
+export function humanizeComposioSlug(slug: string): string {
+  if (!slug) return '';
+  const parts = slug.split('_').filter(Boolean).map((p) => p.toLowerCase());
+  if (parts.length === 0) return '';
+
+  const TOOLKITS: Record<string, string> = {
+    outlook: 'Outlook', gmail: 'Gmail', slack: 'Slack', instagram: 'Instagram',
+    salesforce: 'Salesforce', github: 'GitHub', linear: 'Linear', notion: 'Notion',
+    trello: 'Trello', supabase: 'Supabase', stripe: 'Stripe', composio: 'Composio',
+    discord: 'Discord', google: 'Google', drive: 'Drive', calendar: 'Calendar',
+    sheets: 'Sheets', figma: 'Figma',
+  };
+  const VERBS = new Set([
+    'create', 'list', 'get', 'search', 'update', 'delete', 'send', 'post',
+    'fetch', 'read', 'write', 'add', 'remove', 'find', 'query', 'sync',
+    'invite', 'cancel', 'archive', 'star', 'unstar', 'reply',
+  ]);
+
+  const toolkit = parts[0];
+  const toolkitLabel = TOOLKITS[toolkit] ?? toolkit[0].toUpperCase() + toolkit.slice(1);
+
+  // Find the first verb in the slug; treat everything after as the object.
+  let verbIndex = -1;
+  for (let i = 1; i < parts.length; i += 1) {
+    if (VERBS.has(parts[i])) { verbIndex = i; break; }
+  }
+  if (verbIndex === -1) {
+    return [toolkitLabel, ...parts.slice(1)].join(' ');
+  }
+  const verb = parts[verbIndex][0].toUpperCase() + parts[verbIndex].slice(1);
+  const object = parts.slice(1, verbIndex).concat(parts.slice(verbIndex + 1)).join(' ');
+  return object ? `${verb} ${toolkitLabel} ${object}` : `${verb} ${toolkitLabel}`;
+}
+
+export function truncate(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return `${s.slice(0, n - 1)}…`;
+}

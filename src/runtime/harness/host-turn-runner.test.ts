@@ -67,6 +67,7 @@ const logicalContracts = await import('./logical-call-contract.js');
 const dispatch = await import('./dispatch-ledger.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const outcomes = await import('./attempt-outcome.js');
+const jevClient = await import('../jev/client.js');
 const brackets = await import('./brackets.js');
 const dispatchLeases = await import('./dispatch-lease.js');
 const guardrails = await import('./guardrails.js');
@@ -5555,6 +5556,141 @@ test('user-edited approval arguments traverse the same parse gate on resume',
   () => exerciseProductionWriteApproval('invalid_edit'));
 test('serialized approval without its exact durable grant cannot execute an external write',
   () => exerciseProductionWriteApproval('missing_durable'));
+
+// Live 2026-09-25: "Slack open dm · users UC0806VCJ" told the owner nothing
+// about who the message was for, though Clem had looked the person up.
+test('an approval pause names an id from this conversation\'s own results when Jev is sure of it', async () => {
+  // As live: the lookup ran on an earlier message, the write on the next.
+  const session = eventlog.createSession({ id: `host-canary-${++acceptedSerial}-approval-label`, kind: 'chat' });
+  const earlier = eventlog.appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Find my teammate in the directory.' },
+  });
+  assert.ok(shadow.recordTurnGraphShadow({
+    identity: { sessionId: session.id, sourceUserSeq: earlier.seq, turn: 1 },
+  }));
+  const task = {
+    sessionId: session.id,
+    sourceUserSeq: earlier.seq,
+    turn: 1,
+    acceptedTaskId: identities.acceptedTaskIdFor(session.id, earlier.seq),
+  };
+  const logicalToolCallId = 'logical:find-teammate';
+  const lookup = { query: 'teammate' };
+  const begun = dispatch.beginPhysicalDispatch({
+    identity: { ...task, logicalToolCallId, physicalDispatchId: `dispatch:${logicalToolCallId}`, ordinal: 0 },
+    tool: 'DIRECTORY_FIND_USERS',
+    args: lookup,
+  });
+  assert.equal(begun.status, 'inserted');
+  if (begun.status !== 'inserted') return;
+  assert.equal(dispatch.settlePhysicalDispatch({
+    identity: begun.identity, tool: 'DIRECTORY_FIND_USERS', outcome: 'returned',
+  }).status, 'inserted');
+  const read = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId },
+    contract: { toolName: 'DIRECTORY_FIND_USERS', args: lookup },
+    execution: { kind: 'provider_execution' },
+    result: { payload: { successful: true, data: { members: [{
+      id: 'U0FIXTURE1', name: 'sam', real_name: 'Sam Rivera', tz: 'America/Los_Angeles',
+      profile: { title: 'Recruiter', image: 'https://example.test/sam.png' },
+    }] } } },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'composio', turn: 1 },
+  });
+  assert.equal(read.status, 'committed', JSON.stringify(read));
+  const source = eventlog.appendEvent({
+    sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Message them about the 4:15 review.' },
+  });
+  const fixture = {
+    session,
+    source,
+    parent: {
+      sessionId: session.id,
+      sourceUserSeq: source.seq,
+      counter: new brackets.ToolCallsCounter(8),
+      behaviorScopeId: `${session.id}::turn:2`,
+    },
+    context: { sessionId: session.id, sourceUserSeq: source.seq },
+  } as ReturnType<typeof acceptHostCanarySource>;
+
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorManifestStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  const serverName = `approval_label_${++acceptedSerial}`;
+  const operationId = `${serverName}__send_message`;
+  const inputSchema = {
+    type: 'object', additionalProperties: false,
+    properties: { recipient: { type: 'string' }, message: { type: 'string' } },
+    required: ['recipient', 'message'],
+  };
+  let sendRuns = 0;
+  const fakeServer = {
+    async invalidateToolsCache() {},
+    async listTools() {
+      return [{ name: operationId, description: 'Send a message to the specified recipient.',
+        inputSchema, annotations: {
+          readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false,
+        } }];
+    },
+    async callTool() { sendRuns += 1; return [{ type: 'text', text: '{"sent":true}' }]; },
+  };
+  const runtime: productionMcp.ProductionMcpRuntime = {
+    configuredServers: () => [{ name: serverName, type: 'stdio',
+      command: '/fixture/approval-mcp', args: [], enabled: true, source: 'user' }] as never,
+    serverForEnumeration: () => fakeServer as never,
+    serverForOperation: () => fakeServer as never,
+  };
+  const asked: Array<Record<string, string | null>> = [];
+  jevClient._setTypesafeKeyForTests('ts_test');
+  jevClient._setSystemOneFetchForTests(async (_url, init) => {
+    const criteria = JSON.parse(String(init.body)).questions.label.criteria as Record<string, string | null>;
+    asked.push(criteria);
+    const choice = Object.entries(criteria).find(([, text]) => text === 'Sam Rivera')?.[0] ?? 'none';
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      label: { type: 'choice', choice, confidence: 0.93, probabilities: { [choice]: 0.93 } },
+    }, usage: { input_tokens: 40, output_tokens: 2 } }) };
+  });
+  try {
+    capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+    capabilityManifestStores.installCapabilityManifestStore(
+      capabilityManifestStores.createCapabilityManifestStore([], { durable: true }),
+    );
+    productionPorts.clearProductionCapabilityPorts();
+    const materialized = await productionMcp.createProductionMcpReadCarrier({ serverName, runtime })
+      .materializeExact({ operationId, inputSchema });
+    if (materialized.status !== 'installed') throw new Error(JSON.stringify(materialized));
+    const exactScope = { reason: 'controlled external approval fixture', authority: 'exact' as const,
+      allowedServerSlugs: [serverName], allowedToolNames: [operationId] };
+    const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+      reachableBuiltinNames: new Set<string>(), firstClassNames: new Set<string>(), mcpToolScope: exactScope,
+    }) as never);
+    const model = stubModel([
+      [toolCall('c-send', 'call_tool', { name: operationId, args_json: JSON.stringify({
+        recipient: 'U0FIXTURE1', message: 'Could you run the 4:15 review on your own?',
+      }) })],
+      [textMsg('sent')],
+    ]);
+    const agent = { model, tools: [carrier] };
+    mcpToolAuthority.bindAgentMcpToolScope(agent as never, exactScope);
+    bindHostCanarySurface(fixture, agent, [carrier]);
+    const paused = await runProductionHost(fixture, agent);
+    if (!paused.hasInterruptions) throw new Error(`Expected write approval: ${JSON.stringify(paused.history)}`);
+    assert.equal(sendRuns, 0, 'nothing is sent before approval');
+    assert.deepEqual(paused.interruptions?.[0]?.previewLabels, { U0FIXTURE1: 'Sam Rivera' });
+    assert.equal(asked.length, 1, 'only the id is named; the message text is not');
+    assert.ok(!Object.values(asked[0]!).some((text) => text?.includes('://')), 'a URL is never offered as a name');
+  } finally {
+    jevClient._setTypesafeKeyForTests(undefined);
+    jevClient._setSystemOneFetchForTests(undefined);
+    productionPorts.clearProductionCapabilityPorts();
+    for (const prior of priorPorts) productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+    capabilityManifestStores.installCapabilityManifestStore(priorManifestStore);
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+  }
+});
 
 test('needsApproval exceptions fail closed as an explicit approval pause', async () => {
   // This pin exercises the wrapper predicate failure, not external-write consent.

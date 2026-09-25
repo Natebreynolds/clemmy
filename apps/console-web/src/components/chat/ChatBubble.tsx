@@ -404,7 +404,11 @@ export function ChatBubble({
                 {message.approval.preview.fields.map((field) => (
                   <div key={field.name}>
                     <dt className="text-muted">{approvalFieldLabel(field.name)}</dt>
-                    <dd className="whitespace-pre-wrap break-words text-fg">{field.value}</dd>
+                    <dd className="whitespace-pre-wrap break-words text-fg">
+                      {field.label
+                        ? <>{field.label} <span className="text-muted">· {field.value}</span></>
+                        : field.value}
+                    </dd>
                   </div>
                 ))}
               </dl>

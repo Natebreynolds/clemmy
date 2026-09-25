@@ -8,6 +8,7 @@ const {
 const {
   classifyOpenQuestionReplyWithJev,
   filterPrimerHitsWithJev,
+  labelIdentifierWithJev,
   nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
   decideTurnStartWithJev,
@@ -542,4 +543,36 @@ test('classifyOpenQuestionReplyWithJev reads a reply to Clem\'s question as one 
   assert.deepEqual(await classifyOpenQuestionReplyWithJev(input), { kind: null, confidence: 0.8, failedOpen: false });
   _setTypesafeKeyForTests(null);
   assert.deepEqual(await classifyOpenQuestionReplyWithJev(input), { kind: null, failedOpen: true });
+});
+
+
+test('labelIdentifierWithJev names an id only when Jev is sure, and never offers the id itself', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  let choice = 'c1';
+  let confidence = 0.93;
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      label: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } },
+    }, usage: { input_tokens: 30, output_tokens: 2 } }) };
+  });
+  const input = {
+    operation: 'Open Slack dm', field: 'users', value: 'U0FIXTURE1',
+    candidates: ['sam', 'Sam Rivera', 'U0FIXTURE1', 'America/Los_Angeles', 'sam'],
+  };
+  assert.equal(await labelIdentifierWithJev(input), 'Sam Rivera');
+  const body = posted[0]!;
+  assert.deepEqual(Object.keys(body.questions), ['label']);
+  assert.deepEqual(body.questions.label.criteria, {
+    c0: 'sam', c1: 'Sam Rivera', c2: 'America/Los_Angeles', none: 'None of these names it.',
+  }, 'duplicates and the id itself are not choices');
+  confidence = 0.6;
+  assert.equal(await labelIdentifierWithJev(input), null, 'an unsure pick shows the id alone');
+  choice = 'none'; confidence = 0.99;
+  assert.equal(await labelIdentifierWithJev(input), null);
+  assert.equal(await labelIdentifierWithJev({ ...input, candidates: ['U0FIXTURE1'] }), null, 'nothing to choose from asks nothing');
+  assert.equal(posted.length, 3);
+  _setTypesafeKeyForTests(null);
+  assert.equal(await labelIdentifierWithJev(input), null, 'no Jev, no name');
 });

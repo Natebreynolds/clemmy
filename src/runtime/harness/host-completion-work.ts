@@ -279,7 +279,7 @@ function sourceWorkerEvidenceScopes(input: { sessionId: string; sourceUserSeq: n
  * or conflicted authority cannot supply a workflow identity; the ordinary chat
  * identity then fails the existing settlement verifier for workflow receipts.
  * This is read-only evidence access, not a new invocation or authority grant. */
-function evidenceAcceptedTaskId(sessionId: string, sourceUserSeq: number): string {
+export function evidenceAcceptedTaskId(sessionId: string, sourceUserSeq: number): string {
   const reopened = acceptedTurnCallAuthorityFor(sessionId, sourceUserSeq);
   if (reopened.status === 'ok'
     && reopened.authority.identity.sessionId === sessionId

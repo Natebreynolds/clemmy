@@ -83,6 +83,8 @@ import {
   toolSchemaFingerprint,
 } from '../../agents/capability-envelope.js';
 import type { InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
+import { approvalCallPreview } from './approval-call-preview.js';
+import { approvalPreviewLabels } from './approval-preview-labels.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
@@ -10569,15 +10571,22 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         objectiveJudgeContinuations,
         completionReviewFeedback,
       );
-      return {
-        history,
-        lastResponseId,
-        finalOutput: undefined,
-        hasInterruptions: true,
-        interruptions: approvals.map((pending) => ({
+      // The card names what its ids refer to, from this conversation's own
+      // results; bounded, display-only, and absent when Jev is not sure.
+      const approvalIdentity = exactHostIdentity();
+      const interruptions = await Promise.all(approvals.map(async (pending) => {
+        const info = {
           toolName: pending.name,
           args: parsedArgs(pending.rawItem.arguments),
           rawArgs: pending.rawItem.arguments,
+        };
+        const previewLabels = await approvalPreviewLabels({
+          sessionId: approvalIdentity.sessionId,
+          sourceUserSeq: approvalIdentity.sourceUserSeq,
+          preview: approvalCallPreview(info),
+        }).catch(() => undefined);
+        return {
+          ...info,
           ...(pending.consentCall ? { consentCall: pending.consentCall } : {}),
           ...(pending.consentSubject
             ? {
@@ -10585,7 +10594,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
                   ?? undefined,
               }
             : {}),
-        })),
+          ...(previewLabels ? { previewLabels } : {}),
+        };
+      }));
+      return {
+        history,
+        lastResponseId,
+        finalOutput: undefined,
+        hasInterruptions: true,
+        interruptions,
         serializedState: state.toString(),
       } satisfies RunOutcome;
     }

@@ -6,7 +6,12 @@ import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-
 import { acceptedTaskMode } from './accepted-task-mode.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { retainedHistoryPrefixProjection } from './retained-history-prefix.js';
-import { scanSecrets } from './guardrails.js';
+import {
+  approvalCallPreview,
+  approvalJsonRecord,
+  humanizeComposioSlug,
+  truncate,
+} from './approval-call-preview.js';
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
@@ -3174,6 +3179,9 @@ export interface InterruptionInfo {
   rawArgs: string;
   /** Opaque host-minted identity for one exact reducer consent subject. */
   approvalResumeKey?: string;
+  /** Display only: a human name for an argument value, found in this
+   *  conversation's own evidence (value -> name). Never authority. */
+  previewLabels?: Readonly<Record<string, string>>;
   /** Reducer facts for presentation only; never an approval/dispatch grant. */
   consentCall?: Pick<CapabilityRiskAttestationV1, 'effect' | 'accountId' | 'risk'>;
 }
@@ -15987,47 +15995,6 @@ function extractInterruptionInfo(items: unknown[]): InterruptionInfo[] {
   return out;
 }
 
-/**
- * Pull a human-readable subject out of the tool args. The dashboard
- * and Discord both render this in the approval card, so the more
- * specific the better — "Create Outlook calendar event: 'Follow up
- * with Marlowe Rary'" reads better than "composio_execute_tool".
- *
- * Recognized shapes:
- *   work_call({ name, args_json })
- *       → recursively projects the exact stored inner carrier for display
- *   composio_execute_tool({ tool_slug, arguments: <json string> })
- *       → "<Toolkit Verb> · subject/to/when/account from frozen args"
- *   run_shell_command({ command })
- *       → "Shell: <first 80 chars of command>"
- *   write_file({ path, contents? })
- *       → "Write file: <path>"
- *   any other tool with args.subject / .title / .name / .command
- *       → "<toolName>: <that field>"
- *   fallback
- *       → toolName
- */
-const APPROVAL_DISPLAY_JSON_MAX_CHARS = 256_000;
-
-function approvalJsonRecord(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  if (
-    typeof value !== 'string'
-    || !value.trim()
-    || value.length > APPROVAL_DISPLAY_JSON_MAX_CHARS
-  ) return null;
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 function approvalField(
   record: Record<string, unknown>,
   names: readonly string[],
@@ -16123,70 +16090,26 @@ function composioApprovalSubject(
   return [operation, ...details].join(' · ');
 }
 
-export interface ApprovalCallPreview {
-  operation: string;
-  fields: Array<{ name: string; value: string }>;
-}
-
-const APPROVAL_PREVIEW_MAX_FIELDS = 16;
-const APPROVAL_PREVIEW_TEXT_MAX_CHARS = 2_000;
-const APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS = 600;
-
-function approvalPreviewValue(value: unknown): string | null {
-  if (typeof value === 'string') {
-    const text = value.trim();
-    if (!text) return null;
-    return text.length > APPROVAL_PREVIEW_TEXT_MAX_CHARS
-      ? `${text.slice(0, APPROVAL_PREVIEW_TEXT_MAX_CHARS)}… (${text.length - APPROVAL_PREVIEW_TEXT_MAX_CHARS} more characters)`
-      : text;
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (value === null || value === undefined) return null;
-  try {
-    const json = JSON.stringify(value);
-    if (!json || json === '{}' || json === '[]') return null;
-    return json.length > APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS
-      ? `${json.slice(0, APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS)}…`
-      : json;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * What an approval would actually do, from the exact frozen arguments the
- * registry holds: the operation and each argument the provider receives.
- * Live 2026-09-25: two Slack approvals read "Slack open dm" and "Send Slack
- * message"; the message text sat in the arguments and never reached the
- * card, and the owner approved without knowing what. Display only: authority
- * and resume keep pinning the untouched arguments, and a value that looks
- * like a secret is withheld.
+ * Pull a human-readable subject out of the tool args. The dashboard
+ * and Discord both render this in the approval card, so the more
+ * specific the better — "Create Outlook calendar event: 'Follow up
+ * with Marlowe Rary'" reads better than "composio_execute_tool".
+ *
+ * Recognized shapes:
+ *   work_call({ name, args_json })
+ *       → recursively projects the exact stored inner carrier for display
+ *   composio_execute_tool({ tool_slug, arguments: <json string> })
+ *       → "<Toolkit Verb> · subject/to/when/account from frozen args"
+ *   run_shell_command({ command })
+ *       → "Shell: <first 80 chars of command>"
+ *   write_file({ path, contents? })
+ *       → "Write file: <path>"
+ *   any other tool with args.subject / .title / .name / .command
+ *       → "<toolName>: <that field>"
+ *   fallback
+ *       → toolName
  */
-export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true): ApprovalCallPreview | null {
-  const args = (info.args ?? {}) as Record<string, unknown>;
-  if (unwrapWorkCall && isPlainOrClementineLocalTool(info.toolName, 'work_call')) {
-    const targetName = typeof args.name === 'string' ? args.name.trim() : '';
-    const targetArgs = approvalJsonRecord(args.args_json);
-    return targetName && targetArgs
-      ? approvalCallPreview({ ...info, toolName: targetName, args: targetArgs }, false)
-      : null;
-  }
-  const slug = typeof args.tool_slug === 'string' ? args.tool_slug.trim() : '';
-  const operation = truncate((slug ? humanizeComposioSlug(slug) : '') || info.toolName, 80);
-  const provider = slug ? approvalJsonRecord(args.arguments) ?? {} : args;
-  const fields: ApprovalCallPreview['fields'] = [];
-  for (const [name, raw] of Object.entries(provider)) {
-    if (fields.length >= APPROVAL_PREVIEW_MAX_FIELDS) break;
-    const value = approvalPreviewValue(raw);
-    if (value === null) continue;
-    fields.push({
-      name: truncate(name, 80),
-      value: scanSecrets(value).length > 0 ? '[withheld: looks like a secret]' : value,
-    });
-  }
-  return { operation, fields };
-}
-
 function extractApprovalSubject(info: InterruptionInfo, unwrapWorkCall = true): string {
   const args = (info.args ?? {}) as Record<string, unknown>;
 
@@ -16268,51 +16191,6 @@ function extractApprovalSubject(info: InterruptionInfo, unwrapWorkCall = true): 
   return info.toolName;
 }
 
-/**
- * Turn a Composio slug like `OUTLOOK_CALENDAR_CREATE_EVENT` into a
- * human phrase: "Create Outlook calendar event".
- *
- * Heuristic: known toolkit prefixes are capitalized; known verbs are
- * moved to the front; the rest is title-cased.
- */
-function humanizeComposioSlug(slug: string): string {
-  if (!slug) return '';
-  const parts = slug.split('_').filter(Boolean).map((p) => p.toLowerCase());
-  if (parts.length === 0) return '';
-
-  const TOOLKITS: Record<string, string> = {
-    outlook: 'Outlook', gmail: 'Gmail', slack: 'Slack', instagram: 'Instagram',
-    salesforce: 'Salesforce', github: 'GitHub', linear: 'Linear', notion: 'Notion',
-    trello: 'Trello', supabase: 'Supabase', stripe: 'Stripe', composio: 'Composio',
-    discord: 'Discord', google: 'Google', drive: 'Drive', calendar: 'Calendar',
-    sheets: 'Sheets', figma: 'Figma',
-  };
-  const VERBS = new Set([
-    'create', 'list', 'get', 'search', 'update', 'delete', 'send', 'post',
-    'fetch', 'read', 'write', 'add', 'remove', 'find', 'query', 'sync',
-    'invite', 'cancel', 'archive', 'star', 'unstar', 'reply',
-  ]);
-
-  const toolkit = parts[0];
-  const toolkitLabel = TOOLKITS[toolkit] ?? toolkit[0].toUpperCase() + toolkit.slice(1);
-
-  // Find the first verb in the slug; treat everything after as the object.
-  let verbIndex = -1;
-  for (let i = 1; i < parts.length; i += 1) {
-    if (VERBS.has(parts[i])) { verbIndex = i; break; }
-  }
-  if (verbIndex === -1) {
-    return [toolkitLabel, ...parts.slice(1)].join(' ');
-  }
-  const verb = parts[verbIndex][0].toUpperCase() + parts[verbIndex].slice(1);
-  const object = parts.slice(1, verbIndex).concat(parts.slice(verbIndex + 1)).join(' ');
-  return object ? `${verb} ${toolkitLabel} ${object}` : `${verb} ${toolkitLabel}`;
-}
-
-function truncate(s: string, n: number): string {
-  if (s.length <= n) return s;
-  return `${s.slice(0, n - 1)}…`;
-}
 /** Per-turn recall_tool_result budget — env-tunable so grown data sources
  *  (a daily-append tracker sheet) don't hit a hard cliff. Defaults sized to
  *  page a ~150KB payload in one turn while still bounding re-inflation. */

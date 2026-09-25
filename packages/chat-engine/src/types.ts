@@ -32,7 +32,8 @@ export interface ReplayPayload {
 
 export interface ApprovalPreview {
   operation: string;
-  fields: Array<{ name: string; value: string }>;
+  /** `label` is the name the host found for an id-like value, display only. */
+  fields: Array<{ name: string; value: string; label?: string }>;
 }
 
 /** Admit only the exact bounded preview shape the host projects. */
@@ -43,9 +44,9 @@ export function approvalPreviewFrom(value: unknown): ApprovalPreview | undefined
   const fields: ApprovalPreview['fields'] = [];
   for (const field of record.fields.slice(0, 16)) {
     if (!field || typeof field !== 'object' || Array.isArray(field)) return undefined;
-    const { name, value: shown } = field as Record<string, unknown>;
+    const { name, value: shown, label } = field as Record<string, unknown>;
     if (typeof name !== 'string' || typeof shown !== 'string') return undefined;
-    fields.push({ name, value: shown });
+    fields.push({ name, value: shown, ...(typeof label === 'string' && label.trim() ? { label } : {}) });
   }
   return { operation: record.operation, fields };
 }

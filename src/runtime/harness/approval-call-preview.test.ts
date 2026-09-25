@@ -15,7 +15,7 @@ const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-approval-preview-'));
 process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { approvalCallPreview } = await import('./loop.js');
+const { approvalCallPreview } = await import('./approval-call-preview.js');
 const { projectHarnessEventForPublic } = await import('./public-presentation.js');
 
 test.after(() => rmSync(HOME, { recursive: true, force: true }));
@@ -70,4 +70,26 @@ test('the public approval event carries a well-formed preview and drops a malfor
   assert.deepEqual((shown?.data as Record<string, unknown> | undefined)?.preview, preview);
   const malformed = projectHarnessEventForPublic(event({ preview: { operation: 'x', fields: [{ name: 1, value: 'y' }] } }) as never);
   assert.equal((malformed?.data as Record<string, unknown> | undefined)?.preview, undefined);
+  const named = { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1', label: 'Sam Rivera' }] };
+  assert.deepEqual((projectHarnessEventForPublic(event({ preview: named }) as never)?.data as Record<string, unknown>)?.preview, named);
+  const badName = { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1', label: 'x'.repeat(121) }] };
+  assert.equal((projectHarnessEventForPublic(event({ preview: badName }) as never)?.data as Record<string, unknown>)?.preview, undefined);
+});
+
+test('a name the host found rides beside its id, never beside a withheld secret; call_tool unwraps like work_call', () => {
+  const labelled = approvalCallPreview({
+    ...workCall('SLACK_OPEN_DM', { users: 'U0FIXTURE1', note: 'token xoxb-1234567890-abcdefghij' }),
+    previewLabels: { U0FIXTURE1: 'Sam Rivera', 'token xoxb-1234567890-abcdefghij': 'not a name' },
+  });
+  assert.deepEqual(labelled?.fields, [
+    { name: 'users', value: 'U0FIXTURE1', label: 'Sam Rivera' },
+    { name: 'note', value: '[withheld: looks like a secret]' },
+  ]);
+  const mcp = approvalCallPreview({
+    toolName: 'call_tool',
+    rawArgs: '{}',
+    args: { name: 'fixture__send_message', args_json: JSON.stringify({ recipient: 'U0FIXTURE1', message: 'Hi' }) },
+  });
+  assert.equal(mcp?.operation, 'fixture__send_message');
+  assert.deepEqual(mcp?.fields.map((field) => field.name), ['recipient', 'message']);
 });

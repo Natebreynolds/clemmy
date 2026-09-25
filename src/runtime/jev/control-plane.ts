@@ -390,6 +390,66 @@ export async function classifyOpenQuestionReplyWithJev(
   return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
 }
 
+/** A card that names the wrong person is worse than one that shows the id,
+ *  so the host shows a name only when Jev is sure of it. */
+export const APPROVAL_LABEL_SURE = 0.8;
+const APPROVAL_LABEL_TIMEOUT_MS = 1_500;
+const APPROVAL_LABEL_MAX_CANDIDATES = 20;
+
+/**
+ * An approval card shows an argument value that is an identifier (a user,
+ * channel or record id) the owner cannot read. The host found the record that
+ * value belongs to in this conversation's own results; Jev picks which of that
+ * record's strings names it the way a person would recognise it, or none.
+ * Display only: the card still shows the exact value, and nothing it approves
+ * changes. Live 2026-09-25: "Slack open dm · users UC0806VCJ" gave the owner no
+ * way to tell who the message was for.
+ */
+export async function labelIdentifierWithJev(
+  input: {
+    operation: string;
+    field: string;
+    value: string;
+    candidates: readonly string[];
+    ownerAsked?: string;
+  },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<string | null> {
+  const candidates = [...new Set(input.candidates.map((candidate) => candidate.trim())
+    .filter((candidate) => candidate && candidate !== input.value))]
+    .slice(0, APPROVAL_LABEL_MAX_CANDIDATES);
+  if (candidates.length === 0) return null;
+  const criteria: Record<string, string | null> = {};
+  candidates.forEach((candidate, index) => { criteria[`c${index}`] = candidate; });
+  criteria.none = 'None of these names it.';
+  const result = await evaluateSystemOne({
+    state: {
+      approval: input.operation,
+      field: input.field,
+      value: input.value,
+      ...(input.ownerAsked ? { ownerAsked: input.ownerAsked.slice(0, 400) } : {}),
+    },
+    questions: {
+      label: {
+        type: 'choice',
+        instructions: 'An approval card shows this value, which is an identifier. The choices are strings from the record it belongs to. Which one names it the way the owner would recognise it: a person, channel, file or thing name, not another id, code, time zone or setting?',
+        criteria,
+      },
+    },
+    timeoutMs: Math.min(APPROVAL_LABEL_TIMEOUT_MS, opts.timeoutMs ?? APPROVAL_LABEL_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-approval-label',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.label as ChoiceAnswer | undefined;
+  const index = answer && /^c\d+$/.test(answer.choice) ? Number(answer.choice.slice(1)) : -1;
+  const label = answer && answer.confidence >= APPROVAL_LABEL_SURE ? candidates[index] ?? null : null;
+  noteJevDecisionOutcome(result.decisionId, label ? 'labelled' : 'none', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return label;
+}
+
 /** Name the operation this request needs first, from a host-prepared list,
  *  or none. */
 export async function routeOperationWithJev<T extends RoutableOperation>(

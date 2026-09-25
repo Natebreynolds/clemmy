@@ -1424,6 +1424,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .approval-preview > div + div { margin-top: 6px; }
 .approval-preview dt { color: var(--fg-2); }
 .approval-preview dd { margin: 0; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-preview-id { color: var(--fg-2); }
 
 /* ── markdown inside a reply ────────────────────────────────────── */
 /* Replies carry markdown; the engine renders it sanitized. Spacing stays
