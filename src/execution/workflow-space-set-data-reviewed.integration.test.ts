@@ -116,6 +116,20 @@ test('one accepted scheduled workflow-v3 call updates an existing active Workspa
     audit: readFileSync(spaces.resolveInSpace(args.slug, 'audit.jsonl')),
   };
   assert.equal(before.observations, 1);
+
+  // The run's reviewers read this exact write, and the registry's declared
+  // write contract, rather than "0 logical settlements" (live 2026-09-25).
+  const { readWorkflowTargetEvidence } = await import('./workflow-target-evidence.js');
+  const evidence = readWorkflowTargetEvidence(queued.id);
+  assert.match(evidence.summary, /: 1 logical settlements\./);
+  assert.deepEqual(
+    evidence.results?.map((row) => [row.toolName, row.status]),
+    [['space_set_data', 'verified']],
+    evidence.summary,
+  );
+  assert.match(evidence.summary, new RegExp(first.observationId));
+  assert.match(evidence.summary, /idempotency=content_addressed/);
+  assert.equal(evidence.available, true, evidence.summary);
   const sessionId = `workflow:${queued.id}:${step.id}`;
   const grants = approvals.listPending({ sessionId, status: 'any' });
   assert.equal(grants.length, 1);

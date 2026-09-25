@@ -697,6 +697,52 @@ test('one exact read crosses the immutable port once and replays its durable res
   assert.equal(eventlog.openEventLog().pragma('foreign_key_check').length, 0);
 });
 
+// Live 2026-09-25: a scheduled dashboard refresh settled six reads and one
+// Workspace write, and its goal review was told "0 logical settlements"
+// because the evidence reader admitted only calls sourced from a chat
+// message. A workflow step's source is its own activation event.
+test('the run reviewers see a settled workflow read as authenticated evidence of that run only', async () => {
+  const { readWorkflowTargetEvidence } = await import('./workflow-target-evidence.js');
+  const installed = installExecutionFixture({ label: 'reviewed-evidence' });
+  const identity = executionIdentity(installed.plan, 'reviewed-evidence');
+  const sessionId = eventlog.createSession({
+    id: `workflow:${identity.runId}:${identity.nodeId}`,
+    kind: 'workflow',
+  }).id;
+  const read = await executeWorkflowNodeRead({
+    ...prepareInput({ entry: installed.entry, plan: installed.plan, identity }),
+    sessionId,
+  });
+  assert.equal(read.ok, true, JSON.stringify(read));
+
+  const evidence = readWorkflowTargetEvidence(identity.runId);
+  assert.match(evidence.summary, /: 1 logical settlements\./);
+  assert.deepEqual(
+    evidence.results?.map((row) => [row.toolName, row.status]),
+    [[installed.entry.toolName, 'verified']],
+    evidence.summary,
+  );
+  assert.match(evidence.summary, /record\.reviewed-evidence/, 'the reviewer reads the settled result itself');
+  assert.equal(evidence.available, true, evidence.summary);
+
+  // A session named for another run cannot lend that run this call's
+  // authority: the activation, not the session name, says whose work it was.
+  const borrowed = installExecutionFixture({ label: 'borrowed-evidence' });
+  const borrowedIdentity = executionIdentity(borrowed.plan, 'borrowed-evidence');
+  const borrowedSession = eventlog.createSession({
+    id: `workflow:run.claimed-elsewhere:${borrowedIdentity.nodeId}`,
+    kind: 'workflow',
+  }).id;
+  const borrowedRead = await executeWorkflowNodeRead({
+    ...prepareInput({ entry: borrowed.entry, plan: borrowed.plan, identity: borrowedIdentity }),
+    sessionId: borrowedSession,
+  });
+  assert.equal(borrowedRead.ok, true, JSON.stringify(borrowedRead));
+  const claimed = readWorkflowTargetEvidence('run.claimed-elsewhere');
+  assert.equal(claimed.results?.some((row) => row.status === 'verified') ?? false, false, claimed.summary);
+  assert.equal(claimed.available, false, claimed.summary);
+});
+
 test('authored evidence paths and the step result share one exact payload owner while durable results retain the envelope', async () => {
   const payload = { records: [{ id: 'record.mcp-evidence' }] };
   const cases: Array<{

@@ -1,6 +1,7 @@
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from '../runtime/harness/dispatch-ledger.js';
 import { acceptedTaskIdFor } from '../runtime/harness/attempt-identity.js';
+import { acceptedTurnCallAuthorityFor } from '../runtime/harness/accepted-turn-call-authority.js';
 import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
 import { completionReadPresentation } from '../runtime/harness/host-completion-work.js';
 import { settledSourceArtifacts } from '../runtime/harness/host-turn-runner.js';
@@ -70,24 +71,46 @@ export function humanDecisionBlocks(runId: string): string[] {
   }
 }
 
+/** What the tool registry declares a repeat of this write does. No single
+ * run can show its own replay, so a reviewer asked whether a rerun writes
+ * twice answers from the tool's declared contract. */
+function declaredWriteContract(toolName: string): string | null {
+  const entry = TOOL_REGISTRY.find((tool) => tool.name === toolName);
+  const execution = entry?.localExecution;
+  const reversibility = entry?.localPlanning?.reversibility;
+  if (!execution && !reversibility) return null;
+  const facts = [
+    execution ? `idempotency=${execution.idempotency}${execution.idempotency === 'content_addressed'
+      ? ' (an exact replay of the same content reuses this revision and adds no write)' : ''}` : '',
+    reversibility ? `reversibility=${reversibility}` : '',
+  ].filter(Boolean);
+  return `Declared write contract of ${toolName} (tool registry, not model output): ${facts.join('; ')}.`;
+}
+
 export function readWorkflowTargetEvidence(runId: string, options: { compactResults?: boolean } = {}): WorkflowTargetEvidence {
   try {
     const db = openEventLog();
     const prefix = `workflow:${runId}:`;
+    // A chat-sourced call answers a person's message. A workflow step's call
+    // answers its own activation event; admitting only the first reported
+    // every deterministic step as "0 logical settlements" (live 2026-09-25).
     const rows = db.prepare(`
       SELECT s.rowid AS ordinal, s.session_id AS sessionId, s.source_user_seq AS sourceUserSeq,
              s.logical_tool_call_id AS callId, l.tool_name AS toolName,
-             s.outcome_kind AS outcome, s.outcome_detail AS detail, s.mutating
+             s.outcome_kind AS outcome, s.outcome_detail AS detail, s.mutating,
+             source.type AS sourceType
         FROM logical_call_settlements s
         JOIN logical_tool_calls l ON l.session_id = s.session_id
          AND l.source_user_seq = s.source_user_seq AND l.logical_tool_call_id = s.logical_tool_call_id
         JOIN events source ON source.session_id = s.session_id AND source.seq = s.source_user_seq
-         AND source.type = 'user_input_received' AND source.role = 'user'
+         AND ((source.type = 'user_input_received' AND source.role = 'user')
+           OR (source.role = 'system'
+             AND source.type IN ('workflow_node_invocation_activated', 'workflow_paginated_read_activated')))
        WHERE substr(s.session_id, 1, ?) = ?
        ORDER BY s.rowid
     `).all(prefix.length, prefix) as Array<{
       ordinal: number; sessionId: string; sourceUserSeq: number; callId: string;
-      toolName: string; outcome: string; detail: string | null; mutating: number;
+      toolName: string; outcome: string; detail: string | null; mutating: number; sourceType: string;
     }>;
     const called = db.prepare(`
       SELECT json_extract(data_json, '$.tool') AS tool
@@ -124,7 +147,26 @@ export function readWorkflowTargetEvidence(runId: string, options: { compactResu
       const source = `${row.sessionId}#${row.sourceUserSeq}`;
       const invocation = called.get(row.sessionId, row.sourceUserSeq, row.callId) as { tool: string } | undefined;
       const label = `${invocation?.tool ?? row.toolName} -> ${row.toolName} [source=${source}; logicalCall=${row.callId}; outcome=${row.outcome}; mutating=${row.mutating}]`;
-      if (row.mutating && row.outcome === 'succeeded') {
+      const fromChat = row.sourceType === 'user_input_received';
+      let acceptedTaskId = acceptedTaskIdFor(row.sessionId, row.sourceUserSeq);
+      if (!fromChat) {
+        // The verified activation, not the session name, says whose work
+        // this was: it must recompute and belong to this exact run.
+        const authority = acceptedTurnCallAuthorityFor(row.sessionId, row.sourceUserSeq);
+        const ownerRunId = authority.status === 'ok'
+          ? authority.authority.workflow?.runId ?? authority.authority.paginatedWorkflow?.runId : undefined;
+        if (authority.status !== 'ok' || ownerRunId !== runId) {
+          available = false;
+          results.push({ toolName: row.toolName, outcome: row.outcome, status: 'unavailable', contentComplete: false, logicalToolCallId: row.callId });
+          blocks.push(`${label}: workflow step authority UNAVAILABLE (${authority.status === 'ok'
+            ? 'its activation belongs to another run' : `${authority.status}: ${authority.reason}`}).`);
+          continue;
+        }
+        acceptedTaskId = authority.authority.identity.acceptedTaskId;
+      }
+      // A step's write crosses its reviewed capability port, so its settled
+      // result is its evidence; host-file proof belongs to chat-run writes.
+      if (fromChat && row.mutating && row.outcome === 'succeeded') {
         if (!sources.has(source)) {
           sources.set(source, settledSourceArtifacts(row));
           available &&= sources.get(source)!.evidenceAvailable;
@@ -141,7 +183,7 @@ export function readWorkflowTargetEvidence(runId: string, options: { compactResu
         continue;
       }
       const redeemed = redeemSuccessfulSettlementResultForHost({
-        ...row, acceptedTaskId: acceptedTaskIdFor(row.sessionId, row.sourceUserSeq), logicalToolCallId: row.callId,
+        ...row, acceptedTaskId, logicalToolCallId: row.callId,
       });
       if (redeemed.status !== 'ok') {
         available = false;
@@ -181,7 +223,12 @@ export function readWorkflowTargetEvidence(runId: string, options: { compactResu
         ...(receipt && row.mutating ? { authoringResult: true } : {}) });
       if (receipt) receipts.set(`${source}:${row.callId}`, receipt);
       blocks.push(`${label}: authenticated result ${result.resultHandleId}; dispatch=${result.physicalDispatchId}; sha256=${result.rawPayloadSha256}; bytes=${result.rawByteCount}; completeness=${result.handle.completeness}.`);
-      if (TOOL_REGISTRY.find((tool) => tool.name === row.toolName)?.actionTopologyRole === 'control') continue;
+      const contract = row.mutating ? declaredWriteContract(row.toolName) : null;
+      if (contract) blocks.push(contract);
+      // Control results are execution facts, not content, except a step's
+      // write: with no host artifact below, its receipt is its evidence.
+      if (TOOL_REGISTRY.find((tool) => tool.name === row.toolName)?.actionTopologyRole === 'control'
+        && (fromChat || !row.mutating)) continue;
       blocks.push(toolReadsRetainedOutput(row.toolName)
         ? 'Retained projection: omitted fields do not prove absence from the source.'
         : 'Complete retained result of this call; provider pagination is a separate fact.',
