@@ -121,7 +121,7 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeAuth?.configured, claudeAuth?.degraded]);
-  const onRole = (role: 'worker' | 'judge', v: string) =>
+  const onRole = (role: 'worker' | 'judge' | 'writer', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
 
   return {
@@ -137,6 +137,7 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     brains: mr ? brainChoices(mr, claudeAuth) : [],
     workers: mr ? flatChoices(mr.roleOptions?.worker ?? mr.available) : [],
     judges: mr ? flatChoices(mr.roleOptions?.judge ?? mr.available) : [],
+    writers: mr ? flatChoices(mr.roleOptions?.writer ?? mr.roleOptions?.judge ?? mr.available) : [],
   };
 }
 

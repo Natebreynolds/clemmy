@@ -1227,3 +1227,154 @@ test('workflow request scope stays lazy, survives reopen and cannot be supplied 
   assert.equal(evidence.results.filter(row => row.toolName === 'read_file').length, 3);
   assert.equal(evidence.results.filter(row => row.contentDisposition === 'duplicate_content').length, 2);
 });
+
+// --- the chosen writer (writer / reviewer split) ---
+type WriterRun = {
+  identity: ReturnType<typeof accepted>;
+  outcome: Awaited<ReturnType<typeof host.hostRunRunner>>;
+  brainCalls: number;
+  writerRequests: Array<{ input: unknown; systemInstructions?: string; tools?: unknown[] }>;
+  judged: Array<{ reply: string; author?: string }>;
+};
+async function runWrittenHost(options: {
+  reads: number;
+  writer: 'none' | 'writes' | 'throws' | 'calls_tool';
+  verdicts?: Array<{ done: boolean; reason: string }>;
+}): Promise<WriterRun> {
+  // An action request, so the completion review runs on the scripted turn.
+  const writerRequestText = 'Pull the two retained reports and write me a short snapshot I can use in the pitch.';
+  const identity = accepted(writerRequestText);
+  host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
+  attempted(identity);
+  const judged: WriterRun['judged'] = [];
+  const verdicts = [...(options.verdicts ?? [{ done: true, reason: 'The reply matches the retained reports.' }])];
+  host._setHostObjectiveJudgeForTests(async (_objective, reply, context) => {
+    judged.push({ reply, ...(context?.reviewedAuthor ? { author: context.reviewedAuthor.modelId } : {}) });
+    return verdicts.shift() ?? { done: true, reason: 'ok' };
+  });
+  const message = (text: string) => [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }];
+  const streamed = (model: { getResponse(request?: unknown): Promise<{ responseId: string; usage: unknown; output: unknown[] }> }) =>
+    async function* (request?: unknown) {
+      const response = await model.getResponse(request);
+      yield { type: 'response_started' } as never;
+      yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+    };
+  let brainCalls = 0;
+  const brain = {
+    async getResponse() {
+      brainCalls += 1;
+      if (brainCalls === 1) {
+        for (let index = 0; index < options.reads; index += 1) {
+          retainedRead(identity, 'read_file', { report: `report ${index}`, visits: 1957 + index, rank: 6 + index },
+            false, true, false, { id: `read:writer-${serial}-${index}`, args: { path: `/reports/${index}.json` } });
+        }
+      }
+      return { responseId: `brain-${serial}-${brainCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        output: message(`Brain draft ${brainCalls}: the reports show about 1,957 visits and rank 6.`) };
+    },
+    getStreamedResponse: undefined as unknown,
+  };
+  brain.getStreamedResponse = streamed(brain);
+  const writerRequests: WriterRun['writerRequests'] = [];
+  let writerCalls = 0;
+  const writerModel = {
+    async getResponse(request?: unknown) {
+      writerRequests.push(request as WriterRun['writerRequests'][number]);
+      writerCalls += 1;
+      if (options.writer === 'throws') throw new Error('writer provider unavailable');
+      if (options.writer === 'calls_tool') {
+        return { responseId: `writer-${serial}-${writerCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          output: [{ type: 'function_call', callId: 'writer-tool', name: 'read_file', arguments: '{}', status: 'completed' }] };
+      }
+      return { responseId: `writer-${serial}-${writerCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        output: message(`Written answer ${writerCalls}: 1,957 monthly visits; the site ranks 6th.`) };
+    },
+    getStreamedResponse: undefined as unknown,
+  };
+  writerModel.getStreamedResponse = streamed(writerModel);
+  host._setHostWriterForTests(options.writer === 'none' ? () => null : () => ({
+    resolved: { modelId: 'fixture-writer-model', provider: 'claude', source: 'settings' },
+    model: writerModel as never,
+  }));
+  const agent = { model: brain, tools: [] };
+  const prior = catalogs.peekHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  try {
+    const sealed = envelopes.sealAgentCapabilityUniverse({ sessionId: identity.sessionId, universeTools: [], activeToolNames: [], policyHash: 'completion-contract-writer', budget: { maxUncachedTokens: 10_000, maxModelCalls: 8, maxToolCalls: 20, maxElapsedMs: 60_000 } });
+    assert.equal(sealed.ok, true);
+    if (!sealed.ok) throw new Error('fixture envelope did not seal');
+    envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+    envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+    const runner = Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not execute'); } });
+    const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: writerRequestText }] as never, { maxTurns: 8, hostTurnEngine: 'host_v1', hostJudgeCompletion: true, context: identity } as never));
+    return { identity, outcome, brainCalls, writerRequests, judged };
+  } finally {
+    host._setHostObjectiveJudgeForTests(null);
+    host._setHostWriterForTests(null);
+    catalogs.installHostCapabilityCatalogFactory(prior);
+  }
+}
+function writerJournal(identity: ReturnType<typeof accepted>): string[] {
+  return events.listEvents(identity.sessionId, { types: ['guardrail_tripped'] })
+    .map((event) => event.data as { kind?: string; phase?: string })
+    .filter((data) => data.kind === 'host_final_writer')
+    .map((data) => String(data.phase));
+}
+
+test('a chosen writer writes the final answer from the gathered evidence before review reads it', async () => {
+  const run = await runWrittenHost({ reads: 2, writer: 'writes' });
+  assert.equal(run.writerRequests.length, 1, 'the writer wrote once');
+  const request = run.writerRequests[0]!;
+  assert.deepEqual(request.tools ?? [], [], 'the writer has no tools');
+  const packet = JSON.stringify(request.input);
+  assert.match(packet, /EVIDENCE GATHERED FOR THIS REQUEST/);
+  assert.match(packet, /report 0/, 'the writer sees the same retained results the reviewer sees');
+  assert.match(packet, /Brain draft 1/, 'the writer starts from the brain draft');
+  assert.equal(run.judged.length, 1);
+  assert.match(run.judged[0]!.reply, /Written answer 1/, 'review reads the written answer, not the draft');
+  assert.equal(run.judged[0]!.author, 'fixture-writer-model', 'review independence is measured against the writer');
+  assert.match(String(run.outcome.finalOutput), /Written answer 1/);
+  assert.deepEqual(writerJournal(run.identity), ['armed', 'written']);
+});
+
+test('without a chosen writer the brain draft goes straight to review', async () => {
+  const run = await runWrittenHost({ reads: 2, writer: 'none' });
+  assert.equal(run.writerRequests.length, 0);
+  assert.match(run.judged[0]!.reply, /Brain draft 1/);
+  assert.equal(run.judged[0]!.author, undefined);
+  assert.deepEqual(writerJournal(run.identity), []);
+});
+
+test('a turn without gathered evidence keeps the brain answer and skips the writer', async () => {
+  const run = await runWrittenHost({ reads: 0, writer: 'writes' });
+  assert.equal(run.writerRequests.length, 0, 'a turn without retained read results is not written');
+  assert.match(String(run.outcome.finalOutput), /Brain draft 1/);
+  assert.deepEqual(writerJournal(run.identity), []);
+});
+
+test('a failing writer delivers the brain draft to review instead of failing the turn', async () => {
+  const run = await runWrittenHost({ reads: 2, writer: 'throws' });
+  assert.ok(run.writerRequests.length >= 1);
+  assert.match(run.judged[0]!.reply, /Brain draft 1/, 'the reviewed reply is the brain draft');
+  assert.equal(run.judged[0]!.author, undefined, 'the brain, not the writer, authored it');
+  assert.match(String(run.outcome.finalOutput), /Brain draft 1/);
+  assert.deepEqual(writerJournal(run.identity), ['armed', 'fell_back']);
+});
+
+test('a writer that tries to call a tool is refused and the brain draft is reviewed', async () => {
+  const run = await runWrittenHost({ reads: 2, writer: 'calls_tool' });
+  assert.match(run.judged[0]!.reply, /Brain draft 1/);
+  assert.deepEqual(writerJournal(run.identity), ['armed', 'fell_back']);
+});
+
+test('a review finding reaches the writer when the brain drafts again', async () => {
+  const run = await runWrittenHost({ reads: 2, writer: 'writes', verdicts: [
+    { done: false, reason: 'The visit count in the reply does not match the retained report.' },
+    { done: true, reason: 'The corrected reply matches the retained reports.' },
+  ] });
+  assert.equal(run.judged.length, 2);
+  assert.equal(run.writerRequests.length, 2, 'each new brain draft is written');
+  assert.match(JSON.stringify(run.writerRequests[1]!.input), /REVIEW FINDING TO RESOLVE[\s\S]*visit count/,
+    'the writer sees what the reviewer rejected');
+  assert.match(String(run.outcome.finalOutput), /Written answer 2/);
+});

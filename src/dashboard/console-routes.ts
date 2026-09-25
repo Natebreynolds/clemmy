@@ -8428,6 +8428,7 @@ export function registerConsoleRoutes(
         brain: resolveRoleModel('brain'),
         worker: resolveRoleModel('worker'),
         judge: resolveRoleModel('judge'),
+        writer: resolveRoleModel('writer'),
       },
       bindings: readDurableBindings(),
       available: catalog.available,
@@ -15873,9 +15874,9 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const body = (req.body ?? {}) as { role?: unknown; modelId?: unknown; whenIntent?: unknown; clear?: unknown };
-      const role = (body.role === 'worker' || body.role === 'judge') ? (body.role as ModelRole) : '';
+      const role = (body.role === 'worker' || body.role === 'judge' || body.role === 'writer') ? (body.role as ModelRole) : '';
       if (!role) {
-        res.status(400).json({ error: 'role must be "worker" or "judge" (set the brain via /settings/active-brain)' });
+        res.status(400).json({ error: 'role must be "worker", "judge" or "writer" (set the brain via /settings/active-brain)' });
         return;
       }
       const cleanId = (v: unknown): string => {

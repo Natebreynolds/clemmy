@@ -420,8 +420,9 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
 /** Explicit request role for cost accounting. Set by the caller that knows
  *  what the request IS; never inferred from model names or token sizes.
  *  brain = the turn's foreground model; worker = a delegated child; reviewer =
- *  judges, watchers, completion/goal reviews; router = Jev routing calls. */
-export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router';
+ *  judges, watchers, completion/goal reviews; router = Jev routing calls;
+ *  writer = the chosen model writing the final answer from gathered evidence. */
+export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer';
 
 export interface ModelUsageAttributionContext {
   /** Request-local estimates override ambient parent prompt measurements. */
@@ -473,6 +474,7 @@ export function usageRoleFromChannel(channel: string | undefined): UsageRequestR
   if (!value) return undefined;
   if (value.startsWith('judge') || value.startsWith('watcher') || value.startsWith('review')) return 'reviewer';
   if (value.startsWith('jev')) return 'router';
+  if (value.startsWith('writer')) return 'writer';
   return undefined;
 }
 

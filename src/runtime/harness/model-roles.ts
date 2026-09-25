@@ -53,9 +53,12 @@ import {
 
 /** Fixed internal role seam. brain = the active orchestrator model; worker =
  *  delegated run_worker/grunt labor; judge = the fusion verify checker / debate
- *  reconciler. (debate's draftA is intentionally NOT a registry role — it stays
- *  the flagship and the user never touches it.) */
-export type ModelRole = 'brain' | 'worker' | 'judge';
+ *  reconciler and completion reviewer; writer = the model that writes the final
+ *  answer from gathered evidence. The writer defaults to the brain (the brain
+ *  writes its own answer); only an explicit binding makes it a separate step.
+ *  (debate's draftA is intentionally NOT a registry role — it stays the flagship
+ *  and the user never touches it.) */
+export type ModelRole = 'brain' | 'worker' | 'judge' | 'writer';
 
 /** A user-set role→model assignment (from the Models UI or a chat rule). */
 export interface RoleBinding {
@@ -229,7 +232,8 @@ export function readDurableBindings(): RoleBinding[] {
         typeof b === 'object' &&
         ((b as RoleBinding).role === 'brain' ||
           (b as RoleBinding).role === 'worker' ||
-          (b as RoleBinding).role === 'judge') &&
+          (b as RoleBinding).role === 'judge' ||
+          (b as RoleBinding).role === 'writer') &&
         typeof (b as RoleBinding).modelId === 'string' &&
         (b as RoleBinding).modelId.length > 0,
     );
@@ -308,6 +312,8 @@ export function codexSafeFast(): string {
 }
 
 export function defaultForRole(role: ModelRole): string {
+  // With no writer chosen, the brain writes its own final answer.
+  if (role === 'writer') return defaultForRole('brain');
   const byo = getByoBackendConfig();
   const mode = getModelRoutingMode();
 
@@ -357,7 +363,10 @@ export function defaultForRole(role: ModelRole): string {
       // the OPENAI_MODEL_* slot would mislabel a Codex brain as 'byo' here.
       const brainProvider: ModelProviderClass =
         getActiveAuthMode() === 'claude_oauth' ? 'claude' : resolveProvider(codexSafePrimary());
-      const crossFamily = judgeDefaultModel(brainProvider, debateBrainsAvailable(), {
+      // A chosen writer authors the answers the judge reviews, so the default
+      // judge comes from a family other than the writer's.
+      const writer = boundWriterModel();
+      const crossFamily = judgeDefaultModel(writer?.provider ?? brainProvider, debateBrainsAvailable(), {
         crossFamilyEnabled: judgeCrossFamilyEnabled(),
         explicitJudgeChoice: getRuntimeEnv('CLEMMY_DEBATE_JUDGE', '') || '',
       });
@@ -431,8 +440,10 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
   // Learned route policy — consulted ONLY when no explicit binding matched
   // (user bindings always win), bounded by min-samples/floor/hysteresis inside
   // pickRoutePolicyModel, and live-validated exactly like a binding. Empty
-  // policy table / kill-switch off ⇒ falls through byte-identically.
-  try {
+  // policy table / kill-switch off ⇒ falls through byte-identically. The writer
+  // is only ever the owner's explicit choice or the brain itself: the policy
+  // only drifts toward cheaper models, which is the opposite of its purpose.
+  if (role !== 'writer') try {
     const pick = pickRoutePolicyModel(role, querySlug || undefined, modelId,
       (candidateId) => validateRoleModelBinding(role, candidateId).ok);
     if (pick) {
@@ -483,5 +494,20 @@ function providerForInactiveBinding(modelId: string): ModelProviderClass {
     return resolveEffectiveProviderForModel(modelId);
   } catch {
     return resolveProvider(modelId);
+  }
+}
+
+/**
+ * The owner's chosen writer, or null when the brain writes its own answers.
+ * Only an explicit, currently available binding counts: an unavailable choice
+ * leaves the brain writing rather than routing answers to a stand-in model.
+ */
+export function boundWriterModel(): ResolvedRoleModel | null {
+  try {
+    const writer = resolveRoleModel('writer');
+    if (writer.source === 'default' || writer.source === 'policy' || writer.inactiveBinding || !writer.modelId) return null;
+    return writer;
+  } catch {
+    return null;
   }
 }

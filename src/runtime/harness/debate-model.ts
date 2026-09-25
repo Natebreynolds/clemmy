@@ -980,6 +980,29 @@ function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, have
   );
 }
 
+/**
+ * Build exactly the model a role names: no router fallover chain, no fusion
+ * wrapper and no provider overload fallback. A chosen writer that silently
+ * became a different model would defeat the choice, so an unavailable provider
+ * returns null and the caller keeps its own fallback.
+ */
+export function buildExactRoleModel(resolved: ResolvedRoleModel, routeRole: ModelRouteRole): Model | null {
+  let model: Model | null;
+  if (resolved.provider === 'codex') {
+    model = codexAvailable() ? new CodexModelProvider().getModel(resolved.modelId) : null;
+  } else if (resolved.provider === 'byo') {
+    const byo = resolveByoProviderForModel(resolved.modelId) ?? getByoBackendConfig();
+    model = byo.configured ? getByoModel(resolved.modelId, byo) : null;
+  } else {
+    model = claudeAvailable()
+      ? new ClaudeModelProvider().getModel(resolved.modelId, { allowOverloadFallback: false })
+      : null;
+  }
+  if (!model) return null;
+  return withDirectModelRouteMetrics(model, routeRole, resolved.provider, resolved.modelId,
+    routeSourceForResolvedRole(resolved), routeRole === 'writer' ? 'writer' : 'judge');
+}
+
 function routeSourceForResolvedRole(checker: ResolvedRoleModel): ModelRouteDecisionSource {
   if (checker.source === 'policy') return 'policy';
   if (checker.source === 'default') return 'default';
@@ -994,7 +1017,7 @@ function withDirectModelRouteMetrics(
   provider: ModelProviderClass,
   modelId: string,
   source: ModelRouteDecisionSource,
-  seam: 'draft' | 'judge',
+  seam: 'draft' | 'judge' | 'writer',
 ): Model {
   const sessionId = harnessRunContextStorage.getStore()?.sessionId;
   const workflowRunId = sessionId?.startsWith('workflow:') ? sessionId.split(':')[1] : undefined;
@@ -1006,7 +1029,7 @@ function withDirectModelRouteMetrics(
     resolvedModel: modelId,
     provider,
     source,
-    reason: { seam: `fusion_${seam}` },
+    reason: { seam: seam === 'writer' ? 'host_final_writer' : `fusion_${seam}` },
   });
 }
 
@@ -1040,6 +1063,9 @@ export interface BoundaryJudgeRouting {
   /** Stable BYO registry owner, when a captured selection chose this route. */
   judgeProviderId?: string;
   brainFamily: ModelProviderClass;
+  /** Family of the chosen writer when it, not the brain, wrote the reviewed
+   *  text. Independence is measured against the author of what is reviewed. */
+  authorFamily?: ModelProviderClass;
   /** True when downshiftForBoundary honoured an EXPLICIT heavyweight pin rather
    *  than substituting the cheap boundary model. Callers MUST use
    *  `timeoutMs` below instead of the short boundary default, or the pin
@@ -1282,12 +1308,15 @@ function markIfSubstitute(routing: BoundaryJudgeRouting, captured?: AvailableBou
   };
 }
 
-export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection): BoundaryJudgeRouting {
+export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection, author?: ResolvedRoleModel): BoundaryJudgeRouting {
   if (selection?.status === 'unavailable') throw new Error(selection.reason);
   const captured = selection?.status === 'captured' ? selection : undefined;
   const configuredBrain = resolveRoleModel('brain');
   const brainFamily = executedBrainFamily(configuredBrain.provider);
   const brain = { ...configuredBrain, provider: brainFamily };
+  // The reviewed text's author: the chosen writer when it wrote the reply,
+  // otherwise the brain. A judge grading its own family is a self-judge.
+  const reviewedAuthor = author ?? brain;
   const crossFamily = captured?.crossFamily ?? judgeCrossFamilyEnabled();
   const checker = captured?.role ?? downshiftForBoundary(resolveRoleModel('judge'));
   if (checker.inactiveBinding) {
@@ -1306,6 +1335,7 @@ export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection)
       judgeFamily: checker.provider,
       ...(captured?.byoProvider ? { judgeProviderId: captured.byoProvider.id } : {}),
       brainFamily,
+      ...(author ? { authorFamily: author.provider } : {}),
       transport: boundaryTransport(checker.provider),
       ...(checker.exactHeavyweightPin ? { exactHeavyweightPin: true } : {}),
       ...(hasExplicitJudgeBinding(checker) ? { ownerSelectedJudge: true } : {}),
@@ -1317,7 +1347,7 @@ export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection)
       timeoutMs: hasExplicitJudgeBinding(checker)
         ? exactJudgeBoundaryTimeoutMs()
         : boundaryJudgeTimeoutMs(),
-      selfJudge: sameJudgeFamily(checker, brain, captured),
+      selfJudge: sameJudgeFamily(checker, reviewedAuthor, captured),
     };
   }
   if (hasExplicitJudgeBinding(checker)) {
@@ -1459,7 +1489,8 @@ export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting, selecti
     { provider: 'codex', modelId: captured?.defaultModels.codex ?? boundaryCodexJudgeModel(), available: haveCodex },
   ];
   for (const c of candidates) {
-    if (!c.available || c.provider === primary.judgeFamily || c.provider === primary.brainFamily) continue;
+    if (!c.available || c.provider === primary.judgeFamily || c.provider === primary.brainFamily
+      || c.provider === primary.authorFamily) continue;
     const model = buildJudgeForRole({ modelId: c.modelId, provider: c.provider, source: 'default' }, haveClaude, haveCodex, captured);
     if (!model) continue;
     return {
@@ -1467,8 +1498,9 @@ export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting, selecti
       modelId: c.modelId,
       judgeFamily: c.provider,
       brainFamily: primary.brainFamily,
+      ...(primary.authorFamily ? { authorFamily: primary.authorFamily } : {}),
       transport: boundaryTransport(c.provider),
-      selfJudge: c.provider === primary.brainFamily,
+      selfJudge: c.provider === (primary.authorFamily ?? primary.brainFamily),
     };
   }
   return null;

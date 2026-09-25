@@ -85,6 +85,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const busy = r.busy;
   const workerFlat = r.workers;
   const judgeFlat = r.judges;
+  const writerFlat = r.writers;
   const codexRescue = settings?.models?.codexRescue;
   const codexRescueOptions = [...(mr.available.find((p) => p.provider === 'codex')?.models ?? [])];
   if (codexRescue?.configured && !codexRescueOptions.some((model) => model.id === codexRescue.modelId)) {
@@ -108,6 +109,11 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const boundedFusionAttempts = (fusion?.health?.accepted ?? 0) + (fusion?.health?.corrected ?? 0) + (fusion?.health?.safeFallbacks ?? 0);
   const onFusion = (when: 'off' | 'high' | 'all') => r.run('fusion', () => patchFusion({ mode: when, strategy: 'verify' }));
   const judgeSameAsBrain = mr.roles.judge.provider === mr.roles.brain.provider && mr.roles.judge.modelId === mr.roles.brain.modelId;
+  // A chosen writer reviewed by its own family grades its own work. BYO family
+  // is the endpoint, which this page cannot see, so only name the clear cases.
+  const writer = mr.roles.writer;
+  const judgeSharesWriterFamily = Boolean(writer && writer.source !== 'default' && writer.provider !== 'byo'
+    && mr.roles.judge.provider === writer.provider);
   const onCodexRescue = (value: string) => r.run('codex-rescue', () => patchCodexRescueModel(value === '__primary__' ? { clear: true } : { modelId: value }));
   const workerIntents = mr.bindings.filter((b) => b.role === 'worker' && b.whenIntent);
   const modelLabel = (id: string) => workerFlat.find((m) => m.id === id)?.label ?? id;
@@ -137,13 +143,15 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   // "inactive" whenever the active-brain switch owns the choice — even when
   // both name the same model, which read "Saved grok-4.6 is unavailable" over
   // a grok-4.6 brain.
-  const inactive = (role: 'brain' | 'worker' | 'judge') => mr.roles[role].inactiveBinding
-    && mr.roles[role].inactiveBinding?.modelId !== mr.roles[role].modelId && (
-    <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={mr.roles[role].inactiveBinding?.reason}>
-      <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
-      <span className="min-w-0">Saved {mr.roles[role].inactiveBinding?.modelId} isn’t available, so {mr.roles[role].modelId} answers instead.</span>
-    </div>
-  );
+  const inactive = (role: 'brain' | 'worker' | 'judge' | 'writer') => {
+    const resolved = mr.roles[role];
+    return resolved?.inactiveBinding && resolved.inactiveBinding.modelId !== resolved.modelId && (
+      <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={resolved.inactiveBinding.reason}>
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        <span className="min-w-0">Saved {resolved.inactiveBinding.modelId} isn’t available, so {resolved.modelId} answers instead.</span>
+      </div>
+    );
+  };
   return (
     <div>
       <div className="overflow-hidden rounded-lg border border-border bg-surface">
@@ -156,6 +164,17 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
             <option value="__default__">Follow the brain</option>
             {workerFlat.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>, inactive('worker'))}
+        {writer && row('Writer', 'Writes the final answer from the gathered evidence on research-heavy turns',
+          <Select disabled={busy === 'writer'} value={writer.source === 'default' ? '__default__' : writer.modelId} onChange={(e) => void r.onRole('writer', e.target.value)} aria-label="Writer model">
+            <option value="__default__">The brain writes</option>
+            {writerFlat.map((m) => <option key={`wr-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
+          </Select>,
+          <>
+            {inactive('writer')}
+            {judgeSharesWriterFamily && (
+              <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The judge is from the same family as the writer, so it reviews its own family’s work. Pick a judge from another family.</div>
+            )}
+          </>)}
         {row('Judge', 'Checks finished work before it is called done',
           <Select disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId} onChange={(e) => void r.onRole('judge', e.target.value)} aria-label="Judge model">
             <option value="__default__">Automatic · different family, fast</option>

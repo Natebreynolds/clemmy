@@ -23,9 +23,11 @@ import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
  * SAME CLEMMY_MODEL_ROLES bindings the Models UI writes (source:'chat-rule'), so
  * a chat rule shows up in the panel and vice-versa.
  *
- * v1 sets ROLE-WIDE bindings (worker/judge). The brain is a provider LOGIN switch
- * (handled in Settings → Models), and intent-scoped routing ("use Claude for
- * design") is the next step. Kill-switch CLEMMY_CHAT_MODEL_ROUTING (default on).
+ * Chat routes WORKERS only, role-wide or scoped to one kind of work ("use Claude
+ * for design"). The brain, the writer and the judge are chosen only in Settings →
+ * Models: who writes the answer and who checks the work are the owner's
+ * decisions, and nothing a conversation reads may change them. Kill-switch
+ * CLEMMY_CHAT_MODEL_ROUTING (default on).
  */
 function chatModelRoutingEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_CHAT_MODEL_ROUTING', 'on') || 'on').trim().toLowerCase() !== 'off';
@@ -76,15 +78,15 @@ export function registerModelRoleTools(server: McpServer): void {
   server.tool(
     'set_model_role',
     [
-      'Route a model ROLE to a specific model, or revert it to the default, when the user asks in chat (e.g. "use DeepSeek for the workers", "make the judge Opus", "put the workers back to normal").',
-      'role = worker (delegated run_worker/grunt labor) or judge (the fusion verify checker). The BRAIN is a provider login switch — do NOT set it here; point the user to Settings → Models.',
+      'Route the WORKER model, or revert it to the default, when the user asks in chat (e.g. "use DeepSeek for the workers", "put the workers back to normal").',
+      'role = worker (delegated run_worker/grunt labor). The BRAIN, the WRITER and the JUDGE are chosen only in Settings → Models, so the owner controls who writes and who checks the work — do NOT set them here; point the user there.',
       'modelId is an exact id the user is logged into, e.g. claude-opus-4-8, claude-sonnet-4-6, gpt-5.4, gpt-5.5, deepseek-chat, minimax-01. Takes effect on the next turn, no restart.',
-      'reset=true reverts the role to its provider-derived default instead of setting a model ("put the workers back to normal", "stop using Opus for the judge"). Pass EITHER modelId OR reset:true, not both.',
+      'reset=true reverts the role to its provider-derived default instead of setting a model ("put the workers back to normal"). Pass EITHER modelId OR reset:true, not both.',
       'whenIntent (optional) scopes the rule to ONE kind of work in the user\'s OWN words: "use Claude Opus for design" → role:"worker", modelId:"claude-opus-4-8", whenIntent:"design". With reset it clears only that one intent-scoped rule; omit it for the role-wide rule. When you later fan a sub-task of that kind out to a worker, tag the worker with the same intent word and it routes to this model.',
       'This persists as a durable rule and shows in the Models panel.',
     ].join('\n'),
     {
-      role: z.enum(['worker', 'judge']).describe('worker = delegated labor model; judge = fusion checker model.'),
+      role: z.enum(['worker']).describe('worker = delegated labor model. The brain, writer and judge are Settings-only.'),
       modelId: z.string().min(1).max(60).optional().describe('Exact model id the user has access to (e.g. claude-opus-4-8, gpt-5.4, deepseek-chat). Omit when reset=true.'),
       reset: z.boolean().optional().describe('Revert the role (or the named intent rule) to its provider-derived default. Mutually exclusive with modelId.'),
       whenIntent: z.string().min(1).max(80).optional().describe('Optional free-form category, in the user\'s OWN words, to scope this rule to one kind of work ("design", "legal", "research"). Omit for a role-wide rule.'),

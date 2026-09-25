@@ -34,7 +34,7 @@ export const MODEL_ROUTE_METRICS_TABLES = [
 
 export type ModelRouteMetricsTableName = (typeof MODEL_ROUTE_METRICS_TABLES)[number];
 
-export type ModelRouteRole = 'brain' | 'worker' | 'judge';
+export type ModelRouteRole = 'brain' | 'worker' | 'judge' | 'writer';
 export type ModelRouteOutcomeStatus = 'success' | 'failed' | 'fallback' | 'cancelled';
 export type ModelRouteDecisionSource = 'default' | 'binding' | 'intent_binding' | 'explicit' | 'fallback' | 'policy';
 export type ModelRouteProvider = 'codex' | 'claude' | 'byo' | 'openai' | 'unknown';

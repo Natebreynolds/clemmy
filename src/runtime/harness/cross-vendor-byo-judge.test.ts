@@ -11,10 +11,14 @@ const SRC = readFileSync(new URL('./debate-model.ts', import.meta.url), 'utf8');
 // cross-family judging impossible for a BYO-only user.
 test('selfJudge compares the resolved backend, not the transport bucket', () => {
   assert.ok(
-    !SRC.includes('selfJudge: checker.provider === brain.provider'),
+    !SRC.includes('selfJudge: checker.provider === brain.provider')
+      && !SRC.includes('selfJudge: checker.provider === reviewedAuthor.provider'),
     'the coarse bucket comparison must be gone',
   );
-  assert.match(SRC, /selfJudge: sameJudgeFamily\(checker, brain, captured\)/);
+  // The reviewed reply's author: a chosen writer when it wrote the reply,
+  // otherwise the brain, compared by resolved backend either way.
+  assert.match(SRC, /const reviewedAuthor = author \?\? brain;/);
+  assert.match(SRC, /selfJudge: sameJudgeFamily\(checker, reviewedAuthor, captured\)/);
   assert.match(SRC, /function sameJudgeFamily\(/);
 });
 

@@ -1,3 +1,4 @@
+import type { ResolvedRoleModel } from './model-roles.js';
 import { classifyModelError } from './resilient-model.js';
 import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
@@ -517,6 +518,9 @@ export interface SkillExecutionContext {
   boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
   /** Retained results the reviewer may open with read-only evidence tools. */
   evidence?: JudgeEvidenceSource;
+  /** The chosen writer that wrote the reviewed reply, when it was not the
+   * brain. Reviewer independence is measured against this author. */
+  reviewedAuthor?: ResolvedRoleModel;
 }
 
 export interface CompletionEvidenceRow {
@@ -977,14 +981,14 @@ export async function runHedgedJudge<T>(
   lane: JudgeMetricLane = 'completion',
   opts: {
     timeoutMs?: number; requireCompletePrompt?: boolean; boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
-    evidence?: JudgeEvidenceSource;
+    evidence?: JudgeEvidenceSource; reviewedAuthor?: ResolvedRoleModel;
   } = {},
 ): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   try {
     const { resolveBoundaryJudge, resolveBoundaryJudgeHedge } = await import('./debate-model.js');
-    routing = resolveBoundaryJudge(opts.boundaryJudgeSelection);
+    routing = resolveBoundaryJudge(opts.boundaryJudgeSelection, opts.reviewedAuthor);
     const hedgeRouting = resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
     // Every attempt is attributed to its lane so the usage log can rank judge
     // spend per lane; the turn's own session/source attribution is preserved.
@@ -1078,7 +1082,8 @@ async function runCompletionJudge(
     { ...(judge.timeoutMs ? { timeoutMs: judge.timeoutMs } : {}),
       ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
       ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}),
-      ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}) },
+      ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}),
+      ...(skillContext?.reviewedAuthor ? { reviewedAuthor: skillContext.reviewedAuthor } : {}) },
   );
   return { verdict: run.value, failure: run.failure, routing: run.routing,
     ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),

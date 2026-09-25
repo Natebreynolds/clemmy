@@ -164,9 +164,9 @@ export const getDeveloperFlags = () =>
 export const patchDeveloperFlags = (p: { devMode?: boolean; key?: string; value?: string; clear?: boolean }) =>
   patch<{ developerFlags: DevFlagsSnapshot }>('/api/console/settings/developer-flags', p);
 
-// Role→model registry: which model serves each role (brain/worker/judge), the
-// source of that choice, and the models available grouped by CONNECTED provider.
-export type ModelRoleName = 'brain' | 'worker' | 'judge';
+// Role→model registry: which model serves each role (brain/worker/judge/writer),
+// the source of that choice, and the models available grouped by CONNECTED provider.
+export type ModelRoleName = 'brain' | 'worker' | 'judge' | 'writer';
 export interface ResolvedRole {
   modelId: string;
   provider: 'codex' | 'claude' | 'byo';
@@ -179,12 +179,14 @@ export interface ResolvedRole {
   };
 }
 export interface ModelRolesSnapshot {
-  roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole };
+  // writer is absent on daemons that predate the writer role.
+  roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole; writer?: ResolvedRole };
   bindings: { role: ModelRoleName; modelId: string; whenIntent?: string; source: string }[];
   available: { provider: string; label: string; models: { id: string; label: string }[] }[];
   roleOptions?: {
     worker: { provider: string; label: string; models: { id: string; label: string }[] }[];
     judge: { provider: string; label: string; models: { id: string; label: string }[] }[];
+    writer?: { provider: string; label: string; models: { id: string; label: string }[] }[];
   };
   // The brain picker: Codex / Claude / every connected BYO model, each flagged by
   // availability. `value` is the unique selector (BYO models = `api_key:<modelId>`).
@@ -214,9 +216,9 @@ export interface ModelRolesSnapshot {
     };
   };
 }
-// Set (or clear) a worker/judge role model. Brain is a provider login switch
-// (setActiveBrain). Applies on the next message, no restart.
-export const patchModelRole = (p: { role: 'worker' | 'judge'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
+// Set (or clear) a worker/judge/writer role model. Brain is a provider login
+// switch (setActiveBrain). Applies on the next message, no restart.
+export const patchModelRole = (p: { role: 'worker' | 'judge' | 'writer'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
   patch<{ modelRoles: ModelRolesSnapshot }>('/api/console/settings/models/roles', p);
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
