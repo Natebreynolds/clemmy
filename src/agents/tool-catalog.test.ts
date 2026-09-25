@@ -366,6 +366,49 @@ test('a compound opening purpose keeps the requested object ahead of a different
 });
 
 
+test('a request for two operations keeps both ahead of tools that share only its first verb', () => {
+  // Live shape 2026-09-24: "search ... and create a new Sheet" filled the first
+  // discovery page with built-in search helpers and pushed the create operation
+  // off it, because only the request's first verb could mark a tool's purpose.
+  const entries = [
+    { name: 'LISTING_SEARCH', oneLiner: 'Search venue listings by location and category and return one bounded aggregate set.' },
+    { name: 'LEDGER_SHEET_FROM_ROWS', oneLiner: 'Create one new ledger sheet from a JSON collection of rows.' },
+    { name: 'catalog_search', oneLiner: 'Search the built-in tool catalog by intent and return the closest schemas.' },
+    { name: 'vault_search', oneLiner: 'Search the local vault for relevant notes and memories.' },
+    { name: 'facts_search', oneLiner: 'Semantically search durable facts (long-term memory of the user) by meaning.' },
+    { name: 'broker_search', oneLiner: 'Search the broker for the right action slug before concluding it is unavailable.' },
+    { name: 'server_tool_list', oneLiner: 'Search one configured external server and return exact callable tool names.' },
+    { name: 'conversation_search', oneLiner: 'Find prior conversations owned by the current principal.' },
+    { name: 'broker_execute', oneLiner: 'Execute any broker action by exact slug (mail list, mail search, drive search, record query).' },
+  ];
+  for (const query of [
+    'search for venues by location and create a new ledger sheet from the results',
+    'search for venues by location, then create a new ledger sheet from the results',
+  ]) {
+    for (const ordered of [entries, [...entries].reverse()]) {
+      const ranked = rankCatalogEntriesLexically(query, ordered);
+      assert.deepEqual(new Set(ranked.slice(0, 2).map((row) => row.name)),
+        new Set(['LISTING_SEARCH', 'LEDGER_SHEET_FROM_ROWS']), query);
+      assert.equal(ranked.find((row) => row.name === 'broker_execute')!.purposeLeadMatch, false,
+        'an example in parentheses is not the operation purpose');
+      assert.equal(ranked.length, entries.length, 'ranking never removes a capability from discovery');
+    }
+  }
+});
+
+test('a conjunction inside the object does not invent a second requested operation', () => {
+  const entries = [
+    { name: 'LISTING_SEARCH', oneLiner: 'Search venue listings by location and category.' },
+    { name: 'CATEGORY_ARCHIVE', oneLiner: 'Category archive exports for audits.' },
+    { name: 'LEDGER_EXPORT', oneLiner: 'Export ledger rows.' },
+  ];
+  for (const ordered of [entries, [...entries].reverse()]) {
+    const ranked = rankCatalogEntriesLexically('search venues by location and category', ordered);
+    assert.equal(ranked[0]!.name, 'LISTING_SEARCH',
+      'a coordinated noun may look like a leading word, but coverage still decides within the purpose tier');
+  }
+});
+
 test('a complete compound operation name in ordinary word order precedes incidental description coverage', () => {
   for (const fixture of [
     { query: 'create a container in Orbit', target: 'ORBIT_CREATE_CONTAINER',

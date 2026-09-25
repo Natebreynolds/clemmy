@@ -1684,3 +1684,37 @@ test('ambiguous unified discovery uses Jev before selecting schemas, with exact-
     _setSystemOneFetchForTests(undefined);
   }
 });
+
+test('a request for two operations keeps both on the first page beside the real native catalog', async () => {
+  // Live shape 2026-09-24: "search for restaurants ... and create a new Google
+  // Sheet" returned the search operation plus seven native search helpers on the
+  // first page, and the create operation fell to the second page. The search
+  // operation's provider is named in the request; the create operation's is not
+  // (a spoken product name rarely spells its toolkit id), so only purpose and
+  // coverage can keep it on the page. Every native row competes here.
+  const t = captureToolSearch(undefined, false, [{
+    kind: 'authorized_composio',
+    search: async () => [
+      {
+        name: 'VENUES_SEARCH',
+        summary: 'Search venue listings by location and category and return one bounded aggregate set.',
+        schema: { type: 'object', properties: { location: { type: 'string' }, category: { type: 'string' } } },
+        carrier: 'work_call',
+      },
+      {
+        name: 'GRIDAPP_SHEET_FROM_ROWS',
+        summary: 'Create one new sheet from a JSON collection of rows.',
+        schema: { type: 'object', properties: { title: { type: 'string' }, rows_json: { type: 'string' } } },
+        carrier: 'work_call',
+      },
+    ],
+  }]);
+  const raw = await t.handler({
+    query: 'search for venues by location and create a new sheet from the results',
+    limit: 8,
+  });
+  const body = JSON.parse(raw.content[0]!.text) as { results: Array<{ name: string }> };
+  const firstPage = body.results.map((row) => row.name);
+  assert.ok(firstPage.includes('VENUES_SEARCH'), `the search operation is on the first page: ${firstPage.join(', ')}`);
+  assert.ok(firstPage.includes('GRIDAPP_SHEET_FROM_ROWS'), `the create operation is on the first page: ${firstPage.join(', ')}`);
+});
