@@ -20,7 +20,7 @@ const brackets = await import('./brackets.js');
 const envelopes = await import('../../agents/capability-envelope.js');
 const catalogs = await import('./host-capability-catalog-factory.js');
 const { acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup,
-  sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence } = await import('./host-completion-work.js');
+  sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, earlierTurnsEvidence } = await import('./host-completion-work.js');
 const { DEFAULT_TOOL_RESULT_MAX_CHARS } = await import('./tool-output-format.js');
 const plans = await import('./plan-artifacts.js');
 const { shouldRunObjectiveJudge, buildObjectiveJudgePrompt, JUDGE_SYSTEM_PROMPT,
@@ -45,10 +45,10 @@ after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: tru
 const request = 'Please refresh my Facebook trends report using the Scorpion Facebook URL https://www.facebook.com/scorpion.co and report back the findings.';
 const promise = 'The check-in landed; next I’ll actually run the posts scraper against Scorpion’s Facebook page.';
 let serial = 0;
-function accepted(text = request) {
-  const session = events.createSession({ id: `completion-contract-${++serial}`, kind: 'chat' });
-  const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
-  return { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+function accepted(text = request, sessionId?: string) {
+  const id = sessionId ?? events.createSession({ id: `completion-contract-${++serial}`, kind: 'chat' }).id;
+  const source = events.appendEvent({ sessionId: id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+  return { sessionId: id, sourceUserSeq: source.seq, turn: 1 };
 }
 function attempted(identity: ReturnType<typeof accepted>, tool = 'tool_search') {
   events.appendEvent({ ...identity, role: 'Clem', type: 'tool_called', data: {
@@ -796,8 +796,15 @@ test('large file and all Space components reach the actual completion request wi
 });
 
 async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; firstReply?: string; secondReply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void;
-  firstVerdict?: { done: boolean; reason: string; blocked?: boolean } }) {
-  const identity = accepted(options.text);
+  firstVerdict?: { done: boolean; reason: string; blocked?: boolean };
+  /** An earlier turn in the same session that settled one read. */
+  earlierTurn?: { text: string; tool: string; payload: unknown; args?: Record<string, unknown> } }) {
+  const earlier = options.earlierTurn ? accepted(options.earlierTurn.text) : undefined;
+  if (earlier && options.earlierTurn) {
+    retainedRead(earlier, options.earlierTurn.tool, options.earlierTurn.payload, false, false, false,
+      { id: `earlier:${options.earlierTurn.tool}`, args: options.earlierTurn.args ?? {} });
+  }
+  const identity = accepted(options.text, earlier?.sessionId);
   if (options.policyData) {
     events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'completion_policy_captured',
       data: { ...options.policyData, sourceUserSeq: identity.sourceUserSeq } });
@@ -1455,4 +1462,56 @@ test('a turn without gathered evidence streams the brain answer even with a writ
     onIdentity: (identity) => { watch = watchAnswer(identity.sessionId); } });
   assert.deepEqual(watch!.seen(), [brainDraft(1)]);
   watch!.detach();
+});
+
+// Live 2026-09-25 fixture: "before I say yes, will saving it overwrite
+// anything?" ran the folder checks; the next turn, "go ahead, save it", saved
+// and said it had checked beforehand. The reviewer saw only the save turn's
+// evidence, ruled the pre-check unverified three times, and a finished save
+// ended blocked.
+test('the reviewer sees what an earlier turn checked when the reply rests on it', async () => {
+  const result = await runHost({
+    captured: true, incoming: true,
+    earlierTurn: {
+      text: 'before I say yes, will saving it overwrite anything that is already there?',
+      tool: 'list_files', payload: { path: '/fixture/output', entries: [] }, args: { path: '/fixture/output' },
+    },
+    text: 'go ahead, save the note',
+    firstReply: 'Saved the note. I checked beforehand that /fixture/output was empty, so nothing was overwritten.',
+    firstVerdict: { done: true, reason: 'Saved as asked; the earlier check shows the folder was empty.' },
+  });
+  const evidence = result.judged[0]?.evidence ?? '';
+  assert.match(evidence, /EARLIER TURNS of this conversation/);
+  assert.match(evidence, /before I say yes, will saving it overwrite anything/);
+  assert.match(evidence, /- list_files \(read\) \{"path":"\/fixture\/output"\}: /);
+  assert.match(evidence, /"entries":\[\]/);
+  assert.match(evidence, /EARLIER TURNS evidence counts for what the reply says an earlier turn checked/);
+});
+
+test('earlier-turn evidence is bounded: this turn, synthetic inputs and old turns stay out', () => {
+  const first = accepted('check the folder first');
+  retainedRead(first, 'list_files', { entries: ['a.txt'] }, false, false, false, { id: 'bounded:first', args: { path: '/one' } });
+  const synthetic = events.appendEvent({ sessionId: first.sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: '[continuation]', synthetic: true } });
+  void synthetic;
+  const second = accepted('now read the second folder', first.sessionId);
+  retainedRead(second, 'list_files', { entries: ['b.txt'] }, false, false, false, { id: 'bounded:second', args: { path: '/two' } });
+  const current = accepted('go ahead', first.sessionId);
+  retainedRead(current, 'write_file', { ok: true }, true, false, false, { id: 'bounded:current', args: { path: '/two/c.txt' } });
+
+  const shown = earlierTurnsEvidence(current) ?? '';
+  assert.match(shown, /check the folder first/);
+  assert.match(shown, /now read the second folder/);
+  assert.ok(shown.indexOf('/one') < shown.indexOf('/two'), 'oldest first');
+  assert.doesNotMatch(shown, /write_file/, 'this turn\'s own work is not earlier evidence');
+  assert.doesNotMatch(shown, /\[continuation\]/, 'a synthetic input is not a turn');
+
+  const lastOnly = earlierTurnsEvidence({ ...current, maxTurns: 1 }) ?? '';
+  assert.doesNotMatch(lastOnly, /check the folder first/);
+  assert.match(lastOnly, /now read the second folder/);
+  assert.equal(earlierTurnsEvidence({ ...current, nowMs: Date.now() + 2 * 60 * 60_000 }), undefined,
+    'turns older than the window are not offered');
+  assert.equal(earlierTurnsEvidence(first), undefined, 'a first turn has nothing earlier');
+  const clipped = earlierTurnsEvidence({ ...current, maxChars: 80 }) ?? '';
+  assert.match(clipped, /earlier-turn evidence clipped at 80 characters/);
 });

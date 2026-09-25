@@ -162,6 +162,7 @@ import { conversationalReviewSkipRecord } from './completion-review-skip.js';
 import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
+  earlierTurnsEvidence,
 } from './host-completion-work.js';
 import {
   beginAnswerDraft, markAnswerDraftChecking, presentAnswerDraft, retractAnswerDraft,
@@ -4157,6 +4158,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // never saw is the gap to catch; bytes nobody read are not evidence
           // for or against the reply.
           `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${readEvidence.summary}`,
+          // A reply may rest on a check an earlier turn made ("I checked
+          // beforehand"); without it that claim reads as unverified.
+          planCandidate ? undefined : earlierTurnsEvidence(identity),
           preparation?.summary,
           'Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; '
             + 'a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or '
@@ -4165,6 +4169,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             + 'as its own line says. A claim that rests on content outside what is shown, including a claim that '
             + 'data is missing, empty, unavailable or complete, is unverified unless another read shown here covers '
             + 'it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. '
+            + 'EARLIER TURNS evidence counts for what the reply says an earlier turn checked or found at that time; '
+            + 'it cannot show this turn\'s own effects. '
             + 'A selected/derived projection is not the full source result, and an omitted projection field does '
             + 'not establish absence. Distinguish absent values from zero, empty and uninspected values. '
             + 'When the objective is not met and the evidence shows another attempt cannot change that, the verdict is BLOCKED.',
