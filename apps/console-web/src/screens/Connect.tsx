@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle } from 'lucide-react';
+import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle, ChevronRight } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { Page } from '@/components/Page';
 import { PluginsPanel } from '@/components/connect/PluginsPanel';
 import { Card } from '@/components/ui/Card';
@@ -21,12 +22,12 @@ import { CodexReauth } from './settings/CodexLoginForm';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio,
   getComposioCliDefaultAccounts, authorizeComposioCliDefaultAccount, revokeComposioCliDefaultAccount,
-  setAccountLabel, setComposioApiKey, setupComposioCredentials,
+  setAccountLabel, setComposioApiKey, setupComposioCredentials, setupComposioOAuthApp,
   getCredentials, setCredential, setDiscordOwner,
   normalizeCredentialRows, isConnected, keyUrlHost, CODEX_MANAGED_SECRETS,
-  connectedToolkits, reconnectConnectionId, searchToolkits, staleConnectionStory, toolkitStatus,
+  connectedToolkits, reconnectConnectionId, searchToolkits, staleConnectionStory, toolkitStatus, toolkitConnectKind,
   type CredentialRow, type CredentialDescriptor, type ComposioToolkit, type ComposioConnection,
-  type ComposioAuthorization, type ComposioConnectResult, type ComposioSetupMeta,
+  type ComposioConnectResult, type ComposioSetupMeta, type ComposioSetupField, type ComposioOAuthAppSetup,
   type ComposioCliDefaultAccountAuthority,
 } from '@/lib/connect';
 
@@ -76,11 +77,14 @@ export function Connect() {
   const cliOnlyComposio = composio.data?.executionBackend === 'cli'
     || (composio.data?.executionBackend === 'auto' && !composio.data?.apiKeyPresent);
   const cliAuthenticated = composio.data?.cli?.authenticated === true;
-  // Internal plumbing never renders as a user row: the Codex refresh token is
-  // half of the SAME sign-in as the access token (one "Codex sign-in" row
-  // represents the pair; storage keeps both), and the webhook secret is the
-  // console's own auth — editing it here would only log the user out.
-  const HIDDEN_CREDENTIAL_ROWS = new Set(['codex_oauth_refresh_token', 'webhook_secret', 'typesafe_api_key']);
+  // Internal plumbing never renders as a user row: the webhook secret is the
+  // console's own auth — editing it here would only log the user out. Model
+  // accounts (the Codex sign-in pair, the OpenAI key, the TypeSafe key) live
+  // in Settings › Models beside their usage and billing, so they are not
+  // repeated here; one row points there instead.
+  const HIDDEN_CREDENTIAL_ROWS = new Set([
+    'codex_oauth_access_token', 'codex_oauth_refresh_token', 'openai_api_key', 'typesafe_api_key', 'webhook_secret',
+  ]);
   const credentialRows = normalizeCredentialRows(creds.data?.rows)
     .filter((row) => !HIDDEN_CREDENTIAL_ROWS.has(row.name ?? ''));
   const descriptors = creds.data?.descriptors ?? {};
@@ -89,27 +93,31 @@ export function Connect() {
 
   const [refreshing, setRefreshing] = useState(false);
   const [appNotice, setAppNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
-  const [credentialSetup, setCredentialSetup] = useState<{ slug: string; setup: ComposioSetupMeta } | null>(null);
+  const [setupForm, setSetupForm] = useState<AppSetupForm | null>(null);
 
-  const openAuthorization = (res: ComposioAuthorization, prefix = '') => {
+  /** Open a sign-in link in the browser; the words go back to the card. */
+  const openAuthorization = (res: ComposioConnectResult, prefix = ''): string => {
     const url = res.url || res.redirectUrl;
-    if (url) {
-      window.open(url, '_blank', 'noopener');
-      setAppNotice({ tone: 'info', text: `${prefix}Finish connecting in the window that opened — this list refreshes when you come back.` });
-      const onFocus = () => { window.removeEventListener('focus', onFocus); void refreshApps(); };
-      window.addEventListener('focus', onFocus);
-    } else {
-      setAppNotice({ tone: 'error', text: 'No authorization URL was returned.' });
-    }
+    if (!url) throw new Error('Composio did not return a sign-in link. Try again in a moment.');
+    window.open(url, '_blank', 'noopener');
+    const onFocus = () => { window.removeEventListener('focus', onFocus); void refreshApps(); };
+    window.addEventListener('focus', onFocus);
+    return `${prefix}Finish signing in in your browser — this list refreshes when you come back.`;
   };
 
-  const handleConnectResult = (slug: string, res: ComposioConnectResult, prefix = '') => {
-    if (res.kind === 'credentials') {
-      setCredentialSetup({ slug, setup: res.setup });
-      if (prefix) setAppNotice({ tone: 'info', text: prefix.trim() });
-      return;
+  /** Act on what connecting needs. Returns words for the card, or nothing
+   *  when Clem's own form opened. Throws in plain words on failure. */
+  const handleConnectResult = (slug: string, res: ComposioConnectResult, prefix = ''): string | undefined => {
+    if (res.kind === 'credentials' || res.kind === 'details') {
+      setSetupForm({ kind: res.kind, slug, setup: res.setup });
+      return prefix.trim() || undefined;
     }
-    openAuthorization(res, prefix);
+    if (res.kind === 'oauth_app') {
+      setSetupForm({ kind: 'oauth_app', slug, app: res.app });
+      return prefix.trim() || undefined;
+    }
+    if (res.kind === 'no_auth') return `No sign-in needed — Clementine can use ${res.name} now.`;
+    return openAuthorization(res, prefix);
   };
 
   const refreshApps = async () => {
@@ -124,26 +132,23 @@ export function Connect() {
     finally { setRefreshing(false); }
   };
 
-  const connectApp = async (slug: string, prefix = '') => {
+  // Connect and reconnect report on the card that was clicked, not in a
+  // banner above the search box the person may not be looking at.
+  const connectApp = async (slug: string): Promise<string | undefined> => {
     setAppNotice(null);
-    try {
-      const res = await authorizeComposio(slug);
-      handleConnectResult(slug, res, prefix);
-    } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
+    return handleConnectResult(slug, await authorizeComposio(slug));
   };
 
-  const reconnectApp = async (t: ComposioToolkit) => {
+  const reconnectApp = async (t: ComposioToolkit): Promise<string | undefined> => {
     const staleId = reconnectConnectionId(t);
     setAppNotice(null);
-    try {
-      const res = await reconnectComposio(t.slug, staleId);
-      const prefix = !staleId
-        ? ''
-        : res.staleRemoved
-          ? 'Removed the stale connection. '
-          : 'The stale record could not be removed; the new connection will replace it for Clementine. ';
-      handleConnectResult(t.slug, res, prefix);
-    } catch (e) { setAppNotice({ tone: 'error', text: (e as Error).message }); }
+    const res = await reconnectComposio(t.slug, staleId);
+    const prefix = !staleId
+      ? ''
+      : res.staleRemoved
+        ? 'Removed the stale connection. '
+        : 'The stale record could not be removed; the new connection will replace it for Clementine. ';
+    return handleConnectResult(t.slug, res, prefix);
   };
 
   // Disconnect ONE specific account (mailbox) of a multi-account app.
@@ -268,7 +273,16 @@ export function Connect() {
           />
         ) : (
           <div className="space-y-2">
-            {credentialRows.length === 0 && <Card className="p-4 text-body text-muted">Nothing configured yet.</Card>}
+            <Card className="flex items-center gap-3 px-4 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-body font-medium text-fg">Model accounts</div>
+                <div className="truncate text-caption text-faint">Claude, Codex, Grok, OpenAI, Jev and API-key models: sign-ins, keys, usage and where to add credit.</div>
+              </div>
+              <Link to="/settings#accounts" className="inline-flex shrink-0 items-center gap-1 text-small font-medium text-primary hover:underline">
+                Settings › Models <ChevronRight className="h-3.5 w-3.5" aria-hidden />
+              </Link>
+            </Card>
+            {credentialRows.length === 0 && <Card className="p-4 text-body text-muted">Nothing else configured yet.</Card>}
             {credentialRows.map((row, i) => (
               <CredentialCard key={row.name || i} row={row} descriptor={descriptors[row.name ?? '']}
                 discordAllowedUsers={row.name === 'discord_bot_token' ? discordAllowedUsers : undefined}
@@ -304,17 +318,20 @@ export function Connect() {
       {/* Projects & folders */}
       <ProjectsPanel />
 
-      {credentialSetup && (
-        <ComposioCredentialsModal
-          key={`${credentialSetup.slug}:${credentialSetup.setup.authScheme}`}
-          slug={credentialSetup.slug}
-          setup={credentialSetup.setup}
-          onClose={() => setCredentialSetup(null)}
+      {setupForm && (
+        <ComposioSetupModal
+          key={`${setupForm.kind}:${setupForm.slug}`}
+          form={setupForm}
+          onClose={() => setSetupForm(null)}
           onSaved={async () => {
-            const name = credentialSetup.setup.name || credentialSetup.slug;
-            setCredentialSetup(null);
+            const name = setupForm.kind === 'oauth_app' ? setupForm.app.name : setupForm.setup.name || setupForm.slug;
+            setSetupForm(null);
             await refreshApps();
             setAppNotice({ tone: 'info', text: `${name} connected inside Clementine.` });
+          }}
+          onAuthorized={(res) => {
+            setSetupForm(null);
+            setAppNotice({ tone: 'info', text: openAuthorization(res) });
           }}
         />
       )}
@@ -322,23 +339,86 @@ export function Connect() {
   );
 }
 
-function ComposioCredentialsModal({
-  slug,
-  setup,
-  onClose,
-  onSaved,
-}: {
-  slug: string;
-  setup: ComposioSetupMeta;
-  onClose: () => void;
-  onSaved: () => void | Promise<void>;
+/** The three things Clem can ask for in its own window, so connecting an app
+ *  never sends the person to Composio's site. */
+type AppSetupForm =
+  | { kind: 'credentials'; slug: string; setup: ComposioSetupMeta }
+  | { kind: 'details'; slug: string; setup: ComposioSetupMeta }
+  | { kind: 'oauth_app'; slug: string; app: ComposioOAuthAppSetup };
+
+const GENERIC_KEY_FIELD: ComposioSetupField = { name: 'generic_api_key', label: 'API Key', description: null, default: null, isSecret: true, required: true };
+
+function SetupFields({ fields, values, onChange, onEnter, autoFocus }: {
+  fields: ComposioSetupField[];
+  values: Record<string, string>;
+  onChange: (name: string, value: string) => void;
+  onEnter: () => void;
+  autoFocus: boolean;
 }) {
-  const fields = setup.fields.length > 0
-    ? setup.fields
-    : [{ name: 'generic_api_key', label: 'API Key', description: null, default: null, isSecret: true, required: true }];
-  const [values, setValues] = useState<Record<string, string>>(
-    Object.fromEntries(fields.map((field) => [field.name, field.default ?? ''])),
+  return (
+    <>
+      {fields.map((field, index) => (
+        <label key={field.name} className="flex flex-col gap-1.5">
+          <span className="text-small font-medium text-fg">
+            {field.label || field.name}
+            {field.required !== false && <span className="text-danger"> *</span>}
+          </span>
+          <Input
+            type={field.isSecret || /secret|token|password|api_key/i.test(field.name) ? 'password' : 'text'}
+            value={values[field.name] ?? ''}
+            onChange={(event) => onChange(field.name, event.target.value)}
+            autoFocus={autoFocus && index === 0}
+            autoComplete="off"
+            placeholder={field.default ?? ''}
+            onKeyDown={(event) => { if (event.key === 'Enter') onEnter(); }}
+          />
+          {field.description && <span className="text-caption text-faint">{field.description}</span>}
+        </label>
+      ))}
+    </>
   );
+}
+
+function CopyField({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-small font-medium text-fg">{label}</span>
+      <div className="flex items-center gap-2">
+        <Input readOnly value={value} aria-label={label} className="flex-1 font-mono text-caption" onFocus={(e) => e.currentTarget.select()} />
+        <Button size="sm" variant="secondary" onClick={() => {
+          void navigator.clipboard?.writeText(value).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); });
+        }}>
+          {copied ? <Check className="h-4 w-4" aria-hidden /> : null}{copied ? 'Copied' : 'Copy'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ComposioSetupModal({ form, onClose, onSaved, onAuthorized }: {
+  form: AppSetupForm;
+  onClose: () => void;
+  /** Credentials saved: the account is connected. */
+  onSaved: () => void | Promise<void>;
+  /** A sign-in link is ready: open it. */
+  onAuthorized: (res: ComposioConnectResult) => void;
+}) {
+  const name = form.kind === 'oauth_app' ? form.app.name : form.setup.name;
+  // Developer-app fields: the redirect address is shown to copy, not typed.
+  const appFields = form.kind === 'oauth_app'
+    ? form.app.fields.filter((f) => !/redirect/i.test(f.name))
+    : [];
+  const requiredAppFields = appFields.filter((f) => f.required !== false);
+  const optionalAppFields = appFields.filter((f) => f.required === false);
+  const accountFields = form.kind === 'oauth_app'
+    ? form.app.accountFields
+    : form.setup.fields.length > 0 || form.kind === 'details' ? form.setup.fields : [GENERIC_KEY_FIELD];
+  const allFields = [...appFields, ...accountFields];
+  const [values, setValues] = useState<Record<string, string>>(
+    Object.fromEntries(allFields.map((field) => [field.name, field.default ?? ''])),
+  );
+  const [showOptional, setShowOptional] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -348,27 +428,49 @@ function ComposioCredentialsModal({
     return () => window.removeEventListener('keydown', onKey);
   }, [busy, onClose]);
 
-  const missingRequired = fields.some((field) => field.required !== false && !(values[field.name] ?? '').trim());
+  const pick = (fields: ComposioSetupField[]) =>
+    Object.fromEntries(fields.map((f) => [f.name, (values[f.name] ?? '').trim()]).filter(([, v]) => v));
+  const missingRequired = allFields.some((field) => field.required !== false && !(values[field.name] ?? '').trim());
   const submit = async () => {
     if (busy || missingRequired) return;
     setBusy(true);
     setError('');
     try {
-      await setupComposioCredentials(slug, values);
-      await onSaved();
+      if (form.kind === 'credentials') {
+        await setupComposioCredentials(form.slug, values, form.setup.authScheme);
+        await onSaved();
+      } else if (form.kind === 'details') {
+        onAuthorized(await authorizeComposio(form.slug, pick(accountFields)));
+      } else {
+        onAuthorized(await setupComposioOAuthApp(form.slug, {
+          credentials: pick(appFields),
+          details: pick(accountFields),
+          authScheme: form.app.authScheme,
+        }));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not connect this app.');
     } finally {
       setBusy(false);
     }
   };
+  const setValue = (field: string, value: string) => setValues((current) => ({ ...current, [field]: value }));
+  const helpUrl = form.kind === 'oauth_app'
+    ? form.app.authHintUrl || form.app.authGuideUrl || form.app.appUrl
+    : form.setup.authHintUrl || form.setup.authGuideUrl || form.setup.appUrl;
+
+  const intro = form.kind === 'credentials'
+    ? 'Add the credentials here. Clementine sends them directly to Composio and does not save them in her local settings.'
+    : form.kind === 'details'
+      ? `${name} needs a detail about your account before you sign in.`
+      : `${name} doesn’t offer a shared sign-in, so it connects through a developer app you own. You set this up once; after that, connecting more accounts is one click.`;
 
   return (
     <div
-      className="fixed inset-0 z-[110] flex items-start justify-center bg-black/30 p-4 pt-[10vh] animate-fade-in"
+      className="fixed inset-0 z-[110] flex items-start justify-center bg-black/30 p-4 pt-[8vh] animate-fade-in"
       role="dialog"
       aria-modal="true"
-      aria-label={`Connect ${setup.name}`}
+      aria-label={`Connect ${name}`}
       onMouseDown={() => { if (!busy) onClose(); }}
     >
       <div
@@ -380,45 +482,46 @@ function ComposioCredentialsModal({
             <KeyRound className="h-4 w-4 text-primary" aria-hidden />
           </div>
           <div className="min-w-0 flex-1">
-            <h2 className="text-h3 text-fg">Connect {setup.name}</h2>
-            <p className="mt-0.5 text-small text-muted">
-              Add the credentials here. Clementine sends them directly to Composio and does not save them in her local settings.
-            </p>
+            <h2 className="text-h3 text-fg">Connect {name}</h2>
+            <p className="mt-0.5 text-small text-muted">{intro}</p>
           </div>
           <button type="button" onClick={onClose} disabled={busy} className="text-faint hover:text-fg disabled:opacity-50" aria-label="Close">
             <X className="h-4 w-4" aria-hidden />
           </button>
         </div>
 
-        <div className="max-h-[62vh] space-y-4 overflow-y-auto p-5">
-          {fields.map((field, index) => (
-            <label key={field.name} className="flex flex-col gap-1.5">
-              <span className="text-small font-medium text-fg">
-                {field.label || field.name}
-                {field.required !== false && <span className="text-danger"> *</span>}
-              </span>
-              <Input
-                type={field.isSecret ? 'password' : 'text'}
-                value={values[field.name] ?? ''}
-                onChange={(event) => setValues((current) => ({ ...current, [field.name]: event.target.value }))}
-                autoFocus={index === 0}
-                autoComplete={field.isSecret ? 'new-password' : 'off'}
-                placeholder={field.default ?? ''}
-                onKeyDown={(event) => { if (event.key === 'Enter') void submit(); }}
-              />
-              {field.description && <span className="text-caption text-faint">{field.description}</span>}
-            </label>
-          ))}
-
-          {(setup.authHintUrl || setup.authGuideUrl || setup.appUrl) && (
-            <a
-              href={setup.authHintUrl || setup.authGuideUrl || setup.appUrl || '#'}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-small text-primary hover:underline"
-            >
-              Where to find these credentials <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-            </a>
+        <div className="max-h-[66vh] space-y-4 overflow-y-auto p-5">
+          {form.kind === 'oauth_app' ? (
+            <>
+              <ol className="list-decimal space-y-1 pl-5 text-small text-muted">
+                <li>
+                  Create an app (sometimes called an OAuth client) in {name}’s developer settings.
+                  {helpUrl && <>{' '}<a href={helpUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">Open {name} <ExternalLink className="h-3 w-3" aria-hidden /></a></>}
+                </li>
+                <li>Add the redirect address below to that app.</li>
+                <li>Paste the app’s details here. Clementine creates the connection and opens {name}’s sign-in.</li>
+              </ol>
+              <CopyField label="Redirect address" value={form.app.callbackUrl} />
+              <SetupFields fields={requiredAppFields} values={values} onChange={setValue} onEnter={() => void submit()} autoFocus />
+              {optionalAppFields.length > 0 && (
+                <div>
+                  <button type="button" onClick={() => setShowOptional((v) => !v)} className="text-caption font-medium text-muted hover:text-fg">
+                    {showOptional ? 'Hide' : 'Show'} optional settings ({optionalAppFields.map((f) => f.label || f.name).join(', ')})
+                  </button>
+                  {showOptional && <div className="mt-3 space-y-4"><SetupFields fields={optionalAppFields} values={values} onChange={setValue} onEnter={() => void submit()} autoFocus={false} /></div>}
+                </div>
+              )}
+              {accountFields.length > 0 && <SetupFields fields={accountFields} values={values} onChange={setValue} onEnter={() => void submit()} autoFocus={false} />}
+            </>
+          ) : (
+            <>
+              <SetupFields fields={accountFields} values={values} onChange={setValue} onEnter={() => void submit()} autoFocus />
+              {helpUrl && (
+                <a href={helpUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-small text-primary hover:underline">
+                  Where to find {form.kind === 'details' ? 'this' : 'these credentials'} <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+                </a>
+              )}
+            </>
           )}
 
           {error && <p className="rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-small text-danger">{error}</p>}
@@ -428,7 +531,7 @@ function ComposioCredentialsModal({
           <Button variant="ghost" onClick={onClose} disabled={busy}>Cancel</Button>
           <Button onClick={() => void submit()} disabled={busy || missingRequired}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plug className="h-4 w-4" aria-hidden />}
-            {busy ? 'Connecting…' : 'Connect'}
+            {busy ? 'Connecting…' : form.kind === 'credentials' ? 'Connect' : form.kind === 'details' ? 'Continue to sign in' : 'Save and sign in'}
           </Button>
         </div>
       </div>
@@ -436,26 +539,40 @@ function ComposioCredentialsModal({
   );
 }
 
+/** Under the app's name: what connecting will ask for, before the click. */
+function connectKindNote(kind: ReturnType<typeof toolkitConnectKind>, name: string): string | null {
+  if (kind === 'key') return 'Connects with an API key';
+  if (kind === 'own_app') return `Needs your own ${name} app`;
+  return null;
+}
+
 function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabel }: {
   t: ComposioToolkit;
-  onConnect: () => void | Promise<void>;
-  onReconnect?: () => void | Promise<void>;
+  /** Resolves to words for the card, or nothing when Clem's form opened. */
+  onConnect: () => Promise<string | undefined>;
+  onReconnect?: () => Promise<string | undefined>;
   onDisconnectConnection?: (slug: string, connectionId: string, who: string) => void | Promise<void>;
   onSaveLabel?: (slug: string, connectionId: string, email: string | null | undefined, label: string) => Promise<void>;
 }) {
   const status = toolkitStatus(t);
   const name = t.displayName || t.slug;
+  const kind = toolkitConnectKind(t);
+  const note = status === 'none' ? connectKindNote(kind, name) : null;
   const [imgOk, setImgOk] = useState(Boolean(t.logoUrl));
   const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
   // Accounts under this app (a user may connect several mailboxes/workspaces).
   const accounts = (t.connections ?? []).filter((c) => c.id || c.connectionId);
   const isConnected = status !== 'none';
 
   const doConnect = async (reconnect: boolean) => {
     setBusy(true);
+    setMessage(null);
     try {
-      if (reconnect && onReconnect) await onReconnect();
-      else await onConnect();
+      const words = reconnect && onReconnect ? await onReconnect() : await onConnect();
+      if (words) setMessage({ tone: 'info', text: words });
+    } catch (e) {
+      setMessage({ tone: 'error', text: e instanceof Error ? e.message : String(e) });
     } finally { setBusy(false); }
   };
 
@@ -465,17 +582,29 @@ function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabe
         {imgOk
           ? <img src={t.logoUrl} alt="" width={28} height={28} className="h-7 w-7 shrink-0 rounded-md object-contain" onError={() => setImgOk(false)} />
           : <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-subtle text-body font-semibold text-muted">{name.slice(0, 1).toUpperCase()}</div>}
-        <span className="min-w-0 flex-1 truncate text-body font-medium text-fg">{name}</span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-body font-medium text-fg">{name}</div>
+          {note && <div className="truncate text-caption text-faint" title={note}>{note}</div>}
+        </div>
         {status === 'active'
           ? <StatusPill tone="success">{accounts.length > 1 ? `${accounts.length} accounts` : 'Connected'}</StatusPill>
           : status === 'expired' || status === 'reconnect'
             ? <Button size="sm" variant="secondary" onClick={() => void doConnect(true)} disabled={busy}>
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RotateCw className="h-4 w-4" aria-hidden />} Reconnect
               </Button>
-            : <Button size="sm" variant="secondary" onClick={() => void doConnect(false)} disabled={busy}>
-                {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />} Connect
-              </Button>}
+            : kind === 'none'
+              ? <StatusPill tone="neutral">No sign-in needed</StatusPill>
+              : <Button size="sm" variant="secondary" onClick={() => void doConnect(false)} disabled={busy}>
+                  {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />} {kind === 'own_app' ? 'Set up' : 'Connect'}
+                </Button>}
       </div>
+      {message && (
+        <p className={cn('mt-3 rounded-md border px-3 py-2 text-small',
+          message.tone === 'error' ? 'border-danger/40 bg-danger-tint text-danger' : 'border-border bg-subtle text-muted')}
+          role={message.tone === 'error' ? 'alert' : 'status'}>
+          {message.text}
+        </p>
+      )}
 
       {isConnected && accounts.length > 0 && (
         <div className="mt-3 space-y-1.5 border-t border-border pt-3">

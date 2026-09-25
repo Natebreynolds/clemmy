@@ -1,17 +1,19 @@
 /**
  * Settings — cleaned up, not rebuilt (owner 2026-09-08: "a little cluttered…
  * not looking for a complete overhaul"). A left nav instead of one long
- * scroll; Models first because it is what changes most; providers as chips;
- * the diagnostics panel lives under Advanced › Diagnostics where it belongs.
+ * scroll; Models first because it is what changes most, and every model
+ * account, key and job in that one section; the diagnostics panel lives under
+ * Advanced › Diagnostics where it belongs.
  */
 import { Sun, Moon, Monitor, Sliders, ChevronRight } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { useEffect } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { Button } from '@/components/ui/Button';
 import { openCustomizeHome } from '@/components/home/CustomizePanel';
 import { useTheme, type ThemeChoice } from '@/lib/theme';
 import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
-import { ConnectedSection, ModelsSection } from './settings/ModelsRoutingSection';
+import { ModelsSection } from './settings/ModelsRoutingSection';
 import { DeveloperModeCard } from './settings/DeveloperModeCard';
 import { NotchSettingsCard } from './settings/NotchSettingsCard';
 import { CleanupCard } from './settings/CleanupCard';
@@ -24,7 +26,7 @@ const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
 ];
 
 /**
- * Nine settings in a flat list read as a pile: "Models, Connected, Profile,
+ * Nine settings in a flat list read as a pile: "Models, Profile,
  * Notifications, Clean up, Appearance, In the notch, Home layout, Developer"
  * gives the eye no way to skip the two thirds it does not want. The groups
  * below are the three questions someone actually arrives with — what is she
@@ -33,8 +35,8 @@ const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
  */
 const NAV_GROUPS: { group: string; items: { id: string; label: string }[] }[] = [
   { group: 'Clementine', items: [
-    { id: 'models', label: 'Models' },
-    { id: 'connected', label: 'Connected' },
+    { id: 'accounts', label: 'Model accounts' },
+    { id: 'who-does-what', label: 'Who does what' },
   ] },
   { group: 'You', items: [
     { id: 'profile', label: 'Profile' },
@@ -53,6 +55,13 @@ const NAV_GROUPS: { group: string; items: { id: string; label: string }[] }[] = 
 
 export function Settings() {
   const { choice, setChoice } = useTheme();
+  // Links from elsewhere (Connect, a top-bar chip) land on a section by hash;
+  // the router does not scroll to it on its own.
+  const { hash } = useLocation();
+  useEffect(() => {
+    const id = decodeURIComponent(hash.replace(/^#/, ''));
+    if (id) document.getElementById(id)?.scrollIntoView({ block: 'start' });
+  }, [hash]);
   return (
     <div className="flex h-full min-h-0">
       <nav aria-label="Settings sections" className="hidden w-[220px] shrink-0 flex-col border-r border-border bg-subtle px-3 py-6 md:flex">
@@ -74,7 +83,6 @@ export function Settings() {
         <div className="mx-auto flex w-full max-w-[760px] flex-col gap-8">
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">Clementine</p>
           <ModelsSection />
-          <ConnectedSection />
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">You</p>
           <section id="profile" className="scroll-mt-16"><h2 className="mb-3 text-h2 text-fg">Profile</h2><ProfileForm /></section>
           <section id="notifications" className="scroll-mt-16"><NotificationsEditor /></section>

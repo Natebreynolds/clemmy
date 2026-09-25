@@ -9,9 +9,25 @@ import {
   reconnectComposio,
   reconnectConnectionId,
   staleConnectionStory,
+  toolkitConnectKind,
   toolkitStatus,
   type ComposioToolkit,
 } from './connect';
+
+test('each app says what connecting will ask for before the click, in the same order Connect decides', () => {
+  const kind = (t: Partial<ComposioToolkit>) => toolkitConnectKind({ slug: 'x', ...t });
+  assert.equal(kind({ authMode: 'none' }), 'none');
+  assert.equal(kind({ authMode: 'byo', authSchemes: ['NO_AUTH'] }), 'none');
+  assert.equal(kind({ authMode: 'managed', authSchemes: ['OAUTH2'], managedAuthSchemes: ['OAUTH2'] }), 'sign_in');
+  // No shared sign-in, but a key works: the key form, never a failed OAuth setup.
+  assert.equal(kind({ authMode: 'byo', authSchemes: ['OAUTH2', 'API_KEY', 'S2S_OAUTH2'], managedAuthSchemes: [] }), 'key');
+  // Only OAuth and nothing shared: the person's own developer app.
+  assert.equal(kind({ authMode: 'byo', authSchemes: ['OAUTH2'], managedAuthSchemes: [] }), 'own_app');
+  // Once their own app is set up, it is just a sign-in.
+  assert.equal(kind({ authMode: 'byo', authSchemes: ['OAUTH2'], managedAuthSchemes: [], hasAuthConfig: true }), 'sign_in');
+  // An older snapshot without schemes makes no promise.
+  assert.equal(kind({ authMode: 'byo' }), 'unknown');
+});
 
 test('suppressed ACTIVE connection renders as reconnect, never connected', () => {
   const outlook: ComposioToolkit = {

@@ -36,7 +36,7 @@ import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import type { ModelCapability } from './model-wire-registry.js';
 import { BoundaryError, type BoundaryErrorKind } from '../boundary-error.js';
-import { isProviderCapacityExhausted } from '../../shared/provider-capacity.js';
+import { isProviderCapacityExhausted, isProviderCreditRefusal } from '../../shared/provider-capacity.js';
 import { isProviderInternalGenerationFailure } from '../../shared/provider-internal-generation.js';
 import pino from 'pino';
 
@@ -94,7 +94,9 @@ export function classifyModelError(err: unknown): ErrorClass {
   // Usage/plan quota exhausted — check FIRST (before the status branches), because the
   // 403/400 variants would otherwise mis-classify as auth_expired → terminal. Body text
   // (CodexRuntimeError.bodyText) carries the marker even when the message doesn't.
-  if (isProviderCapacityExhausted(err)) {
+  // A spent prepaid balance routes the same way: the account refuses until its
+  // owner adds credit, so another attempt on it cannot help.
+  if (isProviderCapacityExhausted(err) || isProviderCreditRefusal(status, err)) {
     return {
       retryable: true,
       kind: 'model.rate_limited',

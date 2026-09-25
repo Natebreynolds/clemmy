@@ -1,93 +1,22 @@
-import { useState } from 'react';
-import { ChevronRight, ExternalLink } from 'lucide-react';
-import { cn } from '@/lib/cn';
-import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
-import { PROVIDER_LABEL, useModelRoles } from '@/lib/model-roles';
 import { ModelRolesCard } from './ModelRolesCard';
-import { ClaudeLoginForm } from './ClaudeLoginForm';
-import { CodexLoginForm } from './CodexLoginForm';
-import { XaiLoginForm } from './XaiLoginForm';
-import { ConnectedModelsStrip } from './ConnectedModelsStrip';
-import { JevConnectForm, JEV_KEY_URL } from './JevConnectForm';
-import { UsageMetersPanel } from '@/components/ModelStatusChips';
+import { ModelAccountsCard } from './ModelAccountsCard';
 
-/** Settings › Models: who thinks, who does the legwork, who checks. */
+/**
+ * Settings › Models — the one place for models: the accounts Clem runs on
+ * (sign-ins, API keys, what each costs and where to add credit), adding a
+ * model, and who does which job. Everything opens inline, so the owner never
+ * goes to a second screen to connect, top up, or assign.
+ */
 export function ModelsSection({ sessionId }: { sessionId?: string } = {}) {
   return (
     <section id="models" className="scroll-mt-16">
       <h2 className="mb-1 text-h2 text-fg">Models</h2>
-      <p className="mb-3 text-small text-muted">Who thinks, who does the legwork, who checks. Change any of these mid-conversation from the chip beside the composer.</p>
+      <p className="mb-4 text-small text-muted">The accounts Clem runs on, what each is doing, and how much is left. When one runs out, its button opens the provider’s billing page.</p>
+      <h3 id="accounts" className="mb-2 scroll-mt-16 text-h3 text-fg">Accounts</h3>
+      <ModelAccountsCard />
+      <h3 id="who-does-what" className="mb-1 mt-8 scroll-mt-16 text-h3 text-fg">Who does what</h3>
+      <p className="mb-3 text-small text-muted">Change any of these mid-conversation from the chip beside the composer.</p>
       <ModelRolesCard sessionId={sessionId} />
-    </section>
-  );
-}
-
-/** Settings › Connected: one chip per account; sign-ins and keys behind one disclosure. */
-export function ConnectedSection() {
-  const r = useModelRoles();
-  const [open, setOpen] = useState(false);
-  const mr = r.mr;
-  const groups = mr?.available ?? [];
-  const claude = r.claudeAuth;
-  const jev = r.settings?.jev;
-  const chips: Array<{ key: string; provider: string; label: string; detail: string; on: boolean; color?: string }> = [];
-  const claudeModels = groups.find((g) => g.provider === 'claude')?.models ?? [];
-  chips.push({ key: 'claude', provider: 'claude', label: 'Claude', on: Boolean(claude?.configured), detail: claude?.configured ? (claudeModels.length ? claudeModels.slice(0, 2).map((m) => m.label).join(', ') : 'signed in') : 'not signed in' });
-  const codexModels = groups.find((g) => g.provider === 'codex')?.models ?? [];
-  chips.push({ key: 'codex', provider: 'codex', label: 'Codex', on: codexModels.length > 0, detail: codexModels.length ? `${codexModels.length} model${codexModels.length === 1 ? '' : 's'}` : 'not signed in' });
-  for (const g of groups) {
-    if (g.provider === 'claude' || g.provider === 'codex') continue;
-    chips.push({ key: `${g.provider}:${g.label}`, provider: g.provider, label: g.label, on: g.models.length > 0, detail: g.models.length ? `API key · ${g.models.slice(0, 2).map((m) => m.label).join(', ')}` : 'no models' });
-  }
-  chips.push({ key: 'jev', provider: 'unknown', label: 'Jev', on: Boolean(jev?.configured), detail: jev?.configured ? 'Fast decisions' : 'not connected', color: '#E551BA' });
-  return (
-    <section id="connected" className="scroll-mt-16">
-      <h2 className="mb-1 text-h2 text-fg">Connected</h2>
-      <p className="mb-3 text-small text-muted">Sign in once; every model from that account shows up above.</p>
-      <div className="mb-4">
-        <UsageMetersPanel />
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {chips.map((c) => {
-          const body = (
-            <>
-              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: c.color ?? PROVIDER_DOT[(c.provider as keyof typeof PROVIDER_DOT)] ?? PROVIDER_DOT.unknown, opacity: c.on ? 1 : 0.4 }} aria-hidden />
-              <span className="font-semibold text-fg">{c.label}</span>
-              <span className="text-caption">{c.detail}</span>
-            </>
-          );
-          const chip = cn('inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1.5 pl-2.5 pr-3 text-small', !c.on && 'text-faint');
-          // Something not connected is one click from where it gets connected.
-          return c.on
-            ? <span key={c.key} className={chip}>{body}</span>
-            : <button key={c.key} type="button" onClick={() => setOpen(true)} className={cn(chip, 'hover:border-primary')} aria-label={`Connect ${c.label}`}>{body}</button>;
-        })}
-        <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open} className="inline-flex items-center gap-1.5 rounded-full border border-dashed border-border px-3 py-1.5 text-small text-muted hover:text-fg">
-          <ChevronRight className={cn('h-3.5 w-3.5 transition-transform', open && 'rotate-90')} aria-hidden />
-          {open ? 'Hide sign-ins and keys' : 'Sign in, add a key, or manage'}
-        </button>
-      </div>
-      {!jev?.configured && !open && (
-        <p className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-small text-muted">
-          <span><span className="font-semibold text-fg">New: Jev</span> makes Clem’s quick yes/no checks near-instant.</span>
-          <a href={JEV_KEY_URL} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-primary hover:underline">
-            Get a key at console.typesafe.ai <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-          </a>
-          <button type="button" onClick={() => setOpen(true)} className="text-primary hover:underline">Add it</button>
-        </p>
-      )}
-      {open && (
-        <div className="mt-4 space-y-4">
-          <div className="grid gap-3 sm:grid-cols-3">
-            <div className="rounded-lg border border-border bg-canvas p-4"><CodexLoginForm embedded /></div>
-            <div className="rounded-lg border border-border bg-canvas p-4"><ClaudeLoginForm embedded /></div>
-            <div className="rounded-lg border border-border bg-canvas p-4"><XaiLoginForm embedded /></div>
-          </div>
-          <JevConnectForm status={jev} onDone={r.refresh} />
-          <ConnectedModelsStrip />
-        </div>
-      )}
-      <p className="mt-2 text-caption text-faint">{groups.length} provider{groups.length === 1 ? '' : 's'} · {PROVIDER_LABEL.byo} models come from Connect › Keys</p>
     </section>
   );
 }

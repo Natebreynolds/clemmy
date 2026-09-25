@@ -89,3 +89,71 @@ test('the top-bar chip says the busiest window in words and admits an old readin
   };
   assert.equal(usageChipText(claude, now).text, '38% of week');
 });
+
+test('a provider refusing for credit is shown as what it did, in its own words, with the page that fixes it', async () => {
+  const { usageChipText, creditRefusalSentence } = await import('./usage-presentation.js');
+  const since = Date.parse('2026-09-24T21:14:00Z');
+  const meters = presentUsageMeters({
+    codex: { connected: false },
+    claude: { connected: true, weekly: { usedPercent: 20 }, capturedAt: now, billing: { url: 'https://claude.example/usage', kind: 'plan', roles: ['judge'] } },
+    byoProviders: [{
+      id: 'together', label: 'Together AI', connected: true,
+      limits: { requests: { limit: 100, remaining: 99 }, capturedAt: now },
+      billing: { url: 'https://together.example/billing', kind: 'prepaid', outOfCredit: { since, lastSeenAt: since, status: 402, detail: 'Credit limit exceeded' }, roles: ['worker', 'brain'] },
+    }],
+    spendToday: { date: '2026-09-24', byProvider: { together: { tokens: 1_200_000, calls: 40 } } },
+  });
+  const together = meters.find((m) => m.id === 'together')!;
+  assert.deepEqual(together.billing, { url: 'https://together.example/billing', action: 'Add credit' });
+  assert.deepEqual(together.uses, ['helps in parallel', 'does the work']);
+  assert.equal(together.outOfCredit?.detail, 'Credit limit exceeded');
+  assert.equal(meterTone(together), 'danger', 'a healthy request window does not hide a refusal');
+  // The headline names what the provider did; it never claims a balance.
+  assert.equal(compactUsageText(together), 'refusing requests');
+  assert.deepEqual(usageChipText(together, now), { text: 'refusing requests', stale: false });
+  assert.equal(
+    creditRefusalSentence(together, () => '2:14 PM'),
+    'Together AI turned down Clem’s last request at 2:14 PM: “Credit limit exceeded”. Clem uses another model where it can until Together AI answers again.',
+  );
+  const bare = { ...together, outOfCredit: { since, lastSeenAt: since, status: 402 } };
+  assert.match(creditRefusalSentence(bare, () => '2:14 PM') ?? '', /at 2:14 PM with “payment required\.”/);
+  const claude = meters.find((m) => m.id === 'claude')!;
+  assert.deepEqual(claude.billing, { url: 'https://claude.example/usage', action: 'Manage plan' });
+  assert.equal(creditRefusalSentence(claude, () => ''), null);
+});
+
+test('with no balance to read, the provider’s own billed spend for the month is the headline', () => {
+  const [together] = presentUsageMeters({
+    codex: { connected: false },
+    claude: { connected: false },
+    byoProviders: [{
+      id: 'together', label: 'Together AI', connected: true,
+      billing: { url: 'https://together.example/billing', kind: 'prepaid', monthSpend: { amount: 42.1, currency: 'USD', capturedAt: now } },
+    }],
+    spendToday: { date: '2026-09-24', byProvider: { together: { tokens: 1_200_000, calls: 40 } } },
+  });
+  assert.deepEqual(together.monthSpend, { amount: 42.1, currency: 'USD', capturedAt: now });
+  assert.equal(compactUsageText(together), '$42.10 this month');
+});
+
+test('a readable balance becomes the meter line; the OpenAI key and Jev get meters when connected', async () => {
+  const { formatBalance } = await import('./usage-presentation.js');
+  const meters = presentUsageMeters({
+    codex: { connected: false },
+    claude: { connected: false },
+    openai: { connected: true, billing: { url: 'https://openai.example/billing', kind: 'prepaid', roles: ['memory_search'] } },
+    jev: { connected: true, billing: { url: 'https://typesafe.example/billing', kind: 'prepaid', roles: ['quick_checks'] } },
+    byoProviders: [{ id: 'moonshot', label: 'Moonshot', connected: true, billing: { balance: { amount: 49.5, currency: 'USD', capturedAt: now } } }],
+    spendToday: { date: '2026-09-24', byProvider: { jev: { tokens: 90_000, calls: 300 } } },
+  });
+  assert.deepEqual(meters.map((m) => m.id), ['moonshot', 'openai', 'jev']);
+  const moonshot = meters[0];
+  assert.equal(compactUsageText(moonshot), '$49.50 left');
+  assert.equal(moonshot.billing, undefined, 'no page is invented for an account the daemon gave none');
+  assert.deepEqual(meters[1].uses, ['memory search']);
+  assert.equal(meters[2].spend?.calls, 300, 'Jev spend lands on Jev');
+  assert.equal(formatBalance({ amount: 110, currency: 'cny' }), '¥110.00');
+  assert.equal(formatBalance({ amount: 3, currency: 'XYZ' }), '3.00 XYZ');
+  // Disconnected accounts stay off the list.
+  assert.deepEqual(presentUsageMeters({ codex: { connected: false }, claude: { connected: false }, jev: { connected: false } }), []);
+});

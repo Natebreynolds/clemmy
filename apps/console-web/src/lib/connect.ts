@@ -49,6 +49,32 @@ export interface ComposioToolkit {
   description?: string;
   toolCount?: number;
   connections?: ComposioConnection[];
+  /** 'managed' = Composio signs in with its own app; 'byo' = the person's own
+   *  key or developer app; 'none' = nothing to connect. */
+  authMode?: 'managed' | 'byo' | 'none';
+  authSchemes?: string[];
+  managedAuthSchemes?: string[];
+  /** The project already has a sign-in setup for this app. */
+  hasAuthConfig?: boolean;
+}
+
+/** What connecting an app will ask of the person, known before they click. */
+export type ToolkitConnectKind = 'none' | 'sign_in' | 'key' | 'own_app' | 'unknown';
+
+const isRedirectScheme = (scheme: string) => /OAUTH|DCR/i.test(scheme);
+
+/** Mirrors the daemon's planToolkitConnection order so the card's label
+ *  matches what Connect will do: an existing setup or Composio's own app
+ *  signs in; otherwise a key form; otherwise the person's own developer app. */
+export function toolkitConnectKind(t: ComposioToolkit): ToolkitConnectKind {
+  if (t.authMode === 'none') return 'none';
+  const schemes = (t.authSchemes ?? []).map((s) => s.toUpperCase()).filter((s) => s !== 'NO_AUTH');
+  if (t.authSchemes && schemes.length === 0) return 'none';
+  if (t.authMode === 'managed' || (t.managedAuthSchemes ?? []).some(isRedirectScheme)) return 'sign_in';
+  if (!t.authSchemes) return 'unknown';
+  if (t.hasAuthConfig && schemes.some(isRedirectScheme)) return 'sign_in';
+  if (schemes.some((s) => !isRedirectScheme(s))) return 'key';
+  return 'own_app';
 }
 export interface ComposioSnapshot {
   enabled?: boolean;
@@ -87,7 +113,48 @@ export interface ComposioCredentialsRequired {
   url?: never;
   redirectUrl?: never;
 }
-export type ComposioConnectResult = ComposioAuthorization | ComposioCredentialsRequired;
+/** A browser sign-in that needs account details first (a store subdomain). */
+export interface ComposioDetailsRequired {
+  kind: 'details';
+  setup: ComposioSetupMeta;
+  url?: never;
+  redirectUrl?: never;
+}
+/** The app has no shared sign-in: the person registers their own developer
+ *  app once, and Clem creates the setup from its client id and secret. */
+export interface ComposioOAuthAppSetup {
+  name: string;
+  slug: string;
+  description?: string | null;
+  appUrl?: string | null;
+  authGuideUrl?: string | null;
+  authHintUrl?: string | null;
+  authScheme: string;
+  /** Developer-app fields (client id, client secret, scopes…). */
+  fields: ComposioSetupField[];
+  /** Per-account fields asked before sign-in (a subdomain). */
+  accountFields: ComposioSetupField[];
+  /** The address to register as the app's OAuth redirect/callback URL. */
+  callbackUrl: string;
+}
+export interface ComposioOAuthAppRequired {
+  kind: 'oauth_app';
+  app: ComposioOAuthAppSetup;
+  url?: never;
+  redirectUrl?: never;
+}
+export interface ComposioNoAuth {
+  kind: 'no_auth';
+  name: string;
+  url?: never;
+  redirectUrl?: never;
+}
+export type ComposioConnectResult =
+  | ComposioAuthorization
+  | ComposioCredentialsRequired
+  | ComposioDetailsRequired
+  | ComposioOAuthAppRequired
+  | ComposioNoAuth;
 
 /** One toolkit's connection state, collapsing its connection history. */
 export type ToolkitStatus = 'active' | 'reconnect' | 'expired' | 'none';
@@ -164,12 +231,18 @@ export const revokeComposioCliDefaultAccount = (slug: string) =>
   apiPost<{ ok: true; revoked: boolean }>(
     `/api/composio/cli-default-accounts/${encodeURIComponent(slug)}/revoke`,
   );
-export const authorizeComposio = (slug: string) =>
-  apiPost<ComposioConnectResult>(`/api/composio/toolkits/${encodeURIComponent(slug)}/authorize`);
-export const setupComposioCredentials = (slug: string, credentials: Record<string, string>) =>
+export const authorizeComposio = (slug: string, details?: Record<string, string>) =>
+  apiPost<ComposioConnectResult>(
+    `/api/composio/toolkits/${encodeURIComponent(slug)}/authorize`,
+    details ? { details } : undefined,
+  );
+/** Create the setup from the person's own developer app, then start sign-in. */
+export const setupComposioOAuthApp = (slug: string, body: { credentials: Record<string, string>; details?: Record<string, string>; authScheme?: string }) =>
+  apiPost<ComposioConnectResult>(`/api/composio/toolkits/${encodeURIComponent(slug)}/oauth-app`, body);
+export const setupComposioCredentials = (slug: string, credentials: Record<string, string>, authScheme?: string) =>
   apiPost<{ ok: true; authConfigId: string; connectionId: string }>(
     `/api/composio/toolkits/${encodeURIComponent(slug)}/setup-credentials`,
-    { credentials },
+    { credentials, ...(authScheme ? { authScheme } : {}) },
   );
 // Reset the daemon's cached Composio client so the next status/toolkits read is fresh.
 export const refreshComposio = () => apiPost<{ ok: boolean }>('/api/composio/refresh');

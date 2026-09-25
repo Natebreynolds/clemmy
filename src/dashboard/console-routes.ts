@@ -9322,8 +9322,8 @@ export function registerConsoleRoutes(
   app.get('/api/console/model-status', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { buildModelStatus } = await import('../runtime/harness/model-status.js');
-      res.json(buildModelStatus());
+      const { readModelStatus } = await import('../runtime/harness/model-status.js');
+      res.json(await readModelStatus());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

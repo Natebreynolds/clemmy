@@ -23,17 +23,21 @@ import { getClaudeUsageSnapshot } from './claude-usage.js';
 import { claudeModelsAvailable, codexModelsAvailable } from './model-role-options.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { classifyCodexQuota, getRateLimitSnapshot, type ByoRateLimit } from './rate-limit-store.js';
+import { buildAccountBilling, type AccountBilling } from './provider-billing.js';
+import { JEV_ACCOUNT_ID, OPENAI_KEY_ACCOUNT_ID } from '../provider-credit.js';
 
 export interface ProviderSpend { tokens: number; calls: number; inputTokens: number; outputTokens: number }
 
 export interface ModelStatusPayload {
-  codex: { connected: boolean; primary?: unknown; secondary?: unknown; capturedAt?: number };
-  claude: { connected: boolean } & Record<string, unknown>;
-  openai: { connected: boolean };
+  codex: { connected: boolean; primary?: unknown; secondary?: unknown; capturedAt?: number; billing?: AccountBilling };
+  claude: { connected: boolean; billing?: AccountBilling } & Record<string, unknown>;
+  openai: { connected: boolean; billing?: AccountBilling };
+  /** The TypeSafe key behind Jev's quick checks. */
+  jev: { connected: boolean; billing?: AccountBilling };
   /** The Grok account: connected when an xAI grant is stored; limits when
    *  the provider has answered at least once since the daemon started. */
-  xai: { connected: boolean } & Partial<ByoRateLimit>;
-  byoProviders: Array<{ id: string; label: string; modelIds: string[]; connected: boolean; limits?: ByoRateLimit }>;
+  xai: { connected: boolean; billing?: AccountBilling } & Partial<ByoRateLimit>;
+  byoProviders: Array<{ id: string; label: string; modelIds: string[]; connected: boolean; limits?: ByoRateLimit; billing?: AccountBilling }>;
   together: { connected: boolean };
   /** Today's local token ledger, grouped by provider: codex, claude, xai, or
    *  the BYO provider id. */
@@ -69,7 +73,7 @@ function spendToday(byo: Array<{ id: string; modelIds: readonly string[] }>, now
   const byProvider: Record<string, ProviderSpend> = {};
   try {
     for (const event of readUsageEventsForDate(date)) {
-      const key = providerForSpend(String(event.model ?? ''), byo);
+      const key = event.account || providerForSpend(String(event.model ?? ''), byo);
       const row = byProvider[key] ?? (byProvider[key] = { tokens: 0, calls: 0, inputTokens: 0, outputTokens: 0 });
       row.calls += 1;
       row.tokens += Number(event.totalTokens) || 0;
@@ -84,8 +88,25 @@ function spendToday(byo: Array<{ id: string; modelIds: readonly string[] }>, now
   return value;
 }
 
-export function buildModelStatus(now = Date.now()): ModelStatusPayload {
+/** The status as the routes serve it: resolves what can only be read
+ *  asynchronously (whether a Jev key is saved), then builds. */
+export async function readModelStatus(now = Date.now()): Promise<ModelStatusPayload> {
+  let jevConnected = false;
+  try {
+    const { typesafeKeyIsConfigured } = await import('../jev/client.js');
+    jevConnected = await typesafeKeyIsConfigured();
+  } catch { /* an unreadable vault is a disconnected Jev */ }
+  return buildModelStatus(now, { jevConnected });
+}
+
+export function buildModelStatus(now = Date.now(), opts: { jevConnected?: boolean } = {}): ModelStatusPayload {
   const rl = getRateLimitSnapshot();
+  let billing: Record<string, AccountBilling> = {};
+  try { billing = buildAccountBilling(now); } catch { /* links and credit state are extras; meters still render */ }
+  const withBilling = (id: string): { billing?: AccountBilling } => {
+    const b = billing[id];
+    return b && Object.keys(b).length > 0 ? { billing: b } : {};
+  };
   const claudeConnected = claudeModelsAvailable();
   // Claude windows come from the dedicated account usage endpoint (cached,
   // lazily refreshed) — only poke it when Claude is actually connected.
@@ -99,6 +120,7 @@ export function buildModelStatus(now = Date.now()): ModelStatusPayload {
       modelIds: [...p.modelIds],
       connected: true,
       ...(rl.byo?.[p.id] ? { limits: rl.byo[p.id] } : {}),
+      ...withBilling(p.id),
     }));
   const togetherConnected = byoProviders.some(
     (p) => p.id === 'together' || p.id === 'together-ai' || /together/i.test(p.label),
@@ -114,10 +136,16 @@ export function buildModelStatus(now = Date.now()): ModelStatusPayload {
       primary: codexQuota.fiveHour,
       secondary: codexQuota.weekly,
       capturedAt: codexQuota.capturedAt,
+      ...withBilling('codex'),
     },
-    claude: { connected: claudeConnected, ...(claudeUsage ?? {}) },
-    openai: { connected: Boolean(getOpenAiApiKey()) },
-    xai: { connected: xaiConnected, ...(xaiConnected && rl.byo?.[XAI_PROVIDER_ID] ? rl.byo[XAI_PROVIDER_ID] : {}) },
+    claude: { connected: claudeConnected, ...(claudeUsage ?? {}), ...withBilling('claude') },
+    openai: { connected: Boolean(getOpenAiApiKey()), ...withBilling(OPENAI_KEY_ACCOUNT_ID) },
+    jev: { connected: Boolean(opts.jevConnected), ...withBilling(JEV_ACCOUNT_ID) },
+    xai: {
+      connected: xaiConnected,
+      ...(xaiConnected && rl.byo?.[XAI_PROVIDER_ID] ? rl.byo[XAI_PROVIDER_ID] : {}),
+      ...withBilling(XAI_PROVIDER_ID),
+    },
     byoProviders,
     together: { connected: togetherConnected },
     spendToday: spendToday(configured.map((p) => ({ id: p.id, modelIds: p.modelIds })), now),

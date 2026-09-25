@@ -28,6 +28,8 @@
  */
 import OpenAI from 'openai';
 import { recordByoRateLimit } from './rate-limit-store.js';
+import { noteCreditAnswered, noteCreditRefused } from '../provider-credit.js';
+import { isProviderCreditRefusal } from '../../shared/provider-capacity.js';
 import { createHash } from 'node:crypto';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import type { Model } from '@openai/agents-core';
@@ -1137,6 +1139,30 @@ function clientKey(byo: ByoBackendConfig): string {
   return `${byo.baseURL}::${credentialDigest}::${byo.refreshBearer ? 'refreshable' : 'static'}`;
 }
 
+const CREDIT_BODY_READ_MAX = 4_000;
+const CREDIT_REFUSAL_BODY_STATUSES = new Set([400, 403, 429]);
+
+/** Record a provider response against its account's credit state. Only a
+ *  generation request (POST) that answered proves the account can pay; a
+ *  catalog read answers even when the balance is empty. Never throws. */
+export function noteByoCreditOutcome(providerId: string, res: Response, method?: string): void {
+  try {
+    if (res.ok) {
+      if ((method ?? 'GET').toUpperCase() === 'POST') noteCreditAnswered(providerId);
+      return;
+    }
+    // 402 needs no body to be believed; the body only adds the provider's words.
+    if (res.status === 402) noteCreditRefused(providerId, { status: res.status });
+    else if (!CREDIT_REFUSAL_BODY_STATUSES.has(res.status)) return;
+    void res.clone().text().then((text) => {
+      const body = text.slice(0, CREDIT_BODY_READ_MAX);
+      if (isProviderCreditRefusal(res.status, body)) noteCreditRefused(providerId, { status: res.status, detail: body });
+    }).catch(() => {});
+  } catch {
+    /* never break the model path */
+  }
+}
+
 function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // OAuth-backed providers (xAI): resolve a FRESH bearer per request. The
   // client's static apiKey may be an already-expired access token; refreshing
@@ -1161,13 +1187,17 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // keeps the SDK default (2) — byte-identical legacy behavior.
   // Every answer carries the provider's own limit headers when it has them;
   // reading them here is what the usage meters run on. A provider with no
-  // headers costs one no-op per call.
+  // headers costs one no-op per call. The same seam records whether the
+  // account is refusing for lack of credit: a generation that answers clears
+  // it, and a refusal is read from a copy of the error body so the SDK still
+  // sees the original response.
   const limitKey = byo.providerId || '';
   const baseFetch: typeof fetch = bearerRefreshingFetch ?? fetch;
   const capturingFetch: typeof fetch | undefined = limitKey
     ? (async (url, init) => {
         const res = await baseFetch(url as never, init as never);
         recordByoRateLimit(limitKey, res.headers);
+        noteByoCreditOutcome(limitKey, res, init?.method);
         return res;
       }) as typeof fetch
     : bearerRefreshingFetch;

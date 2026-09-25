@@ -5593,8 +5593,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // disagree about a number.
   router.get('/api/settings/usage', requireMobileSession, async (_req, res) => {
     try {
-      const { buildModelStatus } = await import('../runtime/harness/model-status.js');
-      res.json(buildModelStatus());
+      const { readModelStatus } = await import('../runtime/harness/model-status.js');
+      res.json(await readModelStatus());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
