@@ -7,7 +7,9 @@
  *   - Never throw. A worker that cannot start returns null and the caller falls
  *     back to in-process inference; degraded recall beats no recall.
  *   - Never hang a request forever. A wedged worker is replaced, not waited on.
- *   - Never hold the process open (the worker is unref'd).
+ *   - Never hold the process open while idle. The worker keeps it alive only
+ *     while a caller is waiting on it (its boot, or a request in flight), each
+ *     bounded by a timeout — see syncLiveness below.
  */
 import { Worker } from 'node:worker_threads';
 import pino from 'pino';
@@ -35,6 +37,7 @@ interface Pending {
 
 let handle: EmbeddingWorkerHandle | null | undefined;
 let startInFlight: Promise<EmbeddingWorkerHandle | null> | null = null;
+let entryForTest: URL | null = null;
 
 /** Resolve the worker entry next to this module, in whichever form is running:
  *  `.ts` under tsx from source, `.js` from the built bundle. Getting this wrong
@@ -42,6 +45,7 @@ let startInFlight: Promise<EmbeddingWorkerHandle | null> | null = null;
  *  from THIS module's own URL rather than from a build flag that can disagree
  *  with reality. */
 function workerEntry(): { url: URL; execArgv?: string[] } {
+  if (entryForTest) return { url: entryForTest, execArgv: [] };
   const here = import.meta.url;
   return here.endsWith('.ts')
     ? { url: new URL('./embedding.worker.ts', here), execArgv: ['--import', 'tsx'] }
@@ -65,17 +69,33 @@ export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | nu
     try {
       const { url, execArgv } = workerEntry();
       const worker = new Worker(url, execArgv ? { execArgv } : undefined);
-      // A pending reconnect/inference must never keep the daemon alive.
-      worker.unref();
 
       const pending = new Map<number, Pending>();
       let nextId = 1;
       let dead: string | null = null;
+      let booting = true;
+
+      // Liveness: the worker holds this process open only while a caller is
+      // waiting on it (the model load, or a request in flight), never while it
+      // sits idle, so a process whose work is done can exit.
+      //
+      // A single unref() cannot express that. Attaching the first 'message'
+      // listener to a Worker refs its message port again (Node's
+      // setupPortReferencing), silently undoing an unref() made at spawn. And
+      // a worker unref'd for good lets a process with nothing else on its loop
+      // exit under an embed() whose answer is still on its way, leaving the
+      // caller's await unsettled. So the ref is re-derived from the
+      // outstanding work each time that work changes.
+      const syncLiveness = () => {
+        if (booting || pending.size > 0) worker.ref();
+        else worker.unref();
+      };
 
       const failAll = (reason: string) => {
         dead = reason;
         for (const [, p] of pending) { clearTimeout(p.timer); p.reject(new Error(reason)); }
         pending.clear();
+        syncLiveness();
       };
 
       worker.on('message', (msg: EmbeddingWorkerResponse) => {
@@ -84,6 +104,7 @@ export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | nu
           if (!p) return;
           clearTimeout(p.timer);
           pending.delete(msg.id);
+          syncLiveness();
           if (msg.kind === 'result') p.resolve(msg.vectors);
           else p.reject(new Error(msg.error));
         }
@@ -124,6 +145,8 @@ export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | nu
           }
         });
       });
+      booting = false;
+      syncLiveness();
 
       if (runtime === null || dead) {
         void worker.terminate();
@@ -140,10 +163,12 @@ export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | nu
           return new Promise<Float32Array[]>((resolve, reject) => {
             const timer = setTimeout(() => {
               pending.delete(id);
+              syncLiveness();
               reject(new Error('embedding worker timed out'));
             }, REQUEST_TIMEOUT_MS);
             timer.unref?.();
             pending.set(id, { resolve, reject, timer });
+            syncLiveness();
             worker.postMessage({ id, texts } satisfies EmbeddingWorkerRequest);
           });
         },
@@ -162,6 +187,15 @@ export async function startEmbeddingWorker(): Promise<EmbeddingWorkerHandle | nu
 
 /** Test seam: forget any started/failed worker so the next call re-probes. */
 export function _resetEmbeddingWorkerForTest(): void {
+  handle = undefined;
+  startInFlight = null;
+}
+
+/** Test seam: start a stand-in worker script (plain ESM speaking the same
+ *  protocol) instead of the ONNX one, so the host side can be exercised
+ *  without loading a model. `null` restores the real entry. */
+export function _setEmbeddingWorkerEntryForTest(url: URL | null): void {
+  entryForTest = url;
   handle = undefined;
   startInFlight = null;
 }
