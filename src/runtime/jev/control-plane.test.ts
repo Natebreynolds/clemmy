@@ -9,6 +9,7 @@ const {
   classifyOpenQuestionReplyWithJev,
   filterPrimerHitsWithJev,
   labelIdentifierWithJev,
+  classifyApprovalReplyWithJev,
   nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
   decideTurnStartWithJev,
@@ -575,4 +576,32 @@ test('labelIdentifierWithJev names an id only when Jev is sure, and never offers
   assert.equal(posted.length, 3);
   _setTypesafeKeyForTests(null);
   assert.equal(await labelIdentifierWithJev(input), null, 'no Jev, no name');
+});
+
+
+test('classifyApprovalReplyWithJev reads a written reply to a waiting card as one choice and fails open without Jev', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  let choice = 'changes';
+  let confidence = 0.92;
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      reply: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } },
+    }, usage: { input_tokens: 50, output_tokens: 3 } }) };
+  });
+  const input = {
+    pending: 'Send Slack message\nmarkdown_text: Could you run the 4:15 review on your own today?',
+    reply: 'go ahead but make it shorter',
+  };
+  assert.deepEqual(await classifyApprovalReplyWithJev(input), { kind: 'changes', confidence: 0.92, failedOpen: false });
+  const body = posted[0]!;
+  assert.deepEqual(Object.keys(body.questions), ['reply']);
+  assert.deepEqual(Object.keys(body.questions.reply.criteria).sort(), ['approves', 'changes', 'declines', 'none', 'other']);
+  assert.match(JSON.stringify(body.state), /4:15 review/);
+  assert.match(JSON.stringify(body.state), /make it shorter/);
+  choice = 'none'; confidence = 0.9;
+  assert.deepEqual(await classifyApprovalReplyWithJev(input), { kind: null, confidence: 0.9, failedOpen: false });
+  _setTypesafeKeyForTests(null);
+  assert.deepEqual(await classifyApprovalReplyWithJev(input), { kind: null, failedOpen: true });
 });

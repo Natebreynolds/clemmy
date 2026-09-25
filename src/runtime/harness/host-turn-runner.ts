@@ -1710,6 +1710,12 @@ interface PendingHostCall {
    */
   admittedArgumentsJson?: string;
   decision?: 'approved' | 'rejected';
+  /**
+   * Set only in memory at resume, beside a 'rejected' decision: the owner
+   * answered the card with a change. It is model input for one fresh call,
+   * never authority, and a serialized pause never carries it.
+   */
+  changeRequest?: string;
   /** V3: exact reducer subject for a high-consequence mutation. */
   consentSubject?: HostInteractiveConsentSubjectV1;
   /** Display-only reducer facts; the exact consentSubject remains authority. */
@@ -2067,6 +2073,9 @@ export class HostInterruptState {
           ? 'host_v1_read_only'
           : (() => { throw new Error('paused host state has no exact engine identity'); })();
     const pending = parsed.pending ?? [];
+    // A change request exists only in memory at resume; stored bytes that
+    // carry one are not the owner's words.
+    for (const call of pending) delete call.changeRequest;
     if (version >= 3) {
       for (const call of pending) {
         if (call.consentSubject !== undefined) {
@@ -2172,6 +2181,18 @@ export class HostInterruptState {
     const match = this.pending.find((call) => call.rawItem === raw);
     if (match) match.decision = 'rejected';
   }
+  /** The owner answered this card with a change instead of a decision: the
+   *  exact call is rejected, and their words become model input for a fresh
+   *  call. They never authorize any bytes. */
+  requestChange(item: unknown, request: string): void {
+    const raw = (item as { rawItem?: PendingHostCall['rawItem'] } | null)?.rawItem;
+    const match = this.pending.find((call) => call.rawItem === raw);
+    const text = request.trim().slice(0, 2_000);
+    if (!match || !text) return;
+    match.decision = 'rejected';
+    match.changeRequest = text;
+  }
+
 }
 
 type EmitterLike = { emit?: (event: string, ...args: unknown[]) => unknown };
@@ -8363,6 +8384,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const preparedMutations: Array<{ pending: PendingHostCall; preparation: object }> = [];
     let resumeFrameRepair = resumedFrameArgumentsEdited;
     let resumeFrameRejected = pendingFromResume.some((pending) => pending.decision === 'rejected');
+    // The owner answered a card with a change: the rejected call stays
+    // rejected, and the model gets their words to issue one fresh call, which
+    // is shown for approval again.
+    const changeRequests = pendingFromResume
+      .filter((pending) => pending.decision === 'rejected' && pending.changeRequest);
+    if (changeRequests.length > 0) {
+      pendingHostModelDirective = [
+        pendingHostModelDirective,
+        ...changeRequests.map((pending) => [
+          `APPROVAL CHANGE — the owner reviewed the pending ${pending.name} call and asked for a change instead of approving it: ${JSON.stringify(pending.changeRequest)}.`,
+          `Revise its arguments to do what they asked and issue one fresh ${pending.name} call; it will be shown to them for approval again.`,
+          'Keep everything they did not ask to change. Do not reuse the prior call id.',
+        ].join(' ')),
+      ].filter(Boolean).join(' ');
+    }
 
     // Every mutation in a paused frame is re-materialized under the original
     // accepted source. Process-local nested tokens intentionally do not

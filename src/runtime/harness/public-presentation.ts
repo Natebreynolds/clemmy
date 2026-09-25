@@ -47,7 +47,7 @@ import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMod
  * approving), admitted only in its exact bounded shape. */
 type ApprovalPreviewField = { name: string; value: string; label?: string };
 
-function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: ApprovalPreviewField[] } } | null {
+export function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: ApprovalPreviewField[] } } | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (typeof record.operation !== 'string' || !record.operation.trim() || record.operation.length > 80) return null;
@@ -973,7 +973,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       };
     }
     case 'approval_resolved':
-      return selected(data, ['approvalId', 'decision', 'resolution', 'sourceId']);
+      return selected(data, ['approvalId', 'decision', 'resolution', 'sourceId', 'changeRequested']);
     case 'run_failed':
       // Execution failures are private evidence, not a second terminal
       // protocol. The bridge/graph reducer publishes one typed failed

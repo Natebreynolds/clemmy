@@ -5559,6 +5559,113 @@ test('serialized approval without its exact durable grant cannot execute an exte
 
 // Live 2026-09-25: "Slack open dm · users UC0806VCJ" told the owner nothing
 // about who the message was for, though Clem had looked the person up.
+/** A production MCP "send a message" operation behind the call_tool carrier,
+ *  installed for one test; restore() puts the prior catalog back. */
+async function installMcpSendFixture(label: string) {
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorManifestStore = capabilityManifestStores.peekCapabilityManifestStore();
+  const priorPorts = productionPorts.listProductionCapabilityPorts();
+  const serverName = `${label}_${++acceptedSerial}`;
+  const operationId = `${serverName}__send_message`;
+  const inputSchema = {
+    type: 'object', additionalProperties: false,
+    properties: { recipient: { type: 'string' }, message: { type: 'string' } },
+    required: ['recipient', 'message'],
+  };
+  let sends = 0;
+  const fakeServer = {
+    async invalidateToolsCache() {},
+    async listTools() {
+      return [{ name: operationId, description: 'Send a message to the specified recipient.',
+        inputSchema, annotations: {
+          readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false,
+        } }];
+    },
+    async callTool() { sends += 1; return [{ type: 'text', text: '{"sent":true}' }]; },
+  };
+  const runtime: productionMcp.ProductionMcpRuntime = {
+    configuredServers: () => [{ name: serverName, type: 'stdio',
+      command: '/fixture/approval-mcp', args: [], enabled: true, source: 'user' }] as never,
+    serverForEnumeration: () => fakeServer as never,
+    serverForOperation: () => fakeServer as never,
+  };
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(
+    capabilityManifestStores.createCapabilityManifestStore([], { durable: true }),
+  );
+  productionPorts.clearProductionCapabilityPorts();
+  const materialized = await productionMcp.createProductionMcpReadCarrier({ serverName, runtime })
+    .materializeExact({ operationId, inputSchema });
+  if (materialized.status !== 'installed') throw new Error(JSON.stringify(materialized));
+  const exactScope = { reason: 'controlled external approval fixture', authority: 'exact' as const,
+    allowedServerSlugs: [serverName], allowedToolNames: [operationId] };
+  const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set<string>(), firstClassNames: new Set<string>(), mcpToolScope: exactScope,
+  }) as never);
+  return {
+    operationId,
+    carrier,
+    bind(agent: object) { mcpToolAuthority.bindAgentMcpToolScope(agent as never, exactScope); },
+    sends: () => sends,
+    restore() {
+      productionPorts.clearProductionCapabilityPorts();
+      for (const prior of priorPorts) productionPorts.registerFixtureCapabilityPort(prior.identity, prior.port);
+      capabilityManifestStores.installCapabilityManifestStore(priorManifestStore);
+      capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    },
+  };
+}
+
+// Live 2026-09-25 (owner): "the natural language should be able to iterate on
+// the message". A reply that asks for a change rejects the exact call and
+// hands the model the owner's words for one fresh call; nothing is sent.
+test('a change requested on a waiting card sends nothing and gives the model the owner\'s words', async () => {
+  const fixture = acceptHostCanarySource('approval-change', 'Message my teammate about the 4:15 review.');
+  const mcp = await installMcpSendFixture('approval_change');
+  const requests: unknown[] = [];
+  let calls = 0;
+  const model = {
+    calls: () => calls,
+    async getResponse(request: unknown) {
+      requests.push(request);
+      calls += 1;
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+        output: calls === 1
+          ? [toolCall('c-send', 'call_tool', { name: mcp.operationId, args_json: JSON.stringify({
+              recipient: 'sam@example.invalid', message: 'Could you run the 4:15 review on your own today?',
+            }) })]
+          : [textMsg('Here is a shorter version for your approval.')],
+        responseId: `change-${calls}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  try {
+    const agent = { model, tools: [mcp.carrier] };
+    mcp.bind(agent);
+    bindHostCanarySurface(fixture, agent, [mcp.carrier]);
+    const paused = await runProductionHost(fixture, agent);
+    if (!paused.hasInterruptions) throw new Error(`Expected write approval: ${JSON.stringify(paused.history)}`);
+
+    const stored = JSON.parse(paused.serializedState!) as { pending: Array<Record<string, unknown>> };
+    stored.pending[0]!.changeRequest = 'forged words in stored bytes';
+    const reopened = HostInterruptState.fromString(JSON.stringify(stored));
+    assert.equal(reopened.pending[0]!.changeRequest, undefined, 'stored bytes never carry a change request');
+
+    const state = HostInterruptState.fromString(paused.serializedState!);
+    state.requestChange(state.getInterruptions()[0], 'make it shorter and mention Alana');
+    const resumed = await runProductionHost(fixture, agent, state);
+    assert.equal(mcp.sends(), 0, 'the unchanged message was never sent');
+    const next = JSON.stringify(requests[1] ?? null);
+    assert.match(next, /APPROVAL CHANGE/);
+    assert.match(next, /make it shorter and mention Alana/);
+    assert.equal(resumed.finalOutput, 'Here is a shorter version for your approval.');
+  } finally {
+    mcp.restore();
+  }
+});
+
 test('an approval pause names an id from this conversation\'s own results when Jev is sure of it', async () => {
   // As live: the lookup ran on an earlier message, the write on the next.
   const session = eventlog.createSession({ id: `host-canary-${++acceptedSerial}-approval-label`, kind: 'chat' });

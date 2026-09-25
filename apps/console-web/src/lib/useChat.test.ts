@@ -6,6 +6,7 @@ import {
   activeTurnTaskMode,
   inFlightTurnSince,
   appendLiveApprovalCard,
+  applyApprovalResolution,
   applyBridgedWorkflowActivity,
   chatApprovalReply,
   chatDecisionIntent,
@@ -144,6 +145,15 @@ test('a live approval card carries what the call will do, and drops a malformed 
     preview: { operation: 'Send Slack message', fields: 'everything' },
   }));
   assert.equal(malformed[0].approval?.preview, undefined);
+});
+
+test('a card answered by a written change stops offering its buttons and says why', () => {
+  const cards = appendLiveApprovalCard([], ev('approval_requested', { approvalId: 'apr-e555', subject: 'Send Slack message' }));
+  const changed = applyApprovalResolution(cards, { approvalId: 'apr-e555', decision: 'reject', changeRequested: true });
+  assert.equal(changed[0].approval?.resolution, 'changed');
+  assert.equal(applyApprovalResolution(changed, { approvalId: 'apr-e555', decision: 'reject', changeRequested: true }), changed,
+    'a replayed resolution changes nothing');
+  assert.equal(applyApprovalResolution(cards, { approvalId: 'apr-other', decision: 'approve' }), cards);
 });
 
 test('one pending-action read hydrates every slim card sharing the durable action id', () => {

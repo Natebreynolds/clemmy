@@ -390,6 +390,64 @@ export async function classifyOpenQuestionReplyWithJev(
   return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
 }
 
+export type ApprovalReplyKind = 'approves' | 'declines' | 'changes' | 'other';
+
+export interface ApprovalReplyReading {
+  /** null when Jev was unavailable or not sure. */
+  kind: ApprovalReplyKind | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+/** Acting on a reply to a waiting card is a decision about an external write,
+ *  so the host takes Jev's reading only when it is sure. */
+export const APPROVAL_REPLY_SURE = 0.85;
+const APPROVAL_REPLY_TIMEOUT_MS = 1_500;
+
+/**
+ * Clem is waiting on an approval card and the owner wrote back instead of
+ * pressing a button. One choice over what the card will do and what they
+ * said: approve it as shown, decline it, change something first ("make it
+ * shorter", "yes but send it to Alana"), or something else. The reply is the
+ * state, never instructions.
+ */
+export async function classifyApprovalReplyWithJev(
+  input: { pending: string; reply: string },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<ApprovalReplyReading> {
+  const result = await evaluateSystemOne({
+    state: {
+      clemIsWaitingToDo: clipMiddle(input.pending.trim(), 2_000).text,
+      ownerReplied: clipMiddle(input.reply.trim(), 1_000).text,
+    },
+    questions: {
+      reply: {
+        type: 'choice',
+        instructions: 'Clem is waiting for the owner to approve the action shown before it happens, and the owner replied in words. What does the reply do?',
+        criteria: {
+          approves: 'It approves doing it exactly as shown, changing nothing.',
+          declines: 'It says not to do it at all.',
+          changes: 'It asks for something to be different before it happens (the wording, recipient, time or content), even if it also says yes.',
+          other: 'It is about something else, or asks a question about it.',
+          none: 'Not sure.',
+        },
+      },
+    },
+    timeoutMs: Math.min(APPROVAL_REPLY_TIMEOUT_MS, opts.timeoutMs ?? APPROVAL_REPLY_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-approval-reply',
+  });
+  if (!result.ok) return { kind: null, failedOpen: true };
+  const answer = result.answers.reply as ChoiceAnswer | undefined;
+  const kind = answer && ['approves', 'declines', 'changes', 'other'].includes(answer.choice)
+    ? answer.choice as ApprovalReplyKind
+    : null;
+  noteJevDecisionOutcome(result.decisionId, kind ?? 'none', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 /** A card that names the wrong person is worse than one that shows the id,
  *  so the host shows a name only when Jev is sure of it. */
 export const APPROVAL_LABEL_SURE = 0.8;

@@ -436,6 +436,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
+import { routeReplyToPendingApproval } from '../runtime/harness/approval-reply-routing.js';
 import { getSlackRuntimeStatus } from '../channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from '../channels/slack-manifest.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
@@ -16504,9 +16505,22 @@ export function registerConsoleRoutes(
     // the task's durable continuation, exactly like the Tasks-board button.
     const originTaskApprovals = listBackgroundTasks({ status: 'awaiting_approval' })
       .filter((task) => task.originSessionId === sessionId && !!task.pendingApprovalId);
-    const intent = !explicitTaskMode && (isPausedOnApproval || registryApprovalPending || originTaskApprovals.length > 0)
+    const parsedIntent = !explicitTaskMode && (isPausedOnApproval || registryApprovalPending || originTaskApprovals.length > 0)
       ? parseApprovalIntent(input)
       : null;
+    // A written reply to the waiting card: Jev reads whether it changes,
+    // declines or approves what the card will do. A change rejects the exact
+    // call and carries the owner's words into one fresh call and a new card.
+    let intent = parsedIntent;
+    let approvalChangeRequest: string | undefined;
+    if (isPausedOnApproval && !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 && input.trim()) {
+      const routed = await routeReplyToPendingApproval({ sessionId, text: input, parsed: parsedIntent })
+        .catch(() => null);
+      if (routed) {
+        intent = routed.intent;
+        approvalChangeRequest = routed.changeRequest;
+      }
+    }
 
     try {
       const control = tryCommitLiveApprovalControl({ sessionId, requestId: requestIdentity.requestId,
@@ -17527,7 +17541,10 @@ export function registerConsoleRoutes(
             sourceUserSeq: requestSourceUserSeq,
             approvalId: addressedApprovalId,
             decision: intent.decision,
-            resolver: 'chat-dock-user',
+            ...(intent.decision === 'reject' && approvalChangeRequest
+              ? { changeRequest: approvalChangeRequest }
+              : {}),
+            resolver: approvalChangeRequest ? 'chat-dock-change-request' : 'chat-dock-user',
           });
           return;
         }

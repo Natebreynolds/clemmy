@@ -1,8 +1,8 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { LiveAnswerDraft, TerminalFacts } from '@clem/chat-engine';
-import { applyStreamToken, approvalPreviewFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
-import type { ApprovalPreview } from '@clem/chat-engine';
+import { applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import type { ApprovalPreview, ApprovalResolution } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -128,6 +128,8 @@ export interface ChatMessage {
     pendingAction?: PendingActionApprovalView;
     /** What approving would do: operation + argument values (display only). */
     preview?: ApprovalPreview;
+    /** How the card was answered; 'changed' means a revised card follows. */
+    resolution?: ApprovalResolution;
   };
   taskMode?: TaskMode;
   planArtifactRef?: PlanRevisionRef;
@@ -218,6 +220,24 @@ export function appendCheckIn(
   const liveAt = messages.findIndex((message) => message.id === liveAssistantId);
   if (liveAt < 0) return [...messages, entry];
   return [...messages.slice(0, liveAt), entry, ...messages.slice(liveAt)];
+}
+
+/** Record how an approval card was answered, so a replaced or decided card
+ *  stops offering its buttons (the server refuses a resolved card anyway). */
+export function applyApprovalResolution(
+  messages: readonly ChatMessage[],
+  data: Record<string, unknown>,
+): ChatMessage[] {
+  const approvalId = typeof data.approvalId === 'string' ? data.approvalId : null;
+  const resolution = approvalResolutionFrom(data);
+  if (!approvalId || !resolution) return messages as ChatMessage[];
+  let changed = false;
+  const next = messages.map((message) => {
+    if (message.approval?.approvalId !== approvalId || message.approval.resolution === resolution) return message;
+    changed = true;
+    return { ...message, approval: { ...message.approval, resolution } };
+  });
+  return changed ? next : messages as ChatMessage[];
 }
 
 export function appendLiveApprovalCard(
@@ -1389,6 +1409,9 @@ export function useChat(options?: UseChatOptions) {
         }];
       });
       return;
+    }
+    if (ev.type === 'approval_resolved') {
+      setMessages((prev) => applyApprovalResolution(prev, ev.data as Record<string, unknown>));
     }
     if (ev.type === 'stream_token') {
       // The live answer draft: provisional text the terminal reply replaces.

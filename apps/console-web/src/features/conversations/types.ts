@@ -38,6 +38,7 @@ export interface Turn {
     reason?: string;
     approvalId: string;
     pendingAction?: unknown;
+    preview?: unknown;
   };
 }
 

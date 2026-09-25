@@ -12107,6 +12107,13 @@ export interface ResumePendingApprovalOptions {
    */
   modifiedArgs?: string;
   /**
+   * With decision 'reject': the owner answered the card with a change instead
+   * of a decision ("make it shorter"). The exact call is rejected; their words
+   * reach the model as input for one fresh call, which is shown for approval
+   * again. The words never authorize any bytes.
+   */
+  changeRequest?: string;
+  /**
    * Audit source recorded when the durable approval row is resolved.
    * Callers pass the surface that accepted the approval; the harness
    * resolves the pre-resume row before continuing the SDK run so a
@@ -12516,6 +12523,8 @@ export async function resumePendingApproval(
     } else {
       // A rejection is exact too: a later payload deserves its own decision.
       stateApi.reject(item);
+      const change = options.changeRequest?.trim();
+      if (change && state instanceof HostInterruptState) state.requestChange(item, change);
     }
     const raw = (item as { rawItem?: { name?: string } } | null)?.rawItem;
     resolvedApprovals.push({
@@ -12535,6 +12544,7 @@ export async function resumePendingApproval(
         approvalId: resolvedApproval.approvalId,
         sticky: false,
         edited: options.decision === 'approve_with_edits',
+        ...(options.decision === 'reject' && options.changeRequest?.trim() ? { changeRequested: true } : {}),
       },
     });
   }
@@ -12961,6 +12971,8 @@ export async function runConversationFromResume(opts: {
   decision: 'approve' | 'reject' | 'approve_with_edits';
   /** Required when decision === 'approve_with_edits'. JSON-encoded args. */
   modifiedArgs?: string;
+  /** With decision 'reject': the owner's requested change (see ResumePendingApprovalOptions). */
+  changeRequest?: string;
   resolver?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
@@ -13287,6 +13299,7 @@ async function runConversationFromResumeCore(opts: {
   approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
   modifiedArgs?: string;
+  changeRequest?: string;
   resolver?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
@@ -13386,6 +13399,7 @@ async function runConversationFromResumeCore(opts: {
     approvalId: opts.approvalId,
     decision: opts.decision,
     modifiedArgs: opts.modifiedArgs,
+    ...(opts.decision === 'reject' && opts.changeRequest ? { changeRequest: opts.changeRequest } : {}),
     resolver: opts.resolver,
     maxTurns,
     toolCallsPerTurn,

@@ -336,6 +336,45 @@ test('the production approval wrapper rebuilds the original host source and cont
   assert.deepEqual(settlements.map(row => [row.source_user_seq, row.outcome_kind]), [[fixture.source.seq, 'succeeded']]);
 });
 
+// Owner, 2026-09-25: a waiting card should be something you can change in
+// words. The chat route turns a sure "change" reading into this resume.
+test('a change requested through the resume rejects the exact write, sends nothing, and reaches the model', async () => {
+  const fixture = await directWriteFixture('work_call', 'opaque', 'change-requested', false, 'args_json', 1, {
+    operationId: 'CHANGE_REQUESTED_WRITE', schema: INPUT_SCHEMA, payloads: [ARGS],
+  });
+  assert.ok(fixture);
+  const { runConversation, runConversationFromResume } = await import('./loop.js');
+  const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+  const agent = await fixture.useProductionAgent();
+  const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+    sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+    suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+  assert.equal(paused.status, 'awaiting_approval');
+  const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+  assert.ok(approval);
+  const inputsBefore = fixture.modelInputs.length;
+  eventlog.closeEventLog();
+  await runConversationFromResume({ sessionId: fixture.session.id,
+    approvalId: approval.approvalId, decision: 'reject', changeRequest: 'make it shorter and mention Alana',
+    resolver: 'change-fixture', turnEngine: 'host_v1',
+    makeRunner: () => fixture.runner as never, maxTurns: 3,
+    judgeFn: async () => ({ done: true, reason: 'fixture reply' }),
+    buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+      sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+      ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+      model: fixture.model as never, allowToolJit: true,
+    }),
+  });
+  assert.equal(fixture.counts().providerCalls, 0, 'the unchanged write was never sent');
+  assert.equal(approvals.get(approval.approvalId)?.resolution, 'rejected');
+  const resolved = eventlog.listEvents(fixture.session.id, { types: ['approval_resolved'] })
+    .find((event) => event.data.approvalId === approval.approvalId);
+  assert.equal(resolved?.data.changeRequested, true);
+  const after = JSON.stringify(fixture.modelInputs.slice(inputsBefore));
+  assert.match(after, /APPROVAL CHANGE/);
+  assert.match(after, /make it shorter and mention Alana/);
+});
+
 test('two production task approvals in one session resume independently after reopen', async () => {
   const fixture = await directWriteFixture('work_call', 'opaque', 'two-paused-sources', false, 'args_json', 2, {
     operationId: 'TWO_SOURCE_APPROVAL_WRITE', schema: INPUT_SCHEMA, payloads: [ARGS, ARGS], deferredAcrossSources: true,

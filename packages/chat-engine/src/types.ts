@@ -36,6 +36,16 @@ export interface ApprovalPreview {
   fields: Array<{ name: string; value: string; label?: string }>;
 }
 
+export type ApprovalResolution = 'approved' | 'declined' | 'changed';
+
+/** The card state an approval_resolved event records, or undefined. */
+export function approvalResolutionFrom(data: Record<string, unknown>): ApprovalResolution | undefined {
+  if (data.changeRequested === true) return 'changed';
+  if (data.decision === 'approve' || data.decision === 'approve_with_edits') return 'approved';
+  if (data.decision === 'reject') return 'declined';
+  return undefined;
+}
+
 /** Admit only the exact bounded preview shape the host projects. */
 export function approvalPreviewFrom(value: unknown): ApprovalPreview | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
@@ -166,6 +176,9 @@ export interface ChatMessage {
     /** What approving would actually do: the operation and the argument
      *  values it receives, from the host's frozen arguments. Display only. */
     preview?: ApprovalPreview;
+    /** How the card was answered, from the host's resolution record.
+     *  'changed' means the owner asked for a change; a new card follows. */
+    resolution?: ApprovalResolution;
     /** Host reducer facts, passed through unchanged for display, not authority. */
     consentCall?: {
       effect: string;

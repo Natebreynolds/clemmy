@@ -1,4 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
+import { approvalPreviewFrom } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -42,6 +43,7 @@ function historyMessage(turn: Turn): ChatMessage {
         reason: turn.approval.reason,
         approvalId: turn.approval.approvalId,
         pendingAction: pendingActionFromEvent(turn.approval.pendingAction),
+        ...(approvalPreviewFrom(turn.approval.preview) ? { preview: approvalPreviewFrom(turn.approval.preview) } : {}),
       },
     };
   }

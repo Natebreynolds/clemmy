@@ -29,7 +29,7 @@ import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js'
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
-import { publicUserInputText } from '../runtime/harness/public-presentation.js';
+import { approvalPreviewProjection, publicUserInputText } from '../runtime/harness/public-presentation.js';
 import {
   archiveAuthorityPayloadsForSession,
   permanentlyDeleteSessionAuthorityPayloads,
@@ -590,6 +590,8 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
           // only) — also picks up the CURRENT pending-action state rather
           // than a snapshot from park time.
           pendingAction: pendingActionApprovalViewFromArgs(rowNow.args ?? null),
+          // What approving would do, as the live card showed it.
+          ...(approvalPreviewProjection(d.preview) ?? {}),
         },
       });
     }

@@ -188,6 +188,7 @@ import { attachAnswerStream } from '../runtime/harness/answer-stream.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
+import { routeReplyToPendingApproval } from '../runtime/harness/approval-reply-routing.js';
 import { buildContinueInput, isContinueCompletionReason } from '../runtime/harness/continue-directive.js';
 import {
   projectForegroundWorkingNowSnapshot,
@@ -2929,7 +2930,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     res: express.Response,
     id: string,
     decision: 'approve' | 'reject',
-    options: { request?: { requestId: string; runId: string; inputHash: string } } = {},
+    options: {
+      request?: { requestId: string; runId: string; inputHash: string };
+      /** With 'reject': the owner wrote a change instead of deciding. */
+      changeRequest?: string;
+    } = {},
   ): Promise<void> {
     const acceptedRunId = options.request?.runId;
     const request = options.request ?? {
@@ -3124,17 +3129,19 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const approvalAttempt = executionClaim.attempt;
     let acceptedApprovalSource: HarnessEventRow;
     try {
-      const displayText = `${decision === 'approve' ? 'Approve' : 'Reject'} ${id}`;
+      const changeRequest = decision === 'reject' ? options.changeRequest?.trim() : undefined;
+      const displayText = changeRequest || `${decision === 'approve' ? 'Approve' : 'Reject'} ${id}`;
       acceptedApprovalSource = recordRunAttemptUserInput(approvalAttempt, {
         turn: 0,
         role: 'user',
         data: {
-          text: `${displayText}.`,
+          text: changeRequest ? displayText : `${displayText}.`,
           displayText,
           synthetic: true,
           source: 'mobile_approval',
           approvalId: id,
           decision,
+          ...(changeRequest ? { changeRequested: true } : {}),
           runId,
           attemptId: approvalAttempt.attemptId,
         },
@@ -3307,7 +3314,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           sessionId,
           approvalId: id,
           decision,
-          resolver: 'mobile-inbox',
+          ...(decision === 'reject' && options.changeRequest?.trim()
+            ? { changeRequest: options.changeRequest.trim() }
+            : {}),
+          resolver: options.changeRequest?.trim() ? 'mobile-change-request' : 'mobile-inbox',
           sourceUserSeq: acceptedApprovalSource.seq,
           runAttemptId: approvalAttempt.attemptId,
         });
@@ -3904,6 +3914,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           request: { requestId, runId, inputHash },
         });
         return;
+      }
+      // A written reply to the waiting card (parity with the desktop dock):
+      // a sure change or decline, read by Jev, answers the card itself.
+      if (!typedControl && requestedSessionId && (!taskMode || taskMode.kind === 'normal')
+        && HarnessSession.load(requestedSessionId)?.loadInterruptState()) {
+        const routed = await routeReplyToPendingApproval({ sessionId: requestedSessionId, text: message, parsed: null })
+          .catch(() => null);
+        if (routed?.intent) {
+          await resolveMobileApproval(res, routed.intent.approvalId, routed.intent.decision, {
+            request: { requestId, runId, inputHash },
+            ...(routed.changeRequest ? { changeRequest: routed.changeRequest } : {}),
+          });
+          return;
+        }
       }
       const priorLineage = requestedSessionId
         ? resolveAcceptedSourceIngressLineage({

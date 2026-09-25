@@ -353,7 +353,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             planOutcome={planOutcome}
             onPlanAction={actOnPlan}
             approvalActing={approvalActing}
-            approvalDecided={chatApprovalDecided(messages, message.approval?.approvalId)}
+            approvalDecided={Boolean(message.approval?.resolution) || chatApprovalDecided(messages, message.approval?.approvalId)}
             onApprovalAction={actOnApproval}
             onRetry={(id) => void engine.retry(id)}
             onDiscard={(id) => engine.discard(id)}
@@ -566,6 +566,10 @@ function MessageRow({
           </div>
         ) : !approvalId ? (
           <div class="approval-reason">Open “Needs you” from the menu to act on this.</div>
+        ) : message.approval.resolution === 'changed' ? (
+          <div class="approval-reason">You asked for a change — the revised version is below. Nothing was sent from this one.</div>
+        ) : message.approval.resolution === 'declined' ? (
+          <div class="approval-reason">Declined — nothing was sent.</div>
         ) : null}
       </div>
     );

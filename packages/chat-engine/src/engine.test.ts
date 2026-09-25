@@ -99,6 +99,27 @@ test('an approval preview reaches the card on live delivery and replay; a malfor
   } finally { engine.dispose(); }
 });
 
+test('a card answered by a written change reads as changed; a decline as declined, live and on replay', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({ transport, api: {
+    send: async () => ({ sessionId: 'resolution-card', accepted: true }),
+    loadSession: async () => ({ events: [], latestSeq: 0 }),
+  } });
+  const card = ev(2, 'approval_requested', { approvalId: 'apr-chg1', subject: 'Send Slack message' });
+  const changed = ev(3, 'approval_resolved', { approvalId: 'apr-chg1', decision: 'reject', changeRequested: true });
+  try {
+    await engine.send('Message my teammate on Slack');
+    await wait(10);
+    transport.live!.onEvent(card);
+    transport.live!.onEvent(changed);
+    assert.equal(engine.snapshot().messages.find((m) => m.approval?.approvalId === 'apr-chg1')?.approval?.resolution, 'changed');
+  } finally { engine.dispose(); }
+  assert.equal(foldTranscript([card, changed])[0]?.approval?.resolution, 'changed');
+  const declined = ev(3, 'approval_resolved', { approvalId: 'apr-chg1', decision: 'reject' });
+  assert.equal(foldTranscript([card, declined])[0]?.approval?.resolution, 'declined');
+  assert.equal(foldTranscript([card])[0]?.approval?.resolution, undefined);
+});
+
 test('stream death recovers by poll first and delivers the missed terminal', async () => {
   const transport = new FakeTransport();
   const delivered: HarnessEvent[] = [];

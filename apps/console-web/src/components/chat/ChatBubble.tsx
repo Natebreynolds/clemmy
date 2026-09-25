@@ -36,6 +36,12 @@ import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presenta
  * caret (styles.css `.chat-prose.is-streaming`).
  */
 /** "markdown_text" → "Markdown text": an argument name as a label. */
+function approvalResolutionText(resolution: 'approved' | 'declined' | 'changed'): string {
+  return resolution === 'changed'
+    ? 'You asked for a change — the revised version is below. Nothing was sent from this one.'
+    : resolution === 'declined' ? 'Declined — nothing was sent.' : 'Approved.';
+}
+
 function approvalFieldLabel(name: string): string {
   const words = name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase();
   return words ? words[0]!.toUpperCase() + words.slice(1) : name;
@@ -428,6 +434,11 @@ export function ChatBubble({
             {!canDecide ? (
               <p className="mt-2.5 text-caption text-muted">
                 This is a record of what was asked. Answer it where it is live — in Needs you.
+              </p>
+            ) : message.approval?.resolution && !pendingAction ? (
+              // Answered on the host's record, including by a written reply.
+              <p className="mt-2.5 text-caption text-muted" role="status">
+                {approvalResolutionText(message.approval.resolution)}
               </p>
             ) : setAside && !resolved ? (
               <p className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-muted" role="status">

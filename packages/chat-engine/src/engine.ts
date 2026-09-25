@@ -15,7 +15,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
 import type {
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
-import { approvalPreviewFrom } from './types.js';
+import { approvalPreviewFrom, approvalResolutionFrom } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
@@ -626,6 +626,15 @@ export class ChatEngine {
         this.busy = false;
         break;
       }
+      case 'approval_resolved': {
+        const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
+        const resolution = approvalResolutionFrom(d);
+        if (!approvalId || !resolution) break;
+        this.messages = this.messages.map((m) => (
+          m.approval?.approvalId === approvalId ? { ...m, approval: { ...m.approval, resolution } } : m
+        ));
+        break;
+      }
       case 'plan_revision_published': {
         const ref = readPlanRevisionRef(d.planArtifactRef ?? d.artifact);
         if (ref && this.terminalOwnsActiveTurn(event)) this.updateActive(message => ({ ...message, planArtifactRef: ref }));
@@ -1024,6 +1033,18 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
             ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
           },
         });
+        break;
+      }
+      case 'approval_resolved': {
+        const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
+        const resolution = approvalResolutionFrom(d);
+        if (!approvalId || !resolution) break;
+        for (let index = 0; index < messages.length; index += 1) {
+          const message = messages[index]!;
+          if (message.approval?.approvalId === approvalId) {
+            messages[index] = { ...message, approval: { ...message.approval, resolution } };
+          }
+        }
         break;
       }
       case 'async_work_dispatched': {
