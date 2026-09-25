@@ -1037,6 +1037,25 @@ function quotaResetHintMs(err: unknown): number | undefined {
   return Number.isFinite(secs) && secs > 0 ? secs * 1000 : undefined;
 }
 
+/**
+ * The memory extractor. It runs at low reasoning like the other memory jobs
+ * (owner decision 2026-09-25). On the owner's checker model it was the largest
+ * reviewer output cost: 72 runs in a day, about 1,500 output tokens and 21 s
+ * each at the model's default depth. Measured on one batch, low effort used
+ * 343 output tokens in 4.7 s against 2,195 in 20.8 s, keeping 4 facts, not 7.
+ */
+export function reflectionExtractorAgent(
+  model: NonNullable<ReturnType<typeof getReflectorModel>>,
+  instructions: string,
+): Agent {
+  return new Agent({
+    name: 'Reflection Extractor',
+    model,
+    instructions,
+    modelSettings: { reasoning: { effort: 'low' } },
+  });
+}
+
 async function runExtractor(
   serialized: string,
   options: { allowHedge: boolean } = { allowHedge: true },
@@ -1062,11 +1081,7 @@ async function runExtractor(
   // extraction pass. Clementine-owned sanitization below preserves the signal
   // and drops only fields/entries that cannot be made meaningful.
   const attempt = async (model: NonNullable<ReturnType<typeof getReflectorModel>>): Promise<Extraction | null> => {
-    const agent = new Agent({
-      name: 'Reflection Extractor',
-      model,
-      instructions,
-    });
+    const agent = reflectionExtractorAgent(model, instructions);
     const runner = new Runner({ workflowName: 'clementine-reflection' });
     const result = await runner.run(agent, serialized);
     const final = (result as { finalOutput?: unknown }).finalOutput;

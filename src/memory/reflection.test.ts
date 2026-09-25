@@ -53,6 +53,7 @@ const {
   _testOnly_sanitizeRecursivePatternOutput,
   _testOnly_sanitizeConflictDecision,
   _testOnly_reflectorRoute,
+  reflectionExtractorAgent,
 } = await import('./reflection.js');
 const { rememberFact, getFact, setFactPinned, listRecentlyLearnedFacts, renderRecentlyLearnedForInstructions } = await import('./facts.js');
 const { getFactEvidence, recordMemoryEpisode, reapExpiredPendingReflections } = await import('./temporal-memory.js');
@@ -132,6 +133,15 @@ test('reflection extractor binds to the active provider instead of a gpt-shaped 
       transport: 'byo_openai_compatible',
     });
   });
+});
+
+// Owner decision 2026-09-25: memory extraction runs at low reasoning. On the
+// owner's checker model it was the largest reviewer output cost of the day.
+test('the memory extractor asks its model for low reasoning', () => {
+  const agent = reflectionExtractorAgent({} as never, 'Extract durable facts.');
+  assert.equal(agent.name, 'Reflection Extractor');
+  assert.equal(agent.instructions, 'Extract durable facts.');
+  assert.deepEqual(agent.modelSettings.reasoning, { effort: 'low' });
 });
 
 test('entities: upsert is idempotent + merges aliases', () => {
