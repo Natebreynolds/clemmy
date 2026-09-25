@@ -17,6 +17,7 @@ import {
   createPendingMessageStore,
   type ComposerMode,
   type PlanRevisionRef,
+  answerDraftStatus,
   evidenceChips,
   liveActivityHeadline,
   narrateActivity,
@@ -513,6 +514,7 @@ function MessageRow({
   }
 
   const thinking = message.status === 'thinking';
+  const draftStatus = thinking ? answerDraftStatus(message.answerDraft) : null;
   const activity = narrateActivity(message.activity ?? [], { live: thinking });
   const planStatus = message.planProposalId
     ? (planOutcome[message.planProposalId] ?? message.planProposalStatus ?? 'pending')
@@ -565,12 +567,22 @@ function MessageRow({
         />
       ) : null}
       {message.text ? (
-        // Safe by construction: renderMarkdown escapes ALL input before adding
-        // markup, refuses raw HTML, and only links http(s).
-        <div
-          class={`reply bubble-md${thinking ? ' reply-writing' : ''}`}
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }}
-        />
+        <>
+          {/* Safe by construction: renderMarkdown escapes ALL input before
+              adding markup, refuses raw HTML, and only links http(s). A draft
+              that is being checked or corrected stays on screen (dimmed once
+              withdrawn) until the next draft or the reply replaces it. */}
+          <div
+            class={`reply bubble-md${thinking && !draftStatus ? ' reply-writing' : ''}${message.answerDraft?.phase === 'withdrawn' ? ' reply-withdrawn' : ''}`}
+            dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }}
+          />
+          {draftStatus ? (
+            <p class={`reply-draft-status${message.answerDraft?.withdrawn === 'review' ? ' is-correcting' : ''}`} role="status">
+              <span class="work-orb" aria-hidden="true" />
+              {draftStatus}
+            </p>
+          ) : null}
+        </>
       ) : thinking && activity.length === 0 ? (
         <div class="work"><div class="work-line work-live" role="status">
           <span class="work-orb" aria-hidden="true" />

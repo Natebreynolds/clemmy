@@ -164,7 +164,8 @@ import {
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
 } from './host-completion-work.js';
 import {
-  beginAnswerDraft, presentAnswerDraft, retractAnswerDraft, type AnswerDraftStep,
+  beginAnswerDraft, markAnswerDraftChecking, presentAnswerDraft, retractAnswerDraft,
+  type AnswerDraftRetractReason, type AnswerDraftStep,
 } from './answer-stream.js';
 import {
   isHostDurableContinuationPendingError,
@@ -4109,6 +4110,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let verdict: ObjectiveJudgeVerdict;
     const judgeStartedAt = Date.now();
     let preparation: ReturnType<typeof acceptedPlanPreparationReadEvidence>;
+    // The viewer sees that the finished draft is being checked, not a pause.
+    markAnswerDraftChecking(identity.sessionId, identity.sourceUserSeq);
     try {
       preparation = acceptedPlanPreparationReadEvidence(identity);
       const workflowEvidence = workflowParentActivation(identity.sessionId, identity.sourceUserSeq)?.completionEvidence?.();
@@ -8644,13 +8647,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   })();
   let remainingModelStallRetries = modelStreamStallRetries();
   let committedVerificationRecoveryChecked = false;
+  /** Why the host is taking another step after a shown draft, so the viewer
+   *  can say so instead of the draft silently disappearing. */
+  let nextDraftRetractReason: AnswerDraftRetractReason | undefined;
   for (let stepIndex = currentHostStepIndex; ; stepIndex += 1) {
     const activationContext = harnessRunContextStorage.getStore();
     if (activationContext) workflowParentActivation(activationContext.sessionId, activationContext.sourceUserSeq);
     currentHostStepIndex = stepIndex;
     // A draft still on screen from an earlier step did not become the answer:
     // the host is taking another step instead of delivering it.
-    if (answerOwner) retractAnswerDraft(answerOwner.sessionId, answerOwner.sourceUserSeq);
+    if (answerOwner) retractAnswerDraft(answerOwner.sessionId, answerOwner.sourceUserSeq, nextDraftRetractReason ?? 'continuation');
+    nextDraftRetractReason = undefined;
     const recoveryFrameThisStep = recoveredToolFrame;
     const consumingRecoveredFrame = recoveryFrameThisStep !== undefined;
     checkpointRecoveryFrameInProgress = consumingRecoveredFrame;
@@ -9357,7 +9364,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // Only an admitted completed frame proposes a reply; its admitted text,
     // not the raw stream, is what the draft settles on.
     if (admission.admitted && admission.frame.kind === 'completed') answerDraft?.complete(admission.frame.text);
-    else answerDraft?.retract();
+    else answerDraft?.retract(admission.admitted ? 'tool_call' : undefined);
     if (!admission.admitted) {
       if (admission.reason === 'provider_limit_hit') {
         // A response window limits one emission, not the accepted job. None
@@ -9611,12 +9618,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const writer = hostWriterForStep || consumingRecoveredFrame ? undefined : armHostWriter(admission.frame.text, step, stepIndex);
         if (writer) {
           pendingHostWriter = writer;
+          nextDraftRetractReason = 'writer';
           continue;
         }
         // The draft goes to review as written, so a held draft is shown now.
         if (answerOwner) presentAnswerDraft(answerOwner.sessionId, answerOwner.sourceUserSeq);
         const judged = await judgeHostCompletion(admission.frame.text, admission.frame.history, step.responseId);
-        if (judged === 'continue') continue;
+        if (judged === 'continue') {
+          nextDraftRetractReason = 'review';
+          continue;
+        }
         if (judged === 'awaiting_user_input') {
           history.push(...admission.frame.history);
           if (step.responseId !== undefined) lastResponseId = step.responseId;

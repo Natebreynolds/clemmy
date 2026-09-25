@@ -2,24 +2,26 @@
  * Run: node scripts/run-tests-isolated.mjs packages/chat-engine/src/answer-stream.test.ts
  *
  * The client half of the answer stream: offset-0 frames replace the draft,
- * matching offsets extend it, anything else is ignored, a retraction restores
- * what the message said before, and a draft is never read as the reply.
+ * matching offsets extend it, anything else is ignored, a withdrawn draft
+ * stays on screen (provisional) until the next draft or an authoritative event
+ * replaces it, and a draft is never read as the reply.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { HarnessEvent } from './types.js';
-import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
+import type { HarnessEvent, LiveAnswerDraft } from './types.js';
+import { answerDraftStatus, applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { ChatEngine } from './engine.js';
 import type { StreamConnection, StreamTransport } from './stream.js';
 
 const place = (streamId: string, offset: number, delta: string, sourceUserSeq = 2) =>
   ({ public: true, streamId, offset, delta, sourceUserSeq });
-const reset = (streamId: string) => ({ public: true, streamId, reset: true });
+const reset = (streamId: string, reason?: string) => ({ public: true, streamId, reset: true, ...(reason ? { reason } : {}) });
+const checking = (streamId: string) => ({ public: true, streamId, checking: true });
 
 test('offset 0 replaces, a matching offset extends, and anything else is ignored', () => {
-  let m = { text: 'Sure — checking your calendar.' } as { text: string; answerDraft?: { id: string; base: string } };
+  let m = { text: 'Sure — checking your calendar.' } as { text: string; answerDraft?: LiveAnswerDraft };
   m = applyStreamToken(m, place('a', 0, 'You have three'));
-  assert.deepEqual(m, { text: 'You have three', answerDraft: { id: 'a', base: 'Sure — checking your calendar.' } });
+  assert.deepEqual(m, { text: 'You have three', answerDraft: { id: 'a', base: 'Sure — checking your calendar.', phase: 'writing' } });
   m = applyStreamToken(m, place('a', 14, ' meetings'));
   assert.equal(m.text, 'You have three meetings');
   assert.equal(applyStreamToken(m, place('a', 14, ' meetings')), m, 'a duplicate offset is inert');
@@ -27,10 +29,36 @@ test('offset 0 replaces, a matching offset extends, and anything else is ignored
   assert.equal(applyStreamToken(m, place('b', 3, 'other draft')), m, 'another draft cannot extend this one');
   assert.equal(applyStreamToken(m, reset('b')), m, 'another draft cannot retract this one');
   const replaced = applyStreamToken(m, place('b', 0, 'You have four meetings'));
-  assert.deepEqual(replaced.answerDraft, { id: 'b', base: 'Sure — checking your calendar.' }, 'the original base survives');
-  const retracted = applyStreamToken(replaced, reset('b'));
-  assert.deepEqual(retracted, { text: 'Sure — checking your calendar.', answerDraft: undefined });
+  assert.deepEqual(replaced.answerDraft, { id: 'b', base: 'Sure — checking your calendar.', phase: 'writing' }, 'the original base survives');
   assert.deepEqual(withoutAnswerDraft(m), { text: 'Sure — checking your calendar.', answerDraft: undefined });
+});
+
+test('a withdrawn draft stays on screen, provisional, until the next draft replaces it in place', () => {
+  let m = { text: '' } as { text: string; answerDraft?: LiveAnswerDraft };
+  m = applyStreamToken(m, place('a', 0, 'Deal owners: Ana, Ben'));
+  m = applyStreamToken(m, checking('a'));
+  assert.equal(m.answerDraft?.phase, 'checking');
+  assert.equal(answerDraftStatus(m.answerDraft), 'Checking this answer…');
+  m = applyStreamToken(m, reset('a', 'review'));
+  assert.equal(m.text, 'Deal owners: Ana, Ben', 'the draft does not vanish');
+  assert.deepEqual(m.answerDraft, { id: 'a', base: '', phase: 'withdrawn', withdrawn: 'review' });
+  assert.equal(answerDraftStatus(m.answerDraft), 'Found issues, correcting…');
+  assert.equal(applyStreamToken(m, place('a', 21, ' and Cy')), m, 'a withdrawn draft is never extended');
+  m = applyStreamToken(m, place('b', 0, 'Deal owners: Ana, Dee'));
+  assert.equal(m.text, 'Deal owners: Ana, Dee', 'the corrected draft replaces it in place');
+  assert.deepEqual(m.answerDraft, { id: 'b', base: '', phase: 'writing' });
+  assert.equal(answerDraftStatus(m.answerDraft), null);
+  assert.deepEqual(withoutAnswerDraft(m), { text: '', answerDraft: undefined }, 'no draft is ever the delivered reply');
+});
+
+test('a withdrawal for any other reason reads neutrally', () => {
+  const empty: { text: string; answerDraft?: LiveAnswerDraft } = { text: '' };
+  for (const reason of ['tool_call', 'writer', 'continuation', undefined, 'made-up']) {
+    const m = applyStreamToken(applyStreamToken(empty, place('a', 0, 'A long enough draft')), reset('a', reason));
+    assert.equal(answerDraftStatus(m.answerDraft), 'Still working…', String(reason));
+  }
+  const attached = applyStreamToken(empty, { ...place('a', 0, 'Checked draft'), checking: true });
+  assert.equal(attached.answerDraft?.phase, 'checking', 'a viewer attaching mid-review sees the review');
 });
 
 test('a frame without a draft identity keeps the old plain-append behavior', () => {
@@ -71,14 +99,15 @@ async function liveEngine() {
   return { engine, live: transport.live!, reply };
 }
 
-test('the engine shows a draft over the preamble, restores it on retraction, and lets the terminal replace it', async () => {
+test('the engine shows a draft over the preamble, keeps a rejected one until the correction, and lets the terminal replace it', async () => {
   const { engine, live, reply } = await liveEngine();
   live.onEvent(durable(3, 'conversation_preamble', { text: 'Checking your calendar.' }));
   live.onEvent(frame(place('d1', 0, 'Thursday has three meetings')));
   assert.equal(reply().text, 'Thursday has three meetings');
   assert.equal(reply().answerDraft?.id, 'd1');
-  live.onEvent(frame(reset('d1')));
-  assert.equal(reply().text, 'Checking your calendar.', 'a rejected draft leaves nothing of itself behind');
+  live.onEvent(frame(reset('d1', 'review')));
+  assert.equal(reply().text, 'Thursday has three meetings', 'a rejected draft stays on screen while it is corrected');
+  assert.equal(answerDraftStatus(reply().answerDraft), 'Found issues, correcting…');
   live.onEvent(frame(place('d2', 0, 'Thursday has four meetings')));
   live.onEvent(frame(place('d2', 26, ', the first at 9.')));
   assert.equal(reply().text, 'Thursday has four meetings, the first at 9.');
@@ -97,6 +126,15 @@ test('a draft is never kept as the answer by a terminal, a failure, or a questio
     live.onEvent(frame(place('d1', 0, 'An unreviewed draft')));
     live.onEvent(durable(5, 'conversation_completed', { reason: 'completed' }));
     assert.notEqual(reply().text, 'An unreviewed draft', 'an empty terminal does not promote the draft');
+    engine.dispose();
+  }
+  {
+    const { engine, live, reply } = await liveEngine();
+    live.onEvent(frame(place('d1', 0, 'A withdrawn draft')));
+    live.onEvent(frame(reset('d1', 'review')));
+    live.onEvent(durable(5, 'conversation_completed', { reason: 'completed' }));
+    assert.notEqual(reply().text, 'A withdrawn draft', 'a withdrawn draft kept on screen is never promoted either');
+    assert.equal(reply().answerDraft, undefined);
     engine.dispose();
   }
   {

@@ -11,6 +11,7 @@ import {
   beginAnswerDraft,
   completedDraftReply,
   liveDraftView,
+  markAnswerDraftChecking,
   presentAnswerDraft,
   resetAnswerStreamForTests,
   retractAnswerDraft,
@@ -42,6 +43,49 @@ function viewer(sessionId = SESSION): { frames: EventRow[]; detach: () => void; 
 }
 
 afterEach(() => resetAnswerStreamForTests());
+
+test('a viewer is told the finished draft is being checked, and why a draft is withdrawn', async () => {
+  const view = viewer();
+  const first = beginAnswerDraft({ sessionId: SESSION, sourceUserSeq: SOURCE, mode: 'live' });
+  first.text(LONG_ANSWER);
+  first.complete(LONG_ANSWER);
+  markAnswerDraftChecking(SESSION, SOURCE);
+  assert.deepEqual(view.frames.at(-1)?.data, { public: true, streamId: first.streamId, checking: true, sourceUserSeq: SOURCE });
+  markAnswerDraftChecking(SESSION, SOURCE);
+  assert.equal(view.frames.filter((f) => f.data.checking === true).length, 1, 'the marker is sent once');
+  // A viewer opening the chat mid-review sees the draft and that it is being checked.
+  const late = viewer();
+  assert.equal(late.frames[0]?.data.checking, true);
+  assert.equal(late.text(), LONG_ANSWER);
+  late.detach();
+
+  retractAnswerDraft(SESSION, SOURCE, 'review');
+  assert.equal(view.frames.at(-1)?.data.reset, true);
+  assert.equal(view.frames.at(-1)?.data.reason, 'review');
+
+  const call = beginAnswerDraft({ sessionId: SESSION, sourceUserSeq: SOURCE, mode: 'live' });
+  call.text(`${LONG_ANSWER} Next I will `);
+  await flushed();
+  call.toolCall();
+  assert.equal(view.frames.at(-1)?.data.reason, 'tool_call');
+
+  const writing = beginAnswerDraft({ sessionId: SESSION, sourceUserSeq: SOURCE, mode: 'live' });
+  writing.text(LONG_ANSWER);
+  await flushed();
+  markAnswerDraftChecking(SESSION, SOURCE);
+  assert.notEqual(view.frames.at(-1)?.data.checking, true, 'a draft still being written is not under review');
+});
+
+test('only the closed vocabulary of withdrawal reasons reaches a viewer', () => {
+  const at = (data: Record<string, unknown>) => projectHarnessEventForPublic({
+    seq: 0, id: 'f', sessionId: SESSION, turn: 0, role: 'Clem', type: 'stream_token',
+    parentEventId: null, createdAt: new Date().toISOString(), data: { public: true, streamId: 's-1', ...data },
+  })?.data;
+  assert.deepEqual(at({ reset: true, reason: 'review' }), { public: true, streamId: 's-1', reset: true, reason: 'review' });
+  assert.deepEqual(at({ reset: true, reason: 'the reviewer said the rep names were wrong' }), { public: true, streamId: 's-1', reset: true });
+  assert.deepEqual(at({ checking: true }), { public: true, streamId: 's-1', checking: true });
+  assert.deepEqual(at({ checking: 'yes' }), undefined);
+});
 
 test('live view reads the reply the turn contract would read, cut back to whole words', () => {
   assert.deepEqual(liveDraftView('Here are'), { status: 'pending' }, 'a short head could still be a marker');

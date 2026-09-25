@@ -13,8 +13,17 @@
  *     corrected draft, or the text so far for a client that just attached.
  *     A client ignores a frame whose offset is neither 0 nor the length it
  *     already holds for that draft.
- *   { public, streamId, sourceUserSeq, reset: true }
- *     The draft will not become the answer; the client removes it.
+ *   { public, streamId, sourceUserSeq, checking: true }
+ *     The finished draft is with the reviewer. An offset-0 frame for a
+ *     viewer attaching mid-review carries `checking: true` as well.
+ *   { public, streamId, sourceUserSeq, reset: true, reason? }
+ *     The draft will not become the answer. The client may keep its words on
+ *     screen, marked provisional, until the next draft's offset-0 frame or
+ *     the terminal reply replaces them; it never delivers them. `reason` says
+ *     why: `review` (the reviewer sent it back), `tool_call` (the step turned
+ *     into tool calls), `writer` (a chosen writer is rewriting it), or
+ *     `continuation` (the host is taking another step). No reason means the
+ *     draft stopped being showable.
  *
  * One draft per model step. A draft is retracted when its step turns into
  * tool calls, fails or is not admitted, and when the host takes any further
@@ -39,6 +48,9 @@ import { streamingReplyHead, toOrchestratorDecision } from './turn-decision.js';
 /** `held` drafts are not shown while written; see presentAnswerDraft. */
 export type AnswerDraftMode = 'live' | 'held';
 
+/** Why a shown draft will not become the answer. */
+export type AnswerDraftRetractReason = 'review' | 'tool_call' | 'writer' | 'continuation';
+
 /** One model step's view of the stream. Every method is observational. */
 export interface AnswerDraftStep {
   readonly streamId: string;
@@ -49,7 +61,7 @@ export interface AnswerDraftStep {
   /** The step was admitted as a completed reply with this exact text. */
   complete(frameText: string): void;
   /** The step's text will not become the answer. */
-  retract(): void;
+  retract(reason?: AnswerDraftRetractReason): void;
 }
 
 const FLUSH_MS = 75;
@@ -153,6 +165,8 @@ class AnswerDraft implements AnswerDraftStep {
   private frameText = '';
   private reply: string | undefined;
   private state: 'writing' | 'written' | 'closed' = 'writing';
+  /** The reviewer has the finished draft. */
+  private checking = false;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
@@ -176,7 +190,7 @@ class AnswerDraft implements AnswerDraftStep {
   }
 
   toolCall(): void {
-    this.retract();
+    this.retract('tool_call');
   }
 
   complete(frameText: string): void {
@@ -194,12 +208,19 @@ class AnswerDraft implements AnswerDraftStep {
     if (hasViewers(this.sessionId)) this.showWritten();
   }
 
-  retract(): void {
+  /** The finished, shown draft is with the reviewer. */
+  markChecking(): void {
+    if (this.state !== 'written' || this.mode !== 'live' || this.checking) return;
+    this.checking = true;
+    if (this.published) broadcast(this, { checking: true });
+  }
+
+  retract(reason?: AnswerDraftRetractReason): void {
     if (this.state === 'closed') return;
     this.close();
     if (!this.published) return;
     this.published = '';
-    broadcast(this, { reset: true });
+    broadcast(this, { reset: true, ...(reason ? { reason } : {}) });
   }
 
   /** A terminal superseded the draft on every client; nothing to retract. */
@@ -224,7 +245,7 @@ class AnswerDraft implements AnswerDraftStep {
     if (this.state === 'writing') this.flush();
     else if (this.state === 'written' && this.mode === 'live') this.showWritten();
     return this.state !== 'closed' && this.published
-      ? streamFrame(this, { offset: 0, delta: this.published })
+      ? streamFrame(this, { offset: 0, delta: this.published, ...(this.checking ? { checking: true } : {}) })
       : null;
   }
 
@@ -300,9 +321,15 @@ export function presentAnswerDraft(sessionId: string, sourceUserSeq: number): vo
 
 /** The session's current draft, if it belongs to this source, is not the
  *  answer. */
-export function retractAnswerDraft(sessionId: string, sourceUserSeq?: number): void {
+export function retractAnswerDraft(sessionId: string, sourceUserSeq?: number, reason?: AnswerDraftRetractReason): void {
   const draft = drafts.get(sessionId);
-  if (draft && (sourceUserSeq === undefined || draft.sourceUserSeq === sourceUserSeq)) draft.retract();
+  if (draft && (sourceUserSeq === undefined || draft.sourceUserSeq === sourceUserSeq)) draft.retract(reason);
+}
+
+/** The reviewer is now reading this source's finished draft. */
+export function markAnswerDraftChecking(sessionId: string, sourceUserSeq: number): void {
+  const draft = drafts.get(sessionId);
+  if (draft?.sourceUserSeq === sourceUserSeq) draft.markChecking();
 }
 
 /**

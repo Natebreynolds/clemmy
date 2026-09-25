@@ -351,12 +351,21 @@ function publicStreamTokenData(data: Record<string, unknown>): Record<string, un
   const sourceUserSeq = Number.isSafeInteger(data.sourceUserSeq) && Number(data.sourceUserSeq) > 0
     ? { sourceUserSeq: Number(data.sourceUserSeq) }
     : {};
-  if (data.reset === true) return { public: true, streamId, reset: true, ...sourceUserSeq };
+  if (data.reset === true) {
+    const reason = typeof data.reason === 'string' && PUBLIC_STREAM_RESET_REASONS.has(data.reason) ? { reason: data.reason } : {};
+    return { public: true, streamId, reset: true, ...reason, ...sourceUserSeq };
+  }
   const offset = Number.isSafeInteger(data.offset) && Number(data.offset) >= 0 ? Number(data.offset) : -1;
   const delta = typeof data.delta === 'string' ? data.delta : '';
+  const checking = data.checking === true ? { checking: true } : {};
+  // A review marker on its own carries no text.
+  if (offset < 0 && !delta && data.checking === true) return { public: true, streamId, checking: true, ...sourceUserSeq };
   if (offset < 0 || !delta) return null;
-  return { public: true, streamId, offset, delta, ...sourceUserSeq };
+  return { public: true, streamId, offset, delta, ...checking, ...sourceUserSeq };
 }
+
+/** Why a draft was withdrawn: the answer stream's closed vocabulary. */
+const PUBLIC_STREAM_RESET_REASONS: ReadonlySet<string> = new Set(['review', 'tool_call', 'writer', 'continuation']);
 
 function stringList(value: unknown, max = 12): string[] {
   return Array.isArray(value)

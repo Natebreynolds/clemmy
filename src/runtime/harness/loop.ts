@@ -6662,7 +6662,7 @@ async function runConversationCore(
     stepIndex += 1;
     // Every delivery leaves this loop, so a later step means the draft the
     // previous one left on screen was not delivered (answer-stream.ts).
-    if (stepIndex > 1) retractAnswerDraft(options.sessionId, activeSourceUserSeq);
+    if (stepIndex > 1) retractAnswerDraft(options.sessionId, activeSourceUserSeq, 'continuation');
     // A stall judge may rescue prose that the deterministic parser rejected,
     // but it only establishes "this is a reply", never "the objective is done".
     // Keep the origin for telemetry while the synthesized decision traverses

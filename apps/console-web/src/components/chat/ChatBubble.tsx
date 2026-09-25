@@ -3,7 +3,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { renderMarkdown } from '@clem/chat-engine';
+import { answerDraftStatus, renderMarkdown } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -42,6 +42,30 @@ function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boo
       // eslint-disable-next-line react/no-danger -- renderMarkdown escapes all input first
       dangerouslySetInnerHTML={{ __html: renderMarkdown(text, { workspaceLinks: false }) }}
     />
+  );
+}
+
+/** A draft stays on the page while it is checked or corrected: a withdrawn
+ *  one dims until the next draft or the delivered reply replaces it in
+ *  place, and a line underneath says where it stands. */
+function DraftFrame({ draft, children }: { draft: ChatMessage['answerDraft']; children: React.ReactNode }) {
+  const status = answerDraftStatus(draft);
+  const withdrawn = draft?.phase === 'withdrawn';
+  return (
+    <>
+      <div className={cn('transition-opacity duration-base', withdrawn && 'opacity-60')} aria-busy={status ? true : undefined}>
+        {children}
+      </div>
+      {status && (
+        <p className={cn('flex items-center gap-2 text-small', withdrawn && draft?.withdrawn === 'review' ? 'text-warning' : 'text-muted')} role="status">
+          <span className="relative flex h-2 w-2" aria-hidden>
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current opacity-40 motion-reduce:animate-none" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
+          </span>
+          {status}
+        </p>
+      )}
+    </>
   );
 }
 
@@ -336,7 +360,15 @@ export function ChatBubble({
         <>
           {message.taskMode?.kind === 'plan' && <div className="text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
           {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={executionBusy} onPrepare={onPreparePlan} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
-          {hasReplyText && <ReplyProse text={message.text} streaming={thinking} failed={message.status === 'failed'} />}
+          {hasReplyText && (
+            <DraftFrame draft={message.answerDraft}>
+              <ReplyProse
+                text={message.text}
+                streaming={thinking && message.answerDraft?.phase !== 'withdrawn' && message.answerDraft?.phase !== 'checking'}
+                failed={message.status === 'failed'}
+              />
+            </DraftFrame>
+          )}
 
         {(message.status === 'awaiting-approval' || message.status === 'awaiting-plan') && (
           <div className="rounded-md border border-warning/40 bg-warning-tint p-3">

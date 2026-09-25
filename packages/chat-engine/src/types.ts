@@ -174,13 +174,24 @@ export interface ChatMessage {
 }
 
 /** A provisional reply still being written or reviewed. `text` shows it; the
- *  delivered reply replaces it, and a retraction restores `base`. */
+ *  delivered reply replaces it. A withdrawn draft keeps its words on screen,
+ *  provisional, until the next draft or an authoritative event replaces them
+ *  (which restores `base` first). */
 export interface LiveAnswerDraft {
   /** The server's draft identity (`streamId`). */
   id: string;
   /** What the message said before the draft replaced it. */
   base: string;
+  /** `writing` while it streams, `checking` while the reviewer reads the
+   *  finished draft, `withdrawn` once it will not become the answer. */
+  phase?: 'writing' | 'checking' | 'withdrawn';
+  /** Why a withdrawn draft was withdrawn. */
+  withdrawn?: AnswerDraftWithdrawal;
 }
+
+/** The server's reset reasons, plus `other` for a draft that stopped being
+ *  showable without one. */
+export type AnswerDraftWithdrawal = 'review' | 'tool_call' | 'writer' | 'continuation' | 'other';
 
 /** What the transport layer is doing right now, for an honest connection pill. */
 export type ConnectionState =

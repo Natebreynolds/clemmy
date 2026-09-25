@@ -1324,6 +1324,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .reply-ghost { color: var(--fg-3); }
 /* Live text, still being written: a caret is the only difference, so nothing
    shifts when the finished reply lands. */
+/* A withdrawn draft stays readable but provisional until something replaces it. */
+.reply-withdrawn { opacity: 0.6; transition: opacity var(--clem-dur, 180ms) ease; }
+.reply-draft-status {
+  display: flex; align-items: center; gap: 10px; margin: 8px 0 0;
+  font-size: var(--t-xs); font-weight: 600; color: var(--fg-2);
+}
+.reply-draft-status.is-correcting { color: var(--accent-warn); }
 .reply-writing::after {
   content: '';
   display: inline-block;
