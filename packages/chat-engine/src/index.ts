@@ -8,6 +8,7 @@ export * from './reduce-lifecycle.js';
 export * from './evidence-presentation.js';
 export * from './terminal-presentation.js';
 export * from './stream.js';
+export * from './answer-stream.js';
 export * from './engine.js';
 export * from './markdown.js';
 export * from './task-mode.js';

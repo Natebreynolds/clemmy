@@ -161,6 +161,17 @@ export interface ChatMessage {
   /** Present only while this assistant bubble represents exact, source-bound
    * delegated workflow work. A canonical terminal removes the control. */
   delegatedWork?: DelegatedWorkControl;
+  /** Present only while `text` is a live answer draft; see answer-stream.ts. */
+  answerDraft?: LiveAnswerDraft;
+}
+
+/** A provisional reply still being written or reviewed. `text` shows it; the
+ *  delivered reply replaces it, and a retraction restores `base`. */
+export interface LiveAnswerDraft {
+  /** The server's draft identity (`streamId`). */
+  id: string;
+  /** What the message said before the draft replaced it. */
+  base: string;
 }
 
 /** What the transport layer is doing right now, for an honest connection pill. */

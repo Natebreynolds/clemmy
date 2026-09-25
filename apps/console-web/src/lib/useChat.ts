@@ -1,7 +1,7 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
-import type { TerminalFacts } from '@clem/chat-engine';
-import { readLiveApprovalControl, terminalCompletionPresentation } from '@clem/chat-engine';
+import type { LiveAnswerDraft, TerminalFacts } from '@clem/chat-engine';
+import { applyStreamToken, readLiveApprovalControl, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -87,6 +87,8 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  /** Present only while `text` is a live answer draft (chat-engine answer-stream). */
+  answerDraft?: LiveAnswerDraft;
   status?: MessageStatus;
   /** Client clock when this reply's turn started — the recall receipts for the
    *  turn are read back "since" this moment. */
@@ -1374,18 +1376,16 @@ export function useChat(options?: UseChatOptions) {
       return;
     }
     if (ev.type === 'stream_token') {
-      // Token-level streaming: append delta to current assistant text
-      const delta = typeof d.delta === 'string' ? d.delta : '';
-      if (delta) {
-        setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + delta } : m)));
-      }
+      // The live answer draft: provisional text the terminal reply replaces.
+      setMessages((prev) => prev.map((m) => (m.id === assistantId ? applyStreamToken(m, d) : m)));
     } else if (ev.type === 'async_work_dispatched') {
       awaitingWorkflowReportRef.current = true;
       const ack = typeof d.text === 'string' && d.text.trim()
         ? d.text.trim()
         : 'Started — I’ll post the result here when it’s ready.';
-      setMessages((prev) => prev.map((m) => {
-        if (m.id !== assistantId) return m;
+      setMessages((prev) => prev.map((current) => {
+        if (current.id !== assistantId) return current;
+        const m = withoutAnswerDraft(current);
         const activity = reduceActivity(m.activity ?? EMPTY_ACTIVITY, ev);
         return {
           ...m,
@@ -1404,13 +1404,15 @@ export function useChat(options?: UseChatOptions) {
       const reason = typeof d.reason === 'string' ? d.reason : '';
       const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : '';
       if (reason === 'plan_first' && planProposalId) {
-        patch(assistantId, { text: text || 'I drafted a plan — approve it to go ahead.', status: 'awaiting-plan', planProposalId, progress: undefined });
+        patch(assistantId, { text: text || 'I drafted a plan — approve it to go ahead.', status: 'awaiting-plan', planProposalId, progress: undefined, answerDraft: undefined });
       } else {
         // Keep already-streamed human output when the terminal envelope omits
         // its duplicate reply. With neither source present, fail closed: an
-        // empty/reasoning-only terminal event is not a successful answer.
-        setMessages((prev) => prev.map((m) => {
-          if (m.id !== assistantId) return m;
+        // empty/reasoning-only terminal event is not a successful answer. A
+        // live answer draft is never that output: the terminal replaces it.
+        setMessages((prev) => prev.map((current) => {
+          if (current.id !== assistantId) return current;
+          const m = withoutAnswerDraft(current);
           const activity = reduceActivity(m.activity ?? EMPTY_ACTIVITY, ev);
           return {
             ...m,
@@ -1429,17 +1431,17 @@ export function useChat(options?: UseChatOptions) {
       // while the retry was already succeeding underneath).
       // A transport retry (the model backend never answered) is named as such;
       // the malformed-reply wording stays for the structured-decision repair.
-      patch(assistantId, { text: '', progress: d.kind === 'model_transport_retry'
+      patch(assistantId, { text: '', answerDraft: undefined, progress: d.kind === 'model_transport_retry'
         ? 'The model backend didn’t respond — retrying…'
         : 'First attempt came back malformed — retrying now…' });
     } else if (ev.type === 'run_failed') {
       const errStr = String(d.error ?? '').trim();
       const text = !errStr || looksRawError(errStr) ? GENERIC_TURN_ERROR : `Something went wrong: ${errStr}`;
-      patch(assistantId, { text, status: 'failed', progress: undefined });
+      patch(assistantId, { text, status: 'failed', progress: undefined, answerDraft: undefined });
     } else if (ev.type === 'conversation_limit_exceeded') {
       patch(assistantId, { status: 'stopped', progress: undefined });
     } else if (ev.type === 'awaiting_user_input') {
-      patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined });
+      patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, answerDraft: undefined });
     } else if (ev.type === 'approval_requested') {
       setMessages((prev) => appendLiveApprovalCard(prev, ev));
     } else if (ev.type === 'conversation_check_in') {
