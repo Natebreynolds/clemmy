@@ -9,7 +9,7 @@
  */
 import { test, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -128,19 +128,46 @@ test('a declared repair lists its values, runs one bounded argv, and refuses any
   const unknown = await call({ action: 'repair', catalogId: 'salesforce', repairId: 'invented', values: { org: 'x@y.z' } });
   assert.match(unknown, /No declared repair/);
 
-  for (const org of ['a; rm -rf /', 'a b', '$(whoami)', '']) {
-    const refused = await call({ action: 'repair', catalogId: 'salesforce', repairId: 'salesforce.default-org', values: { org } });
-    assert.match(refused, /was not run/, JSON.stringify(org));
-  }
+  // A repair resolves `sf` on the real (augmented) PATH; the probe resolver
+  // above never reaches it. Without a fixture this spawned whatever Salesforce
+  // CLI the machine happened to have (on a dev laptop, the user's real `sf`,
+  // which sat out the 30 s repair timeout) and failed outright on the Linux
+  // runner, which has none. This `sf` only records the argv it was given.
+  // augmentPath PREPENDS well-known tool dirs (/usr/local/bin, /opt/homebrew/bin,
+  // ...) that PATH lacks, so augment first (idempotent) and put the fixture in
+  // front of all of them.
+  const { augmentPath } = await import('../runtime/spawn-env.js');
+  const binDir = path.join(TMP_HOME, 'bin');
+  const invocations = path.join(TMP_HOME, 'sf-invocations.jsonl');
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(path.join(binDir, 'sf'), [
+    `#!${process.execPath}`,
+    `require('node:fs').appendFileSync(${JSON.stringify(invocations)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+  ].join('\n'), 'utf8');
+  chmodSync(path.join(binDir, 'sf'), 0o700);
+  writeFileSync(invocations, '', 'utf8');
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${augmentPath(priorPath)}`;
+  try {
+    for (const org of ['a; rm -rf /', 'a b', '$(whoami)', '']) {
+      const refused = await call({ action: 'repair', catalogId: 'salesforce', repairId: 'salesforce.default-org', values: { org } });
+      assert.match(refused, /was not run/, JSON.stringify(org));
+    }
 
-  // The resolver above points every catalog command at this node binary, so the
-  // repair really spawns: argv reaches the process and nothing is interpreted.
-  const ran = await call({
-    action: 'repair', catalogId: 'salesforce', repairId: 'salesforce.default-org',
-    values: { org: 'someone@example.test' },
-  });
-  assert.match(ran, /Set the default Salesforce org|failed/);
-  assert.doesNotMatch(ran, /cannot run|unable to run/i);
+    // The repair really spawns: argv reaches the process and nothing is interpreted.
+    const ran = await call({
+      action: 'repair', catalogId: 'salesforce', repairId: 'salesforce.default-org',
+      values: { org: 'someone@example.test' },
+    });
+    assert.match(ran, /Set the default Salesforce org — done: sf config set target-org=someone@example\.test --global/);
+    assert.doesNotMatch(ran, /cannot run|unable to run/i);
+  } finally {
+    if (priorPath === undefined) delete process.env.PATH;
+    else process.env.PATH = priorPath;
+  }
+  const spawned = readFileSync(invocations, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  assert.deepEqual(spawned, [['config', 'set', 'target-org=someone@example.test', '--global']],
+    'exactly one spawn — refused values never reach the process — with the declared argv and the value as one argument');
 });
 
 test('a planning turn may run a declared repair, and may not run an undeclared one', async () => {
