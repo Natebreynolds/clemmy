@@ -17,10 +17,13 @@ import {
   createPendingMessageStore,
   type ComposerMode,
   type PlanRevisionRef,
-  evidenceSummary,
+  evidenceChips,
   liveActivityHeadline,
   narrateActivity,
+  observedEvidenceChips,
   renderMarkdown,
+  turnModelName,
+  turnReview,
   type ActivityItem,
   type ChatMessage,
   type EngineSnapshot,
@@ -336,7 +339,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             {initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.' : 'Type a message to start a new chat.'}
           </div>
         ) : null}
-        {messages.map((message) => (
+        {messages.map((message, index) => (
           <MessageRow
             key={message.id}
             message={message}
@@ -352,6 +355,13 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             onApprovalAction={actOnApproval}
             onRetry={(id) => void engine.retry(id)}
             onDiscard={(id) => engine.discard(id)}
+            // Suggested answers stay tappable only while the question is the
+            // newest message; once anything follows it, they are a record.
+            onAnswer={index === messages.length - 1 ? (text) => {
+              haptic('light');
+              void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
+                .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
+            } : undefined}
             onDelegatedStateChange={(sourceUserSeq, state) => {
               engine.setDelegatedWorkState(sourceUserSeq, state);
             }}
@@ -365,11 +375,16 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       <div class="chat-dock-fade" aria-hidden="true" />
       <div ref={dockRef} class={`chat-dock${listening ? ' listening' : ''}`}>
         <div class="chat-mode-bar">
-          <button type="button" aria-pressed={planning} disabled={busy}
-            onClick={() => setComposerMode(mode => mode === 'plan' ? 'normal' : 'plan')}>Plan</button>
-          <span>{executing ? 'Executing the reviewed plan' : busy && snapshot?.activeTaskMode?.kind === 'plan'
-            ? 'Planning · investigating with read-only tools'
-            : composerMode === 'plan' ? 'Plan mode · review before Execute' : 'Normal · handle the task'}</span>
+          <div class="chat-mode-seg" role="group" aria-label="Mode">
+            <button type="button" aria-pressed={!planning} disabled={busy}
+              onClick={() => setComposerMode('normal')}>Act</button>
+            <button type="button" aria-pressed={planning} disabled={busy}
+              onClick={() => setComposerMode('plan')}>Plan</button>
+          </div>
+          <span role="status">{executing ? 'Executing the reviewed plan' : busy && snapshot?.activeTaskMode?.kind === 'plan'
+            ? 'Planning · read-only tools'
+            : busy ? 'Anything you send reaches her mid-run'
+              : composerMode === 'plan' ? 'Shows you the steps first' : 'Does it now'}</span>
         </div>
         <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
           {dictation ? (
@@ -390,7 +405,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             class="chat-input"
             rows={1}
             aria-label="Message Clem"
-            placeholder={listening ? 'Listening…' : planning ? 'What should we plan?' : 'Message Clem…'}
+            placeholder={listening ? 'Listening…' : busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : 'Message Clem…'}
             value={draft}
             enterkeyhint="send"
             autocomplete="off"
@@ -456,7 +471,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 function MessageRow({
   message, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction,
-  onDelegatedStateChange, onDelegatedChanged,
+  onDelegatedStateChange, onDelegatedChanged, onAnswer,
 }: {
   message: ChatMessage;
   sessionId?: string;
@@ -476,6 +491,9 @@ function MessageRow({
     state: 'running' | 'cancelling' | 'stopped',
   ) => void;
   onDelegatedChanged: () => void;
+  /** Send a suggested answer as the reply, exactly as if it were typed.
+   *  Absent once the question is no longer the newest message. */
+  onAnswer?: (text: string) => void;
 }) {
   if (message.role === 'user') {
     return (
@@ -553,7 +571,10 @@ function MessageRow({
           dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }}
         />
       ) : thinking && activity.length === 0 ? (
-        <div class="reply reply-ghost">Thinking…</div>
+        <div class="work"><div class="work-line work-live" role="status">
+          <span class="work-orb" aria-hidden="true" />
+          <span class="work-summary work-shimmer">{message.progress ?? 'Thinking…'}</span>
+        </div></div>
       ) : null}
       {/* Mirror the backend's TYPED terminal (desktop shows the same pills).
           Without this the phone showed a blocked or paused turn as plain prose,
@@ -575,11 +596,10 @@ function MessageRow({
           remembered. Desktop makes the file chips openable; a phone has nowhere
           local to open to, so here it stays an honest count rather than a
           button that does nothing. */}
-      {(() => {
-        if (thinking) return null;
-        const summary = evidenceSummary(message.terminal?.evidenceRefs);
-        return summary ? <p class="reply-evidence">{summary}</p> : null;
-      })()}
+      {message.status === 'awaiting-reply' && message.options?.length && onAnswer ? (
+        <AnswerChoices options={message.options} onAnswer={onAnswer} />
+      ) : null}
+      {thinking ? null : <TurnReceipt message={message} />}
       {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (
         <div class="plan-actions">
           <button
@@ -644,17 +664,21 @@ function WorkLine({
   const elapsed = useElapsed(activity, live);
   const delegatedControl = delegatedRunControlForExpandedWork(message, open);
 
+  // While live, a running step names itself; between steps the engine's own
+  // rolling line ("Reading your calendar…") says what she is doing.
+  const running = activity.some((item) => item.status === 'running');
   const summary = live
-    ? liveActivityHeadline(activity)
+    ? (!running && message.progress ? message.progress : liveActivityHeadline(activity))
     : `${failed ? 'Ran into trouble · ' : unfinished ? 'Didn’t finish · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
 
   return (
     <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}${unfinished ? ' work-unfinished' : ''}`}>
       <div class="work-head">
-        <button class="work-line" onClick={() => setOpen(!open)} aria-expanded={open}>
-          {live ? <span class="work-spinner" aria-hidden="true" /> : <span class="work-caret" aria-hidden="true">{open ? '⌄' : '›'}</span>}
-          <span class="work-summary">{summary}</span>
+        <button class={`work-line${live ? ' work-live' : ''}`} onClick={() => setOpen(!open)} aria-expanded={open}>
+          {live ? <span class="work-orb" aria-hidden="true" /> : <OutcomeMark failed={failed} unfinished={unfinished} />}
+          <span class={`work-summary${live ? ' work-shimmer' : ''}`}>{summary}</span>
           {live && elapsed ? <span class="work-elapsed">{elapsed}</span> : null}
+          {live ? null : <span class={`work-chevron${open ? ' open' : ''}`} aria-hidden="true">›</span>}
         </button>
         {delegatedControl?.target ? (
           <RunControl
@@ -718,5 +742,66 @@ function ActivityRow({ item }: { item: ActivityItem }) {
         <span class="act-detail">{item.detail}</span>
       ) : null}
     </div>
+  );
+}
+
+function OutcomeMark({ failed, unfinished }: { failed: boolean; unfinished: boolean }) {
+  const tone = failed ? 'fail' : unfinished ? 'warn' : 'ok';
+  const label = failed ? 'Ran into trouble' : unfinished ? 'Did not finish' : 'Completed';
+  return (
+    <svg class={`work-mark work-mark-${tone}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label={label}>
+      <circle cx="12" cy="12" r="9" />
+      {failed ? <path d="m9 9 6 6M15 9l-6 6" /> : unfinished ? <path d="M12 7.5v5M12 16.5v.01" /> : <path d="m8.5 12.5 2.5 2.5 4.5-5.5" />}
+    </svg>
+  );
+}
+
+/**
+ * A question's suggested answers as one-tap replies. A tap sends the choice as
+ * the reply; typing stays open for anything else. The buttons latch after one
+ * tap so a double tap cannot answer twice.
+ */
+function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (text: string) => void }) {
+  const [chosen, setChosen] = useState<string | null>(null);
+  return (
+    <div class="answer-choices" role="group" aria-label="Suggested answers">
+      {options.map((option) => (
+        <button
+          key={option}
+          type="button"
+          class={`answer-choice${chosen === option ? ' chosen' : ''}`}
+          disabled={chosen !== null}
+          aria-pressed={chosen === option}
+          onClick={() => { setChosen(option); onAnswer(option); }}
+        >
+          {option}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The last line under an answer: whether it was checked and what the turn
+ * touched. Tapping it names the model that did the work — kept out of the way
+ * until asked for, the phone's version of the desktop's hover. "Checked"
+ * appears only when a review passed; a turn whose reviewer never ran says so.
+ */
+function TurnReceipt({ message }: { message: ChatMessage }) {
+  const [reveal, setReveal] = useState(false);
+  const review = turnReview(message.activity);
+  const model = turnModelName(message.activity);
+  const proven = evidenceChips(message.terminal?.evidenceRefs);
+  const chips = proven.length > 0 ? proven : observedEvidenceChips(message.activity);
+  const touched = chips.map((chip) => chip.label).join(' · ');
+  if (!review && !touched && !model) return null;
+  return (
+    <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
+      {review === 'checked' ? <span class="receipt-ok">✓ Checked</span> : null}
+      {review === 'unchecked' ? <span class="receipt-warn">Not checked</span> : null}
+      {review === 'rejected' ? <span class="receipt-warn">Didn’t pass review</span> : null}
+      {touched ? <span>{touched}</span> : null}
+      {reveal && model ? <span class="receipt-model">{model} did the work</span> : null}
+    </button>
   );
 }

@@ -1,3 +1,4 @@
+import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
 import type { ActivityItem, HarnessEvent } from './types.js';
 import { humanToolLabel, salientArgDetail } from './tool-labels.js';
@@ -59,8 +60,13 @@ function boundedPhaseIdentity(value: unknown): string {
     ));
 }
 
+function routedModelName(d: Record<string, unknown>): string {
+  const id = boundedModelId(d.model);
+  return id ? modelDisplayName(id).slice(0, 48) : '';
+}
+
 function modelIdentity(d: Record<string, unknown>): string {
-  return boundedPhaseIdentity(d.model) || boundedPhaseIdentity(d.provider);
+  return routedModelName(d) || boundedPhaseIdentity(d.provider);
 }
 
 function upsertModelPhase(
@@ -68,8 +74,10 @@ function upsertModelPhase(
   label: string,
   now: () => number,
   detail?: string,
+  modelName?: string,
 ): ActivityItem[] {
   const prior = prev.find((row) => row.id === MODEL_PHASE_ACTIVITY_ID);
+  const name = modelName || prior?.modelName;
   const row: ActivityItem = {
     id: MODEL_PHASE_ACTIVITY_ID,
     kind: 'event',
@@ -79,6 +87,7 @@ function upsertModelPhase(
     status: 'running',
     startedAt: prior?.startedAt ?? now(),
     ...(detail ? { detail: detail.slice(0, 64) } : prior?.detail ? { detail: prior.detail } : {}),
+    ...(name ? { modelName: name } : {}),
   };
   // Re-append instead of replacing in place: the final running row is the
   // current phase, so a rescue route or heartbeat cannot sit behind an older
@@ -132,7 +141,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
           ? `Continuing with ${identity || 'a backup brain'}…`
           : `Switching to ${identity || 'a backup brain'}…`
         : `Thinking with ${identity || 'your selected brain'}…`;
-      return upsertModelPhase(prev, label, now, identity || undefined);
+      return upsertModelPhase(prev, label, now, identity || undefined, routedModelName(d) || undefined);
     }
     // The compiled graph is internal topology. Pinning "Planned: plan · N
     // steps" is generic noise, not work.
@@ -461,6 +470,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
           : (reason ? { detail: reason } : {})),
         status: failedOpen ? 'done' as const : (pass ? 'done' as const : 'failed' as const),
         ...(failedOpen ? { tone: 'warning' as const } : {}),
+        verdict: failedOpen ? 'unreviewed' as const : (pass ? 'passed' as const : 'rejected' as const),
       }];
     }
     case 'heartbeat': {
@@ -475,7 +485,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
           : '';
         const label = hostMessage
           || (identity ? `Still thinking with ${identity}…` : 'Still working through this…');
-        return upsertModelPhase(prev, label, now, identity || undefined);
+        return upsertModelPhase(prev, label, now, identity || undefined, routedModelName(d) || undefined);
       }
       if (d.kind !== 'watcher_steer') return prev;
       const miss = typeof d.miss === 'string' ? d.miss : '';

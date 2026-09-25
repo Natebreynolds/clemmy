@@ -83,6 +83,12 @@ export interface ActivityItem {
    *  that wants to OPEN the file has to resolve it — and must be able to tell
    *  an exact match from an ambiguous one. */
   deliverable?: { name: string; dir: string };
+  /** kind 'check' verdict rows: what the review decided, as a fact rather
+   *  than a label. `unreviewed` means no reviewer ran — never a pass. */
+  verdict?: 'passed' | 'rejected' | 'unreviewed';
+  /** The model-phase row only: the routed model's display name. Never the
+   *  provider — a family is not a name. */
+  modelName?: string;
 }
 
 /**
@@ -161,6 +167,8 @@ export interface ChatMessage {
   /** Present only while this assistant bubble represents exact, source-bound
    * delegated workflow work. A canonical terminal removes the control. */
   delegatedWork?: DelegatedWorkControl;
+  /** A question's suggested answers, offered as one-tap replies. */
+  options?: string[];
   /** Present only while `text` is a live answer draft; see answer-stream.ts. */
   answerDraft?: LiveAnswerDraft;
 }

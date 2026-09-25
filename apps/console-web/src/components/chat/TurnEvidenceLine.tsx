@@ -32,7 +32,12 @@ const ICON: Record<EvidenceChip['kind'], typeof FileText> = {
 };
 
 export function TurnEvidenceLine(
-  { terminal, activity }: { terminal?: TerminalFacts; activity?: readonly ActivityItem[] },
+  { terminal, activity, inline = false }: {
+    terminal?: TerminalFacts;
+    activity?: readonly ActivityItem[];
+    /** Sit inside a receipt row instead of drawing a row of its own. */
+    inline?: boolean;
+  },
 ) {
   const [problem, setProblem] = useState('');
   // The terminal's own refs win when the harness supplied them — that is its
@@ -52,7 +57,7 @@ export function TurnEvidenceLine(
   };
 
   return (
-    <div className="mt-1.5">
+    <div className={inline ? 'contents' : 'mt-1.5'}>
       <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1" aria-label="What this turn touched">
         {chips.map((chip) => {
           const Icon = ICON[chip.kind];

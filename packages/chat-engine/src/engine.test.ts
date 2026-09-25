@@ -214,6 +214,8 @@ test('awaiting_user_input renders the question and releases mobile immediately',
   const reply = snap.messages.find((message) => message.role === 'assistant');
   assert.equal(reply?.text, 'Which connected account should I use?');
   assert.equal(reply?.status, 'awaiting-reply');
+  assert.deepEqual(reply?.options, ['work@example.com', 'personal@example.com'],
+    'the question keeps its suggested answers so they can be tapped');
   assert.equal(snap.busy, false, 'the composer must return to ordinary send mode');
   assert.equal(snap.cancelKey, null, 'Stop ownership ends at the user-input pause');
   engine.dispose();

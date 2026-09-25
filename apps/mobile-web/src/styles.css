@@ -4054,9 +4054,11 @@ textarea.cz-input { resize: vertical; }
 /* Typed Plan mode uses the same composer and reply vocabulary as normal chat. */
 .chat-mode-bar { flex: 0 0 auto; display: flex; align-items: center; gap: var(--sp-2); padding: 0 4px; color: var(--fg-3); font-size: 12px; line-height: 1.4; min-width: 0; }
 .chat-mode-bar span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-mode-bar button { flex-shrink: 0; min-height: 44px; min-width: 64px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 8px 12px; background: var(--bg-1); color: var(--fg); font: inherit; font-weight: 600; }
-.chat-mode-bar button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-soft, transparent); }
-.chat-mode-bar button:disabled { opacity: .6; }
+/* Act | Plan: one segmented control, the same two words as the desktop. */
+.chat-mode-seg { flex-shrink: 0; display: inline-flex; gap: 2px; padding: 3px; border-radius: 999px; background: var(--bg-3); }
+.chat-mode-seg button { min-height: 44px; min-width: 60px; border: 0; border-radius: 999px; padding: 6px 14px; background: transparent; color: var(--fg-2); font: inherit; font-size: 14px; font-weight: 650; transition: background-color 0.18s var(--clem-ease), color 0.18s var(--clem-ease); }
+.chat-mode-seg button[aria-pressed="true"] { background: var(--bg-1); color: var(--fg); box-shadow: 0 1px 2px rgba(63, 42, 22, 0.12); }
+.chat-mode-seg button:disabled { opacity: .6; }
 .plan-mode-label { font-size: 12px; margin: 8px 0; color: var(--fg-3); }
 .plan-review {
   background: var(--accent-soft);
@@ -4152,3 +4154,59 @@ textarea.cz-input { resize: vertical; }
 .tidy-confirm-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
 .tidy-confirm-actions > * { flex: 1 1 0; }
 .tidy-all { min-height: 44px; }
+
+
+/* ── chat redesign: the live line, the receipt, answers, tables ─────────
+   The same vocabulary as the desktop: a breathing mark and a shimmering
+   label while she works, an outcome mark once she is done, one tap for a
+   suggested answer, and a quiet last line that says whether it was checked. */
+.work-orb { position: relative; flex: 0 0 auto; width: 8px; height: 8px; margin: 0 1px; border-radius: 50%; background: var(--clem-primary); }
+.work-orb::after { content: ''; position: absolute; inset: -5px; border-radius: 50%; border: 2px solid var(--clem-primary); opacity: 0; animation: work-ring 1.9s var(--clem-ease) infinite; }
+@keyframes work-ring { 0% { transform: scale(0.55); opacity: 0.7; } 80%, 100% { transform: scale(1.55); opacity: 0; } }
+.work-live { color: var(--fg-2); font-weight: 600; }
+.work-shimmer {
+  background: linear-gradient(90deg, var(--fg-3) 0%, var(--fg-3) 38%, var(--fg) 50%, var(--fg-3) 62%, var(--fg-3) 100%);
+  background-size: 260% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: work-shimmer 2s linear infinite;
+}
+@keyframes work-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.work-mark { flex: 0 0 auto; width: 16px; height: 16px; }
+.work-mark-ok { color: var(--accent-2); }
+.work-mark-warn { color: var(--accent-warn); }
+.work-mark-fail { color: var(--accent-fail); }
+.work-chevron { flex: 0 0 auto; color: var(--fg-3); transition: transform 0.18s var(--clem-ease); }
+.work-chevron.open { transform: rotate(90deg); }
+
+.answer-choices { display: flex; flex-direction: column; gap: 8px; margin: var(--sp-3) 0 var(--sp-2); }
+.answer-choice {
+  min-height: 48px; border: 1px solid var(--line-strong); border-radius: var(--r-md); padding: 11px 16px;
+  background: var(--bg-1); color: var(--fg); font: inherit; font-size: var(--t-body); font-weight: 600; text-align: left;
+  transition: border-color 0.18s var(--clem-ease), background-color 0.18s var(--clem-ease), transform 0.12s var(--clem-ease);
+}
+.answer-choice:active:not(:disabled) { transform: scale(0.98); background: var(--accent-soft); }
+.answer-choice.chosen { border-color: var(--accent); background: var(--accent-soft); }
+.answer-choice:disabled:not(.chosen) { opacity: 0.45; }
+
+.reply-receipt {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-height: 36px; margin-top: 6px; padding: 4px 0;
+  border: 0; background: none; color: var(--fg-3); font: inherit; font-size: var(--t-xs); text-align: left;
+}
+.receipt-ok { color: var(--accent-2); font-weight: 650; }
+.receipt-warn { color: var(--accent-warn); font-weight: 600; }
+.receipt-model { flex-basis: 100%; color: var(--fg-2); }
+
+.bubble-md .md-table { overflow-x: auto; margin: 0.4em 0 0.7em; border: 1px solid var(--line); border-radius: var(--r-sm); -webkit-overflow-scrolling: touch; }
+.bubble-md table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.4; font-variant-numeric: tabular-nums; }
+.bubble-md th { text-align: left; font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-3); background: var(--bg-2); padding: 7px 10px; white-space: nowrap; }
+.bubble-md td { padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+.bubble-md td:first-child { font-weight: 600; }
+.bubble-md .al-r { text-align: right; }
+.bubble-md .al-c { text-align: center; }
+
+@media (prefers-reduced-motion: reduce) {
+  .work-shimmer { animation: none; background: none; color: var(--fg-2); }
+  .work-orb::after { display: none; }
+}

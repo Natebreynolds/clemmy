@@ -870,3 +870,16 @@ test('a progress check-in heartbeat carries the host-composed plan line onto the
   assert.ok(budget);
   assert.equal(budget!.data.message, undefined);
 });
+
+test('a hosted model id with one namespace segment reaches the chat as the route identity', () => {
+  const routed = projectHarnessEventForPublic(event('turn_model_routed', {
+    model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo', transport: 'private-transport',
+  }));
+  assert.equal(routed?.data.model, 'vendor-ai/Vendor-V4.1-Fast');
+  assert.equal(routed?.data.provider, 'byo');
+  assert.equal(routed?.data.transport, undefined);
+  for (const unsafe of ['a/b/c', '../model', '/abs', 'has space/model']) {
+    const projected = projectHarnessEventForPublic(event('turn_model_routed', { model: unsafe, provider: 'byo' }));
+    assert.equal(projected?.data.model, undefined, `${unsafe} must stay private`);
+  }
+});

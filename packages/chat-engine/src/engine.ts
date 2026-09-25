@@ -1,3 +1,4 @@
+import { readQuestionOptions } from './question-options.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
 import type { PendingMessageStore } from './pending-request.js';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode } from './task-mode.js';
@@ -710,12 +711,14 @@ export class ChatEngine {
         const question = typeof d.question === 'string' && d.question.trim()
           ? d.question.trim()
           : 'I have a question for you.';
+        const options = readQuestionOptions(d.options);
         this.updateActive((m) => ({
           ...m,
           text: question,
           answerDraft: undefined,
           status: 'awaiting-reply',
           progress: undefined,
+          ...(options.length ? { options } : {}),
           activity: settleTerminalActivity(
             m.activity ?? [],
             activityTerminalOutcomeForMessageStatus('awaiting-reply'),
