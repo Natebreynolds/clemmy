@@ -10,6 +10,7 @@ const {
   nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
   rerankNamedCandidatesWithJev,
+  routeOperationWithJev,
   selectProvenRunStrategyWithJev,
   tryJevCompletionVerdict,
   tryJevGroundingVerdict,
@@ -475,3 +476,56 @@ test('valid receipts and a done vote do not certify missing or uncertain request
   assert.equal(posted.state.verifiedReads, reads + ' distinct tail');
   assert.equal(posted.state.evidence, evidence);
 });
+
+// Turn-start routing counts a pick only when Jev is sure of the choice AND of
+// that operation's own fit; every other answer leaves discovery to the brain.
+test('routeOperationWithJev applies a sure, well-fitting pick and nothing else', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const operations = [
+    { id: 'workflow_create', purpose: 'Create a new saved workflow' },
+    { id: 'workflow_get', purpose: 'Read one saved workflow' },
+  ];
+  let posted: Record<string, unknown> | null = null;
+  const answer = (select: { choice: string; confidence: number }, fits: number[]) => {
+    _setSystemOneFetchForTests(async (_url, init) => {
+      posted = JSON.parse(init.body) as Record<string, unknown>;
+      return {
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({
+          model: 'jev-1.13.0',
+          answers: {
+            select: { type: 'choice', choice: select.choice, confidence: select.confidence, probabilities: { [select.choice]: select.confidence } },
+            ...Object.fromEntries(fits.map((noul, index) => [`fit_${index}`, { type: 'noul', noul }])),
+          },
+          usage: { input_tokens: 60, output_tokens: 6 },
+        }),
+      };
+    });
+  };
+  const request = "Create a workflow named 'Invite digest' that reads my calendar every morning";
+
+  answer({ choice: 'op_0', confidence: 0.9 }, [0.93, 0.2]);
+  const picked = await routeOperationWithJev(request, operations, { timeoutMs: 1_000 });
+  assert.equal(picked.outcome, 'picked');
+  assert.equal(picked.pick?.id, 'workflow_create');
+  assert.equal(picked.fit, 0.93);
+  const sent = JSON.stringify(posted);
+  assert.match(sent, /Invite digest/, 'the request text is the decision state');
+  assert.match(sent, /op_0/, 'candidates travel as opaque host ids');
+
+  answer({ choice: 'op_0', confidence: 0.9 }, [0.55, 0.2]);
+  assert.equal((await routeOperationWithJev(request, operations, { timeoutMs: 1_000 })).outcome, 'low_fit',
+    'a sure choice whose own fit is weak is not applied');
+  answer({ choice: 'op_0', confidence: 0.4 }, [0.95, 0.2]);
+  assert.equal((await routeOperationWithJev(request, operations, { timeoutMs: 1_000 })).outcome, 'low_confidence');
+  answer({ choice: 'none', confidence: 0.9 }, [0.1, 0.1]);
+  assert.equal((await routeOperationWithJev(request, operations, { timeoutMs: 1_000 })).pick, null);
+  answer({ choice: 'op_7', confidence: 0.9 }, [0.9, 0.9]);
+  assert.equal((await routeOperationWithJev(request, operations, { timeoutMs: 1_000 })).outcome, 'unavailable',
+    'a choice outside the offered list is never applied');
+  _setSystemOneFetchForTests(async () => ({ status: 504, ok: false, text: async () => '' }));
+  assert.equal((await routeOperationWithJev(request, operations, { timeoutMs: 1_000 })).outcome, 'unavailable');
+  assert.equal((await routeOperationWithJev(request, [], { timeoutMs: 1_000 })).outcome, 'none');
+});
+

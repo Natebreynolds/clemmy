@@ -9,7 +9,6 @@ import {
   peekHostCapabilityCatalogFactory,
 } from '../harness/host-capability-catalog-factory.js';
 import { listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyKeywords, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
-import { readActiveToolSurface } from '../../memory/active-tool-surface.js';
 import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
 import { peekConnectedToolkits } from '../../integrations/composio/client.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
@@ -19,9 +18,11 @@ import type { McpToolScope } from '../mcp-tool-scope.js';
 import { canonicalMcpToolIdentity } from '../mcp-tool-authority.js';
 import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-semantic-proposal.js';
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
-import { TOOL_REGISTRY } from '../../tools/tool-registry.js';
+import { TOOL_REGISTRY, isRegistryDeclaredRead } from '../../tools/tool-registry.js';
 import { renderCarrierInvocationExample } from '../../tools/tool-search-tool.js';
-import { selectProvenRunStrategyWithJev } from './control-plane.js';
+import { routeOperationWithJev, selectProvenRunStrategyWithJev } from './control-plane.js';
+import { DISCOVERY_SIBLING_DOORS, TOOL_SEARCH_ALWAYS_LOADED, rankCatalogEntriesLexically } from '../../agents/tool-catalog.js';
+import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 
 /** Bound so a slow provider refresh cannot stall the first model step. */
 const PROVEN_PROVISION_BUDGET_MS = 10_000;
@@ -30,9 +31,12 @@ const PROVEN_PROVISION_BUDGET_MS = 10_000;
  *  three days most of these picks found nothing to reuse, and the wait they
  *  added outweighed the model rounds the hits saved. */
 export const PROVEN_PICK_BUDGET_MS = 1_500;
-/** A staged-surface guess has no proven run behind it; it landed about once
- *  in eighty live tries, so it gets a short window. */
-export const STAGED_SURFACE_PICK_WAIT_MS = 500;
+/** With no proven run to reuse, Jev may route the request to one operation
+ *  the host can hand over before the first frame. Long enough for most live
+ *  answers, inside the shared budget. */
+export const OPERATION_ROUTE_WAIT_MS = 1_000;
+/** One request's candidates: every operation a named family holds, as a rule. */
+const OPERATION_ROUTE_CANDIDATES = 10;
 /** Below this there is no time for a real answer, so the pick is skipped. */
 const MIN_JEV_PICK_WAIT_MS = 250;
 
@@ -75,6 +79,7 @@ export interface ProvenOperationDependencies {
   acquireLiveRead?: typeof import('../../tools/tool-search-provider-sources.js').acquireProvenLiveReadForSource;
   /** Test seams for the bounded turn-start picks. */
   selectStrategy?: typeof selectProvenRunStrategyWithJev;
+  routeOperation?: typeof routeOperationWithJev;
   now?: () => number;
 }
 
@@ -371,8 +376,18 @@ export function renderProvenOperationGuidance(
   invocations: readonly unknown[] = [],
   boundAccounts: readonly ProvenBoundAccount[] = [],
   liveReads: readonly ProvenLiveRead[] = [],
+  opts: { routed?: boolean } = {},
 ): string {
   const tools = strategy.toolsUsed;
+  if (opts.routed === true && tools.every(isHandoverRegistryTool)) {
+    // The orchestrator loads a handed-over registry tool with its own schema,
+    // unless this turn's mode keeps it off the surface; then search stays the door.
+    return [
+      '[ROUTED OPERATION]',
+      `This request most likely needs ${tools.join(', ')}: ${strategy.objective}`,
+      `When your tools list ${tools.join(', ')}, call it directly. Use tool_search only if it is not listed or cannot do the whole request.`,
+    ].join('\n');
+  }
   const schemaLines = tools.map((name) => {
     const schema = schemas[name] ?? schemas[name.toUpperCase()];
     if (!schema) return `- ${name}`;
@@ -382,10 +397,12 @@ export function renderProvenOperationGuidance(
   });
   const callable = invocations.length > 0;
   return [
-    callable
-      ? '[PROVEN OPERATION — skip tool_search]'
-      : '[PROVEN OPERATION]',
-    `A prior successful run ("${strategy.objective}") already proved these tools: ${tools.join(', ')}.`,
+    opts.routed
+      ? (callable ? '[ROUTED OPERATION — skip tool_search]' : '[ROUTED OPERATION]')
+      : (callable ? '[PROVEN OPERATION — skip tool_search]' : '[PROVEN OPERATION]'),
+    opts.routed
+      ? `This request most likely needs ${tools.join(', ')}: ${strategy.objective}`
+      : `A prior successful run ("${strategy.objective}") already proved these tools: ${tools.join(', ')}.`,
     callable
       ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
       : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
@@ -475,52 +492,61 @@ export function pickProvenRunStrategy(matches: readonly MatchedRunStrategy[]): R
   return null;
 }
 
-function stagedCandidatesForJev(scope: 'chat' | 'any'): Array<{ id: string; objective: string; toolsUsed: string[]; record: RunStrategyRecord }> {
-  const staged = readActiveToolSurface().tools.filter((row) => row.schemaReady).slice(0, 8);
-  if (staged.length === 0) return [];
-  // Live 282184: this path handed a chat request a workflow-step strategy
-  // (outlook read + workflow_step_result) the keyword matcher had already
-  // filtered out. The scope rule applies to every way a strategy is chosen.
-  const proven = listVerifiedRunStrategies().filter((strategy) => scope === 'any' || (strategy.scope ?? 'chat') === 'chat');
-  return staged.map((row) => {
-    const record = proven.find((strategy) => (
-      strategy.toolsUsed.some((name) => name.trim().toLowerCase() === row.name.toLowerCase())
-    ));
-    return {
-      id: record?.id ?? `surface:${row.name}`,
-      objective: record?.objective ?? row.name.replace(/_/g, ' '),
-      toolsUsed: record?.toolsUsed ?? [row.name],
-      record: record ?? {
-        id: `surface:${row.name}`,
-        objective: row.name.replace(/_/g, ' '),
-        keywords: [],
-        toolsUsed: [row.name],
-        workerCount: 0,
-        durationMs: 0,
-        createdAt: new Date().toISOString(),
-        uses: 0,
-      },
-    };
-  });
+/** A registry tool the orchestrator may load before the first frame. Only
+ *  these can be handed over by name; the rest stay behind tool_search. */
+function isHandoverRegistryTool(name: string): boolean {
+  return TOOL_REGISTRY.some((row) => row.name === name
+    && (row.localPlanning !== undefined || row.localPlanningRead === true));
 }
 
-async function pickStagedSurfaceStrategy(
+/** Words of an operation name or a request, lowercased, with a plural `s`
+ *  folded so "workflows" names the workflow tools. */
+function nameWords(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/)
+    .filter((word) => word.length > 1)
+    .map((word) => (word.length > 3 && word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word));
+}
+
+/** The operations this request most plausibly needs, from what the host can
+ *  hand over before the first frame: registry tools the orchestrator can load,
+ *  and provider operations already proven in a successful run. An operation is
+ *  offered only when the request names a distinctive word of its name (one
+ *  most names do not share), then ranked by the same lexical relevance
+ *  tool_search uses. A request that names none of them asks Jev nothing. */
+export function routableOperationsForRequest(
   query: string,
-  sessionId: string | undefined,
-  timeoutMs: number,
-  select: typeof selectProvenRunStrategyWithJev,
-): Promise<RunStrategyRecord | null> {
-  const staged = stagedCandidatesForJev(runStrategyScopeForSession(sessionId) === 'workflow_step' ? 'any' : 'chat');
-  if (staged.length === 0) return null;
-  const jev = await select(
-    query,
-    staged.map((row) => ({ id: row.id, objective: row.objective, toolsUsed: row.toolsUsed })),
-    { sessionId, timeoutMs },
-  );
-  if (jev.strategy) {
-    return staged.find((row) => row.id === jev.strategy!.id)?.record ?? null;
+  scope: 'chat' | 'any',
+): Array<{ id: string; purpose: string }> {
+  const rows = new Map<string, { name: string; oneLiner: string }>();
+  for (const row of TOOL_REGISTRY) {
+    if (!isHandoverRegistryTool(row.name)) continue;
+    if (TOOL_SEARCH_ALWAYS_LOADED.has(row.name) || DISCOVERY_SIBLING_DOORS.has(row.name)) continue;
+    // On an action turn the orchestrator keeps a handed-over registry tool
+    // first-class only if it is a read or a product authoring tool; any other
+    // write would reach the brain without its schema, so it is not offered.
+    if (!isRegistryDeclaredRead(row.name) && !NATIVE_PRODUCT_AUTHORING_TOOLS.has(row.name)) continue;
+    rows.set(row.name.toLowerCase(), { name: row.name, oneLiner: (row.description ?? '').trim() });
   }
-  return null;
+  for (const strategy of listVerifiedRunStrategies()) {
+    if (scope !== 'any' && (strategy.scope ?? 'chat') !== 'chat') continue;
+    for (const raw of selectLearnedStrategyTools(strategy.toolsUsed)) {
+      const name = raw.trim();
+      const key = name.toLowerCase();
+      if (!name || rows.has(key) || TOOL_REGISTRY.some((row) => row.name.toLowerCase() === key)) continue;
+      rows.set(key, { name, oneLiner: strategy.objective });
+    }
+  }
+  const requested = new Set(nameWords(query));
+  const shared = new Map<string, number>();
+  for (const row of rows.values()) {
+    for (const word of new Set(nameWords(row.name))) shared.set(word, (shared.get(word) ?? 0) + 1);
+  }
+  const distinctive = (word: string): boolean => (shared.get(word) ?? 0) <= rows.size / 2;
+  const named = [...rows.values()].filter((row) => nameWords(row.name)
+    .some((word) => distinctive(word) && requested.has(word)));
+  return rankCatalogEntriesLexically(query, named)
+    .slice(0, OPERATION_ROUTE_CANDIDATES)
+    .map((row) => ({ id: row.name, purpose: row.oneLiner.replace(/\s+/g, ' ').slice(0, 200) }));
 }
 
 export async function prepareProvenOperationForRequest(input: {
@@ -569,16 +595,33 @@ export async function prepareProvenOperationForRequest(input: {
       : null)
       ?? (jev.failedOpen ? matches[0]!.strategy : null);
   }
-  // A staged-surface guess has no proven run behind it and rarely lands, so it
-  // gets only a short window, and none once the budget is spent.
-  const stagedWaitMs = Math.min(STAGED_SURFACE_PICK_WAIT_MS, jevTimeLeft());
-  if (!strategy && stagedWaitMs >= MIN_JEV_PICK_WAIT_MS) {
-    strategy = await pickStagedSurfaceStrategy(
-      input.query,
-      input.sessionId,
-      stagedWaitMs,
-      dependencies.selectStrategy ?? selectProvenRunStrategyWithJev,
-    );
+  // No proven run: Jev may route the request to the one operation it needs
+  // first, so the brain calls it instead of paying a discovery round. A pick
+  // stands only when Jev is sure of it and of its fit; it is advisory until
+  // the host hands the operation over below.
+  let routed = false;
+  const routeWaitMs = Math.min(OPERATION_ROUTE_WAIT_MS, jevTimeLeft());
+  if (!strategy && routeWaitMs >= MIN_JEV_PICK_WAIT_MS) {
+    const candidates = routableOperationsForRequest(input.query, strategyScope);
+    if (candidates.length > 0) {
+      const route = await (dependencies.routeOperation ?? routeOperationWithJev)(input.query, candidates, {
+        timeoutMs: routeWaitMs,
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      });
+      if (route.pick) {
+        routed = true;
+        strategy = {
+          id: `route:${route.pick.id}`,
+          objective: route.pick.purpose,
+          keywords: [],
+          toolsUsed: [route.pick.id],
+          workerCount: 0,
+          durationMs: 0,
+          createdAt: new Date().toISOString(),
+          uses: 0,
+        };
+      }
+    }
   }
   if (!strategy) return empty;
   const schemas: Record<string, unknown> = {};
@@ -597,7 +640,9 @@ export async function prepareProvenOperationForRequest(input: {
   // time provisioning its operations. Live 2026-09-24 (source 299433): "I just
   // connected monday.com, check that" matched a calendar strategy and spent
   // 19 s publishing Outlook operations before the brain's first frame.
-  const coversRequest = provenStrategyCoversRequest(input.query, strategy);
+  // A routed pick was judged to do the core of this request; a remembered run
+  // must cover it by its own keywords.
+  const coversRequest = routed || provenStrategyCoversRequest(input.query, strategy);
   if (
     coversRequest
     && composioSlugs.length > 0
@@ -634,7 +679,7 @@ export async function prepareProvenOperationForRequest(input: {
       // called directly, but it never thins the surface: live 282184 a
       // two-word calendar strategy matched "create a workflow… calendar…"
       // and the thinned surface had no door to authoring.
-      skipDiscoverySearch = bound.skipDiscoverySearch && provenStrategyCoversRequest(input.query, strategy);
+      skipDiscoverySearch = bound.skipDiscoverySearch && coversRequest;
       capabilityRefs = bound.capabilityRefs;
       descriptors = bound.descriptors;
       invocations = bound.invocations;
@@ -735,12 +780,10 @@ export async function prepareProvenOperationForRequest(input: {
   }
 
   return {
-    text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads),
+    text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads, { routed }),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
-    nativeTools: provenStrategyCoversRequest(input.query, strategy)
-      ? strategy.toolsUsed.filter(name => TOOL_REGISTRY.some(row => row.name === name
-        && (row.localPlanning !== undefined || row.localPlanningRead === true))) : [],
+    nativeTools: coversRequest ? strategy.toolsUsed.filter(isHandoverRegistryTool) : [],
     skipDiscoverySearch,
     boundAccounts,
     capabilityRefs,

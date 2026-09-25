@@ -11,7 +11,7 @@ const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-proven-op-'));
 process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip, pickProvenRunStrategy, buildCachedProvenResolutionEntries, PROVEN_PICK_BUDGET_MS, STAGED_SURFACE_PICK_WAIT_MS } = await import('./proven-operation.js');
+const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip, pickProvenRunStrategy, buildCachedProvenResolutionEntries, PROVEN_PICK_BUDGET_MS, OPERATION_ROUTE_WAIT_MS, routableOperationsForRequest } = await import('./proven-operation.js');
 const {
   createHostCapabilityCatalogFactory,
   installHostCapabilityCatalogFactory,
@@ -427,10 +427,10 @@ test('a strategy that matches but does not cover the request provisions nothing 
   }
 });
 
-// Every Jev strategy pick holds the request's first model frame. Live, most of
-// them found nothing to reuse, and the wait outweighed the rounds the hits
-// saved, so the picks share one bounded wait and a staged guess gets a short
-// window. A late answer is simply not used.
+// Every Jev pick holds the request's first model frame, so the picks share one
+// bounded wait and a late answer is simply not used. With no proven run to
+// reuse, Jev may route the request to the one operation it needs first, and
+// the host hands that operation over so the brain skips a discovery round.
 function recordZephyrStrategy(objective: string, tool: string, sourceId: string): void {
   recordRunStrategy({
     objective,
@@ -448,57 +448,87 @@ function recordZephyrStrategy(objective: string, tool: string, sourceId: string)
   });
 }
 
-test('the turn start spends one bounded wait on Jev strategy picks and gives a staged guess only a short window', async () => {
-  const { _setToolSchemaLoaderForTests, rememberToolSchema } = await import('../../tools/composio-schema-cache.js');
-  const { tickActiveToolSurfaceHeartbeat } = await import('./active-surface-heartbeat.js');
+test('routing offers only operations the host can hand over, ranked for the request', () => {
+  const offered = routableOperationsForRequest("Create a workflow named 'Invite digest' that runs every morning", 'chat');
+  assert.ok(offered.length > 0 && offered.length <= 10);
+  assert.equal(offered[0]!.id, 'workflow_create', 'the operation the request names leads');
+  for (const name of ['tool_search', 'read_file', 'composio_search_tools', 'workflow_delete', 'set_timer']) {
+    assert.ok(!offered.some((row) => row.id === name), `${name} is already loaded or is a discovery door, never routed`);
+  }
+  assert.deepEqual(routableOperationsForRequest('thanks, that is all', 'chat'), [], 'an unrelated request asks Jev nothing');
+});
+
+test('the turn start spends one bounded wait on Jev picks, and a routed operation is handed over', async () => {
+  const { _setToolSchemaLoaderForTests } = await import('../../tools/composio-schema-cache.js');
   _setToolSchemaLoaderForTests(async () => null);
   recordZephyrStrategy('zephyr ledger reconciliation report', 'zephyr_ledger_read', 'zephyr-a');
   recordZephyrStrategy('zephyr ledger export report', 'zephyr_export_write', 'zephyr-b');
-  // A schema-ready tool the heartbeat stages, proven by a run no query here matches.
-  recordZephyrStrategy('okapi staging warmup', 'zephyr_staged_fixture', 'zephyr-staged');
-  rememberToolSchema('ZEPHYR_STAGED_FIXTURE', { type: 'object', properties: {} });
-  await tickActiveToolSurfaceHeartbeat();
 
   let clock = 1_000_000;
-  const calls: Array<{ ids: string[]; objectives: string[]; timeoutMs: number | undefined }> = [];
-  const answerAfter = (elapsedMs: number) => async (
+  const picks: Array<{ timeoutMs: number | undefined }> = [];
+  const routes: Array<{ ids: string[]; timeoutMs: number }> = [];
+  const pickAfter = (elapsedMs: number) => async (
     _query: string,
-    strategies: Array<{ id: string; objective: string }>,
+    _strategies: Array<{ id: string }>,
     opts?: { timeoutMs?: number },
   ) => {
-    calls.push({ ids: strategies.map((row) => row.id), objectives: strategies.map((row) => row.objective), timeoutMs: opts?.timeoutMs });
+    picks.push({ timeoutMs: opts?.timeoutMs });
     clock += elapsedMs;
     return { strategy: null, failedOpen: false };
   };
+  const routeTo = (id: string | null) => async <T extends { id: string; purpose: string }>(
+    _request: string,
+    candidates: readonly T[],
+    opts: { timeoutMs: number },
+  ) => {
+    routes.push({ ids: candidates.map((row) => row.id), timeoutMs: opts.timeoutMs });
+    const pick = candidates.find((row) => row.id === id) ?? null;
+    return pick ? { pick, outcome: 'picked' as const, confidence: 0.9, fit: 0.9 } : { pick: null, outcome: 'none' as const };
+  };
 
   try {
-    const quick = await prepareProvenOperationForRequest(
-      { query: 'zephyr ledger report for this week' },
-      { selectStrategy: answerAfter(400), now: () => clock },
+    // Proven runs disagree: Jev picks between them first, then routes with
+    // what is left of the budget.
+    const routedWorkflow = await prepareProvenOperationForRequest(
+      { query: 'create a workflow for the zephyr ledger report' },
+      { selectStrategy: pickAfter(400), routeOperation: routeTo('workflow_create'), now: () => clock },
     );
-    assert.equal(quick.text, undefined, 'a confident "none" reuses nothing');
-    assert.equal(calls.length, 2, 'the proven runs disagree, so Jev picks between them, then guesses from the staged surface');
-    assert.deepEqual([...calls[0]!.objectives].sort(), ['zephyr ledger export report', 'zephyr ledger reconciliation report']);
-    assert.equal(calls[0]!.timeoutMs, PROVEN_PICK_BUDGET_MS, 'the first pick may use the whole turn-start budget');
-    assert.ok(calls[1]!.objectives.includes('okapi staging warmup'), 'the second pick is the staged-surface guess');
-    assert.equal(calls[1]!.timeoutMs, STAGED_SURFACE_PICK_WAIT_MS, 'a staged guess gets only its short window');
+    assert.equal(picks.length, 1);
+    assert.equal(picks[0]!.timeoutMs, PROVEN_PICK_BUDGET_MS, 'the first pick may use the whole turn-start budget');
+    assert.equal(routes.length, 1);
+    assert.equal(routes[0]!.timeoutMs, OPERATION_ROUTE_WAIT_MS, 'routing gets its window inside what is left');
+    assert.ok(routes[0]!.ids.includes('workflow_create'));
+    assert.equal(routedWorkflow.strategyId, 'route:workflow_create');
+    assert.deepEqual(routedWorkflow.nativeTools, ['workflow_create'], 'the routed registry tool is handed to the orchestrator to load');
+    assert.match(routedWorkflow.text ?? '', /\[ROUTED OPERATION\]\nThis request most likely needs workflow_create/);
+    assert.match(routedWorkflow.text ?? '', /call it directly/);
+    assert.doesNotMatch(routedWorkflow.text ?? '', /prior successful run/, 'a routed pick is not described as a proven run');
 
-    calls.length = 0;
+    picks.length = 0; routes.length = 0;
     await prepareProvenOperationForRequest(
-      { query: 'zephyr ledger report for this week' },
-      { selectStrategy: answerAfter(PROVEN_PICK_BUDGET_MS - 100), now: () => clock },
+      { query: 'create a workflow for the zephyr ledger report' },
+      { selectStrategy: pickAfter(PROVEN_PICK_BUDGET_MS - 100), routeOperation: routeTo('workflow_create'), now: () => clock },
     );
-    assert.equal(calls.length, 1, 'once the budget is spent the staged guess is skipped, not waited on');
+    assert.equal(routes.length, 0, 'once the budget is spent routing is skipped, not waited on');
 
-    calls.length = 0;
-    await prepareProvenOperationForRequest(
-      { query: 'narwhal migration tally' },
-      { selectStrategy: answerAfter(0), now: () => clock },
+    picks.length = 0; routes.length = 0;
+    const none = await prepareProvenOperationForRequest(
+      { query: 'create a workflow named narwhal tally' },
+      { selectStrategy: pickAfter(0), routeOperation: routeTo(null), now: () => clock },
     );
-    assert.equal(calls.length, 1, 'with no proven run to reuse, only the staged guess runs');
-    assert.equal(calls[0]!.timeoutMs, STAGED_SURFACE_PICK_WAIT_MS, 'and the request waits at most its short window');
+    assert.equal(picks.length, 0, 'no proven run matched, so there is nothing to pick between');
+    assert.equal(routes.length, 1);
+    assert.equal(routes[0]!.timeoutMs, OPERATION_ROUTE_WAIT_MS);
+    assert.equal(none.text, undefined, 'a confident "none" hands nothing over');
+    assert.deepEqual(none.nativeTools, []);
+
+    routes.length = 0;
+    await prepareProvenOperationForRequest(
+      { query: 'thanks, that is all' },
+      { selectStrategy: pickAfter(0), routeOperation: routeTo('workflow_create'), now: () => clock },
+    );
+    assert.equal(routes.length, 0, 'with nothing relevant to offer, Jev is not asked');
   } finally {
     _setToolSchemaLoaderForTests(null);
   }
 });
-
