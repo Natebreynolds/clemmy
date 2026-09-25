@@ -20,25 +20,19 @@ import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-seman
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { TOOL_REGISTRY, isRegistryDeclaredRead } from '../../tools/tool-registry.js';
 import { renderCarrierInvocationExample } from '../../tools/tool-search-tool.js';
-import { routeOperationWithJev, selectProvenRunStrategyWithJev } from './control-plane.js';
+import { decideTurnStartWithJev } from './control-plane.js';
 import { DISCOVERY_SIBLING_DOORS, TOOL_SEARCH_ALWAYS_LOADED, rankCatalogEntriesLexically } from '../../agents/tool-catalog.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 
 /** Bound so a slow provider refresh cannot stall the first model step. */
 const PROVEN_PROVISION_BUDGET_MS = 10_000;
-/** The most a request's first model frame waits on Jev strategy picks, in
- *  total. Live answers at the turn start: half by 0.8 s, 83% by 1.5 s. Over
- *  three days most of these picks found nothing to reuse, and the wait they
+/** The most a request's first model frame waits on the turn-start Jev
+ *  decision. Live answers at the turn start: half by 0.8 s, 83% by 1.5 s. Over
+ *  three days most strategy picks found nothing to reuse, and the wait they
  *  added outweighed the model rounds the hits saved. */
 export const PROVEN_PICK_BUDGET_MS = 1_500;
-/** With no proven run to reuse, Jev may route the request to one operation
- *  the host can hand over before the first frame. Long enough for most live
- *  answers, inside the shared budget. */
-export const OPERATION_ROUTE_WAIT_MS = 1_000;
 /** One request's candidates: every operation a named family holds, as a rule. */
 const OPERATION_ROUTE_CANDIDATES = 10;
-/** Below this there is no time for a real answer, so the pick is skipped. */
-const MIN_JEV_PICK_WAIT_MS = 250;
 
 export interface ProvenLiveRead {
   operation: string;
@@ -77,10 +71,8 @@ export interface ProvenOperationPreparation {
 
 export interface ProvenOperationDependencies {
   acquireLiveRead?: typeof import('../../tools/tool-search-provider-sources.js').acquireProvenLiveReadForSource;
-  /** Test seams for the bounded turn-start picks. */
-  selectStrategy?: typeof selectProvenRunStrategyWithJev;
-  routeOperation?: typeof routeOperationWithJev;
-  now?: () => number;
+  /** Test seam for the turn-start Jev decision. */
+  decideTurnStart?: typeof decideTurnStartWithJev;
 }
 
 function recordedProvenDescriptors(
@@ -581,45 +573,36 @@ export async function prepareProvenOperationForRequest(input: {
   // tools were then recommended while routing to the space tools never ran.
   const lexical = pickProvenRunStrategy(matches);
   let strategy = lexical && provenStrategyCoversRequest(input.query, lexical) ? lexical : null;
-  // Every Jev pick here holds the request's first model frame, so together
-  // they get one bounded wait. A pick that is late is not used.
-  const jevDeadlineAt = (dependencies.now ?? Date.now)() + PROVEN_PICK_BUDGET_MS;
-  const jevTimeLeft = (): number => jevDeadlineAt - (dependencies.now ?? Date.now)();
-  if (!strategy && matches.length > 0) {
-    const jev = await (dependencies.selectStrategy ?? selectProvenRunStrategyWithJev)(
-      input.query,
-      matches.map((row) => ({
-        id: row.strategy.id,
-        objective: row.strategy.objective,
-        toolsUsed: row.strategy.toolsUsed,
-      })),
-      { sessionId: input.sessionId, timeoutMs: jevTimeLeft() },
-    );
-    strategy = (jev.strategy
-      ? matches.find((row) => row.strategy.id === jev.strategy!.id)?.strategy
-      : null)
-      ?? (jev.failedOpen ? matches[0]!.strategy : null);
-  }
-  // No proven run: Jev may route the request to the one operation it needs
-  // first, so the brain calls it instead of paying a discovery round. A pick
-  // stands only when Jev is sure of it and of its fit; it is advisory until
-  // the host hands the operation over below.
+  // Whether a remembered run fits and which operation would do the core of
+  // the request go to Jev together, in one bounded wait before the first model
+  // frame. A late answer is not used. A routed pick stands only when Jev is
+  // sure of it and of its fit; it is advisory until the host hands the
+  // operation over below.
   let routed = false;
-  const routeWaitMs = Math.min(OPERATION_ROUTE_WAIT_MS, jevTimeLeft());
-  if (!strategy && routeWaitMs >= MIN_JEV_PICK_WAIT_MS) {
-    const candidates = routableOperationsForRequest(input.query, strategyScope);
-    if (candidates.length > 0) {
-      const route = await (dependencies.routeOperation ?? routeOperationWithJev)(input.query, candidates, {
-        timeoutMs: routeWaitMs,
-        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-      });
-      if (route.pick) {
+  if (!strategy) {
+    const operations = routableOperationsForRequest(input.query, strategyScope);
+    if (matches.length > 0 || operations.length > 0) {
+      const decision = await (dependencies.decideTurnStart ?? decideTurnStartWithJev)(
+        input.query,
+        matches.map((row) => ({
+          id: row.strategy.id,
+          objective: row.strategy.objective,
+          toolsUsed: row.strategy.toolsUsed,
+        })),
+        operations,
+        { timeoutMs: PROVEN_PICK_BUDGET_MS, ...(input.sessionId ? { sessionId: input.sessionId } : {}) },
+      );
+      strategy = (decision.strategy
+        ? matches.find((row) => row.strategy.id === decision.strategy!.id)?.strategy
+        : null)
+        ?? (decision.failedOpen && matches.length > 0 ? matches[0]!.strategy : null);
+      if (!strategy && decision.route.pick) {
         routed = true;
         strategy = {
-          id: `route:${route.pick.id}`,
-          objective: route.pick.purpose,
+          id: `route:${decision.route.pick.id}`,
+          objective: decision.route.pick.purpose,
           keywords: [],
-          toolsUsed: [route.pick.id],
+          toolsUsed: [decision.route.pick.id],
           workerCount: 0,
           durationMs: 0,
           createdAt: new Date().toISOString(),

@@ -11,7 +11,7 @@ const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-proven-op-'));
 process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip, pickProvenRunStrategy, buildCachedProvenResolutionEntries, PROVEN_PICK_BUDGET_MS, OPERATION_ROUTE_WAIT_MS, routableOperationsForRequest } = await import('./proven-operation.js');
+const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip, pickProvenRunStrategy, buildCachedProvenResolutionEntries, PROVEN_PICK_BUDGET_MS, routableOperationsForRequest } = await import('./proven-operation.js');
 const {
   createHostCapabilityCatalogFactory,
   installHostCapabilityCatalogFactory,
@@ -458,76 +458,86 @@ test('routing offers only operations the host can hand over, ranked for the requ
   assert.deepEqual(routableOperationsForRequest('thanks, that is all', 'chat'), [], 'an unrelated request asks Jev nothing');
 });
 
-test('the turn start spends one bounded wait on Jev picks, and a routed operation is handed over', async () => {
+type DecisionCall = { strategies: string[]; operations: string[]; timeoutMs: number | undefined };
+function decideWith(
+  calls: DecisionCall[],
+  answer: (strategies: Array<{ id: string; objective: string }>, operations: Array<{ id: string; purpose: string }>) => {
+    strategy?: string; route?: string; failedOpen?: boolean;
+  },
+) {
+  return async <S extends { id: string; objective: string; toolsUsed: string[] }, O extends { id: string; purpose: string }>(
+    _request: string,
+    strategies: readonly S[],
+    operations: readonly O[],
+    opts: { timeoutMs?: number } = {},
+  ) => {
+    calls.push({ strategies: strategies.map((row) => row.objective), operations: operations.map((row) => row.id), timeoutMs: opts.timeoutMs });
+    const chosen = answer([...strategies], [...operations]);
+    const strategy = strategies.find((row) => row.id === chosen.strategy) ?? null;
+    const pick = operations.find((row) => row.id === chosen.route) ?? null;
+    return {
+      strategy,
+      route: pick ? { pick, outcome: 'picked' as const, confidence: 0.9, fit: 0.9 } : { pick: null, outcome: 'none' as const },
+      failedOpen: chosen.failedOpen === true,
+    };
+  };
+}
+
+test('one Jev request decides both turn-start questions, and a routed operation is handed over', async () => {
   const { _setToolSchemaLoaderForTests } = await import('../../tools/composio-schema-cache.js');
   _setToolSchemaLoaderForTests(async () => null);
   recordZephyrStrategy('zephyr ledger reconciliation report', 'zephyr_ledger_read', 'zephyr-a');
   recordZephyrStrategy('zephyr ledger export report', 'zephyr_export_write', 'zephyr-b');
-
-  let clock = 1_000_000;
-  const picks: Array<{ timeoutMs: number | undefined }> = [];
-  const routes: Array<{ ids: string[]; timeoutMs: number }> = [];
-  const pickAfter = (elapsedMs: number) => async (
-    _query: string,
-    _strategies: Array<{ id: string }>,
-    opts?: { timeoutMs?: number },
-  ) => {
-    picks.push({ timeoutMs: opts?.timeoutMs });
-    clock += elapsedMs;
-    return { strategy: null, failedOpen: false };
-  };
-  const routeTo = (id: string | null) => async <T extends { id: string; purpose: string }>(
-    _request: string,
-    candidates: readonly T[],
-    opts: { timeoutMs: number },
-  ) => {
-    routes.push({ ids: candidates.map((row) => row.id), timeoutMs: opts.timeoutMs });
-    const pick = candidates.find((row) => row.id === id) ?? null;
-    return pick ? { pick, outcome: 'picked' as const, confidence: 0.9, fit: 0.9 } : { pick: null, outcome: 'none' as const };
-  };
-
+  const calls: DecisionCall[] = [];
   try {
-    // Proven runs disagree: Jev picks between them first, then routes with
-    // what is left of the budget.
+    // Proven runs disagree AND the request names a workflow: both questions
+    // go out together, in one request with one bounded wait.
     const routedWorkflow = await prepareProvenOperationForRequest(
       { query: 'create a workflow for the zephyr ledger report' },
-      { selectStrategy: pickAfter(400), routeOperation: routeTo('workflow_create'), now: () => clock },
+      { decideTurnStart: decideWith(calls, () => ({ route: 'workflow_create' })) },
     );
-    assert.equal(picks.length, 1);
-    assert.equal(picks[0]!.timeoutMs, PROVEN_PICK_BUDGET_MS, 'the first pick may use the whole turn-start budget');
-    assert.equal(routes.length, 1);
-    assert.equal(routes[0]!.timeoutMs, OPERATION_ROUTE_WAIT_MS, 'routing gets its window inside what is left');
-    assert.ok(routes[0]!.ids.includes('workflow_create'));
+    assert.equal(calls.length, 1, 'one Jev request, not one per question');
+    assert.deepEqual([...calls[0]!.strategies].sort(), ['zephyr ledger export report', 'zephyr ledger reconciliation report']);
+    assert.ok(calls[0]!.operations.includes('workflow_create'));
+    assert.equal(calls[0]!.timeoutMs, PROVEN_PICK_BUDGET_MS);
     assert.equal(routedWorkflow.strategyId, 'route:workflow_create');
     assert.deepEqual(routedWorkflow.nativeTools, ['workflow_create'], 'the routed registry tool is handed to the orchestrator to load');
     assert.match(routedWorkflow.text ?? '', /\[ROUTED OPERATION\]\nThis request most likely needs workflow_create/);
-    assert.match(routedWorkflow.text ?? '', /call it directly/);
     assert.doesNotMatch(routedWorkflow.text ?? '', /prior successful run/, 'a routed pick is not described as a proven run');
 
-    picks.length = 0; routes.length = 0;
-    await prepareProvenOperationForRequest(
+    calls.length = 0;
+    const provenWins = await prepareProvenOperationForRequest(
       { query: 'create a workflow for the zephyr ledger report' },
-      { selectStrategy: pickAfter(PROVEN_PICK_BUDGET_MS - 100), routeOperation: routeTo('workflow_create'), now: () => clock },
+      { decideTurnStart: decideWith(calls, (strategies) => ({
+        strategy: strategies.find((row) => /reconciliation/.test(row.objective))?.id,
+        route: 'workflow_create',
+      })) },
     );
-    assert.equal(routes.length, 0, 'once the budget is spent routing is skipped, not waited on');
+    assert.deepEqual(provenWins.tools, ['zephyr_ledger_read'], 'a fitting remembered run wins over a routed operation');
 
-    picks.length = 0; routes.length = 0;
+    calls.length = 0;
+    const unreachable = await prepareProvenOperationForRequest(
+      { query: 'create a workflow for the zephyr ledger report' },
+      { decideTurnStart: decideWith(calls, () => ({ failedOpen: true })) },
+    );
+    assert.ok(unreachable.strategyId && !unreachable.strategyId.startsWith('route:'), 'unreachable Jev keeps the top memory match, as before');
+
+    calls.length = 0;
     const none = await prepareProvenOperationForRequest(
       { query: 'create a workflow named narwhal tally' },
-      { selectStrategy: pickAfter(0), routeOperation: routeTo(null), now: () => clock },
+      { decideTurnStart: decideWith(calls, () => ({})) },
     );
-    assert.equal(picks.length, 0, 'no proven run matched, so there is nothing to pick between');
-    assert.equal(routes.length, 1);
-    assert.equal(routes[0]!.timeoutMs, OPERATION_ROUTE_WAIT_MS);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0]!.strategies, [], 'no proven run matched, so only the routing question is asked');
     assert.equal(none.text, undefined, 'a confident "none" hands nothing over');
     assert.deepEqual(none.nativeTools, []);
 
-    routes.length = 0;
+    calls.length = 0;
     await prepareProvenOperationForRequest(
       { query: 'thanks, that is all' },
-      { selectStrategy: pickAfter(0), routeOperation: routeTo('workflow_create'), now: () => clock },
+      { decideTurnStart: decideWith(calls, () => ({ route: 'workflow_create' })) },
     );
-    assert.equal(routes.length, 0, 'with nothing relevant to offer, Jev is not asked');
+    assert.equal(calls.length, 0, 'with nothing to offer, Jev is not asked');
   } finally {
     _setToolSchemaLoaderForTests(null);
   }
@@ -537,27 +547,15 @@ test('a remembered run that only shares words is checked, and a rejected one lea
   const { _setToolSchemaLoaderForTests } = await import('../../tools/composio-schema-cache.js');
   _setToolSchemaLoaderForTests(async () => null);
   recordZephyrStrategy("Build me a quokka brief workspace: today's calendar and emails waiting on my reply", 'outlook_get_calendar_view', 'quokka-build');
-  const picks: string[][] = [];
-  const routes: string[][] = [];
+  const calls: DecisionCall[] = [];
   try {
     const prepared = await prepareProvenOperationForRequest(
       { query: 'Show me the quokka brief space' },
-      {
-        selectStrategy: async (_query, strategies) => {
-          picks.push(strategies.map((row) => row.objective));
-          return { strategy: null, failedOpen: false };
-        },
-        routeOperation: async (_request, candidates) => {
-          routes.push(candidates.map((row) => row.id));
-          const pick = candidates.find((row) => row.id === 'space_preview') ?? null;
-          return pick ? { pick, outcome: 'picked' as const, confidence: 0.9, fit: 0.9 } : { pick: null, outcome: 'none' as const };
-        },
-      },
+      { decideTurnStart: decideWith(calls, () => ({ route: 'space_preview' })) },
     );
-    assert.equal(picks.length, 1, 'a match that does not cover the request is not taken on keywords alone');
-    assert.match(picks[0]![0]!, /Build me a quokka brief workspace/);
-    assert.equal(routes.length, 1, 'once Jev rejects it, routing runs');
-    assert.ok(routes[0]!.includes('space_preview'));
+    assert.equal(calls.length, 1, 'a match that does not cover the request is not taken on keywords alone');
+    assert.match(calls[0]!.strategies[0]!, /Build me a quokka brief workspace/);
+    assert.ok(calls[0]!.operations.includes('space_preview'), 'and the space tools are offered in the same request');
     assert.equal(prepared.strategyId, 'route:space_preview');
     assert.doesNotMatch(prepared.text ?? '', /outlook_get_calendar_view/, 'the rejected run recommends nothing');
   } finally {

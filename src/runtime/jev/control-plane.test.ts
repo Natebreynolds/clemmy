@@ -9,6 +9,7 @@ const {
   filterPrimerHitsWithJev,
   nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
+  decideTurnStartWithJev,
   rerankNamedCandidatesWithJev,
   routeOperationWithJev,
   selectProvenRunStrategyWithJev,
@@ -132,7 +133,7 @@ test('selectProvenRunStrategyWithJev picks a matching past run and fails open to
     ok: true,
     text: async () => JSON.stringify({
       model: 'jev-1.13.0',
-      answers: { match: { type: 'noul', noul: 0.82 } },
+      answers: { which: { type: 'choice', choice: 'strat-cal', probabilities: { 'strat-cal': 0.82, none: 0.18 }, confidence: 0.82 } },
       usage: { input_tokens: 20, output_tokens: 2 },
     }),
   }));
@@ -463,5 +464,51 @@ test('routeOperationWithJev applies a sure, well-fitting pick and nothing else',
   _setSystemOneFetchForTests(async () => ({ status: 504, ok: false, text: async () => '' }));
   assert.equal((await routeOperationWithJev(request, operations, { timeoutMs: 1_000 })).outcome, 'unavailable');
   assert.equal((await routeOperationWithJev(request, [], { timeoutMs: 1_000 })).outcome, 'none');
+});
+
+// The turn-start questions read the same state and do not depend on each
+// other, so they travel in ONE request. A fitting remembered run wins; a
+// routed operation needs a sure choice and a sure fit.
+test('decideTurnStartWithJev asks both turn-start questions in one request', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Array<Record<string, any>> = [];
+  let which = 'none';
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return {
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          which: { type: 'choice', choice: which, confidence: 0.88, probabilities: { [which]: 0.88 } },
+          select: { type: 'choice', choice: 'op_1', confidence: 0.9, probabilities: { op_1: 0.9 } },
+          fit_0: { type: 'noul', noul: 0.1 },
+          fit_1: { type: 'noul', noul: 0.92 },
+        },
+        usage: { input_tokens: 90, output_tokens: 8 },
+      }),
+    };
+  });
+  const runs = [{ id: 'strat-build', objective: 'Build the brief space', toolsUsed: ['outlook_get_calendar_view'] }];
+  const operations = [
+    { id: 'space_save', purpose: 'Save a Space' },
+    { id: 'space_preview', purpose: 'Render a Space for review' },
+  ];
+  const routed = await decideTurnStartWithJev('Show me the brief space', runs, operations, { timeoutMs: 1_000 });
+  assert.equal(posted.length, 1, 'one request carries both questions');
+  assert.ok(posted[0]!.questions.which && posted[0]!.questions.select && posted[0]!.questions.fit_1);
+  assert.equal(routed.strategy, null);
+  assert.equal(routed.route.pick?.id, 'space_preview');
+  assert.equal(routed.failedOpen, false);
+
+  which = 'strat-build';
+  const remembered = await decideTurnStartWithJev('Show me the brief space', runs, operations, { timeoutMs: 1_000 });
+  assert.equal(remembered.strategy?.id, 'strat-build', 'a fitting remembered run wins');
+
+  _setSystemOneFetchForTests(async () => ({ status: 504, ok: false, text: async () => '' }));
+  const unreachable = await decideTurnStartWithJev('Show me the brief space', runs, operations, { timeoutMs: 1_000 });
+  assert.equal(unreachable.failedOpen, true);
+  assert.equal(unreachable.route.pick, null);
 });
 

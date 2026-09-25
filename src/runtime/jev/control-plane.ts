@@ -190,7 +190,6 @@ export interface ProvenStrategyCandidate {
 }
 
 const PROVEN_STRATEGY_CONFIDENCE_MIN = 0.6;
-const PROVEN_STRATEGY_NOUL_MIN = 0.6;
 // This call sits on the critical path before the first model frame. Live
 // 2026-09-21/22: median 740 ms, p90 2,980 ms across ten calls. Past 2 s the
 // caller keeps the top lexical match (failedOpen), and a wrong pick is
@@ -204,14 +203,15 @@ export interface ProvenStrategyJevPick<T extends ProvenStrategyCandidate> {
   failedOpen: boolean;
 }
 
-// ── Turn-start operation routing ─────────────────────────────────────────────
+// ── Turn-start decisions ─────────────────────────────────────────────────────
 // The keel pattern: the host offers the few operations this request most
-// plausibly needs, and Jev names the one to run first, or none. A pick counts
-// only when Jev is sure of the choice AND of that operation's own fit, because
-// a wrong tool on the first frame costs more than the search it saves.
+// plausibly needs, and Jev names the one to run first, or none. A routed pick
+// counts only when Jev is sure of the choice AND of that operation's own fit,
+// because a wrong tool on the first frame costs more than the search it saves.
 const OPERATION_ROUTE_CONFIDENCE_MIN = 0.6;
 const OPERATION_ROUTE_FIT_MIN = 0.8;
 const OPERATION_ROUTE_WINDOW = 10;
+const PROVEN_STRATEGY_WINDOW = 8;
 
 export interface RoutableOperation {
   id: string;
@@ -225,64 +225,121 @@ export interface OperationRoute<T extends RoutableOperation> {
   fit?: number;
 }
 
-/** Name the operation this request needs first, from a host-prepared list, or
- *  none. The request text is the whole state: tool output and conversation
- *  context never become the decision task. */
+export interface TurnStartDecision<S extends ProvenStrategyCandidate, O extends RoutableOperation> {
+  /** A remembered run Jev judged to fit; it wins over a routed operation. */
+  strategy: S | null;
+  route: OperationRoute<O>;
+  /** Transport/timeout/disabled: the caller may keep its top memory match. */
+  failedOpen: boolean;
+}
+
+/**
+ * Both turn-start questions read the same state (the request) and neither
+ * depends on the other's answer, so they go to Jev as ONE request, as its
+ * documentation recommends for independent questions over shared state:
+ * which remembered run fits well enough to skip discovery, if any, and which
+ * single operation would do the core of the request. Asked separately they
+ * cost two round trips and let the first spend the budget the second needed.
+ * The host prefers a fitting remembered run, which carries proven tools and
+ * request shapes, then a sure, well-fitting operation. The request text is the
+ * whole state: tool output never becomes the decision task.
+ */
+export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, O extends RoutableOperation>(
+  request: string,
+  strategies: readonly S[],
+  operations: readonly O[],
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<TurnStartDecision<S, O>> {
+  const runs = strategies.slice(0, PROVEN_STRATEGY_WINDOW);
+  const ops = operations.slice(0, OPERATION_ROUTE_WINDOW);
+  const none: OperationRoute<O> = { pick: null, outcome: 'none' };
+  if (runs.length === 0 && ops.length === 0) return { strategy: null, route: none, failedOpen: false };
+  const questions: SystemOneQuestions = {};
+  if (runs.length > 0) {
+    const criteria: Record<string, string | null> = { none: 'New work, extra tools needed, or not sure.' };
+    for (const run of runs) {
+      criteria[run.id] = `${run.objective.slice(0, 160)} · ${run.toolsUsed.join(', ')}`.slice(0, 240);
+    }
+    questions.which = {
+      type: 'choice',
+      instructions: 'Which proven past run matches this request well enough to skip tool discovery? Choose none unless the same tools will fulfill it.',
+      criteria,
+    };
+  }
+  if (ops.length > 0) {
+    const criteria: Record<string, string | null> = {
+      none: 'No single listed operation does the core of this request, or not sure.',
+    };
+    questions.select = {
+      type: 'choice',
+      instructions: 'Which listed operation should run first to do the core of this request? Choose none unless one clearly fits.',
+      criteria,
+    };
+    ops.forEach((operation, index) => {
+      criteria[`op_${index}`] = `${operation.id} · ${operation.purpose}`.slice(0, 240);
+      questions[`fit_${index}`] = {
+        type: 'noul',
+        instructions: `Would calling ${operation.id} directly do the core of this request?`,
+        criteria: {
+          true: 'It performs the main thing the request asks for.',
+          false: 'It is unrelated, only a side step, or not sure.',
+        },
+      };
+    });
+  }
+  const result = await evaluateSystemOne({
+    state: { request: request.replace(/\s+/g, ' ').trim().slice(0, 3_000) },
+    questions,
+    timeoutMs: Math.min(PROVEN_STRATEGY_TIMEOUT_MS, opts.timeoutMs ?? PROVEN_STRATEGY_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-turn-start',
+    decisionContext: {
+      ...(runs.length > 0 ? { strategies: runs.map((run) => run.id) } : {}),
+      ...(ops.length > 0 ? { candidates: ops.map((operation) => operation.id) } : {}),
+    },
+  });
+  if (!result.ok) return { strategy: null, route: { pick: null, outcome: 'unavailable' }, failedOpen: true };
+
+  const which = result.answers.which as ChoiceAnswer | undefined;
+  const strategy = which && which.choice !== 'none' && which.confidence >= PROVEN_STRATEGY_CONFIDENCE_MIN
+    ? runs.find((run) => run.id === which.choice) ?? null
+    : null;
+  const route = ((): OperationRoute<O> => {
+    if (ops.length === 0) return none;
+    const answer = result.answers.select as ChoiceAnswer | undefined;
+    if (!answer) return { pick: null, outcome: 'unavailable' };
+    if (answer.choice === 'none') return { pick: null, outcome: 'none', confidence: answer.confidence };
+    const index = /^op_(\d+)$/.exec(answer.choice)?.[1];
+    const pick = index === undefined ? undefined : ops[Number(index)];
+    if (!pick) return { pick: null, outcome: 'unavailable' };
+    if (answer.confidence < OPERATION_ROUTE_CONFIDENCE_MIN) {
+      return { pick: null, outcome: 'low_confidence', confidence: answer.confidence };
+    }
+    const fit = (result.answers[`fit_${index}`] as NoulAnswer | undefined)?.noul;
+    if (typeof fit !== 'number' || fit < OPERATION_ROUTE_FIT_MIN) {
+      return { pick: null, outcome: 'low_fit', confidence: answer.confidence, ...(typeof fit === 'number' ? { fit } : {}) };
+    }
+    return { pick, outcome: 'picked', confidence: answer.confidence, fit };
+  })();
+  noteJevDecisionOutcome(
+    result.decisionId,
+    strategy ? 'strategy' : route.pick ? 'routed' : 'none',
+    {
+      ...(strategy ? { strategy: strategy.id } : {}),
+      ...(ops.length > 0 ? { route: route.outcome, ...(route.pick ? { pick: route.pick.id } : {}) } : {}),
+    },
+  );
+  return { strategy, route, failedOpen: false };
+}
+
+/** Name the operation this request needs first, from a host-prepared list,
+ *  or none. */
 export async function routeOperationWithJev<T extends RoutableOperation>(
   request: string,
   candidates: readonly T[],
   opts: { timeoutMs: number; sessionId?: string },
 ): Promise<OperationRoute<T>> {
-  const window = candidates.slice(0, OPERATION_ROUTE_WINDOW);
-  if (window.length === 0) return { pick: null, outcome: 'none' };
-  const criteria: Record<string, string | null> = {
-    none: 'No single listed operation does the core of this request, or not sure.',
-  };
-  const questions: SystemOneQuestions = {
-    select: {
-      type: 'choice',
-      instructions: 'Which listed operation should run first to do the core of this request? Choose none unless one clearly fits.',
-      criteria,
-    },
-  };
-  window.forEach((operation, index) => {
-    criteria[`op_${index}`] = `${operation.id} · ${operation.purpose}`.slice(0, 240);
-    questions[`fit_${index}`] = {
-      type: 'noul',
-      instructions: `Would calling ${operation.id} directly do the core of this request?`,
-      criteria: {
-        true: 'It performs the main thing the request asks for.',
-        false: 'It is unrelated, only a side step, or not sure.',
-      },
-    };
-  });
-  const result = await evaluateSystemOne({
-    state: { request: request.replace(/\s+/g, ' ').trim().slice(0, 3_000) },
-    questions,
-    timeoutMs: opts.timeoutMs,
-    sessionId: opts.sessionId,
-    channel: 'jev-operation-route',
-    decisionContext: { candidates: window.map((operation) => operation.id) },
-  });
-  const settle = (route: OperationRoute<T>): OperationRoute<T> => {
-    if (result.ok) noteJevDecisionOutcome(result.decisionId, route.outcome, route.pick ? { pick: route.pick.id } : undefined);
-    return route;
-  };
-  if (!result.ok) return { pick: null, outcome: 'unavailable' };
-  const answer = result.answers.select as ChoiceAnswer | undefined;
-  if (!answer) return settle({ pick: null, outcome: 'unavailable' });
-  if (answer.choice === 'none') return settle({ pick: null, outcome: 'none', confidence: answer.confidence });
-  const index = /^op_(\d+)$/.exec(answer.choice)?.[1];
-  const pick = index === undefined ? undefined : window[Number(index)];
-  if (!pick) return settle({ pick: null, outcome: 'unavailable' });
-  if (answer.confidence < OPERATION_ROUTE_CONFIDENCE_MIN) {
-    return settle({ pick: null, outcome: 'low_confidence', confidence: answer.confidence });
-  }
-  const fit = (result.answers[`fit_${index}`] as NoulAnswer | undefined)?.noul;
-  if (typeof fit !== 'number' || fit < OPERATION_ROUTE_FIT_MIN) {
-    return settle({ pick: null, outcome: 'low_fit', confidence: answer.confidence, ...(typeof fit === 'number' ? { fit } : {}) });
-  }
-  return settle({ pick, outcome: 'picked', confidence: answer.confidence, fit });
+  return (await decideTurnStartWithJev(request, [], candidates, opts)).route;
 }
 
 /** Pick one proven past run that can skip discovery, or none.
@@ -292,67 +349,8 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
   strategies: T[],
   opts?: { sessionId?: string; timeoutMs?: number },
 ): Promise<ProvenStrategyJevPick<T>> {
-  if (strategies.length === 0) return { strategy: null, failedOpen: false };
-  const window = strategies.slice(0, 8);
-  const timeoutMs = Math.min(PROVEN_STRATEGY_TIMEOUT_MS, opts?.timeoutMs ?? PROVEN_STRATEGY_TIMEOUT_MS);
-  if (window.length === 1) {
-    const only = window[0]!;
-    const result = await evaluateSystemOne({
-      state: {
-        request: query.replace(/\s+/g, ' ').trim().slice(0, 800),
-        proven: { objective: only.objective, toolsUsed: only.toolsUsed },
-      },
-      questions: {
-        match: {
-          type: 'noul',
-          instructions: 'Does this proven past run match the current request well enough to skip tool discovery?',
-          criteria: {
-            true: 'Same job. The proven tools will fulfill this request.',
-            false: 'Different job, extra tools needed, or not sure.',
-          },
-        },
-      },
-      timeoutMs,
-      sessionId: opts?.sessionId,
-      channel: 'jev-proven-strategy',
-      decisionContext: { candidates: [only.id] },
-    });
-    if (!result.ok) return { strategy: null, failedOpen: true };
-    const answer = result.answers.match as NoulAnswer | undefined;
-    if (!answer || answer.noul < PROVEN_STRATEGY_NOUL_MIN) {
-      noteJevDecisionOutcome(result.decisionId, 'none');
-      return { strategy: null, failedOpen: false };
-    }
-    noteJevDecisionOutcome(result.decisionId, 'picked', { pick: only.id });
-    return { strategy: only, failedOpen: false };
-  }
-  const criteria: Record<string, string | null> = { none: 'New work, extra tools needed, or not sure.' };
-  for (const strategy of window) {
-    criteria[strategy.id] = `${strategy.objective.slice(0, 160)} · ${strategy.toolsUsed.join(', ')}`.slice(0, 240);
-  }
-  const result = await evaluateSystemOne({
-    state: { request: query.replace(/\s+/g, ' ').trim().slice(0, 800) },
-    questions: {
-      which: {
-        type: 'choice',
-        instructions: 'Which proven past run matches this request well enough to skip tool discovery? Choose none unless the same tools will fulfill it.',
-        criteria,
-      },
-    },
-    timeoutMs,
-    sessionId: opts?.sessionId,
-    channel: 'jev-proven-strategy',
-    decisionContext: { candidates: window.map((strategy) => strategy.id) },
-  });
-  if (!result.ok) return { strategy: null, failedOpen: true };
-  const answer = result.answers.which as ChoiceAnswer | undefined;
-  if (!answer || answer.choice === 'none' || answer.confidence < PROVEN_STRATEGY_CONFIDENCE_MIN) {
-    noteJevDecisionOutcome(result.decisionId, answer?.choice === 'none' ? 'none' : 'low_confidence');
-    return { strategy: null, failedOpen: false };
-  }
-  const picked = window.find((strategy) => strategy.id === answer.choice) ?? null;
-  noteJevDecisionOutcome(result.decisionId, picked ? 'picked' : 'unavailable', picked ? { pick: picked.id } : undefined);
-  return { strategy: picked, failedOpen: false };
+  const decision = await decideTurnStartWithJev(query, strategies, [], opts);
+  return { strategy: decision.strategy, failedOpen: decision.failedOpen };
 }
 
 export async function tryJevGroundingVerdict(
