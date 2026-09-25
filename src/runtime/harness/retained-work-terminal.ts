@@ -1,5 +1,6 @@
 import { openEventLog } from './eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { RETAINED_WORK_TERMINAL_HEADER } from './retained-work-checkpoint.js';
 
 /**
  * Host-authored retained-work disclosure for an incomplete terminal.
@@ -10,7 +11,7 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
  * rows and their frozen non-host crossing counts.
  */
 
-export const RETAINED_WORK_TERMINAL_HEADER = 'Retained work (durable checkpoint):';
+export { RETAINED_WORK_TERMINAL_HEADER };
 
 export type RetainedExternalWriteState =
   | 'not_recorded'

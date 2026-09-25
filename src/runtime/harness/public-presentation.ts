@@ -33,6 +33,7 @@ import {
   stripLeakedDecisionAssignment,
 } from './presentation-hygiene.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
+import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import {
   isSettledReadReplayReturnData,
   settledReadReplayCallId,
@@ -595,12 +596,19 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
       },
     };
   }
-  const reply = publicCompletionText(data);
   const reason = text(data.reason);
   const legacyNeedsInput = data.awaitingUser === true
     || reason === 'awaiting_user_input'
     || reason === 'awaiting_approval'
     || reason === 'awaiting_continue';
+  // While Clem waits on the person, they read the question or approval, not
+  // the host's retained-work checkpoint; the durable terminal keeps it for the
+  // model. A failed or blocked terminal still discloses it with its write state.
+  const waitingOnPerson = typedPresentation
+    ? typedPresentation.status === 'needs_input'
+    : legacyNeedsInput;
+  const readable = (value: string) => (waitingOnPerson ? withoutRetainedWorkCheckpoint(value) : value);
+  const reply = readable(publicCompletionText(data));
   const legacyStatus = legacyNeedsInput
     ? 'needs_input'
     : data.delivered === false
@@ -650,15 +658,17 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
     // Compatibility for consumers that historically read summary first.
     summary: reply,
     ...(typedOutcome ? { turnOutcome: typedOutcome } : {}),
-    presentation: typedPresentation ?? {
-      version: 1,
-      audience: 'user',
-      phase: 'final',
-      status: legacyStatus,
-      kind: legacyKind,
-      text: reply,
-      resumable: legacyNeedsInput,
-    },
+    presentation: typedPresentation
+      ? { ...typedPresentation, text: readable(typedPresentation.text) }
+      : {
+          version: 1,
+          audience: 'user',
+          phase: 'final',
+          status: legacyStatus,
+          kind: legacyKind,
+          text: reply,
+          resumable: legacyNeedsInput,
+        },
   };
 }
 

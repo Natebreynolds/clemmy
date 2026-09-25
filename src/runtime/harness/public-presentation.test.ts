@@ -527,6 +527,51 @@ test('a valid typed terminal stays self-validating after crossing the public eve
   assert.equal('internalSummary' in projected.data, false);
 });
 
+// Live 2026-09-25: a clarifying question reached the chat followed by the
+// host's whole retained-work checkpoint, rh_ handle ids included.
+test('a question shows the person the question; the retained-work checkpoint stays in the durable terminal', () => {
+  const question = 'Which interview should I mention: today at 4:15, or the ones next week?';
+  const checkpoint = [
+    'Retained work (durable checkpoint):',
+    '- Source/tool calendar_view: 83 records (complete) retained as rh_463df142f7cee5557b1a54c4c5ca39d6.',
+    'External write state: no settled external-write attempt is recorded.',
+  ].join('\n');
+  const typed = (status: 'needs_input' | 'blocked', kind: 'question' | 'blocked') => {
+    const identity = { sessionId: 'public-projection-test', turn: 1, sourceUserSeq: 9 };
+    const text = `${question}\n\n${checkpoint}`;
+    return event('conversation_completed', {
+      terminalKey: 'turn:9',
+      sourceUserSeq: 9,
+      presentation: {
+        version: 1, id: 'turn:9:presentation', outcomeId: 'turn:9', audience: 'user', phase: 'final',
+        identity, status, kind, text, resumable: status === 'needs_input',
+        ...(status === 'needs_input' ? { needs: { kind: 'input' } } : {}),
+      },
+      turnOutcome: {
+        version: 2, id: 'turn:9', status, resumable: status === 'needs_input',
+        ...(status === 'needs_input' ? { needs: { kind: 'input' } } : {}),
+      },
+      reply: text,
+      ...(status === 'needs_input' ? { awaitingUser: true, reason: 'awaiting_user_input' } : { delivered: false }),
+    });
+  };
+  const asked = projectHarnessEventForPublic(typed('needs_input', 'question'));
+  assert.ok(asked);
+  assert.equal((asked.data.presentation as { text: string }).text, question);
+  assert.equal(asked.data.reply, question);
+  assert.equal((asked.data.turnOutcome as { status?: string } | undefined)?.status, 'needs_input', 'the typed contract was read');
+  assert.equal(publicCompletionText(asked.data), question, 'the projected terminal still validates as typed');
+
+  const blocked = projectHarnessEventForPublic(typed('blocked', 'blocked'));
+  assert.match(String((blocked?.data.presentation as { text: string }).text), /Retained work \(durable checkpoint\)/,
+    'a stopped turn still discloses what was kept and whether anything was written');
+
+  const legacy = projectHarnessEventForPublic(event('conversation_completed', {
+    reply: `${question}\n\n${checkpoint}`, reason: 'awaiting_user_input', awaitingUser: true,
+  }));
+  assert.equal(legacy?.data.reply, question);
+});
+
 test('a malformed typed presentation cannot launder its duplicate legacy reply into publication', () => {
   const projected = projectHarnessEventForPublic(event('conversation_completed', {
     presentation: {
