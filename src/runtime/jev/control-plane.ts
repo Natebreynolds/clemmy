@@ -5,6 +5,7 @@
  */
 
 import { evaluateSystemOne } from './client.js';
+import { noteJevDecisionOutcome } from './decision-log.js';
 import type { ChoiceAnswer, NoulAnswer, SystemOneQuestions } from './system-one.js';
 
 export const RANK_TIMEOUT_MS = 1_200;
@@ -262,22 +263,27 @@ export async function routeOperationWithJev<T extends RoutableOperation>(
     timeoutMs: opts.timeoutMs,
     sessionId: opts.sessionId,
     channel: 'jev-operation-route',
+    decisionContext: { candidates: window.map((operation) => operation.id) },
   });
+  const settle = (route: OperationRoute<T>): OperationRoute<T> => {
+    if (result.ok) noteJevDecisionOutcome(result.decisionId, route.outcome, route.pick ? { pick: route.pick.id } : undefined);
+    return route;
+  };
   if (!result.ok) return { pick: null, outcome: 'unavailable' };
   const answer = result.answers.select as ChoiceAnswer | undefined;
-  if (!answer) return { pick: null, outcome: 'unavailable' };
-  if (answer.choice === 'none') return { pick: null, outcome: 'none', confidence: answer.confidence };
+  if (!answer) return settle({ pick: null, outcome: 'unavailable' });
+  if (answer.choice === 'none') return settle({ pick: null, outcome: 'none', confidence: answer.confidence });
   const index = /^op_(\d+)$/.exec(answer.choice)?.[1];
   const pick = index === undefined ? undefined : window[Number(index)];
-  if (!pick) return { pick: null, outcome: 'unavailable' };
+  if (!pick) return settle({ pick: null, outcome: 'unavailable' });
   if (answer.confidence < OPERATION_ROUTE_CONFIDENCE_MIN) {
-    return { pick: null, outcome: 'low_confidence', confidence: answer.confidence };
+    return settle({ pick: null, outcome: 'low_confidence', confidence: answer.confidence });
   }
   const fit = (result.answers[`fit_${index}`] as NoulAnswer | undefined)?.noul;
   if (typeof fit !== 'number' || fit < OPERATION_ROUTE_FIT_MIN) {
-    return { pick: null, outcome: 'low_fit', confidence: answer.confidence, ...(typeof fit === 'number' ? { fit } : {}) };
+    return settle({ pick: null, outcome: 'low_fit', confidence: answer.confidence, ...(typeof fit === 'number' ? { fit } : {}) });
   }
-  return { pick, outcome: 'picked', confidence: answer.confidence, fit };
+  return settle({ pick, outcome: 'picked', confidence: answer.confidence, fit });
 }
 
 /** Pick one proven past run that can skip discovery, or none.
@@ -310,10 +316,15 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
       timeoutMs,
       sessionId: opts?.sessionId,
       channel: 'jev-proven-strategy',
+      decisionContext: { candidates: [only.id] },
     });
     if (!result.ok) return { strategy: null, failedOpen: true };
     const answer = result.answers.match as NoulAnswer | undefined;
-    if (!answer || answer.noul < PROVEN_STRATEGY_NOUL_MIN) return { strategy: null, failedOpen: false };
+    if (!answer || answer.noul < PROVEN_STRATEGY_NOUL_MIN) {
+      noteJevDecisionOutcome(result.decisionId, 'none');
+      return { strategy: null, failedOpen: false };
+    }
+    noteJevDecisionOutcome(result.decisionId, 'picked', { pick: only.id });
     return { strategy: only, failedOpen: false };
   }
   const criteria: Record<string, string | null> = { none: 'New work, extra tools needed, or not sure.' };
@@ -332,16 +343,17 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
     timeoutMs,
     sessionId: opts?.sessionId,
     channel: 'jev-proven-strategy',
+    decisionContext: { candidates: window.map((strategy) => strategy.id) },
   });
   if (!result.ok) return { strategy: null, failedOpen: true };
   const answer = result.answers.which as ChoiceAnswer | undefined;
   if (!answer || answer.choice === 'none' || answer.confidence < PROVEN_STRATEGY_CONFIDENCE_MIN) {
+    noteJevDecisionOutcome(result.decisionId, answer?.choice === 'none' ? 'none' : 'low_confidence');
     return { strategy: null, failedOpen: false };
   }
-  return {
-    strategy: window.find((strategy) => strategy.id === answer.choice) ?? null,
-    failedOpen: false,
-  };
+  const picked = window.find((strategy) => strategy.id === answer.choice) ?? null;
+  noteJevDecisionOutcome(result.decisionId, picked ? 'picked' : 'unavailable', picked ? { pick: picked.id } : undefined);
+  return { strategy: picked, failedOpen: false };
 }
 
 export async function tryJevGroundingVerdict(

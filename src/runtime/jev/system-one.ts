@@ -7,7 +7,10 @@
  */
 
 export const TYPESAFE_SYSTEMONE_URL = 'https://api.typesafe.ai/v1/systemone';
-export const TYPESAFE_MODEL = 'jev-latest';
+/** A pinned version, not the moving `jev-latest` alias: the vendor can move
+ *  the alias at any time, and a model change alters every lane's decisions.
+ *  A new version is adopted deliberately, as an evaluation event. */
+export const TYPESAFE_MODEL = 'jev-1.13.0';
 
 export type NoulQuestion = {
   type: 'noul';

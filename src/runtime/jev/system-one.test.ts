@@ -70,9 +70,9 @@ test('parseSystemOneResponse fails open on missing answers, out-of-range noul, a
   }, { department: QUESTIONS.department }).reason, 'malformed');
 });
 
-test('buildSystemOneRequest pins jev-latest and the typed questions map', () => {
+test('buildSystemOneRequest pins a model version and the typed questions map', () => {
   const request = buildSystemOneRequest('hello', { alive: { type: 'noul', instructions: 'yes?' } });
-  assert.equal(request.model, 'jev-latest');
+  assert.equal(request.model, 'jev-1.13.0');
   assert.equal(request.questions.alive.type, 'noul');
 });
 

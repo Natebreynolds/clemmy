@@ -5,6 +5,7 @@
 import { getRuntimeEnv } from '../../config.js';
 import { getSecretStore } from '../secrets/index.js';
 import { recordModelUsage } from '../usage-log.js';
+import { compactJevAnswers, recordJevDecision } from './decision-log.js';
 import {
   TYPESAFE_MODEL,
   TYPESAFE_SYSTEMONE_URL,
@@ -54,7 +55,9 @@ export async function evaluateSystemOne(input: {
   timeoutMs?: number;
   sessionId?: string;
   channel?: string;
-}): Promise<SystemOneResult> {
+  /** Host facts worth keeping beside the answers, e.g. the candidate ids. */
+  decisionContext?: Record<string, unknown>;
+}): Promise<SystemOneResult & { decisionId?: string }> {
   if (!jevEnabled()) return { ok: false, reason: 'disabled' };
   const key = await resolveTypesafeApiKey();
   if (!key) return { ok: false, reason: 'missing_key' };
@@ -80,7 +83,17 @@ export async function evaluateSystemOne(input: {
       ...(result.ok ? {} : { failReason: result.reason }),
     });
   } catch { /* usage must never break the decision path */ }
-  return result;
+  const decisionId = recordJevDecision({
+    lane: input.channel ?? 'jev',
+    ...(input.sessionId?.trim() ? { sessionId: input.sessionId.trim() } : {}),
+    requestedModel: TYPESAFE_MODEL,
+    ...(result.ok ? { servedModel: result.model, inputTokens: result.usage.input_tokens } : {}),
+    ok: result.ok,
+    ...(result.ok ? { answers: compactJevAnswers(result.answers) } : { failReason: result.reason }),
+    durationMs,
+    ...(input.decisionContext ? { context: input.decisionContext } : {}),
+  });
+  return { ...result, decisionId };
 }
 
 export async function typesafeKeyIsConfigured(): Promise<boolean> {
