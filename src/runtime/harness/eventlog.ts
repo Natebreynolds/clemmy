@@ -648,6 +648,13 @@ export const EVENT_TYPES = [
   // The scope one accepted source froze for its mutations. Read back by the
   // consent boundary so a later call cannot widen the job by proposing more.
   'accepted_mutation_scope',
+  // Delegated coding agents (Claude Code, Codex) working in a run worktree,
+  // on the run's own `coding:<runId>` session; the origin chat sees them
+  // bridged. The agent's inner tool calls are activity, never tool_called:
+  // they are not Clem's calls and must not feed her restart safety,
+  // adjudication or write accounting.
+  'coding_run_activity',
+  'coding_run_settled',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);
