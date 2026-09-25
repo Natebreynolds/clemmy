@@ -6,6 +6,7 @@ import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-
 import { acceptedTaskMode } from './accepted-task-mode.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { retainedHistoryPrefixProjection } from './retained-history-prefix.js';
+import { scanSecrets } from './guardrails.js';
 import type { Agent, AgentInputItem } from '@openai/agents';
 import { Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
@@ -2872,6 +2873,14 @@ function registerAndEmitApprovalsOnce(
             args: registered.approvalArgs,
             rawArgs: registered.interruption.rawArgs,
             pendingAction: pendingActionApprovalViewFromArgs(row.args),
+            ...(pendingActionApprovalViewFromArgs(row.args)
+              ? {}
+              : {
+                preview: approvalCallPreview({
+                  ...registered.interruption,
+                  args: row.args,
+                }) ?? undefined,
+              }),
             approvalId: row.approvalId,
             ...(registered.interruption.consentCall
               ? { consentCall: registered.interruption.consentCall }
@@ -16112,6 +16121,70 @@ function composioApprovalSubject(
   // the concatenated suffix used to silently erase the account or time when a
   // long subject/recipient appeared first on the card.
   return [operation, ...details].join(' · ');
+}
+
+export interface ApprovalCallPreview {
+  operation: string;
+  fields: Array<{ name: string; value: string }>;
+}
+
+const APPROVAL_PREVIEW_MAX_FIELDS = 16;
+const APPROVAL_PREVIEW_TEXT_MAX_CHARS = 2_000;
+const APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS = 600;
+
+function approvalPreviewValue(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return null;
+    return text.length > APPROVAL_PREVIEW_TEXT_MAX_CHARS
+      ? `${text.slice(0, APPROVAL_PREVIEW_TEXT_MAX_CHARS)}… (${text.length - APPROVAL_PREVIEW_TEXT_MAX_CHARS} more characters)`
+      : text;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value === null || value === undefined) return null;
+  try {
+    const json = JSON.stringify(value);
+    if (!json || json === '{}' || json === '[]') return null;
+    return json.length > APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS
+      ? `${json.slice(0, APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS)}…`
+      : json;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What an approval would actually do, from the exact frozen arguments the
+ * registry holds: the operation and each argument the provider receives.
+ * Live 2026-09-25: two Slack approvals read "Slack open dm" and "Send Slack
+ * message"; the message text sat in the arguments and never reached the
+ * card, and the owner approved without knowing what. Display only: authority
+ * and resume keep pinning the untouched arguments, and a value that looks
+ * like a secret is withheld.
+ */
+export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true): ApprovalCallPreview | null {
+  const args = (info.args ?? {}) as Record<string, unknown>;
+  if (unwrapWorkCall && isPlainOrClementineLocalTool(info.toolName, 'work_call')) {
+    const targetName = typeof args.name === 'string' ? args.name.trim() : '';
+    const targetArgs = approvalJsonRecord(args.args_json);
+    return targetName && targetArgs
+      ? approvalCallPreview({ ...info, toolName: targetName, args: targetArgs }, false)
+      : null;
+  }
+  const slug = typeof args.tool_slug === 'string' ? args.tool_slug.trim() : '';
+  const operation = truncate((slug ? humanizeComposioSlug(slug) : '') || info.toolName, 80);
+  const provider = slug ? approvalJsonRecord(args.arguments) ?? {} : args;
+  const fields: ApprovalCallPreview['fields'] = [];
+  for (const [name, raw] of Object.entries(provider)) {
+    if (fields.length >= APPROVAL_PREVIEW_MAX_FIELDS) break;
+    const value = approvalPreviewValue(raw);
+    if (value === null) continue;
+    fields.push({
+      name: truncate(name, 80),
+      value: scanSecrets(value).length > 0 ? '[withheld: looks like a secret]' : value,
+    });
+  }
+  return { operation, fields };
 }
 
 function extractApprovalSubject(info: InterruptionInfo, unwrapWorkCall = true): string {

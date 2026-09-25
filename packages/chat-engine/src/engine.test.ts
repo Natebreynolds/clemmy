@@ -75,6 +75,28 @@ test('approval consent facts survive both live delivery and transcript replay ve
   } finally { engine.dispose(); }
 });
 
+test('an approval preview reaches the card on live delivery and replay; a malformed one is dropped', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({ transport, api: {
+    send: async () => ({ sessionId: 'preview-card', accepted: true }),
+    loadSession: async () => ({ events: [], latestSeq: 0 }),
+  } });
+  const preview = { operation: 'Send Slack message', fields: [
+    { name: 'channel', value: 'D0FIXTURE1' },
+    { name: 'markdown_text', value: 'Could you run the 4:15 review on your own today?' },
+  ] };
+  const approval = ev(2, 'approval_requested', { approvalId: 'apr-preview', subject: 'Send Slack message', preview });
+  try {
+    await engine.send('Message my teammate on Slack');
+    await wait(10);
+    transport.live!.onEvent(approval);
+    assert.deepEqual(engine.snapshot().messages.find(message => message.approval)?.approval?.preview, preview);
+    assert.deepEqual(foldTranscript([approval])[0]?.approval?.preview, preview);
+    const malformed = ev(3, 'approval_requested', { approvalId: 'apr-bad', subject: 'x', preview: { operation: 'x', fields: [{ name: 1 }] } });
+    assert.equal(foldTranscript([malformed])[0]?.approval?.preview, undefined);
+  } finally { engine.dispose(); }
+});
+
 test('stream death recovers by poll first and delivers the missed terminal', async () => {
   const transport = new FakeTransport();
   const delivered: HarnessEvent[] = [];

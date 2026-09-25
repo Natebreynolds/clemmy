@@ -470,6 +470,12 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   );
 }
 
+/** "markdown_text" → "Markdown text": an argument name as a label. */
+function approvalFieldLabel(name: string): string {
+  const words = name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase();
+  return words ? words[0]!.toUpperCase() + words.slice(1) : name;
+}
+
 function MessageRow({
   message, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction,
@@ -526,6 +532,17 @@ function MessageRow({
       <div class="turn turn-approval">
         <div class="approval-head">Waiting on you — {message.approval.subject}</div>
         {message.approval.reason ? <div class="approval-reason">{message.approval.reason}</div> : null}
+        {message.approval.preview && message.approval.preview.fields.length > 0 ? (
+          // What approving would actually send, from the host's frozen call.
+          <dl class="approval-preview">
+            {message.approval.preview.fields.map((field) => (
+              <div key={field.name}>
+                <dt>{approvalFieldLabel(field.name)}</dt>
+                <dd>{field.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
         {approvalId && !approvalDecided ? (
           <div class="plan-actions">
             <button

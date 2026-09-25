@@ -60,3 +60,25 @@ test('unknown kinds and needs are dropped, never invented', () => {
   });
   assert.deepEqual(facts, { status: 'done' });
 });
+
+// Live 2026-09-25: an approval turn showed the host's filler as prose
+// ("Approval required for Slack open dm. Review apr-k42z to continue.") under
+// which its own card also appeared, and, typed as awaiting a reply, invited the
+// owner to type "approve apr-k42z".
+test('the host approval filler is not repeated as prose under its card; words the model wrote are kept', () => {
+  const approvalTerminal = (text: string, approvalId = 'apr-k42z') => ({
+    reason: 'awaiting_approval',
+    reply: text,
+    presentation: { version: 1, status: 'needs_input', kind: 'approval', text, approvalId },
+    turnOutcome: { version: 2, status: 'needs_input', needs: { kind: 'approval' }, resumable: true },
+  });
+  const filler = terminalCompletionPresentation(approvalTerminal('Approval required for Send Slack message. Review apr-k42z to continue.'), '');
+  assert.equal(filler.text, '');
+  assert.equal(filler.status, 'awaiting-approval');
+  const several = terminalCompletionPresentation(approvalTerminal("2 approvals are waiting, starting with Slack open dm (apr-k42z). Approve or reject each and I'll continue."), '');
+  assert.equal(several.text, '');
+  const spoken = terminalCompletionPresentation(approvalTerminal('Here is the note for your teammate; approve it below and I will send it.'), '');
+  assert.equal(spoken.text, 'Here is the note for your teammate; approve it below and I will send it.');
+  const foreign = terminalCompletionPresentation(approvalTerminal('Approval required for X. Review apr-other to continue.'), '');
+  assert.notEqual(foreign.text, '', 'only the filler naming this presentation\'s own approval is dropped');
+});

@@ -15,6 +15,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
 import type {
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
+import { approvalPreviewFrom } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
@@ -619,6 +620,7 @@ export class ChatEngine {
             reason: typeof d.reason === 'string' ? d.reason : undefined,
             approvalId,
             ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
+            ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
           },
         }];
         this.busy = false;
@@ -1019,6 +1021,7 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
             reason: typeof d.reason === 'string' ? d.reason : undefined,
             approvalId,
             ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
+            ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
           },
         });
         break;

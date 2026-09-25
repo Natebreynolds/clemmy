@@ -1419,6 +1419,11 @@ input, textarea, select { font: inherit; font-size: 16px; }
 }
 .approval-head { font-size: var(--t-sm); font-weight: 600; color: var(--fg); }
 .approval-reason { color: var(--fg-2); font-size: var(--t-sm); margin-top: 4px; }
+/* What approving would send: each argument the tool receives. */
+.approval-preview { margin: 8px 0 0; font-size: var(--t-sm); }
+.approval-preview > div + div { margin-top: 6px; }
+.approval-preview dt { color: var(--fg-2); }
+.approval-preview dd { margin: 0; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ── markdown inside a reply ────────────────────────────────────── */
 /* Replies carry markdown; the engine renders it sanitized. Spacing stays

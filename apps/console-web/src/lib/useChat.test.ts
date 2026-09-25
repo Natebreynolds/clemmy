@@ -124,6 +124,28 @@ test('live approval bursts keep independently addressable cards without overwrit
   assert.equal(appendLiveApprovalCard(afterSecond, second), afterSecond, 'SSE replay is idempotent');
 });
 
+test('a live approval card carries what the call will do, and drops a malformed preview', () => {
+  const preview = {
+    operation: 'Send Slack message',
+    fields: [
+      { name: 'channel', value: 'D0FIXTURE1' },
+      { name: 'markdown_text', value: 'Could you run the 4:15 review on your own today?' },
+    ],
+  };
+  const withPreview = appendLiveApprovalCard([], ev('approval_requested', {
+    approvalId: 'apr-c333',
+    subject: 'Send Slack message',
+    preview,
+  }));
+  assert.deepEqual(withPreview[0].approval?.preview, preview);
+  const malformed = appendLiveApprovalCard([], ev('approval_requested', {
+    approvalId: 'apr-d444',
+    subject: 'Send Slack message',
+    preview: { operation: 'Send Slack message', fields: 'everything' },
+  }));
+  assert.equal(malformed[0].approval?.preview, undefined);
+});
+
 test('one pending-action read hydrates every slim card sharing the durable action id', () => {
   const messages = [
     {

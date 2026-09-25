@@ -35,6 +35,12 @@ import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presenta
  * same on both. While the answer is still arriving the last block carries the
  * caret (styles.css `.chat-prose.is-streaming`).
  */
+/** "markdown_text" → "Markdown text": an argument name as a label. */
+function approvalFieldLabel(name: string): string {
+  const words = name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase();
+  return words ? words[0]!.toUpperCase() + words.slice(1) : name;
+}
+
 function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boolean; failed?: boolean }) {
   return (
     <div
@@ -370,7 +376,7 @@ export function ChatBubble({
             </DraftFrame>
           )}
 
-        {(message.status === 'awaiting-approval' || message.status === 'awaiting-plan') && (
+        {((message.status === 'awaiting-approval' && message.approval) || message.status === 'awaiting-plan') && (
           <div className="rounded-md border border-warning/40 bg-warning-tint p-3">
             <p className="text-small font-semibold text-fg">
               {message.status === 'awaiting-plan'
@@ -390,6 +396,19 @@ export function ChatBubble({
               </div>
             )}
             {message.approval?.reason && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
+            {!pendingAction && message.approval?.preview && message.approval.preview.fields.length > 0 && (
+              // What approving would actually send: each argument the tool
+              // receives, from the host's frozen call (live 2026-09-25: a
+              // Slack approval showed only "Send Slack message").
+              <dl className="mt-2 space-y-1.5 text-caption">
+                {message.approval.preview.fields.map((field) => (
+                  <div key={field.name}>
+                    <dt className="text-muted">{approvalFieldLabel(field.name)}</dt>
+                    <dd className="whitespace-pre-wrap break-words text-fg">{field.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
             {pendingAction && <PayloadPreview value={pendingAction.payload} />}
             {canOfferStandingSendTrust(pendingAction) && !resolved && (
               <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">

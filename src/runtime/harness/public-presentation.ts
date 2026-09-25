@@ -42,6 +42,23 @@ import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 import { appForWriteAction } from '../../integrations/composio/toolkit-identity.js';
 import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMode } from './task-mode.js';
 
+/** The host-built approval preview (operation + argument values the owner is
+ * approving), admitted only in its exact bounded shape. */
+function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: Array<{ name: string; value: string }> } } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.operation !== 'string' || !record.operation.trim() || record.operation.length > 80) return null;
+  if (!Array.isArray(record.fields) || record.fields.length > 16) return null;
+  const fields: Array<{ name: string; value: string }> = [];
+  for (const field of record.fields) {
+    if (!field || typeof field !== 'object' || Array.isArray(field)) return null;
+    const { name, value: shown } = field as Record<string, unknown>;
+    if (typeof name !== 'string' || typeof shown !== 'string' || !name || name.length > 80 || shown.length > 2_100) return null;
+    fields.push({ name, value: shown });
+  }
+  return { preview: { operation: record.operation, fields } };
+}
+
 export function publicPlanArtifactRef(value: unknown): PlanRevisionRef | undefined {
   try { return value === undefined ? undefined : parsePlanRevisionRef(value); } catch { return undefined; }
 }
@@ -935,6 +952,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         ]),
         ...(actionId ? { pendingActionId: actionId } : {}),
         ...(action ? { pendingAction: action } : {}),
+        ...(approvalPreviewProjection(data.preview) ?? {}),
         ...(consentCall && risk ? { consentCall: {
           ...selected(consentCall, ['effect', 'accountId']),
           risk: selected(risk, ['reversibility', 'consequence', 'destructive']),

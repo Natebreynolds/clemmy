@@ -123,11 +123,32 @@ export function terminalCompletionPresentation(
   return terminal ? { ...core, terminal } : core;
 }
 
+/**
+ * The host's own filler for a turn that paused on an approval with no words of
+ * its own ("Approval required for X. Review apr-… to continue."). The approval
+ * card already says it, with its preview and buttons. Shown as prose too, it
+ * read as a second card and, typed as awaiting a reply, invited the owner to
+ * type an answer (live 2026-09-25). Recognized only by its exact shape around
+ * the presentation's own approval id; words the model wrote are kept.
+ */
+function hostApprovalFiller(data: Record<string, unknown>): boolean {
+  const presentation = data.presentation && typeof data.presentation === 'object' && !Array.isArray(data.presentation)
+    ? data.presentation as Record<string, unknown>
+    : null;
+  if (!presentation || presentation.kind !== 'approval' || typeof presentation.approvalId !== 'string') return false;
+  const id = presentation.approvalId;
+  const text = typeof presentation.text === 'string' ? presentation.text.trim() : '';
+  return (text.startsWith('Approval required for ') && text.endsWith(`. Review ${id} to continue.`))
+    || (/^\d+ approvals are waiting, starting with /.test(text)
+      && text.endsWith(`(${id}). Approve or reject each and I'll continue.`));
+}
+
 function terminalCompletionPresentationCore(
   data: Record<string, unknown>,
   currentText: string,
   currentStatus?: MessageStatus,
 ): Pick<ChatMessage, 'text' | 'status' | 'progress'> {
+  if (hostApprovalFiller(data)) return { text: '', status: 'awaiting-approval', progress: undefined };
   const canonicalStatus = canonicalTerminalStatus(data);
   const reason = typeof data.reason === 'string' ? data.reason : '';
   const reasonKey = reason

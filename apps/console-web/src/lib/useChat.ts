@@ -1,7 +1,8 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { LiveAnswerDraft, TerminalFacts } from '@clem/chat-engine';
-import { applyStreamToken, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import { applyStreamToken, approvalPreviewFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import type { ApprovalPreview } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -125,6 +126,8 @@ export interface ChatMessage {
     approvalId?: string | null;
     pendingActionId?: string;
     pendingAction?: PendingActionApprovalView;
+    /** What approving would do: operation + argument values (display only). */
+    preview?: ApprovalPreview;
   };
   taskMode?: TaskMode;
   planArtifactRef?: PlanRevisionRef;
@@ -243,6 +246,7 @@ export function appendLiveApprovalCard(
         approvalId,
         ...(pendingActionId ? { pendingActionId } : {}),
         ...(pendingAction ? { pendingAction } : {}),
+        ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
       },
     },
   ];
@@ -2006,6 +2010,7 @@ export function inboxAdditionsFromEvents(
           approvalId,
           ...(pendingActionId ? { pendingActionId } : {}),
           ...(pendingAction ? { pendingAction } : {}),
+          ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
         },
       });
     }

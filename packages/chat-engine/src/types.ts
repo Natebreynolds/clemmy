@@ -30,6 +30,26 @@ export interface ReplayPayload {
   page?: { version: 1; scannedThroughSeq: number; snapshotSeq: number; hasMore: boolean };
 }
 
+export interface ApprovalPreview {
+  operation: string;
+  fields: Array<{ name: string; value: string }>;
+}
+
+/** Admit only the exact bounded preview shape the host projects. */
+export function approvalPreviewFrom(value: unknown): ApprovalPreview | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.operation !== 'string' || !record.operation.trim() || !Array.isArray(record.fields)) return undefined;
+  const fields: ApprovalPreview['fields'] = [];
+  for (const field of record.fields.slice(0, 16)) {
+    if (!field || typeof field !== 'object' || Array.isArray(field)) return undefined;
+    const { name, value: shown } = field as Record<string, unknown>;
+    if (typeof name !== 'string' || typeof shown !== 'string') return undefined;
+    fields.push({ name, value: shown });
+  }
+  return { operation: record.operation, fields };
+}
+
 export type MessageStatus =
   | 'thinking' | 'complete' | 'failed' | 'stopped'
   | 'awaiting-approval' | 'awaiting-reply' | 'awaiting-plan';
@@ -142,6 +162,9 @@ export interface ChatMessage {
     subject: string;
     reason?: string;
     approvalId?: string | null;
+    /** What approving would actually do: the operation and the argument
+     *  values it receives, from the host's frozen arguments. Display only. */
+    preview?: ApprovalPreview;
     /** Host reducer facts, passed through unchanged for display, not authority. */
     consentCall?: {
       effect: string;
