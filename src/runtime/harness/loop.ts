@@ -375,6 +375,7 @@ import { summarizeWorkManifests } from './work-manifest.js';
 // re-export its public surface so existing importers of loop.js keep working.
 export { isPlainTextContractDirective, toOrchestratorDecision, classifyTurnText } from './turn-decision.js';
 import { looksLikeDispatchHandoffReply, steerTurnReplySalvage, textAwaitsUserMaterial, recoverySummaryReplyIsDeliverable } from './turn-decision.js';
+import { retractAnswerDraft } from './answer-stream.js';
 import { judgeAmbiguousStallReply, stallIsJudgeAmbiguous } from './stall-judge.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import {
@@ -6654,6 +6655,9 @@ async function runConversationCore(
 
   while (stepIndex < maxSteps) {
     stepIndex += 1;
+    // Every delivery leaves this loop, so a later step means the draft the
+    // previous one left on screen was not delivered (answer-stream.ts).
+    if (stepIndex > 1) retractAnswerDraft(options.sessionId, activeSourceUserSeq);
     // A stall judge may rescue prose that the deterministic parser rejected,
     // but it only establishes "this is a reply", never "the objective is done".
     // Keep the origin for telemetry while the synthesized decision traverses

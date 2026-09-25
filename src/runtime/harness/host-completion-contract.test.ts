@@ -1240,10 +1240,13 @@ async function runWrittenHost(options: {
   reads: number;
   writer: 'none' | 'writes' | 'throws' | 'calls_tool';
   verdicts?: Array<{ done: boolean; reason: string }>;
+  /** Runs before the turn, e.g. to attach a live viewer to the session. */
+  onIdentity?: (identity: ReturnType<typeof accepted>) => void;
 }): Promise<WriterRun> {
   // An action request, so the completion review runs on the scripted turn.
   const writerRequestText = 'Pull the two retained reports and write me a short snapshot I can use in the pitch.';
   const identity = accepted(writerRequestText);
+  options.onIdentity?.(identity);
   host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
   attempted(identity);
   const judged: WriterRun['judged'] = [];
@@ -1257,6 +1260,11 @@ async function runWrittenHost(options: {
     async function* (request?: unknown) {
       const response = await model.getResponse(request);
       yield { type: 'response_started' } as never;
+      for (const item of response.output as Array<{ type?: string; content?: Array<{ text?: string }> }>) {
+        const text = item.type === 'message' ? item.content?.[0]?.text ?? '' : '';
+        const half = Math.floor(text.length / 2);
+        if (text) yield* [{ type: 'output_text_delta', delta: text.slice(0, half) }, { type: 'output_text_delta', delta: text.slice(half) }] as never[];
+      }
       yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
     };
   let brainCalls = 0;
@@ -1377,4 +1385,74 @@ test('a review finding reaches the writer when the brain drafts again', async ()
   assert.match(JSON.stringify(run.writerRequests[1]!.input), /REVIEW FINDING TO RESOLVE[\s\S]*visit count/,
     'the writer sees what the reviewer rejected');
   assert.match(String(run.outcome.finalOutput), /Written answer 2/);
+});
+
+// --- the answer stream through the host loop (answer-stream.ts) ---
+const answerStream = await import('./answer-stream.js');
+type AnswerFrame = { streamId: string; offset?: number; delta?: string; reset?: boolean };
+/** Attach a live viewer; `seen` is every text it showed, in order, following
+ *  the client contract (offset 0 replaces, a matching offset extends, a reset
+ *  of the shown draft clears it). */
+function watchAnswer(sessionId: string): { seen: () => string[]; detach: () => void } {
+  const frames: AnswerFrame[] = [];
+  const detach = answerStream.attachAnswerStream(sessionId, (frame) => { frames.push(frame.data as AnswerFrame); });
+  const seen = (): string[] => {
+    const shown: string[] = [];
+    let text = '';
+    let id = '';
+    for (const frame of frames) {
+      if (frame.reset) { if (frame.streamId === id) { text = ''; id = ''; } }
+      else if (frame.offset === 0) { text = frame.delta ?? ''; id = frame.streamId; }
+      else if (frame.streamId === id && frame.offset === text.length) text += frame.delta ?? '';
+      else continue;
+      if (shown.at(-1) !== text) shown.push(text);
+    }
+    return shown;
+  };
+  return { seen, detach };
+}
+const brainDraft = (n: number) => `Brain draft ${n}: the reports show about 1,957 visits and rank 6.`;
+const writtenAnswer = (n: number) => `Written answer ${n}: 1,957 monthly visits; the site ranks 6th.`;
+const rejectThenAccept = [
+  { done: false, reason: 'The visit count in the reply does not match the retained report.' },
+  { done: true, reason: 'The corrected reply matches the retained reports.' },
+];
+
+test('a streamed draft that review rejects is retracted before the next draft is shown', async () => {
+  let watch: ReturnType<typeof watchAnswer> | undefined;
+  const run = await runWrittenHost({ reads: 2, writer: 'none', verdicts: rejectThenAccept,
+    onIdentity: (identity) => { watch = watchAnswer(identity.sessionId); } });
+  assert.equal(run.judged.length, 2);
+  assert.deepEqual(watch!.seen(), [brainDraft(1), '', brainDraft(2)],
+    'draft 1 shows while it is reviewed, is gone once rejected, and draft 2 replaces it');
+  watch!.detach();
+});
+
+test('with a chosen writer, a draft it will rewrite is held and the written answer streams', async () => {
+  let watch: ReturnType<typeof watchAnswer> | undefined;
+  const run = await runWrittenHost({ reads: 2, writer: 'writes', verdicts: rejectThenAccept,
+    onIdentity: (identity) => { watch = watchAnswer(identity.sessionId); } });
+  assert.match(String(run.outcome.finalOutput), /Written answer 2/);
+  // The first draft's evidence settled while that very step ran, so nothing
+  // could hold it; it is retracted before the writer's answer appears. Once
+  // evidence exists at the start of a step, the brain draft is never shown.
+  assert.deepEqual(watch!.seen(), [brainDraft(1), '', writtenAnswer(1), '', writtenAnswer(2)]);
+  watch!.detach();
+});
+
+test('a failing writer shows the brain draft as it goes to review', async () => {
+  let watch: ReturnType<typeof watchAnswer> | undefined;
+  await runWrittenHost({ reads: 2, writer: 'throws',
+    onIdentity: (identity) => { watch = watchAnswer(identity.sessionId); } });
+  assert.equal(watch!.seen().at(-1), brainDraft(1));
+  assert.ok(watch!.seen().every((text) => !/Written answer/.test(text)));
+  watch!.detach();
+});
+
+test('a turn without gathered evidence streams the brain answer even with a writer chosen', async () => {
+  let watch: ReturnType<typeof watchAnswer> | undefined;
+  await runWrittenHost({ reads: 0, writer: 'writes',
+    onIdentity: (identity) => { watch = watchAnswer(identity.sessionId); } });
+  assert.deepEqual(watch!.seen(), [brainDraft(1)]);
+  watch!.detach();
 });

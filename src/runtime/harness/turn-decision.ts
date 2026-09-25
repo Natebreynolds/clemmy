@@ -169,6 +169,42 @@ function decisionFromObject(value: Record<string, unknown>): OrchestratorDecisio
 const ASK_DECISION_MARKER = /^\s*ASK:\s*([\s\S]+)$/i;
 const CONTINUE_DECISION_MARKER = /^\s*CONTINUE:\s*([\s\S]*)$/i;
 
+/** How still-forming output reads under the same contract, for text shown
+ *  while the model writes it. `pending` until the head can be told apart;
+ *  `private` for control text that is never a reply (a CONTINUE note, a
+ *  compact decision envelope, an array); `json` for a legacy envelope whose
+ *  `reply` field is the prose; otherwise the reply starts `skip` characters in
+ *  (past an ASK: marker or a leading think block). */
+export type StreamingReplyHead =
+  | { kind: 'pending' }
+  | { kind: 'private' }
+  | { kind: 'json' }
+  | { kind: 'reply'; skip: number };
+
+const STREAMING_HEAD_MIN_CHARS = 12;
+const STREAMING_ASK_HEAD = /^ASK:\s*/i;
+const STREAMING_CONTINUE_HEAD = /^CONTINUE:/i;
+const STREAMING_ENVELOPE_HEAD = /^["']?(?:summary|reply|done|next[\s_-]*action|reason)["']?\s*=/i;
+const STREAMING_THINK_BLOCK = /^<think\b[^>]*>[\s\S]*?<\/think\s*>\s*/i;
+
+export function streamingReplyHead(text: string, final = false): StreamingReplyHead {
+  let lead = text.length - text.trimStart().length;
+  let head = text.slice(lead);
+  if (/^<think\b/i.test(head)) {
+    const block = STREAMING_THINK_BLOCK.exec(head);
+    if (!block) return final ? { kind: 'private' } : { kind: 'pending' };
+    lead += block[0].length;
+    head = head.slice(block[0].length);
+  }
+  if (!head) return final ? { kind: 'private' } : { kind: 'pending' };
+  if (head.startsWith('{')) return { kind: 'json' };
+  if (head.startsWith('[')) return { kind: 'private' };
+  if (!final && head.length < STREAMING_HEAD_MIN_CHARS) return { kind: 'pending' };
+  if (STREAMING_CONTINUE_HEAD.test(head) || STREAMING_ENVELOPE_HEAD.test(head)) return { kind: 'private' };
+  const ask = STREAMING_ASK_HEAD.exec(head);
+  return { kind: 'reply', skip: lead + (ask ? ask[0].length : 0) };
+}
+
 /** Telemetry-only summary derived IN CODE (first sentence, else first 200 chars) —
  *  never demanded from the model. */
 function deriveDecisionSummary(text: string): string {

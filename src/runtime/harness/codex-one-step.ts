@@ -23,6 +23,7 @@ import {
   isCompletedDeadlineRescue,
   streamEventHasActionableContent,
   streamEventHasModelActivity,
+  streamEventOpensToolCall,
 } from './fallback-model.js';
 import type {
   AgentInputItem,
@@ -77,6 +78,11 @@ export interface CodexOneStepInput {
   stream?: boolean;
   /** Semantic stream activity. Handshake/keepalive metadata never calls it. */
   onActivity?: (activity: ModelStepActivity) => void;
+  /** Observers of a streamed response: its visible text as it arrives, and the
+   * first sign that it is writing a tool call. They cannot change the request,
+   * the response or admission, and an observer that throws is ignored. */
+  onOutputText?: (delta: string) => void;
+  onToolCallStart?: () => void;
   /** Final provider-neutral request boundary. A rejection here stops before
    * either streaming or non-streaming model I/O. */
   beforeModelDispatch?: (request: ModelRequest) => Promise<void> | void;
@@ -741,17 +747,30 @@ function inferredStopReason(output: AgentOutputItem[]): ModelStepStopReason {
   return textOfOutput(output).trim() ? 'completed' : 'unknown';
 }
 
+function observe(observer: () => void): void {
+  try { observer(); } catch { /* an observer never changes the step */ }
+}
+
 async function streamedResponse(
   model: Model,
   request: ModelRequest,
-  onActivity?: (activity: ModelStepActivity) => void,
+  input: Pick<CodexOneStepInput, 'onActivity' | 'onOutputText' | 'onToolCallStart'>,
 ): Promise<{ response: ModelResponse; termination?: TerminationField }> {
+  const { onActivity, onOutputText, onToolCallStart } = input;
   let response: ModelResponse | undefined;
   let observedTermination: TerminationField = ABSENT_TERMINATION_FIELD;
+  let toolCallStarted = false;
   for await (const event of model.getStreamedResponse(request)) {
     const streamEvent = event as StreamEvent;
     if (streamEventHasActionableContent(streamEvent)) onActivity?.('actionable');
     else if (streamEventHasModelActivity(streamEvent)) onActivity?.('private');
+    if (onOutputText && streamEvent.type === 'output_text_delta' && typeof streamEvent.delta === 'string') {
+      const delta = streamEvent.delta;
+      if (delta) observe(() => onOutputText(delta));
+    } else if (onToolCallStart && !toolCallStarted && streamEventOpensToolCall(streamEvent)) {
+      toolCallStarted = true;
+      observe(onToolCallStart);
+    }
     if (streamEvent.type === 'model') {
       const candidate = terminationField(streamEvent.event, 0, true);
       observedTermination = mergeTerminationFields(observedTermination, candidate);
@@ -795,7 +814,7 @@ export async function codexOneStep(input: CodexOneStepInput): Promise<CodexOneSt
   // window in which shared request inputs could change after they were sealed.
   if (inspected !== undefined) await inspected;
   const streamed = input.stream === true
-    ? await streamedResponse(model, request, input.onActivity)
+    ? await streamedResponse(model, request, input)
     : undefined;
   const response = streamed?.response ?? await model.getResponse(request);
   // An adapter may manufacture a completed envelope while cancellation drains

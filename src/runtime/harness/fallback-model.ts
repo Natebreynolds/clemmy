@@ -380,6 +380,30 @@ export function streamEventHasModelActivity(event: StreamEvent): boolean {
   return false;
 }
 
+/** Chat Completions carries a tool call inside the raw chunk's choice delta. */
+function chatCompletionChunkHasToolCall(value: StreamRecord): boolean {
+  if (value.object !== 'chat.completion.chunk' || !Array.isArray(value.choices)) return false;
+  return value.choices.some((choice) => {
+    if (!choice || typeof choice !== 'object') return false;
+    const delta = (choice as StreamRecord).delta;
+    if (!delta || typeof delta !== 'object') return false;
+    const calls = (delta as StreamRecord).tool_calls;
+    return Array.isArray(calls) && calls.length > 0;
+  });
+}
+
+/** The first sign that a streaming response is writing a tool call. Only an
+ * early hint for views of the stream: a provider whose frames show no such
+ * sign is still settled by the completed response. */
+export function streamEventOpensToolCall(event: StreamEvent): boolean {
+  if (event.type !== 'model' || !event.event || typeof event.event !== 'object') return false;
+  const raw = event.event as StreamRecord;
+  if (chatCompletionChunkHasToolCall(raw)) return true;
+  const type = typeof raw.type === 'string' ? raw.type.toLowerCase() : '';
+  if (type && TOOL_CONTENT_RE.test(type)) return true;
+  return [raw.item, raw.part, raw.content_block].some((item) => TOOL_CONTENT_RE.test(modelItemType(item)));
+}
+
 function notePrivateModelActivity(): void {
   const context = harnessRunContextStorage.getStore();
   if (context) context.privateModelActivityAt = Date.now();

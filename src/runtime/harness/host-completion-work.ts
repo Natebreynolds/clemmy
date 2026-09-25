@@ -415,6 +415,26 @@ function discoveredInputContracts(payload: unknown): Record<string, { required: 
   return contracts;
 }
 
+/** How many non-discovery calls this accepted source has settled successfully:
+ * an upper bound on the business results sourceSettledReadEvidence can show,
+ * read without redeeming or rendering any of them. */
+export function sourceSucceededResultCount(input: { sessionId: string; sourceUserSeq: number }): number {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT COUNT(*) AS count
+        FROM logical_call_settlements s
+        JOIN logical_tool_calls l
+          ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+       WHERE s.session_id = ? AND s.source_user_seq = ?
+         AND s.outcome_kind = 'succeeded' AND l.tool_name != 'tool_search'
+    `).get(input.sessionId, input.sourceUserSeq) as { count: number } | undefined;
+    return row?.count ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Evidence for a reviewer: the immutable results this accepted source owns.
  * This reader never executes a tool or selects a plausible handle; settlement
  * redemption checks source, call, crossing and raw digest. A reviewer is shown

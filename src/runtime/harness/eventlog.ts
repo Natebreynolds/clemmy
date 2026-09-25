@@ -136,8 +136,9 @@ export const EVENT_TYPES = [
   'turn_preflight_decision',
   'approval_requested',
   'approval_resolved',
-  // Token-level streaming: emitted for each output_text_delta from the model.
-  // Not persisted to SQLite — only broadcast via actionBus for real-time UI.
+  // A provisional answer draft as it is written (answer-stream.ts). Never
+  // appended to the log or the action bus: frames go only to the session's
+  // live chat viewers, and the terminal reply supersedes them.
   'stream_token',
   // Loop intent proposal: surfaced before tools fire on multi-step requests.
   // Contains the planned objective, steps, and risks.

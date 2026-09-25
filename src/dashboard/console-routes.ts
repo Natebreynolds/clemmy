@@ -415,6 +415,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-authority.js';
 import { selectAddressedApproval } from '../runtime/harness/approval-addressing.js';
 import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
+import { attachAnswerStream } from '../runtime/harness/answer-stream.js';
 import { buildActivitySnapshot, formatElapsed } from '../shared/activity-snapshot.js';
 import { runConversation, runConversationFromResume } from '../runtime/harness/loop.js';
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
@@ -15210,6 +15211,11 @@ export function registerConsoleRoutes(
       writeEvent('replay', { sessionId, events: [], error: PUBLIC_RUN_FAILURE_TEXT });
     }
 
+    // The reply being written right now, never part of the replay: its text so
+    // far, then each new piece (answer-stream.ts). Attached in this same
+    // synchronous block so no piece falls between replay and subscription.
+    const detachAnswerStream = attachAnswerStream(sessionId, (frame) => writeEvent('event', frame));
+
     // 2) Live subscription. Besides the session's own events, forward
     // activity-shaped events from background tasks this chat spawned AND
     // from host-dispatched workflow step sessions (`workflow:<runId>:<step>`)
@@ -15298,6 +15304,7 @@ export function registerConsoleRoutes(
       closed = true;
       clearInterval(heartbeat);
       detachViewer();
+      detachAnswerStream();
       unsubscribe();
     };
     res.on('close', cleanup);

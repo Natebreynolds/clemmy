@@ -810,3 +810,73 @@ test('malformed streamed response ids are never adopted', async () => {
   const admission = admitModelStep(result);
   assert.ok(admission.admitted && admission.frame.kind === 'completed');
 });
+
+test('stream observers see visible text and the first tool-call sign, and never change the step', async (t) => {
+  async function observed(events: unknown[], output: unknown[], throwing = false) {
+    const text: string[] = [];
+    let toolStarts = 0;
+    const model = {
+      async getResponse(): Promise<never> { throw new Error('streaming path required'); },
+      async *getStreamedResponse() {
+        for (const event of events) yield event as never;
+        yield {
+          type: 'response_done',
+          response: { id: 'observed', output, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+        } as never;
+      },
+    };
+    const result = await codexOneStep({
+      input: 'x',
+      stream: true,
+      resolveModel: () => model as never,
+      onOutputText: (delta) => { if (throwing) throw new Error('viewer gone'); text.push(delta); },
+      onToolCallStart: () => { toolStarts += 1; if (throwing) throw new Error('viewer gone'); },
+    });
+    return { result, text, toolStarts };
+  }
+
+  await t.test('text deltas in order; a text-only response opens no call', async () => {
+    const { result, text, toolStarts } = await observed([
+      { type: 'output_text_delta', delta: 'Hello ' },
+      { type: 'output_text_delta', delta: '' },
+      { type: 'output_text_delta', delta: 'there' },
+    ], [TEXT_ITEM]);
+    assert.deepEqual(text, ['Hello ', 'there']);
+    assert.equal(toolStarts, 0);
+    assert.equal(result.stopReason, 'completed');
+  });
+
+  await t.test('chat-completions tool-call chunks open a call once', async () => {
+    const chunk = (delta: Record<string, unknown>) => ({
+      type: 'model', event: { object: 'chat.completion.chunk', choices: [{ index: 0, delta }] },
+    });
+    const { text, toolStarts } = await observed([
+      chunk({ content: 'Let me look.' }),
+      { type: 'output_text_delta', delta: 'Let me look.' },
+      chunk({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'work_call', arguments: '' } }] }),
+      chunk({ tool_calls: [{ index: 0, function: { arguments: '{}' } }] }),
+    ], [CALL_ITEM]);
+    assert.deepEqual(text, ['Let me look.']);
+    assert.equal(toolStarts, 1);
+  });
+
+  await t.test('responses and AI SDK call frames open a call', async () => {
+    const responses = await observed([
+      { type: 'model', event: { type: 'response.output_item.added', item: { type: 'function_call', name: 'work_call' } } },
+    ], [CALL_ITEM]);
+    assert.equal(responses.toolStarts, 1);
+    const aiSdk = await observed([{ type: 'model', event: { type: 'tool-input-start', id: 't1', toolName: 'work_call' } }], [CALL_ITEM]);
+    assert.equal(aiSdk.toolStarts, 1);
+    const reasoning = await observed([{ type: 'model', event: { type: 'reasoning-delta', delta: 'thinking' } }], [TEXT_ITEM]);
+    assert.equal(reasoning.toolStarts, 0);
+  });
+
+  await t.test('a throwing observer is ignored', async () => {
+    const { result } = await observed([
+      { type: 'output_text_delta', delta: 'Hello' },
+      { type: 'model', event: { type: 'tool-input-start', id: 't1' } },
+    ], [CALL_ITEM], true);
+    assert.equal(result.stopReason, 'tool_calls');
+    assert.equal(result.toolCalls.length, 1);
+  });
+});

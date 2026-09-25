@@ -27,7 +27,7 @@ import {
   presentationEventFromCompletionData,
   type PresentationEvent,
 } from './turn-outcome.js';
-import { looksLikeToolCallShape } from './tool-narration-shapes.js';
+import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
 import {
   looksLikeCompactDecisionProtocol,
   stripLeakedDecisionAssignment,
@@ -326,6 +326,35 @@ function projectReplyText(value: unknown, fallback: string, depth: number): stri
 
 export function publicReplyText(value: unknown, fallback = ''): string {
   return projectReplyText(value, fallback, 0);
+}
+
+/** Text still being written can end mid-protocol, before the closing tag or
+ *  brace the whole-reply checks above look for. Live answer text is refused
+ *  on the same protocol shapes, including their unfinished openings. */
+export function publicLiveTextUnsafe(value: string): boolean {
+  return RAW_TOOL_OR_REASONING_PROTOCOL_RE.test(value)
+    || looksLikeToolCallShape(value)
+    || looksLikeToolCallShapeStreaming(value);
+}
+
+const PUBLIC_STREAM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/;
+
+/** A live answer frame: text placed at `offset` of one provisional draft, or
+ *  that draft's retraction. Never persisted; see answer-stream.ts. The
+ *  producer checks the whole draft before a frame exists; a fragment is not
+ *  re-checked here, because line-anchored shapes misread mid-sentence text. */
+function publicStreamTokenData(data: Record<string, unknown>): Record<string, unknown> | null {
+  if (data.public !== true) return null;
+  const streamId = typeof data.streamId === 'string' && PUBLIC_STREAM_ID_RE.test(data.streamId) ? data.streamId : '';
+  if (!streamId) return null;
+  const sourceUserSeq = Number.isSafeInteger(data.sourceUserSeq) && Number(data.sourceUserSeq) > 0
+    ? { sourceUserSeq: Number(data.sourceUserSeq) }
+    : {};
+  if (data.reset === true) return { public: true, streamId, reset: true, ...sourceUserSeq };
+  const offset = Number.isSafeInteger(data.offset) && Number(data.offset) >= 0 ? Number(data.offset) : -1;
+  const delta = typeof data.delta === 'string' ? data.delta : '';
+  if (offset < 0 || !delta) return null;
+  return { public: true, streamId, offset, delta, ...sourceUserSeq };
 }
 
 function stringList(value: unknown, max = 12): string[] {
@@ -725,13 +754,11 @@ function publicLiveApprovalControl(event: EventRow): PublicLiveApprovalControl |
 function projectData(event: EventRow): Record<string, unknown> | null {
   const data = event.data ?? {};
   switch (event.type) {
-    case 'stream_token': {
-      // Raw provider/model deltas are untrusted. A future ReplyComposer may emit
-      // this marker once it owns a typed public-reply port.
-      if (data.public !== true) return null;
-      const delta = typeof data.delta === 'string' ? data.delta : '';
-      return delta ? { delta, public: true } : null;
-    }
+    case 'stream_token':
+      // Raw provider/model deltas are untrusted. Only the answer stream
+      // (answer-stream.ts) marks a frame public, after its own reply-contract
+      // and protocol checks; this projection re-checks the closed shape.
+      return publicStreamTokenData(data);
     case 'user_input_received': {
       const liveApprovalControl = publicLiveApprovalControl(event);
       if (liveApprovalControl) {
