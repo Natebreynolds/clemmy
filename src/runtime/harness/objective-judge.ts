@@ -1254,6 +1254,14 @@ export async function judgeObjectiveComplete(
   // skips the 3–25s hedged chat-model judge. The configured judge remains the
   // backstop when confidence is low, Jev times out, or the key is absent.
   //
+  // Jev is here to save that reviewer call, so it is asked only where its
+  // answer can stand on its own: a DONE that complete receipts back, or a reply
+  // that closes on a genuine question for the owner. A NOT-DONE on Jev's word
+  // alone buys another model round, and on finished work the reviewer
+  // overruled it nearly every time, so every NOT-DONE goes to the configured
+  // reviewer. Where Jev cannot decide, it is not asked, and the reviewer
+  // starts at once instead of after the hedge delay.
+  //
   // Start Jev now; start the configured reviewer only if Jev has not answered
   // within a short hedge delay. Fully serial made every rejected fast path pay
   // Jev's whole latency before grok started; fully parallel (the previous
@@ -1268,7 +1276,8 @@ export async function judgeObjectiveComplete(
     objective,
     results: skillContext?.verifiedReadResults,
   });
-  const jevPromise = (async () => {
+  const directionQuestion = isDirectionSeekingQuestion(assistantResponse);
+  const askJev = async (): Promise<Awaited<ReturnType<typeof import('../jev/control-plane.js').tryJevCompletionVerdict>>> => {
     try {
       const { tryJevCompletionVerdict } = await import('../jev/control-plane.js');
       return await tryJevCompletionVerdict(objective, assistantResponse, {
@@ -1287,64 +1296,62 @@ export async function judgeObjectiveComplete(
     } catch {
       return null;
     }
-  })();
+  };
   let judgePromise: Promise<CompletionJudgeRun> | null = null;
   const startJudge = (): Promise<CompletionJudgeRun> => {
     judgePromise ??= startCompletionJudge(objective, assistantResponse, skillContext);
     return judgePromise;
   };
-  const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
-  hedge.unref?.();
   let jevAttempt: ObjectiveJudgeVerdict['jevAttempt'];
   /** Jev's own reading of THIS reply, kept past the try so the unreachable
    *  path below can still use it. Without this it was computed, recorded as
    *  telemetry, and thrown away at the one moment it was the only reviewer
    *  left. */
   let jevSaid: { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null = null;
-  const fast = await jevPromise;
-  clearTimeout(hedge);
-  const awaitingQuestion = fast?.awaitingUser === true && isDirectionSeekingQuestion(assistantResponse);
-  // Accept a Jev verdict only when coverage supports it. DONE without
-  // receipts is not completion; BLOCKED without a failed attempt is not a
-  // stop. INCOMPLETE is accepted only for missingCoverage; complete
-  // receipts never coerce INCOMPLETE to DONE from reply similarity.
-  const acceptJev = Boolean(fast) && (
-    (fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.complete)
-    || (awaitingQuestion)
-    || (fast!.blocked === true && coverage.failedAttempts.length > 0)
-    || (!fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.missingCoverage)
-  );
-  if (fast) {
+  const noteJev = (fast: NonNullable<Awaited<ReturnType<typeof askJev>>>, accepted: boolean): void => {
     jevSaid = { done: fast.done,
       ...(fast.reason ? { reason: fast.reason } : {}),
       ...(fast.awaitingUser ? { awaitingUser: true } : {}),
       ...(fast.blocked ? { blocked: true } : {}) };
-  }
-  jevAttempt = fast
-    ? {
-        accepted: acceptJev,
-        coverageComplete: coverage.complete,
-        // Whether the hedge saved the reviewer call, so the saving is countable.
-        reviewerStarted: judgePromise !== null,
-        ...(fast.choice ? { choice: fast.choice } : {}),
-        ...(fast.requirementCoverage ? { requirementCoverage: fast.requirementCoverage } : {}),
-        ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
-        ...(typeof fast.replyMatchesReceipts === 'number'
-          ? { replyMatchesReceipts: fast.replyMatchesReceipts }
-          : {}),
-      }
-    : undefined;
-  if (fast && acceptJev) {
-    return {
-      done: fast.done,
-      reason: fast.reason,
-      judgeModelId: fast.judgeModelId,
-      fast: true,
-      ...(jevAttempt ? { jevAttempt } : {}),
-      ...(fast.awaitingUser ? { awaitingUser: true } : {}),
-      ...(fast.blocked ? { blocked: true } : {}),
-      ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
+    jevAttempt = {
+      accepted,
+      coverageComplete: coverage.complete,
+      // Whether the hedge saved the reviewer call, so the saving is countable.
+      reviewerStarted: judgePromise !== null,
+      ...(fast.choice ? { choice: fast.choice } : {}),
+      ...(fast.requirementCoverage ? { requirementCoverage: fast.requirementCoverage } : {}),
+      ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
+      ...(typeof fast.replyMatchesReceipts === 'number'
+        ? { replyMatchesReceipts: fast.replyMatchesReceipts }
+        : {}),
     };
+  };
+  if (coverage.complete || directionQuestion) {
+    const jevPromise = askJev();
+    const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
+    hedge.unref?.();
+    const fast = await jevPromise;
+    clearTimeout(hedge);
+    // DONE stands only on complete receipts (and, inside the helper, every
+    // named requirement satisfied); AWAITING only when the reply really closes
+    // on a question. Nothing else Jev says is final.
+    const acceptJev = Boolean(fast) && (
+      (fast!.done && !fast!.awaitingUser && !fast!.blocked && coverage.complete)
+      || (fast!.awaitingUser === true && directionQuestion)
+    );
+    if (fast) noteJev(fast, acceptJev);
+    if (fast && acceptJev) {
+      return {
+        done: fast.done,
+        reason: fast.reason,
+        judgeModelId: fast.judgeModelId,
+        fast: true,
+        ...(jevAttempt ? { jevAttempt } : {}),
+        ...(fast.awaitingUser ? { awaitingUser: true } : {}),
+        ...(fast.blocked ? { blocked: true } : {}),
+        ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
+      };
+    }
   }
   const run = await startJudge();
   if (!run.verdict) {
@@ -1356,22 +1363,27 @@ export async function judgeObjectiveComplete(
     // reachable with the current model setup." The owner got a promise and a
     // dead end, and the only way forward was to nudge.
     //
-    // Jev had already read that same reply. Its finding was computed and then
-    // discarded here in favour of done:true. So when the configured reviewer
-    // cannot run, a NOT-DONE finding from Jev now drives the ordinary bounded
-    // continuation — the harness does the work instead of describing it.
+    // So when the configured reviewer cannot run, Jev's reading of the same
+    // reply is the one left: a NOT-DONE finding drives the ordinary bounded
+    // continuation — the harness does the work instead of describing it. A
+    // reply Jev was not asked about above is read now, only on this path.
     //
     // One direction only: a Jev DONE still fails open below, because "the
     // reviewer was unreachable" must never be delivered as "this was reviewed".
     // failedOpen stays set, so nothing downstream claims a completed review.
-    if (jevSaid && !jevSaid.done && !jevSaid.awaitingUser) {
+    if (!jevSaid) {
+      const late = await askJev();
+      if (late) noteJev(late, false);
+    }
+    const finding = jevSaid as { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null;
+    if (finding && !finding.done && !finding.awaitingUser) {
       return {
         done: false,
         failedOpen: true,
-        reason: jevSaid.reason?.trim()
-          ? jevSaid.reason
+        reason: finding.reason?.trim()
+          ? finding.reason
           : 'The configured completion reviewer could not be reached; the fast check found the objective unmet.',
-        ...(jevSaid.blocked ? { blocked: true } : {}),
+        ...(finding.blocked ? { blocked: true } : {}),
         ...(jevAttempt ? { jevAttempt } : {}),
       };
     }

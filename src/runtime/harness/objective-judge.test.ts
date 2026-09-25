@@ -489,32 +489,85 @@ test('Jev DONE after discovery-only execution is not accepted as completion', as
   assert.notEqual(v.judgeModelId, 'jev-1.13.0');
 });
 
-test('judgeObjectiveComplete keeps a Jev incomplete verdict when there are no verified reads', async () => {
-  _setTypesafeKeyForTests('ts_test');
-  _setSystemOneFetchForTests(async () => ({
-    status: 200,
-    ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: {
-          type: 'choice',
-          choice: 'incomplete',
-          probabilities: { incomplete: 0.8, done: 0.2 },
-          confidence: 0.84,
+// Jev is there to save the reviewer call. A NOT-DONE on its word alone buys
+// another model round, and on finished work the reviewer overruled it nearly
+// every time, so it is never final. Where Jev cannot settle a reply it is not
+// asked, and the reviewer starts at once instead of after the hedge delay.
+function jevAnswering(choice: string, calls: { count: number }) {
+  return async () => {
+    calls.count += 1;
+    return {
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          verdict: { type: 'choice', choice, probabilities: { [choice]: 0.84, done: 0.16 }, confidence: 0.84 },
         },
-      },
-      usage: { input_tokens: 36, output_tokens: 4 },
-    }),
-  }));
-  const empty = await judgeObjectiveComplete(
-    'find tim in salesforce and tell me if he is on my calendar this week',
-    'Tim Demik is in Salesforce and on the calendar.',
-    { sessionId: 'probe', skills: [], toolCallSummary: 'none' },
+        usage: { input_tokens: 36, output_tokens: 4 },
+      }),
+    };
+  };
+}
+
+test('a Jev NOT-DONE is never final: with no receipts Jev is not asked and the reviewer decides at once', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const jev = { count: 0 };
+  _setSystemOneFetchForTests(jevAnswering('incomplete', jev));
+  const t0 = Date.now();
+  let reviewerStartedAfter = -1;
+  _setCompletionJudgeForTests(async () => {
+    reviewerStartedAfter = Date.now() - t0;
+    return { verdict: { done: true, reason: 'reviewer: the answer stands' }, failure: null };
+  });
+  for (const results of [undefined, [
+    { toolName: 'send_email', outcome: 'failed' as const, status: 'verified' as const, contentComplete: true, evidenceKind: 'source_result' as const },
+  ]]) {
+    reviewerStartedAfter = -1;
+    const v = await judgeObjectiveComplete(
+      'find tim in salesforce and tell me if he is on my calendar this week',
+      'Tim Demik is in Salesforce and on the calendar.',
+      { sessionId: 'probe', skills: [], toolCallSummary: 'none', ...(results ? { verifiedReadResults: results } : {}) },
+    );
+    assert.equal(jev.count, 0, 'Jev cannot settle this reply, so it is not asked');
+    assert.ok(reviewerStartedAfter >= 0 && reviewerStartedAfter < JEV_HEDGE_DELAY_MS,
+      `the reviewer starts at once, not after the hedge delay (started after ${reviewerStartedAfter}ms)`);
+    assert.equal(v.done, true, 'the reviewer decides');
+    assert.notEqual(v.fast, true);
+    assert.equal(v.jevAttempt, undefined);
+  }
+});
+
+test('an unreachable reviewer still gets Jev\'s reading of a reply Jev was not asked about', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const jev = { count: 0 };
+  _setSystemOneFetchForTests(jevAnswering('incomplete', jev));
+  const v = await judgeObjectiveComplete(
+    'Turn the workflow on and run the first batch as the test.',
+    "I'll resolve that and turn it on, then run the first batch as the test.",
+    { sessionId: 'probe-unreachable-no-receipts', skills: [], toolCallSummary: 'none' },
   );
-  assert.equal(empty.judgeModelId, 'jev-1.13.0');
-  assert.equal(empty.done, false);
+  assert.equal(jev.count, 1, 'Jev reads the reply only once the reviewer is known to be unreachable');
+  assert.equal(v.failedOpen, true, 'nothing claims a completed review');
+  assert.equal(v.done, false, 'a promise is not a result: the turn continues');
+  assert.equal(v.jevAttempt?.accepted, false);
+});
+
+test('a reply that closes on a real question is still settled by Jev without the reviewer', async () => {
+  const { isDirectionSeekingQuestion } = await import('./objective-judge.js');
+  const reply = 'I found two calendars on your account. Should I use the work calendar or the personal one?';
+  assert.equal(isDirectionSeekingQuestion(reply), true, 'fixture: the reply closes on a direction question');
+  _setTypesafeKeyForTests('ts_test');
+  const jev = { count: 0 };
+  _setSystemOneFetchForTests(jevAnswering('awaiting', jev));
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: true, reason: 'reviewer ran' }, failure: null }; });
+  const v = await judgeObjectiveComplete('Put the launch review on my calendar.', reply, { sessionId: 'probe-question', skills: [], toolCallSummary: 'none' });
+  assert.equal(jev.count, 1);
+  assert.equal(v.fast, true);
+  assert.equal(v.awaitingUser, true);
+  await new Promise((resolve) => setTimeout(resolve, JEV_HEDGE_DELAY_MS + 100));
+  assert.equal(reviewerCalls, 0, 'the question settles without a reviewer call');
 });
 
 test('an unreachable reviewer plus a Jev NOT-DONE finding continues instead of delivering the promise', async () => {
@@ -1059,7 +1112,7 @@ test('an accepted Jev verdict inside the hedge delay never starts the configured
 test('a Jev verdict slower than the hedge delay lets the configured reviewer start, and its verdict still wins when Jev is rejected', async () => {
   const { _setCompletionJudgeForTests } = await import('./objective-judge.js');
   let reviewerCalls = 0;
-  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: false, reason: 'reviewer: not done' }, failure: null }; });
+  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: true, reason: 'reviewer: done' }, failure: null }; });
   _setTypesafeKeyForTests('ts_test');
   _setSystemOneFetchForTests(async () => {
     await new Promise((resolve) => setTimeout(resolve, JEV_HEDGE_DELAY_MS + 200));
@@ -1068,17 +1121,21 @@ test('a Jev verdict slower than the hedge delay lets the configured reviewer sta
       text: async () => JSON.stringify({
         model: 'jev-1.13.0',
         answers: { requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: { type: 'choice', choice: 'done', probabilities: { done: 0.9, incomplete: 0.1 }, confidence: 0.85 }, matches: { type: 'noul', noul: 0.9 } },
+        verdict: { type: 'choice', choice: 'incomplete', probabilities: { done: 0.15, incomplete: 0.85 }, confidence: 0.85 }, matches: { type: 'noul', noul: 0.9 } },
         usage: { input_tokens: 30, output_tokens: 4 },
       }),
     };
   });
   try {
-    // No verified reads → coverage incomplete → Jev DONE is not accepted.
-    const v = await judgeObjectiveComplete('look up the record', 'I looked it up.', { sessionId: 'probe-jev-slow', skills: [], toolCallSummary: '' });
+    // Complete receipts, so Jev is asked; its NOT-DONE cannot stand on its own.
+    const v = await judgeObjectiveComplete('Create /tmp/jev-slow.txt containing SLOW_OK', 'Created /tmp/jev-slow.txt with exactly SLOW_OK.', {
+      sessionId: 'probe-jev-slow', skills: [], toolCallSummary: 'write_file succeeded',
+      verifiedReadResults: [{ toolName: 'write_file', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' }],
+    });
     assert.equal(reviewerCalls, 1, 'a slow Jev must not delay the reviewer past the hedge');
-    assert.equal(v.done, false);
+    assert.equal(v.done, true, 'the reviewer\'s verdict wins over a NOT-DONE from Jev');
     assert.equal(v.jevAttempt?.reviewerStarted, true);
+    assert.equal(v.jevAttempt?.accepted, false);
   } finally {
     _setCompletionJudgeForTests(null);
   }
