@@ -41,3 +41,10 @@ test('the receipt never lets an unchecked answer borrow a pass', () => {
   assert.match(RECEIPT, /Not checked/);
   assert.match(RECEIPT, /group-hover\/turn:opacity-100/, 'the model name shows on hover only');
 });
+
+test('suggested answers stop being buttons once anything follows the question', () => {
+  for (const rel of ['../../screens/Chat.tsx', '../../features/conversations/chat/ConversationThread.tsx']) {
+    const screen = readFileSync(new URL(rel, import.meta.url), 'utf8');
+    assert.match(screen, /onAnswer=\{index === chat\.messages\.length - 1 \?/, `${rel} offers answers on an old question`);
+  }
+});

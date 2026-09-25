@@ -301,9 +301,10 @@ type CreateFn = (params: Record<string, unknown>, options?: unknown) => Promise<
 
 export interface WrapCompletionsCreateOptions {
   /**
-   * Interactive (non-structured) streams stay SSE on the wire. Default false:
-   * MiniMax-class backends still buffer a full completion and emit one
-   * synthetic chunk so reasoning lift + JSON repair can run.
+   * Interactive (non-structured) streams pass through to the SDK as they
+   * arrive. Default false: reply text still streams, but the rest of each
+   * completion is finished here (reasoning lift, tool-argument repair) and
+   * follows in one closing chunk; structured requests buffer whole.
    */
   nativeChatCompletionsStream?: boolean;
 }
@@ -355,6 +356,7 @@ interface CompatCompletion {
       reasoning?: string;
       reasoning_content?: string;
       reasoning_details?: Array<{ text?: string }>;
+      refusal?: string;
       tool_calls?: Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }>;
     };
   }>;
@@ -658,10 +660,11 @@ async function* synthFaithfulStream(completion: CompatCompletion): AsyncGenerato
 
 /** Wrap an OpenAI-compatible `chat.completions.create`: relax the request,
  *  PRESERVE the model's reasoning across turns (critical for interleaved-
- *  thinking models like M3), and repair structured JSON. Backends that cannot
- *  stream cleanly still run NON-streaming internally and re-emit one SDK-legal
- *  chunk. xAI keeps the caller's `stream: true` on the wire so first token is
- *  first token. Exported for unit tests with an injected `original`. */
+ *  thinking models like M3), and repair structured JSON. Backends whose
+ *  completions must be finished here stream their reply text and re-emit the
+ *  rest as one SDK-legal chunk; structured requests still run NON-streaming.
+ *  Native streams pass straight through. Exported for unit tests with an
+ *  injected `original`. */
 // Context-overflow learning (provider phrasings vary: OpenAI-compat
 // `context_length_exceeded`, GLM "context length exceeded", Moonshot "input
 // token length too long"). On a match, ratchet the model's effective window
@@ -726,54 +729,10 @@ async function wrappedCompletionsCreate(
           usageChunk, relaxed.model, harnessContext, streamStartedAt,
         ));
       }
-      // This adapter intentionally pays for a full non-streaming completion and
-      // only then emits one synthetic SDK chunk. Tell the outer watchdog that a
-      // provider request owns this otherwise eventless interval. The marker is
-      // bounded by the loop's ordinary full-stream deadline; it is not a
-      // heartbeat and cannot keep a genuinely hung request alive forever.
-      const runContext = harnessRunContextStorage.getStore();
-      const bufferedRequest = {
-        kind: 'byo_non_streaming_completion' as const,
-        startedAt: Date.now(),
-        active: true,
-      };
-      const bufferedRequests = runContext
-        ? (runContext.bufferedProviderRequests ??= new Set())
-        : undefined;
-      bufferedRequests?.add(bufferedRequest);
-      try {
-        let completion: CompatCompletion;
-        try {
-          completion = (await original({ ...relaxed, stream: false, stream_options: undefined }, options)) as CompatCompletion;
-        } catch (error) {
-          // The outer watchdog/caller owns cancellation. Falling back to a
-          // second wire shape after its AbortSignal fired can start another
-          // paid request precisely while the cancelled non-streaming request is
-          // still settling provider-side. Only a live caller may probe the
-          // compatibility stream fallback.
-          const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
-          if (signal?.aborted) throw error;
-          return original(relaxed, options); // backend rejects stream:false → real (unmodified) stream
-        }
-        liftReasoning(completion);
-        promoteReasoningFinal(completion);
-        recordByoUsage(completion, relaxed.model, undefined, bufferedRequest.startedAt);
-        const msg = completion?.choices?.[0]?.message;
-        if (isToolOrEmpty(msg)) {
-          repairToolCallArguments(completion, relaxed.tools);
-          return synthFaithfulStream(completion);
-        }
-        if (structured) await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
-        return synthContentStream(completion);
-      } finally {
-        bufferedRequest.active = false;
-        // Bridge the tiny completion→synthetic-chunk scheduling gap without
-        // extending it indefinitely. The ordinary first-byte window resumes
-        // from this real transport settlement timestamp.
-        if (runContext && bufferedRequests?.delete(bufferedRequest)) {
-          runContext.privateModelActivityAt = Date.now();
-        }
-      }
+      // Reply text needs no repair, so it streams even where the rest of the
+      // completion must be finished here first.
+      if (!structured) return streamReplyTextHoldingRest(original, relaxed, options);
+      return bufferedCompletionStream(original, relaxed, options, structured);
     }
 
     const plainStartedAt = Date.now();
@@ -789,6 +748,321 @@ async function wrappedCompletionsCreate(
     }
     return completion;
   }
+}
+
+/** Mark one paid provider request whose progress no SDK event shows yet, so
+ * the outer first-byte watchdog does not read the adapter boundary as provider
+ * silence. The marker is bounded by the loop's ordinary full-stream deadline;
+ * it is not a heartbeat and cannot keep a genuinely hung request alive
+ * forever. Releasing it records the settlement as model activity, bridging
+ * the gap to the next synthetic chunk. */
+function claimBufferedRequest(): { startedAt: number; release: () => void } {
+  const runContext = harnessRunContextStorage.getStore();
+  const bufferedRequest = {
+    kind: 'byo_non_streaming_completion' as const,
+    startedAt: Date.now(),
+    active: true,
+  };
+  const bufferedRequests = runContext
+    ? (runContext.bufferedProviderRequests ??= new Set())
+    : undefined;
+  bufferedRequests?.add(bufferedRequest);
+  return {
+    startedAt: bufferedRequest.startedAt,
+    release: () => {
+      if (!bufferedRequest.active) return;
+      bufferedRequest.active = false;
+      if (runContext && bufferedRequests?.delete(bufferedRequest)) {
+        runContext.privateModelActivityAt = Date.now();
+      }
+    },
+  };
+}
+
+/** One finished completion as an SDK stream: reasoning lifted, a reply left
+ * in the reasoning channel promoted, tool arguments or structured JSON
+ * repaired, then one synthetic chunk. */
+async function finishedCompletionStream(
+  original: CreateFn,
+  relaxed: Record<string, unknown>,
+  options: unknown,
+  structured: boolean,
+  completion: CompatCompletion,
+  startedAt: number,
+): Promise<AsyncGenerator<unknown>> {
+  liftReasoning(completion);
+  promoteReasoningFinal(completion);
+  recordByoUsage(completion, relaxed.model, undefined, startedAt);
+  const msg = completion?.choices?.[0]?.message;
+  if (isToolOrEmpty(msg)) {
+    repairToolCallArguments(completion, relaxed.tools);
+    return synthFaithfulStream(completion);
+  }
+  if (structured) await repairStructuredContent(original, relaxed, options, completion, downgradedSchemas.get(relaxed as object));
+  return synthContentStream(completion);
+}
+
+/** This adapter pays for a full non-streaming completion and only then emits
+ * one synthetic SDK chunk. */
+async function bufferedCompletionStream(
+  original: CreateFn,
+  relaxed: Record<string, unknown>,
+  options: unknown,
+  structured: boolean,
+  allowStreamFallback = true,
+): Promise<unknown> {
+  const owner = claimBufferedRequest();
+  try {
+    let completion: CompatCompletion;
+    try {
+      completion = (await original({ ...relaxed, stream: false, stream_options: undefined }, options)) as CompatCompletion;
+    } catch (error) {
+      // The outer watchdog/caller owns cancellation. Falling back to a
+      // second wire shape after its AbortSignal fired can start another
+      // paid request precisely while the cancelled non-streaming request is
+      // still settling provider-side. Only a live caller may probe the
+      // compatibility stream fallback.
+      const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+      if (signal?.aborted || !allowStreamFallback) throw error;
+      return original(relaxed, options); // backend rejects stream:false → real (unmodified) stream
+    }
+    return await finishedCompletionStream(original, relaxed, options, structured, completion, owner.startedAt);
+  } finally {
+    owner.release();
+  }
+}
+
+/** A 4xx other than authentication, timeout or rate limiting: the backend
+ * refused the request's shape, which a non-streaming request can still meet. */
+function refusedRequestShape(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status === 'number' && status >= 400 && status < 500 && ![401, 403, 408, 429].includes(status);
+}
+
+/**
+ * A backend whose completions this adapter finishes before the SDK reads them
+ * still streams its reply text. The request streams on the wire; reply text
+ * passes through as it arrives, and everything that needs the finished
+ * message (reasoning, tool calls and their argument repair, a reply left in
+ * the reasoning channel, the finish reason, usage) follows in one closing
+ * chunk built from the accumulated completion exactly as the buffered path
+ * builds it. Until reply text flows, the buffered-request marker keeps the
+ * watchdog's first-content semantics, and every held frame counts as model
+ * activity. A backend that refuses to stream is asked once without it.
+ */
+async function streamReplyTextHoldingRest(
+  original: CreateFn,
+  relaxed: Record<string, unknown>,
+  options: unknown,
+): Promise<unknown> {
+  const harnessContext = harnessRunContextStorage.getStore();
+  const owner = claimBufferedRequest();
+  const streamOptions = relaxed.stream_options && typeof relaxed.stream_options === 'object' && !Array.isArray(relaxed.stream_options)
+    ? relaxed.stream_options as Record<string, unknown>
+    : {};
+  let upstream: unknown;
+  try {
+    upstream = await original({ ...relaxed, stream_options: { ...streamOptions, include_usage: true } }, options);
+  } catch (error) {
+    owner.release();
+    const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+    if (signal?.aborted || !refusedRequestShape(error)) throw error;
+    return bufferedCompletionStream(original, relaxed, options, false, false);
+  }
+  if (!upstream || typeof upstream !== 'object' || !(Symbol.asyncIterator in upstream)) {
+    // The backend answered with a finished completion despite `stream`.
+    owner.release();
+    return finishedCompletionStream(original, relaxed, options, false, upstream as CompatCompletion, owner.startedAt);
+  }
+  return replyTextStream(upstream as AsyncIterable<unknown>, relaxed, harnessContext, owner);
+}
+
+async function* replyTextStream(
+  upstream: AsyncIterable<unknown>,
+  relaxed: Record<string, unknown>,
+  harnessContext: ReturnType<typeof harnessRunContextStorage.getStore>,
+  owner: { startedAt: number; release: () => void },
+): AsyncGenerator<unknown> {
+  const streamed = new StreamedCompletion();
+  let forwarded = '';
+  try {
+    for await (const chunk of upstream) {
+      const substantive = streamed.add(chunk);
+      const visible = streamed.forwardableContent();
+      if (visible.length > forwarded.length && visible.startsWith(forwarded)) {
+        owner.release();
+        yield streamed.contentChunk(visible.slice(forwarded.length));
+        forwarded = visible;
+      } else if (substantive && harnessContext) {
+        harnessContext.privateModelActivityAt = Date.now();
+      }
+    }
+  } finally {
+    owner.release();
+  }
+  const completion = streamed.completion();
+  liftReasoning(completion);
+  promoteReasoningFinal(completion);
+  recordByoUsage(completion, relaxed.model, harnessContext, owner.startedAt);
+  const msg = completion.choices?.[0]?.message;
+  if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) repairToolCallArguments(completion, relaxed.tools);
+  const content = typeof msg?.content === 'string' ? msg.content : '';
+  if (!content.startsWith(forwarded)) {
+    logger.warn({ model: relaxed.model }, 'byo streamed reply text diverged from the finished completion; the streamed text stands');
+  }
+  yield closingCompletionChunk(completion, content.startsWith(forwarded) ? content.slice(forwarded.length) : '');
+}
+
+const LEADING_THINK_BLOCK = /^\s*<think\b[^>]*>([\s\S]*?)<\/think\s*>\s*/i;
+
+/** A chat-completions stream accumulated into the completion the
+ * non-streaming request returns, by the SDK converter's own rules: choice 0
+ * only, text and arguments concatenated, tool calls keyed by index, custom
+ * tool calls ignored. */
+class StreamedCompletion {
+  content = '';
+  private id: string | undefined;
+  private created: number | undefined;
+  private model: string | undefined;
+  private usage: unknown;
+  private finishReason: string | null = null;
+  private reasoning = '';
+  private reasoningContent = '';
+  private reasoningDetails = '';
+  private refusal = '';
+  private readonly calls = new Map<number, { id?: string; type?: string; name: string; arguments: string }>();
+  private readonly ignoredCalls = new Set<number>();
+
+  /** Fold one chunk in; true when it carried model output. */
+  add(chunk: unknown): boolean {
+    if (!chunk || typeof chunk !== 'object') return false;
+    const frame = chunk as { id?: unknown; created?: unknown; model?: unknown; usage?: unknown; choices?: unknown };
+    if (typeof frame.id === 'string' && frame.id && !this.id) this.id = frame.id;
+    if (typeof frame.created === 'number' && this.created === undefined) this.created = frame.created;
+    if (typeof frame.model === 'string' && frame.model && !this.model) this.model = frame.model;
+    if (frame.usage) this.usage = frame.usage;
+    if (!Array.isArray(frame.choices)) return false;
+    const choice = frame.choices.find((entry) => (entry as { index?: unknown } | null)?.index === 0) as
+      { finish_reason?: unknown; delta?: Record<string, unknown>; usage?: unknown } | undefined;
+    if (!choice) return false;
+    // Some compatible backends report stream usage on the final choice.
+    if (choice.usage && !frame.usage) this.usage = choice.usage;
+    if (typeof choice.finish_reason === 'string' && choice.finish_reason) this.finishReason = choice.finish_reason;
+    const delta = choice.delta;
+    if (!delta || typeof delta !== 'object') return false;
+    let substantive = false;
+    const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+    if (text(delta.content)) { this.content += text(delta.content); substantive = true; }
+    if (text(delta.reasoning)) { this.reasoning += text(delta.reasoning); substantive = true; }
+    if (text(delta.reasoning_content)) { this.reasoningContent += text(delta.reasoning_content); substantive = true; }
+    if (Array.isArray(delta.reasoning_details)) {
+      for (const detail of delta.reasoning_details) {
+        const piece = text((detail as { text?: unknown } | null)?.text);
+        if (piece) { this.reasoningDetails += piece; substantive = true; }
+      }
+    }
+    if (text(delta.refusal)) { this.refusal += text(delta.refusal); substantive = true; }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const raw of delta.tool_calls) {
+        if (!raw || typeof raw !== 'object') continue;
+        const call = raw as { index?: unknown; id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } };
+        const index = typeof call.index === 'number' ? call.index : 0;
+        if (this.ignoredCalls.has(index)) continue;
+        if (call.type === 'custom') { this.ignoredCalls.add(index); continue; }
+        const entry = this.calls.get(index) ?? { name: '', arguments: '' };
+        if (text(call.id) && !entry.id) entry.id = text(call.id);
+        if (text(call.type)) entry.type = text(call.type);
+        entry.name += text(call.function?.name);
+        entry.arguments += text(call.function?.arguments);
+        this.calls.set(index, entry);
+        substantive = true;
+      }
+    }
+    return substantive;
+  }
+
+  /** The reply text the finished completion is certain to begin with. A
+   * leading think block becomes reasoning (see liftReasoning) when no
+   * reasoning field carries it, so it is held until it closes. */
+  forwardableContent(): string {
+    if (this.reasoning || this.reasoningContent.trim() || this.reasoningDetails.trim()) return this.content;
+    const head = this.content.trimStart();
+    if (!head) return '';
+    if (/^<think\b/i.test(head)) {
+      const block = LEADING_THINK_BLOCK.exec(this.content);
+      return block ? this.content.slice(block[0].length) : '';
+    }
+    if (head.length < '<think'.length && '<think'.startsWith(head.toLowerCase())) return '';
+    return this.content;
+  }
+
+  contentChunk(content: string): Record<string, unknown> {
+    return {
+      id: this.id ?? 'byo-stream',
+      object: 'chat.completion.chunk',
+      created: this.created ?? 0,
+      model: this.model ?? '',
+      choices: [{ index: 0, delta: { content }, finish_reason: null, logprobs: null }],
+    };
+  }
+
+  completion(): CompatCompletion {
+    const toolCalls = [...this.calls.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, call]) => ({ id: call.id, type: call.type ?? 'function', function: { name: call.name, arguments: call.arguments } }));
+    return {
+      id: this.id,
+      created: this.created,
+      model: this.model,
+      usage: this.usage,
+      choices: [{
+        index: 0,
+        finish_reason: this.finishReason,
+        message: {
+          role: 'assistant',
+          content: this.content,
+          ...(this.reasoning ? { reasoning: this.reasoning } : {}),
+          ...(this.reasoningContent ? { reasoning_content: this.reasoningContent } : {}),
+          ...(this.reasoningDetails ? { reasoning_details: [{ text: this.reasoningDetails }] } : {}),
+          ...(this.refusal ? { refusal: this.refusal } : {}),
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        },
+      }],
+    };
+  }
+}
+
+/** The rest of a streamed completion after its forwarded reply text, as one
+ * chunk: the remaining text, reasoning, refusal, repaired tool calls, the
+ * finish reason and usage. */
+function closingCompletionChunk(completion: CompatCompletion, content: string): Record<string, unknown> {
+  const choice = completion?.choices?.[0];
+  const msg = choice?.message ?? {};
+  const delta: Record<string, unknown> = { role: 'assistant' };
+  if (content) delta.content = content;
+  if (typeof msg.reasoning === 'string' && msg.reasoning) delta.reasoning = msg.reasoning;
+  if (typeof msg.refusal === 'string' && msg.refusal) delta.refusal = msg.refusal;
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+    delta.tool_calls = msg.tool_calls.map((tc, index) => ({
+      index,
+      id: tc.id,
+      type: tc.type ?? 'function',
+      function: { name: tc.function?.name, arguments: tc.function?.arguments },
+    }));
+  }
+  return {
+    id: completion?.id ?? 'byo-stream',
+    object: 'chat.completion.chunk',
+    created: completion?.created ?? 0,
+    model: completion?.model ?? '',
+    choices: [{
+      index: 0,
+      delta,
+      finish_reason: choice?.finish_reason ?? (delta.tool_calls ? 'tool_calls' : 'stop'),
+      logprobs: null,
+    }],
+    usage: completion?.usage,
+  };
 }
 
 /**

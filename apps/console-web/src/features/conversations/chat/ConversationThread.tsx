@@ -108,7 +108,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
           <CollaborativeWorkstate snapshot={focus.data} compact />
-          {chat.messages.map((m) => (
+          {chat.messages.map((m, index) => (
             <ChatBubble
               key={m.id}
               message={m}
@@ -119,7 +119,9 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
               onPreparePlan={chat.preparePlan}
-              onAnswer={(text) => send({ text, attachmentIds: [], attachmentNames: [] })}
+              // Suggested answers stay tappable only while the question is the
+              // newest message; once anything follows it, they are a record.
+              onAnswer={index === chat.messages.length - 1 ? (text) => send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />
           ))}

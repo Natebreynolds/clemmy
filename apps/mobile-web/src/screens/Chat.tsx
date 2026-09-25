@@ -339,7 +339,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             {initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.' : 'Type a message to start a new chat.'}
           </div>
         ) : null}
-        {messages.map((message) => (
+        {messages.map((message, index) => (
           <MessageRow
             key={message.id}
             message={message}
@@ -355,11 +355,13 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             onApprovalAction={actOnApproval}
             onRetry={(id) => void engine.retry(id)}
             onDiscard={(id) => engine.discard(id)}
-            onAnswer={(text) => {
+            // Suggested answers stay tappable only while the question is the
+            // newest message; once anything follows it, they are a record.
+            onAnswer={index === messages.length - 1 ? (text) => {
               haptic('light');
               void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
                 .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
-            }}
+            } : undefined}
             onDelegatedStateChange={(sourceUserSeq, state) => {
               engine.setDelegatedWorkState(sourceUserSeq, state);
             }}
@@ -489,8 +491,9 @@ function MessageRow({
     state: 'running' | 'cancelling' | 'stopped',
   ) => void;
   onDelegatedChanged: () => void;
-  /** Send a suggested answer as the reply, exactly as if it were typed. */
-  onAnswer: (text: string) => void;
+  /** Send a suggested answer as the reply, exactly as if it were typed.
+   *  Absent once the question is no longer the newest message. */
+  onAnswer?: (text: string) => void;
 }) {
   if (message.role === 'user') {
     return (
@@ -593,7 +596,7 @@ function MessageRow({
           remembered. Desktop makes the file chips openable; a phone has nowhere
           local to open to, so here it stays an honest count rather than a
           button that does nothing. */}
-      {message.status === 'awaiting-reply' && message.options?.length ? (
+      {message.status === 'awaiting-reply' && message.options?.length && onAnswer ? (
         <AnswerChoices options={message.options} onAnswer={onAnswer} />
       ) : null}
       {thinking ? null : <TurnReceipt message={message} />}

@@ -184,6 +184,7 @@ import { selectSoleExactApprovalDuplicate } from '../runtime/harness/approval-au
 import { exactPendingActionApprovalPreflight } from '../runtime/harness/pending-action-approval.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { attachSessionViewer } from '../runtime/harness/session-viewers.js';
+import { attachAnswerStream } from '../runtime/harness/answer-stream.js';
 import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from '../agents/orchestrator.js';
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
@@ -416,8 +417,8 @@ function serializeEventForMobile(event: HarnessEventRow): {
       break;
     default:
       // Public projection passthrough — identical to what the desktop SSE
-      // writes. Includes stream_token deltas the moment the projection
-      // starts emitting them; seq cursors stay correct either way.
+      // writes, including the answer stream's unsequenced stream_token
+      // frames, which never become a cursor.
       shaped = { ...data };
   }
   return {
@@ -3701,6 +3702,13 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       writeEvent('replay', { sessionId: session.id, events: [], error: PUBLIC_RUN_FAILURE_TEXT });
     }
 
+    // The reply being written right now, never part of the replay: its text so
+    // far, then each new piece (answer-stream.ts). Frames carry seq 0 and no
+    // `id:`, so they never move the browser's Last-Event-ID.
+    const detachAnswerStream = attachAnswerStream(session.id, (frame) => {
+      writeEvent('event', serializeEventForMobile(frame as HarnessEventRow));
+    });
+
     // Besides the session's own events, forward activity-shaped events from
     // background tasks this chat spawned and from host-dispatched workflow
     // step sessions whose origin observer is this chat — without them the
@@ -3713,9 +3721,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         if (!bridgesToThisSession(event.sessionId)) return;
       }
       const shaped = serializeEventForMobile(event.event as HarnessEventRow);
-      // Only the session's own frames advance the browser's Last-Event-ID —
-      // a bridged frame's foreign seq must never become the resume cursor.
-      writeEvent('event', shaped, shaped.sessionId === session.id && !ownPage.page.hasMore ? shaped.seq : undefined);
+      // Only the session's own durable frames advance the browser's
+      // Last-Event-ID — a bridged frame's foreign seq, or an unsequenced one,
+      // must never become the resume cursor.
+      writeEvent('event', shaped, shaped.sessionId === session.id && shaped.seq > 0 && !ownPage.page.hasMore ? shaped.seq : undefined);
     });
 
     // Phone-in-hand is the same "in the room" signal the desktop dock provides:
@@ -3732,6 +3741,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       closed = true;
       clearInterval(heartbeat);
       detachViewer();
+      detachAnswerStream();
       unsubscribe();
       dropRevocationCloser();
     };

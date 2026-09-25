@@ -161,8 +161,11 @@ import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import { conversationalReviewSkipRecord } from './completion-review-skip.js';
 import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup,
-  sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence,
+  sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
 } from './host-completion-work.js';
+import {
+  beginAnswerDraft, presentAnswerDraft, retractAnswerDraft, type AnswerDraftStep,
+} from './answer-stream.js';
 import {
   isHostDurableContinuationPendingError,
   type HostDurableContinuationPendingError,
@@ -4563,6 +4566,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     modelSchemas: readonly unknown[] = schemas,
     formatWorkerModelId?: string,
     exactModel?: Model,
+    answerDraft?: AnswerDraftStep,
   ): Promise<Awaited<ReturnType<typeof codexOneStep>>> => {
     const ambient = harnessRunContextStorage.getStore();
     const killTarget = ambient?.runAttemptId
@@ -4744,6 +4748,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             lastSemanticActivityAt = Date.now();
             if (activity === 'actionable') sawActionableActivity = true;
           },
+          ...(answerDraft
+            ? {
+                onOutputText: (delta: string) => answerDraft.text(delta),
+                onToolCallStart: () => answerDraft.toolCall(),
+              }
+            : {}),
         }),
         stall,
         killed,
@@ -4759,17 +4769,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
   };
 
-  /** Arm the chosen writer for this final draft, or return undefined to let
-   * the draft go straight to review. A skip that concerns the writer itself is
-   * journaled once per draft; ordinary non-evidence turns pass silently. */
-  const armHostWriter = (
-    draftText: string,
-    draftStep: Awaited<ReturnType<typeof codexOneStep>>,
-    currentStepIndex: number,
-  ): PendingHostWriter | undefined => {
+  /** The chosen writer, when a completed final draft on this turn would be
+   * sent to it: the conditions that do not depend on the draft itself. */
+  const eligibleHostWriter = (): { writer: HostWriter; identity: ReturnType<typeof exactHostIdentity> } | undefined => {
     if (!hostProduction || conversationalCheckInSurface() || turnIsPlanMode() || signal?.aborted) return undefined;
-    const draftDigest = createHash('sha256').update(draftText, 'utf8').digest('hex');
-    if (hostWriterDraftDigest === draftDigest) return undefined;
     const writer = hostWriterResolver();
     if (!writer) return undefined;
     // The brain already writing as the chosen model needs no second pass.
@@ -4779,9 +4782,33 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const reviewEnabled = policy.status === 'captured'
       ? policy.policy.enabled
       : policy.status === 'absent' && hostJudgeCompletion;
-    if (!reviewEnabled) return undefined;
+    if (!reviewEnabled || !judgedObjective().trim()) return undefined;
+    return { writer, identity };
+  };
+
+  /** Whether the chosen writer could rewrite a completed draft from the next
+   * brain step. Such a draft is held from the answer stream until it goes to
+   * review as written, so a reply about to be rewritten is never shown. */
+  const hostWriterMayRewrite = (currentStepIndex: number): boolean => {
+    const eligible = eligibleHostWriter();
+    if (!eligible?.writer.model || currentStepIndex + 1 >= maxTurns) return false;
+    return sourceSucceededResultCount(eligible.identity) > 0;
+  };
+
+  /** Arm the chosen writer for this final draft, or return undefined to let
+   * the draft go straight to review. A skip that concerns the writer itself is
+   * journaled once per draft; ordinary non-evidence turns pass silently. */
+  const armHostWriter = (
+    draftText: string,
+    draftStep: Awaited<ReturnType<typeof codexOneStep>>,
+    currentStepIndex: number,
+  ): PendingHostWriter | undefined => {
+    const draftDigest = createHash('sha256').update(draftText, 'utf8').digest('hex');
+    if (hostWriterDraftDigest === draftDigest) return undefined;
+    const eligible = eligibleHostWriter();
+    if (!eligible) return undefined;
+    const { writer, identity } = eligible;
     const objective = judgedObjective();
-    if (!objective.trim()) return undefined;
     const decision = toOrchestratorDecision(draftText);
     if (decision && decision.nextAction !== 'completed') return undefined;
     const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: true });
@@ -4828,6 +4855,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     writer: PendingHostWriter,
     writerInput: AgentInputItem[],
     writerInstructions: string | undefined,
+    answerDraft?: AnswerDraftStep,
   ): Promise<Awaited<ReturnType<typeof codexOneStep>>> => {
     const startedAt = Date.now();
     const identity = exactHostIdentity();
@@ -4839,7 +4867,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
         channel: 'writer:final',
         role: 'writer',
-      }, () => runOneModelStep(writerInput, writerInstructions, [], writer.author.modelId, writer.model));
+      }, () => runOneModelStep(writerInput, writerInstructions, [], writer.author.modelId, writer.model, answerDraft));
       if (written.toolCalls.length > 0) throw new Error('writer_tool_call');
       if (!written.text.trim()) throw new Error('writer_empty_reply');
       hostWrittenReply = { digest: createHash('sha256').update(written.text, 'utf8').digest('hex'), author: writer.author };
@@ -8603,12 +8631,26 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
   }
 
+  // THE ANSWER STREAM (answer-stream.ts): the accepted source whose reply is
+  // shown provisionally while a model step writes it.
+  const answerOwner = ((): { sessionId: string; sourceUserSeq: number } | undefined => {
+    if (!hostProduction) return undefined;
+    try {
+      const identity = exactHostIdentity();
+      return { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq };
+    } catch {
+      return undefined;
+    }
+  })();
   let remainingModelStallRetries = modelStreamStallRetries();
   let committedVerificationRecoveryChecked = false;
   for (let stepIndex = currentHostStepIndex; ; stepIndex += 1) {
     const activationContext = harnessRunContextStorage.getStore();
     if (activationContext) workflowParentActivation(activationContext.sessionId, activationContext.sourceUserSeq);
     currentHostStepIndex = stepIndex;
+    // A draft still on screen from an earlier step did not become the answer:
+    // the host is taking another step instead of delivering it.
+    if (answerOwner) retractAnswerDraft(answerOwner.sessionId, answerOwner.sourceUserSeq);
     const recoveryFrameThisStep = recoveredToolFrame;
     const consumingRecoveredFrame = recoveryFrameThisStep !== undefined;
     checkpointRecoveryFrameInProgress = consumingRecoveredFrame;
@@ -9171,6 +9213,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     let step: Awaited<ReturnType<typeof codexOneStep>>;
     let ranModelStep = false;
+    let answerDraft: AnswerDraftStep | undefined;
     if (recoveryFrameThisStep) {
       step = {
         text: '',
@@ -9185,10 +9228,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       };
       recoveredToolFrame = undefined;
     } else try {
+      if (answerOwner) {
+        // A brain draft the chosen writer may rewrite is held; the writer's
+        // own reply and a format repair are the answer as written.
+        let held = false;
+        if (!hostWriterForStep && !formatWorkerModelId) {
+          try { held = hostWriterMayRewrite(stepIndex); } catch { held = false; }
+        }
+        answerDraft = beginAnswerDraft({ ...answerOwner, mode: held ? 'held' : 'live' });
+      }
       if (hostWriterForStep) {
-        step = await runHostWriterStep(hostWriterForStep, modelInput, instructions);
+        step = await runHostWriterStep(hostWriterForStep, modelInput, instructions, answerDraft);
       } else {
-        step = await runOneModelStep(modelInput, instructions, formatWorkerModelId ? [] : modelStepSchemas, formatWorkerModelId);
+        step = await runOneModelStep(
+          modelInput, instructions, formatWorkerModelId ? [] : modelStepSchemas, formatWorkerModelId, undefined, answerDraft,
+        );
         if (formatWorkerModelId && step.toolCalls.length > 0) {
           throw new UnsupportedHostCapabilityError('response_format_repair_tool_call');
         }
@@ -9219,6 +9273,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // bounds one response's silence, not the whole accepted job.
       remainingModelStallRetries = modelStreamStallRetries();
     } catch (error) {
+      // Whatever the failed response showed is not an answer.
+      answerDraft?.retract();
       // This host admits a complete model frame before running any of its
       // tools. Even after partial text or arguments streamed, a rejected frame
       // has no tool effects to replay. Retry from the accepted history using
@@ -9298,6 +9354,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // the pre-step history and the previously accepted response id. There is
     // no rollback to get wrong: the commit simply has not happened yet.
     const admission = admitModelStep(step);
+    // Only an admitted completed frame proposes a reply; its admitted text,
+    // not the raw stream, is what the draft settles on.
+    if (admission.admitted && admission.frame.kind === 'completed') answerDraft?.complete(admission.frame.text);
+    else answerDraft?.retract();
     if (!admission.admitted) {
       if (admission.reason === 'provider_limit_hit') {
         // A response window limits one emission, not the accepted job. None
@@ -9524,6 +9584,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           if (!continuation.resume) {
             history.push(...admission.frame.history);
             if (step.responseId !== undefined) lastResponseId = step.responseId;
+            presentAnswerDraft(identity.sessionId, identity.sourceUserSeq);
             return {
               ...await completedOutcome(admission.frame.text),
               blockedDetail: continuation.reason,
@@ -9552,6 +9613,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           pendingHostWriter = writer;
           continue;
         }
+        // The draft goes to review as written, so a held draft is shown now.
+        if (answerOwner) presentAnswerDraft(answerOwner.sessionId, answerOwner.sourceUserSeq);
         const judged = await judgeHostCompletion(admission.frame.text, admission.frame.history, step.responseId);
         if (judged === 'continue') continue;
         if (judged === 'awaiting_user_input') {

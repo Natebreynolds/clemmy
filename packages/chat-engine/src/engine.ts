@@ -16,6 +16,7 @@ import type {
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
+import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
@@ -562,9 +563,11 @@ export class ChatEngine {
     }
     switch (event.type) {
       case 'stream_token': {
-        const delta = typeof d.delta === 'string' ? d.delta : '';
-        if (!delta || !this.busy) return;
-        this.updateActive((m) => ({ ...m, text: m.text + delta }));
+        if (!this.busy) return;
+        // A draft belongs to one accepted source; never paint it into another.
+        const source = typeof d.sourceUserSeq === 'number' ? d.sourceUserSeq : null;
+        if (source !== null && this.activeSourceUserSeq !== null && source !== this.activeSourceUserSeq) return;
+        this.updateActive((m) => applyStreamToken(m, d));
         break;
       }
       case 'conversation_preamble': {
@@ -598,7 +601,7 @@ export class ChatEngine {
       }
       case 'stall_retry_attempted': {
         // The streamed draft was detected-bad; the retry replaces it.
-        if (this.busy) this.updateActive((m) => ({ ...m, text: '' }));
+        if (this.busy) this.updateActive((m) => ({ ...m, text: '', answerDraft: undefined }));
         break;
       }
       case 'approval_requested': {
@@ -648,7 +651,7 @@ export class ChatEngine {
         const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : undefined;
         const statusRaw = typeof d.planProposalStatus === 'string' ? d.planProposalStatus : 'pending';
         this.updateActive((m) => ({
-          ...m,
+          ...withoutAnswerDraft(m),
           ...presentation,
           ...(readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ? { planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) } : {}),
           ...(planProposalId ? {
@@ -684,12 +687,15 @@ export class ChatEngine {
           return;
         }
         const error = typeof d.error === 'string' && d.error ? d.error : 'The run failed.';
-        this.updateActive((m) => ({
-          ...m,
-          text: m.text || error,
-          status: 'failed',
-          activity: settleTerminalActivity(m.activity ?? [], 'failed'),
-        }));
+        this.updateActive((active) => {
+          const m = withoutAnswerDraft(active);
+          return {
+            ...m,
+            text: m.text || error,
+            status: 'failed',
+            activity: settleTerminalActivity(m.activity ?? [], 'failed'),
+          };
+        });
         this.busy = false;
         this.activeAssistantId = null;
         break;
@@ -709,6 +715,7 @@ export class ChatEngine {
         this.updateActive((m) => ({
           ...m,
           text: question,
+          answerDraft: undefined,
           status: 'awaiting-reply',
           progress: undefined,
           ...(options.length ? { options } : {}),
@@ -732,22 +739,22 @@ export class ChatEngine {
         ) {
           const currentId = this.activeAssistantId;
           const delegatedId = delegatedAssistantMessageId(sourceUserSeq, event.seq);
-          this.messages = this.messages.map((message) => (
-            message.id === currentId
-              ? {
-                  ...message,
-                  id: delegatedId,
-                  text: message.text.trim()
-                    ? message.text
-                    : runIds.length === 1
-                      ? 'The workflow is running. I’ll report back here when it finishes.'
-                      : `${runIds.length} workflows are running. I’ll report back here when they finish.`,
-                  status: 'thinking',
-                  delegatedWork: { sourceUserSeq, runIds, state: 'running' },
-                  activity: reduceFeed(message.activity ?? [], event, this.now),
-                }
-              : message
-          ));
+          this.messages = this.messages.map((current) => {
+            if (current.id !== currentId) return current;
+            const message = withoutAnswerDraft(current);
+            return {
+              ...message,
+              id: delegatedId,
+              text: message.text.trim()
+                ? message.text
+                : runIds.length === 1
+                  ? 'The workflow is running. I’ll report back here when it finishes.'
+                  : `${runIds.length} workflows are running. I’ll report back here when they finish.`,
+              status: 'thinking',
+              delegatedWork: { sourceUserSeq, runIds, state: 'running' },
+              activity: reduceFeed(message.activity ?? [], event, this.now),
+            };
+          });
           this.activeAssistantId = delegatedId;
           this.activeSourceUserSeq = sourceUserSeq;
           // The background workflow retains its exact bubble and live stream,
@@ -773,8 +780,10 @@ export class ChatEngine {
     this.emit();
   }
 
+  /** The active reply's own text. A live answer draft is never read as it. */
   private activeText(): string {
-    return this.messages.find((m) => m.id === this.activeAssistantId)?.text ?? '';
+    const active = this.messages.find((m) => m.id === this.activeAssistantId);
+    return active ? withoutAnswerDraft(active).text : '';
   }
 
   private activeStatus(): MessageStatus | undefined {
