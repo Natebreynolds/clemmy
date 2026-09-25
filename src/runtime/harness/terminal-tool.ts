@@ -22,6 +22,7 @@
 const TERMINAL_TOOL_NAMES = new Set([
   'ask_user_question',
   'dispatch_background_task',
+  'dispatch_coding_task',
   'background_task_status',
   'background_task_revise',
   'background_task_cancel',
@@ -76,6 +77,7 @@ export function terminalToolShouldHalt(
 
 const BACKGROUND_CONTROL_TOOLS: ReadonlySet<string> = new Set([
   'dispatch_background_task',
+  'dispatch_coding_task',
   'background_task_status',
   'background_task_revise',
   'background_task_cancel',
@@ -116,6 +118,16 @@ export function renderTerminalToolReply(rawName: string, input: unknown, output:
     const title = match?.[1] || (typeof inputObjective === 'string' && inputObjective.trim() ? inputObjective.trim() : 'the task');
     const taskId = match?.[2];
     return `Started "${title}" in the background${taskId ? ` (${taskId})` : ''} — it reports back here when it finishes or gets stuck.`;
+  }
+  if (bare === 'dispatch_coding_task') {
+    // Same voice-first contract as the background handoff: the model's own
+    // handoff_note wins, the generated line is only the floor, and nothing
+    // claims a start without the admission receipt in the output.
+    const note = (input as { handoff_note?: unknown } | null | undefined)?.handoff_note;
+    if (typeof note === 'string' && note.trim().length >= 12) return note.trim();
+    const match = output.match(/Dispatched coding run (\S+): (.+?) will work on "([^"]+)" in (.+?) on its own branch (\S+)/);
+    if (!match) return output.replace(/\n\[harness-directive\][\s\S]*$/, '').trim() || 'dispatch_coding_task completed.';
+    return `${match[2]} is working on "${match[3]}" in ${match[4]}, on its own branch ${match[5]}. I'll check the work and report back here.`;
   }
   if (bare === 'ask_user_question') {
     // Surface the QUESTION inline (from the tool input) so the turn ends on a clean

@@ -439,7 +439,10 @@ function terminalRecoveryCapability(
  *  Effect-evidence for the dispatch-handoff reply salvage below; the tool
  *  result may still be a refusal, but a queued-or-refused dispatch is a REAL
  *  action either way — the reply narrates it, so it is never a zero-work punt. */
-const DISPATCHING_TOOL_NAMES = new Set(['workflow_run', 'dispatch_background_task']);
+const DISPATCHING_TOOL_NAMES = new Set(['workflow_run', 'dispatch_background_task', 'dispatch_coding_task']);
+/** Control receipts that hand execution to a separately owned child: the
+ *  foreground turn is finished once the child is admitted. */
+const TRANSFERRING_CONTROL_TOOL_NAMES: ReadonlySet<string> = new Set(['dispatch_background_task', 'dispatch_coding_task']);
 
 function effectiveCalledToolName(data: Record<string, unknown>): string {
   const hasDurableIdentity = Object.prototype.hasOwnProperty.call(data, 'effectiveTool');
@@ -8211,7 +8214,7 @@ async function runConversationCore(
       doneStands
       && decision.nextAction === 'completed'
       && decision.controlReceipt === true
-      && latestEffectiveCalledToolName(options.sessionId, turnResult.turn) === 'dispatch_background_task'
+      && TRANSFERRING_CONTROL_TOOL_NAMES.has(latestEffectiveCalledToolName(options.sessionId, turnResult.turn))
     ) {
       const transferText = publicReplyText(decision.reply, '')
         || publicReplyText(decision.summary, '');

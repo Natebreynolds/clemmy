@@ -157,7 +157,7 @@ test('a run briefs the agent in its worktree, verifies from git and tests, settl
   scripts.push(async (agent) => {
     agent.emit({ kind: 'session', agentSessionId: agent.input.agentSessionId, model: 'claude-test' });
     agent.emit({ kind: 'message', text: 'Adding greet.js now.', nested: false });
-    agent.emit({ kind: 'step_started', stepId: 's1', tool: 'Write', detail: 'greet.js', nested: false });
+    agent.emit({ kind: 'step_started', stepId: 's1', tool: 'Write', detail: path.join(agent.input.cwd, 'greet.js'), nested: false });
     commitFile(agent.input.cwd, 'greet.js', 'module.exports = 1;\n', 'Add greet');
     agent.emit({ kind: 'step_finished', stepId: 's1', ok: true, output: 'written' });
     agent.emit(turn('Added greet.js.'));
@@ -190,6 +190,8 @@ test('a run briefs the agent in its worktree, verifies from git and tests, settl
     assert.ok(kinds.includes(kind), `activity has ${kind}: ${kinds.join(',')}`);
   }
   assert.equal(listEvents(run.sessionId).filter((event) => event.type === 'coding_run_settled').length, 1);
+  const step = listEvents(run.sessionId).find((event) => (event.data as { kind?: unknown }).kind === 'step_started');
+  assert.equal((step?.data as { detail?: unknown }).detail, 'greet.js', 'worktree paths read project-relative');
   assert.equal(listEvents(run.sessionId).some((event) => event.type === 'tool_called'), false);
   assert.equal(store.getCodingRun(run.runId)?.usageRecorded['claude-test']?.cachedInputTokens, 100);
 });
@@ -310,4 +312,22 @@ test('when the agent process dies, the next claim resumes the agent\'s own sessi
   assert.match(resumedStart.message, /interrupted/);
   assert.equal(store.getCodingRunSettlement(run.runId)?.outcome, 'completed_verified');
   assert.equal(store.getCodingRun(run.runId)?.resumeCount, 1);
+});
+
+test('runs leased to a daemon that no longer exists are released for immediate resume', async () => {
+  const run = admit('orphaned');
+  // A PID far above any live process on this machine stands in for a dead daemon.
+  const deadOwner = 'daemon:999999:deadbeef';
+  let claimed = store.claimNextCodingRun(deadOwner, 60_000);
+  while (claimed && claimed.runId !== run.runId) claimed = store.claimNextCodingRun(deadOwner, 60_000);
+  assert.ok(claimed);
+  assert.equal(executor.releaseRunsOfDeadOwners(), 1);
+  assert.equal(store.getCodingRun(run.runId)?.state, 'resuming');
+  store.requestCodingRunStop(run.runId, 'cleanup');
+  scripts.push(async (agent) => {
+    agent.emit({ kind: 'session', agentSessionId: agent.input.agentSessionId, model: null });
+    await agent.stopped;
+  });
+  await drainAndWait();
+  assert.equal(store.getCodingRunSettlement(run.runId)?.outcome, 'cancelled');
 });

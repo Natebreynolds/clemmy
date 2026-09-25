@@ -14,6 +14,7 @@
  * missing or settles the run and reports back to the chat that asked for it.
  */
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import pino from 'pino';
 import {
   appendEvent,
@@ -40,6 +41,7 @@ import {
   getCodingRun,
   getCodingRunSettlement,
   isCodingRunStopRequested,
+  listCodingRuns,
   listPendingCodingRunReportBacks,
   markCodingRunReportBackDelivered,
   markCodingRunSettling,
@@ -178,25 +180,34 @@ function clip(text: string, max: number): string {
   return redacted.length > max ? `${redacted.slice(0, max)}…` : redacted;
 }
 
-function publishAgentEvent(run: CodingRunRecord, event: CodingAgentEvent): void {
+/** Paths inside the worktree read as project-relative in the live view; the
+ *  agent reports them absolute, sometimes through the /private symlink. */
+function worktreeRelativizer(run: CodingRunRecord): (text: string) => string {
+  const roots = new Set([run.worktreePath]);
+  try { roots.add(realpathSync(run.worktreePath)); } catch { /* not created yet */ }
+  const prefixes = [...roots].map((root) => `${root.replace(/\/+$/, '')}/`);
+  return (text) => prefixes.reduce((out, prefix) => out.split(prefix).join(''), text);
+}
+
+function publishAgentEvent(run: CodingRunRecord, event: CodingAgentEvent, relative: (text: string) => string): void {
   switch (event.kind) {
     case 'message':
-      activity(run, 'agent_message', { text: clip(event.text, 4_000), nested: event.nested }, 'agent');
+      activity(run, 'agent_message', { text: clip(relative(event.text), 4_000), nested: event.nested }, 'agent');
       return;
     case 'plan':
       activity(run, 'plan', { items: event.items.slice(0, 40) }, 'agent');
       return;
     case 'step_started':
       activity(run, 'step_started', {
-        stepId: event.stepId, tool: event.tool, detail: clip(event.detail, 300), nested: event.nested,
+        stepId: event.stepId, tool: event.tool, detail: clip(relative(event.detail), 300), nested: event.nested,
       }, 'agent');
       return;
     case 'step_finished':
-      activity(run, 'step_finished', { stepId: event.stepId, ok: event.ok, output: clip(event.output, 1_500) }, 'agent');
+      activity(run, 'step_finished', { stepId: event.stepId, ok: event.ok, output: clip(relative(event.output), 1_500) }, 'agent');
       return;
     case 'permission':
       activity(run, 'permission', {
-        stepId: event.stepId, tool: event.tool, detail: clip(event.detail, 300),
+        stepId: event.stepId, tool: event.tool, detail: clip(relative(event.detail), 300),
         decision: event.decision, effect: event.effect, reason: event.reason,
       });
       return;
@@ -436,6 +447,10 @@ async function driveRun(claimed: CodingRunRecord, handle: ActiveRun): Promise<vo
   let run = claimed;
   ensureCodingSession(run);
   const resuming = run.resumeCount > 0;
+  if (run.stopRequestedAt) {
+    await settle(run, { outcome: 'cancelled', reason: run.stopReason ?? 'Stopped by the user.' });
+    return;
+  }
 
   const preflight = await preflightImpl(run.agent);
   const bridge = bridges[run.agent];
@@ -502,6 +517,7 @@ async function driveRun(claimed: CodingRunRecord, handle: ActiveRun): Promise<vo
     let lastError: string | null = null;
     let stopReason: 'stop' | 'deadline' | null = null;
     let lastTouch = 0;
+    const relative = worktreeRelativizer(run);
 
     const renew = setInterval(() => {
       if (!renewCodingRunLease(run.runId, OWNER_ID, LEASE_MS)) {
@@ -539,7 +555,7 @@ async function driveRun(claimed: CodingRunRecord, handle: ActiveRun): Promise<vo
           continue;
         }
         if (event.kind !== 'turn_completed') {
-          publishAgentEvent(run, event);
+          publishAgentEvent(run, event, relative);
           continue;
         }
 
@@ -672,9 +688,51 @@ export async function _waitForActiveCodingRunsForTests(): Promise<void> {
 
 let timer: NodeJS.Timeout | null = null;
 
+function ownerPid(ownerId: string | null): number | null {
+  const match = /^daemon:(\d+):/.exec(ownerId ?? '');
+  return match ? Number(match[1]) : null;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * A daemon that died left its runs leased to a PID that no longer exists.
+ * Signal 0 proves the owner is gone, so its runs resume now instead of after
+ * the lease lapses. A live owner (another process on this home) keeps its runs.
+ */
+export function releaseRunsOfDeadOwners(): number {
+  let released = 0;
+  for (const run of listCodingRuns({ states: ['running', 'settling'], limit: 200 })) {
+    const pid = ownerPid(run.leaseOwner);
+    if (!pid || pid === process.pid || processAlive(pid)) continue;
+    if (releaseCodingRunForResume(run.runId, run.leaseOwner!)) released += 1;
+  }
+  return released;
+}
+
+/** Process exit: end every agent process synchronously so a CLI orphaned by
+ *  a dying daemon cannot keep writing to a worktree its successor resumes. */
+function closeAllAgentsOnExit(): void {
+  for (const entry of active.values()) entry.session?.close();
+}
+
 export function startCodingRunExecutor(): void {
   if (timer) return;
   shuttingDown = false;
+  try {
+    const released = releaseRunsOfDeadOwners();
+    if (released > 0) logger.info({ released }, 'Resuming coding runs left by a previous daemon');
+  } catch (error) {
+    logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'coding run dead-owner sweep failed');
+  }
+  process.once('exit', closeAllAgentsOnExit);
   const tick = (): void => {
     void drainCodingRunsOnce().catch((error) => {
       logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'coding run drain failed');
@@ -691,6 +749,7 @@ export async function stopCodingRunExecutor(): Promise<void> {
   if (timer) clearInterval(timer);
   timer = null;
   shuttingDown = true;
+  process.removeListener('exit', closeAllAgentsOnExit);
   for (const entry of active.values()) {
     releaseCodingRunForResume(entry.runId, OWNER_ID);
     entry.session?.close();

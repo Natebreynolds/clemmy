@@ -1,6 +1,7 @@
 # Coding-agent orchestration — Clem drives Claude Code and Codex
 
-Status: design agreed with the owner 2026-09-24; nothing built yet.
+Status: design agreed with the owner 2026-09-24. Slice 1 built on this branch
+(see §9); not yet installed or accepted in the live app.
 Branch: `claude/coding-agents` (worktree `~/clem-worktrees/coding-agents`).
 
 ## 1. What the owner asked for
@@ -91,17 +92,22 @@ file edit, search, web), `diff_updated`, `permission_request`,
 `turn_completed` (usage), `error`. Each bridge is pinned by a replay
 conformance suite: recorded provider streams in, normalized events out.
 
-### 3.2 The durable root — `coding_runs` in harness.db
+### 3.2 The durable root — the coding-run store
 
-A new root, not a background task. Rationale (planner report, 2026-09-24):
+A new root, not a background task, in its own database file
+(`state/coding-runs/<machine>/coding-runs.db`, schema chain of its own) rather
+than a harness.db migration: several agents hotpatch the same installed app,
+and two branches that each ship a different harness v82 would silently skip
+one another's tables in the live home. The run's harness session and events
+stay in harness.db; no harness migration is needed (`events.type` has no
+CHECK, only the `EVENT_TYPES` gate). Rationale (planner report, 2026-09-24):
 background tasks are JSON files with their own lease, their executor is
 hard-wired to Clem's brain (`respondPreferHarness`), and their per-call wall,
 auto-continue, judge self-resume, and restart-safety check read Clem's own
 ledgers, which a CLI run never writes. `subagent-runs.ts` is a best-effort
 completion log, not an owner.
 
-- Migration v82 (claim the number at merge time; every active branch is at 81
-  today). Tables:
+- Tables:
   - `coding_runs`: run id, `session_id` (`coding:<runId>`), origin session,
     origin source-user seq, origin accepted task and logical tool call id
     (UNIQUE → admission is idempotent), harness, project path, worktree path,
@@ -113,19 +119,23 @@ completion log, not an owner.
     cancelled`), head commit, commits, diffstat, dirty flag, test command,
     exit code and tail, final message, completion verdict, receipt digest.
   - `coding_run_report_backs`: outbox with a monotonic acknowledged-at.
-- `src/runtime/harness/coding-run-store.ts` is the only writer (CAS
-  transitions).
-- Each CLI process generation is a `run_attempts` row on the coding session,
-  fenced by `claimRunAttemptLease` / `renewRunAttemptLease`; kill uses
-  `requestKill`. The boot sweep already ends a dead generation; recovery
-  starts a new attempt with `resume`.
-- **Only the daemon spawns.** `project_run start` writes an admission row and
-  returns; a drain on the existing daemon timer (next to `runner.ts:2967`)
+- `src/execution/coding-run-store.ts` is the only writer (CAS transitions).
+- Ownership is the store's own lease (owner `daemon:<pid>:<nonce>`, 60 s,
+  renewed every 15 s), not harness `run_attempts`: those are built around
+  Clem's own turns (supersession, workflow handoff, restart safety, board
+  visibility all key off them). Stop is a store flag any process can set; the
+  owning executor polls it. At start the executor releases runs leased to a
+  PID that signal 0 proves dead, so they resume at once instead of after the
+  lease lapses; a synchronous exit hook closes every agent process.
+- **Only the daemon spawns.** `dispatch_coding_task` writes an admission row
+  and returns (`project_run` keeps status, kill and runs; its `start` stays
+  closed and points at the new tool); a drain on the existing daemon timer (next to `runner.ts:2967`)
   claims admitted and resuming runs. No new scheduler.
 - The agent's inner tool calls are NOT `tool_called` / `tool_returned` and do
   not enter the per-call dispatch kernel. They are `coding_run_activity`
-  events on the coding session. The origin's `project_run start` is a normal
-  logical call that settles as "run admitted", not "work done".
+  events on the coding session. `dispatch_coding_task` is a control receipt
+  like `dispatch_background_task` (terminal tool, transferred terminal,
+  consent-given write, finish-phase tool) and shares its alignment floor.
 - Credit to the origin's expected work only from a `coding_run_settlements`
   row with outcome `completed_verified` (same principle as
   `expected-work-delegation.ts`; its v81 table needs a child contract the CLI
@@ -159,8 +169,14 @@ Every permission prompt from the agent reaches Clem's policy:
   user's decision for that exact effect and destination; otherwise it becomes
   a user decision through the approval registry (desktop card, Inbox, phone,
   notch). Slice 1 denies these outright.
-- Existing classifiers are reused, not duplicated: `needsApprovalForShellSmart`,
-  `classifyShellNetworkMutation`, `assertCommandAllowed`.
+- Existing classifiers are reused, not duplicated: `classifyShellNetworkMutation`,
+  `expandLiteralShellCommands` (opaque wrappers fail closed),
+  `assertCommandAllowed`, `shellCommandTouchesSensitiveData`, `isSensitivePath`,
+  plus a list of developer credential locations and Clem's own home.
+- The enforcement point is the agent's PreToolUse hook, which fires for every
+  tool call even when a settings rule would pre-allow it; `canUseTool` answers
+  with the same policy as a backstop. Only the project and local settings
+  layers load, so the user's personal allow rules and MCP servers do not.
 
 ### 3.5 Finish line — set by the user's words
 
@@ -272,3 +288,18 @@ three live traces before claiming it works, and the owner's OK before a tag.
   keyed on Clem's tool names; neither fits native `Bash` / `Edit` asks yet.
 - Steering is limited to `sess-|space-|discord-` sessions; coding sessions
   get their own delivery path through the bridge, not the host steer notes.
+
+## 9. Slice 1 as built (2026-09-24)
+
+New: `coding-run-store.ts`, `coding-run-policy.ts`, `coding-run-git.ts`,
+`coding-run-env.ts`, `coding-agent-bridge.ts`, `coding-agent-claude.ts`,
+`coding-run-receipt.ts`, `coding-run-executor.ts` (all in `src/execution/`).
+Wired: `dispatch_coding_task` + `project_run` (`src/tools/project-run-tools.ts`),
+the dispatch control-receipt sets, `EVENT_TYPES`, the public projection, the
+shared activity fold (one live row per run in the dispatching chat, desktop and
+phone), origin-chat bridging and replay (desktop and phone), the chat Stop
+cascade, the daemon start, board cards (`sourceKind: 'coding'`, streaming the
+run session, with a stop endpoint), and `/api/console/coding-runs[/:id[/stop]]`.
+
+Not in slice 1: the dialogue view, steering, permission escalation, take-over,
+the phone run screen and stop, Codex, finish lines beyond a local branch.

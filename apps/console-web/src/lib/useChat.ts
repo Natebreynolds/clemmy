@@ -467,6 +467,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   // two of those would be guaranteed to drift.
   if (ev.type === 'turn_started' || ev.type === 'turn_model_routed'
     || ev.type === 'work_manifest_declared' || ev.type === 'work_item_checkpoint'
+    || ev.type === 'coding_run_activity' || ev.type === 'coding_run_settled'
     || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {
     return reduceSharedActivity(prev, sharedEvent(ev));
   }

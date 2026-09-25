@@ -269,7 +269,7 @@ export function isFinishPhaseTool(toolName: string, args: unknown): boolean {
   const tail = toolTail(resolved.toolName);
   if (tail === 'run_worker') return false;
   if (
-    /^(?:run_batch|recall_tool_result|tool_output_query|workspace_artifact_query|ask_user_question|offer_background|dispatch_background_task)$/.test(tail)
+    /^(?:run_batch|recall_tool_result|tool_output_query|workspace_artifact_query|ask_user_question|offer_background|dispatch_background_task|dispatch_coding_task)$/.test(tail)
   ) return true;
   if (isExactReadBack(resolved.toolName, resolved.args)) return true;
   const effect = classifyRuntimeToolEffect(toolName, args);

@@ -206,7 +206,7 @@ export function registerAdminTools(server: McpServer): void {
             if (project.hasClaude) parts.push('  Has imported agent notes');
             const caps = project.capabilities;
             if (caps?.commands.length) {
-              parts.push(`  Commands (runnable via project_run): ${caps.commands.map((c) => `/${c}`).join(', ')}`);
+              parts.push(`  Project commands (a coding agent can use them via dispatch_coding_task): ${caps.commands.map((c) => `/${c}`).join(', ')}`);
             }
             if (caps?.skills.length) parts.push(`  Skills: ${caps.skills.join(', ')}`);
             if (caps?.hasMcp) parts.push('  Brings its own MCP servers (.mcp.json)');

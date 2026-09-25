@@ -71,3 +71,26 @@ test('a registered-but-superseded attempt latches its own kill and touches nothi
   const active = eventlog.getActiveRunAttempt(session.id);
   assert.equal(active?.attemptId, second.attemptId, 'the live attempt survives');
 });
+
+test('stopping a chat also stops the coding runs it dispatched, and only those', async () => {
+  const codingStore = await import('../../execution/coding-run-store.js');
+  const session = eventlog.createSession({ id: 'stop-exact-coding', kind: 'chat' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: 'run-coding' });
+  eventlog.recordRunAttemptUserInput(attempt, {
+    turn: 1, role: 'user', data: { text: 'fix the build' },
+  }, { armRunInFlight: true });
+  const admit = (origin: string, key: string) => codingStore.admitCodingRun({
+    agent: 'claude', projectName: 'p', projectPath: '/tmp/p', worktreePath: `/tmp/w/${key}`, branch: `clem/${key}`,
+    baseRef: 'main', baseCommit: 'a'.repeat(40), objective: 'Fix the build', brief: 'Fix it.',
+    originSessionId: origin, admissionKey: key,
+  }).run;
+  const mine = admit(session.id, 'coding-mine');
+  const other = admit('stop-exact-someone-else', 'coding-other');
+
+  const live = eventlog.getActiveRunAttempt(session.id);
+  assert.ok(live);
+  const stopped = stopExactHarnessAttempt(session.id, live, 'user stop', 'test');
+  assert.equal(stopped.cancelledTasks, 1);
+  assert.equal(codingStore.isCodingRunStopRequested(mine.runId), true);
+  assert.equal(codingStore.isCodingRunStopRequested(other.runId), false);
+});

@@ -271,6 +271,9 @@ const ALWAYS_READ = new Set<string>([
   // task_add below). The work it dispatches is still gated normally inside the
   // background run.
   'dispatch_background_task',
+  // dispatch_coding_task admits an agreed coding run the same way; the agent's
+  // effects are confined to its own worktree by the coding-run policy.
+  'dispatch_coding_task',
   // hold_task_for_later saves an agreed plan locally (reversible, no external
   // effect); resume_held_task queues work the user EXPLICITLY asked to pick back
   // up — both are consent-given like dispatch_background_task. Work stays gated

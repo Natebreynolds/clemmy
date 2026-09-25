@@ -1402,7 +1402,7 @@ function uniqueRunQueueCarrierIssued(item: unknown): boolean {
   const unwrapped = unwrapRuntimeEffectiveToolIdentity(row.name, row.arguments);
   const name = unwrapped.toolName ?? row.name;
   const tail = name.split('__').at(-1) ?? name;
-  return tail === 'workflow_run' || tail === 'dispatch_background_task';
+  return tail === 'workflow_run' || tail === 'dispatch_background_task' || tail === 'dispatch_coding_task';
 }
 
 /** After plan_task uniquely names an existing workflow, the model must call

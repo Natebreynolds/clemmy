@@ -17,7 +17,9 @@
  *  - Cascade: background tasks this session spawned (or that run AS it) die
  *    with the stop. Without this the task row kept polling "Working now" after
  *    the user explicitly stopped the chat that owned it (live 2026-07-08), and
- *    its external writes kept landing.
+ *    its external writes kept landing. Coding runs the chat dispatched stop
+ *    the same way: the request lands in their store and the daemon that owns
+ *    each agent ends it.
  */
 import {
   getActiveRunAttempt,
@@ -27,6 +29,7 @@ import {
 import * as approvalRegistry from './approval-registry.js';
 import { HarnessSession } from './session.js';
 import { listBackgroundTasks, cancelBackgroundTask } from '../../execution/background-tasks.js';
+import { requestCodingRunStopsForOrigin } from '../../execution/coding-run-store.js';
 
 export function stopExactHarnessAttempt(
   sessionId: string,
@@ -68,5 +71,8 @@ export function stopExactHarnessAttempt(
       }
     }
   } catch { /* best effort — the stale-runner sweeper still interrupts them later */ }
+  try {
+    cancelledTasks += requestCodingRunStopsForOrigin(sessionId, 'Stopped with its chat when the user stopped the run.').length;
+  } catch { /* the run's own card and the board can still stop it */ }
   return { cancelledApprovals, cancelledTasks };
 }

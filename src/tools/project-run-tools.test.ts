@@ -108,10 +108,10 @@ test('production project_run start is typed unavailable with zero spawn and zero
   assert.deepEqual(JSON.parse(text(result)), {
     ok: false,
     status: 'unavailable',
-    code: 'durable_delegated_execution_root_required',
+    code: 'project_run_start_moved',
     processStarted: false,
     runRecordCreated: false,
-    reason: 'project_run start cannot launch an unowned guest process. A durable delegated-execution root must own the child process, physical effects, and terminal receipt before new starts can be enabled. Historical status, runs, and kill actions remain available.',
+    reason: 'project_run no longer starts runs. Use dispatch_coding_task, which gives the run a durable owner, its own worktree, and a verified result.',
   });
   assert.equal(spawnCount, 0, 'no Claude/Codex child starts');
   assert.equal(listGuestRuns().length, 0, 'no in-memory guest job is minted');
@@ -161,4 +161,83 @@ test('status, runs, and kill remain available for historical guest-job rows', as
   await settle();
   const killedStatus = await call({ action: 'status', runId: running.id });
   assert.match(text(killedStatus), new RegExp(`${running.id}: killed`));
+});
+
+// ─── dispatch_coding_task ─────────────────────────────────────────────────
+
+const GIT_PROJECT = path.join(WORKSPACE, 'git-fixture');
+mkdirSync(GIT_PROJECT, { recursive: true });
+writeFileSync(path.join(GIT_PROJECT, 'package.json'), '{"name":"git-fixture"}');
+{
+  const { execFileSync } = await import('node:child_process');
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=T', '-c', 'user.email=t@example.invalid', ...args], { cwd: GIT_PROJECT });
+  git('init', '-q', '-b', 'main');
+  git('add', '.');
+  git('commit', '-q', '-m', 'init');
+}
+clearWorkspaceProjectCache();
+
+const { toolOutputContextStorage } = await import('../runtime/harness/tool-output-context.js');
+const codingStore = await import('../execution/coding-run-store.js');
+
+async function dispatch(args: Record<string, unknown>, context?: { sessionId: string; sourceUserSeq?: number }): Promise<ToolResult> {
+  const handler = handlers.get('dispatch_coding_task');
+  assert.ok(handler, 'dispatch_coding_task is registered');
+  const full = {
+    acceptance: null, test_command: null, expect_changes: null, model: null, handoff_note: null,
+    ...args,
+  };
+  return context ? toolOutputContextStorage.run(context, () => handler(full)) : handler(full);
+}
+
+test('dispatch_coding_task admits a durable run for a git project and never spawns', async () => {
+  let spawnCount = 0;
+  setGuestHarnessSpawnForTest((() => { spawnCount += 1; throw new Error('spawned'); }) as any);
+  const context = { sessionId: 'sess-dispatch-test', sourceUserSeq: 11 };
+  const args = {
+    project: 'git-fixture',
+    objective: 'Add a greeting helper',
+    brief: 'Add greet(name) in src/greet.js with a test.',
+    acceptance: ['greet("Ada") returns "Hello, Ada!"'],
+    test_command: 'npm test',
+  };
+  const result = await dispatch(args, context);
+  const body = text(result);
+  assert.match(body, /^Dispatched coding run (code-\S+): Claude Code will work on "Add a greeting helper" in git-fixture on its own branch clem\/add-a-greeting-helper-/);
+  assert.match(body, /\[harness-directive\]/);
+  const runId = /Dispatched coding run (code-\S+):/.exec(body)![1]!;
+  const run = codingStore.getCodingRun(runId);
+  assert.ok(run);
+  assert.equal(run.state, 'admitted');
+  assert.equal(run.originSessionId, 'sess-dispatch-test');
+  assert.equal(run.originSourceUserSeq, 11);
+  assert.equal(run.baseRef, 'main');
+  assert.equal(run.testCommand, 'npm test');
+  assert.deepEqual(run.acceptance, ['greet("Ada") returns "Hello, Ada!"']);
+  assert.ok(!run.worktreePath.startsWith(GIT_PROJECT), 'the worktree lives outside the user checkout');
+  assert.equal(spawnCount, 0);
+
+  // A retried call in the same turn rejoins the run.
+  const again = await dispatch(args, context);
+  assert.match(text(again), new RegExp(`Dispatched coding run ${runId}:`));
+  assert.match(text(again), /rejoined/);
+
+  const status = await call({ action: 'status', runId });
+  assert.match(text(status), new RegExp(`${runId}: admitted`));
+  const stopped = await call({ action: 'kill', runId });
+  assert.match(text(stopped), /stop requested/);
+  assert.equal(codingStore.isCodingRunStopRequested(runId), true);
+  assert.match(text(await call({ action: 'runs' })), new RegExp(runId));
+});
+
+test('dispatch_coding_task refuses without a chat, off the roster, or outside git', async () => {
+  const base = { objective: 'Fix the build', brief: 'Fix it.' };
+  const noChat = JSON.parse(text(await dispatch({ ...base, project: 'git-fixture' })));
+  assert.equal(noChat.code, 'coding_dispatch_needs_chat');
+  const context = { sessionId: 'sess-dispatch-refusals', sourceUserSeq: 3 };
+  const offRoster = JSON.parse(text(await dispatch({ ...base, project: '/etc' }, context)));
+  assert.equal(offRoster.code, 'coding_project_not_on_roster');
+  const notGit = JSON.parse(text(await dispatch({ ...base, project: 'fixture-project' }, context)));
+  assert.equal(notGit.code, 'coding_project_not_git');
+  assert.equal(codingStore.listCodingRuns({ originSessionId: 'sess-dispatch-refusals' }).length, 0);
 });

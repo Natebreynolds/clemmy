@@ -416,6 +416,19 @@ export interface GuestRunSummary {
 }
 export const getGuestRuns = () => apiGet<{ runs: GuestRunSummary[] }>('/api/console/guest-runs');
 
+/** A coding agent Clem dispatched into its own worktree of a project. */
+export interface CodingRunSummary {
+  runId: string;
+  sessionId: string;
+  agent: 'claude' | 'codex';
+  projectName: string;
+  projectPath: string;
+  branch: string;
+  objective: string;
+  state: 'admitted' | 'running' | 'detached' | 'resuming' | 'settling' | 'settled';
+}
+export const getCodingRuns = () => apiGet<{ runs: CodingRunSummary[] }>('/api/console/coding-runs');
+
 export interface BrowseEntry { name: string; path: string }
 export interface BrowseResult { path: string; parent: string | null; home: string; entries: BrowseEntry[] }
 export const browseFolders = (dir?: string) =>

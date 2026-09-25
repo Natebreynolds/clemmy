@@ -28,7 +28,7 @@ export type BoardServerColumnId = 'queued' | 'running' | 'needs_you' | 'done';
  * intent targets it), so the split costs the drag gesture nothing.
  */
 export type BoardColumnId = BoardServerColumnId | 'needs_you_blocked' | 'needs_you_review';
-export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule' | 'guest';
+export type BoardSourceKind = 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule' | 'guest' | 'coding';
 export type BoardPrimaryAction = 'approve' | 'continue' | 'retry_failed_items' | 'open_result' | 'none';
 export type BoardContinueMode = 'approval' | 'background' | 'workflow_failed_items' | 'workflow_resume' | 'open_result' | 'none';
 
@@ -696,7 +696,7 @@ const NOT_A_STOP: ReadonlySet<BoardSourceKind> = new Set(['schedule', 'approval'
  * stop, so absence must keep the button away. Every other kind's cancel route
  * is derived by `runBoardAction` from the card's identity, and the server
  * answers a wrong-state stop with a reason the drawer shows. */
-const STOP_NEEDS_PROJECTED_ENDPOINT: ReadonlySet<BoardSourceKind> = new Set(['run', 'guest']);
+const STOP_NEEDS_PROJECTED_ENDPOINT: ReadonlySet<BoardSourceKind> = new Set(['run', 'guest', 'coding']);
 
 /**
  * May this card be stopped from its trace drawer?
@@ -1037,6 +1037,9 @@ export function sourceLabel(kind: BoardSourceKind): string {
     // The user's own Claude Code / Codex CLI working inside one of their
     // projects, driven by project_run.
     case 'guest': return 'CLI';
+    // A coding agent (Claude Code, Codex) Clem dispatched into its own
+    // worktree of one of the user's projects.
+    case 'coding': return 'Coding';
   }
 }
 

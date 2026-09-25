@@ -129,6 +129,77 @@ const statusSchema = z.enum([
   'all',
 ]);
 
+/**
+ * Whether a consequential dispatch must wait for the conversational opening.
+ * Shared by every tool that hands agreed work to a durable runner, so the
+ * background runner and delegated coding agents hold the same line.
+ */
+export function dispatchAlignmentBeatOwed(sessionId: string): boolean {
+  // STRUCTURAL opening floor. A bare consequential ALIGN row is not enough
+  // to dispatch: older runtimes could enter the tool-capable model before
+  // any conversational opening was actually shown. The current protocol
+  // resolves openness first. OPEN owns an exact needs-input terminal;
+  // SETTLED publishes one exact-source preamble and continues in this SAME
+  // turn. That durable preamble proves the opening was paid — requiring a
+  // second go-ahead here would recreate the blanket confirmation stop this
+  // protocol removed.
+  const beatSourceSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
+  if (typeof beatSourceSeq === 'number' && beatSourceSeq > 0) {
+    try {
+      const structuralRows = listHarnessEvents(sessionId, {
+        types: [
+          'user_input_received',
+          'turn_preflight_decision',
+          'conversation_preamble',
+          'awaiting_user_input',
+        ],
+      });
+      const firstDecision = structuralRows
+        .find((event) => event.type === 'turn_preflight_decision'
+          && (event.data as { sourceUserSeq?: unknown })?.sourceUserSeq === beatSourceSeq);
+      const data = firstDecision?.data as {
+        phase?: unknown;
+        consequential?: unknown;
+        intentKey?: unknown;
+      } | undefined;
+      const source = structuralRows.find((event) => event.type === 'user_input_received'
+        && event.seq === beatSourceSeq
+        && event.role === 'user'
+        && event.data.synthetic !== true);
+      const unresolvedOpenQuestion = structuralRows.some((event) => event.type === 'awaiting_user_input'
+        && event.data.sourceUserSeq === beatSourceSeq
+        && event.data.source === 'preflight_openness');
+      const settledOpening = source
+        ? structuralRows.find((event) => {
+            if (
+              event.type !== 'conversation_preamble'
+              || event.role !== 'Clem'
+              || event.turn !== source.turn
+              || event.parentEventId !== source.id
+            ) return false;
+            const preamble = publicConversationPreambleData(event.data);
+            return preamble?.sourceUserSeq === beatSourceSeq
+              && (typeof data?.intentKey !== 'string' || preamble.intentKey === data.intentKey);
+          })
+        : undefined;
+      if (
+        data?.phase === 'align'
+        && data?.consequential === true
+        && (unresolvedOpenQuestion || !settledOpening)
+      ) {
+        return true;
+      }
+    } catch { /* an unreadable preflight row never blocks dispatch */ }
+  }
+  return false;
+}
+
+export const DISPATCH_ALIGNMENT_BEAT_REFUSAL = [
+  'Tool call refused by harness: alignment beat owed — no task was started.',
+  'This request is consequential and this turn opened in the ALIGN phase: reply to the user FIRST with the plan in plain language — what you will do, the concrete steps, and the success criteria — and ask for their go-ahead.',
+  'Dispatch after they confirm; their confirmation arrives as their next message.',
+].join('\n');
+
 export function registerBackgroundTaskTools(server: McpServer): void {
   server.tool(
     'background_tasks_recent',
@@ -271,71 +342,11 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         }));
       }
 
-      // STRUCTURAL opening floor. A bare consequential ALIGN row is not enough
-      // to dispatch: older runtimes could enter the tool-capable model before
-      // any conversational opening was actually shown. The current protocol
-      // resolves openness first. OPEN owns an exact needs-input terminal;
-      // SETTLED publishes one exact-source preamble and continues in this SAME
-      // turn. That durable preamble proves the opening was paid — requiring a
-      // second go-ahead here would recreate the blanket confirmation stop this
-      // protocol removed.
-      const beatSourceSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
-      if (typeof beatSourceSeq === 'number' && beatSourceSeq > 0) {
-        try {
-          const structuralRows = listHarnessEvents(sessionId, {
-            types: [
-              'user_input_received',
-              'turn_preflight_decision',
-              'conversation_preamble',
-              'awaiting_user_input',
-            ],
-          });
-          const firstDecision = structuralRows
-            .find((event) => event.type === 'turn_preflight_decision'
-              && (event.data as { sourceUserSeq?: unknown })?.sourceUserSeq === beatSourceSeq);
-          const data = firstDecision?.data as {
-            phase?: unknown;
-            consequential?: unknown;
-            intentKey?: unknown;
-          } | undefined;
-          const source = structuralRows.find((event) => event.type === 'user_input_received'
-            && event.seq === beatSourceSeq
-            && event.role === 'user'
-            && event.data.synthetic !== true);
-          const unresolvedOpenQuestion = structuralRows.some((event) => event.type === 'awaiting_user_input'
-            && event.data.sourceUserSeq === beatSourceSeq
-            && event.data.source === 'preflight_openness');
-          const settledOpening = source
-            ? structuralRows.find((event) => {
-                if (
-                  event.type !== 'conversation_preamble'
-                  || event.role !== 'Clem'
-                  || event.turn !== source.turn
-                  || event.parentEventId !== source.id
-                ) return false;
-                const preamble = publicConversationPreambleData(event.data);
-                return preamble?.sourceUserSeq === beatSourceSeq
-                  && (typeof data?.intentKey !== 'string' || preamble.intentKey === data.intentKey);
-              })
-            : undefined;
-          if (
-            data?.phase === 'align'
-            && data?.consequential === true
-            && (unresolvedOpenQuestion || !settledOpening)
-          ) {
-            // The typed refusal prefix keeps this NON-HALTING at the
-            // control-receipt fast path (an unmarked refusal was treated as a
-            // successful receipt, the renderer fabricated a "Started …" line,
-            // and the honesty floor then blocked the whole turn — live
-            // 2026-08-11, second acceptance run).
-            return textResult([
-              'Tool call refused by harness: alignment beat owed — no task was started.',
-              'This request is consequential and this turn opened in the ALIGN phase: reply to the user FIRST with the plan in plain language — what you will do, the concrete steps, and the success criteria — and ask for their go-ahead.',
-              'Dispatch after they confirm; their confirmation arrives as their next message.',
-            ].join('\n'));
-          }
-        } catch { /* an unreadable preflight row never blocks dispatch */ }
-      }
+      // The typed refusal prefix keeps this NON-HALTING at the control-receipt
+      // fast path (an unmarked refusal was treated as a successful receipt, the
+      // renderer fabricated a "Started …" line, and the honesty floor then
+      // blocked the whole turn — live 2026-08-11, second acceptance run).
+      if (dispatchAlignmentBeatOwed(sessionId)) return textResult(DISPATCH_ALIGNMENT_BEAT_REFUSAL);
 
       // Typed fan-out lane: the brain's OWN plan carries the manifest — no
       // second classifier call, no phrase heuristics. Admission validates the

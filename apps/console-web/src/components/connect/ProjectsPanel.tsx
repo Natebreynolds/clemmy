@@ -7,15 +7,17 @@ import { Input } from '@/components/ui/Field';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
-import { getProjects, getGuestRuns, addWorkspace, removeWorkspace, browseFolders } from '@/lib/connect';
+import { getProjects, getGuestRuns, getCodingRuns, addWorkspace, removeWorkspace, browseFolders } from '@/lib/connect';
 
 export function ProjectsPanel() {
   const qc = useQueryClient();
   const projects = usePoll(['projects'], getProjects, 30000);
   const guestRuns = usePoll(['guest-runs'], getGuestRuns, 10000);
-  const runningIn = new Set(
-    (guestRuns.data?.runs ?? []).filter((r) => r.status === 'running').map((r) => r.projectPath),
-  );
+  const codingRuns = usePoll(['coding-runs'], getCodingRuns, 10000);
+  const runningIn = new Set([
+    ...(guestRuns.data?.runs ?? []).filter((r) => r.status === 'running').map((r) => r.projectPath),
+    ...(codingRuns.data?.runs ?? []).filter((r) => r.state !== 'settled').map((r) => r.projectPath),
+  ]);
   const dirs = projects.data?.workspaceDirs ?? [];
   const found = projects.data?.projects ?? [];
   const [path, setPath] = useState('');
@@ -106,7 +108,7 @@ export function ProjectsPanel() {
                     {p.description && <p className="mt-0.5 line-clamp-1 text-caption text-muted">{p.description}</p>}
                     <p className="mt-1 truncate font-mono text-caption text-faint">{p.path}</p>
                     {(p.capabilities?.commands.length || p.capabilities?.skills.length || p.capabilities?.hasMcp || p.capabilities?.hasAgentsMd) ? (
-                      <div className="mt-2 flex flex-wrap gap-1" title="Things Clementine can run in this project through your Claude Code / Codex CLI">
+                      <div className="mt-2 flex flex-wrap gap-1" title="This project's own commands; a coding agent Clementine dispatches here can use them">
                         {(p.capabilities?.commands ?? []).slice(0, 6).map((c) => (
                           <span key={c} className="rounded-sm bg-primary/10 px-1.5 py-0.5 font-mono text-caption text-primary">/{c}</span>
                         ))}
