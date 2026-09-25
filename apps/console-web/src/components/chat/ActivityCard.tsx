@@ -82,7 +82,7 @@ function OpenDeliverable({ file }: { file: { name: string; dir: string } }) {
   );
 }
 
-function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live: boolean; nested?: boolean }) {
+export function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live: boolean; nested?: boolean }) {
   const running = live && a.status === 'running';
   const [peek, setPeek] = useState<boolean | null>(null);
   // While live, only the current step opens its excerpt — auto-opening every
@@ -114,7 +114,7 @@ function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live:
 /** While live, stay pinned to the newest step so the current action never
  *  sits below the fold. Scroll up to inspect history; returning to the
  *  bottom re-engages the pin. */
-function LiveStepList({ live, children }: { live: boolean; children: ReactNode }) {
+export function LiveStepList({ live, children }: { live: boolean; children: ReactNode }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   useEffect(() => {

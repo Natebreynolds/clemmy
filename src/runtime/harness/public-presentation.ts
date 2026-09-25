@@ -620,6 +620,15 @@ function publicToolIdentifier(value: unknown): string {
   return PUBLIC_TOOL_IDENTIFIER_RE.test(candidate) ? candidate : '';
 }
 
+/** Hosted model ids are often `namespace/model`; that shape is a name, not a
+ *  path, so one namespace segment is allowed. Anything else stays private. */
+const PUBLIC_MODEL_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9_.:-]{0,95})?$/;
+
+function publicModelIdentifier(value: unknown): string {
+  const candidate = typeof value === 'string' ? value.trim() : '';
+  return PUBLIC_MODEL_IDENTIFIER_RE.test(candidate) ? candidate : '';
+}
+
 /**
  * One privacy-safe public progress label. The canonical top-level tool name is
  * runtime-owned event metadata; call_tool's target name and Composio slug are
@@ -773,7 +782,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // expose only bounded provider/model names plus two closed transition
       // bits. Internal failure reasons, abandoned brains, transport, attempts,
       // and route topology stay in the audit ledger.
-      const model = publicToolIdentifier(data.model);
+      const model = publicModelIdentifier(data.model);
       const provider = publicToolIdentifier(data.provider);
       if (!model && !provider) return null;
       return {

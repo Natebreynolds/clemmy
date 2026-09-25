@@ -119,6 +119,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
               onPreparePlan={chat.preparePlan}
+              onAnswer={(text) => send({ text, attachmentIds: [], attachmentNames: [] })}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />
           ))}

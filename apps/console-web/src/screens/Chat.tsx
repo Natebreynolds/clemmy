@@ -196,6 +196,7 @@ export function Chat() {
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
               onBackground={chat.background}
+              onAnswer={(text) => chat.send({ text, attachmentIds: [], attachmentNames: [] })}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />
           ))}

@@ -1,7 +1,7 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { TerminalFacts } from '@clem/chat-engine';
-import { readLiveApprovalControl, terminalCompletionPresentation } from '@clem/chat-engine';
+import { readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -81,6 +81,10 @@ export interface ActivityItem {
   };
   /** kind 'event' deliverable rows: the latest file folded in, by basename. */
   deliverable?: { name: string; dir: string };
+  /** kind 'check' verdict rows: the review's decision as a fact. */
+  verdict?: 'passed' | 'rejected' | 'unreviewed';
+  /** The model-phase row only: the routed model's display name. */
+  modelName?: string;
 }
 
 export interface ChatMessage {
@@ -135,6 +139,8 @@ export interface ChatMessage {
    *  still running so someone who walks away can reopen the session and read
    *  what happened. Rendered as an aside, never as the answer. */
   checkIn?: boolean;
+  /** A question's suggested answers, offered as one-tap replies. */
+  options?: string[];
 }
 
 export type ChatApprovalDecision = 'approve' | 'reject';
@@ -743,6 +749,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
         label: failedOpen ? `Verdict · ${door}: accepted (judge unavailable)` : `Verdict · ${door}${scorecard}: ${pass ? 'passed' : 'not passed'}`,
         ...(reason ? { detail: reason } : {}),
         status: pass && !failedOpen ? 'done' : 'failed',
+        verdict: failedOpen ? 'unreviewed' : pass ? 'passed' : 'rejected',
       }];
     }
     case 'heartbeat': {
@@ -1439,7 +1446,8 @@ export function useChat(options?: UseChatOptions) {
     } else if (ev.type === 'conversation_limit_exceeded') {
       patch(assistantId, { status: 'stopped', progress: undefined });
     } else if (ev.type === 'awaiting_user_input') {
-      patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined });
+      const options = readQuestionOptions(d.options);
+      patch(assistantId, { text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, ...(options.length ? { options } : {}) });
     } else if (ev.type === 'approval_requested') {
       setMessages((prev) => appendLiveApprovalCard(prev, ev));
     } else if (ev.type === 'conversation_check_in') {
@@ -1968,12 +1976,14 @@ export function inboxAdditionsFromEvents(
       const q = typeof d.question === 'string' ? d.question : '';
       if (!q) continue;
       const taskRef = claimDelivery(ev);
+      const options = readQuestionOptions(d.options);
       if (taskRef !== null) additions.push({
         id: `inbox-${ev.seq}`,
         role: 'assistant',
         text: q,
         status: 'awaiting-reply',
         taskRef,
+        ...(options.length ? { options } : {}),
       });
     } else if (ev.type === 'approval_requested') {
       const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
