@@ -59,6 +59,52 @@ function cwActionTokens(value: string): string[] {
     .filter(Boolean);
 }
 
+/** What one external write did, read from its action's verb consequence.
+ *  `other` is an action whose verb says nothing the reader can rely on. */
+export type ExternalWriteKind =
+  | 'draft_created' | 'draft_updated'
+  | 'message_sent' | 'post_published'
+  | 'record_created' | 'record_updated' | 'record_deleted'
+  | 'file_saved'
+  | 'other';
+
+/** The one reading of an external write's action that both the feed line
+ *  (describeExternalWrite) and the turn's outside-work cards use. A write
+ *  recorded reversible may never read as delivery. */
+export function externalWriteKind(
+  shapeKey: string | undefined,
+  toolName: string,
+  write?: { irreversible?: boolean; actionKey?: string },
+): ExternalWriteKind {
+  const key = shapeKey || write?.actionKey || toolName || 'action';
+  const tokens = cwActionTokens(key);
+  const has = (token: string): boolean => tokens.includes(token);
+  const deliveryAllowed = write?.irreversible !== false;
+  const fileShaped = has('UPLOAD') || has('SAVE') || has('WRITE') || has('FILE');
+  const consequence = tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
+    : tokens.some((t) => CW_SEND_VERBS.has(t)) ? 'send'
+      : tokens.some((t) => CW_UPDATE_VERBS.has(t)) ? 'update'
+        : tokens.some((t) => CW_CREATE_VERBS.has(t)) ? 'create'
+          : 'other';
+
+  if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH')) {
+    return consequence === 'update' ? 'draft_updated' : 'draft_created';
+  }
+  switch (consequence) {
+    case 'delete':
+      return 'record_deleted';
+    case 'send':
+      if (!deliveryAllowed) return 'other';
+      return has('PUBLISH') || has('POST') || has('TWEET') ? 'post_published' : 'message_sent';
+    case 'update':
+      return fileShaped ? 'file_saved' : 'record_updated';
+    case 'create':
+      return fileShaped ? 'file_saved' : 'record_created';
+    default:
+      return fileShaped ? 'file_saved' : 'other';
+  }
+}
+
 export function describeExternalWrite(
   shapeKey: string | undefined,
   toolName: string,
@@ -72,38 +118,18 @@ export function describeExternalWrite(
   const to = targets.length
     ? ` to ${targets.slice(0, 3).join(', ')}${targets.length > 3 ? ` (+${targets.length - 3} more)` : ''}`
     : '';
-  const tokens = cwActionTokens(key);
-  const has = (token: string): boolean => tokens.includes(token);
-  const deliveryAllowed = write?.irreversible !== false;
-  const fileShaped = has('UPLOAD') || has('SAVE') || has('WRITE') || has('FILE');
   /** Pick the verb for the tense asked for. One table, two readings. */
   const v = (past: string, present: string): string => (write?.tense === 'present' ? present : past);
-  const fallback = `${v('Ran', 'Running')} ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
-  const consequence = tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
-    : tokens.some((t) => CW_SEND_VERBS.has(t)) ? 'send'
-      : tokens.some((t) => CW_UPDATE_VERBS.has(t)) ? 'update'
-        : tokens.some((t) => CW_CREATE_VERBS.has(t)) ? 'create'
-          : 'other';
-
-  if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH')) {
-    return consequence === 'update'
-      ? `${v('Updated', 'Updating')} a draft${to}`
-      : `${v('Created', 'Creating')} a draft${to}`;
-  }
-  switch (consequence) {
-    case 'delete':
-      return `${v('Deleted', 'Deleting')} a record${to}`;
-    case 'send':
-      if (!deliveryAllowed) return fallback;
-      return has('PUBLISH') || has('POST') || has('TWEET')
-        ? `${v('Published', 'Publishing')} a post${to}`
-        : `${v('Sent', 'Sending')} a message${to}`;
-    case 'update':
-      return fileShaped ? `${v('Saved', 'Saving')} a file${to}` : `${v('Updated', 'Updating')} a record${to}`;
-    case 'create':
-      return fileShaped ? `${v('Saved', 'Saving')} a file${to}` : `${v('Created', 'Creating')} a record${to}`;
-    default:
-      return fileShaped ? `${v('Saved', 'Saving')} a file${to}` : fallback;
+  switch (externalWriteKind(shapeKey, toolName, write)) {
+    case 'draft_updated': return `${v('Updated', 'Updating')} a draft${to}`;
+    case 'draft_created': return `${v('Created', 'Creating')} a draft${to}`;
+    case 'record_deleted': return `${v('Deleted', 'Deleting')} a record${to}`;
+    case 'post_published': return `${v('Published', 'Publishing')} a post${to}`;
+    case 'message_sent': return `${v('Sent', 'Sending')} a message${to}`;
+    case 'file_saved': return `${v('Saved', 'Saving')} a file${to}`;
+    case 'record_updated': return `${v('Updated', 'Updating')} a record${to}`;
+    case 'record_created': return `${v('Created', 'Creating')} a record${to}`;
+    case 'other': return `${v('Ran', 'Running')} ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
   }
 }
 

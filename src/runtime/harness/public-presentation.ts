@@ -39,6 +39,7 @@ import {
   SETTLED_READ_REUSE_LABEL,
 } from './settled-read-replay-semantics.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
+import { appForWriteAction } from '../../integrations/composio/toolkit-identity.js';
 import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMode } from './task-mode.js';
 
 export function publicPlanArtifactRef(value: unknown): PlanRevisionRef | undefined {
@@ -1012,11 +1013,17 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'external_write':
     case 'external_write_succeeded':
     case 'external_write_failed':
-    case 'external_write_orphaned':
+    case 'external_write_orphaned': {
+      // The app the write landed in, from the toolkit catalog — a name and
+      // web address Composio publishes, never anything the model wrote.
+      const action = firstString(data.shapeKey) || firstString(data.toolName) || firstString(data.tool);
+      const app = action ? appForWriteAction(action) : null;
       return {
         ...selected(data, ['shapeKey', 'toolName', 'tool', 'callId', 'call_id', 'preDispatch']),
         targets: stringList(data.targets, 25),
+        ...(app ? { app: app.name, ...(app.url ? { appUrl: app.url } : {}) } : {}),
       };
+    }
     case 'codemode_program_summary': // historical event presentation
       return selected(data, ['ok', 'rpcCalls', 'durationMs', 'completed', 'failed']);
     case 'capability_resolution': {
@@ -1090,8 +1097,15 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       if (lines.length === 0) return null;
       return { version: 1, sourceUserSeq: Number(sourceUserSeq), lines };
     }
-    case 'verdict_recorded':
-      return selected(data, ['door', 'pass', 'failedOpen', 'selfJudge', 'criteriaMet', 'criteriaTotal']);
+    case 'verdict_recorded': {
+      // Which model actually ruled, so an answer can say who checked it. Only
+      // a well-formed model id passes; anything else stays private.
+      const judge = publicModelIdentifier(data.judgeModelId);
+      return {
+        ...selected(data, ['door', 'pass', 'failedOpen', 'selfJudge', 'criteriaMet', 'criteriaTotal']),
+        ...(judge ? { judgeModelId: judge } : {}),
+      };
+    }
     case 'heartbeat': {
       // A progress check-in's `message` is the HOST-COMPOSED ledger line
       // (composeRunProgressLine — plan/evidence/collection facts, no model

@@ -68,6 +68,19 @@ export interface WriteLedgerRow {
   irreversible: boolean | null;
   /** Wire position of the event that set the current disposition. */
   settledAtSeq?: number;
+  /** The app the write landed in and its web address, when the server's
+   *  toolkit catalog named them. A label only; never decides anything. */
+  app?: string;
+  appUrl?: string;
+}
+
+function appFields(data: Record<string, unknown>): Pick<WriteLedgerRow, 'app' | 'appUrl'> {
+  const app = stringOf(data.app);
+  const url = stringOf(data.appUrl);
+  return {
+    ...(app ? { app } : {}),
+    ...(app && url && /^https:\/\//i.test(url) ? { appUrl: url } : {}),
+  };
 }
 
 const WRITE_TYPES = new Set([
@@ -147,6 +160,7 @@ export function applyWriteEvent(
       disposition: next,
       irreversible: typeof data.irreversible === 'boolean' ? data.irreversible : null,
       ...(next === 'reserved' ? {} : { settledAtSeq: ev.seq }),
+      ...appFields(data),
     };
   }
 
@@ -168,6 +182,7 @@ export function applyWriteEvent(
     ...(typeof data.irreversible === 'boolean' ? { irreversible: data.irreversible } : {}),
     disposition,
     ...(disposition === prior.disposition ? {} : { settledAtSeq: ev.seq }),
+    ...appFields(data),
   };
 }
 

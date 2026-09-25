@@ -21,8 +21,9 @@ import {
   liveActivityHeadline,
   narrateActivity,
   observedEvidenceChips,
+  outsideWorkCards,
   renderMarkdown,
-  turnModelName,
+  turnByline,
   turnReview,
   type ActivityItem,
   type ChatMessage,
@@ -785,26 +786,47 @@ function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (te
 }
 
 /**
- * The last line under an answer: whether it was checked and what the turn
- * touched. Tapping it names the model that did the work — kept out of the way
- * until asked for, the phone's version of the desktop's hover. "Checked"
- * appears only when a review passed; a turn whose reviewer never ran says so.
+ * The last lines under an answer: what it changed outside Clem (confirmed
+ * writes only), whether it was checked, and what the turn touched. Tapping the
+ * line names the models that did the work and the checking — kept out of the
+ * way until asked for on the phone's narrow width. "Checked" appears only when
+ * a review passed; a turn whose reviewer never ran says so.
  */
 function TurnReceipt({ message }: { message: ChatMessage }) {
   const [reveal, setReveal] = useState(false);
   const review = turnReview(message.activity);
-  const model = turnModelName(message.activity);
+  const byline = turnByline(message.activity);
+  const outside = outsideWorkCards(message.activity);
   const proven = evidenceChips(message.terminal?.evidenceRefs);
   const chips = proven.length > 0 ? proven : observedEvidenceChips(message.activity);
   const touched = chips.map((chip) => chip.label).join(' · ');
-  if (!review && !touched && !model) return null;
+  if (!review && !touched && !byline && outside.length === 0) return null;
   return (
-    <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
-      {review === 'checked' ? <span class="receipt-ok">✓ Checked</span> : null}
-      {review === 'unchecked' ? <span class="receipt-warn">Not checked</span> : null}
-      {review === 'rejected' ? <span class="receipt-warn">Didn’t pass review</span> : null}
-      {touched ? <span>{touched}</span> : null}
-      {reveal && model ? <span class="receipt-model">{model} did the work</span> : null}
-    </button>
+    <>
+      {outside.length > 0 ? (
+        <div class="reply-outside">
+          {outside.map((card) => (
+            <div key={card.key} class="reply-outside-card">
+              <span class="reply-outside-text">
+                <span class="reply-outside-title">{card.title}</span>
+                <span class="reply-outside-sub">{card.subtitle}</span>
+              </span>
+              {card.appUrl ? (
+                <a class="reply-outside-open" href={card.appUrl} target="_blank" rel="noopener noreferrer" aria-label={`Open ${card.app ?? 'the app'}`}>Open ↗</a>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {review || touched || byline ? (
+        <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
+          {review === 'checked' ? <span class="receipt-ok">✓ Checked</span> : null}
+          {review === 'unchecked' ? <span class="receipt-warn">Not checked</span> : null}
+          {review === 'rejected' ? <span class="receipt-warn">Didn’t pass review</span> : null}
+          {touched ? <span>{touched}</span> : null}
+          {reveal && byline ? <span class="receipt-model">{byline}</span> : null}
+        </button>
+      ) : null}
+    </>
   );
 }

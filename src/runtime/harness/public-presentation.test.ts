@@ -8,6 +8,37 @@ import {
   publicCompletionText,
   publicReplyText,
 } from './public-presentation.js';
+import { __setToolkitCatalogForTests } from '../../integrations/composio/toolkit-identity.js';
+
+test('a verdict names the model that ruled, and only a well-formed model id reaches the chat', () => {
+  const ruled = projectHarnessEventForPublic(event('verdict_recorded', {
+    door: 'completion', pass: true, judgeModelId: 'vendor-ai/Vendor-V4.1-Fast', reason: 'private reasoning',
+  }));
+  assert.equal(ruled?.data.judgeModelId, 'vendor-ai/Vendor-V4.1-Fast');
+  assert.equal(ruled?.data.reason, undefined, 'the reviewer’s reasoning stays private');
+  const unsafe = projectHarnessEventForPublic(event('verdict_recorded', { door: 'completion', pass: true, judgeModelId: '../etc/passwd' }));
+  assert.equal(unsafe?.data.judgeModelId, undefined);
+});
+
+test('an external write names the app it landed in from the toolkit catalog, and nothing when the catalog has no match', () => {
+  __setToolkitCatalogForTests([
+    { slug: 'mail_suite', name: 'Mail Suite', appUrl: 'https://mail.example.test' },
+    { slug: 'mail', name: 'Mail', appUrl: 'https://plain.example.test' },
+    { slug: 'sheets', name: 'Sheets', appUrl: 'javascript:alert(1)' },
+  ]);
+  try {
+    const draft = projectHarnessEventForPublic(event('external_write_succeeded', { shapeKey: 'MAIL_SUITE_CREATE_DRAFT', callId: 'c1', targets: ['a@example.test'] }));
+    assert.equal(draft?.data.app, 'Mail Suite', 'the longest matching toolkit slug wins');
+    assert.equal(draft?.data.appUrl, 'https://mail.example.test');
+    const sheet = projectHarnessEventForPublic(event('external_write_succeeded', { shapeKey: 'SHEETS_BATCH_UPDATE', callId: 'c2' }));
+    assert.equal(sheet?.data.app, 'Sheets');
+    assert.equal(sheet?.data.appUrl, undefined, 'only an https address is published');
+    const unknown = projectHarnessEventForPublic(event('external_write_succeeded', { shapeKey: 'server__tool', callId: 'c3' }));
+    assert.equal(unknown?.data.app, undefined);
+  } finally {
+    __setToolkitCatalogForTests(null);
+  }
+});
 
 function event(type: EventType, data: Record<string, unknown> = {}): EventRow {
   return {

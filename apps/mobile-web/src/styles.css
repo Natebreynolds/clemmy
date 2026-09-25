@@ -4201,6 +4201,21 @@ textarea.cz-input { resize: vertical; }
 .receipt-warn { color: var(--accent-warn); font-weight: 600; }
 .receipt-model { flex-basis: 100%; color: var(--fg-2); }
 
+/* Work outside Clem that the app confirmed: one card per app and kind. */
+.reply-outside { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); }
+.reply-outside-card {
+  display: flex; align-items: center; gap: var(--sp-3); padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-2);
+}
+.reply-outside-text { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.3; }
+.reply-outside-title { font-size: var(--t-sm); font-weight: 650; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-outside-sub { font-size: var(--t-xs); color: var(--fg-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-outside-open {
+  display: inline-flex; align-items: center; min-height: 36px; padding: 0 12px; flex-shrink: 0;
+  border: 1px solid var(--line-strong); border-radius: var(--r-md); color: var(--fg-2);
+  font-size: var(--t-xs); font-weight: 650; text-decoration: none;
+}
+
 .bubble-md .md-table { overflow-x: auto; margin: 0.4em 0 0.7em; border: 1px solid var(--line); border-radius: var(--r-sm); -webkit-overflow-scrolling: touch; }
 .bubble-md table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.4; font-variant-numeric: tabular-nums; }
 .bubble-md th { text-align: left; font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-3); background: var(--bg-2); padding: 7px 10px; white-space: nowrap; }

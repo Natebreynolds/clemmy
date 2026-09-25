@@ -163,6 +163,8 @@ export interface CatalogToolkit {
   authSchemes?: string[];
   /** The schemes Composio can sign in with using its own registered app. */
   managedAuthSchemes?: string[];
+  /** The app's own web address, as Composio lists it. */
+  appUrl?: string;
   categories: { slug: string; name: string }[];
 }
 
@@ -1417,6 +1419,7 @@ interface RawCatalogItem {
     toolsCount?: number;
     tools_count?: number;
     categories?: Array<{ slug: string; name: string }>;
+    app_url?: string;
   };
   composioManagedAuthSchemes?: string[];
   composio_managed_auth_schemes?: string[];
@@ -1432,11 +1435,13 @@ function normalizeCatalogItem(item: RawCatalogItem): CatalogToolkit | null {
   const managed = item.composioManagedAuthSchemes ?? item.composio_managed_auth_schemes ?? [];
   const schemes = item.authSchemes ?? item.auth_schemes ?? [];
   const noAuth = item.noAuth ?? item.no_auth ?? false;
+  const appUrl = str(item.meta?.app_url);
   return {
     slug,
     name: str(item.name) ?? displayNameFor(slug),
     logoUrl: item.meta?.logo,
     description: item.meta?.description,
+    ...(appUrl && /^https:\/\//i.test(appUrl) ? { appUrl } : {}),
     toolsCount: item.meta?.toolsCount ?? item.meta?.tools_count,
     authMode: noAuth ? 'none' : (managed.length > 0 ? 'managed' : (schemes.length > 0 ? 'byo' : 'none')),
     authSchemes: schemes.map((s) => String(s).toUpperCase()),

@@ -455,6 +455,10 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       const failedOpen = d.failedOpen === true;
       const scorecard = typeof d.criteriaMet === 'number' && typeof d.criteriaTotal === 'number' ? ` ${d.criteriaMet}/${d.criteriaTotal}` : '';
       const reason = typeof d.reason === 'string' ? d.reason : '';
+      // The model that actually ruled, when the harness named it. A
+      // failed-open verdict had no reviewer, so it names none.
+      const judgeId = failedOpen ? '' : boundedModelId(d.judgeModelId);
+      const judgeName = judgeId ? modelDisplayName(judgeId).slice(0, 48) : '';
       // "The reviewer said no" and "there was no reviewer" are different facts.
       // Both used to render as a failed check, which made an unverified answer
       // look rejected — and made a real rejection look routine. A failed-open
@@ -471,6 +475,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         status: failedOpen ? 'done' as const : (pass ? 'done' as const : 'failed' as const),
         ...(failedOpen ? { tone: 'warning' as const } : {}),
         verdict: failedOpen ? 'unreviewed' as const : (pass ? 'passed' as const : 'rejected' as const),
+        ...(judgeName ? { modelName: judgeName } : {}),
       }];
     }
     case 'heartbeat': {
