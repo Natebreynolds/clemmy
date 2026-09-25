@@ -658,7 +658,10 @@ function WorkLine({
   // on a reply, waiting on approval, blocked. The typed terminal is what knows.
   // Without this the card read "Worked 40s · 6 steps" for all of them, which is
   // the same class of lie as Home's old "done while you were away".
-  const unfinished = !live && !failed
+  // Clem asking for a reply or an approval is her turn ending on purpose: it
+  // waits on you, which is neither done nor "Didn't finish".
+  const waiting = !live && !failed && message.terminal?.status === 'needs_input';
+  const unfinished = !live && !failed && !waiting
     && Boolean(message.terminal) && message.terminal?.status !== 'done';
   const [open, setOpen] = useState(failed);
   const elapsed = useElapsed(activity, live);
@@ -669,13 +672,13 @@ function WorkLine({
   const running = activity.some((item) => item.status === 'running');
   const summary = live
     ? (!running && message.progress ? message.progress : liveActivityHeadline(activity))
-    : `${failed ? 'Ran into trouble · ' : unfinished ? 'Didn’t finish · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
+    : `${failed ? 'Ran into trouble · ' : unfinished ? 'Didn’t finish · ' : waiting ? 'Waiting for you · ' : ''}${elapsed ? `Worked ${elapsed} · ` : ''}${activity.length} ${activity.length === 1 ? 'step' : 'steps'}`;
 
   return (
-    <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}${unfinished ? ' work-unfinished' : ''}`}>
+    <div class={`work${open ? ' work-open' : ''}${failed ? ' work-failed' : ''}${unfinished ? ' work-unfinished' : ''}${waiting ? ' work-waiting' : ''}`}>
       <div class="work-head">
         <button class={`work-line${live ? ' work-live' : ''}`} onClick={() => setOpen(!open)} aria-expanded={open}>
-          {live ? <span class="work-orb" aria-hidden="true" /> : <OutcomeMark failed={failed} unfinished={unfinished} />}
+          {live ? <span class="work-orb" aria-hidden="true" /> : <OutcomeMark failed={failed} unfinished={unfinished} waiting={waiting} />}
           <span class={`work-summary${live ? ' work-shimmer' : ''}`}>{summary}</span>
           {live && elapsed ? <span class="work-elapsed">{elapsed}</span> : null}
           {live ? null : <span class={`work-chevron${open ? ' open' : ''}`} aria-hidden="true">›</span>}
@@ -745,13 +748,13 @@ function ActivityRow({ item }: { item: ActivityItem }) {
   );
 }
 
-function OutcomeMark({ failed, unfinished }: { failed: boolean; unfinished: boolean }) {
-  const tone = failed ? 'fail' : unfinished ? 'warn' : 'ok';
-  const label = failed ? 'Ran into trouble' : unfinished ? 'Did not finish' : 'Completed';
+function OutcomeMark({ failed, unfinished, waiting }: { failed: boolean; unfinished: boolean; waiting: boolean }) {
+  const tone = failed ? 'fail' : unfinished ? 'warn' : waiting ? 'wait' : 'ok';
+  const label = failed ? 'Ran into trouble' : unfinished ? 'Did not finish' : waiting ? 'Waiting for you' : 'Completed';
   return (
     <svg class={`work-mark work-mark-${tone}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label={label}>
       <circle cx="12" cy="12" r="9" />
-      {failed ? <path d="m9 9 6 6M15 9l-6 6" /> : unfinished ? <path d="M12 7.5v5M12 16.5v.01" /> : <path d="m8.5 12.5 2.5 2.5 4.5-5.5" />}
+      {failed ? <path d="m9 9 6 6M15 9l-6 6" /> : unfinished ? <path d="M12 7.5v5M12 16.5v.01" /> : waiting ? <path d="M10 9v6M14 9v6" /> : <path d="m8.5 12.5 2.5 2.5 4.5-5.5" />}
     </svg>
   );
 }

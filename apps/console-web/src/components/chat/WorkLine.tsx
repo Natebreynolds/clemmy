@@ -12,7 +12,7 @@
  */
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { AlertCircle, ArrowUpRight, CheckCircle2, ChevronRight, XCircle } from 'lucide-react';
+import { AlertCircle, ArrowUpRight, CheckCircle2, ChevronRight, PauseCircle, XCircle } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
 import { BatchRow, useNowTick } from '@/components/chat/ActivityFeed';
@@ -37,7 +37,7 @@ export function workLineSummary(
 ): string {
   const worked = workedFor(totalMs);
   const parts = [
-    outcome === 'failed' ? 'Ran into trouble' : outcome === 'interrupted' ? 'Didn’t finish' : '',
+    outcome === 'failed' ? 'Ran into trouble' : outcome === 'interrupted' ? 'Didn’t finish' : outcome === 'waiting' ? 'Waiting for you' : '',
     worked ? (outcome === 'completed' ? `Worked ${worked}` : `worked ${worked}`) : (outcome === 'completed' ? 'Worked through it' : ''),
     steps > 0 ? `${steps} ${steps === 1 ? 'step' : 'steps'}` : '',
     helpers > 0 ? `${helpers} ${helpers === 1 ? 'helper' : 'helpers'}` : '',
@@ -48,6 +48,7 @@ export function workLineSummary(
 function OutcomeMark({ outcome }: { outcome: ActivityTerminalOutcome }) {
   if (outcome === 'failed') return <XCircle className="h-4 w-4 shrink-0 text-danger" strokeWidth={2} role="img" aria-label="Failed" />;
   if (outcome === 'interrupted') return <AlertCircle className="h-4 w-4 shrink-0 text-warning" strokeWidth={2} role="img" aria-label="Did not finish" />;
+  if (outcome === 'waiting') return <PauseCircle className="h-4 w-4 shrink-0 text-info" strokeWidth={2} role="img" aria-label="Waiting for you" />;
   return <CheckCircle2 className="h-4 w-4 shrink-0 text-success" strokeWidth={2} role="img" aria-label="Completed" />;
 }
 

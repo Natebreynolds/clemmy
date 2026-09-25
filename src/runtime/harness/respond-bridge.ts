@@ -48,6 +48,7 @@ import {
   type TurnCapabilityCandidates,
 } from '../read-path/capability-candidates.js';
 import {
+  classifyUnsettledOpenQuestionReply,
   enrichAcceptedRequestWithTaskContinuity,
   inspectDurableMaterialSourceContinuation,
   mergeTurnCapabilityCandidates,
@@ -1519,6 +1520,12 @@ export async function respondViaHarness(
       turn: sourceUserEvent.turn,
       surface,
     });
+    // A reply that bound no answer: Jev reads whether it tries to answer
+    // (reask) or asks something back (the brain replies, step on hold).
+    await classifyUnsettledOpenQuestionReply({
+      sessionId: request.sessionId,
+      sourceUserSeq: sourceUserEvent.seq,
+    });
   }
   markPreparation('clarification_checked');
   const typedClassification = semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
@@ -1535,9 +1542,12 @@ export async function respondViaHarness(
   // supplied semantic context was stripped/rebuilt at the boundary above.
   const verifiedMetaContinuationSteer = typedClassification
     && 'keepOpen' in typedClassification
-    && typedClassification.metaAction
     && request.taskContinuationResolved === true
-    && request.semanticTaskInput?.startsWith('[task-continuation-meta:v1]\n')
+    && (
+      (typedClassification.metaAction
+        && request.semanticTaskInput?.startsWith('[task-continuation-meta:v1]\n'))
+      || request.semanticTaskInput?.startsWith('[task-continuation-question:v1]\n')
+    )
     ? request.semanticTaskInput
     : undefined;
   if (hostOwnsTurn) {

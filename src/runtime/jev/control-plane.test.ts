@@ -6,6 +6,7 @@ const {
   _setTypesafeKeyForTests,
 } = await import('./client.js');
 const {
+  classifyOpenQuestionReplyWithJev,
   filterPrimerHitsWithJev,
   nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
@@ -512,3 +513,33 @@ test('decideTurnStartWithJev asks both turn-start questions in one request', asy
   assert.equal(unreachable.route.pick, null);
 });
 
+
+test('classifyOpenQuestionReplyWithJev reads a reply to Clem\'s question as one choice and fails open without Jev', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  let choice = 'asks';
+  let confidence = 0.91;
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      reply: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } },
+    }, usage: { input_tokens: 60, output_tokens: 4 } }) };
+  });
+  const input = {
+    question: 'Draft — not sent, holding for your go:\n\n```\n:fire: Friday\n```\n\nWhich channel?',
+    reply: 'sorry to confirm what channel are you going to send to',
+  };
+  assert.deepEqual(await classifyOpenQuestionReplyWithJev(input), { kind: 'asks', confidence: 0.91, failedOpen: false });
+  const body = posted[0]!;
+  assert.deepEqual(Object.keys(body.questions), ['reply'], 'one question, one request');
+  assert.equal(body.questions.reply.type, 'choice');
+  assert.deepEqual(Object.keys(body.questions.reply.criteria).sort(), ['answers', 'asks', 'none', 'other']);
+  assert.match(JSON.stringify(body.state), /what channel are you going to send to/);
+
+  choice = 'answers'; confidence = 0.97;
+  assert.deepEqual(await classifyOpenQuestionReplyWithJev(input), { kind: 'answers', confidence: 0.97, failedOpen: false });
+  choice = 'none'; confidence = 0.8;
+  assert.deepEqual(await classifyOpenQuestionReplyWithJev(input), { kind: null, confidence: 0.8, failedOpen: false });
+  _setTypesafeKeyForTests(null);
+  assert.deepEqual(await classifyOpenQuestionReplyWithJev(input), { kind: null, failedOpen: true });
+});

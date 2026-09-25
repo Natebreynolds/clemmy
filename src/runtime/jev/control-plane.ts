@@ -332,6 +332,64 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
   return { strategy, route, failedOpen: false };
 }
 
+export type OpenQuestionReplyKind = 'answers' | 'asks' | 'other';
+
+export interface OpenQuestionReplyReading {
+  /** null when Jev was unavailable or not sure. */
+  kind: OpenQuestionReplyKind | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+/** A verbatim re-ask repeats Clem's own words back, so the host takes one
+ *  only on a sure "answers"; every other reading goes to the brain, which can
+ *  always reply. */
+export const OPEN_QUESTION_ANSWER_SURE = 0.85;
+const OPEN_QUESTION_REPLY_TIMEOUT_MS = 1_500;
+
+/**
+ * Clem paused on a question and the reply did not settle it. It is either an
+ * answer the host could not bind, or something else: most often a question
+ * back before a write ("which channel will you post it to?"). One choice over
+ * what Clem asked and what the user said tells them apart; the reply is the
+ * state, never instructions.
+ */
+export async function classifyOpenQuestionReplyWithJev(
+  input: { question: string; reply: string },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<OpenQuestionReplyReading> {
+  const result = await evaluateSystemOne({
+    state: {
+      clemAsked: clipMiddle(input.question.trim(), 2_000).text,
+      userReplied: clipMiddle(input.reply.trim(), 1_000).text,
+    },
+    questions: {
+      reply: {
+        type: 'choice',
+        instructions: 'Clem paused to ask the user something before continuing, and the user replied. What does the reply do?',
+        criteria: {
+          answers: 'It answers or decides what Clem asked: picks an option, gives the requested detail, says yes or no, or corrects an earlier answer.',
+          asks: 'It asks Clem a question or asks for clarification before deciding.',
+          other: 'It talks about something else or starts different work.',
+          none: 'Not sure.',
+        },
+      },
+    },
+    timeoutMs: Math.min(OPEN_QUESTION_REPLY_TIMEOUT_MS, opts.timeoutMs ?? OPEN_QUESTION_REPLY_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-open-question-reply',
+  });
+  if (!result.ok) return { kind: null, failedOpen: true };
+  const answer = result.answers.reply as ChoiceAnswer | undefined;
+  const kind = answer && (answer.choice === 'answers' || answer.choice === 'asks' || answer.choice === 'other')
+    ? answer.choice as OpenQuestionReplyKind
+    : null;
+  noteJevDecisionOutcome(result.decisionId, kind ?? 'none', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 /** Name the operation this request needs first, from a host-prepared list,
  *  or none. */
 export async function routeOperationWithJev<T extends RoutableOperation>(

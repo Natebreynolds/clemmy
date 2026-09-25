@@ -1382,6 +1382,8 @@ input, textarea, select { font: inherit; font-size: 16px; }
 /* Not a failure, but not a success either — a turn that stopped, is waiting on
    you, or was blocked. It must not read like a finished one. */
 .work-unfinished .work-line { color: var(--accent-deep); }
+/* Clem asked you something: her turn is paused on you, not unfinished. */
+.work-waiting .work-line { color: var(--accent-deep); }
 .work-spinner {
   flex: 0 0 auto;
   width: 9px;
@@ -4176,6 +4178,7 @@ textarea.cz-input { resize: vertical; }
 .work-mark { flex: 0 0 auto; width: 16px; height: 16px; }
 .work-mark-ok { color: var(--accent-2); }
 .work-mark-warn { color: var(--accent-warn); }
+.work-mark-wait { color: var(--accent); }
 .work-mark-fail { color: var(--accent-fail); }
 .work-chevron { flex: 0 0 auto; color: var(--fg-3); transition: transform 0.18s var(--clem-ease); }
 .work-chevron.open { transform: rotate(90deg); }

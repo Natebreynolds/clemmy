@@ -175,16 +175,17 @@ export function ActivityCard({
   const expanded = live || (open ?? defaultOpen ?? false);
   const { top, children } = groupActivityByParent(view);
   const clock = live ? clockLabel(head.startedAt, now) : (head.totalMs !== undefined ? clockLabel(0, head.totalMs) : '');
-  // Three outcomes, three dots. `terminalOutcome` is 'interrupted' for a turn
-  // that stopped, is awaiting a reply, or is waiting on approval
-  // (activity-presentation.ts activityTerminalOutcomeForMessageStatus) — none
-  // of which is success. Painting everything-but-failed green was the same
+  // Four outcomes, four dots. A stopped turn is 'interrupted'; one that asked
+  // for a reply, an approval or a plan decision is 'waiting'
+  // (activity-presentation.ts activityTerminalOutcomeForMessageStatus) —
+  // neither is success. Painting everything-but-failed green was the same
   // class of lie as Home's "done while you were away" rows: the card asserted
   // an outcome the engine had not proved.
   const failed = !live && terminalOutcome === 'failed';
   const unfinished = !live && terminalOutcome === 'interrupted';
-  const dotTone = failed ? 'bg-danger' : unfinished ? 'bg-warning' : 'bg-success';
-  const dotLabel = failed ? 'Failed' : unfinished ? 'Did not finish' : 'Completed';
+  const waiting = !live && terminalOutcome === 'waiting';
+  const dotTone = failed ? 'bg-danger' : unfinished ? 'bg-warning' : waiting ? 'bg-info' : 'bg-success';
+  const dotLabel = failed ? 'Failed' : unfinished ? 'Did not finish' : waiting ? 'Waiting for you' : 'Completed';
 
   if (!expanded) {
     return (

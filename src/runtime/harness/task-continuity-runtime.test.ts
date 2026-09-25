@@ -680,7 +680,9 @@ test('exact live primary-only A/Q/B consumes, narrows, approves, and leaves para
   assert.equal(parked.status, 'available');
   if (parked.status === 'available') {
     assert.equal(parked.packet.originatingSourceUserSeq, source.seq);
-    assert.equal(parked.packet.pause.question, question.replace(/\s+/g, ' ').trim());
+    // Stored as asked: collapsing whitespace ran a held draft together into
+    // one line when the question was shown again (live 2026-09-25).
+    assert.equal(parked.packet.pause.question, question.trim());
   }
   assert.deepEqual(
     turnControl.sourceStrategyBindingAffirmedByAnswer(answerText, sourceStrategyBinding),
@@ -752,7 +754,7 @@ test('exact live primary-only A/Q/B consumes, narrows, approves, and leaves para
 
   assert.equal(enriched.taskContinuation?.disposition, 'affirmed');
   assert.equal(enriched.taskContinuation?.parentSourceUserSeq, source.seq);
-  assert.equal(enriched.taskContinuation?.question, question.replace(/\s+/g, ' ').trim());
+  assert.equal(enriched.taskContinuation?.question, question.trim());
   assert.equal(enriched.taskContinuation?.answer, answerText);
   const narrowedBinding = enriched.turnCandidates?.sourceStrategyBinding;
   assert.equal(narrowedBinding?.primary.capabilityId, `capability:composio:${slug}`);
@@ -1694,4 +1696,174 @@ test('an admitted goal amendment while a clarification is pending dismisses the 
   }, later.seq);
   assert.equal(enriched.taskContinuation, undefined);
   assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'none', 'the pending question gives way to the amended goal');
+});
+
+// Live 2026-09-25: Clem held a Slack draft for the user's go and asked which
+// channel; the user asked back "what channel are you going to send to?". The
+// admitted reading bound no answer, and the host re-asked the draft verbatim,
+// its line breaks collapsed and the user's question unanswered.
+const HELD_DRAFT_QUESTION = 'Draft — not sent, holding for your go:\n\n```\n:fire: *Friday has 6 meetings on the books.*\n:clock6: *6:00a* Discovery\n```\n\nSay the word and I will post it — which channel?';
+const QUESTION_BACK = 'sorry to confirm what channel are you going to send to';
+const AMBIGUOUS_READING = {
+  version: 1, relation: 'ambiguous', targetGoal: null, goal: null, work: null, slotAnswers: [],
+  rationale: 'The user asks a clarifying question back instead of answering.',
+};
+
+function seedSemanticReading(
+  sessionId: string,
+  sourceUserSeq: number,
+  validationOutcome: 'admitted' | 'invalid',
+  raw: Record<string, unknown>,
+) {
+  const event = eventlog.appendEvent({
+    sessionId, turn: 1, role: 'system', type: 'turn_semantics_interpreted',
+    data: { purpose: 'turn_semantics', sourceUserSeq, inputHash: 'a', audienceHash: 'b', policyRevision: 'c', validationOutcome, raw },
+  });
+  const db = eventlog.openEventLog();
+  db.prepare(`DELETE FROM turn_semantics_claims WHERE session_id = ? AND source_user_seq = ?`).run(sessionId, sourceUserSeq);
+  db.prepare(`INSERT INTO turn_semantics_claims (session_id, source_user_seq, owner, created_at, event_id, input_hash, audience_hash, policy_revision)
+              VALUES (?, ?, 'test', ?, ?, 'a', 'b', 'c')`).run(sessionId, sourceUserSeq, new Date().toISOString(), event.id);
+}
+
+function heldDraft(sessionId: string) {
+  const origin = accepted(sessionId, 'Draft a Slack post hyping today\'s meetings and wait for my go before sending it.');
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: HELD_DRAFT_QUESTION });
+  return origin;
+}
+
+test('a question back to Clem\'s open question goes to the brain with the step on hold, never a verbatim reask', async () => {
+  const sessionId = 'continuity-question-back';
+  const origin = heldDraft(sessionId);
+  const open = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(open.status, 'available');
+  if (open.status !== 'available') return;
+  assert.equal(open.packet.pause.question, HELD_DRAFT_QUESTION, 'the stored question keeps the draft\'s line breaks');
+  const reply = accepted(sessionId, QUESTION_BACK);
+  seedSemanticReading(sessionId, reply.seq, 'admitted', AMBIGUOUS_READING);
+  const asked: Array<{ question: string; reply: string }> = [];
+  runtime._setOpenQuestionReplyClassifierForTests(async (input) => {
+    asked.push(input);
+    return { kind: 'asks', confidence: 0.93, failedOpen: false };
+  });
+  try {
+    const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.deepEqual(route, { route: 'respond', parentPacketId: open.packet.packetId });
+    assert.deepEqual(asked, [{ question: HELD_DRAFT_QUESTION, reply: QUESTION_BACK }]);
+    assert.equal(
+      runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq }),
+      null,
+      'no verbatim reask',
+    );
+    assert.deepEqual(await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }), route);
+    assert.equal(asked.length, 1, 'a replay reads the recorded route instead of asking Jev again');
+
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+      sessionId, sourceUserSeq: reply.seq, message: QUESTION_BACK,
+    }, reply.seq, { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+    const steer = enriched.semanticTaskInput ?? '';
+    assert.ok(steer.startsWith('[task-continuation-question:v1]\n'), steer.slice(0, 160));
+    assert.ok(steer.includes(HELD_DRAFT_QUESTION), 'the brain sees the question exactly as asked');
+    assert.ok(steer.includes(`[user-reply]\n${QUESTION_BACK}`));
+    assert.match(steer, /stays on hold: do not write, send, publish, or delete/);
+    assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available',
+      'a question back does not consume the open question');
+
+    // Clem answers and asks again in her own words: that question carries the
+    // open one forward, keeping the original request as its root.
+    commitClarification({
+      sessionId,
+      sourceSeq: reply.seq,
+      question: 'I have not picked one yet. Should it go to #sales-team or #general?',
+    });
+    const successor = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(successor.status, 'available');
+    if (successor.status !== 'available') return;
+    assert.equal(successor.packet.originatingSourceUserSeq, reply.seq);
+    assert.equal(successor.packet.parentPacketId, open.packet.packetId);
+    assert.equal(successor.packet.rootSourceUserSeq, origin.seq);
+  } finally {
+    runtime._setOpenQuestionReplyClassifierForTests(null);
+  }
+});
+
+test('only a sure attempt to answer is re-asked verbatim; an unsure, other or missing reading goes to the brain', async () => {
+  const cases = [
+    ['sure-answer', { kind: 'answers', confidence: 0.95, failedOpen: false }, 'reask'],
+    ['unsure-answer', { kind: 'answers', confidence: 0.6, failedOpen: false }, 'respond'],
+    ['something-else', { kind: 'other', confidence: 0.9, failedOpen: false }, 'respond'],
+    ['no-reading', { kind: null, failedOpen: true }, 'respond'],
+  ] as const;
+  for (const [label, reading, expected] of cases) {
+    const sessionId = `continuity-reply-route-${label}`;
+    heldDraft(sessionId);
+    const reply = accepted(sessionId, 'Sorry platform');
+    seedSemanticReading(sessionId, reply.seq, 'admitted', AMBIGUOUS_READING);
+    runtime._setOpenQuestionReplyClassifierForTests(async () => reading);
+    try {
+      const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      assert.equal(route?.route, expected, label);
+      const reoffer = runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq });
+      if (expected === 'reask') {
+        assert.equal(reoffer?.question, HELD_DRAFT_QUESTION, 'a reask shows the draft with its line breaks');
+      } else {
+        assert.equal(reoffer, null, label);
+      }
+    } finally {
+      runtime._setOpenQuestionReplyClassifierForTests(null);
+    }
+  }
+});
+
+test('an unreadable reply keeps the reask and never asks Jev', async () => {
+  const sessionId = 'continuity-reply-unreadable';
+  heldDraft(sessionId);
+  const reply = accepted(sessionId, 'which channel?');
+  seedSemanticReading(sessionId, reply.seq, 'invalid', AMBIGUOUS_READING);
+  let asked = 0;
+  runtime._setOpenQuestionReplyClassifierForTests(async () => {
+    asked += 1;
+    return { kind: 'asks', confidence: 0.99, failedOpen: false };
+  });
+  try {
+    assert.equal(await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }), null);
+    assert.equal(asked, 0);
+    assert.ok(runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq }));
+  } finally {
+    runtime._setOpenQuestionReplyClassifierForTests(null);
+  }
+});
+
+test('the loop\'s reask and the respond bridge both go through the recorded reply route (connection pin)', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  for (const [label, reading] of [
+    ['asks', { kind: 'asks', confidence: 0.9, failedOpen: false }],
+    ['answers', { kind: 'answers', confidence: 0.95, failedOpen: false }],
+  ] as const) {
+    const sessionId = `continuity-loop-route-${label}`;
+    heldDraft(sessionId);
+    const reply = accepted(sessionId, label === 'asks' ? QUESTION_BACK : 'Sorry platform');
+    seedSemanticReading(sessionId, reply.seq, 'admitted', AMBIGUOUS_READING);
+    runtime._setOpenQuestionReplyClassifierForTests(async () => reading);
+    try {
+      await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+      const reoffered = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+      if (label === 'asks') {
+        assert.equal(reoffered, null, 'the turn continues to the brain');
+      } else {
+        assert.equal(reoffered?.status, 'awaiting_user_input');
+        assert.equal(reoffered?.lastDecision?.reply, HELD_DRAFT_QUESTION);
+      }
+    } finally {
+      runtime._setOpenQuestionReplyClassifierForTests(null);
+    }
+  }
+  const { readFileSync } = await import('node:fs');
+  const bridge = readFileSync(new URL('./respond-bridge.ts', import.meta.url), 'utf8');
+  const checked = bridge.indexOf('await prepareCheckedHostClarificationAnswer({');
+  const classified = bridge.indexOf('await classifyUnsettledOpenQuestionReply({');
+  const typed = bridge.indexOf('const typedClassification = semanticPortParticipated(');
+  assert.ok(checked > 0 && classified > checked && typed > classified,
+    'Jev reads the reply after the turn is interpreted and before continuity is resolved');
+  assert.match(bridge, /startsWith\('\[task-continuation-question:v1\]\\n'\)/,
+    'the host-built question steer reaches the brain as a continuation steer');
 });

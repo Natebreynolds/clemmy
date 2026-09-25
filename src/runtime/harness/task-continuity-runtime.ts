@@ -29,11 +29,16 @@ import {
 } from '../read-path/capability-candidates.js';
 import { discoveryGovernor } from './discovery-governor.js';
 import {
+  appendEvent,
   getSession,
   getTurnGraphEventForSource,
   listEvents,
   type EventRow,
 } from './eventlog.js';
+import {
+  classifyOpenQuestionReplyWithJev,
+  OPEN_QUESTION_ANSWER_SURE,
+} from '../jev/control-plane.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import {
   awaitInputFromGraph,
@@ -138,6 +143,87 @@ export interface UnresolvedClarificationReofferV1 {
   readonly replay: boolean;
 }
 
+const OPEN_QUESTION_REPLY_RECORD = 'open_question_reply_classified';
+
+interface OpenQuestionReplyRoute {
+  /** `reask`: an answer the host could not bind; `respond`: the brain replies. */
+  route: 'reask' | 'respond';
+  parentPacketId: string;
+}
+
+/** The host's recorded reading of this exact accepted reply, if it made one. */
+function openQuestionReplyRouteFor(sessionId: string, sourceUserSeq: number): OpenQuestionReplyRoute | null {
+  const event = listEvents(sessionId, { sinceSeq: sourceUserSeq, types: ['guardrail_tripped'], limit: 50 })
+    .find((row) => row.data.kind === OPEN_QUESTION_REPLY_RECORD && row.data.sourceUserSeq === sourceUserSeq);
+  const route = event?.data.route;
+  const parentPacketId = event?.data.parentPacketId;
+  return (route === 'reask' || route === 'respond') && typeof parentPacketId === 'string'
+    ? { route, parentPacketId }
+    : null;
+}
+
+/** A reply the brain answers keeps the open question it replied to. */
+function repliedOpenQuestionPacket(sessionId: string, sourceUserSeq: number, packet: TaskContinuityPacket): boolean {
+  const recorded = openQuestionReplyRouteFor(sessionId, sourceUserSeq);
+  return recorded?.route === 'respond' && recorded.parentPacketId === packet.packetId;
+}
+
+let openQuestionReplyClassifierForTests: typeof classifyOpenQuestionReplyWithJev | null = null;
+export function _setOpenQuestionReplyClassifierForTests(
+  classifier: typeof classifyOpenQuestionReplyWithJev | null,
+): void {
+  openQuestionReplyClassifierForTests = classifier;
+}
+
+/**
+ * Clem paused on a question and the admitted reading of the reply bound no
+ * answer. Before the host re-asks, Jev reads what the reply does: only a sure
+ * attempt to answer is re-asked word for word; a question back, anything else,
+ * or no reading goes to the brain, which answers with the pending step still
+ * on hold. Live 2026-09-25: "what channel are you going to send to?" in reply
+ * to a Slack draft held for approval got the draft back verbatim, unanswered.
+ * An unreadable reading keeps the re-ask: that failure is the host's.
+ */
+export async function classifyUnsettledOpenQuestionReply(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): Promise<OpenQuestionReplyRoute | null> {
+  const recorded = openQuestionReplyRouteFor(input.sessionId, input.sourceUserSeq);
+  if (recorded) return recorded;
+  const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
+  if (!typed || !('keepOpen' in typed) || typed.metaAction !== undefined) return null;
+  if (readPersistedSemanticInterpretation(input.sessionId, input.sourceUserSeq)?.validationOutcome !== 'admitted') {
+    return null;
+  }
+  const prepared = unresolvedClarificationReofferForAcceptedSource(input);
+  if (!prepared || prepared.replay) return null;
+  const source = realAcceptedSource(input.sessionId, input.sourceUserSeq);
+  const reply = typeof source?.data.text === 'string' ? source.data.text.trim() : '';
+  if (!source || !reply) return null;
+  const classify = openQuestionReplyClassifierForTests ?? classifyOpenQuestionReplyWithJev;
+  const reading: Awaited<ReturnType<typeof classifyOpenQuestionReplyWithJev>> = await classify(
+    { question: prepared.question, reply },
+    { sessionId: input.sessionId },
+  ).catch(() => ({ kind: null, failedOpen: true }));
+  const route: OpenQuestionReplyRoute['route'] = reading.kind === 'answers'
+    && (reading.confidence ?? 0) >= OPEN_QUESTION_ANSWER_SURE ? 'reask' : 'respond';
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: source.turn,
+    role: 'system',
+    type: 'guardrail_tripped',
+    data: {
+      kind: OPEN_QUESTION_REPLY_RECORD,
+      sourceUserSeq: input.sourceUserSeq,
+      parentPacketId: prepared.parentPacketId,
+      route,
+      reading: reading.kind ?? (reading.failedOpen ? 'unavailable' : 'unsure'),
+      ...(typeof reading.confidence === 'number' ? { confidence: reading.confidence } : {}),
+    },
+  });
+  return { route, parentPacketId: prepared.parentPacketId };
+}
+
 /**
  * Prepare the exact public reoffer for an answer that did not settle its open
  * clarification. This is deliberately narrower than the normal successor
@@ -151,6 +237,8 @@ export function unresolvedClarificationReofferForAcceptedSource(input: {
 }): UnresolvedClarificationReofferV1 | null {
   const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
   if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
+  // The brain answers this reply; a verbatim reask would leave it unanswered.
+  if (repliedOpenQuestionPacket(input.sessionId, input.sourceUserSeq, current.packet)) return null;
   const typed = typedClassificationFromLastInterpretation(input.sessionId, input.sourceUserSeq);
   const unresolved = unresolvedOpenSlotTargetFromLastInterpretation(
     input.sessionId,
@@ -548,7 +636,11 @@ export function persistCommittedClarificationContinuity(input: {
     terminalTurn: presentation.identity.turn,
   });
   if (!awaiting) return null;
-  const question = normalized(awaiting.data.question);
+  // Store what the user was asked as it was written: a draft's line breaks
+  // are part of the question, and a reask shows these exact bytes again.
+  // Normalized text is for comparison only.
+  const questionText = typeof awaiting.data.question === 'string' ? awaiting.data.question.trim() : '';
+  const question = normalized(questionText);
   const deliveredQuestion = normalized(presentation.text);
   // The packet must describe the question the user actually saw. An internal
   // Q1 followed by a delivered Q2 cannot let a reply to Q2 inherit Q1's task,
@@ -589,7 +681,11 @@ export function persistCommittedClarificationContinuity(input: {
   const meta = current.status === 'available'
     ? exactMetaChoiceForPacket(typed, current.packet)
     : null;
-  if (current.status === 'available' && !meta) {
+  // A reply the host handed to the brain carries the open question forward in
+  // the brain's own words, exactly as a checked explain choice does.
+  const repliedTo = current.status === 'available'
+    && repliedOpenQuestionPacket(source.sessionId, source.seq, current.packet);
+  if (current.status === 'available' && !meta && !repliedTo) {
     // A later accepted source may replace an open packet only through a checked
     // exact visible meta choice. Arbitrary prose/question identity is not a
     // packet-successor authority.
@@ -601,8 +697,8 @@ export function persistCommittedClarificationContinuity(input: {
   const inheritedSlot = current.status === 'available'
     ? current.packet.pause.slot
     : undefined;
-  if (meta && current.status === 'available' && !inheritedSlot) return null;
-  const packetInput = meta && current.status === 'available' && inheritedSlot
+  if ((meta || repliedTo) && current.status === 'available' && !inheritedSlot) return null;
+  const packetInput = (meta || repliedTo) && current.status === 'available' && inheritedSlot
     ? {
         sessionId: source.sessionId,
         originatingSourceUserSeq: source.seq,
@@ -612,9 +708,9 @@ export function persistCommittedClarificationContinuity(input: {
         },
         pause: {
           kind: 'clarification' as const,
-          question,
+          question: questionText,
           options,
-          slot: meta.action === 'explain'
+          slot: !meta || meta.action === 'explain'
             ? { ...inheritedSlot }
             : {
                 goalId: inheritedSlot.goalId,
@@ -642,7 +738,7 @@ export function persistCommittedClarificationContinuity(input: {
               originatingSourceUserSeq: source.seq,
               awaitInput,
             }).pause,
-            question,
+            question: questionText,
             options,
           },
         }
@@ -651,7 +747,7 @@ export function persistCommittedClarificationContinuity(input: {
           originatingSourceUserSeq: source.seq,
           pause: {
             kind: 'clarification' as const,
-            question,
+            question: questionText,
             options,
             slot: {
               goalId: `goal:${source.sessionId}:${source.seq}`,
@@ -1242,6 +1338,38 @@ function verifiedMetaContinuationInput(input: {
     meta.action,
     '[host-directive]',
     directive,
+  ].join('\n');
+}
+
+/** The checked steer for a reply the brain answers: the root task, the open
+ * question exactly as asked, and the reply. The pending step stays on hold. */
+function repliedOpenQuestionContinuationInput(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): string | null {
+  const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
+  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
+  if (!repliedOpenQuestionPacket(input.sessionId, input.sourceUserSeq, current.packet)) return null;
+  if (!nextRealSourceIs({
+    sessionId: input.sessionId,
+    originatingSourceUserSeq: current.packet.originatingSourceUserSeq,
+    consumingSourceUserSeq: input.sourceUserSeq,
+  })) return null;
+  const rootSourceUserSeq = current.packet.rootSourceUserSeq
+    ?? current.packet.originatingSourceUserSeq;
+  const rootInput = normalized(realAcceptedSource(input.sessionId, rootSourceUserSeq)?.data.text);
+  const reply = realAcceptedSource(input.sessionId, input.sourceUserSeq)?.data.text;
+  if (!rootInput || typeof reply !== 'string' || !reply.trim()) return null;
+  return [
+    '[task-continuation-question:v1]',
+    '[root-task]',
+    rootInput,
+    '[current-question]',
+    current.packet.pause.question,
+    '[user-reply]',
+    reply.trim(),
+    '[host-directive]',
+    'The user replied to your open question with something other than a decision, usually a question back. Answer them from what you know or can read without changing anything. The pending step stays on hold: do not write, send, publish, or delete anything for it until they decide. Then ask for their decision again in your own words.',
   ].join('\n');
 }
 
@@ -2125,7 +2253,7 @@ export async function enrichAcceptedRequestWithTaskContinuity(
       sessionId: request.sessionId,
       sourceUserSeq,
       typed: options.typedClassification,
-    });
+    }) ?? repliedOpenQuestionContinuationInput({ sessionId: request.sessionId, sourceUserSeq });
     const {
       semanticTaskInput: _semantic,
       taskContinuation: _context,

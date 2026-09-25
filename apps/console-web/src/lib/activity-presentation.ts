@@ -2,7 +2,7 @@ import { writeRowLabel, writeRowStatus, writeRowTone } from '../../../../package
 import type { ActivityItem, MessageStatus } from './useChat';
 import { isWorkPlanRow, workPlanStepLabel } from './work-plan-presentation';
 
-export type ActivityTerminalOutcome = 'completed' | 'failed' | 'interrupted';
+export type ActivityTerminalOutcome = 'completed' | 'failed' | 'interrupted' | 'waiting';
 
 /**
  * NARRATION — show the work, not the mechanism.
@@ -209,6 +209,10 @@ export function activityTerminalOutcomeForMessageStatus(
   if (status === 'thinking') return undefined;
   if (status === 'complete') return 'completed';
   if (status === 'failed') return 'failed';
+  // Clem asked for a reply, an approval or a plan decision: the turn ended on
+  // purpose and waits on the person. That is not success, and it is not a
+  // stop either: "Didn't finish" under her question read as a failure.
+  if (status === 'awaiting-reply' || status === 'awaiting-approval' || status === 'awaiting-plan') return 'waiting';
   return 'interrupted';
 }
 

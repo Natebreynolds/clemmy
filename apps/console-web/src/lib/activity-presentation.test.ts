@@ -52,15 +52,19 @@ test('live activity remains untouched and preserves its array identity', () => {
   assert.equal(items[0]?.status, 'running');
 });
 
-test('chat terminal status distinguishes success, failure, and parked or stopped work', () => {
+test('chat terminal status distinguishes success, failure, waiting on the person, and stopped work', () => {
   assert.equal(activityTerminalOutcomeForMessageStatus('thinking'), undefined);
   assert.equal(activityTerminalOutcomeForMessageStatus('complete'), 'completed');
   assert.equal(activityTerminalOutcomeForMessageStatus('failed'), 'failed');
   assert.equal(activityTerminalOutcomeForMessageStatus('stopped'), 'interrupted');
-  assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-approval'), 'interrupted');
-  assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-reply'), 'interrupted');
-  assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-plan'), 'interrupted');
+  // Live 2026-09-25: a turn that asked "which channel?" read "Didn't finish".
+  assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-approval'), 'waiting');
+  assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-reply'), 'waiting');
+  assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-plan'), 'waiting');
   assert.equal(activityTerminalOutcomeForMessageStatus(undefined), 'interrupted');
+  // Waiting settles leftover rows exactly as a stop does: it proves no success.
+  const running = { id: 'r', kind: 'tool', label: 'Reading', status: 'running' } as unknown as Parameters<typeof settleTerminalActivity>[0][number];
+  assert.equal(settleTerminalActivity([running], 'waiting')[0]?.status, 'interrupted');
 });
 
 test('board feed uses durable terminal events and fails closed without one', () => {
