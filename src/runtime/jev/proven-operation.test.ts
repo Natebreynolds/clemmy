@@ -11,7 +11,7 @@ const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-proven-op-'));
 process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip, pickProvenRunStrategy, buildCachedProvenResolutionEntries } = await import('./proven-operation.js');
+const { renderProvenOperationGuidance, prepareProvenOperationForRequest, resolveCallableProvenDiscoverySkip, pickProvenRunStrategy, buildCachedProvenResolutionEntries, PROVEN_PICK_BUDGET_MS, STAGED_SURFACE_PICK_WAIT_MS } = await import('./proven-operation.js');
 const {
   createHostCapabilityCatalogFactory,
   installHostCapabilityCatalogFactory,
@@ -426,3 +426,79 @@ test('a strategy that matches but does not cover the request provisions nothing 
     assert.deepEqual(asked, []);
   }
 });
+
+// Every Jev strategy pick holds the request's first model frame. Live, most of
+// them found nothing to reuse, and the wait outweighed the rounds the hits
+// saved, so the picks share one bounded wait and a staged guess gets a short
+// window. A late answer is simply not used.
+function recordZephyrStrategy(objective: string, tool: string, sourceId: string): void {
+  recordRunStrategy({
+    objective,
+    toolsUsed: [tool],
+    workerCount: 0,
+    durationMs: 20_000,
+    learningReceipt: evaluateLearningCandidate({
+      target: 'strategy',
+      authority: 'background_delivery_verifier',
+      sessionId: `background:${sourceId}`,
+      sourceId,
+      terminalSuccess: true,
+      controllerValidation: true,
+    }).receipt!,
+  });
+}
+
+test('the turn start spends one bounded wait on Jev strategy picks and gives a staged guess only a short window', async () => {
+  const { _setToolSchemaLoaderForTests, rememberToolSchema } = await import('../../tools/composio-schema-cache.js');
+  const { tickActiveToolSurfaceHeartbeat } = await import('./active-surface-heartbeat.js');
+  _setToolSchemaLoaderForTests(async () => null);
+  recordZephyrStrategy('zephyr ledger reconciliation report', 'zephyr_ledger_read', 'zephyr-a');
+  recordZephyrStrategy('zephyr ledger export report', 'zephyr_export_write', 'zephyr-b');
+  // A schema-ready tool the heartbeat stages, proven by a run no query here matches.
+  recordZephyrStrategy('okapi staging warmup', 'zephyr_staged_fixture', 'zephyr-staged');
+  rememberToolSchema('ZEPHYR_STAGED_FIXTURE', { type: 'object', properties: {} });
+  await tickActiveToolSurfaceHeartbeat();
+
+  let clock = 1_000_000;
+  const calls: Array<{ ids: string[]; objectives: string[]; timeoutMs: number | undefined }> = [];
+  const answerAfter = (elapsedMs: number) => async (
+    _query: string,
+    strategies: Array<{ id: string; objective: string }>,
+    opts?: { timeoutMs?: number },
+  ) => {
+    calls.push({ ids: strategies.map((row) => row.id), objectives: strategies.map((row) => row.objective), timeoutMs: opts?.timeoutMs });
+    clock += elapsedMs;
+    return { strategy: null, failedOpen: false };
+  };
+
+  try {
+    const quick = await prepareProvenOperationForRequest(
+      { query: 'zephyr ledger report for this week' },
+      { selectStrategy: answerAfter(400), now: () => clock },
+    );
+    assert.equal(quick.text, undefined, 'a confident "none" reuses nothing');
+    assert.equal(calls.length, 2, 'the proven runs disagree, so Jev picks between them, then guesses from the staged surface');
+    assert.deepEqual([...calls[0]!.objectives].sort(), ['zephyr ledger export report', 'zephyr ledger reconciliation report']);
+    assert.equal(calls[0]!.timeoutMs, PROVEN_PICK_BUDGET_MS, 'the first pick may use the whole turn-start budget');
+    assert.ok(calls[1]!.objectives.includes('okapi staging warmup'), 'the second pick is the staged-surface guess');
+    assert.equal(calls[1]!.timeoutMs, STAGED_SURFACE_PICK_WAIT_MS, 'a staged guess gets only its short window');
+
+    calls.length = 0;
+    await prepareProvenOperationForRequest(
+      { query: 'zephyr ledger report for this week' },
+      { selectStrategy: answerAfter(PROVEN_PICK_BUDGET_MS - 100), now: () => clock },
+    );
+    assert.equal(calls.length, 1, 'once the budget is spent the staged guess is skipped, not waited on');
+
+    calls.length = 0;
+    await prepareProvenOperationForRequest(
+      { query: 'narwhal migration tally' },
+      { selectStrategy: answerAfter(0), now: () => clock },
+    );
+    assert.equal(calls.length, 1, 'with no proven run to reuse, only the staged guess runs');
+    assert.equal(calls[0]!.timeoutMs, STAGED_SURFACE_PICK_WAIT_MS, 'and the request waits at most its short window');
+  } finally {
+    _setToolSchemaLoaderForTests(null);
+  }
+});
+

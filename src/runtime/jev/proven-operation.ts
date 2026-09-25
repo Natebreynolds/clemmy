@@ -25,6 +25,16 @@ import { selectProvenRunStrategyWithJev } from './control-plane.js';
 
 /** Bound so a slow provider refresh cannot stall the first model step. */
 const PROVEN_PROVISION_BUDGET_MS = 10_000;
+/** The most a request's first model frame waits on Jev strategy picks, in
+ *  total. Live answers at the turn start: half by 0.8 s, 83% by 1.5 s. Over
+ *  three days most of these picks found nothing to reuse, and the wait they
+ *  added outweighed the model rounds the hits saved. */
+export const PROVEN_PICK_BUDGET_MS = 1_500;
+/** A staged-surface guess has no proven run behind it; it landed about once
+ *  in eighty live tries, so it gets a short window. */
+export const STAGED_SURFACE_PICK_WAIT_MS = 500;
+/** Below this there is no time for a real answer, so the pick is skipped. */
+const MIN_JEV_PICK_WAIT_MS = 250;
 
 export interface ProvenLiveRead {
   operation: string;
@@ -63,6 +73,9 @@ export interface ProvenOperationPreparation {
 
 export interface ProvenOperationDependencies {
   acquireLiveRead?: typeof import('../../tools/tool-search-provider-sources.js').acquireProvenLiveReadForSource;
+  /** Test seams for the bounded turn-start picks. */
+  selectStrategy?: typeof selectProvenRunStrategyWithJev;
+  now?: () => number;
 }
 
 function recordedProvenDescriptors(
@@ -491,13 +504,18 @@ function stagedCandidatesForJev(scope: 'chat' | 'any'): Array<{ id: string; obje
   });
 }
 
-async function pickStagedSurfaceStrategy(query: string, sessionId?: string): Promise<RunStrategyRecord | null> {
+async function pickStagedSurfaceStrategy(
+  query: string,
+  sessionId: string | undefined,
+  timeoutMs: number,
+  select: typeof selectProvenRunStrategyWithJev,
+): Promise<RunStrategyRecord | null> {
   const staged = stagedCandidatesForJev(runStrategyScopeForSession(sessionId) === 'workflow_step' ? 'any' : 'chat');
   if (staged.length === 0) return null;
-  const jev = await selectProvenRunStrategyWithJev(
+  const jev = await select(
     query,
     staged.map((row) => ({ id: row.id, objective: row.objective, toolsUsed: row.toolsUsed })),
-    { sessionId },
+    { sessionId, timeoutMs },
   );
   if (jev.strategy) {
     return staged.find((row) => row.id === jev.strategy!.id)?.record ?? null;
@@ -532,23 +550,35 @@ export async function prepareProvenOperationForRequest(input: {
   const matches = listMatchingRunStrategies(input.query, 4, { scope: strategyScope });
   const lexical = pickProvenRunStrategy(matches);
   let strategy = lexical;
+  // Every Jev pick here holds the request's first model frame, so together
+  // they get one bounded wait. A pick that is late is not used.
+  const jevDeadlineAt = (dependencies.now ?? Date.now)() + PROVEN_PICK_BUDGET_MS;
+  const jevTimeLeft = (): number => jevDeadlineAt - (dependencies.now ?? Date.now)();
   if (!strategy && matches.length > 0) {
-    const jev = await selectProvenRunStrategyWithJev(
+    const jev = await (dependencies.selectStrategy ?? selectProvenRunStrategyWithJev)(
       input.query,
       matches.map((row) => ({
         id: row.strategy.id,
         objective: row.strategy.objective,
         toolsUsed: row.strategy.toolsUsed,
       })),
-      { sessionId: input.sessionId },
+      { sessionId: input.sessionId, timeoutMs: jevTimeLeft() },
     );
     strategy = (jev.strategy
       ? matches.find((row) => row.strategy.id === jev.strategy!.id)?.strategy
       : null)
       ?? (jev.failedOpen ? matches[0]!.strategy : null);
   }
-  if (!strategy) {
-    strategy = await pickStagedSurfaceStrategy(input.query, input.sessionId);
+  // A staged-surface guess has no proven run behind it and rarely lands, so it
+  // gets only a short window, and none once the budget is spent.
+  const stagedWaitMs = Math.min(STAGED_SURFACE_PICK_WAIT_MS, jevTimeLeft());
+  if (!strategy && stagedWaitMs >= MIN_JEV_PICK_WAIT_MS) {
+    strategy = await pickStagedSurfaceStrategy(
+      input.query,
+      input.sessionId,
+      stagedWaitMs,
+      dependencies.selectStrategy ?? selectProvenRunStrategyWithJev,
+    );
   }
   if (!strategy) return empty;
   const schemas: Record<string, unknown> = {};

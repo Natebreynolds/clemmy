@@ -195,6 +195,7 @@ const PROVEN_STRATEGY_NOUL_MIN = 0.6;
 // 2026-09-21/22: median 740 ms, p90 2,980 ms across ten calls. Past 2 s the
 // caller keeps the top lexical match (failedOpen), and a wrong pick is
 // recoverable in-turn now that tool_search stays on the proven-skip surface.
+// The caller may shorten it to what the pick is worth at the turn start.
 const PROVEN_STRATEGY_TIMEOUT_MS = 2_000;
 
 export interface ProvenStrategyJevPick<T extends ProvenStrategyCandidate> {
@@ -208,10 +209,11 @@ export interface ProvenStrategyJevPick<T extends ProvenStrategyCandidate> {
 export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCandidate>(
   query: string,
   strategies: T[],
-  opts?: { sessionId?: string },
+  opts?: { sessionId?: string; timeoutMs?: number },
 ): Promise<ProvenStrategyJevPick<T>> {
   if (strategies.length === 0) return { strategy: null, failedOpen: false };
   const window = strategies.slice(0, 8);
+  const timeoutMs = Math.min(PROVEN_STRATEGY_TIMEOUT_MS, opts?.timeoutMs ?? PROVEN_STRATEGY_TIMEOUT_MS);
   if (window.length === 1) {
     const only = window[0]!;
     const result = await evaluateSystemOne({
@@ -229,7 +231,7 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
           },
         },
       },
-      timeoutMs: PROVEN_STRATEGY_TIMEOUT_MS,
+      timeoutMs,
       sessionId: opts?.sessionId,
       channel: 'jev-proven-strategy',
     });
@@ -251,7 +253,7 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
         criteria,
       },
     },
-    timeoutMs: PROVEN_STRATEGY_TIMEOUT_MS,
+    timeoutMs,
     sessionId: opts?.sessionId,
     channel: 'jev-proven-strategy',
   });
