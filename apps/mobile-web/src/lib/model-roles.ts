@@ -46,12 +46,20 @@ export function modelName(label: string, providerLabel: string): string {
 }
 
 /** "Provider — Model", the same form the brain options use, for an exact id.
- *  An id missing from the catalog shows as itself. */
-export function describeModel(modelId: string, groups: RoleModelGroup[] | undefined, provider?: string): string {
+ *  The brain options name models of a provider that is not connected too; an
+ *  id missing from both shows as itself. */
+export function describeModel(
+  modelId: string,
+  groups: RoleModelGroup[] | undefined,
+  provider?: string,
+  brainOptions: ModelSettings['options'] = [],
+): string {
   for (const group of groups ?? []) {
     const model = group.models.find((candidate) => candidate.id === modelId);
     if (model) return `${group.label} — ${modelName(model.label, group.label)}`;
   }
+  const named = brainOptions.find((option) => option.modelId === modelId);
+  if (named) return named.label;
   const name = provider ? PROVIDER_NAME[provider] : undefined;
   return name ? `${name} — ${modelId}` : modelId;
 }
@@ -61,27 +69,30 @@ function catalogGroups(settings: ModelSettings): RoleModelGroup[] {
   return [...(options.writer ?? []), ...(options.judge ?? []), ...(options.worker ?? [])];
 }
 
+function describe(modelId: string, provider: string | undefined, settings: ModelSettings): string {
+  return describeModel(modelId, catalogGroups(settings), provider, settings.options);
+}
+
 /** The brain as its picker names it. */
 export function brainSummary(settings: ModelSettings): string {
   return settings.options.find((option) => option.value === settings.effectiveValue)?.label
-    ?? describeModel(settings.brain.modelId, catalogGroups(settings), settings.brain.provider);
+    ?? describe(settings.brain.modelId, settings.brain.provider, settings);
 }
 
 /** The model that will actually fill a role, and whether the owner chose it. */
 export function roleSummary(role: ModelRoleName, settings: ModelSettings): string {
   const resolved = settings.roles?.[role];
   if (!resolved) return '';
-  if (isChosen(resolved)) return describeModel(resolved.modelId, catalogGroups(settings), resolved.provider);
+  if (isChosen(resolved)) return describe(resolved.modelId, resolved.provider, settings);
   if (resolved.modelId === settings.brain.modelId) return 'Same model that does the work';
-  return `Automatic · ${describeModel(resolved.modelId, catalogGroups(settings), resolved.provider)}`;
+  return `Automatic · ${describe(resolved.modelId, resolved.provider, settings)}`;
 }
 
 /** A saved choice that is unavailable, and what runs instead. */
 export function inactiveNote(resolved: ResolvedBrain | undefined, settings: ModelSettings): string | null {
   const saved = resolved?.inactiveBinding;
   if (!resolved || !saved || saved.modelId === resolved.modelId) return null;
-  const groups = catalogGroups(settings);
-  return `Your pick, ${describeModel(saved.modelId, groups, saved.provider)}, isn't available, so ${describeModel(resolved.modelId, groups, resolved.provider)} is used instead.`;
+  return `Your pick, ${describe(saved.modelId, saved.provider, settings)}, isn't available, so ${describe(resolved.modelId, resolved.provider, settings)} is used instead.`;
 }
 
 /** Warn only when the owner made a choice the checker's independence depends

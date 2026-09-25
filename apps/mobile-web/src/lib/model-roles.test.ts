@@ -47,6 +47,13 @@ test('models read as "Provider — Model" without the provider repeated', () => 
   assert.equal(describeModel('hosted-model-c', groups), 'Hosted — hosted-model-c');
   assert.equal(describeModel('gone-model', groups, 'claude'), 'Claude — gone-model', 'an id missing from the catalog still names its provider');
   assert.equal(describeModel('gone-model', groups), 'gone-model');
+  assert.equal(
+    describeModel('unconnected-model', groups, 'claude', [
+      { id: 'claude_oauth', value: 'claude_oauth:unconnected-model', label: 'Claude — Unconnected', available: false, modelId: 'unconnected-model' },
+    ]),
+    'Claude — Unconnected',
+    'a model of a provider that is not connected keeps its display name',
+  );
 });
 
 test('each row names the model that will actually run and who picked it', () => {

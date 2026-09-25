@@ -119,7 +119,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
               <span class="brain-dot ok" aria-hidden="true" />
               <div class="min-w-0">
                 <div class="brain-current-name truncate">{currentLabel}</div>
-                <div class="brain-current-meta">{settings.brain.provider} · {sessionId ? 'answers your next message' : 'answers new conversations'}</div>
+                <div class="brain-current-meta">{sessionId ? 'Answers your next message' : 'Answers new conversations'}</div>
               </div>
             </div>
             {settings.brain.inactiveBinding && settings.brain.inactiveBinding.modelId !== settings.brain.modelId ? (
@@ -155,7 +155,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
 
             {switched ? (
               <p class="brain-note switched">
-                Switched to {switched} — {sessionId ? 'applies to your next message.' : 'applies to new conversations.'}
+                Switched to {switched}. {sessionId ? 'Applies to your next message.' : 'Applies to new conversations.'}
               </p>
             ) : null}
             {switchError ? <p class="error brain-note">{switchError}</p> : null}
@@ -163,7 +163,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
               <p class="brain-note muted">
                 {sessionId
                   ? 'Switching applies to your next message. No restart needed.'
-                  : 'Switching applies to new conversations — a conversation already underway keeps its brain unless you switch from inside it.'}
+                  : 'Switching applies to new conversations. A conversation already underway keeps its model unless you switch from inside it.'}
               </p>
             ) : null}
           </>

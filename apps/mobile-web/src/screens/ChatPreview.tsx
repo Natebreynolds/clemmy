@@ -80,7 +80,7 @@ export function ChatPreview() {
           <div class="chat-header">
             <ChatBackButton onClick={() => undefined} />
             <h2 class="chat-title">{title}</h2>
-            <button type="button" class="brain-chip" title="Brain — who answers your next message">
+            <button type="button" class="brain-chip" title="Does the work: the model that answers your next message">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M12 3a4 4 0 0 0-4 4 4 4 0 0 0-3 6.5 4 4 0 0 0 3 6.5h.5" /><path d="M12 3a4 4 0 0 1 4 4 4 4 0 0 1 3 6.5 4 4 0 0 1-3 6.5h-.5" /><path d="M12 3v17" />
               </svg>

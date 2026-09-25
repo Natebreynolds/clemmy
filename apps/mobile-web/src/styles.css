@@ -3204,6 +3204,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 /* Models card: one row per part of a request, each opening a picker over the
    connected catalog. Rarely changed options fold under Advanced. */
 .model-role-row + .model-role-row { border-top: 1px solid var(--line); }
+.model-role-row .settings-row-note.warning { color: var(--accent-warn); }
 .model-roles-warning { margin: var(--sp-2) 0 0; }
 .settings-advanced { border-top: 1px solid var(--line); margin-top: var(--sp-1); }
 .settings-advanced > summary {
@@ -3226,11 +3227,16 @@ input, textarea, select { font: inherit; font-size: 16px; }
 }
 .settings-advanced[open] > summary::after { transform: rotate(90deg); }
 .settings-advanced .settings-rescue { border-top: 0; margin-top: 0; }
+/* Under Advanced the backup's menu gets its own line, so its choice is legible. */
+.settings-advanced .settings-rescue .settings-row { flex-wrap: wrap; }
+.settings-advanced .settings-rescue .settings-select { flex: 1 1 100%; }
+.settings-advanced .settings-rescue .brain-dot { display: none; }
 
 .role-explain { margin: var(--sp-1) 0 var(--sp-2); font-size: var(--t-sm); color: var(--fg-2); }
 .role-review { border-bottom: 1px solid var(--line); }
 .role-row-main { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
 .role-row-note { font-size: var(--t-xs); font-weight: 500; color: var(--fg-3); }
+.role-group { display: flex; flex-direction: column; }
 .role-group-label {
   padding: var(--sp-3) var(--sp-2) var(--sp-1);
   font-size: var(--t-xs);

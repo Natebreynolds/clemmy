@@ -301,7 +301,7 @@ function ModelsCard({ loaded, onRefresh }: {
           <RoleRow
             title={ROLE_COPY.brain.title}
             summary={brainSummary(settings)}
-            note={inactiveNote(settings.brain, settings)}
+            warning={inactiveNote(settings.brain, settings)}
             onOpen={() => setBrainOpen(true)}
           />
           {(['writer', 'judge', 'worker'] as const).map((role) => settings.roles?.[role] ? (
@@ -309,8 +309,8 @@ function ModelsCard({ loaded, onRefresh }: {
               key={role}
               title={ROLE_COPY[role].title}
               summary={roleSummary(role, settings)}
-              note={inactiveNote(settings.roles[role], settings)
-                ?? (role === 'judge' && reviewOff ? 'Review of finished work is off.' : null)}
+              warning={inactiveNote(settings.roles[role], settings)}
+              note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : null}
               onOpen={() => setSheet(role)}
             />
           ) : null)}
@@ -338,10 +338,11 @@ function ModelsCard({ loaded, onRefresh }: {
   );
 }
 
-function RoleRow({ title, summary, note, onOpen }: {
+function RoleRow({ title, summary, note, warning, onOpen }: {
   title: string;
   summary: string;
   note?: string | null;
+  warning?: string | null;
   onOpen: () => void;
 }) {
   return (
@@ -349,7 +350,8 @@ function RoleRow({ title, summary, note, onOpen }: {
       <span class="settings-row-main">
         <span class="settings-row-label">{title}</span>
         <span class="settings-row-note">{summary}</span>
-        {note ? <span class="settings-row-note warning">{note}</span> : null}
+        {warning ? <span class="settings-row-note warning">{warning}</span> : null}
+        {note ? <span class="settings-row-note">{note}</span> : null}
       </span>
       <span class="settings-row-action">Change</span>
     </button>
