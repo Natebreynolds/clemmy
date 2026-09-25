@@ -4119,6 +4119,28 @@ textarea.cz-input { resize: vertical; }
 .usage-fill-danger { background: var(--accent-fail); }
 .usage-tone-warning { color: var(--accent); font-weight: 650; }
 .usage-tone-danger { color: var(--accent-fail); font-weight: 650; }
+/* An account refusing work for lack of credit: the fix is one tap away. */
+.usage-out-note { margin: var(--sp-1) 0 0; font-size: var(--t-xs); color: var(--accent-fail); }
+.usage-billing-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  margin-top: var(--sp-2);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--bg-3);
+  color: var(--fg-2);
+  font-size: var(--t-xs);
+  font-weight: 650;
+  text-decoration: none;
+}
+.usage-billing-link.urgent {
+  border-color: rgba(208, 69, 58, 0.45);
+  background: var(--fail-soft);
+  color: var(--accent-fail);
+}
+.usage-billing-link:active { transform: scale(0.96); }
 
 /* ── clean up (Settings) ─────────────────────────────────────────────── */
 .tidy-row { padding: var(--sp-3) 0; border-top: 1px solid var(--line); }

@@ -39,6 +39,8 @@ export interface UsageEvent {
   /** Failed requests with no reported usage have unknown cost, not certified zero. */
   ok?: boolean;
   failReason?: string;
+  /** Billed account, when the recording client named it (see recordModelUsage). */
+  account?: string;
   /** ISO-8601 timestamp when the model response finished. */
   at: string;
   /** Where the call came from: session ID, cron name, "embedding-backfill", etc. */
@@ -513,6 +515,9 @@ export function recordModelUsage(args: {
   /** Call-site attribution (Jev channel, judge lane). Survives NDJSON. */
   ok?: boolean;
   failReason?: string;
+  /** The billed account this call spent against, stamped by a client that
+   *  owns its account and whose model id names no provider. */
+  account?: string;
 }): void {
   const attribution = modelUsageAttributionStorage.getStore();
   const argsSource = args.sessionId?.trim() || 'unknown';
@@ -600,6 +605,7 @@ export function recordModelUsage(args: {
     ...(role ? { role } : {}),
     roleReason,
     ...(args.ok === false ? { ok: false, failReason: args.failReason } : {}),
+    ...(args.account ? { account: args.account } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
     promptComponents: reconcilePromptComponents(attribution?.promptComponents ?? args.promptComponents, args.inputTokens),

@@ -29,6 +29,7 @@ import { composioSlugIsReadOnly } from './slug-effect.js';
 import { successorSlugsFromProse } from './lifecycle-prose.js';
 import { aliasLabelFor } from '../../memory/account-alias-store.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { redactSensitiveText } from '../../runtime/security.js';
 
 const ENV_FILE = path.join(BASE_DIR, '.env');
 const CACHE_DIR = path.join(BASE_DIR, 'state');
@@ -157,6 +158,11 @@ export interface CatalogToolkit {
   description?: string;
   toolsCount?: number;
   authMode: ToolkitAuthMode;
+  /** Every sign-in scheme the toolkit offers, upper-case (absent in caches
+   *  written before it was kept). */
+  authSchemes?: string[];
+  /** The schemes Composio can sign in with using its own registered app. */
+  managedAuthSchemes?: string[];
   categories: { slug: string; name: string }[];
 }
 
@@ -329,6 +335,8 @@ export interface ComposioDashboardToolkit {
   slug: string;
   displayName: string;
   authMode: ToolkitAuthMode;
+  authSchemes?: string[];
+  managedAuthSchemes?: string[];
   hasAuthConfig: boolean;
   logoUrl: string | null;
   description: string | null;
@@ -1431,6 +1439,8 @@ function normalizeCatalogItem(item: RawCatalogItem): CatalogToolkit | null {
     description: item.meta?.description,
     toolsCount: item.meta?.toolsCount ?? item.meta?.tools_count,
     authMode: noAuth ? 'none' : (managed.length > 0 ? 'managed' : (schemes.length > 0 ? 'byo' : 'none')),
+    authSchemes: schemes.map((s) => String(s).toUpperCase()),
+    managedAuthSchemes: managed.map((s) => String(s).toUpperCase()),
     categories: item.meta?.categories ?? [],
   };
 }
@@ -1599,6 +1609,64 @@ function selectAuthConfigIdForToolkit(
   return null;
 }
 
+/** Whether an auth config signs in with Composio's own registered app. */
+function authConfigIsComposioManaged(item: Record<string, unknown>): boolean | undefined {
+  const inner = obj(item.auth_config);
+  const v = item.is_composio_managed ?? item.isComposioManaged ?? inner.is_composio_managed ?? inner.isComposioManaged;
+  return typeof v === 'boolean' ? v : undefined;
+}
+
+/** The project's auth config for a toolkit and scheme, and whether it is
+ *  Composio's own app or the person's. */
+async function findToolkitAuthConfig(
+  composio: Composio,
+  slug: string,
+  expectedAuthScheme?: string,
+): Promise<{ id: string; managed?: boolean } | null> {
+  try {
+    const resp = await (composio as any).authConfigs.list({ limit: 50, toolkit: slug });
+    const items = Array.isArray(resp) ? resp : (obj(resp).items ?? []);
+    const list = Array.isArray(items) ? items.filter((i): i is Record<string, unknown> => Boolean(i && typeof i === 'object')) : [];
+    const id = selectAuthConfigIdForToolkit(list, slug, expectedAuthScheme);
+    if (id) {
+      const item = list.find((i) => authConfigId(i) === id);
+      const managed = item ? authConfigIsComposioManaged(item) : undefined;
+      return { id, ...(managed !== undefined ? { managed } : {}) };
+    }
+  } catch {
+    // Fall through to the id-only lookup.
+  }
+  const id = await findToolkitAuthConfigId(composio, slug, expectedAuthScheme);
+  return id ? { id } : null;
+}
+
+/** Connect Link with account details already filled in (a store subdomain),
+ *  so Composio's hosted page does not ask for them. The SDK's link() does
+ *  not send `connection_data`, so this calls the REST endpoint. */
+async function linkWithConnectionData(
+  userId: string,
+  authConfigIdToUse: string,
+  connectionData: Record<string, string>,
+): Promise<{ redirectUrl: string | null; connectionId: string }> {
+  const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
+  if (!composioApiKey) throw new Error('COMPOSIO_API_KEY is not configured.');
+  const res = await fetch('https://backend.composio.dev/api/v3/connected_accounts/link', {
+    method: 'POST',
+    headers: { 'x-api-key': composioApiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auth_config_id: authConfigIdToUse, user_id: userId, connection_data: connectionData }),
+  });
+  if (!res.ok) {
+    const error = new Error(`Composio sign-in link failed (${res.status}).`) as Error & { status?: number };
+    error.status = res.status;
+    throw error;
+  }
+  const body = (await res.json()) as Record<string, unknown>;
+  return {
+    redirectUrl: str(body.redirect_url) ?? str(body.redirectUrl) ?? null,
+    connectionId: str(body.connected_account_id) ?? str(body.connectedAccountId) ?? '',
+  };
+}
+
 async function findToolkitAuthConfigId(
   composio: Composio,
   slug: string,
@@ -1628,37 +1696,83 @@ async function findToolkitAuthConfigId(
 
 export class ComposioNeedsAuthConfigError extends Error {
   constructor(public readonly slug: string, public readonly underlying: string) {
-    super(`Toolkit "${slug}" needs an auth config in Composio before OAuth can start. Open ${COMPOSIO_AUTH_CONFIGS_URL} and add the toolkit to your project.`);
+    super(`Composio has no sign-in set up for "${slug}" yet.`);
     this.name = 'ComposioNeedsAuthConfigError';
   }
+}
+
+/**
+ * Words for a person when connecting an app fails. Every failure is said in
+ * plain terms and never points at Composio's dashboard; the raw cause goes to
+ * the log. Pure; exported for tests.
+ */
+export function plainConnectError(appName: string, error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (/COMPOSIO_API_KEY is not configured/i.test(raw)) {
+    return 'Add your Composio key at the top of this page first, then connect again.';
+  }
+  if (/not found in Composio's catalog/i.test(raw)) {
+    return `Composio no longer lists ${appName}, so it can’t be connected.`;
+  }
+  if (error instanceof ComposioNeedsAuthConfigError || /auth_config create failed|no sign-in set up/i.test(raw)) {
+    return `Composio wouldn’t start ${appName}’s sign-in. Try again in a moment.`;
+  }
+  if (/rejected the .* credentials/i.test(raw)) {
+    return `${appName} didn’t accept those details. Check them and try again.`;
+  }
+  if (/fetch failed|ETIMEDOUT|ENOTFOUND|ECONNRESET|network/i.test(raw)) {
+    return 'Couldn’t reach Composio. Check your connection and try again.';
+  }
+  const clipped = redactSensitiveText(raw).replace(/\s+/g, ' ').trim().slice(0, 160);
+  return `Couldn’t connect ${appName}: ${clipped}`;
 }
 
 export async function authorizeToolkit(
   slug: string,
   expectedAuthScheme?: string,
+  details?: Record<string, string>,
 ): Promise<{ redirectUrl: string | null; connectionId: string }> {
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY is not configured.');
 
   const userId = getPreferredUserId();
+  const accountData = details && Object.keys(details).length > 0 ? details : undefined;
   try {
-    const authConfigIdToUse = await findToolkitAuthConfigId(composio, slug, expectedAuthScheme);
-    if (!authConfigIdToUse) {
-      throw new ComposioNeedsAuthConfigError(
-        slug,
-        `No auth_config for "${slug}" in this Composio project. Add one at ${COMPOSIO_AUTH_CONFIGS_URL} before connecting.`,
-      );
+    const config = await findToolkitAuthConfig(composio, slug, expectedAuthScheme);
+    if (!config) {
+      throw new ComposioNeedsAuthConfigError(slug, `No auth config for "${slug}" in this Composio project.`);
     }
 
-    // Do not use composio.toolkits.authorize() here. In @composio/core
-    // 0.10.0 it still delegates to connectedAccounts.initiate(), and
-    // Composio is retiring that path for managed OAuth orgs in favor of
-    // Connect Link (/api/v3/connected_accounts/link).
-    const connection = await (composio as any).connectedAccounts.link(userId, authConfigIdToUse, { allowMultiple: true });
+    // The person's own developer app signs in at the provider directly:
+    // initiate() returns the provider's consent URL with no Composio page in
+    // between, and Composio keeps that path for custom apps. Composio's own
+    // registered app must go through Connect Link's hosted consent page.
+    if (config.managed === false && expectedAuthScheme && isRedirectableToolkitAuthScheme(expectedAuthScheme)) {
+      try {
+        const request = await (composio as any).connectedAccounts.initiate(userId, config.id, {
+          allowMultiple: true,
+          config: { authScheme: expectedAuthScheme.toUpperCase(), val: { status: 'INITIALIZING', ...(accountData ?? {}) } },
+        });
+        const redirectUrl = request?.redirectUrl ?? request?.redirect_url ?? null;
+        if (redirectUrl) {
+          invalidateConnectedAccountSnapshot();
+          return { redirectUrl, connectionId: request?.id ?? request?.connectedAccountId ?? '' };
+        }
+      } catch {
+        // Fall through to Connect Link, which always works.
+      }
+    }
+
+    // Do not use composio.toolkits.authorize() here: it delegates to
+    // initiate(), which Composio retired for its own managed OAuth apps in
+    // favor of Connect Link (/api/v3/connected_accounts/link).
+    const connection = accountData
+      ? await linkWithConnectionData(userId, config.id, accountData)
+      : await (composio as any).connectedAccounts.link(userId, config.id, { allowMultiple: true });
     invalidateConnectedAccountSnapshot();
     return {
       redirectUrl: connection.redirectUrl ?? connection.redirect_url ?? null,
-      connectionId: connection.id ?? connection.connectedAccountId ?? connection.connected_account_id ?? '',
+      connectionId: connection.connectionId ?? connection.id ?? connection.connectedAccountId ?? connection.connected_account_id ?? '',
     };
   } catch (error) {
     const status = (error as { status?: number; statusCode?: number }).status ?? (error as { statusCode?: number }).statusCode;
@@ -1690,7 +1804,74 @@ export interface ComposioToolkitSetupMeta {
   authScheme: string;
 }
 
-export async function getToolkitSetupMeta(slug: string): Promise<ComposioToolkitSetupMeta | null> {
+type ComposioSetupField = ComposioToolkitSetupMeta['fields'][number];
+
+/** One way a toolkit can be signed in to, with the fields each step needs:
+ *  `creationFields` build the project's auth config (a developer app's client
+ *  id and secret), `initiationFields` belong to one account (an API key, a
+ *  store subdomain). */
+export interface ComposioAuthModeDetail {
+  mode: string;
+  authHintUrl: string | null;
+  creationFields: ComposioSetupField[];
+  initiationFields: ComposioSetupField[];
+}
+
+/** Everything the toolkit's own record says about signing in. */
+export interface ComposioToolkitDetail {
+  slug: string;
+  name: string;
+  description: string | null;
+  appUrl: string | null;
+  authGuideUrl: string | null;
+  /** Schemes Composio can sign in with using its own registered app. */
+  managedSchemes: string[];
+  modes: ComposioAuthModeDetail[];
+}
+
+function setupFields(group: unknown, includeOptional: boolean): ComposioSetupField[] {
+  const g = obj(group);
+  const list = [
+    ...(Array.isArray(g.required) ? g.required : []),
+    ...(includeOptional && Array.isArray(g.optional) ? g.optional : []),
+  ] as Array<Record<string, unknown>>;
+  return list.map((f) => ({
+    name: str(f.name) ?? '',
+    label: str(f.displayName) ?? str(f.name) ?? '',
+    description: str(f.description) ?? null,
+    default: str(f.default) ?? null,
+    isSecret: Boolean(f.is_secret),
+    required: Boolean(f.required),
+  })).filter((f) => f.name);
+}
+
+/** Parse a `GET /api/v3/toolkits/{slug}` body. Pure; exported for tests. */
+export function parseToolkitDetail(slug: string, data: Record<string, unknown>): ComposioToolkitDetail {
+  const details = Array.isArray(data.auth_config_details) ? data.auth_config_details as Array<Record<string, unknown>> : [];
+  const meta = obj(data.meta);
+  const managed = Array.isArray(data.composio_managed_auth_schemes)
+    ? (data.composio_managed_auth_schemes as unknown[]).filter((s): s is string => typeof s === 'string')
+    : [];
+  return {
+    slug,
+    name: str(data.name) ?? slug,
+    description: str(meta.description) ?? null,
+    appUrl: str(meta.app_url) ?? null,
+    authGuideUrl: str(data.auth_guide_url) ?? null,
+    managedSchemes: managed.map((s) => s.toUpperCase()),
+    modes: details.map((d) => {
+      const fields = obj(d.fields);
+      return {
+        mode: (str(d.mode) ?? '').toUpperCase(),
+        authHintUrl: str(d.auth_hint_url) ?? null,
+        creationFields: setupFields(fields.auth_config_creation, true),
+        initiationFields: setupFields(fields.connected_account_initiation, false),
+      };
+    }).filter((m) => m.mode),
+  };
+}
+
+export async function getToolkitDetail(slug: string): Promise<ComposioToolkitDetail | null> {
   const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
   if (!composioApiKey) return null;
   try {
@@ -1698,34 +1879,39 @@ export async function getToolkitSetupMeta(slug: string): Promise<ComposioToolkit
       headers: { 'x-api-key': composioApiKey },
     });
     if (!res.ok) return null;
-    const data = (await res.json()) as Record<string, unknown>;
-    const detail = Array.isArray(data.auth_config_details)
-      ? (data.auth_config_details[0] as Record<string, unknown>)
-      : null;
-    const fieldsObj = detail ? obj(detail.fields) : {};
-    const initiation = obj((fieldsObj as { connected_account_initiation?: unknown }).connected_account_initiation);
-    const required = Array.isArray(initiation.required) ? initiation.required : [];
-    const fields = (required as Array<Record<string, unknown>>).map((f) => ({
-      name: str(f.name) ?? '',
-      label: str(f.displayName) ?? str(f.name) ?? '',
-      description: str(f.description) ?? null,
-      default: str(f.default) ?? null,
-      isSecret: Boolean(f.is_secret),
-      required: Boolean(f.required),
-    })).filter((f) => f.name);
-    const meta = obj(data.meta);
-    return {
-      name: str(data.name) ?? slug,
-      description: str(meta.description) ?? null,
-      appUrl: str(meta.app_url) ?? null,
-      authHintUrl: detail ? str((detail as { auth_hint_url?: unknown }).auth_hint_url) ?? null : null,
-      authGuideUrl: str(data.auth_guide_url) ?? null,
-      fields,
-      authScheme: detail ? str((detail as { mode?: unknown }).mode) ?? 'API_KEY' : 'API_KEY',
-    };
+    return parseToolkitDetail(slug, (await res.json()) as Record<string, unknown>);
   } catch {
     return null;
   }
+}
+
+/** The account-level form for one sign-in mode. */
+export function setupMetaForMode(detail: ComposioToolkitDetail, mode: string): ComposioToolkitSetupMeta {
+  const m = detail.modes.find((x) => x.mode === mode.toUpperCase());
+  return {
+    name: detail.name,
+    description: detail.description,
+    appUrl: detail.appUrl,
+    authHintUrl: m?.authHintUrl ?? null,
+    authGuideUrl: detail.authGuideUrl,
+    fields: m?.initiationFields ?? [],
+    authScheme: m?.mode ?? mode.toUpperCase(),
+  };
+}
+
+/** The key-style mode a person would fill in, if the toolkit offers one. */
+export function credentialModeFor(detail: ComposioToolkitDetail, preferred?: string): string | null {
+  const usable = detail.modes.map((m) => m.mode).filter((m) => m !== 'NO_AUTH' && !isRedirectableToolkitAuthScheme(m));
+  const want = preferred?.toUpperCase();
+  if (want && usable.includes(want)) return want;
+  return usable[0] ?? null;
+}
+
+export async function getToolkitSetupMeta(slug: string): Promise<ComposioToolkitSetupMeta | null> {
+  const detail = await getToolkitDetail(slug);
+  if (!detail) return null;
+  const mode = credentialModeFor(detail) ?? detail.modes[0]?.mode ?? 'API_KEY';
+  return setupMetaForMode(detail, mode);
 }
 
 /**
@@ -1778,15 +1964,116 @@ export async function setupOAuthToolkit(slug: string): Promise<{ ok: true; authC
   return { ok: true, authConfigId };
 }
 
+/**
+ * Create the project's sign-in setup from the person's own developer app
+ * (client id, client secret, scopes…), so an app Composio has no shared
+ * sign-in for connects from Clem without a dashboard visit. The redirect
+ * address is sent explicitly and is the same one the form told the person to
+ * register. A failure names the provider's complaint but never echoes a
+ * submitted value.
+ */
+export async function setupCustomOAuthToolkit(
+  slug: string,
+  authScheme: string,
+  credentials: Record<string, string>,
+  redirectUri: string,
+): Promise<{ ok: true; authConfigId: string }> {
+  const composioApiKey = readComposioEnv('COMPOSIO_API_KEY');
+  if (!composioApiKey) throw new Error('COMPOSIO_API_KEY is not configured.');
+  const scheme = authScheme.trim().toUpperCase();
+  if (!isRedirectableToolkitAuthScheme(scheme)) {
+    throw new Error(`Toolkit "${slug}" does not sign in through a developer app.`);
+  }
+  const values: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(credentials)) {
+    const value = typeof raw === 'string' ? raw.trim() : '';
+    if (/^[A-Za-z][A-Za-z0-9_-]{0,79}$/.test(key) && value) values[key] = value;
+  }
+  if (Object.keys(values).length === 0) throw new Error('The developer app’s details are required.');
+  const res = await fetch('https://backend.composio.dev/api/v3/auth_configs', {
+    method: 'POST',
+    headers: { 'x-api-key': composioApiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      toolkit: { slug },
+      auth_config: {
+        type: 'use_custom_auth',
+        authScheme: scheme,
+        name: slug,
+        credentials: { ...values, oauth_redirect_uri: redirectUri },
+      },
+    }),
+  });
+  if (!res.ok) {
+    let reason = '';
+    try {
+      const body = (await res.json()) as Record<string, unknown>;
+      reason = str(obj(body.error).message) ?? str(body.message) ?? '';
+    } catch { /* no readable reason */ }
+    for (const value of Object.values(values)) if (value.length >= 4) reason = reason.split(value).join('…');
+    const said = redactSensitiveText(reason).replace(/\s+/g, ' ').trim().slice(0, 160);
+    throw new Error(`Composio rejected the ${slug} app details (${res.status})${said ? `: ${said}` : ''}.`);
+  }
+  const result = (await res.json()) as Record<string, unknown>;
+  const authConfigIdCreated = str(result.id) ?? str(obj(result.auth_config).id) ?? str(result.nanoid) ?? '';
+  if (!authConfigIdCreated) throw new Error('Composio returned no id for the new sign-in setup.');
+  invalidateConnectedAccountSnapshot();
+  return { ok: true, authConfigId: authConfigIdCreated };
+}
+
+/** What a person's own developer app needs, for Clem's in-app form. */
+export interface ComposioOAuthAppSetup {
+  name: string;
+  slug: string;
+  description: string | null;
+  appUrl: string | null;
+  authGuideUrl: string | null;
+  authHintUrl: string | null;
+  authScheme: string;
+  /** Developer-app fields: client id, client secret, scopes… */
+  fields: ComposioSetupField[];
+  /** Per-account fields asked before sign-in (a store subdomain). */
+  accountFields: ComposioSetupField[];
+  /** The redirect address to register in the developer app. */
+  callbackUrl: string;
+}
+
+/** Composio's current OAuth callback, used when a toolkit's record names no
+ *  default of its own (some still default to the older v1 address, which
+ *  stays supported; whichever is shown is also the one sent). */
+export const COMPOSIO_OAUTH_CALLBACK_URL = 'https://backend.composio.dev/api/v3/toolkits/auth/callback';
+
+export function oauthAppSetupFor(detail: ComposioToolkitDetail, mode: string): ComposioOAuthAppSetup {
+  const m = detail.modes.find((x) => x.mode === mode.toUpperCase());
+  const redirect = m?.creationFields.find((f) => /redirect/i.test(f.name));
+  return {
+    name: detail.name,
+    slug: detail.slug,
+    description: detail.description,
+    appUrl: detail.appUrl,
+    authGuideUrl: detail.authGuideUrl,
+    authHintUrl: m?.authHintUrl ?? null,
+    authScheme: m?.mode ?? mode.toUpperCase(),
+    fields: m?.creationFields ?? [],
+    accountFields: m?.initiationFields ?? [],
+    callbackUrl: redirect?.default || COMPOSIO_OAUTH_CALLBACK_URL,
+  };
+}
+
 export type InAppToolkitConnection =
   | ({ kind: 'authorization' } & Awaited<ReturnType<typeof authorizeToolkit>>)
-  | { kind: 'credentials'; setup: ComposioToolkitSetupMeta };
+  | { kind: 'credentials'; setup: ComposioToolkitSetupMeta }
+  | { kind: 'details'; setup: ComposioToolkitSetupMeta }
+  | { kind: 'oauth_app'; app: ComposioOAuthAppSetup }
+  | { kind: 'no_auth'; name: string };
 
 export interface InAppToolkitConnectionDeps {
-  getSetupMeta: (slug: string) => Promise<ComposioToolkitSetupMeta | null>;
+  getDetail: (slug: string) => Promise<ComposioToolkitDetail | null>;
+  /** Schemes of the auth configs the project already has for this toolkit. */
+  listConfiguredSchemes: (slug: string) => Promise<string[]>;
   authorize: (
     slug: string,
     expectedAuthScheme?: string,
+    details?: Record<string, string>,
   ) => Promise<Awaited<ReturnType<typeof authorizeToolkit>>>;
   setupOAuth: (slug: string) => Promise<Awaited<ReturnType<typeof setupOAuthToolkit>>>;
 }
@@ -1814,34 +2101,110 @@ export function selectToolkitCredentialValues(
   return { credentials, missing };
 }
 
+/** Redirect schemes in the order a person would want them: an interactive
+ *  sign-in first, a server-to-server grant last. */
+function redirectSchemePreference(mode: string): number {
+  if (mode === 'OAUTH2') return 0;
+  if (/^S2S/.test(mode)) return 2;
+  return 1;
+}
+
+export type ToolkitConnectPlan =
+  /** Nothing to connect: the toolkit works without an account. */
+  | { kind: 'no_auth' }
+  /** A browser sign-in, through a config the project has or Composio's own app. */
+  | { kind: 'authorize'; scheme: string; provisionManaged: boolean }
+  /** An in-app form for an API key or other account credentials. */
+  | { kind: 'credentials'; mode: string }
+  /** Only sign-in is through a developer app the owner registers themselves. */
+  | { kind: 'oauth_app'; mode: string };
+
 /**
- * One Clementine-native connection entrypoint:
- *  - API key/basic/bearer apps return their field schema for our own modal.
- *  - OAuth apps with an existing auth config return a Connect Link.
- *  - OAuth apps without a config get Composio-managed auth provisioned here,
- *    then return a Connect Link — no dashboard detour.
+ * How one toolkit gets connected, from its own record and the schemes of the
+ * auth configs the project already has. Order: a sign-in the project already
+ * set up; Composio's own registered app; an API key the person can paste; and
+ * only when none of those exists, the person's own developer app. Pure.
+ */
+export function planToolkitConnection(detail: ComposioToolkitDetail, existingSchemes: readonly string[]): ToolkitConnectPlan {
+  const modes = detail.modes.map((m) => m.mode).filter((m) => m !== 'NO_AUTH');
+  if (modes.length === 0) return { kind: 'no_auth' };
+  const existing = new Set(existingSchemes.map((s) => s.toUpperCase()));
+  const redirect = modes.filter(isRedirectableToolkitAuthScheme)
+    .sort((a, b) => redirectSchemePreference(a) - redirectSchemePreference(b));
+  const configured = redirect.find((m) => existing.has(m));
+  if (configured) return { kind: 'authorize', scheme: configured, provisionManaged: false };
+  const managed = redirect.find((m) => detail.managedSchemes.includes(m));
+  if (managed) return { kind: 'authorize', scheme: managed, provisionManaged: true };
+  const credential = credentialModeFor(detail, [...existing].find((s) => !isRedirectableToolkitAuthScheme(s)));
+  if (credential) return { kind: 'credentials', mode: credential };
+  return { kind: 'oauth_app', mode: redirect[0] };
+}
+
+/**
+ * One Clementine-native connection entrypoint; nothing sends the person to
+ * Composio's dashboard:
+ *  - no-auth toolkits say so instead of asking for a key;
+ *  - key-style apps return their field schema for Clem's own form;
+ *  - OAuth apps with a project config, or with Composio's own app, return a
+ *    sign-in link (Composio's managed config is provisioned on first use);
+ *  - OAuth apps that only work with the person's own developer app return
+ *    the fields for Clem's own form, which creates the config.
  */
 export async function prepareInAppToolkitConnection(
   slug: string,
-  deps: InAppToolkitConnectionDeps = {
-    getSetupMeta: getToolkitSetupMeta,
+  deps: InAppToolkitConnectionDeps = defaultConnectionDeps(),
+  details?: Record<string, string>,
+): Promise<InAppToolkitConnection> {
+  const detail = await deps.getDetail(slug);
+  if (!detail) {
+    // The toolkit's record could not be read: try the sign-in a project
+    // setup may already support rather than guessing a form.
+    return { kind: 'authorization', ...await deps.authorize(slug, undefined, details) };
+  }
+  const configured = await deps.listConfiguredSchemes(slug).catch(() => [] as string[]);
+  const plan = planToolkitConnection(detail, configured);
+  if (plan.kind === 'no_auth') return { kind: 'no_auth', name: detail.name };
+  if (plan.kind === 'credentials') return { kind: 'credentials', setup: setupMetaForMode(detail, plan.mode) };
+  if (plan.kind === 'oauth_app') return { kind: 'oauth_app', app: oauthAppSetupFor(detail, plan.mode) };
+
+  // A sign-in that needs account details first (a store subdomain) asks for
+  // them in Clem's own form, so Composio's page never has to.
+  const setup = setupMetaForMode(detail, plan.scheme);
+  const missing = setup.fields.filter((f) => f.required && !(details?.[f.name] ?? '').trim());
+  if (missing.length > 0) return { kind: 'details', setup };
+  const accountData = setup.fields.length > 0 && details
+    ? selectToolkitCredentialValues(setup, details).credentials
+    : undefined;
+  try {
+    return { kind: 'authorization', ...await deps.authorize(slug, plan.scheme, accountData) };
+  } catch (error) {
+    if (!(error instanceof ComposioNeedsAuthConfigError) || !plan.provisionManaged) throw error;
+    await deps.setupOAuth(slug);
+    return { kind: 'authorization', ...await deps.authorize(slug, plan.scheme, accountData) };
+  }
+}
+
+function defaultConnectionDeps(): InAppToolkitConnectionDeps {
+  return {
+    getDetail: getToolkitDetail,
+    listConfiguredSchemes: listToolkitAuthConfigSchemes,
     authorize: authorizeToolkit,
     setupOAuth: setupOAuthToolkit,
-  },
-): Promise<InAppToolkitConnection> {
-  const setup = await deps.getSetupMeta(slug);
-  if (setup && !isRedirectableToolkitAuthScheme(setup.authScheme)) {
-    return { kind: 'credentials', setup };
-  }
+  };
+}
 
-  try {
-    return { kind: 'authorization', ...await deps.authorize(slug, setup?.authScheme) };
-  } catch (error) {
-    if (!(error instanceof ComposioNeedsAuthConfigError)) throw error;
-    if (!setup || !isRedirectableToolkitAuthScheme(setup.authScheme)) throw error;
-    await deps.setupOAuth(slug);
-    return { kind: 'authorization', ...await deps.authorize(slug, setup.authScheme) };
-  }
+/** Schemes of the auth configs this Composio project has for a toolkit. */
+export async function listToolkitAuthConfigSchemes(slug: string): Promise<string[]> {
+  const composio = getComposio();
+  if (!composio) return [];
+  const resp = await (composio as any).authConfigs.list({ limit: 50, toolkit: slug });
+  const items = Array.isArray(resp) ? resp : (obj(resp).items ?? []);
+  if (!Array.isArray(items)) return [];
+  const normalizedSlug = slug.trim().toLowerCase();
+  return (items as Array<Record<string, unknown>>)
+    .filter((item) => (authConfigToolkitSlug(item) ?? '').toLowerCase() === normalizedSlug)
+    .map((item) => (authConfigAuthScheme(item) ?? '').toUpperCase())
+    .filter(Boolean);
 }
 
 export async function disconnectToolkit(connectionId: string): Promise<void> {
@@ -3643,6 +4006,8 @@ async function buildComposioDashboardSnapshotLive(): Promise<ComposioDashboardSn
       slug: toolkit.slug,
       displayName: toolkit.name,
       authMode: toolkit.authMode,
+      ...(toolkit.authSchemes ? { authSchemes: toolkit.authSchemes } : {}),
+      ...(toolkit.managedAuthSchemes ? { managedAuthSchemes: toolkit.managedAuthSchemes } : {}),
       hasAuthConfig: configured.has(toolkit.slug),
       logoUrl: toolkit.logoUrl ?? null,
       description: toolkit.description ?? null,

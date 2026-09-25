@@ -5,6 +5,8 @@
 import { getRuntimeEnv } from '../../config.js';
 import { getSecretStore } from '../secrets/index.js';
 import { recordModelUsage } from '../usage-log.js';
+import { JEV_ACCOUNT_ID, noteCreditAnswered, noteCreditRefused } from '../provider-credit.js';
+import { isProviderCreditRefusal } from '../../shared/provider-capacity.js';
 import {
   TYPESAFE_MODEL,
   TYPESAFE_SYSTEMONE_URL,
@@ -16,6 +18,15 @@ import {
 } from './system-one.js';
 
 export { TYPESAFE_MODEL, TYPESAFE_SYSTEMONE_URL };
+
+/** Credit state for the account from one System One answer. */
+export function noteJevCreditOutcome(result: SystemOneResult): void {
+  if (result.ok) { noteCreditAnswered(JEV_ACCOUNT_ID); return; }
+  if (result.reason !== 'http_error' && result.reason !== 'unauthorized') return;
+  if (isProviderCreditRefusal(result.status, result.body ?? '')) {
+    noteCreditRefused(JEV_ACCOUNT_ID, { status: result.status, detail: result.body });
+  }
+}
 
 let keyOverride: string | null | undefined;
 let fetchOverride: SystemOneFetch | undefined;
@@ -66,11 +77,13 @@ export async function evaluateSystemOne(input: {
     fetchImpl: fetchOverride,
   });
   const durationMs = Date.now() - started;
+  noteJevCreditOutcome(result);
   try {
     recordModelUsage({
       sessionId: input.sessionId?.trim() || 'jev',
       channel: input.channel ?? 'jev',
       role: 'router',
+      account: JEV_ACCOUNT_ID,
       model: result.ok ? result.model : TYPESAFE_MODEL,
       cacheDialect: 'none',
       inputTokens: result.ok ? result.usage.input_tokens : 0,

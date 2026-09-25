@@ -28,10 +28,15 @@ import {
   peekCurrentConnectedToolkits,
   prepareComposioOneShotDispatch,
   prepareInAppToolkitConnection,
+  planToolkitConnection,
+  parseToolkitDetail,
+  plainConnectError,
   resetComposioClient,
   selectToolkitCredentialValues,
   toComposioDashboardConnection,
+  type ComposioToolkitDetail,
   type ConnectedToolkit,
+  type InAppToolkitConnectionDeps,
 } from './client.js';
 
 test('prepared SDK dispatch is one exact no-retry POST with no core schema/modifier/reconnect path', async () => {
@@ -480,28 +485,156 @@ test('Composio auth-config fallback URL uses the current dashboard path', () => 
   assert.equal(COMPOSIO_AUTH_CONFIGS_URL, 'https://dashboard.composio.dev/~/project/auth-configs');
 });
 
-test('in-app connection returns native credential fields without opening Composio', async () => {
-  let authorizeCalls = 0;
-  const result = await prepareInAppToolkitConnection('firecrawl', {
-    getSetupMeta: async () => ({
-      name: 'Firecrawl',
-      description: null,
-      appUrl: null,
+type TestField = { name: string; label?: string; required?: boolean; default?: string | null; isSecret?: boolean };
+function field(f: TestField) {
+  return { name: f.name, label: f.label ?? f.name, description: null, default: f.default ?? null, isSecret: Boolean(f.isSecret), required: f.required ?? true };
+}
+function toolkitDetail(
+  slug: string,
+  modes: Array<{ mode: string; creation?: TestField[]; initiation?: TestField[] }>,
+  managed: string[] = [],
+): ComposioToolkitDetail {
+  return {
+    slug,
+    name: slug[0].toUpperCase() + slug.slice(1),
+    description: null,
+    appUrl: `https://${slug}.example.test`,
+    authGuideUrl: null,
+    managedSchemes: managed,
+    modes: modes.map((m) => ({
+      mode: m.mode,
       authHintUrl: null,
-      authGuideUrl: null,
-      authScheme: 'API_KEY',
-      fields: [
-        { name: 'full', label: 'Base URL', description: null, default: 'https://api.firecrawl.dev/v1', isSecret: false, required: true },
-        { name: 'generic_api_key', label: 'API Key', description: null, default: null, isSecret: true, required: true },
-      ],
+      creationFields: (m.creation ?? []).map(field),
+      initiationFields: (m.initiation ?? []).map(field),
+    })),
+  };
+}
+type ConnectCalls = { authorize: number; setupOAuth: number; lastScheme?: string; lastDetails?: Record<string, string> };
+function connectionDeps(over: Partial<InAppToolkitConnectionDeps> & { detail: ComposioToolkitDetail | null }): InAppToolkitConnectionDeps & { calls: ConnectCalls } {
+  const calls: ConnectCalls = { authorize: 0, setupOAuth: 0 };
+  return {
+    calls,
+    getDetail: async () => over.detail,
+    listConfiguredSchemes: over.listConfiguredSchemes ?? (async () => []),
+    authorize: over.authorize ?? (async (slug, scheme, details) => {
+      calls.authorize += 1;
+      calls.lastScheme = scheme;
+      calls.lastDetails = details;
+      return { redirectUrl: `https://connect.example.test/${slug}`, connectionId: 'ca_new' };
     }),
-    authorize: async () => { authorizeCalls += 1; return { redirectUrl: 'https://should-not-open.test', connectionId: '' }; },
-    setupOAuth: async () => ({ ok: true, authConfigId: 'unused' }),
-  });
+    setupOAuth: over.setupOAuth ?? (async () => { calls.setupOAuth += 1; return { ok: true as const, authConfigId: 'ac_new' }; }),
+  };
+}
 
+test('in-app connection returns native credential fields without opening Composio', async () => {
+  const deps = connectionDeps({
+    detail: toolkitDetail('firecrawl', [{ mode: 'API_KEY', initiation: [{ name: 'full', label: 'Base URL', default: 'https://api.firecrawl.dev/v1' }, { name: 'generic_api_key', label: 'API Key', isSecret: true }] }]),
+  });
+  const result = await prepareInAppToolkitConnection('firecrawl', deps);
   assert.equal(result.kind, 'credentials');
-  assert.equal(result.setup.fields[0].name, 'full');
-  assert.equal(authorizeCalls, 0, 'non-OAuth credentials stay inside Clementine');
+  assert.equal(result.kind === 'credentials' && result.setup.fields[0].name, 'full');
+  assert.equal(deps.calls.authorize, 0, 'non-OAuth credentials stay inside Clementine');
+});
+
+test('an app with no sign-in says so instead of asking for a key', async () => {
+  const deps = connectionDeps({ detail: toolkitDetail('hackernews', [{ mode: 'NO_AUTH' }]) });
+  const result = await prepareInAppToolkitConnection('hackernews', deps);
+  assert.deepEqual(result, { kind: 'no_auth', name: 'Hackernews' });
+  assert.equal(deps.calls.authorize, 0);
+});
+
+test('without a shared sign-in, an app that also takes an API key opens the key form, not a failed OAuth setup', async () => {
+  const deps = connectionDeps({
+    detail: toolkitDetail('pipedrive', [
+      { mode: 'OAUTH2', creation: [{ name: 'client_id' }, { name: 'client_secret' }] },
+      { mode: 'API_KEY', initiation: [{ name: 'generic_api_key', isSecret: true }] },
+    ]),
+  });
+  const result = await prepareInAppToolkitConnection('pipedrive', deps);
+  assert.equal(result.kind, 'credentials');
+  assert.equal(result.kind === 'credentials' && result.setup.authScheme, 'API_KEY');
+  assert.equal(deps.calls.setupOAuth, 0, 'no managed-auth setup is attempted for an app Composio has no app for');
+});
+
+test('an OAuth-only app with no shared sign-in returns Clem’s own developer-app form with the redirect address', async () => {
+  const deps = connectionDeps({
+    detail: toolkitDetail('twitter', [{
+      mode: 'OAUTH2',
+      creation: [
+        { name: 'client_id' }, { name: 'client_secret' }, { name: 'generic_id', label: 'Application Bearer Token' },
+        { name: 'oauth_redirect_uri', required: false, default: 'https://backend.composio.dev/api/v1/auth-apps/add' },
+        { name: 'scopes', required: false, default: 'tweet.read' },
+      ],
+    }]),
+  });
+  const result = await prepareInAppToolkitConnection('twitter', deps);
+  assert.equal(result.kind, 'oauth_app');
+  if (result.kind !== 'oauth_app') return;
+  assert.equal(result.app.callbackUrl, 'https://backend.composio.dev/api/v1/auth-apps/add', 'the toolkit’s own default wins');
+  assert.deepEqual(result.app.fields.map((f) => f.name), ['client_id', 'client_secret', 'generic_id', 'oauth_redirect_uri', 'scopes']);
+  assert.equal(deps.calls.setupOAuth, 0);
+  assert.equal(deps.calls.authorize, 0);
+});
+
+test('an app whose own developer app is already set up signs in without asking again', async () => {
+  const deps = connectionDeps({
+    detail: toolkitDetail('twitter', [{ mode: 'OAUTH2', creation: [{ name: 'client_id' }, { name: 'client_secret' }] }]),
+    listConfiguredSchemes: async () => ['OAUTH2'],
+  });
+  const result = await prepareInAppToolkitConnection('twitter', deps);
+  assert.equal(result.kind, 'authorization');
+  assert.equal(deps.calls.lastScheme, 'OAUTH2');
+});
+
+test('a sign-in that needs an account detail asks for it in Clem, then passes only its own fields on', async () => {
+  const shopify = toolkitDetail('shopify', [
+    { mode: 'OAUTH2', creation: [{ name: 'client_id' }, { name: 'client_secret' }], initiation: [{ name: 'subdomain', label: 'Store Subdomain' }] },
+  ], ['OAUTH2']);
+  const first = connectionDeps({ detail: shopify });
+  const ask = await prepareInAppToolkitConnection('shopify', first);
+  assert.equal(ask.kind, 'details');
+  assert.equal(first.calls.authorize, 0, 'no half-filled sign-in page is opened');
+
+  const second = connectionDeps({ detail: shopify, listConfiguredSchemes: async () => ['OAUTH2'] });
+  const signIn = await prepareInAppToolkitConnection('shopify', second, { subdomain: 'acme', injected: 'dropped' });
+  assert.equal(signIn.kind, 'authorization');
+  assert.deepEqual(second.calls.lastDetails, { subdomain: 'acme' });
+});
+
+test('the managed sign-in outranks a key form, and a server-to-server scheme is never picked first', () => {
+  const salesforce = toolkitDetail('salesforce', [{ mode: 'S2S_OAUTH2' }, { mode: 'OAUTH2' }, { mode: 'API_KEY' }], ['OAUTH2']);
+  assert.deepEqual(planToolkitConnection(salesforce, []), { kind: 'authorize', scheme: 'OAUTH2', provisionManaged: true });
+  assert.deepEqual(planToolkitConnection(toolkitDetail('x', []), []), { kind: 'no_auth' });
+});
+
+test('toolkit records are read for every sign-in mode, not just the first', () => {
+  const detail = parseToolkitDetail('shopify', {
+    name: 'Shopify',
+    meta: { app_url: 'https://www.shopify.com', description: 'Commerce' },
+    composio_managed_auth_schemes: [],
+    auth_config_details: [
+      { mode: 'OAUTH2', fields: { auth_config_creation: { required: [{ name: 'client_id', displayName: 'Client id', required: true }], optional: [{ name: 'scopes', displayName: 'Scopes', required: false, default: 'read_products' }] }, connected_account_initiation: { required: [{ name: 'subdomain', displayName: 'Store Subdomain', required: true }], optional: [] } } },
+      { mode: 'API_KEY', fields: { auth_config_creation: { required: [], optional: [] }, connected_account_initiation: { required: [{ name: 'generic_api_key', displayName: 'Admin Api Access Token', required: true, is_secret: true }], optional: [] } } },
+    ],
+  });
+  assert.deepEqual(detail.modes.map((m) => m.mode), ['OAUTH2', 'API_KEY']);
+  assert.deepEqual(detail.modes[0].creationFields.map((f) => f.name), ['client_id', 'scopes']);
+  assert.equal(detail.modes[1].initiationFields[0].isSecret, true);
+  assert.equal(detail.appUrl, 'https://www.shopify.com');
+});
+
+test('connect failures are said in plain words and never point at Composio’s dashboard', () => {
+  const words = [
+    plainConnectError('Twitter', new Error('Composio auth_config create failed (400): {"error":{"message":"no managed auth"}}')),
+    plainConnectError('Twitter', new ComposioNeedsAuthConfigError('twitter', 'missing')),
+    plainConnectError('Gmail', new Error('COMPOSIO_API_KEY is not configured.')),
+    plainConnectError('Gmail', new Error("Toolkit \"gmail\" was not found in Composio's catalog.")),
+    plainConnectError('Gmail', new Error('fetch failed')),
+  ];
+  for (const w of words) assert.doesNotMatch(w, /dashboard\.composio|platform\.composio|auth_config|\{"/, w);
+  assert.match(words[0], /Twitter’s sign-in/);
+  assert.match(words[2], /Composio key/);
+  assert.doesNotMatch(new ComposioNeedsAuthConfigError('x', 'y').message, /composio\.dev/, 'the error itself sends no one to the dashboard');
 });
 
 test('native credential selection preserves exact live field names, fills defaults, and drops extras', () => {
@@ -548,49 +681,39 @@ test('native credential selection reports missing fields by their human labels',
 
 test('in-app OAuth provisions missing managed auth then retries once', async () => {
   let authorizeCalls = 0;
-  let setupCalls = 0;
-  const result = await prepareInAppToolkitConnection('github', {
-    getSetupMeta: async () => ({
-      name: 'GitHub',
-      description: null,
-      appUrl: null,
-      authHintUrl: null,
-      authGuideUrl: null,
-      authScheme: 'OAUTH2',
-      fields: [],
-    }),
+  const deps = connectionDeps({
+    detail: toolkitDetail('github', [{ mode: 'OAUTH2' }], ['OAUTH2']),
     authorize: async (slug) => {
       authorizeCalls += 1;
       if (authorizeCalls === 1) throw new ComposioNeedsAuthConfigError(slug, 'missing');
       return { redirectUrl: 'https://connect.example.test/github', connectionId: 'ca_new' };
     },
-    setupOAuth: async () => { setupCalls += 1; return { ok: true, authConfigId: 'ac_github' }; },
   });
-
+  const result = await prepareInAppToolkitConnection('github', deps);
   assert.equal(result.kind, 'authorization');
-  assert.equal(result.redirectUrl, 'https://connect.example.test/github');
+  assert.equal(result.kind === 'authorization' && result.redirectUrl, 'https://connect.example.test/github');
   assert.equal(authorizeCalls, 2);
-  assert.equal(setupCalls, 1);
+  assert.equal(deps.calls.setupOAuth, 1);
 });
 
 test('in-app OAuth with an existing config does not create another', async () => {
-  let setupCalls = 0;
-  const result = await prepareInAppToolkitConnection('notion', {
-    getSetupMeta: async () => ({
-      name: 'Notion',
-      description: null,
-      appUrl: null,
-      authHintUrl: null,
-      authGuideUrl: null,
-      authScheme: 'OAUTH2',
-      fields: [],
-    }),
-    authorize: async () => ({ redirectUrl: 'https://connect.example.test/notion', connectionId: 'ca_notion' }),
-    setupOAuth: async () => { setupCalls += 1; return { ok: true, authConfigId: 'unused' }; },
+  const deps = connectionDeps({
+    detail: toolkitDetail('notion', [{ mode: 'OAUTH2' }], ['OAUTH2']),
+    listConfiguredSchemes: async () => ['OAUTH2'],
   });
-
+  const result = await prepareInAppToolkitConnection('notion', deps);
   assert.equal(result.kind, 'authorization');
-  assert.equal(setupCalls, 0);
+  assert.equal(deps.calls.setupOAuth, 0);
+});
+
+test('a failed sign-in on the person’s own app is not papered over with a managed setup', async () => {
+  const deps = connectionDeps({
+    detail: toolkitDetail('twitter', [{ mode: 'OAUTH2' }]),
+    listConfiguredSchemes: async () => ['OAUTH2'],
+    authorize: async (slug) => { throw new ComposioNeedsAuthConfigError(slug, 'rejected'); },
+  });
+  await assert.rejects(prepareInAppToolkitConnection('twitter', deps), ComposioNeedsAuthConfigError);
+  assert.equal(deps.calls.setupOAuth, 0);
 });
 
 test('getPreferredUserId honors a real explicit COMPOSIO_USER_ID (short-circuits before any network)', async () => {

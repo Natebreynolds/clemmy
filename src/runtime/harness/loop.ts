@@ -202,6 +202,8 @@ import { addNotification } from '../notifications.js';
 import { classifyCodexAuthError, markCodexAuthDead, isCodexAuthDead } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
 import { classifyModelError } from './resilient-model.js';
+import { recentCreditRefusalNotice } from './provider-billing.js';
+import { isProviderCreditRefusal } from '../../shared/provider-capacity.js';
 import { getRuntimeEnv, withRuntimeConfigSnapshot } from '../../config.js';
 import { withAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
@@ -15238,10 +15240,13 @@ function handleRunError(
       const cls = classifyModelError(err);
       const transientModelKinds = new Set(['model.overloaded', 'model.rate_limited', 'model.http_5xx', 'model.transport_timeout']);
       if (cls.retryable && transientModelKinds.has(cls.kind)) {
+        // An account out of credit is fixed by its owner, not by waiting:
+        // name the account and the page where credit is added.
+        const creditNotice = isProviderCreditRefusal(cls.status, err) ? recentCreditRefusalNotice() : null;
         err = BoundaryError.from(err, {
           kind: cls.kind,
           retryable: true,
-          userMessage: 'The model runtime is temporarily unavailable.',
+          userMessage: creditNotice ?? 'The model runtime is temporarily unavailable.',
         });
       } else if (typeof cls.status === 'number' && !cls.isAuth && !isCodexAuthRevoked(err, message)) {
         // A2#3 — an unhandled MODEL-BACKEND HTTP error (a non-401/403/429/5xx status the

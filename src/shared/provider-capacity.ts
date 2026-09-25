@@ -59,3 +59,21 @@ export function isProviderExtraUsageUnavailable(value: unknown): boolean {
   return /out of extra usage|extra usage (?:is )?(?:exhausted|unavailable|disabled)/i
     .test(providerCapacityErrorText(value));
 }
+
+/**
+ * A prepaid balance or credit line is used up: the account refuses every call
+ * until its owner adds credit. HTTP 402 says exactly that. Providers that use
+ * another status say it only in their own error text, so the text is read only
+ * for the statuses those refusals arrive on. Unlike a plan window, this does
+ * not reset on its own.
+ */
+const PROVIDER_CREDIT_REFUSED_RE =
+  /insufficient[_ ]?(?:quota|balance|credits?|funds)|credit_balance_exhausted|no credits? (?:remaining|left)|out of credits?|credit balance is too low|exceeded your current quota|exceeded_current_quota|check your plan and billing|used all (?:of your |its )?(?:available )?credits|balance (?:is )?(?:insufficient|too low|exhausted|not enough)|"code"\s*:\s*"?1113\b/i;
+
+const CREDIT_REFUSAL_TEXT_STATUSES = new Set([400, 403, 429]);
+
+export function isProviderCreditRefusal(status: number | undefined, value: unknown): boolean {
+  if (status === 402) return true;
+  if (status !== undefined && !CREDIT_REFUSAL_TEXT_STATUSES.has(status)) return false;
+  return PROVIDER_CREDIT_REFUSED_RE.test(providerCapacityErrorText(value));
+}

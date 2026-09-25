@@ -32,6 +32,8 @@ const ENV_KEYS = [
   'BYO_PROVIDERS',
   'BYO_PROVIDER_DEEPSEEK_API_KEY',
   'BYO_PROVIDER_TOGETHER_API_KEY',
+  'BYO_PROVIDER_MOONSHOT_API_KEY',
+  'CLEMMY_MODEL_ROLES',
 ];
 
 async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
@@ -76,8 +78,8 @@ test('returns connection booleans for all providers + updatedAt; never leaks a k
       assert.equal(typeof body[p]?.connected, 'boolean', `${p}.connected is a boolean`);
     }
     assert.equal(typeof body.updatedAt, 'number');
-    // No secret material ever serialized.
-    const raw = JSON.stringify(body).toLowerCase();
+    // No secret material ever serialized (billing pages are directory data).
+    const raw = JSON.stringify(body, (k, v) => (k === 'url' ? undefined : v)).toLowerCase();
     assert.ok(!raw.includes('apikey') && !raw.includes('api_key') && !raw.includes('bearer') && !raw.includes('sk-'),
       'no key/secret in the payload');
   } finally {
@@ -124,7 +126,8 @@ test('surfaces every configured BYO provider generically without leaking keys', 
       assert.equal(body.byoProviders.find((p) => p.id === 'default')?.label, 'GLM (Z.ai)');
       assert.deepEqual(body.byoProviders.find((p) => p.id === 'deepseek')?.modelIds, ['deepseek-chat']);
       assert.equal(body.together.connected, true, 'legacy together chip remains compatible');
-      const raw = JSON.stringify(body).toLowerCase();
+      // Billing pages are directory data, not secrets; scan everything else.
+      const raw = JSON.stringify(body, (k, v) => (k === 'url' ? undefined : v)).toLowerCase();
       for (const secret of ['zai-secret', 'deepseek-secret', 'together-secret', 'api_key', 'apikey', 'bearer']) {
         assert.ok(!raw.includes(secret.toLowerCase()), `payload leaked ${secret}`);
       }
@@ -183,4 +186,108 @@ test('a Grok account that is not connected is reported as such without limits', 
   } finally {
     await h.close();
   }
+});
+
+interface BillingView {
+  url?: string;
+  kind?: string;
+  outOfCredit?: { status?: number; detail?: string };
+  balance?: { amount: number; currency: string };
+  roles?: string[];
+}
+
+test('each account carries its billing page, whether its provider refused for credit, and the money figures the key can read', async () => {
+  const { noteCreditRefused, __resetProviderCreditForTests } = await import('../runtime/provider-credit.js');
+  const { __setBalanceFetchForTests, __resetProviderBillingForTests, recentCreditRefusalNotice } = await import('../runtime/harness/provider-billing.js');
+  __resetProviderCreditForTests();
+  __resetProviderBillingForTests();
+  const balanceReads: string[] = [];
+  __setBalanceFetchForTests(async (url) => {
+    balanceReads.push(url);
+    if (url.includes('/billing/usage')) {
+      return {
+        ok: true,
+        json: async () => ({
+          object: 'list', billing_period: '2026-09', currency: 'USD',
+          data: [
+            { date: '2026-09-23', line_items: [{ product_name: 'a', cost: '30.00' }, { product_name: 'b', cost: '2.10' }] },
+            { date: '2026-09-24', line_items: [{ product_name: 'a', cost: '10.00' }] },
+          ],
+          next_cursor: null,
+        }),
+      };
+    }
+    return { ok: true, json: async () => ({ code: 0, data: { available_balance: 49.5, voucher_balance: 46.5, cash_balance: 3 }, status: true }) };
+  });
+  await withEnv({
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'together', label: 'Together AI', baseURL: 'https://api.together.ai/v1', modelIds: ['zai-org/GLM-5.2'] },
+      { id: 'moonshot', label: 'Moonshot', baseURL: 'https://api.moonshot.ai/v1', modelIds: ['kimi-k3'] },
+    ]),
+    BYO_PROVIDER_TOGETHER_API_KEY: 'together-secret',
+    BYO_PROVIDER_MOONSHOT_API_KEY: 'moonshot-secret',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'zai-org/GLM-5.2', scope: 'durable', source: 'settings' }]),
+  }, async () => {
+    noteCreditRefused('together', { status: 402, detail: 'Credit limit exceeded' });
+    const h = await boot();
+    try {
+      const read = async () => (await fetch(`${h.url}/api/console/model-status`)).text();
+      await read(); // the first read starts the balance fetch in the background
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const raw = await read();
+      for (const secret of ['together-secret', 'moonshot-secret']) assert.ok(!raw.includes(secret), `payload leaked ${secret}`);
+      const body = JSON.parse(raw) as {
+        byoProviders: Array<{ id: string; billing?: BillingView }>;
+        claude: { billing?: BillingView };
+        codex: { billing?: BillingView };
+        openai: { billing?: BillingView };
+        jev: { connected: boolean; billing?: BillingView };
+      };
+      const together = body.byoProviders.find((p) => p.id === 'together')?.billing;
+      assert.equal(together?.url, 'https://api.together.ai/settings/organization/~current/billing');
+      assert.equal(together?.kind, 'prepaid');
+      assert.equal(together?.outOfCredit?.status, 402);
+      assert.equal(together?.outOfCredit?.detail, 'Credit limit exceeded');
+      assert.equal(together?.balance, undefined, 'Together serves no balance to the key');
+      assert.deepEqual(together?.monthSpend && { amount: together.monthSpend.amount, currency: together.monthSpend.currency }, { amount: 42.1, currency: 'USD' },
+        'Together serves its billed spend for the month, summed from its own line items');
+      assert.ok(together?.roles?.includes('worker'), 'the account names the job it is doing');
+      assert.ok(!body.byoProviders.find((p) => p.id === 'moonshot')?.billing?.roles?.includes('worker'));
+
+      const moonshot = body.byoProviders.find((p) => p.id === 'moonshot')?.billing;
+      assert.deepEqual(moonshot?.balance && { amount: moonshot.balance.amount, currency: moonshot.balance.currency }, { amount: 49.5, currency: 'USD' });
+      assert.equal(moonshot?.outOfCredit, undefined);
+      assert.deepEqual(
+        [...balanceReads].sort(),
+        ['https://api.moonshot.ai/v1/users/me/balance', 'https://api.together.ai/v1/billing/usage?granularity=day&limit=100'],
+        'only what a provider serves to the key is read, once each',
+      );
+
+      assert.equal(body.claude.billing?.url, 'https://claude.ai/settings/usage');
+      assert.equal(body.claude.billing?.kind, 'plan');
+      assert.equal(body.codex.billing?.kind, 'plan');
+      assert.deepEqual(body.openai.billing?.roles, ['memory_search']);
+      assert.equal(body.jev.connected, false);
+      assert.equal(body.jev.billing?.url, 'https://console.typesafe.ai/settings/billing');
+
+      // A chat turn that fails on the refusal quotes the provider and links its page.
+      assert.equal(
+        recentCreditRefusalNotice(),
+        'Together AI turned down this request: “Credit limit exceeded”. Add credit here: https://api.together.ai/settings/organization/~current/billing',
+      );
+    } finally {
+      await h.close();
+      __resetProviderBillingForTests();
+      __resetProviderCreditForTests();
+    }
+  });
+});
+
+test('a Coding Plan endpoint and a pay-as-you-go endpoint on one host get their own pages', async () => {
+  const { billingEntryForBaseURL } = await import('../runtime/harness/provider-billing.js');
+  assert.equal(billingEntryForBaseURL('https://api.z.ai/api/coding/paas/v4')?.kind, 'plan');
+  assert.equal(billingEntryForBaseURL('https://api.z.ai/api/paas/v4')?.kind, 'prepaid');
+  assert.equal(billingEntryForBaseURL('https://api.kimi.com/coding/v1')?.kind, 'plan');
+  assert.equal(billingEntryForBaseURL('https://llm.internal.example/v1'), undefined, 'an unknown endpoint gets no guessed link');
+  assert.equal(billingEntryForBaseURL('not a url'), undefined);
 });

@@ -163,6 +163,20 @@ test('classifyModelError: usage/plan quota exhausted → rate_limited (fallover)
     { retryable: true, kind: 'model.auth_expired', isAuth: true });
 });
 
+test('classifyModelError: a spent prepaid balance switches routes instead of retrying the same account', () => {
+  const paymentRequired = classifyModelError({ status: 402, message: '402 Credit limit exceeded' });
+  assert.deepEqual(pick(paymentRequired), { retryable: true, kind: 'model.rate_limited', isAuth: false });
+  assert.equal(paymentRequired.sameProviderRetryable, false, 'more attempts on an empty balance cannot help');
+  const spent = classifyModelError({ status: 429, message: '429', bodyText: '{"error":{"code":"credit_balance_exhausted"}}' });
+  assert.equal(spent.kind, 'model.rate_limited');
+  assert.equal(spent.sameProviderRetryable, false);
+  // A 403 whose words name spent credit is not an auth failure.
+  assert.deepEqual(pick(classifyModelError({ status: 403, message: 'Your team has used all available credits.' })),
+    { retryable: true, kind: 'model.rate_limited', isAuth: false });
+  // A burst rate limit keeps its same-provider retry.
+  assert.notEqual(classifyModelError({ status: 429, message: 'Too Many Requests' }).sameProviderRetryable, false);
+});
+
 test('classifyModelError: honors Retry-After header (seconds)', () => {
   const c = classifyModelError({ statusCode: 429, responseHeaders: { 'retry-after': '2' } });
   assert.equal(c.retryAfterMs, 2000);

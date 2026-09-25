@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { compactUsageText, formatTokenCount, presentUsageMeters, resetsInText } from '@clem/chat-engine';
+import { compactUsageText, creditRefusalSentence, formatBalance, formatTokenCount, presentUsageMeters, resetsInText } from '@clem/chat-engine';
 import {
   getCompletionReview,
   getConnectionsHealth,
@@ -471,19 +471,29 @@ function UsageCard() {
   const now = Date.now();
   if (!usage.data && !usage.error) return null;
   return (
-    <section class="card settings-card" aria-label="Usage">
-      <h2 class="settings-card-title">Usage</h2>
+    <section class="card settings-card" aria-label="Model accounts">
+      <h2 class="settings-card-title">Model accounts</h2>
       {usage.error && !usage.data ? (
         <p class="card-note">Could not load usage right now.</p>
       ) : meters.length === 0 ? (
         <p class="card-note">No model account is connected yet.</p>
       ) : meters.map((meter) => (
-        <div key={meter.id} class="usage-meter">
+        <div key={meter.id} class={`usage-meter${meter.outOfCredit ? ' usage-meter-out' : ''}`}>
           <div class="usage-meter-head">
             <span class="settings-row-label">{meter.label}</span>
-            <span class="usage-meter-compact">{compactUsageText(meter)}</span>
+            <span class={`usage-meter-compact${meter.outOfCredit ? ' usage-tone-danger' : ''}`}>{compactUsageText(meter)}</span>
           </div>
-          {meter.windows.map((w) => {
+          {meter.uses?.length ? <p class="settings-row-note">{sentenceCase(meter.uses.join(' · '))}</p> : null}
+          {meter.outOfCredit ? <p class="usage-out-note">{creditRefusalSentence(meter, clockTime)}</p> : null}
+          {meter.outOfCredit && meter.monthSpend ? (
+            <p class="settings-row-note">{formatBalance(meter.monthSpend)} billed this month</p>
+          ) : null}
+          {!meter.outOfCredit && meter.windows.length === 0 && (meter.balance ?? meter.monthSpend) ? (
+            <p class="settings-row-note">
+              {meter.balance ? 'Balance' : `${meter.label}’s figure`} as of {clockTime((meter.balance ?? meter.monthSpend)!.capturedAt)}
+            </p>
+          ) : null}
+          {meter.outOfCredit ? null : meter.windows.map((w) => {
             const reset = resetsInText(w.resetAt, now);
             return (
               <div key={w.id} class="usage-window">
@@ -498,15 +508,38 @@ function UsageCard() {
             );
           })}
           <p class="settings-row-note">
-            {meter.windows.length === 0 && meter.note ? `${meter.note} ` : ''}
+            {meter.windows.length === 0 && meter.note && !meter.outOfCredit && !meter.balance && !meter.monthSpend ? `${meter.note} ` : ''}
             {meter.spend
               ? `Today: ${formatTokenCount(meter.spend.tokens)} tokens · ${meter.spend.calls} call${meter.spend.calls === 1 ? '' : 's'}`
               : 'Today: nothing yet'}
           </p>
+          {meter.billing ? (
+            <a
+              class={`usage-billing-link${meter.outOfCredit ? ' urgent' : ''}`}
+              href={meter.billing.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label={`${meter.billing.action} for ${meter.label} on the provider's billing page`}
+            >
+              {meter.billing.action} ↗
+            </a>
+          ) : null}
         </div>
       ))}
+      <p class="card-note">Sign-ins and keys are added on your Mac, in Settings › Models.</p>
     </section>
   );
+}
+
+function sentenceCase(text: string): string {
+  return text ? text[0].toUpperCase() + text.slice(1) : text;
+}
+
+function clockTime(epochMs: number): string {
+  const d = new Date(epochMs);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : d.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
 /** Shown only when there is a meaningful choice. Every option id and label is

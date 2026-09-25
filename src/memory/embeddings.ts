@@ -6,6 +6,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { CUTOVER_HOLD } from '../runtime/cutover-hold.js';
+import { noteCreditAnswered, noteCreditRefused, OPENAI_KEY_ACCOUNT_ID } from '../runtime/provider-credit.js';
 import { openMemoryDb, STATE_DIR } from './db.js';
 import { startEmbeddingWorker } from './embedding-worker.js';
 
@@ -200,6 +201,7 @@ function providerCooldown(provider: EmbeddingProvider): PersistedProviderCooldow
 
 function markProviderCooldown(provider: EmbeddingProvider, cls: EmbedErrorClass, untilMs: number, failures: number): void {
   if (provider.name !== 'openai' || untilMs <= Date.now()) return;
+  if (cls === 'quota') noteCreditRefused(OPENAI_KEY_ACCOUNT_ID);
   loadProviderCooldowns();
   providerCooldowns.set(providerCooldownKey(provider), {
     cls,
@@ -212,6 +214,7 @@ function markProviderCooldown(provider: EmbeddingProvider, cls: EmbedErrorClass,
 
 function clearProviderCooldown(provider: EmbeddingProvider): void {
   if (provider.name !== 'openai') return;
+  noteCreditAnswered(OPENAI_KEY_ACCOUNT_ID);
   loadProviderCooldowns();
   if (providerCooldowns.delete(providerCooldownKey(provider))) persistProviderCooldowns();
 }
