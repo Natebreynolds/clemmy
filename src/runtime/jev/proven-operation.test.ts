@@ -532,3 +532,35 @@ test('the turn start spends one bounded wait on Jev picks, and a routed operatio
     _setToolSchemaLoaderForTests(null);
   }
 });
+
+test('a remembered run that only shares words is checked, and a rejected one leaves routing to run', async () => {
+  const { _setToolSchemaLoaderForTests } = await import('../../tools/composio-schema-cache.js');
+  _setToolSchemaLoaderForTests(async () => null);
+  recordZephyrStrategy("Build me a quokka brief workspace: today's calendar and emails waiting on my reply", 'outlook_get_calendar_view', 'quokka-build');
+  const picks: string[][] = [];
+  const routes: string[][] = [];
+  try {
+    const prepared = await prepareProvenOperationForRequest(
+      { query: 'Show me the quokka brief space' },
+      {
+        selectStrategy: async (_query, strategies) => {
+          picks.push(strategies.map((row) => row.objective));
+          return { strategy: null, failedOpen: false };
+        },
+        routeOperation: async (_request, candidates) => {
+          routes.push(candidates.map((row) => row.id));
+          const pick = candidates.find((row) => row.id === 'space_preview') ?? null;
+          return pick ? { pick, outcome: 'picked' as const, confidence: 0.9, fit: 0.9 } : { pick: null, outcome: 'none' as const };
+        },
+      },
+    );
+    assert.equal(picks.length, 1, 'a match that does not cover the request is not taken on keywords alone');
+    assert.match(picks[0]![0]!, /Build me a quokka brief workspace/);
+    assert.equal(routes.length, 1, 'once Jev rejects it, routing runs');
+    assert.ok(routes[0]!.includes('space_preview'));
+    assert.equal(prepared.strategyId, 'route:space_preview');
+    assert.doesNotMatch(prepared.text ?? '', /outlook_get_calendar_view/, 'the rejected run recommends nothing');
+  } finally {
+    _setToolSchemaLoaderForTests(null);
+  }
+});

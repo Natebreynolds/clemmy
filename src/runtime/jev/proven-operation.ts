@@ -574,8 +574,13 @@ export async function prepareProvenOperationForRequest(input: {
   // anything it or a chat proved.
   const strategyScope = runStrategyScopeForSession(input.sessionId) === 'workflow_step' ? 'any' as const : 'chat' as const;
   const matches = listMatchingRunStrategies(input.query, 4, { scope: strategyScope });
+  // A remembered run is taken on keywords alone only when it covers the
+  // request. One that merely shares words with it goes through Jev's check
+  // below like any other ambiguous match: live 300948, "Show me the Daily
+  // Brief space" matched a run that BUILT that space, whose calendar and mail
+  // tools were then recommended while routing to the space tools never ran.
   const lexical = pickProvenRunStrategy(matches);
-  let strategy = lexical;
+  let strategy = lexical && provenStrategyCoversRequest(input.query, lexical) ? lexical : null;
   // Every Jev pick here holds the request's first model frame, so together
   // they get one bounded wait. A pick that is late is not used.
   const jevDeadlineAt = (dependencies.now ?? Date.now)() + PROVEN_PICK_BUDGET_MS;
