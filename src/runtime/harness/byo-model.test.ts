@@ -1014,3 +1014,161 @@ test('native stream asks for the usage chunk and records it once, on the ALS ses
   assert.equal(row.cachedInputTokens, 900);
   assert.equal(row.outputTokens, 25);
 });
+
+// --- reply text streams where the rest of the completion is finished here ---
+type Chunk = AnyObj;
+const chunk = (delta: AnyObj, extra: AnyObj = {}): Chunk => ({
+  id: 'cs1', object: 'chat.completion.chunk', created: 7, model: 'deepseek-test',
+  choices: [{ index: 0, delta, finish_reason: null }], ...extra,
+});
+const finish = (reason: string, usage?: AnyObj): Chunk => ({
+  id: 'cs1', object: 'chat.completion.chunk', created: 7, model: 'deepseek-test',
+  choices: [{ index: 0, delta: {}, finish_reason: reason }], ...(usage ? { usage } : {}),
+});
+/** A streaming backend: yields its chunks, pausing after each so a test can
+ * observe what reached the SDK before the next one arrives. */
+function streamingBackend(chunks: Chunk[]) {
+  const calls: AnyObj[] = [];
+  const fn = async (params: AnyObj) => {
+    calls.push(params);
+    if (params.stream !== true) return completionWith('non-stream answer');
+    return (async function* () { for (const c of chunks) yield c; })();
+  };
+  return { fn: fn as unknown as (p: AnyObj, o?: unknown) => Promise<unknown>, calls };
+}
+const plainParams = (overrides: AnyObj = {}): AnyObj => ({
+  model: 'deepseek-test', messages: [{ role: 'user', content: 'go' }], stream: true, ...overrides,
+});
+const deltaOf = (c: AnyObj): AnyObj => (c.choices as AnyObj[])[0].delta as AnyObj;
+
+test('wrap(text stream): reply text passes through as it arrives; the rest closes the stream', async () => {
+  const backend = streamingBackend([
+    chunk({ role: 'assistant', reasoning_content: 'plan ' }),
+    chunk({ reasoning_content: 'the reply' }),
+    chunk({ content: 'Thursday has ' }),
+    chunk({ content: 'three meetings.' }),
+    finish('stop'),
+    { id: 'cs1', object: 'chat.completion.chunk', created: 7, model: 'deepseek-test', choices: [], usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 } },
+  ]);
+  const chunks = await collect(await wrapCompletionsCreate(backend.fn)(plainParams()));
+  assert.equal(backend.calls.length, 1, 'one wire request');
+  assert.equal(backend.calls[0].stream, true);
+  assert.deepEqual((backend.calls[0].stream_options as AnyObj).include_usage, true);
+  assert.deepEqual(chunks.slice(0, 2).map((c) => deltaOf(c).content), ['Thursday has ', 'three meetings.']);
+  const closing = chunks.at(-1)!;
+  assert.equal(chunks.length, 3);
+  assert.equal(deltaOf(closing).content, undefined, 'no text is sent twice');
+  assert.equal(deltaOf(closing).reasoning, 'plan the reply', 'reasoning is lifted exactly as the buffered path lifts it');
+  assert.equal((closing.choices as AnyObj[])[0].finish_reason, 'stop');
+  assert.deepEqual(closing.usage, { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 });
+});
+
+test('wrap(text stream): tool calls are held and closed repaired, with their reasoning', async () => {
+  const backend = streamingBackend([
+    chunk({ reasoning_content: 'list tasks first' }),
+    chunk({ tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'composio_execute_tool', arguments: '' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: '{"tool_slug":"PROOF_LIST_TASKS",' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: '"arguments":"{}"}' } }] }),
+    finish('tool_calls'),
+  ]);
+  const chunks = await collect(await wrapCompletionsCreate(backend.fn)(plainParams({ tools: strictComposioCarrierTool })));
+  assert.equal(chunks.length, 1, 'nothing reaches the SDK before the calls are whole');
+  const delta = deltaOf(chunks[0]);
+  assert.equal(delta.reasoning, 'list tasks first');
+  const call = (delta.tool_calls as AnyObj[])[0];
+  assert.equal(call.id, 'call-1');
+  assert.deepEqual(JSON.parse((call.function as AnyObj).arguments as string), {
+    tool_slug: 'PROOF_LIST_TASKS', arguments: '{}', connected_account_id: null,
+  }, 'strict-nullable omissions are materialized as on the buffered path');
+  assert.equal((chunks[0].choices as AnyObj[])[0].finish_reason, 'tool_calls');
+});
+
+test('wrap(text stream): a leading think block is held until it closes and becomes reasoning', async () => {
+  const backend = streamingBackend([
+    chunk({ content: '<thi' }),
+    chunk({ content: 'nk>weigh the options</think>\n\n' }),
+    chunk({ content: 'Go with the second ' }),
+    chunk({ content: 'vendor.' }),
+    finish('stop'),
+  ]);
+  const chunks = await collect(await wrapCompletionsCreate(backend.fn)(plainParams()));
+  const streamedText = chunks.map((c) => deltaOf(c).content ?? '').join('');
+  assert.equal(streamedText, 'Go with the second vendor.');
+  assert.ok(chunks.every((c) => !String(deltaOf(c).content ?? '').includes('<think')));
+  assert.equal(deltaOf(chunks.at(-1)!).reasoning, 'weigh the options');
+});
+
+test('wrap(text stream): a reply left in the reasoning channel is promoted in the closing chunk', async () => {
+  const backend = streamingBackend([chunk({ reasoning_content: 'Paris is the capital.' }), finish('stop')]);
+  const chunks = await collect(await wrapCompletionsCreate(backend.fn)(plainParams()));
+  assert.equal(chunks.length, 1);
+  assert.equal(deltaOf(chunks[0]).content, 'Paris is the capital.');
+  assert.equal(deltaOf(chunks[0]).reasoning, undefined, 'never doubled into reasoning');
+});
+
+test('wrap(text stream): a refused stream shape is asked once without streaming; other failures are not retried here', async () => {
+  const refused = makeFake([(p) => {
+    if (p.stream === true) throw Object.assign(new Error('stream_options not supported'), { status: 400 });
+    return completionWith('buffered answer');
+  }]);
+  const chunks = await collect(await wrapCompletionsCreate(refused.fn)(plainParams()));
+  assert.deepEqual(refused.calls.map((c) => c.stream), [true, false]);
+  assert.equal(deltaOf(chunks[0]).content, 'buffered answer');
+
+  const limited = makeFake([() => { throw Object.assign(new Error('rate limited'), { status: 429 }); }]);
+  await assert.rejects(wrapCompletionsCreate(limited.fn)(plainParams()), /rate limited/);
+  assert.equal(limited.calls.length, 1, 'the resilience layer owns retry and backoff');
+
+  const refusedTwice = makeFake([() => { throw Object.assign(new Error('bad request'), { status: 400 }); }]);
+  await assert.rejects(wrapCompletionsCreate(refusedTwice.fn)(plainParams()), /bad request/);
+  assert.equal(refusedTwice.calls.length, 2, 'the non-streaming fallback does not probe a stream again');
+});
+
+test('wrap(text stream): the buffered-request marker holds until reply text flows, and held frames are activity', async () => {
+  const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js');
+  const context: AnyObj & { bufferedProviderRequests?: Set<{ active: boolean }>; privateModelActivityAt?: number } = {
+    sessionId: 'byo-text-stream-marker', counter: new ToolCallsCounter(4),
+  };
+  const backend = streamingBackend([chunk({ reasoning_content: 'thinking' }), chunk({ content: 'Answer.' }), finish('stop')]);
+  const stream = await withHarnessRunContext(context as never, () => wrapCompletionsCreate(backend.fn)(plainParams()));
+  const owner = [...(context.bufferedProviderRequests ?? [])][0];
+  assert.equal(owner?.active, true, 'the paid request is owned before any text');
+  const iterator = (stream as AsyncIterable<AnyObj>)[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  assert.equal(deltaOf(first.value as AnyObj).content, 'Answer.');
+  assert.equal(owner?.active, false, 'visible text ends the buffered interval');
+  assert.equal(typeof context.privateModelActivityAt, 'number');
+  while (!(await iterator.next()).done) { /* drain */ }
+  assert.equal(context.bufferedProviderRequests?.size, 0);
+});
+
+test('conformance(text stream): the SDK sees incremental text and protocol-legal items', async () => {
+  const backend = streamingBackend([
+    chunk({ reasoning_content: 'check first' }),
+    chunk({ content: 'Hello ' }),
+    chunk({ content: 'world' }),
+    finish('stop', { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }),
+  ]);
+  const model = new OpenAIChatCompletionsModel(fakeClient(backend.fn as never) as never, 'deepseek-test');
+  const deltas: string[] = [];
+  let output: unknown[] = [];
+  await withTrace('byo-text-stream', async () => {
+    for await (const ev of model.getStreamedResponse(conformanceRequest() as never) as AsyncIterable<AnyObj>) {
+      if (ev.type === 'output_text_delta') deltas.push(ev.delta as string);
+      if (ev.type === 'response_done') output = (ev.response as AnyObj).output as unknown[];
+    }
+  });
+  assert.deepEqual(deltas, ['Hello ', 'world']);
+  assert.deepEqual(output.map((item) => (item as AnyObj).type), ['reasoning', 'message']);
+  assertItemsConform('text stream', output);
+});
+
+test('wrap(text stream): usage reported on the final choice still closes the stream', async () => {
+  const usage = { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 };
+  const backend = streamingBackend([
+    chunk({ content: 'Done.' }),
+    { id: 'cs1', object: 'chat.completion.chunk', created: 7, model: 'deepseek-test', choices: [{ index: 0, delta: {}, finish_reason: 'stop', usage }] },
+  ]);
+  const chunks = await collect(await wrapCompletionsCreate(backend.fn)(plainParams()));
+  assert.deepEqual(chunks.at(-1)!.usage, usage);
+});
