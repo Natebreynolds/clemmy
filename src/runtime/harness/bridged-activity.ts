@@ -19,6 +19,7 @@ import type { EventType, EventRow as HarnessEventRow, SessionRow as HarnessSessi
 import { listEvents as listHarnessEvents, listSessions as listHarnessSessions } from './eventlog.js';
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import { getBackgroundTask } from '../../execution/background-tasks.js';
+import { getCodingRun, listCodingRuns, runIdFromCodingSession } from '../../execution/coding-run-store.js';
 import { readWorkflowRunOriginSessionIds } from '../../tools/workflow-run-queue.js';
 
 export const BRIDGED_BACKGROUND_ACTIVITY_TYPES: ReadonlySet<string> = new Set([
@@ -37,6 +38,10 @@ export const BRIDGED_BACKGROUND_ACTIVITY_TYPES: ReadonlySet<string> = new Set([
   // Files landing in a promoted run belong in the origin chat's live feed —
   // the drafting-emails scenario is exactly the work users background.
   'deliverable_saved',
+  // A delegated coding agent the chat dispatched: what it is doing now, and
+  // how its run settled.
+  'coding_run_activity',
+  'coding_run_settled',
 ]);
 
 const BRIDGED_BACKGROUND_ACTIVITY_TYPE_LIST =
@@ -71,7 +76,17 @@ export function isCanonicalBridgedActivity(event: HarnessEventRow | { type: stri
 export function createBridgePredicate(originSessionId: string): (eventSessionId: string) => boolean {
   const backgroundOriginCache = new Map<string, string | null>();
   const workflowOriginCache = new Map<string, string[]>();
+  const codingOriginCache = new Map<string, string | null>();
   return (eventSessionId: string): boolean => {
+    const codingRunId = runIdFromCodingSession(eventSessionId);
+    if (codingRunId) {
+      let origin = codingOriginCache.get(codingRunId);
+      if (origin === undefined) {
+        try { origin = getCodingRun(codingRunId)?.originSessionId ?? null; } catch { origin = null; }
+        codingOriginCache.set(codingRunId, origin);
+      }
+      return origin === originSessionId;
+    }
     if (eventSessionId.startsWith('background:')) {
       let origin = backgroundOriginCache.get(eventSessionId);
       if (origin === undefined) {
@@ -145,4 +160,40 @@ export function collectBridgedWorkflowReplay(
     }
   }
   return out;
+}
+
+const CODING_REPLAY_TYPES: EventType[] = ['coding_run_activity', 'coding_run_settled'];
+
+/**
+ * Replay-side counterpart for coding runs: their activity rides the origin
+ * chat's replay so a reconnect mid-run shows the agent's row immediately.
+ * The run store names each run's origin, so no marker on the origin is needed.
+ */
+export function collectBridgedCodingReplay(originSessionId: string): HarnessEventRow[] {
+  let runs: ReturnType<typeof listCodingRuns> = [];
+  try {
+    runs = listCodingRuns({ originSessionId, limit: 20 });
+  } catch {
+    return [];
+  }
+  const out: HarnessEventRow[] = [];
+  for (const run of runs) {
+    try {
+      // The newest rows (a long run's settlement is its last event), returned
+      // in chronological order.
+      out.push(...listHarnessEvents(run.sessionId, { types: CODING_REPLAY_TYPES, desc: true, limit: 200 }));
+    } catch { /* a run whose session never opened has nothing to replay */ }
+  }
+  return out;
+}
+
+/** Everything a chat's replay bridges in from work it delegated. */
+export function collectBridgedDelegatedReplay(
+  originSessionId: string,
+  originEvents: HarnessEventRow[],
+): HarnessEventRow[] {
+  return [
+    ...collectBridgedWorkflowReplay(originSessionId, originEvents),
+    ...collectBridgedCodingReplay(originSessionId),
+  ];
 }

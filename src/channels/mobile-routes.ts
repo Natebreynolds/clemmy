@@ -115,7 +115,7 @@ import {
   PUBLIC_RUN_FAILURE_TEXT,
 } from '../runtime/harness/public-presentation.js';
 import {
-  collectBridgedWorkflowReplay,
+  collectBridgedDelegatedReplay,
   createBridgePredicate,
   isCanonicalBridgedActivity,
 } from '../runtime/harness/bridged-activity.js';
@@ -3688,7 +3688,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // Merge host-dispatched workflow activity into the replay so a
       // reconnect mid-run seeds the live activity strip instead of waiting
       // for the next tool frame — same rule as the desktop console stream.
-      const bridged = collectBridgedWorkflowReplay(session.id, ownPage.events);
+      const bridged = collectBridgedDelegatedReplay(session.id, ownPage.events);
       // Child activity is incidental context. It never consumes the origin's
       // raw page or supplies a traversal cursor, and this is not child history.
       const shaped = [...ownPage.events, ...projectHarnessEventsForPublic(bridged)]
@@ -3775,7 +3775,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const ownPage = readPublicHarnessEventPage(session.id, {
         sinceSeq: req.query.sinceSeq, throughSeq: req.query.throughSeq, limit: req.query.limit ?? 200,
       });
-      const bridged = collectBridgedWorkflowReplay(session.id, ownPage.events);
+      const bridged = collectBridgedDelegatedReplay(session.id, ownPage.events);
       const shaped = [...ownPage.events, ...projectHarnessEventsForPublic(bridged)]
         .sort((a, b) => a.seq - b.seq).map(serializeEventForMobile);
       res.json({ sessionId: session.id, sessionStatus: session.status,
@@ -4523,7 +4523,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     if (!session) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
     try {
       const ownEvents = harnessListEvents(session.id, { limit: 400 });
-      const bridged = collectBridgedWorkflowReplay(session.id, ownEvents);
+      const bridged = collectBridgedDelegatedReplay(session.id, ownEvents);
       const merged = [...ownEvents, ...bridged].sort((a, b) => a.seq - b.seq);
       const shaped = projectHarnessEventsForPublic(merged.slice(-400)).map(serializeEventForMobile);
 

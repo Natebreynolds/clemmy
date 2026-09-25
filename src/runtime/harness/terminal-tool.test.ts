@@ -6,6 +6,7 @@ import {
   ASK_USER_QUESTION_AUTO_RESOLVED_PREFIX,
   formatAutoResolvedAskUserQuestionOutput,
   parseAsyncReadRefinementTerminalResult,
+  renderTerminalToolReply,
 } from './terminal-tool.js';
 
 const asyncReadScopeGate = {
@@ -211,4 +212,22 @@ test('the alignment-beat refusal is a failed control receipt and fabricates noth
   assert.equal(terminalToolShouldHalt('dispatch_background_task', refusal), false);
   const rendered = renderTerminalToolReply('dispatch_background_task', null, 'anything without a dispatch receipt');
   assert.doesNotMatch(rendered, /^Started "/, 'no fabricated handoff claim without a real receipt');
+});
+
+test('dispatch_coding_task halts on an admission receipt and renders the handoff honestly', () => {
+  const receipt = 'Dispatched coding run code-abc-12345678: Claude Code will work on "Add greet" in fixture on its own branch clem/add-greet-12345678 (cut from main). '
+    + 'The user\'s checkout is untouched.\n[harness-directive] Tell the user in your own words that it is running.';
+  assert.equal(isTerminalToolName('mcp__clementine__dispatch_coding_task'), true);
+  assert.equal(terminalToolShouldHalt('dispatch_coding_task', receipt), true);
+  assert.equal(
+    renderTerminalToolReply('dispatch_coding_task', { handoff_note: 'On it — Claude Code is adding greet() on its own branch.' }, receipt),
+    'On it — Claude Code is adding greet() on its own branch.',
+  );
+  const fallback = renderTerminalToolReply('dispatch_coding_task', {}, receipt);
+  assert.match(fallback, /^Claude Code is working on "Add greet" in fixture, on its own branch clem\/add-greet-12345678\./);
+  assert.doesNotMatch(fallback, /harness-directive/);
+
+  const refused = JSON.stringify({ ok: false, code: 'coding_project_not_git', reason: 'fixture is not a git repository.' });
+  assert.equal(terminalToolShouldHalt('dispatch_coding_task', refused), false, 'a refusal goes back to the model');
+  assert.doesNotMatch(renderTerminalToolReply('dispatch_coding_task', {}, refused), /is working on/);
 });

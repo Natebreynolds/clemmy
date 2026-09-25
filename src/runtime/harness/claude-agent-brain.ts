@@ -1493,7 +1493,8 @@ async function buildClaudeAgentBrainTurnContext(
   }
   // Project-command deliverable routes (parity with the context packet — this
   // lane doesn't consume the packet): when the ask matches a local project's
-  // own slash command, steer to project_run instead of an in-loop rebuild.
+  // own slash command, surface it as context (a coding agent dispatched with
+  // dispatch_coding_task can run it) instead of an in-loop rebuild.
   let projectRoutes = '';
   if (!declinedContinuation) {
     try { projectRoutes = projectCommandsLineForInput(taskInput) ?? ''; } catch { projectRoutes = ''; }

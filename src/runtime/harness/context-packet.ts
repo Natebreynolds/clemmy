@@ -104,7 +104,8 @@ export interface AgentContextPacket {
   skills: RankedContextCandidate[];
   workflows: RankedContextCandidate[];
   /** Local project slash commands (proposal-builder's /seo-audit, …) whose
-   *  names match the request — the project_run route to the REAL deliverable. */
+   *  names match the request — context for the REAL deliverable, never an
+   *  attestation that an executor is available. */
   projectCommands: RankedContextCandidate[];
   toolScope: McpToolScope;
   mcp: Array<Pick<MCPServerHealthSnapshot, 'slug' | 'state' | 'toolCount' | 'failureCount' | 'lastError'>>;

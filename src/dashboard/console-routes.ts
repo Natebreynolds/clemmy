@@ -103,6 +103,13 @@ import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflo
 import { normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
 import { getGuestRun, killGuestRun, listGuestRuns, type GuestRunJob } from '../execution/guest-run-jobs.js';
 import {
+  getCodingRun,
+  getCodingRunSettlement,
+  listCodingRuns,
+  requestCodingRunStop,
+  type CodingRunRecord,
+} from '../execution/coding-run-store.js';
+import {
   validateWorkflowDefinition as runValidator,
   type WorkflowValidation,
 } from '../execution/workflow-validator.js';
@@ -595,6 +602,7 @@ import {
 } from '../runtime/harness/trace-lab.js';
 import { buildStartupDoctor } from '../runtime/startup-doctor.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
+import { collectBridgedCodingReplay, createBridgePredicate } from '../runtime/harness/bridged-activity.js';
 
 function toolEventsDir(): string {
   return path.join(process.env.CLEMENTINE_HOME || BASE_DIR, 'state', 'tool-events');
@@ -1867,6 +1875,9 @@ function isWorkflowStepHarnessSession(session: HarnessSessionRow): boolean {
 }
 
 function isConsoleVisibleHarnessSession(session: HarnessSessionRow): boolean {
+  // A coding run's session carries its live activity; the run itself is one
+  // board card from the coding-run store, never a second harness card.
+  if (session.id.startsWith('coding:')) return false;
   return session.kind === 'chat'
     || session.kind === 'workflow'
     || session.status === 'active'
@@ -1875,6 +1886,46 @@ function isConsoleVisibleHarnessSession(session: HarnessSessionRow): boolean {
     || session.channel === 'workflow'
     || session.metadata.source === 'workflow'
     || session.metadata.source === 'desktop';
+}
+
+function codingRunBoardCard(run: CodingRunRecord): BoardCard {
+  const settlement = run.state === 'settled' ? getCodingRunSettlement(run.runId) : null;
+  const agent = run.agent === 'codex' ? 'Codex' : 'Claude Code';
+  const live = run.state !== 'settled';
+  const column: BoardColumnId = run.state === 'admitted' ? 'queued' : live ? 'running' : 'done';
+  const progressHint = settlement
+    ? settlement.outcome === 'completed_verified'
+      ? `Done and checked · ${settlement.commits.length} commit(s) on ${run.branch}`
+      : settlement.outcome === 'completed_unverified'
+        ? `Done on ${run.branch}; not verified`
+        : settlement.outcome === 'cancelled' ? 'Stopped' : settlement.reason
+    : run.stopRequestedAt
+      ? 'Stopping…'
+      : `${agent} is working on ${run.branch}${run.round > 0 ? ` (review round ${run.round + 1})` : ''}`;
+  return {
+    id: `coding:${run.runId}`,
+    sourceKind: 'coding',
+    title: `${run.projectName}: ${run.objective.length > 60 ? `${run.objective.slice(0, 60)}…` : run.objective}`,
+    column,
+    status: settlement?.outcome ?? run.state,
+    progressHint,
+    sessionId: run.sessionId,
+    ageMs: Math.max(0, Date.now() - Date.parse(run.updatedAt)),
+    updatedAt: run.updatedAt,
+    actions: live && !run.stopRequestedAt ? ['cancel'] : [],
+    ...(live && !run.stopRequestedAt ? { cancelEndpoint: `/api/console/coding-runs/${encodeURIComponent(run.runId)}/stop` } : {}),
+    primaryAction: 'none',
+    continueMode: 'none',
+    ...(live ? { nextSafeAction: `Watch ${agent} work, or stop it — its branch keeps what it has done.` } : {}),
+    raw: {
+      codingRunId: run.runId,
+      agent: run.agent,
+      projectName: run.projectName,
+      branch: run.branch,
+      objective: run.objective,
+      originSessionId: run.originSessionId,
+    },
+  };
 }
 
 function harnessSessionSourceLabel(session: HarnessSessionRow): string {
@@ -2911,7 +2962,7 @@ interface BoardNextEdge {
 
 interface BoardCard {
   id: string;
-  sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule' | 'guest';
+  sourceKind: 'background' | 'run' | 'execution' | 'workflow' | 'approval' | 'schedule' | 'guest' | 'coding';
   title: string;
   column: BoardColumnId;
   /** Raw source status, for the pill label / tooltip. */
@@ -7362,6 +7413,63 @@ export function registerConsoleRoutes(
     const run = killGuestRun(req.params.id);
     if (!run) { res.status(404).json({ ok: false, reason: 'no such guest run' }); return; }
     res.json({ ok: true, status: run.status });
+  });
+
+  // ─── Coding runs (dispatch_coding_task) ──────────────────────
+
+  const codingRunView = (run: CodingRunRecord) => {
+    const settlement = run.state === 'settled' ? getCodingRunSettlement(run.runId) : null;
+    return {
+      runId: run.runId,
+      sessionId: run.sessionId,
+      agent: run.agent,
+      projectName: run.projectName,
+      projectPath: run.projectPath,
+      branch: run.branch,
+      baseRef: run.baseRef,
+      objective: run.objective,
+      acceptance: run.acceptance,
+      testCommand: run.testCommand,
+      state: run.state,
+      round: run.round,
+      maxRounds: run.maxRounds,
+      originSessionId: run.originSessionId,
+      stopRequestedAt: run.stopRequestedAt,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+      settlement: settlement
+        ? {
+          outcome: settlement.outcome,
+          reason: settlement.reason,
+          commits: settlement.commits,
+          diffStat: settlement.diffStat,
+          testExitCode: settlement.testExitCode,
+          verdict: settlement.verdict,
+          settledAt: settlement.settledAt,
+        }
+        : null,
+    };
+  };
+
+  app.get('/api/console/coding-runs', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const origin = typeof req.query.originSessionId === 'string' ? req.query.originSessionId : undefined;
+    res.json({ runs: listCodingRuns({ originSessionId: origin, limit: 50 }).map(codingRunView) });
+  });
+
+  app.get('/api/console/coding-runs/:id', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const run = getCodingRun(req.params.id);
+    if (!run) { res.status(404).json({ error: 'no such coding run' }); return; }
+    res.json(codingRunView(run));
+  });
+
+  app.post('/api/console/coding-runs/:id/stop', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const run = requestCodingRunStop(req.params.id, 'Stopped from the board.');
+    if (!run) { res.status(404).json({ ok: false, reason: 'no such coding run' }); return; }
+    if (run.state === 'settled') { res.json({ ok: false, reason: 'This run already finished.' }); return; }
+    res.json({ ok: true, status: 'stop_requested' });
   });
 
   // ─── Projects (workspace) ─────────────────────────────────────
@@ -12561,6 +12669,12 @@ export function registerConsoleRoutes(
         });
       }
 
+      // Coding runs — a coding agent working in its own worktree, owned by the
+      // coding-run store. The card streams the run's own session live.
+      for (const run of listCodingRuns({ limit: 50 })) {
+        cards.push(codingRunBoardCard(run));
+      }
+
       // U1 (v2.3.0): one pipeline = one card. A background task's ORIGIN chat
       // attempt is the same pipeline — its FINISHED attempt card (the handoff
       // turn) duplicates the task card (live 2026-07-22: bg row + completed
@@ -15072,6 +15186,9 @@ export function registerConsoleRoutes(
     // Files landing in a promoted run belong in the origin chat's live feed —
     // the drafting-emails scenario is exactly the work users background.
     'deliverable_saved',
+    // A delegated coding agent the chat dispatched.
+    'coding_run_activity',
+    'coding_run_settled',
   ]);
   const BRIDGED_BACKGROUND_ACTIVITY_TYPE_LIST = [...BRIDGED_BACKGROUND_ACTIVITY_TYPES] as EventType[];
 
@@ -15183,6 +15300,8 @@ export function registerConsoleRoutes(
       const ownEvents = listHarnessEvents(sessionId, { sinceSeq, limit: 500 });
       const workflowEvents = collectBridgedWorkflowReplay(sessionId, ownEvents)
         .filter((ev) => ev.seq > sinceSeq);
+      const codingEvents = collectBridgedCodingReplay(sessionId)
+        .filter((ev) => ev.seq > sinceSeq);
       // Helpers this turn spawned: the raw worker_started carries the child
       // session id, so a reconnect mid-run re-seeds the helper's steps too.
       const workerItems = new Map<string, string>();
@@ -15200,7 +15319,7 @@ export function registerConsoleRoutes(
           }
         } catch { /* a missing worker session only costs its replay */ }
       }
-      const merged = [...ownEvents, ...workflowEvents, ...workerEvents].sort((a, b) => a.seq - b.seq);
+      const merged = [...ownEvents, ...workflowEvents, ...codingEvents, ...workerEvents].sort((a, b) => a.seq - b.seq);
       const replay = projectHarnessEventsForPublic(merged.slice(-500)).map((row) => {
         const item = workerItems.get(row.sessionId);
         return item === undefined ? row : { ...row, worker: { sessionId: row.sessionId, item } };
@@ -15247,7 +15366,9 @@ export function registerConsoleRoutes(
       }
       return lineage;
     };
+    const codingBridge = createBridgePredicate(sessionId);
     const bridgesToThisSession = (eventSessionId: string): boolean => {
+      if (eventSessionId.startsWith('coding:')) return codingBridge(eventSessionId);
       if (eventSessionId.startsWith('sess-worker-')) {
         return workerLineage(eventSessionId)?.parentSessionId === sessionId;
       }

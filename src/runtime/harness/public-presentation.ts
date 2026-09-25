@@ -637,6 +637,55 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
 
 const PUBLIC_TOOL_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/;
 
+/**
+ * A delegated coding agent's live activity. Text was redacted when the
+ * executor wrote it; this bounds it again and admits only the fields each
+ * kind carries. An unknown kind stays private.
+ */
+function publicCodingRunActivity(data: Record<string, unknown>): Record<string, unknown> | null {
+  const kind = typeof data.kind === 'string' ? data.kind : '';
+  const base = selected(data, ['runId', 'agent', 'kind']);
+  const textField = (max: number) => {
+    const value = shortString(data.text, max);
+    return value ? { text: value } : {};
+  };
+  switch (kind) {
+    case 'status':
+      return { ...base, ...selected(data, ['state', 'projectName', 'branch']), ...textField(400),
+        ...(shortString(data.objective, 300) ? { objective: shortString(data.objective, 300) } : {}) };
+    case 'clem_message':
+    case 'agent_message':
+      return { ...base, ...selected(data, ['nested']), ...textField(4_000) };
+    case 'plan': {
+      const items = Array.isArray(data.items)
+        ? data.items.slice(0, 40).flatMap((item) => {
+          if (!item || typeof item !== 'object') return [];
+          const row = item as { text?: unknown; status?: unknown };
+          const itemText = shortString(row.text, 200);
+          const status = row.status === 'completed' || row.status === 'in_progress' ? row.status : 'pending';
+          return itemText ? [{ text: itemText, status }] : [];
+        })
+        : [];
+      return { ...base, items };
+    }
+    case 'step_started':
+      return { ...base, ...selected(data, ['stepId', 'tool', 'nested']),
+        ...(shortString(data.detail, 300) ? { detail: shortString(data.detail, 300) } : {}) };
+    case 'step_finished':
+      return { ...base, ...selected(data, ['stepId', 'ok']),
+        ...(shortString(data.output, 1_500) ? { output: shortString(data.output, 1_500) } : {}) };
+    case 'permission':
+      return { ...base, ...selected(data, ['stepId', 'tool', 'decision', 'effect']),
+        ...(shortString(data.detail, 300) ? { detail: shortString(data.detail, 300) } : {}),
+        ...(shortString(data.reason, 400) ? { reason: shortString(data.reason, 400) } : {}) };
+    case 'review':
+      return { ...base, ...selected(data, ['verdict', 'next', 'commitCount', 'filesChanged', 'testExitCode']),
+        ...(shortString(data.reason, 600) ? { reason: shortString(data.reason, 600) } : {}) };
+    default:
+      return null;
+  }
+}
+
 function firstString(...values: unknown[]): string {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value.trim();
@@ -939,6 +988,14 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'worker_result':
     case 'worker_capped':
       return selected(data, ['item', 'role', 'model', 'provider', 'ok']);
+    case 'coding_run_activity':
+      return publicCodingRunActivity(data);
+    case 'coding_run_settled':
+      return {
+        ...selected(data, ['runId', 'agent', 'outcome', 'branch', 'projectName', 'headCommit',
+          'commitCount', 'filesChanged', 'insertions', 'deletions', 'testExitCode', 'verdict']),
+        ...(shortString(data.reason, 600) ? { reason: shortString(data.reason, 600) } : {}),
+      };
     case 'batch_started':
     case 'batch_progress':
     case 'batch_completed':

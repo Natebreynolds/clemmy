@@ -539,7 +539,99 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         tone: ok ? 'muted' : 'danger',
       }];
     }
+    case 'coding_run_activity':
+      return foldCodingRunActivity(prev, d, now);
+    case 'coding_run_settled':
+      return foldCodingRunSettled(prev, d);
     default:
       return prev;
   }
+}
+
+// ─── Delegated coding agents ────────────────────────────────────────────
+// One row per coding run in the chat that dispatched it: the agent and its
+// task as the label, what it is doing right now as the detail. The full
+// Clem ↔ agent conversation lives on the run's own view; the strip only has
+// to answer "is it still working, and on what".
+
+function codingAgentName(agent: unknown): string {
+  return agent === 'codex' ? 'Codex' : 'Claude Code';
+}
+
+function codingRowId(d: Record<string, unknown>): string | null {
+  return typeof d.runId === 'string' && d.runId ? `coding-${d.runId}` : null;
+}
+
+function firstLine(value: unknown, max = 140): string {
+  if (typeof value !== 'string') return '';
+  const line = value.split('\n').map((part) => part.trim()).find(Boolean) ?? '';
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+function codingDetail(d: Record<string, unknown>): string | null {
+  switch (d.kind) {
+    case 'status': return firstLine(d.text) || null;
+    case 'agent_message': return d.nested === true ? null : firstLine(d.text) || null;
+    case 'step_started': {
+      const tool = typeof d.tool === 'string' ? d.tool : '';
+      const detail = firstLine(d.detail, 110);
+      return tool ? (detail ? `${tool}: ${detail}` : tool) : null;
+    }
+    case 'plan': {
+      const items = Array.isArray(d.items) ? d.items as Array<{ status?: unknown }> : [];
+      if (items.length === 0) return null;
+      const done = items.filter((item) => item?.status === 'completed').length;
+      return `Plan: ${done} of ${items.length} done`;
+    }
+    case 'permission':
+      return d.decision === 'deny' ? `Refused ${typeof d.tool === 'string' ? d.tool : 'a step'}: ${firstLine(d.reason, 110)}` : null;
+    case 'review':
+      return d.next === 'continue'
+        ? `Clem sent it back: ${firstLine(d.reason, 110)}`
+        : `Clem checked the work: ${firstLine(d.reason, 110)}`;
+    default:
+      return null;
+  }
+}
+
+function foldCodingRunActivity(prev: ActivityItem[], d: Record<string, unknown>, now: () => number): ActivityItem[] {
+  const id = codingRowId(d);
+  if (!id) return prev;
+  const detail = codingDetail(d);
+  const existing = prev.find((row) => row.id === id);
+  if (!existing) {
+    const task = firstLine(d.objective, 100) || (typeof d.projectName === 'string' ? d.projectName : '');
+    return [...prev, {
+      id,
+      kind: 'agent',
+      label: task ? `${codingAgentName(d.agent)} · ${task}` : codingAgentName(d.agent),
+      ...(detail ? { detail } : {}),
+      provider: d.agent === 'codex' ? 'codex' : 'claude',
+      status: 'running',
+      startedAt: now(),
+    }];
+  }
+  if (!detail || existing.status !== 'running') return prev;
+  return prev.map((row) => (row.id === id ? { ...row, detail } : row));
+}
+
+function foldCodingRunSettled(prev: ActivityItem[], d: Record<string, unknown>): ActivityItem[] {
+  const id = codingRowId(d);
+  if (!id) return prev;
+  const outcome = typeof d.outcome === 'string' ? d.outcome : '';
+  const status: ActivityItem['status'] = outcome.startsWith('completed') ? 'done'
+    : outcome === 'cancelled' ? 'interrupted' : 'failed';
+  const commits = typeof d.commitCount === 'number' ? d.commitCount : 0;
+  const branch = typeof d.branch === 'string' ? d.branch : '';
+  const detail = outcome === 'completed_verified'
+    ? `Done and checked${commits ? ` · ${commits} commit${commits === 1 ? '' : 's'}` : ''}${branch ? ` on ${branch}` : ''}`
+    : outcome === 'completed_unverified' ? 'Done, not verified'
+      : outcome === 'cancelled' ? 'Stopped'
+        : firstLine(d.reason) || 'Did not finish';
+  const tone: ActivityItem['tone'] = outcome === 'completed_verified' ? 'success'
+    : outcome === 'completed_unverified' || outcome === 'cancelled' ? 'warning' : 'danger';
+  if (!prev.some((row) => row.id === id)) {
+    return [...prev, { id, kind: 'agent', label: codingAgentName(d.agent), detail, provider: d.agent === 'codex' ? 'codex' : 'claude', status, tone }];
+  }
+  return prev.map((row) => (row.id === id ? { ...row, status, detail, tone } : row));
 }

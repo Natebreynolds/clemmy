@@ -26,6 +26,7 @@ const CONTROL_ONLY_TOOLS = new Set([
   'ask_user_question',
   'request_approval',
   'dispatch_background_task',
+  'dispatch_coding_task',
   'hold_task_for_later',
   'resume_held_task',
   'workflow_step_result',

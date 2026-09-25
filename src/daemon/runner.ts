@@ -3339,6 +3339,16 @@ export async function startDaemon(
     workflowRunTimer.unref?.();
   }
 
+  // Delegated coding agents: the daemon is the only owner that starts them.
+  // Admitted runs are claimed on its own timer; runs a previous daemon left
+  // behind resume in the agent's own session.
+  try {
+    const { startCodingRunExecutor } = await import('../execution/coding-run-executor.js');
+    startCodingRunExecutor();
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Coding run executor failed to start');
+  }
+
   // Calendar watch heartbeat: a minute-level check that ticks on the policy
   // cadence, reads every connected calendar through the prepared read path,
   // diffs deterministically, and asks Jev only about low-signal changes. It

@@ -437,6 +437,7 @@ test('delegation primitives are exactly the host-local unpropagated child and fu
     'create_agent',
     'delegate_task',
     'dispatch_background_task',
+    'dispatch_coding_task',
     'execution_create',
     'execution_reconcile_write',
     'execution_update_step',
