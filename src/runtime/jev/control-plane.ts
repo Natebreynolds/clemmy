@@ -13,7 +13,6 @@ const PRIMER_TIMEOUT_MS = 1_200;
 const GATE_TIMEOUT_MS = 1_500;
 const PRIMER_DROP_BELOW = 0.25;
 const GROUNDING_CONFIDENCE_MIN = 0.55;
-const COMPLETION_CONFIDENCE_MIN = 0.6;
 const READ_NOMINATION_CONFIDENCE_MIN = 0.6;
 // Live 2026-09-22: a completion verdict timed out at 1,525 ms while the two
 // hits landed at 270 and 988 ms. With the reviewer hedged rather than raced,
@@ -481,28 +480,42 @@ export interface JevCompletionVerdict {
 }
 
 const COMPLETION_REASONS = {
-  done: 'Jev found verifiable evidence of the named deliverable.',
-  incomplete: 'Jev found named work still missing.',
+  done: 'Jev found the requested result delivered, with nothing left undone or unsupported.',
+  incomplete: 'Jev found part of the request left without a result.',
   awaiting: 'Jev found a genuine question for the user.',
   blocked: 'Jev found the work cannot finish with available tools.',
-  revise_reply: 'Jev found only a final-answer format issue.',
 } as const;
 
-function mapCompletionChoice(choice: string): Omit<JevCompletionVerdict, 'judgeModelId'> | null {
-  const key = choice.trim().toLowerCase().replace(/[\s-]+/g, '_');
-  if (key === 'done') return { done: true, reason: COMPLETION_REASONS.done };
-  if (key === 'incomplete') return { done: false, reason: COMPLETION_REASONS.incomplete };
-  if (key === 'awaiting') return { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting };
-  if (key === 'blocked') return { done: false, blocked: true, reason: COMPLETION_REASONS.blocked };
-  if (key === 'revise_reply' || key === 'revisereply') {
-    return { done: false, repairScope: 'reply_format', reason: COMPLETION_REASONS.revise_reply };
-  }
-  return null;
+/** Jev's documented budget is 32K tokens for state plus the longest question;
+ *  live, every completion request past about that size failed, and those were
+ *  the research turns. The state stays well inside it, counted in characters
+ *  as a conservative stand-in for tokens. */
+const COMPLETION_STATE_BUDGET_CHARS = 72_000;
+const COMPLETION_REQUEST_CHARS = 3_000;
+const COMPLETION_RESPONSE_CHARS = 12_000;
+/** Each yes/no answer counts only this sure; Jev settles a review only when
+ *  every question it rests on is. Uncalibrated until the decision log has
+ *  measured it. */
+const COMPLETION_SURE = 0.85;
+
+/** Head and tail of an over-long text, with the elision said in place. */
+function clipMiddle(text: string, max: number): { text: string; clipped: boolean } {
+  if (text.length <= max) return { text, clipped: false };
+  const marker = '\n[… middle elided for length …]\n';
+  const keep = Math.max(0, max - marker.length);
+  const head = Math.ceil(keep * 0.6);
+  return { text: `${text.slice(0, head)}${marker}${text.slice(text.length - (keep - head))}`, clipped: true };
 }
 
 /**
- * Fast completion gate. A confident Choice skips the Settings judge; low
- * confidence, timeout, or a missing key returns null so that judge still runs.
+ * Fast completion gate, in the typed form Jev is built for: a few independent
+ * yes/no questions over compact state, instead of one broad verdict over the
+ * whole evidence dump. Jev settles a review only when the reply delivered the
+ * requested result, left no part without one, and states nothing the receipts
+ * and evidence do not show, or when it closes on a real question. Anything
+ * else returns a reading the caller may keep, or null, and the configured
+ * reviewer decides. Numbers and dates are Jev's documented weak spots, so an
+ * answer resting on them rarely clears the bar; that is the reviewer's work.
  */
 export async function tryJevCompletionVerdict(
   objective: string,
@@ -518,79 +531,64 @@ export async function tryJevCompletionVerdict(
   },
 ): Promise<JevCompletionVerdict | null> {
   const questions: SystemOneQuestions = {
-    verdict: {
-      type: 'choice',
-      instructions: [
-        'Audit whether the assistant finished the user objective.',
-        'coverage.outcomeEvidence lists settled business receipts for this source. Discovery/control rows are not receipts.',
-        'DONE when those receipts cover the named work and the response reports them (quoted output, path, handle, or listed values).',
-        'A successful write or read receipt is execution of that work. Do not mark INCOMPLETE merely because the receipt is a write rather than a read.',
-        'Do not accept a plan or "task complete" as done.',
-        'AWAITING if the response asks the user a genuine direction or authorization question.',
-        'BLOCKED if another attempt cannot finish it (missing access, missing record, refused tool).',
-        'REVISE_REPLY only for format or extra wording when the work itself is verified.',
-        'INCOMPLETE if a named deliverable has no receipt and another attempt could still fetch it.',
-      ].join(' '),
+    delivered: {
+      type: 'noul',
+      instructions: 'Does response give the user the result request asked for (the requested information, artifact or confirmed action), rather than a plan, a promise or a partial answer?',
       criteria: {
-        done: 'Verified receipts cover the named work, and the response reports them.',
-        incomplete: 'A named deliverable has no verified receipt and another attempt could still fetch it.',
-        awaiting: 'The response asks the user a genuine direction or authorization question.',
-        blocked: 'The work cannot finish with available tools or access.',
-        revise_reply: 'Work is verified; only final-answer format or extra wording is wrong.',
+        true: 'The requested result is in the response.',
+        false: 'The response plans, promises, asks, or covers only part of the request.',
       },
     },
-  };
-  if (opts?.coverage?.complete) {
-    questions.requirements = {
-      type: 'choice',
-      instructions: 'Compare the entire objective with the evidence and response. coverage.complete only means the supplied receipts are inspectable; it does not prove all requested work was supplied. Audit every explicit deliverable, process requirement, ordering constraint and verification. A response that admits an unmet requested requirement is not fully satisfied, even when the main artifact exists. Do not invent requirements the user did not ask for.',
-      criteria: {
-        satisfied: 'Evidence covers every explicit requirement, including any requested process or ordering; none is left undone.',
-        missing: 'At least one explicit requirement is unmet or admitted missing.',
-        uncertain: 'The evidence is insufficient to determine whether all explicit requirements were met.',
-      },
-    };
-    questions.matches = {
+    unaddressed: {
       type: 'noul',
-      instructions: 'Does the assistant response report the verified receipts without inventing extra load-bearing facts?',
+      instructions: 'Is any part of request left without a result or a stated reason in response?',
       criteria: {
-        true: 'The response states the receipt values (paths, records, events, counts) without adding unsupported specifics.',
-        false: 'The response invents load-bearing facts, omits a named receipt, or only promises the work.',
+        true: 'At least one asked-for part has neither a result nor a reason it could not be done.',
+        false: 'Every asked-for part has a result or a stated reason.',
       },
-    };
-  }
+    },
+    unsupported: {
+      type: 'noul',
+      instructions: 'Does response state a specific fact (a name, number, date, time, amount or status) that neither receipts nor evidence show?',
+      criteria: {
+        true: 'At least one stated specific does not appear in receipts or evidence.',
+        false: 'Every stated specific appears in receipts or evidence, or none is stated.',
+      },
+    },
+    asksUser: {
+      type: 'noul',
+      instructions: 'Does response end by asking the user something they must answer before the work can continue?',
+    },
+    cannotFinish: {
+      type: 'noul',
+      instructions: 'Does response report that the work cannot be done with the tools or access available?',
+    },
+  };
+  const request = clipMiddle(objective.trim(), COMPLETION_REQUEST_CHARS).text;
+  const response = clipMiddle(assistantResponse.trim(), COMPLETION_RESPONSE_CHARS).text;
+  const receipts = (opts?.coverage?.outcomeEvidence ?? []).map((row) => ({
+    tool: row.toolName,
+    outcome: row.outcome,
+    complete: row.contentComplete !== false,
+  }));
+  // The host summary already embeds its verified reads verbatim; send them
+  // once. Every receipt is listed in full above, so eliding the middle of a
+  // long evidence text hides no result from the questions.
+  const evidenceText = [
+    opts?.toolCallSummary ?? '',
+    opts?.verifiedReads && !opts.toolCallSummary?.includes(opts.verifiedReads) ? opts.verifiedReads : '',
+  ].filter(Boolean).join('\n\n');
+  const fixed = request.length + response.length + JSON.stringify(receipts).length + 400;
+  const evidence = clipMiddle(evidenceText, Math.max(0, COMPLETION_STATE_BUDGET_CHARS - fixed));
   const started = Date.now();
   const result = await evaluateSystemOne({
     state: {
-      // Completion is a verdict over this exact source, not a relevance
-      // ranking over excerpts. Prefix clipping hid late receipts (including
-      // a completed disable) while coverage still advertised complete work.
-      // Retain the supplied source-scoped evidence; transport/context failure
-      // must abstain through the existing reviewer fallback, never judge an
-      // undisclosed partial view as the whole task.
-      objective,
-      response: assistantResponse,
-      ...(opts?.coverage
-        ? {
-            coverage: {
-              complete: opts.coverage.complete,
-              outcomeEvidence: opts.coverage.outcomeEvidence.map((row) => ({
-                toolName: row.toolName,
-                outcome: row.outcome,
-                contentComplete: row.contentComplete !== false,
-              })),
-            },
-          }
-        : {}),
-      // The host summary already embeds its verified reads verbatim. Send
-      // that evidence once, preserving every byte and its surrounding scope.
-      // A partial or differently formatted match must retain both blocks.
-      ...(opts?.verifiedReads
-        ? opts.toolCallSummary?.includes(opts.verifiedReads)
-          ? { verifiedReadsIncludedIn: 'evidence' }
-          : { verifiedReads: opts.verifiedReads }
-        : {}),
-      ...(opts?.toolCallSummary ? { evidence: opts.toolCallSummary } : {}),
+      request,
+      response,
+      receipts,
+      receiptsComplete: opts?.coverage?.complete === true,
+      ...(evidence.text ? { evidence: evidence.text } : {}),
+      ...(evidence.clipped ? { evidenceNote: 'The middle of evidence was elided for length; receipts lists every result.' } : {}),
     },
     questions,
     timeoutMs: COMPLETION_TIMEOUT_MS,
@@ -598,36 +596,49 @@ export async function tryJevCompletionVerdict(
     channel: 'jev-completion',
   });
   if (!result.ok) return null;
-  const answer = result.answers.verdict as ChoiceAnswer | undefined;
-  if (!answer || answer.confidence < COMPLETION_CONFIDENCE_MIN) return null;
-  let mapped = mapCompletionChoice(answer.choice);
-  if (!mapped) return null;
-  let choice = answer.choice;
-  let confidence = answer.confidence;
-  const requirements = result.answers.requirements as ChoiceAnswer | undefined;
-  if (mapped.done && !mapped.awaitingUser && !mapped.blocked && opts?.coverage?.complete) {
-    if (!requirements || requirements.confidence < COMPLETION_CONFIDENCE_MIN) return null;
-    if (requirements.choice === 'missing') {
-      // Preserve this negative finding for the reviewer-unavailable path;
-      // an abstention must not erase known missing work into failed-open done.
-      mapped = { done: false, reason: 'Jev found an explicit requirement unsupported by the evidence.' };
-      choice = 'incomplete';
-      confidence = requirements.confidence;
-    } else if (requirements.choice !== 'satisfied') return null;
-  }
-  const matches = result.answers.matches as NoulAnswer | undefined;
-  const durationMs = Date.now() - started;
-  const passed = mapped.done;
-  await recordJevJudgeMetric('completion', passed ? 'passed' : 'blocked', result.model, durationMs);
-  return {
-    ...mapped,
-    judgeModelId: result.model,
-    choice,
-    confidence,
-    ...(typeof matches?.noul === 'number' ? { replyMatchesReceipts: matches.noul } : {}),
-    ...(requirements?.choice === 'satisfied' || requirements?.choice === 'missing' || requirements?.choice === 'uncertain'
-      ? { requirementCoverage: requirements.choice } : {}),
+  const read = (id: string): number | null => {
+    const answer = result.answers[id] as NoulAnswer | undefined;
+    return typeof answer?.noul === 'number' ? answer.noul : null;
   };
+  const delivered = read('delivered');
+  const unaddressed = read('unaddressed');
+  const unsupported = read('unsupported');
+  const asksUser = read('asksUser');
+  const cannotFinish = read('cannotFinish');
+  const sure = (value: number | null): boolean => value !== null && value >= COMPLETION_SURE;
+  const sureNot = (value: number | null): boolean => value !== null && value <= 1 - COMPLETION_SURE;
+  let verdict: Omit<JevCompletionVerdict, 'judgeModelId'> | null = null;
+  if (sure(asksUser)) {
+    verdict = { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting, choice: 'awaiting', confidence: asksUser! };
+  } else if (sure(delivered) && sureNot(unaddressed) && sureNot(unsupported)) {
+    verdict = {
+      done: true,
+      reason: COMPLETION_REASONS.done,
+      choice: 'done',
+      confidence: Math.min(delivered!, 1 - unaddressed!, 1 - unsupported!),
+      requirementCoverage: 'satisfied',
+      replyMatchesReceipts: 1 - unsupported!,
+    };
+  } else if (sure(cannotFinish)) {
+    verdict = { done: false, blocked: true, reason: COMPLETION_REASONS.blocked, choice: 'blocked', confidence: cannotFinish! };
+  } else if (sure(unaddressed) || sureNot(delivered)) {
+    // Kept for the reviewer-unavailable path only: the caller never treats a
+    // NOT-DONE from Jev as final while a reviewer can run.
+    verdict = {
+      done: false,
+      reason: COMPLETION_REASONS.incomplete,
+      choice: 'incomplete',
+      confidence: Math.max(unaddressed ?? 0, 1 - (delivered ?? 1)),
+      ...(sure(unaddressed) ? { requirementCoverage: 'missing' as const } : {}),
+      ...(unsupported !== null ? { replyMatchesReceipts: 1 - unsupported } : {}),
+    };
+  }
+  noteJevDecisionOutcome(result.decisionId, verdict ? verdict.choice ?? 'read' : 'abstained', {
+    ...(evidence.clipped ? { evidenceClipped: true } : {}),
+  });
+  if (!verdict) return null;
+  await recordJevJudgeMetric('completion', verdict.done ? 'passed' : 'blocked', result.model, Date.now() - started);
+  return { ...verdict, judgeModelId: result.model };
 }
 
 export interface JevWatchChangeVerdict {

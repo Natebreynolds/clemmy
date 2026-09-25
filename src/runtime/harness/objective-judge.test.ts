@@ -25,6 +25,21 @@ afterEach(() => {
 });
 _setCompletionJudgeForTests(unavailableSettingsJudge);
 
+/** Jev's completion readings in the typed form the check asks for: separate
+ *  yes/no answers, never a single verdict. */
+function jevCompletionReading(kind: 'done' | 'incomplete' | 'awaiting' | 'missing', unsupported = 0.05) {
+  const nouls: Record<string, number> = kind === 'done' ? { delivered: 0.93, unaddressed: 0.05, unsupported }
+    : kind === 'incomplete' ? { delivered: 0.1, unaddressed: 0.9, unsupported }
+      : kind === 'missing' ? { delivered: 0.9, unaddressed: 0.9, unsupported }
+        : { delivered: 0.2, unaddressed: 0.5, unsupported, asksUser: 0.92 };
+  return {
+    model: 'jev-1.13.0',
+    answers: Object.fromEntries(Object.entries({ asksUser: 0.03, cannotFinish: 0.03, ...nouls })
+      .map(([id, noul]) => [id, { type: 'noul', noul }])),
+    usage: { input_tokens: 36, output_tokens: 5 },
+  };
+}
+
 test('parseProgressVerdict: on-contract PROGRESS/STUCK single-line verdicts (Wave 3 self-resume)', () => {
   assert.deepEqual(parseProgressVerdict('PROGRESS: fetched 12 new firm records this cycle'), { progressing: true, reason: 'fetched 12 new firm records this cycle' });
   assert.deepEqual(parseProgressVerdict('STUCK: re-running the same failing search'), { progressing: false, reason: 're-running the same failing search' });
@@ -303,20 +318,7 @@ test('judgeObjectiveComplete uses a confident Jev verdict and skips the chat-mod
   _setSystemOneFetchForTests(async () => ({
     status: 200,
     ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: {
-          type: 'choice',
-          choice: 'done',
-          probabilities: { done: 0.91, incomplete: 0.09 },
-          confidence: 0.88,
-        },
-        matches: { type: 'noul', noul: 0.9 },
-      },
-      usage: { input_tokens: 36, output_tokens: 4 },
-    }),
+    text: async () => JSON.stringify(jevCompletionReading('done')),
   }));
   const v = await judgeObjectiveComplete(
     'Create /tmp/jev.txt containing JEV_OK',
@@ -461,19 +463,7 @@ test('Jev DONE after discovery-only execution is not accepted as completion', as
   _setSystemOneFetchForTests(async () => ({
     status: 200,
     ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: {
-          type: 'choice',
-          choice: 'done',
-          probabilities: { done: 0.9, incomplete: 0.1 },
-          confidence: 0.84,
-        },
-      },
-      usage: { input_tokens: 20, output_tokens: 2 },
-    }),
+    text: async () => JSON.stringify(jevCompletionReading('done')),
   }));
   const v = await judgeObjectiveComplete(
     'look up the named record',
@@ -493,20 +483,10 @@ test('Jev DONE after discovery-only execution is not accepted as completion', as
 // another model round, and on finished work the reviewer overruled it nearly
 // every time, so it is never final. Where Jev cannot settle a reply it is not
 // asked, and the reviewer starts at once instead of after the hedge delay.
-function jevAnswering(choice: string, calls: { count: number }) {
+function jevAnswering(choice: 'incomplete' | 'awaiting', calls: { count: number }) {
   return async () => {
     calls.count += 1;
-    return {
-      status: 200,
-      ok: true,
-      text: async () => JSON.stringify({
-        model: 'jev-1.13.0',
-        answers: {
-          verdict: { type: 'choice', choice, probabilities: { [choice]: 0.84, done: 0.16 }, confidence: 0.84 },
-        },
-        usage: { input_tokens: 36, output_tokens: 4 },
-      }),
-    };
+    return { status: 200, ok: true, text: async () => JSON.stringify(jevCompletionReading(choice)) };
   };
 }
 
@@ -580,16 +560,7 @@ test('an unreachable reviewer plus a Jev NOT-DONE finding continues instead of d
   _setSystemOneFetchForTests(async () => ({
     status: 200,
     ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-          verdict: { type: 'choice', choice: 'incomplete', probabilities: { incomplete: 0.86, done: 0.14 }, confidence: 0.85 },
-        // Jev's own 'matches' criterion for false is "or only promises the work".
-        matches: { type: 'noul', noul: 0.08 },
-      },
-      usage: { input_tokens: 30, output_tokens: 4 },
-    }),
+    text: async () => JSON.stringify(jevCompletionReading('incomplete', 0.92)),
   }));
   const v = await judgeObjectiveComplete(
     'Turn the workflow on and run the first batch as the test.',
@@ -617,20 +588,7 @@ test('Jev incomplete after a paged read is not coerced to done from reply simila
   _setSystemOneFetchForTests(async () => ({
     status: 200,
     ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: {
-          type: 'choice',
-          choice: 'incomplete',
-          probabilities: { incomplete: 0.88, done: 0.12 },
-          confidence: 0.88,
-        },
-        matches: { type: 'noul', noul: 0.79 },
-      },
-      usage: { input_tokens: 40, output_tokens: 6 },
-    }),
+    text: async () => JSON.stringify(jevCompletionReading('incomplete', 0.21)),
   }));
   const v = await judgeObjectiveComplete(
     'look up the named record and its window',
@@ -658,20 +616,7 @@ test('Jev incomplete with complete receipts falls through; reply similarity does
   _setSystemOneFetchForTests(async () => ({
     status: 200,
     ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: {
-          type: 'choice',
-          choice: 'incomplete',
-          probabilities: { incomplete: 0.7, done: 0.3 },
-          confidence: 0.84,
-        },
-        matches: { type: 'noul', noul: 0.82 },
-      },
-      usage: { input_tokens: 40, output_tokens: 6 },
-    }),
+    text: async () => JSON.stringify(jevCompletionReading('incomplete', 0.25)),
   }));
   const v = await judgeObjectiveComplete(
     'Create /tmp/jev.txt containing JEV_OK',
@@ -686,7 +631,7 @@ test('Jev incomplete with complete receipts falls through; reply similarity does
   );
   assert.equal(v.jevAttempt?.accepted, false);
   assert.equal(v.jevAttempt?.coverageComplete, true);
-  assert.equal(v.jevAttempt?.replyMatchesReceipts, 0.82);
+  assert.equal(v.jevAttempt?.replyMatchesReceipts, 0.75);
   assert.notEqual(v.fast, true);
   assert.notEqual(v.judgeModelId, 'jev-1.13.0');
   assert.notEqual(v.reason, 'Jev found the response reports the verified receipts.');
@@ -709,15 +654,7 @@ test('a Jev miss does not serialize: the reviewer starts at the hedge delay, bef
     return {
       status: 200,
       ok: true,
-      text: async () => JSON.stringify({
-        model: 'jev-1.13.0',
-        answers: {
-          requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-          verdict: { type: 'choice', choice: 'incomplete', probabilities: { done: 0.2, incomplete: 0.8 }, confidence: 0.7 },
-          matches: { type: 'noul', noul: 0.2 },
-        },
-        usage: { input_tokens: 36, output_tokens: 4 },
-      }),
+      text: async () => JSON.stringify(jevCompletionReading('incomplete', 0.8)),
     };
   });
   const v = await judgeObjectiveComplete(
@@ -745,20 +682,7 @@ test('judgeObjectiveComplete still uses Jev when a captured judge selection is p
   _setSystemOneFetchForTests(async () => ({
     status: 200,
     ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: {
-          type: 'choice',
-          choice: 'done',
-          probabilities: { done: 0.9, incomplete: 0.1 },
-          confidence: 0.84,
-        },
-        matches: { type: 'noul', noul: 0.9 },
-      },
-      usage: { input_tokens: 36, output_tokens: 4 },
-    }),
+    text: async () => JSON.stringify(jevCompletionReading('done')),
   }));
   const v = await judgeObjectiveComplete(
     'Create /tmp/jev.txt containing JEV_OK',
@@ -1084,12 +1008,7 @@ test('an accepted Jev verdict inside the hedge delay never starts the configured
   _setTypesafeKeyForTests('ts_test');
   _setSystemOneFetchForTests(async () => ({
     status: 200, ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: { requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: { type: 'choice', choice: 'done', probabilities: { done: 0.9, incomplete: 0.1 }, confidence: 0.85 }, matches: { type: 'noul', noul: 0.9 } },
-      usage: { input_tokens: 30, output_tokens: 4 },
-    }),
+    text: async () => JSON.stringify(jevCompletionReading('done')),
   }));
   try {
     const v = await judgeObjectiveComplete(
@@ -1118,12 +1037,7 @@ test('a Jev verdict slower than the hedge delay lets the configured reviewer sta
     await new Promise((resolve) => setTimeout(resolve, JEV_HEDGE_DELAY_MS + 200));
     return {
       status: 200, ok: true,
-      text: async () => JSON.stringify({
-        model: 'jev-1.13.0',
-        answers: { requirements: { type: 'choice', choice: 'satisfied', probabilities: { satisfied: 0.95, missing: 0.03, uncertain: 0.02 }, confidence: 0.95 },
-        verdict: { type: 'choice', choice: 'incomplete', probabilities: { done: 0.15, incomplete: 0.85 }, confidence: 0.85 }, matches: { type: 'noul', noul: 0.9 } },
-        usage: { input_tokens: 30, output_tokens: 4 },
-      }),
+      text: async () => JSON.stringify(jevCompletionReading('incomplete')),
     };
   });
   try {
@@ -1143,13 +1057,7 @@ test('a Jev verdict slower than the hedge delay lets the configured reviewer sta
 
 test('receipt integrity cannot override an explicit missing requirement, even when the reviewer is unavailable', async () => {
   _setTypesafeKeyForTests('ts_test');
-  _setSystemOneFetchForTests(async () => ({ status: 200, ok: true, text: async () => JSON.stringify({
-    model: 'jev-1.13.0', answers: {
-      verdict: { type: 'choice', choice: 'done', probabilities: { done: 0.9, incomplete: 0.1 }, confidence: 0.9 },
-      requirements: { type: 'choice', choice: 'missing', probabilities: { satisfied: 0.05, missing: 0.9, uncertain: 0.05 }, confidence: 0.9 },
-      matches: { type: 'noul', noul: 0.95 },
-    }, usage: { input_tokens: 40, output_tokens: 6 },
-  }) }));
+  _setSystemOneFetchForTests(async () => ({ status: 200, ok: true, text: async () => JSON.stringify(jevCompletionReading('missing')) }));
   let reviewerCalls = 0;
   for (const available of [true, false]) {
     _setCompletionJudgeForTests(async () => {
