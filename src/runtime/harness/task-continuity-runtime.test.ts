@@ -1765,22 +1765,24 @@ test('a question back to Clem\'s open question goes to the brain with the step o
     assert.ok(steer.includes(HELD_DRAFT_QUESTION), 'the brain sees the question exactly as asked');
     assert.ok(steer.includes(`[user-reply]\n${QUESTION_BACK}`));
     assert.match(steer, /stays on hold: do not write, send, publish, or delete/);
-    assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available',
-      'a question back does not consume the open question');
+    // While a stored question stays open, planning refuses the turn ("durable
+    // accepted-source continuation is unresolved"): the brain could never
+    // answer. The host releases it once the steer carries it.
+    assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'none',
+      'the answered-back question is released so the brain can plan');
 
-    // Clem answers and asks again in her own words: that question carries the
-    // open one forward, keeping the original request as its root.
+    // Clem answers and asks again in her own words: that question opens anew.
     commitClarification({
       sessionId,
       sourceSeq: reply.seq,
       question: 'I have not picked one yet. Should it go to #sales-team or #general?',
     });
-    const successor = continuity.peekTaskContinuityPacket({ sessionId });
-    assert.equal(successor.status, 'available');
-    if (successor.status !== 'available') return;
-    assert.equal(successor.packet.originatingSourceUserSeq, reply.seq);
-    assert.equal(successor.packet.parentPacketId, open.packet.packetId);
-    assert.equal(successor.packet.rootSourceUserSeq, origin.seq);
+    const reasked = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(reasked.status, 'available');
+    if (reasked.status !== 'available') return;
+    assert.equal(reasked.packet.originatingSourceUserSeq, reply.seq);
+    assert.notEqual(reasked.packet.packetId, open.packet.packetId);
+    void origin;
   } finally {
     runtime._setOpenQuestionReplyClassifierForTests(null);
   }
@@ -1866,4 +1868,40 @@ test('the loop\'s reask and the respond bridge both go through the recorded repl
     'Jev reads the reply after the turn is interpreted and before continuity is resolved');
   assert.match(bridge, /startsWith\('\[task-continuation-question:v1\]\\n'\)/,
     'the host-built question steer reaches the brain as a continuation steer');
+});
+
+test('a side conversation while a question is open goes to the brain, and planning is no longer refused', async () => {
+  // Live 2026-09-25 fixture: "before I say yes, will saving it overwrite
+  // anything that is already there?" was read as conversation; with the
+  // question still open, planning refused and the user was told to retry.
+  const sessionId = 'continuity-side-conversation';
+  heldDraft(sessionId);
+  const reply = accepted(sessionId, 'before I say yes, will saving it overwrite anything that is already there?');
+  seedSemanticReading(sessionId, reply.seq, 'admitted', {
+    ...AMBIGUOUS_READING, relation: 'conversation',
+    rationale: 'A clarifying side question; the open slot remains open.',
+  });
+  let asked = 0;
+  runtime._setOpenQuestionReplyClassifierForTests(async () => {
+    asked += 1;
+    return { kind: 'answers', confidence: 0.99, failedOpen: false };
+  });
+  try {
+    const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(route?.route, 'respond');
+    assert.equal(asked, 0, 'the interpreter already read a side conversation; Jev is not asked');
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({
+      sessionId, sourceUserSeq: reply.seq, message: 'before I say yes, will saving it overwrite anything that is already there?',
+    }, reply.seq, { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+    assert.ok(enriched.semanticTaskInput?.startsWith('[task-continuation-question:v1]\n'));
+    const { primePrimaryModelPlanningCatalog } = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
+    const primed = await primePrimaryModelPlanningCatalog({ sessionId, sourceUserSeq: reply.seq })
+      .catch((error: unknown) => ({ ok: false as const, reason: String(error) }));
+    // Past every accepted-source stage (source present, continuation settled):
+    // whatever planning does next, it is not the open-question refusal.
+    assert.doesNotMatch(String((primed as { reason?: string }).reason ?? ''), /durable accepted[- ]source/,
+      'planning no longer refuses the turn that answers a question back');
+  } finally {
+    runtime._setOpenQuestionReplyClassifierForTests(null);
+  }
 });
