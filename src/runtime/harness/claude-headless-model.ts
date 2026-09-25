@@ -12,6 +12,8 @@ import { recordModelUsage } from '../usage-log.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
+import { resolveModelCapability } from './model-wire-registry.js';
+import type { ReasoningEffort } from './reasoning-effort.js';
 import { redactSensitiveText } from '../security.js';
 import pino from 'pino';
 
@@ -121,13 +123,52 @@ export const CLAUDE_HEADLESS_OPTIONAL_FLAGS: Array<{ flag: string; extra?: strin
 ];
 const CLAUDE_HEADLESS_MANDATORY_FLAGS = ['--tools'] as const;
 
-export function buildClaudeHeadlessArgs(modelId: string, flagSupported?: (flag: string) => boolean): string[] {
+/** The request's reasoning tier reaches the CLI as its own --effort flag.
+ *  Without it every call ran at whatever effort the owner set for their own
+ *  Claude Code sessions (settings.json effortLevel), whatever the harness
+ *  asked for. Optional: a CLI that does not advertise it keeps its default. */
+const CLAUDE_HEADLESS_EFFORT_FLAG = '--effort';
+const REASONING_TIERS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high'];
+
+/**
+ * The reasoning a request asks for, in this wire's vocabulary. --effort takes
+ * the same mapped value the Messages lane sends as output_config.effort. That
+ * enum's floor is 'low', where adaptive thinking still runs, so a none or
+ * minimal tier also switches the CLI's thinking off. Measured 2026-09-25 on one
+ * account-routing verdict, same model and prompt: 297-492 output tokens in
+ * 5.3-6.4 s with thinking, 68 tokens in 2.5 s without, and the same verdict.
+ * A request that names no tier keeps the CLI's default.
+ */
+export function claudeHeadlessReasoningControls(
+  request: Pick<ModelRequest, 'modelSettings'>,
+  modelId: string,
+): { effort: string | null; disableThinking: boolean } {
+  const tier = (request.modelSettings?.reasoning as { effort?: unknown } | undefined)?.effort;
+  if (typeof tier !== 'string' || !REASONING_TIERS.includes(tier as ReasoningEffort)) {
+    return { effort: null, disableThinking: false };
+  }
+  const capability = resolveModelCapability(modelId);
+  return {
+    effort: capability.supportsEffort ? capability.effortMap[tier as ReasoningEffort] : null,
+    disableThinking: tier === 'none' || tier === 'minimal',
+  };
+}
+
+export function buildClaudeHeadlessArgs(
+  modelId: string,
+  flagSupported?: (flag: string) => boolean,
+  effort?: string | null,
+): string[] {
   const optional = CLAUDE_HEADLESS_OPTIONAL_FLAGS
     .filter((o) => (flagSupported ? flagSupported(o.flag) : true))
     .flatMap((o) => [o.flag, ...(o.extra ?? [])]);
+  const effortArgs = effort && (flagSupported ? flagSupported(CLAUDE_HEADLESS_EFFORT_FLAG) : true)
+    ? [CLAUDE_HEADLESS_EFFORT_FLAG, effort]
+    : [];
   return [
     '-p',
     ...optional,
+    ...effortArgs,
     // This transport is a Model, never an execution owner. Tool isolation is
     // mandatory rather than a compatibility flag: an older CLI that rejects
     // it must fail closed and fall over to another text-only wire.
@@ -172,6 +213,7 @@ async function probeSupportedHeadlessFlags(command: string): Promise<Set<string>
     const set = new Set(
       [
         ...CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag),
+        CLAUDE_HEADLESS_EFFORT_FLAG,
         ...CLAUDE_HEADLESS_MANDATORY_FLAGS,
       ].filter((flag) => help.includes(flag)),
     );
@@ -586,17 +628,21 @@ async function* runClaudeHeadless(request: ModelRequest, modelId: string): Async
     );
   }
   // Start from the probed set (or every optional flag when the probe failed).
-  const active = new Set(support ?? CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag));
+  const active = new Set(support ?? [
+    ...CLAUDE_HEADLESS_OPTIONAL_FLAGS.map((o) => o.flag),
+    CLAUDE_HEADLESS_EFFORT_FLAG,
+  ]);
+  const reasoning = claudeHeadlessReasoningControls(request, modelId);
   // Unknown-option exits happen BEFORE any stream output, so dropping only the
   // flag the CLI names and retrying preserves the isolation flags it DOES
   // support (--tools '' keeps the print-mode subprocess tool-less — dropping
   // it wholesale would hand the retry a tool-capable Claude Code). Bounded by
   // the optional-flag count; never retried after output starts.
   let emittedAnything = false;
-  for (let attempt = 0; attempt <= CLAUDE_HEADLESS_OPTIONAL_FLAGS.length; attempt += 1) {
-    const args = buildClaudeHeadlessArgs(modelId, (f) => active.has(f));
+  for (let attempt = 0; attempt <= CLAUDE_HEADLESS_OPTIONAL_FLAGS.length + 1; attempt += 1) {
+    const args = buildClaudeHeadlessArgs(modelId, (f) => active.has(f), reasoning.effort);
     try {
-      for await (const evt of runClaudeHeadlessAttempt(request, modelId, command, args)) {
+      for await (const evt of runClaudeHeadlessAttempt(request, modelId, command, args, reasoning.disableThinking)) {
         if (evt.kind === 'delta') emittedAnything = true;
         yield evt;
       }
@@ -616,8 +662,15 @@ async function* runClaudeHeadless(request: ModelRequest, modelId: string): Async
   throw new Error('Claude Code headless could not agree on CLI flags after retries.');
 }
 
-async function* runClaudeHeadlessAttempt(request: ModelRequest, modelId: string, command: string, args: string[]): AsyncGenerator<{ kind: 'delta'; delta: string } | { kind: 'done'; response: ModelResponse }> {
+async function* runClaudeHeadlessAttempt(
+  request: ModelRequest,
+  modelId: string,
+  command: string,
+  args: string[],
+  disableThinking = false,
+): AsyncGenerator<{ kind: 'delta'; delta: string } | { kind: 'done'; response: ModelResponse }> {
   const env = await buildClaudeHeadlessEnv();
+  if (disableThinking) env.MAX_THINKING_TOKENS = '0';
   const prompt = renderClaudeHeadlessPrompt(request);
   assertConversationProtocolAtProviderBoundary(request.input, 'claude.headless');
   const state: HeadlessRunState = {

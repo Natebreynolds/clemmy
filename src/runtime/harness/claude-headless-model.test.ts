@@ -25,6 +25,7 @@ const {
   resolveClaudeCliPath,
   assistantMessage,
   _setHeadlessFlagSupportForTests,
+  claudeHeadlessReasoningControls,
 } = mod;
 
 const STATE_DIR = path.join(TMP_HOME, 'state');
@@ -568,4 +569,42 @@ test('nonzero exit retains bounded redacted error detail but never trusts ordina
       return true;
     });
   }
+});
+
+// The CLI used to run every call at the owner's own Claude Code effort
+// (settings.json effortLevel) whatever the harness asked. Measured 2026-09-25:
+// one account-routing verdict spent 297-492 output tokens and 5.3-6.4 s on
+// hidden reasoning; with thinking off it took 68 tokens and 2.5 s, same verdict.
+test('the headless lane carries the request reasoning tier to the CLI', async () => {
+  assert.deepEqual(claudeHeadlessReasoningControls({ modelSettings: { reasoning: { effort: 'none' } } } as any, 'claude-sonnet-5'),
+    { effort: 'low', disableThinking: true });
+  assert.deepEqual(claudeHeadlessReasoningControls({ modelSettings: { reasoning: { effort: 'medium' } } } as any, 'claude-sonnet-5'),
+    { effort: 'medium', disableThinking: false });
+  assert.deepEqual(claudeHeadlessReasoningControls({ modelSettings: {} } as any, 'claude-sonnet-5'),
+    { effort: null, disableThinking: false });
+  assert.deepEqual(claudeHeadlessReasoningControls({ modelSettings: { reasoning: { effort: 'turbo' } } } as any, 'claude-sonnet-5'),
+    { effort: null, disableThinking: false });
+  assert.deepEqual(buildClaudeHeadlessArgs('claude-sonnet-5', (f) => f === '--effort', 'low').slice(0, 3), ['-p', '--effort', 'low']);
+  assert.equal(buildClaudeHeadlessArgs('claude-sonnet-5', () => false, 'low').includes('--effort'), false,
+    'a CLI that does not advertise --effort keeps its default');
+
+  _setHeadlessFlagSupportForTests(fixtureCommand, new Set(['--tools', '--effort']));
+  const lines = [
+    { type: 'system', subtype: 'init', session_id: 'session-effort' },
+    { type: 'result', subtype: 'success', session_id: 'session-effort', result: '{"ok":true}', usage: { input_tokens: 5, output_tokens: 2 } },
+  ];
+  const request = (reasoning?: string) => ({
+    input: 'Verdict?', modelSettings: reasoning ? { reasoning: { effort: reasoning } } : {},
+    tools: [], outputType: 'text', handoffs: [], tracing: false,
+  }) as any;
+  const quiet: { args?: string[]; env?: NodeJS.ProcessEnv } = {};
+  installSpawnMock(lines, quiet);
+  await new ClaudeHeadlessModel('claude-sonnet-5').getResponse(request('none'));
+  assert.equal(quiet.args?.[quiet.args.indexOf('--effort') + 1], 'low');
+  assert.equal(quiet.env?.MAX_THINKING_TOKENS, '0');
+  const silent: { args?: string[]; env?: NodeJS.ProcessEnv } = {};
+  installSpawnMock(lines, silent);
+  await new ClaudeHeadlessModel('claude-sonnet-5').getResponse(request());
+  assert.equal(silent.args?.includes('--effort'), false, 'a request that names no tier keeps the CLI default');
+  assert.equal(silent.env?.MAX_THINKING_TOKENS, process.env.MAX_THINKING_TOKENS);
 });

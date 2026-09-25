@@ -73,3 +73,34 @@ test('usage observations do not leak between concurrent completions or from a fa
   const fallback = await observeModelUsageRecording(async () => 'fallback response');
   assert.equal(fallback.recorded, false, 'a failed role cannot claim the fallback role already recorded its response');
 });
+
+// Live 2026-09-25: the account-routing verdict held a Slack write turn's tool
+// search for 7.9 s, almost all of it hidden reasoning for a one-word verdict.
+test('the account-routing verdict reaches its model with no extended thinking; effect judgment keeps the default', async () => {
+  const session = createSession({ kind: 'chat' });
+  const requests: Array<{ modelSettings?: { reasoning?: { effort?: unknown } } }> = [];
+  const modelIds: string[] = [];
+  setDefaultModelProvider({ getModel: async (modelId?: string) => ({
+    async getResponse(request: never) {
+      modelIds.push(String(modelId));
+      requests.push(request);
+      return { responseId: `reasoning-${requests.length}`,
+        usage: new Usage({ inputTokens: 10, outputTokens: 2, totalTokens: 12, requests: 1 }),
+        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
+          text: JSON.stringify({ verdict: 'uncertain', proposalDigest: 'b'.repeat(64) }), providerData: {} }] }] } as never;
+    },
+    async *getStreamedResponse() { throw new Error('semantic completion is not streaming'); },
+  }) as never });
+  const port = configuredBrainSemanticPort(completeViaConfiguredBrain);
+  await withModelUsageAttribution({ sessionId: session.id }, () => port.judgeAccountSelection!({
+    purpose: 'turn_semantics_account_selection', sessionId: session.id, sourceUserSeq: 1,
+    mode: 'current_source_default', acceptedText: 'send it', sourceQuote: null, toolkit: 'fixture',
+    accountIdentity: 'only', accountLabel: 'Only', proposalDigest: 'b'.repeat(64) }));
+  assert.equal(requests[0]?.modelSettings?.reasoning?.effort, 'none');
+  await completeViaConfiguredBrain({ purpose: 'turn_semantics_effect_judge', system: 'fixture', user: '{}',
+    schemaName: 'SourceEffectJudgeV1' }).catch(() => undefined);
+  // Same judge model, no tier asked. (The fixture's reply does not fit the
+  // effect schema, so a brain fallback may follow with its SDK defaults.)
+  assert.equal(modelIds[1], modelIds[0]);
+  assert.equal(requests[1]?.modelSettings?.reasoning, undefined);
+});

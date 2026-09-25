@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { extractJsonCandidate } from '../harness/json-repair.js';
 import { resolveRoleModel } from '../harness/model-roles.js';
 import type { ModelRole } from '../harness/model-roles.js';
+import type { ReasoningEffort } from '../harness/reasoning-effort.js';
 import {
   modelUsageAttributionStorage,
   observeModelUsageRecording,
@@ -116,6 +117,19 @@ export function semanticModelRoleForPurpose(
   return purpose === 'turn_semantics' ? 'brain' : 'judge';
 }
 
+/**
+ * The reasoning each purpose asks its model for; undefined keeps the model's
+ * default. Account routing returns one enum verdict and has 'uncertain' for
+ * anything unclear, so it runs without extended thinking, like the harness's
+ * other structured verdicts. Measured 2026-09-25: this call held a Slack write
+ * turn's tool search for 7.9 s, almost all of it hidden reasoning.
+ */
+export function semanticReasoningForPurpose(
+  purpose: 'turn_semantics' | 'turn_semantics_effect_judge' | 'turn_semantics_plan_grounding' | 'turn_semantics_account_selection',
+): ReasoningEffort | undefined {
+  return purpose === 'turn_semantics_account_selection' ? 'none' : undefined;
+}
+
 async function completeStructured(input: {
   purpose: 'turn_semantics' | 'turn_semantics_effect_judge' | 'turn_semantics_plan_grounding' | 'turn_semantics_account_selection';
   system: string;
@@ -135,6 +149,7 @@ async function completeStructured(input: {
   // user's available model stack permits it. Calling the brain for both made
   // the supposedly independent gate self-approval by construction.
   const wantedRole = semanticModelRoleForPurpose(input.purpose);
+  const reasoning = semanticReasoningForPurpose(input.purpose);
   const firstRole = resolveRoleModel(wantedRole);
   return runOnRole(firstRole).catch(async (error) => {
     // The judge role is cross-family by default, so it can be bound to a model
@@ -164,6 +179,7 @@ async function completeStructured(input: {
     model: role.modelId,
     tools: [],
     outputType: input.schema as typeof TurnSemanticProposalV1WireSchema,
+    ...(reasoning ? { modelSettings: { reasoning: { effort: reasoning } } } : {}),
   }) as unknown as Agent;
   const runner = new Runner({ workflowName: `clementine-${input.purpose}` });
   const { value: result, recorded: usageRecorded } = await observeModelUsageRecording(
