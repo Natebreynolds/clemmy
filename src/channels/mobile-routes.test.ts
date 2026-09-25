@@ -4393,7 +4393,7 @@ test('mobile settings routes are session-gated: anon requests get 401 at every d
       const anon = await fetch(`${h.url}${p}`);
       assert.equal(anon.status, 401, `GET ${p} must demand a mobile session`);
     }
-    for (const p of ['/m/api/settings/models/brain', '/m/api/settings/models/codex-rescue', '/m/api/tidy/apply', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
+    for (const p of ['/m/api/settings/models/brain', '/m/api/settings/models/role', '/m/api/settings/models/codex-rescue', '/m/api/tidy/apply', '/m/api/devices/dev-x/revoke', '/m/api/devices/revoke-all']) {
       const anon = await fetch(`${h.url}${p}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -4535,6 +4535,125 @@ test('Codex rescue route exposes exact connected options, persists one id, refre
     else process.env.OPENAI_MODEL_PRIMARY = previousPrimary;
     if (previousRescue === undefined) delete process.env.OPENAI_MODEL_RESCUE;
     else process.env.OPENAI_MODEL_RESCUE = previousRescue;
+  }
+});
+
+// The phone sets who writes the final answer, who checks the work and who helps
+// in parallel through the same owner as desktop Settings: exact connected ids,
+// refusals that write nothing, and clear back to automatic.
+test('phone role route sets and clears writer and judge through the desktop owner', async () => {
+  const keys = [
+    'AUTH_MODE', 'MODEL_ROUTING_MODE', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_API_KEY', 'BYO_MODEL_ID',
+    'BYO_BRAIN_MODEL_ID', 'CLEMMY_MODEL_ROLES', 'CLEMMY_DEBATE_JUDGE',
+  ];
+  const previousEnv: Record<string, string | undefined> = {};
+  for (const key of keys) previousEnv[key] = process.env[key];
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  process.env.BYO_MODEL_BASE_URL = 'https://api.example.test/v1';
+  process.env.BYO_MODEL_API_KEY = 'test-only-key';
+  process.env.BYO_MODEL_ID = 'glm-5.2';
+  process.env.CLEMMY_MODEL_ROLES = '[]';
+  delete process.env.BYO_BRAIN_MODEL_ID;
+  delete process.env.CLEMMY_DEBATE_JUDGE;
+  const authFile = path.join(TMP_ROOT, 'state', 'auth.json');
+  const claudeAuthFile = path.join(TMP_ROOT, 'state', 'claude-auth.json');
+  mkdirSync(path.dirname(authFile), { recursive: true });
+  writeFileSync(authFile, JSON.stringify({
+    source: 'native',
+    codexOauth: { accessToken: 'mobile-role-test-access', refreshToken: 'mobile-role-test-refresh' },
+  }), 'utf-8');
+  // Claude stays disconnected without reaching for this machine's own login.
+  writeFileSync(claudeAuthFile, JSON.stringify({ accessToken: 'sk-ant-api03-not-a-subscription-token' }), 'utf-8');
+  const { readDurableBindings } = await import('../runtime/harness/model-roles.js');
+
+  type RoleRow = { modelId?: string; provider?: string; source?: string };
+  type ModelsBody = {
+    ok?: boolean;
+    error?: string;
+    brain?: RoleRow;
+    roles?: { writer?: RoleRow; judge?: RoleRow; worker?: RoleRow };
+    roleOptions?: Record<'writer' | 'judge' | 'worker', Array<{ provider: string; models: Array<{ id: string }> }>>;
+    judgeReviewsOwnFamily?: boolean;
+  };
+  const h = await startHarness();
+  const post = async (cookie: string, body: unknown) => {
+    const res = await fetch(`${h.url}/m/api/settings/models/role`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: (await res.json()) as ModelsBody };
+  };
+  try {
+    const cookie = await loginMobile(h, 'Models phone');
+    const initialRes = await fetch(`${h.url}/m/api/settings/models`, { headers: { cookie } });
+    assert.equal(initialRes.status, 200);
+    const initial = (await initialRes.json()) as ModelsBody;
+    assert.equal(initial.roles?.writer?.source, 'default');
+    assert.equal(initial.roles?.writer?.modelId, initial.brain?.modelId, 'with no writer chosen, the brain writes');
+    assert.equal(initial.roles?.judge?.source, 'default');
+    assert.equal(initial.roles?.worker?.source, 'default');
+    for (const role of ['writer', 'judge', 'worker'] as const) {
+      assert.ok(initial.roleOptions?.[role]?.some((group) => group.models.some((model) => model.id === 'glm-5.2')),
+        `the connected model is offered for the ${role}`);
+    }
+    assert.equal(typeof initial.judgeReviewsOwnFamily, 'boolean');
+
+    const refusals: Array<[unknown, string]> = [
+      [{ role: 'brain', modelId: 'glm-5.2' }, 'UNKNOWN_ROLE'],
+      [{ role: 'writer' }, 'MODEL_REQUIRED'],
+      [{ role: 'writer', modelId: 'glm-5.2', clear: true }, 'MODEL_REQUIRED'],
+      [{ role: 'writer', modelId: 'not-a-connected-model' }, 'MODEL_UNAVAILABLE'],
+      [{ role: 'judge', modelId: 'glm 5.2' }, 'INVALID_MODEL_ID'],
+    ];
+    for (const [body, code] of refusals) {
+      const refused = await post(cookie, body);
+      assert.equal(refused.status, 400, JSON.stringify(body));
+      assert.equal(refused.body.error, code, JSON.stringify(body));
+    }
+    assert.deepEqual(readDurableBindings(), [], 'a refused change writes nothing');
+
+    const writer = await post(cookie, { role: 'writer', modelId: 'glm-5.2' });
+    assert.equal(writer.status, 200, writer.body.error);
+    assert.deepEqual(
+      { modelId: writer.body.roles?.writer?.modelId, source: writer.body.roles?.writer?.source },
+      { modelId: 'glm-5.2', source: 'settings' },
+    );
+    const persisted = await readFile(path.join(TMP_ROOT, '.env'), 'utf-8');
+    assert.ok(persisted.split(/\r?\n/).includes(
+      `CLEMMY_MODEL_ROLES=${JSON.stringify([{ role: 'writer', modelId: 'glm-5.2', scope: 'durable', source: 'settings' }])}`,
+    ), 'the choice is saved exactly as desktop Settings saves it');
+
+    const sameFamily = await post(cookie, { role: 'judge', modelId: 'glm-5.2' });
+    assert.equal(sameFamily.status, 200, sameFamily.body.error);
+    assert.equal(sameFamily.body.judgeReviewsOwnFamily, true, 'a judge on the writer\'s endpoint grades its own family');
+
+    const codexJudge = sameFamily.body.roleOptions?.judge.find((group) => group.provider === 'codex')?.models[0]?.id;
+    assert.ok(codexJudge, 'the connected Codex login offers a judge');
+    const otherFamily = await post(cookie, { role: 'judge', modelId: codexJudge });
+    assert.equal(otherFamily.status, 200, otherFamily.body.error);
+    assert.equal(otherFamily.body.roles?.judge?.modelId, codexJudge);
+    assert.equal(otherFamily.body.judgeReviewsOwnFamily, false);
+    assert.equal(process.env.CLEMMY_DEBATE_JUDGE, 'codex', 'the legacy judge branch follows, as on desktop');
+
+    for (const role of ['writer', 'judge'] as const) {
+      const cleared = await post(cookie, { role, clear: true });
+      assert.equal(cleared.status, 200, cleared.body.error);
+      assert.equal(cleared.body.roles?.[role]?.source, 'default', `the ${role} is automatic again`);
+    }
+    assert.deepEqual(readDurableBindings(), []);
+  } finally {
+    await h.close();
+    const { removeEnvKey } = await import('../tools/shared.js');
+    removeEnvKey('CLEMMY_MODEL_ROLES');
+    removeEnvKey('CLEMMY_DEBATE_JUDGE');
+    rmSync(authFile, { force: true });
+    rmSync(claudeAuthFile, { force: true });
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 

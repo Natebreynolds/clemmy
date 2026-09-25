@@ -130,6 +130,28 @@ test('the brain switcher renders from the live catalog, never a hardcoded roster
   }
 });
 
+test('the Models card names each part of a request and picks only from the live catalog', () => {
+  const copy = read('./model-roles.ts');
+  const sheet = read('../components/RoleSheet.tsx');
+  const api = read('./api.ts');
+  for (const title of ['Does the work', 'Writes the final answer', 'Checks the work', 'Helps in parallel']) {
+    assert.match(copy, new RegExp(`title: '${title}'`), `the "${title}" row is named in plain words`);
+  }
+  assert.match(sheet, /settings\.roleOptions\?\.\[role\]/,
+    'the picker lists the daemon catalog for that role');
+  assert.match(sheet, /setModelRole\(role, modelId\)/,
+    'a pick is saved through the one role route');
+  assert.match(api, /\/m\/api\/settings\/models\/role/);
+  assert.match(api, /modelId === null \? \{ role, clear: true \} : \{ role, modelId \}/,
+    'the only role write is an exact model id or a clear back to automatic');
+  for (const literal of ['gpt-5', 'claude-opus', 'claude-sonnet', 'glm-', 'deepseek', 'minimax', 'grok']) {
+    const re = new RegExp(literal, 'i');
+    assert.doesNotMatch(sheet, re, `model id "${literal}" must not be hardcoded in the role picker`);
+    assert.doesNotMatch(copy, re, `model id "${literal}" must not be hardcoded in the role wording`);
+  }
+  assert.doesNotMatch(sheet, /<input/i, 'the role picker is taps only');
+});
+
 test('the mobile model API owns an exact rescue snapshot and credential-free save call', () => {
   const api = read('../lib/api.ts');
   assert.match(api, /codexRescue\?: CodexRescueSettings/,

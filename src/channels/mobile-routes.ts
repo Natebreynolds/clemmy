@@ -5590,27 +5590,93 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // One snapshot for the read and for every write's answer, so the card the
+  // phone redraws after a change is the same shape it loaded.
+  const modelSettingsSnapshot = async () => {
+    const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+    const { effectiveBrainValue, modelRoleOptionCatalogSnapshot } = await import('../runtime/harness/model-role-options.js');
+    const { codexRescueSettingsSnapshot } = await import('../runtime/harness/codex-rescue-settings.js');
+    const { judgeReviewsOwnFamily } = await import('../runtime/harness/debate-model.js');
+    const { getActiveAuthMode } = await import('../config.js');
+    const catalog = modelRoleOptionCatalogSnapshot();
+    return {
+      // WHO actually answers the next message — including the honest
+      // inactiveBinding when a saved choice is unavailable.
+      brain: resolveRoleModel('brain'),
+      options: catalog.brainOptions,
+      effectiveValue: effectiveBrainValue(),
+      activeBrain: getActiveAuthMode(),
+      // Who writes the final answer, who checks the work and who helps in
+      // parallel, each with the connected models that can fill it: the same
+      // resolution and catalog desktop Settings shows.
+      roles: {
+        writer: resolveRoleModel('writer'),
+        judge: resolveRoleModel('judge'),
+        worker: resolveRoleModel('worker'),
+      },
+      roleOptions: catalog.roleOptions,
+      judgeReviewsOwnFamily: judgeReviewsOwnFamily(),
+      // Exact connected Codex ids only. The phone never derives provider
+      // identity or accepts credentials; console and mobile share one
+      // validation + persistence owner for OPENAI_MODEL_RESCUE.
+      codexRescue: codexRescueSettingsSnapshot(catalog),
+    };
+  };
+
   router.get('/api/settings/models', requireMobileSession, async (_req, res) => {
     try {
-      const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
-      const { effectiveBrainValue, modelRoleOptionCatalogSnapshot } = await import('../runtime/harness/model-role-options.js');
-      const { codexRescueSettingsSnapshot } = await import('../runtime/harness/codex-rescue-settings.js');
-      const { getActiveAuthMode } = await import('../config.js');
-      const catalog = modelRoleOptionCatalogSnapshot();
-      res.json({
-        // WHO actually answers the next message — including the honest
-        // inactiveBinding when a saved choice is unavailable.
-        brain: resolveRoleModel('brain'),
-        options: catalog.brainOptions,
-        effectiveValue: effectiveBrainValue(),
-        activeBrain: getActiveAuthMode(),
-        // Exact connected Codex ids only. The phone never derives provider
-        // identity or accepts credentials; console and mobile share one
-        // validation + persistence owner for OPENAI_MODEL_RESCUE.
-        codexRescue: codexRescueSettingsSnapshot(catalog),
-      });
+      res.json(await modelSettingsSnapshot());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Writer, judge and workers from the phone: an exact connected model id, or
+  // clear to go back to automatic. Role-wide only; routing a kind of work to a
+  // model stays on the desktop. Desktop Settings and the chat tool persist
+  // through the same owner, so the three doors cannot disagree.
+  router.post('/api/settings/models/role', requireMobileSession, async (req, res) => {
+    try {
+      const {
+        isBindableModelRole,
+        persistModelRoleSetting,
+      } = await import('../runtime/harness/model-role-settings.js');
+      const role: unknown = req.body?.role;
+      if (!isBindableModelRole(role)) {
+        res.status(400).json({
+          error: 'UNKNOWN_ROLE',
+          message: 'Choose the writer, the judge or the workers. The brain has its own switch.',
+        });
+        return;
+      }
+      const rawModelId = typeof req.body?.modelId === 'string' ? req.body.modelId.trim() : '';
+      const clear = req.body?.clear === true;
+      if (clear === Boolean(rawModelId)) {
+        res.status(400).json({
+          error: 'MODEL_REQUIRED',
+          message: 'Choose one connected model, or clear the choice to go back to automatic.',
+        });
+        return;
+      }
+      persistModelRoleSetting({ role, modelId: clear ? undefined : rawModelId, clear, source: 'settings' });
+
+      // Apply on the next turn without restarting, matching the desktop door.
+      const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
+      const { resetClaudeModelCache } = await import('../runtime/harness/claude-model.js');
+      const { resetByoModelCache } = await import('../runtime/harness/byo-model.js');
+      const { clearAutonomyAgentCache } = await import('../agents/autonomy-v2.js');
+      resetHarnessRuntimeConfig();
+      resetClaudeModelCache();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+      res.json({ ok: true, ...(await modelSettingsSnapshot()) });
+    } catch (err) {
+      const { ModelRoleSettingError } = await import('../runtime/harness/model-role-settings.js');
+      const status = err instanceof ModelRoleSettingError ? 400 : 500;
+      res.status(status).json({
+        error: err instanceof ModelRoleSettingError ? err.code : 'MODEL_ROLE_SAVE_FAILED',
+        message: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 

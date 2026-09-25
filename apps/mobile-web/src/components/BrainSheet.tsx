@@ -5,6 +5,7 @@ import {
   type ApiError,
   type ModelSettings,
 } from '../lib/api';
+import { ROLE_COPY } from '../lib/model-roles';
 import { haptic } from '../lib/native-bridge';
 
 /**
@@ -99,11 +100,11 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
 
   return (
     <div class="brain-layer" role="dialog" aria-modal="true" aria-labelledby="brain-sheet-title">
-      <button class="brain-scrim" type="button" aria-label="Close brain picker" onClick={onClose} />
+      <button class="brain-scrim" type="button" aria-label="Close" onClick={onClose} />
       <section ref={sheetRef} class="brain-sheet">
         <header class="brain-sheet-head">
           <button ref={closeRef} type="button" class="brain-sheet-close" aria-label="Close" onClick={onClose}>×</button>
-          <h2 id="brain-sheet-title">Brain</h2>
+          <h2 id="brain-sheet-title">{ROLE_COPY.brain.title}</h2>
           <span aria-hidden="true" />
         </header>
 

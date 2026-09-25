@@ -1,10 +1,11 @@
-import { CompletionReviewCard } from '../components/CompletionReviewCard';
 import { useEffect, useState } from 'preact/hooks';
 import { compactUsageText, formatTokenCount, presentUsageMeters, resetsInText } from '@clem/chat-engine';
 import {
+  getCompletionReview,
   getConnectionsHealth,
   getDaemonStatus,
   getModelSettings,
+  setCompletionReview,
   getTidyPlan,
   applyTidy,
   getUsageStatus,
@@ -18,6 +19,8 @@ import {
   setCodexRescueModel,
   type CodexRescueSettings,
   type MobileDeviceRow,
+  type ModelRoleName,
+  type ModelSettings,
 } from '../lib/api';
 import { useScreenData } from '../lib/use-screen-data';
 import { haptic, inNativeShell, type ConnectionDoor } from '../lib/native-bridge';
@@ -29,6 +32,14 @@ import {
   unsubscribePush,
 } from '../lib/push';
 import { BrainSheet } from '../components/BrainSheet';
+import { RoleSheet } from '../components/RoleSheet';
+import {
+  ROLE_COPY,
+  brainSummary,
+  inactiveNote,
+  roleSummary,
+  sameFamilyWarning,
+} from '../lib/model-roles';
 import { ScreenNotice } from '../components/ScreenNotice';
 
 /**
@@ -58,7 +69,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
   const failedSections = [
     devices.error ? 'devices' : '',
     daemon.error ? 'app status' : '',
-    models.error ? 'brain' : '',
+    models.error ? 'models' : '',
     connections.error ? 'connections' : '',
   ].filter(Boolean);
   const retryAll = () => Promise.allSettled([
@@ -94,19 +105,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
 
       <NotificationsCard />
 
-      <BrainCard
-        currentLabel={
-          models.data?.options.find((o) => o.value === models.data?.effectiveValue)?.label
-            ?? models.data?.brain.modelId
-        }
-        provider={models.data?.brain.provider}
-        inactive={models.data?.brain.inactiveBinding}
-        actualModelId={models.data?.brain.modelId}
-        codexRescue={models.data?.codexRescue}
-        onChanged={() => models.refresh()}
-      />
-
-      <CompletionReviewCard />
+      <ModelsCard loaded={models.data} onRefresh={models.refresh} />
 
       <UsageCard />
 
@@ -249,38 +248,111 @@ function NotificationsCard() {
   );
 }
 
-function BrainCard({ currentLabel, provider, inactive, actualModelId, codexRescue, onChanged }: {
-  currentLabel?: string;
-  provider?: string;
-  inactive?: { modelId: string; reason: string };
-  actualModelId?: string;
-  codexRescue?: CodexRescueSettings;
-  onChanged: () => Promise<void> | void;
+/**
+ * Who handles each part of a request, in plain words: the model that does the
+ * work, the one that writes the final answer, the one that checks it, and the
+ * helpers that run side tasks. Each row names the model that will actually
+ * run and opens a picker over the daemon's connected catalog. Rarely changed
+ * options sit under Advanced.
+ */
+function ModelsCard({ loaded, onRefresh }: {
+  loaded: ModelSettings | null;
+  onRefresh: () => Promise<void>;
 }) {
-  const [open, setOpen] = useState(false);
+  const review = useScreenData(getCompletionReview);
+  const [latest, setLatest] = useState<ModelSettings | null>(null);
+  const [brainOpen, setBrainOpen] = useState(false);
+  const [sheet, setSheet] = useState<ModelRoleName | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+
+  // A save answers with the full snapshot so the card redraws at once; the
+  // next load supersedes it.
+  useEffect(() => { setLatest(null); }, [loaded]);
+  const settings = latest ?? loaded;
+
+  const toggleReview = async (enabled: boolean) => {
+    setReviewBusy(true);
+    setReviewError(null);
+    try {
+      await setCompletionReview(enabled);
+      haptic('light');
+      await review.refresh();
+    } catch (err) {
+      setReviewError(err instanceof Error ? err.message : 'The change was not confirmed. Try again.');
+    } finally {
+      setReviewBusy(false);
+    }
+  };
+
+  const rescue = settings?.codexRescue;
+  const rescueMeaningful = (rescue?.options.filter((option) => option.available).length ?? 0) >= 2;
+  const warning = settings ? sameFamilyWarning(settings) : null;
+  const reviewOff = review.data ? !review.data.enabled : false;
+
   return (
-    <section class="card settings-card" aria-label="Brain">
-      <h2 class="settings-card-title">Brain</h2>
-      <button
-        type="button"
-        class="settings-row"
-        onClick={() => { haptic('light'); setOpen(true); }}
-      >
-        <span class="brain-dot ok" aria-hidden="true" />
-        <span class="settings-row-main">
-          <span class="settings-row-label truncate">{currentLabel ?? 'Loading…'}</span>
-          <span class="settings-row-note">{provider ? `${provider} · switching applies to your next message` : ''}</span>
-        </span>
-        <span class="settings-row-action">Change</span>
-      </button>
-      {inactive && inactive.modelId !== actualModelId ? (
-        <p class="warning card-note">
-          Saved {inactive.modelId} is unavailable — {actualModelId} answers instead.
-        </p>
-      ) : null}
-      {codexRescue ? <CodexRescueRow settings={codexRescue} onChanged={onChanged} /> : null}
-      <BrainSheet open={open} onClose={() => setOpen(false)} onChanged={onChanged} />
+    <section class="card settings-card" aria-label="Models">
+      <h2 class="settings-card-title">Models</h2>
+      <p class="card-note">Which model handles each part of a request.</p>
+      {!settings ? (
+        <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
+      ) : (
+        <>
+          <RoleRow
+            title={ROLE_COPY.brain.title}
+            summary={brainSummary(settings)}
+            note={inactiveNote(settings.brain, settings)}
+            onOpen={() => setBrainOpen(true)}
+          />
+          {(['writer', 'judge', 'worker'] as const).map((role) => settings.roles?.[role] ? (
+            <RoleRow
+              key={role}
+              title={ROLE_COPY[role].title}
+              summary={roleSummary(role, settings)}
+              note={inactiveNote(settings.roles[role], settings)
+                ?? (role === 'judge' && reviewOff ? 'Review of finished work is off.' : null)}
+              onOpen={() => setSheet(role)}
+            />
+          ) : null)}
+          {warning ? <p class="warning card-note model-roles-warning">{warning}</p> : null}
+          {rescue && rescueMeaningful ? (
+            <details class="settings-advanced">
+              <summary>Advanced</summary>
+              <CodexRescueRow settings={rescue} onChanged={onRefresh} />
+            </details>
+          ) : null}
+        </>
+      )}
+      <BrainSheet open={brainOpen} onClose={() => setBrainOpen(false)} onChanged={() => void onRefresh()} />
+      <RoleSheet
+        role={sheet}
+        settings={settings}
+        review={review.data}
+        reviewBusy={reviewBusy}
+        reviewError={reviewError}
+        onToggleReview={(enabled) => void toggleReview(enabled)}
+        onClose={() => setSheet(null)}
+        onChanged={(next) => { setLatest(next); void onRefresh(); }}
+      />
     </section>
+  );
+}
+
+function RoleRow({ title, summary, note, onOpen }: {
+  title: string;
+  summary: string;
+  note?: string | null;
+  onOpen: () => void;
+}) {
+  return (
+    <button type="button" class="settings-row model-role-row" onClick={() => { haptic('light'); onOpen(); }}>
+      <span class="settings-row-main">
+        <span class="settings-row-label">{title}</span>
+        <span class="settings-row-note">{summary}</span>
+        {note ? <span class="settings-row-note warning">{note}</span> : null}
+      </span>
+      <span class="settings-row-action">Change</span>
+    </button>
   );
 }
 
@@ -465,8 +537,8 @@ function CodexRescueRow({ settings, onChanged }: {
       <label class="settings-row" for="codex-rescue-model">
         <span class="brain-dot ok" aria-hidden="true" />
         <span class="settings-row-main">
-          <span class="settings-row-label">Codex rescue</span>
-          <span class="settings-row-note">Used only if an all-in custom brain fails before answering.</span>
+          <span class="settings-row-label">Codex backup</span>
+          <span class="settings-row-note">Answers only if an API-key model doing the work fails before replying.</span>
         </span>
         <select
           id="codex-rescue-model"

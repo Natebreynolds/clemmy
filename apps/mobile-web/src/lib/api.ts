@@ -1649,6 +1649,18 @@ export interface CodexRescueSettings {
   options: CodexRescueModelOption[];
 }
 
+/** The roles the phone can bind to a model. The brain has its own switch. */
+export type ModelRoleName = 'writer' | 'judge' | 'worker';
+
+/** Connected models that can fill a role, grouped by provider, straight from
+ *  the daemon catalog desktop Settings renders. */
+export interface RoleModelGroup {
+  provider: string;
+  providerId?: string;
+  label: string;
+  models: Array<{ id: string; label: string }>;
+}
+
 export interface ModelSettings {
   brain: ResolvedBrain;
   options: BrainOptionRow[];
@@ -1656,6 +1668,12 @@ export interface ModelSettings {
   activeBrain: string;
   /** Optional for cached PWAs talking briefly to an older daemon. */
   codexRescue?: CodexRescueSettings;
+  /** Who writes the final answer, checks the work and helps in parallel, as
+   *  the daemon resolves them. Optional for an older daemon. */
+  roles?: Partial<Record<ModelRoleName, ResolvedBrain>>;
+  roleOptions?: Partial<Record<ModelRoleName, RoleModelGroup[]>>;
+  /** The selected checker would review its own family's answers. */
+  judgeReviewsOwnFamily?: boolean;
 }
 
 /** Paired mobile endpoint; independent of model choice and Second opinion. */
@@ -1712,6 +1730,15 @@ export async function setBrain(value: string, sessionId?: string): Promise<{ ok:
   return api('/m/api/settings/models/brain', {
     method: 'POST',
     body: JSON.stringify(sessionId ? { value, sessionId } : { value }),
+  });
+}
+
+/** Bind a role to an exact connected model id, or null to go back to
+ *  automatic. Desktop Settings saves through the same daemon owner. */
+export async function setModelRole(role: ModelRoleName, modelId: string | null): Promise<ModelSettings & { ok: boolean }> {
+  return api('/m/api/settings/models/role', {
+    method: 'POST',
+    body: JSON.stringify(modelId === null ? { role, clear: true } : { role, modelId }),
   });
 }
 

@@ -3201,6 +3201,48 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .brain-note { margin: var(--sp-3) 0 0; font-size: var(--t-sm); }
 .brain-note.switched { color: var(--accent-2); font-weight: 650; }
 
+/* Models card: one row per part of a request, each opening a picker over the
+   connected catalog. Rarely changed options fold under Advanced. */
+.model-role-row + .model-role-row { border-top: 1px solid var(--line); }
+.model-roles-warning { margin: var(--sp-2) 0 0; }
+.settings-advanced { border-top: 1px solid var(--line); margin-top: var(--sp-1); }
+.settings-advanced > summary {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  list-style: none;
+  cursor: pointer;
+  font-size: var(--t-sm);
+  font-weight: 650;
+  color: var(--fg-2);
+}
+.settings-advanced > summary::-webkit-details-marker { display: none; }
+.settings-advanced > summary::after {
+  content: '›';
+  margin-left: auto;
+  font-size: 18px;
+  color: var(--fg-3);
+  transition: transform 0.2s var(--ease-out);
+}
+.settings-advanced[open] > summary::after { transform: rotate(90deg); }
+.settings-advanced .settings-rescue { border-top: 0; margin-top: 0; }
+
+.role-explain { margin: var(--sp-1) 0 var(--sp-2); font-size: var(--t-sm); color: var(--fg-2); }
+.role-review { border-bottom: 1px solid var(--line); }
+.role-row-main { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.role-row-note { font-size: var(--t-xs); font-weight: 500; color: var(--fg-3); }
+.role-group-label {
+  padding: var(--sp-3) var(--sp-2) var(--sp-1);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-advanced > summary::after { transition: none; }
+}
+
 
 /* ── Named agents ───────────────────────────────────────────────────────────
    Agents are the user's own standing helpers, so the surface stays quiet and

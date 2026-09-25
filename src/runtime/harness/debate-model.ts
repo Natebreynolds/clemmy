@@ -32,7 +32,7 @@ import { getByoModel } from './byo-model.js';
 import { captureByoRoutingSnapshot, resolveByoProviderForModel, resolveByoProviderForModelFromSnapshot, resolveEffectiveProviderForModel } from './byo-providers.js';
 import type { ByoBackendConfig } from '../../config.js';
 import { classifyTurnIntent } from './turn-intent.js';
-import { resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
+import { boundWriterModel, resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
 import { resolveProvider } from './model-wire-registry.js';
 import {
@@ -1251,6 +1251,20 @@ function hasExplicitJudgeBinding(checker: ResolvedRoleModel): boolean {
  * (live 2026-09-05: Codex quota exhausted, everything ran on Claude, the judge
  * lane still said brainFamily codex / selfJudge false). The configured brain
  * remains the answer when no fallover has been recorded for this session. */
+/** Whether the selected judge reviews answers written by its own family: the
+ * chosen writer's when one is bound, otherwise the brain's. Settings surfaces
+ * warn from this so the warning follows the runtime's family rule. An endpoint
+ * that cannot be resolved reports false: a page names only what it can show. */
+export function judgeReviewsOwnFamily(): boolean {
+  try {
+    const checker = resolveRoleModel('judge');
+    if (checker.inactiveBinding) return false;
+    return sameJudgeFamily(checker, boundWriterModel() ?? resolveRoleModel('brain'));
+  } catch {
+    return false;
+  }
+}
+
 export function executedBrainFamily(configured: ModelProviderClass): ModelProviderClass {
   const store = harnessRunContextStorage.getStore();
   const sessionId = store?.sessionId;
