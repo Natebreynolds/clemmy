@@ -315,7 +315,7 @@ export function ChatBubble({
   const answerable = message.status === 'awaiting-reply' && Boolean(onAnswer) && (message.options?.length ?? 0) > 0;
   return (
     <article className="group/turn flex min-w-0 flex-col gap-2.5" aria-label="Clem">
-      <TurnHeader at={message.startedAt} />
+      <TurnHeader at={message.startedAt ?? message.sentAt} />
       {/* The work rides ABOVE the answer: while the turn runs it is the whole
           story (steps, helpers, the live line); once the answer lands it folds
           to one line you can reopen. */}

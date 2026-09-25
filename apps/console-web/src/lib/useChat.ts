@@ -141,6 +141,9 @@ export interface ChatMessage {
   checkIn?: boolean;
   /** A question's suggested answers, offered as one-tap replies. */
   options?: string[];
+  /** When a reopened turn was written, for display only. Live turns show
+   *  `startedAt`; this never drives the recall lookup that key uses. */
+  sentAt?: number;
 }
 
 export type ChatApprovalDecision = 'approve' | 'reject';

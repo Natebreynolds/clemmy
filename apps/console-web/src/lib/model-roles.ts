@@ -6,6 +6,7 @@
  * re-pins THAT conversation; worker and judge are global today (the daemon has
  * no per-session scope for them), and the UI says so rather than pretending.
  */
+import { modelDisplayName } from '@clem/chat-engine';
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePoll } from './poll';
@@ -141,7 +142,15 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
   };
 }
 
-/** "Claude — Opus 4.8 (flagship)" → "Opus 4.8": the chip has 150px, the provider is the dot. */
+/** "Claude — Opus 4.8 (flagship)" → "Opus 4.8": the chip has 150px, the provider is the dot.
+ *  What is left can still be a raw id (`namespace/model-v2`, `vendor-model-4-5`);
+ *  that is named by the shared rule instead of shown raw. A vendor's own
+ *  mixed-case label ("GPT-5.x") is already a name and stays as written. */
 export function shortModelLabel(label: string): string {
-  return label.replace(/^[^—–-]+[—–-]\s*/, '').replace(/\s*\(.*\)\s*$/, '').trim() || label;
+  const trimmed = label.trim();
+  const short = (/^[^\s—–]+$/.test(trimmed)
+    ? trimmed
+    : label.replace(/^[^—–-]+[—–-]\s*/, '').replace(/\s*\(.*\)\s*$/, '').trim()) || label;
+  const rawId = !/\s/.test(short) && (short.includes('/') || short === short.toLowerCase());
+  return rawId ? (modelDisplayName(short) || short) : short;
 }

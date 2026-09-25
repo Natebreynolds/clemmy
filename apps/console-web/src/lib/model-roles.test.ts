@@ -50,4 +50,7 @@ test('the chip label drops the provider prefix and the parenthetical tail', () =
   assert.equal(shortModelLabel('Claude — Opus 4.8 (flagship)'), 'Opus 4.8');
   assert.equal(shortModelLabel('GPT 5.6 Terra'), 'GPT 5.6 Terra');
   assert.equal(shortModelLabel('Codex — GPT-5.x'), 'GPT-5.x');
+  assert.equal(shortModelLabel('vendor-ai/Vendor-V4.1-Fast'), 'Vendor V4.1 Fast', 'a bare id is named, never shown raw');
+  assert.equal(shortModelLabel('Host — vendor-ai/Vendor-V4.1-Fast'), 'Vendor V4.1 Fast', 'an id left after the provider is named too');
+  assert.equal(shortModelLabel('Host — acme-large-4-5'), 'Acme Large 4.5');
 });
