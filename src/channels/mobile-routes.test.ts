@@ -5364,3 +5364,56 @@ test('a bulk clear reads the named updates and refuses to decide anything', asyn
     markNotificationRead(questionId);
   }
 });
+
+test('the phone chat stream carries the live answer draft without ever moving Last-Event-ID', async () => {
+  const { beginAnswerDraft } = await import('../runtime/harness/answer-stream.js');
+  const h = await startHarness();
+  try {
+    const sessionId = 'mobile-answer-stream';
+    createHarnessSession({ id: sessionId, kind: 'chat' });
+    const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'what is on thursday' } });
+    const answer = 'Thursday has three meetings: the design review at 9:00, lunch with the vendor at 12:30, '
+      + 'and quarterly planning at 3:00 in the large room.';
+    const draft = beginAnswerDraft({ sessionId, sourceUserSeq: source.seq, mode: 'live' });
+    draft.text(answer.slice(0, 130));
+
+    const fixture = await pairedDeviceAfterRotation(h);
+    const streamPath = `/m/api/chat/sessions/${sessionId}/stream`;
+    const mintProof = await deviceProof(fixture.pair, 'POST', '/m/auth/stream-ticket', fixture.currentFingerprint);
+    const minted = await fetch(`${h.url}/m/auth/stream-ticket`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: fixture.currentCookie, 'x-clem-device-proof': mintProof },
+      body: JSON.stringify({ path: streamPath }),
+    });
+    const { ticket } = await minted.json() as { ticket: string };
+    const res = await fetch(`${h.url}${streamPath}?ticket=${encodeURIComponent(ticket)}`, {
+      headers: { cookie: fixture.currentCookie, accept: 'text/event-stream' },
+    });
+    assert.equal(res.status, 200);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let raw = '';
+    const readUntil = async (pattern: RegExp): Promise<void> => {
+      const deadline = Date.now() + 2_000;
+      while (!pattern.test(raw) && Date.now() < deadline) {
+        const chunk = await Promise.race([reader.read(), new Promise<null>((r) => setTimeout(() => r(null), 200))]);
+        if (chunk && !chunk.done) raw += decoder.decode(chunk.value, { stream: true });
+      }
+    };
+    await readUntil(/"type":"stream_token"/);
+    draft.text(answer.slice(130));
+    draft.complete(answer);
+    await readUntil(/"offset":1\d\d/);
+    await reader.cancel();
+
+    const blocks = raw.split('\n\n').filter((block) => block.includes('"type":"stream_token"'));
+    assert.equal(blocks.length, 2, 'the text so far, then the rest');
+    for (const block of blocks) {
+      assert.ok(!/^id: /m.test(block), 'an unsequenced frame never carries an SSE id');
+    }
+    const frames = blocks.map((block) => JSON.parse(block.split('\n').find((line) => line.startsWith('data: '))!.slice(6)) as { seq: number; data: { offset: number; delta: string } });
+    assert.equal(frames[0]!.seq, 0);
+    assert.equal(frames[0]!.data.offset, 0);
+    assert.equal(frames[0]!.data.delta + frames[1]!.data.delta, answer);
+  } finally { await h.close(); }
+});
