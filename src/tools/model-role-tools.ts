@@ -1,16 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { textResult, updateEnvKey } from './shared.js';
+import { textResult } from './shared.js';
 import { getRuntimeEnv } from '../config.js';
-import {
-  readDurableBindings,
-  resolveRoleModel,
-  type ModelRole,
-  type RoleBinding,
-} from '../runtime/harness/model-roles.js';
-import { resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
-import { slugifyIntent } from '../memory/tool-choice-store.js';
-import { validateRoleModelBinding } from '../runtime/harness/model-role-options.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { ModelRoleSettingError, persistModelRoleSetting } from '../runtime/harness/model-role-settings.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { resetClaudeModelCache } from '../runtime/harness/claude-model.js';
 import { resetByoModelCache } from '../runtime/harness/byo-model.js';
@@ -18,10 +11,10 @@ import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 
 /**
  * model-role tools — Clem's chat interface to the role→model registry, so a user
- * can steer model routing in plain language ("use DeepSeek for the workers",
- * "make the judge Opus", "put the workers back on the default"). These write the
- * SAME CLEMMY_MODEL_ROLES bindings the Models UI writes (source:'chat-rule'), so
- * a chat rule shows up in the panel and vice-versa.
+ * can steer worker routing in plain language ("use DeepSeek for the workers",
+ * "put the workers back on the default"). They write through the same owner the
+ * Models UI and the phone use (source:'chat-rule'), so a chat rule shows up in
+ * the panel and vice-versa.
  *
  * Chat routes WORKERS only, role-wide or scoped to one kind of work ("use Claude
  * for design"). The brain, the writer and the judge are chosen only in Settings →
@@ -38,40 +31,6 @@ function bustModelCaches(): void {
   resetClaudeModelCache();
   resetByoModelCache();
   clearAutonomyAgentCache();
-}
-
-/** Upsert (or clear) a role-wide binding + keep the judge branch in sync. */
-function applyRoleBinding(role: ModelRole, modelId: string, clear: boolean, whenIntent?: string): void {
-  // Free-form intent is the user's OWN category word; store the slug and key the
-  // upsert on (role + intent slug) so a role-wide rule and any number of
-  // distinct-intent rules coexist. undefined intent = the role-wide rule.
-  const intentSlug = whenIntent ? slugifyIntent(whenIntent) : undefined;
-  const keyOf = (b: RoleBinding): string | undefined => (b.whenIntent ? slugifyIntent(b.whenIntent) : undefined);
-  const current = readDurableBindings();
-  const next: RoleBinding[] = current.filter((b) => !(b.role === role && keyOf(b) === intentSlug));
-  if (!clear) next.push({ role, modelId, ...(intentSlug ? { whenIntent: intentSlug } : {}), scope: 'durable', source: 'chat-rule' });
-  updateEnvKey('CLEMMY_MODEL_ROLES', JSON.stringify(next));
-  // The claude↔codex judge BRANCH sync applies ONLY to a ROLE-WIDE judge rule —
-  // an intent-scoped judge rule must not flip the global default.
-  if (role === 'judge' && !intentSlug) {
-    if (clear) {
-      updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
-      delete process.env.CLEMMY_DEBATE_JUDGE;
-    } else {
-      const provider = resolveEffectiveProviderForModel(modelId);
-      if (provider === 'byo') {
-        // The role binding carries the exact BYO model. The legacy fusion branch
-        // can only express Claude/Codex, so clear it instead of silently forcing
-        // a BYO judge onto Claude.
-        updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
-        delete process.env.CLEMMY_DEBATE_JUDGE;
-      } else {
-        updateEnvKey('CLEMMY_DEBATE_JUDGE', provider);
-        process.env.CLEMMY_DEBATE_JUDGE = provider;
-      }
-    }
-  }
-  bustModelCaches();
 }
 
 export function registerModelRoleTools(server: McpServer): void {
@@ -95,16 +54,19 @@ export function registerModelRoleTools(server: McpServer): void {
       if (!chatModelRoutingEnabled()) return textResult('Chat model routing is disabled (CLEMMY_CHAT_MODEL_ROUTING=off).');
       const clean = modelId?.trim();
       if (reset && clean) return textResult('Pass either modelId (to set a model) or reset:true (to revert to default), not both.');
+      if (!reset && !clean) return textResult('Provide a modelId to set the role, or reset:true to revert it to the default.');
+      try {
+        persistModelRoleSetting({ role, modelId: reset ? undefined : clean, clear: reset === true, whenIntent, source: 'chat-rule' });
+      } catch (err) {
+        if (err instanceof ModelRoleSettingError) return textResult(`I can't set that model role: ${err.message}`);
+        throw err;
+      }
+      bustModelCaches();
       if (reset) {
-        applyRoleBinding(role as ModelRole, '', true, whenIntent);
         const scope = whenIntent ? ` "${whenIntent.trim()}" rule` : '';
-        const r = resolveRoleModel(role as ModelRole, whenIntent);
+        const r = resolveRoleModel(role, whenIntent);
         return textResult(`Cleared the ${role}${scope}. ${role} now resolves to ${r.modelId} (${r.provider}).`);
       }
-      if (!clean) return textResult('Provide a modelId to set the role, or reset:true to revert it to the default.');
-      const validation = validateRoleModelBinding(role as ModelRole, clean);
-      if (!validation.ok) return textResult(`I can't set that model role: ${validation.reason}`);
-      applyRoleBinding(role as ModelRole, clean, false, whenIntent);
       const scope = whenIntent ? ` for "${whenIntent.trim()}"` : '';
       return textResult(
         `Done — ${role}${scope} now routes to ${clean}.` +

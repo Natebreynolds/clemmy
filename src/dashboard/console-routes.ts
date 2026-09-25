@@ -458,10 +458,11 @@ const CONSOLE_PROCESS_IDENTITY = Object.freeze({
 
 /** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
 const XAI_BASE_URL = 'https://api.x.ai/v1';
-import { resolveRoleModel, readDurableBindings, pinSessionBrain, type ModelRole, type RoleBinding } from '../runtime/harness/model-roles.js';
-import { slugifyIntent, listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
+import { resolveRoleModel, readDurableBindings, pinSessionBrain } from '../runtime/harness/model-roles.js';
+import { isBindableModelRole, ModelRoleSettingError, persistModelRoleSetting } from '../runtime/harness/model-role-settings.js';
+import { listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { modelRoleOptionCatalogSnapshot, validateRoleModelBinding, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
+import { modelRoleOptionCatalogSnapshot, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
 import { CodexRescueSettingsError, persistCodexRescueModel } from '../runtime/harness/codex-rescue-settings.js';
 import { modelDiscoveryStatus, refreshModelDiscoveryNow } from '../runtime/harness/model-discovery.js';
 import { getRateLimitSnapshot, classifyCodexQuota } from '../runtime/harness/rate-limit-store.js';
@@ -15874,61 +15875,24 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const body = (req.body ?? {}) as { role?: unknown; modelId?: unknown; whenIntent?: unknown; clear?: unknown };
-      const role = (body.role === 'worker' || body.role === 'judge' || body.role === 'writer') ? (body.role as ModelRole) : '';
-      if (!role) {
+      if (!isBindableModelRole(body.role)) {
         res.status(400).json({ error: 'role must be "worker", "judge" or "writer" (set the brain via /settings/active-brain)' });
         return;
       }
-      const cleanId = (v: unknown): string => {
-        const s = typeof v === 'string' ? v.trim() : '';
-        return /^[A-Za-z0-9._:/-]*$/.test(s) ? s : '';
-      };
-      const rawModelId = typeof body.modelId === 'string' ? body.modelId.trim() : '';
-      const modelId = cleanId(body.modelId);
-      if (rawModelId && !modelId) { res.status(400).json({ error: 'modelId contains unsupported characters.' }); return; }
-      // Optional intent scope ("design", "writing", …) — same slug form the chat
-      // tool (set_model_role) writes, so Settings and chat share one binding store.
-      const whenIntentRaw = typeof body.whenIntent === 'string' ? body.whenIntent.trim() : '';
-      const slug = whenIntentRaw ? slugifyIntent(whenIntentRaw) : '';
-      if (whenIntentRaw && !slug) { res.status(400).json({ error: 'whenIntent is empty after normalization' }); return; }
-      const clear = body.clear === true || rawModelId === '';
-      if (!clear && !modelId) { res.status(400).json({ error: 'modelId required (or clear:true to reset to default)' }); return; }
-      if (!clear) {
-        const validation = validateRoleModelBinding(role, modelId);
-        if (!validation.ok) { res.status(400).json({ error: validation.reason }); return; }
-      }
-
-      // Upsert the binding. An intent-scoped binding (whenIntent) routes only that
-      // user-named category (e.g. "design") to the model; a role-wide binding (no
-      // whenIntent) is the role default. Both write to the SAME CLEMMY_MODEL_ROLES
-      // store the chat tool uses, so Settings and chat stay one source of truth.
-      const current = readDurableBindings();
-      const next: RoleBinding[] = slug
-        ? current.filter((b) => !(b.role === role && b.whenIntent && slugifyIntent(b.whenIntent) === slug))
-        : current.filter((b) => !(b.role === role && !b.whenIntent));
-      if (!clear) {
-        next.push(slug
-          ? { role, modelId, whenIntent: slug, scope: 'durable', source: 'settings' }
-          : { role, modelId, scope: 'durable', source: 'settings' });
-      }
-      updateEnvKey('CLEMMY_MODEL_ROLES', JSON.stringify(next));
-
-      // The fusion judge BRANCH is GLOBAL (which provider reconciles), so only a
-      // role-WIDE judge binding flips it — an intent-scoped judge rule must not.
-      if (role === 'judge' && !slug) {
-        if (clear) {
-          updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
-          delete process.env.CLEMMY_DEBATE_JUDGE;
-        } else {
-          const provider = resolveEffectiveProviderForModel(modelId);
-          if (provider === 'byo') {
-            updateEnvKey('CLEMMY_DEBATE_JUDGE', '');
-            delete process.env.CLEMMY_DEBATE_JUDGE;
-          } else {
-            updateEnvKey('CLEMMY_DEBATE_JUDGE', provider);
-            process.env.CLEMMY_DEBATE_JUDGE = provider;
-          }
-        }
+      // The optional intent scope ("design", "writing", …) takes the same slug
+      // form the chat tool writes. Settings, the phone and chat share one
+      // validation + persistence owner and one binding store.
+      try {
+        persistModelRoleSetting({
+          role: body.role,
+          modelId: typeof body.modelId === 'string' ? body.modelId : undefined,
+          whenIntent: typeof body.whenIntent === 'string' ? body.whenIntent : undefined,
+          clear: body.clear === true,
+          source: 'settings',
+        });
+      } catch (err) {
+        if (err instanceof ModelRoleSettingError) { res.status(400).json({ error: err.message }); return; }
+        throw err;
       }
 
       // Re-resolve next turn (no restart).
