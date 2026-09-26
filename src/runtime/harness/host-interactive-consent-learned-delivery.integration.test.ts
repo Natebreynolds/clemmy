@@ -400,6 +400,25 @@ test('a changed definition ignores the stored verdict and asks', async () => {
   assertAsks(descriptionChanged.result, 'a changed description asks again');
 });
 
+test('unreadable observed metadata retires the learned exception without changing the input schema', async () => {
+  assert.equal(await learnOpen(), 'learned');
+  await wait(5);
+  const learned = await acceptedCall({ tag: 'open', operationId: OPEN_OPERATION,
+    schema: OPEN_SCHEMA, args: { users: 'U4' } });
+  assertProceedsWithoutCard(learned.result, 'the readable learned definition proceeds');
+
+  const screens = jevRequests.length;
+  const judges = judgeRequests.length;
+  assert.equal(learner.scheduleOperationDeliveryLearning([{
+    providerKind: 'composio', operationId: OPEN_OPERATION, inputSchema: OPEN_SCHEMA,
+  }]), 0);
+  const observed = await acceptedCall({ tag: 'open', operationId: OPEN_OPERATION,
+    schema: OPEN_SCHEMA, args: { users: 'U4' } });
+  assertAsks(observed.result, 'the next accepted source uses the existing structural send behavior');
+  assert.equal(jevRequests.length, screens, 'retiring the exception does not ask a model');
+  assert.equal(judgeRequests.length, judges);
+});
+
 test('an outbound-delivery argument on a downgraded operation is still a send and still asks', async () => {
   assert.equal(await learnOpen(OPEN_WITH_NOTIFY_SCHEMA), 'learned');
   await wait(5);

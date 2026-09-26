@@ -6,7 +6,7 @@
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
@@ -226,6 +226,121 @@ test('a newly observed definition removes the old verdict at once, and a reading
   const verdict = store.learnedOperationDeliveryVerdict('composio', OPEN.operationId);
   assert.ok(verdict, 'the newer definition was read and agreed on');
   assert.notEqual(verdict.definitionDigest, oldDigest, 'the superseded reading never wrote its verdict');
+});
+
+for (const [label, patch] of [
+  ['missing description', { description: undefined }],
+  ['blank description', { description: '   ' }],
+  ['oversized description', { description: 'x'.repeat(4_001) }],
+  ['missing schema', { inputSchema: undefined }],
+  ['oversized schema', { inputSchema: { type: 'object', description: 'x'.repeat(12_001) } }],
+  ['changed semantic classification', { semanticName: 'delete_message' }],
+] as const) {
+  test(`observing a ${label} retires the prior verdict without new model work`, async () => {
+    const unrelated = { ...OPEN, operationId: 'OTHER_OPEN_DM' };
+    assert.equal(await learner.learnOperationDelivery(OPEN), 'learned');
+    assert.equal(await learner.learnOperationDelivery(unrelated), 'learned');
+    const screenCalls = jevRequests.length;
+    const judgeCalls = judgeRequests.length;
+
+    assert.equal(learner.scheduleOperationDeliveryLearning([{ ...OPEN, ...patch }]), 0);
+    assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null);
+    assert.ok(store.learnedOperationDeliveryVerdict('composio', unrelated.operationId), 'another operation is preserved');
+    const persisted = JSON.parse(readFileSync(path.join(TEST_HOME, 'state', 'operation-delivery-verdicts.json'), 'utf8'));
+    assert.equal(Object.hasOwn(persisted.verdicts, store.learnedOperationDeliveryKey('composio', OPEN.operationId)!), false,
+      'the retired verdict is gone from disk, not just this process');
+    assert.equal(jevRequests.length, screenCalls);
+    assert.equal(judgeRequests.length, judgeCalls);
+  });
+}
+
+test('invalidation keeps provider boundaries and exact native operation identities', async () => {
+  const native = { ...OPEN, providerKind: 'native_mcp' as const, semanticName: 'open_dm' };
+  const differentlyCased = { ...native, operationId: OPEN.operationId.toLowerCase() };
+  for (const definition of [OPEN, native, differentlyCased]) {
+    assert.equal(await learner.learnOperationDelivery(definition), 'learned');
+  }
+  assert.equal(learner.scheduleOperationDeliveryLearning([{ ...native, description: null }]), 0);
+  assert.equal(store.learnedOperationDeliveryVerdict('native_mcp', native.operationId), null);
+  assert.ok(store.learnedOperationDeliveryVerdict('native_mcp', differentlyCased.operationId));
+  assert.ok(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId));
+
+  assert.equal(learner.scheduleOperationDeliveryLearning([{ ...OPEN, operationId: OPEN.operationId.toLowerCase(), description: null }]), 0);
+  assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null,
+    'the existing case-insensitive identity rule still applies');
+  assert.ok(store.learnedOperationDeliveryVerdict('native_mcp', differentlyCased.operationId));
+  assert.equal(jevRequests.length, 3);
+});
+
+test('metadata without an operation identity cannot retire another operation', async () => {
+  assert.equal(await learner.learnOperationDelivery(OPEN), 'learned');
+  assert.equal(learner.scheduleOperationDeliveryLearning([{ ...OPEN, operationId: '', description: null }]), 0);
+  assert.ok(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId));
+  assert.equal(jevRequests.length, 1);
+});
+
+test('an unreadable definition supersedes a judge reading already in flight', async () => {
+  judgeHook = () => {
+    judgeHook = null;
+    assert.equal(learner.scheduleOperationDeliveryLearning([{ ...OPEN, description: null }]), 0);
+  };
+  assert.equal(await learner.learnOperationDelivery(OPEN), 'superseded');
+  assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null,
+    'the old judge cannot restore the retired verdict');
+  assert.equal(judgeRequests.length, 1);
+});
+
+test('a definition superseded during screening does not spend a judge call', async () => {
+  assert.equal(await learner.learnOperationDelivery(OPEN, {
+    screen: async () => {
+      learner.scheduleOperationDeliveryLearning([{ ...OPEN, inputSchema: undefined }]);
+      return { ok: true, model: 'screen-fixture', deliveryProbability: 0, irreversibleProbability: 0 };
+    },
+  }), 'superseded');
+  assert.equal(judgeRequests.length, 0);
+  assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null);
+});
+
+test('a superseded queued definition spends no model calls', async () => {
+  assert.equal(learner.scheduleOperationDeliveryLearning([OPEN]), 1);
+  assert.equal(learner.scheduleOperationDeliveryLearning([{ ...OPEN, description: null }]), 0);
+  await learner._drainOperationDeliveryLearningForTests();
+  assert.equal(jevRequests.length, 0);
+  assert.equal(judgeRequests.length, 0);
+  assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null);
+});
+
+test('a discovery batch still retires stale verdicts after its model-work budget is full', async () => {
+  assert.equal(await learner.learnOperationDelivery(OPEN), 'learned');
+  const newDefinitions = Array.from({ length: 6 }, (_, index) => ({ ...OPEN, operationId: `NEW_OPEN_DM_${index}` }));
+  try {
+    assert.equal(learner.scheduleOperationDeliveryLearning([
+      ...newDefinitions, { ...OPEN, description: 'Now posts a greeting to the conversation.' },
+    ]), 6);
+    assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null);
+    assert.equal(jevRequests.length, 1, 'observing definitions does not run models on the discovery path');
+  } finally {
+    await learner._drainOperationDeliveryLearningForTests();
+  }
+  assert.equal(jevRequests.length, 7, 'the six-new-learning budget is unchanged');
+});
+
+test('a full background queue does not suppress invalidation of an observed definition', async () => {
+  assert.equal(await learner.learnOperationDelivery(OPEN), 'learned');
+  let scheduled = 0;
+  try {
+    for (let batch = 0; batch < 6; batch += 1) {
+      scheduled += learner.scheduleOperationDeliveryLearning(Array.from({ length: 6 }, (_, index) => ({
+        ...OPEN, operationId: `QUEUED_OPEN_DM_${batch}_${index}`,
+      })));
+    }
+    assert.equal(scheduled, 32);
+    assert.equal(learner.scheduleOperationDeliveryLearning([{ ...OPEN, description: null }]), 0);
+    assert.equal(store.learnedOperationDeliveryVerdict('composio', OPEN.operationId), null);
+  } finally {
+    await learner._drainOperationDeliveryLearningForTests();
+  }
+  assert.equal(jevRequests.length, 33, 'queue capacity stays bounded');
 });
 
 test('scheduling returns before any model is asked, is bounded, deduplicated, and waits after an answer', async () => {

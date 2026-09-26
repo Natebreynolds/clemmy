@@ -215,13 +215,21 @@ function prepareDefinition(definition: OperationDefinitionForDelivery): Preparat
 
 /**
  * Record that this exact definition is the current one for its operation. A
- * stored verdict for any other definition is removed now, before any model is
- * asked, so a changed definition never keeps the old verdict. Returns the
+ * stored verdict for any other or unreadable definition is removed now,
+ * before any model is asked. Unreadable metadata also supersedes any reading
+ * already queued or in flight. Returns the
  * definition when it still needs learning, or the reason it does not.
  */
 function observeDefinition(definition: OperationDefinitionForDelivery): Preparation {
   const preparation = prepareDefinition(definition);
-  if (preparation.status !== 'prepared') return preparation;
+  if (preparation.status !== 'prepared') {
+    const key = learnedOperationDeliveryKey(definition.providerKind, definition.operationId);
+    if (key) {
+      latestObserved.delete(key);
+      forgetLearnedOperationDelivery(definition.providerKind, definition.operationId);
+    }
+    return preparation;
+  }
   const prepared = preparation.definition;
   boundedSet(latestObserved, prepared.key, prepared.definitionDigest);
   const existing = learnedOperationDeliveryVerdict(prepared.providerKind, prepared.operationId);
@@ -339,6 +347,9 @@ async function learnPrepared(
     now?: () => Date;
   },
 ): Promise<OperationDeliveryLearningOutcome> {
+  // A queued reading can become obsolete before it starts. Do not spend a
+  // model call on metadata discovery has already replaced or invalidated.
+  if (latestObserved.get(prepared.key) !== prepared.definitionDigest) return 'superseded';
   const session = options.sessionId ? { sessionId: options.sessionId } : {};
   const screen = await boundedWait(
     (options.screen ?? screenWithJev)({
@@ -348,6 +359,7 @@ async function learnPrepared(
     }),
     SCREEN_TIMEOUT_MS + 2_000,
   );
+  if (latestObserved.get(prepared.key) !== prepared.definitionDigest) return 'superseded';
   if (!screen?.ok || typeof screen.model !== 'string' || !screen.model.trim()) return 'screen_unavailable';
   if (
     !probabilityAtMost(screen.deliveryProbability, LEARNED_OPERATION_DELIVERY_SCREEN_MAX)
@@ -502,10 +514,12 @@ export function scheduleOperationDeliveryLearning(
 ): number {
   let scheduled = 0;
   for (const definition of definitions) {
-    if (scheduled >= MAX_NEW_PER_CALL || queue.length >= MAX_QUEUED) break;
     try {
+      // The budget bounds new model work, not freshness of definitions the
+      // caller already observed. Later rows can retire old verdicts too.
       const preparation = observeDefinition(definition);
       if (preparation.status !== 'prepared') continue;
+      if (scheduled >= MAX_NEW_PER_CALL || queue.length >= MAX_QUEUED) continue;
       const prepared = preparation.definition;
       if (pending.has(prepared.key)) continue;
       const retryAt = retryAfter.get(retryKey(prepared));
