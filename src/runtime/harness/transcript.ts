@@ -150,6 +150,22 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     checkInsBySource.set(key, list);
   }
 
+  // Who answered each accepted source: its first route marker names the saved
+  // agent the turn ran as, or none (Clem). A separate read, so the marker
+  // count never shortens the window of visible turns.
+  const answeredBy = new Map<string, string | null>();
+  for (const event of listEvents(sessionId, { types: ['turn_model_routed'], limit })) {
+    const seq = positiveSeq(event.data.sourceUserSeq);
+    if (seq === null) continue;
+    const key = sourceKey(event.sessionId, seq);
+    if (answeredBy.has(key)) continue;
+    const name = typeof event.data.agentName === 'string' ? event.data.agentName.trim().slice(0, 64) : '';
+    answeredBy.set(key, name || null);
+  }
+  const attributed = (key: string, turns: UnifiedSessionTurn[]): UnifiedSessionTurn[] => (
+    answeredBy.has(key) ? turns.map((turn) => ({ ...turn, agentName: answeredBy.get(key) ?? null })) : turns
+  );
+
   // Pair typed terminals by the exact accepted event and elect the durable
   // first writer. This deliberately ignores physical attempt/run identity.
   const assistantBySource = new Map<string, AssistantTurn>();
@@ -248,7 +264,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       if (userTurns.length === 0 && assistant.text === PUBLIC_RUN_FAILURE_TEXT) continue;
       settled.push({
         order: source.event.seq,
-        turns: [
+        turns: attributed(source.key, [
           ...userTurns,
           ...(checkInsBySource.get(source.key) ?? []),
           {
@@ -258,7 +274,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
             planProposalId: assistant.planProposalId,
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
           },
-        ],
+        ]),
       });
     } else if (userTurns.length > 0) {
       // No reply yet — the turn is still running. This is exactly the case the
@@ -266,9 +282,9 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       // far, not an empty wait.
       unpaired.push({
         order: source.event.seq,
-        turns: [...userTurns, ...(checkInsBySource.get(source.key) ?? []),
+        turns: attributed(source.key, [...userTurns, ...(checkInsBySource.get(source.key) ?? []),
           ...(publishedPlan ? [{ role: 'assistant' as const, text: publishedPlan.text,
-            createdAt: publishedPlan.createdAt, planArtifactRef: publishedPlan.ref }] : [])],
+            createdAt: publishedPlan.createdAt, planArtifactRef: publishedPlan.ref }] : [])]),
       });
     }
   }

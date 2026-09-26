@@ -928,7 +928,7 @@ export interface ChatSession {
   status: SessionStatus;
   createdAt: number;
   updatedAt: number;
-  /** Saved agent this conversation was opened inside, when it was. */
+  /** Saved agent answering this conversation's next message; null = Clem. */
   agentId: string | null;
   agentName: string | null;
 }
@@ -945,6 +945,16 @@ export interface ChatEvent {
 
 export async function listChatSessions(): Promise<{ sessions: ChatSession[] }> {
   return api<{ sessions: ChatSession[] }>('/m/api/chat/sessions');
+}
+
+/** Switch who answers a conversation from its next message: a saved agent's
+ *  id, or null for Clem. Repeating the current choice is a no-op. */
+export async function switchChatAgent(sessionId: string, agentId: string | null): Promise<{ agentId: string | null; agentName: string | null; changed: boolean }> {
+  return api(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/agent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agentId }),
+  });
 }
 
 export async function getChatSession(id: string): Promise<{ session: ChatSession; events: ChatEvent[]; latestSeq: number }> {

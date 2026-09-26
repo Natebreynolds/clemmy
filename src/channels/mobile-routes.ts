@@ -149,6 +149,7 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
+import { setSessionAgent } from '../agents/session-agent.js';
 import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import {
@@ -3630,6 +3631,25 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const sessions = harnessListSessions({ limit: 80, archived: false, kind: 'chat', withoutConversationState: true })
       .map(serializeSessionForMobile);
     res.json({ sessions });
+  });
+
+  // Switch who answers a conversation from its next turn — the same decision
+  // the desktop composer makes: a saved agent's id, or null for Clem.
+  router.post('/api/chat/sessions/:sessionId/agent', requireMobileSession, (req, res) => {
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const agentId = (req.body as { agentId?: unknown } | undefined)?.agentId;
+    if (agentId !== null && typeof agentId !== 'string') { res.status(400).json({ error: 'INVALID_AGENT' }); return; }
+    try {
+      const result = setSessionAgent(sessionId, agentId, { by: 'owner' });
+      if (!result.ok) {
+        const status = result.reason === 'session_not_found' ? 404 : result.reason === 'agent_not_found' ? 400 : 409;
+        res.status(status).json({ error: result.reason.toUpperCase() });
+        return;
+      }
+      res.json({ sessionId, agentId: result.agentId, agentName: result.agentName, changed: result.changed });
+    } catch {
+      res.status(500).json({ error: 'AGENT_SWITCH_FAILED' });
+    }
   });
 
   router.get('/api/chat/sessions/:sessionId', requireMobileSession, (req, res) => {

@@ -130,6 +130,7 @@ import {
 } from './exact-checkpoint-reentry.js';
 import pino from 'pino';
 import { appendEvent, getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
+import { sessionAgentReviewContext } from './session-composition.js';
 import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-steer.js';
 import * as approvalRegistry from './approval-registry.js';
 import { classifyMessageIntent, selfContainedConversation, intentRequestsNoToolWork } from '../../assistant/message-intent.js';
@@ -4168,8 +4169,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     try {
       preparation = acceptedPlanPreparationReadEvidence(identity);
       const workflowEvidence = workflowParentActivation(identity.sessionId, identity.sourceUserSeq)?.completionEvidence?.();
+      const agentInstructions = sessionAgentReviewContext(identity.sessionId);
       verdict = await hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
+        ...(agentInstructions ? { agentInstructions } : {}),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
         fullSourceEvidence: true,

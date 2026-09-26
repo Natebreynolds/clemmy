@@ -29,6 +29,7 @@ import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js'
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
+import { sessionAgentState } from '../agents/session-agent-state.js';
 import { approvalPreviewProjection, publicUserInputText } from '../runtime/harness/public-presentation.js';
 import {
   archiveAuthorityPayloadsForSession,
@@ -180,10 +181,9 @@ function summarizeDesktop(record: SessionRecord): UnifiedSessionSummary {
   };
 }
 
-function metaAgent(meta: Record<string, unknown> | undefined): { agentId: string | null; agentName: string | null } {
-  const agentId = typeof meta?.agentId === 'string' && meta.agentId.trim() ? meta.agentId.trim() : null;
-  const agentName = agentId && typeof meta?.agentName === 'string' && meta.agentName.trim() ? meta.agentName.trim() : null;
-  return { agentId, agentName };
+function metaAgent(meta: Record<string, unknown> | undefined): { agentId: string | null; agentName: string | null; agentIds: string[] } {
+  const { agentId, agentName, agentIds } = sessionAgentState(meta);
+  return { agentId, agentName, agentIds };
 }
 
 function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): UnifiedSessionSummary {
@@ -618,7 +618,7 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
 
 // ─── Public API ──────────────────────────────────────────────────────────
 
-/** Conversations opened in one saved agent, newest first. */
+/** Conversations one saved agent answered in, newest first. */
 export function listSessionsForAgent(agentId: string, limit = 20): UnifiedRunSummary[] {
   return buildUnifiedSessionList({ agent: agentId, limit });
 }
@@ -652,7 +652,9 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRu
 
   if (!includeArchived) all = all.filter((s) => !s.archived);
   if (source) all = all.filter((s) => s.origin === source);
-  if (agent) all = all.filter((s) => s.agentId === agent);
+  // Every conversation the agent answered in, including ones since switched
+  // to another agent or back to Clem.
+  if (agent) all = all.filter((s) => s.agentId === agent || Boolean(s.agentIds?.includes(agent)));
   if (tag) all = all.filter((s) => s.tags.includes(tag));
   if (q) {
     all = all.filter((s) => {

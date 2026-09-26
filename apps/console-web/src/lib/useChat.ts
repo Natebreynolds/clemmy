@@ -122,6 +122,10 @@ export interface ChatMessage {
      *  (live 2026-08-07: six silent minutes inside a watched scrape). */
     awaitingApproval?: { approvalId?: string; subject?: string };
   };
+  /** Who this exchange is with: a saved agent's name, null for Clem. Set on
+   *  a sent message from the composer's choice and on reopened history; a
+   *  live reply says it on its model-phase activity row instead. */
+  agentName?: string | null;
   /** Mid-run steering: this user message was sent while a run was active and
    *  rides to the model at its next step instead of starting a new turn. */
   steer?: 'pending' | 'delivered' | 'failed';
@@ -1582,7 +1586,7 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string }, retryRequest?: PendingChatPost) => {
+  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null }, retryRequest?: PendingChatPost) => {
     const taskMode = snapshotTaskMode(input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
     if (busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
@@ -1591,8 +1595,9 @@ export function useChat(options?: UseChatOptions) {
     const text = input.text.trim();
     const attachmentIds = input.attachmentIds ?? [];
     if (!text && attachmentIds.length === 0) return;
-    // An agent binds a session at creation only; once this chat has a session
-    // the field is dropped so a retry fingerprint never differs by it.
+    // A new session opens inside the chosen agent. Once this chat has a
+    // session, a switch travels separately (lib/conversation-agent) and the
+    // field is dropped so a retry fingerprint never differs by it.
     const agentId = sessionIdRef.current ? undefined : (input.agentId || undefined);
     if (!busy && pendingPostRef.current && !retryRequest) {
       const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode, agentId });
@@ -1637,7 +1642,8 @@ export function useChat(options?: UseChatOptions) {
     activeAssistantId.current = assistantId;
     setMessages((prev) => [
       ...prev,
-      { id: userId, role: 'user', text, attachmentNames: input.attachmentNames, taskMode },
+      { id: userId, role: 'user', text, attachmentNames: input.attachmentNames, taskMode,
+        ...(input.agentName !== undefined ? { agentName: input.agentName } : {}) },
       { id: assistantId, role: 'assistant', text: '', status: 'thinking', startedAt: Date.now(), taskMode, progress: taskMode?.kind === 'plan' ? 'Investigating with read-only tools…' : 'Starting up…' },
     ]);
     setBusy(true);

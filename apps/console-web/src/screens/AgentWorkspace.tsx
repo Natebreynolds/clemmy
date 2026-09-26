@@ -5,7 +5,7 @@
  * first message of a new thread carries the agent id, and the server binds
  * the session to it from then on.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link, NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
@@ -18,6 +18,9 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { AgentPicker } from '@/components/chat/AgentPicker';
+import { AgentSwitchLine } from '@/components/chat/AgentSwitchLine';
+import { agentThreadMarks } from '@clem/chat-engine';
+import { useConversationAgent } from '@/lib/conversation-agent';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { AgentForm } from '@/components/agents/AgentForm';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
@@ -262,6 +265,10 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
   const fresh = !sessionId;
+  // This page is the agent: every message sent from it goes to this agent,
+  // including in a thread that was switched to another one elsewhere.
+  const agentChoice = useConversationAgent({ id: agent.id, name: agent.name });
+  const marks = agentThreadMarks(chat.messages, agent.name);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -287,7 +294,8 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
   }, [location.state, fresh, resetChat]);
 
   const send = async (input: SendInput) => {
-    await chat.send({ ...input, ...(fresh ? { agentId: agent.id } : {}) });
+    const addressed = await agentChoice.prepare(chat.sessionId.current, chat.busy);
+    await chat.send({ ...input, ...addressed });
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
     // The server minted the session on that first send; from here the thread
     // is addressable, so the URL says which one it is.
@@ -299,7 +307,8 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
     const intent = chatDecisionIntent(message, decision);
     if (intent.kind === 'invalid-plan') throw new Error(intent.message);
     if (intent.kind === 'approval-reply') {
-      await send({ text: intent.text, attachmentIds: [], attachmentNames: [] });
+      // An answer to a waiting card resumes that reply as it started.
+      await chat.send({ text: intent.text, attachmentIds: [], attachmentNames: [] });
       return;
     }
     await decidePlanProposal(intent.planProposalId, intent.decision);
@@ -326,10 +335,11 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
             </div>
           )}
           {chat.messages.map((m, index) => (
+            <Fragment key={m.id}>
+            {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
             <ChatBubble
-              key={m.id}
               message={m}
-              speaker={agent.name}
+              speaker={marks[index]?.speaker ?? undefined}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -341,6 +351,7 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
               onAnswer={index === chat.messages.length - 1 ? (text) => send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
               traceHref={traceHref}
             />
+            </Fragment>
           ))}
           <div ref={bottomRef} />
         </div>

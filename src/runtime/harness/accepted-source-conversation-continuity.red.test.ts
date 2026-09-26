@@ -260,3 +260,24 @@ test('stale and parked focus stay within their conversation; prior details requi
   assert.equal(review.focus, null);
   assert.deepEqual(review.parked, []);
 });
+
+test("a successor keeps the conversation's agent and every agent that answered in it", () => {
+  const parent = HarnessSession.create({
+    id: `parent-conversation-${++serial}`,
+    kind: 'chat', channel: 'mobile', userId: continuity.audienceId,
+    metadata: {
+      source: 'mobile', channelId: continuity.conversationId, userId: continuity.audienceId,
+      agentId: 'prospect-research', agentName: 'Prospect Research', agentIds: ['instagram-manager', 'prospect-research'],
+    },
+  });
+  completedExchange(parent, 'Research the prospect', 'Findings', 1);
+  prepareFailure(parent);
+  const selected = selectSessionForAcceptedSource({
+    kind: 'ordinary', entrySessionId: parent.id, durableSourceId: `agent-carry-${serial}`, continuity,
+  });
+  assert.notEqual(selected.sessionId, parent.id, 'a failed parent continues in a successor');
+  const metadata = eventlog.getSession(selected.sessionId)!.metadata;
+  assert.equal(metadata.agentId, 'prospect-research');
+  assert.equal(metadata.agentName, 'Prospect Research');
+  assert.deepEqual(metadata.agentIds, ['instagram-manager', 'prospect-research']);
+});

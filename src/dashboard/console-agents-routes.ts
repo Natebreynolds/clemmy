@@ -9,6 +9,7 @@ import {
   type AgentRecord,
 } from '../agents/agent-record.js';
 import { listSubagentRunsForAgent } from '../agents/subagent-runs.js';
+import { setSessionAgent } from '../agents/session-agent.js';
 import { listSessionsForAgent } from './sessions-api.js';
 import { listActiveSkills } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
@@ -104,6 +105,31 @@ export function registerConsoleAgentsRoutes(
       const proposal = rejectAgentProposal(String(req.params.id), reason);
       if (!proposal) { res.status(404).json({ error: 'pending proposal not found' }); return; }
       res.json({ proposal, generatedAt: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Switch who answers a conversation from its next turn: a saved agent's id,
+  // or null for Clem as usual. The body is the whole decision; repeating the
+  // same choice is a no-op.
+  app.post('/api/console/sessions/:id/agent', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const body = (req.body ?? {}) as { agentId?: unknown };
+      if (body.agentId !== null && typeof body.agentId !== 'string') {
+        res.status(400).json({ error: 'agentId must be a saved agent id or null', code: 'INVALID_AGENT' });
+        return;
+      }
+      const raw = String(req.params.id);
+      const sessionId = raw.startsWith('harness:') ? raw.slice('harness:'.length) : raw;
+      const result = setSessionAgent(sessionId, body.agentId, { by: 'owner' });
+      if (!result.ok) {
+        const status = result.reason === 'session_not_found' ? 404 : result.reason === 'agent_not_found' ? 400 : 409;
+        res.status(status).json({ error: result.reason, code: result.reason.toUpperCase() });
+        return;
+      }
+      res.json({ sessionId, agentId: result.agentId, agentName: result.agentName, changed: result.changed });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

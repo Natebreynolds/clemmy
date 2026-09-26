@@ -19,7 +19,7 @@ import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
 import { composeRunProgressLine } from './run-progress.js';
-import { applySessionMountPrimers, composeSession } from './session-composition.js';
+import { applySessionMountPrimers, composeSession, sessionAgentReviewContext } from './session-composition.js';
 import {
   clearRunInFlightAfterTerminal,
   releaseRunInFlightAfterWorkflowTransfer,
@@ -8640,9 +8640,11 @@ async function runConversationCore(
         // <url>"), stranding real completions into a false stuck loop (25 such
         // sessions in one week of eventlog). Fail-open: summarizeToolCallsForJudge
         // returns '' on error and the prompt builder only renders a real summary.
+        const agentInstructions = sessionAgentReviewContext(options.sessionId);
         const skillContext = {
           skills: loadedSkills,
           toolCallSummary: summarizeToolCallsForJudge(options.sessionId, { sourceUserSeq: activeSourceUserSeq }),
+          ...(agentInstructions ? { agentInstructions } : {}),
         };
         // A bare follow-up ("just mine please") judged in isolation is
         // inherently ambiguous → false NOT-finished retries (5 in the live
@@ -9353,9 +9355,11 @@ async function runConversationCore(
         // those bytes differ, the early exact certificate no longer owns the
         // terminal. Route that rare shape through the ordinary judge before
         // publishing instead of leaving a receiptless optimized completion.
+        const lateAgentInstructions = sessionAgentReviewContext(options.sessionId);
         const lateVerdict = await objectiveJudge(objective, userVisibleSummary, {
           skills: gatherSessionSkills(options.sessionId, { sourceUserSeq: activeSourceUserSeq, includeUnavailable: true }),
           toolCallSummary: summarizeToolCallsForJudge(options.sessionId, { sourceUserSeq: activeSourceUserSeq }),
+          ...(lateAgentInstructions ? { agentInstructions: lateAgentInstructions } : {}),
         });
         recordVerdictEvent(options.sessionId, turnResult.turn, {
           door: 'completion',

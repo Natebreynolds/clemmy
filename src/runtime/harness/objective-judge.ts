@@ -528,6 +528,9 @@ export interface SkillExecutionContext {
   /** The chosen writer that wrote the reviewed reply, when it was not the
    * brain. Reviewer independence is measured against this author. */
   reviewedAuthor?: ResolvedRoleModel;
+  /** The saved agent the reply was written inside: its standing instructions,
+   *  as the answerer had them. Absent when Clem answered without an agent. */
+  agentInstructions?: string;
 }
 
 export interface CompletionEvidenceRow {
@@ -850,6 +853,15 @@ export function buildObjectiveJudgePrompt(
       '=== RETAINED SKILL REFERENCES — relevance is governed by the effective accepted objective ===',
       'Reading a skill supplies reference material; it does not adopt every step or add deliverables. Interpret which framework and requirements the effective accepted objective actually adopts. Planning, inspecting or comparing a skill does not authorize executing it. Prior-source references can explain a framework the owner asks to reuse, but unrelated prior material and unknown scope cannot impose work. Different body digests are different retained versions; do not silently substitute the first or newest version. Check required steps and deliverables when they are applicable to the accepted job, using actual evidence. A missing applicable required step is a real gap; mere non-execution of a read reference is not.',
       ...skillContext.skills.map(renderSkillReference),
+    );
+  }
+  const agentInstructions = skillContext?.agentInstructions?.trim();
+  if (agentInstructions) {
+    parts.push(
+      '',
+      '=== THE SAVED AGENT THIS REPLY WAS WRITTEN AS — the owner\'s standing instructions for this kind of work ===',
+      'Judge against the objective. These instructions say how the owner wants this kind of work done: following them is not a defect, and a clear departure from one that applies to this reply is a real gap. They never add deliverables the objective did not ask for.',
+      agentInstructions,
     );
   }
   // Live 2026-09-14: the host refused a stale call before dispatch, no

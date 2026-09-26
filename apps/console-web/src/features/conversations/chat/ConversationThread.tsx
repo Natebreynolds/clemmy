@@ -1,12 +1,15 @@
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
 import type { TaskMode } from '@/lib/task-mode';
-import { useEffect, useRef } from 'react';
+import { Fragment, useEffect, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
+import { AgentSwitchLine } from '@/components/chat/AgentSwitchLine';
+import { agentThreadMarks } from '@clem/chat-engine';
+import { useConversationAgent } from '@/lib/conversation-agent';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
@@ -36,7 +39,7 @@ function Header({ session }: { session: Session }) {
         <div className="flex items-center gap-2">
           <h2 className="truncate text-h3 text-fg">{session.title || 'New chat'}</h2>
           <Tag>{meta.label}</Tag>
-          {session.agentName && <Tag title="This conversation works inside an agent">{session.agentName}</Tag>}
+          {session.agentName && <Tag title="Answering this conversation">{session.agentName}</Tag>}
         </div>
       </div>
       <Button
@@ -64,6 +67,14 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     rememberAsLastSession: true,
     reattachActiveRun: true,
   });
+  // Who answers next: the conversation's own agent until the chip changes it.
+  // A Space dock takes no agent, so it shows no chip.
+  const takesAgent = !rawId(session.id).startsWith('space-');
+  const agentChoice = useConversationAgent(
+    session.agentId && session.agentName ? { id: session.agentId, name: session.agentName } : null,
+    { onSwitched: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); } },
+  );
+  const marks = agentThreadMarks(chat.messages, session.agentName ?? null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -83,7 +94,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
   }, [chat.messages, chat.busy]);
 
   const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode }) => {
-    await chat.send(input);
+    const addressed = takesAgent ? await agentChoice.prepare(chat.sessionId.current, chat.busy) : {};
+    await chat.send({ ...input, ...addressed });
     // Re-sort + re-title the list now that this conversation has a new turn.
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
   };
@@ -92,6 +104,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     const intent = chatDecisionIntent(message, decision);
     if (intent.kind === 'invalid-plan') throw new Error(intent.message);
     if (intent.kind === 'approval-reply') {
+      // An answer to a waiting card resumes that reply; a pending agent
+      // switch waits for the next new message.
       await chat.send({ text: intent.text, attachmentIds: [], attachmentNames: [] });
       return;
     }
@@ -111,10 +125,11 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
         <div className={CHAT_THREAD}>
           <CollaborativeWorkstate snapshot={focus.data} compact />
           {chat.messages.map((m, index) => (
+            <Fragment key={m.id}>
+            {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
             <ChatBubble
-              key={m.id}
               message={m}
-              speaker={session.agentName ?? undefined}
+              speaker={marks[index]?.speaker ?? undefined}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -127,12 +142,13 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               onAnswer={index === chat.messages.length - 1 ? (text) => send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />
+            </Fragment>
           ))}
           <div ref={bottomRef} />
         </div>
       </div>
       <div className={CHAT_COMPOSER_WRAP}>
-        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={session.agentName ? <AgentPicker bound={session.agentName} /> : undefined} />
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={takesAgent ? <AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} started /> : undefined} placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined} />
       </div>
     </div>
   );
@@ -141,6 +157,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
 /** Read-only transcript (workflow / agent runs, or legacy desktop chats). */
 function ReadOnlyThread({ session, history }: { session: Session; history: Turn[] }) {
   const messages = historyToMessages(history);
+  const marks = agentThreadMarks(messages, session.agentName ?? null);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
@@ -149,7 +166,12 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
           {messages.length === 0 ? (
             <p className="py-12 text-center text-body text-faint">No messages in this conversation.</p>
           ) : (
-            messages.map((m) => <ChatBubble key={m.id} message={m} speaker={session.agentName ?? undefined} sessionId={rawId(session.id)} />)
+            messages.map((m, index) => (
+              <Fragment key={m.id}>
+                {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
+                <ChatBubble message={m} speaker={marks[index]?.speaker ?? undefined} sessionId={rawId(session.id)} />
+              </Fragment>
+            ))
           )}
         </div>
       </div>

@@ -9,7 +9,12 @@ let seedSeq = 0;
  * the chat UI. Durable plan and approval identities survive navigation; plain
  * assistant history remains terminal text. */
 export function historyToMessages(turns: Turn[]): ChatMessage[] {
-  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn) }));
+  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn) }));
+}
+
+/** Who answered the exchange, when the server recorded it. */
+function answeredBy(turn: Turn): Pick<ChatMessage, 'agentName'> {
+  return turn.agentName !== undefined ? { agentName: turn.agentName } : {};
 }
 
 /** When the turn was written, for the reply's header. Display only. */

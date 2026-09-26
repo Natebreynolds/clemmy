@@ -28,6 +28,7 @@ const {
   pinCompositionTools,
   renderSessionMountPrimers,
   WORKSPACE_CONTEXT_PRIMER_PREFIX,
+  sessionAgentReviewContext,
 } = await import('./session-composition.js');
 const { WORKSPACE_DOCK_HOT_TOOLS, WORKSPACE_DOCK_TOOLS } = await import('../../spaces/workspace-context.js');
 
@@ -235,4 +236,19 @@ test('a chat opened in a saved agent mounts its context and the tools its pins n
 
   const unknown = composeSession({ sessionId: 'sess-desktop-gone', sessionKind: 'chat', metadata: { agentId: 'deleted-desk' } });
   assert.equal(unknown.agent, null, 'a deleted agent leaves an ordinary chat, never a broken one');
+});
+
+test('a reviewer is told the agent a reply was written as; a plain chat tells it nothing', async () => {
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const { createSession } = await import('./eventlog.js');
+  const created = createAgentRecord({ name: 'Review Desk', handles: 'Replies for review.', instructions: 'Always cite the source row.' });
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+  const bound = createSession({ kind: 'chat', metadata: { agentId: created.agent.id, agentName: created.agent.name } });
+  const context = sessionAgentReviewContext(bound.id);
+  assert.match(context, /Agent: Review Desk/);
+  assert.match(context, /Always cite the source row/);
+  const plain = createSession({ kind: 'chat', metadata: {} });
+  assert.equal(sessionAgentReviewContext(plain.id), '');
+  assert.equal(sessionAgentReviewContext(null), '');
 });

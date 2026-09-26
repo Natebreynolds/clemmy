@@ -160,9 +160,11 @@ export interface UnifiedSessionSummary {
   /** True when the desktop can send a new turn into this session. */
   continuable: boolean;
   turnCount: number;
-  /** The saved agent this conversation was opened in, when it was. */
+  /** The saved agent answering this conversation's next turn; null = Clem. */
   agentId: string | null;
   agentName: string | null;
+  /** Every saved agent that has answered here, oldest first. */
+  agentIds?: string[];
 }
 
 /** A single normalized turn for rendering a conversation's history. */
@@ -180,6 +182,9 @@ export interface UnifiedSessionTurn {
    *  so someone who walked away can read what happened while they were gone —
    *  including on a turn that is still running and has no reply yet. */
   checkIn?: boolean;
+  /** Who this exchange was answered by: a saved agent's name, null for Clem
+   *  without an agent. Absent when the turn left no route marker. */
+  agentName?: string | null;
   /** A2 (v2.3.0): a STILL-PENDING approval attached to this turn, so a
    *  reopened chat renders the actionable approve/execute card — not just
    *  the prose that told the user a card exists somewhere else. */

@@ -14,6 +14,7 @@ import {
 import { previewPersistedSessionConversationProtocolInTransaction } from './conversation-protocol-session.js';
 import { publicCompletionText, publicUserInputText, validTypedCompletionPresentation } from './public-presentation.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
+import { sessionAgentState } from '../../agents/session-agent-state.js';
 
 const BRANCH_META = '__accepted_source_branch';
 const MOUNT_META = '__session_mount';
@@ -566,15 +567,17 @@ function safeChildMetadata(input: {
   now: string;
 }): Record<string, unknown> {
   const mount = input.validatedMount;
-  // The agent a conversation was opened in follows it onto a successor;
-  // otherwise the desk would silently vanish mid-conversation.
-  let parentAgent: { agentId: string; agentName?: string } | null = null;
+  // The conversation's agent, and every agent that answered in it, follow it
+  // onto a successor; otherwise the agent would silently vanish mid-conversation.
+  let parentAgent: { agentId?: string; agentName?: string; agentIds?: string[] } | null = null;
   try {
     const parentMeta = JSON.parse(input.parent.metadata_json || '{}') as Record<string, unknown>;
-    if (typeof parentMeta.agentId === 'string' && parentMeta.agentId.trim()) {
+    const state = sessionAgentState(parentMeta);
+    if (state.agentId || state.agentIds.length > 0) {
       parentAgent = {
-        agentId: parentMeta.agentId.trim(),
-        ...(typeof parentMeta.agentName === 'string' ? { agentName: parentMeta.agentName } : {}),
+        ...(state.agentId ? { agentId: state.agentId } : {}),
+        ...(state.agentName ? { agentName: state.agentName } : {}),
+        ...(state.agentIds.length > 0 ? { agentIds: state.agentIds } : {}),
       };
     }
   } catch {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, X } from 'lucide-react';
@@ -11,6 +11,10 @@ import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import type { TaskMode } from '@/lib/task-mode';
 import { Composer } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
+import { AgentSwitchLine } from '@/components/chat/AgentSwitchLine';
+import { agentThreadMarks } from '@clem/chat-engine';
+import { useConversationAgent } from '@/lib/conversation-agent';
+import { sessionKeys } from '@/features/conversations/hooks/keys';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '@/features/conversations/lib/chatColumn';
@@ -80,10 +84,12 @@ export function Chat() {
     }
   };
   const chat = useChat({ rememberAsLastSession: true });
-  // The agent this new conversation starts in. Held here until the first send
-  // mints the session; after that the binding lives on the server and the
-  // chip is a label.
-  const [agent, setAgent] = useState<{ id: string; name: string } | null>(null);
+  // Who answers: chosen on the chip at any time, applied just before the next
+  // message (the first one opens the conversation inside it).
+  const agentChoice = useConversationAgent(null, {
+    onSwitched: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); },
+  });
+  const agent = agentChoice.chosen;
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -97,16 +103,19 @@ export function Chat() {
 
   const needsYou = cc.data?.needsYou ?? [];
   const hasThread = chat.messages.length > 0;
-  const send = (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode }) =>
-    chat.send({ ...input, ...(agent ? { agentId: agent.id } : {}) });
-  const agentSlot = chat.sessionId.current
-    ? (agent ? <AgentPicker bound={agent.name} /> : undefined)
-    : <AgentPicker value={agent?.id ?? null} onChange={setAgent} />;
+  const send = async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode }) => {
+    const addressed = await agentChoice.prepare(chat.sessionId.current, chat.busy);
+    await chat.send({ ...input, ...addressed });
+  };
+  const agentSlot = <AgentPicker value={agent} onChange={agentChoice.choose} started={hasThread} />;
+  const marks = agentThreadMarks(chat.messages);
   const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
     const intent = chatDecisionIntent(message, decision);
     if (intent.kind === 'invalid-plan') throw new Error(intent.message);
     if (intent.kind === 'approval-reply') {
-      await send({ text: intent.text });
+      // An answer to a waiting card resumes that reply; a pending agent
+      // switch waits for the next new message.
+      await chat.send({ text: intent.text });
       return;
     }
     await decidePlanProposal(intent.planProposalId, intent.decision);
@@ -140,7 +149,7 @@ export function Chat() {
     if (stamp && stamp !== lastNewChatRef.current) {
       lastNewChatRef.current = stamp;
       resetChat();
-      setAgent(null);
+      agentChoice.choose(null);
       // An explicit "New chat" releases the active-conversation pointer — the
       // index must not bounce straight back into the thread being left.
       rememberLastChatSession(null);
@@ -197,10 +206,11 @@ export function Chat() {
             <AttentionStrip needsYou={needsYou} onDismiss={dismissCard} />
           )}
           {chat.messages.map((m, index) => (
+            <Fragment key={m.id}>
+            {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
             <ChatBubble
-              key={m.id}
               message={m}
-              speaker={agent?.name}
+              speaker={marks[index]?.speaker ?? undefined}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -214,6 +224,7 @@ export function Chat() {
               onAnswer={index === chat.messages.length - 1 ? (text) => send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />
+            </Fragment>
           ))}
           <div ref={bottomRef} />
         </div>

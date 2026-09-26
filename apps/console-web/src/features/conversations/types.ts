@@ -18,9 +18,11 @@ export interface Session {
   archived: boolean;
   continuable: boolean;
   turnCount: number;
-  /** The agent this conversation works inside, when it was started in one. */
+  /** The agent answering this conversation's next message; null = Clem. */
   agentId?: string | null;
   agentName?: string | null;
+  /** Every agent that has answered here, oldest first. */
+  agentIds?: string[];
   /** Exact step sessions supplied by the backend for a collapsed run. */
   runSteps?: RunStep[];
   runCoverage?: RunSourceCoverage;
@@ -32,6 +34,9 @@ export interface Turn {
   role: 'user' | 'assistant';
   text: string;
   createdAt: string;
+  /** Who answered this exchange: an agent's name, null for Clem. Absent when
+   *  the turn left no record of it. */
+  agentName?: string | null;
   /** Exact still-pending plan proposal restored by the server on reopen. */
   planProposalId?: string;
   /** A still-pending approval attached by the server so a reopened chat
