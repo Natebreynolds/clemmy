@@ -453,10 +453,21 @@ function buildSlackBotMessage(notification: NotificationRecord): string {
   return formatSlackNotificationMessage(notification.title, notification.body, notification.metadata);
 }
 
+/**
+ * What one delivery attempt did. A destination that was reached but chose not
+ * to interrupt (the two rules, or a channel's own rules) is SETTLED and SKIPPED:
+ * not a delivery, not a failure, never retried. The ledger says which, so a
+ * record that buzzed nobody is never written down as delivered.
+ */
+export type DeliveryOutcome =
+  | { sent: true }
+  | { sent: false; skipped: 'not_worth_interrupting' | 'channel_rules' };
+const SENT: DeliveryOutcome = { sent: true };
+
 export async function deliverNotificationToDestination(
   notification: NotificationRecord,
   destination: NotificationDestination,
-): Promise<void> {
+): Promise<DeliveryOutcome> {
   if (
     hasExactOriginDeliveryMode(notification)
     && !exactOriginDeliveryDestinationMatches(notification, destination)
@@ -485,10 +496,10 @@ export async function deliverNotificationToDestination(
     // poll. This leg exists so loud notifications always resolve at least one
     // destination (never "deferred: no destinations", live 2026-07-22) and so
     // the delivery ledger records the surface.
-    return;
+    return SENT;
   }
   if (destination.type === 'web_push' || destination.type === 'apns') {
-    if (!isWorthNotifying(notification)) return;
+    if (!isWorthNotifying(notification)) return { sent: false, skipped: 'not_worth_interrupting' };
   }
   if (destination.type === 'web_push') {
     if (!destination.pushEndpoint || !destination.pushP256dh || !destination.pushAuth) {
@@ -523,7 +534,7 @@ export async function deliverNotificationToDestination(
       }
       throw err;
     }
-    return;
+    return SENT;
   }
 
   if (destination.type === 'apns') {
@@ -547,7 +558,7 @@ export async function deliverNotificationToDestination(
       // tap that does nothing at all — so this leg keeps the route it accepts.
       url: inboxNotificationUrl(notification),
     });
-    if (result.ok) return;
+    if (result.ok) return SENT;
     if (isApnsTokenGone(result)) {
       const { removeApnsDestinationByToken } = await import('./notifications.js');
       removeApnsDestinationByToken(destination.apnsDeviceToken);
@@ -560,7 +571,7 @@ export async function deliverNotificationToDestination(
     if (!destination.userId) {
       throw new Error('Discord user destination is missing userId.');
     }
-    if (!shouldDeliverDiscordNotification(notification)) return;
+    if (!shouldDeliverDiscordNotification(notification)) return { sent: false, skipped: 'channel_rules' };
     // Attach approval buttons when the notification carries an
     // actionable target (approvalId for SDK interrupts, planProposalId
     // for plan proposals). Plain text otherwise. sendDiscordDirectMessage
@@ -568,14 +579,14 @@ export async function deliverNotificationToDestination(
     // and keeps the components on the last chunk only.
     const components = buildDiscordComponentsForNotification(notification);
     await deliverySenders.sendDiscordDirectMessage(destination.userId, buildDiscordBotMessage(notification), { components });
-    return;
+    return SENT;
   }
 
   if (destination.type === 'discord_channel') {
     if (!destination.channelId) {
       throw new Error('Discord channel destination is missing channelId.');
     }
-    if (!shouldDeliverDiscordNotification(notification)) return;
+    if (!shouldDeliverDiscordNotification(notification)) return { sent: false, skipped: 'channel_rules' };
     const components = buildDiscordComponentsForNotification(notification);
     if (components && components.length > 0) {
       await deliverySenders.sendDiscordChannelMessageWithComponents(destination.channelId, buildDiscordBotMessage(notification), components);
@@ -587,28 +598,28 @@ export async function deliverNotificationToDestination(
         nonce ? { nonce, enforceNonce: true } : {},
       );
     }
-    return;
+    return SENT;
   }
 
   if (destination.type === 'slack_user') {
     if (!destination.userId) {
       throw new Error('Slack user destination is missing userId.');
     }
-    if (!shouldDeliverSlackNotification(notification)) return;
+    if (!shouldDeliverSlackNotification(notification)) return { sent: false, skipped: 'channel_rules' };
     const blocks = buildSlackBlocksForNotification(notification);
     const exactDelivery = exactSlackDeliveryIdentity(notification);
     await deliverySenders.sendSlackDirectMessage(destination.userId, buildSlackBotMessage(notification), {
       blocks,
       ...(exactDelivery ? { exactDelivery } : {}),
     });
-    return;
+    return SENT;
   }
 
   if (destination.type === 'slack_channel') {
     if (!destination.channelId) {
       throw new Error('Slack channel destination is missing channelId.');
     }
-    if (!shouldDeliverSlackNotification(notification)) return;
+    if (!shouldDeliverSlackNotification(notification)) return { sent: false, skipped: 'channel_rules' };
     const blocks = buildSlackBlocksForNotification(notification);
     const threadTs = slackThreadForDelivery(notification, destination);
     const exactDelivery = exactSlackDeliveryIdentity(notification);
@@ -623,7 +634,7 @@ export async function deliverNotificationToDestination(
         ...(exactDelivery ? { exactDelivery } : {}),
       });
     }
-    return;
+    return SENT;
   }
 
   if (destination.type === 'slack_webhook') {
@@ -637,7 +648,7 @@ export async function deliverNotificationToDestination(
       body: JSON.stringify({ text: `*${notification.title}*\n${notification.body}` }),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return;
+    return SENT;
   }
 
   if (!destination.url) {
@@ -668,7 +679,7 @@ export async function deliverNotificationToDestination(
         throw new Error(`HTTP ${response.status}`);
       }
     }
-    return;
+    return SENT;
   }
 
   const response = await fetch(destination.url, {
@@ -679,6 +690,7 @@ export async function deliverNotificationToDestination(
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
+  return SENT;
 }
 
 /**

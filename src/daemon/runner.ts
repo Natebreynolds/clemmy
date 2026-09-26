@@ -208,13 +208,16 @@ function reconcileAutomationPartitionsOnDaemon(context: string): void {
 }
 const STATE_FILE = path.join(path.dirname(CRON_RUNS_DIR), 'daemon-state.json');
 
-let deliverNotificationToDestinationImpl: typeof deliverNotificationToDestination =
+type NotificationDeliveryFn = (
+  ...args: Parameters<typeof deliverNotificationToDestination>
+) => Promise<Awaited<ReturnType<typeof deliverNotificationToDestination>> | void>;
+let deliverNotificationToDestinationImpl: NotificationDeliveryFn =
   deliverNotificationToDestination;
 
 /** Narrow delivery seam for crash/restart tests. Production always uses the
- * real provider dispatcher. */
+ * real provider dispatcher. A stub that returns nothing counts as sent. */
 export function _setNotificationDeliveryForTests(
-  fn: typeof deliverNotificationToDestination | null,
+  fn: NotificationDeliveryFn | null,
 ): void {
   deliverNotificationToDestinationImpl = fn ?? deliverNotificationToDestination;
 }
@@ -1848,6 +1851,9 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
     const lastErrorByDestination = {
       ...(notification.deliveryLastErrorByDestination ?? {}),
     };
+    const skippedByDestination = {
+      ...(notification.deliverySkippedByDestination ?? {}),
+    };
     delete nextAttemptAtByDestination[NO_DESTINATION_RETRY_KEY];
     const successfulDestinationIds: string[] = [];
     let lastError = '';
@@ -1910,8 +1916,9 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
 
       attemptCountByDestination[destination.id] = (attemptCountByDestination[destination.id] ?? 0) + 1;
 
+      let outcome: Awaited<ReturnType<NotificationDeliveryFn>>;
       try {
-        await deliverNotificationToDestinationImpl(notification, destination);
+        outcome = await deliverNotificationToDestinationImpl(notification, destination);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         lastError = message;
@@ -1933,6 +1940,27 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
           deliveryAttemptCountByDestination: attemptCountByDestination,
           deliveryNextAttemptAtByDestination: nextAttemptAtByDestination,
           deliveryLastErrorByDestination: lastErrorByDestination,
+        });
+        continue;
+      }
+
+      if (outcome && outcome.sent === false) {
+        // Reached, and chose not to interrupt: the two rules, or the channel's
+        // own rules. Settled for this destination, but NOT a delivery: no
+        // deliveredAt, no receipt. Before this, the same return was written
+        // down as delivered, and a heartbeat item that never buzzed a phone
+        // read as pushed (live 09-26).
+        completed.add(destination.id);
+        delete nextAttemptAtByDestination[destination.id];
+        delete lastErrorByDestination[destination.id];
+        skippedByDestination[destination.id] = outcome.skipped;
+        updateObservedNotification({
+          deliveryAttempts: Object.values(attemptCountByDestination)
+            .reduce((sum, value) => sum + value, 0),
+          deliveryAttemptCountByDestination: attemptCountByDestination,
+          deliveryNextAttemptAtByDestination: nextAttemptAtByDestination,
+          deliveryLastErrorByDestination: lastErrorByDestination,
+          deliverySkippedByDestination: skippedByDestination,
         });
         continue;
       }

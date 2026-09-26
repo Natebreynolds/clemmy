@@ -130,6 +130,19 @@ function hasUnresolvedQuestion(
   return true;
 }
 
+/**
+ * A heartbeat item (work review, calendar watch) is Clementine noticing that
+ * something of the owner's is stuck and offering help. It has a referent (the
+ * item key; the runs, chats or drafts it points at) and it retires on its own,
+ * marking its card read, when that thing resolves, so it never sits in the
+ * badge forever. Unlike a bare needsAttention flag, it is a real ask.
+ */
+function isOpenHeartbeatItem(meta: Record<string, unknown> | undefined): boolean {
+  return typeof meta?.heartbeatId === 'string'
+    && typeof meta?.itemKey === 'string'
+    && meta?.needsAttention === true;
+}
+
 /** A proposal is a decision only while it is actually pending. */
 function hasPendingProposal(
   meta: Record<string, unknown> | undefined,
@@ -181,6 +194,7 @@ export function classifyNotification(
     || hasUnresolvedQuestion(meta, live)
     || (AWAITING_STATUSES.has(status) && meta?.needsAttention !== false)
     || statusOf(meta) === 'blocked_readiness'
+    || isOpenHeartbeatItem(meta)
   ) {
     return 'awaiting_you';
   }

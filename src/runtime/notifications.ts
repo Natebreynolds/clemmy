@@ -269,6 +269,10 @@ export interface NotificationRecord {
   deliveryAttemptCountByDestination?: Record<string, number>;
   deliveryNextAttemptAtByDestination?: Record<string, string>;
   deliveryLastErrorByDestination?: Record<string, string>;
+  /** Destinations reached that chose not to interrupt (the two rules, or a
+   * channel's own rules). Settled, not delivered, not failed, never retried;
+   * written down so a record that buzzed nobody never reads as delivered. */
+  deliverySkippedByDestination?: Record<string, string>;
   /** Explicit user retry generation. Unlike a queue cursor timestamp, this is
    * carrier authority to give an old generic notification a fresh age window. */
   deliveryRetryRequestedAt?: string;
@@ -1022,7 +1026,18 @@ function isTerminalOriginChatPushEligible(item: NotificationRecord): boolean {
   ) return false;
   const destinations = loadDestinationsUnlocked();
   return destinationsRequireRecovery()
-    || destinations.some((entry) => entry.enabled && entry.type === 'web_push');
+    || phonePushDestinations(destinations).length > 0;
+}
+
+/**
+ * The destinations that reach a phone: a PWA web-push subscription or the
+ * native app's APNs token. Every report-back filter goes through here, so a
+ * phone registered one way is never left out because a filter named the other
+ * (live 09-26: the native app registers APNs only, and three filters said
+ * web_push).
+ */
+export function phonePushDestinations(destinations: NotificationDestination[]): NotificationDestination[] {
+  return destinations.filter((entry) => entry.enabled && (entry.type === 'web_push' || entry.type === 'apns'));
 }
 
 function shouldQueueNotificationDelivery(item: NotificationRecord): boolean {
@@ -2140,6 +2155,7 @@ export function updateNotificationDeliveryStatus(
     | 'deliveryAttemptCountByDestination'
     | 'deliveryNextAttemptAtByDestination'
     | 'deliveryLastErrorByDestination'
+    | 'deliverySkippedByDestination'
   >>,
   options: { expectedDeliveryRetryRequestedAt?: string | null } = {},
 ): NotificationRecord | undefined {
@@ -2521,7 +2537,7 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
       if (!isTerminalOriginChatPushEligible(notification)) return [];
       const destinations = listNotificationDestinations();
       if (destinationsRequireRecovery()) return [];
-      return destinations.filter((entry) => entry.enabled && entry.type === 'web_push');
+      return phonePushDestinations(destinations);
     }
 
     if (target.type === 'discord_channel') {
@@ -2569,7 +2585,7 @@ export function getNotificationDestinationsForRecord(notification: NotificationR
       && (process.env.CLEMMY_REPORTBACK_PUSH ?? 'on').toLowerCase() !== 'off') {
       const destinations = listNotificationDestinations();
       if (destinationsRequireRecovery()) return [];
-      return destinations.filter((e) => e.enabled && e.type === 'web_push');
+      return phonePushDestinations(destinations);
     }
     return [];
   }

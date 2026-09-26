@@ -36,6 +36,7 @@ const {
   requeueNotificationDelivery,
   replaceQueuedNotificationDeliveries,
   updateNotificationDeliveryStatus,
+  upsertApnsDestination,
   upsertNotificationDestination,
 } = await import('../runtime/notifications.js');
 const {
@@ -132,6 +133,65 @@ test('silent exact origin-chat carrier owns one web-push receipt and never falls
 
   removeNotificationDestination(pushId);
   removeNotificationDestination(genericId);
+});
+
+test('a phone registered through the native app (APNs) gets the same report-backs as a web-push phone', async () => {
+  replaceQueuedNotificationDeliveries([]);
+  const apns = upsertApnsDestination({ deviceToken: 'ab'.repeat(32), deviceId: 'device-apns-1', deviceLabel: 'Owner iPhone' });
+  const notificationId = 'terminal-report-back-to-native-phone';
+  addNotification({
+    id: notificationId,
+    kind: 'workflow',
+    title: 'Workflow finished',
+    body: 'Done.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { terminalReportBack: true, status: 'done' },
+  });
+  const destinations = getNotificationDestinationsForRecord(getNotification(notificationId)!);
+  assert.ok(destinations.some((d) => d.id === apns.id && d.type === 'apns'), 'the APNs phone is a report-back destination');
+  removeNotificationDestination(apns.id);
+  replaceQueuedNotificationDeliveries([]);
+});
+
+test('a destination reached that chose not to interrupt is written down as skipped, never as delivered', async () => {
+  replaceQueuedNotificationDeliveries([]);
+  const pushId = 'quiet-phone';
+  upsertNotificationDestination({
+    id: pushId,
+    name: 'Phone',
+    type: 'web_push',
+    pushEndpoint: 'https://push.example/quiet-phone',
+    pushP256dh: 'p256dh',
+    pushAuth: 'auth',
+    deviceId: 'device-2',
+    enabled: true,
+    createdAt: new Date().toISOString(),
+  });
+  const notificationId = 'history-not-an-interruption';
+  addNotification({
+    id: notificationId,
+    kind: 'system',
+    title: 'Clementine was offline for 8 min',
+    body: 'Back now.',
+    createdAt: new Date().toISOString(),
+    read: false,
+    metadata: { sessionId: 's' },
+  });
+  // The real dispatcher: the two-rules gate returns before any provider call.
+  _setNotificationDeliveryForTests(null);
+  await processNotificationDeliveries(assistantStub);
+  const record = getNotification(notificationId)!;
+  assert.equal(record.deliverySkippedByDestination?.[pushId], 'not_worth_interrupting');
+  assert.equal(record.deliveredDestinations?.includes(pushId) ?? false, false, 'no receipt for a buzz that never happened');
+  assert.equal(record.deliveryLastErrorByDestination?.[pushId], undefined, 'and it is not a failure either');
+  assert.equal(
+    listQueuedNotificationDeliveries().some((job) => job.notificationId === notificationId && !job.completedDestinationIds?.includes(pushId)),
+    false,
+    'settled: not retried',
+  );
+  removeNotificationDestination(pushId);
+  replaceQueuedNotificationDeliveries([]);
 });
 
 test('a settled capability gate cannot leak through an already-admitted delivery cursor', async () => {

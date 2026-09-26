@@ -17,6 +17,7 @@ import {
   type HeartbeatContract,
   type HeartbeatNotifyMode,
 } from './heartbeat-contracts.js';
+import { phonePushReadiness, type PhonePushReadiness } from './phone-push-readiness.js';
 
 export const HEARTBEAT_IDS = ['work-review', 'calendar', 'workflow-suggestions'] as const;
 export type HeartbeatId = (typeof HEARTBEAT_IDS)[number];
@@ -57,6 +58,8 @@ export interface HeartbeatStatus {
   /** Whether this heartbeat's rules are applied to its items (the watches ship their own rules for now). */
   rulesApply: boolean;
   contract: HeartbeatContract;
+  /** Whether "reach my phone" could reach one right now, and if not, why. */
+  phonePush: PhonePushReadiness;
 }
 
 const CADENCE_RANGE: Record<HeartbeatId, { min: number; max: number }> = {
@@ -65,8 +68,17 @@ const CADENCE_RANGE: Record<HeartbeatId, { min: number; max: number }> = {
   'workflow-suggestions': { min: 30, max: 1440 },
 };
 
+async function currentPhonePush(): Promise<PhonePushReadiness> {
+  const [{ listNotificationDestinations }, { isApnsConfigured }] = await Promise.all([
+    import('../runtime/notifications.js'),
+    import('../runtime/apns.js'),
+  ]);
+  return phonePushReadiness(listNotificationDestinations(), isApnsConfigured());
+}
+
 async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
   const contract = loadHeartbeatContract(id);
+  const phonePush = await currentPhonePush();
   if (id === 'work-review') {
     const { workReviewStatus } = await import('./work-review-runtime.js');
     const s = workReviewStatus();
@@ -81,6 +93,7 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
       recentlyRetired: s.recentlyRetired.map((i) => ({ key: i.key, kind: i.kind, subject: i.subject, detail: i.detail, createdAt: i.createdAt, retiredAt: i.retiredAt, retiredReason: i.retiredReason })),
       rulesApply: true,
       contract,
+      phonePush,
     };
   }
   if (id === 'calendar') {
@@ -97,6 +110,7 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
       recentlyRetired: s.recentlyRetired.map((i) => ({ key: i.key, kind: i.kind, subject: i.subject, createdAt: i.createdAt, retiredAt: i.retiredAt, retiredReason: i.retiredReason })),
       rulesApply: false,
       contract,
+      phonePush,
     };
   }
   const { workflowSuggestionsStatus } = await import('./workflow-suggestions.js');
@@ -133,6 +147,7 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
     recentlyRetired: items(s.recentlyRetired),
     rulesApply: false,
     contract,
+    phonePush,
   };
 }
 

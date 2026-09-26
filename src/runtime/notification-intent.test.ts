@@ -146,6 +146,16 @@ test('needsAttention alone, with no referent and no status, is not a decision', 
   );
 });
 
+test('an open heartbeat item is an ask: it has a referent and retires on its own', () => {
+  const item = { kind: 'execution', title: 'Still waiting: weekly-review', metadata: { heartbeatId: 'work-review', itemKey: 'run_waiting:weekly-review', needsAttention: true, refs: ['r1', 'r2'] } };
+  assert.equal(classifyNotification(item), 'awaiting_you');
+  assert.equal(isWorthNotifying(item), true);
+  // Retired: the same record with the flag cleared is history.
+  assert.equal(classifyNotification({ ...item, metadata: { ...item.metadata, needsAttention: false } }), 'neither');
+  // A heartbeat id without an item key is a producer's bookkeeping, not an ask.
+  assert.equal(classifyNotification({ kind: 'execution', title: 'tick', metadata: { heartbeatId: 'work-review', needsAttention: true } }), 'neither');
+});
+
 test('the two rules together decide what may interrupt a person', () => {
   const finished = { kind: 'execution', title: 'Run done', metadata: { status: 'done' } };
   const asking = { kind: 'execution', title: 'Question', metadata: { status: 'needs_input' } };

@@ -24,7 +24,7 @@ import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
-  addHeartbeatRule, cadenceChoices, cadenceWords, listHeartbeats, patchHeartbeat, refineHeartbeatPrompt, removeHeartbeatRule, tickHeartbeat,
+  addHeartbeatRule, cadenceChoices, cadenceWords, listHeartbeats, patchHeartbeat, phonePushCaveat, refineHeartbeatPrompt, removeHeartbeatRule, tickHeartbeat,
   type HeartbeatStatus,
 } from '@/lib/heartbeats';
 
@@ -155,6 +155,9 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
             </label>
             <span>Last check {ago(h.lastTickAt)}{h.enabled && h.nextTickAt ? ` · next ${inWords(h.nextTickAt)}` : ''}</span>
           </div>
+          {h.contract.notify === 'push' && phonePushCaveat(h.phonePush) ? (
+            <p className="text-caption text-warning">{phonePushCaveat(h.phonePush)}</p>
+          ) : null}
 
           <div className="rounded-md border border-border bg-subtle px-3 py-2 text-small">
             <span className="text-muted">Last finding: </span>

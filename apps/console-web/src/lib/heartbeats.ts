@@ -40,6 +40,8 @@ export interface HeartbeatStatus {
   recentlyRetired: HeartbeatItem[];
   rulesApply: boolean;
   contract: { id: string; notify: HeartbeatNotifyMode; rules: HeartbeatRule[]; updatedAt: string };
+  /** Whether "reach my phone" could reach one right now, and if not, why. */
+  phonePush: { ready: boolean; reason?: 'no_phone_registered' | 'apns_key_missing'; phones: { webPush: number; apns: number } };
 }
 
 export const listHeartbeats = () => apiGet<{ heartbeats: HeartbeatStatus[] }>('/api/console/heartbeats');
@@ -64,6 +66,13 @@ export function cadenceChoices(range: { min: number; max: number }, current: num
   const all = [5, 10, 15, 30, 60, 120, 180, 240, 360, 720, 1440];
   const inRange = all.filter((m) => m >= range.min && m <= range.max);
   return inRange.includes(current) ? inRange : [...inRange, current].sort((a, b) => a - b);
+}
+
+/** Why push would not reach a phone today, in the owner's terms; empty when it would. */
+export function phonePushCaveat(readiness: HeartbeatStatus['phonePush'] | undefined): string {
+  if (!readiness || readiness.ready) return '';
+  if (readiness.reason === 'apns_key_missing') return 'Your phone is paired, but this Mac has no Apple push key yet, so these items stay in the app for now.';
+  return 'No phone is set up for notifications yet. Open Clem on your phone and allow notifications; until then these items stay in the app.';
 }
 
 /** The opening line of a chat about a heartbeat: names it and stops. */
