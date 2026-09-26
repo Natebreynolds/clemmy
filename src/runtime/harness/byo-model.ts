@@ -44,7 +44,12 @@ import { recordWindowAcceptance, recordWindowRejection } from './model-window-ob
 import { harnessRunContextStorage } from './brackets.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
-import { placeTurnContextAtAnchor, promptLayoutFor, schedulePromptLayoutProbe } from './byo-prompt-layout.js';
+import {
+  PROMPT_LAYOUT_PROBE_CHANNEL,
+  placeTurnContextAtAnchor,
+  promptLayoutFor,
+  schedulePromptLayoutProbe,
+} from './byo-prompt-layout.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-model' });
@@ -711,7 +716,7 @@ export function wrapCompletionsCreate(
 }
 
 /** Context under which a layout measurement records its own spend. */
-const PROMPT_LAYOUT_PROBE_CONTEXT = { sessionId: 'byo-prompt-layout-probe' } as unknown as ReturnType<typeof harnessRunContextStorage.getStore>;
+const PROMPT_LAYOUT_PROBE_CONTEXT = { sessionId: PROMPT_LAYOUT_PROBE_CHANNEL } as unknown as ReturnType<typeof harnessRunContextStorage.getStore>;
 
 /**
  * Apply the measured per-turn context layout to a request that carries the

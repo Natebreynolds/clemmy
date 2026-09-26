@@ -23,6 +23,7 @@ import {
   stripPromptCacheLayerSentinels,
 } from './model-wire-registry.js';
 import { relaxRequestForCompatBackend, wrapCompletionsCreate } from './byo-model.js';
+import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
 import { ToolCallsCounter, harnessRunContextStorage, type HarnessRunContext } from './brackets.js';
 
 type AnyObj = Record<string, unknown>;
@@ -282,6 +283,34 @@ test('a scheduled measurement runs once per endpoint and model and records its v
   schedulePromptLayoutProbe(input);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(provider.bodies.length, PROMPT_LAYOUT_PROBE_ROUNDS * 4 + 1, 'a fresh verdict is not measured again');
+});
+
+test('a measurement started inside a turn runs outside it and is filed as measurement spend', async () => {
+  _resetPromptLayoutForTest();
+  const provider = prefixCachingProvider(inPlaceTemplate);
+  const seen: Array<{ run: unknown; attribution: unknown }> = [];
+  const input = {
+    baseURL: 'https://detached.example/v1',
+    model: 'provider/model-h',
+    create: async (body: AnyObj) => {
+      seen.push({ run: harnessRunContextStorage.getStore(), attribution: modelUsageAttributionStorage.getStore() });
+      return provider.create(body);
+    },
+    sleep: async () => {},
+  };
+  const turn = { sessionId: 'sess-owner-turn', counter: new ToolCallsCounter() } as HarnessRunContext;
+  harnessRunContextStorage.run(turn, () => withModelUsageAttribution(
+    { sessionId: 'sess-owner-turn', sourceUserSeq: 42, role: 'brain' },
+    () => schedulePromptLayoutProbe(input),
+  ));
+  for (let i = 0; i < 50 && !readPromptLayoutVerdict(input.baseURL, input.model); i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(seen.length > 0);
+  for (const observed of seen) {
+    assert.equal(observed.run, undefined, 'the owner turn\'s run context is not inherited');
+    assert.deepEqual(observed.attribution, { sessionId: 'prompt-layout-probe', sourceUserSeq: 0, channel: 'prompt-layout-probe' });
+  }
 });
 
 function runContext(anchor?: string): HarnessRunContext {
