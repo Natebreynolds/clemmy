@@ -168,6 +168,17 @@ test('both models read the request and the response, never the tool name, and on
   assert.equal(jevRequests.length, 1);
 });
 
+test('a screen that is unsure but not alarmed hands the request to the judge, who decides', async () => {
+  // Live 2026-09-26 14:32: Jev put two live SERP reads at 0.21 and 0.17.
+  jevAnswer = 0.21;
+  const outcome = await learner.learnRequestEffect(
+    { providerKind: 'native_mcp', operationId: OPERATION, args: LIVE_ARGS, result: LIVE_RESPONSE },
+  );
+  assert.equal(outcome, 'learned');
+  assert.equal(judgeRequests.length, 1, 'the judge read the evidence');
+  assert.equal(store.learnedRequestEffectVerdict('native_mcp', OPERATION, LIVE_SHAPE)?.screen.changeProbability, 0.21);
+});
+
 test('disagreement, doubt, a mismatched digest, one model, or missing evidence records nothing', async () => {
   const input = { providerKind: 'native_mcp' as const, operationId: OPERATION, args: LIVE_ARGS, result: LIVE_RESPONSE };
   jevAnswer = 0.4;
