@@ -757,8 +757,15 @@ input, textarea, select { font: inherit; font-size: 16px; }
 }
 .btn-approve:active, .btn-reject:active { transform: scale(0.96); }
 .btn-approve:disabled, .btn-reject:disabled { opacity: 0.5; box-shadow: none; }
+/* A card never sizes itself to its longest label. Flex and grid items
+   default to min-width:auto, so one long button or a select's longest
+   option pushed the whole Needs-you card to 615px on a 390px phone (live
+   09-26). Constrain at the stack, the card and the control. */
+.stack, .stack > * { min-width: 0; max-width: 100%; }
+.card { min-width: 0; max-width: 100%; }
+.card-actions > * { min-width: 0; }
 .workspace-choice-actions { flex-direction: column; }
-.workspace-choice-actions > * { width: 100%; min-width: 0; }
+.workspace-choice-actions > * { width: 100%; min-width: 0; max-width: 100%; }
 .workspace-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; white-space: normal; }
 .workspace-choice-title { overflow-wrap: anywhere; }
 .workspace-choice-id, .workspace-pick-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--t-xs); font-weight: 500; opacity: 0.72; overflow-wrap: anywhere; }
@@ -766,6 +773,9 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .workspace-pick-label { color: var(--fg-3); font-size: var(--t-xs); font-weight: 750; }
 .workspace-pick-select {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   min-height: 44px;
   padding: 10px 12px;
   border: 1px solid var(--line-hot);
@@ -2351,7 +2361,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
   font-size: var(--t-xs);
   font-weight: 750;
   line-height: 1.35;
-  text-transform: lowercase;
+  text-transform: none;
 }
 .workflow-row-status.status-completed,
 .workflow-row-status.status-success { background: rgba(53, 123, 41, 0.12) !important; color: var(--accent-2); }
