@@ -1041,3 +1041,36 @@ test('a carrier-bounded call that returns cleanly reads as a call, never as a wr
   assert.equal(engine.writeRowIsChange(rows[0]!), false, 'not listed under what changed');
   assert.equal(engine.writeRowTone(rows[0]!), 'muted');
 });
+
+// Recipients are separate people (live 2026-09-25): a send's recorded targets
+// held the merged recipient string "A, B" as a third recipient beside A and B.
+test('a send to a merged recipient list records each person once', async () => {
+  const schema = { type: 'object', properties: { to: { type: 'string' }, body: { type: 'string' } }, required: ['to', 'body'], additionalProperties: false };
+  const payload = { to: 'Pat Doe <Pat@Example.test>, "Lee, Sam" <sam@example.test>', body: 'Validated message body.' };
+  const fixture = await directWriteFixture('call_tool', 'send', 'merged-recipients', false, 'args_json', 1, {
+    operationId: 'EXAMPLE_SEND_TEAM_MESSAGE', schema, payloads: [payload],
+  });
+  assert.ok(fixture);
+  const paused = await fixture.run();
+  assert.equal(paused.hasInterruptions, true);
+  const interruption = paused.interruptions![0]!;
+  const approval = approvals.registerResumable({ sessionId: fixture.session.id,
+    subject: 'Send this exact message.', tool: interruption.toolName, args: interruption.args,
+    resumeKey: interruption.approvalResumeKey! }).row;
+  assert.equal(approvals.resolve(approval.approvalId, 'approved', 'direct-host-fixture').ok, true);
+  eventlog.closeEventLog();
+  const state = HostInterruptState.fromString(paused.serializedState!);
+  state.approve(state.getInterruptions()[0]);
+  const resumed = await fixture.run(state, { hostApprovalIds: [approval.approvalId] });
+  assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(resumed.history));
+  const ledger = eventlog.listEvents(fixture.session.id, { types: ['external_write', 'external_write_succeeded'] });
+  assert.equal(ledger.length, 2);
+  for (const event of ledger) {
+    assert.deepEqual(event.data.targets, ['pat@example.test', 'sam@example.test'], `${event.type} names two people`);
+  }
+  const { projectHarnessEventsForPublic } = await import('./public-presentation.js');
+  const engine = await import('../../../packages/chat-engine/src/index.js');
+  const rows = [...engine.foldWriteLedger(projectHarnessEventsForPublic(ledger)).values()];
+  assert.equal(engine.outsideWorkCards(rows.map((write) => ({ write })))[0]?.subtitle,
+    'To pat@example.test, sam@example.test');
+});

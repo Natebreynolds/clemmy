@@ -45,6 +45,7 @@ import {
   hasApprovedResendConsent,
 } from './approval-registry.js';
 import { appendEvent, searchToolOutputs, resolveToolOutputEvidenceExcerptsForAuthority } from './eventlog.js';
+import { parseAddressList } from './address-list.js';
 
 // ─────────────────────────────────────────────────────────────────
 // Config + pure classification
@@ -488,17 +489,27 @@ function normalizedArgKey(key: string): string {
  * recipient extraction, reversible writes need their resource destination
  * (for example spreadsheet_id + range) recorded. Payload content, provider
  * connection IDs, and values nested in cells/bodies are deliberately excluded.
+ *
+ * A recipient field's value is an address list, so it is recorded as the
+ * separate people it names, never also as the merged string, which would read
+ * as one more recipient. A value that does not parse as an address list stays
+ * whole.
  */
 export function extractExternalWriteIdentityKeys(rawArgs: unknown): string[] {
   const keys = new Set<string>(extractDuplicateIdentityKeys(rawArgs));
-  const addExplicitValue = (value: unknown): void => {
+  const addExplicitValue = (value: unknown, recipients: boolean): void => {
     if (typeof value === 'string') {
       const trimmed = value.trim();
+      const addresses = recipients ? parseAddressList(trimmed) : null;
+      if (addresses) {
+        for (const address of addresses) keys.add(address);
+        return;
+      }
       if (trimmed.length > 0 && trimmed.length <= 2048 && trimmed.toLowerCase() !== 'me') keys.add(trimmed);
       return;
     }
     if (typeof value === 'number' || typeof value === 'bigint') keys.add(String(value));
-    if (Array.isArray(value)) for (const item of value) addExplicitValue(item);
+    if (Array.isArray(value)) for (const item of value) addExplicitValue(item, recipients);
   };
   const visit = (value: unknown): void => {
     if (value === null || value === undefined) return;
@@ -516,8 +527,9 @@ export function extractExternalWriteIdentityKeys(rawArgs: unknown): string[] {
     for (const [rawKey, nested] of Object.entries(value as Record<string, unknown>)) {
       const key = normalizedArgKey(rawKey);
       if (PROVIDER_CONNECTION_KEY_RE.test(key) || EXTERNAL_WRITE_PAYLOAD_KEYS.has(key)) continue;
-      if (EXTERNAL_WRITE_RESOURCE_KEYS.has(key)) addExplicitValue(nested);
-      else visit(nested);
+      if (EXTERNAL_WRITE_RESOURCE_KEYS.has(key)) {
+        addExplicitValue(nested, RECIPIENT_EMAIL_KEY_RE.test(key) && !SENDER_EMAIL_KEY_RE.test(key));
+      } else visit(nested);
     }
   };
   visit(rawArgs);
