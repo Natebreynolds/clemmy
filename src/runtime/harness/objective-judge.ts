@@ -4,7 +4,7 @@ import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usag
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
 import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
-import { MODELS } from '../../config.js';
+import { MODELS, getRuntimeEnv } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
 import type { BoundaryJudgeRouting, CapturedBoundaryJudgeSelection } from './debate-model.js';
@@ -742,6 +742,16 @@ function parseCompletionObject(obj: Record<string, unknown>): { done: boolean; r
   return { done, reason };
 }
 
+/** The most output one review response may produce. A verdict is a few
+ *  hundred tokens; a provider that keeps generating past this bound is
+ *  spending, not deciding, and the bound ends that call instead of letting it
+ *  run to the provider's own ceiling. Configurable, with a floor that leaves
+ *  room for a provider whose reasoning counts against its output. */
+export function judgeMaxOutputTokens(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_JUDGE_MAX_OUTPUT_TOKENS', '16384') ?? '16384', 10);
+  return Number.isFinite(raw) && raw >= 2_048 ? Math.min(raw, 65_536) : 16_384;
+}
+
 function buildJudgeAgent(
   routing?: BoundaryJudgeRouting,
   instructions: string = JUDGE_SYSTEM_PROMPT,
@@ -757,7 +767,7 @@ function buildJudgeAgent(
     // Let the selected provider own its reasoning default. An explicit empty
     // settings object prevents a string fallback from acquiring an SDK-imposed
     // reasoning tier; the harness imposes no tier.
-    modelSettings: {},
+    modelSettings: { maxTokens: judgeMaxOutputTokens() },
     tools,
   });
 }

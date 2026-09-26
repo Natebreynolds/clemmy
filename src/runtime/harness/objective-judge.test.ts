@@ -1092,3 +1092,21 @@ test('receipt integrity cannot override an explicit missing requirement, even wh
   }
   assert.equal(reviewerCalls, 2);
 });
+
+test('judgeMaxOutputTokens: a configured bound is honoured within its floor and ceiling', async () => {
+  const { judgeMaxOutputTokens } = await import('./objective-judge.js');
+  const prior = process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS;
+  try {
+    delete process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS;
+    assert.equal(judgeMaxOutputTokens(), 16_384);
+    process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS = '24000';
+    assert.equal(judgeMaxOutputTokens(), 24_000);
+    process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS = '100';
+    assert.equal(judgeMaxOutputTokens(), 16_384, 'below the floor the default stands');
+    process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS = '999999';
+    assert.equal(judgeMaxOutputTokens(), 65_536, 'never above the ceiling');
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS;
+    else process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS = prior;
+  }
+});

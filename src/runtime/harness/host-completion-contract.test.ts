@@ -1533,3 +1533,24 @@ test('earlier-turn evidence is bounded: this turn, synthetic inputs and old turn
   const clipped = earlierTurnsEvidence({ ...current, maxChars: 80 }) ?? '';
   assert.match(clipped, /earlier-turn evidence clipped at 80 characters/);
 });
+
+test('every review response carries the output bound, on whichever wire answers', async () => {
+  const { judgeMaxOutputTokens } = await import('./objective-judge.js');
+  let seenMaxTokens: unknown = 'unset';
+  const model = {
+    async getResponse(request: { modelSettings?: { maxTokens?: number } }) {
+      seenMaxTokens = request.modelSettings?.maxTokens;
+      return { responseId: 'bounded-judge', usage: { inputTokens: 10, outputTokens: 5,
+        totalTokens: 15, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
+        text: 'DONE: the requested result is delivered.' }] }] };
+    },
+    async *getStreamedResponse() { throw new Error('the one-step judge must use the response path'); },
+  };
+  const verdict = await runRoutedJudgeAttempt({ model: model as never, modelId: 'fixture-judge',
+    judgeFamily: 'byo', brainFamily: 'byo', transport: 'byo_api', selfJudge: false },
+    JUDGE_SYSTEM_PROMPT, 'OBJECTIVE: say hello\nRESPONSE: hello', parseCompletionVerdict, false);
+  assert.equal(verdict.done, true);
+  assert.equal(seenMaxTokens, judgeMaxOutputTokens(), 'the bound travels on the request the wire receives');
+  assert.ok(judgeMaxOutputTokens() <= 65_536 && judgeMaxOutputTokens() >= 2_048);
+});
