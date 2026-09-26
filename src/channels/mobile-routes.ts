@@ -4220,6 +4220,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             return new ClementineGateway(deps.assistant!).handleMessage({
             ...taskModeFields(taskMode),
             message: executionMessage,
+            // The bubble shows what was typed (or "Attached: …"); the fold is for the model.
+            ...(ingestedAttachments.length ? { visibleMessage: message } : {}),
             sessionId,
             userId: reviewedPlanOwnerControl?.conversationPrincipalId ?? ctx.record.deviceId,
             channel: 'mobile',

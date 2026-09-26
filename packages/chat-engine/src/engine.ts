@@ -28,6 +28,14 @@ export interface SendResult {
   steered?: boolean;
 }
 
+/** The user's own words for a user_input_received row: displayText when the
+ *  server folded attachment contents into text, else text. */
+function userVisibleText(d: Record<string, unknown>): string {
+  const shown = typeof d.displayText === 'string' ? d.displayText.trim() : '';
+  if (shown) return shown;
+  return typeof d.text === 'string' ? d.text.trim() : '';
+}
+
 export interface ChatApi {
   /** Async-accepted send: resolves as soon as the turn is durably claimed.
    *  Retries with the SAME idempotency key must be safe. A mid-run steer
@@ -603,7 +611,9 @@ export class ChatEngine {
         break;
       }
       case 'user_input_received': {
-        const text = typeof d.text === 'string' ? d.text.trim() : '';
+        // What the person typed is the bubble; `text` may carry folded
+        // attachment contents meant for the model, never for the screen.
+        const text = userVisibleText(d);
         if (!text) return;
         if (
           this.busy
@@ -884,7 +894,7 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
     }
     switch (event.type) {
       case 'user_input_received': {
-        const text = typeof d.text === 'string' ? d.text.trim() : '';
+        const text = userVisibleText(d);
         if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode) });
         currentSourceUserSeq = event.seq;
         const mode = readTaskMode(d.taskMode);

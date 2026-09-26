@@ -695,3 +695,14 @@ test('an unbound plan offers a binding pass, and a ready one does not', () => {
   assert.equal(needsBindingPass(running, boundRef), false);
   assert.equal(canExecuteReviewedPlan(running, boundRef), false);
 });
+
+test('a user row shows what was typed, never the attachment contents folded in for the model', () => {
+  const folded = 'What does the file say?\n\n---\n\n### Attachment: notes.txt\n\nlong contents';
+  const events = [
+    ev(1, 'user_input_received', { text: folded, displayText: 'What does the file say?' }),
+    ev(2, 'user_input_received', { text: 'plain, no attachment' }),
+  ];
+  const messages = foldTranscript(events);
+  const users = messages.filter((m) => m.role === 'user').map((m) => m.text);
+  assert.deepEqual(users, ['What does the file say?', 'plain, no attachment']);
+});

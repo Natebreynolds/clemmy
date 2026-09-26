@@ -88,6 +88,12 @@ export interface GatewayRequest {
   /** Server-only attribution after authenticated owner Plan control. */
   reviewedPlanOwnerControl?: ReviewedPlanOwnerControlV1;
   message: string;
+  /** What the person typed, when `message` carries more than that (folded
+   *  attachment contents). Shown as the user's bubble; `message` is what the
+   *  model reads and what the accepted turn is identified by. Absent means
+   *  the two are the same. Distinct from the bridge's `displayMessage`, which
+   *  names the accepted text before a model directive rewrite. */
+  visibleMessage?: string;
   sessionId: string;
   userId?: string;
   channel?: string;
@@ -395,7 +401,7 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
       role: 'user',
       data: {
         text: request.message,
-        displayText: request.message,
+        displayText: request.visibleMessage ?? request.message,
         ...taskModeFields(request.taskMode),
         runId,
         ...(request.reviewedPlanOwnerControl
