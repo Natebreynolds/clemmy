@@ -4,7 +4,7 @@ import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js'
 
 export type WorkflowRunGraphStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 export type WorkflowRunGraphAttentionLevel = 'none' | 'watch' | 'blocked' | 'failed';
-export type WorkflowRunGoalStatus = 'unknown' | 'satisfied' | 'repursue' | 'escalate' | 'advisory';
+export type WorkflowRunGoalStatus = 'unknown' | 'satisfied' | 'repursue' | 'follow_up' | 'gap' | 'escalate' | 'advisory';
 export type WorkflowRunGraphStepVerdictStatus =
   | 'pending'
   | 'running'
@@ -1012,13 +1012,18 @@ function applyRunGoalEvent(goal: WorkflowRunGoalOverlay, event: WorkflowEvent): 
 
 function goalStatusFromMeta(meta: Record<string, unknown>): WorkflowRunGoalStatus | undefined {
   const raw = stringFromMeta(meta, 'goal') ?? stringFromMeta(meta, 'goalOutcome') ?? stringFromMeta(meta, 'outcome');
-  if (raw === 'satisfied' || raw === 'repursue' || raw === 'escalate' || raw === 'advisory') return raw;
+  if (
+    raw === 'satisfied' || raw === 'repursue' || raw === 'follow_up' || raw === 'gap'
+    || raw === 'escalate' || raw === 'advisory'
+  ) return raw;
   return undefined;
 }
 
 function attentionForGoalStatus(status: WorkflowRunGoalStatus): WorkflowRunGraphAttentionLevel {
   if (status === 'escalate') return 'blocked';
-  if (status === 'repursue' || status === 'advisory') return 'watch';
+  // A follow-up or a named gap after landed writes is done work with a note,
+  // never a block.
+  if (status === 'repursue' || status === 'follow_up' || status === 'gap' || status === 'advisory') return 'watch';
   return 'none';
 }
 

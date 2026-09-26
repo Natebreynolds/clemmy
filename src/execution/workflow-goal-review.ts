@@ -14,9 +14,22 @@ export function validateWorkflowRunGoal(input: ValidateGoalInput, deps: Validate
   }, deps);
 }
 
+/** A follow-up attempt's view of the attempts before it: what they landed,
+ * which steps it carried from them, and their authenticated receipts. */
+export interface WorkflowGoalEarlierAttempts {
+  attempts: Array<{ runId: string; target: WorkflowTargetEvidence }>;
+  carriedStepIds: string[];
+  /** Plain lines naming the writes earlier attempts landed. */
+  landedSummary: string;
+}
+
 /** Reuse the authenticated target-review evidence for pinned goals as well.
  * Large reads/writes stay behind exact refs instead of growing every prompt. */
-export function workflowGoalExecutionEvidence(target: WorkflowTargetEvidence, definition: unknown): {
+export function workflowGoalExecutionEvidence(
+  target: WorkflowTargetEvidence,
+  definition: unknown,
+  earlier?: WorkflowGoalEarlierAttempts,
+): {
   summary: string; evidence: JudgeEvidenceSource;
 } {
   const counts = new Map<string, number>();
@@ -26,19 +39,33 @@ export function workflowGoalExecutionEvidence(target: WorkflowTargetEvidence, de
   }
   const entries = [...counts].map(([key, count]) => `${key}: ${count}`);
   const refs = new Map((target.evidence?.refs() ?? []).map(ref => [ref, ref]));
+  const earlierRefs = new Map((earlier?.attempts ?? []).map((attempt) => [`earlier_attempt_execution:${attempt.runId}`, attempt.target]));
+  const earlierLines = earlier && earlier.attempts.length > 0
+    ? [
+        `This run follows up on earlier attempts of the same goal (${earlier.attempts.map((attempt) => attempt.runId).join(', ')}). Their writes landed and stay; this run was not asked to repeat them.`,
+        ...(earlier.carriedStepIds.length > 0
+          ? [`Steps carried as completed from the attempt before this one, not re-executed here: ${earlier.carriedStepIds.join(', ')}. Their outputs above are the recorded outputs of that attempt.`]
+          : []),
+        ...(earlier.landedSummary ? [earlier.landedSummary] : []),
+        `Open ${[...earlierRefs.keys()].join(', ')} for the authenticated receipts of those attempts.`,
+      ]
+    : [];
   return {
     summary: [
       `Workflow execution evidence available: ${target.available}. Receipt verification is not proof of objective completion.`,
       ...entries.slice(0, 40),
       ...(entries.length > 40 ? [`${entries.length - 40} additional tool/outcome groups are retained; omitted groups are not absent.`] : []),
       'Open workflow_execution for authenticated read AND write receipts, and workflow_contract for the saved workflow instructions and constraints. Output keys and a URL alone do not prove fulfillment or preservation of existing data.',
+      ...earlierLines,
     ].join('\n'),
     evidence: {
       refKind: 'the saved workflow contract, authenticated execution receipts, and retained result contents',
-      refs: () => ['workflow_contract', 'workflow_execution', ...refs.keys()],
+      refs: () => ['workflow_contract', 'workflow_execution', ...earlierRefs.keys(), ...refs.keys()],
       resolve(ref) {
         if (ref === 'workflow_contract') return { text: JSON.stringify(definition), value: definition };
         if (ref === 'workflow_execution') return { text: target.summary };
+        const earlierTarget = earlierRefs.get(ref);
+        if (earlierTarget) return { text: earlierTarget.summary };
         const original = refs.get(ref);
         return original === undefined ? undefined : target.evidence?.resolve(original);
       },

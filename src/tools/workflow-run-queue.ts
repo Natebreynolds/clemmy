@@ -42,9 +42,14 @@ import {
   isCompiledWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
   workflowDefinitionHash,
+  workflowDefinitionMatchesSnapshotIgnoringEnabled,
   type CompiledWorkflowRunDefinitionSnapshot,
   type WorkflowRunDefinitionSnapshot,
 } from '../execution/workflow-run-definition.js';
+import {
+  normalizeWorkflowGoalFollowUpLineage,
+  type WorkflowGoalFollowUpLineage,
+} from '../execution/workflow-run-write-facts.js';
 import { preflightWorkflow } from '../execution/workflow-preflight.js';
 import {
   bindWorkflowReadPilotAdmission,
@@ -1355,6 +1360,10 @@ export interface QueueWorkflowRunOptions {
     stepId: string;
     itemKeys: string[];
   };
+  /** Pinned-goal follow-up lineage: the next attempt after a run whose writes
+   *  landed. Carried steps are inherited as completed and never dispatch
+   *  again; continued steps re-run to re-check and do only what is missing. */
+  goalFollowUp?: WorkflowGoalFollowUpLineage;
   /** Origin surface for UI/filtering only (console, mobile, schedule, webhook). */
   source?: string;
   /** Durable trigger-ingestion receipt attached to the accepted run. Recovery
@@ -2569,6 +2578,7 @@ function queueWorkflowRunUnlocked(
     ? opts.goalAttempt
     : undefined;
   const goalFeedback = opts?.goalFeedback?.trim() || undefined;
+  const goalFollowUp = normalizeWorkflowGoalFollowUpLineage(opts?.goalFollowUp);
   const retryFailedItems = opts?.retryFailedItems
     && opts.retryFailedItems.fromRunId.trim()
     && opts.retryFailedItems.stepId.trim()
@@ -2743,6 +2753,7 @@ function queueWorkflowRunUnlocked(
       ...(selfHealAttempt && opts?.selfHealBackupId?.trim() ? { selfHealBackupId: opts.selfHealBackupId.trim() } : {}),
       ...(goalAttempt ? { goalAttempt } : {}),
       ...(goalFeedback ? { goalFeedback } : {}),
+      ...(goalFollowUp ? { goalFollowUp } : {}),
       ...(retryFailedItems ? retryFailedItems : {}),
     };
   };
@@ -3380,6 +3391,130 @@ export function requeueWorkflowFromRun(
       sourceRunId: originalRunId,
       requestedFrom: opts.source,
       reason: opts.selfHealAttempt ? 'self-heal verification requeue' : 'whole-run requeue',
+    },
+  });
+  return { status: queued.status, id: queued.id, message: queued.message, readiness: queued.readiness };
+}
+
+/**
+ * Queue the next attempt of a pinned goal after a run whose writes landed.
+ *
+ * The runner has read the source run's ledger and named the lineage: carried
+ * steps are inherited as completed and never dispatch again (their recorded
+ * output feeds downstream steps); continued steps are model-driven steps whose
+ * writes landed and which re-run to re-check and do only what is missing,
+ * with those writes listed as done; every other step re-runs because running
+ * it again adds no write. That is why this path does not apply the blanket
+ * whole-run mutation refusals of `requeueWorkflowFromRun`: nothing whose
+ * landed write could repeat is re-executed blind.
+ *
+ * The queue still owns what it can check: the source run exists and settled,
+ * belongs to no durable project, ran the definition that is current now, and
+ * completed every step it carries.
+ */
+export function queueWorkflowGoalFollowUp(
+  sourceRunId: string,
+  opts: {
+    lineage: WorkflowGoalFollowUpLineage;
+    goalAttempt: number;
+    goalFeedback: string;
+    originSessionIds?: string[];
+    /** Runner-only: the source execution has settled but its terminal record
+     *  is not yet installed. */
+    sourceExecutionSettled?: boolean;
+  },
+): RequeueResult {
+  const safe = sourceRunId.replace(/[^a-zA-Z0-9_.:-]/g, '');
+  const file = path.join(WORKFLOW_RUNS_DIR, `${safe}.json`);
+  if (!safe || safe !== sourceRunId || !existsSync(file)) {
+    return { status: 'not_found', message: `Run "${sourceRunId}" not found; no follow-up was queued.` };
+  }
+  let rec: Record<string, unknown>;
+  try {
+    rec = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    return { status: 'not_found', message: 'Run record unreadable; no follow-up was queued.' };
+  }
+  if (isReservedProjectWorkflowRunRecord(rec)) return projectOwnedRequeueRefusal(sourceRunId);
+  const lineage = normalizeWorkflowGoalFollowUpLineage(opts.lineage);
+  if (!lineage || lineage.fromRunId !== sourceRunId) {
+    return { status: 'ambiguous', message: 'The follow-up lineage does not name this run; no follow-up was queued.' };
+  }
+  if (!workflowRunIsTerminal(rec.status) && opts.sourceExecutionSettled !== true) {
+    return {
+      status: 'ambiguous',
+      message: `Run "${sourceRunId}" is not terminal, so its execution may still dispatch; no follow-up was queued.`,
+    };
+  }
+  const workflowName = typeof rec.workflow === 'string' ? rec.workflow : undefined;
+  const workflowEntry = workflowName
+    ? listWorkflows().find((entry) => entry.data.name === workflowName || entry.name === workflowName)
+    : undefined;
+  if (!workflowName || !workflowEntry) {
+    return { status: 'not_found', message: `Workflow of run "${sourceRunId}" no longer exists; no follow-up was queued.` };
+  }
+  const snapshot = resolveWorkflowRunDefinitionSnapshot(rec.workflowDefinitionSnapshot);
+  if (
+    snapshot.status !== 'valid'
+    || isCompiledWorkflowRunDefinitionSnapshot(snapshot.snapshot)
+    || snapshot.snapshot.workflowSlug !== workflowEntry.name
+    || !workflowDefinitionMatchesSnapshotIgnoringEnabled(snapshot.snapshot, workflowEntry.data)
+  ) {
+    return {
+      status: 'ambiguous',
+      message: `Workflow "${workflowName}" changed since run "${sourceRunId}", so what that run carried cannot be reused; no follow-up was queued.`,
+    };
+  }
+  const stepIds = new Set(workflowEntry.data.steps.map((step) => step.id));
+  let completed: Set<string>;
+  try {
+    completed = new Set(computeResumeState(workflowEntry.name, sourceRunId).completedSteps.keys());
+  } catch (err) {
+    return {
+      status: 'ambiguous',
+      message: `Run "${sourceRunId}" has unreadable step history; no follow-up was queued (${err instanceof Error ? err.message : String(err)}).`,
+    };
+  }
+  const missing = [
+    ...lineage.carriedSteps.map((step) => step.stepId).filter((stepId) => !stepIds.has(stepId) || !completed.has(stepId)),
+    ...lineage.continuedStepIds.filter((stepId) => !stepIds.has(stepId)),
+  ];
+  if (missing.length > 0) {
+    return {
+      status: 'ambiguous',
+      message: `Run "${sourceRunId}" did not complete step(s) ${missing.join(', ')} that the follow-up would carry; no follow-up was queued.`,
+    };
+  }
+  const inputs = normalizeWorkflowRunInputs(
+    rec.inputs && typeof rec.inputs === 'object' && !Array.isArray(rec.inputs)
+      ? (rec.inputs as Record<string, string>)
+      : {},
+  );
+  const originSessionIds = opts.originSessionIds && opts.originSessionIds.length > 0
+    ? normalizeOriginSessionIds(undefined, opts.originSessionIds)
+    : normalizeOriginSessionIds(rec.originSessionId, rec.originSessionIds, readWorkflowRunOriginSessionIds(sourceRunId));
+  const queued = queueWorkflowRun(workflowName, inputs, {
+    originSessionId: originSessionIds[0],
+    originSessionIds,
+    goalAttempt: opts.goalAttempt,
+    goalFeedback: opts.goalFeedback,
+    goalFollowUp: lineage,
+    catchupFire: rec.catchupFire === true,
+    ...(Number.isFinite(rec.catchupOccurrenceAtMs) ? { catchupOccurrenceAtMs: Number(rec.catchupOccurrenceAtMs) } : {}),
+    workflowSlug: typeof rec.workflowSlug === 'string' ? rec.workflowSlug : workflowEntry.name,
+    ...(Number.isFinite(rec.catchupFirstDueAtMs) ? { catchupFirstDueAtMs: Number(rec.catchupFirstDueAtMs) } : {}),
+    ...(Number.isFinite(rec.catchupScheduledAtMs) ? { catchupScheduledAtMs: Number(rec.catchupScheduledAtMs) } : {}),
+    ...(Number.isFinite(rec.catchupMissedCount) ? { catchupMissedCount: Number(rec.catchupMissedCount) } : {}),
+    ...(rec.catchupFire === true ? { catchupDisposition: 'resumed' as const } : {}),
+    ...(rec.catchupDisposition === 'resumed' && typeof rec.catchupDecidedAt === 'string'
+      ? { catchupDecidedAt: rec.catchupDecidedAt }
+      : {}),
+    excludeRunId: sourceRunId,
+    requeuedFromRunId: sourceRunId,
+    recoveryIntent: {
+      kind: 'goal_rerun',
+      sourceRunId,
+      reason: 'pinned goal follow-up after landed writes',
     },
   });
   return { status: queued.status, id: queued.id, message: queued.message, readiness: queued.readiness };

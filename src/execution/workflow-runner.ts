@@ -93,6 +93,15 @@ import {
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
 import { toGoalEvidence, goalMissIsJudgeOnlyAdvisory, type GoalValidationResult } from './goal-validate.js';
 import {
+  applyGoalFollowUpLineage,
+  normalizeWorkflowGoalFollowUpLineage,
+  readWorkflowRunWriteFacts,
+  renderLandedWritesForFollowUp,
+  workflowStepLandedWrites,
+  type WorkflowGoalFollowUpLineage,
+  type WorkflowRunWriteFacts,
+} from './workflow-run-write-facts.js';
+import {
   ensureWorkflowRunGoal,
   recordGoalValidation,
   satisfyGoal,
@@ -193,6 +202,7 @@ import {
   readWorkflowRunOriginSessionIds,
   readWorkflowTriggerReceiptAcceptance,
   reconcileAwaitingCompiledWorkflowRunBindings,
+  queueWorkflowGoalFollowUp,
   requeueWorkflowFromRun,
   WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
 } from '../tools/workflow-run-queue.js';
@@ -1023,8 +1033,12 @@ export interface QueuedRunRecord {
    */
   goalAttempt?: number;
   goalFeedback?: string;
+  /** Follow-up lineage after a run whose writes landed: steps carried as
+   *  completed from that run, and model-driven steps continuing its work. */
+  goalFollowUp?: WorkflowGoalFollowUpLineage;
   /** Terminal pinned-goal verdict for this run (satisfied | repursue |
-   *  escalate | advisory) + the one-line reason — rendered by run_status. */
+   *  follow_up | gap | escalate | advisory) + the one-line reason — rendered
+   *  by run_status. */
   goalOutcome?: string;
   goalReason?: string;
   /** Exact run-local validation receipt. Recurrence and other downstream
@@ -3276,6 +3290,26 @@ function exactHumanRunAuthority(
 }
 
 /**
+ * A pinned-goal follow-up continues the occurrence of the run that started
+ * its lineage. Walk that lineage, bounded, requiring the same workflow at
+ * every hop and the queue's own requeue link to match each lineage source.
+ * Returns the starting run's id, or null for a run that follows up on nothing.
+ */
+function goalFollowUpRootRunId(workflowSlug: string, runId: string): string | null {
+  let current = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+  const seen = new Set<string>();
+  for (let hop = 0; hop < 4 && current; hop += 1) {
+    if (seen.has(current.id) || recordedWorkflowSlug(current) !== workflowSlug) return null;
+    seen.add(current.id);
+    const lineage = normalizeWorkflowGoalFollowUpLineage(current.goalFollowUp);
+    if (!lineage) return hop === 0 ? null : current.id;
+    if (current.requeuedFromRunId !== lineage.fromRunId || !/^[a-zA-Z0-9_.:-]+$/.test(lineage.fromRunId)) return null;
+    current = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${lineage.fromRunId}.json`));
+  }
+  return null;
+}
+
+/**
  * Project an already-proven workflow policy into the v3 kernel's exact
  * one-shot registry shape. Only the closed upstream authorities below may use
  * this bridge: the runner's already-resolved declarative gate (avoids asking
@@ -3436,9 +3470,18 @@ async function resolveWorkflowBareCallV3Consent(
   const scheduledDefinition = ctx.workflow.enabled === true
     && typeof ctx.workflow.trigger?.schedule === 'string'
     && ctx.workflow.trigger.schedule.trim().length > 0;
+  // A goal follow-up is the same occurrence's next attempt, so its non-send
+  // writes carry the authority of the run that started the lineage. Sends
+  // are never re-run by a follow-up and keep their own floor above.
+  const followUpRootRunId = prepared.binding.effect !== 'host_only'
+    ? goalFollowUpRootRunId(ctx.workflowSlug, ctx.runId)
+    : null;
   if (scheduledDefinition && prepared.binding.effect !== 'host_only') {
     const occurrence = exactScheduleOccurrenceAuthority(ctx.workflowSlug, ctx.runId);
-    if (occurrence.ok) {
+    if (
+      occurrence.ok
+      || (followUpRootRunId && exactScheduleOccurrenceAuthority(ctx.workflowSlug, followUpRootRunId).ok)
+    ) {
       return mintWorkflowPolicyV3Authorization(
         step,
         sessionId,
@@ -3448,7 +3491,13 @@ async function resolveWorkflowBareCallV3Consent(
       );
     }
   }
-  if (prepared.binding.effect !== 'host_only' && exactHumanRunAuthority(ctx.workflowSlug, ctx.runId).ok) {
+  if (
+    prepared.binding.effect !== 'host_only'
+    && (
+      exactHumanRunAuthority(ctx.workflowSlug, ctx.runId).ok
+      || (followUpRootRunId !== null && exactHumanRunAuthority(ctx.workflowSlug, followUpRootRunId).ok)
+    )
+  ) {
     return mintWorkflowPolicyV3Authorization(
       step,
       sessionId,
@@ -4548,7 +4597,7 @@ function applyWorkflowOriginLineage(ctx: Pick<StepExecutionContext, 'originSessi
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'target_unverified' | 'goal_validation_unavailable' | 'goal_validation_unmet' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
+  kind: 'skill_not_executed' | 'target_missed' | 'target_unverified' | 'goal_validation_unavailable' | 'goal_validation_unmet' | 'goal_gap_after_landed_writes' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
   note: string;
 }
 
@@ -4581,6 +4630,11 @@ export function workflowAdvisoryRequiresAttention(
       // Preserve delivered artifacts, but an unmet authored criterion is not
       // clean success. Attention alone does not authorize replaying mutations.
       return true;
+    case 'goal_gap_after_landed_writes':
+      // The run did its work and its writes landed; what the review found
+      // missing is named in the report. That is done-with-a-gap, not a block
+      // and not a failure that pauses self-healing.
+      return false;
     case 'synthesis_degraded':
       // Every step already completed and verified — only the final prose
       // rollup fell back to the deterministic step-output format. Substance
@@ -6170,6 +6224,7 @@ async function runStepViaHarness(
     const stepToolUses = stepToolEvents
       .map((e) => (typeof e.data?.tool === 'string' ? e.data.tool : ''))
       .filter((t) => t.length > 0);
+    const continuesLandedWork = workflowRunContinuesLandedStep(workflowRunId, step.id);
     const guardStepOutput = (output: unknown): unknown => {
       const businessToolsBySource = new Map<number, string[]>();
       for (const event of stepToolEvents) {
@@ -6193,6 +6248,7 @@ async function runStepViaHarness(
           sourceUserSeq: sourceUserEvent.seq,
           toolUses: stepToolUses,
           output,
+          continuesLandedWork,
         });
       }
       for (const [sourceUserSeq, toolUses] of businessToolsBySource) {
@@ -6202,6 +6258,7 @@ async function runStepViaHarness(
           sourceUserSeq,
           toolUses,
           output,
+          continuesLandedWork,
         });
         if (isBlockedStepOutput(guarded)) return guarded;
       }
@@ -9619,8 +9676,13 @@ export function settlementGuardedStepOutput(input: {
   sourceUserSeq: number;
   toolUses: string[] | undefined;
   output: unknown;
+  /** This step continues a pinned-goal follow-up: its writes landed in the
+   *  earlier attempt, which is where its business evidence lives. Finding
+   *  nothing more to change completes it; a failed or unresolved call in this
+   *  attempt still blocks it. */
+  continuesLandedWork?: boolean;
 }): unknown {
-  if (isPhantomStepCompletion(input.step, input.toolUses, input.output)) {
+  if (input.continuesLandedWork !== true && isPhantomStepCompletion(input.step, input.toolUses, input.output)) {
     // The true reason: a refused write is not "no tool was called".
     const refusals = readPreDispatchRefusals(input.sessionId, input.sourceUserSeq);
     const cls = stepSideEffectClass(input.step);
@@ -9674,6 +9736,9 @@ export function settlementGuardedStepOutput(input: {
     && audit.facts.successfulReads > 0
     && audit.facts.attemptedMutations === 0
   ) return input.output;
+  // A continued step's writes landed in the earlier attempt; re-checking and
+  // changing nothing more is a complete continuation, never "no evidence".
+  if (audit.status === 'no_business_evidence' && input.continuesLandedWork === true) return input.output;
   return {
     blocked: true,
     reason: `Step "${input.step.id}" is not complete yet: ${audit.reason}. Its captured output remains in the run record for recovery.`,
@@ -9944,6 +10009,61 @@ function downstreamOfStep(steps: WorkflowStepInput[], rootStepId: string): Set<s
 function failedItemRetrySeeded(workflowSlug: string, runId: string): boolean {
   return readWorkflowEvents(workflowSlug, runId).some((ev) =>
     ev.kind === 'step_advisory' && ev.meta?.reason === 'failed_item_retry_seeded');
+}
+
+function goalFollowUpSeeded(workflowSlug: string, runId: string): boolean {
+  return readWorkflowEvents(workflowSlug, runId).some((ev) =>
+    ev.kind === 'step_advisory' && ev.meta?.reason === 'goal_follow_up_seeded');
+}
+
+/**
+ * A pinned-goal follow-up inherits, as completed, each step whose landed
+ * writes cannot repeat: its recorded output feeds the steps after it, and it
+ * never dispatches again. Every other step runs in the follow-up. Safe to call
+ * again after a restart: a step already seeded is not seeded twice.
+ */
+export function seedGoalFollowUpRun(
+  workflow: WorkflowDefinition,
+  workflowSlug: string,
+  runId: string,
+  lineage: WorkflowGoalFollowUpLineage,
+): { carriedSteps: number } {
+  if (goalFollowUpSeeded(workflowSlug, runId)) return { carriedSteps: 0 };
+  const source = hydrateCompletedOutputArtifacts(
+    computeResumeState(workflowSlug, lineage.fromRunId),
+    workflowSlug,
+    lineage.fromRunId,
+  );
+  const alreadyCompleted = computeResumeState(workflowSlug, runId).completedSteps;
+  let carriedSteps = 0;
+  for (const { stepId } of lineage.carriedSteps) {
+    if (!workflow.steps.some((step) => step.id === stepId)) {
+      throw new Error(`Goal follow-up carries step "${stepId}", which workflow "${workflow.name}" no longer has.`);
+    }
+    if (!source.completedSteps.has(stepId)) {
+      throw new Error(`Goal follow-up carries step "${stepId}", which run "${lineage.fromRunId}" did not complete.`);
+    }
+    if (alreadyCompleted.has(stepId)) continue;
+    persistAndPublishStepCompletion({
+      workflowSlug,
+      runId,
+      stepId,
+      output: source.completedSteps.get(stepId),
+      meta: { inheritedFromRunId: lineage.fromRunId, goalFollowUp: true },
+    });
+    carriedSteps += 1;
+  }
+  appendWorkflowEvent(workflowSlug, runId, {
+    kind: 'step_advisory',
+    stepId: '(run goal)',
+    meta: {
+      reason: 'goal_follow_up_seeded',
+      fromRunId: lineage.fromRunId,
+      carriedStepIds: lineage.carriedSteps.map((step) => step.stepId),
+      continuedStepIds: lineage.continuedStepIds,
+    },
+  });
+  return { carriedSteps };
 }
 
 export function seedFailedItemRetryRun(
@@ -13509,29 +13629,144 @@ function workflowRunGoal(def: WorkflowDefinition): { objective: string; successC
  * "this mutates" signal), and the prose heuristic still backstops undeclared
  * steps. Returns the first offending step id, or null when safe. Exported
  * for tests.
+ *
+ * With the run's ledger facts, the law reads what each completed step actually
+ * changed instead of its declared class alone: a write step whose landed
+ * writes all declare that a repeat adds no write (or that landed nothing the
+ * ledger can see) is safe to run again; a landed non-repeatable write, a send,
+ * an approval gate and an unresolved write are not.
  */
 export function runUnsafeToRepursue(
   steps: WorkflowStepInput[],
   completedStepIds: Set<string>,
+  writeFacts?: WorkflowRunWriteFacts,
 ): string | null {
+  const facts = writeFacts?.available
+    ? new Map(writeFacts.steps.map((step) => [step.stepId, step]))
+    : null;
   for (const s of steps) {
     if (!completedStepIds.has(s.id)) continue;
     const cls = stepSideEffectClass(s);
     if (cls === 'send') return s.id;
-    if (cls === 'write' && s.loopSafe !== true) return s.id;
     if (s.requiresApproval === true) return s.id;
+    const stepFacts = facts?.get(s.id);
+    if (stepFacts) {
+      if (stepFacts.disposition === 'landed' || stepFacts.disposition === 'uncertain') return s.id;
+      continue;
+    }
+    if (cls === 'write' && s.loopSafe !== true) return s.id;
   }
   return null;
 }
 
 export interface GoalRunDecision {
-  action: 'satisfied' | 'repursue' | 'escalate' | 'advisory';
+  /**
+   * `follow_up`: the run's writes landed; a targeted next attempt re-checks
+   * and does only what the review found missing, carrying what landed.
+   * `gap`: the run's writes landed and nothing more runs automatically; the
+   * run is done, and its report names what is still missing.
+   */
+  action: 'satisfied' | 'repursue' | 'follow_up' | 'gap' | 'escalate' | 'advisory';
   reason: string;
+}
+
+/**
+ * What the run's ledger says about its completed steps, for the decision.
+ * `landed`: some completed step changed something that stays changed, and no
+ * completed step's write is unresolved. `followUpStepIds`: model-driven steps
+ * whose non-repeatable writes landed; they can re-check and do only what is
+ * missing.
+ */
+export interface GoalRunLandedWrites {
+  landed: boolean;
+  followUpStepIds: string[];
+}
+
+/**
+ * The next attempt's lineage after this run: a step whose landed writes
+ * cannot repeat and which no model can re-check is carried as completed; a
+ * model-driven step whose writes landed continues, to re-check and do only
+ * what is missing; every other step simply runs again.
+ */
+export function goalFollowUpLineageFor(runId: string, facts: WorkflowRunWriteFacts): WorkflowGoalFollowUpLineage {
+  const carriedSteps: WorkflowGoalFollowUpLineage['carriedSteps'] = [];
+  const continuedStepIds: string[] = [];
+  for (const step of facts.steps) {
+    if (step.disposition === 'landed' && step.modelDriven && !step.carriedFromRunId) {
+      continuedStepIds.push(step.stepId);
+    } else if (step.disposition === 'landed' || step.disposition === 'sent') {
+      carriedSteps.push({ stepId: step.stepId, disposition: step.disposition });
+    }
+  }
+  return { fromRunId: runId, carriedSteps, continuedStepIds };
+}
+
+/** A pinned-goal follow-up names the model-driven steps whose writes landed in
+ * the attempt before it; in this run those steps continue that work. */
+function workflowRunContinuesLandedStep(runId: string, stepId: string): boolean {
+  if (!/^[a-zA-Z0-9_.:-]+$/.test(runId)) return false;
+  const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+  return normalizeWorkflowGoalFollowUpLineage(record?.goalFollowUp)?.continuedStepIds.includes(stepId) === true;
+}
+
+/** Earlier attempts of this run's pinned goal, oldest first, each with its own
+ * ledger facts. Empty for a run that follows up on nothing. */
+function goalFollowUpEarlierAttempts(
+  workflow: WorkflowDefinition,
+  workflowSlug: string,
+  run: Pick<QueuedRunRecord, 'id' | 'goalFollowUp'>,
+): Array<{ runId: string; facts: WorkflowRunWriteFacts }> {
+  const chain: Array<{ runId: string; facts: WorkflowRunWriteFacts }> = [];
+  const seen = new Set<string>([run.id]);
+  let lineage = normalizeWorkflowGoalFollowUpLineage(run.goalFollowUp);
+  while (lineage && chain.length < 4 && !seen.has(lineage.fromRunId)) {
+    const sourceRunId = lineage.fromRunId;
+    seen.add(sourceRunId);
+    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${sourceRunId}.json`));
+    if (!record || record.id !== sourceRunId) break;
+    const sourceLineage = normalizeWorkflowGoalFollowUpLineage(record.goalFollowUp);
+    let completed: Set<string>;
+    try {
+      completed = new Set(computeResumeState(workflowSlug, sourceRunId).completedSteps.keys());
+    } catch {
+      break;
+    }
+    chain.unshift({
+      runId: sourceRunId,
+      facts: applyGoalFollowUpLineage(readWorkflowRunWriteFacts({
+        runId: sourceRunId,
+        steps: workflow.steps,
+        completedStepIds: completed,
+        sideEffectOf: stepSideEffectClass,
+      }), sourceLineage),
+    });
+    lineage = sourceLineage;
+  }
+  return chain;
+}
+
+export function goalRunLandedWrites(facts: WorkflowRunWriteFacts | undefined): GoalRunLandedWrites {
+  if (!facts?.available || facts.steps.some((step) => step.disposition === 'uncertain')) {
+    return { landed: false, followUpStepIds: [] };
+  }
+  return {
+    landed: facts.steps.some(workflowStepLandedWrites),
+    followUpStepIds: facts.steps
+      .filter((step) => step.disposition === 'landed' && step.modelDriven)
+      .map((step) => step.stepId),
+  };
 }
 
 /**
  * Pure decision: what happens to a completed run whose pinned goal was just
  * validated. Exported for tests — every branch is deterministic.
+ *
+ * Landed writes are facts the run keeps. When the review finds a gap after
+ * the run's writes landed, the run never ends blocked on it: a run whose
+ * landed writes are all safe to repeat runs again; one with a model-driven
+ * step that can re-check gets a targeted follow-up that carries what landed;
+ * otherwise the run is done with the gap named. Judging the gap stays the
+ * reviewer's job — this only reads the verdict and the ledger.
  */
 export function decideGoalRunOutcome(args: {
   verdict: GoalValidationResult;
@@ -13542,6 +13777,9 @@ export function decideGoalRunOutcome(args: {
   /** First completed step unsafe to re-run, from runUnsafeToRepursue. */
   unsafeStepId: string | null;
   chronicallyFailing: boolean;
+  /** Ledger facts for the run's completed steps; absent keeps the rules that
+   *  predate them. */
+  landedWrites?: GoalRunLandedWrites;
 }): GoalRunDecision {
   const attemptsUsed = args.priorRepursuits + 1;
   if (args.verdict.pass) return { action: 'satisfied', reason: 'all success criteria met' };
@@ -13552,6 +13790,27 @@ export function decideGoalRunOutcome(args: {
   const provenMiss = args.verdict.perCriterion.some((c) => !c.pass && c.method === 'deterministic');
   if (args.verdict.judgeFailedOpen && !provenMiss) {
     return { action: 'advisory', reason: 'goal validation unavailable (judge error) — not re-running on an unverifiable verdict' };
+  }
+  if (args.landedWrites?.landed) {
+    if (attemptsUsed >= args.maxAttempts) {
+      return { action: 'gap', reason: `the run's writes landed; the goal review still found a gap after ${attemptsUsed}/${args.maxAttempts} attempts` };
+    }
+    if (args.chronicallyFailing) {
+      return { action: 'gap', reason: 'the run\'s writes landed; this workflow has been failing, so no further attempt runs automatically' };
+    }
+    if (!args.unsafeStepId) {
+      return { action: 'repursue', reason: `the run's writes landed and are safe to repeat; running again for the gap (attempt ${attemptsUsed}/${args.maxAttempts})` };
+    }
+    if (args.landedWrites.followUpStepIds.length > 0) {
+      return {
+        action: 'follow_up',
+        reason: `the run's writes landed; re-checking only what is missing (attempt ${attemptsUsed}/${args.maxAttempts})`,
+      };
+    }
+    return {
+      action: 'gap',
+      reason: `the run's writes landed; step "${args.unsafeStepId}" cannot run again automatically, so the gap is reported instead`,
+    };
   }
   if (attemptsUsed >= args.maxAttempts) {
     return { action: 'escalate', reason: `goal unmet after ${attemptsUsed}/${args.maxAttempts} attempts` };
@@ -15402,6 +15661,8 @@ async function processOneRunFile(
           itemKeys: run.retryFailedItemKeys,
         });
       }
+      const followUpLineage = normalizeWorkflowGoalFollowUpLineage(run.goalFollowUp);
+      if (followUpLineage) seedGoalFollowUpRun(workflow.data, workflow.name, run.id, followUpLineage);
       const {
         finalOutput: executionFinalOutput,
         publicTerminalStepId,
@@ -15808,8 +16069,29 @@ async function processOneRunFile(
       let goalDecision: GoalRunDecision | null = null;
       let goalFeedbackNext = '';
       let goalRequeueId: string | undefined;
+      let runWriteFacts: WorkflowRunWriteFacts | undefined;
+      // The goal decision kept writes that landed: it continued, re-ran safely
+      // repeatable work, or named a gap, and never blocked on the review.
+      let landedWritesKept = false;
+      const runFollowUpLineage = normalizeWorkflowGoalFollowUpLineage(run.goalFollowUp);
       if (runGoal) {
-        const executionEvidence = workflowGoalExecutionEvidence(readWorkflowTargetEvidence(run.id), workflow.data);
+        const earlierAttempts = runFollowUpLineage
+          ? goalFollowUpEarlierAttempts(workflow.data, workflow.name, run)
+          : [];
+        const executionEvidence = workflowGoalExecutionEvidence(
+          readWorkflowTargetEvidence(run.id),
+          workflow.data,
+          earlierAttempts.length > 0
+            ? {
+                attempts: earlierAttempts.map((attempt) => ({
+                  runId: attempt.runId,
+                  target: readWorkflowTargetEvidence(attempt.runId, { compactResults: true }),
+                })),
+                carriedStepIds: runFollowUpLineage?.carriedSteps.map((step) => step.stepId) ?? [],
+                landedSummary: renderLandedWritesForFollowUp(earlierAttempts),
+              }
+            : undefined,
+        );
         goalVerdict = await validateWorkflowRunGoal({
           objective: runGoal.objective,
           successCriteria: runGoal.successCriteria,
@@ -15894,15 +16176,34 @@ async function processOneRunFile(
             });
           } catch { /* attempt record is best-effort */ }
         }
+        // What the completed steps changed, from the durable ledger. A run with
+        // failed fan-out items or a one-off compiled project keeps its own
+        // recovery owner, so neither reads landed writes here.
+        const completedStepIds = new Set(resume.completedSteps.keys());
+        runWriteFacts = definitionResolution.definitionSource === 'compiled_snapshot' || forEachFailures.length > 0
+          ? undefined
+          : applyGoalFollowUpLineage(readWorkflowRunWriteFacts({
+              runId: run.id,
+              steps: workflow.data.steps,
+              completedStepIds,
+              sideEffectOf: stepSideEffectClass,
+            }), runFollowUpLineage);
+        const landedWrites = goalRunLandedWrites(runWriteFacts);
         goalDecision = decideGoalRunOutcome({
           verdict: goalVerdict,
           maxAttempts: runGoal.maxAttempts,
           priorRepursuits: run.goalAttempt ?? 0,
           // A fresh re-pursuit receives the authored definition and a freshly
           // compiled graph; run-local additive nodes do not cross run lineage.
-          unsafeStepId: runUnsafeToRepursue(workflow.data.steps, new Set(resume.completedSteps.keys())),
+          unsafeStepId: runUnsafeToRepursue(workflow.data.steps, completedStepIds, runWriteFacts),
           chronicallyFailing: shouldStopAutoHeal(workflow.name),
+          landedWrites,
         });
+        landedWritesKept = landedWrites.landed && (
+          goalDecision.action === 'repursue'
+          || goalDecision.action === 'follow_up'
+          || goalDecision.action === 'gap'
+        );
         if (
           definitionResolution.definitionSource === 'compiled_snapshot'
           && goalDecision.action === 'repursue'
@@ -15913,7 +16214,7 @@ async function processOneRunFile(
               'goal unmet in a one-off compiled project run — the durable project controller must patch or resume the admitted graph',
           };
         }
-        if (goalDecision.action === 'repursue') {
+        if (goalDecision.action === 'repursue' || goalDecision.action === 'follow_up') {
           // ONLY a fresh 'queued' run counts as a re-pursuit. A 'duplicate'
           // (an identical run already queued — e.g. the next scheduled fire)
           // carries NO goalAttempt lineage and NO feedback, so treating it as
@@ -15924,15 +16225,39 @@ async function processOneRunFile(
           let requeued: ReturnType<typeof requeueWorkflowFromRun> | null = null;
           try {
             throwIfWorkflowRunCancelled(run.id);
-            requeued = requeueWorkflowFromRun(run.id, {
-              originSessionIds: workflowRunOriginSessionIds(run),
-              goalAttempt: (run.goalAttempt ?? 0) + 1,
-              goalFeedback: goalFeedbackNext,
-              sourceExecutionSettled: true,
-            });
+            if (landedWritesKept && runWriteFacts) {
+              // The next attempt carries what landed: what cannot repeat is
+              // inherited as completed, model-driven steps continue with the
+              // landed writes listed as done, the rest runs again.
+              const landedSummary = renderLandedWritesForFollowUp([
+                ...goalFollowUpEarlierAttempts(workflow.data, workflow.name, run),
+                { runId: run.id, facts: runWriteFacts },
+              ]);
+              requeued = queueWorkflowGoalFollowUp(run.id, {
+                lineage: goalFollowUpLineageFor(run.id, runWriteFacts),
+                goalAttempt: (run.goalAttempt ?? 0) + 1,
+                goalFeedback: [goalFeedbackNext, landedSummary].filter(Boolean).join('\n\n'),
+                originSessionIds: workflowRunOriginSessionIds(run),
+                sourceExecutionSettled: true,
+              });
+            } else {
+              requeued = requeueWorkflowFromRun(run.id, {
+                originSessionIds: workflowRunOriginSessionIds(run),
+                goalAttempt: (run.goalAttempt ?? 0) + 1,
+                goalFeedback: goalFeedbackNext,
+                sourceExecutionSettled: true,
+              });
+            }
           } catch { requeued = null; }
           if (requeued?.status === 'queued') {
             goalRequeueId = requeued.id;
+          } else if (landedWritesKept) {
+            goalDecision = {
+              action: 'gap',
+              reason: requeued?.status === 'duplicate'
+                ? 'the run\'s writes landed; another run of this workflow is already queued and will check the goal again'
+                : `the run's writes landed; the next attempt could not be queued${requeued?.message ? ` (${requeued.message})` : ''}, so the gap is reported instead`,
+            };
           } else {
             goalDecision = {
               action: 'escalate',
@@ -15947,9 +16272,18 @@ async function processOneRunFile(
         if (goalDecision.action === 'advisory') {
           qualityAdvisories.push({ stepId: '(run goal)', kind: 'goal_validation_unavailable', note: goalDecision.reason });
         }
+        if (goalDecision.action === 'gap') {
+          qualityAdvisories.push({
+            stepId: '(run goal)',
+            kind: 'goal_gap_after_landed_writes',
+            note: 'The goal review found something still missing after this run\'s changes landed (details above).',
+          });
+        }
         try {
           if (goalContractId && goalDecision.action === 'satisfied') satisfyGoal(goalContractId, 'external validation passed');
-          if (goalContractId && goalDecision.action === 'escalate') expireGoal(goalContractId, goalDecision.reason);
+          if (goalContractId && (goalDecision.action === 'escalate' || goalDecision.action === 'gap')) {
+            expireGoal(goalContractId, goalDecision.reason);
+          }
         } catch { /* best-effort */ }
 	        try {
 	          appendWorkflowEvent(workflow.name, run.id, {
@@ -15976,7 +16310,12 @@ async function processOneRunFile(
         );
       }
       const goalMissed = goalDecision?.action === 'escalate';
-      const goalRepursuing = goalDecision?.action === 'repursue';
+      const goalRepursuing = goalDecision?.action === 'repursue' || goalDecision?.action === 'follow_up';
+      const goalGap = goalDecision?.action === 'gap';
+      // A run whose writes landed and whose goal decision kept them did its
+      // work: another attempt is queued or the gap is named, but the run is
+      // not a failure, so it never feeds the streak that pauses self-healing.
+      const goalAttemptCountsAsFailure = goalRepursuing && !landedWritesKept;
 
       // Only GENUINE blocks (explicit {blocked:true} / prose) are routed to the
       // Doctor — its remedies (rewrite the prompt, reconnect a service, fix an
@@ -16076,20 +16415,24 @@ async function processOneRunFile(
       // Terminal-derived ledgers, learned patterns, and contract tightening are
       // authorized only by the worker that actually publishes terminal truth.
       // Compute the breaker preview without mutating it so report copy remains
-      // deterministic before publication.
+      // deterministic before publication. A run whose landed writes the goal
+      // decision kept is not a failure (see goalAttemptCountsAsFailure).
       const prospectiveConsecutiveFailures = isCompiledProjectRun
         ? (needsAttention || goalRepursuing ? 1 : 0)
-        : !needsAttention && !goalRepursuing
+        : !needsAttention && !goalAttemptCountsAsFailure
           ? 0
           : getConsecutiveFailures(workflow.name) + 1;
       const recordPublishedOutcomeLearning = (): void => {
         if (definitionResolution.definitionSource === 'compiled_snapshot') return;
         recordWorkflowOutcome(
           workflow.name,
-          !needsAttention && !goalRepursuing,
-          needsAttention ? attentionReason : goalRepursuing ? 'pinned goal unmet — re-pursuing' : undefined,
+          !needsAttention && !goalAttemptCountsAsFailure,
+          needsAttention ? attentionReason : goalAttemptCountsAsFailure ? 'pinned goal unmet — re-pursuing' : undefined,
         );
-        if (!needsAttention && !goalRepursuing) {
+        // Learning (skills, patterns, contract tightening) comes only from a
+        // run whose goal is met or that has none; a kept gap is not a model
+        // of success.
+        if (!needsAttention && !goalRepursuing && !goalGap) {
           if ((run.selfHealAttempt ?? 0) > 0) {
             try { confirmPendingFix(run.id, new Date().toISOString()); } catch { /* best-effort */ }
           }
@@ -16179,7 +16522,7 @@ async function processOneRunFile(
       // The dataset receipt predates goal review. Keep its immutable timestamp
       // for exact projection replay, but never backdate the whole run's terminal:
       // recurrence requires the judge receipt to precede run completion.
-      if (!needsAttention && !goalRepursuing && reviewedProjectionLineage) {
+      if (!needsAttention && !goalRepursuing && !goalGap && reviewedProjectionLineage) {
         canonicalEntityWorkspaceProjectionFinishedAt = reviewedProjectionLineage.finishedAt;
         canonicalEntityWorkspaceProjectionClaim = reviewedProjectionLineage.claim;
       }
@@ -16219,11 +16562,20 @@ async function processOneRunFile(
       // outcome and re-enters the origin chat via the carried originSessionId.
       if (goalRepursuing) {
         const attemptNowRunning = (run.goalAttempt ?? 0) + 2;
-        const goalRetryMsg =
-          `🎯 "${workflow.data.name}" finished but its pinned goal isn't met yet:\n${goalFeedbackNext}\n\n`
-          + `Re-running with this feedback — attempt ${attemptNowRunning} of ${runGoal?.maxAttempts ?? attemptNowRunning}`
-          + `${goalRequeueId ? ` (run ${goalRequeueId})` : ''}. It will report back when it finishes.`;
-        const report = { workflowName: workflow.data.name, outcome: 'blocked' as const, detail: goalRetryMsg };
+        const goalRetryMsg = landedWritesKept
+          // The run did its work: say so first, then what the next attempt
+          // does about the gap. Nothing here asks the owner to reconcile.
+          ? `🎯 "${workflow.data.name}" finished, and what it changed landed and stays as it is. The goal review found something still missing:\n${goalFeedbackNext}\n\n`
+            + `${goalDecision?.action === 'follow_up' ? 'Re-checking only what is missing' : 'Running it again, which repeats nothing that landed'} — attempt ${attemptNowRunning} of ${runGoal?.maxAttempts ?? attemptNowRunning}`
+            + `${goalRequeueId ? ` (run ${goalRequeueId})` : ''}. It will report back when it finishes.`
+          : `🎯 "${workflow.data.name}" finished but its pinned goal isn't met yet:\n${goalFeedbackNext}\n\n`
+            + `Re-running with this feedback — attempt ${attemptNowRunning} of ${runGoal?.maxAttempts ?? attemptNowRunning}`
+            + `${goalRequeueId ? ` (run ${goalRequeueId})` : ''}. It will report back when it finishes.`;
+        const report = {
+          workflowName: workflow.data.name,
+          outcome: landedWritesKept ? 'done' as const : 'blocked' as const,
+          detail: goalRetryMsg,
+        };
         const terminalRecord = writeRunRecord(filePath, terminalProjection, report);
         if (!terminalPublicationMatches(filePath, terminalRecord, report)) return;
         appendWorkflowEvent(workflow.name, run.id, { kind: 'run_completed' });
@@ -16352,6 +16704,8 @@ async function processOneRunFile(
           ? `\n\n🎯 Pinned goal review — the work above was delivered; the judge could not evidence every criterion:\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nReview if the gap matters, or adjust the goal.`
           : goalMissed
           ? `\n\n🎯 PINNED GOAL NOT MET (${goalDecision?.reason ?? 'criteria unmet'}):\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nThe run's output is above. Inspect the existing results and reconcile any completed writes before deciding how to address the gaps.`
+          : goalGap
+          ? `\n\n🎯 Done, with a gap — what this run changed landed and stays as it is. The goal review found something still missing:\n${goalFeedbackNext || '(no per-criterion detail)'}\n\nNothing more runs for this gap automatically (${goalDecision?.reason ?? 'no further attempt is available'}).`
           : '';
       // Wave 2.2 (structured run summary): emit "succeeded because X + artifacts
       // (files/URLs/counts)" at completion. The structured `run_summary` event is
