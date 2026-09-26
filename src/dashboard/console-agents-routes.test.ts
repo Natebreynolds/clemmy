@@ -212,3 +212,31 @@ test('agent proposal endpoints create, list, approve into the one store, and rej
     await close();
   }
 });
+
+test('POST /api/console/sessions/:id/agent switches who answers next; auth gated; refusals are typed', async () => {
+  const { createSession, getSession } = await import('../runtime/harness/eventlog.js');
+  const session = createSession({ kind: 'chat', title: 'switch me' });
+  const auth = { v: true };
+  const { url, close } = await boot(auth);
+  const post = (id: string, body: unknown) => fetch(`${url}/api/console/sessions/${encodeURIComponent(id)}/agent`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  try {
+    const on = await post(`harness:${session.id}`, { agentId: 'researcher' });
+    assert.equal(on.status, 200);
+    assert.deepEqual(await on.json(), { sessionId: session.id, agentId: 'researcher', agentName: 'Researcher', changed: true });
+    assert.equal(getSession(session.id)!.metadata.agentId, 'researcher');
+
+    const off = await post(session.id, { agentId: null });
+    assert.deepEqual(await off.json(), { sessionId: session.id, agentId: null, agentName: null, changed: true });
+
+    assert.equal((await post(session.id, { agentId: 'clementine' })).status, 400, 'the host is not an agent to switch to');
+    assert.equal((await post(session.id, {})).status, 400, 'the body must say which agent, or null');
+    assert.equal((await post('sess-nope', { agentId: 'researcher' })).status, 404);
+
+    auth.v = false;
+    assert.equal((await post(session.id, { agentId: 'researcher' })).status, 401);
+  } finally {
+    await close();
+  }
+});

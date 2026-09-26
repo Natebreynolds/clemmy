@@ -312,3 +312,41 @@ test('a FAILED daemon-driven relay turn renders no error bubble; a successful re
   assert.ok(texts.some((t) => t.includes('profiles are ready')), 'the successful relay reply still renders');
   assert.ok(texts.some((t) => t.includes('running in the background')), 'the real turn pair is untouched');
 });
+
+test('reconstructHarnessTranscript names who answered each exchange from its route marker', () => {
+  const session = createSession({ kind: 'chat', title: 'switching agents' });
+  const ask = (text: string) => appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+  const routed = (sourceUserSeq: number, agentName?: string) => appendEvent({
+    sessionId: session.id, turn: 0, role: 'system', type: 'turn_model_routed',
+    data: { model: 'test-model', provider: 'test', sourceUserSeq, ...(agentName ? { agentName } : {}) },
+  });
+  const first = ask('plain question');
+  routed(first.seq);
+  appendTypedTerminal(session.id, first.seq, 'plain answer');
+  const second = ask('draft the posts');
+  routed(second.seq, 'Instagram Manager');
+  // A fallover's second marker for the same source never re-attributes it.
+  routed(second.seq);
+  appendTypedTerminal(session.id, second.seq, 'three drafts');
+  const third = ask('back to the calendar');
+  routed(third.seq);
+  appendTypedTerminal(session.id, third.seq, 'calendar answer');
+  // A turn without a route marker says nothing about who answered.
+  const fourth = ask('still running');
+
+  const turns = reconstructHarnessTranscript(session.id);
+  assert.deepEqual(
+    turns.map((turn) => [turn.role, turn.text, turn.agentName]),
+    [
+      ['user', 'plain question', null],
+      ['assistant', 'plain answer', null],
+      ['user', 'draft the posts', 'Instagram Manager'],
+      ['assistant', 'three drafts', 'Instagram Manager'],
+      ['user', 'back to the calendar', null],
+      ['assistant', 'calendar answer', null],
+      ['user', 'still running', undefined],
+    ],
+  );
+  assert.equal(Object.prototype.hasOwnProperty.call(turns[6], 'agentName'), false);
+  void fourth;
+});
