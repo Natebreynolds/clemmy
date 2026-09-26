@@ -4234,11 +4234,20 @@ textarea.cz-input { resize: vertical; }
 .reply-offer-button:disabled { opacity: 0.6; }
 .reply-offer-saved { margin-top: var(--sp-2); font-size: var(--t-xs); color: var(--fg-3); }
 
-.bubble-md .md-table { overflow-x: auto; margin: 0.4em 0 0.7em; border: 1px solid var(--line); border-radius: var(--r-sm); -webkit-overflow-scrolling: touch; }
-.bubble-md table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.4; font-variant-numeric: tabular-nums; }
-.bubble-md th { text-align: left; font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-3); background: var(--bg-2); padding: 7px 10px; white-space: nowrap; }
-.bubble-md td { padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+/* A table sizes to its content and scrolls sideways inside its own frame;
+   it is never squeezed into the bubble so hard that words break letter by
+   letter (live 09-26: a four-column comparison rendered "Pai d- sea rch").
+   The row label stays put while the numbers scroll. */
+.bubble-md .md-table { overflow-x: auto; max-width: 100%; margin: 0.4em 0 0.7em; border: 1px solid var(--line); border-radius: var(--r-sm); -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+.bubble-md table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; line-height: 1.4; font-variant-numeric: tabular-nums; }
+.bubble-md th, .bubble-md td { min-width: 5.5em; max-width: 16em; padding: 8px 10px; vertical-align: top; text-align: left; white-space: normal; overflow-wrap: normal; word-break: normal; hyphens: none; }
+.bubble-md th { font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-3); background: var(--bg-2); padding: 7px 10px; }
+.bubble-md td { border-top: 1px solid var(--line); }
+.bubble-md th:first-child, .bubble-md td:first-child { position: sticky; left: 0; z-index: 1; min-width: 7em; max-width: 11em; background: var(--bg-1); box-shadow: 1px 0 0 var(--line); }
+.bubble-md th:first-child { background: var(--bg-2); }
 .bubble-md td:first-child { font-weight: 600; }
+/* Long tokens in prose (URLs, ids) may break anywhere; words never do inside a table. */
+.bubble-md p, .bubble-md li, .bubble-md blockquote { overflow-wrap: anywhere; }
 .bubble-md .al-r { text-align: right; }
 .bubble-md .al-c { text-align: center; }
 

@@ -271,7 +271,9 @@
 .chat-prose pre code { background: none; padding: 0; font-size: inherit; }
 .chat-prose blockquote { border-left: 2px solid var(--border-strong); padding-left: 14px; color: var(--text-muted); }
 .chat-prose .md-table { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-surface); }
-.chat-prose table { width: 100%; border-collapse: collapse; font-size: 0.9375rem; line-height: 1.45; font-variant-numeric: tabular-nums; }
+/* Sizes to its content and scrolls inside its frame; words never break letter by letter (same rule as the phone). */
+.chat-prose table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 0.9375rem; line-height: 1.45; font-variant-numeric: tabular-nums; }
+.chat-prose th, .chat-prose td { min-width: 5.5em; max-width: 22em; overflow-wrap: normal; word-break: normal; hyphens: none; }
 .chat-prose th { text-align: left; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-subtle); background: var(--bg-subtle); padding: 8px 14px; white-space: nowrap; }
 .chat-prose td { padding: 9px 14px; border-top: 1px solid var(--border); vertical-align: top; }
 .chat-prose td:first-child { font-weight: 600; }
