@@ -1,5 +1,6 @@
 import { writeRowLabel, writeRowStatus, writeRowTone } from '../../../../packages/chat-engine/src/write-ledger';
 import type { ActivityItem, MessageStatus } from './useChat';
+import { MODEL_PHASE_ACTIVITY_ID } from '@clem/chat-engine';
 import { isWorkPlanRow, workPlanStepLabel } from './work-plan-presentation';
 
 export type ActivityTerminalOutcome = 'completed' | 'failed' | 'interrupted' | 'waiting';
@@ -111,6 +112,10 @@ export function narrateActivity(
     if (isCapabilityInventoryRow(raw)) continue;
     // An offer is answered under the reply (the receipt), not listed as work.
     if (raw.offer) continue;
+    // The model's own wait is the live beat, never a completed work step: a
+    // settled turn that listed "Still working…" with a tick counted its
+    // thinking as work and inflated the step count.
+    if (raw.id === MODEL_PHASE_ACTIVITY_ID && options.live !== true) continue;
     const plan = publicWorkPlanRow(raw);
     if (plan === null) continue;
     const item = plan;

@@ -102,6 +102,9 @@ export interface ActivityItem {
   status: 'running' | 'done' | 'failed' | 'interrupted';
   /** Client-clock start, for the live per-row elapsed timer while running. */
   startedAt?: number;
+  /** Client-clock settle, so a finished step keeps an honest duration and its
+   *  place on the turn's timeline. */
+  finishedAt?: number;
   /** kind 'batch' only: live meter state from authoritative batch_progress events. */
   batch?: { done: number; total: number; failed: number; throttled?: boolean };
   variant?: 'write' | 'program' | 'lifecycle';
