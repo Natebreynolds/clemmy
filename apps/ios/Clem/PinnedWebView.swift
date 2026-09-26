@@ -471,8 +471,10 @@ final class WebViewModel: NSObject, ObservableObject {
             pendingApnsToken = hexToken
             return
         }
-        // Token is hex from our own AppDelegate — safe to inline.
-        webView.evaluateJavaScript("window.clemNative && window.clemNative.registerApnsToken('\(hexToken)')")
+        // Token is hex from our own AppDelegate, environment is one of two
+        // fixed words — both safe to inline.
+        let environment = AppDelegate.apsEnvironment
+        webView.evaluateJavaScript("window.clemNative && window.clemNative.registerApnsToken('\(hexToken)', '\(environment)')")
     }
 
     /// RootView flips this only after the app is foregrounded and its owner has

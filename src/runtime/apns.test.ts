@@ -6,7 +6,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   _resetApnsTokenCacheForTests,
+  apnsEnvironmentFor,
   apnsHost,
+  parseApnsEnvironment,
   buildApnsPayload,
   isApnsConfigured,
   isApnsTokenGone,
@@ -101,4 +103,20 @@ test('dead-token classification reaps exactly the right failures', () => {
   assert.equal(isApnsTokenGone({ ok: false, status: 400, reason: 'DeviceTokenNotForTopic' }), true);
   assert.equal(isApnsTokenGone({ ok: false, status: 429, reason: 'TooManyRequests' }), false, 'throttling must retry, not reap');
   assert.equal(isApnsTokenGone({ ok: false, status: 500, reason: 'InternalServerError' }), false);
+});
+
+test('a phone names its environment in Apple words or ours; anything else is unknown, not a guess', () => {
+  assert.equal(parseApnsEnvironment('development'), 'sandbox');
+  assert.equal(parseApnsEnvironment(' Sandbox '), 'sandbox');
+  assert.equal(parseApnsEnvironment('production'), 'production');
+  assert.equal(parseApnsEnvironment('prod'), undefined);
+  assert.equal(parseApnsEnvironment(42), undefined);
+  assert.equal(parseApnsEnvironment(undefined), undefined);
+});
+
+test('the device is pushed through the host its token belongs to; the daemon setting is only the fallback', () => {
+  const daemon = { environment: 'sandbox' as const };
+  assert.equal(apnsEnvironmentFor({ environment: 'production' }, daemon), 'production', 'a TestFlight phone while the Mac still says sandbox');
+  assert.equal(apnsEnvironmentFor({}, daemon), 'sandbox', 'a token registered before phones said');
+  assert.equal(apnsHost(apnsEnvironmentFor({ environment: 'production' }, daemon)), 'https://api.push.apple.com');
 });

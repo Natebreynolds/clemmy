@@ -551,6 +551,7 @@ export async function deliverNotificationToDestination(
     const copy = buildPushCopy(notification);
     const result = await sendApnsAlert({
       deviceToken: destination.apnsDeviceToken,
+      ...(destination.apnsEnvironment ? { environment: destination.apnsEnvironment } : {}),
       title: copy.title,
       body: copy.body,
       // The native shell parks ONLY the Inbox route (see inboxNotificationUrl).

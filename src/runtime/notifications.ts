@@ -330,6 +330,10 @@ export interface NotificationDestination {
   pushExpirationTime?: number | null;
   /** APNs device token (hex) for native iOS pushes. */
   apnsDeviceToken?: string;
+  /** Which APNs host this token belongs to, as the phone reported at
+   *  registration (its build's aps-environment). Absent for tokens registered
+   *  before phones said; the daemon-wide setting then applies. */
+  apnsEnvironment?: 'sandbox' | 'production';
   enabled: boolean;
   createdAt: string;
 }
@@ -388,6 +392,7 @@ export function notificationDestinationAuthorityDigest(
     pushP256dh: destination.pushP256dh ?? null,
     pushAuth: destination.pushAuth ?? null,
     apnsDeviceToken: destination.apnsDeviceToken ?? null,
+    apnsEnvironment: destination.apnsEnvironment ?? null,
     providerAccountAuthorityDigest,
   };
   return createHash('sha256')
@@ -663,6 +668,11 @@ function validNotificationDestination(value: unknown): value is NotificationDest
   ] as const) {
     if (item[key] !== undefined && typeof item[key] !== 'string') return false;
   }
+  if (
+    item.apnsEnvironment !== undefined
+    && item.apnsEnvironment !== 'sandbox'
+    && item.apnsEnvironment !== 'production'
+  ) return false;
   if (
     item.pushExpirationTime !== undefined
     && item.pushExpirationTime !== null
@@ -2298,6 +2308,8 @@ export function upsertApnsDestination(input: {
   deviceToken: string;
   deviceId: string;
   deviceLabel?: string;
+  /** The phone's build environment; omitted keeps what this device said before. */
+  environment?: 'sandbox' | 'production';
 }): NotificationDestination {
   return withNotificationStateLock(() => {
     const items = loadDestinationsUnlocked();
@@ -2312,6 +2324,7 @@ export function upsertApnsDestination(input: {
       type: 'apns',
       apnsDeviceToken: input.deviceToken,
       deviceId: input.deviceId,
+      ...((input.environment ?? existing?.apnsEnvironment) ? { apnsEnvironment: input.environment ?? existing?.apnsEnvironment } : {}),
       enabled: true,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
     };

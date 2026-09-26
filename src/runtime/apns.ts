@@ -22,6 +22,32 @@ import { BASE_DIR } from '../config.js';
 /** Xcode debug/dev builds get sandbox tokens; TestFlight/App Store get production. */
 export type ApnsEnvironment = 'sandbox' | 'production';
 
+/**
+ * The environment a phone reports with its token, in Apple's words or ours.
+ * The entitlement says `development` / `production`; the push hosts are
+ * called sandbox / production. Anything else is unknown, not a guess.
+ */
+export function parseApnsEnvironment(value: unknown): ApnsEnvironment | undefined {
+  if (typeof value !== 'string') return undefined;
+  const v = value.trim().toLowerCase();
+  if (v === 'sandbox' || v === 'development') return 'sandbox';
+  if (v === 'production') return 'production';
+  return undefined;
+}
+
+/**
+ * Which host a given device is pushed through: the environment the phone
+ * registered with wins, the daemon-wide setting is the fallback for tokens
+ * registered before phones said. A production token sent to the sandbox host
+ * (or the reverse) is BadDeviceToken and silence; this is where it is decided.
+ */
+export function apnsEnvironmentFor(
+  device: { environment?: ApnsEnvironment },
+  config: Pick<ApnsConfig, 'environment'>,
+): ApnsEnvironment {
+  return device.environment ?? config.environment;
+}
+
 export interface ApnsConfig {
   keyId: string;
   teamId: string;
@@ -135,6 +161,8 @@ export interface ApnsAlert {
   body: string;
   /** Deep link the app opens on tap; carried outside `aps`. */
   url?: string;
+  /** The environment this device's token belongs to, when the phone said. */
+  environment?: ApnsEnvironment;
 }
 
 export function buildApnsPayload(alert: Pick<ApnsAlert, 'title' | 'body' | 'url'>): Record<string, unknown> {
@@ -161,7 +189,7 @@ export function sendApnsAlert(alert: ApnsAlert, opts?: ApnsConfigOptions): Promi
   const payload = JSON.stringify(buildApnsPayload(alert));
 
   return new Promise((resolve) => {
-    const session = http2.connect(apnsHost(config.environment));
+    const session = http2.connect(apnsHost(apnsEnvironmentFor(alert, config)));
     const finish = (result: ApnsSendResult): void => {
       session.close();
       resolve(result);

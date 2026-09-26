@@ -3606,10 +3606,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(400).json({ error: 'INVALID_DEVICE_TOKEN' });
       return;
     }
+    // The build's aps-environment, so the daemon pushes through the host this
+    // token belongs to. Unknown words are ignored, not guessed.
+    const { parseApnsEnvironment } = await import('../runtime/apns.js');
+    const environment = parseApnsEnvironment(req.body?.environment);
     const destination = upsertApnsDestination({
       deviceToken: deviceToken.toLowerCase(),
       deviceId: ctx.record.deviceId,
       deviceLabel: ctx.record.deviceLabel,
+      ...(environment ? { environment } : {}),
     });
     await markPushSubscribed(ctx.token, true, stateOpts).catch(() => undefined);
     res.json({ ok: true, destinationId: destination.id });

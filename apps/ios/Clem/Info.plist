@@ -20,6 +20,12 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<!-- Which APNs host this build's tokens belong to. Expanded from the same
+	     build setting that drives the aps-environment entitlement, so the two
+	     can never disagree; the shell reports it with the token and the daemon
+	     pushes through that host, per phone. -->
+	<key>ClemApsEnvironment</key>
+	<string>$(APS_ENVIRONMENT)</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

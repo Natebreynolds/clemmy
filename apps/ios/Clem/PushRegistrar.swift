@@ -89,6 +89,27 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// The APNs environment this build's tokens belong to, in the daemon's
+    /// words: "sandbox" for an Xcode (development) build, "production" for
+    /// TestFlight and the App Store. Read from Info.plist, which Xcode expands
+    /// from the same APS_ENVIRONMENT setting as the entitlement, so a token
+    /// can never be reported against the wrong host. A missing key falls back
+    /// to the build configuration.
+    static var apsEnvironment: String {
+        let raw = (Bundle.main.object(forInfoDictionaryKey: "ClemApsEnvironment") as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch raw {
+        case "production": return "production"
+        case "development", "sandbox": return "sandbox"
+        default:
+            #if DEBUG
+            return "sandbox"
+            #else
+            return "production"
+            #endif
+        }
+    }
+
     /// The only recovery from a denial: the system Settings page for this app.
     static func openSystemNotificationSettings() {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }

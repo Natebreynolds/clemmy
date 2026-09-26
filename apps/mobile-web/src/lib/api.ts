@@ -902,10 +902,10 @@ export async function registerPushSubscription(subscription: PushSubscription): 
 }
 
 /** Native shell only: registers the iOS APNs device token over this session. */
-export async function registerApnsToken(deviceToken: string): Promise<{ destinationId: string }> {
+export async function registerApnsToken(deviceToken: string, environment?: string): Promise<{ destinationId: string }> {
   return api<{ ok: true; destinationId: string }>('/m/push/apns', {
     method: 'POST',
-    body: JSON.stringify({ deviceToken }),
+    body: JSON.stringify({ deviceToken, ...(environment ? { environment } : {}) }),
   });
 }
 

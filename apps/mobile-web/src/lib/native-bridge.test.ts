@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { api } from './api.js';
+import { parsePendingApnsRegistration } from './native-bridge.js';
 import {
   parkOriginHandoff,
   installNativeBridge,
@@ -242,4 +243,12 @@ test('native Keychain storage acknowledgement becomes one exact browser event', 
     if (priorStorage === undefined) delete (globalThis as { localStorage?: unknown }).localStorage;
     else Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: priorStorage });
   }
+});
+
+test('a parked APNs registration is read back with its environment, and an older bare-token park still works', () => {
+  assert.deepEqual(parsePendingApnsRegistration(JSON.stringify({ deviceToken: 'ab'.repeat(32), environment: 'production' })), { deviceToken: 'ab'.repeat(32), environment: 'production' });
+  assert.deepEqual(parsePendingApnsRegistration('ab'.repeat(32)), { deviceToken: 'ab'.repeat(32) });
+  assert.equal(parsePendingApnsRegistration(null), null);
+  assert.equal(parsePendingApnsRegistration('not a token'), null);
+  assert.equal(parsePendingApnsRegistration(JSON.stringify({ environment: 'production' })), null);
 });

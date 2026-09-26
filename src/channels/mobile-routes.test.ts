@@ -3837,6 +3837,40 @@ test('setPin enforces 8-64 char floor + allowed-char policy', async () => {
 
 // ---- native (APNs) push registration ---------------------------------------
 
+test('APNs registration carries the build environment per phone; a re-registration without one keeps it', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Clem iPhone (TestFlight)');
+    const { listNotificationDestinations, removeNotificationDestination } = await import('../runtime/notifications.js');
+    const token = 'ab'.repeat(32);
+    const post = (body: Record<string, unknown>) => fetch(`${h.url}/m/push/apns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify(body),
+    });
+    // The shell reports Apple's word for the entitlement; the daemon stores the host's.
+    assert.equal((await post({ deviceToken: token, environment: 'production' })).status, 200);
+    let apns = listNotificationDestinations().filter((d) => d.type === 'apns');
+    assert.equal(apns.length, 1);
+    assert.equal(apns[0].apnsEnvironment, 'production');
+    // A rotated token from an older shell that says nothing keeps what the phone said.
+    assert.equal((await post({ deviceToken: 'cd'.repeat(32) })).status, 200);
+    apns = listNotificationDestinations().filter((d) => d.type === 'apns');
+    assert.equal(apns.length, 1);
+    assert.equal(apns[0].apnsEnvironment, 'production');
+    // Reinstalled from Xcode: development = the sandbox host.
+    assert.equal((await post({ deviceToken: 'ef'.repeat(32), environment: 'development' })).status, 200);
+    assert.equal(listNotificationDestinations().find((d) => d.type === 'apns')?.apnsEnvironment, 'sandbox');
+    // An unknown word is ignored, not guessed.
+    assert.equal((await post({ deviceToken: 'ef'.repeat(32), environment: 'staging' })).status, 200);
+    assert.equal(listNotificationDestinations().find((d) => d.type === 'apns')?.apnsEnvironment, 'sandbox');
+    // The destination store is one per process, not per harness: leave it as found.
+    for (const dest of listNotificationDestinations().filter((x) => x.type === 'apns')) removeNotificationDestination(dest.id);
+  } finally {
+    await h.close();
+  }
+});
+
 test('APNs registration: valid token upserts one destination per device, bad token 400s, unsubscribe reaps it', async () => {
   const h = await startHarness();
   try {

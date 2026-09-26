@@ -24,7 +24,7 @@ export type ConnectionDoor = 'direct' | 'relay' | 'offline';
 declare global {
   interface Window {
     clemNative?: {
-      registerApnsToken(deviceToken: string): void;
+      registerApnsToken(deviceToken: string, environment?: string): void;
       /** Called by the shell's pull-to-refresh. */
       refresh?(): void;
       /** Called by the shell when the door or reachability changes. */
@@ -183,13 +183,26 @@ export function reportConnectionLost(): boolean {
   }
 }
 
-async function tryRegister(deviceToken: string): Promise<boolean> {
+/** A parked registration: the token and, when the shell said, its build's environment. */
+export function parsePendingApnsRegistration(raw: string | null): { deviceToken: string; environment?: string } | null {
+  if (!raw) return null;
   try {
-    await registerApnsToken(deviceToken);
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { deviceToken?: unknown }).deviceToken === 'string') {
+      const p = parsed as { deviceToken: string; environment?: unknown };
+      return { deviceToken: p.deviceToken, ...(typeof p.environment === 'string' ? { environment: p.environment } : {}) };
+    }
+  } catch { /* an older park stored the bare token */ }
+  return /^[0-9a-fA-F]{16,512}$/.test(raw) ? { deviceToken: raw } : null;
+}
+
+async function tryRegister(deviceToken: string, environment?: string): Promise<boolean> {
+  try {
+    await registerApnsToken(deviceToken, environment);
     try { localStorage.removeItem(PENDING_KEY); } catch { /* private browsing */ }
     return true;
   } catch {
-    try { localStorage.setItem(PENDING_KEY, deviceToken); } catch { /* private browsing */ }
+    try { localStorage.setItem(PENDING_KEY, JSON.stringify({ deviceToken, ...(environment ? { environment } : {}) })); } catch { /* private browsing */ }
     return false;
   }
 }
@@ -197,8 +210,8 @@ async function tryRegister(deviceToken: string): Promise<boolean> {
 /** Installed once at app bootstrap; also drains a parked token from a prior failed attempt. */
 export function installNativeBridge(): void {
   window.clemNative = {
-    registerApnsToken(deviceToken: string): void {
-      void tryRegister(deviceToken);
+    registerApnsToken(deviceToken: string, environment?: string): void {
+      void tryRegister(deviceToken, environment);
     },
     refresh(): void {
       window.dispatchEvent(new Event(REFRESH_EVENT));
@@ -218,7 +231,8 @@ export function installNativeBridge(): void {
   };
   let pending: string | null = null;
   try { pending = localStorage.getItem(PENDING_KEY); } catch { /* private browsing */ }
-  if (pending) void tryRegister(pending);
+  const parked = parsePendingApnsRegistration(pending);
+  if (parked) void tryRegister(parked.deviceToken, parked.environment);
 
   // In a plain browser (or before the shell speaks) the platform's own
   // signals are the best available truth.
