@@ -1110,3 +1110,18 @@ test('judgeMaxOutputTokens: a configured bound is honoured within its floor and 
     else process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS = prior;
   }
 });
+
+test('the reviewer sees the standing instructions of the agent a reply was written as, and nothing new otherwise', () => {
+  const plain = buildObjectiveJudgePrompt('draft three posts', 'Here are three drafts.', { skills: [], toolCallSummary: '' });
+  assert.doesNotMatch(plain, /SAVED AGENT/);
+  const inAgent = buildObjectiveJudgePrompt('draft three posts', 'Here are three drafts.', {
+    skills: [],
+    toolCallSummary: '',
+    agentInstructions: 'Agent: Instagram Manager\nStanding instructions:\nNever use more than two hashtags.',
+  });
+  assert.match(inAgent, /SAVED AGENT THIS REPLY WAS WRITTEN AS/);
+  assert.match(inAgent, /Never use more than two hashtags/);
+  assert.match(inAgent, /never add deliverables the objective did not ask for/);
+  assert.equal(inAgent.startsWith(plain.slice(0, plain.indexOf('A statement that a provider'))), true,
+    'the agent section only adds to what a plain reply is judged on');
+});

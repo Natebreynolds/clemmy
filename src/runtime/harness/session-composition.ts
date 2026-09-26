@@ -250,6 +250,36 @@ export function composeSessionFromStore(
   });
 }
 
+/** Characters of an agent's standing instructions a reviewer is shown. */
+const AGENT_REVIEW_MAX_CHARS = 6_000;
+
+/**
+ * What a reviewer needs to judge a reply written inside a saved agent: its
+ * name, what it handles, its standing instructions and the skills it pins.
+ * Empty for a turn Clem answered without an agent. The pinned skill bodies
+ * stay with the answerer; the reviewer opens a skill it needs by name.
+ */
+export function sessionAgentReviewContext(sessionId: string | null | undefined): string {
+  if (!sessionId) return '';
+  try {
+    const agentId = getSession(sessionId)?.metadata?.agentId;
+    const binding = typeof agentId === 'string' ? resolveAgentBinding(agentId) : null;
+    if (!binding) return '';
+    const { agent } = binding;
+    const instructions = agent.instructions.length > AGENT_REVIEW_MAX_CHARS
+      ? `${agent.instructions.slice(0, AGENT_REVIEW_MAX_CHARS)}\n[instructions cut here for length]`
+      : agent.instructions;
+    return [
+      `Agent: ${agent.name}`,
+      agent.handles ? `Handles: ${agent.handles}` : '',
+      instructions ? `Standing instructions:\n${instructions}` : '',
+      binding.pinnedSkills.length > 0 ? `Pinned skills: ${binding.pinnedSkills.join(', ')}` : '',
+    ].filter(Boolean).join('\n');
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Durable eventlog kind for a newly created session. Workspace docks stay
  * `chat`; only workflow identity changes the kind.
