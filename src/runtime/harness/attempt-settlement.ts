@@ -14,6 +14,7 @@
  *      credit progress, and hand the caller a typed outcome to act on.
  */
 import { localNonWriteStatus } from '../../tools/shared.js';
+import { learnedReadRequest } from './execution-gate.js';
 import { openEventLog } from './eventlog.js';
 import { acceptedTaskIdFor, settlementIdentityFor } from './attempt-identity.js';
 import {
@@ -1229,10 +1230,12 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   // caller's claim, is the authority for that basis.
   const preparationProbe = input.consentBasis === 'plan_preparation_probe'
     && loadJournaledConsentBasis(identity) === 'plan_preparation_probe';
+  // A bound write whose request shape was learned to read only is booked as
+  // a read, as the host lane books it (hostCallAccounting).
   const settlementMutating = preparationProbe
     ? false
     : binding
-      ? runtimeEffectIsMutation(binding.effect)
+      ? runtimeEffectIsMutation(binding.effect) && !learnedReadRequest(input.toolName, input.args)
       : input.mutating === true;
   if (binding || preparationProbe) extracted.mutating = settlementMutating;
   if (settlementMutating && extracted.acknowledged === undefined) {

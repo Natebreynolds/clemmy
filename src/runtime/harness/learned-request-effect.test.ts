@@ -26,6 +26,7 @@ const ports = await import('../semantic-boundary/turn-semantic-port-registry.js'
 const { configuredBrainSemanticPort } = await import('../semantic-boundary/configured-brain-semantic-port.js');
 const catalog = await import('./host-capability-catalog-factory.js');
 const manifests = await import('./capability-manifest.js');
+const hostInvocation = await import('./host-tool-invocation.js');
 const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
@@ -386,4 +387,38 @@ test('under the live manifest that seals "may write" as a write, the shape is le
   assert.equal(gate.requestEffectLearnable(TOOL, { ...LIVE_ARGS, path: '/v3/other' }), true);
   declared.recordDeclaredMcpToolEffect(TOOL, { readOnlyHint: true });
   assert.equal(gate.requestEffectLearnable(TOOL, LIVE_ARGS), false);
+});
+
+test('a host-owned call of a learned shape is booked as a read: no write settlement, no write reservation, sealed effect untouched', () => {
+  const verdict = {
+    version: 1 as const, providerKind: 'native_mcp' as const, operationId: OPERATION, shape: LIVE_SHAPE, verdict: 'reads_only' as const,
+    evidenceDigest: sha('evidence'),
+    screen: { model: 'jev-fixture', changeProbability: 0.02 },
+    confirm: { role: 'judge' as const, model: 'judge-fixture-model', changesProvider: 'no' as const, confidence: 0.95 },
+    learnedAt: new Date().toISOString(),
+  };
+  // The live shape: the host invokes the carrier-less name under the sealed manifest effect.
+  const call = (args: unknown) => ({
+    identity: { toolName: OPERATION, args } as never,
+    effect: 'external_write' as const,
+    boundary: 'host_owned_external' as const,
+  });
+  withCatalog([sealedMayWriteManifest({ readOnly: false, destructive: false })], () => {
+    const before = hostInvocation.hostCallAccounting(call(LIVE_ARGS));
+    assert.deepEqual(before, { learnedRead: false, mutating: true, projectsExternalWrite: true }, 'a write until learned');
+    assert.ok(store.rememberLearnedRequestEffect(verdict));
+    const after = hostInvocation.hostCallAccounting(call(LIVE_ARGS));
+    assert.deepEqual(after, { learnedRead: true, mutating: false, projectsExternalWrite: false });
+    assert.equal(gate.learnedReadRequest(OPERATION, LIVE_ARGS), true);
+    assert.equal(gate.learnedReadRequest(`mcp__${OPERATION}`, LIVE_ARGS), true, 'either spelling');
+    const other = hostInvocation.hostCallAccounting(call({ ...LIVE_ARGS, path: '/v3/serp/google/organic/task_post' }));
+    assert.deepEqual(other, { learnedRead: false, mutating: true, projectsExternalWrite: true }, 'another endpoint is still a write');
+    assert.equal(hostInvocation.hostCallAccounting({ ...call(LIVE_ARGS), consentBasis: 'plan_preparation_probe' as never }).mutating, false);
+    assert.equal(hostInvocation.hostCallAccounting({ ...call(LIVE_ARGS), effect: 'admin' as const }).learnedRead, false, 'only a sealed external_write is refined');
+  });
+  // A declared destructive tool is never booked as a read, learned or not.
+  withCatalog([sealedMayWriteManifest({ readOnly: false, destructive: true })], () => {
+    assert.equal(hostInvocation.hostCallAccounting(call(LIVE_ARGS)).mutating, true);
+    assert.equal(gate.learnedReadRequest(OPERATION, LIVE_ARGS), false);
+  });
 });
