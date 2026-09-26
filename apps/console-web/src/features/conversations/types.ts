@@ -1,3 +1,4 @@
+import type { WorkflowCardData } from '@clem/chat-engine';
 import type { RunStep, RunSourceCoverage } from '@/lib/run-presentation';
 import type { TaskMode, PlanRevisionRef } from '../../lib/task-mode';
 /** Mirrors the backend UnifiedSessionSummary (src/types.ts). */
@@ -29,6 +30,8 @@ export interface Session {
 }
 
 export interface Turn {
+  /** Workflows this reply created or changed, as saved; drawn as cards under it. */
+  workflows?: WorkflowCardData[];
   taskMode?: TaskMode;
   planArtifactRef?: PlanRevisionRef;
   role: 'user' | 'assistant';

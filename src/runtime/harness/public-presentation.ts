@@ -1088,6 +1088,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         changedStepIds: ids(data.changedStepIds),
         addedStepIds: ids(data.addedStepIds),
         removedStepIds: ids(data.removedStepIds),
+        ...(Number.isSafeInteger(data.sourceUserSeq) && Number(data.sourceUserSeq) > 0 ? { sourceUserSeq: Number(data.sourceUserSeq) } : {}),
       };
     }
     case 'handoff':

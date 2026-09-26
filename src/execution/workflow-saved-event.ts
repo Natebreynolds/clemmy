@@ -103,18 +103,24 @@ export function emitWorkflowSaved(
   before: WorkflowDefinition | null,
   opts: { sessionId?: string } = {},
 ): WorkflowSavedEventData | null {
-  const sessionId = opts.sessionId ?? getToolOutputContext()?.sessionId;
+  const context = getToolOutputContext();
+  const sessionId = opts.sessionId ?? context?.sessionId;
   if (!sessionId) return null;
   const entry = readWorkflow(slug);
   if (!entry) return null;
   const data = workflowSavedEventData(slug, before, entry.data);
+  // The exact accepted user input this change answers, so a reopened
+  // conversation can put the card under the right reply.
+  const sourceUserSeq = Number.isSafeInteger(context?.sourceUserSeq) && Number(context?.sourceUserSeq) > 0
+    ? Number(context?.sourceUserSeq)
+    : undefined;
   try {
     appendEvent({
       sessionId,
       turn: 0,
       role: 'system',
       type: 'workflow_saved',
-      data: data as unknown as Record<string, unknown>,
+      data: { ...(data as unknown as Record<string, unknown>), ...(sourceUserSeq ? { sourceUserSeq } : {}) },
     });
   } catch {
     /* the reply still carries the text receipt */

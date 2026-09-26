@@ -185,6 +185,9 @@ export interface UnifiedSessionTurn {
   /** Who this exchange was answered by: a saved agent's name, null for Clem
    *  without an agent. Absent when the turn left no route marker. */
   agentName?: string | null;
+  /** Workflows this reply created or changed, as saved, so a reopened
+   *  conversation shows the same card the live reply did. */
+  workflows?: import('./execution/workflow-saved-event.js').WorkflowSavedEventData[];
   /** A2 (v2.3.0): a STILL-PENDING approval attached to this turn, so a
    *  reopened chat renders the actionable approve/execute card — not just
    *  the prose that told the user a card exists somewhere else. */

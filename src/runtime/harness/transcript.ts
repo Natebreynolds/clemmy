@@ -7,6 +7,7 @@
  * version so the unified `/api/console/sessions/:id` endpoint and any UI
  * agree on exactly one rendering of harness history.
  */
+import type { WorkflowSavedEventData } from '../../execution/workflow-saved-event.js';
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
 import {
@@ -68,6 +69,8 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       // someone who walked away can reopen the session and read it.
       'conversation_check_in',
       'plan_revision_published',
+      // A workflow the reply created or changed rides on that reply as a card.
+      'workflow_saved',
     ],
     limit,
   });
@@ -149,6 +152,26 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     list.push({ role: 'assistant', text, createdAt: event.createdAt, checkIn: true });
     checkInsBySource.set(key, list);
   }
+
+  // Workflows each reply saved, by the exact source the tool ran for; the
+  // newest save of a workflow within a turn is the one shown.
+  const workflowsBySource = new Map<string, Map<string, WorkflowSavedEventData>>();
+  for (const event of events) {
+    if (event.type !== 'workflow_saved') continue;
+    const exactSeq = positiveSeq(event.data.sourceUserSeq);
+    if (exactSeq === null) continue;
+    const key = sourceKey(event.sessionId, exactSeq);
+    if (!sources.has(key)) continue;
+    const slug = typeof event.data.slug === 'string' ? event.data.slug : '';
+    if (!slug) continue;
+    const list = workflowsBySource.get(key) ?? new Map<string, WorkflowSavedEventData>();
+    list.set(slug, event.data as unknown as WorkflowSavedEventData);
+    workflowsBySource.set(key, list);
+  }
+  const withWorkflows = (key: string, turn: UnifiedSessionTurn): UnifiedSessionTurn => {
+    const saved = workflowsBySource.get(key);
+    return saved && saved.size > 0 ? { ...turn, workflows: [...saved.values()] } : turn;
+  };
 
   // Who answered each accepted source: its first route marker names the saved
   // agent the turn ran as, or none (Clem). A separate read, so the marker
@@ -267,13 +290,13 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         turns: attributed(source.key, [
           ...userTurns,
           ...(checkInsBySource.get(source.key) ?? []),
-          {
+          withWorkflows(source.key, {
             role: 'assistant',
             text: assistant.text,
             createdAt: assistant.createdAt,
             planProposalId: assistant.planProposalId,
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
-          },
+          }),
         ]),
       });
     } else if (userTurns.length > 0) {

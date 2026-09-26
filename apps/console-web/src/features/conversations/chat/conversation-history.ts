@@ -9,7 +9,24 @@ let seedSeq = 0;
  * the chat UI. Durable plan and approval identities survive navigation; plain
  * assistant history remains terminal text. */
 export function historyToMessages(turns: Turn[]): ChatMessage[] {
-  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn) }));
+  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...savedWorkflows(turn) }));
+}
+
+/** The workflows the reply saved, as the receipt-only rows the live card is
+ *  drawn from, so reopening shows the same card the live reply did. */
+function savedWorkflows(turn: Turn): Pick<ChatMessage, 'activity'> {
+  if (turn.role !== 'assistant' || !turn.workflows?.length) return {};
+  return {
+    activity: turn.workflows.map((workflow) => ({
+      id: `workflow-${workflow.slug}`,
+      kind: 'event' as const,
+      variant: 'write' as const,
+      tone: 'success' as const,
+      status: 'done' as const,
+      label: workflow.op === 'created' ? `Created workflow “${workflow.name}”` : `Changed workflow “${workflow.name}”`,
+      workflow,
+    })),
+  };
 }
 
 /** Who answered the exchange, when the server recorded it. */

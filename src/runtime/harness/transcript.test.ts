@@ -350,3 +350,33 @@ test('reconstructHarnessTranscript names who answered each exchange from its rou
   assert.equal(Object.prototype.hasOwnProperty.call(turns[6], 'agentName'), false);
   void fourth;
 });
+
+test('a workflow the reply saved rides on that reply, newest save per workflow, and on no other turn', () => {
+  const session = createSession({ kind: 'chat', title: 'workflow cards' });
+  const ask = (text: string) => appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+  const saved = (sourceUserSeq: number | undefined, slug: string, changedStepIds: string[]) => appendEvent({
+    sessionId: session.id, turn: 0, role: 'system', type: 'workflow_saved',
+    data: {
+      name: slug, slug, op: 'updated', enabled: false,
+      steps: [{ id: 'a', label: 'A', effect: 'read', approval: false, forEach: false, dependsOn: [] }],
+      changedStepIds, addedStepIds: [], removedStepIds: [],
+      ...(sourceUserSeq ? { sourceUserSeq } : {}),
+    },
+  });
+  const first = ask('change step a');
+  saved(first.seq, 'weekly-posts', ['a']);
+  saved(first.seq, 'weekly-posts', []); // a second save in the same turn wins
+  saved(first.seq, 'other-flow', ['a']);
+  appendTypedTerminal(session.id, first.seq, 'done');
+  const second = ask('unrelated');
+  saved(undefined, 'weekly-posts', ['a']); // no source: attaches to nothing
+  appendTypedTerminal(session.id, second.seq, 'sure');
+
+  const turns = reconstructHarnessTranscript(session.id);
+  assert.deepEqual(turns.map((turn) => [turn.role, turn.workflows?.map((w) => `${w.slug}:${w.changedStepIds.join(',')}`)]), [
+    ['user', undefined],
+    ['assistant', ['weekly-posts:', 'other-flow:a']],
+    ['user', undefined],
+    ['assistant', undefined],
+  ]);
+});
