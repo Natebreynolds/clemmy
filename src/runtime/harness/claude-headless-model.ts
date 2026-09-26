@@ -134,9 +134,8 @@ const REASONING_TIERS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', '
  * The reasoning a request asks for, in this wire's vocabulary. --effort takes
  * the same mapped value the Messages lane sends as output_config.effort. That
  * enum's floor is 'low', where adaptive thinking still runs, so a none or
- * minimal tier also switches the CLI's thinking off. Measured 2026-09-25 on one
- * account-routing verdict, same model and prompt: 297-492 output tokens in
- * 5.3-6.4 s with thinking, 68 tokens in 2.5 s without, and the same verdict.
+ * minimal tier also switches the CLI's thinking off: a structured verdict
+ * gains nothing from hidden reasoning and pays for it in time and tokens.
  * A request that names no tier keeps the CLI's default.
  */
 export function claudeHeadlessReasoningControls(

@@ -1038,11 +1038,10 @@ function quotaResetHintMs(err: unknown): number | undefined {
 }
 
 /**
- * The memory extractor. It runs at low reasoning like the other memory jobs
- * (owner decision 2026-09-25). On the owner's checker model it was the largest
- * reviewer output cost: 72 runs in a day, about 1,500 output tokens and 21 s
- * each at the model's default depth. Measured on one batch, low effort used
- * 343 output tokens in 4.7 s against 2,195 in 20.8 s, keeping 4 facts, not 7.
+ * The memory extractor. It runs at low reasoning like the other memory jobs:
+ * it runs after nearly every turn, so at a model's default depth it becomes a
+ * large share of all reviewer output, and extraction needs recall more than
+ * deliberation.
  */
 export function reflectionExtractorAgent(
   model: NonNullable<ReturnType<typeof getReflectorModel>>,

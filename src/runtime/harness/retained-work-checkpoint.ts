@@ -7,11 +7,10 @@
 export const RETAINED_WORK_TERMINAL_HEADER = 'Retained work (durable checkpoint):';
 
 /**
- * The part of a terminal a person reads while Clem waits on them. Live
- * 2026-09-25: a clarifying question reached the chat followed by the whole
- * checkpoint ("Source/tool outlook_get_calendar_view: 83 records (complete)
- * retained as rh_463d…"). Someone answering a question or an approval has no
- * use for handle ids; the durable terminal keeps them for the model.
+ * The part of a terminal a person reads while Clem waits on them: the words
+ * before the retained-work checkpoint. Someone answering a question or an
+ * approval has no use for record counts and handle ids; the durable terminal
+ * keeps them for the model.
  */
 export function withoutRetainedWorkCheckpoint(text: string): string {
   const index = text.indexOf(RETAINED_WORK_TERMINAL_HEADER);

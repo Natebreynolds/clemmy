@@ -148,8 +148,8 @@ export function semanticModelRoleForPurpose(
  * The reasoning each purpose asks its model for; undefined keeps the model's
  * default. Account routing returns one enum verdict and has 'uncertain' for
  * anything unclear, so it runs without extended thinking, like the harness's
- * other structured verdicts. Measured 2026-09-25: this call held a Slack write
- * turn's tool search for 7.9 s, almost all of it hidden reasoning.
+ * other structured verdicts: it sits in front of the turn's tool search, so
+ * any hidden reasoning here is time the owner waits.
  */
 export function semanticReasoningForPurpose(
   purpose: ConfiguredSemanticPurpose,

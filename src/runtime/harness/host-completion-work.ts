@@ -701,8 +701,8 @@ function settledRequestArgs(sessionId: string, sourceUserSeq: number, callId: st
 /**
  * What the turns just before this one read or wrote, for a reply that rests
  * on them ("I checked beforehand: the folder did not exist"). Completion
- * review otherwise sees only this request's evidence, so such a claim was
- * ruled unverified and a finished save ended blocked (live 2026-09-25). Each
+ * review otherwise sees only this request's evidence, so such a claim would
+ * read as unverified and finished work would end blocked. Each
  * result is redeemed under its own turn's authority, as this request's are,
  * shown compactly and dated: it supports what was true then, never this
  * turn's own effects.

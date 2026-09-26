@@ -7,9 +7,9 @@ import type { ApprovalCallPreview } from './approval-call-preview.js';
 /**
  * Human names for the identifiers an approval card shows.
  *
- * A card that reads "users UC0806VCJ" tells the owner nothing (live
- * 2026-09-25). Clem found that id in an earlier result of this conversation,
- * and the record it came from names it. The host gathers the strings of the
+ * A card that shows only an opaque id tells the owner nothing. When Clem found
+ * that id in an earlier result of this conversation, the record it came from
+ * names it. The host gathers the strings of the
  * records that carry the exact value, and Jev picks the one a person would
  * recognise, or none. Display only: the card keeps the exact value, and the
  * approval still pins the untouched arguments.

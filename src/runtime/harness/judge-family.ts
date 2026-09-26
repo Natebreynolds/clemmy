@@ -56,8 +56,8 @@ export function debateBrainsAvailable(): { claude: boolean; codex: boolean } {
 // The COMPLETION CHECKER's quota availability.
 //
 // claudeAvailable() has no quota check (codexAvailable() has one), so a checker
-// on a used-up Claude plan kept being chosen and every completion review failed
-// open as unreviewed (live 2026-09-21). claudeAvailable() stays as it is: brain
+// on a used-up Claude plan would keep being chosen and every completion review
+// would fail open as unreviewed. claudeAvailable() stays as it is: brain
 // routing reads it too (router-model.ts, the session brain pin in
 // model-roles.ts), and moving the brain is a separate decision. The checker
 // asks this instead. Signing out is not a quota state: an explicit pin that

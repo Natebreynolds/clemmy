@@ -1581,9 +1581,9 @@ export interface CheckerOutage {
 }
 
 /**
- * The stand-in for a completion checker whose provider is out of quota (live
- * 2026-09-21: every review failed open while the Claude plan window was used
- * up). The J1 chain's members without the family that is out: another
+ * The stand-in for a completion checker whose provider is out of quota, so a
+ * used-up plan window never turns every review into an unreviewed pass. The
+ * J1 chain's members without the family that is out: another
  * flagship family's cheap checker, one that did not write the answer first;
  * then, for an answer a BYO model wrote, that family's own checker. A stand-in
  * that shares the answer's family says so (selfJudge). It is marked as a

@@ -4,11 +4,10 @@
  * by two independent models. The external-capability risk loader consults
  * them; nothing else grants them meaning.
  *
- * Live 2026-09-25: to message a teammate Clem needed two calls. The first
- * opened a direct conversation: it returns a conversation id and delivers
- * nothing. It was carded as an irreversible send because of a word in its
- * name. The owner approved that card and never opened the second one, which
- * carried the real message, so the message was never sent.
+ * An operation that only opens a conversation returns an id and delivers
+ * nothing. Carded as an irreversible send because of a word in its name, it
+ * asks the owner to approve a step with no content, and the card that carries
+ * the real message can go unseen.
  *
  * Exactly one verdict is ever written: both models agree the exact definition
  * delivers nothing to anyone other than the owner and can neither delete nor

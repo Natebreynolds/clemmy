@@ -127,8 +127,8 @@ export function terminalCompletionPresentation(
  * The host's own filler for a turn that paused on an approval with no words of
  * its own ("Approval required for X. Review apr-… to continue."). The approval
  * card already says it, with its preview and buttons. Shown as prose too, it
- * read as a second card and, typed as awaiting a reply, invited the owner to
- * type an answer (live 2026-09-25). Recognized only by its exact shape around
+ * reads as a second card and, typed as awaiting a reply, invites the owner to
+ * type an answer. Recognized only by its exact shape around
  * the presentation's own approval id; words the model wrote are kept.
  */
 function hostApprovalFiller(data: Record<string, unknown>): boolean {

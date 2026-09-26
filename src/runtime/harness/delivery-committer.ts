@@ -920,8 +920,7 @@ function acceptedSourceHasZeroExternalEffectSurface(
 
 
 /** The reviewer's findings for the owner: every numbered item when it fits,
- *  cut only between items or sentences, never mid-word. Live 2026-09-25: the
- *  note stopped mid-sentence at a fixed 240 characters. */
+ *  cut only between items or sentences, never mid-word or mid-sentence. */
 function reviewFindingForOwner(reason: string, max = 900): string {
   const text = reason.replace(/\s+/g, ' ').trim();
   if (text.length <= max) return text;

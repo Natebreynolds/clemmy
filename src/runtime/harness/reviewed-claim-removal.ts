@@ -1,8 +1,7 @@
 /**
  * Remove the claims a completion review found wrong, and nothing else.
  *
- * Live 2026-09-24 and 2026-09-25: after the last review round, an answer was
- * delivered "blocked" while still containing the figures the reviewer had
+ * An answer is never delivered still carrying the figures its reviewer
  * flagged. When a review's only findings are specific claims (the CORRECT
  * verdict) and the rounds are spent, the host deletes exactly the sentences
  * or list lines that carry the reviewer's own quotes, then names what it

@@ -5,9 +5,9 @@
  *
  * The structural risk classifier reads operation names. When a name looks
  * like a send, every call is carded as an irreversible send even when the
- * operation only opens or returns something (live 2026-09-25: opening a
- * direct conversation cost the owner a card, and the card that carried the
- * real message went unseen). This module asks two models about the exact
+ * operation only opens or returns something, and a card for a step with no
+ * content can hide the card that carries the real one. This module asks two
+ * models about the exact
  * definition instead:
  *
  * 1. The fast classifier screens it with two yes/no probabilities. Only a

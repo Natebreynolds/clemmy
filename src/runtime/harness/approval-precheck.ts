@@ -9,12 +9,11 @@ import type { ApprovalCallPreview } from './approval-call-preview.js';
  * Check an outgoing action against the owner's standing rules before its
  * approval card is shown.
  *
- * Live 2026-09-25: an email went out naming a tool the owner had asked never
- * to name in emails. The rule was already in Clem's own context, the card
- * showed only the subject and recipients, and the mistake was noticed after
- * the send. The owner's checker model now reads the exact content first; the
- * card shows any conflict and the owner decides. Advisory only: nothing here
- * holds, rewrites or authorizes the call.
+ * A rule already in Clem's context can still be broken by the content she
+ * drafts, and a card showing only a subject and recipients leaves the owner
+ * to catch it after the send. The owner's checker model reads the exact
+ * content first; the card shows any conflict and the owner decides. Advisory
+ * only: nothing here holds, rewrites or authorizes the call.
  */
 
 export interface ApprovalPrecheck {

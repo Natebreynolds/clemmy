@@ -63,12 +63,10 @@ function approvalPreviewValue(value: unknown): string | null {
 
 /**
  * What an approval would actually do, from the exact frozen arguments the
- * registry holds: the operation and each argument the provider receives.
- * Live 2026-09-25: two Slack approvals read "Slack open dm" and "Send Slack
- * message"; the message text sat in the arguments and never reached the
- * card, and the owner approved without knowing what. Display only: authority
- * and resume keep pinning the untouched arguments, and a value that looks
- * like a secret is withheld.
+ * registry holds: the operation and each argument the provider receives, so
+ * the owner approves the content itself, never an operation's name alone.
+ * Display only: authority and resume keep pinning the untouched arguments,
+ * and a value that looks like a secret is withheld.
  */
 export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true): ApprovalCallPreview | null {
   const args = (info.args ?? {}) as Record<string, unknown>;

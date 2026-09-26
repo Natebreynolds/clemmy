@@ -341,9 +341,7 @@ export function currentWatcherJudge(): WatcherJudgeFn {
 }
 
 /** Jev's reading settles a window only at or above this confidence; anything
- * less says nothing and the next window looks again. Measured 2026-09-17→24:
- * of 217 shadowed reviews Jev agreed with the flagship watcher on 214, and the
- * three disagreements were Jev readings at confidence 0.33. */
+ * less says nothing and the next window looks again. */
 export const JEV_TRAJECTORY_TRUST_MIN = 0.85;
 
 export interface WatcherJudgeDependencies {
@@ -381,9 +379,9 @@ function driftSteer(
 }
 
 /**
- * One trajectory check, on Jev alone (owner decision 2026-09-25). The flagship
- * watcher cost about $15 on 09-24 and delivered no steer on 09-25 (24 reviews,
- * all on track). A confident on-track reading settles the window; a confident
+ * One trajectory check, on Jev alone: a mid-task look runs often, so it must
+ * cost almost nothing, and a flagship reviewer here spends heavily for steers
+ * it rarely gives. A confident on-track reading settles the window; a confident
  * drift reading becomes one host-authored steer toward the goal; anything less
  * says nothing, and the window stays pending for the next check. Never a
  * fabricated steer, never a model call beyond Jev.

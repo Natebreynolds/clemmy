@@ -3391,9 +3391,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     : undefined;
   const modelSettings = ((agent as { modelSettings?: unknown }).modelSettings ?? {}) as never;
   // EFFORT FOLLOWS THE WORK. The turn's reasoning tier is picked from the
-  // opening message, so a "quick" ask that then gathers many results drafted a
-  // data-heavy answer at tier none (live 2026-09-25: first drafts with wrong
-  // figures, each rejection adding 15-55 s). Once several business calls have
+  // opening message, so a "quick" ask that then gathers many results would
+  // draft a data-heavy answer at tier none, and each figure it gets wrong costs
+  // a review round. Once several business calls have
   // returned, drafting runs at least at low; a redo after a review rejection
   // runs at medium. Raises only, never lowers; with no tier chosen the
   // provider default stands, and a backend that cannot steer effort ignores it.

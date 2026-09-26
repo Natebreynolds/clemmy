@@ -432,8 +432,8 @@ export function ChatBubble({
             )}
             {!pendingAction && message.approval?.preview && message.approval.preview.fields.length > 0 && (
               // What approving would actually send: each argument the tool
-              // receives, from the host's frozen call (live 2026-09-25: a
-              // Slack approval showed only "Send Slack message").
+              // receives, from the host's frozen call, so the owner never
+              // approves on an operation's name alone.
               <dl className="mt-2 space-y-1.5 text-caption">
                 {message.approval.preview.fields.map((field) => (
                   <div key={field.name}>

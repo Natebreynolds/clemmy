@@ -460,8 +460,7 @@ const APPROVAL_LABEL_MAX_CANDIDATES = 20;
  * value belongs to in this conversation's own results; Jev picks which of that
  * record's strings names it the way a person would recognise it, or none.
  * Display only: the card still shows the exact value, and nothing it approves
- * changes. Live 2026-09-25: "Slack open dm · users UC0806VCJ" gave the owner no
- * way to tell who the message was for.
+ * changes. A bare id gives the owner no way to tell who a message is for.
  */
 export async function labelIdentifierWithJev(
   input: {
