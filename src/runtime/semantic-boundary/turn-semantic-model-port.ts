@@ -176,6 +176,30 @@ export interface OperationDeliveryJudgeResult {
   modelIdentity: string;
 }
 
+export const REQUEST_EFFECT_JUDGE_PURPOSE = 'request_effect_judge' as const;
+
+/** One settled request of a generic provider tool, judged from what it asked
+ * and what the provider returned: did it change anything on the provider's
+ * side? The tool's name is deliberately not part of the call. */
+export interface RequestEffectJudgeCall {
+  purpose: typeof REQUEST_EFFECT_JUDGE_PURPOSE;
+  sessionId?: string;
+  method: string;
+  pathTemplate: string;
+  /** Canonical JSON text of the request arguments, bounded. */
+  request: string;
+  /** The provider's response as the model saw it, bounded. */
+  response: string;
+  evidenceDigest: string;
+}
+
+export interface RequestEffectJudgeResult {
+  changesProvider: 'yes' | 'no' | 'uncertain';
+  confidence: number;
+  evidenceDigest: string;
+  modelIdentity: string;
+}
+
 export interface TurnSemanticModelPort {
   interpret(call: TurnSemanticModelCall): Promise<TurnSemanticModelResult>;
   /** Independent tool-less judge. Must not see the proposing model's write claim. */
@@ -187,4 +211,8 @@ export interface TurnSemanticModelPort {
   /** Confirms, on the judge role, whether one operation definition delivers
    * anything. A verdict is evidence for the learned-delivery store only. */
   judgeOperationDelivery?(call: OperationDeliveryJudgeCall): Promise<OperationDeliveryJudgeResult>;
+  /** Confirms, on the judge role, whether one settled request changed
+   * anything on its provider. A verdict is evidence for the learned
+   * request-effect store only. */
+  judgeRequestEffect?(call: RequestEffectJudgeCall): Promise<RequestEffectJudgeResult>;
 }

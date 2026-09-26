@@ -19,6 +19,8 @@ import { durableLogicalCallContract } from './logical-call-contract.js';
 import { normalizeCallableArguments } from './callable-contract.js';
 import { isTrustedComposioGateway } from './runtime-tool-identity.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { classifyCanonicalExternalEffect, nativeRequestOperationId } from './execution-gate.js';
+import { scheduleRequestEffectLearning } from './learned-request-effect.js';
 import {
   expectedTaskFor,
   recordResolvedOperationInTransaction,
@@ -640,6 +642,32 @@ export function redeemDurableLogicalCallSettlementForHost(
  * the byte-equivalent persisted verdict. Every other status is fail-closed and
  * distinguishable; storage failure is never reported as a duplicate.
  */
+/**
+ * A provider call that settled as a write only because its effect could not
+ * be classified has, now that it returned, evidence of what it did. Offer
+ * that evidence to request-effect learning, off this settlement's path.
+ * Learning never waits on, or fails, a settlement.
+ */
+function observeSettledRequestEffect(input: CommitLogicalCallSettlementInput): void {
+  try {
+    if (
+      input.execution.kind !== 'provider_execution'
+      || input.outcome.kind !== 'succeeded'
+      || input.recovery.mutating !== true
+    ) return;
+    const operationId = nativeRequestOperationId(input.contract.toolName);
+    if (!operationId) return;
+    const effect = classifyCanonicalExternalEffect(`mcp__${operationId}`, input.contract.args);
+    if (!effect.external || !effect.mutating || effect.classificationKnown) return;
+    scheduleRequestEffectLearning(
+      { providerKind: 'native_mcp', operationId, args: input.contract.args, result: input.result?.payload },
+      { sessionId: input.identity.sessionId },
+    );
+  } catch {
+    // Learning is additive; the settlement stands on its own.
+  }
+}
+
 export function commitLogicalCallSettlement(
   input: CommitLogicalCallSettlementInput,
 ): LogicalCallSettlementResult {
@@ -1237,6 +1265,7 @@ export function commitLogicalCallSettlement(
     if (result.status === 'committed') {
       if (mirror) publishCommittedInternalEvent(mirror);
       if (operationMirror) publishCommittedInternalEvent(operationMirror);
+      observeSettledRequestEffect(input);
     }
     return result;
   } catch (error) {
