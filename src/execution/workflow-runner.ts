@@ -73,6 +73,7 @@ import { HOST_TOOL_DISPOSITION_PROTOCOL } from '../runtime/harness/host-model-re
 import { bindStepInputs, resolveFrom } from './step-binding.js';
 import {
   addNotification,
+  adoptWorkflowStepReportAsOutcome,
   loadNotifications,
   markWorkflowCapabilityNotificationsSettled,
   type NotificationRecord,
@@ -507,6 +508,33 @@ export function shouldSilenceCompletionEcho(opts: {
   );
 }
 
+interface WorkflowFailureEscalation { consecutiveFailures: number }
+
+/**
+ * Record a failed occurrence in the cross-run ledger. Returns the streak only
+ * when this failure is the one that crosses the escalation line. Bookkeeping
+ * never masks the failure it records.
+ */
+function recordWorkflowFailureEscalation(workflowName: string, reason: string): WorkflowFailureEscalation | null {
+  try {
+    const outcome = recordWorkflowOutcome(workflowName, false, reason);
+    return outcome?.justEscalated ? { consecutiveFailures: outcome.consecutiveFailures } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A crossed streak rides the run's own outcome notification, once. */
+function workflowEscalationLine(workflowName: string, escalation: WorkflowFailureEscalation | null): string {
+  return escalation
+    ? `\n\n"${workflowName}" has now failed ${escalation.consecutiveFailures} times in a row.`
+    : '';
+}
+
+function workflowEscalationMetadata(escalation: WorkflowFailureEscalation | null): Record<string, unknown> {
+  return escalation ? { escalated: true, consecutiveFailures: escalation.consecutiveFailures } : {};
+}
+
 /** The latest authored notify_user body is a presentation contribution, not
  * merely a side effect. Exact-origin workflows silence that intermediate
  * notification, so their source reducer must carry its text into the one final
@@ -784,20 +812,9 @@ function startWorkflowHeartbeat(
       : '';
     const stepLabel = cur ? ` · step ${cur.index} of ${cur.total} · ${cur.stepId}${itemLabel}` : '';
     const stepBody = cur ? `Currently: \`${cur.stepId}\` (step ${cur.index}/${cur.total}${itemLabel}). ` : '';
-    addNotification({
-      id: `workflow-heartbeat-${runId}-${count}`,
-      kind: 'workflow',
-      title: `Workflow still running: ${workflowName}${stepLabel}`,
-      body: `${stepBody}Run ${runId} has been working for ${elapsedMin} min. Will notify on completion or failure. Open Console → Activity for live status.`,
-      createdAt: new Date().toISOString(),
-      read: false,
-      // Dashboard-only: "still running" heartbeats are live-status reassurance,
-      // not report-backs. Delivering them spammed Discord every ~10 min during
-      // long runs. The terminal completion/failure notification (and any
-      // notify_user report) still delivers — this only stops the noise.
-      silent: true,
-      metadata: { workflow: workflowName, runId, heartbeat: true, elapsedMin },
-    });
+    // A quiet "still running" beat is live status, which the run views already
+    // show from the run itself; it is not written to the notification record.
+    //
     // T4.1 (desktop↔channel parity): channels used to be COMPLETELY blind
     // between kickoff and the terminal report — every heartbeat was
     // dashboard-only. For genuinely long runs, a LOUD but heavily
@@ -5456,23 +5473,13 @@ async function runStepViaHarness(
         ...graduatedSends,
       ])],
     });
-    if (graduatedSends.length > 0) {
-      try {
-        addNotification({
-          id: `send-graduated-${workflowRunId}-${step.id}`,
-          kind: 'workflow',
-          title: `Send runs without approval: ${workflowName} · ${step.id}`,
-          body: [
-            `Run ${workflowRunId} sends via ${graduatedSends.join(', ')} without pausing — a person approved this step's send in a prior run, and the workflow is enabled + scheduled.`,
-            'Author the step with `requiresApproval` to always wait for a human; disable the workflow to stop it entirely.',
-          ].join('\n'),
-          createdAt: new Date().toISOString(),
-          read: false,
-          silent: true,
-          metadata: { workflow: workflowName, runId: workflowRunId, stepId: step.id, graduatedSends },
-        });
-      } catch { /* audit notification is best-effort */ }
-    }
+    // The consent that lets this step's send run without pausing is recorded
+    // once per step attempt in the run's own history (below), never as a
+    // notification: the owner hears the run's outcome, not consent they
+    // already gave.
+    const standingSendConsent: { basis: Array<'prior_approval' | 'authored_send'>; authorityDigest?: string } = {
+      basis: graduatedSends.length > 0 ? ['prior_approval'] : [],
+    };
 
     // Self-heal move 2: arm submission-time contract validation for this step
     // session (workflow_step_result refuses a wrong-shape result with the exact
@@ -5628,22 +5635,21 @@ async function runStepViaHarness(
         );
       }
       if (declaredSendStep && writeAuthority.status === 'ready' && !step.requiresApproval) {
-        try {
-          addNotification({
-            id: `send-authored-${workflowRunId}-${step.id}`,
-            kind: 'workflow',
-            title: `Send runs without approval: ${workflowName} · ${step.id}`,
-            body: [
-              `Run ${workflowRunId}: this step is authored as a send (sideEffect: send) without a human-in-the-loop gate, so it sends without pausing — saving and running/enabling the workflow is the consent. The host binds that consent to this exact step attempt: one send, the exact recipient/arguments the step names, never a second copy.`,
-              'Author the step with `requiresApproval` to always wait for a human; disable the workflow to stop it entirely.',
-            ].join('\n'),
-            createdAt: new Date().toISOString(),
-            read: false,
-            silent: true,
-            metadata: { workflow: workflowName, runId: workflowRunId, stepId: step.id, authorityDigest: writeAuthority.authorityDigest },
-          });
-        } catch { /* audit notification is best-effort */ }
+        standingSendConsent.basis.push('authored_send');
+        standingSendConsent.authorityDigest = writeAuthority.authorityDigest;
       }
+    }
+    if (standingSendConsent.basis.length > 0) {
+      appendWorkflowEvent(workflowStorageName, workflowRunId, {
+        kind: 'approval_granted',
+        stepId: step.id,
+        meta: {
+          consent: 'standing',
+          basis: standingSendConsent.basis,
+          ...(graduatedSends.length > 0 ? { sends: graduatedSends } : {}),
+          ...(standingSendConsent.authorityDigest ? { authorityDigest: standingSendConsent.authorityDigest } : {}),
+        },
+      });
     }
     // This is request policy, not retrieval text. Retain it across a tool-limit
     // checkpoint that starts a fresh runConversation activation; otherwise the
@@ -6396,23 +6402,12 @@ async function awaitDeclarativeStepApproval(
     && isUnattendedScheduledRun(ctx.runId)
     && stepSideEffectClass(step) !== 'send'
   ) {
+    // The run's history carries the consent; it is not a notification.
     appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
       kind: 'step_started',
       stepId: step.id,
       meta: { gate: 'auto_approved_unattended', reason: 'enabled scheduled run — consent was enable + schedule' },
     });
-    try {
-      addNotification({
-        id: `gate-autoapproved-${ctx.runId}-${step.id}`,
-        kind: 'workflow',
-        title: `Approval gate auto-approved: ${ctx.workflow.name} · ${step.id}`,
-        body: `Scheduled run ${ctx.runId} reached the approval gate on step "${step.id}" with no one present, and the step is not a send — so it was auto-approved (your consent was enabling + scheduling the workflow). If this step should ALWAYS wait for you, declare \`sideEffect: send\` on it or remove the schedule.`,
-        createdAt: new Date().toISOString(),
-        read: false,
-        silent: true,
-        metadata: { workflow: ctx.workflow.name, runId: ctx.runId, stepId: step.id, gate: 'auto_approved_unattended' },
-      });
-    } catch { /* audit notification is best-effort */ }
     logger.info(
       { workflow: ctx.workflow.name, runId: ctx.runId, step: step.id },
       'declarative approval gate auto-approved for unattended scheduled run (enable was the consent; non-send step)',
@@ -15178,14 +15173,28 @@ async function processOneRunFile(
           error: message,
           meta: { preflightErrors: preflight.errors.slice(0, 8), editAdvisories: preflight.editAdvisories.slice(0, 8) },
         });
+        // Same reason as the harness-blocked branch: a run rejected at preflight
+        // is a failed occurrence. Returning here without recording it is why an
+        // unrunnable workflow could fail every scheduled fire indefinitely with
+        // a flat streak and no escalation. It is recorded before the outcome
+        // notification so that one notification can say the streak crossed.
+        const escalation = definitionResolution.definitionSource !== 'compiled_snapshot'
+          ? recordWorkflowFailureEscalation(workflow.data.name, preflight.summary)
+          : null;
         addNotification({
           id: `workflow-${run.id}-preflight`,
           kind: 'workflow',
           title: `Workflow needs edits: ${workflow.data.name}`,
-          body: renderPreflightReport(workflow.data.name, preflight),
+          body: `${renderPreflightReport(workflow.data.name, preflight)}${workflowEscalationLine(workflow.data.name, escalation)}`,
           createdAt: new Date().toISOString(),
           read: false,
-          metadata: { workflow: workflow.data.name, runId: run.id, status: 'error', preflight: true },
+          metadata: {
+            workflow: workflow.data.name,
+            runId: run.id,
+            status: 'error',
+            preflight: true,
+            ...workflowEscalationMetadata(escalation),
+          },
         });
         markRunNotified(filePath);
         finishWorkflowActivityRun(run.id, {
@@ -15198,32 +15207,6 @@ async function processOneRunFile(
           outcome: 'blocked',
           detail: message,
         });
-        // Same reason as the harness-blocked branch: a run rejected at preflight
-        // is a failed occurrence. Returning here without recording it is why an
-        // unrunnable workflow could fail every scheduled fire indefinitely with
-        // a flat streak and no escalation.
-        if (definitionResolution.definitionSource !== 'compiled_snapshot') {
-          try {
-            const outcome = recordWorkflowOutcome(workflow.data.name, false, preflight.summary);
-            if (outcome?.justEscalated) {
-              addNotification({
-                id: `workflow-${workflow.data.name}-escalated`,
-                kind: 'workflow',
-                title: `Workflow needs you: ${workflow.data.name}`,
-                body: `"${workflow.data.name}" has now failed ${outcome.consecutiveFailures} times in a row. Latest: ${preflight.summary}`,
-                createdAt: new Date().toISOString(),
-                read: false,
-                metadata: {
-                  workflow: workflow.data.name,
-                  runId: run.id,
-                  status: 'escalated',
-                  consecutiveFailures: outcome.consecutiveFailures,
-                  needsAttention: true,
-                },
-              });
-            }
-          } catch { /* ledger bookkeeping must never mask the refusal itself */ }
-        }
         logger.warn(
           { workflow: workflow.data.name, runId: run.id, errors: preflight.errors },
           'Workflow run rejected before start: preflight failed',
@@ -16474,7 +16457,18 @@ async function processOneRunFile(
       // completion row is still duplicate Activity/inbox content even though
       // it does not fan out. Scheduled runs and legacy origins retain the
       // existing global notification path unchanged.
-      if (!hasExactOriginObserver) {
+      //
+      // A clean run whose step already told the owner its result has exactly
+      // one outcome notification: that report. Anything the runner would add
+      // (an advisory, an escalation) keeps its own delivered record.
+      const adoptedStepReport = !hasExactOriginObserver
+        && !suppressGlobalTerminal
+        && stepAlreadyNotified
+        && !hasAdvisories
+        && !autoHealPaused
+        ? adoptWorkflowStepReportAsOutcome({ runId: run.id, workflow: workflow.data.name })
+        : null;
+      if (!hasExactOriginObserver && !adoptedStepReport) {
         addNotification({
           id: `workflow-${run.id}-completed`,
           kind: 'workflow',
@@ -16590,11 +16584,20 @@ async function processOneRunFile(
           meta: { stepId: error.stepId, sessionId: error.sessionId },
         });
         attemptWorkflowRunReportBack(filePath);
+        // A blocked run is a FAILED occurrence and must enter the ledger, or the
+        // streak never advances, escalation never fires, and the same step
+        // blocks again on the next schedule with nothing learned. A compiled
+        // projection is not the owner's authored workflow and never moves
+        // their streak. The ledger is written before the outcome notification
+        // so that the one notification can say the streak crossed.
+        const escalation = definitionResolution.definitionSource !== 'compiled_snapshot'
+          ? recordWorkflowFailureEscalation(workflow.data.name, error.reason)
+          : null;
         addNotification({
           id: `workflow-${run.id}-blocked`,
           kind: 'workflow',
           title: `Workflow blocked: ${workflow.data.name}`,
-          body: detail,
+          body: `${detail}${workflowEscalationLine(workflow.data.name, escalation)}`,
           createdAt: finishedAt,
           read: false,
           metadata: {
@@ -16603,46 +16606,10 @@ async function processOneRunFile(
             status: 'blocked',
             stepId: error.stepId,
             needsAttention: true,
+            ...workflowEscalationMetadata(escalation),
           },
         });
         markRunNotified(filePath);
-        // A blocked run is a FAILED occurrence and must enter the ledger.
-        // Without this the streak never advances, escalation never fires, and
-        // the same step blocks again on the next schedule with nothing learned:
-        // live 2026-08-24, five scheduled runs blocked (scorpion-facebook-trends,
-        // platform-49-slack-channel-review, daily-standup-email, morning-briefing,
-        // weekly-review) and NONE reached workflow-failure-ledger.json, whose
-        // newest entry was the day before. `escalated: true` on weekly-review
-        // was 7 failures old and stale.
-        //
-        // compiled_snapshot is excluded for the same reason the two existing
-        // call sites exclude it: a compiled projection is not the user's
-        // authored workflow and must not move their streak.
-        if (definitionResolution.definitionSource !== 'compiled_snapshot') {
-          try {
-            const outcome = recordWorkflowOutcome(workflow.data.name, false, error.reason);
-            // justEscalated is computed by the ledger and was discarded at BOTH
-            // pre-existing call sites, which is why crossing the threshold has
-            // never been visible to anyone. Surface it exactly once.
-            if (outcome?.justEscalated) {
-              addNotification({
-                id: `workflow-${workflow.data.name}-escalated`,
-                kind: 'workflow',
-                title: `Workflow needs you: ${workflow.data.name}`,
-                body: `"${workflow.data.name}" has now failed ${outcome.consecutiveFailures} times in a row. Latest: ${error.reason}`,
-                createdAt: finishedAt,
-                read: false,
-                metadata: {
-                  workflow: workflow.data.name,
-                  runId: run.id,
-                  status: 'escalated',
-                  consecutiveFailures: outcome.consecutiveFailures,
-                  needsAttention: true,
-                },
-              });
-            }
-          } catch { /* ledger bookkeeping must never mask the block itself */ }
-        }
         // Hand the block to the Doctor. This branch already assembled exactly
         // the input diagnoseWorkflowBlock takes -- {stepId, reason} -- and then
         // threw it away: recordProposedFix had only two callers, one needing an

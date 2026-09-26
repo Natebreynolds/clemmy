@@ -1459,6 +1459,37 @@ export function addNotification(item: NotificationRecord): void {
   if (result.emit) actionBus.emit({ kind: 'notification.created', notification: item });
 }
 
+/**
+ * A workflow step that told the owner its result (notify_user) has already
+ * delivered the run's content. When the run then finishes cleanly, that report
+ * is the run's one outcome notification: it is labelled with its run and
+ * workflow instead of a second record repeating it. Returns the adopted id, or
+ * null when the run has no delivered report of its own.
+ */
+export function adoptWorkflowStepReportAsOutcome(input: { runId: string; workflow: string }): string | null {
+  const runId = input.runId.trim();
+  if (!runId) return null;
+  return withNotificationStateLock(() => {
+    const items = loadNotificationsUnlocked();
+    const report = items
+      .filter((item) =>
+        item.metadata?.source === 'notify_user_tool'
+        && item.metadata?.workflowRunId === runId
+        && !item.silent
+        && !hasExactOriginDeliveryMode(item))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .at(-1);
+    if (!report) return null;
+    const metadata: Record<string, unknown> = { ...(report.metadata ?? {}) };
+    if (typeof metadata.workflow !== 'string' || !metadata.workflow.trim()) metadata.workflow = input.workflow;
+    if (typeof metadata.runId !== 'string' || !metadata.runId.trim()) metadata.runId = runId;
+    metadata.runOutcome = 'completed';
+    report.metadata = metadata;
+    saveNotificationsUnlocked(items);
+    return report.id;
+  });
+}
+
 export function markNotificationRead(id: string): NotificationRecord | undefined {
   return withNotificationStateLock(() => {
     const items = loadNotificationsUnlocked();
