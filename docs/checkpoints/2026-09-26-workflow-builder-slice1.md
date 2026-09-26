@@ -1,4 +1,4 @@
-# Workflow builder, slices 1 and 2: a workflow opens to its graph, and a step is changed in place (2026-09-26)
+# Workflow builder, slices 1–3: a workflow opens to its graph, a step is changed in place, and Clementine's reply carries the workflow (2026-09-26)
 
 Branch `claude/wf-builder-slice1` (worktree `~/clem-worktrees/hotpatch-0926`), on top of
 `claude/hotpatch-0926` 10b88cca9 (the installed 09-25 23:01 candidate: checker-evidence +
@@ -92,9 +92,56 @@ review), created through the API and deleted afterwards. On the served page:
   the run record has `targetStepId: collect`, status completed; Open run landed on
   `/automate?workflow=…&run=…` with the run drawer over the list.
 
+## Slice 3: Clementine's reply carries the workflow (598fec378, 6e178a7b5, f5c63d417)
+
+- After `workflow_create`, `workflow_update` or `workflow_edit_step`, the reply shows a card:
+  the workflow's name, what changed ("2 steps changed", "created · off until you turn it on"),
+  the step chain by dependency level with changed steps marked and new ones labelled, and Open
+  to edit onto `/automate/<name>`. Same card on the phone (informational, no link).
+- The card is drawn from the SAVED definition, never the tool call. `withWorkflowCommit` (the
+  helper every authoring tool returns through) publishes a `workflow_saved` event to the asking
+  chat when the caller names the definition it started from (`before`, null for a creation):
+  `src/execution/workflow-saved-event.ts` reads the file, builds the steps with the graph
+  builder (effect, gates, dependsOn), and marks the step ids whose behaviour changed (prompt,
+  dependsOn, gates, forEach, tools, call, skill, model, contracts; a reworded description marks
+  nothing). The event names the exact accepted user input (`sourceUserSeq`).
+- Every allowlist between the log and the screen admits it: `EVENT_TYPES`, the public
+  projection (bounded, re-validated), the bridged lists, the chat engine's `ACTIVITY_FOLD_EVENTS`,
+  the console's own delegation list in `useChat.ts`. The chat engine reduces it to a receipt-only
+  row (`ActivityItem.workflow`); `workflowCards()` dedupes by workflow, newest save wins;
+  `workflowCardLevels()` lays the chain out.
+- Reopen: the transcript attaches each reply's saved workflows to that reply by exact source
+  (`UnifiedSessionTurn.workflows`); the console maps them back into the same rows. The phone
+  replays events, so it needed nothing.
+- Create with Clementine draws its right-hand canvas from the same event (the stream withholds
+  tool arguments, which is why its live draft never drew).
+- Ask Clementine about a step still opens chat with `/chat?prompt=About the "<step>" step of my
+  "<workflow>" workflow: `; the model reads the step with `workflow_get`. Putting the step in
+  the session's context directly is not done.
+
+Pins: `workflow-saved-event.test.ts` (3), `turn-receipt.test.ts` (+1 card), `transcript.test.ts`
+(+1 reopen), `event-coverage.test.ts` holds; chat tool suites 104/104.
+
+### Live acceptance, slice 3 (09-26 00:24–00:47 PT, installed 8c26a5daf → 6e178a7b5 → f5c63d417)
+
+Fixture `FRAMEWORK-TEST card fixture` (off; collect → summarize → review), created by API and
+deleted afterwards. Three real chat turns on the owner's brain asked Clementine to change the
+summarize step's wording; each landed through `workflow_edit_step`.
+
+- 8c26a5daf: the `workflow_saved` event was in the log (seq 306089, right session) but no card
+  drew: two client allowlists did not admit it. Fixed in 6e178a7b5.
+- 6e178a7b5: the card appeared live 21 s after sending, with the right subtitle and the changed
+  step marked; reopening the conversation lost it because the transcript carries only text.
+  Fixed in f5c63d417.
+- f5c63d417: card live in 12 s; still there after a reload; Open to edit landed on
+  `/console/automate/FRAMEWORK-TEST card fixture` with the three-node graph.
+- Not live-checked: the phone card, and Create with Clementine drawing from the event.
+
 ## Not in these slices (next)
 
-- Slice 3: the chat card from the saved definition, live redraw of the open page (the
+- Slice 3 leftovers: phone card live check; Ask Clementine with the step in the session's
+  context rather than a prefilled line.
+- Slice 3 (done): the chat card from the saved definition, live redraw of the open page (the
   refetch half exists), Ask Clementine with the step already in context.
 - Slice 4: the Last run tab and honest run statuses.
 - Traps: git tracks `apps/console-web/src/app.tsx` in lower case while the file on disk is
