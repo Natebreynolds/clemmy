@@ -345,3 +345,19 @@ test('a reshape with no model reason describes only what changed, never a cause'
     'Clementine changed the run shape',
   );
 });
+
+test('an approval gate at step start reads as waiting for approval, and a plain restart returns it to running', () => {
+  const detail = buildWorkflowRunDetail([
+    { t: '2026-09-26T16:11:55.000Z', kind: 'run_started' },
+    { t: '2026-09-26T16:12:27.000Z', kind: 'step_started', stepId: 'review', meta: { gate: 'awaiting_approval', approvalId: 'apr-j30j' } },
+  ]);
+  assert.equal(detail.steps[0].status, 'awaiting_approval');
+  assert.match(detail.steps[0].error, /approval/);
+  const resumed = buildWorkflowRunDetail([
+    { t: '2026-09-26T16:12:27.000Z', kind: 'step_started', stepId: 'review', meta: { gate: 'awaiting_approval', approvalId: 'apr-j30j' } },
+    { t: '2026-09-26T16:20:01.000Z', kind: 'step_started', stepId: 'review' },
+    { t: '2026-09-26T16:20:09.000Z', kind: 'step_completed', stepId: 'review', output: 'shown' },
+  ]);
+  assert.equal(resumed.steps[0].status, 'done');
+  assert.equal(resumed.steps[0].error, '');
+});

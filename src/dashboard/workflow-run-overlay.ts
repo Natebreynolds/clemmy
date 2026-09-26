@@ -308,6 +308,10 @@ const STEP_STATUS_BY_KIND: Partial<Record<WorkflowEventKind, WorkflowRunGraphSte
  */
 function honestStepStatus(kind: WorkflowEventKind, event: WorkflowEvent, byKind: WorkflowRunGraphStepStatus): WorkflowRunGraphStepStatus {
   const meta = event.meta ?? {};
+  // A declarative approval gate parks the run at step_started itself: the
+  // runner tags it (live 09-26: `meta.gate: 'awaiting_approval'`, with the
+  // approval id) and writes nothing else until the owner answers.
+  if ((kind === 'step_started' || kind === 'workflow_node_started') && meta.gate === 'awaiting_approval') return 'awaiting_approval';
   if (kind === 'step_completed' && meta.blocked === true) return 'blocked';
   if (kind === 'step_failed' || kind === 'workflow_node_failed') {
     const reason = typeof meta.reason === 'string' ? meta.reason : '';
@@ -466,6 +470,10 @@ export function buildWorkflowRunGraphOverlay(
     } else if (nextStatus) {
       const honest = honestStepStatus(kind, event, nextStatus);
       step.status = honest;
+      if (honest === 'awaiting_approval' && (kind === 'step_started' || kind === 'workflow_node_started')) {
+        step.startedAt = step.startedAt ?? event.t;
+        step.approvalsRequested += 1;
+      }
       if (honest === 'running') {
         step.startedAt = event.t;
         // A re-run after a park, a redo, or a retry must not keep the earlier

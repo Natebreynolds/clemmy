@@ -553,3 +553,30 @@ test('a step waiting on the owner, a blocked finish, and a redo read as themselv
   assert.equal(resumed.steps[0].status, 'done');
   assert.equal(resumed.steps[0].error, undefined);
 });
+
+test('a declarative approval gate parks the run at step_started, and that reads as waiting on you', () => {
+  const overlay = buildWorkflowRunGraphOverlay([
+    { t: '2026-09-26T16:11:55.000Z', kind: 'run_started' },
+    { t: '2026-09-26T16:11:55.000Z', kind: 'step_started', stepId: 'summarize' },
+    { t: '2026-09-26T16:12:26.000Z', kind: 'step_completed', stepId: 'summarize', output: 'one sentence' },
+    { t: '2026-09-26T16:12:27.000Z', kind: 'step_started', stepId: 'review', meta: { gate: 'awaiting_approval', approvalId: 'apr-j30j' } },
+  ], { stepIds: ['summarize', 'review'] });
+  const review = overlay.steps.find((s) => s.stepId === 'review')!;
+  assert.equal(review.status, 'awaiting_approval');
+  assert.equal(review.runVerdict.label, 'Waiting on you');
+  assert.equal(review.runVerdict.primaryAction, 'Resolve approval');
+  assert.equal(review.approvalsRequested, 1);
+  assert.equal(overlay.summary.waitingSteps, 1);
+  assert.equal(overlay.summary.runningSteps, 0);
+  assert.equal(overlay.summary.bottleneckStepId, 'review');
+  assert.equal(overlay.summary.bottleneck, 'approval wait');
+  // The owner approves: the step starts for real and finishes.
+  const resumed = buildWorkflowRunGraphOverlay([
+    { t: '2026-09-26T16:12:27.000Z', kind: 'step_started', stepId: 'review', meta: { gate: 'awaiting_approval', approvalId: 'apr-j30j' } },
+    { t: '2026-09-26T16:20:00.000Z', kind: 'approval_granted', stepId: 'review' },
+    { t: '2026-09-26T16:20:01.000Z', kind: 'step_started', stepId: 'review' },
+    { t: '2026-09-26T16:20:09.000Z', kind: 'step_completed', stepId: 'review', output: 'shown' },
+  ], { stepIds: ['review'] });
+  assert.equal(resumed.steps[0].status, 'done');
+  assert.equal(resumed.steps[0].error, undefined);
+});
