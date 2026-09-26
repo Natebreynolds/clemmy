@@ -1,4 +1,4 @@
-# Workflow builder, slices 1–3: a workflow opens to its graph, a step is changed in place, and Clementine's reply carries the workflow (2026-09-26)
+# Workflow builder, slices 1–4: a workflow opens to its graph, a step is changed in place, Clementine's reply carries the workflow, and the last run shows on the graph (2026-09-26)
 
 Branch `claude/wf-builder-slice1` (worktree `~/clem-worktrees/hotpatch-0926`), on top of
 `claude/hotpatch-0926` 10b88cca9 (the installed 09-25 23:01 candidate: checker-evidence +
@@ -137,13 +137,62 @@ summarize step's wording; each landed through `workflow_edit_step`.
   `/console/automate/FRAMEWORK-TEST card fixture` with the three-node graph.
 - Not live-checked: the phone card, and Create with Clementine drawing from the event.
 
+## Slice 4: the last run on the graph, honestly (58327f815, 4117d82c9)
+
+- A Last run tab on the workflow page (`view` state in `WorkflowPage.tsx`) colours each node by
+  what the run did, from `GET /:name/runs/:runId/graph-overlay`: Done (with duration), Working,
+  Waiting on you, Waiting for your answer, Waiting for a connection, Blocked, Redoing, Failed,
+  Skipped, Not started. A recent-runs picker, a headline that counts states in plain words
+  (`runHeadline`), Open run onto the full run drawer. The overlay refetches every 3 s while the
+  run can still change (`runStillGoing`). Clicking a step shows why it waits or failed, what it
+  produced, when it started and finished, tool calls, attempts, items, approvals, tools, models,
+  and "Edit this step" back to the Steps view. Rewiring is off in run view.
+- The daemon overlay (`src/dashboard/workflow-run-overlay.ts`) gained the states `blocked`,
+  `awaiting_approval`, `awaiting_input`, `awaiting_capability`, `redoing` and reads the runner's
+  tags for them: a park logged as `step_failed` with `meta.reason parked_on_*`; a deliverable-less
+  finish logged as `step_completed` with `meta.blocked`; `step_invalidated` after a change request;
+  `approval_requested` marks waiting until granted; and, found live, a declarative approval gate
+  parks the run at `step_started` with `meta.gate: 'awaiting_approval'` and writes nothing else.
+  Waits and blocks are counted on their own (`waitingSteps`, `blockedSteps`) so they never inflate
+  failed or working; verdict labels and primary actions name the wait.
+- Both client run readers (`apps/console-web` and the verbatim phone copy) already read the
+  `parked_on_*` and `meta.blocked` tags; they now also read the gate at `step_started`, so the run
+  drawer and the phone stop saying "running" for a step waiting on the owner.
+
+Pins: `workflow-run-overlay.test.ts` (+2), `workflow-run-view.test.ts` (4), console
+`workflow-run-detail.test.ts` (+1).
+
+### Live acceptance, slice 4 (09-26 09:11–09:20 PT, installed 16d6c0168 → 4117d82c9)
+
+Fixture `FRAMEWORK-TEST last run fixture` (collect → summarize → review with `requiresApproval`),
+enabled directly (no external reads, so no creation test), run once from the API on the owner's
+brain; it parked at the review gate (run status `parked`, approval apr-j30j). Cancelled and
+deleted afterwards.
+
+- 16d6c0168: the tab drew the run, collect and summarize Done with durations, but review read
+  Working: the gate park is a tagged `step_started`, not a `step_failed`. Fixed in 4117d82c9.
+- 4117d82c9: review reads Waiting on you on the node and in the panel ("Waiting for your
+  approval; the run resumes once you decide", Next: Resolve approval); headline "Running · 2 done ·
+  1 waiting on you"; the collect panel shows Done, what it produced, and its facts; Edit this step
+  returns to the editable panel.
+
+### Install coordination, 09-26 morning
+
+The 09:02 install of 58327f815 replaced 83e196ee3 (clementine-next-f8's token-efficiency and
+review-latency work, installed 08:23) and interrupted its measurement run; a peer's hold arrived as
+the patch ran. Restored at 09:10 as 16d6c0168 = slice 4 + `claude/judge-latency` 9b8d05270 (f8's
+shipping line, without the two measurement-only commits, at f8's request). Rule recorded: read
+build-info and message peers before every quit; a peer's wait loop naming the bundle path blocks
+`hotpatch-daemon.mjs`.
+
 ## Not in these slices (next)
 
 - Slice 3 leftovers: phone card live check; Ask Clementine with the step in the session's
   context rather than a prefilled line.
 - Slice 3 (done): the chat card from the saved definition, live redraw of the open page (the
   refetch half exists), Ask Clementine with the step already in context.
-- Slice 4: the Last run tab and honest run statuses.
+- Slice 4 (done): a few overlay verdicts still say "Needs attention · Review tool preflight" for a
+  clean no-tool step (one advisory from harness evidence); worth a look, not a builder defect.
 - Traps: git tracks `apps/console-web/src/app.tsx` in lower case while the file on disk is
   `App.tsx`, so `git add App.tsx` stages nothing here; and touching ANY file (even under
   docs/) during `npm run build` fails it with "source changed during candidate build".
