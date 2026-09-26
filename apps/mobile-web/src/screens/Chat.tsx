@@ -35,6 +35,9 @@ import {
   type ModelRuleOffer,
   type ChatMessage,
   type EngineSnapshot,
+  workflowCardLevels,
+  workflowCards,
+  type WorkflowCardData,
 } from '@clem/chat-engine';
 import {
   answerModelRuleOffer,
@@ -949,11 +952,46 @@ function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (te
 /** Changes the provider confirmed in other apps. Shown the moment a write is
  *  confirmed, while the answer is still being written and checked; the
  *  finished receipt keeps them in the same place. */
+function WorkflowCardView({ card }: { card: WorkflowCardData }) {
+  const levels = workflowCardLevels(card);
+  const changed = new Set(card.changedStepIds);
+  const n = card.changedStepIds.length;
+  const sub = card.op === 'created'
+    ? `${card.steps.length} step${card.steps.length === 1 ? '' : 's'} · ${card.enabled ? 'on' : 'off until you turn it on'}`
+    : n === 0 ? 'Settings changed · steps as before' : `${n} step${n === 1 ? '' : 's'} changed${card.enabled ? '' : ' · off until its test passes'}`;
+  return (
+    <div class="reply-outside-card reply-workflow">
+      <span class="reply-outside-text">
+        <span class="reply-outside-title">{card.name}</span>
+        <span class="reply-outside-sub">{sub}</span>
+        {card.steps.length > 0 ? (
+          <span class="reply-workflow-chain" aria-label="Steps">
+            {levels.map((level, i) => (
+              <span key={i} class="reply-workflow-level">
+                {i > 0 ? <span class="reply-workflow-arrow" aria-hidden>→</span> : null}
+                <span class="reply-workflow-stack">
+                  {level.map((step) => (
+                    <span key={step.id} class={`reply-workflow-step${changed.has(step.id) ? ' changed' : ''}`} title={step.label}>
+                      {step.label}{step.approval ? ' 🔒' : ''}
+                    </span>
+                  ))}
+                </span>
+              </span>
+            ))}
+          </span>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
 function OutsideWork({ activity }: { activity: ChatMessage['activity'] }) {
   const outside = outsideWorkCards(activity);
-  if (outside.length === 0) return null;
+  const workflows = workflowCards(activity);
+  if (outside.length === 0 && workflows.length === 0) return null;
   return (
     <div class="reply-outside">
+      {workflows.map((card) => <WorkflowCardView key={card.slug} card={card} />)}
       {outside.map((card) => (
         <div key={card.key} class="reply-outside-card">
           <span class="reply-outside-text">
@@ -1010,7 +1048,7 @@ function TurnReceipt({ message, sessionId }: { message: ChatMessage; sessionId?:
   const proven = evidenceChips(message.terminal?.evidenceRefs);
   const chips = proven.length > 0 ? proven : observedEvidenceChips(message.activity);
   const touched = chips.map((chip) => chip.label).join(' · ');
-  if (!review && !touched && !byline && outside.length === 0 && !offer) return null;
+  if (!review && !touched && !byline && outside.length === 0 && !offer && workflowCards(message.activity).length === 0) return null;
   return (
     <>
       <OutsideWork activity={message.activity} />

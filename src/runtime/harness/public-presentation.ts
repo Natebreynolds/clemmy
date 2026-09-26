@@ -1052,6 +1052,44 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         ...(excerpt ? { excerpt: excerpt.slice(0, 700) } : {}),
       };
     }
+    case 'workflow_saved': {
+      // The saved workflow as a small graph. Every value is re-validated and
+      // bounded here: ids and labels are short strings, effects are the closed
+      // set the graph builder emits, and nothing else on the row passes.
+      const name = firstString(data.name);
+      const slug = firstString(data.slug);
+      const op = data.op === 'created' || data.op === 'updated' ? data.op : null;
+      if (!name || !slug || !op || name.length > 160 || slug.length > 160) return null;
+      const ids = (value: unknown): string[] => (Array.isArray(value)
+        ? value.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 80).slice(0, 60)
+        : []);
+      const rawSteps = Array.isArray(data.steps) ? data.steps.slice(0, 60) : [];
+      const steps = rawSteps.flatMap((raw) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
+        const step = raw as Record<string, unknown>;
+        const id = firstString(step.id);
+        if (!id || id.length > 80) return [];
+        const effect = step.effect === 'read' || step.effect === 'write' || step.effect === 'send' ? step.effect : 'unknown';
+        return [{
+          id,
+          label: (firstString(step.label) || id).slice(0, 120),
+          effect,
+          approval: step.approval === true,
+          forEach: step.forEach === true,
+          dependsOn: ids(step.dependsOn),
+        }];
+      });
+      return {
+        name,
+        slug,
+        op,
+        enabled: data.enabled === true,
+        steps,
+        changedStepIds: ids(data.changedStepIds),
+        addedStepIds: ids(data.addedStepIds),
+        removedStepIds: ids(data.removedStepIds),
+      };
+    }
     case 'handoff':
       return selected(data, ['from', 'to', 'target']);
     case 'step_started':

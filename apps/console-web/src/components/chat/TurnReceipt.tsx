@@ -9,8 +9,13 @@
  * appears only for writes the provider confirmed.
  */
 import { useState, type ReactNode } from 'react';
-import { AlertCircle, Check, CheckCircle2, Copy, FileText, Mail, PenLine, Send, Sparkles } from 'lucide-react';
-import { outsideWorkCards, turnByline, turnModelOffer, turnReview, type ModelRuleOffer, type OutsideWorkCard } from '@clem/chat-engine';
+import { Link } from 'react-router-dom';
+import { AlertCircle, Check, CheckCircle2, Copy, FileText, Lock, Mail, PenLine, Repeat, Send, Sparkles, Workflow } from 'lucide-react';
+import {
+  outsideWorkCards, turnByline, turnModelOffer, turnReview, workflowCardLevels, workflowCards,
+  type ModelRuleOffer, type OutsideWorkCard, type WorkflowCardData,
+} from '@clem/chat-engine';
+import { cn } from '@/lib/cn';
 import { answerModelRuleOffer } from '@/lib/chat';
 import type { ActivityItem } from '@/lib/useChat';
 import type { TerminalFacts } from '@clem/chat-engine';
@@ -87,6 +92,67 @@ function OutsideWorkCardView({ card }: { card: OutsideWorkCard }) {
           Open
         </a>
       )}
+    </div>
+  );
+}
+
+/** A workflow she created or changed this turn, drawn from the saved
+ *  definition: the step chain by dependency level, with the steps that
+ *  changed marked, and Open to the workflow's own page. */
+function WorkflowCardView({ card }: { card: WorkflowCardData }) {
+  const levels = workflowCardLevels(card);
+  const changed = new Set(card.changedStepIds);
+  const added = new Set(card.addedStepIds);
+  const changedCount = card.changedStepIds.length;
+  const subtitle = card.op === 'created'
+    ? `${card.steps.length} step${card.steps.length === 1 ? '' : 's'} · ${card.enabled ? 'on' : 'off until you turn it on'}`
+    : changedCount === 0
+      ? (card.removedStepIds.length > 0 ? `${card.removedStepIds.length} step${card.removedStepIds.length === 1 ? '' : 's'} removed` : 'Settings changed · steps as before')
+      : `${changedCount} step${changedCount === 1 ? '' : 's'} changed${card.removedStepIds.length > 0 ? `, ${card.removedStepIds.length} removed` : ''}${card.enabled ? '' : ' · off until its test passes'}`;
+  return (
+    <div className="flex min-w-0 flex-col gap-2 rounded-md border border-border bg-surface px-3 py-2.5 sm:col-span-2">
+      <div className="flex min-w-0 items-center gap-3">
+        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-sm bg-primary-tint text-primary">
+          <Workflow className="h-[18px] w-[18px]" aria-hidden />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col leading-tight">
+          <span className="truncate text-small font-semibold text-fg" title={card.name}>{card.name}</span>
+          <span className="truncate text-caption text-faint">{subtitle}</span>
+        </span>
+        <Link
+          to={`/automate/${encodeURIComponent(card.name)}`}
+          className="shrink-0 rounded-sm border border-border-strong px-3 py-1 text-caption font-semibold text-fg transition-colors hover:bg-subtle active:scale-press"
+        >
+          Open to edit
+        </Link>
+      </div>
+      {card.steps.length > 0 ? (
+        <div className="flex items-center gap-1 overflow-x-auto pb-0.5" aria-label="Steps">
+          {levels.map((level, i) => (
+            <div key={i} className="flex items-center gap-1">
+              {i > 0 ? <span className="text-faint" aria-hidden>→</span> : null}
+              <div className="flex flex-col gap-1">
+                {level.map((step) => (
+                  <span
+                    key={step.id}
+                    title={`${step.id}: ${step.label}`}
+                    className={cn(
+                      'inline-flex max-w-[160px] items-center gap-1 whitespace-nowrap rounded-sm border px-2 py-0.5 text-caption font-medium',
+                      changed.has(step.id) ? 'border-primary bg-primary-tint text-primary' : 'border-border bg-canvas text-fg',
+                    )}
+                  >
+                    <span className="truncate">{step.label}</span>
+                    {step.approval ? <Lock className="h-3 w-3 shrink-0" aria-hidden /> : null}
+                    {step.forEach ? <Repeat className="h-3 w-3 shrink-0" aria-hidden /> : null}
+                    {step.effect === 'send' ? <Send className="h-3 w-3 shrink-0" aria-hidden /> : null}
+                    {added.has(step.id) ? <span className="text-[10px] uppercase">new</span> : null}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -176,9 +242,11 @@ function CopyAnswer({ text }: { text: string }) {
  *  away. The finished receipt keeps them in the same place. */
 export function OutsideWorkCards({ activity, children }: { activity?: ActivityItem[]; children?: ReactNode }) {
   const outside = outsideWorkCards(activity);
-  if (outside.length === 0 && !children) return null;
+  const workflows = workflowCards(activity);
+  if (outside.length === 0 && workflows.length === 0 && !children) return null;
   return (
     <div className="grid gap-2.5 sm:grid-cols-2">
+      {workflows.map((card) => <WorkflowCardView key={card.slug} card={card} />)}
       {outside.map((card) => <OutsideWorkCardView key={card.key} card={card} />)}
       {children}
     </div>

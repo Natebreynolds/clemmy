@@ -8,6 +8,7 @@
  * `space-build.ts`: the stream is the truth, nothing is invented.
  */
 import type { ChatMessage, ActivityItem } from './useChat';
+import type { WorkflowCardData } from '@clem/chat-engine';
 
 export const WORKFLOW_AUTHORING_TOOLS = new Set([
   'workflow_create', 'workflow_update', 'workflow_from_session', 'workflow_apply_contract_fixes', 'workflow_schedule',
@@ -92,6 +93,15 @@ export function workflowBuildFromMessages(messages: readonly ChatMessage[]): Wor
   for (const m of messages) {
     if (m.role !== 'assistant') continue;
     for (const row of m.activity ?? []) {
+      // The saved workflow the host published is the signal that the write
+      // landed; the stream withholds tool arguments, so this is the only
+      // draw that shows what was actually stored.
+      if (row.workflow) {
+        draft = draftFromSavedWorkflow(row.workflow);
+        state = 'written';
+        writtenName = row.workflow.name;
+        continue;
+      }
       const d = row.draft;
       if (!d) continue;
       draft = d;
@@ -111,4 +121,19 @@ export function authoringRowLabel(row: Pick<ActivityItem, 'label' | 'draft'>): s
   if (!row.draft) return row.label;
   const n = row.draft.steps.length;
   return `${row.draft.name ? `Writing “${row.draft.name}”` : 'Writing the workflow'} · ${n} step${n === 1 ? '' : 's'}`;
+}
+
+/** The saved definition as a draft, so the canvas can draw it the same way. */
+export function draftFromSavedWorkflow(card: WorkflowCardData): WorkflowDraft {
+  return {
+    name: card.name,
+    description: '',
+    steps: card.steps.map((step) => ({
+      id: step.id,
+      purpose: step.label,
+      effect: step.effect,
+      gated: step.approval,
+      dependsOn: step.dependsOn,
+    })),
+  };
 }

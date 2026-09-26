@@ -145,6 +145,31 @@ export interface ActivityItem {
   /** Offer rows only: keep a model the owner named for one kind of work.
    *  Rendered with the turn's receipt, never as an activity row. */
   offer?: ModelRuleOffer;
+  /** A workflow this turn created or changed, as saved. Rendered with the
+   *  turn's receipt as a small graph, never as an activity row. */
+  workflow?: WorkflowCardData;
+}
+
+/** One step of a saved workflow, as the card draws it. */
+export interface WorkflowCardStep {
+  id: string;
+  label: string;
+  effect: 'read' | 'write' | 'send' | 'unknown';
+  approval: boolean;
+  forEach: boolean;
+  dependsOn: string[];
+}
+
+/** A workflow as saved after Clementine created or changed it this turn. */
+export interface WorkflowCardData {
+  name: string;
+  slug: string;
+  op: 'created' | 'updated';
+  enabled: boolean;
+  steps: WorkflowCardStep[];
+  changedStepIds: string[];
+  addedStepIds: string[];
+  removedStepIds: string[];
 }
 
 /** "Use <model> for <kind of work> from now on?" — asked once after a turn

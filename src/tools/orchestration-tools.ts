@@ -1278,6 +1278,7 @@ export function registerOrchestrationTools(server: McpServer): void {
             + `${appendVisualContract(created.executionPlan)}`
             + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
             + `${renderMissingSmokeInputs(name, missingSmokeInputs)}${advisoryTail}`,
+            { before: null },
           ));
         }
         const queued = queueWorkflowCreationTest(name, testInputs, {
@@ -1303,6 +1304,7 @@ export function registerOrchestrationTools(server: McpServer): void {
             + `${appendVisualContract(created.executionPlan)}`
             + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
             + `${renderCreationTestSettlementReceipt(settled, readWorkflow(dirName)?.data ?? created.savedDef, name)}${advisoryTail}`,
+            { before: null },
           ));
         }
         return textResult(withWorkflowCommit(
@@ -1312,6 +1314,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           + `${appendVisualContract(created.executionPlan)}`
           + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
           + `${queued.message}${advisoryTail}`,
+          { before: null },
         ));
       }
       return textResult(withWorkflowCommit(
@@ -1321,6 +1324,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         + `${appendVisualContract(created.executionPlan)}`
         + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}`
         + `${advisoryTail}`,
+        { before: null },
       ));
     },
   );
@@ -2163,6 +2167,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           + `${updatePrep.status === 'readiness_gaps' ? `${renderReadinessHold(name)}\n\n` : ''}`
           + `${reSmoke ? `${reSmoke.message}\n\n` : ''}`
           + `${updateBindReport}${updateAdvisories}${updateGaps}`.trim(),
+        { before: entry.data },
       ));
     },
   );
@@ -2270,6 +2275,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       return textResult(withWorkflowCommit(
         workflowSlug,
         `${resultMessage}${reSmokeMsg}`,
+        { before: live.before },
       ));
     },
   );

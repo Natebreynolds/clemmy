@@ -1,6 +1,6 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
-import type { LiveAnswerDraft, ModelRuleOffer, TerminalFacts } from '@clem/chat-engine';
+import type { LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
 import { applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { ApprovalPreview, ApprovalResolution } from '@clem/chat-engine';
@@ -91,6 +91,8 @@ export interface ActivityItem {
   helperFor?: string;
   /** Offer rows only: keep a model the owner named for one kind of work. */
   offer?: ModelRuleOffer;
+  /** A workflow this turn created or changed, as saved; drawn under the reply. */
+  workflow?: WorkflowCardData;
 }
 
 export interface ChatMessage {

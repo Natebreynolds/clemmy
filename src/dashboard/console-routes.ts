@@ -15344,6 +15344,8 @@ export function registerConsoleRoutes(
     // Files landing in a promoted run belong in the origin chat's live feed —
     // the drafting-emails scenario is exactly the work users background.
     'deliverable_saved',
+    // A workflow the promoted run saved belongs in the origin chat as its card.
+    'workflow_saved',
     // A delegated coding agent the chat dispatched.
     'coding_run_activity',
     'coding_run_settled',

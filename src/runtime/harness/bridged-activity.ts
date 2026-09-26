@@ -38,6 +38,8 @@ export const BRIDGED_BACKGROUND_ACTIVITY_TYPES: ReadonlySet<string> = new Set([
   // Files landing in a promoted run belong in the origin chat's live feed —
   // the drafting-emails scenario is exactly the work users background.
   'deliverable_saved',
+  // A workflow the promoted run saved belongs in the origin chat as its card.
+  'workflow_saved',
   // A delegated coding agent the chat dispatched: what it is doing now, and
   // how its run settled.
   'coding_run_activity',

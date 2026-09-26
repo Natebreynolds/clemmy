@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { outsideWorkCards, turnAgentName, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewerName } from './turn-receipt.js';
+import { outsideWorkCards, turnAgentName, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewerName, workflowCardLevels, workflowCards } from './turn-receipt.js';
+import { narrateActivity } from './activity-presentation.js';
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readQuestionOptions } from './question-options.js';
 import { MODEL_PHASE_ACTIVITY_ID, reduceActivity } from './reduce-activity.js';
@@ -153,4 +154,29 @@ test('a turn inside a saved agent says so first on the receipt; an unbound turn 
   const plain = fold([{ type: 'turn_model_routed', data: { model: 'acme-flagship-5', provider: 'byo' } }]);
   assert.equal(turnAgentName(plain), undefined);
   assert.doesNotMatch(turnByline(plain), /·/);
+});
+
+test('a saved workflow becomes one card under the reply, from the saved definition, and never a work row', () => {
+  const saved = {
+    name: 'Weekly posts', slug: 'weekly-posts', op: 'updated', enabled: true,
+    steps: [
+      { id: 'pull', label: 'Pull posts', effect: 'read', approval: false, forEach: false, dependsOn: [] },
+      { id: 'caption', label: 'Write captions', effect: 'unknown', approval: false, forEach: true, dependsOn: ['pull'] },
+      { id: 'images', label: 'Find images', effect: 'read', approval: false, forEach: true, dependsOn: ['pull'] },
+      { id: 'review', label: 'Show me the drafts', effect: 'unknown', approval: true, forEach: false, dependsOn: ['caption', 'images'] },
+    ],
+    changedStepIds: ['review'], addedStepIds: ['review'], removedStepIds: [],
+  };
+  const rows = fold([
+    { type: 'workflow_saved', data: { ...saved, changedStepIds: ['caption'], addedStepIds: [] } },
+    { type: 'workflow_saved', data: saved },
+  ]);
+  const cards = workflowCards(rows);
+  assert.equal(cards.length, 1, 'the newest save of the same workflow replaces the earlier card');
+  assert.deepEqual(cards[0].changedStepIds, ['review']);
+  assert.deepEqual(workflowCardLevels(cards[0]).map((level) => level.map((s) => s.id)), [['pull'], ['caption', 'images'], ['review']]);
+  assert.equal(narrateActivity(rows).some((row) => row.workflow), false, 'the card is not listed as work');
+
+  const malformed = fold([{ type: 'workflow_saved', data: { name: 'x', slug: '', op: 'updated', steps: [] } }]);
+  assert.equal(workflowCards(malformed).length, 0);
 });

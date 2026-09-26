@@ -10,7 +10,7 @@
  */
 import { MODEL_PHASE_ACTIVITY_ID } from './reduce-activity.js';
 import { externalWriteKind, type ExternalWriteKind } from './tool-labels.js';
-import type { ActivityItem, ModelRuleOffer } from './types.js';
+import type { ActivityItem, ModelRuleOffer, WorkflowCardData } from './types.js';
 
 /** `checked` is a review that passed. `unchecked` is a turn whose reviewer
  *  never ran: it must never read as a pass. `rejected` is the last review
@@ -213,4 +213,43 @@ export function outsideWorkCards(
     ...(g.appUrl ? { appUrl: g.appUrl } : {}),
     ...cardWords(g.kind, g.count, g.app, g.targets),
   }));
+}
+
+/** The workflows this turn created or changed, one card each, newest save of
+ *  a workflow winning. Built from the saved definition the host published,
+ *  never from the tool call. */
+export function workflowCards(
+  activity: readonly Pick<ActivityItem, 'workflow'>[] | undefined,
+): WorkflowCardData[] {
+  const bySlug = new Map<string, WorkflowCardData>();
+  for (const row of activity ?? []) {
+    if (row.workflow) bySlug.set(row.workflow.slug, row.workflow);
+  }
+  return [...bySlug.values()];
+}
+
+/** Steps arranged by dependency level, for a compact left-to-right chain. */
+export function workflowCardLevels(card: Pick<WorkflowCardData, 'steps'>): WorkflowCardData['steps'][] {
+  const known = new Set(card.steps.map((s) => s.id));
+  const level = new Map<string, number>();
+  const visiting = new Set<string>();
+  const depth = (id: string): number => {
+    const cached = level.get(id);
+    if (cached !== undefined) return cached;
+    if (visiting.has(id)) return 0;
+    visiting.add(id);
+    const step = card.steps.find((s) => s.id === id);
+    const deps = (step?.dependsOn ?? []).filter((d) => known.has(d) && d !== id);
+    const value = deps.length === 0 ? 0 : Math.max(...deps.map((d) => depth(d) + 1));
+    visiting.delete(id);
+    level.set(id, value);
+    return value;
+  };
+  const levels: WorkflowCardData['steps'][] = [];
+  for (const step of card.steps) {
+    const l = depth(step.id);
+    while (levels.length <= l) levels.push([]);
+    levels[l].push(step);
+  }
+  return levels;
 }

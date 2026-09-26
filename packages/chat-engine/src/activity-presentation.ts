@@ -115,6 +115,8 @@ export function narrateActivity(
     if (isCapabilityInventoryRow(raw)) continue;
     // An offer is answered under the reply (the receipt), not listed as work.
     if (raw.offer) continue;
+    // A saved workflow is shown under the reply as its card, not as a row.
+    if (raw.workflow) continue;
     const plan = publicWorkPlanRow(raw);
     if (plan === null) continue;
     const item = plan;

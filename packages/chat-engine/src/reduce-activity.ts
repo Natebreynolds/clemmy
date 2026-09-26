@@ -1,6 +1,6 @@
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
-import type { ActivityItem, HarnessEvent } from './types.js';
+import type { ActivityItem, HarnessEvent, WorkflowCardStep } from './types.js';
 import { humanToolLabel, salientArgDetail } from './tool-labels.js';
 import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone } from './write-ledger.js';
 import { workPlanActivityItem } from './work-plan-presentation.js';
@@ -489,6 +489,43 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         label: `Use ${modelName} for ${intent}`,
         status: 'done',
         offer: { offerId, intent: intent.slice(0, 80), modelId, modelName, ...(resolved ? { resolved } : {}) },
+      };
+      return prev.some((a) => a.id === row.id) ? prev.map((a) => (a.id === row.id ? row : a)) : [...prev, row];
+    }
+    case 'workflow_saved': {
+      // The saved workflow, for the card under the reply. The host already
+      // bounded every field; here only the shape is checked, and the newest
+      // save of the same workflow replaces the earlier card.
+      const name = typeof d.name === 'string' ? d.name : '';
+      const slug = typeof d.slug === 'string' ? d.slug : '';
+      const op = d.op === 'created' || d.op === 'updated' ? d.op : null;
+      if (!name || !slug || !op) return prev;
+      const ids = (value: unknown): string[] => (Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []);
+      const steps = (Array.isArray(d.steps) ? d.steps : []).flatMap((raw): WorkflowCardStep[] => {
+        if (!raw || typeof raw !== 'object') return [];
+        const step = raw as Record<string, unknown>;
+        if (typeof step.id !== 'string' || !step.id) return [];
+        const effect = step.effect === 'read' || step.effect === 'write' || step.effect === 'send' ? step.effect : 'unknown';
+        return [{
+          id: step.id,
+          label: typeof step.label === 'string' && step.label ? step.label : step.id,
+          effect,
+          approval: step.approval === true,
+          forEach: step.forEach === true,
+          dependsOn: ids(step.dependsOn),
+        }];
+      });
+      const row: ActivityItem = {
+        id: `workflow-${slug}`,
+        kind: 'event',
+        variant: 'write',
+        tone: 'success',
+        label: op === 'created' ? `Created workflow “${name}”` : `Changed workflow “${name}”`,
+        status: 'done',
+        workflow: {
+          name, slug, op, enabled: d.enabled === true, steps,
+          changedStepIds: ids(d.changedStepIds), addedStepIds: ids(d.addedStepIds), removedStepIds: ids(d.removedStepIds),
+        },
       };
       return prev.some((a) => a.id === row.id) ? prev.map((a) => (a.id === row.id ? row : a)) : [...prev, row];
     }
