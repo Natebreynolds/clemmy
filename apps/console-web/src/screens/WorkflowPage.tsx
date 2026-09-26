@@ -33,7 +33,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import {
-  AlertTriangle, ArrowLeft, Bot, Check, ChevronRight, Clock, ExternalLink, FlaskConical, Loader2, Lock, MessageSquare,
+  AlertTriangle, ArrowLeft, Bot, Check, ChevronRight, Clock, ExternalLink, FlaskConical, History, Loader2, Lock, MessageSquare,
   PenLine, Play, Plus, Puzzle, Repeat, RotateCcw, Save, ScrollText, Send, ShieldCheck, Trash2, Undo2, Wrench, Zap,
   type LucideIcon,
 } from 'lucide-react';
@@ -48,7 +48,7 @@ import { StatusPill, Tag, type Tone } from '@/components/ui/StatusPill';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { ScheduleEditor } from '@/components/automate/ScheduleEditor';
 import { WorkflowEnginePanel } from '@/components/automate/WorkflowDrawer';
-import { WorkflowCanvasNode, type WorkflowCanvasFlowNode } from '@/components/automate/WorkflowCanvasNode';
+import { WorkflowCanvasNode, type WorkflowCanvasFlowNode, type WorkflowCanvasNodeRun } from '@/components/automate/WorkflowCanvasNode';
 import { useWorkflowChanges } from '@/lib/workflow-changes';
 import { usePoll } from '@/lib/poll';
 import { getSettings, type ModelRolesSnapshot } from '@/lib/settings';
@@ -56,11 +56,15 @@ import { detectedTimezone, humanizeCron } from '@/lib/cron';
 import { cn } from '@/lib/cn';
 import { certPrimaryAction, certificationTone, sentenceCaseLabel } from '@/lib/workflowCertification';
 import {
-  deleteWorkflow, editWorkflowStep, getWorkflow, listWorkflowRuns, listWorkflowStepEdits, patchWorkflow, putWorkflowLayout,
-  revertWorkflowStepEdit, runWorkflow, runWorkflowStep, setWorkflowEnabled,
-  type WorkflowCertification, type WorkflowDetail, type WorkflowStep,
+  deleteWorkflow, editWorkflowStep, getWorkflow, getWorkflowRunOverlay, listWorkflowRuns, listWorkflowStepEdits, patchWorkflow,
+  putWorkflowLayout, revertWorkflowStepEdit, runWorkflow, runWorkflowStep, setWorkflowEnabled,
+  type WorkflowCertification, type WorkflowDetail, type WorkflowRunOverlay, type WorkflowRunOverlayStep, type WorkflowRunRecord,
+  type WorkflowStep,
 } from '@/lib/automate';
 import { statusTone } from '@/lib/inbox';
+import {
+  formatDuration, latestRun, overlayByStep, runHeadline, runStepLabel, runStepTone, runStillGoing, runWhen,
+} from '@/lib/workflow-run-view';
 import {
   choosePositions,
   findCycle,
@@ -383,6 +387,46 @@ function WorkflowView({ name }: { name: string }) {
   const selectedTrace = selectedId ? detail?.certification?.dryRun?.steps?.find((s) => s.stepId === selectedId) : undefined;
   const canvasGraph = useMemo<CanvasGraph>(() => ({ nodes: graphNodes, edges: canvasEdges }), [graphNodes, canvasEdges]);
 
+  /* ---------- the Last run tab ---------- */
+  const [view, setView] = useState<'steps' | 'run'>(() => (searchParams.get('run') ? 'run' : 'steps'));
+  const [chosenRunId, setChosenRunId] = useState<string | null>(() => searchParams.get('run'));
+  const runsQuery = useQuery({
+    queryKey: ['workflow-runs', name],
+    queryFn: () => listWorkflowRuns(name, 20),
+    refetchInterval: (query) => (view !== 'run' ? false : (query.state.data?.runs ?? []).some((r) => runStillGoing(r)) ? 5000 : 30000),
+  });
+  const runs = runsQuery.data?.runs ?? [];
+  const newest = latestRun(runs);
+  const shownRun: WorkflowRunRecord | null = (chosenRunId ? runs.find((r) => r.id === chosenRunId) : null) ?? newest;
+  const overlayQuery = useQuery({
+    queryKey: ['workflow-run-overlay', name, shownRun?.id ?? null],
+    queryFn: () => getWorkflowRunOverlay(name, shownRun!.id),
+    enabled: view === 'run' && !!shownRun,
+    refetchInterval: () => (runStillGoing(shownRun) ? 3000 : false),
+  });
+  const overlay: WorkflowRunOverlay | null = view === 'run' ? overlayQuery.data?.overlay ?? null : null;
+  const overlaySteps = useMemo(() => overlayByStep(overlay), [overlay]);
+
+  // Colour the nodes by what the run did. A map over the current nodes keeps
+  // positions, selection and any unsaved rewiring exactly as they are.
+  useEffect(() => {
+    setNodes((current) => current.map((n) => {
+      const step = view === 'run' ? overlaySteps.get(n.id) : undefined;
+      const run: WorkflowCanvasNodeRun | undefined = step
+        ? {
+            label: runStepLabel(step.status),
+            tone: runStepTone(step.status),
+            ...(step.status === 'done' && step.durationMs !== undefined ? { detail: formatDuration(step.durationMs) }
+              : step.error ? { detail: step.error } : {}),
+          }
+        : view === 'run' && overlay ? { label: 'Not started', tone: 'neutral' } : undefined;
+      if (run === n.data.run || (run && n.data.run && run.label === n.data.run.label && run.detail === n.data.run.detail)) return n;
+      const { run: _drop, ...rest } = n.data;
+      return { ...n, data: run ? { ...rest, run } : rest };
+    }));
+  }, [view, overlay, overlaySteps, setNodes]);
+  const selectedRunStep = selectedId && view === 'run' ? overlaySteps.get(selectedId) ?? null : null;
+
   if (detailQuery.isError) {
     return (
       <Page title={name}>
@@ -495,23 +539,63 @@ function WorkflowView({ name }: { name: string }) {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
         <Card className="flex min-h-[460px] flex-col overflow-hidden p-0 h-[min(70vh,760px)]">
           <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-            <span className="mr-auto text-small font-medium text-fg">Steps</span>
-            <Button variant="ghost" size="sm" onClick={addStep}>
-              <Plus size={16} aria-hidden />
-              Add step
-            </Button>
-            <Button variant="ghost" size="sm" onClick={removeSelected} disabled={!selectedId}>
-              <Trash2 size={16} aria-hidden />
-              Remove
-            </Button>
-            <Button variant="ghost" size="sm" onClick={revert} disabled={!dirty || saving}>
-              <RotateCcw size={16} aria-hidden />
-              Revert
-            </Button>
-            <Button size="sm" variant={dirty ? 'primary' : 'secondary'} onClick={() => void saveGraph()} disabled={!dirty || !!cycle || saving || stepless}>
-              {saving ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Save size={16} aria-hidden />}
-              Save
-            </Button>
+            <div role="tablist" aria-label="Graph view" className="mr-auto inline-flex rounded-full bg-subtle p-0.5">
+              <button
+                type="button" role="tab" aria-selected={view === 'steps'}
+                onClick={() => setView('steps')}
+                className={cn('rounded-full px-3 py-1 text-small font-medium cursor-pointer', view === 'steps' ? 'bg-surface text-fg shadow-xs' : 'text-muted hover:text-fg')}
+              >
+                Steps
+              </button>
+              <button
+                type="button" role="tab" aria-selected={view === 'run'}
+                onClick={() => setView('run')}
+                className={cn('inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-small font-medium cursor-pointer', view === 'run' ? 'bg-surface text-fg shadow-xs' : 'text-muted hover:text-fg')}
+              >
+                <History size={14} aria-hidden />
+                Last run{newest ? ` · ${runWhen(newest)}` : ''}
+              </button>
+            </div>
+            {view === 'steps' ? (
+              <>
+                <Button variant="ghost" size="sm" onClick={addStep}>
+                  <Plus size={16} aria-hidden />
+                  Add step
+                </Button>
+                <Button variant="ghost" size="sm" onClick={removeSelected} disabled={!selectedId}>
+                  <Trash2 size={16} aria-hidden />
+                  Remove
+                </Button>
+                <Button variant="ghost" size="sm" onClick={revert} disabled={!dirty || saving}>
+                  <RotateCcw size={16} aria-hidden />
+                  Revert
+                </Button>
+                <Button size="sm" variant={dirty ? 'primary' : 'secondary'} onClick={() => void saveGraph()} disabled={!dirty || !!cycle || saving || stepless}>
+                  {saving ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Save size={16} aria-hidden />}
+                  Save
+                </Button>
+              </>
+            ) : runs.length > 0 ? (
+              <>
+                <select
+                  aria-label="Which run"
+                  className="max-w-[260px] rounded-md border border-border bg-canvas px-2 py-1 text-small text-fg"
+                  value={shownRun?.id ?? ''}
+                  onChange={(e) => setChosenRunId(e.target.value || null)}
+                >
+                  {runs.map((r) => (
+                    <option key={r.id} value={r.id}>{runWhen(r)} · {statusTone(r.status).label}{r.targetStepId ? ` · only ${r.targetStepId}` : ''}</option>
+                  ))}
+                </select>
+                {shownRun ? (
+                  <Link to={`/automate?workflow=${encodeURIComponent(detail.name)}&run=${encodeURIComponent(shownRun.id)}`} className="inline-flex items-center gap-1 text-small text-muted underline-offset-2 hover:text-fg hover:underline">
+                    Open run <ExternalLink size={12} aria-hidden />
+                  </Link>
+                ) : null}
+              </>
+            ) : (
+              <span className="text-small text-muted">No runs yet</span>
+            )}
           </div>
           {stepless ? (
             <EmptyState
@@ -534,7 +618,8 @@ function WorkflowView({ name }: { name: string }) {
                 onEdgesChange={onEdgesChange}
                 onConnect={onConnect}
                 onSelectionChange={({ nodes: sel }) => setSelectedId(sel[0]?.id ?? null)}
-                deleteKeyCode={['Backspace', 'Delete']}
+                nodesConnectable={view === 'steps'}
+                deleteKeyCode={view === 'steps' ? ['Backspace', 'Delete'] : null}
                 colorMode={isDark ? 'dark' : 'light'}
                 fitView
               >
@@ -545,12 +630,26 @@ function WorkflowView({ name }: { name: string }) {
             </div>
           )}
           <p className="border-t border-border px-3 py-1.5 text-caption text-faint">
-            Drag between steps to change what waits on what. Click a step to open it. Placement is saved with the workflow.
+            {view === 'run'
+              ? (overlay ? runHeadline(overlay, shownRun) : shownRun ? 'Loading the run…' : 'Run the workflow once and its steps show here, coloured by what happened.')
+              : 'Drag between steps to change what waits on what. Click a step to open it. Placement is saved with the workflow.'}
           </p>
         </Card>
 
         <Card className="flex min-h-0 flex-col overflow-hidden p-0 lg:h-[min(70vh,760px)]">
-          {selectedNode ? (
+          {view === 'run' ? (
+            selectedNode ? (
+              <RunStepPanel
+                node={selectedNode}
+                step={selectedRunStep}
+                run={shownRun}
+                loaded={!!overlay}
+                onEdit={() => setView('steps')}
+              />
+            ) : (
+              <RunSummaryPanel overlay={overlay} run={shownRun} workflowName={detail.name} loading={overlayQuery.isPending && !!shownRun} />
+            )
+          ) : selectedNode ? (
             <StepPanel
               key={selectedNode.id}
               workflowName={detail.name}
@@ -936,6 +1035,136 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
         <p className="mt-2 text-caption text-faint">Tools, model and output shape change through Clementine or Advanced.</p>
       </div>
     </>
+  );
+}
+
+/* ---------- the Last run tab's right-hand panels ---------- */
+
+function RunStepPanel({ node, step, run, loaded, onEdit }: {
+  node: CanvasGraphNode;
+  step: WorkflowRunOverlayStep | null;
+  run: WorkflowRunRecord | null;
+  loaded: boolean;
+  onEdit: () => void;
+}) {
+  const tone = step ? runStepTone(step.status) : 'neutral';
+  const waiting = step && (step.status === 'awaiting_approval' || step.status === 'awaiting_input' || step.status === 'awaiting_capability');
+  return (
+    <>
+      <div className="border-b border-border px-4 py-3">
+        <div className="font-mono text-caption text-faint">{node.id}</div>
+        <div className="text-body font-medium text-fg">{node.label || node.id}</div>
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {step ? <StatusPill tone={tone}>{runStepLabel(step.status)}</StatusPill> : loaded ? <StatusPill tone="neutral">Not started</StatusPill> : null}
+          {step?.durationMs !== undefined && step.status === 'done' ? <Tag>{formatDuration(step.durationMs)}</Tag> : null}
+          {step && step.retries > 0 ? <Tag>{step.retries} retr{step.retries === 1 ? 'y' : 'ies'}</Tag> : null}
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-3">
+        {!step ? (
+          <p className="text-small text-muted">{loaded ? (run ? 'This step did not run in this run.' : 'No run to show yet.') : 'Loading…'}</p>
+        ) : (
+          <>
+            {step.error ? (
+              <section className={cn('rounded-md border px-3 py-2 text-small', waiting ? 'border-warning/30 bg-warning-tint text-fg' : step.status === 'failed' || step.status === 'blocked' ? 'border-danger/30 bg-danger-tint text-fg' : 'border-border bg-subtle text-fg')}>
+                <div className="mb-0.5 text-caption font-semibold text-muted">{waiting ? 'Waiting' : step.status === 'blocked' ? 'Why it was blocked' : step.status === 'redoing' ? 'Why it runs again' : 'What went wrong'}</div>
+                <p className="whitespace-pre-wrap">{step.error}</p>
+              </section>
+            ) : null}
+            {step.runVerdict?.primaryAction && (waiting || step.status === 'failed' || step.status === 'blocked') ? (
+              <p className="text-small text-muted">Next: {step.runVerdict.primaryAction}.</p>
+            ) : null}
+            {step.outputPreview ? (
+              <section>
+                <div className="mb-1 text-label text-fg">What it produced</div>
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-canvas px-3 py-2 text-caption text-fg">{step.outputPreview}</pre>
+              </section>
+            ) : null}
+            <section className="grid grid-cols-2 gap-2 text-small">
+              <Fact label="Started" value={step.startedAt ? new Date(step.startedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—'} />
+              <Fact label="Finished" value={step.finishedAt && step.status !== 'running' ? new Date(step.finishedAt).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—'} />
+              <Fact label="Tool calls" value={String(step.toolCalls)} />
+              <Fact label="Attempts" value={String(Math.max(1, step.attempts))} />
+              {step.itemsStarted > 0 ? <Fact label="Items" value={`${step.itemsCompleted}/${step.itemsStarted}${step.itemsFailed ? ` · ${step.itemsFailed} failed` : ''}`} /> : null}
+              {step.approvalsRequested > 0 ? <Fact label="Approvals" value={`${step.approvalsResolved}/${step.approvalsRequested} answered`} /> : null}
+              {step.externalWrites > 0 ? <Fact label="Outside writes" value={String(step.externalWrites)} /> : null}
+            </section>
+            {step.tools.length > 0 ? (
+              <section>
+                <div className="mb-1 flex items-center gap-1.5 text-label text-fg"><Wrench size={13} aria-hidden /> Tools it used</div>
+                <ChipList items={step.tools} />
+              </section>
+            ) : null}
+            {step.models.length > 0 ? (
+              <section>
+                <div className="mb-1 text-label text-fg">Models</div>
+                <ChipList items={step.models} />
+              </section>
+            ) : null}
+            {step.attentionReasons.length > 0 ? (
+              <section>
+                <div className="mb-1 text-label text-fg">Worth knowing</div>
+                <ul className="space-y-0.5 text-caption text-muted">
+                  {step.attentionReasons.slice(0, 6).map((r) => <li key={r}>{r}</li>)}
+                </ul>
+              </section>
+            ) : null}
+          </>
+        )}
+      </div>
+      <div className="border-t border-border px-4 py-3">
+        <Button variant="secondary" size="sm" className="w-full" onClick={onEdit}>
+          <PenLine size={16} aria-hidden />
+          Edit this step
+        </Button>
+      </div>
+    </>
+  );
+}
+
+function RunSummaryPanel({ overlay, run, workflowName, loading }: {
+  overlay: WorkflowRunOverlay | null;
+  run: WorkflowRunRecord | null;
+  workflowName: string;
+  loading: boolean;
+}) {
+  const bottleneck = overlay?.summary.bottleneckStepId;
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-border px-4 py-3">
+        <div className="text-body font-medium text-fg">{run ? runWhen(run) : 'Last run'}</div>
+        {run ? <div className="mt-2"><StatusPill tone={statusTone(run.status).tone}>{statusTone(run.status).label}</StatusPill></div> : null}
+      </div>
+      <div className="space-y-3 px-4 py-3 text-small text-muted">
+        {!run ? (
+          <p>This workflow has not run yet. Run now, or test one step from the Steps view.</p>
+        ) : loading ? (
+          <p>Loading the run…</p>
+        ) : overlay ? (
+          <>
+            <p className="text-fg">{runHeadline(overlay, run)}</p>
+            {bottleneck && overlay.summary.bottleneck ? <p>Held up at <span className="font-mono text-fg">{bottleneck}</span>: {overlay.summary.bottleneck}.</p> : null}
+            {overlay.goal && overlay.goal.status !== 'unknown' ? <p>Goal: {overlay.goal.status.replace(/_/g, ' ')}.</p> : null}
+            {run.error ? <p className="text-danger">{run.error}</p> : null}
+            <p className="text-faint">Click a step to see what it did, how long it took, and what it produced.</p>
+            <Link to={`/automate?workflow=${encodeURIComponent(workflowName)}&run=${encodeURIComponent(run.id)}`} className="inline-flex items-center gap-1 underline-offset-2 hover:text-fg hover:underline">
+              Open the full run <ExternalLink size={12} aria-hidden />
+            </Link>
+          </>
+        ) : (
+          <p>The run's details are unavailable right now.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Fact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md border border-border bg-subtle px-2.5 py-1.5">
+      <div className="text-caption text-faint">{label}</div>
+      <div className="text-small text-fg">{value}</div>
+    </div>
   );
 }
 

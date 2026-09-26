@@ -2,7 +2,18 @@ import type { AttemptRecord, WorkflowEvent, WorkflowEventKind } from '../executi
 import type { WorkflowExecutionPlan, WorkflowToolReadiness, WorkflowToolReadinessItem } from './workflow-execution-plan.js';
 import { isCanonicalTopLevelToolEvent } from '../runtime/harness/tool-effect.js';
 
-export type WorkflowRunGraphStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+/**
+ * What a step is doing, as the runner recorded it. A step waiting on the owner
+ * (approval, an answer, a connection) is its own state: it is not running and
+ * it has not failed. `blocked` is a step that finished without its deliverable;
+ * `redoing` is a step whose result was set aside after a change request and
+ * that runs again.
+ */
+export type WorkflowRunGraphStepStatus =
+  | 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  | 'blocked' | 'awaiting_approval' | 'awaiting_input' | 'awaiting_capability' | 'redoing';
+/** The states in which the run is waiting for the owner, not working. */
+export const WAITING_STEP_STATUSES: ReadonlySet<WorkflowRunGraphStepStatus> = new Set(['awaiting_approval', 'awaiting_input', 'awaiting_capability']);
 export type WorkflowRunGraphAttentionLevel = 'none' | 'watch' | 'blocked' | 'failed';
 export type WorkflowRunGoalStatus = 'unknown' | 'satisfied' | 'repursue' | 'follow_up' | 'gap' | 'escalate' | 'advisory';
 export type WorkflowRunGraphStepVerdictStatus =
@@ -118,6 +129,10 @@ export interface WorkflowRunGraphOverlaySummary {
   doneSteps: number;
   failedSteps: number;
   skippedSteps: number;
+  /** Steps waiting on the owner: an approval, an answer, or a connection. */
+  waitingSteps: number;
+  /** Steps that finished without their deliverable. */
+  blockedSteps: number;
   attentionSteps: number;
   concurrencyCapPressureSteps: number;
   maxBatchWidth: number;
@@ -280,7 +295,47 @@ const STEP_STATUS_BY_KIND: Partial<Record<WorkflowEventKind, WorkflowRunGraphSte
   step_failed: 'failed',
   workflow_node_failed: 'failed',
   step_skipped: 'skipped',
+  step_blocked: 'blocked',
+  step_invalidated: 'redoing',
 };
+
+/**
+ * The runner logs a park as step_failed BY CONTRACT (the reaper re-admits on
+ * that durable event) and a deliverable-less finish as step_completed with
+ * meta.blocked. Read those tags here so the graph says "waiting on you" and
+ * "blocked" instead of "failed" and "done". Mirrors the desktop and phone run
+ * readers (the workflow-run-detail module in each web app).
+ */
+function honestStepStatus(kind: WorkflowEventKind, event: WorkflowEvent, byKind: WorkflowRunGraphStepStatus): WorkflowRunGraphStepStatus {
+  const meta = event.meta ?? {};
+  if (kind === 'step_completed' && meta.blocked === true) return 'blocked';
+  if (kind === 'step_failed' || kind === 'workflow_node_failed') {
+    const reason = typeof meta.reason === 'string' ? meta.reason : '';
+    if (reason === 'parked_on_approval' || /parked on approval/i.test(event.error ?? '')) return 'awaiting_approval';
+    if (reason === 'parked_on_input') return 'awaiting_input';
+    if (reason === 'parked_on_capability') return 'awaiting_capability';
+  }
+  return byKind;
+}
+
+function waitingText(status: WorkflowRunGraphStepStatus, event: WorkflowEvent): string | undefined {
+  const meta = event.meta ?? {};
+  if (status === 'awaiting_approval') return 'Waiting for your approval; the run resumes once you decide.';
+  if (status === 'awaiting_input') return event.error || 'Waiting for your answer; completed work is kept.';
+  if (status === 'awaiting_capability') {
+    const toolkit = typeof meta.toolkit === 'string' && meta.toolkit ? meta.toolkit : 'a required connection';
+    return event.error || `Waiting for ${toolkit}; completed work is kept and the run resumes on its own.`;
+  }
+  if (status === 'blocked') {
+    const output = event.output && typeof event.output === 'object' ? (event.output as { reason?: unknown }).reason : undefined;
+    return (typeof output === 'string' && output) || event.error || 'Blocked: the step could not produce its deliverable.';
+  }
+  if (status === 'redoing') {
+    const note = typeof meta.note === 'string' && meta.note ? `Redoing after your change request: ${meta.note}` : 'Redoing after a change request.';
+    return note;
+  }
+  return undefined;
+}
 
 function pendingRunVerdict(): WorkflowRunGraphStepVerdict {
   return { status: 'pending', label: 'Pending', reasons: [], primaryAction: null };
@@ -409,17 +464,25 @@ export function buildWorkflowRunGraphOverlay(
       const deferred = booleanFromMeta(event.meta, 'deferredByConcurrency');
       if (deferred !== undefined) step.deferredByConcurrency = deferred;
     } else if (nextStatus) {
-      step.status = nextStatus;
-      if (nextStatus === 'running') step.startedAt = event.t;
-      if (nextStatus === 'done' || nextStatus === 'failed' || nextStatus === 'skipped') {
+      const honest = honestStepStatus(kind, event, nextStatus);
+      step.status = honest;
+      if (honest === 'running') {
+        step.startedAt = event.t;
+        // A re-run after a park, a redo, or a retry must not keep the earlier
+        // attempt's wait text or error while it is working.
+        step.error = undefined;
+      }
+      if (honest === 'done' || honest === 'failed' || honest === 'skipped' || honest === 'blocked' || WAITING_STEP_STATUSES.has(honest)) {
         step.finishedAt = event.t;
       }
-      if (nextStatus === 'failed') {
+      if (honest === 'failed') {
         step.error = event.error || step.error;
         pushUnique(step.failedTools, toolNameFromEvent(event));
       }
-      if (nextStatus === 'done') step.outputPreview = previewValue(event.output);
-      if (nextStatus === 'skipped') step.outputPreview = stringFromMeta(event.meta, 'reason') || step.outputPreview;
+      if (honest === 'done') step.outputPreview = previewValue(event.output);
+      if (honest === 'skipped') step.outputPreview = stringFromMeta(event.meta, 'reason') || step.outputPreview;
+      const waiting = waitingText(honest, event);
+      if (waiting) step.error = waiting;
     } else if (kind === 'step_retry' || kind === 'step_loop_retry' || kind === 'item_retry' || kind === 'workflow_node_failed') {
       step.retries += 1;
       if (event.error) step.error = event.error;
@@ -443,9 +506,17 @@ export function buildWorkflowRunGraphOverlay(
       if (tool && !step.tools.includes(tool)) step.tools.push(tool);
     } else if (kind === 'approval_requested') {
       step.approvalsRequested += 1;
-      if (step.status === 'pending') step.status = 'running';
+      // The step is asking, not working: the run waits on the owner here.
+      if (step.status === 'pending' || step.status === 'running') {
+        step.status = 'awaiting_approval';
+        step.error = waitingText('awaiting_approval', event);
+      }
     } else if (kind === 'approval_granted' || kind === 'approval_rejected') {
       step.approvalsResolved += 1;
+      if (step.status === 'awaiting_approval') {
+        step.status = 'running';
+        step.error = undefined;
+      }
     } else if (kind === 'step_advisory') {
       step.advisories += 1;
       if (looksLikeJudgeVerdict(event.meta)) step.judgeVerdicts += 1;
@@ -559,7 +630,11 @@ function deriveStepOperations(
   const riskSignals: string[] = [];
 
   if (row.status === 'failed') attentionReasons.push(row.error ? `failed: ${row.error}` : 'failed');
-  if (row.approvalsRequested > row.approvalsResolved) attentionReasons.push('waiting for approval');
+  if (row.status === 'awaiting_approval' || row.approvalsRequested > row.approvalsResolved) attentionReasons.push('waiting for your approval');
+  if (row.status === 'awaiting_input') attentionReasons.push('waiting for your answer');
+  if (row.status === 'awaiting_capability') attentionReasons.push('waiting for a connection');
+  if (row.status === 'blocked') attentionReasons.push(row.error ? `blocked: ${row.error}` : 'blocked without its deliverable');
+  if (row.status === 'redoing') attentionReasons.push('redoing after a change request');
   if (row.deferredByConcurrency && row.status === 'pending') attentionReasons.push('deferred by concurrency cap');
   if (row.itemsFailed > 0) attentionReasons.push(`${row.itemsFailed} failed item${row.itemsFailed === 1 ? '' : 's'}`);
   if (row.externalWriteFailures > 0) attentionReasons.push(`${row.externalWriteFailures} external write failure${row.externalWriteFailures === 1 ? '' : 's'}`);
@@ -579,7 +654,7 @@ function deriveStepOperations(
 
   let attentionLevel: WorkflowRunGraphAttentionLevel = 'none';
   if (row.status === 'failed') attentionLevel = 'failed';
-  else if (row.approvalsRequested > row.approvalsResolved) attentionLevel = 'blocked';
+  else if (row.status === 'blocked' || WAITING_STEP_STATUSES.has(row.status) || row.approvalsRequested > row.approvalsResolved) attentionLevel = 'blocked';
   else if (attentionReasons.length > 0) attentionLevel = 'watch';
 
   const itemsTotal = Math.max(row.itemsStarted, row.itemsCompleted + row.itemsFailed);
@@ -635,13 +710,30 @@ function runtimeVerdictForStep(step: WorkflowRunGraphStepOverlay): WorkflowRunGr
 
   return {
     status,
-    label: runtimeVerdictLabel(status),
+    label: runtimeVerdictLabel(status, step.status),
     reasons: uniqueStrings(reasons).slice(0, 8),
     primaryAction: runtimeVerdictPrimaryAction(step, status),
   };
 }
 
-function runtimeVerdictLabel(status: WorkflowRunGraphStepVerdictStatus): string {
+/** The words a person reads on the step: a wait is named as a wait. */
+export function stepStatusLabel(status: WorkflowRunGraphStepStatus): string {
+  switch (status) {
+    case 'pending': return 'Not started';
+    case 'running': return 'Working';
+    case 'done': return 'Done';
+    case 'failed': return 'Failed';
+    case 'skipped': return 'Skipped';
+    case 'blocked': return 'Blocked';
+    case 'awaiting_approval': return 'Waiting on you';
+    case 'awaiting_input': return 'Waiting for your answer';
+    case 'awaiting_capability': return 'Waiting for a connection';
+    case 'redoing': return 'Redoing';
+  }
+}
+
+function runtimeVerdictLabel(status: WorkflowRunGraphStepVerdictStatus, stepStatus: WorkflowRunGraphStepStatus): string {
+  if (WAITING_STEP_STATUSES.has(stepStatus) || stepStatus === 'blocked' || stepStatus === 'redoing') return stepStatusLabel(stepStatus);
   if (status === 'proven') return 'Proven';
   if (status === 'completed') return 'Completed';
   if (status === 'attention') return 'Needs attention';
@@ -667,7 +759,10 @@ function runtimeVerdictPrimaryAction(
     return 'Retry failed step';
   }
   if (status === 'blocked') {
-    if (step.approvalsRequested > step.approvalsResolved) return 'Resolve approval';
+    if (step.status === 'awaiting_approval' || step.approvalsRequested > step.approvalsResolved) return 'Resolve approval';
+    if (step.status === 'awaiting_input') return 'Answer the question';
+    if (step.status === 'awaiting_capability') return 'Connect the tool';
+    if (step.status === 'blocked') return 'Review why it was blocked';
     if (issues.includes('concurrency_cap') || step.deferredByConcurrency) return 'Tune runner concurrency';
     if (hasToolFailure) return 'Repair failed tool connection';
     if (issues.includes('critical_path_blocked')) return 'Re-run critical path';
@@ -689,7 +784,10 @@ function runtimeVerdictPrimaryAction(
 
 function bottleneckForStep(row: MutableStepOverlay): string | null {
   if (row.status === 'failed') return 'failed step';
-  if (row.approvalsRequested > row.approvalsResolved) return 'approval wait';
+  if (row.status === 'awaiting_approval' || row.approvalsRequested > row.approvalsResolved) return 'approval wait';
+  if (row.status === 'awaiting_input') return 'waiting for an answer';
+  if (row.status === 'awaiting_capability') return 'waiting for a connection';
+  if (row.status === 'blocked') return 'blocked step';
   if (row.deferredByConcurrency && row.status === 'pending') return 'concurrency cap';
   if (row.itemsFailed > 0) return 'failed items';
   if (row.externalWriteFailures > 0) return 'external write failure';
@@ -709,6 +807,8 @@ function summarizeOverlaySteps(steps: WorkflowRunGraphStepOverlay[], goal: Workf
     doneSteps: 0,
     failedSteps: 0,
     skippedSteps: 0,
+    waitingSteps: 0,
+    blockedSteps: 0,
     attentionSteps: 0,
     concurrencyCapPressureSteps: 0,
     maxBatchWidth: 0,
@@ -732,6 +832,9 @@ function summarizeOverlaySteps(steps: WorkflowRunGraphStepOverlay[], goal: Workf
     else if (step.status === 'done') summary.doneSteps += 1;
     else if (step.status === 'failed') summary.failedSteps += 1;
     else if (step.status === 'skipped') summary.skippedSteps += 1;
+    else if (step.status === 'blocked') summary.blockedSteps += 1;
+    else if (WAITING_STEP_STATUSES.has(step.status)) summary.waitingSteps += 1;
+    else if (step.status === 'redoing') summary.runningSteps += 1;
     if (step.attentionLevel !== 'none') summary.attentionSteps += 1;
     if ((step.readyWidth ?? 0) > (step.concurrencyCap ?? Number.POSITIVE_INFINITY)) {
       summary.concurrencyCapPressureSteps += 1;

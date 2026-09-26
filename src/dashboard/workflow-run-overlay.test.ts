@@ -504,3 +504,52 @@ test('buildWorkflowRunGraphOverlay surfaces pinned run-goal judge evidence witho
   assert.equal(overlay.goal.attempts[0].changeSummary, 'run attempt 1: 50% (1/2 criteria met)');
   assert.equal(overlay.goal.attentionLevel, 'watch');
 });
+
+test('a step waiting on the owner, a blocked finish, and a redo read as themselves, never as running or failed', () => {
+  const events: WorkflowEvent[] = [
+    { t: '2026-09-26T10:00:00.000Z', kind: 'run_started' },
+    { t: '2026-09-26T10:00:01.000Z', kind: 'step_started', stepId: 'send' },
+    { t: '2026-09-26T10:00:02.000Z', kind: 'approval_requested', stepId: 'send' },
+    // Parked by contract as step_failed; the tag says why.
+    { t: '2026-09-26T10:00:03.000Z', kind: 'step_failed', stepId: 'send', error: 'parked on approval', meta: { reason: 'parked_on_approval' } },
+    { t: '2026-09-26T10:00:04.000Z', kind: 'step_started', stepId: 'ask' },
+    { t: '2026-09-26T10:00:05.000Z', kind: 'step_failed', stepId: 'ask', error: 'Which account?', meta: { reason: 'parked_on_input', questionId: 'q1' } },
+    { t: '2026-09-26T10:00:06.000Z', kind: 'step_started', stepId: 'fetch' },
+    { t: '2026-09-26T10:00:07.000Z', kind: 'step_failed', stepId: 'fetch', meta: { reason: 'parked_on_capability', toolkit: 'gmail' } },
+    { t: '2026-09-26T10:00:08.000Z', kind: 'step_started', stepId: 'summarize' },
+    { t: '2026-09-26T10:00:09.000Z', kind: 'step_completed', stepId: 'summarize', output: { blocked: true, reason: 'no rows to summarize' }, meta: { blocked: true } },
+    { t: '2026-09-26T10:00:10.000Z', kind: 'step_started', stepId: 'draft' },
+    { t: '2026-09-26T10:00:11.000Z', kind: 'step_completed', stepId: 'draft', output: 'first draft' },
+    { t: '2026-09-26T10:00:12.000Z', kind: 'step_invalidated', stepId: 'draft', meta: { note: 'shorter please' } },
+  ];
+  const overlay = buildWorkflowRunGraphOverlay(events, { stepIds: ['send', 'ask', 'fetch', 'summarize', 'draft'] });
+  const by = Object.fromEntries(overlay.steps.map((step) => [step.stepId, step]));
+  assert.equal(by.send.status, 'awaiting_approval');
+  assert.equal(by.send.runVerdict.label, 'Waiting on you');
+  assert.equal(by.send.runVerdict.primaryAction, 'Resolve approval');
+  assert.match(by.send.error ?? '', /approval/);
+  assert.equal(by.ask.status, 'awaiting_input');
+  assert.equal(by.ask.error, 'Which account?');
+  assert.equal(by.ask.runVerdict.primaryAction, 'Answer the question');
+  assert.equal(by.fetch.status, 'awaiting_capability');
+  assert.match(by.fetch.error ?? '', /gmail/);
+  assert.equal(by.summarize.status, 'blocked');
+  assert.equal(by.summarize.error, 'no rows to summarize');
+  assert.equal(by.summarize.runVerdict.label, 'Blocked');
+  assert.equal(by.draft.status, 'redoing');
+  assert.match(by.draft.error ?? '', /shorter please/);
+  assert.equal(overlay.summary.failedSteps, 0, 'a wait is not a failure');
+  assert.equal(overlay.summary.waitingSteps, 3, 'three steps wait on the owner');
+  assert.equal(overlay.summary.blockedSteps, 1);
+  assert.equal(overlay.summary.runningSteps, 1, 'only the redo counts as work in progress');
+
+  // Approval granted: the step is working again, with the wait text gone.
+  const resumed = buildWorkflowRunGraphOverlay([
+    ...events.slice(0, 4),
+    { t: '2026-09-26T10:00:20.000Z', kind: 'approval_granted', stepId: 'send' },
+    { t: '2026-09-26T10:00:21.000Z', kind: 'step_started', stepId: 'send' },
+    { t: '2026-09-26T10:00:25.000Z', kind: 'step_completed', stepId: 'send', output: 'sent' },
+  ], { stepIds: ['send'] });
+  assert.equal(resumed.steps[0].status, 'done');
+  assert.equal(resumed.steps[0].error, undefined);
+});
