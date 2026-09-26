@@ -1463,10 +1463,20 @@ export function addNotification(item: NotificationRecord): void {
  * A workflow step that told the owner its result (notify_user) has already
  * delivered the run's content. When the run then finishes cleanly, that report
  * is the run's one outcome notification: it is labelled with its run and
- * workflow instead of a second record repeating it. Returns the adopted id, or
- * null when the run has no delivered report of its own.
+ * workflow instead of a second record repeating it, and anything the runner
+ * would have said under its own clean-finish report (a quality note) is
+ * folded into it. Adoption happens once per run; a repeat returns the same id
+ * and changes nothing. Returns the adopted id, or null when the run has no
+ * delivered report of its own.
  */
-export function adoptWorkflowStepReportAsOutcome(input: { runId: string; workflow: string }): string | null {
+export function adoptWorkflowStepReportAsOutcome(input: {
+  runId: string;
+  workflow: string;
+  /** Text the runner would otherwise have placed under the result. */
+  appendix?: string;
+  /** The structured form of that text, kept beside it. */
+  qualityAdvisories?: readonly unknown[];
+}): string | null {
   const runId = input.runId.trim();
   if (!runId) return null;
   return withNotificationStateLock(() => {
@@ -1480,10 +1490,16 @@ export function adoptWorkflowStepReportAsOutcome(input: { runId: string; workflo
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
       .at(-1);
     if (!report) return null;
+    if (report.metadata?.runOutcome === 'completed') return report.id;
     const metadata: Record<string, unknown> = { ...(report.metadata ?? {}) };
     if (typeof metadata.workflow !== 'string' || !metadata.workflow.trim()) metadata.workflow = input.workflow;
     if (typeof metadata.runId !== 'string' || !metadata.runId.trim()) metadata.runId = runId;
     metadata.runOutcome = 'completed';
+    if (input.qualityAdvisories && input.qualityAdvisories.length > 0) {
+      metadata.qualityAdvisories = [...input.qualityAdvisories];
+    }
+    const appendix = input.appendix?.trim();
+    if (appendix) report.body = `${report.body.trimEnd()}\n\n${appendix}`;
     report.metadata = metadata;
     saveNotificationsUnlocked(items);
     return report.id;

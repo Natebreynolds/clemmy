@@ -408,6 +408,7 @@ let runWorkflowConversationImpl: typeof runConversation = runConversation;
 let resumeWorkflowConversationImpl: typeof runConversationFromResume = runConversationFromResume;
 let configureWorkflowHarnessRuntimeImpl: typeof configureHarnessRuntime = configureHarnessRuntime;
 let rewriteWorkflowReportInVoiceImpl: typeof rewriteInClementineVoice = rewriteInClementineVoice;
+let diagnoseWorkflowBlockImpl: typeof diagnoseWorkflowBlock = diagnoseWorkflowBlock;
 let beforeWorkflowGraphFinalizationForTests: ((input: {
   workflowName: string;
   runId: string;
@@ -453,6 +454,14 @@ export function _setWorkflowVoiceRewriteForTests(
   fn: typeof rewriteInClementineVoice | null,
 ): void {
   rewriteWorkflowReportInVoiceImpl = fn ?? rewriteInClementineVoice;
+}
+
+/** Narrow block-diagnosis seam. Production always consults the real Doctor;
+ * a test that ends a run blocked stubs it so no model transport is reached. */
+export function _setWorkflowDiagnosisForTests(
+  fn: typeof diagnoseWorkflowBlock | null,
+): void {
+  diagnoseWorkflowBlockImpl = fn ?? diagnoseWorkflowBlock;
 }
 
 /** Deterministic race seam: production leaves this null. Tests can admit a
@@ -812,7 +821,7 @@ function startWorkflowHeartbeat(
       : '';
     const stepLabel = cur ? ` · step ${cur.index} of ${cur.total} · ${cur.stepId}${itemLabel}` : '';
     const stepBody = cur ? `Currently: \`${cur.stepId}\` (step ${cur.index}/${cur.total}${itemLabel}). ` : '';
-    // A quiet "still running" beat is live status, which the run views already
+    // A quiet "still running" beat is current status, which the run views already
     // show from the run itself; it is not written to the notification record.
     //
     // T4.1 (desktop↔channel parity): channels used to be COMPLETELY blind
@@ -15998,7 +16007,7 @@ async function processOneRunFile(
             : null;
           if (remembered) priorFix = { fixKind: remembered.fixKind, fixDescription: remembered.fixDescription, fixJson: JSON.stringify(remembered.fix) };
         } catch { /* recall is best-effort */ }
-        diagnosis = await diagnoseWorkflowBlock({
+        diagnosis = await diagnoseWorkflowBlockImpl({
           workflow: executionWorkflowData,
           blockedSteps: diagnosableBlocks,
           // The step's blocked reason usually carries the real tool error.
@@ -16459,14 +16468,18 @@ async function processOneRunFile(
       // existing global notification path unchanged.
       //
       // A clean run whose step already told the owner its result has exactly
-      // one outcome notification: that report. Anything the runner would add
-      // (an advisory, an escalation) keeps its own delivered record.
+      // one outcome notification: that report. A quality note the runner would
+      // have placed under its own report rides that record instead of minting
+      // a second one whose only content is the step's receipt. A run that
+      // needs attention is not clean and keeps its own delivered notification.
       const adoptedStepReport = !hasExactOriginObserver
         && !suppressGlobalTerminal
         && stepAlreadyNotified
-        && !hasAdvisories
-        && !autoHealPaused
-        ? adoptWorkflowStepReportAsOutcome({ runId: run.id, workflow: workflow.data.name })
+        ? adoptWorkflowStepReportAsOutcome({
+          runId: run.id,
+          workflow: workflow.data.name,
+          ...(hasAdvisories ? { appendix: advisorySummary, qualityAdvisories: publicQualityAdvisories } : {}),
+        })
         : null;
       if (!hasExactOriginObserver && !adoptedStepReport) {
         addNotification({
@@ -16647,7 +16660,7 @@ async function processOneRunFile(
                 };
               }
             } catch { /* recall is best-effort */ }
-            const diagnosis = await diagnoseWorkflowBlock({
+            const diagnosis = await diagnoseWorkflowBlockImpl({
               workflow: workflow.data,
               blockedSteps,
               toolErrors: [error.reason],
@@ -16955,7 +16968,7 @@ async function processOneRunFile(
               reason: `output contract violation: ${cv.problems.join('; ') || message}`,
               kind: 'blocked',
             }];
-            const diagnosis = await diagnoseWorkflowBlock({
+            const diagnosis = await diagnoseWorkflowBlockImpl({
               workflow: workflow.data,
               blockedSteps: blocked,
               toolErrors: cv.problems.length ? cv.problems : [message],

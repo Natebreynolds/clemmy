@@ -23,6 +23,7 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-wf-one-outcom
 
 const {
   processWorkflowRuns,
+  _setWorkflowDiagnosisForTests,
   _setWorkflowHarnessLoopImplsForTests,
   _setWorkflowVoiceRewriteForTests,
   _setWorkflowWatcherForTests,
@@ -33,17 +34,22 @@ const { queueWorkflowRun } = await import('../tools/workflow-run-queue.js');
 const { recordStepResult } = await import('../tools/step-result-tool.js');
 const { registerAutonomyActionTools } = await import('../tools/autonomy-action-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { loadNotifications } = await import('../runtime/notifications.js');
+const { addNotification, adoptWorkflowStepReportAsOutcome, loadNotifications } = await import('../runtime/notifications.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 
+// No model transport in this hermetic file: the mid-run watcher, the tone
+// pass and the block Doctor are all stubbed to their no-op answers.
 _setWorkflowWatcherForTests(async () => ({ onTrack: true, miss: '', steer: '' }));
 _setWorkflowVoiceRewriteForTests(async (body: string) => ({ message: body, nothingHappened: false }));
+let diagnosisCalls = 0;
+_setWorkflowDiagnosisForTests(async () => { diagnosisCalls += 1; return null; });
 
 test.after(() => {
   _setWorkflowHarnessLoopImplsForTests();
   _setWorkflowVoiceRewriteForTests(null);
   _setWorkflowWatcherForTests(null);
+  _setWorkflowDiagnosisForTests(null);
   eventlog.closeEventLog();
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
@@ -119,13 +125,22 @@ test('a clean run whose step told the owner its result has exactly one notificat
   try {
     await drain();
     const rows = notificationsForRun(runId);
-    assert.equal(rows.length, 1, `one outcome, one notification (got: ${rows.map((row) => row.title).join(' | ')})`);
+    assert.equal(rows.length, 1, `one outcome, one notification (got: ${JSON.stringify(rows.map((row) => ({ id: row.id, title: row.title, silent: row.silent, createdAt: row.createdAt, body: row.body.slice(0, 300), metadata: row.metadata })), null, 1)})`);
     const [only] = rows;
-    assert.equal(only!.body, report, 'the notification carries the content');
+    assert.ok(only!.body.startsWith(report), 'the notification carries the content, first');
+    assert.doesNotMatch(only!.body, /Notification queued/, 'the step\'s receipt never becomes content');
     assert.equal(only!.silent, undefined, 'and it is the one that is delivered');
     assert.equal(only!.metadata?.workflow, workflowName, 'it names its workflow');
     assert.equal(only!.metadata?.runId, runId, 'and its run');
     assert.equal(only!.metadata?.runOutcome, 'completed');
+    // This hermetic file has no target judge, so even a clean run carries the
+    // runner's quality note. It rides the adopted report, not a second record.
+    const advisories = only!.metadata?.qualityAdvisories;
+    assert.ok(
+      Array.isArray(advisories) && advisories.length === 1,
+      'fixture precondition: an unavailable target judge leaves one quality note on a clean run',
+    );
+    assert.match(only!.body, /Quality check[\s\S]*target judge was unavailable/, 'the note is folded under the result');
     assert.equal(
       loadNotifications().some((row) => row.id === `workflow-${runId}-completed`),
       false,
@@ -197,7 +212,9 @@ test('a send that runs on standing consent is run history, not a notification', 
     }) as never,
   });
   try {
+    const diagnosisCallsBefore = diagnosisCalls;
     await drain();
+    assert.ok(diagnosisCalls > diagnosisCallsBefore, 'the blocked step reached the Doctor through its seam, not a model transport');
     const consent = readWorkflowEvents(slug, runId)
       .filter((event) => event.kind === 'approval_granted' && event.meta?.consent === 'standing');
     assert.equal(consent.length, 1, 'the consent is recorded once, in the run\'s own history');
@@ -209,10 +226,43 @@ test('a send that runs on standing consent is run history, not a notification', 
       0,
       'no informational consent notice',
     );
-    assert.equal(rows.length, 1, `one outcome, one notification (got: ${rows.map((row) => row.title).join(' | ')})`);
+    // The fixture's model loop never reaches a provider, so this send step ends
+    // as a phantom completion and the run needs attention. That outcome is the
+    // run's one notification; nothing else about the run is one.
+    assert.equal(rows.length, 1, `one outcome, one notification (got: ${rows.map((row) => `${row.id}: ${row.title}`).join(' | ')})`);
+    assert.equal(rows[0]!.id, `workflow-${runId}-completed`);
+    assert.equal(rows[0]!.metadata?.needsAttention, true);
   } finally {
     _setWorkflowHarnessLoopImplsForTests();
   }
+});
+
+test('adopting a step report is once per run and folds the runner\'s note under the content', () => {
+  const runId = 'framework-test-adopt-once-run';
+  addNotification({
+    id: `${runId}-report`,
+    kind: 'workflow',
+    title: 'Fixture digest',
+    body: 'Two fixture rows changed.',
+    createdAt: '2026-06-10T08:00:00.000Z',
+    read: false,
+    metadata: { source: 'notify_user_tool', workflowRunId: runId, workflowStepId: 'report' },
+  });
+  const first = adoptWorkflowStepReportAsOutcome({
+    runId,
+    workflow: 'FRAMEWORK-TEST Adopt Once',
+    appendix: 'Quality check: one note.',
+    qualityAdvisories: [{ stepId: 'report', kind: 'target_unverified', note: 'one note' }],
+  });
+  assert.equal(first, `${runId}-report`);
+  const second = adoptWorkflowStepReportAsOutcome({ runId, workflow: 'FRAMEWORK-TEST Adopt Once', appendix: 'Quality check: one note.' });
+  assert.equal(second, first, 'a repeat names the same record');
+  const adopted = loadNotifications().find((row) => row.id === first);
+  assert.equal(adopted?.body, 'Two fixture rows changed.\n\nQuality check: one note.', 'the note is appended exactly once');
+  assert.equal(adopted?.metadata?.workflow, 'FRAMEWORK-TEST Adopt Once');
+  assert.equal(adopted?.metadata?.runId, runId);
+  assert.equal(adopted?.metadata?.workflowStepId, 'report', 'what the record already knew is kept');
+  assert.equal(adoptWorkflowStepReportAsOutcome({ runId: 'framework-test-no-report', workflow: 'x' }), null, 'a run with no report of its own adopts nothing');
 });
 
 test('a run refused at preflight that crosses the failure streak says so in its one notification', async () => {
