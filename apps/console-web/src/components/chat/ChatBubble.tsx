@@ -109,12 +109,12 @@ function DraftFrame({ draft, children }: { draft: ChatMessage['answerDraft']; ch
 
 /** Who is speaking, and when. The avatar lives here now rather than in a
  *  gutter beside every reply, so the answer can use the full column. */
-function TurnHeader({ at, quiet }: { at?: number; quiet?: boolean }) {
+function TurnHeader({ at, quiet, speaker }: { at?: number; quiet?: boolean; speaker?: string }) {
   const time = at ? new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
   return (
     <div className={cn('flex items-center gap-2 text-small', quiet && 'opacity-70')}>
       <DogMark size={20} className="rounded-[5px]" />
-      <span className="font-semibold text-fg">Clem</span>
+      <span className="font-semibold text-fg">{speaker || 'Clem'}</span>
       {time && <time className="font-mono text-caption text-faint" dateTime={new Date(at!).toISOString()}>{time}</time>}
     </div>
   );
@@ -184,10 +184,13 @@ export function ChatBubble({
   onBackground,
   traceHref,
   onAnswer,
+  speaker,
   sessionId, executionBusy, onExecutePlan, onPreparePlan, onRevisePlan,
 }: {
   message: ChatMessage;
   sessionId?: string;
+  /** Who is answering, when the thread works inside an agent. Clem otherwise. */
+  speaker?: string;
   executionBusy?: boolean;
   onExecutePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
   onPreparePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
@@ -376,8 +379,8 @@ export function ChatBubble({
     || hasReplyText;
   const answerable = message.status === 'awaiting-reply' && Boolean(onAnswer) && (message.options?.length ?? 0) > 0;
   return (
-    <article className="group/turn flex min-w-0 flex-col gap-2.5" aria-label="Clem">
-      <TurnHeader at={message.startedAt ?? message.sentAt} />
+    <article className="group/turn flex min-w-0 flex-col gap-2.5" aria-label={speaker || 'Clem'}>
+      <TurnHeader at={message.startedAt ?? message.sentAt} speaker={speaker} />
       {/* The work rides ABOVE the answer: while the turn runs it is the whole
           story (steps, helpers, the live line); once the answer lands it folds
           to one line you can reopen. */}

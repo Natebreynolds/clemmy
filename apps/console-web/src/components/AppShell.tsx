@@ -141,7 +141,9 @@ export function AppShell() {
         )}
         <main
           id="main"
-          className={`min-h-0 flex-1 ${location.pathname === '/chat' || location.pathname.startsWith('/chat/') ? 'overflow-hidden' : 'overflow-y-auto'}`}
+          // Chat and an agent's workspace own their scrollers (a full-height
+          // thread over a composer); every other screen scrolls as a page.
+          className={`min-h-0 flex-1 ${location.pathname.startsWith('/agents/') || location.pathname === '/chat' || location.pathname.startsWith('/chat/') ? 'overflow-hidden' : 'overflow-y-auto'}`}
         >
           <ErrorBoundary resetKey={location.pathname}>
             <ShellTitleContext.Provider value={title}>

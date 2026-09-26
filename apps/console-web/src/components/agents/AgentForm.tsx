@@ -1,74 +1,70 @@
 /**
- * Create / edit a team agent (multi-agent workspace, slice 2). A centered
- * modal over the agent stores. canMessage is edited as checkboxes of the
- * other agents; persona/role/model/cadence are plain fields. On save it
- * POSTs (create) or PATCHes (edit) and invalidates the agents queries.
+ * Create / edit an agent: a name, what it handles, the standing instructions
+ * every thread starts from, and what it reaches for first. A centered modal;
+ * on save it POSTs (create) or PATCHes (edit) and hands the record back.
  */
 import { useState } from 'react';
 import { X } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { Field, Input, Textarea } from '@/components/ui/Field';
-import { Switch } from '@/components/ui/Switch';
-import { createAgent, updateAgent, type AgentInput, type AgentSummary, type AgentCatalog } from '@/lib/agents';
+import { Field, Input, Select, Textarea } from '@/components/ui/Field';
+import { createAgent, updateAgent, type AgentInput, type AgentRecord, type AgentCatalog } from '@/lib/agents';
+
+/** The select value that means "no model of its own — follow the brain". */
+const FOLLOW_BRAIN = '__follow__';
 
 export function AgentForm({
   mode,
   agent,
-  allAgents,
   catalog,
   onClose,
   onSaved,
 }: {
   mode: 'create' | 'edit';
-  agent?: AgentSummary;
-  allAgents: AgentSummary[];
+  agent?: AgentRecord;
   catalog?: AgentCatalog;
   onClose: () => void;
-  onSaved: (saved: AgentSummary) => void;
+  onSaved: (saved: AgentRecord) => void;
 }) {
   const [name, setName] = useState(agent?.name ?? '');
-  const [role, setRole] = useState(agent?.role ?? '');
-  const [description, setDescription] = useState(agent?.description ?? '');
-  const [personality, setPersonality] = useState(agent?.personality ?? '');
-  const [model, setModel] = useState(agent?.model ?? '');
-  const [canMessage, setCanMessage] = useState<Set<string>>(new Set(agent?.canMessage ?? []));
+  const [handles, setHandles] = useState(agent?.handles ?? '');
+  const [instructions, setInstructions] = useState(agent?.instructions ?? '');
+  const [model, setModel] = useState(agent?.model ?? FOLLOW_BRAIN);
   const [skills, setSkills] = useState<Set<string>>(new Set(agent?.skills ?? []));
   const [workflows, setWorkflows] = useState<Set<string>>(new Set(agent?.workflows ?? []));
-  const [proactive, setProactive] = useState(agent?.proactive ?? true);
-  const [cadence, setCadence] = useState(String(agent?.cadenceMinutes ?? 30));
+  const [tools, setTools] = useState<Set<string>>(new Set(agent?.tools ?? []));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Edit can't message itself; create can target any existing agent.
-  const targets = allAgents.filter((a) => a.slug !== agent?.slug);
-
-  const toggleIn = (setter: typeof setCanMessage) => (value: string) =>
+  const toggleIn = (setter: typeof setSkills) => (value: string) =>
     setter((prev) => {
       const next = new Set(prev);
       next.has(value) ? next.delete(value) : next.add(value);
       return next;
     });
-  const toggleTarget = toggleIn(setCanMessage);
+
+  const models = catalog?.models;
+  // A model the record names but the catalog no longer offers still shows,
+  // so editing something else does not silently drop it.
+  const staleModel = agent?.model && models && !models.some((m) => m.id === agent.model) ? agent.model : null;
 
   const submit = async () => {
-    if (!name.trim()) { setError('Name is required.'); return; }
+    if (!name.trim()) { setError('Give the agent a name.'); return; }
     setSaving(true); setError(null);
     const input: AgentInput = {
       name: name.trim(),
-      description: description.trim(),
-      role: role.trim() || undefined,
-      personality: personality.trim() || undefined,
-      model: model.trim() || undefined,
-      canMessage: Array.from(canMessage),
+      handles: handles.trim(),
+      instructions: instructions.trim(),
       skills: Array.from(skills),
       workflows: Array.from(workflows),
-      proactive,
-      cadenceMinutes: Math.max(5, Number(cadence) || 30),
+      tools: Array.from(tools),
+      // No model picker offered: leave the record's model alone.
+      ...(models ? { model: model === FOLLOW_BRAIN ? null : model } : {}),
     };
     try {
-      const saved = mode === 'create' ? await createAgent(input) : await updateAgent(agent!.slug, input);
+      const saved = mode === 'create' ? await createAgent(input) : await updateAgent(agent!.id, input);
       onSaved(saved);
     } catch (e) {
+      // The server answers with one plain sentence; show it as is.
       setError(e instanceof Error ? e.message : String(e));
       setSaving(false);
     }
@@ -87,50 +83,26 @@ export function AgentForm({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           <Field label="Name">
-            {(id) => <Input id={id} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Researcher" autoFocus />}
+            {(id) => <Input id={id} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Sales" autoFocus />}
           </Field>
-          <Field label="Role" hint="Short label, e.g. research, writing, analysis.">
-            {(id) => <Input id={id} value={role} onChange={(e) => setRole(e.target.value)} placeholder="research" />}
+          <Field label="What it handles" hint="One line, in your words.">
+            {(id) => <Input id={id} value={handles} onChange={(e) => setHandles(e.target.value)} placeholder="Follow-ups, proposals and pipeline questions" />}
           </Field>
-          <Field label="Mission" hint="One line: what this agent is for.">
-            {(id) => <Input id={id} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Gathers facts before decisions" />}
-          </Field>
-          <Field label="Persona & guidance" hint="How the agent should behave — its system instructions.">
-            {(id) => <Textarea id={id} value={personality} onChange={(e) => setPersonality(e.target.value)} placeholder="You are a meticulous researcher…" />}
-          </Field>
-          <Field label="Model" hint="Optional model override (blank = follows the brain).">
-            {(id) => <Input id={id} value={model} onChange={(e) => setModel(e.target.value)} placeholder="claude-sonnet-4-6" />}
-          </Field>
-
-          <div className="mb-4">
-            <div className="mb-1.5 text-label text-fg">Can message</div>
-            {targets.length === 0 ? (
-              <p className="text-caption text-muted">No other agents to message yet.</p>
-            ) : (
-              <div className="flex flex-wrap gap-1.5">
-                {targets.map((t) => {
-                  const on = canMessage.has(t.slug);
-                  return (
-                    <button
-                      key={t.slug}
-                      type="button"
-                      onClick={() => toggleTarget(t.slug)}
-                      className={
-                        'rounded-full border px-2.5 py-1 text-caption transition-colors cursor-pointer ' +
-                        (on ? 'border-primary bg-primary-tint text-primary' : 'border-border bg-surface text-muted hover:border-border-strong')
-                      }
-                    >
-                      {t.name}
-                    </button>
-                  );
-                })}
-              </div>
+          <Field label="Standing instructions" hint="Every thread in this agent starts from these.">
+            {(id) => (
+              <Textarea
+                id={id}
+                value={instructions}
+                onChange={(e) => setInstructions(e.target.value)}
+                placeholder="Keep replies short. Check the CRM before answering a pipeline question. Draft, never send."
+                className="min-h-[160px]"
+              />
             )}
-          </div>
+          </Field>
 
           <ChipPicker
             label="Skills"
-            hint="Their SKILL.md is injected into this agent's instructions so it boots knowing the craft."
+            hint="What it reaches for first."
             options={catalog?.skills ?? []}
             selected={skills}
             onToggle={toggleIn(setSkills)}
@@ -138,27 +110,35 @@ export function AgentForm({
           />
           <ChipPicker
             label="Workflows"
-            hint="Workflows this agent owns — it prefers running these over redoing the work ad-hoc."
+            hint="Saved workflows it prefers over working things out from scratch."
             options={catalog?.workflows ?? []}
             selected={workflows}
             onToggle={toggleIn(setWorkflows)}
             empty="No workflows saved yet."
           />
-
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <div>
-              <div className="text-label text-fg">Proactive</div>
-              <p className="text-caption text-muted">Wake on a cadence and take initiative.</p>
-            </div>
-            <Switch checked={proactive} onChange={setProactive} label="Proactive" />
-          </div>
-          {proactive && (
-            <Field label="Cadence (minutes)" hint="How often it wakes. Minimum 5.">
-              {(id) => <Input id={id} type="number" min={5} value={cadence} onChange={(e) => setCadence(e.target.value)} />}
+          {catalog?.tools && (
+            <ChipPicker
+              label="Tools"
+              hint="Tools it should keep close."
+              options={catalog.tools}
+              selected={tools}
+              onToggle={toggleIn(setTools)}
+              empty="No tools to pick from yet."
+            />
+          )}
+          {models && (
+            <Field label="Model" hint="Leave on the brain unless this agent needs a particular model.">
+              {(id) => (
+                <Select id={id} value={model} onChange={(e) => setModel(e.target.value)}>
+                  <option value={FOLLOW_BRAIN}>Follow the brain</option>
+                  {models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                  {staleModel && <option value={staleModel}>{staleModel} (no longer offered)</option>}
+                </Select>
+              )}
             </Field>
           )}
 
-          {error && <p className="text-body text-danger">{error}</p>}
+          {error && <p className="text-body text-danger" role="alert">{error}</p>}
         </div>
 
         <footer className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
@@ -170,8 +150,8 @@ export function AgentForm({
   );
 }
 
-/** A labeled wrap of toggle chips backed by a Set — used for skills +
- *  workflows. Each option shows its name; the description is a tooltip. */
+/** A labeled wrap of toggle chips backed by a Set. Each option shows its
+ *  name; the description is a tooltip. */
 function ChipPicker({
   label,
   hint,
@@ -201,6 +181,7 @@ function ChipPicker({
                 key={opt.name}
                 type="button"
                 title={opt.description}
+                aria-pressed={on}
                 onClick={() => onToggle(opt.name)}
                 className={
                   'rounded-full border px-2.5 py-1 text-caption transition-colors cursor-pointer ' +

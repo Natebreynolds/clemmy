@@ -70,6 +70,9 @@ export async function postChat(
   attachments: string[],
   clientRequestId: string,
   taskMode?: TaskMode,
+  /** The agent a NEW session starts in. An existing session keeps its own
+   *  binding; the server ignores this for one. */
+  agentId?: string,
 ): Promise<ChatPostResult> {
   const result = await apiPost<ChatPostResult>('/api/harness/chat', {
     input,
@@ -77,6 +80,7 @@ export async function postChat(
     attachments,
     clientRequestId,
     ...(taskMode ? { taskMode } : {}),
+    ...(agentId ? { agentId } : {}),
   });
   if (!result || typeof result.sessionId !== 'string' || !result.sessionId) {
     throw Object.assign(new TypeError('chat acknowledgement was incomplete'), { status: 0 });

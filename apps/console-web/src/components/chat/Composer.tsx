@@ -1,6 +1,6 @@
 import type { ComposerMode, TaskMode } from '@/lib/task-mode';
 import { ModelPicker } from '@/components/chat/ModelPicker';
-import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type RefObject } from 'react';
+import { useRef, useState, useCallback, type KeyboardEvent, type ChangeEvent, type ReactNode, type RefObject } from 'react';
 import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack, Mic } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { uploadAttachment } from '@/lib/chat';
@@ -33,6 +33,7 @@ export function Composer({
   inputRef,
   placeholder = 'Ask Clementine anything…',
   sessionId,
+  agentSlot,
 }: {
   busy: boolean;
   mode?: ComposerMode;
@@ -50,6 +51,9 @@ export function Composer({
   /** Explicit adjacent-composer focus target for transient foreground controls. */
   inputRef?: RefObject<HTMLTextAreaElement | null>;
   placeholder?: string;
+  /** A chip drawn beside the model chip — the agent this thread works in.
+   *  The composer stays generic; the surface decides what goes here. */
+  agentSlot?: ReactNode;
 }) {
   const [value, setValue] = useState('');
   const [deliveryError, setDeliveryError] = useState('');
@@ -260,7 +264,10 @@ export function Composer({
           </button>
         </div>
 
-        <ModelPicker sessionId={sessionId} className="ml-auto" />
+        <div className="ml-auto flex min-w-0 items-center gap-1.5">
+          {agentSlot}
+          <ModelPicker sessionId={sessionId} />
+        </div>
 
         {/* Offered only where the browser actually provides speech recognition —
             a microphone button that does nothing is a lie. The phone has had

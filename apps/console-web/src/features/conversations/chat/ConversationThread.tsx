@@ -6,6 +6,7 @@ import { useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
+import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
@@ -35,6 +36,7 @@ function Header({ session }: { session: Session }) {
         <div className="flex items-center gap-2">
           <h2 className="truncate text-h3 text-fg">{session.title || 'New chat'}</h2>
           <Tag>{meta.label}</Tag>
+          {session.agentName && <Tag title="This conversation works inside an agent">{session.agentName}</Tag>}
         </div>
       </div>
       <Button
@@ -112,6 +114,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
             <ChatBubble
               key={m.id}
               message={m}
+              speaker={session.agentName ?? undefined}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -129,7 +132,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
         </div>
       </div>
       <div className={CHAT_COMPOSER_WRAP}>
-        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} />
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={session.agentName ? <AgentPicker bound={session.agentName} /> : undefined} />
       </div>
     </div>
   );
@@ -146,7 +149,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
           {messages.length === 0 ? (
             <p className="py-12 text-center text-body text-faint">No messages in this conversation.</p>
           ) : (
-            messages.map((m) => <ChatBubble key={m.id} message={m} sessionId={rawId(session.id)} />)
+            messages.map((m) => <ChatBubble key={m.id} message={m} speaker={session.agentName ?? undefined} sessionId={rawId(session.id)} />)
           )}
         </div>
       </div>

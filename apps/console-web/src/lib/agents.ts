@@ -1,262 +1,165 @@
 /**
- * Multi-agent workspace — typed fetchers over the daemon's read-only
- * /api/console/agents routes. Surfaces the team-agent roster, the
- * canMessage permission graph, team comms + delegations, and per-agent
- * autonomy runs. Read-only (slice 1); mirrors lib/spaces.ts.
+ * Agents — typed fetchers over /api/console/agents.
+ *
+ * An agent is a specialized working context a person opens and works in: a
+ * name, what it handles, standing instructions, and the skills / workflows /
+ * tools / model it reaches for first. A turn inside an agent is an ordinary
+ * Clem turn whose starting context was chosen once. Mirrors lib/spaces.ts.
  */
 import { apiGet, apiPost, apiPatch, apiDelete } from './api';
+import type { RunAgent } from './board';
+import type { Session } from '@/features/conversations/types';
 
-export type AgentStatus = 'idle' | 'active' | 'blocked';
-
-export interface AgentSummary {
-  slug: string;
+export interface AgentRecord {
+  id: string;
   name: string;
-  role: string | null;
-  description: string;
-  model: string | null;
-  project: string | null;
-  channelName: string | null;
-  canMessage: string[];
-  allowedTools: string[];
-  proactive: boolean;
-  autonomyEnabled: boolean;
-  cadenceMinutes: number | null;
-  wakeTriggers: string[];
+  /** One line: what this agent handles. */
+  handles: string;
+  /** Standing instructions every thread in this agent starts from. */
+  instructions: string;
   skills: string[];
   workflows: string[];
-  personality: string;
-  status: AgentStatus;
-  pendingInbox: number;
-  pendingRequests: number;
-  lastRunAt: string | null;
-  lastSummary: string | null;
-  commitments: string[];
-  nextWakeAt: string | null;
-  lastError: string | null;
+  tools: string[];
+  /** A model id, or null to follow the brain. */
+  model: string | null;
+  memoryScope: string | null;
+  createdFrom: 'chat' | 'console' | 'phone' | 'plugin' | null;
+  createdAt: string | null;
+  updatedAt: string | null;
 }
 
-export type GraphNodeKind = 'agent' | 'skill' | 'workflow';
-export interface AgentGraphNode {
-  id: string;
-  label: string;
-  role: string | null;
-  primary: boolean;
-  status: AgentStatus;
-  kind: GraphNodeKind;
+/** Editable fields. On PATCH every field is optional; '' or null clears a
+ *  string field. */
+export interface AgentInput {
+  name?: string;
+  handles?: string;
+  instructions?: string;
+  skills?: string[];
+  workflows?: string[];
+  tools?: string[];
+  model?: string | null;
+  memoryScope?: string | null;
 }
-export interface AgentGraphEdge { source: string; target: string; kind: 'message' | 'skill' | 'workflow' }
-export interface AgentGraphData { nodes: AgentGraphNode[]; edges: AgentGraphEdge[] }
 
 export interface CatalogEntry { name: string; description: string }
-export interface AgentCatalog { skills: CatalogEntry[]; workflows: CatalogEntry[] }
-
-export interface TeamMessage {
-  id: string;
-  fromAgent: string;
-  toAgent: string;
-  content: string;
-  timestamp: string;
-  protocol: 'message' | 'request' | 'response';
-  requestId?: string;
-}
-export interface Delegation {
-  id: string;
-  fromAgent: string;
-  toAgent: string;
-  task: string;
-  expectedOutput: string;
-  status: 'pending' | 'in_progress' | 'completed';
-  result?: string;
-  /** How the result is grounded. 'model_prose' = the model's own text with no
-   *  independent evidence — the UI must not present it as verified work. */
-  resultEvidence?: 'model_prose';
-  /** Who actually recorded the result — not assumed to be the assignee. */
-  completedBy?: string;
-  /** Set when Clementine closed work that was queued for someone else. */
-  onBehalfOf?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-export interface AgentComms { messages: TeamMessage[]; delegations: Delegation[] }
-
-/**
- * Plain-language attribution for a finished delegation.
- *
- * The timeline draws delegations as `from → to`, which on its own reads as
- * "the assignee did this". When Clementine closed the work herself that would
- * be a quiet lie, so say it outright.
- */
-export function describeDelegationOutcome(delegation: Delegation): string | null {
-  if (delegation.status !== 'completed') return null;
-  const actor = delegation.completedBy;
-  if (delegation.resultEvidence === 'model_prose') {
-    if (!actor) return 'Result reported · verification required';
-    if (delegation.onBehalfOf) {
-      return `Reported by Clementine, on behalf of ${delegation.onBehalfOf} · verification required`;
-    }
-    return `Reported by ${actor} · verification required`;
-  }
-  if (!actor) return 'Completed';
-  if (delegation.onBehalfOf) return `Completed by Clementine, on behalf of ${delegation.onBehalfOf}`;
-  return `Completed by ${actor}`;
+export interface CatalogModel { id: string; label: string }
+export interface AgentCatalog {
+  skills: CatalogEntry[];
+  workflows: CatalogEntry[];
+  /** Absent until the daemon offers a tool picker; hide the picker when so. */
+  tools?: CatalogEntry[];
+  /** Absent until the daemon offers a model picker; hide the picker when so. */
+  models?: CatalogModel[];
 }
 
-
-/**
- * Honest wake-state line for an agent card. Derived ONLY from durable record
- * fields — it never claims the engine is running, only what the record says:
- * when the agent last worked, when it will next be considered, and whether the
- * last cycle ended in an error it is backing off from.
- */
-export function describeAgentWakeState(
-  agent: Pick<AgentSummary, 'proactive' | 'autonomyEnabled' | 'nextWakeAt' | 'lastError' | 'lastRunAt'>,
-  now: number = Date.now(),
-): string {
-  if (!agent.autonomyEnabled) return 'Autonomy off';
-  if (!agent.proactive) return 'On demand only';
-  const wakeAt = agent.nextWakeAt ? Date.parse(agent.nextWakeAt) : NaN;
-  const wakeIn = Number.isFinite(wakeAt) && wakeAt > now
-    ? formatWakeDelta(wakeAt - now)
-    : null;
-  if (agent.lastError) {
-    return wakeIn ? `Retrying in ${wakeIn} after an error` : 'Retrying after an error';
-  }
-  if (wakeIn) return `Next wake in ${wakeIn}`;
-  if (agent.lastRunAt) return 'Due on next cycle';
-  return 'Waiting for first cycle';
+/** A worker run spawned from a thread inside an agent. */
+export interface AgentWorker extends RunAgent {
+  boundAgentId?: string;
+  parentRunId?: string;
 }
 
-function formatWakeDelta(ms: number): string {
-  const minutes = Math.round(ms / 60_000);
-  if (minutes < 1) return 'under a minute';
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h ${minutes % 60}m`;
+export interface AgentWork {
+  threads: Session[];
+  workers: AgentWorker[];
 }
 
-export interface AgentRunEvent {
-  id: string;
-  type: string;
-  message: string;
-  createdAt: string;
-  data?: Record<string, unknown>;
+/** Server records arrive with whatever the daemon stored; every list and
+ *  nullable field is filled in here so screens never branch on absence. */
+function normalizeAgent(raw: Partial<AgentRecord> & { id: string; name: string }): AgentRecord {
+  return {
+    id: raw.id,
+    name: raw.name,
+    handles: raw.handles ?? '',
+    instructions: raw.instructions ?? '',
+    skills: raw.skills ?? [],
+    workflows: raw.workflows ?? [],
+    tools: raw.tools ?? [],
+    model: raw.model ?? null,
+    memoryScope: raw.memoryScope ?? null,
+    createdFrom: raw.createdFrom ?? null,
+    createdAt: raw.createdAt ?? null,
+    updatedAt: raw.updatedAt ?? null,
+  };
 }
-export interface AgentRun {
-  id: string;
-  sessionId: string;
-  title: string;
-  input: string;
-  status: string;
-  createdAt: string;
-  updatedAt: string;
-  completedAt?: string;
-  error?: string;
-  outputPreview?: string;
-  events: AgentRunEvent[];
+
+export const listAgents = () =>
+  apiGet<{ agents?: AgentRecord[] }>('/api/console/agents')
+    .then((r) => (r.agents ?? []).map(normalizeAgent));
+
+export const getAgent = (id: string) =>
+  apiGet<{ agent: AgentRecord }>(`/api/console/agents/${encodeURIComponent(id)}`)
+    .then((r) => normalizeAgent(r.agent));
+
+export const createAgent = (input: AgentInput) =>
+  apiPost<{ agent: AgentRecord }>('/api/console/agents', input).then((r) => normalizeAgent(r.agent));
+
+export const updateAgent = (id: string, input: AgentInput) =>
+  apiPatch<{ agent: AgentRecord }>(`/api/console/agents/${encodeURIComponent(id)}`, input)
+    .then((r) => normalizeAgent(r.agent));
+
+export const deleteAgent = (id: string) =>
+  apiDelete<{ removed: boolean; id: string }>(`/api/console/agents/${encodeURIComponent(id)}`);
+
+export const getAgentCatalog = () =>
+  apiGet<Partial<AgentCatalog>>('/api/console/agents/catalog')
+    .then((r): AgentCatalog => ({
+      skills: r.skills ?? [],
+      workflows: r.workflows ?? [],
+      ...(r.tools ? { tools: r.tools } : {}),
+      ...(r.models ? { models: r.models } : {}),
+    }));
+
+export const getAgentWork = (id: string, limit = 20) =>
+  apiGet<Partial<AgentWork>>(`/api/console/agents/${encodeURIComponent(id)}/work?limit=${limit}`)
+    .then((r): AgentWork => ({ threads: r.threads ?? [], workers: r.workers ?? [] }));
+
+/** The chips a roster card shows: what the agent reaches for first. */
+export function agentReachSummary(agent: AgentRecord, modelLabel?: string | null): string[] {
+  const parts: string[] = [];
+  const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+  if (agent.skills.length > 0) parts.push(count(agent.skills.length, 'skill'));
+  if (agent.workflows.length > 0) parts.push(count(agent.workflows.length, 'workflow'));
+  if (agent.tools.length > 0) parts.push(count(agent.tools.length, 'tool'));
+  if (agent.model) parts.push(modelLabel || agent.model);
+  return parts;
 }
+
+// ─── Drafts from Clem ───
+// A proposal Clem wrote during a conversation, waiting for the owner to turn
+// it into an agent. Stays until the chat-card flow replaces it.
 
 export type AgentProposalStatus = 'pending' | 'approved' | 'rejected';
-export type AgentCreationDecisionKind = 'one_off' | 'agent' | 'workflow' | 'workflow_with_agent';
-
-export interface AgentCreationDecision {
-  kind: AgentCreationDecisionKind;
-  agentScore: number;
-  workflowScore: number;
-  oneOffScore: number;
-  confidence: number;
-  reasons: string[];
-}
 
 export interface AgentProposal {
   id: string;
   proposedAt: string;
-  proposedByAgent: string;
   status: AgentProposalStatus;
   source: 'chat' | 'console' | 'system' | 'tool';
   originatingRequest: string;
   sessionId?: string;
   rationale: string;
-  decision: AgentCreationDecision;
   agent: {
     name: string;
-    description: string;
-    role?: string;
-    personality?: string;
-    model?: string;
-    project?: string;
-    canMessage: string[];
-    allowedTools: string[];
-    skills: string[];
-    workflows: string[];
-    proactive: boolean;
-    autonomyEnabled: boolean;
-    cadenceMinutes: number;
+    description?: string;
+    handles?: string;
+    instructions?: string;
+    model?: string | null;
+    skills?: string[];
+    workflows?: string[];
+    tools?: string[];
   };
-  memoryScope?: string;
-  approvalPolicy?: string;
-  evalCriteria: string[];
-  suggestedWorkflows: string[];
+  suggestedWorkflows?: string[];
   resolvedAt?: string;
-  resolvedAgentSlug?: string;
   rejectionReason?: string;
 }
 
-export const listAgents = () =>
-  apiGet<{ agents: AgentSummary[]; generatedAt: string }>('/api/console/agents').then((r) => r.agents);
-
-export const getAgentGraph = () =>
-  apiGet<AgentGraphData & { generatedAt: string }>('/api/console/agents/graph');
-
-export const getAgentComms = (limit = 50) =>
-  apiGet<AgentComms & { generatedAt: string }>(`/api/console/agents/comms?limit=${limit}`);
-
-export const getAgentCatalog = () =>
-  apiGet<AgentCatalog & { generatedAt: string }>('/api/console/agents/catalog');
-
-export const getAgentRuns = (slug: string, limit = 20) =>
-  apiGet<{ runs: AgentRun[]; generatedAt: string }>(
-    `/api/console/agents/${encodeURIComponent(slug)}/runs?limit=${limit}`,
-  ).then((r) => r.runs);
-
 export const listAgentProposals = (status: AgentProposalStatus | 'all' = 'pending', limit = 20) =>
-  apiGet<{ proposals: AgentProposal[]; generatedAt: string }>(
+  apiGet<{ proposals?: AgentProposal[] }>(
     `/api/console/agents/proposals?status=${encodeURIComponent(status)}&limit=${limit}`,
-  ).then((r) => r.proposals);
-
-/** Editable fields for create/update (slice 2). All optional on PATCH. */
-export interface AgentInput {
-  name?: string;
-  description?: string;
-  role?: string;
-  personality?: string;
-  model?: string;
-  project?: string;
-  canMessage?: string[];
-  allowedTools?: string[];
-  skills?: string[];
-  workflows?: string[];
-  cadenceMinutes?: number;
-  proactive?: boolean;
-  autonomyEnabled?: boolean;
-}
-
-export const createAgent = (input: AgentInput) =>
-  apiPost<{ agent: AgentSummary }>('/api/console/agents', input).then((r) => r.agent);
-
-export interface AgentProposalInput extends AgentInput {
-  originatingRequest: string;
-  rationale: string;
-  memoryScope?: string;
-  approvalPolicy?: string;
-  evalCriteria?: string[];
-  suggestedWorkflows?: string[];
-}
-
-export const createAgentProposal = (input: AgentProposalInput) =>
-  apiPost<{ proposal: AgentProposal }>('/api/console/agents/proposals', input).then((r) => r.proposal);
+  ).then((r) => r.proposals ?? []);
 
 export const approveAgentProposal = (id: string) =>
-  apiPost<{ proposal: AgentProposal; agent: AgentSummary }>(
+  apiPost<{ proposal: AgentProposal; agent?: AgentRecord }>(
     `/api/console/agents/proposals/${encodeURIComponent(id)}/approve`,
   );
 
@@ -265,18 +168,3 @@ export const rejectAgentProposal = (id: string, reason?: string) =>
     `/api/console/agents/proposals/${encodeURIComponent(id)}/reject`,
     reason ? { reason } : {},
   ).then((r) => r.proposal);
-
-export const updateAgent = (slug: string, input: AgentInput) =>
-  apiPatch<{ agent: AgentSummary }>(`/api/console/agents/${encodeURIComponent(slug)}`, input).then((r) => r.agent);
-
-export const deleteAgent = (slug: string) =>
-  apiDelete<{ removed: boolean; slug: string }>(`/api/console/agents/${encodeURIComponent(slug)}`);
-
-/** A signature of the most recent comms event, so the graph can detect a
- *  fresh message between polls and pulse the matching edge. */
-export function latestCommsKey(comms: AgentComms | undefined): string {
-  if (!comms) return '';
-  const m = comms.messages[0];
-  const d = comms.delegations[0];
-  return `${m ? `${m.id}:${m.timestamp}` : ''}|${d ? `${d.id}:${d.updatedAt}` : ''}`;
-}
