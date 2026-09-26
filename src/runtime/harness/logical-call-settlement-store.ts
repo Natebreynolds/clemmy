@@ -19,7 +19,7 @@ import { durableLogicalCallContract } from './logical-call-contract.js';
 import { normalizeCallableArguments } from './callable-contract.js';
 import { isTrustedComposioGateway } from './runtime-tool-identity.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
-import { classifyCanonicalExternalEffect, nativeRequestOperationId } from './execution-gate.js';
+import { nativeRequestOperationId, requestEffectLearnable } from './execution-gate.js';
 import { scheduleRequestEffectLearning } from './learned-request-effect.js';
 import {
   expectedTaskFor,
@@ -657,8 +657,7 @@ function observeSettledRequestEffect(input: CommitLogicalCallSettlementInput): v
     ) return;
     const operationId = nativeRequestOperationId(input.contract.toolName);
     if (!operationId) return;
-    const effect = classifyCanonicalExternalEffect(`mcp__${operationId}`, input.contract.args);
-    if (!effect.external || !effect.mutating || effect.classificationKnown) return;
+    if (!requestEffectLearnable(`mcp__${operationId}`, input.contract.args)) return;
     scheduleRequestEffectLearning(
       { providerKind: 'native_mcp', operationId, args: input.contract.args, result: input.result?.payload },
       { sessionId: input.identity.sessionId },

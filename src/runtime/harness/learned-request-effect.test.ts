@@ -24,6 +24,8 @@ const declared = await import('../mcp-declared-effects.js');
 const jev = await import('../jev/client.js');
 const ports = await import('../semantic-boundary/turn-semantic-port-registry.js');
 const { configuredBrainSemanticPort } = await import('../semantic-boundary/configured-brain-semantic-port.js');
+const catalog = await import('./host-capability-catalog-factory.js');
+const manifests = await import('./capability-manifest.js');
 const eventlog = await import('./eventlog.js');
 const shadow = await import('../graph/turn-graph-shadow.js');
 const identities = await import('./attempt-identity.js');
@@ -286,4 +288,91 @@ test('a provider call that settled as an unclassified write offers its evidence,
   settle('serp-live-learned', { ...LIVE_ARGS, data: [{ keyword: 'other' }] }, true);
   await learner._drainRequestEffectLearningForTests();
   assert.equal(jevRequests.length, 1);
+});
+
+/** The live shape of a native generic tool's manifest (DataForSEO api_request,
+ *  2026-09-26): sealed external_write from readOnly:false, nothing documented. */
+function sealedMayWriteManifest(hints: { readOnly: boolean | null; destructive: boolean | null }, semantics?: { version: 1; reversibility: 'reversible' }) {
+  const manifest = manifests.attachSemanticContract({
+    version: 1,
+    manifestId: `cap:test:${sha(OPERATION).slice(0, 20)}`,
+    providerKind: 'native_mcp',
+    operationId: OPERATION,
+    providerIdentity: 'mcp-config:seo_vendor:test',
+    providerVersion: 'mcp-config-v1:test',
+    operationVersion: 'mcp-tool-v1:test',
+    definitionFingerprint: sha(`schema:${OPERATION}`),
+    externalDefinition: {
+      version: 1,
+      providerInputSchemaDigest: sha('input-schema'),
+      semanticName: 'api_request',
+      behaviorHints: { readOnly: hints.readOnly, destructive: hints.destructive, idempotent: false, openWorld: true },
+    },
+    effect: 'external_write',
+    ...(semantics ? { operationSemantics: semantics } : {}),
+    destination: { family: 'seo_vendor', posture: 'named_existing' },
+    accountId: 'native_mcp:seo_vendor:test',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'result' },
+    evidenceContract: { kinds: ['result'], readbackRequired: false },
+    provenance: { issuer: 'host:native-mcp-live-materializer:v1', issuedAt: '2026-09-26T20:53:04.058Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: ['capability'],
+  });
+  const registered: import('./host-capability-catalog-factory.js').RegisteredHostCapability = {
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    destination: manifest.destination,
+    account: manifest.accountId,
+    manifestDigest: manifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => ({}),
+  };
+  return registered;
+}
+
+function withCatalog<T>(entries: ReturnType<typeof sealedMayWriteManifest>[], run: () => T): T {
+  catalog.installHostCapabilityCatalogFactory(catalog.createHostCapabilityCatalogFactory(entries));
+  try { return run(); } finally { catalog.installHostCapabilityCatalogFactory(null); }
+}
+
+test('under the live manifest that seals "may write" as a write, the shape is learnable and a learned read refines it', () => {
+  const verdict = {
+    version: 1 as const, providerKind: 'native_mcp' as const, operationId: OPERATION, shape: LIVE_SHAPE, verdict: 'reads_only' as const,
+    evidenceDigest: sha('evidence'),
+    screen: { model: 'jev-fixture', changeProbability: 0.02 },
+    confirm: { role: 'judge' as const, model: 'judge-fixture-model', changesProvider: 'no' as const, confidence: 0.95 },
+    learnedAt: new Date().toISOString(),
+  };
+  withCatalog([sealedMayWriteManifest({ readOnly: false, destructive: false })], () => {
+    const sealed = gate.classifyCanonicalExternalEffect(TOOL, LIVE_ARGS);
+    assert.equal(sealed.mutating, true, 'the sealed declaration is a write before anything is learned');
+    assert.equal(sealed.classificationKnown, true, 'and a known one: no approval card is owed (unchanged)');
+    assert.equal(gate.requestEffectLearnable(TOOL, LIVE_ARGS), true, 'so a settled call may teach its shape');
+    assert.ok(store.rememberLearnedRequestEffect(verdict));
+    const learned = gate.classifyCanonicalExternalEffect(TOOL, LIVE_ARGS);
+    assert.equal(learned.mutating, false, 'the learned shape is a read under the manifest');
+    assert.equal(gate.isMutatingExternalWrite(TOOL, LIVE_ARGS), false);
+    assert.equal(gate.isMutatingExternalWrite(TOOL, { ...LIVE_ARGS, path: '/v3/serp/google/organic/task_post' }), true, 'other endpoints stay sealed writes');
+    assert.equal(gate.requestEffectLearnable(TOOL, { ...LIVE_ARGS, path: '/v3/serp/google/organic/task_post' }), true);
+  });
+  // A destructive declaration, or documented semantics, is never refined and never learnable.
+  withCatalog([sealedMayWriteManifest({ readOnly: false, destructive: true })], () => {
+    assert.equal(gate.isMutatingExternalWrite(TOOL, LIVE_ARGS), true);
+    assert.equal(gate.requestEffectLearnable(TOOL, LIVE_ARGS), false);
+  });
+  withCatalog([sealedMayWriteManifest({ readOnly: false, destructive: false }, { version: 1, reversibility: 'reversible' })], () => {
+    assert.equal(gate.isMutatingExternalWrite(TOOL, LIVE_ARGS), true);
+    assert.equal(gate.requestEffectLearnable(TOOL, LIVE_ARGS), false);
+  });
+  // Without a manifest an unknown write is learnable as before; a proven read is not.
+  assert.equal(gate.requestEffectLearnable(TOOL, { ...LIVE_ARGS, path: '/v3/other' }), true);
+  declared.recordDeclaredMcpToolEffect(TOOL, { readOnlyHint: true });
+  assert.equal(gate.requestEffectLearnable(TOOL, LIVE_ARGS), false);
 });

@@ -380,6 +380,18 @@ function canonicalExternalActionWriteClassification(
   const manifest = currentManifestOperationContract(operationId);
   if (manifest) {
     if (manifest.effect === 'read') return { mutating: false, classificationKnown: true };
+    // A native tool's manifest seals its server's declaration: "may write"
+    // (readOnly false, not destructive, nothing documented) is sealed as a
+    // write, and rightly so before anything is known. For a generic request
+    // tool that is one definition for every endpoint, so the request shape
+    // is what a settled call's evidence can refine. Live 2026-09-26: four
+    // DataForSEO POST .../live/... reads settled as writes under exactly
+    // this manifest.
+    if (
+      manifest.effect === 'external_write'
+      && learnedRequestEffect === 'reads_only'
+      && manifestSealsDeclaredMayWrite(manifest)
+    ) return { mutating: false, classificationKnown: false };
     if (
       manifest.effect === 'external_write'
       || manifest.effect === 'local_write'
@@ -453,6 +465,38 @@ function canonicalExternalActionIsWrite(
     declaredEffect,
     learnedRequestEffect,
   ).mutating;
+}
+
+/**
+ * A sealed write that is only the server's "may write" declaration: the
+ * manifest's effect is external_write, its hints say not read-only and not
+ * destructive, and nothing documented describes the operation. The one kind
+ * of manifest a learned request effect may refine; a documented write, a
+ * declared destructive tool, or a manifest with sealed semantics is never
+ * touched.
+ */
+export function manifestSealsDeclaredMayWrite(
+  manifest: { effect: string; semantics: unknown; behaviorHints: { readOnly: boolean | null; destructive: boolean | null } | null } | null,
+): boolean {
+  return Boolean(manifest)
+    && manifest!.effect === 'external_write'
+    && manifest!.semantics === null
+    && manifest!.behaviorHints?.readOnly === false
+    && manifest!.behaviorHints.destructive !== true;
+}
+
+/**
+ * Whether a settled call of this tool may teach its request shape's effect:
+ * an external call classified as a write only because nothing knew better,
+ * either with no manifest at all or under a manifest that seals a bare
+ * "may write" declaration.
+ */
+export function requestEffectLearnable(toolName: string, rawArgs: unknown): boolean {
+  const effect = classifyCanonicalExternalEffect(toolName, rawArgs);
+  if (!effect.external || !effect.mutating) return false;
+  if (!effect.classificationKnown) return true;
+  const canonical = canonicalExternalAction(toolName, rawArgs);
+  return manifestSealsDeclaredMayWrite(currentManifestOperationContract(canonical.operationId));
 }
 
 /**
