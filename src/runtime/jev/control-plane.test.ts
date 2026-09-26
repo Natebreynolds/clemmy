@@ -272,9 +272,10 @@ test('tryJevGroundingVerdict returns a typed verdict only when confidence is hig
 
 // The completion check asks Jev the typed questions it is built for: a few
 // independent yes/no readings over compact state. It settles a review only
-// when every reading it rests on is sure.
-function completionAnswers(nouls: Partial<Record<'delivered' | 'unaddressed' | 'unsupported' | 'asksUser' | 'cannotFinish', number>>) {
-  const values = { delivered: 0.5, unaddressed: 0.5, unsupported: 0.5, asksUser: 0.05, cannotFinish: 0.05, ...nouls };
+// when the delivery readings are sure and the reply leans supported by
+// evidence Jev saw in full, with no figure Jev finds computed.
+function completionAnswers(nouls: Partial<Record<'delivered' | 'unaddressed' | 'unsupported' | 'computed' | 'asksUser' | 'cannotFinish', number>>) {
+  const values = { delivered: 0.5, unaddressed: 0.5, unsupported: 0.5, computed: 0.05, asksUser: 0.05, cannotFinish: 0.05, ...nouls };
   return JSON.stringify({
     model: 'jev-1.13.0',
     answers: Object.fromEntries(Object.entries(values).map(([id, noul]) => [id, { type: 'noul', noul }])),
@@ -300,7 +301,7 @@ test('tryJevCompletionVerdict settles only when every yes/no reading is sure', a
   assert.equal(accepted?.judgeModelId, 'jev-1.13.0');
   assert.equal(accepted?.replyMatchesReceipts, 0.94);
   assert.equal(accepted?.requirementCoverage, 'satisfied');
-  for (const id of ['delivered', 'unaddressed', 'unsupported', 'asksUser', 'cannotFinish']) {
+  for (const id of ['delivered', 'unaddressed', 'unsupported', 'computed', 'asksUser', 'cannotFinish']) {
     assert.equal(posted.questions?.[id]?.type, 'noul', `${id} is its own yes/no question`);
   }
   assert.equal(posted.model, 'jev-1.13.0', 'the request names a pinned model, not the moving alias');
@@ -314,8 +315,13 @@ test('tryJevCompletionVerdict settles only when every yes/no reading is sure', a
   const missing = await ask({ delivered: 0.7, unaddressed: 0.9, unsupported: 0.1 });
   assert.equal(missing?.done, false, 'a sure unaddressed part is kept for the reviewer-unavailable path');
   assert.equal(missing?.requirementCoverage, 'missing');
-  assert.equal(await ask({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.4 }), null,
+  const leansSupported = await ask({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.3 });
+  assert.equal(leansSupported?.done, true,
+    'a read-back Jev leans supported settles: real answers add framing no result states word for word');
+  assert.equal(await ask({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.5 }), null,
     'a sure delivery that may state unsupported specifics goes to the reviewer');
+  assert.equal(await ask({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.1, computed: 0.9 }), null,
+    'an answer resting on a figure Jev finds computed stays with the reviewer');
   assert.equal(await ask({ delivered: 0.7, unaddressed: 0.3, unsupported: 0.3 }), null, 'unsure readings settle nothing');
   const question = await ask({ asksUser: 0.92 });
   assert.equal(question?.awaitingUser, true);
@@ -404,6 +410,25 @@ test('completion state stays inside Jev\'s budget and still lists every receipt'
   assert.match(posted.state.evidence, /FINAL READ: enabled=false$/, 'and so does the final read');
   assert.match(posted.state.evidence, /middle elided for length/);
   assert.ok(posted.state.evidenceNote, 'the elision is disclosed');
+});
+
+test('a completion check over clipped evidence never settles on support', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let posted: Record<string, any> = {};
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted = JSON.parse(String(init.body));
+    return { status: 200, ok: true, text: async () => completionAnswers({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.05 }) };
+  });
+  const receipts = { complete: true, outcomeEvidence: [{ toolName: 'read_report', outcome: 'succeeded', contentComplete: true }] };
+  const whole = await tryJevCompletionVerdict('Summarize the report', 'The report says revenue rose.', {
+    toolCallSummary: 'read_report: revenue rose', coverage: receipts,
+  });
+  assert.equal(whole?.done, true, 'the same readings settle when Jev saw every result in full');
+  const clipped = await tryJevCompletionVerdict('Summarize the report', 'The report says revenue rose.', {
+    toolCallSummary: 'read_report: ' + 'Row of the report. '.repeat(8_000), coverage: receipts,
+  });
+  assert.ok(posted.state?.evidenceNote, 'the evidence was elided');
+  assert.equal(clipped, null, 'content Jev did not see may be what a specific rests on, so the reviewer decides');
 });
 
 test('completion sends an identical embedded read block once without dropping distinct evidence', async () => {

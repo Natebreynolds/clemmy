@@ -675,7 +675,7 @@ export interface JevCompletionVerdict {
 }
 
 const COMPLETION_REASONS = {
-  done: 'Jev found the requested result delivered, with nothing left undone or unsupported.',
+  done: 'Jev found the requested result delivered and nothing left undone; nothing in it stood out as unsupported by the results.',
   incomplete: 'Jev found part of the request left without a result.',
   awaiting: 'Jev found a genuine question for the user.',
   blocked: 'Jev found the work cannot finish with available tools.',
@@ -689,9 +689,16 @@ const COMPLETION_STATE_BUDGET_CHARS = 72_000;
 const COMPLETION_REQUEST_CHARS = 3_000;
 const COMPLETION_RESPONSE_CHARS = 12_000;
 /** Each yes/no answer counts only this sure; Jev settles a review only when
- *  every question it rests on is. Uncalibrated until the decision log has
- *  measured it. */
+ *  every question it rests on is, except the support question below. */
 const COMPLETION_SURE = 0.85;
+/** The support question's bar. A real answer adds inference, framing and an
+ *  offer that no result states word for word, so Jev almost never rules out
+ *  every unsupported specific with certainty, even on a plain read-back the
+ *  reviewer accepts. A lean toward supported settles a review only where Jev
+ *  can see what it checks: the evidence in full, and no figure Jev finds
+ *  computed, since arithmetic, counting and dates are its weak spots and stay
+ *  with the reviewer. */
+const COMPLETION_UNSUPPORTED_MAX = 0.4;
 
 /** Head and tail of an over-long text, with the elision said in place. */
 function clipMiddle(text: string, max: number): { text: string; clipped: boolean } {
@@ -706,11 +713,12 @@ function clipMiddle(text: string, max: number): { text: string; clipped: boolean
  * Fast completion gate, in the typed form Jev is built for: a few independent
  * yes/no questions over compact state, instead of one broad verdict over the
  * whole evidence dump. Jev settles a review only when the reply delivered the
- * requested result, left no part without one, and states nothing the receipts
- * and evidence do not show, or when it closes on a real question. Anything
- * else returns a reading the caller may keep, or null, and the configured
- * reviewer decides. Numbers and dates are Jev's documented weak spots, so an
- * answer resting on them rarely clears the bar; that is the reviewer's work.
+ * requested result, left no part without one, and leans supported by evidence
+ * Jev saw in full, or when it closes on a real question. Anything else returns
+ * a reading the caller may keep, or null, and the configured reviewer
+ * decides. Numbers and dates are Jev's documented weak spots, so an answer Jev
+ * finds resting on a computed figure never settles here; that is the
+ * reviewer's work.
  */
 export async function tryJevCompletionVerdict(
   objective: string,
@@ -750,6 +758,14 @@ export async function tryJevCompletionVerdict(
         false: 'Every stated specific appears in receipts or evidence, or none is stated.',
       },
     },
+    computed: {
+      type: 'noul',
+      instructions: 'Does response state a figure that had to be worked out from evidence (a count, total, average, percentage, ranking, difference or date calculation) rather than copied as it appears in one result?',
+      criteria: {
+        true: 'At least one stated figure is computed, counted, ranked or compared.',
+        false: 'Every stated figure is copied as it appears in one result, or none is stated.',
+      },
+    },
     asksUser: {
       type: 'noul',
       instructions: 'Does response end by asking the user something they must answer before the work can continue?',
@@ -768,7 +784,8 @@ export async function tryJevCompletionVerdict(
   }));
   // The host summary already embeds its verified reads verbatim; send them
   // once. Every receipt is listed in full above, so eliding the middle of a
-  // long evidence text hides no result from the questions.
+  // long evidence text hides no call from the questions; it can hide content
+  // a specific rests on, so a clipped view never settles on support.
   const evidenceText = [
     opts?.toolCallSummary ?? '',
     opts?.verifiedReads && !opts.toolCallSummary?.includes(opts.verifiedReads) ? opts.verifiedReads : '',
@@ -798,6 +815,7 @@ export async function tryJevCompletionVerdict(
   const delivered = read('delivered');
   const unaddressed = read('unaddressed');
   const unsupported = read('unsupported');
+  const computed = read('computed');
   const asksUser = read('asksUser');
   const cannotFinish = read('cannotFinish');
   const sure = (value: number | null): boolean => value !== null && value >= COMPLETION_SURE;
@@ -805,7 +823,11 @@ export async function tryJevCompletionVerdict(
   let verdict: Omit<JevCompletionVerdict, 'judgeModelId'> | null = null;
   if (sure(asksUser)) {
     verdict = { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting, choice: 'awaiting', confidence: asksUser! };
-  } else if (sure(delivered) && sureNot(unaddressed) && sureNot(unsupported)) {
+  } else if (
+    sure(delivered) && sureNot(unaddressed)
+    && unsupported !== null && unsupported <= COMPLETION_UNSUPPORTED_MAX
+    && !evidence.clipped && !sure(computed)
+  ) {
     verdict = {
       done: true,
       reason: COMPLETION_REASONS.done,

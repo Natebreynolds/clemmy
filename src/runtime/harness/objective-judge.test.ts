@@ -34,7 +34,7 @@ function jevCompletionReading(kind: 'done' | 'incomplete' | 'awaiting' | 'missin
         : { delivered: 0.2, unaddressed: 0.5, unsupported, asksUser: 0.92 };
   return {
     model: 'jev-1.13.0',
-    answers: Object.fromEntries(Object.entries({ asksUser: 0.03, cannotFinish: 0.03, ...nouls })
+    answers: Object.fromEntries(Object.entries({ computed: 0.03, asksUser: 0.03, cannotFinish: 0.03, ...nouls })
       .map(([id, noul]) => [id, { type: 'noul', noul }])),
     usage: { input_tokens: 36, output_tokens: 5 },
   };
