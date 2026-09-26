@@ -95,7 +95,7 @@ export const WorkerToolInputSchema = z.object({
     .min(1)
     .nullable()
     .optional()
-    .describe('Model id; null or unroutable uses routing.'),
+    .describe('Model the user named; null uses routing.'),
   workManifest: WorkerManifestDescriptorSchema
     .nullable()
     .optional()

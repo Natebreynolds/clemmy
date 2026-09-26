@@ -5298,6 +5298,31 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * a stale tap can never widen into a session-wide kill (409 STALE_RUN_ATTEMPT,
    * exactly as on desktop).
    */
+  /** The owner answered "use <model> for <kind of work> from now on?" on the
+   *  phone. Same owner as the desktop door: Save writes the rule Settings →
+   *  Models shows; either answer closes the offer. */
+  router.post('/api/chat/sessions/:sessionId/model-rule-offers/:offerId', requireMobileSession, async (req, res) => {
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const offerId = Array.isArray(req.params.offerId) ? req.params.offerId[0] : req.params.offerId;
+    if (!harnessGetSession(sessionId)) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+    const action = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>).action : undefined;
+    if (action !== 'save' && action !== 'dismiss') {
+      res.status(400).json({ error: 'INVALID_ACTION', message: 'Choose save or just this once.' });
+      return;
+    }
+    try {
+      const { resolveWorkerModelOffer } = await import('../runtime/harness/worker-model-offer.js');
+      const result = await resolveWorkerModelOffer({ sessionId, offerId, action });
+      if (!result.ok) {
+        res.status(result.code === 'NOT_FOUND' ? 404 : 400).json({ error: result.code, message: result.message });
+        return;
+      }
+      res.json({ ok: true, action: result.action, alreadyResolved: result.alreadyResolved });
+    } catch (err) {
+      res.status(500).json({ error: 'SAVE_FAILED', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.post('/api/chat/sessions/:sessionId/cancel', requireMobileSession, async (req, res) => {
     const ctx = req.mobileSession!;
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;

@@ -390,6 +390,10 @@ export const EVENT_TYPES = [
   // mid-run daemon restart lost it; this makes the swarm's coverage + per-worker
   // spend restart-surviving and queryable for a 30-60min 100-subagent run.
   'worker_result',
+  // The owner named a model for one kind of work and a helper ran on it: the
+  // chat offers once to keep that as a rule, and records the owner's answer.
+  'worker_model_offer',
+  'worker_model_offer_resolved',
   // Durable long-horizon work graph. A manifest declares the canonical item
   // universe and ordered phases once; checkpoints update one canonical
   // item/phase with evidence; contract revisions decide whether completed

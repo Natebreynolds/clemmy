@@ -180,8 +180,12 @@ const GOLDEN = {
   // count, total, average or ranking is computed by tool_output_query over the
   // stored result, never read off rows (live 09-25: miscounted figures drove
   // most factual rejections). Legacy, native and fresh-action are unchanged.
-  instructions: { len: 31829, sha16: '69eb4212bed8c8a1' },
-  native: { len: 30936, sha16: 'e13ee9cdb94fb22a' },
+  // 2026-09-25 named-model phase requests: the legacy rubric no longer saves a
+  // standing rule the first time the user names a model for one phase. The
+  // phase runs on that model through run_worker's packet model, and the host
+  // offers to keep it; set_model_role is for a rule the user asks for.
+  instructions: { len: 31875, sha16: 'c9eac469104ff975' },
+  native: { len: 30982, sha16: '2aea8fb0afd4a18f' },
   claudeBrain: { len: 9095, sha16: 'eccdec0053e125e4' },
   lean: { len: 11100, sha16: '8e6dea1f165b21d3' },
 } as const;

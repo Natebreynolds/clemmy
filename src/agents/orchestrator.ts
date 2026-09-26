@@ -9,6 +9,8 @@ import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
 import { DEFAULT_CODEX_FAST_MODEL, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { routeWorkerModel, type WorkerRouteTrace } from '../runtime/harness/worker-model-route.js';
+import { recordWorkerModelOffer } from '../runtime/harness/worker-model-offer.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import type { RuntimeContextValue, TaskContinuationContext } from '../types.js';
 import { buildPlannerTool } from './planner.js';
@@ -440,15 +442,7 @@ export function isCommitSafeWorkerFallover(err: unknown): boolean {
 
 interface ChatWorkerModelRoute {
   model?: string;
-  trace?: {
-    seam: 'chat';
-    attemptedIntent: string;
-    matchedIntent: string | null;
-    item: string;
-    modelId: string;
-    provider: string;
-    source: string;
-  };
+  trace?: WorkerRouteTrace;
 }
 
 /** The executed model/provider recorded by the child run for this item (a
@@ -2558,6 +2552,28 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           error instanceof Error ? error.message : String(error), ['itemContexts:partition'],
         );
       }
+      // One model decision for the whole call: every item shares the packet.
+      // A model name nothing resolves is refused here, before any helper
+      // starts, instead of being swapped for another model at dispatch.
+      const routeSessionId = extractSessionId(runContext) ?? '';
+      const routeSourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq ?? extractSourceUserSeq(runContext);
+      const workerRoute = await routeWorkerModel({
+        sessionId: routeSessionId,
+        sourceUserSeq: routeSourceUserSeq,
+        model: call.model,
+        intent: call.intent,
+        objective: call.objective,
+        item: callItems[0],
+      });
+      if (workerRoute.kind === 'refuse') {
+        return refuseWorkerPacketBeforeDispatch(workerRoute.reason, workerRoute.shapes);
+      }
+      const decidedRoute: ChatWorkerModelRoute = { model: workerRoute.model, trace: workerRoute.trace };
+      const withRouteNote = (text: string): string => (workerRoute.hostNote ? `${workerRoute.hostNote}\n\n${text}` : text);
+      const offerAfterSuccess = (anySucceeded: boolean): void => {
+        if (!anySucceeded || !workerRoute.offer || !routeSessionId) return;
+        recordWorkerModelOffer({ sessionId: routeSessionId, sourceUserSeq: routeSourceUserSeq, offer: workerRoute.offer });
+      };
       // Advisory-only cost note for browser-per-item fan-outs (live 2026-07-23).
       const heavyAdvisory = maybeHeavyPerItemToolAdvisory(
         extractSessionId(runContext) ?? undefined,
@@ -2623,7 +2639,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         : null;
       const { items: _batch, itemContexts: _itemContexts, ...packetRaw } = call;
       const packetBase = bindWorkerPacketExpectedWork({
-        packet: packetRaw,
+        packet: { ...packetRaw, model: workerRoute.model },
         sessionId: manifestSessionId,
         sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
@@ -2668,7 +2684,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           }
           throw error;
         }
-        const previewRoute = resolveChatWorkerModel(specs[0]!.input);
+        const previewRoute = decidedRoute;
         const previewModel = getSessionWorkerModelOverride(manifestSessionId)
           ?? previewRoute.model
           ?? resolveRoleModel('worker').modelId;
@@ -2707,6 +2723,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                   perDetails,
                   manifestBinding,
                   lease,
+                  decidedRoute,
                 ) ?? '');
               } catch (err) {
                 if (
@@ -2741,12 +2758,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           ].join('\n\n');
         }
         if (callItems.length === 1 && batch.items[0]?.output !== undefined) {
-          return [
+          offerAfterSuccess(!workerResultIndicatesFailure(outs[0]));
+          return withRouteNote([
             ...(allRequestedItemsReused && manifestBinding ? [
               `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
             ] : []),
             outs[0], durableReuseGuidance,
-          ].filter(Boolean).join('\n\n');
+          ].filter(Boolean).join('\n\n'));
         }
         const rendered = callItems.map((item, index) => {
           const text = outs[index] ?? `ERROR: worker for "${item}" crashed before returning a result.`;
@@ -2799,20 +2817,25 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           : uniform
             ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
             : `Batch finished with FAILURES: ${rendered.length - failedItems.length}/${rendered.length} succeeded; FAILED items: ${failedItems.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
-        return [
+        offerAfterSuccess(rendered.some((r) => !r.failed));
+        return withRouteNote([
           ...(heavyAdvisory ? [heavyAdvisory] : []),
           header,
           ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`),
           ...(durableReuseGuidance ? [durableReuseGuidance] : []),
-        ].join('\n\n');
+        ].join('\n\n'));
       }
-      const singleResult = await runOneOrchestratorWorker(
+      const rawSingleResult = await runOneOrchestratorWorker(
         { ...packetBase, item: callItems[0],
           context: workerContextForItem(packetBase.context, itemContexts, callItems[0]!) } as WorkerToolInput,
         runContext,
         details,
         manifestBinding,
+        undefined,
+        decidedRoute,
       );
+      const singleResult = typeof rawSingleResult === 'string' ? withRouteNote(rawSingleResult) : rawSingleResult;
+      if (typeof rawSingleResult === 'string') offerAfterSuccess(!workerResultIndicatesFailure(rawSingleResult));
       if (!allRequestedItemsReused || !manifestBinding) return singleResult;
       return [
         `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
@@ -2857,12 +2880,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     details: any,
     manifestBinding?: PreparedWorkerManifest,
     batchLease?: WorkerBatchExecutionLease,
+    // The call's one model decision (routeWorkerModel); absent only on paths
+    // that never went through the run_worker tool body.
+    decidedRoute?: ChatWorkerModelRoute,
   ) => {
     {
       const input = params as WorkerToolInput;
       // Wave 4 Stage 1: packet key for durable-resume idempotency (see below).
       const packetKey = workerPacketKey(input);
-      const route = resolveChatWorkerModel(input);
+      const route: ChatWorkerModelRoute = decidedRoute
+        ? { ...decidedRoute, ...(decidedRoute.trace ? { trace: { ...decidedRoute.trace, item: input.item } } : {}) }
+        : resolveChatWorkerModel(input);
       const sessionId = extractSessionId(runContext);
       const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
       const assertWorkerMayStart = (): void => {

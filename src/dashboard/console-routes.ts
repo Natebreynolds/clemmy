@@ -15543,6 +15543,31 @@ export function registerConsoleRoutes(
    * the foreground left off, and reports back to this chat. Frees the composer
    * immediately for the next request.
    */
+  /** The owner answered "use <model> for <kind of work> from now on?".
+   *  Save writes the rule through the one settings owner (it shows in
+   *  Settings → Models); either answer closes the offer. */
+  app.post('/api/console/harness-sessions/:sessionId/model-rule-offers/:offerId', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = req.params.sessionId;
+    if (!getHarnessSession(sessionId)) { res.status(404).json({ error: 'session not found' }); return; }
+    const action = (req.body ?? {}).action;
+    if (action !== 'save' && action !== 'dismiss') {
+      res.status(400).json({ error: 'action must be "save" or "dismiss"' });
+      return;
+    }
+    try {
+      const { resolveWorkerModelOffer } = await import('../runtime/harness/worker-model-offer.js');
+      const result = await resolveWorkerModelOffer({ sessionId, offerId: req.params.offerId, action });
+      if (!result.ok) {
+        res.status(result.code === 'NOT_FOUND' ? 404 : 400).json({ error: result.message, code: result.code });
+        return;
+      }
+      res.json({ ok: true, action: result.action, alreadyResolved: result.alreadyResolved });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/harness-sessions/:sessionId/background', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const sessionId = req.params.sessionId;

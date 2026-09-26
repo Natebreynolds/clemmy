@@ -18,6 +18,8 @@ import {
 } from '../agents/worker-batch-execution.js';
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { routeWorkerModel } from '../runtime/harness/worker-model-route.js';
+import { recordWorkerModelOffer } from '../runtime/harness/worker-model-offer.js';
 import { DEFAULT_CLAUDE_FAST_MODEL, getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
@@ -229,12 +231,29 @@ export function registerWorkerTools(server: McpServer): void {
           ? `Manifest guidance: the complete "${manifestBinding.phase}" phase is already proven for ${manifestBinding.manifestId} contract ${manifestBinding.contractVersion}. Do not call run_worker again for this phase; synthesize the user-facing result now from the returned work-products and durable evidence.`
           : `Manifest guidance: this requested slice is already proven for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. Do not repeat these items; continue only with canonical items that remain incomplete.`
         : null;
+      // The same one-per-call model decision as the orchestrator lane: a model
+      // name nothing resolves is refused before any helper starts.
+      const workerRoute = await routeWorkerModel({
+        sessionId: manifestSessionId,
+        sourceUserSeq: manifestSourceUserSeq,
+        model: call.model,
+        intent: call.intent,
+        objective: call.objective,
+        item: callItems[0],
+      });
+      if (workerRoute.kind === 'refuse') return textResult(`ERROR: workers were NOT started — ${workerRoute.reason}`);
+      const withRouteNote = (text: string): string => (workerRoute.hostNote ? `${workerRoute.hostNote}\n\n${text}` : text);
+      const offerAfterSuccess = (anySucceeded: boolean): void => {
+        if (!anySucceeded || !workerRoute.offer || !manifestSessionId) return;
+        recordWorkerModelOffer({ sessionId: manifestSessionId, sourceUserSeq: manifestSourceUserSeq, offer: workerRoute.offer });
+      };
       const { items: _batch, ...packetRaw } = call;
       // One authority-derived packet shape across SDK-brain, orchestrator and
       // nested carrier worker lanes. Model-provided expectedWork is only a hint;
       // the durable accepted-task contract supplies the binding when proven.
+      // The packet carries the model that will actually run.
       const packetBase = bindWorkerPacketExpectedWork({
-        packet: packetRaw,
+        packet: { ...packetRaw, model: workerRoute.model },
         sessionId: manifestSessionId,
         sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
@@ -274,7 +293,7 @@ export function registerWorkerTools(server: McpServer): void {
           }
           throw error;
         }
-        const batchRoute = resolveSdkBrainWorker(call.intent || undefined, call.model || undefined);
+        const batchRoute = resolveSdkBrainWorker(call.intent || undefined, workerRoute.model);
         const batchProvider = resolveEffectiveProviderForModel(batchRoute.modelId);
         let batch: WorkerBatchExecutionResult<string>;
         try {
@@ -389,19 +408,22 @@ export function registerWorkerTools(server: McpServer): void {
           : uniform
             ? `PARALLEL FAN-OUT IS DOWN for this run: ALL ${rendered.length} items failed IDENTICALLY (${uniform}). This is an infrastructure failure, not an item problem — do NOT call run_worker again this turn. Process the remaining work inline and TELL THE USER the run degraded to sequential (and why).`
             : `Batch finished with FAILURES: ${rendered.length - failed.length}/${rendered.length} succeeded; FAILED items: ${failed.map((f) => f.item).join(', ')}. Report these honestly — they were NOT done.`;
-        return textResult([
+        offerAfterSuccess(rendered.some((r) => !r.failed));
+        return textResult(withRouteNote([
           ...(heavyAdvisory ? [heavyAdvisory] : []),
           header,
           ...rendered.map((r) => `--- item: ${r.item} ---\n${r.text}`),
           ...(durableReuseGuidance ? [durableReuseGuidance] : []),
-        ].join('\n\n'));
+        ].join('\n\n')));
       }
       const singleResult = await runOneWorker(
         { ...packetBase, item: callItems[0] } as WorkerToolInput,
         manifestBinding,
       );
-      if (!allRequestedItemsReused || !manifestBinding) return singleResult;
       const singleText = String(singleResult.content?.[0]?.text ?? '');
+      offerAfterSuccess(!workerResultIndicatesFailure(singleText));
+      const reusedReceipt = allRequestedItemsReused && manifestBinding;
+      if (!reusedReceipt && !workerRoute.hostNote) return singleResult;
       // The inner result may already be an authenticated compact projection.
       // Keep these host facts in the formatter's annotation channel: prepending
       // them to that projection and formatting again redeems the original bytes
@@ -410,8 +432,11 @@ export function registerWorkerTools(server: McpServer): void {
         ...singleResult,
         content: [{ type: 'text' as const, text: formatRecallableToolText(singleText, {
           hostAnnotations: [
-            `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
-            ...(durableReuseGuidance ? [durableReuseGuidance] : []),
+            ...(workerRoute.hostNote ? [workerRoute.hostNote] : []),
+            ...(reusedReceipt && manifestBinding ? [
+              `Durable receipt: this item was already complete for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. No worker ran and no action was repeated.`,
+              ...(durableReuseGuidance ? [durableReuseGuidance] : []),
+            ] : []),
           ],
         }) }],
       };

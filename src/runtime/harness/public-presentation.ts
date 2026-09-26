@@ -41,6 +41,7 @@ import {
 } from './settled-read-replay-semantics.js';
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 import { appForWriteAction } from '../../integrations/composio/toolkit-identity.js';
+import { workerModelOfferResolution } from './worker-model-offer.js';
 import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMode } from './task-mode.js';
 import {
   isInteractiveConsentConsequence,
@@ -1057,6 +1058,20 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'worker_result':
     case 'worker_capped':
       return selected(data, ['item', 'role', 'model', 'provider', 'ok']);
+    case 'worker_model_offer': {
+      // The offer carries its own answer, so a replay never shows an offer
+      // the owner already answered.
+      const offerId = firstString(data.offerId);
+      if (!offerId || !/^wmo-[a-f0-9]{16}$/.test(offerId)) return null;
+      let resolved: string | null = null;
+      try { resolved = workerModelOfferResolution(event.sessionId, offerId); } catch { resolved = null; }
+      return {
+        ...selected(data, ['offerId', 'intent', 'modelId', 'modelName']),
+        ...(resolved ? { resolved } : {}),
+      };
+    }
+    case 'worker_model_offer_resolved':
+      return selected(data, ['offerId', 'action']);
     case 'coding_run_activity':
       return publicCodingRunActivity(data);
     case 'coding_run_settled':
