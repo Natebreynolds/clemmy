@@ -51,6 +51,9 @@ import {
   boundaryCodexJudgeModel,
   boundaryJudgeTimeoutMs,
   exactJudgeBoundaryTimeoutMs,
+  checkerQuotaExhaustion,
+  describeCheckerQuotaExhaustion,
+  CheckerQuotaUnavailableError,
 } from './judge-family.js';
 // Re-exported from the judge-family leaf (moved out of this file) so existing
 // importers of debate-model keep working: console-routes (debateBrainsAvailable),
@@ -1084,9 +1087,10 @@ export interface BoundaryJudgeRouting {
    *  Carried into durable terminal results so requested-vs-actual stays
    *  auditable after the fact, not only at routing time. */
   requestedModelId?: string;
-  /** Why a substitute is standing in: the exact pin never resolved, or it led
-   *  the chain and this is a later fallback lane. */
-  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin';
+  /** Why a substitute is standing in: the exact pin never resolved, it led
+   *  the chain and this is a later fallback lane, or its provider's plan quota
+   *  is used up (resolveCheckerQuotaFallthrough). */
+  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin' | 'exact_pin_quota_exhausted';
   /** Concrete provider adapter used for the call. A non-null model plus this
    * field prevents a model-id string from being resolved through a different
    * globally registered provider. */
@@ -1518,6 +1522,136 @@ export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting, selecti
     };
   }
   return null;
+}
+
+/** What the completion review dials: its checker, and the tail-latency hedge
+ *  when one applies. */
+export interface CompletionCheckerRoute {
+  primary: BoundaryJudgeRouting;
+  hedge: BoundaryJudgeRouting | null;
+}
+
+/**
+ * The COMPLETION CHECKER's route: resolveBoundaryJudge plus its hedge, aware
+ * of the chosen checker's plan quota. A chosen checker whose provider can
+ * serve is used exactly as before and never swapped. One whose provider is
+ * provably out of quota is not dialed; the review moves to the next available
+ * family (resolveCheckerQuotaFallthrough). The other boundary lanes still call
+ * resolveBoundaryJudge directly.
+ */
+export function resolveCompletionCheckerRoute(
+  selection?: CapturedBoundaryJudgeSelection,
+  author?: ResolvedRoleModel,
+): CompletionCheckerRoute {
+  if (selection?.status === 'unavailable') throw new Error(selection.reason);
+  const captured = selection?.status === 'captured' ? selection : undefined;
+  const chosen = captured?.role ?? downshiftForBoundary(resolveRoleModel('judge'));
+  // An explicit pin names its provider before anything is built. Without this
+  // a pinned Codex checker out of quota reads as merely "unavailable", since
+  // codexAvailable() already counts quota and nothing would be built for it.
+  if (!chosen.inactiveBinding && hasExplicitJudgeBinding(chosen)) {
+    const exhausted = checkerQuotaExhaustion(chosen.provider);
+    if (exhausted) {
+      return {
+        primary: resolveCheckerQuotaFallthrough({ modelId: chosen.modelId, provider: chosen.provider,
+          why: describeCheckerQuotaExhaustion(exhausted) }, selection, author),
+        hedge: null,
+      };
+    }
+  }
+  const primary = resolveBoundaryJudge(selection, author);
+  const exhausted = checkerQuotaExhaustion(primary.judgeFamily);
+  if (exhausted) {
+    return {
+      primary: resolveCheckerQuotaFallthrough({ modelId: primary.modelId, provider: primary.judgeFamily,
+        why: describeCheckerQuotaExhaustion(exhausted) }, selection, author),
+      hedge: null,
+    };
+  }
+  const hedge = resolveBoundaryJudgeHedge(primary, selection);
+  // A hedge onto an account that is out of quota is a call that cannot answer.
+  return { primary, hedge: hedge && !checkerQuotaExhaustion(hedge.judgeFamily) ? hedge : null };
+}
+
+/** The checker that cannot serve this review, and why, in words for the record. */
+export interface CheckerOutage {
+  modelId: string;
+  provider: ModelProviderClass;
+  why: string;
+}
+
+/**
+ * The stand-in for a completion checker whose provider is out of quota (live
+ * 2026-09-21: every review failed open while the Claude plan window was used
+ * up). The J1 chain's members without the family that is out: another
+ * flagship family's cheap checker, one that did not write the answer first;
+ * then, for an answer a BYO model wrote, that family's own checker. A stand-in
+ * that shares the answer's family says so (selfJudge). It is marked as a
+ * stand-in whenever the owner pinned the checker, is never owner-selected,
+ * and keeps a pinned checker's deliberate deadline. Honours the chain
+ * kill-switch. Throws CheckerQuotaUnavailableError, whose message is the
+ * reason the unreviewed verdict records, when nothing may or can stand in.
+ */
+export function resolveCheckerQuotaFallthrough(
+  outage: CheckerOutage,
+  selection?: CapturedBoundaryJudgeSelection,
+  author?: ResolvedRoleModel,
+): BoundaryJudgeRouting {
+  const captured = selection?.status === 'captured' ? selection : undefined;
+  const lead = `The completion checker ${outage.modelId} could not review this answer: ${outage.why}.`;
+  if (!judgeChainEnabled()) {
+    throw new CheckerQuotaUnavailableError(`${lead} Standing in another checker is turned off `
+      + '(CLEMMY_JUDGE_CHAIN=off), so no review was completed.');
+  }
+  const configuredBrain = resolveRoleModel('brain');
+  const brainFamily = executedBrainFamily(configuredBrain.provider);
+  const reviewed = author ?? { ...configuredBrain, provider: brainFamily };
+  const requested = requestedJudgePinModelId(captured);
+  const standIn = (routing: BoundaryJudgeRouting): BoundaryJudgeRouting => {
+    const marked: BoundaryJudgeRouting = {
+      ...routing,
+      timeoutMs: requested ? exactJudgeBoundaryTimeoutMs() : routing.timeoutMs ?? boundaryJudgeTimeoutMs(),
+      ...(requested && routing.modelId !== requested
+        ? { substituteForExactPin: true, requestedModelId: requested, substituteReason: 'exact_pin_quota_exhausted' as const }
+        : {}),
+    };
+    logger.warn({ from: outage.modelId, fromFamily: outage.provider, to: marked.modelId, toFamily: marked.judgeFamily,
+      selfJudge: marked.selfJudge }, 'completion checker cannot serve for quota; the next family checks this review');
+    return marked;
+  };
+  const haveClaude = claudeAvailable() && !checkerQuotaExhaustion('claude');
+  const haveCodex = codexAvailable();
+  const flagships = ([
+    { provider: 'claude', modelId: captured?.defaultModels.claude ?? boundaryClaudeJudgeModel(), available: haveClaude },
+    { provider: 'codex', modelId: captured?.defaultModels.codex ?? boundaryCodexJudgeModel(), available: haveCodex },
+  ] as const)
+    .filter((f) => f.available && f.provider !== outage.provider)
+    // A family independent of the answer's author first; its own family last.
+    .sort((a, b) => Number(a.provider === reviewed.provider) - Number(b.provider === reviewed.provider));
+  for (const f of flagships) {
+    let model: Model | null = null;
+    try {
+      model = buildJudgeForRole({ modelId: f.modelId, provider: f.provider, source: 'default' }, haveClaude, haveCodex, captured);
+    } catch { /* this family cannot build here; try the next */ }
+    if (!model) continue;
+    return standIn({
+      model,
+      modelId: f.modelId,
+      judgeFamily: f.provider,
+      brainFamily,
+      ...(author ? { authorFamily: author.provider } : {}),
+      transport: boundaryTransport(f.provider),
+      selfJudge: f.provider === reviewed.provider,
+    });
+  }
+  // The chain's last resort, for an answer a BYO model wrote. Never the family
+  // that just ran out, and never a captured non-BYO selection re-resolved by
+  // model name (resolveSameFamilyBoundaryJudge refuses that).
+  if (reviewed.provider === 'byo' && outage.provider !== 'byo') {
+    try { return standIn(resolveSameFamilyBoundaryJudge(reviewed, captured)); } catch { /* no BYO route */ }
+  }
+  throw new CheckerQuotaUnavailableError(`${lead} No other model family is available to check the work, `
+    + 'so no review was completed.');
 }
 
 export function resolveDebateBrains(passthrough: ModelProvider, modelName?: string): DebateBrains | null {

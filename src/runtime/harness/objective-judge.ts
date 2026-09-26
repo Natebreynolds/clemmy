@@ -8,7 +8,8 @@ import { MODELS } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
 import type { BoundaryJudgeRouting, CapturedBoundaryJudgeSelection } from './debate-model.js';
-import { recordJudgeMetric, withJudgeHedge, type JudgeMetricLane, type JudgeMetricOutcome, goalJudgeTimeoutMs } from './judge-family.js';
+import { recordJudgeMetric, withJudgeHedge, type JudgeMetricLane, type JudgeMetricOutcome, goalJudgeTimeoutMs, CheckerQuotaUnavailableError } from './judge-family.js';
+import { providerCapacityErrorText } from '../../shared/provider-capacity.js';
 import { extractJsonCandidate } from './json-repair.js';
 import { estimateMessagesTokens, predictTurnCost } from './budget.js';
 import { renderSkillReference, type SessionSkill } from './skill-execution.js';
@@ -124,7 +125,7 @@ export interface ObjectiveJudgeVerdict {
   judgeProviderId?: string;
   substituteForExactPin?: boolean;
   requestedJudgeModelId?: string;
-  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin';
+  substituteReason?: BoundaryJudgeRouting['substituteReason'];
   /**
    * The judge ruled the turn's deliverable is a genuine direction/authorization
    * question to the user (AWAITING verdict). Treated as done for bounce purposes;
@@ -882,6 +883,15 @@ export function completionJudgeContextAdmission(
 
 class JudgeContextUnavailableError extends Error {}
 
+/** The provider's own words when a checker call was refused for lack of plan
+ *  quota or credit: the shared classifier's "another attempt on this account
+ *  cannot help". Null for every other failure, which stays unjudged. */
+function quotaRefusalWords(error: unknown): string | null {
+  const shape = classifyModelError(error);
+  if (shape.kind !== 'model.rate_limited' || shape.sameProviderRetryable !== false) return null;
+  return redactSensitiveText(providerCapacityErrorText(error)).replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
 /** The same attempt used by the primary and hedge, exported for a provider-
  * free test of the actual assembled SDK request. This does not add a judge. */
 export async function runRoutedJudgeAttempt<T>(
@@ -992,14 +1002,24 @@ export async function runHedgedJudge<T>(
   opts: {
     timeoutMs?: number; requireCompletePrompt?: boolean; boundaryJudgeSelection?: CapturedBoundaryJudgeSelection;
     evidence?: JudgeEvidenceSource; reviewedAuthor?: ResolvedRoleModel;
+    /** The completion checker's route, aware of its provider's plan quota
+     *  (resolveCompletionCheckerRoute). Other lanes keep the boundary route. */
+    quotaAwareRoute?: boolean;
   } = {},
 ): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   try {
-    const { resolveBoundaryJudge, resolveBoundaryJudgeHedge } = await import('./debate-model.js');
-    routing = resolveBoundaryJudge(opts.boundaryJudgeSelection, opts.reviewedAuthor);
-    const hedgeRouting = resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
+    const debate = await import('./debate-model.js');
+    let hedgeRouting: BoundaryJudgeRouting | null;
+    if (opts.quotaAwareRoute) {
+      const route = debate.resolveCompletionCheckerRoute(opts.boundaryJudgeSelection, opts.reviewedAuthor);
+      routing = route.primary;
+      hedgeRouting = route.hedge;
+    } else {
+      routing = debate.resolveBoundaryJudge(opts.boundaryJudgeSelection, opts.reviewedAuthor);
+      hedgeRouting = debate.resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
+    }
     // Every attempt is attributed to its lane so the usage log can rank judge
     // spend per lane; the turn's own session/source attribution is preserved.
     const inherited = modelUsageAttributionStorage.getStore();
@@ -1016,12 +1036,35 @@ export async function runHedgedJudge<T>(
     // the 25s cheap-checker default and timing out into fail-open — reported to
     // the owner as if the pinned judge had agreed.
     const effectiveTimeoutMs = opts.timeoutMs ?? routing.timeoutMs;
+    // The route that answers the primary attempt. A quota meter can lag the
+    // provider, and a spent allowance the meter cannot see (extra usage, a
+    // model-scoped cap) surfaces only as the provider's own refusal. When the
+    // chosen checker is refused for lack of quota, the review moves to the next
+    // family once; any other failure stays unjudged as before. With a hedge in
+    // play, the hedge already starts the moment the primary fails.
+    const chosen = routing;
+    let answering = chosen;
+    const primaryAttempt = opts.quotaAwareRoute && !hedgeRouting
+      ? async (): Promise<T> => {
+          try {
+            return await attempt(chosen)();
+          } catch (error) {
+            const refusal = quotaRefusalWords(error);
+            if (refusal === null) throw error;
+            answering = debate.resolveCheckerQuotaFallthrough({
+              modelId: chosen.modelId, provider: chosen.judgeFamily,
+              why: `its provider refused the review for lack of quota or credit${refusal ? ` ("${refusal}")` : ''}`,
+            }, opts.boundaryJudgeSelection, opts.reviewedAuthor);
+            return await attempt(answering)();
+          }
+        }
+      : attempt(chosen);
     const raced = await withJudgeHedge(
-      attempt(routing),
+      primaryAttempt,
       hedgeRouting ? attempt(hedgeRouting) : null,
       effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {},
     );
-    const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;
+    const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : answering;
     if (raced.value !== null) {
       recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
       return { value: raced.value, failure: null, routing: winner };
@@ -1035,16 +1078,18 @@ export async function runHedgedJudge<T>(
     const invalidDetail = failure === 'invalid'
       ? raced.errors.find((e) => e instanceof JudgeVerdictParseError)?.message.replace(/^judge output did not parse;?\s*/, '').slice(0, 260)
       : undefined;
-    recordCompletionJudgeMetric(failure, startedAt, routing, lane);
+    recordCompletionJudgeMetric(failure, startedAt, answering, lane);
+    const quotaUnavailable = raced.errors.find((error) => error instanceof CheckerQuotaUnavailableError);
     const contextFailure = raced.errors.find((error) => error instanceof JudgeContextUnavailableError);
     const rateLimited = raced.errors.some((error) => classifyModelError(error).kind === 'model.rate_limited');
     const transportError = failure === 'error' ? raced.errors.find((error) => error instanceof Error) : undefined;
-    const unavailableReason = contextFailure instanceof Error ? contextFailure.message
+    const unavailableReason = quotaUnavailable instanceof Error ? quotaUnavailable.message
+      : contextFailure instanceof Error ? contextFailure.message
       : rateLimited ? 'A completion reviewer was rate-limited; no review was completed. Choose an available reviewer in Settings.'
         : transportError instanceof Error
           ? `The completion reviewer was unavailable; no review was completed. ${redactSensitiveText(transportError.message).replace(/\s+/g, ' ').slice(0, 400)}`
         : undefined;
-    return { value: null, failure, routing, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
+    return { value: null, failure, routing: answering, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
   } catch (err) {
     recordCompletionJudgeMetric('error', startedAt, routing, lane);
     logDebugSafe(err);
@@ -1093,7 +1138,8 @@ async function runCompletionJudge(
       ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
       ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}),
       ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}),
-      ...(skillContext?.reviewedAuthor ? { reviewedAuthor: skillContext.reviewedAuthor } : {}) },
+      ...(skillContext?.reviewedAuthor ? { reviewedAuthor: skillContext.reviewedAuthor } : {}),
+      quotaAwareRoute: true },
   );
   return { verdict: run.value, failure: run.failure, routing: run.routing,
     ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),

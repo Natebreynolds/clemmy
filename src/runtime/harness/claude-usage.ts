@@ -16,6 +16,7 @@ import { installedClaudeClientVersion } from './claude-client-version.js';
  * immediately and kicks a background refresh when stale.
  */
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
+import { isolatedTestContractActive } from './isolated-test-contract.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.claude-usage' });
@@ -103,6 +104,9 @@ export function parseClaudeUsage(body: unknown, now: number): ClaudeUsageSnapsho
 }
 
 async function refresh(): Promise<void> {
+  // The usage endpoint is the owner's live Claude account. A test run never
+  // calls it; a test installs its reading with __setClaudeUsageForTests.
+  if (isolatedTestContractActive()) return;
   if (inflight) return;
   inflight = true;
   lastAttempt = Date.now();
@@ -135,9 +139,66 @@ export function getClaudeUsageSnapshot(): ClaudeUsageSnapshot | null {
   return cache;
 }
 
+/** How long a usage reading stays evidence of CURRENT exhaustion. The same
+ *  bound, for the same reason, as the Codex reading (rate-limit-store.ts): a
+ *  single stale 100% sample must never lock an account out for a whole window.
+ *  Past it, the account is dialed again and the provider's answer decides. */
+export const CLAUDE_QUOTA_SAMPLE_FRESH_MS = 15 * 60_000;
+
+export interface ClaudeQuotaExhaustion {
+  /** The plan window that is used up. */
+  window: 'five_hour' | 'seven_day';
+  usedPercent: number;
+  resetAt: number;
+  capturedAt: number;
+}
+
+/**
+ * PURE: does this reading PROVE the account cannot serve right now? Only a
+ * fresh reading of a plan window at 100% with its reset still ahead counts.
+ * Not while extra usage is on: the account keeps serving past the plan window
+ * then, and when extra usage runs out too the provider's own refusal says so.
+ * A model-scoped cap is also left to that refusal, because the reading names
+ * the capped model only by its display name. Missing, stale or expired data
+ * proves nothing.
+ */
+export function claudeUsageExhaustion(snapshot: ClaudeUsageSnapshot | null | undefined, now: number): ClaudeQuotaExhaustion | null {
+  if (!snapshot || snapshot.extraUsageEnabled === true) return null;
+  const capturedAt = snapshot.capturedAt;
+  if (!(capturedAt > 0) || now - capturedAt > CLAUDE_QUOTA_SAMPLE_FRESH_MS) return null;
+  const windows: Array<[ClaudeQuotaExhaustion['window'], ClaudeUsageWindow | undefined]> = [
+    ['five_hour', snapshot.fiveHour],
+    ['seven_day', snapshot.weekly],
+  ];
+  for (const [window, reading] of windows) {
+    if (reading && reading.usedPercent >= 100 && typeof reading.resetAt === 'number' && reading.resetAt > now) {
+      return { window, usedPercent: reading.usedPercent, resetAt: reading.resetAt, capturedAt };
+    }
+  }
+  return null;
+}
+
+/** The account's plan quota as the usage meters read it. Answers from the
+ *  cached reading at once and, like the meters, kicks the throttled background
+ *  refresh when the reading is old. Never blocks, never throws. */
+export function claudeQuotaExhaustion(now: number = Date.now()): ClaudeQuotaExhaustion | null {
+  try {
+    return claudeUsageExhaustion(getClaudeUsageSnapshot(), now);
+  } catch {
+    return null;
+  }
+}
+
 /** Test-only: clear the cache + refresh gate. */
 export function __resetClaudeUsageForTests(): void {
   cache = null;
   inflight = false;
   lastAttempt = 0;
+}
+
+/** Test-only: install a usage reading and hold off the background refresh. */
+export function __setClaudeUsageForTests(snapshot: ClaudeUsageSnapshot | null): void {
+  cache = snapshot;
+  inflight = false;
+  lastAttempt = Date.now();
 }

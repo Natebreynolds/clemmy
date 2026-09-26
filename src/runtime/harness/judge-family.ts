@@ -14,6 +14,7 @@
  * decision into a live Model.
  */
 import { codexQuotaExhausted } from './rate-limit-store.js';
+import { claudeQuotaExhaustion } from './claude-usage.js';
 import { DEFAULT_CODEX_FAST_MODEL, getRuntimeEnv } from '../../config.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getClaudeAuthSnapshot } from '../claude-oauth.js';
@@ -49,6 +50,68 @@ export function codexAvailable(): boolean {
 /** Diagnostic: which flagships are logged in. Debate needs BOTH. */
 export function debateBrainsAvailable(): { claude: boolean; codex: boolean } {
   return { claude: claudeAvailable(), codex: codexAvailable() };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// The COMPLETION CHECKER's quota availability.
+//
+// claudeAvailable() has no quota check (codexAvailable() has one), so a checker
+// on a used-up Claude plan kept being chosen and every completion review failed
+// open as unreviewed (live 2026-09-21). claudeAvailable() stays as it is: brain
+// routing reads it too (router-model.ts, the session brain pin in
+// model-roles.ts), and moving the brain is a separate decision. The checker
+// asks this instead. Signing out is not a quota state: an explicit pin that
+// cannot sign in stays unavailable (objective-judge-pin.integration.test.ts).
+// ─────────────────────────────────────────────────────────────────
+
+export interface CheckerQuotaExhaustion {
+  provider: 'claude' | 'codex';
+  /** The used-up plan window and its reset, when the provider reported them. */
+  window?: 'five_hour' | 'seven_day';
+  resetAt?: number;
+}
+
+/** The checker's provider is signed in but provably out of plan quota right
+ *  now, by the app's own trackers: Claude's usage meter (claude-usage.ts), and
+ *  Codex's captured windows and 429 latch (rate-limit-store.ts). Null when the
+ *  provider can serve, is signed out, or nothing proves exhaustion. */
+export function checkerQuotaExhaustion(provider: ModelProviderClass, now: number = Date.now()): CheckerQuotaExhaustion | null {
+  try {
+    if (provider === 'claude') {
+      if (!claudeAvailable()) return null;
+      const reading = claudeQuotaExhaustion(now);
+      return reading ? { provider, window: reading.window, resetAt: reading.resetAt } : null;
+    }
+    if (provider === 'codex') {
+      if (!getStoredCodexOAuthTokens()?.accessToken) return null;
+      return codexQuotaExhausted(now) ? { provider } : null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** The exhaustion as a clause for the reason recorded on the verdict. */
+export function describeCheckerQuotaExhaustion(exhaustion: CheckerQuotaExhaustion): string {
+  const plan = exhaustion.provider === 'claude' ? 'Claude' : 'Codex';
+  const limit = exhaustion.window === 'five_hour' ? 'five-hour limit'
+    : exhaustion.window === 'seven_day' ? 'weekly limit'
+      : 'usage limit';
+  const until = typeof exhaustion.resetAt === 'number' && Number.isFinite(exhaustion.resetAt)
+    ? ` until ${new Date(exhaustion.resetAt).toISOString()}`
+    : '';
+  return `the ${plan} plan's ${limit} is used up${until}`;
+}
+
+/** No checker may or can review this answer: the message is the reason the
+ *  unreviewed verdict records. Typed so the review keeps this reason rather
+ *  than a generic "unavailable". */
+export class CheckerQuotaUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CheckerQuotaUnavailableError';
+  }
 }
 
 /** Cross-provider judging is the DEFAULT (2026-07-12): the judge should never be

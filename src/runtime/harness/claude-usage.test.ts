@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseClaudeUsage } from './claude-usage.js';
+import { CLAUDE_QUOTA_SAMPLE_FRESH_MS, claudeUsageExhaustion, parseClaudeUsage } from './claude-usage.js';
 
 // Verbatim shape from a live GET https://api.anthropic.com/api/oauth/usage.
 const LIVE_BODY = {
@@ -87,4 +87,39 @@ test('surfaces an active model-scoped weekly cap even when overall weekly usage 
   });
   assert.equal(snap!.extraUsageEnabled, false);
   assert.equal(snap!.extraUsageUserDisabled, true);
+});
+
+// The checker reads this rule to decide whether the Claude account can serve a
+// review (judge-family.ts checkerQuotaExhaustion). Only proof counts.
+const NOW = Date.parse('2026-09-25T12:00:00Z');
+const HOUR = 3_600_000;
+const usedUp = { usedPercent: 100, resetAt: NOW + HOUR };
+
+test('exhaustion: a fresh reading of a used-up plan window with its reset ahead is proof', () => {
+  assert.deepEqual(claudeUsageExhaustion({ fiveHour: usedUp, capturedAt: NOW - 60_000 }, NOW),
+    { window: 'five_hour', usedPercent: 100, resetAt: NOW + HOUR, capturedAt: NOW - 60_000 });
+  assert.equal(claudeUsageExhaustion({ fiveHour: { usedPercent: 12, resetAt: NOW + HOUR }, weekly: usedUp, capturedAt: NOW }, NOW)?.window,
+    'seven_day', 'a used-up week blocks the account too');
+  assert.equal(claudeUsageExhaustion({ fiveHour: usedUp, extraUsageEnabled: false, capturedAt: NOW }, NOW)?.window, 'five_hour');
+});
+
+test('exhaustion: headroom, a missing or passed reset, extra usage and old readings prove nothing', () => {
+  assert.equal(claudeUsageExhaustion(null, NOW), null);
+  assert.equal(claudeUsageExhaustion({ fiveHour: { usedPercent: 99, resetAt: NOW + HOUR }, capturedAt: NOW }, NOW), null);
+  assert.equal(claudeUsageExhaustion({ fiveHour: { usedPercent: 100 }, capturedAt: NOW }, NOW), null);
+  assert.equal(claudeUsageExhaustion({ fiveHour: { usedPercent: 100, resetAt: NOW - 1 }, capturedAt: NOW }, NOW), null);
+  assert.equal(claudeUsageExhaustion({ fiveHour: usedUp, extraUsageEnabled: true, capturedAt: NOW }, NOW), null,
+    'with extra usage on the account keeps serving past the plan window');
+  assert.equal(claudeUsageExhaustion({ fiveHour: usedUp, capturedAt: NOW - CLAUDE_QUOTA_SAMPLE_FRESH_MS }, NOW)?.window,
+    'five_hour', 'at the freshness bound the reading still counts');
+  assert.equal(claudeUsageExhaustion({ fiveHour: usedUp, capturedAt: NOW - CLAUDE_QUOTA_SAMPLE_FRESH_MS - 1 }, NOW), null,
+    'past it, the account is dialed again and the provider decides');
+});
+
+test('exhaustion: a model-scoped cap alone is left to the provider’s own refusal', () => {
+  assert.equal(claudeUsageExhaustion({
+    fiveHour: { usedPercent: 10, resetAt: NOW + HOUR }, weekly: { usedPercent: 40, resetAt: NOW + 50 * HOUR },
+    scopedWeekly: { usedPercent: 100, resetAt: NOW + 50 * HOUR, active: true, modelLabel: 'Scoped' },
+    capturedAt: NOW,
+  }, NOW), null, 'the reading names the capped model only by display name');
 });
