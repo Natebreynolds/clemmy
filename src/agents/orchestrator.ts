@@ -1855,6 +1855,10 @@ export function recentConversationTextsForFanout(
 
 export interface ProvenTurnDisclosure {
   skipDiscoverySearch: boolean;
+  /** The bound turn's surface narrows to the proven carrier only when the
+   *  request is known to be the proven run; a same-kind judgement binds the
+   *  operations and leaves the rest of the surface as it was. */
+  narrowSurface?: boolean;
   descriptors: HostCapabilityDescriptorV1[];
   /** Operation names the proven strategy used, for the instruction line. */
   tools: string[];
@@ -1904,7 +1908,9 @@ function provenOperationDisclosureForTurn(
     const nativeTools = Array.isArray(selected.data.nativeTools)
       ? selected.data.nativeTools.filter((name: unknown): name is string =>
           typeof name === 'string' && tools.includes(name)) : [];
-    return { ...callable, tools, nativeTools, boundAccounts };
+    // A selection recorded without the field narrowed whenever it skipped.
+    const narrowSurface = callable.skipDiscoverySearch && selected.data.narrowSurface !== false;
+    return { ...callable, narrowSurface, tools, nativeTools, boundAccounts };
   } catch {
     return NO_PROVEN_DISCLOSURE;
   }
@@ -3660,7 +3666,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                   && !frozenContract && NATIVE_PRODUCT_AUTHORING_TOOLS.has(name)))
             )))
           : firstClassNames;
-        return provenDisclosure.skipDiscoverySearch
+        return provenDisclosure.narrowSurface === true
           ? applyProvenSkipToHotSet(visible)
           : visible;
       })();
@@ -4075,10 +4081,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const name = (toolRef as { name?: string }).name ?? '';
     return !name || !structuralToolNames.has(name);
   });
-  const skipDiscoverySearch = provenDisclosure.skipDiscoverySearch;
+  const narrowSurface = provenDisclosure.narrowSurface === true;
   const assembledTools = turnStateToolsLast([
     ...structuralTools.filter((toolRef) => (
-      !skipDiscoverySearch || (toolRef as { name?: string }).name !== 'run_worker'
+      !narrowSurface || (toolRef as { name?: string }).name !== 'run_worker'
     )),
     ...(carrierWork && workCallOptions ? [buildWorkCall(workCallOptions)] : []),
     // Live 277906: skip already published the op on work_call; grok wrapped
@@ -4095,7 +4101,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     // remembered read through it and lost a frame; the authoring dead end
     // (live 282184) is closed by keeping the native authoring tools first-class
     // through the proven skip instead (tool-catalog PROVEN_SKIP_KEEP_LOADED).
-    ...((callTool && !skipDiscoverySearch) ? [callTool] : []),
+    ...((callTool && !narrowSurface) ? [callTool] : []),
     ...nonStructuralDiscovery,
   ]);
   searchFirstClassCount = assembledTools.length;

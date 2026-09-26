@@ -6232,6 +6232,7 @@ async function runConversationWithinRuntimeConfig(
                 tools: proven.tools,
                 nativeTools: proven.nativeTools,
                 skipDiscoverySearch: proven.skipDiscoverySearch,
+                narrowSurface: proven.narrowSurface,
                 capabilityRefs: proven.capabilityRefs,
                 descriptors: proven.descriptors,
                 boundAccounts: proven.boundAccounts,

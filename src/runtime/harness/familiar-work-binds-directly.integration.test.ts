@@ -322,9 +322,29 @@ test('the second time a familiar kind of question is asked, the learned operatio
   assert.equal(second.selected?.skipDiscoverySearch, true, debug(second));
   assert.ok((second.selected?.capabilityRefs as string[] | undefined)?.some((ref) => REF_PATTERN.test(ref)), debug(second));
   assert.ok(second.frames[0]?.tools.includes('tool_search'), 'search stays on the surface as the way back');
+  // A same-kind judgement says the operations do the core of the request, not
+  // all of it: the rest of the ordinary surface stays.
+  assert.equal(second.selected?.narrowSurface, false, debug(second));
+  for (const kernel of ['read_file', 'skill_read', 'call_tool']) {
+    assert.ok(second.frames[0]?.tools.includes(kernel), `${kernel} stays on a same-kind bound surface: ${debug(second)}`);
+  }
   assert.deepEqual(second.toolCalls.filter((name) => name === 'tool_search'), [], `zero tool_search: ${debug(second)}`);
   assert.equal(transportCalls, 2, 'the bound operation ran once, directly');
   assert.equal(second.result.status, 'completed', debug(second));
+});
+
+test('a request that restates the proven run is bound on its own words and narrows to the proven carrier', async () => {
+  const before = transportCalls;
+  const turnStartsBefore = turnStartRequests.length;
+  const run = await hostTurn('restated', 'Is there a file called Q3 Plan in my Google Drive?', 'Q3 Plan');
+  assert.equal(turnStartRequests.length, turnStartsBefore, 'a restated run needs no turn-start judgement');
+  assert.equal(run.selected?.pickedBy, 'keywords', debug(run));
+  assert.equal(run.selected?.skipDiscoverySearch, true, debug(run));
+  assert.equal(run.selected?.narrowSurface, true, debug(run));
+  assert.ok(!run.frames[0]?.tools.includes('read_file'), `the restated run's surface narrows: ${debug(run)}`);
+  assert.ok(run.frames[0]?.tools.includes('tool_search'));
+  assert.deepEqual(run.toolCalls.filter((name) => name === 'tool_search'), [], debug(run));
+  assert.equal(transportCalls, before + 1);
 });
 
 test('when the learned operation cannot be bound because its connection is gone, search runs', async () => {

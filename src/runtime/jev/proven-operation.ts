@@ -81,6 +81,12 @@ export interface ProvenOperationPreparation {
    * this source's proven resolution before the first frame; callable by name. */
   liveReads: ProvenLiveRead[];
   liveReadOutcomes: ProvenLiveReadOutcome[];
+  /** Whether the bound turn may also narrow its tool surface to the proven
+   *  carrier. Only a request known to BE the proven run (it restates it, or
+   *  was routed to one operation) narrows; a judgement that a run did the same
+   *  kind of work says its operations do the core of the request, not all of
+   *  it, so the rest of the surface stays. */
+  narrowSurface: boolean;
   /** How the remembered run was chosen; absent when none was. */
   pickedBy?: ProvenPickSource;
   /** How long the first frame waited on the turn-start decision, when asked. */
@@ -658,6 +664,7 @@ export async function prepareProvenOperationForRequest(input: {
     tools: [],
     nativeTools: [],
     skipDiscoverySearch: false,
+    narrowSurface: false,
     capabilityRefs: [],
     descriptors: [],
     boundAccounts: [],
@@ -894,6 +901,7 @@ export async function prepareProvenOperationForRequest(input: {
     tools: strategy.toolsUsed,
     nativeTools: coversRequest ? strategy.toolsUsed.filter(isHandoverRegistryTool) : [],
     skipDiscoverySearch,
+    narrowSurface: skipDiscoverySearch && pickedBy !== 'jev',
     boundAccounts,
     capabilityRefs,
     descriptors,
