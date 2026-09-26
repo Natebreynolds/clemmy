@@ -590,6 +590,30 @@ function structuralClassification(
   };
 }
 
+/**
+ * The risk the structural classifier alone gives one exact name, carrier
+ * declaration and argument evidence, as if no documented semantic existed.
+ * Two narrow callers use it: choosing which definitions are worth a model's
+ * reading, and refusing to let a learned semantic replace anything other than
+ * a structural send. It is never itself a reason to lower risk.
+ */
+export function structuralExternalCapabilityRiskV1(input: {
+  semanticName: string;
+  behaviorHints: ExternalCapabilityRiskInputV1['behaviorHints'];
+  callSignals: ExternalCapabilityRiskInputV1['callSignals'];
+}): CapabilityRiskAttestationV1['risk'] {
+  const structural = structuralClassification(
+    input.semanticName,
+    input.behaviorHints,
+    input.callSignals,
+  );
+  return {
+    reversibility: structural.reversibility,
+    consequence: structural.consequence,
+    destructive: structural.destructive,
+  };
+}
+
 function sha256(bytes: string): string {
   return createHash('sha256').update(bytes, 'utf8').digest('hex');
 }

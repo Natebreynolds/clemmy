@@ -153,6 +153,29 @@ export interface SourceAccountJudgeResult {
   modelIdentity: string;
 }
 
+export const OPERATION_DELIVERY_JUDGE_PURPOSE = 'operation_delivery_judge' as const;
+
+/** One external operation's own definition, judged for delivery and for
+ * deletion or irreversible change. The operation's name is deliberately not
+ * part of the call: an operation is judged from what it declares, never from
+ * how it is spelled. */
+export interface OperationDeliveryJudgeCall {
+  purpose: typeof OPERATION_DELIVERY_JUDGE_PURPOSE;
+  sessionId?: string;
+  description: string;
+  /** Canonical JSON text of the exact input schema. */
+  inputSchema: string;
+  definitionDigest: string;
+}
+
+export interface OperationDeliveryJudgeResult {
+  deliversToOthers: 'yes' | 'no' | 'uncertain';
+  deletesOrIrreversible: 'yes' | 'no' | 'uncertain';
+  confidence: number;
+  definitionDigest: string;
+  modelIdentity: string;
+}
+
 export interface TurnSemanticModelPort {
   interpret(call: TurnSemanticModelCall): Promise<TurnSemanticModelResult>;
   /** Independent tool-less judge. Must not see the proposing model's write claim. */
@@ -161,4 +184,7 @@ export interface TurnSemanticModelPort {
   judgePlanGrounding?(call: PlanGroundingJudgeCall): Promise<PlanGroundingJudgeResult>;
   /** Checks source-versus-recipient meaning using the existing judge role. */
   judgeAccountSelection?(call: SourceAccountJudgeCall): Promise<SourceAccountJudgeResult>;
+  /** Confirms, on the judge role, whether one operation definition delivers
+   * anything. A verdict is evidence for the learned-delivery store only. */
+  judgeOperationDelivery?(call: OperationDeliveryJudgeCall): Promise<OperationDeliveryJudgeResult>;
 }
