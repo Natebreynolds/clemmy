@@ -27,33 +27,33 @@ import {
   approvePlanProposal,
   getReminders,
   listApprovals,
-  listDelivered,
   listInboxNotifications,
   listInboxQuestions,
   listPlanProposals,
   listWorkspaceDestinationChoosers,
-  listWorkspaces,
   rejectApproval,
   rejectPlanProposal,
   resolveWorkspaceDestinationChooser,
   runWorkflow,
   type ApprovalRow,
-  type DeliveredGroup,
   type InboxNotification,
   type InboxQuestion,
   type PlanProposalRow,
   type ReminderItem,
   type WorkspaceDestinationChooser,
-  type WorkspaceSummary,
+  listChatSessions,
+  markInboxNotificationRead,
+  type ChatSession,
 } from '../lib/api';
 import { greetingName, timeGreeting } from '../lib/greeting';
+import { shouldShowDigest, todayDigest, todayRows, type TodayRow } from '../lib/today';
 import { relativeTime } from '../components/Approvals';
 import { PushPrompt } from '../components/PushPrompt';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import { presentWorkingNow } from '@clem/chat-engine';
 import { useScreenData } from '../lib/use-screen-data';
-import { approvalKindLabel, approvalQuestion } from '../lib/inbox-presentation';
+import { approvalKindLabel, approvalQuestion, workspaceChoiceLayout, workspaceChoiceTitle } from '../lib/inbox-presentation';
 import { homeLead, homeNeedsYouPane, type NeedsYouPane } from '../lib/home-presentation';
 import { phoneVisiblePanes, useHomePreferences, type HomePaneId, type QuickAction } from '../lib/home-prefs';
 import { useWorkingNow } from '../lib/working-now';
@@ -61,7 +61,10 @@ import { HomeTiles } from '../components/HomeTiles';
 
 const POLL_MS = 6_000;
 const MAX_NEEDS_ROWS = 3;
-const MAX_AWAY_ROWS = 4;
+const MAX_TODAY_ROWS = 6;
+const MAX_RECENT_ROWS = 4;
+const DIGEST_SHOWN_KEY = 'clem.today.digestShownAt';
+const LAST_OPEN_KEY = 'clem.today.lastOpenAt';
 // Every other pane on this screen is capped. This one was not, which is why
 // the owner's twenty-one stalled runs were the tallest thing on his phone.
 const MAX_QUICK_CHIPS = 3;
@@ -69,6 +72,8 @@ const MAX_QUICK_CHIPS = 3;
 interface Props {
   name: string;
   onAsk: (draft: string, attachments?: ChatAttachment[]) => void;
+  /** Open a recent conversation from the Recent stack. */
+  onOpenChat: (session: ChatSession) => void;
   onOpenInbox: () => void;
   onOpenWorkspace: (id: string) => void;
   /** Open a run's own screen. Every surface that shows running work must be
@@ -96,7 +101,6 @@ interface HomeData {
   questions: InboxQuestion[];
   notifications: InboxNotification[];
   reminders: ReminderItem[];
-  workspaces: WorkspaceSummary[];
 }
 
 type Part<T> = { v: T } | { e: unknown } | { skip: true };
@@ -111,12 +115,12 @@ async function part<T>(wanted: boolean, work: () => Promise<T>): Promise<Part<T>
 }
 
 const EMPTY: HomeData = {
-  approvals: [], plans: [], workspaceChoosers: [], questions: [], notifications: [], reminders: [], workspaces: [],
+  approvals: [], plans: [], workspaceChoosers: [], questions: [], notifications: [], reminders: [],
 };
 
 
 export function Home({
-  name, onAsk, onOpenInbox, onOpenWorkspace, onOpenActivity, onCustomize,
+  name, onAsk, onOpenChat, onOpenInbox, onOpenWorkspace, onOpenActivity, onCustomize,
   needsYouCount, needsYouCountKnown, needsYouCountLive, needsYouCountAge,
 }: Props) {
   const { prefs } = useHomePreferences();
@@ -133,16 +137,15 @@ export function Home({
   const loadHome = useCallback(async (): Promise<HomeData> => {
     const want = wantRef.current;
     const needs = want.has('needs_you');
-    const [a, p, w, q, n, r, s] = await Promise.all([
+    const [a, p, w, q, n, r] = await Promise.all([
       part(needs, listApprovals),
       part(needs, listPlanProposals),
       part(needs, listWorkspaceDestinationChoosers),
       part(needs, listInboxQuestions),
       part(want.has('while_away'), () => listInboxNotifications(30)),
-      part(want.has('projects'), getReminders),
-      part(want.has('projects'), listWorkspaces),
+      part(want.has('while_away'), getReminders),
     ]);
-    const attempted = [a, p, w, q, n, r, s].filter((res) => !('skip' in res));
+    const attempted = [a, p, w, q, n, r].filter((res) => !('skip' in res));
     if (attempted.length > 0 && attempted.every((res) => 'e' in res)) throw (attempted[0] as { e: unknown }).e;
     const prev = lastGood.current;
     const merged: HomeData = {
@@ -152,13 +155,41 @@ export function Home({
       questions: 'v' in q ? q.v.questions : prev.questions,
       notifications: 'v' in n ? n.v.notifications : prev.notifications,
       reminders: 'v' in r ? r.v.items : prev.reminders,
-      workspaces: 'v' in s ? s.v.workspaces : prev.workspaces,
     };
     lastGood.current = merged;
     return merged;
   }, []);
   const { data, loading, error, offline, refresh } = useScreenData(loadHome, { intervalMs: POLL_MS });
-  const { approvals, plans, workspaceChoosers, questions, notifications, reminders, workspaces } = data ?? lastGood.current;
+  const { approvals, plans, workspaceChoosers, questions, notifications, reminders } = data ?? lastGood.current;
+
+  // Recent conversations: read once per open, never polled (the Chats screen
+  // owns the live list). A failure leaves the stack out; nothing else moves.
+  const [recent, setRecent] = useState<ChatSession[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void listChatSessions().then((r) => {
+      if (!cancelled) setRecent(r.sessions.filter((x) => x.kind === 'chat' || x.kind === 'agent').slice(0, MAX_RECENT_ROWS));
+    }).catch(() => { /* the stack stays out */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  // The once-a-day line: what happened since you last looked. Bookkeeping is
+  // per device and best effort; without storage the line simply never shows.
+  const [digestOpen, setDigestOpen] = useState<boolean>(() => {
+    try { return shouldShowDigest(localStorage.getItem(DIGEST_SHOWN_KEY), Date.now()); } catch { return false; }
+  });
+  const sinceMs = useRef<number>((() => {
+    try {
+      const last = localStorage.getItem(LAST_OPEN_KEY);
+      const parsed = last ? Date.parse(last) : NaN;
+      localStorage.setItem(LAST_OPEN_KEY, new Date().toISOString());
+      return Number.isFinite(parsed) ? parsed : Date.now() - 24 * 60 * 60 * 1000;
+    } catch { return Date.now() - 24 * 60 * 60 * 1000; }
+  })());
+  const dismissDigest = () => {
+    setDigestOpen(false);
+    try { localStorage.setItem(DIGEST_SHOWN_KEY, new Date().toISOString()); } catch { /* per-device convenience */ }
+  };
 
   // The canonical server-owned working-now projection, from the ONE store
   // the shell polls, rendered through the ONE shared presenter the sheet
@@ -183,18 +214,12 @@ export function Home({
   // Quiet past the stall threshold: started, never ended, nobody waiting.
   const unfinished = workingView.stalled;
 
-  // Durable results only. Open decisions live in Needs you; everything that
-  // is finished, or was read, is what happened while you were away.
-  const awayRows = paneSet.has('while_away')
-    ? notifications.filter((row) => row.read || !row.needsAttention).slice(0, MAX_AWAY_ROWS)
+  // The day in one list: calendar next, what Clementine noticed on her own,
+  // what came back. Open decisions live in Needs you, never here.
+  const dayRows: TodayRow[] = paneSet.has('while_away')
+    ? todayRows({ reminders, notifications, nowMs: Date.now(), limit: MAX_TODAY_ROWS })
     : [];
-  const projects = paneSet.has('projects')
-    ? workspaces
-      .filter((space) => space.onPhone ?? (space.rows ?? 0) > 0)
-      .sort((x, y) => Date.parse(y.updatedAt) - Date.parse(x.updatedAt))
-      .slice(0, 3)
-    : [];
-  const upcoming = paneSet.has('projects') ? reminders.slice(0, 3) : [];
+  const digest = digestOpen ? todayDigest({ notifications, sinceMs: sinceMs.current }) : '';
 
   // The decision rows this screen can actually put on the glass. The shell's
   // count is a different number and is never printed as if it were this one.
@@ -224,8 +249,8 @@ export function Home({
     unfinished,
     workKnown: workingNow.known,
     workPaneShown: false,
-    awayCount: awayRows.length,
-    otherRows: upcoming.length + projects.length,
+    awayCount: dayRows.length,
+    otherRows: recent.length,
   });
   // Narrowed here, not in the callback: TypeScript drops a property narrowing
   // the moment it crosses into a closure.
@@ -247,58 +272,33 @@ export function Home({
     ) : null),
     // Current work lives in Activity; the headline and the header chip lead there.
     running: () => null,
-    made: () => <MadeSection />,
-    while_away: () => (awayRows.length > 0 ? (
-      <section class="home-section" aria-labelledby="home-away">
-        <h2 id="home-away" class="section-head pane-head">While you were away</h2>
+    // Delivered work is a row in Today now; this pane is folded in.
+    made: () => null,
+    while_away: () => (dayRows.length > 0 ? (
+      <section class="home-section" aria-labelledby="home-today">
+        <h2 id="home-today" class="section-head pane-head">Today</h2>
         <div class="home-card">
-          {awayRows.map((row) => <AwayRow key={row.id} row={row} />)}
+          {dayRows.map((row) => (
+            <TodayLine key={row.key} row={row} onDone={async () => { if (row.notificationId) { await markInboxNotificationRead(row.notificationId); void refresh(); } }} />
+          ))}
         </div>
       </section>
     ) : null),
-    projects: () => (upcoming.length > 0 || projects.length > 0 ? (
-      <>
-        {upcoming.length > 0 ? (
-          <section class="home-section" aria-labelledby="home-upcoming">
-            <h2 id="home-upcoming" class="section-head pane-head">Coming up</h2>
-            <div class="home-card">
-              {upcoming.map((item) => (
-                <div key={item.id} class="home-row home-row-static">
-                  <span class={`upcoming-dot ${item.kind}`} aria-hidden="true" />
-                  <div class="min-w-0">
-                    <div class="home-row-title">{item.text}</div>
-                    <div class="home-row-note">
-                      {item.at ? formatUpcoming(item.at) : 'when the moment comes'}
-                      {item.recurring ? ' · repeats' : ''}
-                      {item.status === 'blocked' ? ' · waiting on something' : ''}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
-        {projects.length > 0 ? (
-          <section class="home-section" aria-labelledby="home-projects">
-            <h2 id="home-projects" class="section-head pane-head">Spaces</h2>
-            <div class="home-card">
-              {projects.map((space) => (
-                <button key={space.id} type="button" class="home-row home-row-tap" onClick={() => { haptic('light'); onOpenWorkspace(space.id); }}>
-                  <div class="min-w-0">
-                    <div class="home-row-title truncate">{space.title}</div>
-                    <div class="home-row-note truncate">
-                      {space.objective || (space.rows ? `${space.rows} ${space.rows === 1 ? 'row' : 'rows'}` : `Updated ${relativeTime(space.updatedAt)}`)}
-                    </div>
-                  </div>
-                  <svg class="card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                    <path d="m9 18 6-6-6-6" />
-                  </svg>
-                </button>
-              ))}
-            </div>
-          </section>
-        ) : null}
-      </>
+    projects: () => (recent.length > 0 ? (
+      <section class="home-section" aria-labelledby="home-recent">
+        <h2 id="home-recent" class="section-head pane-head">Recent</h2>
+        <div class="home-card">
+          {recent.map((session) => (
+            <button key={session.id} type="button" class="home-row home-row-tap" onClick={() => { haptic('light'); onOpenChat(session); }}>
+              <div class="min-w-0" style={{ flex: '1 1 auto' }}>
+                <div class="home-row-title truncate">{session.title || 'Conversation'}</div>
+                {session.agentName ? <div class="home-row-note truncate">{session.agentName}</div> : null}
+              </div>
+              <span class="today-recent-when">{relativeTime(new Date(session.updatedAt).toISOString())}</span>
+            </button>
+          ))}
+        </div>
+      </section>
     ) : null),
     workstate: () => null,
   };
@@ -325,6 +325,12 @@ export function Home({
               given — with how old it is. */}
           {lead.asOf ? <p class="home-lead-asof">{lead.asOf}</p> : null}
         </div>
+        {digest ? (
+          <p class="today-digest" role="status">
+            <span>{digest}</span>
+            <button type="button" aria-label="Dismiss" onClick={dismissDigest}>×</button>
+          </p>
+        ) : null}
         {leadAction ? (
           <button
             type="button"
@@ -347,7 +353,7 @@ export function Home({
         error={error ?? workingNow.error}
         offline={offline || workingNow.offline}
         onRetry={() => { void refresh(); void workingNow.refresh(); }}
-        hasData={needsYouCount + workingView.total + awayRows.length + projects.length > 0}
+        hasData={needsYouCount + workingView.total + dayRows.length + recent.length > 0}
       />
 
       <HomeTiles onOpenWorkspace={onOpenWorkspace} onAsk={onAsk} />
@@ -365,15 +371,9 @@ export function Home({
           decision waiting on you. */}
       <PushPrompt />
 
-      <button type="button" class="home-customize" onClick={() => { haptic('light'); onCustomize(); }}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3" /><path d="M1 14h6M9 8h6M17 16h6" />
-        </svg>
-        <span>Customize your home</span>
-        <svg class="card-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-          <path d="m9 18 6-6-6-6" />
-        </svg>
-      </button>
+      <div class="today-foot">
+        <button type="button" onClick={() => { haptic('light'); onCustomize(); }}>Arrange Today</button>
+      </div>
     </div>
   );
 }
@@ -472,54 +472,6 @@ function QuickActions({ actions, onAsk }: {
   );
 }
 
-function MadeSection() {
-  const [groups, setGroups] = useState<DeliveredGroup[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    void listDelivered(8).then((r) => {
-      if (!cancelled) setGroups(r.groups ?? []);
-    }).catch(() => { /* pane degrades on its own */ });
-    return () => { cancelled = true; };
-  }, []);
-  if (groups.length === 0) return null;
-  return (
-    <section class="home-section" aria-labelledby="home-made">
-      <h2 id="home-made" class="section-head pane-head">Made</h2>
-      <div class="home-card">
-        {groups.slice(0, 6).map((group) => {
-          const open = group.artifacts?.find((a) => a.openable && /^https?:/i.test(a.target))?.target ?? group.url;
-          const n = group.artifacts?.length || group.artifactCount;
-          const body = (
-            <div class="min-w-0">
-              <div class="home-row-title truncate">{group.title}</div>
-              <div class="home-row-note">{n === 1 ? '1 item' : `${n} items`}</div>
-            </div>
-          );
-          // A group with no openable http artifact and no url has nowhere to
-          // go, and the tap only buzzed. A control that cannot act is not a
-          // control: render the same row without the affordance rather than a
-          // button whose entire effect is a haptic.
-          return open ? (
-            <button
-              key={group.id}
-              type="button"
-              class="home-row home-row-tap"
-              onClick={() => {
-                haptic('light');
-                window.open(open, '_blank', 'noopener,noreferrer');
-              }}
-            >
-              {body}
-            </button>
-          ) : (
-            <div key={group.id} class="home-row">{body}</div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 // ─── needs you ──────────────────────────────────────────────────────────────
 
 type NeedsItem =
@@ -565,6 +517,7 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
   const [busy, setBusy] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [picked, setPicked] = useState('');
   const lock = useRef(false);
 
   const act = async (id: string, work: () => Promise<unknown>, done: string) => {
@@ -652,7 +605,30 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
     const row = item.row;
     title = 'Where should these records live?';
     note = `Workspace · ${relativeTime(row.createdAt)}`;
-    actions = row.choices.length <= 3 ? (
+    const existing = row.choices.filter((choice) => choice.kind === 'existing');
+    const createNew = row.choices.find((choice) => choice.kind === 'create_new');
+    const pickedChoice = existing.find((choice) => choice.choiceId === picked) ?? existing[0];
+    actions = workspaceChoiceLayout(row.choices) === 'picker' ? (
+      <>
+        <select
+          class="workspace-pick-select"
+          aria-label="Existing Workspaces"
+          value={pickedChoice?.choiceId ?? ''}
+          disabled={busy !== null}
+          onChange={(event) => setPicked((event.currentTarget as HTMLSelectElement).value)}
+        >
+          {existing.map((choice) => <option key={choice.choiceId} value={choice.choiceId}>{workspaceChoiceTitle(choice)}</option>)}
+        </select>
+        <button type="button" class="home-btn home-btn-primary" disabled={busy !== null || !pickedChoice} onClick={() => { if (pickedChoice) void act(pickedChoice.choiceId, () => resolveWorkspaceDestinationChooser(row, pickedChoice.choiceId), `Chose ${workspaceChoiceTitle(pickedChoice)}`); }}>
+          {busy && busy !== createNew?.choiceId ? 'Working…' : `Use ${pickedChoice ? workspaceChoiceTitle(pickedChoice) : 'this'}`}
+        </button>
+        {createNew ? (
+          <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void act(createNew.choiceId, () => resolveWorkspaceDestinationChooser(row, createNew.choiceId), 'Preparing a new Workspace')}>
+            {busy === createNew.choiceId ? 'Working…' : 'Prepare a new one'}
+          </button>
+        ) : null}
+      </>
+    ) : (
       <>
         {row.choices.map((choice) => (
           <button
@@ -660,13 +636,13 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
             type="button"
             class={`home-btn${choice.kind === 'existing' ? ' home-btn-primary' : ''}`}
             disabled={busy !== null}
-            onClick={() => void act(choice.choiceId, () => resolveWorkspaceDestinationChooser(row, choice.choiceId), `Chose ${choice.label}`)}
+            onClick={() => void act(choice.choiceId, () => resolveWorkspaceDestinationChooser(row, choice.choiceId), `Chose ${workspaceChoiceTitle(choice)}`)}
           >
-            {busy === choice.choiceId ? 'Working…' : choice.label}
+            {busy === choice.choiceId ? 'Working…' : workspaceChoiceTitle(choice)}
           </button>
         ))}
       </>
-    ) : openInInbox;
+    );
   }
 
   return (
@@ -688,26 +664,24 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
   );
 }
 
-// ─── while you were away ────────────────────────────────────────────────────
+// ─── today ─────────────────────────────────────────────────────────────────
 
-function AwayRow({ row }: { row: InboxNotification }) {
-  // Typed fields only: a warning is a notification that needed attention or
-  // failed to deliver; never a guess from the prose.
-  const warn = row.needsAttention || Boolean(row.deliveryError);
+function TodayLine({ row, onDone }: { row: TodayRow; onDone: () => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const when = row.kind === 'calendar' ? formatUpcoming(row.at) : clockOrDay(row.at);
   return (
-    <div class="home-row home-row-static home-away">
-      {warn ? (
-        <svg class="home-away-glyph warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
-        </svg>
+    <div class="home-row today-row">
+      <div class="today-row-body">
+        <span class={`today-row-eyebrow${row.kind === 'heartbeat' ? ' heartbeat' : ''}`}>{row.eyebrow}</span>
+        <span class="home-row-title">{row.title}</span>
+      </div>
+      {row.kind === 'heartbeat' ? (
+        <button type="button" class="today-row-done" disabled={busy} onClick={async () => { haptic('light'); setBusy(true); try { await onDone(); } finally { setBusy(false); } }}>
+          {busy ? '…' : 'Done'}
+        </button>
       ) : (
-        <svg class="home-away-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="10" /><path d="M12 11v5M12 8h.01" />
-        </svg>
+        <time class="today-row-when" dateTime={row.at}>{when}</time>
       )}
-      <span class="sr-only">{warn ? 'Needs a look. ' : 'Update. '}</span>
-      <span class="home-away-text truncate">{row.title || 'Update from Clem'}</span>
-      <time class="home-away-time" dateTime={row.createdAt}>{clockOrDay(row.createdAt)}</time>
     </div>
   );
 }

@@ -205,7 +205,7 @@ test('the title switcher and the ask capsule replace the hamburger and the inlin
   assert.doesNotMatch(app, /class="menu-btn"/);
   const home = read('../screens/Home.tsx');
   assert.doesNotMatch(home, /class="ask rise"|class="ask-input"/, 'the inline ask box is gone from Home');
-  assert.doesNotMatch(home, /listRecentRuns|listChatSessions/, 'no dead run fetch, no duplicate working-now poll');
+  assert.doesNotMatch(home, /listRecentRuns|useScreenData\(listChatSessions/, 'no dead run fetch, no duplicate polls: Recent loads once per open');
   assert.match(home, /useWorkingNow\(\)/, 'Running renders from the ONE shared snapshot');
   const css = read('../styles.css');
   assert.match(css, /\.ask-capsule \{[\s\S]*?position: fixed;[\s\S]*?env\(safe-area-inset-bottom\)/);

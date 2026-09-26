@@ -795,6 +795,7 @@ export function App() {
               name={name}
               onOpenRun={openRun}
               onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })}
+              onOpenChat={(session) => goToChat({ session, sessionId: session.id, title: session.title })}
               onOpenInbox={() => navigateTo('inbox')}
               onOpenWorkspace={openWorkspace}
               onOpenActivity={() => navigateTo('activity')}
@@ -916,7 +917,7 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 };
 
 const TAB_TITLES: Record<Tab, string> = {
-  home: 'Home',
+  home: 'Today',
   inbox: 'Needs you',
   chats: 'Chats',
   agents: 'Agents',
@@ -932,7 +933,7 @@ const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round'
 const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
   {
     id: 'home',
-    label: 'Home',
+    label: 'Today',
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <path d="m3 10 9-7 9 7v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M9 21V12h6v9" />
