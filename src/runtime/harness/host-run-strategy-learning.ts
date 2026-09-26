@@ -86,6 +86,14 @@ export function provenCallShapesForSource(
       if (args && typeof args === 'object' && typeof (args as { args_json?: unknown }).args_json === 'string') {
         try { args = JSON.parse((args as { args_json: string }).args_json); } catch { continue; }
       }
+      // A provider carrier serializes the operation's own arguments once more;
+      // the roles of the request live inside that string, not in its type.
+      if (args && typeof args === 'object' && typeof (args as { arguments?: unknown }).arguments === 'string') {
+        try {
+          const inner: unknown = JSON.parse((args as { arguments: string }).arguments);
+          if (inner && typeof inner === 'object') args = { ...(args as Record<string, unknown>), arguments: inner };
+        } catch { /* not a serialized object: its type is the shape */ }
+      }
       if (!args || typeof args !== 'object') continue;
       shapes.push({ tool, shape: shapeOfProvenArguments(args) });
     }

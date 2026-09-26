@@ -116,3 +116,40 @@ test('a learned strategy carries the request shapes of the settled calls behind 
   assert.deepEqual(shapes, [{ tool: 'dataforseo__api_request', shape: '{"method":"POST","path":"/v3/dataforseo_labs/google/historical_bulk_traffic_estimation/live","data":[{"targets":["string"],"location_code":"number","language_code":"string"}]}' }]);
   assert.deepEqual(provenCallShapesForSource({ sessionId: session.id, sourceUserSeq: source.seq }, ['other_tool']), [], 'only the learned tools contribute shapes');
 });
+
+test('a provider carrier\'s own arguments, serialized once more inside the envelope, still yield the request roles', async () => {
+  const shadow = await import('../graph/turn-graph-shadow.js');
+  const dispatch = await import('./dispatch-ledger.js');
+  const identities = await import('./attempt-identity.js');
+  const outcomes = await import('./attempt-outcome.js');
+  const store = await import('./logical-call-settlement-store.js');
+  const { provenCallShapesForSource } = await import('./host-run-strategy-learning.js');
+  const session = createSession({ id: 'carrier-shapes-learning', kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'find the thread from Dana Lee about the plan' } });
+  assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 } }));
+  const task = { sessionId: session.id, sourceUserSeq: source.seq, acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq) };
+  const operationArgs = { query: 'Dana Lee', top: 10 };
+  const callId = 'call_carrier_shape_1';
+  appendEvent({ sessionId: session.id, turn: 1, role: 'assistant', type: 'tool_called', data: {
+    sourceUserSeq: source.seq, callId, tool: 'work_call', effectiveTool: 'SAMPLEMAIL_SEARCH_MESSAGES', effect: 'read',
+    arguments: JSON.stringify({ requirement_id: 'cap:resolved:samplemail_search_messages', name: 'composio_execute_tool',
+      args_json: JSON.stringify({ tool_slug: 'SAMPLEMAIL_SEARCH_MESSAGES', arguments: JSON.stringify(operationArgs) }) }),
+  } });
+  const started = dispatch.beginPhysicalDispatch({ identity: { ...task, logicalToolCallId: 'lc-carrier-1', physicalDispatchId: 'lc-carrier-1:1', ordinal: 0 }, tool: 'samplemail_search_messages', args: operationArgs });
+  assert.equal(started.status, 'inserted');
+  if (started.status !== 'inserted') return;
+  assert.equal(dispatch.settlePhysicalDispatch({ identity: started.identity, tool: 'samplemail_search_messages', outcome: 'returned' }).status, 'inserted');
+  const committed = store.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId: 'lc-carrier-1' },
+    contract: { toolName: 'samplemail_search_messages', args: operationArgs },
+    execution: { kind: 'provider_execution' },
+    result: { payload: { messages: [] } },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: false },
+    observer: { lane: 'byo', callId, turn: 1 },
+  });
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+  const shapes = provenCallShapesForSource({ sessionId: session.id, sourceUserSeq: source.seq }, ['samplemail_search_messages']);
+  assert.deepEqual(shapes, [{ tool: 'samplemail_search_messages', shape: '{"tool_slug":"SAMPLEMAIL_SEARCH_MESSAGES","arguments":{"query":"string","top":"number"}}' }]);
+  assert.doesNotMatch(JSON.stringify(shapes), /Dana Lee/, 'the person\'s name is a value, not a role');
+});

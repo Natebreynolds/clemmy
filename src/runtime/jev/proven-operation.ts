@@ -396,7 +396,7 @@ export function renderProvenOperationGuidance(
   invocations: readonly unknown[] = [],
   boundAccounts: readonly ProvenBoundAccount[] = [],
   liveReads: readonly ProvenLiveRead[] = [],
-  opts: { routed?: boolean; sameKind?: boolean } = {},
+  opts: { routed?: boolean } = {},
 ): string {
   const tools = strategy.toolsUsed;
   if (opts.routed === true && tools.every(isHandoverRegistryTool)) {
@@ -404,7 +404,7 @@ export function renderProvenOperationGuidance(
     // unless this turn's mode keeps it off the surface; then search stays the door.
     return [
       '[ROUTED OPERATION]',
-      `This request most likely needs ${tools.join(', ')}: ${strategy.objective}`,
+      `This request most likely needs ${tools.join(', ')}.`,
       `When your tools list ${tools.join(', ')}, call it directly. Use tool_search only if it is not listed or cannot do the whole request.`,
     ].join('\n');
   }
@@ -420,13 +420,12 @@ export function renderProvenOperationGuidance(
     opts.routed
       ? (callable ? '[ROUTED OPERATION — skip tool_search]' : '[ROUTED OPERATION]')
       : (callable ? '[PROVEN OPERATION — skip tool_search]' : '[PROVEN OPERATION]'),
+    // The earlier request's text carries that instance's targets and values,
+    // which are not this one's, however close the wording: the hint names
+    // the tools and the roles of their arguments only.
     opts.routed
-      ? `This request most likely needs ${tools.join(', ')}: ${strategy.objective}`
-      // A run of the same kind was about another target or wording; its
-      // request text carries that instance's values, which are not this one's.
-      : opts.sameKind
-        ? `A prior successful run of this same kind of request already proved these tools: ${tools.join(', ')}. Use this request's own targets and values.`
-        : `A prior successful run ("${strategy.objective}") already proved these tools: ${tools.join(', ')}.`,
+      ? `This request most likely needs ${tools.join(', ')}.`
+      : `A prior successful run of this same kind of request already proved these tools: ${tools.join(', ')}. Use this request's own targets and values.`,
     callable
       ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
       : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
@@ -446,7 +445,7 @@ export function renderProvenOperationGuidance(
     // account the host had already routed. Say so, in the brain's own terms.
     ...((strategy.provenShapes?.length ?? 0) > 0
       ? [
-          'Request shapes that succeeded in the proven run (values elided; method and path literal). Reuse the same field names:',
+          'Request shapes that succeeded in the proven run (values elided; only the operation selectors method, tool_slug and an API route stay literal). Reuse the same field names with this request\'s own values:',
           ...strategy.provenShapes!.map((row) => `- ${row.tool}: ${row.shape}`),
         ]
       : []),
@@ -895,7 +894,6 @@ export async function prepareProvenOperationForRequest(input: {
   return {
     text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads, {
       routed,
-      sameKind: pickedBy === 'jev',
     }),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,

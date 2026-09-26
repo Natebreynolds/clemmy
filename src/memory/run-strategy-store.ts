@@ -91,27 +91,113 @@ function mergeProvenShapes(
 }
 
 /** The structure of one successful call's arguments with values elided.
- * Strings under `method`, `path`, `endpoint` and `tool_slug` stay literal: they
- * select the operation, they are not the user's data. */
+ * Only strings that select the operation stay literal: `method` and
+ * `tool_slug` always; `path` and `endpoint` only beside a `method`, where they
+ * are an API route, with resource segments elided. Anywhere else a path is the
+ * user's own file or resource, a value like any other. */
 export function shapeOfProvenArguments(args: unknown, depth = 0): string {
-  const shape = (value: unknown, key: string | null, level: number): unknown => {
+  const shape = (value: unknown, key: string | null, level: number, siblings: Record<string, unknown> | null): unknown => {
     if (level > 6) return '…';
     if (value === null || value === undefined) return 'null';
-    if (typeof value === 'string') return key && LITERAL_SHAPE_KEYS.has(key) ? value.slice(0, 120) : 'string';
+    if (typeof value === 'string') return literalSelector(key, value, siblings) ?? 'string';
     if (typeof value === 'number') return 'number';
     if (typeof value === 'boolean') return 'boolean';
-    if (Array.isArray(value)) return value.length ? [shape(value[0], null, level + 1)] : [];
+    if (Array.isArray(value)) return value.length ? [shape(value[0], null, level + 1, null)] : [];
     if (typeof value === 'object') {
+      const record = value as Record<string, unknown>;
       const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, 24)) out[k] = shape(v, k, level + 1);
+      for (const [k, v] of Object.entries(record).slice(0, 24)) out[k] = shape(v, k, level + 1, record);
       return out;
     }
     return typeof value;
   };
-  return JSON.stringify(shape(args, null, depth)).slice(0, MAX_SHAPE_CHARS);
+  return JSON.stringify(shape(args, null, depth, null)).slice(0, MAX_SHAPE_CHARS);
 }
 
-const LITERAL_SHAPE_KEYS: ReadonlySet<string> = new Set(['method', 'path', 'endpoint', 'tool_slug']);
+const ALWAYS_LITERAL_SELECTOR_KEYS: ReadonlySet<string> = new Set(['method', 'tool_slug']);
+const ROUTE_SELECTOR_KEYS: ReadonlySet<string> = new Set(['path', 'endpoint']);
+const SHAPE_TYPE_WORDS: ReadonlySet<string> = new Set(['string', 'number', 'boolean', 'null', '…', 'object', 'function', 'symbol', 'bigint', 'undefined']);
+
+function literalSelector(key: string | null, value: string, siblings: Record<string, unknown> | null): string | null {
+  if (!key) return null;
+  if (ALWAYS_LITERAL_SELECTOR_KEYS.has(key)) return value.slice(0, 120);
+  if (ROUTE_SELECTOR_KEYS.has(key) && siblings && typeof siblings.method === 'string') return elideRouteResources(value).slice(0, 120);
+  return null;
+}
+
+/** An API route keeps the segments that name the operation. The origin, the
+ *  query string and the fragment are dropped, and a segment that names a
+ *  resource (a host-like token, a long number, an id) is elided. */
+export function elideRouteResources(route: string): string {
+  const withoutQuery = route.split(/[?#]/)[0] ?? '';
+  const schemeMatch = /^[a-z][a-z0-9+.-]*:\/\/[^/]*(\/.*)?$/i.exec(withoutQuery);
+  const pathPart = schemeMatch ? (schemeMatch[1] ?? '/') : withoutQuery;
+  return pathPart.split('/').map((segment) => (
+    segment && (/\./.test(segment) || /\d{4,}/.test(segment) || /^[0-9a-f-]{16,}$/i.test(segment)) ? '{id}' : segment
+  )).join('/');
+}
+
+/** A stored shape re-read under the current literal rule: a route beside a
+ *  method keeps its operation segments; any other literal path is a value. */
+export function normalizeProvenShape(shape: string): string {
+  let parsed: unknown;
+  try { parsed = JSON.parse(shape); } catch { return shape; }
+  const walk = (value: unknown, siblings: Record<string, unknown> | null, key: string | null): unknown => {
+    if (Array.isArray(value)) return value.map((item) => walk(item, null, null));
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(record)) out[k] = walk(v, record, k);
+      return out;
+    }
+    if (typeof value === 'string' && key && ROUTE_SELECTOR_KEYS.has(key) && !SHAPE_TYPE_WORDS.has(value)) {
+      return literalSelector(key, value, siblings) ?? 'string';
+    }
+    return value;
+  };
+  return JSON.stringify(walk(parsed, null, null)).slice(0, MAX_SHAPE_CHARS);
+}
+
+/** The role of each argument in the proven calls of one tool, as dotted
+ *  field paths (`data[].target`), with a literal selector shown as
+ *  `path=/v3/…`. This is what a hint may carry about a past run: the shape of
+ *  the work, never the values an earlier request put into it. */
+export function describeProvenShapeRoles(
+  shapes: readonly ProvenCallShape[] | undefined,
+  tool: string,
+  limits: { maxRoles?: number; maxChars?: number; maxShapes?: number } = {},
+): string {
+  const maxRoles = limits.maxRoles ?? 10;
+  const maxChars = limits.maxChars ?? 200;
+  const roles: string[] = [];
+  const literals = new Map<string, string[]>();
+  const add = (role: string) => { if (!roles.includes(role)) roles.push(role); };
+  const walk = (value: unknown, prefix: string): void => {
+    if (Array.isArray(value)) {
+      if (value.length) walk(value[0], `${prefix}[]`); else add(prefix);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) walk(v, prefix ? `${prefix}.${k}` : k);
+      return;
+    }
+    if (!prefix) return;
+    if (typeof value === 'string' && !SHAPE_TYPE_WORDS.has(value)) {
+      const list = literals.get(prefix) ?? [];
+      if (!list.includes(value)) list.push(value);
+      literals.set(prefix, list);
+    }
+    add(prefix);
+  };
+  for (const row of (shapes ?? []).filter((entry) => entry.tool === tool).slice(0, limits.maxShapes ?? 4)) {
+    try { walk(JSON.parse(row.shape), ''); } catch { /* a clipped shape describes nothing */ }
+  }
+  const text = roles.slice(0, maxRoles).map((role) => {
+    const list = literals.get(role);
+    return list ? `${role}=${list.slice(0, 3).join(' | ')}` : role;
+  }).join(', ');
+  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
+}
 const MAX_RECORDS = 200;
 const MAX_OBJECTIVE_CHARS = 200;
 
@@ -150,9 +236,19 @@ function readStore(): StrategyFile {
   const file = readStoreRaw();
   let changed = false;
   for (const record of file.strategies) {
-    if (record.scope !== undefined) continue;
-    record.scope = runStrategyScopeForSession(record.learningReceipt?.sessionId);
-    changed = true;
+    if (record.scope === undefined) {
+      record.scope = runStrategyScopeForSession(record.learningReceipt?.sessionId);
+      changed = true;
+    }
+    // A shape recorded before the route rule may hold a literal file path;
+    // it is re-read under the current rule once and written back.
+    if (record.provenShapes?.length) {
+      const normalized = record.provenShapes.map((row) => ({ tool: row.tool, shape: normalizeProvenShape(row.shape) }));
+      if (normalized.some((row, index) => row.shape !== record.provenShapes![index]!.shape)) {
+        record.provenShapes = mergeProvenShapes(undefined, normalized);
+        changed = true;
+      }
+    }
   }
   if (changed) {
     try { writeStore(file); } catch { /* the in-memory view is already scoped */ }
@@ -263,11 +359,18 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
   return record;
 }
 
+/** A hint carries the shape of the work: the tools and the role of each
+ *  argument. It never quotes the earlier request or what that run produced;
+ *  those targets, names, figures and handles belong to that instance and
+ *  would be carried into this one. */
 function renderOne(s: RunStrategyRecord): string {
   const minutes = Math.max(1, Math.round(s.durationMs / 60_000));
   const shape = s.workerCount >= 2 ? `fan-out ${s.workerCount} workers` : 'single-threaded';
-  const produced = s.deliverable ? ` → produced ${s.deliverable}` : '';
-  return `- A similar past run ("${s.objective}") succeeded with: ${s.toolsUsed.join(', ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}${produced}.`;
+  const tools = s.toolsUsed.map((tool) => {
+    const roles = describeProvenShapeRoles(s.provenShapes, tool);
+    return roles ? `${tool} (${roles})` : tool;
+  });
+  return `- A proven run of this kind of request used: ${tools.join('; ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}. Use this request's own targets and values.`;
 }
 
 export interface MatchedRunStrategy {

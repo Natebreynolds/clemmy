@@ -83,18 +83,58 @@ test('runs that used no real tools teach nothing', () => {
   }), null);
 });
 
-test('deliverable memory: recall answers "where did we put it" (the 2026-07-23 mailbox-guess class)', async () => {
+test('a hint carries the tools and argument roles of a proven run, never that run\'s request text, values or handle', async () => {
   const rec = recordRunStrategy({
-    objective: 'Write 30 personalized AI-search emails for market leader accounts',
+    objective: 'Write 30 personalized AI-search emails for the market leader accounts at https://first-target.example',
     toolsUsed: ['composio_execute_tool', 'write_file'],
     workerCount: 0,
     durationMs: 8 * 60_000,
     deliverable: '/Users/example/Desktop/ML-30-AI-Search-Drafts.md',
+    provenShapes: [{ tool: 'write_file', shape: '{"path":"string","content":"string"}' }],
     learningReceipt: receipt('run-3'),
   });
   assert.ok(rec);
-  const hit = renderRunStrategiesForContext('find those 30 emails we drafted for market leaders');
-  assert.match(hit, /→ produced \/Users\/example\/Desktop\/ML-30-AI-Search-Drafts\.md/);
+  assert.equal(rec.deliverable, '/Users/example/Desktop/ML-30-AI-Search-Drafts.md', 'the record keeps what the run produced, for audit');
+  const hit = renderRunStrategiesForContext('write personalized AI-search emails for the market leader accounts');
+  assert.match(hit, /A proven run of this kind of request used: composio_execute_tool; write_file \(path, content\)/);
+  assert.match(hit, /Use this request's own targets and values/);
+  assert.doesNotMatch(hit, /first-target|ML-30|Desktop|30 personalized|produced|similar past run/, 'nothing from that instance reaches the hint');
+});
+
+test('a route beside a method keeps its operation segments; a path on its own is a value like any other', async () => {
+  const { shapeOfProvenArguments, normalizeProvenShape, elideRouteResources, describeProvenShapeRoles } = await import('./run-strategy-store.js');
+  assert.equal(shapeOfProvenArguments({ path: '/Users/example/notes/plan.txt', max_chars: 4000 }), '{"path":"string","max_chars":"number"}');
+  assert.equal(
+    shapeOfProvenArguments({ method: 'GET', endpoint: 'https://api.provider.example/v1/sites/first-target.example/summary?key=abc#x' }),
+    '{"method":"GET","endpoint":"/v1/sites/{id}/summary"}',
+    'the origin, a resource segment, the query and the fragment are not the operation',
+  );
+  assert.equal(elideRouteResources('/v3/accounts/123456/users/9f8e7d6c5b4a39281716/live'), '/v3/accounts/{id}/users/{id}/live');
+  assert.equal(normalizeProvenShape('{"path":"~/.clementine-next/output/fixture/note.txt","max_chars":"number"}'), '{"path":"string","max_chars":"number"}');
+  assert.equal(normalizeProvenShape('{"method":"POST","path":"/v3/serp/live?token=1","data":[{"target":"string"}]}'), '{"method":"POST","path":"/v3/serp/live","data":[{"target":"string"}]}');
+  assert.equal(normalizeProvenShape('{"method":"POST","path":"/v3/serp/li'), '{"method":"POST","path":"/v3/serp/li', 'a clipped shape is left as it is');
+  assert.equal(
+    describeProvenShapeRoles([{ tool: 't', shape: '{"method":"POST","path":"/v3/serp/live","data":[{"target":"string","depth":"number"}]}' }], 't'),
+    'method=POST, path=/v3/serp/live, data[].target, data[].depth',
+  );
+  assert.equal(describeProvenShapeRoles([{ tool: 'other', shape: '{"q":"string"}' }], 't'), '', 'roles come from the named tool only');
+});
+
+test('a stored shape recorded under the old literal rule is re-read without its literal path and written back once', () => {
+  const file = path.join(TMP_HOME, 'state', 'run-strategies.json');
+  const raw = JSON.parse(readFileSync(file, 'utf8')) as { strategies: Array<Record<string, unknown>> };
+  raw.strategies.push({
+    id: 'strat-legacy-shape', objective: 'read the note file and count its words', keywords: ['read', 'note', 'file', 'count', 'words'],
+    toolsUsed: ['read_file'], workerCount: 0, durationMs: 5, createdAt: new Date().toISOString(), uses: 1, scope: 'chat',
+    provenShapes: [{ tool: 'read_file', shape: '{"path":"~/.clementine-next/output/fixture-question-back/note.txt","max_chars":"number"}' }],
+    learningReceipt: receipt('legacy-shape'),
+  });
+  writeFileSync(file, JSON.stringify(raw));
+  const hit = renderRunStrategiesForContext('read the note file and count its words');
+  assert.match(hit, /read_file \(path, max_chars\)/);
+  assert.doesNotMatch(hit, /fixture-question-back|note\.txt/);
+  const persisted = JSON.parse(readFileSync(file, 'utf8')) as { strategies: Array<{ id: string; provenShapes?: Array<{ shape: string }> }> };
+  assert.equal(persisted.strategies.find((s) => s.id === 'strat-legacy-shape')?.provenShapes?.[0]?.shape, '{"path":"string","max_chars":"number"}');
 });
 
 test('legacy strategy records stay on disk for audit but cannot steer a future run', () => {
@@ -211,6 +251,7 @@ test('proven request shapes elide values, keep operation selectors literal, dedu
   const shape = shapeOfProvenArguments({ method: 'POST', path: '/v3/dataforseo_labs/google/domain_rank_overview/live', data: [{ target: 'weartriallaw.com', location_code: 2840, language_code: 'en', flag: true, nested: { key: 'secret' } }] });
   assert.equal(shape, '{"method":"POST","path":"/v3/dataforseo_labs/google/domain_rank_overview/live","data":[{"target":"string","location_code":"number","language_code":"string","flag":"boolean","nested":{"key":"string"}}]}');
   assert.doesNotMatch(shape, /weartriallaw|secret/, 'no user value survives');
+  assert.equal(shapeOfProvenArguments({ tool_slug: 'SAMPLEMAIL_SEARCH_MESSAGES', arguments: { query: 'Dana Lee', top: 10 } }), '{"tool_slug":"SAMPLEMAIL_SEARCH_MESSAGES","arguments":{"query":"string","top":"number"}}');
   const receipt = evaluateLearningCandidate({ target: 'strategy', authority: 'background_delivery_verifier', sessionId: 'background:shapes', sourceId: 'shapes-1', terminalSuccess: true, controllerValidation: true }).receipt!;
   const shapes = Array.from({ length: 12 }, (_, i) => ({ tool: 'dataforseo__api_request', shape: `{"method":"POST","path":"/v3/endpoint-${i}"}` }));
   const recorded = recordRunStrategy({ objective: 'organic traffic value for a law firm domain over six months', toolsUsed: ['dataforseo__api_request'], workerCount: 0, durationMs: 5_000, learningReceipt: receipt,
