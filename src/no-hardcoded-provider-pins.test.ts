@@ -98,7 +98,6 @@ const BASELINE: Record<string, number> = {
   'runtime/harness/source-strategy-admission.ts': 1,
   'runtime/harness/runtime-tool-identity.ts': 1,
   'runtime/harness/public-presentation.ts': 1,
-  'runtime/harness/loop.ts': 1,
   'runtime/harness/host-turn-runner.ts': 1,
   'runtime/harness/callable-surface.ts': 1,
   'runtime/harness/attempt-settlement.ts': 1,

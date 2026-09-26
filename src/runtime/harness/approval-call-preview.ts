@@ -115,7 +115,7 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
 }
 
 /**
- * Turn a Composio slug like `OUTLOOK_CALENDAR_CREATE_EVENT` into a
+ * Turn a Composio slug shaped `<TOOLKIT>_<OBJECT>_<VERB>_<OBJECT>` into a
  * human phrase: "Create Outlook calendar event".
  *
  * Heuristic: known toolkit prefixes are capitalized; known verbs are
