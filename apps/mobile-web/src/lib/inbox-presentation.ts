@@ -379,3 +379,20 @@ export function clearReceipt(result: {
     ? `${cleared} ${heldText}`
     : `${cleared} Nothing was decided — they stay in your history.`;
 }
+
+/**
+ * How a workspace choice renders on a phone. Up to three existing Workspaces
+ * are buttons the thumb can tell apart; more than that is a picker, because a
+ * stack of ten full-width orange buttons (live 09-26) is a wall, not a choice.
+ * "Prepare a new one" is always its own button.
+ */
+export function workspaceChoiceLayout(choices: ReadonlyArray<{ kind: string }>): 'buttons' | 'picker' {
+  return choices.filter((choice) => choice.kind === 'existing').length > 3 ? 'picker' : 'buttons';
+}
+
+/** The Workspace's name alone; the identifier is a caption, never part of the title. */
+export function workspaceChoiceTitle(choice: { label: string; workspaceId: string }): string {
+  const label = choice.label.trim();
+  const suffix = ` (${choice.workspaceId})`;
+  return label.endsWith(suffix) ? label.slice(0, -suffix.length).trim() : label;
+}

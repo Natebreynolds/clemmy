@@ -86,7 +86,7 @@ test('durable run records project to shared snapshots with truth rules and priva
   }), 'utf-8');
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'act-blocked.json'), JSON.stringify({
     id: 'act-blocked', workflow: 'CRM Sync', status: 'blocked_capability',
-    createdAt: '2026-08-04T10:01:00.000Z',
+    createdAt: new Date(Date.now() - 60_000).toISOString(), // fresh: an aged wait is reaped from Working Now by design
     capabilityBlock: {
       state: 'blocked', toolkit: 'salesforce',
       message: 'Reconnect Salesforce to resume.',
@@ -95,7 +95,7 @@ test('durable run records project to shared snapshots with truth rules and priva
   }), 'utf-8');
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'act-mutation.json'), JSON.stringify({
     id: 'act-mutation', workflow: 'Team Update', status: 'blocked_mutation',
-    createdAt: '2026-08-04T10:01:30.000Z',
+    createdAt: new Date(Date.now() - 30_000).toISOString(),
     mutationBlock: {
       state: 'awaiting_reconciliation', stepId: 'send_update',
       fingerprint: 'a'.repeat(64), providerRedispatched: false,
@@ -412,7 +412,7 @@ test('canonical workflow terminal vocabulary has one truthful Working Now member
       id: `terminal-vocabulary-${index}`,
       workflow: 'Vocabulary workflow',
       status: expected.status,
-      createdAt: '2026-08-04T10:00:00.000Z',
+      createdAt: '2026-08-04T11:30:00.000Z',
       finishedAt: '2026-08-04T10:05:00.000Z',
     }, observedAt)!;
     assert.equal(projected.lifecycle, expected.lifecycle, expected.status);
@@ -425,7 +425,7 @@ test('canonical workflow terminal vocabulary has one truthful Working Now member
       id: `unfinished-${status}`,
       workflow: 'Unfinished test workflow',
       status,
-      createdAt: '2026-08-04T10:00:00.000Z',
+      createdAt: '2026-08-04T11:30:00.000Z',
     }, observedAt)!;
     assert.equal(unfinished.lifecycle, 'accepted', `${status} was treated as final without finishedAt`);
     assert.equal(unfinished.terminal, undefined);
@@ -436,7 +436,7 @@ test('canonical workflow terminal vocabulary has one truthful Working Now member
       workflow: 'Needs-review test workflow',
       status,
       needsAttention: true,
-      createdAt: '2026-08-04T10:00:00.000Z',
+      createdAt: '2026-08-04T11:30:00.000Z',
       finishedAt: '2026-08-04T10:05:00.000Z',
     }, observedAt)!;
     assert.equal(needsReview.lifecycle, 'blocked');
@@ -450,7 +450,7 @@ test('canonical workflow terminal vocabulary has one truthful Working Now member
       id: `active-${status}`,
       workflow: 'Active blocked workflow',
       status,
-      createdAt: '2026-08-04T10:00:00.000Z',
+      createdAt: '2026-08-04T11:30:00.000Z',
     }, observedAt)!;
     assert.equal(activeBlock.lifecycle, 'blocked');
     assert.equal(activeBlock.terminal, undefined);
@@ -459,7 +459,7 @@ test('canonical workflow terminal vocabulary has one truthful Working Now member
 
   const parked = projectWorkflowRunActivity({
     id: 'parked-terminal-vocabulary', workflow: 'Parked workflow', status: 'parked',
-    createdAt: '2026-08-04T10:00:00.000Z',
+    createdAt: '2026-08-04T11:30:00.000Z',
   }, observedAt)!;
   assert.equal(parked.lifecycle, 'awaiting_approval');
   assert.equal(parked.terminal, undefined);
@@ -721,6 +721,24 @@ test('Working Now shows a workflow rewrite session the moment it starts, named b
   assert.equal(row?.presentationLane, 'scheduled');
   assert.match(row?.headline ?? '', /Rewriting workflow "team-activity-slack-updates" into exact steps \(attempt 1 of 3\)/);
   assert.doesNotMatch(row?.headline ?? '', /definition file/, 'the prompt\'s first line is not a headline');
+});
+
+test('waiting work leaves Working Now after the reap window; a held lease or fresh wait stays', () => {
+  const observedAt = '2026-09-26T20:00:00.000Z';
+  const observedAtMs = Date.parse(observedAt);
+  const blockedFor = (hoursAgo: number) => projectWorkflowRunActivity({
+    id: `blocked-${hoursAgo}h`,
+    workflow: 'morning-briefing',
+    status: 'blocked_readiness',
+    createdAt: new Date(observedAtMs - hoursAgo * 3_600_000).toISOString(),
+  }, observedAt)!;
+  // Live 09-26: 32 rows like this, parked 3 to 32 days earlier, were the phone's "32 stalled".
+  assert.equal(shouldSurfaceInWorkingNow(blockedFor(72), observedAtMs), false, 'three days parked is an ask, not work in flight');
+  assert.equal(shouldSurfaceInWorkingNow(blockedFor(3), observedAtMs), false, 'past the window it belongs to Needs you');
+  assert.equal(shouldSurfaceInWorkingNow(blockedFor(1), observedAtMs), true, 'an hour ago the owner may be about to answer');
+  // A run that is actually running says so through its lease, not the clock.
+  const live = { ...blockedFor(72), liveness: 'live' as const, needsAttention: false };
+  assert.equal(shouldSurfaceInWorkingNow(live, observedAtMs), true);
 });
 
 test('a run waiting on a workspace binding is blocked on a person, never counted as running', () => {

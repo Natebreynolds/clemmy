@@ -14,6 +14,7 @@
  * only once it has been waiting a while ("still waiting since yesterday"),
  * because the fresh wait already has its own card.
  */
+import { STALLED_WORK_REAP_MS } from '../dashboard/working-now-policy.js';
 import type { NotificationRecord } from '../runtime/notifications.js';
 
 export interface WorkRunObservation {
@@ -141,7 +142,7 @@ export interface WorkReviewConfig {
 }
 
 export const DEFAULT_WORK_REVIEW_CONFIG: WorkReviewConfig = {
-  staleWaitMs: 2 * 60 * 60 * 1000,
+  staleWaitMs: STALLED_WORK_REAP_MS,
   staleDraftMs: 60 * 60 * 1000,
   maxAgeMs: 7 * 24 * 60 * 60 * 1000,
   failureLookbackMs: 24 * 60 * 60 * 1000,

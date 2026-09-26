@@ -13,7 +13,7 @@ import {
   type WorkspaceDestinationChooser,
 } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
-import { approvalDetails, approvalKindLabel, approvalQuestion } from '../lib/inbox-presentation';
+import { approvalDetails, approvalKindLabel, approvalQuestion, workspaceChoiceLayout, workspaceChoiceTitle } from '../lib/inbox-presentation';
 
 export function relativeTime(iso: string | number): string {
   const then = typeof iso === 'number' ? iso : Date.parse(iso);
@@ -152,6 +152,11 @@ function WorkspaceChooserCard({ chooser, index, acting, disabled, onChoose }: {
   disabled: boolean;
   onChoose: (choiceId: string) => void;
 }) {
+  const existing = chooser.choices.filter((choice) => choice.kind === 'existing');
+  const createNew = chooser.choices.find((choice) => choice.kind === 'create_new');
+  const layout = workspaceChoiceLayout(chooser.choices);
+  const [picked, setPicked] = useState(existing[0]?.choiceId ?? '');
+  const pickedChoice = existing.find((choice) => choice.choiceId === picked) ?? existing[0];
   return (
     <article class="card card-approval rise" style={{ '--i': index }}>
       <header class="card-head">
@@ -163,19 +168,37 @@ function WorkspaceChooserCard({ chooser, index, acting, disabled, onChoose }: {
         Pick an existing Workspace, or ask me to prepare a new one.
       </p>
       <footer class="card-actions workspace-choice-actions">
-        {chooser.choices.map((choice) => (
-          <button
-            type="button"
-            key={choice.choiceId}
-            class={choice.kind === 'existing' ? 'btn-approve' : 'btn-reject'}
-            disabled={disabled}
-            onClick={() => onChoose(choice.choiceId)}
-          >
-            {acting
-              ? 'Working…'
-              : choice.kind === 'existing' ? `${choice.label} (${choice.workspaceId})` : choice.label}
+        {layout === 'picker' ? (
+          <>
+            <label class="workspace-pick">
+              <span class="workspace-pick-label">{existing.length} Workspaces</span>
+              <select
+                class="workspace-pick-select"
+                value={pickedChoice?.choiceId ?? ''}
+                disabled={disabled}
+                onChange={(event) => setPicked((event.currentTarget as HTMLSelectElement).value)}
+              >
+                {existing.map((choice) => (
+                  <option key={choice.choiceId} value={choice.choiceId}>{workspaceChoiceTitle(choice)}</option>
+                ))}
+              </select>
+              {pickedChoice ? <span class="workspace-pick-id">{pickedChoice.workspaceId}</span> : null}
+            </label>
+            <button type="button" class="btn-approve" disabled={disabled || !pickedChoice} onClick={() => { if (pickedChoice) onChoose(pickedChoice.choiceId); }}>
+              {acting ? 'Working…' : `Use ${pickedChoice ? workspaceChoiceTitle(pickedChoice) : 'this Workspace'}`}
+            </button>
+          </>
+        ) : existing.map((choice) => (
+          <button type="button" key={choice.choiceId} class="btn-approve workspace-choice" disabled={disabled} onClick={() => onChoose(choice.choiceId)}>
+            <span class="workspace-choice-title">{acting ? 'Working…' : workspaceChoiceTitle(choice)}</span>
+            {!acting ? <span class="workspace-choice-id">{choice.workspaceId}</span> : null}
           </button>
         ))}
+        {createNew ? (
+          <button type="button" key={createNew.choiceId} class="btn-reject" disabled={disabled} onClick={() => onChoose(createNew.choiceId)}>
+            {acting ? 'Working…' : createNew.label}
+          </button>
+        ) : null}
       </footer>
     </article>
   );

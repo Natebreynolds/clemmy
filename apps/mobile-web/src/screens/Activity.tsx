@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import { workflowDisplayName } from '@clem/chat-engine';
 import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import { isActiveRunStatus, listRecentRuns, listWorkingNow, type ActivityEntry, type RunSummary } from '../lib/api';
 import { presentWorkingNow, type PresentedWorkingNowEntry } from '@clem/chat-engine';
@@ -157,7 +158,7 @@ function LiveCard({ presented, index, onChanged, onOpen }: {
         ? <span class="pulse-dot" aria-hidden="true" />
         : <span class="running-task-state" style={{ background: 'var(--line-strong)' }} aria-hidden="true" />}
       <div class="min-w-0">
-        <div class="card-title-sm">{entry.headline || 'Working…'}</div>
+        <div class="card-title-sm">{entry.kind === 'workflow' && entry.headline ? workflowDisplayName(entry.headline) : (entry.headline || 'Working…')}</div>
         {/* One vocabulary with the chip and with Home: a row that stopped
             says so, and how long ago, instead of replaying the phase text it
             was showing when it stopped. */}

@@ -28,6 +28,7 @@
  * seq, record timestamps) rather than a per-process counter — a daemon restart
  * must not rewind a surface's revision.
  */
+import { STALLED_WORK_REAP_MS } from './working-now-policy.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -1021,6 +1022,14 @@ function hasLiveWorkEvidence(entry: ActivityEntry): boolean {
 
 export function shouldSurfaceInWorkingNow(entry: ActivityEntry, observedAtMs: number): boolean {
   if (entry.terminal) return false;
+  // Waiting on a person, and nothing has happened for the reap window: this is
+  // an ask, and Needs you owns asks (the work-review heartbeat raises it once,
+  // grouped per workflow). Keeping it here made "stalled" a count of history.
+  // A held lease (liveness 'live') keeps the row whatever the clock says.
+  if (entry.needsAttention && entry.liveness !== 'live') {
+    const lastMs = Date.parse(entry.lastEvidenceAt || entry.startedAt);
+    if (Number.isFinite(lastMs) && observedAtMs - lastMs >= STALLED_WORK_REAP_MS) return false;
+  }
   if (entry.presentationLane !== 'foreground') return true;
   // The dwell exists so an ordinary turn does not flash a row for two seconds.
   // It was never meant to hide work in flight: a foreground turn that is ALREADY

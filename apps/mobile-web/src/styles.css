@@ -758,6 +758,24 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .btn-approve:active, .btn-reject:active { transform: scale(0.96); }
 .btn-approve:disabled, .btn-reject:disabled { opacity: 0.5; box-shadow: none; }
 .workspace-choice-actions { flex-direction: column; }
+.workspace-choice-actions > * { width: 100%; min-width: 0; }
+.workspace-choice { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; white-space: normal; }
+.workspace-choice-title { overflow-wrap: anywhere; }
+.workspace-choice-id, .workspace-pick-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--t-xs); font-weight: 500; opacity: 0.72; overflow-wrap: anywhere; }
+.workspace-pick { display: grid; gap: 6px; }
+.workspace-pick-label { color: var(--fg-3); font-size: var(--t-xs); font-weight: 750; }
+.workspace-pick-select {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-hot);
+  border-radius: var(--r-md, 12px);
+  background: var(--bg-1);
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 700;
+}
 .workspace-choice-actions .btn-approve,
 .workspace-choice-actions .btn-reject { flex: 1 1 auto; width: 100%; padding: 0 14px; }
 
@@ -2344,6 +2362,15 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .workflow-row-status.status-queued { background: var(--accent-soft) !important; color: var(--accent-deep); }
 /* Finished, with a goal gap: done work with a note, neither success green nor failure red. */
 .workflow-row-status.status-gap { background: var(--accent-soft) !important; color: var(--accent-deep); }
+/* The six product words, one tone each. */
+.workflow-row-status.status-done { background: rgba(53, 123, 41, 0.12) !important; color: var(--accent-2); }
+.workflow-row-status.status-working { background: var(--accent-soft) !important; color: var(--accent-deep); }
+.workflow-row-status.status-needs_you { background: var(--warn-soft, rgba(176, 125, 10, 0.14)) !important; color: var(--accent-warn); }
+.workflow-row-status.status-paused,
+.workflow-row-status.status-scheduled,
+.workflow-row-status.status-ready,
+.workflow-row-status.status-off { background: var(--bg-2) !important; color: var(--fg-3); }
+.workflow-row-slug { margin-top: 2px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--t-xs); color: var(--fg-3); overflow-wrap: anywhere; }
 .chat-row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-row-meta { font-size: var(--t-xs); color: var(--fg-3); margin-top: 3px; display: flex; gap: var(--sp-2); }
 /* "needs input" / "needs binding" are asks, not successes: warning tone, and

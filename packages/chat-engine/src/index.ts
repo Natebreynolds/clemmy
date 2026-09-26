@@ -23,3 +23,4 @@ export type { HomeTile, HomeLayout, HomeLayoutChange } from './home-layout.js';
 export * from './usage-presentation.js';
 export * from './turn-agent.js';
 export * from './turn-progress.js';
+export * from './workflow-name.js';

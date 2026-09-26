@@ -1,4 +1,6 @@
 import { useState } from 'preact/hooks';
+import { workflowCaption, workflowDisplayName } from '@clem/chat-engine';
+import { workflowRowStatus } from '../lib/workflow-status';
 import { useBackGesture } from '../lib/back-gesture';
 import { renderMarkdown } from '@clem/chat-engine';
 import {
@@ -27,23 +29,6 @@ const TERMINAL_RUN_STATUSES = new Set([
 
 /** A finished run whose goal review found a gap is done work with a note:
  *  its pill says so instead of reading as plain success. */
-function workflowRowGoalGap(wf: Pick<MobileWorkflow, 'lastRunOutcome' | 'lastRunGoalOutcome'>): 'gap' | 'follow_up' | null {
-  if (wf.lastRunOutcome !== 'succeeded') return null;
-  return wf.lastRunGoalOutcome === 'gap' || wf.lastRunGoalOutcome === 'follow_up' ? wf.lastRunGoalOutcome : null;
-}
-
-function workflowRowStatusKey(wf: Pick<MobileWorkflow, 'lastRunOutcome' | 'lastRunStatus' | 'lastRunGoalOutcome'>): string {
-  if (workflowRowGoalGap(wf)) return 'gap';
-  return (wf.lastRunOutcome ?? wf.lastRunStatus ?? 'unknown').toLowerCase();
-}
-
-function workflowRowStatusLabel(wf: Pick<MobileWorkflow, 'enabled' | 'lastRunOutcome' | 'lastRunStatus' | 'lastRunGoalOutcome'>): string {
-  if (!wf.enabled) return 'disabled';
-  const gap = workflowRowGoalGap(wf);
-  if (gap === 'gap') return 'done, with a gap';
-  if (gap === 'follow_up') return 'done, re-checking';
-  return wf.lastRunOutcome ?? wf.lastRunStatus ?? 'idle';
-}
 
 export function Workflows() {
   const [selected, setSelected] = useState<MobileWorkflow | null>(null);
@@ -80,11 +65,12 @@ export function Workflows() {
       {workflows.map((wf) => (
         <button key={wf.name} class="workflow-row" onClick={() => setSelected(wf)}>
           <div class="workflow-row-head">
-            <span class="workflow-row-name">{wf.name}</span>
-            <span class={`workflow-row-status status-${workflowRowStatusKey(wf)}`}>
-              {workflowRowStatusLabel(wf)}
+            <span class="workflow-row-name">{workflowDisplayName(wf.name, wf.description)}</span>
+            <span class={`workflow-row-status status-${workflowRowStatus(wf).key}`}>
+              {workflowRowStatus(wf).label}
             </span>
           </div>
+          {workflowCaption(wf.name, wf.description) ? <div class="workflow-row-slug">{wf.name}</div> : null}
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}
           <div class="workflow-row-meta">
             <span>{wf.stepCount} {wf.stepCount === 1 ? 'step' : 'steps'}</span>
@@ -163,9 +149,10 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
     <div class="workflow-detail">
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
-        <div class="chat-title">{workflow.name}</div>
+        <div class="chat-title">{workflowDisplayName(workflow.name, workflow.description)}</div>
       </div>
       <div class="workflow-detail-body">
+        {workflowCaption(workflow.name, workflow.description) ? <div class="workflow-row-slug">{workflow.name}</div> : null}
         {workflow.description ? <p class="workflow-desc">{workflow.description}</p> : null}
         <ScreenNotice error={infoError} offline={infoOffline} onRetry={() => void reloadInfo()} hasData={Boolean(info)} />
 

@@ -11,6 +11,8 @@ import {
   notificationRunTarget,
   trustScopeSummary,
   updatesClearScope,
+  workspaceChoiceLayout,
+  workspaceChoiceTitle,
 } from './inbox-presentation';
 import type { InboxNotification } from './api';
 import { readFileSync } from 'node:fs';
@@ -288,4 +290,12 @@ test('a notification title drops a leading emoji status icon', async () => {
   assert.equal(notificationTitle('📅 Reply needed: Pipeline review'), 'Reply needed: Pipeline review');
   assert.equal(notificationTitle('⚠️ Workflow needs attention: Digest'), 'Workflow needs attention: Digest');
   assert.equal(notificationTitle('Plain title'), 'Plain title');
+});
+
+test('a workspace choice is buttons up to three Workspaces and a picker beyond; the id never sits in the title', () => {
+  const existing = (n: number) => Array.from({ length: n }, (_, i) => ({ kind: 'existing', label: `Board ${i} (board-${i})`, workspaceId: `board-${i}`, choiceId: `c${i}` }));
+  assert.equal(workspaceChoiceLayout([...existing(3), { kind: 'create_new' }]), 'buttons');
+  assert.equal(workspaceChoiceLayout([...existing(10), { kind: 'create_new' }]), 'picker');
+  assert.equal(workspaceChoiceTitle({ label: 'Scorpion Inbox Triage (and-inpox-triage)', workspaceId: 'and-inpox-triage' }), 'Scorpion Inbox Triage');
+  assert.equal(workspaceChoiceTitle({ label: 'Prepare a new Workspace', workspaceId: '' }), 'Prepare a new Workspace');
 });
