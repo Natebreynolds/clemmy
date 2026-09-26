@@ -8,6 +8,8 @@ import {
   type AgentPatch,
   type AgentRecord,
 } from '../agents/agent-record.js';
+import { listSubagentRunsForAgent } from '../agents/subagent-runs.js';
+import { listSessionsForAgent } from './sessions-api.js';
 import { listActiveSkills } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import {
@@ -102,6 +104,24 @@ export function registerConsoleAgentsRoutes(
       const proposal = rejectAgentProposal(String(req.params.id), reason);
       if (!proposal) { res.status(404).json({ error: 'pending proposal not found' }); return; }
       res.json({ proposal, generatedAt: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // What the agent has actually done: threads worked in it and workers that
+  // ran as it. Read from the records, never from the definition.
+  app.get('/api/console/agents/:id/work', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const id = String(req.params.id);
+      if (!getAgentRecord(id)) { res.status(404).json({ error: `agent not found: ${id}` }); return; }
+      const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
+      res.json({
+        threads: listSessionsForAgent(id, limit),
+        workers: listSubagentRunsForAgent(id, limit),
+        generatedAt: new Date().toISOString(),
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

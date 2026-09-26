@@ -487,6 +487,10 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   focusInput?: string;
   includeRememberedToolChoices?: boolean;
   includeSessionActions?: boolean;
+  /** The saved agent this session works in: its standing instructions and
+   *  pinned skills. Stable for the life of the session, so it joins the
+   *  identity/rubric prefix before the cache boundary. */
+  agentInstructions?: string;
   /** Per-accepted-turn rules, frozen authority and catalog disclosures. These
    *  remain model-visible but MUST sit after the stable rubric boundary. */
   volatileInstructions?: string;
@@ -508,9 +512,11 @@ export function harnessInstructions(roleInstructions: string, opts?: {
     includeRememberedToolChoices: opts?.includeRememberedToolChoices,
     includeSessionActions: opts?.includeSessionActions,
   });
+  const agentInstructions = opts?.agentInstructions?.trim() ?? '';
+  const stableRole = [roleInstructions, agentInstructions].filter(Boolean).join('\n\n');
   const volatileInstructions = opts?.volatileInstructions?.trim() ?? '';
   const volatileMemoryInstructions = opts?.volatileMemoryInstructions?.trim() ?? '';
-  const historicalRole = [roleInstructions, volatileInstructions].filter(Boolean).join('\n\n');
+  const historicalRole = [stableRole, volatileInstructions].filter(Boolean).join('\n\n');
   const dynamic = [
     volatileInstructions,
     ...(ctx ? [CACHE_MEMORY_CONTEXT_SENTINEL, ctx] : []),
@@ -522,7 +528,7 @@ export function harnessInstructions(roleInstructions: string, opts?: {
     // Only the identity/rubric policy precedes the boundary. Every current-turn
     // authority/catalog byte and every memory byte follows it, so changing
     // either can invalidate only its own suffix rather than re-billing policy.
-    ? `${roleInstructions}\n\n${CACHE_BREAK_SENTINEL}\n\n${dynamic}`
+    ? `${stableRole}\n\n${CACHE_BREAK_SENTINEL}\n\n${dynamic}`
     // Kill-switch/legacy path retains the exact historical order: memory first,
     // separator, then role + the per-turn instruction trailer.
     : [

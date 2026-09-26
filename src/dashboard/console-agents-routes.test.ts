@@ -140,6 +140,32 @@ test('POST creates; duplicate → 409; reserved name → 400; PATCH edits and cl
   }
 });
 
+test('GET /api/console/agents/:id/work lists the agent\'s conversations and worker runs, never the definition', async () => {
+  const { url, close } = await boot();
+  try {
+    // A worker that ran as the researcher, and one that ran as nobody.
+    const { recordSubagentRun } = await import('../agents/subagent-runs.js');
+    recordSubagentRun({
+      id: 'w-1', parentRunId: 'sess-desktop-abc', parentKind: 'session', role: 'research', boundAgentId: 'researcher',
+      provider: 'claude', model: 'claude-x', task: 'acme', status: 'ok', output: 'Three findings.',
+      startedAt: '2026-09-25T10:00:00.000Z', finishedAt: '2026-09-25T10:00:30.000Z',
+    });
+    recordSubagentRun({
+      id: 'w-2', parentRunId: 'sess-desktop-abc', parentKind: 'session', role: 'research',
+      provider: 'claude', model: 'claude-x', task: 'globex', status: 'ok', output: 'Unbound.',
+      startedAt: '2026-09-25T10:01:00.000Z', finishedAt: '2026-09-25T10:01:30.000Z',
+    });
+    const res = await fetch(`${url}/api/console/agents/researcher/work`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { threads: unknown[]; workers: Array<{ id: string; boundAgentId?: string }> };
+    assert.ok(Array.isArray(body.threads));
+    assert.deepEqual(body.workers.map((w) => w.id), ['w-1'], 'only the worker that ran as this agent');
+    assert.equal((await fetch(`${url}/api/console/agents/nobody/work`)).status, 404);
+  } finally {
+    await close();
+  }
+});
+
 test('GET /api/console/agents/catalog lists what an agent can reach for', async () => {
   const { url, close } = await boot();
   try {

@@ -148,6 +148,7 @@ import {
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
+import { resolveAgentBinding } from '../agents/agent-binding.js';
 import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import {
@@ -242,10 +243,12 @@ function mobileChatDigest(deviceId: string, idempotencyKey: string): string {
     .digest('hex');
 }
 
-function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode): string {
+function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode, agentId?: string): string {
   if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: message, taskMode });
+  // A request opened inside a saved agent is a different request; one that
+  // named none keeps its historical hash.
   return createHash('sha256')
-    .update(JSON.stringify({ message, requestedSessionId, ...taskModeFields(taskMode) }))
+    .update(JSON.stringify({ message, requestedSessionId, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}) }))
     .digest('hex');
 }
 
@@ -330,13 +333,18 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
   status: HarnessSessionRow['status'];
   createdAt: number;
   updatedAt: number;
+  agentId: string | null;
+  agentName: string | null;
 } {
   const title = session.title?.trim()
     || (session.objective ? session.objective.slice(0, 80) : '')
     || (session.channel === 'discord' ? 'Discord conversation' : 'Clementine session');
+  const agentId = typeof session.metadata?.agentId === 'string' ? session.metadata.agentId : null;
   return {
     id: session.id,
     title,
+    agentId,
+    agentName: agentId && typeof session.metadata?.agentName === 'string' ? session.metadata.agentName : null,
     kind: session.kind,
     channel: session.channel,
     status: session.status,
@@ -3852,7 +3860,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       ? req.body.sessionId.trim()
       : null;
     const proposedSessionId = requestedSessionId ?? `sess-mob-${digest.slice(0, 32)}`;
-    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode);
+    // Opening a new conversation inside a saved agent. Unknown is refused by
+    // name; an existing conversation keeps the agent it was opened in.
+    const requestedAgentId = typeof req.body?.agentId === 'string' ? req.body.agentId.trim() : '';
+    const requestedAgent = requestedAgentId ? resolveAgentBinding(requestedAgentId) : null;
+    if (requestedAgentId && !requestedAgent) { res.status(400).json({ error: 'AGENT_NOT_FOUND' }); return; }
+    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode, requestedAgent?.agent.id);
     if (taskMode?.kind === 'execute' && !requestedSessionId) {
       res.status(400).json({ error: 'PLAN_CONVERSATION_REQUIRED' });
       return;
@@ -4018,6 +4031,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             userId: ctx.record.deviceId,
             ...(spaceSlug ? { spaceSlug } : {}),
             ...(validatedMount ? { __session_mount: validatedMount } : {}),
+            ...(requestedAgent ? { agentId: requestedAgent.agent.id, agentName: requestedAgent.agent.name } : {}),
           },
         });
       }

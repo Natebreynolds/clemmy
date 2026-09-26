@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { DEFAULT_CODEX_FAST_MODEL, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel, type WorkerRouteTrace } from '../runtime/harness/worker-model-route.js';
+import { resolveWorkerAgentRequest } from './agent-binding.js';
 import { recordWorkerModelOffer } from '../runtime/harness/worker-model-offer.js';
 import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import type { RuntimeContextValue, TaskContinuationContext } from '../types.js';
@@ -2409,7 +2410,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       : scope === null
         ? 'scope:deny'
         : `scope:exact:${JSON.stringify(scope)}`;
-    const key = `${model}\0${scopeKey}\0${child?.sessionId ?? ''}\0${child?.sourceUserSeq ?? ''}\0${child?.delegatedExpectedWork ? 'delegated' : ''}\0${child?.hostFreshPlanning ? 'planning' : ''}`;
+    // A saved agent changes the instructions, so two agents never share one
+    // cached Worker.
+    const key = `${model}\0${scopeKey}\0${child?.sessionId ?? ''}\0${child?.sourceUserSeq ?? ''}\0${child?.delegatedExpectedWork ? 'delegated' : ''}\0${child?.hostFreshPlanning ? 'planning' : ''}\0${input.agent ?? ''}`;
     let pending = workerAgentCache.get(key);
     if (!pending) {
       // The child owns its scoped catalog namespace; explicit packet lineage
@@ -2557,10 +2560,17 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // starts, instead of being swapped for another model at dispatch.
       const routeSessionId = extractSessionId(runContext) ?? '';
       const routeSourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq ?? extractSourceUserSeq(runContext);
+      // A saved agent the caller named is resolved once here too; unknown is
+      // refused with the saved names listed, before any worker starts.
+      const agentRequest = resolveWorkerAgentRequest(call);
+      if (agentRequest.kind === 'refuse') {
+        return refuseWorkerPacketBeforeDispatch(agentRequest.reason, agentRequest.shapes);
+      }
+      if (agentRequest.kind === 'bound') call.agent = agentRequest.binding.agent.id;
       const workerRoute = await routeWorkerModel({
         sessionId: routeSessionId,
         sourceUserSeq: routeSourceUserSeq,
-        model: call.model,
+        model: agentRequest.kind === 'bound' ? agentRequest.model : call.model,
         intent: call.intent,
         objective: call.objective,
         item: callItems[0],
@@ -3079,6 +3089,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             workflowName: ctx?.workflowName,
             stepId: ctx?.stepId,
             role: input.intent || undefined,
+            boundAgentId: input.agent || undefined,
             provider,
             model,
             task: input.item,
@@ -3238,7 +3249,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (sessionId) {
         if (useClaudeSdkWorker) {
           try {
-            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'orchestrator' } });
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, agent: input.agent || undefined, lane: 'orchestrator' } });
           } catch { /* telemetry is best-effort */ }
         }
         if (manifestBinding) {
@@ -4028,6 +4039,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     ? ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN
     : rubricChoice.instructions;
   const instructions = harnessInstructions(acceptedActionRubric, {
+    // The agent this session works in: stable for the session, so it sits
+    // with the rubric before the cache boundary.
+    agentInstructions: sessionMount.agent?.context,
     sourceUserSeq: options.sourceUserSeq,
     sessionId: options.sessionId ?? undefined,
     focusInput: scopeUserInput || undefined,

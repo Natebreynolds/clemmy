@@ -137,6 +137,8 @@ export interface ActivityItem {
   /** The model-phase row and helper rows: the routed model's display name.
    *  Never the provider — a family is not a name. */
   modelName?: string;
+  /** The model-phase row: the saved agent this turn ran as, by its name. */
+  agentName?: string;
   /** kind 'agent' rows: the kind of work the brain handed this helper, in
    *  the brain's own words, when it named one. */
   helperFor?: string;

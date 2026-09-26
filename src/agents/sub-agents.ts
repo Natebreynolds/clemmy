@@ -28,6 +28,7 @@ import {
 import { getGoalPinForDelegation } from './plan-proposals.js';
 import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
+import { resolveAgentBinding } from './agent-binding.js';
 import { runPacketWorkerWithHost } from '../runtime/harness/worker-host-runner.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import {
@@ -321,7 +322,12 @@ export async function buildWorkerAgent(options: {
       'You may write per-item artifacts (write_file with a unique path) if the parent\'s prompt asks for them. Otherwise, prefer returning the result inline.',
     ].join('\n\n');
   const planning = acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq ?? undefined)?.kind === 'plan';
-  const instructionsWithCatalog = `${baseInstructions}${workerCatalogBlock}${planning
+  // Running as a saved agent: its standing context and pinned skills join the
+  // instructions once, for every item of the batch.
+  const agentContext = options.workerInput?.agent
+    ? resolveAgentBinding(options.workerInput.agent)?.context ?? ''
+    : '';
+  const instructionsWithCatalog = `${baseInstructions}${workerCatalogBlock}${agentContext ? `\n\n${agentContext}` : ''}${planning
     ? '\n\nYou are investigating part of a Plan. Explain the evidence, missing facts and relevant tool contracts that will make the parent’s execution plan useful. Distinguish observed facts from claims and inference. Return findings to the parent; do not execute the proposed business work.'
     : ''}`;
   const agent = new Agent<RuntimeContextValue>({

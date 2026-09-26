@@ -21,6 +21,7 @@
  */
 import { matchSkillChoices } from './skill-choice-store.js';
 import { gatherSessionSkills } from '../runtime/harness/skill-execution.js';
+import { composeSessionFromStore } from '../runtime/harness/session-composition.js';
 
 export interface SkillBindingHold {
   skill: string;
@@ -50,6 +51,9 @@ export function skillBindingHold(input: {
     const skill = best?.record.skill;
     if (!skill) return null;
     const loaded = new Set(gatherSessionSkills(input.sessionId).map((s) => s.name));
+    // A skill pinned by the agent this session works in arrived with the
+    // turn's instructions; it was loaded, just not through skill_read.
+    for (const name of composeSessionFromStore(input.sessionId).agent?.pinnedSkills ?? []) loaded.add(name);
     if (loaded.has(skill)) return null;
     const runs = best.record.successCount;
     const scale = input.itemCount && input.itemCount > 1 ? `${input.itemCount} items` : 'this batch';

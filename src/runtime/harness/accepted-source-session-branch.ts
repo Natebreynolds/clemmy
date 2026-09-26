@@ -566,6 +566,20 @@ function safeChildMetadata(input: {
   now: string;
 }): Record<string, unknown> {
   const mount = input.validatedMount;
+  // The agent a conversation was opened in follows it onto a successor;
+  // otherwise the desk would silently vanish mid-conversation.
+  let parentAgent: { agentId: string; agentName?: string } | null = null;
+  try {
+    const parentMeta = JSON.parse(input.parent.metadata_json || '{}') as Record<string, unknown>;
+    if (typeof parentMeta.agentId === 'string' && parentMeta.agentId.trim()) {
+      parentAgent = {
+        agentId: parentMeta.agentId.trim(),
+        ...(typeof parentMeta.agentName === 'string' ? { agentName: parentMeta.agentName } : {}),
+      };
+    }
+  } catch {
+    parentAgent = null;
+  }
   return {
     source: mount ? 'workspace' : input.continuity.provider,
     ingressProvider: input.continuity.provider,
@@ -574,6 +588,7 @@ function safeChildMetadata(input: {
     ...(input.continuity.scopeId ? { guildId: input.continuity.scopeId } : {}),
     ...(mount ? { spaceSlug: mount.workspaceSlug } : {}),
     ...(mount ? { [MOUNT_META]: mount } : {}),
+    ...(parentAgent ?? {}),
     [BRANCH_META]: {
       version: POINTER_PROTOCOL,
       rootSessionId: input.rootSessionId,

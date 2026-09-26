@@ -93,6 +93,7 @@ import {
   requestKill,
   type EventRow,
 } from './eventlog.js';
+import { sessionAgentFields } from './session-composition.js';
 import { listPending, projectPendingApprovalUserDependency } from './approval-registry.js';
 import { claudeAgentSdkBrainEnabled, respondViaClaudeAgentSdkBrain, isClaudeSdkUnparseableToolCall } from './claude-agent-brain.js';
 import { buildContinueInput } from './continue-directive.js';
@@ -1848,6 +1849,7 @@ export async function respondViaHarness(
           surface,
           sourceUserSeq: sourceUserEvent.seq,
           attemptId: requestAttempt.attemptId,
+          ...sessionAgentFields(sessionId),
         },
       });
     } catch { /* telemetry only */ }

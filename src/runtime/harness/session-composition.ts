@@ -22,6 +22,8 @@ import {
   WORKSPACE_DOCK_TOOLS,
 } from '../../spaces/workspace-context.js';
 
+import { resolveAgentBinding, type AgentBinding } from '../../agents/agent-binding.js';
+
 export const WORKSPACE_CONTEXT_PRIMER_PREFIX = '[workspace-context]';
 
 export type SessionMountKind = 'chat' | 'workspace' | 'workflow' | 'execution' | 'agent';
@@ -52,6 +54,22 @@ export interface SessionMount {
   hotTools: readonly string[];
   /** Saved-bundle restriction. Null = connected surface, not a job type. */
   toolAllowlist: readonly string[] | null;
+  /** The saved agent this session works in, when it was opened in one. */
+  agent: AgentBinding | null;
+}
+
+/** Tools an agent's pinned workflows need first-class to be run by name. */
+const AGENT_WORKFLOW_TOOLS: readonly string[] = Object.freeze(['workflow_get', 'workflow_run']);
+const AGENT_SKILL_TOOLS: readonly string[] = Object.freeze(['skill_read']);
+
+function agentFromMetadata(metadata: Record<string, unknown> | null | undefined): AgentBinding | null {
+  const id = typeof metadata?.agentId === 'string' ? metadata.agentId.trim() : '';
+  if (!id) return null;
+  try {
+    return resolveAgentBinding(id);
+  } catch {
+    return null;
+  }
 }
 
 export interface ComposeSessionInput {
@@ -163,8 +181,20 @@ export function composeSession(input: ComposeSessionInput): SessionMount {
       pinnedTools: WORKSPACE_DOCK_TOOLS,
       hotTools: WORKSPACE_DOCK_HOT_TOOLS,
       toolAllowlist,
+      agent: null,
     };
   }
+
+  // A chat opened inside a saved agent: its standing context joins the
+  // stable system prefix (see harnessInstructions), and the tools its pinned
+  // workflows and skills need stay first-class. Nothing widens.
+  const agent = kind === 'chat' ? agentFromMetadata(input.metadata) : null;
+  const agentTools = agent
+    ? [
+        ...(agent.agent.workflows.length > 0 ? AGENT_WORKFLOW_TOOLS : []),
+        ...(agent.pinnedSkills.length > 0 || agent.missingSkills.length > 0 ? AGENT_SKILL_TOOLS : []),
+      ]
+    : [];
 
   return {
     kind,
@@ -174,10 +204,28 @@ export function composeSession(input: ComposeSessionInput): SessionMount {
     workflow,
     memory: MEMORY,
     primers: [],
-    pinnedTools: [],
-    hotTools: [],
+    pinnedTools: agentTools,
+    hotTools: agentTools,
     toolAllowlist,
+    agent,
   };
+}
+
+/**
+ * The agent a session was opened in, as bounded event fields, so a route
+ * marker can say who the turn ran as. Empty for an unbound session.
+ */
+export function sessionAgentFields(sessionId: string | null | undefined): { agentId?: string; agentName?: string } {
+  if (!sessionId) return {};
+  try {
+    const metadata = getSession(sessionId)?.metadata;
+    const agentId = typeof metadata?.agentId === 'string' ? metadata.agentId.trim() : '';
+    if (!agentId) return {};
+    const agentName = typeof metadata?.agentName === 'string' ? metadata.agentName.trim().slice(0, 64) : '';
+    return { agentId, ...(agentName ? { agentName } : {}) };
+  } catch {
+    return {};
+  }
 }
 
 /** Look up the durable row when present; identity still parses from the id. */

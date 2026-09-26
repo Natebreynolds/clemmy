@@ -18,6 +18,7 @@ import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whis
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
+import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
   BASE_DIR,
   DEFAULT_MODELS,
@@ -3248,10 +3249,12 @@ function harnessChatStableDigest(requestId: string): string {
   return createHash('sha256').update(requestId).digest('hex');
 }
 
-function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode?: TaskMode): string {
+function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode?: TaskMode, agentId?: string): string {
   if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: input, attachmentIds, taskMode });
+  // A request opened inside a saved agent is a different request; one that
+  // named none keeps its historical hash.
   return createHash('sha256')
-    .update(JSON.stringify({ input, attachmentIds, ...taskModeFields(taskMode) }))
+    .update(JSON.stringify({ input, attachmentIds, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}) }))
     .digest('hex');
 }
 
@@ -16343,6 +16346,11 @@ export function registerConsoleRoutes(
       ? body.attachments.filter((a: unknown): a is string => typeof a === 'string').slice(0, 10)
       : [];
     if (!input && attachmentIds.length === 0) { res.status(400).json({ error: 'input required' }); return; }
+    // Opening a new conversation inside a saved agent. Unknown is refused by
+    // name; an existing conversation keeps the agent it was opened in.
+    const requestedAgentId = typeof body.agentId === 'string' ? body.agentId.trim() : '';
+    const requestedAgent = requestedAgentId ? resolveAgentBinding(requestedAgentId) : null;
+    if (requestedAgentId && !requestedAgent) { res.status(400).json({ error: 'AGENT_NOT_FOUND', code: 'AGENT_NOT_FOUND' }); return; }
 
     let requestIdentity: ReturnType<typeof harnessChatRequestIdentity>;
     try {
@@ -16355,7 +16363,7 @@ export function registerConsoleRoutes(
       });
       return;
     }
-    const payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode);
+    const payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode, requestedAgent?.agent.id);
     const priorReceipt = getHarnessChatRequestReceipt(requestIdentity.requestId);
     if (priorReceipt && priorReceipt.inputHash !== payloadHash) {
       res.status(409).json({ error: 'client request id is already bound to different input' });
@@ -16427,6 +16435,7 @@ export function registerConsoleRoutes(
           source: 'desktop',
           channelId: deterministicSessionId || undefined,
           userId: 'desktop',
+          ...(requestedAgent ? { agentId: requestedAgent.agent.id, agentName: requestedAgent.agent.name } : {}),
         },
       });
     }
@@ -18397,9 +18406,10 @@ export function registerConsoleRoutes(
       const q = typeof req.query.q === 'string' ? req.query.q : undefined;
       const tag = typeof req.query.tag === 'string' ? req.query.tag : undefined;
       const source = typeof req.query.source === 'string' ? req.query.source : undefined;
+      const agent = typeof req.query.agent === 'string' ? req.query.agent : undefined;
       const includeArchived = req.query.includeArchived === '1' || req.query.includeArchived === 'true';
       const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
-      const sessions = buildUnifiedSessionList({ q, tag, source, includeArchived, limit });
+      const sessions = buildUnifiedSessionList({ q, tag, source, agent, includeArchived, limit });
       res.json({ sessions, total: sessions.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

@@ -32,8 +32,10 @@ export interface SubagentRunRecord {
   /** Present when spawned inside a workflow. */
   workflowName?: string;
   stepId?: string;
-  /** Specialist role — the fan-out intent/category (or a team-agent name later). */
+  /** Specialist role — the fan-out intent/category. */
   role?: string;
+  /** The saved agent this worker ran as, when it ran as one. */
+  boundAgentId?: string;
   provider: SubagentProvider;
   model?: string;
   /** The single item/task this agent handled. */
@@ -189,6 +191,7 @@ export function recordSubagentRun(
       ...(input.workflowName ? { workflowName: input.workflowName } : {}),
       ...(input.stepId ? { stepId: input.stepId } : {}),
       ...(input.role ? { role: input.role } : {}),
+      ...(input.boundAgentId ? { boundAgentId: input.boundAgentId } : {}),
       provider: input.provider,
       ...(input.model ? { model: input.model } : {}),
       task: input.task,
@@ -207,6 +210,32 @@ export function recordSubagentRun(
 }
 
 /** All subagent runs for a parent (workflow run or chat session), oldest first. */
+/**
+ * Every worker run that ran as one saved agent, newest first, across every
+ * parent. Reads each parent's file once; parents whose newest record is
+ * older than what is already collected are skipped once the limit is met.
+ */
+export function listSubagentRunsForAgent(agentId: string, limit = 20): SubagentRunRecord[] {
+  const root = path.join(BASE_DIR, 'state', 'subagents');
+  const wanted = String(agentId ?? '').trim();
+  if (!wanted || !existsSync(root)) return [];
+  let parents: string[];
+  try {
+    parents = readdirSync(root);
+  } catch {
+    return [];
+  }
+  const out: SubagentRunRecord[] = [];
+  for (const parent of parents) {
+    for (const record of listSubagentRuns(parent)) {
+      if (record.boundAgentId === wanted) out.push(record);
+    }
+  }
+  return out
+    .sort((left, right) => right.finishedAt.localeCompare(left.finishedAt))
+    .slice(0, Math.max(1, limit));
+}
+
 export function listSubagentRuns(parentRunId: string): SubagentRunRecord[] {
   try {
     const raw = readFileSync(recordsPath(parentRunId), 'utf-8');
