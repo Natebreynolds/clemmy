@@ -806,10 +806,10 @@ test('parseApprovalIntent: loose verbs DO match when an apr-xxxx is present', ()
 test('parseApprovalIntent: strong verbs pick up an apr-xxxx when present', () => {
   assert.deepEqual(parseApprovalIntent('approve apr-xy7q'), { decision: 'approve', approvalId: 'apr-xy7q' });
   assert.deepEqual(parseApprovalIntent('reject apr-26ba'), { decision: 'reject', approvalId: 'apr-26ba' });
-  // ID at end of a longer phrase still extracts.
+  // An address inside a qualified reply is a target hint, not authority.
   assert.deepEqual(
     parseApprovalIntent('approve the salesforce one apr-111h please'),
-    { decision: 'approve', approvalId: 'apr-111h' },
+    null,
   );
 });
 

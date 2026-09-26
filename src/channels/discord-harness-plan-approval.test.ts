@@ -68,6 +68,18 @@ test('a non-approval phrase does nothing (no plan resolved)', () => {
   assert.equal(getPlanProposal(proposal.id)?.status, 'pending', 'plan stays pending');
 });
 
+test('a qualified approval leaves the original plan pending and inactive', () => {
+  const sess = createSession({ kind: 'chat' });
+  const channelId = 'discord-qualified-plan';
+  __test__.setChannelSessionForTest(channelId, sess.id);
+  const proposal = surfacePlan({ plan: aPlan() as never, originatingRequest: 'send the 8 emails', sessionId: sess.id });
+  for (const text of ['approve with changes', 'go ahead but shorter', 'confirm different recipient']) {
+    assert.equal(maybeResolvePendingPlanProposal(channelId, text), null, text);
+    assert.equal(getPlanProposal(proposal.id)?.status, 'pending');
+    assert.equal(getActiveGoalForSession(sess.id), null, 'no unchanged plan is activated');
+  }
+});
+
 test('an apr- registry id is NOT shadowed — it returns null (registry path owns it)', () => {
   const sess = createSession({ kind: 'chat' });
   const channelId = 'discord-chan-4';

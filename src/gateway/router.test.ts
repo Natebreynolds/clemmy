@@ -501,6 +501,47 @@ test('gateway parked reply: declining leaves the task paused and does NOT re-nag
   assert.equal(legacyCalls(), 0);
 });
 
+test('gateway parked answer confirmation preserves qualified replies instead of forwarding the old candidate', async () => {
+  for (const answer of ['yes but use Tuesday', 'go ahead with Tuesday', 'yes?']) {
+    const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Qualified answer' });
+    const task = createBackgroundTask({ title: 'Choose a day', prompt: 'choose a day',
+      originSessionId: session.id, channel: 'mobile', source: 'mobile' });
+    markBackgroundTaskAwaitingInput(task.id, `question-${task.id}`, 'Which day?');
+    let captured = '';
+    const { gateway, legacyCalls } = hostGatewayForTest(async (options) => {
+      captured = options.input;
+      return completedHostAnswer(options, 'foreground');
+    });
+    const opts = { sessionId: session.id, channel: 'mobile' as const, source: 'mobile' as const };
+    const ask = await gateway.handleMessage({ message: 'Monday', ...opts });
+    assert.equal(ask.handledControl, true);
+    const reply = await gateway.handleMessage({ message: answer, ...opts });
+    assert.equal(getBackgroundTask(task.id)?.status, 'awaiting_input', answer);
+    assert.equal(getBackgroundTask(task.id)?.inputResolution, undefined, answer);
+    assert.equal(reply.handledControl ?? false, false);
+    assert.equal(captured, answer, 'the original user correction reaches the foreground host');
+    assert.equal(legacyCalls(), 0);
+  }
+});
+
+test('gateway parked answer confirmation retains punctuated exact assent without model work', async () => {
+  const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Exact answer' });
+  const task = createBackgroundTask({ title: 'Choose a day', prompt: 'choose a day',
+    originSessionId: session.id, channel: 'mobile', source: 'mobile' });
+  markBackgroundTaskAwaitingInput(task.id, `question-${task.id}`, 'Which day?');
+  let hostCalls = 0;
+  const { gateway } = hostGatewayForTest(async (options) => {
+    hostCalls += 1;
+    return completedHostAnswer(options, 'unexpected');
+  });
+  const opts = { sessionId: session.id, channel: 'mobile' as const, source: 'mobile' as const };
+  await gateway.handleMessage({ message: 'Monday', ...opts });
+  const reply = await gateway.handleMessage({ message: 'Yes!', ...opts });
+  assert.equal(reply.handledControl, true);
+  assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'Monday');
+  assert.equal(hostCalls, 0);
+});
+
 test('gateway bare continue prioritizes a parked background continuation', async () => {
   const session = createSession({ kind: 'chat', channel: 'mobile', title: 'Mobile background continue' });
   appendEvent({

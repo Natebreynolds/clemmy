@@ -1793,79 +1793,10 @@ export async function handleHarnessSessions(opts: {
   }
 }
 
-/**
- * Detect approve / reject intent in a Discord prompt. Conservative —
- * only matches at the start of the message and only when a session
- * is actually awaiting approval. "Yes" mid-conversation when nothing
- * is pending should be treated as a regular new turn, not an approval.
- *
- * Returns `{ decision, approvalId? }` so callers can route an explicit
- * `approve apr-xy7q` (or `reject apr-xy7q`) at exactly the addressable
- * approval, instead of the legacy "most recent paused session" fallback
- * that today silently routes to the wrong session when multiple are
- * pending. The approval ID is the apr-<4 base36 chars> format minted
- * by approval-registry.ts.
- *
- * Matcher tightening (T1.2): the old permissive set (`yes|y|ok|okay`)
- * hijacked plenty of conversational messages — "yes please continue
- * the workflow" got routed as an approval. The new rule:
- *   - STRONG verbs (`approve`, `reject`, `proceed`, `go ahead`, `lgtm`,
- *     `do it`, `confirm`, `deny`, `abort`, `nevermind`, 👍/👎) match
- *     regardless of whether an apr-xxxx is present.
- *   - LOOSE verbs (`yes`, `y`, `ok`, `okay`, `no`, `n`, `sure`, etc.)
- *     ONLY match when paired with an explicit apr-xxxx code. A bare
- *     "yes" no longer reads as approval; "yes apr-26ba" does.
- *   - "cancel" is reserved for the /cancel command (parseHarnessCommand);
- *     it no longer counts as a reject so users can abandon the pause
- *     entirely instead of resolving it as rejected.
- */
-export interface ParsedApprovalIntent {
-  decision: 'approve' | 'reject';
-  /** When the user typed `approve apr-xy7q` or `reject apr-xy7q`. */
-  approvalId?: string;
-}
-
-// Strong verbs — unambiguous endorsement / rejection of an approval.
-// Match at the start of the message ONLY so "I approve of that idea"
-// doesn't fire when nothing is asking for approval.
-//
-// The emoji patterns are separate from the word patterns because
-// JavaScript's `\b` (ASCII word boundary) doesn't fire around an
-// emoji codepoint, so `^👍\b` never matches. Two patterns, OR'd at
-// the caller, keeps each clean and well-tested.
-const STRONG_APPROVE = /^(approve(d)?|proceed|go ahead|lgtm|do it|confirm(ed)?)\b/;
-const STRONG_APPROVE_EMOJI = /^👍/;
-const STRONG_REJECT = /^(reject(ed)?|deny|denied|abort|nevermind|never mind|not now|don'?t do (it|that))\b/;
-const STRONG_REJECT_EMOJI = /^👎/;
-// Loose verbs — require an apr-xxxx in the message to disambiguate
-// from regular conversation. "yes apr-26ba" reads as approval; bare
-// "yes" does not (it's just a conversational ack).
-const LOOSE_APPROVE_WITH_ID = /^(yes|y|ok|okay|sure|sounds good|do this)\b/;
-const LOOSE_REJECT_WITH_ID = /^(no|n|stop)\b/;
-const APR_ID_PATTERN = /\bapr-([a-z0-9]{4})\b/;
-
-export function parseApprovalIntent(prompt: string): ParsedApprovalIntent | null {
-  const t = prompt.trim().toLowerCase();
-  if (!t) return null;
-  const idMatch = APR_ID_PATTERN.exec(t);
-  const approvalId = idMatch ? `apr-${idMatch[1]}` : undefined;
-
-  if (STRONG_APPROVE.test(t) || STRONG_APPROVE_EMOJI.test(t)) {
-    return approvalId ? { decision: 'approve', approvalId } : { decision: 'approve' };
-  }
-  if (STRONG_REJECT.test(t) || STRONG_REJECT_EMOJI.test(t)) {
-    return approvalId ? { decision: 'reject', approvalId } : { decision: 'reject' };
-  }
-  // Loose verbs only count when an apr-xxxx code is also present —
-  // that's the explicit signal "yes I mean THIS approval".
-  if (approvalId && LOOSE_APPROVE_WITH_ID.test(t)) {
-    return { decision: 'approve', approvalId };
-  }
-  if (approvalId && LOOSE_REJECT_WITH_ID.test(t)) {
-    return { decision: 'reject', approvalId };
-  }
-  return null;
-}
+// All ingress surfaces share the same decision grammar. Import locally for
+// channel routing and re-export for callers using the historical entry point.
+import { parseApprovalIntent } from '../runtime/harness/approval-intent.js';
+export { parseApprovalIntent, type ParsedApprovalIntent } from '../runtime/harness/approval-intent.js';
 
 /**
  * Slash-style command parser for harness-channel control. Distinct

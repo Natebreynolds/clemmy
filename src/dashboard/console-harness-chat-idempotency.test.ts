@@ -1157,6 +1157,79 @@ test('desktop /new and /cancel acknowledgements are typed source-bound outcomes'
   }
 });
 
+test('desktop qualified approval steers the live owner without authorizing its pending call', async () => {
+  resetEventLog();
+  resetHarnessRuntimeConfig();
+  let brainCalls = 0;
+  const unexpectedBrain = async () => {
+    brainCalls += 1;
+    throw new Error('a live-owner steer or exact approval must not start a model turn');
+  };
+  _setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    runConversation: unexpectedBrain as never,
+    claudeAgentBrain: unexpectedBrain as never,
+  });
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const { steerBlockForToolBoundary } = await import('../runtime/harness/steer-notes.js');
+  const harness = await boot();
+  try {
+    const session = createSession({ id: 'sess-desktop-qualified-approval', kind: 'chat', channel: 'desktop' });
+    const frozenArgs = { recipient: 'fixture@example.test', body: 'Original reviewed message.' };
+    const approval = approvalRegistry.register({
+      sessionId: session.id,
+      channel: 'desktop',
+      subject: 'Send the reviewed fixture message',
+      tool: 'fixture_send_message',
+      args: frozenArgs,
+    });
+    let resolutions = 0;
+    approvalRegistry.onApprovalResolved((row) => {
+      if (row.approvalId === approval.approvalId) resolutions += 1;
+    });
+    const owner = claimRunAttemptLease({ sessionId: session.id, runId: 'desktop:qualified-approval-owner',
+      ownerId: 'qualified-approval-owner', leaseMs: 60_000 }).attempt!;
+    recordRunAttemptUserInput(owner, {
+      turn: 0, role: 'user', data: { text: 'Prepare the fixture message and wait for my approval.' },
+    }, { armRunInFlight: true });
+
+    // This registry-owned live wait has no saved interrupt state, so it does
+    // not enter the conversational amendment router. The real ingress must
+    // not turn a prefix-shaped instruction into authority for frozen bytes.
+    const amendment = await fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'approve with changes', sessionId: session.id,
+        clientRequestId: 'qualified-approval-change' }),
+    });
+    const amendmentBody = await amendment.json() as { steered?: boolean };
+    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'pending',
+      'a qualified approval must not release the original call');
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, null);
+    assert.deepEqual(approvalRegistry.get(approval.approvalId)?.args, frozenArgs);
+    assert.equal(resolutions, 0);
+    assert.equal(amendment.status, 200);
+    assert.equal(amendmentBody.steered, true);
+    assert.match(steerBlockForToolBoundary(session.id), /approve with changes/,
+      'the original live owner receives the user\'s actual instruction');
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, owner.attemptId);
+
+    const exact = await fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'approve', sessionId: session.id,
+        clientRequestId: 'qualified-approval-exact-decision' }),
+    });
+    assert.equal(exact.status, 202);
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'approved',
+      'an exact later approval still resolves the sole existing card');
+    assert.equal(resolutions, 1);
+    assert.equal(getActiveRunAttempt(session.id)?.attemptId, owner.attemptId);
+    assert.equal(brainCalls, 0);
+  } finally {
+    _setBridgeImplsForTests({});
+    await harness.close();
+  }
+});
+
 test('desktop chat approval buttons resolve one exact card; bare decisions never fan out', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();

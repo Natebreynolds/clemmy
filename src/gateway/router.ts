@@ -744,7 +744,9 @@ const pendingParkedApply = new Map<string, PendingParkedApply>();
 // for THAT question on every subsequent message — only re-offer when the question changes.
 const declinedParkedQuestion = new Map<string, string>();
 const PARKED_CONFIRM_TTL_MS = 30 * 60_000;
-const PARKED_AFFIRM_RE = /^\/?(y|yes|yep|yeah|yup|sure|ok|okay|apply|apply it|send it|use (?:that|it)|do it|confirm|go ahead|please do)\b/i;
+// This confirms forwarding the frozen candidate. Any qualification belongs to
+// the foreground host instead of silently sending the old answer to the task.
+const PARKED_AFFIRM_RE = /^\/?(?:y|yes|yep|yeah|yup|sure|ok|okay|apply|apply it|send it|use (?:that|it)|do it|confirm|go ahead|please do)[.!]*$/i;
 
 interface ParkedBackgroundRoute {
   response: GatewayResponse;
