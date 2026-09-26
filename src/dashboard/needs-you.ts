@@ -259,6 +259,7 @@ export function needsYouKey(
   const actionItemId = notificationActionItemId(notification);
   if (actionItemId) return actionItemId;
   if (str(meta, 'watch') === 'calendar' && str(meta, 'itemKey')) return `calendar:${str(meta, 'itemKey')}`;
+  if (str(meta, 'heartbeatId') && str(meta, 'itemKey')) return `heartbeat:${str(meta, 'heartbeatId')}:${str(meta, 'itemKey')}`;
   const workflow = notificationWorkflowKey(notification, ref.runs);
   if (workflow) return workflow;
   const sessionId = str(meta, 'sessionId', 'targetSessionId');
@@ -276,6 +277,13 @@ function calendarAskOpen(meta: Meta, nowMs: number): boolean {
   return Number.isFinite(startsAt) ? startsAt > nowMs : true;
 }
 
+/** A heartbeat item is an ask while the heartbeat still holds it open: the
+ *  heartbeat marks the notification read (and needsAttention false) when the
+ *  thing it points at resolves, so this reads the heartbeat's own bookkeeping. */
+function heartbeatItemOpen(meta: Meta): boolean {
+  return Boolean(str(meta, 'heartbeatId')) && Boolean(str(meta, 'itemKey')) && meta?.needsAttention !== false;
+}
+
 /** Does this notification need the owner now, by the one definition? Read
  *  status is the caller's business (an opened card still needs an answer
  *  until the answer lands); this is about the referent. */
@@ -285,6 +293,7 @@ export function notificationNeedsYou(
 ): boolean {
   const meta = notification.metadata;
   if (calendarAskOpen(meta, ref.nowMs)) return true;
+  if (heartbeatItemOpen(meta)) return true;
   // A workflow notice is current exactly while its workflow's newest run is
   // stopped: five "blocked" notices for runs that have since run again are
   // history, and a notice for a workflow still parked is an ask.

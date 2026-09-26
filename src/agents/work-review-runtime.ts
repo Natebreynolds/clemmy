@@ -12,7 +12,7 @@ import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { listRuns } from '../runtime/run-events.js';
-import { addNotification, getNotification } from '../runtime/notifications.js';
+import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
 import { tryJevHeartbeatItemVerdict } from '../runtime/jev/control-plane.js';
 import { isQuietHoursActive, loadProactivityPolicy, saveProactivityPolicy } from './proactivity-policy.js';
 import { loadHeartbeatContract } from './heartbeat-contracts.js';
@@ -193,6 +193,7 @@ export function runWorkReviewTickNow(options: { source: string } = { source: 'he
     judge: judgeWorkReviewCandidate,
     publish: addNotification,
     isNotificationRead: (id) => getNotification(id)?.read === true,
+    markNotificationRead: (id) => { markNotificationRead(id); },
     loadState: loadWorkReviewState,
     saveState: saveWorkReviewState,
   }).then((result) => {

@@ -60,8 +60,11 @@ export interface WorkReviewCandidate {
   subject: string;
   /** Plain facts for the owner and for Jev; never a guess. */
   detail: string;
-  /** What the item points at, so it can retire when that resolves. */
+  /** What the item points at, so it can retire when that resolves. Several
+   *  runs or conversations about one thing are one item with several refs. */
   ref: { type: 'workflow_run' | 'chat_run' | 'draft'; id: string };
+  refs: string[];
+  count: number;
   /** Where Clementine could help, in one line. Model voice comes later; this is the fact. */
   offer: string;
   observedAt: string;
@@ -124,6 +127,8 @@ export interface WorkReviewConfig {
   staleWaitMs: number;
   /** How old a draft has to be before it counts as sitting unsent. */
   staleDraftMs: number;
+  /** Older than this, a wait or a draft is history, not an ask. */
+  maxAgeMs: number;
   /** How far back a failure counts on the first tick, and after a long gap. */
   failureLookbackMs: number;
   maxJudgeCallsPerTick: number;
@@ -133,9 +138,10 @@ export interface WorkReviewConfig {
 export const DEFAULT_WORK_REVIEW_CONFIG: WorkReviewConfig = {
   staleWaitMs: 2 * 60 * 60 * 1000,
   staleDraftMs: 60 * 60 * 1000,
+  maxAgeMs: 7 * 24 * 60 * 60 * 1000,
   failureLookbackMs: 24 * 60 * 60 * 1000,
-  maxJudgeCallsPerTick: 6,
-  maxItemsPerTick: 6,
+  maxJudgeCallsPerTick: 12,
+  maxItemsPerTick: 8,
 };
 
 export interface WorkReviewJudgeVerdict {
@@ -158,6 +164,8 @@ export interface WorkReviewDeps {
   judge?: (candidate: WorkReviewCandidate, rules: string[]) => Promise<WorkReviewJudgeVerdict | null>;
   publish: (n: NotificationRecord) => void;
   isNotificationRead: (id: string) => boolean;
+  /** A resolved item's card leaves Needs you: the heartbeat marks it read. */
+  markNotificationRead: (id: string) => void;
   loadState: () => WorkReviewState;
   saveState: (s: WorkReviewState) => void;
 }
@@ -179,8 +187,13 @@ export function emptyWorkReviewState(): WorkReviewState {
   };
 }
 
-const WAITING_RUN_STATUSES = new Set(['parked', 'blocked_capability', 'blocked_mutation', 'awaiting_approval', 'awaiting_input', 'paused']);
-const FAILED_RUN_STATUSES = new Set(['failed']);
+/** The run statuses the product already reads as "stopped on a person"
+ *  (dashboard/needs-you.ts), plus the two pauses. */
+const WAITING_RUN_STATUSES = new Set(['blocked', 'blocked_capability', 'blocked_readiness', 'blocked_mutation', 'parked', 'paused', 'awaiting_approval', 'awaiting_input']);
+/** A run record stores a failure as `error` (live 2026-09-26, 8 of 329 records); the API vocabulary says `failed`. */
+const FAILED_RUN_STATUSES = new Set(['failed', 'error']);
+/** A creation test is the daemon proving a workflow, never the owner's work. */
+const IGNORED_RUN_STATUSES = new Set(['creation_test', 'completed', 'cancelled']);
 
 function ms(iso: string | undefined): number | null {
   if (!iso) return null;
@@ -217,9 +230,14 @@ export function deriveWorkReviewCandidates(
   const out: WorkReviewCandidate[] = [];
   const observedAt = new Date(nowMs).toISOString();
   const failureSince = lastTickMs === null ? nowMs - config.failureLookbackMs : Math.max(lastTickMs, nowMs - config.failureLookbackMs);
+  const tooOld = nowMs - config.maxAgeMs;
 
+  // Waits group by workflow: three runs of one workflow parked on the same
+  // question are one thing the owner has to settle, not three.
+  const waitingByWorkflow = new Map<string, { runs: WorkRunObservation[]; oldest: number; connection: boolean }>();
   for (const run of observation.runs) {
     if (run.targetStepId) continue; // a one-step try is the owner testing, not work
+    if (IGNORED_RUN_STATUSES.has(run.status)) continue;
     const finished = ms(run.finishedAt) ?? ms(run.createdAt);
     if (FAILED_RUN_STATUSES.has(run.status)) {
       if (finished === null || finished < failureSince) continue;
@@ -229,6 +247,8 @@ export function deriveWorkReviewCandidates(
         subject: run.workflow,
         detail: `${run.workflow} failed ${formatAgo(finished, nowMs)}${run.error ? `: ${short(run.error, 160)}` : '.'}`,
         ref: { type: 'workflow_run', id: run.runId },
+        refs: [run.runId],
+        count: 1,
         offer: 'I can look at what went wrong, or run it again.',
         observedAt,
       });
@@ -236,42 +256,73 @@ export function deriveWorkReviewCandidates(
     }
     if (WAITING_RUN_STATUSES.has(run.status)) {
       const since = ms(run.createdAt);
-      if (since === null || nowMs - since < config.staleWaitMs) continue;
-      out.push({
-        key: `run_waiting:${run.runId}`,
-        kind: 'run_waiting',
-        subject: run.workflow,
-        detail: `${run.workflow} has been waiting on you since ${formatAgo(since, nowMs)}${run.status === 'blocked_capability' ? ' for a connection' : ''}.`,
-        ref: { type: 'workflow_run', id: run.runId },
-        offer: run.status === 'blocked_capability' ? 'I can walk you through reconnecting it.' : 'I can show you what it is asking, or cancel it.',
-        observedAt,
-      });
+      if (since === null || nowMs - since < config.staleWaitMs || since < tooOld) continue;
+      const group = waitingByWorkflow.get(run.workflow) ?? { runs: [], oldest: since, connection: false };
+      group.runs.push(run);
+      group.oldest = Math.min(group.oldest, since);
+      if (run.status === 'blocked_capability') group.connection = true;
+      waitingByWorkflow.set(run.workflow, group);
     }
   }
+  for (const [workflow, group] of waitingByWorkflow) {
+    const n = group.runs.length;
+    out.push({
+      key: `run_waiting:${workflow}`,
+      kind: 'run_waiting',
+      subject: workflow,
+      detail: n === 1
+        ? `${workflow} has been waiting on you since ${formatAgo(group.oldest, nowMs)}${group.connection ? ' for a connection' : ''}.`
+        : `${n} runs of ${workflow} are waiting on you, the oldest since ${formatAgo(group.oldest, nowMs)}${group.connection ? ', one for a connection' : ''}.`,
+      ref: { type: 'workflow_run', id: group.runs[0].runId },
+      refs: group.runs.map((r) => r.runId),
+      count: n,
+      offer: group.connection ? 'I can walk you through reconnecting it.' : 'I can show you what it is asking, or cancel the old ones.',
+      observedAt,
+    });
+  }
 
+  // Conversations group by what they are about.
+  const chatsByTitle = new Map<string, { chats: ChatWaitObservation[]; oldest: number; approval: boolean }>();
   for (const chat of observation.chats) {
     const since = ms(chat.updatedAt);
-    if (since === null || nowMs - since < config.staleWaitMs) continue;
+    if (since === null || nowMs - since < config.staleWaitMs || since < tooOld) continue;
+    const titleKey = chat.title.replace(/\s+/g, ' ').trim().toLowerCase();
+    const group = chatsByTitle.get(titleKey) ?? { chats: [], oldest: since, approval: false };
+    group.chats.push(chat);
+    group.oldest = Math.min(group.oldest, since);
+    if (chat.waitingOn === 'approval') group.approval = true;
+    chatsByTitle.set(titleKey, group);
+  }
+  for (const [titleKey, group] of chatsByTitle) {
+    const n = group.chats.length;
+    const title = short(group.chats[0].title, 80);
+    const what = group.approval ? 'approval' : 'answer';
     out.push({
-      key: `chat_waiting:${chat.runId}`,
+      key: `chat_waiting:${titleKey}`,
       kind: 'chat_waiting',
-      subject: chat.title,
-      detail: `"${short(chat.title, 80)}" has been waiting for your ${chat.waitingOn === 'approval' ? 'approval' : 'answer'} since ${formatAgo(since, nowMs)}.`,
-      ref: { type: 'chat_run', id: chat.runId },
-      offer: 'I can bring it back up, or drop it if it no longer matters.',
+      subject: group.chats[0].title,
+      detail: n === 1
+        ? `"${title}" has been waiting for your ${what} since ${formatAgo(group.oldest, nowMs)}.`
+        : `${n} conversations about "${title}" are waiting for your ${what}, the oldest since ${formatAgo(group.oldest, nowMs)}.`,
+      ref: { type: 'chat_run', id: group.chats[0].runId },
+      refs: group.chats.map((c) => c.runId),
+      count: n,
+      offer: n === 1 ? 'I can bring it back up, or drop it if it no longer matters.' : 'I can bring the newest back up and close the rest.',
       observedAt,
     });
   }
 
   for (const draft of observation.drafts) {
     const at = ms(draft.modifiedAt);
-    if (at === null || nowMs - at < config.staleDraftMs) continue;
+    if (at === null || nowMs - at < config.staleDraftMs || at < tooOld) continue;
     out.push({
       key: `draft_unsent:${draft.dir}/${draft.name}`,
       kind: 'draft_unsent',
       subject: draft.name,
       detail: `${draft.name} has been sitting in ${draft.dir} since ${formatAgo(at, nowMs)}, unsent.`,
       ref: { type: 'draft', id: `${draft.dir}/${draft.name}` },
+      refs: [`${draft.dir}/${draft.name}`],
+      count: 1,
       offer: 'I can send it, revise it, or file it away.',
       observedAt,
     });
@@ -314,11 +365,13 @@ export function buildWorkReviewNotification(
       ...(notify === 'quiet' ? { inboxOnly: true } : {}),
       source: 'work-review',
       watch: 'work-review',
-      heartbeat: 'work-review',
+      heartbeatId: 'work-review',
       itemKey: candidate.key,
       changeKind: candidate.kind,
       refType: candidate.ref.type,
       refId: candidate.ref.id,
+      refs: candidate.refs.slice(0, 20),
+      count: candidate.count,
     },
   };
 }
@@ -363,6 +416,8 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
     item.retiredAt = at;
     item.retiredReason = 'resolved';
     state.metrics.itemsRetired += 1;
+    // The card leaves Needs you with the thing it pointed at.
+    if (item.notificationId) { try { deps.markNotificationRead(item.notificationId); } catch { /* the state still says resolved */ } }
   }
   for (const item of open) {
     if (item.notificationId && !item.acknowledgedAt && deps.isNotificationRead(item.notificationId)) {
@@ -382,6 +437,8 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
   let vetoed = 0;
   let held = 0;
   let judgeCalls = 0;
+  const rank = (c: WorkReviewCandidate): number => (c.kind === 'run_failed' ? 0 : c.kind === 'run_waiting' ? 1 : c.kind === 'chat_waiting' ? 2 : 3);
+  fresh.sort((a, b) => rank(a) - rank(b) || a.subject.localeCompare(b.subject));
   for (const candidate of fresh) {
     if (deps.rules.length > 0 && deps.judge) {
       if (judgeCalls >= cfg.maxJudgeCallsPerTick) { held += 1; continue; }
@@ -400,9 +457,7 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
   }
   state.metrics.heldForBudget += held;
 
-  // 5. Surface, failures first, bounded per tick.
-  const rank = (c: WorkReviewCandidate): number => (c.kind === 'run_failed' ? 0 : c.kind === 'run_waiting' ? 1 : c.kind === 'chat_waiting' ? 2 : 3);
-  surfaced.sort((a, b) => rank(a) - rank(b) || a.subject.localeCompare(b.subject));
+  // 5. Surface, failures first (already in rank order), bounded per tick.
   const produced: WorkReviewItem[] = [];
   for (const candidate of surfaced.slice(0, cfg.maxItemsPerTick)) {
     const notification = buildWorkReviewNotification(candidate, at, deps.notify);

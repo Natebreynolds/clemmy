@@ -33,11 +33,17 @@ const observation: WorkObservation = {
     { runId: 'r-ok', workflow: 'end-of-day', status: 'completed', createdAt: iso(-10 * H), finishedAt: iso(-10 * H + 45_000) },
     { runId: 'r-try', workflow: 'FRAMEWORK-TEST fixture', status: 'failed', createdAt: iso(-1 * H), finishedAt: iso(-1 * H), targetStepId: 'collect', error: 'try failed' },
     { runId: 'r-wait-old', workflow: 'weekly-review', status: 'parked', createdAt: iso(-5 * H) },
+    { runId: 'r-wait-old-2', workflow: 'weekly-review', status: 'blocked', createdAt: iso(-3 * H) },
     { runId: 'r-wait-new', workflow: 'morning-briefing', status: 'parked', createdAt: iso(-20 * 60_000) },
+    { runId: 'r-ancient', workflow: 'quarter-close', status: 'blocked', createdAt: iso(-30 * 24 * H) },
+    { runId: 'r-error', workflow: 'inbox-sweep', status: 'error', createdAt: iso(-2 * H), finishedAt: iso(-2 * H + 30_000), error: 'IMAP login refused' },
+    { runId: 'r-test', workflow: 'inbox-sweep', status: 'creation_test', createdAt: iso(-1 * H) },
   ],
   chats: [
     { runId: 'c-old', sessionId: 's1', title: 'Send the leadership email', status: 'awaiting_approval', updatedAt: iso(-26 * H), waitingOn: 'approval' },
     { runId: 'c-new', sessionId: 's2', title: 'Which account?', status: 'awaiting_input', updatedAt: iso(-10 * 60_000), waitingOn: 'input' },
+    { runId: 'c-standup-1', sessionId: 's3', title: 'Workflow: daily-standup-email', status: 'awaiting_input', updatedAt: iso(-48 * H), waitingOn: 'input' },
+    { runId: 'c-standup-2', sessionId: 's4', title: 'Workflow: daily-standup-email', status: 'awaiting_input', updatedAt: iso(-72 * H), waitingOn: 'input' },
   ],
   drafts: [
     { name: 'weekly-workflow-priorities-2026-09-28.md', dir: 'drafts', modifiedAt: iso(-9 * H), bytes: 715 },
@@ -45,19 +51,26 @@ const observation: WorkObservation = {
   ],
 };
 
-test('candidates: a failure and long waits are raised; fresh waits, clean runs and one-step tries are not', () => {
+test('candidates: failures and long waits are raised, grouped by what they are about; fresh waits, clean runs, tests, one-step tries and ancient waits are not', () => {
   const c = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, null);
   assert.deepEqual(c.map((x) => x.key).sort(), [
-    'chat_waiting:c-old',
+    'chat_waiting:send the leadership email',
+    'chat_waiting:workflow: daily-standup-email',
     'draft_unsent:drafts/weekly-workflow-priorities-2026-09-28.md',
+    'run_failed:r-error',
     'run_failed:r-fail',
-    'run_waiting:r-wait-old',
+    'run_waiting:weekly-review',
   ]);
-  const failed = c.find((x) => x.kind === 'run_failed')!;
+  const failed = c.find((x) => x.key === 'run_failed:r-fail')!;
   assert.match(failed.detail, /friday-dashboard-daily-refresh failed 3 h ago: Salesforce query timed out/);
   assert.match(failed.offer, /look at what went wrong/);
+  assert.match(c.find((x) => x.key === 'run_failed:r-error')!.detail, /inbox-sweep failed 2 h ago: IMAP login refused/, 'a record stored as error is a failure');
   const wait = c.find((x) => x.kind === 'run_waiting')!;
-  assert.match(wait.detail, /waiting on you since 5 h ago/);
+  assert.match(wait.detail, /2 runs of weekly-review are waiting on you, the oldest since 5 h ago/);
+  assert.deepEqual(wait.refs, ['r-wait-old', 'r-wait-old-2']);
+  const standup = c.find((x) => x.key === 'chat_waiting:workflow: daily-standup-email')!;
+  assert.equal(standup.count, 2);
+  assert.match(standup.detail, /2 conversations about "Workflow: daily-standup-email" are waiting for your answer, the oldest since 3 days ago/);
   // A failure older than the last tick is not raised again on the next tick.
   const later = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, NOW - 60 * 60_000);
   assert.equal(later.some((x) => x.kind === 'run_failed'), false);
@@ -73,6 +86,7 @@ function harness(opts: {
   now?: number;
 }) {
   const published: NotificationRecord[] = [];
+  const markedRead: string[] = [];
   let state = opts.state ?? emptyWorkReviewState();
   let judgeCalls = 0;
   const deps = {
@@ -86,24 +100,25 @@ function harness(opts: {
     judge: opts.judge ? async (c: WorkReviewCandidate) => { judgeCalls += 1; return opts.judge!(c); } : undefined,
     publish: (n: NotificationRecord) => { published.push(n); },
     isNotificationRead: (id: string) => opts.readIds?.has(id) ?? false,
+    markNotificationRead: (id: string) => { markedRead.push(id); },
     loadState: () => state,
     saveState: (s: WorkReviewState) => { state = s; },
   };
-  return { deps, published, get state() { return state; }, get judgeCalls() { return judgeCalls; } };
+  return { deps, published, markedRead, get state() { return state; }, get judgeCalls() { return judgeCalls; } };
 }
 
 test('a tick raises each new item once, quietly by default, and a second tick is quiet', async () => {
   const h = harness({});
   const first = await runWorkReviewTick(h.deps);
-  assert.equal(first.produced, 4);
+  assert.equal(first.produced, 6);
   assert.equal(first.quiet, false);
-  assert.equal(h.published.length, 4);
+  assert.equal(h.published.length, 6);
   for (const n of h.published) {
     assert.equal(n.metadata?.needsAttention, true);
     assert.equal(n.metadata?.inboxOnly, true, 'quiet mode stays in the app');
-    assert.equal(n.metadata?.heartbeat, 'work-review');
+    assert.equal(n.metadata?.heartbeatId, 'work-review');
   }
-  assert.equal(h.published[0].title, 'Run failed: friday-dashboard-daily-refresh', 'failures first');
+  assert.match(h.published[0].title, /^Run failed: /, 'failures first');
   assert.match(h.published[0].body, /I can look at what went wrong/);
   assert.equal(h.judgeCalls, 0, 'no rules, no model call');
 
@@ -111,9 +126,9 @@ test('a tick raises each new item once, quietly by default, and a second tick is
   const second = await runWorkReviewTick({ ...h.deps, tickId: 't2', now: () => NOW + 30 * 60_000 });
   assert.equal(second.produced, 0);
   assert.equal(second.quiet, true);
-  assert.equal(h.published.length, 4);
+  assert.equal(h.published.length, 6);
   assert.equal(h.state.metrics.quietTicks, 1);
-  assert.equal(h.state.metrics.duplicatesSuppressed, 3, 'the waits and the draft were seen again; the failure aged out of the window');
+  assert.equal(h.state.metrics.duplicatesSuppressed, 4, 'the waits and the draft were seen again; the failures aged out of the window');
 });
 
 test("the owner's rules skip an item through Jev, and the judge budget holds what it cannot judge", async () => {
@@ -123,8 +138,8 @@ test("the owner's rules skip an item through Jev, and the judge budget holds wha
   });
   const tick = await runWorkReviewTick(h.deps);
   assert.equal(tick.vetoed, 1);
-  assert.equal(tick.produced, 3);
-  assert.equal(h.judgeCalls, 4);
+  assert.equal(tick.produced, 5);
+  assert.equal(h.judgeCalls, 6);
   const skipped = h.state.items['draft_unsent:drafts/weekly-workflow-priorities-2026-09-28.md'];
   assert.equal(skipped.retiredReason, 'jev_skip');
   assert.equal(h.published.some((n) => /Unsent draft/.test(n.title)), false);
@@ -134,30 +149,32 @@ test("the owner's rules skip an item through Jev, and the judge budget holds wha
   tight.deps.config = { ...DEFAULT_WORK_REVIEW_CONFIG, maxJudgeCallsPerTick: 2 };
   const t = await runWorkReviewTick(tight.deps);
   assert.equal(t.produced, 2);
-  assert.equal(t.held, 2);
-  assert.equal(tight.state.metrics.heldForBudget, 2);
+  assert.equal(t.held, 4);
+  assert.ok(t.items.every((i) => i.kind === 'run_failed'), 'the budget goes to failures first');
+  assert.equal(tight.state.metrics.heldForBudget, 4);
   // Jev unavailable: the item is kept, not dropped.
   const dark = harness({ rules: ['any rule'], judge: async () => null });
   const d = await runWorkReviewTick(dark.deps);
-  assert.equal(d.produced, 4);
+  assert.equal(d.produced, 6);
 });
 
 test('push mode lets an item travel; an item retires when what it points at resolves; a read card is acknowledged', async () => {
   const h = harness({ notify: 'push' });
   await runWorkReviewTick(h.deps);
   assert.equal(h.published[0].metadata?.inboxOnly, undefined);
-  const waitId = h.state.items['run_waiting:r-wait-old'].notificationId!;
-  // The parked run resumed and the old chat was answered.
+  const waitId = h.state.items['run_waiting:weekly-review'].notificationId!;
+  // Both parked weekly-review runs resumed and the old chat was answered.
   const resolved: WorkObservation = {
     ...observation,
-    runs: observation.runs.filter((r) => r.runId !== 'r-wait-old'),
+    runs: observation.runs.filter((r) => r.workflow !== 'weekly-review'),
     chats: observation.chats.filter((c) => c.runId !== 'c-old'),
   };
   const second = await runWorkReviewTick({ ...h.deps, tickId: 't2', now: () => NOW + 30 * 60_000, observe: async () => ({ observation: resolved, readFailures: 0 }), isNotificationRead: (id) => id === waitId });
   assert.equal(second.retired, 2);
-  assert.equal(h.state.items['run_waiting:r-wait-old'].retiredReason, 'resolved');
-  assert.equal(h.state.items['chat_waiting:c-old'].retiredReason, 'resolved');
-  assert.equal(h.state.items['run_waiting:r-wait-old'].acknowledgedAt !== undefined, true);
+  assert.equal(h.state.items['run_waiting:weekly-review'].retiredReason, 'resolved');
+  assert.equal(h.state.items['chat_waiting:send the leadership email'].retiredReason, 'resolved');
+  assert.ok(h.markedRead.includes(h.state.items['chat_waiting:send the leadership email'].notificationId!), 'a resolved item leaves Needs you');
+  assert.equal(h.state.items['run_waiting:weekly-review'].acknowledgedAt !== undefined, true);
   assert.equal(h.state.metrics.itemsAcknowledged, 1);
   // A failure never retires by absence: the record stays failed, and the owner saw it.
   assert.equal(h.state.items['run_failed:r-fail'].retiredAt, undefined);
