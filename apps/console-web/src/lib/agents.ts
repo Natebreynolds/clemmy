@@ -4,7 +4,8 @@
  * An agent is a specialized working context a person opens and works in: a
  * name, what it handles, standing instructions, and the skills / workflows /
  * tools / model it reaches for first. A turn inside an agent is an ordinary
- * Clem turn whose starting context was chosen once. Mirrors lib/spaces.ts.
+ * Clem turn with that agent's context; a conversation can switch agents
+ * between messages. Mirrors lib/spaces.ts.
  */
 import { apiGet, apiPost, apiPatch, apiDelete } from './api';
 import type { RunAgent } from './board';
@@ -112,6 +113,17 @@ export const getAgentCatalog = () =>
 export const getAgentWork = (id: string, limit = 20) =>
   apiGet<Partial<AgentWork>>(`/api/console/agents/${encodeURIComponent(id)}/work?limit=${limit}`)
     .then((r): AgentWork => ({ threads: r.threads ?? [], workers: r.workers ?? [] }));
+
+/** Who answers a conversation: a saved agent, by id and the name it shows. */
+export interface ConversationAgent { id: string; name: string }
+
+/** Switch who answers a conversation from its next message: an agent's id,
+ *  or null for Clem. Repeating the current choice is a no-op. */
+export const setConversationAgent = (sessionId: string, agentId: string | null) =>
+  apiPost<{ sessionId: string; agentId: string | null; agentName: string | null; changed: boolean }>(
+    `/api/console/sessions/${encodeURIComponent(sessionId)}/agent`,
+    { agentId },
+  );
 
 /** The chips a roster card shows: what the agent reaches for first. */
 export function agentReachSummary(agent: AgentRecord, modelLabel?: string | null): string[] {

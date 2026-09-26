@@ -11,12 +11,16 @@
  *  - Markdown replies (sanitized by construction — input is escaped before
  *    any markup is added).
  */
+import { Fragment } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   ChatEngine,
+  agentSwitchLabel,
+  agentThreadMarks,
   createPendingMessageStore,
   type ComposerMode,
   type PlanRevisionRef,
+  type TaskMode,
   answerDraftStatus,
   evidenceChips,
   liveActivityHeadline,
@@ -43,6 +47,7 @@ import {
   listAgents,
   rejectPlanProposal,
   sendChatMessageAsync,
+  switchChatAgent,
   type MobileAgent,
 } from '../lib/api';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
@@ -72,16 +77,19 @@ interface Props {
 
 export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, onBack }: Props) {
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
+  // Who answers the next message — changeable at any time, like the brain.
+  // A new conversation opens inside it; after that a change is applied just
+  // before the next message (see sendMessage).
   const [agent, setAgent] = useState<{ id: string; name: string } | null>(
     initialAgentId ? { id: initialAgentId, name: initialAgentName ?? '' } : null,
   );
-  // Only a conversation that does not exist yet can still choose its agent;
-  // a reopened thread keeps the one it was opened in, whatever we send.
-  const boundAgentId = initialSessionId ? null : agent?.id ?? null;
+  // The agent a NEW conversation is created in. Frozen once a session exists:
+  // the engine is rebuilt when it changes, which must never drop a thread.
+  const [openingAgentId, setOpeningAgentId] = useState<string | null>(initialSessionId ? null : initialAgentId ?? null);
+  const boundAgentId = initialSessionId ? null : openingAgentId;
   const [agentPickOpen, setAgentPickOpen] = useState(false);
   const [agentChoices, setAgentChoices] = useState<MobileAgent[] | null>(null);
   useEffect(() => {
-    if (!agentPickOpen) return;
     let cancelled = false;
     listAgents()
       .then((result) => { if (!cancelled) setAgentChoices(result.agents); })
@@ -130,7 +138,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         try {
           const result = await getChatSession(sessionId);
           setTitle(result.session.title);
-          if (result.session.agentId) setAgent({ id: result.session.agentId, name: result.session.agentName ?? '' });
+          setAgent(result.session.agentId ? { id: result.session.agentId, name: result.session.agentName ?? '' } : null);
           return { events: result.events, latestSeq: result.latestSeq };
         } catch (err) {
           // Workspace threads use a STABLE session id (space-<slug>) that may
@@ -192,9 +200,28 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // indicator rather than a control that would silently do nothing.
   const cancelKey = snapshot?.cancelKey ?? null;
   const canStop = busy && Boolean(snapshot?.sessionId);
-  // The agent can still change until the first message claims a session.
-  const canPickAgent = !initialSessionId && !snapshot?.sessionId && messages.length === 0 && !busy;
-  const agentLabel = agent?.name || (agent ? 'Agent' : '');
+  // A Space dock takes no agent; everything else can switch at any time.
+  const takesAgent = !(snapshot?.sessionId ?? initialSessionId ?? '').startsWith('space-');
+  const showAgentChip = takesAgent && (Boolean(agent) || (agentChoices?.length ?? 0) > 0);
+  const agentLabel = agent?.name || (agent ? 'Agent' : 'Clem');
+  const agentMarks = agentThreadMarks(messages, agent?.name ?? null);
+
+  function pickAgent(next: { id: string; name: string } | null) {
+    haptic('light');
+    setAgent(next);
+    if (!snapshot?.sessionId && messages.length === 0) setOpeningAgentId(next?.id ?? null);
+    setAgentPickOpen(false);
+  }
+
+  /** Send a new message to whoever the chip names. A message sent while a
+   *  reply runs steers that reply; the choice waits for the next one. */
+  async function sendMessage(text: string, mode: TaskMode | undefined) {
+    const sessionId = snapshot?.sessionId;
+    if (sessionId && !busy && takesAgent) {
+      await switchChatAgent(sessionId, agent?.id ?? null);
+    }
+    await engine.send(text, mode);
+  }
   const followingTail = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const { available: dictation, listening, toggle: toggleDictation, stop: stopDictation } = useDictation(
@@ -278,7 +305,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       autoresize(textareaRef.current);
     }
     haptic('light');
-    void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
+    void sendMessage(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
       .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
   }
 
@@ -330,34 +357,34 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
-        {agent || canPickAgent ? (
+        {showAgentChip ? (
           <button
             type="button"
             class="brain-chip agent-chip"
-            disabled={!canPickAgent}
-            title={agent ? `This conversation lives inside ${agentLabel}` : 'Open this conversation inside one of your agents'}
+            disabled={executing}
+            title="Who answers your next message"
             onClick={() => { haptic('light'); setAgentPickOpen(true); }}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" />
             </svg>
-            <span class="truncate">{agent ? agentLabel : 'Agent'}</span>
+            <span class="truncate">{agentLabel}</span>
           </button>
         ) : null}
-        <Sheet open={agentPickOpen} onClose={() => setAgentPickOpen(false)} title="Open inside an agent" class="sheet-compact">
+        <Sheet open={agentPickOpen} onClose={() => setAgentPickOpen(false)} title="Who answers" class="sheet-compact">
           {agentChoices === null ? (
             <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
           ) : (
             <ul class="agent-pick-list">
               <li>
-                <button type="button" aria-pressed={!agent} onClick={() => { haptic('light'); setAgent(null); setAgentPickOpen(false); }}>
-                  <span class="agent-name">Just Clem</span>
-                  <span class="agent-desc">A plain conversation, no standing context</span>
+                <button type="button" aria-pressed={!agent} onClick={() => pickAgent(null)}>
+                  <span class="agent-name">Clem</span>
+                  <span class="agent-desc">As usual, no agent's instructions</span>
                 </button>
               </li>
               {agentChoices.map((choice) => (
                 <li key={choice.id}>
-                  <button type="button" aria-pressed={agent?.id === choice.id} onClick={() => { haptic('light'); setAgent({ id: choice.id, name: choice.name }); setAgentPickOpen(false); }}>
+                  <button type="button" aria-pressed={agent?.id === choice.id} onClick={() => pickAgent({ id: choice.id, name: choice.name })}>
                     <span class="agent-name">{choice.name}</span>
                     {choice.handles ? <span class="agent-desc">{choice.handles}</span> : null}
                   </button>
@@ -411,8 +438,11 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           </div>
         ) : null}
         {messages.map((message, index) => (
+          <Fragment key={message.id}>
+          {agentMarks[index]?.switchedTo ? (
+            <div class="agent-switch-line" role="separator">{agentSwitchLabel(agentMarks[index].switchedTo!.name)}</div>
+          ) : null}
           <MessageRow
-            key={message.id}
             message={message}
             sessionId={snapshot?.sessionId ?? undefined}
             busy={busy}
@@ -430,7 +460,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             // newest message; once anything follows it, they are a record.
             onAnswer={index === messages.length - 1 ? (text) => {
               haptic('light');
-              void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
+              void sendMessage(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
                 .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
             } : undefined}
             onDelegatedStateChange={(sourceUserSeq, state) => {
@@ -438,6 +468,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             }}
             onDelegatedChanged={() => engine.resume()}
           />
+          </Fragment>
         ))}
       </div>
       {showJumpToLatest ? (

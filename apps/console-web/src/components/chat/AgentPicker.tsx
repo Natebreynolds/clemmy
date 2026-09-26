@@ -1,8 +1,9 @@
 /**
- * The agent chip beside the composer: which specialized context a NEW
- * conversation starts in. A conversation binds to its agent once, at
- * creation, so on an existing bound thread the chip is a plain label —
- * there is nothing to switch.
+ * The agent chip beside the composer: who answers the next message — Clem,
+ * or one of the owner's saved agents. Like the model chip it can change at
+ * any point in a conversation; the switch takes effect on the next message
+ * (lib/conversation-agent). Inside an agent's own page the chip is a plain
+ * label: that page is the agent.
  *
  * The popover is drawn at the top of the page and placed against the
  * window (lib/popover-placement.ts), the same way the model chip is, so it
@@ -14,7 +15,7 @@ import { Link } from 'react-router-dom';
 import { ChevronUp, Users } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
-import { listAgents, type AgentRecord } from '@/lib/agents';
+import { listAgents, type AgentRecord, type ConversationAgent } from '@/lib/agents';
 import { placePopover } from '@/lib/popover-placement';
 
 const POPOVER_WIDTH = 320;
@@ -24,19 +25,20 @@ const CHIP = 'inline-flex items-center gap-2 rounded-full border border-border b
 export function AgentPicker({
   value,
   onChange,
+  started,
   bound,
   className,
 }: {
-  /** The chosen agent id for a conversation not yet started. */
-  value?: string | null;
-  /** The chosen agent (id and name for the label), or null for none. */
-  onChange?: (agent: { id: string; name: string } | null) => void;
-  /** The name of the agent an existing conversation already works in. */
+  /** Who answers the next message, or null for Clem. */
+  value?: ConversationAgent | null;
+  onChange?: (agent: ConversationAgent | null) => void;
+  /** The conversation already has messages: a pick changes who answers next. */
+  started?: boolean;
+  /** Inside an agent's own page: the chip only names it. */
   bound?: string | null;
   className?: string;
 }) {
-  // Read only while a choice can still be made; a bound thread has no roster
-  // to fetch.
+  // Read only while a choice can be made; a locked chip has no roster to fetch.
   const roster = usePoll(['agents'], listAgents, 30_000, { enabled: !bound });
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -112,8 +114,9 @@ export function AgentPicker({
   const agents: AgentRecord[] = roster.data ?? [];
   // Nothing to choose from yet: the composer stays as it was.
   if (agents.length === 0 && !value) return null;
-  const current = agents.find((a) => a.id === value) ?? null;
-  const label = current?.name ?? 'No agent';
+  // A chosen agent that is no longer saved still shows by name until changed.
+  const current = value ? agents.find((a) => a.id === value.id) ?? value : null;
+  const label = current?.name ?? 'Clem';
 
   const pick = (chosen: AgentRecord | null) => {
     onChange?.(chosen ? { id: chosen.id, name: chosen.name } : null);
@@ -128,7 +131,7 @@ export function AgentPicker({
         onClick={() => (open ? close(false) : setOpen(true))}
         aria-expanded={open}
         aria-haspopup="dialog"
-        title="Start this conversation inside an agent"
+        title={started ? 'Who answers your next message' : 'Who answers this conversation'}
         className={cn(CHIP, 'transition-colors hover:border-border-strong', !current && 'text-muted')}
       >
         <Users className={cn('h-3.5 w-3.5', current ? 'text-primary' : 'text-faint')} aria-hidden />
@@ -139,19 +142,21 @@ export function AgentPicker({
         <div
           ref={popRef}
           role="dialog"
-          aria-label="Agent for this conversation"
+          aria-label="Who answers"
           tabIndex={-1}
           style={style ?? { position: 'fixed', visibility: 'hidden', width: POPOVER_WIDTH }}
           className="z-[120] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-surface pb-1 pt-2 shadow-lg outline-none"
         >
           <div className="px-4 pb-2">
-            <span className="block text-small font-semibold text-fg">Agent</span>
-            <span className="block text-caption text-faint">Chosen once, when the conversation starts</span>
+            <span className="block text-small font-semibold text-fg">Who answers</span>
+            <span className="block text-caption text-faint">
+              {started ? 'Switch any time. Takes effect on your next message.' : 'Switch any time in the conversation.'}
+            </span>
           </div>
           <div className="mx-2 mb-1 rounded-md bg-subtle">
-            <Row on={!current} name="No agent" note="Clem as usual" onPick={() => pick(null)} />
+            <Row on={!current} name="Clem" note="As usual, no agent's instructions" onPick={() => pick(null)} />
             {agents.map((a) => (
-              <Row key={a.id} on={a.id === value} name={a.name} note={a.handles} onPick={() => pick(a)} />
+              <Row key={a.id} on={a.id === current?.id} name={a.name} note={agentNote(a)} onPick={() => pick(a)} />
             ))}
           </div>
           <div className="border-t border-border px-4 pb-1 pt-2 text-caption text-faint">
@@ -162,6 +167,13 @@ export function AgentPicker({
       )}
     </div>
   );
+}
+
+/** What the agent handles, and the model its helpers run on when it names one
+ *  (the conversation itself keeps the model chip's choice). */
+function agentNote(agent: AgentRecord): string {
+  const helpers = agent.model ? `helpers on ${agent.model}` : '';
+  return [agent.handles, helpers].filter(Boolean).join(' · ');
 }
 
 function Row({ on, name, note, onPick }: { on: boolean; name: string; note?: string; onPick: () => void }) {
