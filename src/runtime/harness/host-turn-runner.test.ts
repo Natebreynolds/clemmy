@@ -9654,6 +9654,39 @@ test('the host explanation survives an enabled completion judge without claiming
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
+// Live 2026-09-24/25: after the last review round an answer was delivered
+// "blocked" while still containing the figures the reviewer flagged.
+test('when the rounds are spent on claims-only findings, the answer ships without them and passes delivery', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Traffic is about 1,200 visits a month. Revenue grew 40% this year. The site ranks for 180 keywords. Full report: https://example.test/firm-report.';
+  const finding = '(1) "Revenue grew 40% this year" — the report shows 14%';
+  let judgeCalls = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judgeCalls += 1;
+    return { done: false, repairScope: 'claims', reason: finding } as never;
+  });
+  try {
+    // Review runs for requested work; the checker here is a stub that keeps
+    // finding the same claim, so the objective only needs to invite review.
+    const fixture = acceptJudgedSource('claims-removed', 'Post the firm snapshot to the channel');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(draft)], [textMsg(draft)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await runJudgedHost(fixture, agent, true);
+    assert.equal(judgeCalls, 3, 'three rounds were spent');
+    const delivered = String(outcome.finalOutput);
+    assert.doesNotMatch(delivered.slice(0, delivered.indexOf('\n\n_I took out')), /Revenue grew 40%/);
+    assert.match(delivered, /Traffic is about 1,200 visits a month\. The site ranks for 180 keywords\./);
+    assert.match(delivered, /I took out one claim the review could not verify/);
+    const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+    const last = verdicts.at(-1)!;
+    assert.equal(last.data.fulfills, true);
+    assert.deepEqual((last.data.claimRemoval as { removed: string[] }).removed, ['Revenue grew 40% this year']);
+    assert.equal(last.data.replyDigest, createHash('sha256').update(delivered, 'utf8').digest('hex'),
+      'the recorded review names the exact bytes delivered');
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
 test('production host retains completion feedback in request projection without adding an uncheckpointed draft to history)', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const verdicts = [

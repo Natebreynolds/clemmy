@@ -86,6 +86,7 @@ import type { InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
 import { approvalCallPreview } from './approval-call-preview.js';
 import { approvalPreviewLabels } from './approval-preview-labels.js';
 import { approvalPrecheck } from './approval-precheck.js';
+import { removeReviewedClaims } from './reviewed-claim-removal.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
@@ -3753,6 +3754,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
    *  before a second identical verdict is bought. */
   let judgedBusinessCallsAtLastVerdict: number | undefined;
   let pendingResponseFormatRepair: { objective: string; instructions: string; text: string } | undefined;
+  /** Set by the review when the answer ships without the claims it flagged. */
+  let reviewedReplacementText: string | undefined;
   // A chosen writer's pending final-answer step, the last brain draft sent to
   // it (a draft is never written twice), and the reply it wrote, so review
   // measures independence against that reply's actual author.
@@ -4225,8 +4228,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const continuation = !honestStop && !blockedByReview && ((!verdict.done && !awaitingInput)
       || (awaitingInput && planCandidate?.readiness === 'ready')) && !signal?.aborted
       && (Boolean(planCandidate) || objectiveJudgeContinuations < MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
+    let judgedVerdictRow: ReturnType<typeof appendEvent> | undefined;
     try {
-      const judgedRow = appendEvent({
+      judgedVerdictRow = appendEvent({
         sessionId: identity.sessionId,
         turn: 0,
         role: 'system',
@@ -4312,6 +4316,38 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         },
       });
     } catch { /* telemetry never blocks the reply */ }
+    // A CLAIMS-ONLY FINDING NEVER SHIPS INSIDE THE ANSWER. With the rounds
+    // spent and only specific claims found wrong (the work itself is there),
+    // the host deletes exactly the sentences carrying the reviewer's quotes and
+    // names them; nothing is reworded or added (reviewed-claim-removal.ts).
+    // Only for an answer that changed nothing outside, and only when every
+    // quote is found verbatim; otherwise the unverified delivery stands.
+    if (!continuation && !awaitingInput && !verdict.done && verdict.repairScope === 'claims'
+      && !blockedByReview && !verdict.failedOpen && !planCandidate && settled.count === 0
+      && judgedVerdictRow) {
+      const removal = removeReviewedClaims(judgedReply, verdict.reason);
+      if (removal) {
+        try {
+          const { repairScope: _claims, ...negative } = judgedVerdictRow.data as Record<string, unknown>;
+          void _claims;
+          appendEvent({
+            sessionId: identity.sessionId,
+            turn: 0,
+            role: 'system',
+            type: 'goal_alignment_judged',
+            data: {
+              ...negative,
+              fulfills: true,
+              reason: `The review's findings were removed from the answer: ${removal.removed.map((quote) => `"${quote}"`).join('; ')}`.slice(0, 1_600),
+              replyDigest: createHash('sha256').update(removal.text, 'utf8').digest('hex'),
+              claimRemoval: { fromEventId: judgedVerdictRow.id, removed: removal.removed.slice(0, 12) },
+              continuation: false,
+            },
+          });
+          reviewedReplacementText = removal.text;
+        } catch { /* the unverified delivery stands */ }
+      }
+    }
     hostTurnLogger.info({
       sessionId: identity.sessionId,
       sourceUserSeq: identity.sourceUserSeq,
@@ -9684,7 +9720,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       history.push(...admission.frame.history);
       if (step.responseId !== undefined) lastResponseId = step.responseId;
-      return await completedOutcome(admission.frame.text);
+      const deliveredText = reviewedReplacementText ?? admission.frame.text;
+      reviewedReplacementText = undefined;
+      return await completedOutcome(deliveredText);
     }
 
     const canonicalCalls = admission.frame.calls;
