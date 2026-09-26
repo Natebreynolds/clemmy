@@ -32,6 +32,7 @@
  */
 
 import { declaredMcpToolEffect, type DeclaredMcpToolEffect } from '../mcp-declared-effects.js';
+import { learnedRequestEffectVerdict, requestShapeOf } from './learned-request-effect-store.js';
 import { composioSlugHasCuratedReadRule } from '../../integrations/composio/slug-effect.js';
 import {
   currentManifestOperationContract,
@@ -223,6 +224,13 @@ interface CanonicalExternalAction {
    * read, and it may raise risk, but it can never override contrary evidence.
    */
   declaredEffect?: DeclaredMcpToolEffect;
+  /**
+   * What this exact request shape of a generic native tool was found to do,
+   * learned from a settled call's own evidence by two models. Admits a read
+   * below the server's declarations and curated knowledge; never overrides
+   * a declared destructive hint or a sealed manifest.
+   */
+  learnedRequestEffect?: 'reads_only';
   /** True only when the carrier is known to cross an external boundary. */
   external: boolean;
 }
@@ -334,12 +342,16 @@ function canonicalExternalAction(
     if (isClementineLocalMcpName(toolName)) return { external: false };
     const action = [server, tail].filter(Boolean).join('_');
     const declaredEffect = declaredMcpToolEffect(toolName);
+    const learned = normalized
+      ? learnedRequestEffectVerdict('native_mcp', normalized, requestShapeOf(args))
+      : null;
     return {
       external: true,
       ...(action ? { action } : {}),
       ...(normalized ? { operationId: normalized } : {}),
       ...(tail ? { effectToken: tail } : {}),
       ...(declaredEffect ? { declaredEffect } : {}),
+      ...(learned ? { learnedRequestEffect: learned.verdict } : {}),
     };
   }
 
@@ -359,6 +371,8 @@ function canonicalExternalActionWriteClassification(
   _effectToken?: string,
   /** What the owning server declared. Admits a read; never overrides. */
   declaredEffect?: DeclaredMcpToolEffect,
+  /** What this request shape was found to do. Admits a read; never overrides. */
+  learnedRequestEffect?: 'reads_only',
 ): {
   mutating: boolean;
   classificationKnown: boolean;
@@ -395,6 +409,15 @@ function canonicalExternalActionWriteClassification(
   ) {
     return { mutating: false, classificationKnown: true };
   }
+  // A generic request tool declares one definition for every endpoint it can
+  // reach, so nothing about the tool says whether one call reads or writes;
+  // the request does. A shape that a settled call's own evidence showed to
+  // read only, as two models agreed, is a read from then on. Learned from
+  // results, not proven by the provider, so classificationKnown stays false,
+  // and it sits below every declaration and curated rule above.
+  if (learnedRequestEffect === 'reads_only') {
+    return { mutating: false, classificationKnown: false };
+  }
   // A read-verb provider operation with no exact contract is a READ, not a
   // conservative mutation. The absent-manifest default-to-write is the
   // documented seam that OVER-gates ordinary reads while under-gating sends
@@ -421,13 +444,37 @@ function canonicalExternalActionIsWrite(
   action: string | undefined,
   effectToken?: string,
   declaredEffect?: DeclaredMcpToolEffect,
+  learnedRequestEffect?: 'reads_only',
 ): boolean {
   return canonicalExternalActionWriteClassification(
     operationId,
     action,
     effectToken,
     declaredEffect,
+    learnedRequestEffect,
   ).mutating;
+}
+
+/**
+ * The operation id a native provider tool's learned request effects are
+ * keyed by: `server__tool`, for a namespaced tool that is neither a
+ * Clementine-local control nor a Composio carrier. Null for anything else.
+ */
+export function nativeRequestOperationId(toolName: string): string | null {
+  const trimmed = toolName.trim();
+  if (!trimmed) return null;
+  const qualified = trimmed.startsWith('mcp__') ? trimmed : `mcp__${withoutMcpTransportPrefix(trimmed)}`;
+  const normalized = withoutMcpTransportPrefix(qualified);
+  // No server segment: the prefix stays, and there is no native operation.
+  if (normalized.startsWith('mcp__') || !normalized.includes('__')) return null;
+  if (
+    isClementineLocalMcpName(qualified)
+    || isTrustedComposioCarrier(qualified)
+    || isTrustedDynamicComposioTool(qualified)
+  ) return null;
+  const tail = mcpToolTail(qualified);
+  if (tail === 'composio_execute_tool' || tail === 'execute_tool' || tail.toLowerCase().startsWith('cx_')) return null;
+  return normalized;
 }
 
 /** THE canonical "is this an irreversible external send" predicate — the one
@@ -491,6 +538,7 @@ export function isMutatingExternalWrite(
         canonical.action,
         canonical.effectToken,
         canonical.declaredEffect,
+        canonical.learnedRequestEffect,
       )
     : false;
 }
@@ -528,6 +576,7 @@ export function classifyCanonicalExternalEffect(
     canonical.action,
     canonical.effectToken,
     canonical.declaredEffect,
+    canonical.learnedRequestEffect,
   );
   const manifest = currentManifestOperationContract(canonical.operationId);
   const manifestReversibility = manifest?.effect === 'read'
