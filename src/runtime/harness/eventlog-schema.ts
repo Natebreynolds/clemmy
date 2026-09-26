@@ -11234,8 +11234,7 @@ const MIGRATIONS: EventLogMigration[] = [
   {
     // v82: a formal approval still unanswered after its reminder threshold
     // gets exactly one reminder. The row records when that reminder went out,
-    // so a restart or a pruned notification can never send a second one
-    // (live 2026-09-25: a time-sensitive approval sat unseen for hours).
+    // so a restart or a pruned notification can never send a second one.
     // Existing rows stay NULL; sparse rehearsal tables gain only the column.
     version: 82,
     sql: '',

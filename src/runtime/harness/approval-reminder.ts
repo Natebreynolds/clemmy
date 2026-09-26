@@ -2,12 +2,10 @@
  * One reminder for an approval nobody has answered.
  *
  * A formal approval card pauses work until the owner decides, and its notice
- * goes out once, when the card is raised. Nothing brought it back after that.
- * Live 2026-09-25: a card for a time-sensitive message was raised, its
- * channel copies were held back for 56 minutes because chat views were open,
- * the notice went unread, and the message missed its moment. Across the live
- * registry, 154 of 173 approvals were answered within 30 minutes; the rest
- * waited hours or days.
+ * goes out once, when the card is raised. An unread notice leaves the work
+ * waiting with nothing to bring it back, however time-sensitive it is. Most
+ * approvals are answered within minutes; one still open well after that has
+ * most likely gone unseen.
  *
  * So a formal approval still pending and actionable 30 minutes after it was
  * requested gets exactly one reminder, carrying what the card shows and how

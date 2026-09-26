@@ -5703,7 +5703,8 @@ export function applyEventToState(event: EventRow, state: DisplayState): void {
     }
     case 'approval_resolved': {
       const decision = String(data.decision ?? 'resolved');
-      state.status = decision === 'approved' ? 'approved — continuing' : 'rejected — stopping';
+      state.status = decision === 'approved' ? 'approved — continuing'
+        : decision === 'expired' ? 'expired — not run' : 'rejected — stopping';
       // Buttons are no longer relevant; clear so the next flush drops them.
       state.pendingApprovalId = undefined;
       state.pendingApprovalIds = undefined;

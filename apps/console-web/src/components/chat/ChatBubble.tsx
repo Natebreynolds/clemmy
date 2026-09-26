@@ -28,14 +28,6 @@ import type { ChatMessage } from '@/lib/useChat';
 import { snoozeNeedsYou } from '@/lib/inbox';
 import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presentation';
 
-/**
- * Clem's answer as a page, not a card. The shared renderer escapes every
- * character of the reply before adding markup, so model text can never inject
- * HTML; the phone renders through the same function, so an answer reads the
- * same on both. While the answer is still arriving the last block carries the
- * caret (styles.css `.chat-prose.is-streaming`).
- */
-/** "markdown_text" → "Markdown text": an argument name as a label. */
 /** What the pre-send check found in this exact content, before approval.
  *  Advisory: the owner decides either way. */
 function ApprovalCheckNote({ check }: {
@@ -68,11 +60,19 @@ function approvalResolutionText(resolution: 'approved' | 'declined' | 'changed' 
       : resolution === 'expired' ? 'Expired without an answer — it did not run.' : 'Approved.';
 }
 
+/** "markdown_text" → "Markdown text": an argument name as a label. */
 function approvalFieldLabel(name: string): string {
   const words = name.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase();
   return words ? words[0]!.toUpperCase() + words.slice(1) : name;
 }
 
+/**
+ * Clem's answer as a page, not a card. The shared renderer escapes every
+ * character of the reply before adding markup, so model text can never inject
+ * HTML; the phone renders through the same function, so an answer reads the
+ * same on both. While the answer is still arriving the last block carries the
+ * caret (styles.css `.chat-prose.is-streaming`).
+ */
 function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boolean; failed?: boolean }) {
   return (
     <div

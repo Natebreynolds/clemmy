@@ -347,6 +347,20 @@ test('approval_requested surfaces the subject in summary and marks the display d
   assert.equal(s.done, true);
 });
 
+test('approval_resolved names how the approval ended and clears its buttons', () => {
+  for (const [decision, status] of [
+    ['approved', 'approved — continuing'],
+    ['rejected', 'rejected — stopping'],
+    ['expired', 'expired — not run'],
+  ] as const) {
+    const s = freshState();
+    s.pendingApprovalId = 'apr-test';
+    applyEventToState(event('approval_resolved', { approvalId: 'apr-test', decision }), s);
+    assert.equal(s.status, status, `${decision} reads as its own outcome`);
+    assert.equal(s.pendingApprovalId, undefined, 'the buttons are gone once the approval is settled');
+  }
+});
+
 test('approval_requested falls back to tool name when no subject', () => {
   const s = freshState();
   applyEventToState(event('approval_requested', { tool: 'cx_zendesk_create_ticket' }), s);

@@ -1894,9 +1894,7 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
       // reaches Discord/push at all. Fail-open: no presence signal (fresh
       // restart, headless daemon) sends the mirror as before.
       // A reminder is exempt: it exists because the card sat unanswered past
-      // its threshold, so a live viewer is no evidence the owner saw it
-      // (live 2026-09-25: open chat views held an approval's channel copies
-      // back for 56 minutes and the approval was never answered).
+      // its threshold, so a live viewer is no evidence the owner saw it.
       if (
         notification.kind === 'approval'
         && notification.metadata?.approvalReminder !== true
