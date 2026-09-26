@@ -284,6 +284,16 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
     const meta = asMeta(ev.meta);
     switch (kind) {
       case 'step_started':
+        // A declarative approval gate parks the run at step_started itself: the
+        // runner tags it (meta.gate 'awaiting_approval', with the approval id)
+        // and writes nothing else until the owner answers. Read that as the
+        // wait it is; a plain start is work.
+        if (str(meta.gate) === 'awaiting_approval') {
+          s.status = 'awaiting_approval';
+          s.startedAt = s.startedAt || t;
+          s.error = 'Waiting for your approval — the run resumes automatically once you decide.';
+          break;
+        }
         s.status = 'running';
         s.startedAt = t;
         // A re-run (resume after approval / retry attempt) must not keep
