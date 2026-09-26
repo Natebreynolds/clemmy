@@ -81,11 +81,13 @@ import {
   readWorkflowChatDispatchAdmissions,
   readWorkflowOriginGroup,
   readWorkflowOriginGroupClosedBatch,
+  readWorkflowOriginGroupCloseIntent,
   requestWorkflowRunDrainKick,
   workflowChatDispatchQueueRequestDigest,
   workflowOriginGroupAdmissionForRequest,
   workflowOriginSourceGroupId,
   workflowRunHasRecordedChatDispatchPreparation,
+  workflowRunIsTerminalForOriginGroup,
   workflowRunOriginObserverId,
   withWorkflowOriginGroupAuthorityLock,
   type ExactWorkflowRunOriginRecord,
@@ -942,11 +944,25 @@ export function readPendingWorkflowChatDispatchOwnership(
       }
       runStatuses[runId] = status;
     }
+    const closed = readWorkflowOriginGroupClosedBatch(sourceGroupId) !== null;
+    // Membership that was never fenced for close can only be closed by the
+    // turn that prepared it, and activation only releases members that are
+    // still held. Once every admitted run has reached a terminal status and no
+    // close is in progress, nothing remains to dispatch: the group owns no
+    // work, and holding the source for it would promise a resume nobody can
+    // perform. A closed or closing batch keeps its own reducer and stays owned.
+    if (
+      !closed
+      && readWorkflowOriginGroupCloseIntent(sourceGroupId) === null
+      && runIds.every((runId) => workflowRunIsTerminalForOriginGroup(runStatuses[runId]))
+    ) {
+      return null;
+    }
     return {
       sourceGroupId,
       originSessionId,
       sourceUserSeq,
-      phase: readWorkflowOriginGroupClosedBatch(sourceGroupId) ? 'closed' : 'prepared',
+      phase: closed ? 'closed' : 'prepared',
       runIds,
       runStatuses,
     };

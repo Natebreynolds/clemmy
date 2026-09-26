@@ -504,6 +504,7 @@ export function clearRunInFlightAfterTerminal(
   sessionId: string,
   ownerAttemptId?: string,
   sourceUserSeq?: number,
+  options: RecoveryMarkerClearOptions = {},
 ): boolean {
   if (!enabled()) return false;
   try {
@@ -538,7 +539,7 @@ export function clearRunInFlightAfterTerminal(
     })) {
       return false;
     }
-    return clearExactRunInFlightOwner(sessionId, ownerAttemptId, sourceUserSeq);
+    return clearExactRunInFlightOwner(sessionId, ownerAttemptId, sourceUserSeq, options);
   } catch {
     return false;
   }
@@ -583,17 +584,26 @@ export function releaseRunInFlightAfterWorkflowTransfer(
   }
 }
 
+export interface RecoveryMarkerClearOptions {
+  /** Removing bookkeeping is not conversation activity. Recovery that only
+   * retires a marker whose source is already settled leaves `updated_at`
+   * alone, so the conversation does not jump to the top of every list. */
+  touchSession?: boolean;
+}
+
 function clearExactRunInFlightOwner(
   sessionId: string,
   ownerAttemptId?: string,
   sourceUserSeq?: number,
+  options: RecoveryMarkerClearOptions = {},
 ): boolean {
   const owner = ownerAttemptId?.trim() || '';
   const source = Number.isSafeInteger(sourceUserSeq) && Number(sourceUserSeq) > 0
     ? Number(sourceUserSeq)
     : null;
   const db = openEventLog();
-  const now = new Date().toISOString();
+  // NULL keeps the stored value through COALESCE in every statement below.
+  const now = options.touchSession === false ? null : new Date().toISOString();
   const removeOwnerAndMarker = `json_remove(
     metadata_json,
     '$.__run_in_flight',
@@ -604,7 +614,7 @@ function clearExactRunInFlightOwner(
     const result = db.prepare(
       `UPDATE sessions
           SET metadata_json = ${removeOwnerAndMarker},
-              updated_at = ?
+              updated_at = COALESCE(?, updated_at)
         WHERE id = ?
           AND kind = 'chat'
           AND json_valid(metadata_json)
@@ -638,7 +648,7 @@ function clearExactRunInFlightOwner(
     const result = db.prepare(
       `UPDATE sessions
           SET metadata_json = ${removeOwnerAndMarker},
-              updated_at = ?
+              updated_at = COALESCE(?, updated_at)
         WHERE id = ?
           AND kind = 'chat'
           AND json_valid(metadata_json)
@@ -677,7 +687,7 @@ function clearExactRunInFlightOwner(
     const result = db.prepare(
       `UPDATE sessions
           SET metadata_json = ${removeOwnerAndMarker},
-              updated_at = ?
+              updated_at = COALESCE(?, updated_at)
         WHERE id = ?
           AND kind = 'chat'
           AND json_valid(metadata_json)
@@ -701,7 +711,7 @@ function clearExactRunInFlightOwner(
   const result = db.prepare(
     `UPDATE sessions
         SET metadata_json = ${removeOwnerAndMarker},
-            updated_at = ?
+            updated_at = COALESCE(?, updated_at)
       WHERE id = ?
         AND kind = 'chat'
         AND json_valid(metadata_json)
@@ -757,6 +767,9 @@ export interface RestartRecoveryRecord {
   preparedDispatchSourceGroupId?: string;
   preparedDispatchPhase?: PendingWorkflowChatDispatchOwnership['phase'];
   preparedDispatchRunIds: string[];
+  /** The accepted source the marker's recorded owner names, when it recorded
+   * one. Recovery settles that source, not whichever attempt ran last. */
+  markerOwnerSourceUserSeq?: number;
   /** Why auto-resume did NOT run (for the boot log / forensics). */
   autoResumeSkipped?:
     | 'disabled'
@@ -996,6 +1009,38 @@ function recoveryTurnIdentity(
     : null;
 }
 
+/** The exact accepted user event with this seq, as a turn identity. */
+function acceptedSourceIdentity(
+  sessionId: string,
+  sourceUserSeq: number,
+): TurnIdentity | null {
+  const source = listEvents(sessionId, {
+    sinceSeq: sourceUserSeq - 1,
+    types: ['user_input_received'],
+    limit: 1,
+  }).find((event) => event.seq === sourceUserSeq);
+  return source ? { sessionId, turn: source.turn, sourceUserSeq: source.seq } : null;
+}
+
+/** The structured owner armed beside the coarse marker. The marker names the
+ * accepted source that was in flight; the session's newest physical attempt
+ * may belong to an older source (a turn that ran without its own attempt) or
+ * be a later retry of the same source. JSON numbers compare by value, so an
+ * owner stored as `12.0` names source 12. Anything that is not a positive
+ * integer is not an owner. */
+interface RecordedRecoveryOwner {
+  sourceUserSeq: number;
+  attemptId: string | null;
+}
+
+function recordedRecoveryOwner(session: HarnessSession | null): RecordedRecoveryOwner | null {
+  const raw = objectRecord(session?.sessionRow.metadata.__run_in_flight_owner);
+  if (!raw) return null;
+  const sourceUserSeq = positiveEventSeq(raw.sourceUserSeq);
+  if (sourceUserSeq === null) return null;
+  return { sourceUserSeq, attemptId: nonEmptyString(raw.attemptId) };
+}
+
 /** Read the exact already-accepted user bytes. A restart may reuse this event,
  * but it may not substitute an internal recovery prompt or infer missing text
  * from a title, snapshot, or later chat turn. */
@@ -1113,21 +1158,45 @@ function recoveryAttemptForIdentity(
 /** Clear only the exact owner captured by recovery, then report whether the
  * session is actually marker-free. A terminal append may already have removed
  * the owner atomically; conversely a newer turn may have armed its own marker
- * between the boot scan and this cleanup. */
+ * between the boot scan and this cleanup.
+ *
+ * When the marker records an owner for this same accepted source, that
+ * recorded owner is the compare-and-swap key: it may be an earlier physical
+ * attempt of the source that a later retry never took over, or the source
+ * itself when the turn ran without an attempt. A marker that names any other
+ * source is never cleared here. Every caller has already settled the source,
+ * so retiring its marker is bookkeeping, not conversation activity. */
 function reconcileRecoveryMarker(
   sessionId: string,
   identity: TurnIdentity | null,
   fallback: RunAttemptRecord | null,
 ): boolean {
-  const owner = recoveryAttemptForIdentity(sessionId, identity, fallback);
-  if (owner) {
+  const clearOptions: RecoveryMarkerClearOptions = { touchSession: false };
+  let recorded: RecordedRecoveryOwner | null = null;
+  try {
+    recorded = recordedRecoveryOwner(HarnessSession.load(sessionId));
+  } catch {
+    recorded = null;
+  }
+  if (identity && recorded?.sourceUserSeq === identity.sourceUserSeq) {
     clearRunInFlightAfterTerminal(
       sessionId,
-      owner.attemptId,
-      identity?.sourceUserSeq,
+      recorded.attemptId ?? undefined,
+      identity.sourceUserSeq,
+      clearOptions,
     );
   } else {
-    clearRunInFlightAfterTerminal(sessionId);
+    const owner = recoveryAttemptForIdentity(sessionId, identity, fallback);
+    if (owner) {
+      clearRunInFlightAfterTerminal(
+        sessionId,
+        owner.attemptId,
+        identity?.sourceUserSeq,
+        clearOptions,
+      );
+    } else {
+      clearRunInFlightAfterTerminal(sessionId, undefined, undefined, clearOptions);
+    }
   }
   return HarnessSession.load(sessionId)?.runInFlightSince() === null;
 }
@@ -1193,7 +1262,12 @@ function recoveryEventAlreadyRecorded(
   sessionId: string,
   type: 'run_paused' | 'restart_recovery_decision',
   interruptedAt: string,
-  match: { phase?: string; reason?: string },
+  match: {
+    phase?: string;
+    reason?: string;
+    sourceUserSeq?: number | null;
+    preparedDispatchOwnershipPreserved?: boolean;
+  },
 ): boolean {
   try {
     const latest = listEvents(sessionId, { types: [type], desc: true, limit: 1 })[0];
@@ -1202,8 +1276,30 @@ function recoveryEventAlreadyRecorded(
     if (data.interruptedAt !== interruptedAt) return false;
     if (match.phase !== undefined && data.phase !== match.phase) return false;
     if (match.reason !== undefined && data.reason !== match.reason) return false;
+    // A different source or a released queue owner is a different decision,
+    // and the record of it is new information.
+    if (match.sourceUserSeq !== undefined && (data.sourceUserSeq ?? null) !== match.sourceUserSeq) {
+      return false;
+    }
+    if (
+      match.preparedDispatchOwnershipPreserved !== undefined
+      && (data.preparedDispatchOwnershipPreserved === true) !== match.preparedDispatchOwnershipPreserved
+    ) return false;
     return true;
   } catch {
+    return false;
+  }
+}
+
+/** Whether the owner was already shown a notice for this exact interruption.
+ * Settling it later is not news, and must not ping them about it again. */
+function interruptionAlreadyAnnounced(sessionId: string, interruptedAt: string): boolean {
+  try {
+    return listEvents(sessionId, { types: ['run_paused'], desc: true, limit: 50 })
+      .some((event) => objectRecord(event.data)?.interruptedAt === interruptedAt);
+  } catch {
+    // An unreadable history cannot prove a notice was seen; the notification
+    // budget below still bounds what this scan can send.
     return false;
   }
 }
@@ -1276,16 +1372,38 @@ export function recoverInterruptedChatRuns(
       errors: [],
     };
 
+    // The marker's recorded owner names the accepted source that was in
+    // flight. Settle that source. The session's newest physical attempt can
+    // belong to an older turn (the interrupted one ran without an attempt of
+    // its own), and settling that older turn instead finds its long-published
+    // terminal while the marker's real source stays unsettled on every boot.
+    // Legacy markers without an owner keep the attempt-derived identity.
+    let ownerIdentity: TurnIdentity | null = null;
+    try {
+      const owner = recordedRecoveryOwner(sess);
+      if (owner) {
+        record.markerOwnerSourceUserSeq = owner.sourceUserSeq;
+        ownerIdentity = acceptedSourceIdentity(row.id, owner.sourceUserSeq);
+      }
+    } catch {
+      ownerIdentity = null;
+    }
     let interruptedAttempt: RunAttemptRecord | null = null;
     let userStopped = false;
     try {
-      interruptedAttempt = getLatestRunAttempt(row.id);
-      userStopped = isKillRequested(row.id, interruptedAttempt ?? undefined);
+      interruptedAttempt = ownerIdentity
+        ? getRunAttemptBySourceUserSeq(row.id, ownerIdentity.sourceUserSeq)
+        : getLatestRunAttempt(row.id);
+      userStopped = isKillRequested(row.id, ownerIdentity
+        ? { sourceUserSeq: ownerIdentity.sourceUserSeq }
+        : interruptedAttempt ?? undefined);
     } catch {
       // A failed kill read must not invent a stop. The ordinary conservative
       // external-write/age checks still decide whether resume is safe.
     }
-    const recoveryIdentity = recoveryTurnIdentity(row.id, interruptedAttempt);
+    const recoveryIdentity = ownerIdentity ?? recoveryTurnIdentity(row.id, interruptedAttempt);
+    // Read before this scan writes anything for the interruption.
+    const alreadyAnnounced = interruptionAlreadyAnnounced(row.id, since);
     let acceptedInput: string | null = null;
     if (recoveryIdentity) {
       try {
@@ -1374,7 +1492,10 @@ export function recoverInterruptedChatRuns(
         record.errors.push(`checkpoint_clear: ${err instanceof Error ? err.message : String(err)}`);
       }
       try {
-        if (!recoveryEventAlreadyRecorded(row.id, 'restart_recovery_decision', since, { phase: 'terminal_reconciled' })) appendEvent({
+        if (!recoveryEventAlreadyRecorded(row.id, 'restart_recovery_decision', since, {
+          phase: 'terminal_reconciled',
+          sourceUserSeq: recoveryIdentity?.sourceUserSeq ?? null,
+        })) appendEvent({
           sessionId: row.id,
           turn: 0,
           role: 'system',
@@ -1431,6 +1552,10 @@ export function recoverInterruptedChatRuns(
       && acceptedInput !== null
       && checkpointRecoverySource === recoveryIdentity.sourceUserSeq,
     );
+    // Later user inputs are not stop or settlement authority. They can be
+    // status questions, continuations, or corrections to this same work. Only
+    // the exact committed terminal above or the existing user-stop authority
+    // can close the source as non-resumable.
     if (exactCheckpointRecovery && userStopped && checkpointRecovery?.phase !== 'continue') {
       record.autoResumeSkipped = 'user_stopped';
       if (
@@ -1549,7 +1674,11 @@ export function recoverInterruptedChatRuns(
     // or stayed manual without parsing human-facing copy or daemon boot logs.
     try {
       const decisionPhase = willAutoResume && exactCheckpointRecovery ? 'dispatch_claimed' : 'policy_decided';
-      if (decisionPhase === 'dispatch_claimed' || !recoveryEventAlreadyRecorded(row.id, 'restart_recovery_decision', since, { phase: decisionPhase })) appendEvent({
+      if (decisionPhase === 'dispatch_claimed' || !recoveryEventAlreadyRecorded(row.id, 'restart_recovery_decision', since, {
+        phase: decisionPhase,
+        sourceUserSeq: recoveryIdentity?.sourceUserSeq ?? null,
+        preparedDispatchOwnershipPreserved: record.preparedDispatchOwnershipPreserved,
+      })) appendEvent({
         sessionId: row.id,
         turn: 0,
         role: 'system',
@@ -1587,6 +1716,7 @@ export function recoverInterruptedChatRuns(
           preparedDispatchSourceGroupId: record.preparedDispatchSourceGroupId ?? null,
           preparedDispatchPhase: record.preparedDispatchPhase ?? null,
           preparedDispatchRunIds: record.preparedDispatchRunIds,
+          markerOwnerSourceUserSeq: record.markerOwnerSourceUserSeq ?? null,
         },
       });
       record.decisionRecorded = true;
@@ -1738,8 +1868,14 @@ export function recoverInterruptedChatRuns(
     // Bounded proactive notification so the user is told even off-session.
     // An auto-resumed run notifies only if the resume FAILS (below) — a
     // successful resume delivers its own answer, and "it broke + it's fixed"
-    // as two pings is noise.
-    if (!willAutoResume && !noticeRepeated && notified < MAX_NOTIFICATIONS) {
+    // as two pings is noise. An interruption the owner was already shown is
+    // settled without a second ping.
+    if (
+      !willAutoResume
+      && !noticeRepeated
+      && !alreadyAnnounced
+      && notified < MAX_NOTIFICATIONS
+    ) {
       try {
         addNotification({
           id: `${tick}-chat-interrupted-${row.id}`,
