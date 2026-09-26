@@ -21,8 +21,15 @@ import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 
 export const LEARNED_REQUEST_EFFECT_VERSION = 1 as const;
-/** The screen's probability that the request changed anything, at most. */
-export const LEARNED_REQUEST_EFFECT_SCREEN_MAX = 0.1;
+/**
+ * The screen's probability that the request changed anything, at most. The
+ * screen is a cheap filter for the obvious writes; the judge, reading the
+ * same evidence at LEARNED_REQUEST_EFFECT_CONFIRM_MIN, decides. Live
+ * 2026-09-26 14:32: Jev put two DataForSEO live SERP reads (a POST with a
+ * task body, a response with a cost line) at 0.21 and 0.17, and a 0.1 bar
+ * never let the judge look.
+ */
+export const LEARNED_REQUEST_EFFECT_SCREEN_MAX = 0.35;
 /** The judge's confidence that it changed nothing, at least. */
 export const LEARNED_REQUEST_EFFECT_CONFIRM_MIN = 0.9;
 

@@ -46,6 +46,8 @@ const CONFIRM_TIMEOUT_MS = 90_000;
 const MAX_CONCURRENT = 2;
 const MAX_QUEUED = 32;
 const RETRY_AFTER_ANSWER_MS = 24 * 60 * 60_000;
+/** The screen alone said no; the judge never looked. Ask again sooner. */
+const RETRY_AFTER_SCREEN_MS = 2 * 60 * 60_000;
 const RETRY_AFTER_UNAVAILABLE_MS = 10 * 60_000;
 const MAX_REMEMBERED = 500;
 
@@ -268,7 +270,12 @@ async function learnPrepared(
     SCREEN_TIMEOUT_MS + 2_000,
   );
   if (!screen?.ok || typeof screen.model !== 'string' || !screen.model.trim()) return 'screen_unavailable';
-  if (!probabilityAtMost(screen.changeProbability, LEARNED_REQUEST_EFFECT_SCREEN_MAX)) return 'screen_not_confident';
+  if (!probabilityAtMost(screen.changeProbability, LEARNED_REQUEST_EFFECT_SCREEN_MAX)) {
+    logger.info({ operationId: prepared.operationId, shape: prepared.shape, screen: screen.model,
+      changeProbability: screen.changeProbability, bar: LEARNED_REQUEST_EFFECT_SCREEN_MAX },
+      'request effect screen saw a possible change; the judge was not asked');
+    return 'screen_not_confident';
+  }
 
   const confirm = await boundedWait(
     (options.confirm ?? confirmWithJudge)({
@@ -281,15 +288,27 @@ async function learnPrepared(
   if (!confirm?.ok || typeof confirm.model !== 'string' || !confirm.model.trim()) return 'confirm_unavailable';
   // Two readings by one model are one reading.
   if (confirm.model.trim() === screen.model.trim()) return 'confirm_unavailable';
-  if (confirm.evidenceDigest !== prepared.evidenceDigest) return 'confirm_mismatched';
-  if (confirm.changesProvider === 'yes') return 'confirm_disagreed';
+  const judged = { operationId: prepared.operationId, shape: prepared.shape, screen: screen.model,
+    changeProbability: screen.changeProbability, judge: confirm.model,
+    changesProvider: confirm.changesProvider, confidence: confirm.confidence };
+  if (confirm.evidenceDigest !== prepared.evidenceDigest) {
+    logger.info(judged, 'request effect judge answered about different evidence');
+    return 'confirm_mismatched';
+  }
+  if (confirm.changesProvider === 'yes') {
+    logger.info(judged, 'request effect judge found a change; the shape stays a write');
+    return 'confirm_disagreed';
+  }
   if (
     confirm.changesProvider !== 'no'
     || typeof confirm.confidence !== 'number'
     || !Number.isFinite(confirm.confidence)
     || confirm.confidence < LEARNED_REQUEST_EFFECT_CONFIRM_MIN
     || confirm.confidence > 1
-  ) return 'confirm_not_confident';
+  ) {
+    logger.info(judged, 'request effect judge was not confident; the shape stays a write');
+    return 'confirm_not_confident';
+  }
 
   const stored = rememberLearnedRequestEffect({
     version: LEARNED_REQUEST_EFFECT_VERSION,
@@ -356,13 +375,13 @@ function noteOutcome(prepared: PreparedRequest, outcome: RequestEffectLearningOu
   const unavailable = outcome === 'screen_unavailable'
     || outcome === 'confirm_unavailable'
     || outcome === 'store_failed';
-  const answered = outcome === 'screen_not_confident'
-    || outcome === 'confirm_disagreed'
+  const screened = outcome === 'screen_not_confident';
+  const answered = outcome === 'confirm_disagreed'
     || outcome === 'confirm_not_confident'
     || outcome === 'confirm_mismatched';
-  if (unavailable || answered) {
+  if (unavailable || screened || answered) {
     boundedSet(retryAfter, prepared.key,
-      Date.now() + (unavailable ? RETRY_AFTER_UNAVAILABLE_MS : RETRY_AFTER_ANSWER_MS));
+      Date.now() + (unavailable ? RETRY_AFTER_UNAVAILABLE_MS : screened ? RETRY_AFTER_SCREEN_MS : RETRY_AFTER_ANSWER_MS));
   }
   const log = outcome === 'learned' ? logger.info.bind(logger) : logger.debug.bind(logger);
   log({ operationId: prepared.operationId, providerKind: prepared.providerKind, shape: prepared.shape, outcome },
