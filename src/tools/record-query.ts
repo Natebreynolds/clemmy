@@ -1,5 +1,5 @@
 /**
- * Exact figures over retained records: conditions, ordering and aggregates.
+ * Computed figures over retained records: conditions, ordering and aggregates.
  *
  * A count, total, average or ranking read off rows by eye drifts: a model
  * skims a long list and states a figure the data does not hold. These pure
@@ -8,6 +8,8 @@
  * numbers, as dates when both are ISO dates, and otherwise as trimmed,
  * case-insensitive text; a record whose value cannot be compared that way
  * does not match, and the caller is told how many were skipped.
+ * Arithmetic uses JavaScript Numbers without additional decimal rounding;
+ * results retain the precision and limits of floating-point arithmetic.
  */
 
 export type RecordQueryOp = 'eq' | 'ne' | 'contains' | 'lt' | 'lte' | 'gt' | 'gte';
@@ -25,6 +27,11 @@ type Comparable =
   | { kind: 'date'; text: string }
   | { kind: 'instant'; n: number }
   | { kind: 'text'; text: string };
+
+// Unlike kinds have no shared numeric/date meaning. Keep each kind together
+// instead of treating an incompatible pair as an input-order tie, which makes
+// the comparator non-transitive and can leave numeric rankings out of order.
+const SORT_KIND_ORDER: Record<Comparable['kind'], number> = { number: 0, date: 1, instant: 2, text: 3 };
 
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/;
@@ -117,13 +124,17 @@ export function applyWhere(rows: readonly unknown[], conditions: readonly Record
   return { rows: kept, skipped };
 }
 
-/** Records ordered by a field; records without a comparable value go last. */
+/** Records grouped as numbers, dates, instants, then text, with the requested
+ * direction applied within each kind. Missing/unusable values go last in both
+ * directions; ties preserve input order. No cross-kind conversion is guessed. */
 export function sortRows(rows: readonly unknown[], field: string, order: 'asc' | 'desc'): unknown[] {
   const keyed = rows.map((row, index) => ({ row, index, key: comparable(fieldValue(row, field)) }));
   keyed.sort((a, b) => {
     if (!a.key && !b.key) return a.index - b.index;
     if (!a.key) return 1;
     if (!b.key) return -1;
+    const kindOrder = SORT_KIND_ORDER[a.key.kind] - SORT_KIND_ORDER[b.key.kind];
+    if (kindOrder !== 0) return kindOrder;
     const result = compare(a.key, b.key);
     if (result === null || result === 0) return a.index - b.index;
     return order === 'asc' ? result : -result;
@@ -132,6 +143,7 @@ export function sortRows(rows: readonly unknown[], field: string, order: 'asc' |
 }
 
 export interface AggregateFigure {
+  /** Unrounded JavaScript Number result, or null when no numeric values exist. */
   value: number | null;
   /** Records the figure was computed from. */
   counted: number;
@@ -154,7 +166,7 @@ function figure(rows: readonly unknown[], op: RecordAggregateOp, valueField?: st
     : op === 'avg' ? total / numbers.length
       : op === 'min' ? Math.min(...numbers)
         : Math.max(...numbers);
-  return { value: Number(value.toFixed(10)), counted: numbers.length, lackedNumber };
+  return { value, counted: numbers.length, lackedNumber };
 }
 
 export interface AggregateResult {
@@ -163,7 +175,7 @@ export interface AggregateResult {
   groups?: Array<{ group: string; figure: AggregateFigure }>;
 }
 
-/** An exact aggregate over every record, optionally per group. */
+/** An aggregate over every record, optionally per group, using Number arithmetic. */
 export function aggregateRows(
   rows: readonly unknown[],
   op: RecordAggregateOp,

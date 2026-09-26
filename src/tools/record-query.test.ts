@@ -58,7 +58,44 @@ test('sorting ranks numbers numerically with missing values last', () => {
   assert.equal(sortRows(keywords, 'position', 'desc').at(-1), keywords[4]);
 });
 
-test('aggregates are exact over every record and say what they could not count', () => {
+test('mixed-kind rankings keep numbers together, order within each kind, and leave missing values last', () => {
+  const rows = [
+    { id: 'ten', value: 10 },
+    { id: 'text-z', value: 'z' },
+    { id: 'two', value: '2' },
+    { id: 'missing' },
+    { id: 'text-a', value: 'A' },
+    { id: 'hundred', value: '100' },
+    { id: 'empty', value: '' },
+    { id: 'ten-again', value: '10' },
+    { id: 'null', value: null },
+  ];
+  const ids = (order: 'asc' | 'desc') => sortRows(rows, 'value', order)
+    .map((row) => (row as { id: string }).id);
+  assert.deepEqual(ids('asc'), ['two', 'ten', 'ten-again', 'hundred', 'text-a', 'text-z', 'missing', 'empty', 'null']);
+  assert.deepEqual(ids('desc'), ['hundred', 'ten', 'ten-again', 'two', 'text-z', 'text-a', 'missing', 'empty', 'null']);
+  assert.equal(rows[0]!.id, 'ten', 'ranking does not mutate the retained input');
+});
+
+test('mixed-kind ordering is consistent across input permutations, with separate date and instant groups', () => {
+  const rows = [
+    { id: 'number', value: 2 },
+    { id: 'date-early', value: '2026-09-24' },
+    { id: 'date-late', value: '2026-09-25' },
+    { id: 'instant-early', value: '2026-09-24T23:00:00Z' },
+    { id: 'instant-late', value: '2026-09-25T10:00:00+00:00' },
+    { id: 'text', value: 'unknown' },
+    { id: 'missing', value: null },
+  ];
+  for (const input of [rows, [...rows].reverse(), [rows[5], rows[4], rows[0], rows[6], rows[2], rows[3], rows[1]]]) {
+    assert.deepEqual(sortRows(input, 'value', 'asc').map((row) => (row as { id: string }).id),
+      ['number', 'date-early', 'date-late', 'instant-early', 'instant-late', 'text', 'missing']);
+    assert.deepEqual(sortRows(input, 'value', 'desc').map((row) => (row as { id: string }).id),
+      ['number', 'date-late', 'date-early', 'instant-late', 'instant-early', 'text', 'missing']);
+  }
+});
+
+test('aggregates cover every record and say what they could not count', () => {
   const deals = [
     { owner: 'Rep One', amount: 1200 },
     { owner: 'Rep Two', amount: '3,230' },
@@ -75,6 +112,21 @@ test('aggregates are exact over every record and say what they could not count',
   assert.deepEqual(perOwner.groups?.map((group) => [group.group, group.figure.value]),
     [['Rep Two', 3230], ['Rep One', 1700.5]], 'groups come largest first');
   assert.equal(aggregateRows([], 'sum', { valueField: 'amount' }).overall.value, null, 'no numbers is not zero');
+});
+
+test('aggregates retain very small and high-precision Number results without fixed decimal rounding', () => {
+  const tiny = [{ value: '0.000000000001', group: 'a' }, { value: '0.000000000002', group: 'b' }];
+  assert.equal(aggregateRows(tiny, 'sum', { valueField: 'value' }).overall.value, 3e-12);
+  assert.equal(aggregateRows(tiny, 'avg', { valueField: 'value' }).overall.value, 1.5e-12);
+  assert.equal(aggregateRows(tiny, 'min', { valueField: 'value' }).overall.value, 1e-12);
+  assert.equal(aggregateRows(tiny, 'max', { valueField: 'value' }).overall.value, 2e-12);
+  assert.deepEqual(aggregateRows(tiny, 'sum', { valueField: 'value', groupBy: 'group' }).groups
+    ?.map((entry) => [entry.group, entry.figure.value]), [['b', 2e-12], ['a', 1e-12]]);
+  const precise = [{ value: 1.000000000001 }, { value: 1.000000000001 }];
+  assert.equal(aggregateRows(precise, 'sum', { valueField: 'value' }).overall.value, 2.000000000002);
+  assert.equal(aggregateRows(precise, 'avg', { valueField: 'value' }).overall.value, 1.000000000001);
+  assert.equal(aggregateRows([{ value: 0.1 }, { value: 0.2 }], 'sum', { valueField: 'value' }).overall.value,
+    0.30000000000000004, 'ordinary Number arithmetic is retained, not represented as exact decimal arithmetic');
 });
 
 test('dotted fields reach nested values', () => {
