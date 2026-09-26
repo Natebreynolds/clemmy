@@ -668,3 +668,21 @@ test('tool_output_query refuses an exact figure over a clipped prefix instead of
   assert.match(await run({ call_id: 'call_clipped_rows', filter_field: 'id', filter_equals: 'b' }), /full total unknown/,
     'a plain lookup over the recovered records still works and says the total is unknown');
 });
+
+test('a displayed aggregate carries the figure, not floating-point noise, and keeps tiny values', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_cents', tool: 'composio_execute_tool',
+    output: JSON.stringify([{ amount: 0.1 }, { amount: 0.2 }, { amount: 1200.1 }, { amount: 3230.2 }]) });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_tiny', tool: 'composio_execute_tool',
+    output: JSON.stringify([{ share: 0.000000000001 }, { share: 0.000000000002 }]) });
+  const query = captureToolOutputQueryHandler();
+  const run = (input: Record<string, unknown>) => withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(5, 200_000) },
+    () => query(input),
+  ).then((res) => res.content[0].text);
+  assert.match(await run({ call_id: 'call_cents', aggregate: 'sum', value_field: 'amount' }), /sum of amount = 4430\.6 \(/,
+    'the model reads 4430.6, never 4430.599999999999');
+  assert.match(await run({ call_id: 'call_tiny', aggregate: 'sum', value_field: 'share' }), /sum of share = 3e-12 \(/,
+    'a very small figure is still shown, not rounded to 0');
+});

@@ -138,9 +138,16 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
   group_by: z.string().optional().describe('Compute the aggregate per distinct value of this field.'),
 };
 
+/** A computed figure as the model should read it: binary floating-point
+ *  noise (0.1 + 0.2) is not part of the data, so the text carries at most 12
+ *  significant digits, which still shows very small and very large values. */
+function figureText(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toPrecision(12)));
+}
+
 function aggregateLine(label: string, op: RecordAggregateOp, valueField: string | undefined, result: AggregateFigure): string {
   const what = op === 'count' ? 'count' : `${op} of ${valueField}`;
-  const value = result.value === null ? 'no numeric values' : String(result.value);
+  const value = result.value === null ? 'no numeric values' : figureText(result.value);
   const lacking = result.lackedNumber > 0 ? `; ${result.lackedNumber} matching record(s) had no number in ${valueField}` : '';
   return `${label}${what} = ${value}${op === 'count' ? '' : ` (over ${result.counted} record(s)${lacking})`}`;
 }
