@@ -361,7 +361,7 @@ test('an unusable preserved override makes the exact foreground daemon process f
 
 function packageRootWith(label: string, overrides: Record<string, string> = {}): string {
   const root = path.join(HOME, `package-${label}`);
-  for (const name of [builtins.TECHNICAL_CONTENT_MARKETING_SKILL, builtins.WORKSPACE_BUILDER_SKILL]) {
+  for (const name of [builtins.TECHNICAL_CONTENT_MARKETING_SKILL, builtins.WORKSPACE_BUILDER_SKILL, builtins.PEOPLE_LOOKUP_SKILL]) {
     const dir = path.join(root, 'builtin-skills', name);
     mkdirSync(dir, { recursive: true });
     writeFileSync(
@@ -461,4 +461,38 @@ test('Clem finds the workspace-builder skill for ordinary Space requests and not
     assert.ok(names.includes(builtins.WORKSPACE_BUILDER_SKILL), `request ${index} did not surface the skill: ${JSON.stringify(names)}`);
   }
   assert.equal(found[4]!.includes(builtins.WORKSPACE_BUILDER_SKILL), false, 'unrelated work does not pull it in');
+});
+
+test('Clem finds the people-lookup skill when a request names a person to reach, and not for unrelated work', async () => {
+  const home = path.join(HOME, 'people-discovery');
+  builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: PKG_DIR });
+  const probe = spawnSync(process.execPath, ['--import', 'tsx', '-e', `
+    const { findRelevantSkills } = await import(${JSON.stringify(path.join(PKG_DIR, 'src', 'memory', 'skill-store.ts'))});
+    const { rankSkills } = await import(${JSON.stringify(path.join(PKG_DIR, 'src', 'runtime', 'harness', 'context-packet.ts'))});
+    const asks = JSON.parse(process.argv[1]);
+    console.log(JSON.stringify(asks.map((ask) => [
+      findRelevantSkills(ask).map((m) => m.skill.name),
+      rankSkills(ask).map((m) => m.name),
+    ])));
+  `, JSON.stringify([
+    'Can you send this to Dana Lee and Sam Ortiz please from my work email',
+    'send Priya on the sales team the Q3 summary by email',
+    'invite Dana Lee to the planning meeting tomorrow at 3',
+    'what is the weather in denver tomorrow',
+    'summarize this article for me in three bullets',
+  ])], {
+    cwd: PKG_DIR,
+    env: { ...process.env, CLEMENTINE_HOME: home, CLEMMY_TEST_ISOLATED_HOME: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(probe.status, 0, probe.stderr);
+  const found = JSON.parse(probe.stdout.trim().split('\n').pop()!) as Array<[string[], string[]]>;
+  for (const [index, [relevant, ranked]] of found.slice(0, 3).entries()) {
+    assert.ok(relevant.includes(builtins.PEOPLE_LOOKUP_SKILL), `request ${index} did not surface the skill in memory context: ${JSON.stringify(relevant)}`);
+    assert.ok(ranked.includes(builtins.PEOPLE_LOOKUP_SKILL), `request ${index} did not surface the skill in the context packet: ${JSON.stringify(ranked)}`);
+  }
+  for (const [index, [relevant, ranked]] of found.slice(3).entries()) {
+    assert.equal(relevant.includes(builtins.PEOPLE_LOOKUP_SKILL), false, `unrelated request ${index} pulled it in: ${JSON.stringify(relevant)}`);
+    assert.equal(ranked.includes(builtins.PEOPLE_LOOKUP_SKILL), false, `unrelated request ${index} pulled it into the packet: ${JSON.stringify(ranked)}`);
+  }
 });
