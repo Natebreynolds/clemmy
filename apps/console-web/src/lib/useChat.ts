@@ -534,6 +534,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     || ev.type === 'work_manifest_declared' || ev.type === 'work_item_checkpoint'
     || ev.type === 'coding_run_activity' || ev.type === 'coding_run_settled'
     || ev.type === 'worker_model_offer' || ev.type === 'worker_model_offer_resolved'
+    || ev.type === 'workflow_saved'
     || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {
     return reduceSharedActivity(prev, sharedEvent(ev));
   }

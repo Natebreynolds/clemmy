@@ -119,7 +119,7 @@ export const ACTIVITY_FOLD_EVENTS: ReadonlySet<string> = new Set([
   'batch_started', 'batch_progress', 'batch_completed',
   'async_work_dispatched', 'expected_work_progress',
   'external_write', 'external_write_succeeded', 'external_write_failed', 'external_write_orphaned',
-  'deliverable_saved', 'codemode_program_summary', 'verdict_recorded',
+  'deliverable_saved', 'workflow_saved', 'codemode_program_summary', 'verdict_recorded',
   'stream_token', 'user_input_received', 'conversation_preamble', 'conversation_check_in',
   'approval_resolved', 'conversation_limit_exceeded', 'stall_retry_attempted',
   'plan_drafted', 'plan_revision_published', 'memory_signals_captured', 'handoff',
