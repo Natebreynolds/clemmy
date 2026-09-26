@@ -3121,6 +3121,16 @@ input, textarea, select { font: inherit; font-size: 16px; }
 }
 .brain-chip:active { transform: scale(0.96); }
 .brain-chip svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--accent); }
+/* The agent a conversation lives inside: same chip shape, calmer than the brain
+   chip because it is a fact about the thread, not a switch. */
+.chat-header .agent-chip { max-width: 30vw; color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.chat-header .agent-chip[disabled] { opacity: 1; }
+.chip-agent { margin-top: 3px; color: var(--accent); background: var(--accent-soft); font-family: var(--font-display); }
+.agent-pick-list { list-style: none; margin: 0; padding: 0 4px 8px; }
+.agent-pick-list button { display: flex; flex-direction: column; gap: 2px; width: 100%; min-height: 52px; padding: 10px 12px; border: 0; border-radius: 12px; background: transparent; color: var(--fg); text-align: left; }
+.agent-pick-list button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+.agent-pick-list button:active { background: var(--bg-2); }
+.agent-pick-list .agent-desc { font-size: 13px; color: var(--fg-2); }
 
 .brain-layer { position: fixed; inset: 0; z-index: 95; display: flex; align-items: flex-end; justify-content: center; }
 .brain-scrim {

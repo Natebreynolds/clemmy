@@ -928,6 +928,9 @@ export interface ChatSession {
   status: SessionStatus;
   createdAt: number;
   updatedAt: number;
+  /** Saved agent this conversation was opened inside, when it was. */
+  agentId: string | null;
+  agentName: string | null;
 }
 
 export interface ChatEvent {
@@ -1011,7 +1014,15 @@ export async function sendChatMessage(
  * the accepted run keeps going.
  */
 export async function sendChatMessageAsync(
-  input: { message: string; sessionId?: string | null; idempotencyKey: string; steerOnly?: boolean; taskMode?: TaskMode },
+  input: {
+    message: string;
+    sessionId?: string | null;
+    idempotencyKey: string;
+    steerOnly?: boolean;
+    taskMode?: TaskMode;
+    /** Binds a NEW conversation to this saved agent; ignored once it exists. */
+    agentId?: string;
+  },
 ): Promise<{ accepted: boolean; sessionId: string; runId?: string; sinceSeq?: number; steered?: boolean }> {
   return api('/m/api/chat/send', {
     method: 'POST',
@@ -1020,6 +1031,7 @@ export async function sendChatMessageAsync(
       message: input.message,
       ...(input.taskMode ? { taskMode: input.taskMode } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.agentId ? { agentId: input.agentId } : {}),
       async: true,
       ...(input.steerOnly ? { steerOnly: true } : {}),
     }),

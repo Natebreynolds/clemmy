@@ -38,6 +38,9 @@ export interface ChatApi {
     idempotencyKey: string;
     steerOnly?: boolean;
     taskMode?: TaskMode;
+    /** Saved agent a NEW conversation opens inside. The server binds it at
+     *  creation and ignores it once the session exists. */
+    agentId?: string;
   }): Promise<SendResult>;
   /** Full transcript load for opening an existing session. */
   loadSession(sessionId: string): Promise<{ events: HarnessEvent[]; latestSeq: number; title?: string }>;
@@ -47,6 +50,9 @@ export interface ChatEngineOptions {
   transport: StreamTransport;
   api: ChatApi;
   sessionId?: string | null;
+  /** Agent the first message of a fresh conversation binds it to; forwarded
+   *  on every send, harmless once the session exists. */
+  agentId?: string | null;
   pendingStore?: PendingMessageStore;
   newIdempotencyKey?: () => string;
   now?: () => number;
@@ -114,6 +120,7 @@ export class ChatEngine {
   private readonly streamTimings: Partial<Parameters<typeof runChatStream>[0]>;
 
   private sessionId: string | null;
+  private readonly agentId: string | null;
   private messages: ChatMessage[] = [];
   private busy = false;
   /** Key of the turn in flight; see EngineSnapshot.cancelKey. */
@@ -140,6 +147,12 @@ export class ChatEngine {
     this.now = options.now ?? Date.now;
     this.streamTimings = options.streamTimings ?? {};
     this.sessionId = options.sessionId ?? null;
+    this.agentId = options.agentId ?? null;
+  }
+
+  /** Spread into every api.send call so a fresh conversation opens inside its agent. */
+  private agentField(): { agentId?: string } {
+    return this.agentId ? { agentId: this.agentId } : {};
   }
 
   subscribe(listener: (snapshot: EngineSnapshot) => void): () => void {
@@ -275,6 +288,7 @@ export class ChatEngine {
           sessionId: this.sessionId,
           idempotencyKey: steerMessage.idempotencyKey!,
           steerOnly: true,
+          ...this.agentField(),
         });
         this.messages = this.messages.map((entry) => (
           entry.id === steerId
@@ -329,7 +343,8 @@ export class ChatEngine {
       this.emit();
       try {
         const result = await this.api.send({ message: failed.text, sessionId: failed.requestSessionId ?? this.sessionId,
-          idempotencyKey: failed.idempotencyKey, steerOnly: true, ...(failed.taskMode ? { taskMode: failed.taskMode } : {}) });
+          idempotencyKey: failed.idempotencyKey, steerOnly: true, ...(failed.taskMode ? { taskMode: failed.taskMode } : {}),
+          ...this.agentField() });
         this.messages = this.messages.map(message => message.id === messageId
           ? { ...message, pending: result.steered ? undefined : 'failed', steer: result.steered ? 'delivered' : 'failed' } : message);
       } catch (error) {
@@ -364,6 +379,7 @@ export class ChatEngine {
         const result = await this.api.send({ message, sessionId: userMessage.requestSessionId !== undefined ? userMessage.requestSessionId : this.sessionId, idempotencyKey,
           ...(userMessage.taskMode ? { taskMode: userMessage.taskMode } : {}),
           ...(userMessage.steer ? { steerOnly: true } : {}),
+          ...this.agentField(),
         });
         if (this.disposed) return;
         this.messages = this.messages.map((m) => (m.id === userMessage.id

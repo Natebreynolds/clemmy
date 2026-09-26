@@ -40,8 +40,10 @@ import {
   createChatStreamTransport,
   freshIdempotencyKey,
   getChatSession,
+  listAgents,
   rejectPlanProposal,
   sendChatMessageAsync,
+  type MobileAgent,
 } from '../lib/api';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
@@ -50,6 +52,7 @@ import { useDictation } from '../lib/use-dictation';
 import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
 import { ChatBackButton } from '../components/ChatBackButton';
+import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 
@@ -60,11 +63,31 @@ interface Props {
   initialDraft?: string;
   /** Only Home's explicit Send handoff uses this; response/edit handoffs stay editable. */
   initialAutoSend?: boolean;
+  /** The saved agent a NEW conversation opens inside, or the one a reopened
+   *  thread already lives in (from its session row). */
+  agentId?: string;
+  agentName?: string;
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAutoSend, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, onBack }: Props) {
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
+  const [agent, setAgent] = useState<{ id: string; name: string } | null>(
+    initialAgentId ? { id: initialAgentId, name: initialAgentName ?? '' } : null,
+  );
+  // Only a conversation that does not exist yet can still choose its agent;
+  // a reopened thread keeps the one it was opened in, whatever we send.
+  const boundAgentId = initialSessionId ? null : agent?.id ?? null;
+  const [agentPickOpen, setAgentPickOpen] = useState(false);
+  const [agentChoices, setAgentChoices] = useState<MobileAgent[] | null>(null);
+  useEffect(() => {
+    if (!agentPickOpen) return;
+    let cancelled = false;
+    listAgents()
+      .then((result) => { if (!cancelled) setAgentChoices(result.agents); })
+      .catch(() => { if (!cancelled) setAgentChoices([]); });
+    return () => { cancelled = true; };
+  }, [agentPickOpen]);
   const [title, setTitle] = useState(initialTitle ?? '');
   const [draft, setDraft] = useState(initialDraft ?? '');
   const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
@@ -96,16 +119,18 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const engine = useMemo(() => new ChatEngine({
     transport: createChatStreamTransport(),
     sessionId: initialSessionId ?? null,
+    agentId: boundAgentId,
     pendingStore: createPendingMessageStore(localStorage, `clem.pending.mobile:${initialSessionId ?? 'new'}`),
     api: {
-      send: async ({ message, sessionId, idempotencyKey, steerOnly, taskMode }) => {
-        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly, taskMode });
+      send: async ({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId }) => {
+        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId });
         return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered };
       },
       loadSession: async (sessionId) => {
         try {
           const result = await getChatSession(sessionId);
           setTitle(result.session.title);
+          if (result.session.agentId) setAgent({ id: result.session.agentId, name: result.session.agentName ?? '' });
           return { events: result.events, latestSeq: result.latestSeq };
         } catch (err) {
           // Workspace threads use a STABLE session id (space-<slug>) that may
@@ -118,7 +143,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       },
     },
     newIdempotencyKey: freshIdempotencyKey,
-  }), [initialSessionId]);
+  }), [initialSessionId, boundAgentId]);
 
   useEffect(() => {
     const unsubscribe = engine.subscribe(setSnapshot);
@@ -167,6 +192,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // indicator rather than a control that would silently do nothing.
   const cancelKey = snapshot?.cancelKey ?? null;
   const canStop = busy && Boolean(snapshot?.sessionId);
+  // The agent can still change until the first message claims a session.
+  const canPickAgent = !initialSessionId && !snapshot?.sessionId && messages.length === 0 && !busy;
+  const agentLabel = agent?.name || (agent ? 'Agent' : '');
   const followingTail = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const { available: dictation, listening, toggle: toggleDictation, stop: stopDictation } = useDictation(
@@ -302,6 +330,43 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
+        {agent || canPickAgent ? (
+          <button
+            type="button"
+            class="brain-chip agent-chip"
+            disabled={!canPickAgent}
+            title={agent ? `This conversation lives inside ${agentLabel}` : 'Open this conversation inside one of your agents'}
+            onClick={() => { haptic('light'); setAgentPickOpen(true); }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" />
+            </svg>
+            <span class="truncate">{agent ? agentLabel : 'Agent'}</span>
+          </button>
+        ) : null}
+        <Sheet open={agentPickOpen} onClose={() => setAgentPickOpen(false)} title="Open inside an agent" class="sheet-compact">
+          {agentChoices === null ? (
+            <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
+          ) : (
+            <ul class="agent-pick-list">
+              <li>
+                <button type="button" aria-pressed={!agent} onClick={() => { haptic('light'); setAgent(null); setAgentPickOpen(false); }}>
+                  <span class="agent-name">Just Clem</span>
+                  <span class="agent-desc">A plain conversation, no standing context</span>
+                </button>
+              </li>
+              {agentChoices.map((choice) => (
+                <li key={choice.id}>
+                  <button type="button" aria-pressed={agent?.id === choice.id} onClick={() => { haptic('light'); setAgent({ id: choice.id, name: choice.name }); setAgentPickOpen(false); }}>
+                    <span class="agent-name">{choice.name}</span>
+                    {choice.handles ? <span class="agent-desc">{choice.handles}</span> : null}
+                  </button>
+                </li>
+              ))}
+              {agentChoices.length === 0 ? <li><p class="agent-desc">No agents yet. Make one on the Agents tab.</p></li> : null}
+            </ul>
+          )}
+        </Sheet>
         {brainLabel ? (
           <button
             type="button"
@@ -341,7 +406,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         {error ? <div class="global-error">{error}</div> : null}
         {messages.length === 0 ? (
           <div class="inbox-empty">
-            {initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.' : 'Type a message to start a new chat.'}
+            {initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.'
+              : agent?.name ? `Type a message to start a chat with ${agent.name}.` : 'Type a message to start a new chat.'}
           </div>
         ) : null}
         {messages.map((message, index) => (
@@ -409,8 +475,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             ref={textareaRef}
             class="chat-input"
             rows={1}
-            aria-label="Message Clem"
-            placeholder={listening ? 'Listening…' : busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : 'Message Clem…'}
+            aria-label={agent?.name ? `Message ${agent.name}` : 'Message Clem'}
+            placeholder={listening ? 'Listening…' : busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : `Message ${agent?.name || 'Clem'}…`}
             value={draft}
             enterkeyhint="send"
             autocomplete="off"
