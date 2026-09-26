@@ -223,10 +223,22 @@ export interface TurnEvidenceRef {
   uri?: string;
 }
 
+/** A file the person attached to a message: a photo, a screenshot, a document. */
+export interface ChatAttachment {
+  /** The daemon's inbox id, minted by the upload route. */
+  id: string;
+  name: string;
+  kind: 'image' | 'file';
+  /** A local preview while the message is on this device; never sent. */
+  previewUrl?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  /** What the person attached with this message. */
+  attachments?: ChatAttachment[];
   status?: MessageStatus;
   progress?: string;
   /** See TerminalFacts. */

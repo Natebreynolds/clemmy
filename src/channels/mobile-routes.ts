@@ -3598,6 +3598,25 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * — the native shell asks the page to make this call, so the device-bound
    * proof machinery stays the single auth path. Idempotent per device.
    */
+  /**
+   * A file from the phone's camera, photo library or Files, ahead of the
+   * message that refers to it. Same converter and inbox as the desktop's
+   * /api/attach; the id comes back and rides on /api/chat/send.
+   */
+  router.post('/api/chat/attach', requireMobileSession, express.raw({ type: '*/*', limit: '30mb' }), async (req, res) => {
+    const name = typeof req.query.name === 'string' && req.query.name.trim() ? req.query.name.trim().slice(0, 200) : 'attachment';
+    const bytes = Buffer.isBuffer(req.body) && req.body.length > 0 ? (req.body as Buffer) : undefined;
+    if (!bytes) { res.status(400).json({ error: 'FILE_REQUIRED' }); return; }
+    try {
+      const { ingestAttachment, saveIngestedToInbox } = await import('../runtime/attachments.js');
+      const ingested = await ingestAttachment({ name, bytes });
+      const id = saveIngestedToInbox(ingested);
+      res.json({ id, name: ingested.name, ok: !ingested.error, error: ingested.error ?? null, chars: ingested.markdown?.length ?? 0 });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   router.post('/push/apns', requireMobileSession, async (req, res) => {
     const ctx = req.mobileSession!;
     const deviceToken = typeof req.body?.deviceToken === 'string' ? req.body.deviceToken.trim() : '';
@@ -3857,7 +3876,19 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     try { taskMode = parseTaskMode(req.body?.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
     if (taskMode && req.body?.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
     const ctx = req.mobileSession!;
-    const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    const typedMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    // Files uploaded ahead of this message through /api/chat/attach. A photo
+    // with no words is a complete message; the title then names the files.
+    const attachmentIds: string[] = Array.isArray(req.body?.attachments)
+      ? (req.body.attachments as unknown[]).filter((a): a is string => typeof a === 'string' && a.trim().length > 0).slice(0, 10)
+      : [];
+    const { loadInboxAttachment, foldAttachmentsIntoMessage } = await import('../runtime/attachments.js');
+    const ingestedAttachments = attachmentIds
+      .map((id) => loadInboxAttachment(id))
+      .filter((a): a is NonNullable<ReturnType<typeof loadInboxAttachment>> => a !== null);
+    const message = typedMessage || (ingestedAttachments.length
+      ? `Attached: ${ingestedAttachments.map((a) => a.name).join(', ')}`
+      : '');
     if (!message) {
       res.status(400).json({ error: 'EMPTY_MESSAGE' });
       return;
@@ -4152,7 +4183,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         return;
       }
 
-      let executionMessage = message;
+      let executionMessage = ingestedAttachments.length
+        ? foldAttachmentsIntoMessage(typedMessage, ingestedAttachments)
+        : message;
       if (typedControl?.kind === 'session_control' && typedControl.command === 'continue') {
         const lastCompletion = harnessListEvents(sessionId, {
           types: ['conversation_completed'],

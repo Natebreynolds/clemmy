@@ -1032,6 +1032,8 @@ export async function sendChatMessageAsync(
     taskMode?: TaskMode;
     /** Binds a NEW conversation to this saved agent; ignored once it exists. */
     agentId?: string;
+    /** Inbox ids from uploadChatAttachment, sent with this message. */
+    attachments?: string[];
   },
 ): Promise<{ accepted: boolean; sessionId: string; runId?: string; sinceSeq?: number; steered?: boolean }> {
   return api('/m/api/chat/send', {
@@ -1044,6 +1046,7 @@ export async function sendChatMessageAsync(
       ...(input.agentId ? { agentId: input.agentId } : {}),
       async: true,
       ...(input.steerOnly ? { steerOnly: true } : {}),
+      ...(input.attachments?.length ? { attachments: input.attachments } : {}),
     }),
   });
 }
@@ -1851,4 +1854,16 @@ export function answerModelRuleOffer(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action }),
   });
+}
+
+/**
+ * Upload one file ahead of the message that refers to it. The bytes go raw
+ * (no multipart) through the same converter the desktop uses; the id comes
+ * back and rides on sendChatMessageAsync's `attachments`.
+ */
+export async function uploadChatAttachment(file: File): Promise<{ id: string; name: string; ok: boolean; error: string | null }> {
+  return api<{ id: string; name: string; ok: boolean; error: string | null }>(
+    `/m/api/chat/attach?name=${encodeURIComponent(file.name || 'attachment')}`,
+    { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file },
+  );
 }

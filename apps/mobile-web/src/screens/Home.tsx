@@ -18,6 +18,7 @@
  * inferred from chat prose. The user shapes the window: which panes show
  * and in what order come from HomePreferences, saved on the daemon.
  */
+import type { ChatAttachment } from '@clem/chat-engine';
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
@@ -67,7 +68,7 @@ const MAX_QUICK_CHIPS = 3;
 
 interface Props {
   name: string;
-  onAsk: (draft: string) => void;
+  onAsk: (draft: string, attachments?: ChatAttachment[]) => void;
   onOpenInbox: () => void;
   onOpenWorkspace: (id: string) => void;
   /** Open a run's own screen. Every surface that shows running work must be

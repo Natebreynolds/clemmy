@@ -200,8 +200,8 @@ test('the title switcher and the ask capsule replace the hamburger and the inlin
   assert.match(app, /<TitleSwitcher/);
   assert.match(app, /phoneSwitcherIds\(prefs, TABS\.map/,
     'the switcher lists the user\'s chosen destinations from the ONE preferences record');
-  assert.match(app, /<AskCapsule onAsk=\{\(draft\) => goToChat\(\{ draft, autoSend: true \}\)\}/,
-    'the capsule sends through the same path Home\'s ask box used');
+  assert.match(app, /<AskCapsule onAsk=\{\(draft, attachments\) => goToChat\(\{ draft, attachments, autoSend: true \}\)\}/,
+    'the capsule sends through the same path Home\'s ask box used, files included');
   assert.doesNotMatch(app, /class="menu-btn"/);
   const home = read('../screens/Home.tsx');
   assert.doesNotMatch(home, /class="ask rise"|class="ask-input"/, 'the inline ask box is gone from Home');
@@ -209,8 +209,12 @@ test('the title switcher and the ask capsule replace the hamburger and the inlin
   assert.match(home, /useWorkingNow\(\)/, 'Running renders from the ONE shared snapshot');
   const css = read('../styles.css');
   assert.match(css, /\.ask-capsule \{[\s\S]*?position: fixed;[\s\S]*?env\(safe-area-inset-bottom\)/);
-  assert.match(css, /\.ask-capsule-send \{[\s\S]*?width: 44px;[\s\S]*?height: 44px/);
-  assert.match(css, /\.ask-capsule-mic \{[\s\S]*?width: 44px;[\s\S]*?height: 44px/);
+  // One composer card for the capsule and the thread; its controls are 40px
+  // circles inside a card that itself clears 44px.
+  const capsule = read('../components/AskCapsule.tsx');
+  assert.match(capsule, /<Composer[\s\S]*?compact/);
+  assert.match(css, /\.composer-icon \{[\s\S]*?width: 40px;[\s\S]*?height: 40px/);
+  assert.doesNotMatch(css, /\.ask-capsule-send \{|\.ask-capsule-mic \{|\.chat-composer \{|\.chat-mode-seg \{/, 'the old capsule and thread composer styles are deleted, not hidden');
   assert.doesNotMatch(css, /\.menu-btn \{|\.inbox-intro \{/, 'dead chrome styles are deleted, not hidden');
 });
 

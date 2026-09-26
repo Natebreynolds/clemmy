@@ -794,7 +794,7 @@ export function App() {
             <Home
               name={name}
               onOpenRun={openRun}
-              onAsk={(draft) => goToChat({ draft, autoSend: true })}
+              onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })}
               onOpenInbox={() => navigateTo('inbox')}
               onOpenWorkspace={openWorkspace}
               onOpenActivity={() => navigateTo('activity')}
@@ -870,7 +870,7 @@ export function App() {
         </ScreenBoundary>
       </main>
 
-      {capsuleShown ? <AskCapsule onAsk={(draft) => goToChat({ draft, autoSend: true })} /> : null}
+      {capsuleShown ? <AskCapsule onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })} /> : null}
     </>
   );
 }

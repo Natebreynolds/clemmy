@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import { useBackGesture } from '../lib/back-gesture';
 import { listChatSessions, type ChatSession } from '../lib/api';
+import type { ChatAttachment } from '@clem/chat-engine';
 import { Chat } from './Chat';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -8,6 +9,8 @@ import { useScreenData } from '../lib/use-screen-data';
 
 export interface ChatHandoff {
   draft?: string;
+  /** Files already uploaded from the capsule, sent with the draft. */
+  attachments?: ChatAttachment[];
   /** Home's send arrow means send; contextual reply handoffs remain drafts. */
   autoSend?: boolean;
   session?: ChatSession;
@@ -40,7 +43,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
     setSelectedTitle(undefined);
   };
   useBackGesture(selectedId !== null, closeSelected);
-  const [composing, setComposing] = useState<{ draft?: string; autoSend?: boolean; agentId?: string; agentName?: string } | null>(null);
+  const [composing, setComposing] = useState<{ draft?: string; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string } | null>(null);
   const [pendingLatest, setPendingLatest] = useState(false);
   // The list keeps polling and wake-refreshing only while it is the visible
   // surface — an open thread owns its own stream.
@@ -81,7 +84,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
       setSelectedDraft(handoff.draft);
     }
     else if (handoff.openLatest) setPendingLatest(true);
-    else setComposing({ draft: handoff.draft, autoSend: handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName });
+    else setComposing({ draft: handoff.draft, attachments: handoff.attachments, autoSend: handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName });
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
 
@@ -89,6 +92,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
     return (
       <Chat
         initialDraft={composing.draft}
+        initialAttachments={composing.attachments}
         initialAutoSend={composing.autoSend}
         agentId={composing.agentId}
         agentName={composing.agentName}

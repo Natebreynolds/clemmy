@@ -12,7 +12,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
  * injected transports so both the desktop console and the mobile PWA can
  * drive it.
  */
-import type {
+import type { ChatAttachment,
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
 import { approvalPreviewFrom, approvalResolutionFrom } from './types.js';
@@ -41,6 +41,8 @@ export interface ChatApi {
     /** Saved agent a NEW conversation opens inside. The server binds it at
      *  creation and ignores it once the session exists. */
     agentId?: string;
+    /** Inbox ids of files uploaded ahead of this message. */
+    attachments?: string[];
   }): Promise<SendResult>;
   /** Full transcript load for opening an existing session. */
   loadSession(sessionId: string): Promise<{ events: HarnessEvent[]; latestSeq: number; title?: string }>;
@@ -259,13 +261,15 @@ export class ChatEngine {
     this.emit();
   }
 
-  async send(text: string, selectedMode?: TaskMode): Promise<void> {
+  async send(text: string, selectedMode?: TaskMode, options: { attachments?: ChatAttachment[] } = {}): Promise<void> {
     const taskMode = snapshotTaskMode(selectedMode);
     if (this.busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, this.snapshot().activeTaskMode))) {
       throw new Error('Wait for the current turn to finish before changing modes or executing a plan.');
     }
     const message = text.trim();
-    if (!message) return;
+    const attachments = (options.attachments ?? []).filter((a) => a.id);
+    // A photo with no words is a complete message; words with nothing are not.
+    if (!message && attachments.length === 0) return;
     if (this.busy) {
       // Mid-run steering (OPEN-THE-GATES 4.2). The composer stays open; the
       // text is delivered into the live turn. Never claim a competing attempt.
@@ -312,6 +316,7 @@ export class ChatEngine {
       id: nextLocalId(),
       role: 'user',
       text: message,
+      ...(attachments.length ? { attachments } : {}),
       pending: 'sending',
       ...(taskMode ? { taskMode } : {}),
       requestSessionId: this.sessionId,
@@ -379,6 +384,7 @@ export class ChatEngine {
         const result = await this.api.send({ message, sessionId: userMessage.requestSessionId !== undefined ? userMessage.requestSessionId : this.sessionId, idempotencyKey,
           ...(userMessage.taskMode ? { taskMode: userMessage.taskMode } : {}),
           ...(userMessage.steer ? { steerOnly: true } : {}),
+          ...(userMessage.attachments?.length ? { attachments: userMessage.attachments.map((a) => a.id) } : {}),
           ...this.agentField(),
         });
         if (this.disposed) return;

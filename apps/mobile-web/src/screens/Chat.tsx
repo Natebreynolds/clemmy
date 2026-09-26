@@ -18,6 +18,8 @@ import {
   agentSwitchLabel,
   agentThreadMarks,
   createPendingMessageStore,
+  modelDisplayName,
+  type ChatAttachment,
   type ComposerMode,
   type PlanRevisionRef,
   type TaskMode,
@@ -54,15 +56,17 @@ import {
   listAgents,
   rejectPlanProposal,
   sendChatMessageAsync,
+  uploadChatAttachment,
   switchChatAgent,
   type MobileAgent,
 } from '../lib/api';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { getModelSettings } from '../lib/api';
-import { useDictation } from '../lib/use-dictation';
 import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
+import { Composer } from '../components/Composer';
+import { attachmentLabel, attachmentsSummary } from '../lib/attachments';
 import { ChatBackButton } from '../components/ChatBackButton';
 import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
@@ -74,6 +78,8 @@ interface Props {
   initialTitle?: string;
   /** Text typed on Home's ask bar, waiting in the composer on arrival. */
   initialDraft?: string;
+  /** Files uploaded from Home's capsule, sent with that text. */
+  initialAttachments?: ChatAttachment[];
   /** Only Home's explicit Send handoff uses this; response/edit handoffs stay editable. */
   initialAutoSend?: boolean;
   /** The saved agent a NEW conversation opens inside, or the one a reopened
@@ -83,7 +89,7 @@ interface Props {
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, onBack }: Props) {
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   // Who answers the next message — changeable at any time, like the brain.
   // A new conversation opens inside it; after that a change is applied just
@@ -138,8 +144,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     agentId: boundAgentId,
     pendingStore: createPendingMessageStore(localStorage, `clem.pending.mobile:${initialSessionId ?? 'new'}`),
     api: {
-      send: async ({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId }) => {
-        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId });
+      send: async ({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId, attachments }) => {
+        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId, attachments });
         return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered };
       },
       loadSession: async (sessionId) => {
@@ -189,14 +195,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   }, [engine]);
 
   useEffect(() => {
-    const text = initialDraft?.trim();
-    if (!initialAutoSend || !text || autoSent.current) return;
+    const text = initialDraft?.trim() ?? '';
+    const files = initialAttachments ?? [];
+    if (!initialAutoSend || (!text && files.length === 0) || autoSent.current) return;
     autoSent.current = true;
     setDraft('');
     haptic('light');
-    void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
+    void engine.send(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode }, { attachments: files })
       .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
-  }, [engine, initialAutoSend, initialDraft]);
+  }, [engine, initialAutoSend, initialDraft, initialAttachments]);
 
   const messages = snapshot?.messages ?? [];
   const busy = snapshot?.busy ?? false;
@@ -223,7 +230,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   /** Send a new message to whoever the chip names. A message sent while a
    *  reply runs steers that reply; the choice waits for the next one. */
-  async function sendMessage(text: string, mode: TaskMode | undefined) {
+  async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = []) {
     const sessionId = snapshot?.sessionId;
     if (sessionId && !busy && takesAgent) {
       const result = await switchChatAgent(sessionId, agent?.id ?? null);
@@ -232,16 +239,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         setAgent(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
       }
     }
-    await engine.send(text, mode);
+    await engine.send(text, mode, { attachments });
   }
   const followingTail = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
-  const { available: dictation, listening, toggle: toggleDictation, stop: stopDictation } = useDictation(
-    draft,
-    setDraft,
-    () => textareaRef.current?.focus(),
-  );
-
   useEffect(() => { if (!busy) setStopping(false); }, [busy]);
 
   function stopTurn() {
@@ -292,11 +293,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     haptic('light');
   }
 
-  function autoresize(el: HTMLTextAreaElement) {
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
-  }
-
   useEffect(() => {
     const el = dockRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
@@ -305,19 +301,12 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     const observer = new ResizeObserver(measure);
     observer.observe(el);
     return () => observer.disconnect();
-  }, [canStop, planning, listening]);
+  }, [canStop, planning]);
 
-  function submitDraft() {
-    const text = draft.trim();
-    if (!text || executing) return;
-    stopDictation();
-    setDraft('');
-    if (textareaRef.current) {
-      textareaRef.current.value = '';
-      autoresize(textareaRef.current);
-    }
+  function submitDraft(text: string, attachments: ChatAttachment[]) {
+    if (executing) return;
     haptic('light');
-    void sendMessage(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
+    void sendMessage(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode }, attachments)
       .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
   }
 
@@ -406,19 +395,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             </ul>
           )}
         </Sheet>
-        {brainLabel ? (
-          <button
-            type="button"
-            class="brain-chip"
-            title="Does the work: the model that answers your next message"
-            onClick={() => { haptic('light'); setBrainOpen(true); }}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 3a4 4 0 0 0-4 4 4 4 0 0 0-3 6.5 4 4 0 0 0 3 6.5h.5" /><path d="M12 3a4 4 0 0 1 4 4 4 4 0 0 1 3 6.5 4 4 0 0 1-3 6.5h-.5" /><path d="M12 3v17" />
-            </svg>
-            <span class="truncate">{brainLabel}</span>
-          </button>
-        ) : null}
         {/* This sheet lives in a conversation, so it passes the session id: the
             daemon re-pins THIS conversation and the switch truly applies to its
             next message (Settings mounts the same sheet with no session). */}
@@ -487,96 +463,46 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         <button type="button" class="chat-jump" onClick={jumpToLatest}>Jump to latest</button>
       ) : null}
       <div class="chat-dock-fade" aria-hidden="true" />
-      <div ref={dockRef} class={`chat-dock${listening ? ' listening' : ''}`}>
-        <div class="chat-mode-bar">
-          <div class="chat-mode-seg" role="group" aria-label="Mode">
-            <button type="button" aria-pressed={!planning} disabled={busy}
-              onClick={() => setComposerMode('normal')}>Act</button>
-            <button type="button" aria-pressed={planning} disabled={busy}
-              onClick={() => setComposerMode('plan')}>Plan</button>
-          </div>
-          <span role="status">{executing ? 'Executing the reviewed plan' : busy && snapshot?.activeTaskMode?.kind === 'plan'
-            ? 'Planning · read-only tools'
-            : busy ? 'Anything you send reaches her mid-run'
-              : composerMode === 'plan' ? 'Shows you the steps first' : 'Does it now'}</span>
-        </div>
-        <form class="chat-composer" onSubmit={(ev) => { ev.preventDefault(); submitDraft(); }}>
-          {dictation ? (
-            <button
-              type="button"
-              class="chat-mic"
-              aria-label={listening ? 'Stop dictation' : 'Dictate'}
-              aria-pressed={listening}
-              onClick={toggleDictation}
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
-              </svg>
-            </button>
-          ) : null}
-          <textarea
-            ref={textareaRef}
-            class="chat-input"
-            rows={1}
-            aria-label={agent?.name ? `Message ${agent.name}` : 'Message Clem'}
-            placeholder={listening ? 'Listening…' : busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : `Message ${agent?.name || 'Clem'}…`}
-            value={draft}
-            enterkeyhint="send"
-            autocomplete="off"
-            onInput={(ev) => {
-              const el = ev.currentTarget as HTMLTextAreaElement;
-              setDraft(el.value);
-              autoresize(el);
-            }}
-            onKeyDown={(ev) => {
-              if (ev.isComposing) return;
-              if (ev.key === 'Enter' && !ev.shiftKey) {
-                ev.preventDefault();
-                submitDraft();
-              }
-            }}
-          />
-          {canStop ? (
+      <div ref={dockRef} class="chat-dock">
+        <Composer
+          value={draft}
+          onChange={setDraft}
+          textareaRef={textareaRef}
+          placeholder={busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : `Message ${agent?.name || 'Clem'}…`}
+          ariaLabel={agent?.name ? `Message ${agent.name}` : 'Message Clem'}
+          upload={uploadChatAttachment}
+          disabled={executing}
+          canStop={canStop}
+          stopping={stopping}
+          onStop={stopTurn}
+          onSend={submitDraft}
+          chips={(
             <>
+              {/* Act | Plan as one chip: tap flips it. Disabled mid-run, when
+                  the mode belongs to the turn already going. */}
               <button
-                class="chat-send"
-                type="submit"
-                disabled={executing || draft.trim().length === 0}
-                aria-label="Send while she works"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M12 19V5M5 12l7-7 7 7" />
-                </svg>
-              </button>
-              <button
-                class="chat-stop"
                 type="button"
-                onClick={stopTurn}
-                disabled={stopping}
-                aria-label="Stop"
+                class={`composer-chip mode-chip${planning ? ' is-plan' : ''}`}
+                disabled={busy}
+                aria-pressed={planning}
+                title={planning ? 'Plan: shows you the steps first' : 'Act: does it now'}
+                onClick={() => { haptic('light'); setComposerMode(planning ? 'normal' : 'plan'); }}
               >
-                {stopping ? (
-                  <span class="chat-stop-busy" aria-hidden="true" />
-                ) : (
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" />
-                  </svg>
-                )}
+                {executing ? 'Executing plan' : planning ? 'Plan' : 'Act'}
               </button>
+              {brainLabel ? (
+                <button
+                  type="button"
+                  class="composer-chip brain-chip"
+                  title="Does the work: the model that answers your next message"
+                  onClick={() => { haptic('light'); setBrainOpen(true); }}
+                >
+                  <span class="truncate">{modelDisplayName(brainLabel)}</span>
+                </button>
+              ) : null}
             </>
-          ) : (
-            <button
-              class="chat-send"
-              type="submit"
-              disabled={executing || draft.trim().length === 0}
-              aria-label="Send"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M12 19V5M5 12l7-7 7 7" />
-              </svg>
-            </button>
           )}
-        </form>
+        />
       </div>
     </div>
   );
@@ -618,7 +544,16 @@ function MessageRow({
   if (message.role === 'user') {
     return (
       <div class={`turn turn-user${message.pending ? ` pending pending-${message.pending}` : ''}`}>
-        <div class="user-said">{message.text}</div>
+        {message.attachments?.length ? (
+          <div class="user-attachments" aria-label={attachmentsSummary(message.attachments)}>
+            {message.attachments.map((a) => (
+              a.kind === 'image' && a.previewUrl
+                ? <img key={a.id} class="user-attachment-image" src={a.previewUrl} alt={attachmentLabel(a)} />
+                : <span key={a.id} class="user-attachment-chip">{attachmentLabel(a)}</span>
+            ))}
+          </div>
+        ) : null}
+        {message.text ? <div class="user-said">{message.text}</div> : null}
         {message.pending === 'sending' ? <div class="pending-status">sending…</div> : null}
         {message.pending === 'failed' ? (
           <div class="pending-status pending-failed">
