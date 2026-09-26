@@ -464,8 +464,9 @@ export function ChatBubble({
               <p className="mt-2.5 text-caption text-muted">
                 This is a record of what was asked. Answer it where it is live — in Needs you.
               </p>
-            ) : message.approval?.resolution && !pendingAction ? (
-              // Answered on the host's record, including by a written reply.
+            ) : message.approval?.resolution && (!pendingAction || message.approval.resolution === 'expired') ? (
+              // Answered on the host's record, including by a written reply. An
+              // expired card has nothing left to execute, queued action or not.
               <p className="mt-2.5 text-caption text-muted" role="status">
                 {approvalResolutionText(message.approval.resolution)}
               </p>

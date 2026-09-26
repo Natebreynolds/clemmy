@@ -48,3 +48,10 @@ test('suggested answers stop being buttons once anything follows the question', 
     assert.match(screen, /onAnswer=\{index === chat\.messages\.length - 1 \?/, `${rel} offers answers on an old question`);
   }
 });
+
+test('an expired card says so instead of offering its controls, queued action or not', () => {
+  // The host marks a card expired when nobody answered in its lifetime; a
+  // queued action's Execute button must not come back on it.
+  assert.match(SOURCE, /resolution === 'expired' \? 'Expired without an answer — it did not run\.'/);
+  assert.match(SOURCE, /message\.approval\?\.resolution && \(!pendingAction \|\| message\.approval\.resolution === 'expired'\) \?/);
+});
