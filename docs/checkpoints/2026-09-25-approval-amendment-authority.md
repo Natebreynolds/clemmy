@@ -1,6 +1,6 @@
 **Approval amendments — integration checkpoint, September 25, 2026**
 
-The owner authorized work alongside the existing agents following the north-star review. This is one bounded framework correction, based on the active integrator's commit 74546ebee. Branch: codex/approval-amendment-fix. Worktree: /Users/nathan.reynolds/.codex/worktrees/approval-amendment-fix/clementine-next.
+The owner authorized work alongside the existing agents following the north-star review. This is one bounded framework correction, based on the active integrator's commit 74546ebee. Branch: codex/approval-amendment-fix. Worktree: /Users/you/.codex/worktrees/approval-amendment-fix/clementine-next.
 
 **Problem and behavior.** The shared approval parser accepted the start of a message as authority for an unchanged action or plan. The newer conversational router skipped interpretation for any parsed decision of four words or fewer. “Go ahead but shorter,” “approve with changes,” and “confirm different recipient” could therefore authorize the old operation. Registry-owned live waits, background-task continuation and plan approval also use the shared parser without passing through the amendment router.
 

@@ -2,7 +2,7 @@
 
 ## Verified
 
-Worktree: `/Users/nathan.reynolds/.codex/worktrees/learned-tool-freshness/clementine-next`.
+Worktree: `/Users/you/.codex/worktrees/learned-tool-freshness/clementine-next`.
 Branch: `codex/learned-tool-freshness`, based on integrator commit `00bc1d417`.
 This is a separate framework correction for review and integration, not an installed candidate.
 
