@@ -3390,6 +3390,26 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     ? () => agentModel as never
     : undefined;
   const modelSettings = ((agent as { modelSettings?: unknown }).modelSettings ?? {}) as never;
+  // EFFORT FOLLOWS THE WORK. The turn's reasoning tier is picked from the
+  // opening message, so a "quick" ask that then gathers many results drafted a
+  // data-heavy answer at tier none (live 2026-09-25: first drafts with wrong
+  // figures, each rejection adding 15-55 s). Once several business calls have
+  // returned, drafting runs at least at low; a redo after a review rejection
+  // runs at medium. Raises only, never lowers; with no tier chosen the
+  // provider default stands, and a backend that cannot steer effort ignores it.
+  const effortRank: Record<string, number> = { none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+  const stepModelSettings = (): never => {
+    const settings = modelSettings as { reasoning?: { effort?: string } };
+    const current = settings.reasoning?.effort;
+    if (current === undefined) return modelSettings;
+    const businessCallsSoFar = history.filter((item) => {
+      const row = item as { type?: unknown; name?: unknown };
+      return row.type === 'function_call' && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
+    }).length;
+    const wanted = completionReviewFeedback ? 'medium' : businessCallsSoFar >= 3 ? 'low' : undefined;
+    if (!wanted || (effortRank[current] ?? 0) >= effortRank[wanted]!) return modelSettings;
+    return { ...settings, reasoning: { ...settings.reasoning, effort: wanted } } as never;
+  };
   // The owners inject per-call context through callModelInputFilter (the
   // Runner applied it before every model request). The host applies the SAME
   // filter to the SAME shape, so context packets and instruction overlays
@@ -4773,10 +4793,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (signal.aborted) rejectAbort();
       else signal.addEventListener('abort', rejectAbort, { once: true });
     });
+    const settingsForStep = formatWorkerModelId ? {} : stepModelSettings();
     const hostProjection = canonicalPromptCacheRequest({
       ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
       input: modelInput,
-      modelSettings: formatWorkerModelId ? {} : modelSettings,
+      modelSettings: settingsForStep,
       tools: modelSchemas as never,
       toolsExplicitlyProvided: true,
       outputType: 'text',
@@ -4793,7 +4814,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ...(formatWorkerModelId ? { modelId: formatWorkerModelId } : modelId !== undefined ? { modelId } : {}),
           ...(exactModel ? { resolveModel: () => exactModel } : !formatWorkerModelId && resolveModel ? { resolveModel } : {}),
           ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
-          modelSettings: formatWorkerModelId ? {} : modelSettings,
+          modelSettings: settingsForStep,
           signal: controller.signal,
           stream: true,
           ...(hostProduction

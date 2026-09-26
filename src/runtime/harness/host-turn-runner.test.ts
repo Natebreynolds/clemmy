@@ -984,6 +984,66 @@ function commitHostSettlement(input: {
   return committed.status === 'committed' ? committed.settlement : null;
 }
 
+// Live 2026-09-25: a "quick" ask gathered many results and drafted its
+// data-heavy answer at the opening message's tier none.
+test('reasoning effort rises once the work has gathered results, and never falls', async () => {
+  const fixture = acceptHostCanarySource('effort-follows-work', 'go');
+  const requests: Array<{ modelSettings?: { reasoning?: { effort?: string } } }> = [];
+  const script = [
+    [toolCall('c1', 'ping', { q: '1' })],
+    [toolCall('c2', 'ping', { q: '2' })],
+    [toolCall('c3', 'ping', { q: '3' })],
+    [textMsg('here is the synthesis')],
+  ];
+  let call = 0;
+  const model = {
+    calls: () => call,
+    async getResponse(request: never) {
+      requests.push(request);
+      const output = script[Math.min(call, script.length - 1)]!;
+      call += 1;
+      return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
+        output, responseId: `effort-${call}` };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent = {
+    model,
+    modelSettings: { reasoning: { effort: 'none' } },
+    tools: [brackets.wrapToolForHarness({
+      type: 'function', name: 'ping', description: 'test', parameters: { type: 'object', properties: {} },
+      invoke: async () => 'pong', needsApproval: async () => false,
+    })],
+  };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: 'go' }] as never,
+    { maxTurns: 8, hostTurnEngine: 'host_v1', context: fixture.context } as never,
+  ));
+  const efforts = requests.map((request) => request.modelSettings?.reasoning?.effort);
+  assert.deepEqual(efforts, ['none', 'none', 'none', 'low'], 'the drafting step after three results runs at low');
+});
+
+test('a redo after a review rejection runs at medium effort', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const verdicts = [{ done: false, reason: 'nothing was posted: no tool ran and no link is shown' }, { done: true, reason: 'ok' }];
+  _setHostObjectiveJudgeForTests(async () => verdicts.shift() ?? { done: true, reason: 'ok' });
+  try {
+    const fixture = acceptJudgedSource('effort-redo', 'Post the summary to the channel');
+    const model = scriptedRecordingModel([
+      [textMsg('Done: posted the summary to the channel.')],
+      [textMsg('I could not post it: no channel tool is available. Here is the text to paste.')],
+    ]);
+    const agent = { model, tools: [], modelSettings: { reasoning: { effort: 'none' } } };
+    bindHostCanarySurface(fixture, agent, []);
+    await runJudgedHost(fixture, agent, true);
+    const efforts = (model.requests as Array<{ modelSettings?: { reasoning?: { effort?: string } } }>)
+      .map((request) => request.modelSettings?.reasoning?.effort);
+    assert.deepEqual(efforts, ['none', 'medium']);
+  } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
 test('host stepping: N host steps = N getResponse; tools run on host; hooks still fire', async () => {
   const fixture = acceptHostCanarySource('host-stepping', 'go');
   let toolRuns = 0;
