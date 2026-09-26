@@ -110,6 +110,10 @@ export interface ObjectiveJudgeVerdict {
   /** Why no review verdict was produced, when none was: the reviewer ran out
    *  of time, answered unreadably, or could not be reached. */
   reviewFailure?: 'timeout' | 'invalid' | 'unavailable';
+  /** How deep the deciding review went, and, when a fast review wanted to
+   *  send the work back, whether a full review upheld or overruled it. */
+  reviewDepth?: 'full' | 'fast';
+  reviewConfirmation?: 'upheld' | 'overruled' | 'unavailable';
   selfJudge?: boolean;
   /** The judge was an EXPLICIT owner selection, not a no-other-family fallback.
    *  `selfJudge` stays an honest statement about model family; this says whether
@@ -536,6 +540,9 @@ export interface SkillExecutionContext {
   agentInstructions?: string;
   /** The candidate is a plan, reviewed before anything runs. */
   reviewsPlan?: boolean;
+  /** What the review protects: work that wrote to an app or file, a plan
+   *  that runs only after the owner approves it, or a read-only answer. */
+  reviewStakes?: ReviewStakes;
 }
 
 export interface CompletionEvidenceRow {
@@ -1012,6 +1019,8 @@ export async function runRoutedJudgeAttempt<T>(
 }
 
 interface CompletionJudgeRun {
+  reviewDepth?: 'full' | 'fast';
+  reviewConfirmation?: 'upheld' | 'overruled' | 'unavailable';
   /** Parsed verdict from the first attempt to answer, or null. */
   verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' | 'claims' } | null;
   /** null-verdict cause for metrics/fail semantics: pure deadline miss vs
@@ -1213,22 +1222,61 @@ async function runCompletionJudge(
   skillContext?: SkillExecutionContext,
   judge: { lane?: JudgeMetricLane; timeoutMs?: number } = {},
 ): Promise<CompletionJudgeRun> {
-  const run = await runHedgedJudge(
-    JUDGE_SYSTEM_PROMPT,
-    buildObjectiveJudgePrompt(objective, assistantResponse, skillContext),
-    parseCompletionVerdict,
-    (v) => v.done,
-    judge.lane ?? 'completion',
-    { ...(judge.timeoutMs ? { timeoutMs: judge.timeoutMs } : {}),
-      ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
-      ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}),
-      ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}),
-      ...(skillContext?.reviewedAuthor ? { reviewedAuthor: skillContext.reviewedAuthor } : {}),
-      quotaAwareRoute: true },
-  );
-  return { verdict: run.value, failure: run.failure, routing: run.routing,
-    ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),
-    ...(run.invalidDetail ? { invalidDetail: run.invalidDetail } : {}) };
+  const prompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext);
+  const review = async (depth: ReviewDepthRequest): Promise<CompletionJudgeRun> => {
+    const timeoutMs = judge.timeoutMs ?? depth.timeoutMs;
+    const run = await runHedgedJudge(
+      JUDGE_SYSTEM_PROMPT,
+      prompt,
+      parseCompletionVerdict,
+      (v) => v.done,
+      judge.lane ?? 'completion',
+      { ...(timeoutMs ? { timeoutMs } : {}),
+        ...(skillContext?.fullSourceEvidence ? { requireCompletePrompt: true } : {}),
+        ...(skillContext?.boundaryJudgeSelection ? { boundaryJudgeSelection: skillContext.boundaryJudgeSelection } : {}),
+        ...(skillContext?.evidence ? { evidence: skillContext.evidence } : {}),
+        ...(skillContext?.reviewedAuthor ? { reviewedAuthor: skillContext.reviewedAuthor } : {}),
+        ...(depth.effort ? { effort: depth.effort } : {}),
+        quotaAwareRoute: true },
+    );
+    return { verdict: run.value, failure: run.failure, routing: run.routing,
+      ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),
+      ...(run.invalidDetail ? { invalidDetail: run.invalidDetail } : {}) };
+  };
+  return skillContext?.reviewStakes ? reviewAtStakes(skillContext.reviewStakes, review) : review({});
+}
+
+export type ReviewStakes = 'write' | 'plan' | 'read';
+export interface ReviewDepthRequest { effort?: JudgeReviewEffort; timeoutMs?: number }
+
+/** A review of work that wrote to an app or file may take this long to finish. */
+export const WRITE_REVIEW_TIMEOUT_MS = 180_000;
+
+/**
+ * Review depth follows what the review protects. Work that wrote to an app or
+ * file gets the reviewer's full depth, with time to finish: that review is the
+ * guarantee that what was written is right before the turn says done. A plan
+ * (nothing runs until the owner approves it) and a read-only answer (already on
+ * the owner's screen while it is checked) get a fast review first; a fast
+ * review that wants to send the work back is checked by a full review, whose
+ * verdict decides, so a fast misreading never costs the owner a rewrite. When
+ * the full review cannot finish, the fast review's completed finding stands.
+ * The fast pass applies to reviewers that take a thinking level; others review
+ * once, as before.
+ */
+export async function reviewAtStakes(
+  stakes: ReviewStakes,
+  review: (depth: ReviewDepthRequest) => Promise<CompletionJudgeRun>,
+): Promise<CompletionJudgeRun> {
+  if (stakes === 'write') {
+    return { ...(await review({ timeoutMs: WRITE_REVIEW_TIMEOUT_MS })), reviewDepth: 'full' };
+  }
+  const fast = await review({ effort: 'medium' });
+  if (fast.routing?.judgeFamily !== 'claude') return fast;
+  if (!fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
+  const full = await review({});
+  if (!full.verdict) return { ...fast, reviewDepth: 'fast', reviewConfirmation: 'unavailable' };
+  return { ...full, reviewDepth: 'full', reviewConfirmation: full.verdict.done ? 'overruled' : 'upheld' };
 }
 
 /** Swallow-with-trace: the judge lanes are fail-open/fail-strict by CONTRACT,
@@ -1471,7 +1519,10 @@ export async function judgeObjectiveComplete(
   // Jev's completion reading to find, and that reading would send back every
   // plan. A plan is left to the configured reviewer alone.
   const reviewsPlan = skillContext?.reviewsPlan === true;
-  if (!reviewsPlan && (coverage.complete || directionQuestion)) {
+  // Work that wrote to an app or file is closed only by the configured
+  // reviewer: that review is the check that what was written is right.
+  const reviewsWrite = skillContext?.reviewStakes === 'write';
+  if (!reviewsPlan && !reviewsWrite && (coverage.complete || directionQuestion)) {
     const jevPromise = askJev();
     const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
     hedge.unref?.();
@@ -1571,6 +1622,8 @@ export async function judgeObjectiveComplete(
       : {}),
     ...(run.verdict.awaitingUser ? { awaitingUser: true } : {}),
     ...(run.verdict.blocked ? { blocked: true } : {}),
+    ...(run.reviewDepth ? { reviewDepth: run.reviewDepth } : {}),
+    ...(run.reviewConfirmation ? { reviewConfirmation: run.reviewConfirmation } : {}),
   };
 }
 

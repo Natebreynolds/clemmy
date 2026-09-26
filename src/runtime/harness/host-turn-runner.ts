@@ -143,6 +143,7 @@ import {
   replyClaimsCompletedWork,
   shouldRunObjectiveJudge,
   type ObjectiveJudgeVerdict,
+  type ReviewStakes,
 } from './objective-judge.js';
 import { gatherSessionSkills, summarizeToolCallsForJudge } from './skill-execution.js';
 import {
@@ -165,7 +166,7 @@ import {
 import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import { conversationalReviewSkipRecord } from './completion-review-skip.js';
 import {
-  acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup,
+  acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceAttemptedWrites, sourceEvidenceLookup,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
   earlierTurnsEvidence,
 } from './host-completion-work.js';
@@ -1820,6 +1821,13 @@ function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReview
   return { version: 1, sessionId: row.sessionId, sourceUserSeq: Number(row.sourceUserSeq),
     objective: row.objective, objectiveDigest: String(row.objectiveDigest),
     reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason, ...(row.phase === 'plan' ? { phase: 'plan' } : {}) };
+}
+
+/** What a completion review protects: work that wrote or tried to write
+ *  something, a plan that runs only after approval, or a read-only answer. */
+export function completionReviewStakes(input: { plan: boolean; attemptedWrites: number }): ReviewStakes {
+  if (input.plan) return 'plan';
+  return input.attemptedWrites > 0 ? 'write' : 'read';
 }
 
 function hostCompletionReviewFeedbackContext(feedback: HostCompletionReviewFeedback): string {
@@ -4174,6 +4182,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         sessionId: identity.sessionId,
         ...(agentInstructions ? { agentInstructions } : {}),
         ...(planCandidate ? { reviewsPlan: true } : {}),
+        reviewStakes: completionReviewStakes({
+          plan: Boolean(planCandidate),
+          attemptedWrites: Math.max(settled.count, sourceAttemptedWrites(identity)),
+        }),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
         fullSourceEvidence: true,
@@ -4274,6 +4286,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
           ...(verdict.failedOpen && verdict.reviewFailure ? { reviewFailure: verdict.reviewFailure } : {}),
+          ...(verdict.reviewDepth ? { reviewDepth: verdict.reviewDepth } : {}),
+          ...(verdict.reviewConfirmation ? { reviewConfirmation: verdict.reviewConfirmation } : {}),
           ...(verdict.selfJudge ? { selfJudge: true } : {}),
           // Requested-vs-actual judge identity on the durable event, so a
           // substitute is never read back as the pinned model's judgment. A

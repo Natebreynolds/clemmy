@@ -39,6 +39,24 @@ export function sourceAttemptedCompletionWork(input: {
   }
 }
 
+/** Writes this accepted source attempted, whatever their outcome. A write that
+ *  failed or was refused counts: the answer must not claim it happened. */
+export function sourceAttemptedWrites(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): number {
+  try {
+    const row = openEventLog().prepare(`
+      SELECT COUNT(*) AS n FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ? AND mutating = 1
+    `).get(input.sessionId, input.sourceUserSeq) as { n: number } | undefined;
+    return row?.n ?? 0;
+  } catch {
+    // Unknown is read as a write: the full review is the safe side.
+    return 1;
+  }
+}
+
 export interface CompletionReadEvidence {
   count: number;
   evidenceAvailable: boolean;
