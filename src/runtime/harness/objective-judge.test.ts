@@ -533,6 +533,56 @@ test('an unreachable reviewer still gets Jev\'s reading of a reply Jev was not a
   assert.equal(v.jevAttempt?.accepted, false);
 });
 
+test('a review with no verdict says why: out of time, unreadable, or unreachable', async () => {
+  _setTypesafeKeyForTests(null);
+  try {
+    for (const [failure, expected] of [['timeout', 'timeout'], ['invalid', 'invalid'], ['error', 'unavailable']] as const) {
+      _setCompletionJudgeForTests(async () => ({ verdict: null, failure }));
+      const v = await judgeObjectiveComplete('Summarize the report.', 'The report says revenue rose.',
+        { sessionId: `probe-failure-${failure}`, skills: [], toolCallSummary: 'none' });
+      assert.equal(v.failedOpen, true);
+      assert.equal(v.reviewFailure, expected);
+    }
+  } finally {
+    _setCompletionJudgeForTests(unavailableSettingsJudge);
+    _setTypesafeKeyForTests(undefined);
+  }
+});
+
+test('a plan is not sent back on Jev\'s reading when the reviewer cannot run', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const jev = { count: 0 };
+  _setSystemOneFetchForTests(jevAnswering('incomplete', jev));
+  const v = await judgeObjectiveComplete(
+    'Scrape ten firms, find their reviews and traffic trends, and put it all in a new sheet.',
+    '**Goal:** find ten firms, read their reviews and traffic trends, and write them to a new sheet. Steps: 1. search 2. read 3. write.',
+    { sessionId: 'probe-plan-unreachable', skills: [], toolCallSummary: 'THIS IS A PLAN TURN.', reviewsPlan: true },
+  );
+  assert.equal(jev.count, 0, 'a plan has no delivered result for Jev to read');
+  assert.equal(v.done, true, 'the plan is published, not rewritten on a reading that fits no plan');
+  assert.equal(v.failedOpen, true, 'nothing claims the plan was reviewed');
+  assert.match(v.reason, /no review was completed|unavailable|reviewer/i);
+});
+
+test('a plan is never settled by Jev, even when Jev could settle a reply', async () => {
+  const { isDirectionSeekingQuestion } = await import('./objective-judge.js');
+  const plan = 'Plan: search, read, write. Should I use the work sheet or a new one?';
+  assert.equal(isDirectionSeekingQuestion(plan), true, 'fixture: Jev would otherwise be asked first');
+  _setTypesafeKeyForTests('ts_test');
+  const jev = { count: 0 };
+  _setSystemOneFetchForTests(jevAnswering('awaiting', jev));
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: true, reason: 'reviewer: the plan covers the objective' }, failure: null }; });
+  try {
+    const v = await judgeObjectiveComplete('Plan the sheet update.', plan,
+      { sessionId: 'probe-plan-question', skills: [], toolCallSummary: 'THIS IS A PLAN TURN.', reviewsPlan: true });
+    assert.equal(jev.count, 0);
+    assert.equal(reviewerCalls, 1, 'the configured reviewer decides a plan');
+    assert.equal(v.done, true);
+    assert.equal(v.jevAttempt, undefined);
+  } finally { _setCompletionJudgeForTests(unavailableSettingsJudge); }
+});
+
 test('a reply that closes on a real question is still settled by Jev without the reviewer', async () => {
   const { isDirectionSeekingQuestion } = await import('./objective-judge.js');
   const reply = 'I found two calendars on your account. Should I use the work calendar or the personal one?';

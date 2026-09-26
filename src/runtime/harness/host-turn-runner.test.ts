@@ -11319,7 +11319,7 @@ for (const variant of ['corrected', 'discovery'] as const) test(`a concrete tool
   assert.equal(seen.length, variant === 'corrected' ? 1 : 2, 'a tool-free explanation cannot start another review');
 });
 
-for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wrong_plan_digest', 'card_reply', 'card_reply_altered'] as const) test(`final Plan review sees prepared graph and preserves publication (${variant})`, async t => {
+for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'timed_out', 'wrong_plan_digest', 'card_reply', 'card_reply_altered'] as const) test(`final Plan review sees prepared graph and preserves publication (${variant})`, async t => {
   const host = await import('./host-turn-runner.js');
   const { buildPublishPlanTool } = await import('../../tools/publish-plan.js');
   const { planReviewDigest } = await import('./plan-publication-review.js');
@@ -11335,6 +11335,7 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wro
     count++;
     assert.equal(reply, publication(false).full_text);
     assert.match(options?.toolCallSummary ?? '', /THIS IS A PLAN TURN/);
+    assert.equal(options?.reviewsPlan, true, 'the reviewer is told it reviews a plan, so no completion reading of results sends it back');
     assert.match(options?.toolCallSummary ?? '', /preparedBindings/);
     assert.match(options?.toolCallSummary ?? '', /structuredPlan.steps is the complete reviewed graph/);
     assert.match(options?.toolCallSummary ?? '', /executionDraft is a host-derived tool-only projection/);
@@ -11346,6 +11347,7 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wro
     assert.doesNotMatch(options?.toolCallSummary ?? '', /do not require execution findings during Plan|not a probe that performs the deferred work/);
     assert.equal(eventlog.listEvents(fixture.session.id, { types: ['plan_revision_published'] }).length, 0, 'the reviewed bytes must still be an editable draft');
     if (variant === 'unavailable') throw new Error('review service unavailable');
+    if (variant === 'timed_out') return { done: true, failedOpen: true, reviewFailure: 'timeout' as const, reason: 'The completion reviewer timed out; no review was completed.' };
     if (variant === 'correction' && count === 1) return { done: false, reason: 'The graph omits evidence coverage. Revise the comparison step.' };
     if (variant === 'correction') assert.match(options?.toolCallSummary ?? '', /Every required source accounted for/);
     return { done: true, reason: 'The plan covers the objective.', judgeModelId: 'claude-opus-5', judgeProvider: 'claude', ownerSelectedJudge: true, selfJudge: true };
@@ -11389,7 +11391,9 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wro
   if (variant === 'disabled') assert.equal(verdict, null);
   else {
     assert.equal(verdict?.planDigest, planReviewDigest({ fullText: artifact.fullText, structuredPlan: artifact.structuredPlan, readiness: artifact.readiness, missingPrerequisites: artifact.missingPrerequisites }));
-    assert.equal(verdict?.failedOpen, variant === 'unavailable' ? true : undefined);
+    assert.equal(verdict?.failedOpen, variant === 'unavailable' || variant === 'timed_out' ? true : undefined);
+    assert.equal(verdict?.reviewFailure, variant === 'unavailable' ? 'unavailable' : variant === 'timed_out' ? 'timeout' : undefined,
+      'why the review has no verdict is kept with it');
   }
   if (variant === 'wrong_plan_digest') {
     const row = eventlog.openEventLog().prepare('SELECT data_json FROM events WHERE seq=?').get(verdict!.seq) as { data_json: string };
@@ -11414,6 +11418,10 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wro
     assert.match(terminal.presentation.text, /saved plan differs/);
   } else if (variant === 'disabled') assert.equal((terminal.event.data.completionReview as any)?.disposition, 'disabled_by_owner');
   else assert.equal((terminal.event.data.completionVerdictRef as any)?.verified, false);
+  if (variant === 'timed_out') {
+    assert.match(terminal.presentation.text, /did not finish within its time limit/);
+    assert.doesNotMatch(terminal.presentation.text, /not reachable/);
+  }
 
 });
 

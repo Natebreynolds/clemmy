@@ -331,6 +331,52 @@ export const revertWorkflowStepEdit = (name: string, backupId: string) =>
   apiPost<{ ok: true; stepId: string; message: string; enabled: boolean }>(
     `/api/console/workflows/${encodeURIComponent(name)}/step-edits/${encodeURIComponent(backupId)}/revert`,
   );
+/** One step of a run, as the daemon's overlay reads it (src/dashboard/workflow-run-overlay.ts). */
+export type WorkflowRunStepStatus =
+  | 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  | 'blocked' | 'awaiting_approval' | 'awaiting_input' | 'awaiting_capability' | 'redoing';
+export interface WorkflowRunOverlayStep {
+  stepId: string;
+  status: WorkflowRunStepStatus;
+  runVerdict: { status: string; label: string; reasons: string[]; primaryAction: string | null };
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+  retries: number;
+  attempts: number;
+  toolCalls: number;
+  tools: string[];
+  failedTools: string[];
+  models: string[];
+  itemsStarted: number;
+  itemsCompleted: number;
+  itemsFailed: number;
+  approvalsRequested: number;
+  approvalsResolved: number;
+  externalWrites: number;
+  attentionLevel: 'none' | 'watch' | 'blocked' | 'failed';
+  attentionReasons: string[];
+  error?: string;
+  outputPreview?: string;
+}
+export interface WorkflowRunOverlay {
+  runStatus: 'unknown' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+  runStartedAt?: string;
+  runFinishedAt?: string;
+  terminal: boolean;
+  summary: {
+    totalSteps: number; pendingSteps: number; runningSteps: number; doneSteps: number; failedSteps: number;
+    skippedSteps: number; waitingSteps: number; blockedSteps: number; attentionSteps: number;
+    bottleneckStepId: string | null; bottleneck: string | null;
+  };
+  goal: { status: string; attentionLevel: string; failedCriteria?: string[] } | null;
+  steps: WorkflowRunOverlayStep[];
+}
+export const getWorkflowRunOverlay = (name: string, runId: string) =>
+  apiGet<{ runId: string; workflow: string; overlay: WorkflowRunOverlay }>(
+    `/api/console/workflows/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/graph-overlay`,
+  );
+
 /** Run one step by itself, without its upstream chain, to see what it does. */
 export const runWorkflowStep = (name: string, stepId: string) =>
   apiPost<{ queued?: boolean; held?: boolean; id?: string; message?: string; targetStepId?: string | null }>(

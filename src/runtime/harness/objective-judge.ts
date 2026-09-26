@@ -14,7 +14,7 @@ import { extractJsonCandidate } from './json-repair.js';
 import { estimateMessagesTokens, predictTurnCost } from './budget.js';
 import { renderSkillReference, type SessionSkill } from './skill-execution.js';
 import { effectiveContextWindow } from './model-window-observations.js';
-import { resolveModelCapability } from './model-wire-registry.js';
+import { INSTRUCTION_CACHE_DELIM, resolveModelCapability } from './model-wire-registry.js';
 import {
   JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceReferences, judgeEvidenceTools, type JudgeEvidenceSource,
 } from './judge-evidence-tools.js';
@@ -107,6 +107,9 @@ export interface ObjectiveJudgeVerdict {
    * Absent ⇒ a clean cross-family verdict (full confidence).
    */
   failedOpen?: boolean;
+  /** Why no review verdict was produced, when none was: the reviewer ran out
+   *  of time, answered unreadably, or could not be reached. */
+  reviewFailure?: 'timeout' | 'invalid' | 'unavailable';
   selfJudge?: boolean;
   /** The judge was an EXPLICIT owner selection, not a no-other-family fallback.
    *  `selfJudge` stays an honest statement about model family; this says whether
@@ -531,6 +534,8 @@ export interface SkillExecutionContext {
   /** The saved agent the reply was written inside: its standing instructions,
    *  as the answerer had them. Absent when Clem answered without an agent. */
   agentInstructions?: string;
+  /** The candidate is a plan, reviewed before anything runs. */
+  reviewsPlan?: boolean;
 }
 
 export interface CompletionEvidenceRow {
@@ -755,10 +760,14 @@ export function judgeMaxOutputTokens(): number {
   return Number.isFinite(raw) && raw >= 2_048 ? Math.min(raw, 65_536) : 16_384;
 }
 
+/** How hard a review thinks. Unset leaves the provider's own default. */
+export type JudgeReviewEffort = 'low' | 'medium' | 'high';
+
 function buildJudgeAgent(
   routing?: BoundaryJudgeRouting,
   instructions: string = JUDGE_SYSTEM_PROMPT,
   tools: Agent<RuntimeContextValue>['tools'] = [],
+  effort?: JudgeReviewEffort,
 ): Agent<RuntimeContextValue> {
   return new Agent<RuntimeContextValue>({
     name: 'ObjectiveCompletionJudge',
@@ -770,7 +779,7 @@ function buildJudgeAgent(
     // Let the selected provider own its reasoning default. An explicit empty
     // settings object prevents a string fallback from acquiring an SDK-imposed
     // reasoning tier; the harness imposes no tier.
-    modelSettings: { maxTokens: judgeMaxOutputTokens() },
+    modelSettings: { maxTokens: judgeMaxOutputTokens(), ...(effort ? { reasoning: { effort } } : {}) },
     tools,
   });
 }
@@ -924,6 +933,7 @@ export async function runRoutedJudgeAttempt<T>(
   requireCompletePrompt = false,
   evidence?: JudgeEvidenceSource,
   signal?: AbortSignal,
+  effort?: JudgeReviewEffort,
 ): Promise<T> {
   // Keep per-review handles out of tool schemas and stable instructions.
   // Supply them once with the evidence whose handles they identify.
@@ -942,9 +952,17 @@ export async function runRoutedJudgeAttempt<T>(
   // With evidence tools the review is a short conversation: each lookup is a
   // turn, the verdict is the last. The tools refuse past their budget, so the
   // turn ceiling is only a backstop.
+  // A Claude review with evidence tools marks its whole instructions as the
+  // stable prefix, so every review reads them (with the tools) from the prompt
+  // cache. The words and their order are unchanged; the marker never reaches
+  // the model.
+  // A review effort is a Claude setting; other providers keep their default.
+  const reviewEffort = routing.judgeFamily === 'claude' ? effort : undefined;
   const agent = evidence
-    ? buildJudgeAgent(routing, reviewInstructions, judgeEvidenceTools(evidence))
-    : buildJudgeAgent(routing, instructions);
+    ? buildJudgeAgent(routing,
+      routing.judgeFamily === 'claude' ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : reviewInstructions,
+      judgeEvidenceTools(evidence), reviewEffort)
+    : buildJudgeAgent(routing, instructions, [], reviewEffort);
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
   let value = parse(result.finalOutput);
@@ -1029,6 +1047,7 @@ export async function runHedgedJudge<T>(
     /** The completion checker's route, aware of its provider's plan quota
      *  (resolveCompletionCheckerRoute). Other lanes keep the boundary route. */
     quotaAwareRoute?: boolean;
+    effort?: JudgeReviewEffort;
   } = {},
 ): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string }> {
   const startedAt = Date.now();
@@ -1056,7 +1075,7 @@ export async function runHedgedJudge<T>(
       { sessionId: inherited?.sessionId ?? 'unknown', sourceUserSeq: inherited?.sourceUserSeq ?? 0,
         ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}), channel: `judge:${lane}`, role: 'reviewer' },
       () => runRoutedJudgeAttempt<T>(
-        r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence, signal,
+        r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence, signal, opts.effort,
       ),
     );
     // An explicit caller deadline still wins; otherwise use the deadline the
@@ -1448,7 +1467,11 @@ export async function judgeObjectiveComplete(
         : {}),
     };
   };
-  if (coverage.complete || directionQuestion) {
+  // A plan is reviewed before anything runs, so it has no delivered result for
+  // Jev's completion reading to find, and that reading would send back every
+  // plan. A plan is left to the configured reviewer alone.
+  const reviewsPlan = skillContext?.reviewsPlan === true;
+  if (!reviewsPlan && (coverage.complete || directionQuestion)) {
     const jevPromise = askJev();
     const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
     hedge.unref?.();
@@ -1493,15 +1516,18 @@ export async function judgeObjectiveComplete(
     // One direction only: a Jev DONE still fails open below, because "the
     // reviewer was unreachable" must never be delivered as "this was reviewed".
     // failedOpen stays set, so nothing downstream claims a completed review.
-    if (!jevSaid) {
+    if (!jevSaid && !reviewsPlan) {
       const late = await askJev();
       if (late) noteJev(late, false);
     }
     const finding = jevSaid as { done: boolean; reason?: string; awaitingUser?: boolean; blocked?: boolean } | null;
+    const reviewFailure: NonNullable<ObjectiveJudgeVerdict['reviewFailure']> =
+      run.failure === 'timeout' ? 'timeout' : run.failure === 'invalid' ? 'invalid' : 'unavailable';
     if (finding && !finding.done && !finding.awaitingUser) {
       return {
         done: false,
         failedOpen: true,
+        reviewFailure,
         reason: finding.reason?.trim()
           ? finding.reason
           : 'The configured completion reviewer could not be reached; the fast check found the objective unmet.',
@@ -1509,7 +1535,7 @@ export async function judgeObjectiveComplete(
         ...(jevAttempt ? { jevAttempt } : {}),
       };
     }
-    if (run.unavailableReason) return { done: true, failedOpen: true,
+    if (run.unavailableReason) return { done: true, failedOpen: true, reviewFailure,
       reason: run.unavailableReason, ...(jevAttempt ? { jevAttempt } : {}) };
     const why =
       run.failure === 'timeout'
@@ -1517,7 +1543,7 @@ export async function judgeObjectiveComplete(
         : run.failure === 'invalid'
           ? `The completion reviewer returned an unreadable verdict; no review was completed.${run.invalidDetail ? ` (${run.invalidDetail})` : ''}`
           : 'The completion reviewer was unavailable; no review was completed.';
-    return { done: true, reason: why, failedOpen: true, ...(jevAttempt ? { jevAttempt } : {}) };
+    return { done: true, reason: why, failedOpen: true, reviewFailure, ...(jevAttempt ? { jevAttempt } : {}) };
   }
   return {
     done: run.verdict.done,
