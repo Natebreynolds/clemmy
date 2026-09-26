@@ -95,7 +95,9 @@ export function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number
       <StepIcon a={a} live={live} />
       <span className="min-w-0">
         <span className={cn('block text-body', running ? 'font-semibold text-fg' : a.kind === 'agent' ? 'truncate font-medium text-fg' : 'truncate text-muted')}>{a.label}</span>
-        {a.detail && <span className={cn('block font-mono text-caption text-faint', running ? 'whitespace-normal' : 'truncate')}>{a.detail}</span>}
+        {a.kind === 'agent' && a.modelName
+          ? <span className={cn('block text-caption text-faint', running ? 'whitespace-normal' : 'truncate')}>{a.modelName}</span>
+          : a.detail && <span className={cn('block font-mono text-caption text-faint', running ? 'whitespace-normal' : 'truncate')}>{a.detail}</span>}
         {showExcerpt && (
           <pre className="mt-1 max-h-36 overflow-y-auto whitespace-pre-wrap rounded-sm bg-subtle px-2.5 py-2 font-sans text-caption leading-relaxed text-muted">{a.excerpt}</pre>
         )}

@@ -25,12 +25,15 @@ import {
   outsideWorkCards,
   renderMarkdown,
   turnByline,
+  turnModelOffer,
   turnReview,
   type ActivityItem,
+  type ModelRuleOffer,
   type ChatMessage,
   type EngineSnapshot,
 } from '@clem/chat-engine';
 import {
+  answerModelRuleOffer,
   approvePlanProposal,
   cancelActiveChat,
   cancelChatRequest,
@@ -654,7 +657,7 @@ function MessageRow({
       {message.status === 'awaiting-reply' && message.options?.length && onAnswer ? (
         <AnswerChoices options={message.options} onAnswer={onAnswer} />
       ) : null}
-      {thinking ? <OutsideWork activity={message.activity} /> : <TurnReceipt message={message} />}
+      {thinking ? <OutsideWork activity={message.activity} /> : <TurnReceipt message={message} sessionId={sessionId} />}
       {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (
         <div class="plan-actions">
           <button
@@ -869,18 +872,52 @@ function OutsideWork({ activity }: { activity: ChatMessage['activity'] }) {
   );
 }
 
-function TurnReceipt({ message }: { message: ChatMessage }) {
+/**
+ * "Use <model> for <kind of work> from now on?" — asked once, after a turn
+ * where the owner named a model for one part of the work. Save writes the same
+ * rule Settings → Models shows; nothing changes until the owner taps.
+ */
+function ModelRuleOfferCard({ offer, sessionId }: { offer: ModelRuleOffer; sessionId: string }) {
+  const [answer, setAnswer] = useState<'save' | 'dismiss' | undefined>(offer.resolved);
+  const [working, setWorking] = useState(false);
+  const [problem, setProblem] = useState('');
+  if (answer === 'dismiss') return null;
+  if (answer === 'save') {
+    return <p class="reply-offer-saved" role="status">✓ {offer.modelName} will do {offer.intent} from now on. Change it in Settings.</p>;
+  }
+  const respond = (action: 'save' | 'dismiss') => {
+    setWorking(true);
+    setProblem('');
+    void answerModelRuleOffer(sessionId, offer.offerId, action)
+      .then((result) => { setAnswer(result.action); setWorking(false); })
+      .catch(() => { setWorking(false); setProblem('That did not save. Try again, or set it in Settings.'); });
+  };
+  return (
+    <div class="reply-offer">
+      <span class="reply-offer-title">Use {offer.modelName} for {offer.intent} from now on?</span>
+      <span class="reply-offer-sub">{problem || 'It will show in Settings, where you can change it.'}</span>
+      <span class="reply-offer-actions">
+        <button type="button" class="reply-offer-button" disabled={working} onClick={() => respond('dismiss')}>Just this once</button>
+        <button type="button" class="reply-offer-button primary" disabled={working} onClick={() => respond('save')}>{working ? 'Saving…' : 'Save for next time'}</button>
+      </span>
+    </div>
+  );
+}
+
+function TurnReceipt({ message, sessionId }: { message: ChatMessage; sessionId?: string }) {
   const [reveal, setReveal] = useState(false);
   const review = turnReview(message.activity);
   const byline = turnByline(message.activity);
   const outside = outsideWorkCards(message.activity);
+  const offer = turnModelOffer(message.activity);
   const proven = evidenceChips(message.terminal?.evidenceRefs);
   const chips = proven.length > 0 ? proven : observedEvidenceChips(message.activity);
   const touched = chips.map((chip) => chip.label).join(' · ');
-  if (!review && !touched && !byline && outside.length === 0) return null;
+  if (!review && !touched && !byline && outside.length === 0 && !offer) return null;
   return (
     <>
       <OutsideWork activity={message.activity} />
+      {offer && sessionId ? <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} /> : null}
       {review || touched || byline ? (
         <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
           {review === 'checked' ? <span class="receipt-ok">✓ Checked</span> : null}

@@ -10,7 +10,7 @@
  */
 import { MODEL_PHASE_ACTIVITY_ID } from './reduce-activity.js';
 import { externalWriteKind, type ExternalWriteKind } from './tool-labels.js';
-import type { ActivityItem } from './types.js';
+import type { ActivityItem, ModelRuleOffer } from './types.js';
 
 /** `checked` is a review that passed. `unchecked` is a turn whose reviewer
  *  never ran: it must never read as a pass. `rejected` is the last review
@@ -58,17 +58,73 @@ export function turnReviewerName(
   return undefined;
 }
 
-/** "<worker> did the work, <reviewer> checked it." Who did what, in words,
- *  from the turn's own events. Empty when the turn named no model. */
+/** A model other than the brain that did part of the turn as a helper. */
+export interface TurnHelper {
+  modelName: string;
+  /** The kind of work, in the brain's words, when every one of these helpers named the same one. */
+  work?: string;
+  count: number;
+}
+
+/** Helpers that ran on a model other than the brain, one entry per model,
+ *  in the order they first appeared. Helpers on the brain's own model are
+ *  the brain's work and are not listed. */
+export function turnHelpers(
+  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'modelName' | 'helperFor'>[] | undefined,
+): TurnHelper[] {
+  if (!activity) return [];
+  const brain = turnModelName(activity);
+  const byModel = new Map<string, { count: number; works: Set<string> }>();
+  for (const row of activity) {
+    if (row.kind !== 'agent' || row.status === 'failed') continue;
+    const name = row.modelName?.trim();
+    if (!name || name === brain) continue;
+    const entry = byModel.get(name) ?? { count: 0, works: new Set<string>() };
+    entry.count += 1;
+    const work = row.helperFor?.trim();
+    if (work) entry.works.add(work);
+    byModel.set(name, entry);
+  }
+  return [...byModel.entries()].map(([modelName, entry]) => ({
+    modelName,
+    count: entry.count,
+    ...(entry.works.size === 1 ? { work: [...entry.works][0] } : {}),
+  }));
+}
+
+function helperPhrase(helper: TurnHelper): string {
+  return helper.work ? `${helper.modelName} handled ${helper.work}` : `${helper.modelName} helped`;
+}
+
+/** "<brain> did the work, <helper> handled <work>, <reviewer> checked it."
+ *  Every model that produced the answer, in words, from the turn's own
+ *  events. Empty when the turn named no model. */
 export function turnByline(
-  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'verdict' | 'modelName'>[] | undefined,
+  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'verdict' | 'modelName' | 'helperFor'>[] | undefined,
 ): string {
   const worker = turnModelName(activity);
   const reviewer = turnReviewerName(activity);
+  const helpers = turnHelpers(activity).map(helperPhrase);
   const verb = turnReview(activity) === 'checked' ? 'checked' : 'reviewed';
-  if (worker && reviewer) return `${worker} did the work, ${reviewer} ${verb} it`;
-  if (worker) return `${worker} did the work`;
-  return reviewer ? `${reviewer} ${verb} the work` : '';
+  const parts = [
+    ...(worker ? [`${worker} did the work`] : []),
+    ...helpers,
+  ];
+  if (reviewer) parts.push(parts.length ? `${reviewer} ${verb} it` : `${reviewer} ${verb} the work`);
+  return parts.join(', ');
+}
+
+/** The open or answered "keep this model for this kind of work?" offer from
+ *  this turn, if the harness made one. */
+export function turnModelOffer(
+  activity: readonly Pick<ActivityItem, 'offer'>[] | undefined,
+): ModelRuleOffer | null {
+  if (!activity) return null;
+  for (let i = activity.length - 1; i >= 0; i -= 1) {
+    const offer = activity[i].offer;
+    if (offer) return offer;
+  }
+  return null;
 }
 
 /** One card per app and kind of change the turn made outside Clem. Only

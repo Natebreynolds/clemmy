@@ -1,6 +1,7 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { reduceActivity as reduceSharedActivity, reduceLifecycle, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
-import type { LiveAnswerDraft, TerminalFacts } from '@clem/chat-engine';
+import type { LiveAnswerDraft, ModelRuleOffer, TerminalFacts } from '@clem/chat-engine';
+import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
 import { applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { ApprovalPreview, ApprovalResolution } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
@@ -86,6 +87,10 @@ export interface ActivityItem {
   verdict?: 'passed' | 'rejected' | 'unreviewed';
   /** The model-phase row only: the routed model's display name. */
   modelName?: string;
+  /** kind 'agent' rows: the kind of work the brain handed this helper. */
+  helperFor?: string;
+  /** Offer rows only: keep a model the owner named for one kind of work. */
+  offer?: ModelRuleOffer;
 }
 
 export interface ChatMessage {
@@ -293,6 +298,12 @@ function isContractNegotiationReturn(d: Record<string, unknown>): boolean {
   if (d.ok !== false) return false;
   const preview = typeof d.preview === 'string' ? d.preview : '';
   return CONTRACT_NEGOTIATION_RE.test(preview);
+}
+
+/** A helper's model as a person would say it, or '' when the id is not id-shaped. */
+function helperModelName(model: string): string {
+  const id = boundedModelId(model);
+  return id ? modelDisplayName(id).slice(0, 48) : '';
 }
 
 function providerFromModel(model: string): ActivityItem['provider'] {
@@ -503,6 +514,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   if (ev.type === 'turn_started' || ev.type === 'turn_model_routed'
     || ev.type === 'work_manifest_declared' || ev.type === 'work_item_checkpoint'
     || ev.type === 'coding_run_activity' || ev.type === 'coding_run_settled'
+    || ev.type === 'worker_model_offer' || ev.type === 'worker_model_offer_resolved'
     || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {
     return reduceSharedActivity(prev, sharedEvent(ev));
   }
@@ -733,7 +745,16 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     case 'worker_started': {
       if (!item) return prev;
       const role = typeof d.role === 'string' ? d.role : '';
-      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status: 'running', startedAt: Date.now(), ...(stepOf(ev) ? { step: stepOf(ev) } : {}) }];
+      const modelName = helperModelName(model);
+      // A helper rerun on the same item replaces its row instead of stacking
+      // a second row under the same id.
+      return [...prev.filter((a) => !(a.kind === 'agent' && a.id === `a-${item}`)), {
+        id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined,
+        provider: providerFor(d, model), status: 'running', startedAt: Date.now(),
+        ...(stepOf(ev) ? { step: stepOf(ev) } : {}),
+        ...(modelName ? { modelName } : {}),
+        ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
+      }];
     }
     case 'worker_result': {
       // UPSERT: on non-Claude (orchestrator) lanes worker_started historically
@@ -755,13 +776,19 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
               // append the short reason so "<item> ✗ <reason>" reads by default.
               ...(status === 'failed' && reason ? { label: `${a.label} — ${reason.slice(0, 80)}` } : {}),
               ...(model ? { detail: model, provider: providerFor(d, model) } : {}),
+              ...(helperModelName(model) ? { modelName: helperModelName(model) } : {}),
             }
           : a));
       }
       const role = typeof d.role === 'string' ? d.role : '';
       const base = role ? `${role}: ${item}` : item;
       const label = status === 'failed' && reason ? `${base} — ${reason.slice(0, 80)}` : base;
-      return [...prev, { id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status, finishedAt: Date.now() }];
+      const modelName = helperModelName(model);
+      return [...prev, {
+        id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status, finishedAt: Date.now(),
+        ...(modelName ? { modelName } : {}),
+        ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
+      }];
     }
     case 'worker_capped':
       return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed', finishedAt: Date.now() } : a));

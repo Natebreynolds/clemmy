@@ -113,6 +113,8 @@ export function narrateActivity(
     // Inventory and compiler sequencing are not work. A leftover Outlook pin
     // or "N6 execute — blocked" is the mechanism, not the job.
     if (isCapabilityInventoryRow(raw)) continue;
+    // An offer is answered under the reply (the receipt), not listed as work.
+    if (raw.offer) continue;
     const plan = publicWorkPlanRow(raw);
     if (plan === null) continue;
     const item = plan;

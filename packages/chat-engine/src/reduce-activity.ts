@@ -17,6 +17,12 @@ function isContractNegotiationReturn(d: Record<string, unknown>): boolean {
   return CONTRACT_NEGOTIATION_RE.test(preview);
 }
 
+/** A helper's model as a person would say it, or '' when the id is not id-shaped. */
+function helperModelName(model: string): string {
+  const id = boundedModelId(model);
+  return id ? modelDisplayName(id).slice(0, 48) : '';
+}
+
 function providerFromModel(model: string): ActivityItem['provider'] {
   const id = model.toLowerCase();
   if (/claude|sonnet|opus|haiku|fable|anthropic/.test(id)) return 'claude';
@@ -418,7 +424,19 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
     case 'worker_started': {
       if (!item) return prev;
       const role = typeof d.role === 'string' ? d.role : '';
-      return [...prev, { id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined, provider: providerFor(d, model), status: 'running' }];
+      const modelName = helperModelName(model);
+      // A helper rerun on the same item (a different model, a retry) replaces
+      // its row rather than stacking a second one under the same id.
+      return [...prev.filter((a) => !(a.kind === 'agent' && a.id === `a-${item}`)), {
+        id: `a-${item}`,
+        kind: 'agent',
+        label: role ? `${role}: ${item}` : item,
+        detail: model || undefined,
+        provider: providerFor(d, model),
+        status: 'running',
+        ...(modelName ? { modelName } : {}),
+        ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
+      }];
     }
     case 'worker_result': {
       // UPSERT: on lanes where worker_started historically wasn't emitted
@@ -437,13 +455,44 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
               // append the short reason so "<item> ✗ <reason>" reads by default.
               ...(status === 'failed' && reason ? { label: `${a.label} — ${reason.slice(0, 80)}` } : {}),
               ...(model ? { detail: model, provider: providerFor(d, model) } : {}),
+              ...(helperModelName(model) ? { modelName: helperModelName(model) } : {}),
             }
           : a));
       }
       const role = typeof d.role === 'string' ? d.role : '';
       const base = role ? `${role}: ${item}` : item;
       const label = status === 'failed' && reason ? `${base} — ${reason.slice(0, 80)}` : base;
-      return [...prev, { id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status }];
+      const modelName = helperModelName(model);
+      return [...prev, {
+        id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status,
+        ...(modelName ? { modelName } : {}),
+        ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
+      }];
+    }
+    case 'worker_model_offer': {
+      const offerId = typeof d.offerId === 'string' ? d.offerId : '';
+      const intent = typeof d.intent === 'string' ? d.intent.trim() : '';
+      const modelId = boundedModelId(d.modelId);
+      if (!offerId || !intent || !modelId) return prev;
+      const modelName = typeof d.modelName === 'string' && d.modelName.trim() && d.modelName.trim() !== modelId
+        ? d.modelName.trim().slice(0, 48)
+        : modelDisplayName(modelId).slice(0, 48);
+      const resolved = d.resolved === 'save' || d.resolved === 'dismiss' ? d.resolved : undefined;
+      const row: ActivityItem = {
+        id: `offer-${offerId}`,
+        kind: 'event',
+        variant: 'lifecycle',
+        label: `Use ${modelName} for ${intent}`,
+        status: 'done',
+        offer: { offerId, intent: intent.slice(0, 80), modelId, modelName, ...(resolved ? { resolved } : {}) },
+      };
+      return prev.some((a) => a.id === row.id) ? prev.map((a) => (a.id === row.id ? row : a)) : [...prev, row];
+    }
+    case 'worker_model_offer_resolved': {
+      const offerId = typeof d.offerId === 'string' ? d.offerId : '';
+      const action = d.action === 'save' || d.action === 'dismiss' ? d.action : undefined;
+      if (!offerId || !action) return prev;
+      return prev.map((a) => (a.offer?.offerId === offerId ? { ...a, offer: { ...a.offer, resolved: action } } : a));
     }
     case 'worker_capped':
       return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed' } : a));

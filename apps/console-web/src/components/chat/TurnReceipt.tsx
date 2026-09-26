@@ -9,8 +9,9 @@
  * appears only for writes the provider confirmed.
  */
 import { useState, type ReactNode } from 'react';
-import { AlertCircle, Check, CheckCircle2, Copy, FileText, Mail, PenLine, Send } from 'lucide-react';
-import { outsideWorkCards, turnByline, turnReview, type OutsideWorkCard } from '@clem/chat-engine';
+import { AlertCircle, Check, CheckCircle2, Copy, FileText, Mail, PenLine, Send, Sparkles } from 'lucide-react';
+import { outsideWorkCards, turnByline, turnModelOffer, turnReview, type ModelRuleOffer, type OutsideWorkCard } from '@clem/chat-engine';
+import { answerModelRuleOffer } from '@/lib/chat';
 import type { ActivityItem } from '@/lib/useChat';
 import type { TerminalFacts } from '@clem/chat-engine';
 import { openFile, resolveDeliverablePath } from '@/lib/files';
@@ -90,6 +91,63 @@ function OutsideWorkCardView({ card }: { card: OutsideWorkCard }) {
   );
 }
 
+/** "Use <model> for <kind of work> from now on?" — asked once, after a turn
+ *  where the owner named a model for one part of the work. Save writes the
+ *  same rule Settings → Models shows; nothing changes until the owner taps. */
+function ModelRuleOfferCard({ offer, sessionId }: { offer: ModelRuleOffer; sessionId: string }) {
+  const [answer, setAnswer] = useState<'save' | 'dismiss' | undefined>(offer.resolved);
+  const [state, setState] = useState<'idle' | 'working'>('idle');
+  const [problem, setProblem] = useState('');
+  if (answer === 'dismiss') return null;
+  const respond = (action: 'save' | 'dismiss') => {
+    setState('working');
+    setProblem('');
+    void answerModelRuleOffer(sessionId, offer.offerId, action)
+      .then((result) => { setAnswer(result.action); setState('idle'); })
+      .catch((err: unknown) => {
+        setState('idle');
+        setProblem(err instanceof Error && err.message ? err.message : 'That did not save. Try again, or set it in Settings → Models.');
+      });
+  };
+  if (answer === 'save') {
+    return (
+      <div className="flex min-w-0 items-center gap-2 text-caption text-muted" role="status">
+        <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden />
+        <span className="truncate">{offer.modelName} will do {offer.intent} from now on. Change it in Settings → Models.</span>
+      </div>
+    );
+  }
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-3 rounded-md border border-border bg-surface px-3 py-2.5">
+      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-sm bg-primary-tint text-primary">
+        <Sparkles className="h-[18px] w-[18px]" aria-hidden />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col leading-tight">
+        <span className="text-small font-semibold text-fg">Use {offer.modelName} for {offer.intent} from now on?</span>
+        <span className="text-caption text-faint">{problem || 'It will show in Settings → Models, where you can change it.'}</span>
+      </span>
+      <span className="flex shrink-0 items-center gap-2">
+        <button
+          type="button"
+          onClick={() => respond('dismiss')}
+          disabled={state === 'working'}
+          className="rounded-sm border border-border-strong px-3 py-1 text-caption font-semibold text-fg transition-colors hover:bg-subtle disabled:opacity-60 active:scale-press"
+        >
+          Just this once
+        </button>
+        <button
+          type="button"
+          onClick={() => respond('save')}
+          disabled={state === 'working'}
+          className="rounded-sm bg-primary px-3 py-1 text-caption font-semibold text-primary-fg transition-colors hover:bg-primary-hover disabled:opacity-60 active:scale-press"
+        >
+          {state === 'working' ? 'Saving…' : 'Save for next time'}
+        </button>
+      </span>
+    </div>
+  );
+}
+
 function CopyAnswer({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   if (!text.trim()) return null;
@@ -131,17 +189,21 @@ export function TurnReceipt({
   activity,
   terminal,
   text,
+  sessionId,
 }: {
   activity?: ActivityItem[];
   terminal?: TerminalFacts;
   text: string;
+  sessionId?: string;
 }) {
   const review = turnReview(activity);
   const byline = turnByline(activity);
   const saved = activity?.find((row) => row.id === 'deliverables' && row.deliverable);
+  const offer = turnModelOffer(activity);
   return (
     <>
       <OutsideWorkCards activity={activity}>{saved ? <DeliverableCard row={saved} /> : null}</OutsideWorkCards>
+      {offer && sessionId && <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} />}
       <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
         {review === 'checked' && (
           <span className="inline-flex items-center gap-1 font-semibold text-success">

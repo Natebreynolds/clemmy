@@ -412,3 +412,12 @@ test('an unknown lifecycle fails closed instead of leaking an internal spelling'
   assert.equal(workingNowLifecycleLabel('new_runtime_state'), 'Status unavailable');
   assert.equal(workingNowLifecycleLabel('blocked'), 'Needs review');
 });
+
+test('an offer to keep a model is answered under the reply, never listed as work', () => {
+  const rows: ActivityItem[] = [
+    { id: 't1', kind: 'tool', label: 'Read the page', status: 'done' },
+    { id: 'offer-wmo-0123456789abcdef', kind: 'event', variant: 'lifecycle', label: 'Use Acme Flagship 5 for emails', status: 'done',
+      offer: { offerId: 'wmo-0123456789abcdef', intent: 'emails', modelId: 'acme-flagship-5', modelName: 'Acme Flagship 5' } },
+  ];
+  assert.deepEqual(narrateActivity(rows).map((row) => row.id), ['t1']);
+});

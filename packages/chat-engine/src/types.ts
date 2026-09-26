@@ -134,9 +134,26 @@ export interface ActivityItem {
   /** kind 'check' verdict rows: what the review decided, as a fact rather
    *  than a label. `unreviewed` means no reviewer ran — never a pass. */
   verdict?: 'passed' | 'rejected' | 'unreviewed';
-  /** The model-phase row only: the routed model's display name. Never the
-   *  provider — a family is not a name. */
+  /** The model-phase row and helper rows: the routed model's display name.
+   *  Never the provider — a family is not a name. */
   modelName?: string;
+  /** kind 'agent' rows: the kind of work the brain handed this helper, in
+   *  the brain's own words, when it named one. */
+  helperFor?: string;
+  /** Offer rows only: keep a model the owner named for one kind of work.
+   *  Rendered with the turn's receipt, never as an activity row. */
+  offer?: ModelRuleOffer;
+}
+
+/** "Use <model> for <kind of work> from now on?" — asked once after a turn
+ *  where the owner named a model for one part of the work. */
+export interface ModelRuleOffer {
+  offerId: string;
+  intent: string;
+  modelId: string;
+  modelName: string;
+  /** The owner's answer, once given. */
+  resolved?: 'save' | 'dismiss';
 }
 
 /**

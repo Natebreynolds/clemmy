@@ -1808,3 +1808,16 @@ export async function revokeDevice(deviceId: string): Promise<{ ok: boolean; rem
 export async function revokeAllDevices(): Promise<{ ok: boolean; removed: number }> {
   return api('/m/api/devices/revoke-all', { method: 'POST', body: '{}' });
 }
+
+/** Answer "use <model> for <kind of work> from now on?" under a reply. */
+export function answerModelRuleOffer(
+  sessionId: string,
+  offerId: string,
+  action: 'save' | 'dismiss',
+): Promise<{ ok: boolean; action: 'save' | 'dismiss'; alreadyResolved: boolean }> {
+  return api(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/model-rule-offers/${encodeURIComponent(offerId)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+}

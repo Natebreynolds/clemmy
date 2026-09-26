@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { outsideWorkCards, turnByline, turnModelName, turnReview, turnReviewerName } from './turn-receipt.js';
+import { outsideWorkCards, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewerName } from './turn-receipt.js';
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readQuestionOptions } from './question-options.js';
 import { MODEL_PHASE_ACTIVITY_ID, reduceActivity } from './reduce-activity.js';
@@ -92,4 +92,55 @@ test('question options keep real, distinct, readable choices only', () => {
   assert.deepEqual(readQuestionOptions(['Your inbox', ' your  inbox ', '', 42, 'The shared inbox', 'x'.repeat(121)]), ['Your inbox', 'The shared inbox']);
   assert.deepEqual(readQuestionOptions('Your inbox'), []);
   assert.equal(readQuestionOptions(Array.from({ length: 12 }, (_v, i) => `Option ${i}`)).length, 8);
+});
+
+test('a helper on another model is credited by name and by the work it was handed', () => {
+  const rows = fold([
+    { type: 'turn_model_routed', data: { model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo' } },
+    { type: 'worker_started', data: { item: 'speed', role: 'outbound email writing', model: 'acme-flagship-5', provider: 'claude' } },
+    { type: 'worker_started', data: { item: 'booking', role: 'outbound email writing', model: 'acme-flagship-5', provider: 'claude' } },
+    { type: 'worker_result', data: { item: 'speed', ok: true, model: 'acme-flagship-5' } },
+    { type: 'worker_result', data: { item: 'booking', ok: true, model: 'acme-flagship-5' } },
+    { type: 'verdict_recorded', data: { door: 'completion', pass: true, judgeModelId: 'acme-large-4-5' } },
+  ]);
+  assert.deepEqual(turnHelpers(rows), [{ modelName: 'Acme Flagship 5', count: 2, work: 'outbound email writing' }]);
+  assert.equal(
+    turnByline(rows),
+    'Vendor V4.1 Fast did the work, Acme Flagship 5 handled outbound email writing, Acme Large 4.5 checked it',
+  );
+});
+
+test('helpers on the brain model are the brain work, and a failed helper earns no credit', () => {
+  const rows = fold([
+    { type: 'turn_model_routed', data: { model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo' } },
+    { type: 'worker_started', data: { item: 'a', model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo' } },
+    { type: 'worker_result', data: { item: 'a', ok: true, model: 'vendor-ai/Vendor-V4.1-Fast' } },
+    { type: 'worker_started', data: { item: 'b', model: 'acme-flagship-5', provider: 'claude' } },
+    { type: 'worker_result', data: { item: 'b', ok: false, reason: 'ERROR: timed out', model: 'acme-flagship-5' } },
+  ]);
+  assert.deepEqual(turnHelpers(rows), []);
+  assert.equal(turnByline(rows), 'Vendor V4.1 Fast did the work');
+});
+
+test('a helper rerun on the same item replaces its row with the model that ran last', () => {
+  const rows = fold([
+    { type: 'worker_started', data: { item: 'speed', role: 'emails', model: 'other-model-5', provider: 'byo' } },
+    { type: 'worker_result', data: { item: 'speed', ok: true, model: 'other-model-5' } },
+    { type: 'worker_started', data: { item: 'speed', role: 'emails', model: 'acme-flagship-5', provider: 'claude' } },
+    { type: 'worker_result', data: { item: 'speed', ok: true, model: 'acme-flagship-5' } },
+  ]);
+  const agents = rows.filter((row) => row.kind === 'agent');
+  assert.equal(agents.length, 1);
+  assert.equal(agents[0]!.modelName, 'Acme Flagship 5');
+});
+
+test('an offer to keep a model is carried to the receipt with the owner answer', () => {
+  const offerEvent = { type: 'worker_model_offer', data: { offerId: 'wmo-0123456789abcdef', intent: 'outbound email writing', modelId: 'acme-flagship-5', modelName: 'Acme Flagship 5' } };
+  const open = fold([offerEvent]);
+  assert.deepEqual(turnModelOffer(open), { offerId: 'wmo-0123456789abcdef', intent: 'outbound email writing', modelId: 'acme-flagship-5', modelName: 'Acme Flagship 5' });
+  const answered = fold([offerEvent, { type: 'worker_model_offer_resolved', data: { offerId: 'wmo-0123456789abcdef', action: 'save' } }]);
+  assert.equal(turnModelOffer(answered)?.resolved, 'save');
+  const replayed = fold([{ ...offerEvent, data: { ...offerEvent.data, resolved: 'dismiss' } }]);
+  assert.equal(turnModelOffer(replayed)?.resolved, 'dismiss');
+  assert.equal(turnModelOffer(fold([])), null);
 });

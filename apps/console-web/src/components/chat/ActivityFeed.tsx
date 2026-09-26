@@ -9,6 +9,7 @@ import { useEffect, useState } from 'react';
 import { Wrench, Users, Check, X, Zap, Send, AlertCircle, CheckCircle2, Radio, Dot } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
+import { turnModelName } from '@clem/chat-engine';
 import {
   narrateActivity,
   settleTerminalActivity,
@@ -110,16 +111,20 @@ function EventIcon({ a }: { a: ActivityItem }) {
 /** One non-batch activity row (tool / agent / trust check / effect-or-lifecycle
  *  event). `showDetails` reveals the demoted power-user detail (an agent's model
  *  id) — the plain-human label is always the default. */
-export function ActivityRow({ a, now, live, showDetails = false }: {
+export function ActivityRow({ a, now, live, showDetails = false, brainName }: {
   a: ActivityItem;
   now: number;
   live: boolean;
   showDetails?: boolean;
+  /** The turn's brain, so a helper on a different model is named by default. */
+  brainName?: string;
 }) {
   const running = live && a.status === 'running';
   const elapsed = running ? elapsedLabel(a.startedAt, now) : '';
   const isEvent = a.kind === 'event';
-  const detailVisible = a.detail && (a.kind === 'tool' || a.kind === 'check' || isEvent || (a.kind === 'agent' && showDetails));
+  const helperOnOtherModel = a.kind === 'agent' && Boolean(a.modelName) && a.modelName !== brainName;
+  const detailVisible = a.detail && (a.kind === 'tool' || a.kind === 'check' || isEvent || (a.kind === 'agent' && (showDetails || helperOnOtherModel)));
+  const detailText = a.kind === 'agent' && !showDetails && a.modelName ? a.modelName : a.detail;
   // The peek pane: auto-open while the run is live (the whole point is seeing
   // work as it happens); the user's toggle wins once touched.
   const [peekTouched, setPeekTouched] = useState(false);
@@ -141,7 +146,7 @@ export function ActivityRow({ a, now, live, showDetails = false }: {
         )}
         <span className={cn('min-w-0 truncate', running || (isEvent && a.tone && a.tone !== 'muted') ? 'text-fg' : 'text-muted')}>{a.label}</span>
         {detailVisible && (
-          <span className="min-w-0 flex-1 truncate text-faint">→ {a.detail}</span>
+          <span className="min-w-0 flex-1 truncate text-faint">→ {detailText}</span>
         )}
         {!detailVisible && <span className="flex-1" />}
         {a.excerpt && (
@@ -190,6 +195,7 @@ export function LiveFeed({ items, live, showDetails, terminalOutcome }: {
     return <p className="text-body text-faint">No activity yet — it streams in as the agent works.</p>;
   }
   const agents = view.filter((a) => a.kind === 'agent');
+  const brainName = turnModelName(items);
   const doneAgents = agents.filter((a) => a.status !== 'running').length;
   return (
     <div>
@@ -202,7 +208,7 @@ export function LiveFeed({ items, live, showDetails, terminalOutcome }: {
       <ul className="flex flex-col gap-1">
         {view.map((a) => (a.kind === 'batch'
           ? <BatchRow key={a.id} a={a} now={now} live={live} />
-          : <ActivityRow key={a.id} a={a} now={now} live={live} showDetails={showDetails} />))}
+          : <ActivityRow key={a.id} a={a} now={now} live={live} showDetails={showDetails} brainName={brainName} />))}
       </ul>
     </div>
   );

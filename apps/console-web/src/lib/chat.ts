@@ -489,3 +489,15 @@ export function subscribeDelegatedActivity(
     es = null;
   };
 }
+
+/** Answer "use <model> for <kind of work> from now on?" under a reply. */
+export function answerModelRuleOffer(
+  sessionId: string,
+  offerId: string,
+  action: 'save' | 'dismiss',
+): Promise<{ ok: boolean; action: 'save' | 'dismiss'; alreadyResolved: boolean }> {
+  return apiPost(
+    `/api/console/harness-sessions/${encodeURIComponent(sessionId)}/model-rule-offers/${encodeURIComponent(offerId)}`,
+    { action },
+  );
+}

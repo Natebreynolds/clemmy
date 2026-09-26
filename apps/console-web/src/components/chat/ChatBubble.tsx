@@ -578,7 +578,7 @@ export function ChatBubble({
             app shows as soon as it lands; the rest waits for the turn's end. */}
         {live
           ? <OutsideWorkCards activity={message.activity} />
-          : <TurnReceipt activity={message.activity} terminal={message.terminal} text={hasReplyText ? message.text : ''} />}
+          : <TurnReceipt activity={message.activity} terminal={message.terminal} text={hasReplyText ? message.text : ''} sessionId={sessionId} />}
     </article>
   );
 }
