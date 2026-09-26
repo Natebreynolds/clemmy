@@ -124,6 +124,17 @@ test('classifyModelError: 429/529/5xx/401/transport classified; random not retry
   assert.equal(classifyModelError(new Error('bad input')).retryable, false);
 });
 
+test('classifyModelError: a dropped connection is transport, however the SDK wraps it', () => {
+  // An SDK connection error names itself and says only "Connection error.";
+  // the socket condition sits in its cause. None of those words are a status.
+  const sdkShaped = Object.assign(new Error('Connection error.'), { name: 'APIConnectionError', cause: Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' }) });
+  assert.deepEqual(pick(classifyModelError(sdkShaped)), { retryable: true, kind: 'model.transport_timeout', isAuth: false });
+  assert.deepEqual(pick(classifyModelError(new Error('Connection error.'))), { retryable: true, kind: 'model.transport_timeout', isAuth: false });
+  assert.deepEqual(pick(classifyModelError({ message: 'request failed', cause: { code: 'ETIMEDOUT' } })), { retryable: true, kind: 'model.transport_timeout', isAuth: false },
+    'a transport code anywhere in the cause chain counts');
+  assert.equal(classifyModelError({ message: 'bad input', cause: { message: 'schema mismatch' } }).retryable, false);
+});
+
 test('classifyModelError: a provider-internal generation crash with no HTTP status is infra', () => {
   // Live 2026-08-28: xAI native SSE finished HTTP 200 then threw this bare
   // message after plan_task; missing status used to classify as runtime.unknown

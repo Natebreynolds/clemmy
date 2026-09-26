@@ -11720,6 +11720,42 @@ test('persistent transport failure becomes a visible continuation question with 
 });
 
 
+test('a dropped connection reported by the SDK ends in the same continuation question, never a failed run', async () => {
+  // The SDK reports a dropped socket as a named connection error whose message
+  // carries no status and no transport word; the socket condition sits in its
+  // cause. Read as unknown, it once ended the run "failed" with no way on.
+  const prior = process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '1';
+  const session = HarnessSession.create({ kind: 'chat', title: 'sdk connection error continuation' });
+  let requests = 0;
+  const model = {
+    async getResponse(): Promise<never> { throw new Error('stream required'); },
+    async *getStreamedResponse() {
+      requests++;
+      yield { type: 'output_text_delta', delta: 'UNACCEPTED_SDK_OUTPUT' } as never;
+      // The bare shape the live run recorded: a name and this message, nothing
+      // else that says transport.
+      throw Object.assign(new Error('Connection error.'), { name: 'APIConnectionError' });
+    },
+  };
+  try {
+    const result = await runTurn({ sessionId: session.id, input: 'Continue the existing research.',
+      agent: { model, tools: [], instructions: 'Respond to the owner.' } as never,
+      makeRunner: throwingRunner as never, runRunner: productionHostRunRunner, maxTurns: 3 });
+    assert.equal(requests, 2, 'the dropped connection is retried once from accepted history');
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.match(String(result.finalOutput), /Would you like me to try continuing from here\?/);
+    const waiting = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+    assert.equal(waiting.length, 1);
+    assert.equal(waiting[0].data.reason, 'model_transport_unavailable');
+    assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0, 'no failed terminal');
+    assert.doesNotMatch(JSON.stringify(HarnessSession.load(session.id)?.toInputItems()), /UNACCEPTED_SDK_OUTPUT/);
+  } finally {
+    if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
+    else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
+  }
+});
+
 test('a result completed on the last repair receives a fresh positive verdict', async (t) => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const fixture = acceptJudgedSource('final-repair-verification', 'Read the current harness status and report it.');

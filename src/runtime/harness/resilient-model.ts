@@ -71,7 +71,19 @@ interface ErrorClass {
   sameProviderRetryable?: boolean;
 }
 
-const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefused|fetch failed|socket hang up|network|und_err|aborted|timeout/i;
+const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefused|fetch failed|socket hang up|network|und_err|aborted|timeout|connection error|apiconnection/i;
+
+/** A transport failure often arrives wrapped: an SDK's connection error whose
+ *  cause is the socket error, which in turn may carry only a code. Any link
+ *  of that chain naming a transport condition makes the whole error one. */
+function transportErrorInChain(err: unknown, depth = 0): boolean {
+  if (!err || typeof err !== 'object' || depth > 3) return false;
+  const e = err as { message?: unknown; name?: unknown; code?: unknown; cause?: unknown };
+  for (const field of [e.message, e.name, e.code]) {
+    if (typeof field === 'string' && TRANSPORT_RE.test(field)) return true;
+  }
+  return transportErrorInChain(e.cause, depth + 1);
+}
 // A plan/usage QUOTA is exhausted (e.g. Codex/ChatGPT "usage_limit_reached", "The usage
 // limit has been reached", plan_limit). Providers return this as 429 OR 403 OR a 400 with
 // the marker only in the body — the bare status classifier mis-tags the 403/400 variants as
@@ -128,9 +140,7 @@ export function classifyModelError(err: unknown): ErrorClass {
     if (isProviderInternalGenerationFailure(err)) {
       return { retryable: true, kind: 'model.http_5xx', isAuth: false, retryAfterMs };
     }
-    const msg = typeof e?.message === 'string' ? e.message : '';
-    const name = typeof e?.name === 'string' ? e.name : '';
-    if (TRANSPORT_RE.test(msg) || TRANSPORT_RE.test(name)) {
+    if (transportErrorInChain(err)) {
       return { retryable: true, kind: 'model.transport_timeout', isAuth: false, retryAfterMs };
     }
   }
