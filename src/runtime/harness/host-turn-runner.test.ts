@@ -9747,6 +9747,46 @@ test('when the rounds are spent on claims-only findings, the answer ships withou
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
+/** Records one settled business call for an accepted source, as the ledger does. */
+function settleFixtureBusinessCall(input: { sessionId: string; sourceUserSeq: number; turn: number },
+  label: string, mutating: boolean, succeeded: boolean) {
+  const task = { ...input, acceptedTaskId: identities.acceptedTaskIdFor(input.sessionId, input.sourceUserSeq) };
+  shadow.recordTurnGraphShadow({ identity: task });
+  const logicalToolCallId = `logical:${label}`;
+  const opened = dispatch.beginPhysicalDispatch({
+    identity: { ...task, logicalToolCallId, physicalDispatchId: `dispatch:${label}`, ordinal: 0 },
+    tool: 'FIXTURE_TOOL', args: { label },
+  });
+  assert.equal(opened.status, 'inserted', JSON.stringify(opened));
+  if (opened.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+  dispatch.settlePhysicalDispatch({ identity: opened.identity, tool: 'FIXTURE_TOOL', outcome: 'returned' });
+  const committed = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId },
+    contract: { toolName: 'FIXTURE_TOOL', args: { label } },
+    execution: { kind: 'provider_execution' },
+    result: { payload: succeeded ? { successful: true, data: {} } : { successful: false, error: { code: 'UPSTREAM_FAILURE' } } },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: succeeded }),
+    recovery: { businessCall: true, mutating },
+    observer: { lane: 'composio', turn: task.turn },
+  });
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+}
+
+test('a review protects what the turn did: a write it tried, a plan, or a read-only answer', async () => {
+  const { completionReviewStakes, settledSourceArtifacts } = await import('./host-turn-runner.js');
+  const { sourceAttemptedWrites } = await import('./host-completion-work.js');
+  const failedWrite = acceptJudgedSource('stakes-failed-write', 'TEST FIXTURE: post the summary to the channel');
+  settleFixtureBusinessCall({ ...failedWrite.context, turn: 1 }, 'stakes-failed-write', true, false);
+  assert.equal(settledSourceArtifacts(failedWrite.context).count, 0, 'nothing was written');
+  assert.equal(sourceAttemptedWrites(failedWrite.context), 1, 'but a write was tried, and the answer must not claim it happened');
+  const read = acceptJudgedSource('stakes-read', 'TEST FIXTURE: read the channel');
+  settleFixtureBusinessCall({ ...read.context, turn: 1 }, 'stakes-read', false, true);
+  assert.equal(sourceAttemptedWrites(read.context), 0);
+  assert.equal(completionReviewStakes({ plan: false, attemptedWrites: 1 }), 'write');
+  assert.equal(completionReviewStakes({ plan: false, attemptedWrites: 0 }), 'read');
+  assert.equal(completionReviewStakes({ plan: true, attemptedWrites: 0 }), 'plan');
+});
+
 test('production host retains completion feedback in request projection without adding an uncheckpointed draft to history)', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const verdicts = [
@@ -11336,6 +11376,7 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'tim
     assert.equal(reply, publication(false).full_text);
     assert.match(options?.toolCallSummary ?? '', /THIS IS A PLAN TURN/);
     assert.equal(options?.reviewsPlan, true, 'the reviewer is told it reviews a plan, so no completion reading of results sends it back');
+    assert.equal(options?.reviewStakes, 'plan', 'a plan gets a fast review, confirmed at full depth before any send-back');
     assert.match(options?.toolCallSummary ?? '', /preparedBindings/);
     assert.match(options?.toolCallSummary ?? '', /structuredPlan.steps is the complete reviewed graph/);
     assert.match(options?.toolCallSummary ?? '', /executionDraft is a host-derived tool-only projection/);
@@ -11774,6 +11815,7 @@ test('a result completed on the last repair receives a fresh positive verdict', 
     if (judged < 3) return { done: false, reason: 'Read the actual current status before answering.' };
     assert.equal(reply, corrected);
     assert.match(options?.toolCallSummary ?? '', /harness_status/);
+    assert.equal(options?.reviewStakes, 'read', 'a read-only answer gets the fast review, confirmed at full depth before any send-back');
     return { done: true, reason: 'The current result now answers the request.' };
   });
   t.after(() => _setHostObjectiveJudgeForTests(null));

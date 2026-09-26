@@ -533,6 +533,74 @@ test('an unreachable reviewer still gets Jev\'s reading of a reply Jev was not a
   assert.equal(v.jevAttempt?.accepted, false);
 });
 
+test('review depth follows what the review protects', async () => {
+  const { reviewAtStakes, WRITE_REVIEW_TIMEOUT_MS } = await import('./objective-judge.js');
+  const claude = { modelId: 'claude-sonnet-5', judgeFamily: 'claude', model: null, brainFamily: 'byo', selfJudge: false } as never;
+  const script = (...runs: Array<{ done: boolean; reason: string } | null>) => {
+    const asked: Array<{ effort?: string; timeoutMs?: number }> = [];
+    const review = async (depth: { effort?: 'low' | 'medium' | 'high'; timeoutMs?: number }) => {
+      asked.push({ ...depth });
+      const verdict = runs.shift() ?? null;
+      return { verdict, failure: verdict ? null : 'timeout' as const, routing: claude };
+    };
+    return { asked, review };
+  };
+
+  const write = script({ done: true, reason: 'the sheet holds the requested rows' });
+  const w = await reviewAtStakes('write', write.review);
+  assert.deepEqual(write.asked, [{ timeoutMs: WRITE_REVIEW_TIMEOUT_MS }], 'a write gets one full-depth review with time to finish');
+  assert.equal(w.reviewDepth, 'full');
+
+  for (const stakes of ['read', 'plan'] as const) {
+    const pass = script({ done: true, reason: 'fast: supported' });
+    const p = await reviewAtStakes(stakes, pass.review);
+    assert.deepEqual(pass.asked, [{ effort: 'medium' }], `${stakes}: a passing fast review is final`);
+    assert.equal(p.reviewDepth, 'fast');
+    assert.equal(p.verdict?.done, true);
+
+    const overruled = script({ done: false, reason: 'fast: looks unsupported' }, { done: true, reason: 'full: the evidence supports it' });
+    const o = await reviewAtStakes(stakes, overruled.review);
+    assert.deepEqual(overruled.asked, [{ effort: 'medium' }, {}], `${stakes}: a fast send-back is checked at full depth`);
+    assert.equal(o.verdict?.done, true, 'a fast misreading never costs a rewrite');
+    assert.equal(o.reviewConfirmation, 'overruled');
+    assert.equal(o.reviewDepth, 'full');
+
+    const upheld = script({ done: false, reason: 'fast: figure missing' }, { done: false, reason: 'full: the total is not in the evidence' });
+    const u = await reviewAtStakes(stakes, upheld.review);
+    assert.equal(u.verdict?.done, false);
+    assert.equal(u.verdict?.reason, 'full: the total is not in the evidence', 'the full review\'s finding is what the model fixes');
+    assert.equal(u.reviewConfirmation, 'upheld');
+
+    const unconfirmed = script({ done: false, reason: 'fast: figure missing' }, null);
+    const n = await reviewAtStakes(stakes, unconfirmed.review);
+    assert.equal(n.verdict?.reason, 'fast: figure missing', 'a completed fast finding stands when the full review cannot finish');
+    assert.equal(n.reviewConfirmation, 'unavailable');
+  }
+
+  const other = { modelId: 'judge-model', judgeFamily: 'codex', model: null, brainFamily: 'byo', selfJudge: false } as never;
+  const asked: unknown[] = [];
+  const once = await reviewAtStakes('read', async (depth) => {
+    asked.push(depth);
+    return { verdict: { done: false, reason: 'not done' }, failure: null, routing: other };
+  });
+  assert.equal(asked.length, 1, 'a reviewer without thinking levels reviews once, as before');
+  assert.equal(once.reviewDepth, undefined);
+});
+
+test('work that wrote something is never closed by Jev alone', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const jev = { count: 0 };
+  _setSystemOneFetchForTests(jevAnswering('awaiting', jev));
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => { reviewerCalls += 1; return { verdict: { done: true, reason: 'reviewer: the sheet matches' }, failure: null }; });
+  const reply = 'I created the sheet with the three firms. Should I share it with the team?';
+  const v = await judgeObjectiveComplete('Create a sheet with the three firms.', reply,
+    { sessionId: 'probe-write', skills: [], toolCallSummary: 'none', reviewStakes: 'write' });
+  assert.equal(jev.count, 0);
+  assert.equal(reviewerCalls, 1, 'the configured reviewer checks what was written');
+  assert.equal(v.done, true);
+});
+
 test('a review with no verdict says why: out of time, unreadable, or unreachable', async () => {
   _setTypesafeKeyForTests(null);
   try {
