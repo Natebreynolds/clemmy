@@ -91,12 +91,11 @@ export function describeExternalWriteEvent(input: {
     actionKey,
     correlationFingerprint: toolCallCorrelationFingerprint(toolName, input.args),
     semanticFingerprint,
-    // The consent card and the ledger state one reversibility. The shape
-    // classifier reads a materialized manifest's semantics alone, so a send
-    // whose manifest declares none recorded irreversible=false while its
-    // consent, which also sees the definition and the bound arguments, said
-    // irreversible (live 2026-09-25). It stays the fallback for lanes that
-    // never decided consent from a risk classification.
+    // The consent card and the ledger state one reversibility: a call whose
+    // consent was decided from a risk classification records that
+    // classification. The shape classifier reads a materialized manifest's
+    // semantics alone and can contradict it; it stays the fallback for lanes
+    // that never decided consent from a risk classification.
     irreversible: consent
       ? consent.reversibility === 'irreversible'
       : input.irreversible ?? shape.irreversible,

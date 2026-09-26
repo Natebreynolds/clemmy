@@ -8240,10 +8240,8 @@ export function resolveToolOutputForAuthority(
  * nonce-less branch, which authority keeps to reads because an unproven write
  * confirmation must never become evidence for a later action. A query only
  * shows the model bytes its own session already received, so the producer's
- * effect class cannot decide whether they open (live 2026-09-25: research
- * calls through a generic API-request operation were classified as writes,
- * file_query refused every result, and the model paged raw text instead and
- * misread numbers). `effect` still travels with the record.
+ * effect class never decides whether they open: a call classified as a write
+ * can still have returned data. `effect` still travels with the record.
  */
 export function resolveToolOutputForQuery(
   sessionId: string,

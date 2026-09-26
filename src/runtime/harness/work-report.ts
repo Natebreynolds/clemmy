@@ -214,7 +214,7 @@ function describeUncertainWrite(event: EventRow): string {
  * instead of from slug verbs, so the report says what the consent card said.
  * A consequence that classification could not name (or one that is not a
  * change, such as execute) reads as the call it was: a verb in an operation's
- * name cannot supply a change nothing proved (live 2026-09-25).
+ * name cannot supply a change nothing proved.
  */
 export function describeExternalWrite(
   shapeKey: string | undefined,

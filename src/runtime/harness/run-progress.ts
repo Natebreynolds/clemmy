@@ -54,8 +54,7 @@ function collectionFacts(sessionId: string, sourceUserSeq: number): {
 /** Succeeded business operations for one source. A mutating settlement is a
  *  write only when its ledger row affirms a change; a call classified as a
  *  write whose own consent classification never named one is a completed
- *  call (live 2026-09-25: five research requests read as "5 writes
- *  completed"). */
+ *  call. */
 function settledOperationCounts(
   sessionId: string,
   sourceUserSeq: number,

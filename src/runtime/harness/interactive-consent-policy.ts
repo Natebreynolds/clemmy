@@ -69,8 +69,7 @@ const AFFIRMED_CHANGE_CONSEQUENCES: ReadonlySet<InteractiveConsentConsequence> =
  * consequence, or a destructive declaration. The classifier affirms neither
  * `execute` nor `unknown`. A call that is a write only because its carrier
  * could not be proven read-only proves, when it returns cleanly, that it ran,
- * not that anything changed (live 2026-09-25: research requests through a
- * generic API-request operation read as "5 writes completed").
+ * not that anything changed.
  */
 export function consentRiskAffirmsChange(
   risk: { consequence: InteractiveConsentConsequence; destructive: boolean },
