@@ -19,6 +19,7 @@ import {
 import { clearFanoutUniformFailure, fanoutUniformFailure, markFanoutUniformFailure, workerItemAlreadyCapped, workerAlreadyCompletedForPacket, workerResumeIdempotencyEnabled } from '../agents/worker-respawn-guard.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel } from '../runtime/harness/worker-model-route.js';
+import { resolveWorkerAgentRequest } from '../agents/agent-binding.js';
 import { recordWorkerModelOffer } from '../runtime/harness/worker-model-offer.js';
 import { DEFAULT_CLAUDE_FAST_MODEL, getClaudeBrainModel, getRuntimeEnv } from '../config.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
@@ -231,12 +232,14 @@ export function registerWorkerTools(server: McpServer): void {
           ? `Manifest guidance: the complete "${manifestBinding.phase}" phase is already proven for ${manifestBinding.manifestId} contract ${manifestBinding.contractVersion}. Do not call run_worker again for this phase; synthesize the user-facing result now from the returned work-products and durable evidence.`
           : `Manifest guidance: this requested slice is already proven for ${manifestBinding.manifestId}/${manifestBinding.phase} contract ${manifestBinding.contractVersion}. Do not repeat these items; continue only with canonical items that remain incomplete.`
         : null;
-      // The same one-per-call model decision as the orchestrator lane: a model
-      // name nothing resolves is refused before any helper starts.
+      // The same one-per-call decisions as the orchestrator lane: a saved agent
+      // or model name nothing resolves is refused before any helper starts.
+      const agentRequest = resolveWorkerAgentRequest(call);
+      if (agentRequest.kind === 'refuse') return textResult(`ERROR: workers were NOT started — ${agentRequest.reason}`);
       const workerRoute = await routeWorkerModel({
         sessionId: manifestSessionId,
         sourceUserSeq: manifestSourceUserSeq,
-        model: call.model,
+        model: agentRequest.kind === 'bound' ? agentRequest.model : call.model,
         intent: call.intent,
         objective: call.objective,
         item: callItems[0],
@@ -253,7 +256,12 @@ export function registerWorkerTools(server: McpServer): void {
       // the durable accepted-task contract supplies the binding when proven.
       // The packet carries the model that will actually run.
       const packetBase = bindWorkerPacketExpectedWork({
-        packet: { ...packetRaw, model: workerRoute.model },
+        packet: {
+          ...packetRaw,
+          model: workerRoute.model,
+          // The packet carries the agent's id, so every lane and record agree.
+          ...(agentRequest.kind === 'bound' ? { agent: agentRequest.binding.agent.id } : {}),
+        },
         sessionId: manifestSessionId,
         sourceUserSeq: manifestSourceUserSeq,
         items: callItems,
@@ -726,7 +734,7 @@ export function registerWorkerTools(server: McpServer): void {
       // running specialist immediately, not only when worker_result lands). Cheap,
       // fail-open. provider/role let the UI badge it (Claude/Codex/GLM + specialty).
       try {
-        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, lane: 'sdk_brain' } });
+        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, agent: input.agent || undefined, lane: 'sdk_brain' } });
       } catch { /* telemetry is best-effort */ }
       if (manifestBinding) {
         try {
@@ -794,6 +802,7 @@ export function registerWorkerTools(server: McpServer): void {
             workflowName: ctx?.workflowName,
             stepId: ctx?.stepId,
             role: input.intent || undefined,
+            boundAgentId: input.agent || undefined,
             provider: resultProvider,
             model: result.model ?? workerModel,
             task: input.item,
@@ -833,6 +842,7 @@ export function registerWorkerTools(server: McpServer): void {
             workflowName: ctx?.workflowName,
             stepId: ctx?.stepId,
             role: input.intent || undefined,
+            boundAgentId: input.agent || undefined,
             provider: failedProvider,
             model: workerModel,
             task: input.item,

@@ -1,4 +1,5 @@
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, workerPacketKey, type WorkerToolInput } from '../../agents/worker-job-packet.js';
+import { resolveAgentBinding } from '../../agents/agent-binding.js';
 import { getRuntimeEnv } from '../../config.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
 import {
@@ -83,6 +84,9 @@ export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agen
     // identical batch wires diverge before the prompt cache could help.
     'The exact worker item is the final field of the attached Packet JSON.',
     input.intent ? `Worker intent: ${input.intent}` : '',
+    // Running as a saved agent: its standing context joins the stable prefix,
+    // so every item of the batch shares one wire.
+    input.agent ? resolveAgentBinding(input.agent)?.context ?? '' : '',
   ].filter(Boolean).join('\n');
 }
 

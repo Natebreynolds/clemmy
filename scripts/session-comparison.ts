@@ -47,6 +47,8 @@ export interface SessionMeasurement {
   discoveryOperations: number;
   schemaMetadataRefreshes: number;
   topLevelToolSearches: number;
+  /** Wall time spent inside top-level tool_search calls (call → return). */
+  toolSearchMs: number;
   composioSearchDispatches: number;
   perTool: Record<string, number>;
   usageRecords: number;
@@ -456,7 +458,25 @@ function measureRows(args: {
   ));
   const perTool: Record<string, number> = {};
   for (const event of canonicalCalls) increment(perTool, semanticToolName(event.data));
-  const topLevelToolSearches = canonicalCalls.filter((event) => semanticToolName(event.data) === 'tool_search').length;
+  const toolSearchCalls = canonicalCalls.filter((event) => semanticToolName(event.data) === 'tool_search');
+  const topLevelToolSearches = toolSearchCalls.length;
+  // A search's cost is the time the turn waited on it: from its call row to
+  // its return row, paired by call id. Unpaired calls count zero rather than
+  // guessing.
+  const returnByCallId = new Map<string, SessionEvent>();
+  for (const event of toolReturns) {
+    const callId = typeof event.data.callId === 'string' ? event.data.callId : '';
+    if (callId && !returnByCallId.has(callId)) returnByCallId.set(callId, event);
+  }
+  let toolSearchMs = 0;
+  for (const call of toolSearchCalls) {
+    const callId = typeof call.data.callId === 'string' ? call.data.callId : '';
+    const returned = callId ? returnByCallId.get(callId) : undefined;
+    if (!returned) continue;
+    const started = Date.parse(call.createdAt);
+    const finished = Date.parse(returned.createdAt);
+    if (Number.isFinite(started) && Number.isFinite(finished) && finished >= started) toolSearchMs += finished - started;
+  }
   const composioSearchDispatches = actualComposioSearchDispatches(canonicalCalls, mirrorCalls);
   const schemaMetadataRefreshes = events.filter((event) => event.type === 'warm_schema_metadata_refresh').length;
 
@@ -497,6 +517,7 @@ function measureRows(args: {
     discoveryOperations: topLevelToolSearches + composioSearchDispatches,
     schemaMetadataRefreshes,
     topLevelToolSearches,
+    toolSearchMs,
     composioSearchDispatches,
     perTool,
     usageRecords: usageEvents.length,
@@ -907,6 +928,7 @@ export function formatSessionComparison(comparison: SessionComparison): string {
     row('Transport mirror lifecycle events', b.transportMirrorEvents, c.transportMirrorEvents),
     row('Discovery operations', b.discoveryOperations, c.discoveryOperations),
     row('  top-level tool_search', b.topLevelToolSearches, c.topLevelToolSearches),
+    row('  time inside tool_search', b.toolSearchMs, c.toolSearchMs, duration),
     row('  composio_search dispatches', b.composioSearchDispatches, c.composioSearchDispatches),
     row('Provider schema metadata refreshes (non-business)', b.schemaMetadataRefreshes, c.schemaMetadataRefreshes),
     row('Usage records (agent runs + auxiliaries)', b.usageRecords, c.usageRecords),
@@ -963,6 +985,7 @@ export function formatAcceptedTurnComparison(comparison: AcceptedTurnComparison)
     row('Tool lifecycle events (call+return)', b.toolLifecycleEvents, c.toolLifecycleEvents),
     row('Discovery operations', b.discoveryOperations, c.discoveryOperations),
     row('  top-level tool_search', b.topLevelToolSearches, c.topLevelToolSearches),
+    row('  time inside tool_search', b.toolSearchMs, c.toolSearchMs, duration),
     row('  composio_search dispatches', b.composioSearchDispatches, c.composioSearchDispatches),
     row('Provider schema metadata refreshes (non-business)', b.schemaMetadataRefreshes, c.schemaMetadataRefreshes),
     row('Usage records (all attributed)', b.usageRecords, c.usageRecords),

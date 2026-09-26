@@ -42,6 +42,15 @@ export function turnModelName(
   return name ? name : undefined;
 }
 
+/** The saved agent this turn ran as, by the name the owner gave it. */
+export function turnAgentName(
+  activity: readonly Pick<ActivityItem, 'id' | 'agentName'>[] | undefined,
+): string | undefined {
+  const row = activity?.find((item) => item.id === MODEL_PHASE_ACTIVITY_ID);
+  const name = row?.agentName?.trim();
+  return name ? name : undefined;
+}
+
 /** The model behind the verdict that decided this turn (the latest one), when
  *  the harness named it. A turn with no reviewer has no reviewer name. */
 export function turnReviewerName(
@@ -100,7 +109,7 @@ function helperPhrase(helper: TurnHelper): string {
  *  Every model that produced the answer, in words, from the turn's own
  *  events. Empty when the turn named no model. */
 export function turnByline(
-  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'verdict' | 'modelName' | 'helperFor'>[] | undefined,
+  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'verdict' | 'modelName' | 'helperFor' | 'agentName'>[] | undefined,
 ): string {
   const worker = turnModelName(activity);
   const reviewer = turnReviewerName(activity);
@@ -111,7 +120,11 @@ export function turnByline(
     ...helpers,
   ];
   if (reviewer) parts.push(parts.length ? `${reviewer} ${verb} it` : `${reviewer} ${verb} the work`);
-  return parts.join(', ');
+  const byline = parts.join(', ');
+  // A turn inside a saved agent says so first: "Prospect Research Desk · Luna
+  // did the work, Jev checked it".
+  const agent = turnAgentName(activity);
+  return agent ? (byline ? `${agent} · ${byline}` : agent) : byline;
 }
 
 /** The open or answered "keep this model for this kind of work?" offer from

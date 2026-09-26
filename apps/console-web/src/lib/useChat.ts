@@ -340,6 +340,9 @@ export interface PendingChatPost {
   sessionId: string | null;
   attachments: string[];
   taskMode?: TaskMode;
+  /** The agent a brand-new session should start in. Part of the request
+   *  identity: a retry under a different agent is a different request. */
+  agentId?: string;
 }
 
 export class ChatPostCancelledError extends Error {
@@ -364,11 +367,16 @@ function throwIfChatPostCancelled(signal?: AbortSignal): void {
  * second model/tool run. */
 export function retainPendingChatPost(
   previous: PendingChatPost | null,
-  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode },
+  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode; agentId?: string },
   createId: () => string = createChatClientRequestId,
 ): PendingChatPost {
   const taskMode = snapshotTaskMode(payload.taskMode);
-  const fingerprint = JSON.stringify([payload.sessionId ?? '', payload.input, payload.attachments, ...(taskMode ? [taskMode] : [])]);
+  const agentId = payload.agentId || undefined;
+  const fingerprint = JSON.stringify([
+    payload.sessionId ?? '', payload.input, payload.attachments,
+    ...(taskMode ? [taskMode] : []),
+    ...(agentId ? [{ agentId }] : []),
+  ]);
   if (previous?.fingerprint === fingerprint) return previous;
   return {
     fingerprint,
@@ -377,6 +385,7 @@ export function retainPendingChatPost(
     sessionId: payload.sessionId,
     attachments: [...payload.attachments],
     ...(taskMode ? { taskMode } : {}),
+    ...(agentId ? { agentId } : {}),
   };
 }
 
@@ -386,6 +395,7 @@ export function loadPendingChatPost(storage: Pick<Storage, 'getItem'>, key: stri
     if (!row || typeof row.clientRequestId !== 'string' || !row.clientRequestId
       || typeof row.input !== 'string' || (row.sessionId !== null && typeof row.sessionId !== 'string')
       || !Array.isArray(row.attachments) || !row.attachments.every(id => typeof id === 'string')
+      || (row.agentId !== undefined && typeof row.agentId !== 'string')
       || (row.taskMode !== undefined && !readTaskMode(row.taskMode))) return null;
     const checked = retainPendingChatPost(null, row, () => row.clientRequestId);
     return checked.fingerprint === row.fingerprint ? checked : null;
@@ -452,6 +462,9 @@ export async function postPendingChatWithRetry(
         pending.attachments,
         pending.clientRequestId,
         pending.taskMode,
+        // Only a request that names an agent carries the extra argument, so a
+        // plain request keeps the exact transport call it always made.
+        ...(pending.agentId ? [pending.agentId] : []),
       );
       if (options.signal?.aborted) {
         try {
@@ -1569,7 +1582,7 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode }, retryRequest?: PendingChatPost) => {
+  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string }, retryRequest?: PendingChatPost) => {
     const taskMode = snapshotTaskMode(input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
     if (busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
@@ -1578,8 +1591,11 @@ export function useChat(options?: UseChatOptions) {
     const text = input.text.trim();
     const attachmentIds = input.attachmentIds ?? [];
     if (!text && attachmentIds.length === 0) return;
+    // An agent binds a session at creation only; once this chat has a session
+    // the field is dropped so a retry fingerprint never differs by it.
+    const agentId = sessionIdRef.current ? undefined : (input.agentId || undefined);
     if (!busy && pendingPostRef.current && !retryRequest) {
-      const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode });
+      const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode, agentId });
       if (candidate !== pendingPostRef.current) throw new Error('Retry or cancel the unconfirmed request before sending a different one.');
     }
     if (busy) {
@@ -1635,6 +1651,7 @@ export function useChat(options?: UseChatOptions) {
         sessionId: sessionIdRef.current,
         attachments: attachmentIds,
         ...(taskMode ? { taskMode } : {}),
+        ...(agentId ? { agentId } : {}),
       });
       retainPending(pending);
       const body = await postPendingChatWithRetry(pending, {

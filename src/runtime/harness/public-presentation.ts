@@ -921,10 +921,14 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       const model = publicModelIdentifier(data.model);
       const provider = publicToolIdentifier(data.provider);
       if (!model && !provider) return null;
+      // The saved agent the turn ran as is a name the owner chose; bounded,
+      // never an id or a path.
+      const agentName = typeof data.agentName === 'string' ? data.agentName.trim().slice(0, 64) : '';
       return {
         phase: 'model',
         ...(model ? { model } : {}),
         ...(provider ? { provider } : {}),
+        ...(agentName ? { agentName } : {}),
         fallover: data.fallover === true,
         preselected: data.preselected === true,
       };
@@ -1057,7 +1061,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'worker_started':
     case 'worker_result':
     case 'worker_capped':
-      return selected(data, ['item', 'role', 'model', 'provider', 'ok']);
+      return selected(data, ['item', 'role', 'agent', 'model', 'provider', 'ok']);
     case 'worker_model_offer': {
       // The offer carries its own answer, so a replay never shows an offer
       // the owner already answered.

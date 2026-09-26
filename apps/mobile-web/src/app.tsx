@@ -826,10 +826,9 @@ export function App() {
           ) : tab === 'agents' ? (
             <Agents
               onMessage={(agent) => {
-                // Messaging an agent is an ORDINARY chat turn. The agent's name
-                // opens the draft so the turn carries its standing context; no
-                // separate lane, no extra authority.
-                goToChat({ draft: `@${agent.name} ` });
+                // Messaging an agent opens a NEW conversation inside it: the
+                // agent is the working context every turn there starts from.
+                goToChat({ agentId: agent.id, agentName: agent.name });
               }}
             />
           ) : tab === 'workflows' ? <Workflows />

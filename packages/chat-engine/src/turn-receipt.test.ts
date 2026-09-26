@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { outsideWorkCards, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewerName } from './turn-receipt.js';
+import { outsideWorkCards, turnAgentName, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewerName } from './turn-receipt.js';
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readQuestionOptions } from './question-options.js';
 import { MODEL_PHASE_ACTIVITY_ID, reduceActivity } from './reduce-activity.js';
@@ -143,4 +143,14 @@ test('an offer to keep a model is carried to the receipt with the owner answer',
   const replayed = fold([{ ...offerEvent, data: { ...offerEvent.data, resolved: 'dismiss' } }]);
   assert.equal(turnModelOffer(replayed)?.resolved, 'dismiss');
   assert.equal(turnModelOffer(fold([])), null);
+});
+
+test('a turn inside a saved agent says so first on the receipt; an unbound turn reads as before', () => {
+  const routed = { type: 'turn_model_routed', data: { model: 'acme-flagship-5', provider: 'byo', agentName: 'Prospect Research Desk' } };
+  const bound = fold([routed]);
+  assert.equal(turnAgentName(bound), 'Prospect Research Desk');
+  assert.match(turnByline(bound), /^Prospect Research Desk · .+ did the work$/);
+  const plain = fold([{ type: 'turn_model_routed', data: { model: 'acme-flagship-5', provider: 'byo' } }]);
+  assert.equal(turnAgentName(plain), undefined);
+  assert.doesNotMatch(turnByline(plain), /·/);
 });

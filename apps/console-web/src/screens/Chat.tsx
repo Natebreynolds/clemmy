@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, X } from 'lucide-react';
@@ -8,7 +8,9 @@ import { decidePlanProposal, dismissInboxItem } from '@/lib/inbox';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import type { CommandCenter, CommandCenterItem } from '@/lib/types';
+import type { TaskMode } from '@/lib/task-mode';
 import { Composer } from '@/components/chat/Composer';
+import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '@/features/conversations/lib/chatColumn';
@@ -78,6 +80,10 @@ export function Chat() {
     }
   };
   const chat = useChat({ rememberAsLastSession: true });
+  // The agent this new conversation starts in. Held here until the first send
+  // mints the session; after that the binding lives on the server and the
+  // chip is a label.
+  const [agent, setAgent] = useState<{ id: string; name: string } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -91,11 +97,16 @@ export function Chat() {
 
   const needsYou = cc.data?.needsYou ?? [];
   const hasThread = chat.messages.length > 0;
+  const send = (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode }) =>
+    chat.send({ ...input, ...(agent ? { agentId: agent.id } : {}) });
+  const agentSlot = chat.sessionId.current
+    ? (agent ? <AgentPicker bound={agent.name} /> : undefined)
+    : <AgentPicker value={agent?.id ?? null} onChange={setAgent} />;
   const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
     const intent = chatDecisionIntent(message, decision);
     if (intent.kind === 'invalid-plan') throw new Error(intent.message);
     if (intent.kind === 'approval-reply') {
-      await chat.send({ text: intent.text });
+      await send({ text: intent.text });
       return;
     }
     await decidePlanProposal(intent.planProposalId, intent.decision);
@@ -129,6 +140,7 @@ export function Chat() {
     if (stamp && stamp !== lastNewChatRef.current) {
       lastNewChatRef.current = stamp;
       resetChat();
+      setAgent(null);
       // An explicit "New chat" releases the active-conversation pointer — the
       // index must not bounce straight back into the thread being left.
       rememberLastChatSession(null);
@@ -171,7 +183,7 @@ export function Chat() {
       <div className="flex h-full min-h-0 flex-col">
         <div className="min-h-0 flex-1" />
         <div className={CHAT_COMPOSER_WRAP}>
-          <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
+          <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} />
         </div>
       </div>
     );
@@ -188,6 +200,7 @@ export function Chat() {
             <ChatBubble
               key={m.id}
               message={m}
+              speaker={agent?.name}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -198,7 +211,7 @@ export function Chat() {
               onBackground={chat.background}
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.
-              onAnswer={index === chat.messages.length - 1 ? (text) => chat.send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
+              onAnswer={index === chat.messages.length - 1 ? (text) => send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />
           ))}
@@ -206,7 +219,7 @@ export function Chat() {
         </div>
       </div>
       <div className={CHAT_COMPOSER_WRAP}>
-        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} onBackground={chat.background} />
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} />
       </div>
     </div>
   );

@@ -652,3 +652,18 @@ test('explicit selection supplies only the selected offer to the volatile harnes
   assert.doesNotMatch(context, /UNSELECTED_OFFER_FIXTURE/);
   assert.doesNotMatch(renderHarnessMemoryContext({ sessionId, sourceUserSeq: event.seq, partition: 'stable' }), /SELECTED_SKILL_FIXTURE/);
 });
+
+test('agent instructions join the stable prefix before the cache boundary, never the volatile tail', async () => {
+  const { CACHE_BREAK_SENTINEL } = await import('../runtime/harness/model-wire-registry.js');
+  const rendered = harnessInstructions('STABLE RUBRIC', {
+    agentInstructions: '## Working as Prospect Research Desk\nCheck speed first.',
+    volatileInstructions: 'TURN AUTHORITY',
+  })();
+  const at = rendered.indexOf(CACHE_BREAK_SENTINEL);
+  assert.ok(at > 0, 'one boundary');
+  const stable = rendered.slice(0, at);
+  assert.match(stable, /STABLE RUBRIC/);
+  assert.match(stable, /Working as Prospect Research Desk/);
+  assert.doesNotMatch(stable, /TURN AUTHORITY/);
+  assert.equal(rendered.split(CACHE_BREAK_SENTINEL).length, 2, 'never a second sentinel');
+});

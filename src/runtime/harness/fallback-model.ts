@@ -29,6 +29,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import path from 'node:path';
 import { BoundaryError } from '../boundary-error.js';
 import { appendEvent } from './eventlog.js';
+import { sessionAgentFields } from './session-composition.js';
 import { classifyModelError } from './resilient-model.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { providerCapacityErrorText, isProviderExtraUsageUnavailable } from '../../shared/provider-capacity.js';
@@ -1255,6 +1256,7 @@ export class FallbackModel implements Model {
         data: {
           model: to.model ?? to.label,
           ...(to.provider ? { provider: to.provider } : {}),
+          ...sessionAgentFields(sessionId),
           transport: 'host_harness',
           routeKind: 'harness_fallover',
           fallover: true,

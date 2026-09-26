@@ -96,6 +96,12 @@ export const WorkerToolInputSchema = z.object({
     .nullable()
     .optional()
     .describe('Model the user named; null uses routing.'),
+  agent: z
+    .string()
+    .min(1)
+    .nullable()
+    .optional()
+    .describe('Saved agent to run as (its name); null for none.'),
   workManifest: WorkerManifestDescriptorSchema
     .nullable()
     .optional()
@@ -345,6 +351,9 @@ export function workerPacketKey(input: WorkerToolInput): string {
     // discriminator; null/[] are intentionally equivalent local-only leases.
     ...(input.externalMcpToolNames === undefined ? [] : [externalMcpLeaseKey]),
     ...(input.retainedResultIds?.length ? [`retained-results:${JSON.stringify([...new Set(input.retainedResultIds)].sort())}`] : []),
+    // Running as a saved agent changes the work; a packet without one keeps
+    // its historical key.
+    ...(input.agent ? [`agent:${input.agent}`] : []),
     input.context,
     input.instructions,
     input.expectedOutput,

@@ -54,6 +54,8 @@ export interface SessionListQuery {
   q?: string;
   tag?: string;
   source?: string;
+  /** Only conversations opened in this saved agent. */
+  agent?: string;
   includeArchived?: boolean;
   limit?: number;
 }
@@ -173,7 +175,15 @@ function summarizeDesktop(record: SessionRecord): UnifiedSessionSummary {
     archived: Boolean(record.archived),
     continuable: true,
     turnCount: publicDesktopTurns(record).length,
+    agentId: null,
+    agentName: null,
   };
+}
+
+function metaAgent(meta: Record<string, unknown> | undefined): { agentId: string | null; agentName: string | null } {
+  const agentId = typeof meta?.agentId === 'string' && meta.agentId.trim() ? meta.agentId.trim() : null;
+  const agentName = agentId && typeof meta?.agentName === 'string' && meta.agentName.trim() ? meta.agentName.trim() : null;
+  return { agentId, agentName };
 }
 
 function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): UnifiedSessionSummary {
@@ -195,6 +205,7 @@ function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): Unifi
     // unguarded and can re-fire tools — see plan).
     continuable: row.kind === 'chat',
     turnCount: 0,
+    ...metaAgent(row.metadata),
   };
 }
 
@@ -607,11 +618,17 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
 
 // ─── Public API ──────────────────────────────────────────────────────────
 
+/** Conversations opened in one saved agent, newest first. */
+export function listSessionsForAgent(agentId: string, limit = 20): UnifiedRunSummary[] {
+  return buildUnifiedSessionList({ agent: agentId, limit });
+}
+
 export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRunSummary[] {
   const store = new SessionStore();
   const q = query.q?.trim().toLowerCase() ?? '';
   const tag = query.tag?.trim() ?? '';
   const source = query.source?.trim() ?? '';
+  const agent = query.agent?.trim() ?? '';
   const includeArchived = Boolean(query.includeArchived);
   const limit = Math.max(1, Math.min(500, Math.trunc(query.limit ?? 100)));
   const harnessCollection = collectHarnessSummaries();
@@ -635,6 +652,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRu
 
   if (!includeArchived) all = all.filter((s) => !s.archived);
   if (source) all = all.filter((s) => s.origin === source);
+  if (agent) all = all.filter((s) => s.agentId === agent);
   if (tag) all = all.filter((s) => s.tags.includes(tag));
   if (q) {
     all = all.filter((s) => {

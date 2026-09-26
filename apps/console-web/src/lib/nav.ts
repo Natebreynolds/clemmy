@@ -44,7 +44,7 @@ export const PRIMARY_NAV: NavDest[] = [
   { path: '/memory', label: 'Memory', icon: Brain, hint: 'What Clementine knows about you' },
   { path: '/meetings', label: 'Meetings', icon: Video, hint: 'Recorded meetings & summaries' },
   { path: '/goals', label: 'Goals', icon: Goal, hint: 'Long-running outcomes and self-drive' },
-  { path: '/agents', label: 'Agents', icon: Users, hint: 'Your specialized team & how they talk' },
+  { path: '/agents', label: 'Agents', icon: Users, hint: 'Specialized agents you work in' },
 ];
 
 /**

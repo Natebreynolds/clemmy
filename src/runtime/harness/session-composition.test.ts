@@ -208,3 +208,31 @@ test('applySessionMountPrimers writes the workspace primer onto the Codex snapsh
   });
   assert.equal(primers.length, 1, 'primer replace is idempotent by prefix');
 });
+
+test('a chat opened in a saved agent mounts its context and the tools its pins need; nothing else changes', async () => {
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const created = createAgentRecord({
+    name: 'Prospect Research Desk',
+    handles: 'Research on new prospects.',
+    instructions: 'Check speed first.',
+    workflows: ['prospect-batch'],
+  });
+  assert.equal(created.ok, true);
+  const mount = composeSession({
+    sessionId: 'sess-desktop-agent1',
+    sessionKind: 'chat',
+    metadata: { source: 'desktop', agentId: 'prospect-research-desk', agentName: 'Prospect Research Desk' },
+  });
+  assert.equal(mount.kind, 'chat', 'an agent session stays an ordinary chat');
+  assert.equal(mount.agent?.agent.id, 'prospect-research-desk');
+  assert.match(mount.agent?.context ?? '', /Check speed first/);
+  assert.deepEqual([...mount.hotTools], ['workflow_get', 'workflow_run'], 'pinned workflows keep their tools first-class');
+  assert.deepEqual([...mount.primers], [], 'the context goes to the system prefix, not a primer');
+
+  const unbound = composeSession({ sessionId: 'sess-desktop-plain', sessionKind: 'chat', metadata: { source: 'desktop' } });
+  assert.equal(unbound.agent, null);
+  assert.deepEqual([...unbound.hotTools], []);
+
+  const unknown = composeSession({ sessionId: 'sess-desktop-gone', sessionKind: 'chat', metadata: { agentId: 'deleted-desk' } });
+  assert.equal(unknown.agent, null, 'a deleted agent leaves an ordinary chat, never a broken one');
+});

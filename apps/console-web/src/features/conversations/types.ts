@@ -18,6 +18,9 @@ export interface Session {
   archived: boolean;
   continuable: boolean;
   turnCount: number;
+  /** The agent this conversation works inside, when it was started in one. */
+  agentId?: string | null;
+  agentName?: string | null;
   /** Exact step sessions supplied by the backend for a collapsed run. */
   runSteps?: RunStep[];
   runCoverage?: RunSourceCoverage;
@@ -66,6 +69,8 @@ export interface SessionFilters {
   q?: string;
   tag?: string;
   source?: string;
+  /** Only conversations bound to this agent id. */
+  agent?: string;
   includeArchived?: boolean;
   /** Rows to ask the server for. Runs share the page with chats now, so the
    *  route's default of 100 would let a busy morning of workflow runs push

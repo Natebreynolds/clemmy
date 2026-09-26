@@ -148,6 +148,7 @@ import {
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
+import { resolveAgentBinding } from '../agents/agent-binding.js';
 import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import {
@@ -242,10 +243,12 @@ function mobileChatDigest(deviceId: string, idempotencyKey: string): string {
     .digest('hex');
 }
 
-function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode): string {
+function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode, agentId?: string): string {
   if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: message, taskMode });
+  // A request opened inside a saved agent is a different request; one that
+  // named none keeps its historical hash.
   return createHash('sha256')
-    .update(JSON.stringify({ message, requestedSessionId, ...taskModeFields(taskMode) }))
+    .update(JSON.stringify({ message, requestedSessionId, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}) }))
     .digest('hex');
 }
 
@@ -330,13 +333,18 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
   status: HarnessSessionRow['status'];
   createdAt: number;
   updatedAt: number;
+  agentId: string | null;
+  agentName: string | null;
 } {
   const title = session.title?.trim()
     || (session.objective ? session.objective.slice(0, 80) : '')
     || (session.channel === 'discord' ? 'Discord conversation' : 'Clementine session');
+  const agentId = typeof session.metadata?.agentId === 'string' ? session.metadata.agentId : null;
   return {
     id: session.id,
     title,
+    agentId,
+    agentName: agentId && typeof session.metadata?.agentName === 'string' ? session.metadata.agentName : null,
     kind: session.kind,
     channel: session.channel,
     status: session.status,
@@ -3852,7 +3860,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       ? req.body.sessionId.trim()
       : null;
     const proposedSessionId = requestedSessionId ?? `sess-mob-${digest.slice(0, 32)}`;
-    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode);
+    // Opening a new conversation inside a saved agent. Unknown is refused by
+    // name; an existing conversation keeps the agent it was opened in.
+    const requestedAgentId = typeof req.body?.agentId === 'string' ? req.body.agentId.trim() : '';
+    const requestedAgent = requestedAgentId ? resolveAgentBinding(requestedAgentId) : null;
+    if (requestedAgentId && !requestedAgent) { res.status(400).json({ error: 'AGENT_NOT_FOUND' }); return; }
+    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode, requestedAgent?.agent.id);
     if (taskMode?.kind === 'execute' && !requestedSessionId) {
       res.status(400).json({ error: 'PLAN_CONVERSATION_REQUIRED' });
       return;
@@ -4018,6 +4031,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             userId: ctx.record.deviceId,
             ...(spaceSlug ? { spaceSlug } : {}),
             ...(validatedMount ? { __session_mount: validatedMount } : {}),
+            ...(requestedAgent ? { agentId: requestedAgent.agent.id, agentName: requestedAgent.agent.name } : {}),
           },
         });
       }
@@ -5564,16 +5578,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
-  // NAMED AGENTS — a person's own standing helpers. Reads and edits only; a
-  // message to an agent is an ordinary chat turn (see /api/chat), so nothing
-  // here grants authority a plain turn would not have.
+  // AGENTS — the same records the desktop Agents page edits. Reads and edits
+  // only; a message inside an agent is an ordinary chat turn (see /api/chat),
+  // so nothing here grants authority a plain turn would not have.
   router.get('/api/agents', requireMobileSession, async (_req, res) => {
     try {
-      const { listAgents } = await import('../memory/agent-store.js');
+      const { listAgentRecords } = await import('../agents/agent-record.js');
       const { listSkills } = await import('../memory/skill-store.js');
       const { listWorkflows } = await import('../memory/workflow-store.js');
       res.json({
-        agents: listAgents(),
+        agents: listAgentRecords(),
         // The pinnable inventory travels with the list so the phone can build
         // an agent without a second round trip on a slow connection.
         available: {
@@ -5588,14 +5602,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/agents', requireMobileSession, async (req, res) => {
     try {
-      const { createAgent } = await import('../memory/agent-store.js');
+      const { createAgentRecord } = await import('../agents/agent-record.js');
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const created = createAgent({
+      const created = createAgentRecord({
         name: String(body.name ?? ''),
-        description: typeof body.description === 'string' ? body.description : '',
+        handles: typeof body.handles === 'string' ? body.handles : '',
+        instructions: typeof body.instructions === 'string' ? body.instructions : '',
         skills: Array.isArray(body.skills) ? body.skills as string[] : [],
         workflows: Array.isArray(body.workflows) ? body.workflows as string[] : [],
         model: typeof body.model === 'string' ? body.model : null,
+        createdFrom: 'phone',
       });
       if (!created.ok) {
         res.status(created.reason === 'name_taken' ? 409 : 400).json({ error: created.reason });
@@ -5609,11 +5625,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/agents/:id', requireMobileSession, async (req, res) => {
     try {
-      const { updateAgent } = await import('../memory/agent-store.js');
+      const { updateAgentRecord } = await import('../agents/agent-record.js');
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const updated = updateAgent(String(req.params.id ?? ''), {
+      const updated = updateAgentRecord(String(req.params.id ?? ''), {
         ...(typeof body.name === 'string' ? { name: body.name } : {}),
-        ...(typeof body.description === 'string' ? { description: body.description } : {}),
+        ...(typeof body.handles === 'string' ? { handles: body.handles } : {}),
+        ...(typeof body.instructions === 'string' ? { instructions: body.instructions } : {}),
         ...(Array.isArray(body.skills) ? { skills: body.skills as string[] } : {}),
         ...(Array.isArray(body.workflows) ? { workflows: body.workflows as string[] } : {}),
         ...(body.model === null || typeof body.model === 'string' ? { model: body.model as string | null } : {}),
@@ -5630,8 +5647,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/agents/:id/delete', requireMobileSession, async (req, res) => {
     try {
-      const { deleteAgent } = await import('../memory/agent-store.js');
-      res.json({ deleted: deleteAgent(String(req.params.id ?? '')) });
+      const { deleteAgentRecord } = await import('../agents/agent-record.js');
+      res.json({ deleted: deleteAgentRecord(String(req.params.id ?? '')) });
     } catch (error) {
       res.status(500).json({ error: String((error as Error)?.message ?? error) });
     }

@@ -330,6 +330,7 @@ function recordFromProposal(proposal: AgentProposal, overrides: Partial<Proposed
   const personality = (agent.personality?.trim()
     || `You are ${agent.name}. ${agent.description}`).trim();
 
+  const now = new Date().toISOString();
   return {
     slug: slugifyAgentName(agent.name),
     name: agent.name.trim(),
@@ -341,11 +342,15 @@ function recordFromProposal(proposal: AgentProposal, overrides: Partial<Proposed
     workflows: cleanList(agent.workflows),
     model: agent.model?.trim() || undefined,
     project: agent.project?.trim() || undefined,
-    tier: 2,
-    autonomyEnabled: agent.autonomyEnabled ?? true,
-    proactive: agent.proactive ?? true,
-    cadenceMinutes: agent.cadenceMinutes !== undefined ? Math.max(5, agent.cadenceMinutes) : 30,
-    wakeTriggers: ['inbox', 'delegation', 'request', 'stale_tasks', 'daily_review'],
+    memoryScope: proposal.memoryScope?.trim() || undefined,
+    // A draft that did not ask to wake does not wake. Only what the proposal
+    // said is written down.
+    autonomyEnabled: agent.autonomyEnabled,
+    proactive: agent.proactive,
+    cadenceMinutes: agent.cadenceMinutes !== undefined ? Math.max(5, agent.cadenceMinutes) : undefined,
+    createdFrom: 'chat',
+    createdAt: now,
+    updatedAt: now,
     personality: `${personality}${memoryLine}${approvalLine}${evalLines}`.trim(),
   };
 }

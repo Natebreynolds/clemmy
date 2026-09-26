@@ -160,6 +160,9 @@ export interface UnifiedSessionSummary {
   /** True when the desktop can send a new turn into this session. */
   continuable: boolean;
   turnCount: number;
+  /** The saved agent this conversation was opened in, when it was. */
+  agentId: string | null;
+  agentName: string | null;
 }
 
 /** A single normalized turn for rendering a conversation's history. */

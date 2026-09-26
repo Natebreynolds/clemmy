@@ -12,6 +12,7 @@ export function buildSessionsQuery(f: SessionFilters): string {
   if (f.q) params.set('q', f.q);
   if (f.tag) params.set('tag', f.tag);
   if (f.source) params.set('source', f.source);
+  if (f.agent) params.set('agent', f.agent);
   if (f.includeArchived) params.set('includeArchived', '1');
   if (f.limit) params.set('limit', String(f.limit));
   const qs = params.toString();

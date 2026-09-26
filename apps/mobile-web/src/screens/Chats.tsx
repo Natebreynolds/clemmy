@@ -16,6 +16,9 @@ export interface ChatHandoff {
   /** Open the most recent conversation once the list has loaded (the
    *  "last conversation" launch preference). */
   openLatest?: boolean;
+  /** Start a NEW conversation inside this saved agent. */
+  agentId?: string;
+  agentName?: string;
 }
 
 interface Props {
@@ -37,7 +40,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
     setSelectedTitle(undefined);
   };
   useBackGesture(selectedId !== null, closeSelected);
-  const [composing, setComposing] = useState<{ draft?: string; autoSend?: boolean } | null>(null);
+  const [composing, setComposing] = useState<{ draft?: string; autoSend?: boolean; agentId?: string; agentName?: string } | null>(null);
   const [pendingLatest, setPendingLatest] = useState(false);
   // The list keeps polling and wake-refreshing only while it is the visible
   // surface — an open thread owns its own stream.
@@ -78,12 +81,20 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
       setSelectedDraft(handoff.draft);
     }
     else if (handoff.openLatest) setPendingLatest(true);
-    else setComposing({ draft: handoff.draft, autoSend: handoff.autoSend });
+    else setComposing({ draft: handoff.draft, autoSend: handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName });
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
 
   if (composing) {
-    return <Chat initialDraft={composing.draft} initialAutoSend={composing.autoSend} onBack={() => { setComposing(null); void refresh(); }} />;
+    return (
+      <Chat
+        initialDraft={composing.draft}
+        initialAutoSend={composing.autoSend}
+        agentId={composing.agentId}
+        agentName={composing.agentName}
+        onBack={() => { setComposing(null); void refresh(); }}
+      />
+    );
   }
 
   if (selectedId) {
@@ -93,6 +104,8 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
         sessionId={selectedId}
         initialTitle={selectedTitle ?? session?.title ?? ''}
         initialDraft={selectedDraft}
+        agentId={session?.agentId ?? undefined}
+        agentName={session?.agentName ?? undefined}
         onBack={() => { closeSelected(); void refresh(); }}
       />
     );
@@ -129,6 +142,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
           }}>
             <div class="min-w-0">
               <div class="card-title-sm truncate">{session.title || 'Untitled'}</div>
+              {session.agentName ? <span class="chip chip-agent">{session.agentName}</span> : null}
               {/* Nearly every conversation is "active" (not terminal), so
                   that word is noise on a list. Only a terminal state earns a
                   word and a dot; an ordinary conversation shows when it was

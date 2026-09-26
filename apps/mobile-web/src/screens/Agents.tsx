@@ -73,7 +73,7 @@ export function Agents({ onMessage }: { onMessage: (agent: MobileAgent) => void 
               onClick={() => { haptic('light'); onMessage(agent); }}
             >
               <span class="agent-name">{agent.name}</span>
-              {agent.description ? <span class="agent-desc">{agent.description}</span> : null}
+              {agent.handles ? <span class="agent-desc">{agent.handles}</span> : null}
               <span class="agent-pins">
                 {agent.skills.length > 0 ? <span>{agent.skills.length} skills</span> : null}
                 {agent.workflows.length > 0 ? <span>{agent.workflows.length} workflows</span> : null}
@@ -101,7 +101,8 @@ function AgentEditor({ agent, available, onClose }: {
   onClose: () => void;
 }) {
   const [name, setName] = useState(agent?.name ?? '');
-  const [description, setDescription] = useState(agent?.description ?? '');
+  const [handles, setHandles] = useState(agent?.handles ?? '');
+  const [instructions, setInstructions] = useState(agent?.instructions ?? '');
   const [skills, setSkills] = useState<string[]>(agent?.skills ?? []);
   const [workflows, setWorkflows] = useState<string[]>(agent?.workflows ?? []);
   const [busy, setBusy] = useState(false);
@@ -118,9 +119,9 @@ function AgentEditor({ agent, available, onClose }: {
     setFailure(null);
     try {
       if (agent) {
-        await updateAgent(agent.id, { name, description, skills, workflows });
+        await updateAgent(agent.id, { name, handles, instructions, skills, workflows });
       } else {
-        await createAgent({ name, description, skills, workflows });
+        await createAgent({ name, handles, instructions, skills, workflows });
       }
       haptic('light');
       onClose();
@@ -163,11 +164,22 @@ function AgentEditor({ agent, available, onClose }: {
       <label class="agent-field">
         <span>What it handles</span>
         <textarea
-          value={description}
-          rows={3}
+          value={handles}
+          rows={2}
           maxLength={500}
           placeholder="Pipeline questions and renewal prep."
-          onInput={(event) => setDescription((event.target as HTMLTextAreaElement).value)}
+          onInput={(event) => setHandles((event.target as HTMLTextAreaElement).value)}
+        />
+      </label>
+
+      <label class="agent-field">
+        <span>Standing instructions</span>
+        <textarea
+          value={instructions}
+          rows={4}
+          maxLength={20000}
+          placeholder="Check the pipeline sheet before answering. Flag any renewal inside 30 days."
+          onInput={(event) => setInstructions((event.target as HTMLTextAreaElement).value)}
         />
       </label>
 
