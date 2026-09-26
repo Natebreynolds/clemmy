@@ -1,9 +1,11 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../../config.js';
 import { withFileLockSync } from '../atomic-json.js';
+import { withModelUsageAttribution } from '../usage-log.js';
 import { INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 
 /**
@@ -342,20 +344,33 @@ export async function measurePromptLayout(input: PromptLayoutProbeInput): Promis
 
 const inFlight = new Set<string>();
 
+/** Captured at load, before any request exists. A measurement belongs to no
+ *  turn: it must not inherit the triggering request's run context or have its
+ *  spend recorded as that turn's work. */
+const outsideAnyRequest = AsyncLocalStorage.snapshot();
+
+/** Usage lane that identifies measurement spend in the usage log. */
+export const PROMPT_LAYOUT_PROBE_CHANNEL = 'prompt-layout-probe';
+
 /** Measure in the background when due; the current request never waits. */
 export function schedulePromptLayoutProbe(input: PromptLayoutProbeInput): void {
   const key = promptLayoutKey(input.baseURL, input.model);
   if (inFlight.has(key) || !promptLayoutProbeDue(input.baseURL, input.model)) return;
   inFlight.add(key);
-  void (async () => {
-    try {
-      const verdict = await measurePromptLayout(input);
-      recordPromptLayoutVerdict(input.baseURL, input.model, verdict);
-      logger.info({ baseURL: input.baseURL, model: input.model, ...verdict }, 'measured prompt layout');
-    } catch { /* measurement is additive; the system layout stays in use */ } finally {
-      inFlight.delete(key);
-    }
-  })();
+  outsideAnyRequest(() => withModelUsageAttribution(
+    { sessionId: PROMPT_LAYOUT_PROBE_CHANNEL, sourceUserSeq: 0, channel: PROMPT_LAYOUT_PROBE_CHANNEL },
+    () => {
+      void (async () => {
+        try {
+          const verdict = await measurePromptLayout(input);
+          recordPromptLayoutVerdict(input.baseURL, input.model, verdict);
+          logger.info({ baseURL: input.baseURL, model: input.model, ...verdict }, 'measured prompt layout');
+        } catch { /* measurement is additive; the system layout stays in use */ } finally {
+          inFlight.delete(key);
+        }
+      })();
+    },
+  ));
 }
 
 export function _resetPromptLayoutForTest(): void {
