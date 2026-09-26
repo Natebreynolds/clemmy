@@ -2,7 +2,7 @@
  * revised text must pass the normal source/effect/independent completion review. */
 export function responseFormatRepairPacket(input: {
   done: boolean; failedOpen?: boolean; awaitingUser?: boolean; blocked?: boolean;
-  repairScope?: 'reply_format'; plan: boolean; objective: string; reply: string; reason: string;
+  repairScope?: 'reply_format' | 'claims'; plan: boolean; objective: string; reply: string; reason: string;
 }): { instructions: string; text: string } | null {
   if (input.done || input.failedOpen || input.awaitingUser || input.blocked || input.plan
     || input.repairScope !== 'reply_format') return null;

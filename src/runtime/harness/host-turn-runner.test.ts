@@ -9682,6 +9682,10 @@ test('production host retains completion feedback in request projection without 
     const second = JSON.stringify(model.requests[1]);
     assert.match(second, /RETAINED COMPLETION REVIEW/, 'the negative verdict reached the next model request');
     assert.match(second, /nothing was posted/);
+    // Live 2026-09-25: three rounds each found a new nit, and rewrites added
+    // errors. The model fixes the listed items and nothing else.
+    assert.match(second, /Fix every numbered item the review lists in this one revision, and change nothing else/);
+    assert.match(second, /Recompute a figure from the retained results/);
     assert.equal(JSON.stringify(outcome.history).includes('RETAINED COMPLETION REVIEW'), false, 'review feedback does not alter accepted-batch history');
     assert.doesNotMatch(JSON.stringify(outcome.history), /Done: posted the summary/, 'the rejected draft is never an uncheckpointed canonical edge');
     assert.match(second, /Done: posted the summary/, 'the model still receives its exact rejected draft');

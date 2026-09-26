@@ -810,6 +810,18 @@ test('parseCompletionVerdict: DONE marker → done:true + reason', () => {
   assert.match(v!.reason, /Q3\.xlsx/);
 });
 
+// Live 2026-09-25: each review named one problem, so three rounds each found
+// a new nit and the answer ended blocked. One verdict names them all, and a
+// claims-only verdict says the work itself is there.
+test('parseCompletionVerdict: CORRECT lists every claim to fix, as a claims-only repair; long lists survive', () => {
+  const items = Array.from({ length: 14 }, (_, i) => `(${i + 1}) "figure ${i}" — the results show ${i * 3}`).join('; ');
+  const v = parseCompletionVerdict(`CORRECT: ${items}`);
+  assert.deepEqual(v, { done: false, repairScope: 'claims', reason: items });
+  assert.ok(items.length > 400, 'longer than the old one-sentence bound');
+  assert.match(JUDGE_SYSTEM_PROMPT, /ONE PASS, EVERY FINDING/);
+  assert.match(JUDGE_SYSTEM_PROMPT, /"CORRECT: <every contradicted or unsupported claim, numbered/);
+});
+
 test('parseCompletionVerdict: INCOMPLETE marker → done:false + missing evidence', () => {
   const v = parseCompletionVerdict('INCOMPLETE: Assistant proposed steps but no artifact or URL was produced');
   assert.equal(v?.done, false);
@@ -844,9 +856,9 @@ test('parseCompletionVerdict: no marker → null (caller applies its own fail se
 });
 
 test('parseCompletionVerdict: reason clamped in code, never validated', () => {
-  const v = parseCompletionVerdict(`DONE: ${'z'.repeat(900)}`);
+  const v = parseCompletionVerdict(`DONE: ${'z'.repeat(2_000)}`);
   assert.equal(v?.done, true);
-  assert.equal(v!.reason.length, 400);
+  assert.equal(v!.reason.length, 1_600, 'a numbered list of findings fits; the bound is a list\'s');
 });
 
 // ─── Per-criterion checklist verdict parsing (goal-contract granularity) ───

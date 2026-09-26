@@ -919,6 +919,21 @@ function acceptedSourceHasZeroExternalEffectSurface(
 }
 
 
+/** The reviewer's findings for the owner: every numbered item when it fits,
+ *  cut only between items or sentences, never mid-word. Live 2026-09-25: the
+ *  note stopped mid-sentence at a fixed 240 characters. */
+function reviewFindingForOwner(reason: string, max = 900): string {
+  const text = reason.replace(/\s+/g, ' ').trim();
+  if (text.length <= max) return text;
+  const head = text.slice(0, max);
+  // Before the next numbered item, or just after a sentence's full stop.
+  const beforeItem = head.lastIndexOf('; (');
+  const afterSentence = head.lastIndexOf('. ') + 1;
+  const cut = Math.max(beforeItem, afterSentence);
+  const kept = cut > max / 3 ? head.slice(0, cut) : head.slice(0, head.lastIndexOf(' '));
+  return `${kept.trimEnd()} …`;
+}
+
 function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
   switch (outcome.status) {
     case 'needs_input': {
@@ -1481,9 +1496,7 @@ export function commitTurnOutcome(
         + 'or choose a reachable review model in your model settings.',
       completion_review_negative:
         'Verification note: the completion review did not accept this write-up. '
-        + (publishedVerdict?.reason
-          ? `${publishedVerdict.reason.replace(/\s+/g, ' ').trim().slice(0, 240)} `
-          : '')
+        + (publishedVerdict?.reason ? `${reviewFindingForOwner(publishedVerdict.reason)} ` : '')
         + 'The tool receipts from this request are still retained; I can re-read those next.',
       completion_review_evidence_unreadable:
         'Verification note: I could not read the record of what this request wrote, so I '

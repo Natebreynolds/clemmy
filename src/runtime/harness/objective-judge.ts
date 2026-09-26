@@ -33,6 +33,9 @@ import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
  * it. Below Jev's measured miss latency on this machine, above its hit median. */
 export const JEV_HEDGE_DELAY_MS = 1_000;
 
+/** A verdict names every finding at once, numbered; this bounds that list. */
+const VERDICT_REASON_MAX_CHARS = 1_600;
+
 export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
@@ -52,6 +55,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- Quantity language such as "up to N", "at most N", "no more than N", and "maximum N" is a CEILING, not a minimum. Zero through N verified results satisfies that quantity. Never reinterpret an upper bound as a quota.',
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
   '- WOULD ANOTHER ATTEMPT HELP? When the objective is not met, decide whether the assistant could still meet it by trying again with the tools it has. If it could (it missed items, chose the wrong scope, made a claim it can correct, or stopped without trying), the verdict is INCOMPLETE. If it could not, because the evidence shows what stands in the way (a tool, provider or connection failing, a call refused before it ran, missing access, data that does not exist), the verdict is BLOCKED, even when the response misstates the cause. A BLOCKED reason is read by the owner: one plain sentence saying what did not happen and what stands in the way, without tool or internal names.',
+  '- ONE PASS, EVERY FINDING: when the objective is not met, name every missing item and every claim the evidence contradicts or does not support in this one verdict, numbered (1), (2)…, quoting the words at issue. The assistant fixes them all in one revision; reporting only the first problem you find makes it rewrite again and again, and each rewrite can add new errors.',
   '- Audit ONLY the deliverables the objective actually names. Do NOT invent extra deliverables (an "audit artifact", a "decision document", a saved file) that the user never asked for — demanding unnamed artifacts trains the assistant to write filler evidence files instead of doing work.',
   '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
   '- AWAITING THE USER: if the response asks the user a genuine direction or authorization question — which option to take, whether to proceed with an external action (sending, posting, deleting), or scope the objective left open — that question IS this turn\'s deliverable. The assistant must NOT take consequential external actions without the user\'s go-ahead, so demanding it "finish" instead of asking would be wrong. This includes an honest partial-progress report that pauses for the user\'s decision.',
@@ -59,7 +63,8 @@ export const JUDGE_SYSTEM_PROMPT = [
   'Reply with EXACTLY ONE LINE and nothing else, one of:',
   '  "DONE: <one short sentence naming the artifact/URL/result that satisfied the objective>";',
   '  "AWAITING: <one short sentence naming the decision the user was asked to make>";',
-  '  "INCOMPLETE: <one short sentence naming the missing evidence>";',
+  '  "INCOMPLETE: <every missing deliverable or evidence gap, numbered (1), (2)…>";',
+  '  "CORRECT: <every contradicted or unsupported claim, numbered (1), (2)…, each quoting the words at issue and what the evidence shows>" ONLY when all requested work is present and what remains is specific claims to correct or remove;',
   '  "REVISE_REPLY: <exact formatting or extraneous-wording correction>" ONLY when all requested work and factual claims are verified and the sole remaining defect is final-answer format or extra wording. Missing evidence, factual corrections, artifact edits, actions, or genuine user decisions must never use REVISE_REPLY;',
   '  "BLOCKED: <one plain sentence for the owner: what did not happen and what stands in the way>".',
   '',
@@ -69,6 +74,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '  AWAITING: Assistant asked whether to send the 55 prepared emails now or review them first',
   '  INCOMPLETE: Assistant proposed steps but did not produce the deliverable the objective named',
   '  INCOMPLETE: Two of three deliverables remain — emails drafted but no send confirmation evidence',
+  '  CORRECT: (1) "revenue grew 40%" — the report shows 14%; (2) "all three offices confirmed" — only two replies were retrieved',
   '  BLOCKED: The invite was not changed because the update was refused before it reached the calendar.',
 ].join('\n');
 
@@ -88,7 +94,7 @@ export const JUDGE_SYSTEM_PROMPT = [
 export interface ObjectiveJudgeVerdict {
   done: boolean;
   reason: string;
-  repairScope?: 'reply_format';
+  repairScope?: 'reply_format' | 'claims';
   /**
    * Verification PROVENANCE (Move 4 — defeat silent success). Callers surface
    * these so a "done" the user trusts is distinguishable from an ASSUMED done:
@@ -680,18 +686,22 @@ export type ObjectiveJudgeFn = (
 // nothing left to reject a valid verdict on presentation. Returns null on no marker
 // so each caller applies its OWN fail semantics (strict throws → not-passed; the
 // interactive judge fails open → done:true), preserving both directions unchanged.
-export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' } | null {
+export function parseCompletionVerdict(finalOutput: unknown): { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' | 'claims' } | null {
   if (isRecord(finalOutput)) return parseCompletionObject(finalOutput);
   const raw = String(finalOutput ?? '').trim();
-  const match = /^\s*(DONE|AWAITING|INCOMPLETE|BLOCKED|REVISE_REPLY|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
+  const match = /^\s*(DONE|AWAITING|INCOMPLETE|CORRECT|BLOCKED|REVISE_REPLY|NOT[- ]?DONE)\b(?:\s*[:\-]\s*|\s+)?(.*)$/im.exec(raw);
   if (match) {
     const marker = match[1].toUpperCase();
-    const reason = (match[2] || '').trim().slice(0, 400);
+    // Every finding in one verdict (numbered), so the bound is a list's, not
+    // a sentence's.
+    const reason = (match[2] || '').trim().slice(0, VERDICT_REASON_MAX_CHARS);
     // AWAITING = the deliverable is a question to the user. Done for bounce
     // purposes (never scold-continue past it); the caller yields awaiting-user.
     if (marker === 'AWAITING') return { done: true, awaitingUser: true, reason };
     // BLOCKED = not done, and trying again cannot change it: no re-run.
     if (marker === 'REVISE_REPLY') return { done: false, repairScope: 'reply_format', reason };
+    // CORRECT = the work is all there; named claims need fixing or removing.
+    if (marker === 'CORRECT') return { done: false, repairScope: 'claims', reason };
     if (marker === 'BLOCKED') return { done: false, blocked: true, reason };
     return { done: marker === 'DONE', reason };
   }
@@ -726,7 +736,7 @@ function parseCompletionObject(obj: Record<string, unknown>): { done: boolean; r
   if (done === null) return null;
   const rawReason = obj.reason ?? obj.rationale ?? obj.explanation ?? obj.missing ?? obj.evidence ?? obj.summary;
   const reason = typeof rawReason === 'string' && rawReason.trim()
-    ? rawReason.trim().slice(0, 400)
+    ? rawReason.trim().slice(0, VERDICT_REASON_MAX_CHARS)
     : done ? 'objective satisfied' : 'objective missing required evidence';
   return { done, reason };
 }
@@ -951,7 +961,7 @@ export async function runRoutedJudgeAttempt<T>(
 
 interface CompletionJudgeRun {
   /** Parsed verdict from the first attempt to answer, or null. */
-  verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' } | null;
+  verdict: { done: boolean; reason: string; awaitingUser?: boolean; blocked?: boolean; repairScope?: 'reply_format' | 'claims' } | null;
   /** null-verdict cause for metrics/fail semantics: pure deadline miss vs
    *  parse failure vs transport error. */
   failure: 'timeout' | 'invalid' | 'error' | null;

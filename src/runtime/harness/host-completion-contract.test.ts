@@ -1051,6 +1051,24 @@ test('a blocked finding replaces the rejected draft; a plain negative keeps the 
   }
 });
 
+// Live 2026-09-25: the note stopped mid-sentence at a fixed 240 characters.
+test('a negative review note shows every finding whole, cut only between items', () => {
+  const identity = accepted('Summarize the three offices.');
+  host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true });
+  const items = Array.from({ length: 30 }, (_, i) => `(${i + 1}) "office ${i} grew" — the report shows no change for office ${i}`).join('; ');
+  events.appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+    lane: 'host_v1', kind: 'completion', sourceUserSeq: identity.sourceUserSeq, fulfills: false, reason: items,
+    objectiveDigest: createHash('sha256').update('Summarize the three offices.').digest('hex'),
+    replyDigest: createHash('sha256').update('All offices grew.').digest('hex'), continuation: false } });
+  const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+    presentation: { kind: 'answer', text: 'All offices grew.' } });
+  const note = committed.presentation.text.slice(committed.presentation.text.indexOf('Verification note'));
+  assert.match(note, /\(1\) "office 0 grew" — the report shows no change for office 0/);
+  assert.match(note, /\(3\) "office 2 grew" — the report shows no change for office 2/);
+  assert.match(note, /no change for office \d+ …/, 'a long list ends at a whole item, marked as cut');
+  assert.doesNotMatch(note, /offic …|repor …/, 'never cut mid-word');
+});
+
 test('a reviewer looks up the evidence it needs through the real SDK loop, then rules', async () => {
   const lookup = {
     refKind: 'step ids of this run',
