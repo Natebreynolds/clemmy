@@ -11,7 +11,8 @@
  * name alone. The canvas therefore sends `{ id, dependsOn }` and nothing else
  * for a step it did not create: prompt, allowedTools, output contracts,
  * approval gates and every other authored field survive a save untouched
- * because the canvas never names them.
+ * because the canvas never names them. A step removed on the canvas is named
+ * in `removeStepIds`; without that the additive save keeps it.
  *
  * Two consequences of the storage format are load-bearing here:
  *
@@ -351,6 +352,16 @@ export function graphDiffersFrom(graph: CanvasGraph, patch: CanvasStepPatch[]): 
   return false;
 }
 
+/**
+ * Steps the daemon stored that are no longer on the canvas. The additive save
+ * never deletes on its own, so a removal is sent by id or the step comes back
+ * after Save.
+ */
+export function removedStepIds(graph: CanvasGraph, nodes: CanvasGraphNode[]): string[] {
+  const onCanvas = new Set(nodes.map((n) => n.id));
+  return (graph.nodes ?? []).map((n) => n.id).filter((id) => !onCanvas.has(id));
+}
+
 /* ---------- reporting what a save actually did ---------- */
 
 /**
@@ -389,6 +400,22 @@ export function saveOutcome(result: CanvasSaveResult | null | undefined): string
     return `Saved, with ${repairs.length} automatic ${repairs.length === 1 ? 'repair' : 'repairs'}: ${repairs.join('; ')}`;
   }
   return SAVED_PLAINLY;
+}
+
+/**
+ * A save the daemon refused to finish but did write. Changing a workflow that
+ * is ON stores the change as OFF and answers 409 when the test it needs is
+ * missing an input. That is a save to reload and explain, not an error to
+ * retry: the workflow on disk has changed and is no longer running.
+ */
+export function writtenButTurnedOff(error: unknown): string | null {
+  const body = error && typeof error === 'object' ? (error as { body?: unknown }).body : undefined;
+  if (!body || typeof body !== 'object' || (body as { updated?: unknown }).updated !== true) return null;
+  const missing = (body as { missingSmokeInputs?: unknown }).missingSmokeInputs;
+  const names = Array.isArray(missing) ? missing.filter((m): m is string => typeof m === 'string' && m.trim().length > 0) : [];
+  return names.length > 0
+    ? `Saved, and this workflow is now off. Its test can't run until it has a value for ${names.join(', ')}.`
+    : 'Saved, and this workflow is now off until its test runs.';
 }
 
 /* ---------- browser-local node placement ---------- */

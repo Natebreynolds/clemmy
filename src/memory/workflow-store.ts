@@ -331,6 +331,57 @@ export interface WorkflowStepInput {
   loopSafe?: boolean;
 }
 
+/**
+ * How the save paths treat one step field. `kept`: the file writer persists
+ * it, so every save must hand it back unchanged. `patch`: a targeted
+ * single-step edit may change it.
+ */
+export interface WorkflowStepFieldRule {
+  kept: boolean;
+  patch: boolean;
+}
+
+/**
+ * Every step field, listed once. Keyed by WorkflowStepInput, so a field added
+ * to the type does not compile until it is listed here with how saves treat
+ * it. The save normalizer, the single-step patch and the store round-trip
+ * suite all answer to this list; a save path that drops a kept field is a bug.
+ */
+export const WORKFLOW_STEP_FIELDS = {
+  id: { kept: true, patch: false },
+  prompt: { kept: true, patch: true },
+  project: { kept: true, patch: true },
+  dependsOn: { kept: true, patch: true },
+  // Deprecated: dependsOn carries upstream output now, so the writer drops it
+  // and the next save of a workflow removes it.
+  orderingOnlyDeps: { kept: false, patch: false },
+  model: { kept: true, patch: true },
+  intent: { kept: true, patch: true },
+  tier: { kept: true, patch: true },
+  maxTurns: { kept: true, patch: true },
+  useHarness: { kept: true, patch: true },
+  forEach: { kept: true, patch: true },
+  forEachNewOnly: { kept: true, patch: true },
+  subgraph: { kept: true, patch: true },
+  transform: { kept: true, patch: true },
+  deterministic: { kept: true, patch: false },
+  call: { kept: true, patch: true },
+  invocationPlan: { kept: true, patch: false },
+  codifiedFrom: { kept: true, patch: false },
+  allowedTools: { kept: true, patch: true },
+  sideEffect: { kept: true, patch: true },
+  executionRole: { kept: true, patch: false },
+  usesSkill: { kept: true, patch: true },
+  requiresApproval: { kept: true, patch: true },
+  approvalPreview: { kept: true, patch: true },
+  inputs: { kept: true, patch: true },
+  output: { kept: true, patch: true },
+  retryBudget: { kept: true, patch: true },
+  optional: { kept: true, patch: false },
+  loopUntil: { kept: true, patch: true },
+  loopSafe: { kept: true, patch: true },
+} as const satisfies { [K in keyof WorkflowStepInput]-?: WorkflowStepFieldRule };
+
 export type WorkflowContractType = 'string' | 'number' | 'boolean' | 'object' | 'array';
 
 /** CALL-1: a first-class structured tool invocation (see WorkflowStepInput.call). */
@@ -1159,6 +1210,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       if (s.intent) out.intent = s.intent;
       if (s.tier !== undefined) out.tier = s.tier;
       if (s.maxTurns !== undefined) out.maxTurns = s.maxTurns;
+      if (typeof s.useHarness === 'boolean') out.useHarness = s.useHarness;
       if (s.forEach) out.forEach = s.forEach;
       if (s.forEachNewOnly) out.forEachNewOnly = true;
       if (s.subgraph !== undefined) {

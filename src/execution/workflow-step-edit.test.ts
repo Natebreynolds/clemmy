@@ -234,7 +234,7 @@ test('a patch refuses unknown fields, a rename, an empty patch and a no-op, with
   const unknown = applyStepPatch('patch-wf', 'read_digest', { colour: 'blue' }, { nowIso: NOW });
   assert.equal(unknown.ok, false);
   assert.match(unknown.message, /Unknown step field\(s\) in patch: colour/);
-  assert.match(unknown.message, /Patchable fields: prompt, call/);
+  assert.match(unknown.message, /Patchable fields: prompt, project, dependsOn/);
   const rename = applyStepPatch('patch-wf', 'read_digest', { id: 'other' }, { nowIso: NOW });
   assert.equal(rename.ok, false);
   assert.match(rename.message, /cannot rename/);
@@ -253,4 +253,24 @@ test('a patch that breaks the graph is validated before anything is written', ()
   const r = applyStepPatch('patch-wf', 'summarize', { dependsOn: ['ghost'] }, { nowIso: NOW });
   assert.equal(r.ok, false);
   assert.deepEqual(readWorkflow('patch-wf')!.data.steps[1].dependsOn, ['read_digest'], 'nothing written');
+});
+
+test('a patch keeps the fields it did not name, including ones the patch cannot set', () => {
+  writeWorkflow('patch-keep-wf', {
+    name: 'patch-keep-wf',
+    description: 'untouched fields survive a targeted patch',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [
+      { id: 'enrich', prompt: 'Add images.', sideEffect: 'read', optional: true, executionRole: 'specialist', useHarness: false },
+      { id: 'draft', prompt: 'Draft captions.', dependsOn: ['enrich'] },
+    ],
+  });
+  const r = applyStepPatch('patch-keep-wf', 'enrich', { prompt: 'Add one image per post.' }, { nowIso: NOW });
+  assert.equal(r.ok, true, r.message);
+  const step = readWorkflow('patch-keep-wf')!.data.steps[0];
+  assert.equal(step.prompt, 'Add one image per post.');
+  assert.equal(step.optional, true, 'keep going if this fails');
+  assert.equal(step.executionRole, 'specialist');
+  assert.equal(step.useHarness, false);
 });

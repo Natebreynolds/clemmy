@@ -3,10 +3,10 @@
  *
  * Read and write both go through the surface the form-based Automate screens
  * already use: GET /api/console/workflows/:name supplies the graph the daemon
- * derived from the workflow's own steps, and PATCH sends `steps` back. Nothing
- * here is a parallel representation — see lib/workflow-canvas.ts for why the
- * save only ever names `id` and `dependsOn`, and why a cycle is blocked here
- * rather than at the API.
+ * derived from the workflow's own steps, and PATCH sends `stepEdits` back, plus
+ * `removeStepIds` for steps taken off the canvas. Nothing here is a parallel
+ * representation — see lib/workflow-canvas.ts for why the save only ever names
+ * `id` and `dependsOn`, and why a cycle is blocked here rather than at the API.
  *
  * This screen is additive. The guided form at /automate and /automate/new is
  * untouched and remains the way a workflow is created.
@@ -48,11 +48,13 @@ import {
   loadPositions,
   newStepId,
   nextFreePosition,
+  removedStepIds,
   resolvePositions,
   SAVED_PLAINLY,
   saveOutcome,
   savePositions,
   toStepPatch,
+  writtenButTurnedOff,
   type CanvasGraph,
   type CanvasGraphNode,
   type CanvasPosition,
@@ -288,29 +290,44 @@ function CanvasEditor({ name }: { name: string }) {
     () => toStepPatch(graphNodes, canvasEdges, createdIds),
     [graphNodes, canvasEdges, createdIds],
   );
+  const removedIds = useMemo(() => removedStepIds(baseline.current, graphNodes), [graphNodes]);
   const dirty = useMemo(() => graphDiffersFrom(baseline.current, patch), [patch]);
 
   const save = useCallback(async () => {
     if (cycle || !dirty || patch.length === 0) return;
     setSaving(true);
     setSaveError(null);
-    try {
-      const result = await patchWorkflow(name, { stepEdits: patch });
+    const reload = async () => {
       const fresh = await getWorkflow(name);
       setDetail(fresh);
       applyGraph(fresh.graph ?? EMPTY_GRAPH);
       // The list screens cache workflow rows; a step change moves stepCount.
       void queryClient.invalidateQueries({ queryKey: ['workflows'] });
+    };
+    try {
+      const result = await patchWorkflow(name, {
+        stepEdits: patch,
+        ...(removedIds.length > 0 ? { removeStepIds: removedIds } : {}),
+      });
+      await reload();
       // A 2xx is not always a plain save: rewiring a live workflow can turn it
       // off pending a verification test, and the daemon may have repaired the
       // definition. Saying only "Saved" would leave a workflow silently off.
       setNotice(saveOutcome(result));
     } catch (err: unknown) {
-      setSaveError(err instanceof Error ? err.message : 'Could not save the graph.');
+      // A refusal can still have written the change (stored as off). Reload so
+      // the page shows the workflow as it now is, instead of a stale "on".
+      const written = writtenButTurnedOff(err);
+      if (written) {
+        await reload().catch(() => undefined);
+        setNotice(written);
+      } else {
+        setSaveError(err instanceof Error ? err.message : 'Could not save the graph.');
+      }
     } finally {
       setSaving(false);
     }
-  }, [applyGraph, cycle, dirty, name, patch, queryClient]);
+  }, [applyGraph, cycle, dirty, name, patch, queryClient, removedIds]);
 
   if (loadError) {
     return (
@@ -371,6 +388,13 @@ function CanvasEditor({ name }: { name: string }) {
           <strong className="font-semibold">These steps depend on each other in a loop:</strong>{' '}
           <span className="font-mono">{cycle.join(' → ')}</span>. A loop never becomes ready to run, so saving is
           blocked until it is broken.
+        </Banner>
+      ) : null}
+
+      {removedIds.length > 0 ? (
+        <Banner tone="warning">
+          Saving deletes {removedIds.length === 1 ? 'this step' : `these ${removedIds.length} steps`}:{' '}
+          <span className="font-mono">{removedIds.join(', ')}</span>. Revert brings {removedIds.length === 1 ? 'it' : 'them'} back.
         </Banner>
       ) : null}
 

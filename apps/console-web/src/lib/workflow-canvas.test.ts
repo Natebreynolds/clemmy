@@ -11,11 +11,13 @@ import {
   newStepId,
   nextFreePosition,
   positionStorageKey,
+  removedStepIds,
   resolvePositions,
   SAVED_PLAINLY,
   saveOutcome,
   savePositions,
   toStepPatch,
+  writtenButTurnedOff,
   type CanvasGraph,
 } from './workflow-canvas.js';
 
@@ -260,4 +262,32 @@ test('unreadable, malformed and non-numeric stored positions all degrade to none
   };
   assert.deepEqual(loadPositions('w', throwing), {}, 'blocked site data must not break the canvas');
   assert.doesNotThrow(() => savePositions('w', { a: { x: 1, y: 2 } }, throwing));
+});
+
+test('removedStepIds names the stored steps that are no longer on the canvas', () => {
+  const stored: CanvasGraph = {
+    nodes: [{ id: 'pull' }, { id: 'extra', dependsOn: ['pull'] }, { id: 'draft', dependsOn: ['extra'] }],
+    edges: [],
+  };
+  assert.deepEqual(removedStepIds(stored, [{ id: 'pull' }, { id: 'draft' }]), ['extra']);
+  // A step added on the canvas is not a removal, and nothing removed is nothing sent.
+  assert.deepEqual(removedStepIds(stored, [{ id: 'pull' }, { id: 'extra' }, { id: 'draft' }, { id: 'step' }]), []);
+});
+
+test('writtenButTurnedOff reports a refused save that was written as off, and nothing else', () => {
+  const refusedButWritten = Object.assign(new Error('workflow verification missing inputs'), {
+    status: 409,
+    body: { updated: true, enabled: false, missingSmokeInputs: ['topic', 'region'] },
+  });
+  assert.equal(
+    writtenButTurnedOff(refusedButWritten),
+    "Saved, and this workflow is now off. Its test can't run until it has a value for topic, region.",
+  );
+  assert.equal(
+    writtenButTurnedOff({ body: { updated: true } }),
+    'Saved, and this workflow is now off until its test runs.',
+  );
+  assert.equal(writtenButTurnedOff(Object.assign(new Error('bad'), { status: 400, body: { error: 'loop' } })), null);
+  assert.equal(writtenButTurnedOff(new Error('offline')), null);
+  assert.equal(writtenButTurnedOff(null), null);
 });

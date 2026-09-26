@@ -245,8 +245,9 @@ export interface WorkflowDetail {
  * untouched rather than deleted — which is what lets the canvas save the two
  * dependencies it changed without restating a workflow it may have loaded
  * before someone else added to it. An id the daemon has never stored is
- * appended as a new step. (The sibling `steps` field is authoritative and does
- * delete what it omits; the canvas deliberately does not use it.)
+ * appended as a new step. A step is deleted only when its id is named in
+ * `removeStepIds`. (The sibling `steps` field is authoritative and does delete
+ * what it omits; the canvas deliberately does not use it.)
  */
 export interface WorkflowStepPatch {
   id: string;
@@ -274,7 +275,7 @@ export interface WorkflowPatchResult {
 
 export const getWorkflow = (name: string) =>
   apiGet<WorkflowDetail>(`/api/console/workflows/${encodeURIComponent(name)}`);
-export const patchWorkflow = (name: string, body: { description?: string; enabled?: boolean; triggerSchedule?: string; clearTriggerSchedule?: boolean; timezone?: string; models?: { brain?: string; worker?: string }; stepEdits?: WorkflowStepPatch[] }) =>
+export const patchWorkflow = (name: string, body: { description?: string; enabled?: boolean; triggerSchedule?: string; clearTriggerSchedule?: boolean; timezone?: string; models?: { brain?: string; worker?: string }; stepEdits?: WorkflowStepPatch[]; removeStepIds?: string[] }) =>
   api<WorkflowPatchResult>(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteWorkflow = (name: string) =>
   api(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' });

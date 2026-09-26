@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlink
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { STATE_DIR } from '../memory/db.js';
-import { readWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
+import { readWorkflow, WORKFLOW_STEP_FIELDS, type WorkflowDefinition, type WorkflowStepInput } from '../memory/workflow-store.js';
 import { mismatchHint } from '../shared/edit-mismatch.js';
 import { writeWorkflowAndSyncTriggers } from './workflow-write.js';
 import { normalizeWorkflowSteps, prepareWorkflowUpdateForWrite, renderReadinessHold } from './workflow-authoring.js';
@@ -142,13 +142,11 @@ export function applyStepPromptEdit(
   };
 }
 
-/** The step fields a targeted patch may change. Everything the authoring
- *  schema accepts for a step except its id; the host owns `call.account`. */
-export const STEP_PATCH_FIELDS = [
-  'prompt', 'call', 'transform', 'dependsOn', 'allowedTools', 'requiresApproval', 'approvalPreview',
-  'inputs', 'output', 'sideEffect', 'forEach', 'forEachNewOnly', 'model', 'intent', 'tier', 'maxTurns',
-  'useHarness', 'usesSkill', 'project', 'loopUntil', 'loopSafe', 'retryBudget', 'subgraph',
-] as const;
+/** The step fields a targeted patch may change: the ones WORKFLOW_STEP_FIELDS
+ *  marks patchable. Never the id; the host owns `call.account`. */
+export const STEP_PATCH_FIELDS: ReadonlyArray<keyof WorkflowStepInput> = (
+  Object.keys(WORKFLOW_STEP_FIELDS) as Array<keyof WorkflowStepInput>
+).filter((field) => WORKFLOW_STEP_FIELDS[field].patch);
 
 /**
  * Make a TARGETED, reversible patch to ONE step: only the named fields change,
