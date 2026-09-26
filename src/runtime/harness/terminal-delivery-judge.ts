@@ -331,12 +331,14 @@ export function selectIndependentTerminalDeliveryJudgeRoute(
   // before any failure had occurred. Cross-family preference is the rule for
   // UNPINNED defaults and for permitted fallback — it is not a reason to
   // override a judge the owner actually selected.
+  // A selected fallback behind a healthy primary is not yet eligible. This
+  // one-shot lane does not observe a failure that would activate that tail.
   for (const route of routes) {
-    if (route.model && route.ownerSelectedJudge) return route;
+    if (route.model && route.ownerSelectedJudge && !route.deferredFallback) return route;
   }
   // No explicit selection: prefer a genuinely independent lane.
   for (const route of routes) {
-    if (route.model && !route.selfJudge && route.judgeFamily !== route.brainFamily) {
+    if (route.model && !route.deferredFallback && !route.selfJudge && route.judgeFamily !== route.brainFamily) {
       return route;
     }
   }

@@ -13,10 +13,13 @@ import { usePoll } from './poll';
 import {
   getSettings,
   patchModelRole,
+  patchJudgeFallback,
   setActiveBrain,
   type ActiveBrain,
   type ModelRolesSnapshot,
   type SettingsSnapshot,
+  type JudgeFallbackSetting,
+  type JudgeFallbackSelection,
 } from './settings';
 
 export interface ModelChoice { id: string; label: string; provider: string }
@@ -59,6 +62,28 @@ export function currentBrainValue(mr: ModelRolesSnapshot): string {
 
 export function flatChoices(groups: ModelRolesSnapshot['available'] | undefined): ModelChoice[] {
   return (groups ?? []).flatMap((p) => p.models.map((m) => ({ id: m.id, label: m.label, provider: p.provider })));
+}
+
+export function judgeFallbackValue(setting: JudgeFallbackSetting): string {
+  return setting.mode === 'model' ? `model:${setting.modelId ?? ''}` : setting.mode;
+}
+
+export function judgeFallbackSelection(value: string): JudgeFallbackSelection {
+  if (value === 'automatic' || value === 'off') return { mode: value };
+  if (value.startsWith('model:') && value.slice(6)) return { mode: 'model', modelId: value.slice(6) };
+  throw new Error('Choose a fallback judge from the list.');
+}
+
+export function judgeFallbackChoices(mr: ModelRolesSnapshot): Array<ModelChoice & { available: boolean }> {
+  const setting = mr.judgeFallback;
+  const rows = flatChoices(setting?.options ?? mr.roleOptions?.judge).map((model) => ({
+    ...model,
+    available: !(setting?.mode === 'model' && setting.modelId === model.id && setting.available === false),
+  }));
+  if (setting?.mode === 'model' && !rows.some((row) => row.id === (setting.modelId ?? ''))) {
+    rows.push({ id: setting.modelId ?? '', label: setting.modelId || 'Saved model', provider: '', available: false });
+  }
+  return rows;
 }
 
 /** Short human label for a resolved role: the option label when known, else the id. */
@@ -124,6 +149,8 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
   }, [claudeAuth?.configured, claudeAuth?.degraded]);
   const onRole = (role: 'worker' | 'judge' | 'writer', v: string) =>
     run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
+  const onJudgeFallback = (value: string) =>
+    run('judge-fallback', () => patchJudgeFallback(judgeFallbackSelection(value)));
 
   return {
     settings: settings.data,
@@ -133,7 +160,7 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     mr,
     claudeAuth,
     busy, saved, error, claudeSignInFor,
-    run, refresh, onBrain, onRole,
+    run, refresh, onBrain, onRole, onJudgeFallback,
     brainValue: mr ? currentBrainValue(mr) : '',
     brains: mr ? brainChoices(mr, claudeAuth) : [],
     workers: mr ? flatChoices(mr.roleOptions?.worker ?? mr.available) : [],

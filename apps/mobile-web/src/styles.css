@@ -3004,6 +3004,8 @@ input, textarea, select { font: inherit; font-size: 16px; }
   font-size: var(--t-sm);
 }
 .settings-select:disabled { color: var(--fg-3); }
+.settings-fallback .settings-row { flex-wrap: wrap; }
+.settings-fallback .settings-select { flex: 1 1 100%; }
 .settings-row-action {
   flex: 0 0 auto;
   font-size: var(--t-sm);

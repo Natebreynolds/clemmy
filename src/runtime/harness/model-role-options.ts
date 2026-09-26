@@ -25,6 +25,7 @@ import {
   type ByoRoutingSnapshot,
 } from './byo-providers.js';
 import { discoveredModels, labelForModelId, modelDiscoveryStatus, type ModelDiscoveryPhase } from './model-discovery.js';
+import { readJudgeFallbackSetting } from './judge-fallback-policy.js';
 
 export interface AvailableModelGroup {
   provider: ModelProviderClass;
@@ -379,6 +380,46 @@ export function connectedModelGroupsForRole(role: ModelRole): AvailableModelGrou
   return connectedModelGroupsForRoleFromContext(role, context);
 }
 
+/** An explicitly selected fallback is an isolated reviewer. The brain's
+ * all-in routing mode does not move this selection onto its API backend.
+ * Reuse the captured catalog and ownership indexes without changing globals. */
+function judgeFallbackContext(context: ModelOptionDerivationContext): ModelOptionDerivationContext {
+  return { ...context, byo: { ...context.byo, mode: 'off' } };
+}
+
+function connectedJudgeFallbackModelGroupsFromContext(
+  context: ModelOptionDerivationContext,
+  groups = connectedModelGroupsFromContext(context),
+): AvailableModelGroup[] {
+  const fallbackContext = judgeFallbackContext(context);
+  const saved = readJudgeFallbackSetting();
+  if (saved.mode === 'model') {
+    const capability = roleModelCapabilityFromContext('judge', saved.modelId, fallbackContext);
+    if (capability.ok && (capability.provider === 'codex' || capability.provider === 'claude')) {
+      const phase = modelDiscoveryStatus().providers[capability.provider === 'codex' ? 'openai' : 'anthropic'].phase;
+      if (phase !== 'ready') {
+        // A fallback-only native selection needs the same restart continuity as
+        // saved role bindings. Keep it local to this picker: it must not become
+        // a primary judge/worker/brain choice, or revive a disconnected account.
+        const suffix = phase === 'idle' || phase === 'refreshing'
+          ? ' (saved; checking availability)'
+          : ' (saved; using last known route)';
+        groups = groups.map((group) => {
+          if (group.provider !== capability.provider) return group;
+          const models = [...group.models];
+          pushUnique(models, saved.modelId, `${labelForModelId(saved.modelId)}${suffix}`);
+          return { ...group, models };
+        });
+      }
+    }
+  }
+  return connectedModelGroupsForRoleFromContext('judge', fallbackContext, groups);
+}
+
+export function connectedJudgeFallbackModelGroups(): AvailableModelGroup[] {
+  return connectedJudgeFallbackModelGroupsFromContext(captureModelOptionContext());
+}
+
 function modelIdsAvailableForRoleFromContext(
   role: ModelRole,
   context: ModelOptionDerivationContext,
@@ -399,11 +440,28 @@ export function roleModelCapability(role: ModelRole, modelId: string): RoleModel
 }
 
 export function validateRoleModelBinding(role: ModelRole, modelId: string): RoleModelCapability {
-  const context = captureModelOptionContext();
+  return validateRoleModelBindingFromContext(role, modelId, captureModelOptionContext());
+}
+
+/** Exact connected-account selection, independent of the brain routing mode.
+ * Shared capability checks still reject unknown models and ambiguous owners. */
+export function validateJudgeFallbackModelBinding(modelId: string): RoleModelCapability {
+  const context = judgeFallbackContext(captureModelOptionContext());
+  const allowed = new Set(connectedJudgeFallbackModelGroupsFromContext(context)
+    .flatMap((group) => group.models.map((model) => model.id)));
+  return validateRoleModelBindingFromContext('judge', modelId, context, allowed);
+}
+
+function validateRoleModelBindingFromContext(
+  role: ModelRole,
+  modelId: string,
+  context: ModelOptionDerivationContext,
+  allowedModelIds?: ReadonlySet<string>,
+): RoleModelCapability {
   const capability = roleModelCapabilityFromContext(role, modelId, context);
   if (!capability.ok) return capability;
 
-  const allowed = modelIdsAvailableForRoleFromContext(role, context);
+  const allowed = allowedModelIds ?? modelIdsAvailableForRoleFromContext(role, context);
   const clean = modelId.trim();
   if (!allowed.has(clean)) {
     const available = [...allowed].sort();
@@ -505,6 +563,7 @@ export function brainOptions(): BrainOption[] {
 
 export interface ModelRoleOptionCatalogSnapshot {
   available: AvailableModelGroup[];
+  judgeFallbackOptions: AvailableModelGroup[];
   roleOptions: {
     worker: AvailableModelGroup[];
     judge: AvailableModelGroup[];
@@ -521,6 +580,7 @@ export function modelRoleOptionCatalogSnapshot(): ModelRoleOptionCatalogSnapshot
   const available = connectedModelGroupsFromContext(context);
   return {
     available,
+    judgeFallbackOptions: connectedJudgeFallbackModelGroupsFromContext(context, available),
     roleOptions: {
       worker: connectedModelGroupsForRoleFromContext('worker', context, available),
       judge: connectedModelGroupsForRoleFromContext('judge', context, available),

@@ -27,7 +27,8 @@ const catalog: ModelRoleOptionCatalogSnapshot = {
       { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
     ],
   }],
-  roleOptions: { worker: [], judge: [] },
+  roleOptions: { worker: [], writer: [], judge: [] },
+  judgeFallbackOptions: [],
   brainOptions: [],
   providerSnapshots: [],
 };

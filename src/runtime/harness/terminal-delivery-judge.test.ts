@@ -10,6 +10,7 @@ import {
   buildTerminalDeliveryJudgePrompt,
   evaluateTerminalDelivery,
   parseTerminalDeliveryJudgeVerdict,
+  selectIndependentTerminalDeliveryJudgeRoute,
   type TerminalDeliveryJudgeInput,
   type TerminalDeliveryJudgePort,
   type TerminalDeliveryJudgeRequest,
@@ -73,6 +74,24 @@ function route(overrides: Partial<BoundaryJudgeRouting> = {}): BoundaryJudgeRout
     ...overrides,
   };
 }
+
+test('a healthy default primary’s negative delivery decision does not invite the selected fallback', async () => {
+  const primary = route();
+  const alternate = route({ modelId: 'selected-fallback-fixture', ownerSelectedJudge: true, deferredFallback: true });
+  const executed: BoundaryJudgeRouting[] = [];
+  const result = await evaluateTerminalDelivery(input(), {
+    port: {
+      async resolveRoute() { return selectIndependentTerminalDeliveryJudgeRoute([primary, alternate]); },
+      async run(request) {
+        executed.push(request.route);
+        return { verb: 'ask', reason: 'The email receipt remains unverified.', publicText: 'Please confirm the email receipt.' };
+      },
+    },
+  });
+  assert.equal(result.status, 'decided');
+  assert.equal(result.status === 'decided' && result.verb, 'ask');
+  assert.deepEqual(executed, [primary]);
+});
 
 function injectedPort(
   output: unknown,

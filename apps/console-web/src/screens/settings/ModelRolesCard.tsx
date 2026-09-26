@@ -3,7 +3,7 @@ import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { useState } from 'react';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
-import { PROVIDER_LABEL, useModelRoles } from '@/lib/model-roles';
+import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, useModelRoles } from '@/lib/model-roles';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -86,6 +86,10 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const workerFlat = r.workers;
   const judgeFlat = r.judges;
   const writerFlat = r.writers;
+  const fallback = mr.judgeFallback;
+  const fallbackChoices = judgeFallbackChoices(mr);
+  const fallbackUnavailable = fallback?.mode === 'model'
+    && fallbackChoices.some((model) => model.id === (fallback.modelId ?? '') && !model.available);
   const codexRescue = settings?.models?.codexRescue;
   const codexRescueOptions = [...(mr.available.find((p) => p.provider === 'codex')?.models ?? [])];
   if (codexRescue?.configured && !codexRescueOptions.some((model) => model.id === codexRescue.modelId)) {
@@ -201,6 +205,17 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
               <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The judge is the same model as the brain, so a second opinion adds little.</div>
             )}
           </>)}
+        {fallback && row('Fallback judge', 'Used only when the primary judge cannot complete a review. A completed verdict is kept.',
+          <Select disabled={busy !== null} value={judgeFallbackValue(fallback)} onChange={(event) => void r.onJudgeFallback(event.target.value)} aria-label="Fallback judge model" aria-describedby="judge-fallback-note">
+            <option value="automatic">Automatic</option>
+            <option value="off">No fallback</option>
+            {fallbackChoices.map((model) => <option key={`jf-${model.provider}-${model.id}`} value={`model:${model.id}`} disabled={!model.available}>{model.label}{model.provider ? ` · ${PROVIDER_LABEL[model.provider] ?? model.provider}` : ''}{!model.available ? ' (unavailable)' : ''}</option>)}
+          </Select>,
+          <div id="judge-fallback-note" className={`mt-1 text-caption ${fallbackUnavailable ? 'text-warning' : 'text-muted'}`} role={busy === 'judge-fallback' ? 'status' : undefined}>
+            {busy === 'judge-fallback' ? 'Saving…' : fallbackUnavailable
+              ? `Your saved choice is unavailable. ${fallback.reason || 'Connect it again or choose another fallback.'}`
+              : fallback.mode === 'off' ? 'The primary judge handles review without a fallback.' : 'Applies to new requests.'}
+          </div>)}
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />

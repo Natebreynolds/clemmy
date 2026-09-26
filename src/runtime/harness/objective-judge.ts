@@ -8,7 +8,7 @@ import { MODELS } from '../../config.js';
 import { codexSafeFast } from './model-roles.js';
 import type { RuntimeContextValue } from '../../types.js';
 import type { BoundaryJudgeRouting, CapturedBoundaryJudgeSelection } from './debate-model.js';
-import { recordJudgeMetric, withJudgeHedge, type JudgeMetricLane, type JudgeMetricOutcome, goalJudgeTimeoutMs, CheckerQuotaUnavailableError } from './judge-family.js';
+import { recordJudgeMetric, withJudgeHedge, type HedgedJudgeResult, type JudgeMetricLane, type JudgeMetricOutcome, goalJudgeTimeoutMs, CheckerQuotaUnavailableError, isTransientJudgeError } from './judge-family.js';
 import { providerCapacityErrorText } from '../../shared/provider-capacity.js';
 import { extractJsonCandidate } from './json-repair.js';
 import { estimateMessagesTokens, predictTurnCost } from './budget.js';
@@ -901,6 +901,7 @@ export async function runRoutedJudgeAttempt<T>(
   parse: (output: unknown) => T | null,
   requireCompletePrompt = false,
   evidence?: JudgeEvidenceSource,
+  signal?: AbortSignal,
 ): Promise<T> {
   // Keep per-review handles out of tool schemas and stable instructions.
   // Supply them once with the evidence whose handles they identify.
@@ -922,7 +923,8 @@ export async function runRoutedJudgeAttempt<T>(
   const agent = evidence
     ? buildJudgeAgent(routing, reviewInstructions, judgeEvidenceTools(evidence))
     : buildJudgeAgent(routing, instructions);
-  const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1 });
+  const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
+  signal?.throwIfAborted();
   let value = parse(result.finalOutput);
   if (value === null) {
     // Live 2026-09-24 (source 294528): a flagship reviewer wrote a 2,800-token
@@ -953,7 +955,7 @@ export async function runRoutedJudgeAttempt<T>(
         const repairAdmission = completionJudgeContextAdmission(routing.modelId, instructions, repairPrompt);
         if (!repairAdmission.fits) throw new JudgeContextUnavailableError('Complete verdict repair exceeds the reviewer context window.');
         const repaired = await new Runner({ workflowName: 'clementine-objective-judge-verdict' }).run(
-          repairAgent, repairPrompt, { maxTurns: 1 },
+          repairAgent, repairPrompt, { maxTurns: 1, signal },
         );
         value = parse(repaired.finalOutput);
       } catch (error) {
@@ -985,7 +987,7 @@ interface CompletionJudgeRun {
  * One HEDGED judge run — the shared engine for every completion-lane verdict
  * shape. The selected judge starts immediately. An unpinned selection may
  * race a separately eligible independent family after the hedge delay (or an
- * early failure); an explicit pin remains the only attempt. When a hedge is
+ * early failure); an explicit fallback is sequential and never raced. When a hedge is
  * eligible, the first PARSED value wins (judge-family.ts).
  * Metrics record the winner's model/family, so a hedge win is visible in
  * telemetry. Parametrized on (instructions, prompt, parse, lane) so the
@@ -1011,23 +1013,28 @@ export async function runHedgedJudge<T>(
   let routing: BoundaryJudgeRouting | undefined;
   try {
     const debate = await import('./debate-model.js');
+    // Accepted turns already carry this snapshot. Direct callers with an
+    // explicit fallback capture it once too, before the primary starts.
+    const selection = opts.boundaryJudgeSelection
+      ?? (debate.boundaryJudgeFallbackMode() !== 'automatic' ? debate.captureBoundaryJudgeSelection() : undefined);
+    const fallbackMode = debate.boundaryJudgeFallbackMode(selection);
     let hedgeRouting: BoundaryJudgeRouting | null;
-    if (opts.quotaAwareRoute) {
-      const route = debate.resolveCompletionCheckerRoute(opts.boundaryJudgeSelection, opts.reviewedAuthor);
+    if (opts.quotaAwareRoute || fallbackMode === 'model') {
+      const route = debate.resolveCompletionCheckerRoute(selection, opts.reviewedAuthor);
       routing = route.primary;
       hedgeRouting = route.hedge;
     } else {
-      routing = debate.resolveBoundaryJudge(opts.boundaryJudgeSelection, opts.reviewedAuthor);
-      hedgeRouting = debate.resolveBoundaryJudgeHedge(routing, opts.boundaryJudgeSelection);
+      routing = debate.resolveBoundaryJudge(selection, opts.reviewedAuthor);
+      hedgeRouting = debate.resolveBoundaryJudgeHedge(routing, selection);
     }
     // Every attempt is attributed to its lane so the usage log can rank judge
     // spend per lane; the turn's own session/source attribution is preserved.
     const inherited = modelUsageAttributionStorage.getStore();
-    const attempt = (r: BoundaryJudgeRouting) => (): Promise<T> => withModelUsageAttribution<Promise<T>>(
+    const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (): Promise<T> => withModelUsageAttribution<Promise<T>>(
       { sessionId: inherited?.sessionId ?? 'unknown', sourceUserSeq: inherited?.sourceUserSeq ?? 0,
         ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}), channel: `judge:${lane}`, role: 'reviewer' },
       () => runRoutedJudgeAttempt<T>(
-        r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence,
+        r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence, signal,
       ),
     );
     // An explicit caller deadline still wins; otherwise use the deadline the
@@ -1044,7 +1051,7 @@ export async function runHedgedJudge<T>(
     // play, the hedge already starts the moment the primary fails.
     const chosen = routing;
     let answering = chosen;
-    const primaryAttempt = opts.quotaAwareRoute && !hedgeRouting
+    const primaryAttempt = opts.quotaAwareRoute && !hedgeRouting && fallbackMode === 'automatic'
       ? async (): Promise<T> => {
           try {
             return await attempt(chosen)();
@@ -1054,16 +1061,53 @@ export async function runHedgedJudge<T>(
             answering = debate.resolveCheckerQuotaFallthrough({
               modelId: chosen.modelId, provider: chosen.judgeFamily,
               why: `its provider refused the review for lack of quota or credit${refusal ? ` ("${refusal}")` : ''}`,
-            }, opts.boundaryJudgeSelection, opts.reviewedAuthor);
+            }, selection, opts.reviewedAuthor);
             return await attempt(answering)();
           }
         }
       : attempt(chosen);
-    const raced = await withJudgeHedge(
-      primaryAttempt,
-      hedgeRouting ? attempt(hedgeRouting) : null,
-      effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {},
-    );
+    let raced: HedgedJudgeResult<T>;
+    if (fallbackMode === 'model') {
+      const callerCancelSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
+      // Each lane gets its existing bounded attempt. Cancel the first request
+      // before advancing on a deadline; a late response cannot win or launch a
+      // verdict repair after the selected fallback has begun.
+      const boundedAttempt = async (route: BoundaryJudgeRouting) => {
+        callerCancelSignal?.throwIfAborted();
+        const controller = new AbortController();
+        const signal = callerCancelSignal ? AbortSignal.any([controller.signal, callerCancelSignal]) : controller.signal;
+        const result = await withJudgeHedge(attempt(route, signal), null,
+          { timeoutMs: opts.timeoutMs ?? route.timeoutMs });
+        const settled = { ...result, errors: [...result.errors] };
+        if (result.value === null) controller.abort();
+        callerCancelSignal?.throwIfAborted();
+        return settled;
+      };
+      raced = await boundedAttempt(chosen);
+      if (raced.value === null && (raced.errors.length === 0 || raced.errors.some((error) => {
+        // Cancellation belongs to the caller, never to fallback policy.
+        if (error instanceof Error && error.name === 'AbortError') return false;
+        return isTransientJudgeError(error) || classifyModelError(error).isAuth;
+      }))) {
+        const refusal = raced.errors.map(quotaRefusalWords).find((words) => words !== null);
+        try {
+          answering = debate.resolveSelectedJudgeFallback({ modelId: chosen.modelId, provider: chosen.judgeFamily,
+            why: raced.errors.length === 0 ? 'its review deadline expired'
+              : refusal !== undefined ? 'its provider refused the review for lack of quota or credit'
+                : 'its provider could not serve the review' }, selection, opts.reviewedAuthor,
+          refusal !== undefined ? 'exact_pin_quota_exhausted' : 'chain_fallback_after_exact_pin');
+          raced = await boundedAttempt(answering);
+        } catch (error) {
+          raced = { ...raced, errors: [...raced.errors, error] };
+        }
+      }
+    } else {
+      raced = await withJudgeHedge(
+        primaryAttempt,
+        hedgeRouting ? attempt(hedgeRouting) : null,
+        effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {},
+      );
+    }
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : answering;
     if (raced.value !== null) {
       recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);

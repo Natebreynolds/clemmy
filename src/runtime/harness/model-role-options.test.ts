@@ -14,6 +14,8 @@ process.env.CLEMENTINE_HOME = home;
 const {
   connectedModelGroups,
   connectedModelGroupsForRole,
+  connectedJudgeFallbackModelGroups,
+  validateJudgeFallbackModelBinding,
   validateRoleModelBinding,
   brainOptions,
   effectiveBrain,
@@ -30,10 +32,11 @@ const {
   resolveEffectiveProviderForModelFromSnapshot,
 } = await import('./byo-providers.js');
 const { _setRuntimeEnvReadObserverForTest } = await import('../../config.js');
-const { _setDiscoveredModelsForTest } = await import('./model-discovery.js');
+const { _setDiscoveredModelsForTest, _setModelDiscoverersForTest } = await import('./model-discovery.js');
 // Keep this unit file deterministic: provider auth fixtures are fake, so model
 // discovery itself is covered separately with injected discoverers.
 _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
+_setModelDiscoverersForTest({ anthropic: async () => [], openai: async () => [] });
 
 function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
   const prev: Record<string, string | undefined> = {};
@@ -231,6 +234,142 @@ test('multi-provider: a provider with no saved key is not offered', () => {
     assert.equal(validateRoleModelBinding('worker', 'MiniMax-M3').ok, false, 'cannot bind an unkeyed provider model');
     assert.equal(validateRoleModelBinding('worker', 'glm-5.2').ok, true);
   });
+});
+
+test('an explicitly selected fallback keeps connected subscription and API routes separate from an all-in brain', () => {
+  writeAuthFiles();
+  withEnv({
+    MODEL_ROUTING_MODE: 'all_in', AUTH_MODE: 'api_key',
+    BYO_MODEL_BASE_URL: 'https://api.brain.test/v1', BYO_MODEL_API_KEY: 'brain-key',
+    BYO_MODEL_ID: 'research/brain', BYO_MODEL_JUDGE_ID: '', OPENAI_MODEL_WORKER: '',
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'review', label: 'Review', baseURL: 'https://api.review.test/v1', modelIds: ['review/exact-model'] },
+    ]),
+    BYO_PROVIDER_REVIEW_API_KEY: 'review-key',
+  }, () => {
+    const ordinary = connectedModelGroupsForRole('judge');
+    assert.equal(ordinary.some((group) => group.provider === 'codex'), false,
+      'the existing all-in primary judge catalog remains unchanged');
+    assert.equal(validateRoleModelBinding('judge', 'gpt-5.4-nano').ok, false);
+
+    const fallback = connectedJudgeFallbackModelGroups();
+    assert.equal(fallback.find((group) => group.provider === 'codex')?.models.some((model) => model.id === 'gpt-5.4-nano'), true);
+    assert.deepEqual(validateJudgeFallbackModelBinding('gpt-5.4-nano'), { ok: true, provider: 'codex' });
+    assert.deepEqual(validateJudgeFallbackModelBinding('claude-sonnet-4-6'), { ok: true, provider: 'claude' });
+    assert.deepEqual(validateJudgeFallbackModelBinding('review/exact-model'), { ok: true, provider: 'byo' });
+    assert.equal(fallback.find((group) => group.providerId === 'review')?.models[0]?.id, 'review/exact-model');
+    assert.equal(validateJudgeFallbackModelBinding('review/not-offered').ok, false);
+
+    let captures = 0;
+    _setModelOptionSnapshotObserverForTest(() => { captures += 1; });
+    try {
+      const catalog = modelRoleOptionCatalogSnapshot();
+      assert.equal(captures, 1, 'fallback options share the catalog\'s existing provider snapshot');
+      assert.deepEqual(catalog.judgeFallbackOptions, fallback);
+      assert.deepEqual(catalog.roleOptions.judge, ordinary);
+    } finally {
+      _setModelOptionSnapshotObserverForTest(null);
+    }
+    assert.equal(process.env.MODEL_ROUTING_MODE, 'all_in', 'isolating the fallback does not change the brain routing setting');
+  });
+});
+
+test('fallback options reject ambiguous API ownership and keep disconnected models unavailable', () => {
+  writeAuthFiles();
+  withEnv({
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://api.brain.test/v1', BYO_MODEL_API_KEY: 'brain-key',
+    BYO_MODEL_ID: 'research/brain', BYO_MODEL_JUDGE_ID: '', OPENAI_MODEL_WORKER: '',
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'first', label: 'First', baseURL: 'https://first.test/v1', modelIds: ['review/shared', 'gpt-5.4-nano'] },
+      { id: 'second', label: 'Second', baseURL: 'https://second.test/v1', modelIds: ['review/shared'] },
+      { id: 'disconnected', label: 'Disconnected', baseURL: 'https://disconnected.test/v1', modelIds: ['review/offline'] },
+    ]),
+    BYO_PROVIDER_FIRST_API_KEY: 'first-key', BYO_PROVIDER_SECOND_API_KEY: 'second-key',
+    BYO_PROVIDER_DISCONNECTED_API_KEY: '',
+  }, () => {
+    const ids = new Set(connectedJudgeFallbackModelGroups().flatMap((group) => group.models.map((model) => model.id)));
+    for (const id of ['review/shared', 'gpt-5.4-nano', 'review/offline']) {
+      assert.equal(ids.has(id), false, `${id} must not be offered without unique connected ownership`);
+      assert.equal(validateJudgeFallbackModelBinding(id).ok, false, `${id} must not be saved`);
+    }
+  });
+});
+
+test('saved native fallback survives uncertain discovery without entering primary role or brain choices', () => {
+  writeAuthFiles();
+  try {
+    withEnv({
+      MODEL_ROUTING_MODE: 'off', CLEMMY_MODEL_ROLES: '[]',
+      OPENAI_API_KEY: 'test-only', ANTHROPIC_API_KEY: 'test-only',
+      BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '',
+      BYO_MODEL_JUDGE_ID: '', OPENAI_MODEL_WORKER: '', BYO_PROVIDERS: '[]',
+      CLEMMY_JUDGE_FALLBACK: '',
+    }, () => {
+      for (const [modelId, provider] of [
+        ['gpt-9-fallback-only', 'codex'],
+        ['claude-future-fallback-only', 'claude'],
+      ] as const) {
+        process.env.CLEMMY_JUDGE_FALLBACK = JSON.stringify({ mode: 'model', modelId });
+        for (const phase of ['idle', 'degraded'] as const) {
+          _setDiscoveredModelsForTest(phase === 'idle' ? null : { anthropic: [], openai: [] }, 'degraded');
+          const catalog = modelRoleOptionCatalogSnapshot();
+          const choice = catalog.judgeFallbackOptions.find((group) => group.provider === provider)
+            ?.models.find((model) => model.id === modelId);
+          assert.ok(choice, `${provider} fallback remains selectable while discovery is ${phase}`);
+          assert.match(choice.label, /saved;/, 'provisional availability is visible');
+          assert.deepEqual(validateJudgeFallbackModelBinding(modelId), { ok: true, provider });
+          assert.equal(catalog.available.some((group) => group.models.some((model) => model.id === modelId)), false);
+          assert.equal(catalog.roleOptions.judge.some((group) => group.models.some((model) => model.id === modelId)), false);
+          assert.equal(catalog.brainOptions.some((option) => option.modelId === modelId), false);
+          assert.equal(validateRoleModelBinding('judge', modelId).ok, false);
+        }
+        _setDiscoveredModelsForTest({ anthropic: [], openai: [] }, 'ready');
+        assert.equal(validateJudgeFallbackModelBinding(modelId).ok, false,
+          'a completed catalog that omits the saved fallback remains authoritative');
+      }
+    });
+  } finally {
+    _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
+  }
+});
+
+test('saved fallback does not revive disconnected, ambiguous, or malformed choices during discovery', () => {
+  writeAuthFiles();
+  _setDiscoveredModelsForTest({ anthropic: [], openai: [] }, 'degraded');
+  try {
+    withEnv({
+      MODEL_ROUTING_MODE: 'off', CLEMMY_MODEL_ROLES: '[]',
+      BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '',
+      BYO_MODEL_JUDGE_ID: '', OPENAI_MODEL_WORKER: '', BYO_PROVIDERS: '[]',
+      CLEMMY_JUDGE_FALLBACK: JSON.stringify({ mode: 'model', modelId: 'claude-future-fallback-only' }),
+      BYO_PROVIDER_COLLISION_API_KEY: 'collision-key',
+    }, () => {
+      blockClaudeKeychainFallback();
+      assert.equal(validateJudgeFallbackModelBinding('claude-future-fallback-only').ok, false);
+      writeAuthFiles();
+      process.env.BYO_PROVIDERS = JSON.stringify([{
+        id: 'collision', label: 'Collision', baseURL: 'https://collision.test/v1',
+        modelIds: ['claude-future-fallback-only'],
+      }]);
+      assert.equal(validateJudgeFallbackModelBinding('claude-future-fallback-only').ok, false);
+      process.env.BYO_PROVIDERS = '[]';
+      for (const saved of [
+        '{invalid',
+        JSON.stringify({ mode: 'off' }),
+        JSON.stringify({ mode: 'model', modelId: 'claude-future-fallback-only', unexpected: true }),
+        JSON.stringify({ mode: 'model', modelId: 'custom/not-connected' }),
+      ]) {
+        process.env.CLEMMY_JUDGE_FALLBACK = saved;
+        const ids = connectedJudgeFallbackModelGroups().flatMap((group) => group.models.map((model) => model.id));
+        assert.equal(ids.includes('claude-future-fallback-only'), false);
+        assert.equal(ids.includes('custom/not-connected'), false);
+      }
+    });
+  } finally {
+    writeAuthFiles();
+    _setDiscoveredModelsForTest({ anthropic: [], openai: [] });
+  }
 });
 
 test('200-model settings catalog captures runtime provider state once, preserves output, and yields promptly', async () => {

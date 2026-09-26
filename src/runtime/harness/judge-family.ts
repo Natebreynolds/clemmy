@@ -20,6 +20,7 @@ import { getStoredCodexOAuthTokens } from '../auth-store.js';
 import { getClaudeAuthSnapshot } from '../claude-oauth.js';
 import { classifyModelError } from './resilient-model.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
+import { readJudgeFallbackSetting } from './judge-fallback-policy.js';
 
 /** Is the Claude (Anthropic) subscription brain logged in + usable right now? */
 export function claudeAvailable(): boolean {
@@ -493,7 +494,7 @@ export function chooseBoundaryJudgeFamily(
  *  with the pre-chain retry-once + fail-closed semantics (byte-identical to
  *  before J1). Default on. */
 export function judgeChainEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_JUDGE_CHAIN', 'on') || 'on').trim().toLowerCase() !== 'off';
+  return readJudgeFallbackSetting().mode !== 'off';
 }
 
 /** True when a thrown judge error is a TRANSIENT provider shape — a rate-limit /

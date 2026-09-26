@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { brainCall, brainChoices, brainProvider, currentBrainValue, roleLabel, shortModelLabel } from './model-roles.js';
+import { brainCall, brainChoices, brainProvider, currentBrainValue, judgeFallbackChoices, judgeFallbackSelection, judgeFallbackValue, roleLabel, shortModelLabel } from './model-roles.js';
 import type { ModelRolesSnapshot } from './settings.js';
 
 const mr: ModelRolesSnapshot = {
@@ -23,6 +23,42 @@ const mr: ModelRolesSnapshot = {
   effectiveBrainValue: 'claude_oauth:claude-opus-5',
   activeBrain: 'claude_oauth',
 };
+
+test('fallback selection distinguishes automatic, off and exact catalog ids', () => {
+  for (const selection of [{ mode: 'automatic' }, { mode: 'off' }, { mode: 'model', modelId: 'vendor/model:revision' }] as const) {
+    assert.deepEqual(judgeFallbackSelection(judgeFallbackValue(selection)), selection);
+  }
+  assert.throws(() => judgeFallbackSelection('model:'), /Choose/);
+  assert.throws(() => judgeFallbackSelection('unrecognized'), /Choose/);
+});
+
+test('fallback choices use only the judge catalog and preserve an unavailable saved choice', () => {
+  const snapshot: ModelRolesSnapshot = {
+    ...mr,
+    roleOptions: { worker: mr.available, judge: [mr.available[0]!] },
+    judgeFallback: { mode: 'model', modelId: 'removed-model', available: false, reason: 'Not connected' },
+  };
+  const choices = judgeFallbackChoices(snapshot);
+  assert.deepEqual(choices.map((choice) => choice.id), ['gpt-5.6-terra', 'removed-model']);
+  assert.equal(choices[1]?.available, false);
+  assert.equal(judgeFallbackValue(snapshot.judgeFallback!), 'model:removed-model');
+  assert.equal(judgeFallbackChoices({ ...snapshot, judgeFallback: { mode: 'model', modelId: 'gpt-5.6-terra', available: false } })[0]?.available, false,
+    'backend unavailability wins even when a cached catalog still lists the model');
+  assert.deepEqual(judgeFallbackChoices({ ...mr, judgeFallback: { mode: 'automatic' } }), [],
+    'an absent judge catalog does not expose worker-only models');
+});
+
+test('fallback reviewers use their own connected catalog independently of primary brain routing', () => {
+  const snapshot: ModelRolesSnapshot = {
+    ...mr,
+    roleOptions: { worker: mr.available, judge: [mr.available[1]!] },
+    judgeFallback: { mode: 'automatic', options: mr.available },
+  };
+  assert.deepEqual(judgeFallbackChoices(snapshot).map((model) => model.id), ['gpt-5.6-terra', 'glm-5.3'],
+    'connected Codex remains a fallback even when absent from the primary judge options');
+  assert.deepEqual(judgeFallbackChoices({ ...snapshot, judgeFallback: { mode: 'automatic', options: [] } }), [],
+    'an explicitly empty fallback catalog must not revive the primary list');
+});
 
 test('a brain option value splits into the door call and names its provider', () => {
   assert.deepEqual(brainCall('claude_oauth:claude-opus-5'), { brain: 'claude_oauth', modelId: 'claude-opus-5' });

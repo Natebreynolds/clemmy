@@ -1662,6 +1662,7 @@ export interface RoleModelGroup {
 }
 
 export interface ModelSettings {
+  judgeFallback?: JudgeFallbackSetting;
   brain: ResolvedBrain;
   options: BrainOptionRow[];
   effectiveValue: string;
@@ -1689,6 +1690,20 @@ export async function setCompletionReview(enabled: boolean) {
 
 export async function getModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>('/m/api/settings/models');
+}
+
+export interface JudgeFallbackSetting {
+  mode: 'automatic' | 'off' | 'model';
+  modelId?: string;
+  available?: boolean;
+  reason?: string;
+  options?: RoleModelGroup[];
+}
+export type JudgeFallbackSelection = Pick<JudgeFallbackSetting, 'mode' | 'modelId'>;
+export async function setJudgeFallback(selection: JudgeFallbackSelection): Promise<{ judgeFallback: JudgeFallbackSetting }> {
+  return api('/m/api/settings/models/judge-fallback', {
+    method: 'PATCH', body: JSON.stringify(selection),
+  });
 }
 
 /** Tidy: the one door for clearing clutter. Plan first (exact counts, nothing

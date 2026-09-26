@@ -1,4 +1,27 @@
-import type { ModelRoleName, ModelSettings, ResolvedBrain, RoleModelGroup } from './api';
+import type { JudgeFallbackSelection, JudgeFallbackSetting, ModelRoleName, ModelSettings, ResolvedBrain, RoleModelGroup } from './api';
+
+export function judgeFallbackValue(setting: JudgeFallbackSetting): string {
+  return setting.mode === 'model' ? `model:${setting.modelId ?? ''}` : setting.mode;
+}
+
+export function judgeFallbackSelection(value: string): JudgeFallbackSelection {
+  if (value === 'automatic' || value === 'off') return { mode: value };
+  if (value.startsWith('model:') && value.slice(6)) return { mode: 'model', modelId: value.slice(6) };
+  throw new Error('Choose a fallback judge from the list.');
+}
+
+export function judgeFallbackChoices(settings: ModelSettings): Array<{ id: string; label: string; available: boolean }> {
+  const setting = settings.judgeFallback;
+  const rows = (setting?.options ?? settings.roleOptions?.judge ?? []).flatMap((group) => group.models.map((model) => ({
+    id: model.id,
+    label: `${group.label} — ${modelName(model.label, group.label)}`,
+    available: !(setting?.mode === 'model' && setting.modelId === model.id && setting.available === false),
+  })));
+  if (setting?.mode === 'model' && !rows.some((row) => row.id === (setting.modelId ?? ''))) {
+    rows.push({ id: setting.modelId ?? '', label: setting.modelId || 'Saved model', available: false });
+  }
+  return rows;
+}
 
 /**
  * Plain words for who handles each part of a request. The phone names a role

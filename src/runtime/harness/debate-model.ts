@@ -33,6 +33,8 @@ import { captureByoRoutingSnapshot, resolveByoProviderForModel, resolveByoProvid
 import type { ByoBackendConfig } from '../../config.js';
 import { classifyTurnIntent } from './turn-intent.js';
 import { boundWriterModel, resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
+import { readJudgeFallbackSetting } from './judge-fallback-policy.js';
+import { resolveJudgeFallbackModel } from './judge-fallback-settings.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
 import { resolveProvider } from './model-wire-registry.js';
 import {
@@ -45,7 +47,6 @@ import {
   codexAvailable,
   debateBrainsAvailable,
   judgeCrossFamilyEnabled,
-  judgeChainEnabled,
   chooseBoundaryJudgeFamily,
   boundaryClaudeJudgeModel,
   boundaryCodexJudgeModel,
@@ -864,39 +865,75 @@ function logDebateAvailabilityTransition(active: boolean): void {
  */
 /** The existing boundary judge's accepted-source routing choice. Live auth is
  * rechecked at invocation, but settings changes cannot choose a different judge. */
-export type CapturedBoundaryJudgeSelection = {
-  status: 'captured';
+interface CapturedJudgeIdentity {
   role: ResolvedRoleModel;
+  byoProvider?: { id: string; baseURL: string; ownership: 'declared' | 'single_provider' };
+}
+
+export type CapturedJudgeFallback = { mode: 'automatic' | 'off' } | {
+  mode: 'model';
+  modelId: string;
+  resolution: ({ status: 'available' } & CapturedJudgeIdentity) | { status: 'unavailable'; reason: string };
+};
+
+export type CapturedBoundaryJudgeSelection = CapturedJudgeIdentity & {
+  status: 'captured';
   crossFamily: boolean;
   defaultModels: { claude: string; codex: string };
-  byoProvider?: { id: string; baseURL: string; ownership: 'declared' | 'single_provider' };
+  /** Source-bound fallback policy. Optional only for persisted pre-setting turns. */
+  fallback?: CapturedJudgeFallback;
 } | { status: 'unavailable'; reason: string };
 
 type AvailableBoundaryJudgeSelection = Extract<CapturedBoundaryJudgeSelection, { status: 'captured' }>;
+
+function captureJudgeIdentity(role: ResolvedRoleModel): CapturedJudgeIdentity {
+  let byoProvider: CapturedJudgeIdentity['byoProvider'];
+  if (role.provider === 'byo' && !role.inactiveBinding) {
+    const snapshot = captureByoRoutingSnapshot();
+    const backend = resolveByoProviderForModelFromSnapshot(role.modelId, snapshot);
+    const owners = snapshot.providers.filter((row) => row.backend === backend);
+    if (owners.length !== 1) throw new Error('The selected BYO judge has no unique provider identity.');
+    const owner = owners[0]!;
+    byoProvider = { id: owner.provider.id, baseURL: owner.provider.baseURL,
+      ownership: owner.provider.modelIds.includes(role.modelId) ? 'declared' : 'single_provider' };
+  }
+  return { role: { ...role, ...(role.inactiveBinding ? { inactiveBinding: { ...role.inactiveBinding } } : {}) },
+    ...(byoProvider ? { byoProvider } : {}) };
+}
+
+function captureJudgeFallback(): CapturedJudgeFallback {
+  const setting = readJudgeFallbackSetting();
+  if (setting.mode !== 'model') return setting;
+  try {
+    const resolved = resolveJudgeFallbackModel(setting);
+    if (resolved.status === 'available') {
+      return { ...setting, resolution: { status: 'available', ...captureJudgeIdentity(resolved.role) } };
+    }
+    return { ...setting, resolution: { status: 'unavailable', reason: resolved.status === 'unavailable'
+      ? resolved.reason : 'The selected fallback model is unavailable.' } };
+  } catch {
+    return { ...setting, resolution: { status: 'unavailable', reason: 'The selected fallback model could not be captured.' } };
+  }
+}
+
+export function boundaryJudgeFallbackMode(selection?: CapturedBoundaryJudgeSelection): CapturedJudgeFallback['mode'] {
+  return selection?.status === 'captured' && selection.fallback
+    ? selection.fallback.mode : readJudgeFallbackSetting().mode;
+}
+
+function selectedJudgeFallback(selection?: CapturedBoundaryJudgeSelection): CapturedJudgeFallback {
+  return selection?.status === 'captured' && selection.fallback ? selection.fallback : captureJudgeFallback();
+}
 
 export function captureBoundaryJudgeSelection(): CapturedBoundaryJudgeSelection {
   try {
     // Resolve/downshift once, including the actual requested inactive binding.
     // The resolver must never replace an unavailable owner pin with its default.
     const role = downshiftForBoundary(resolveRoleModel('judge'));
-    let byoProvider: AvailableBoundaryJudgeSelection['byoProvider'];
-    if (role.provider === 'byo' && !role.inactiveBinding) {
-      const snapshot = captureByoRoutingSnapshot();
-      const backend = resolveByoProviderForModelFromSnapshot(role.modelId, snapshot);
-      const owners = snapshot.providers.filter((row) => row.backend === backend);
-      if (owners.length !== 1) return { status: 'unavailable', reason: 'The selected BYO judge has no unique provider identity.' };
-      const owner = owners[0]!;
-      byoProvider = { id: owner.provider.id, baseURL: owner.provider.baseURL,
-        ownership: owner.provider.modelIds.includes(role.modelId) ? 'declared' : 'single_provider' };
-    }
-    return { status: 'captured', role: {
-      modelId: role.modelId, provider: role.provider, source: role.source,
-      ...(role.inactiveBinding ? { inactiveBinding: { ...role.inactiveBinding } } : {}),
-      ...(role.matchedIntent ? { matchedIntent: role.matchedIntent } : {}),
-      ...(role.exactHeavyweightPin ? { exactHeavyweightPin: true } : {}),
-    }, crossFamily: judgeCrossFamilyEnabled(), defaultModels: {
+    return { status: 'captured', ...captureJudgeIdentity(role),
+      fallback: captureJudgeFallback(), crossFamily: judgeCrossFamilyEnabled(), defaultModels: {
       claude: boundaryClaudeJudgeModel(), codex: boundaryCodexJudgeModel(),
-    }, ...(byoProvider ? { byoProvider } : {}) };
+    } };
   } catch {
     return { status: 'unavailable', reason: 'The completion judge selection could not be captured.' };
   }
@@ -930,6 +967,23 @@ export function isCapturedBoundaryJudgeSelection(value: unknown): value is Captu
     const byo = data.byoProvider as Record<string, unknown>;
     if (!nonempty(byo.id) || !nonempty(byo.baseURL)
       || (byo.ownership !== 'declared' && byo.ownership !== 'single_provider')) return false;
+  }
+  if (data.fallback !== undefined) {
+    if (!data.fallback || typeof data.fallback !== 'object') return false;
+    const fallback = data.fallback as Record<string, unknown>;
+    if (fallback.mode === 'model') {
+      if (!nonempty(fallback.modelId) || !fallback.resolution || typeof fallback.resolution !== 'object') return false;
+      const resolution = fallback.resolution as Record<string, unknown>;
+      if (resolution.status === 'unavailable') {
+        if (!nonempty(resolution.reason)) return false;
+      } else if (resolution.status === 'available') {
+        const fallbackRole = resolution.role as Record<string, unknown> | undefined;
+        if (!fallbackRole || fallbackRole.source !== 'settings' || fallbackRole.inactiveBinding
+          || fallbackRole.modelId !== fallback.modelId
+          || !isCapturedBoundaryJudgeSelection({ status: 'captured', role: resolution.role,
+            byoProvider: resolution.byoProvider, crossFamily: data.crossFamily, defaultModels: data.defaultModels })) return false;
+      } else return false;
+    } else if (fallback.mode !== 'automatic' && fallback.mode !== 'off') return false;
   }
   return role.provider !== 'byo' || Boolean(role.inactiveBinding) || data.byoProvider !== undefined;
 }
@@ -1103,8 +1157,13 @@ export interface BoundaryJudgeRouting {
    *  owner-selected judge may legitimately share the brain's family, and the
    *  owner policy says such a configured path must not be rejected merely
    *  because legacy metadata calls it selfJudge. Never derived from
-   *  substituteForExactPin — a stand-in is precisely NOT the owner's choice. */
+   *  substituteForExactPin — automatic stand-ins are not the owner's choice;
+   *  an explicitly selected fallback is, while still naming the primary pin. */
   ownerSelectedJudge?: boolean;
+  /** A selected chain alternate behind a resolved primary. One-shot selectors
+   * must not promote it for ownership or independence; only a caller that
+   * actually observed primary failure may advance to this lane. */
+  deferredFallback?: true;
 }
 
 function boundaryTransport(provider: ModelProviderClass): BoundaryJudgeRouting['transport'] {
@@ -1390,6 +1449,8 @@ export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection,
  * ⇒ only the preferred lane (pre-J1 single-lane behavior).
  */
 export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
+  const selection = captureBoundaryJudgeSelection();
+  const fallbackMode = boundaryJudgeFallbackMode(selection);
   const chain: BoundaryJudgeRouting[] = [];
   const seen = new Set<string>();
   const push = (r: BoundaryJudgeRouting | null): void => {
@@ -1401,9 +1462,25 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
   };
 
   // 1) The preferred lane (cross-family when available; same-family fail-open else).
-  try { push(resolveBoundaryJudge()); } catch { /* no provider could build — skip */ }
+  try {
+    const primary = resolveBoundaryJudge(fallbackMode === 'automatic' ? undefined : selection);
+    // A selected fallback replaces a known exhausted lane before any request.
+    if (fallbackMode !== 'model' || !checkerQuotaExhaustion(primary.judgeFamily)) push(primary);
+  } catch { /* no provider could build — skip */ }
 
-  if (!judgeChainEnabled()) return chain; // kill-switch: single lane only
+  if (fallbackMode === 'off') return chain;
+  if (fallbackMode === 'model') {
+    if (selection.status !== 'captured') return chain;
+    try {
+      const requested = selection.role.inactiveBinding ?? selection.role;
+      const alternate = resolveSelectedJudgeFallback({ modelId: requested.modelId, provider: requested.provider,
+        why: 'the primary checker could not serve this review' }, selection, undefined,
+      chain.length ? 'chain_fallback_after_exact_pin'
+        : checkerQuotaExhaustion(requested.provider) ? 'exact_pin_quota_exhausted' : 'exact_pin_unresolved');
+      push(chain.length ? { ...alternate, deferredFallback: true } : alternate);
+    } catch { /* The selected fallback is unavailable; never add an unchosen lane. */ }
+    return chain;
+  }
 
   // A lane standing in for the owner's chosen judge must be marked SO THAT a
   // substitute or fail-open verdict is never reported as qualification of that
@@ -1493,6 +1570,7 @@ export function resolveBoundaryJudgeChain(): BoundaryJudgeRouting[] {
  * and the brain. Otherwise the existing single attempt/deadline applies. */
 export function resolveBoundaryJudgeHedge(primary: BoundaryJudgeRouting, selection?: CapturedBoundaryJudgeSelection): BoundaryJudgeRouting | null {
   if (selection?.status === 'unavailable') return null;
+  if (boundaryJudgeFallbackMode(selection) !== 'automatic') return null;
   const captured = selection?.status === 'captured' ? selection : undefined;
   if (!(captured?.crossFamily ?? judgeCrossFamilyEnabled())) return null;
   // A configured checker is a selection, not just a head start in a race.
@@ -1559,7 +1637,14 @@ export function resolveCompletionCheckerRoute(
       };
     }
   }
-  const primary = resolveBoundaryJudge(selection, author);
+  let primary: BoundaryJudgeRouting;
+  try { primary = resolveBoundaryJudge(selection, author); }
+  catch (error) {
+    if (boundaryJudgeFallbackMode(selection) !== 'model') throw error;
+    return { primary: resolveSelectedJudgeFallback({ modelId: chosen.inactiveBinding?.modelId ?? chosen.modelId,
+      provider: chosen.inactiveBinding?.provider ?? chosen.provider,
+      why: 'the selected primary checker is unavailable' }, selection, author, 'exact_pin_unresolved'), hedge: null };
+  }
   const exhausted = checkerQuotaExhaustion(primary.judgeFamily);
   if (exhausted) {
     return {
@@ -1578,6 +1663,59 @@ export interface CheckerOutage {
   modelId: string;
   provider: ModelProviderClass;
   why: string;
+}
+
+/** Build the owner's one permitted fallback exactly. Its captured provider
+ * identity survives settings edits; credentials may refresh but the endpoint
+ * and model owner may not change. A fallback is never downshifted or hedged. */
+export function resolveSelectedJudgeFallback(
+  outage: CheckerOutage,
+  selection?: CapturedBoundaryJudgeSelection,
+  author?: ResolvedRoleModel,
+  substituteReason: BoundaryJudgeRouting['substituteReason'] = 'chain_fallback_after_exact_pin',
+): BoundaryJudgeRouting {
+  const fallback = selectedJudgeFallback(selection);
+  const unavailable = (reason: string): never => {
+    throw new CheckerQuotaUnavailableError(`The completion checker ${outage.modelId} could not review this answer: `
+      + `${outage.why}. ${reason} No review was completed.`);
+  };
+  if (fallback.mode !== 'model') return unavailable('No explicit fallback model is selected.');
+  if (fallback.resolution.status !== 'available') {
+    return unavailable(`The selected fallback ${fallback.modelId} is unavailable: ${fallback.resolution.reason}.`);
+  }
+  const identity = fallback.resolution;
+  const role = identity.role;
+  if (role.modelId === outage.modelId && role.provider === outage.provider) {
+    return unavailable(`The selected fallback ${fallback.modelId} is the same checker that could not serve.`);
+  }
+  const exhausted = checkerQuotaExhaustion(role.provider);
+  if (exhausted) return unavailable(`The selected fallback ${fallback.modelId} cannot serve: ${describeCheckerQuotaExhaustion(exhausted)}.`);
+  const captured = selection?.status === 'captured' ? selection : undefined;
+  const fallbackSelection: AvailableBoundaryJudgeSelection = {
+    ...identity, status: 'captured', role, crossFamily: captured?.crossFamily ?? judgeCrossFamilyEnabled(),
+    defaultModels: captured?.defaultModels ?? { claude: boundaryClaudeJudgeModel(), codex: boundaryCodexJudgeModel() },
+    fallback: { mode: 'off' },
+  };
+  let model: Model | null;
+  try { model = buildJudgeForRole(role, claudeAvailable(), codexAvailable(), fallbackSelection); }
+  catch { return unavailable(`The selected fallback ${fallback.modelId} provider identity is unavailable or has changed.`); }
+  if (!model) return unavailable(`The selected fallback ${fallback.modelId} is not connected.`);
+  const configuredBrain = resolveRoleModel('brain');
+  const brainFamily = executedBrainFamily(configuredBrain.provider);
+  const reviewed = author ?? { ...configuredBrain, provider: brainFamily };
+  const requested = requestedJudgePinModelId(captured);
+  return {
+    model, modelId: role.modelId, judgeFamily: role.provider,
+    ...(identity.byoProvider ? { judgeProviderId: identity.byoProvider.id } : {}),
+    brainFamily, ...(author ? { authorFamily: author.provider } : {}),
+    transport: boundaryTransport(role.provider), timeoutMs: exactJudgeBoundaryTimeoutMs(),
+    selfJudge: sameJudgeFamily(role, reviewed, fallbackSelection),
+    // This alternate is explicitly chosen too; substitute identity still says
+    // that it did not qualify the primary pin.
+    ownerSelectedJudge: true,
+    ...(requested && (role.modelId !== requested || role.provider !== captured?.role.provider)
+      ? { substituteForExactPin: true, requestedModelId: requested, substituteReason } : {}),
+  };
 }
 
 /**
@@ -1599,9 +1737,13 @@ export function resolveCheckerQuotaFallthrough(
 ): BoundaryJudgeRouting {
   const captured = selection?.status === 'captured' ? selection : undefined;
   const lead = `The completion checker ${outage.modelId} could not review this answer: ${outage.why}.`;
-  if (!judgeChainEnabled()) {
+  const fallbackMode = boundaryJudgeFallbackMode(selection);
+  if (fallbackMode === 'off') {
     throw new CheckerQuotaUnavailableError(`${lead} Standing in another checker is turned off `
-      + '(CLEMMY_JUDGE_CHAIN=off), so no review was completed.');
+      + '(No fallback, or legacy CLEMMY_JUDGE_CHAIN=off), so no review was completed.');
+  }
+  if (fallbackMode === 'model') {
+    return resolveSelectedJudgeFallback(outage, selection, author, 'exact_pin_quota_exhausted');
   }
   const configuredBrain = resolveRoleModel('brain');
   const brainFamily = executedBrainFamily(configuredBrain.provider);

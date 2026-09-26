@@ -52,10 +52,10 @@ test.after(() => {
   try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-async function boot() {
+async function boot(authorized = true) {
   const app = express();
   app.use(express.json());
-  registerConsoleRoutes(app, () => true, {} as never, { serveLegacyAtRoot: false });
+  registerConsoleRoutes(app, () => authorized, {} as never, { serveLegacyAtRoot: false });
   const server: Server = await new Promise((resolve) => {
     const instance = createServer(app);
     instance.listen(0, '127.0.0.1', () => resolve(instance));
@@ -99,6 +99,35 @@ function persistedEnvValue(key: string): string | undefined {
     return undefined;
   }
 }
+
+test('fallback judge settings authenticate, persist exactly, and preserve the primary judge', async () => {
+  const { removeEnvKey } = await import('../tools/shared.js');
+  const h = await boot();
+  const unauthorized = await boot(false);
+  const originalPrimary = process.env.CLEMMY_MODEL_ROLES;
+  const save = (url: string, body: unknown) => fetch(`${url}/api/console/settings/models/judge-fallback`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  try {
+    assert.equal((await save(unauthorized.url, { mode: 'off' })).status, 401);
+    assert.equal((await save(h.url, { mode: 'model', modelId: 'not-connected' })).status, 400);
+    const saved = await save(h.url, { mode: 'model', modelId: 'glm-5.2' });
+    assert.equal(saved.status, 200, await saved.clone().text());
+    const { options, ...choice } = (await saved.json()).judgeFallback;
+    assert.deepEqual(choice, { mode: 'model', modelId: 'glm-5.2', available: true });
+    assert.ok(Array.isArray(options));
+    assert.equal(process.env.CLEMMY_MODEL_ROLES, originalPrimary);
+    assert.equal(JSON.parse(persistedEnvValue('CLEMMY_JUDGE_FALLBACK')!).modelId, 'glm-5.2');
+    const snapshot = await fetch(`${h.url}/api/console/settings`);
+    assert.equal((await snapshot.json()).modelRoles.judgeFallback.modelId, 'glm-5.2');
+    const off = await save(h.url, { mode: 'off' });
+    assert.equal((await off.json()).judgeFallback.mode, 'off');
+  } finally {
+    await h.close();
+    await unauthorized.close();
+    removeEnvKey('CLEMMY_JUDGE_FALLBACK');
+  }
+});
 
 test('switching to the BYO brain syncs the all-in worker slot without rewriting durable bindings', async () => {
   const durableBindings = process.env.CLEMMY_MODEL_ROLES;

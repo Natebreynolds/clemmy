@@ -469,6 +469,7 @@ const CONSOLE_PROCESS_IDENTITY = Object.freeze({
 const XAI_BASE_URL = 'https://api.x.ai/v1';
 import { resolveRoleModel, readDurableBindings, pinSessionBrain } from '../runtime/harness/model-roles.js';
 import { isBindableModelRole, ModelRoleSettingError, persistModelRoleSetting } from '../runtime/harness/model-role-settings.js';
+import { judgeFallbackSettingsSnapshot, JudgeFallbackSettingError, persistJudgeFallbackSetting } from '../runtime/harness/judge-fallback-settings.js';
 import { listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
 import { modelRoleOptionCatalogSnapshot, brainOptions, effectiveBrain, effectiveBrainValue, codexModelsAvailable, claudeModelsAvailable } from '../runtime/harness/model-role-options.js';
@@ -8544,6 +8545,7 @@ export function registerConsoleRoutes(
       bindings: readDurableBindings(),
       available: catalog.available,
       roleOptions: catalog.roleOptions,
+      judgeFallback: judgeFallbackSettingsSnapshot(catalog),
       brainOptions: catalog.brainOptions,
       effectiveBrain: effectiveBrain(),
       effectiveBrainValue: effectiveBrainValue(),
@@ -15998,6 +16000,21 @@ export function registerConsoleRoutes(
         judgeSource: resolveRoleModel('judge').source,
       },
     });
+  });
+
+  app.patch('/api/console/settings/models/judge-fallback', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const judgeFallback = persistJudgeFallbackSetting(req.body);
+      resetHarnessRuntimeConfig();
+      resetClaudeModelCache();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+      res.json({ judgeFallback });
+    } catch (err) {
+      res.status(err instanceof JudgeFallbackSettingError ? 400 : 500)
+        .json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.patch('/api/console/settings/models/roles', (req, res) => {

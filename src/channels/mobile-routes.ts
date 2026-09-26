@@ -5630,6 +5630,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
     const { effectiveBrainValue, modelRoleOptionCatalogSnapshot } = await import('../runtime/harness/model-role-options.js');
     const { codexRescueSettingsSnapshot } = await import('../runtime/harness/codex-rescue-settings.js');
+    const { judgeFallbackSettingsSnapshot } = await import('../runtime/harness/judge-fallback-settings.js');
     const { judgeReviewsOwnFamily } = await import('../runtime/harness/debate-model.js');
     const { getActiveAuthMode } = await import('../config.js');
     const catalog = modelRoleOptionCatalogSnapshot();
@@ -5649,6 +5650,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         worker: resolveRoleModel('worker'),
       },
       roleOptions: catalog.roleOptions,
+      judgeFallback: judgeFallbackSettingsSnapshot(catalog),
       judgeReviewsOwnFamily: judgeReviewsOwnFamily(),
       // Exact connected Codex ids only. The phone never derives provider
       // identity or accepts credentials; console and mobile share one
@@ -5662,6 +5664,25 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.json(await modelSettingsSnapshot());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.patch('/api/settings/models/judge-fallback', requireMobileSession, async (req, res) => {
+    const { persistJudgeFallbackSetting, JudgeFallbackSettingError } = await import('../runtime/harness/judge-fallback-settings.js');
+    try {
+      const judgeFallback = persistJudgeFallbackSetting(req.body);
+      const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
+      const { resetClaudeModelCache } = await import('../runtime/harness/claude-model.js');
+      const { resetByoModelCache } = await import('../runtime/harness/byo-model.js');
+      const { clearAutonomyAgentCache } = await import('../agents/autonomy-v2.js');
+      resetHarnessRuntimeConfig();
+      resetClaudeModelCache();
+      resetByoModelCache();
+      clearAutonomyAgentCache();
+      res.json({ judgeFallback });
+    } catch (err) {
+      res.status(err instanceof JudgeFallbackSettingError ? 400 : 500)
+        .json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

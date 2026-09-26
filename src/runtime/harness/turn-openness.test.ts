@@ -283,6 +283,25 @@ test('a route marked self-judge is refused even when its cached brain label is s
   );
 });
 
+test('one-shot openness cannot activate a selected fallback to bypass a healthy same-family primary', async () => {
+  const primary = {
+    model: {} as any, modelId: 'same-family-primary-fixture', judgeFamily: 'codex' as const,
+    brainFamily: 'codex' as const, transport: 'codex_responses' as const, selfJudge: true,
+  };
+  const alternate = {
+    model: {} as any, modelId: 'selected-alternate-fixture', judgeFamily: 'claude' as const,
+    brainFamily: 'codex' as const, transport: 'claude_subscription' as const, selfJudge: false,
+    ownerSelectedJudge: true, deferredFallback: true as const,
+  };
+  let calls = 0;
+  _setOpennessJudgePortForTests({
+    async resolveRoutes() { return [primary, alternate]; },
+    async run() { calls++; return 'OPEN: which account'; },
+  });
+  assert.equal(await resolveTurnOpenness({ message: 'Review this request.', brainFamily: 'codex' }), null);
+  assert.equal(calls, 0, 'independence is not a primary failure or permission to use the selected fallback');
+});
+
 test('no different-family judge route fails open without executing a model', async () => {
   let calls = 0;
   const sameFamily = {

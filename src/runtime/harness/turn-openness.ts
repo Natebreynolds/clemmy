@@ -219,13 +219,14 @@ export function _setOpennessJudgePortForTests(port: TurnOpennessJudgePort | null
 /** First model-bearing route whose family differs from the actual active brain.
  * Route metadata about the brain may be stale; the caller's current family is
  * the authority, while `selfJudge` remains a defense-in-depth refusal. Route
- * discovery never executes or retries anything. */
+ * discovery never executes or retries anything. A selected fallback behind a
+ * healthy primary cannot be promoted merely to obtain an independent family. */
 export function selectIndependentTurnOpennessJudgeRoute(
   routes: readonly BoundaryJudgeRouting[],
   brainFamily: ModelProviderClass,
 ): IndependentTurnOpennessJudgeRoute | null {
   for (const route of routes) {
-    if (route.model && !route.selfJudge && route.judgeFamily !== brainFamily) {
+    if (route.model && !route.deferredFallback && !route.selfJudge && route.judgeFamily !== brainFamily) {
       return route as IndependentTurnOpennessJudgeRoute;
     }
   }

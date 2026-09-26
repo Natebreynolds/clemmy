@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import { Fragment } from 'preact';
 import { compactUsageText, creditRefusalSentence, formatBalance, formatTokenCount, presentUsageMeters, resetsInText } from '@clem/chat-engine';
 import {
   getCompletionReview,
@@ -17,6 +18,8 @@ import {
   revokeAllDevices,
   revokeDevice,
   setCodexRescueModel,
+  setJudgeFallback,
+  type JudgeFallbackSetting,
   type CodexRescueSettings,
   type MobileDeviceRow,
   type ModelRoleName,
@@ -39,6 +42,9 @@ import {
   inactiveNote,
   roleSummary,
   sameFamilyWarning,
+  judgeFallbackChoices,
+  judgeFallbackSelection,
+  judgeFallbackValue,
 } from '../lib/model-roles';
 import { ScreenNotice } from '../components/ScreenNotice';
 
@@ -305,14 +311,21 @@ function ModelsCard({ loaded, onRefresh }: {
             onOpen={() => setBrainOpen(true)}
           />
           {(['writer', 'judge', 'worker'] as const).map((role) => settings.roles?.[role] ? (
-            <RoleRow
-              key={role}
-              title={ROLE_COPY[role].title}
-              summary={roleSummary(role, settings)}
-              warning={inactiveNote(settings.roles[role], settings)}
-              note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : null}
-              onOpen={() => setSheet(role)}
-            />
+            <Fragment key={role}>
+              <RoleRow
+                title={ROLE_COPY[role].title}
+                summary={roleSummary(role, settings)}
+                warning={inactiveNote(settings.roles[role], settings)}
+                note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : null}
+                onOpen={() => setSheet(role)}
+              />
+              {role === 'judge' && settings.judgeFallback ? (
+                <FallbackJudgeRow settings={settings} onChanged={(judgeFallback) => {
+                  setLatest((previous) => ({ ...(previous ?? settings), judgeFallback }));
+                  void onRefresh();
+                }} />
+              ) : null}
+            </Fragment>
           ) : null)}
           {warning ? <p class="warning card-note model-roles-warning">{warning}</p> : null}
           {rescue && rescueMeaningful ? (
@@ -335,6 +348,57 @@ function ModelsCard({ loaded, onRefresh }: {
         onChanged={(next) => { setLatest(next); void onRefresh(); }}
       />
     </section>
+  );
+}
+
+function FallbackJudgeRow({ settings, onChanged }: {
+  settings: ModelSettings;
+  onChanged: (setting: JudgeFallbackSetting) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const fallback = settings.judgeFallback;
+  if (!fallback) return null;
+  const choices = judgeFallbackChoices(settings);
+  const unavailable = fallback.mode === 'model'
+    && choices.some((model) => model.id === (fallback.modelId ?? '') && !model.available);
+  const save = async (value: string) => {
+    setBusy(true);
+    setSaved(false);
+    setError(null);
+    try {
+      const response = await setJudgeFallback(judgeFallbackSelection(value));
+      onChanged(response.judgeFallback);
+      haptic('light');
+      setSaved(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save the fallback judge. Try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div class="settings-rescue settings-fallback">
+      <label class="settings-row" for="judge-fallback-model">
+        <span class="settings-row-main">
+          <span class="settings-row-label">Fallback judge</span>
+          <span class="settings-row-note" id="judge-fallback-description">Used only when the primary judge cannot complete a review. A completed verdict is kept.</span>
+        </span>
+        <select id="judge-fallback-model" class="settings-select" aria-label="Fallback judge model" aria-describedby="judge-fallback-description judge-fallback-status" disabled={busy} value={judgeFallbackValue(fallback)} onChange={(event) => void save(event.currentTarget.value)}>
+          <option value="automatic">Automatic</option>
+          <option value="off">No fallback</option>
+          {choices.map((model) => <option key={model.id} value={`model:${model.id}`} disabled={!model.available}>{model.label}{!model.available ? ' (unavailable)' : ''}</option>)}
+        </select>
+      </label>
+      <p id="judge-fallback-status" class={`card-note${unavailable ? ' warning' : ''}`} role="status">
+        {busy ? 'Saving…' : unavailable
+          ? `Your saved choice is unavailable. ${fallback.reason || 'Connect it again or choose another fallback.'}`
+          : saved ? 'Saved. Applies to new requests.'
+          : fallback.mode === 'off' ? 'The primary judge handles review without a fallback.' : 'Applies to new requests.'}
+      </p>
+      {error ? <p class="error card-note" role="alert">{error}</p> : null}
+    </div>
   );
 }
 

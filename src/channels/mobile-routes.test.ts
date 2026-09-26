@@ -4541,6 +4541,53 @@ test('Codex rescue route exposes exact connected options, persists one id, refre
 // The phone sets who writes the final answer, who checks the work and who helps
 // in parallel through the same owner as desktop Settings: exact connected ids,
 // refusals that write nothing, and clear back to automatic.
+test('phone fallback judge setting shares the desktop policy and requires authentication', async () => {
+  const keys = ['AUTH_MODE', 'MODEL_ROUTING_MODE', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_API_KEY', 'BYO_MODEL_ID',
+    'CLEMMY_JUDGE_FALLBACK', 'CLEMMY_JUDGE_CHAIN'];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.AUTH_MODE = 'api_key';
+  process.env.MODEL_ROUTING_MODE = 'all_in';
+  process.env.BYO_MODEL_BASE_URL = 'https://fixture.invalid/v1';
+  process.env.BYO_MODEL_API_KEY = 'fixture-only-key';
+  process.env.BYO_MODEL_ID = 'glm-5.2';
+  process.env.CLEMMY_JUDGE_CHAIN = 'off';
+  delete process.env.CLEMMY_JUDGE_FALLBACK;
+  const primary = process.env.CLEMMY_MODEL_ROLES;
+  const { readJudgeFallbackSetting } = await import('../runtime/harness/judge-fallback-policy.js');
+  const h = await startHarness();
+  const patch = (body: unknown, cookie = '') => fetch(`${h.url}/m/api/settings/models/judge-fallback`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify(body),
+  });
+  try {
+    assert.equal((await patch({ mode: 'automatic' })).status, 401);
+    const cookie = await loginMobile(h, 'Fallback judge phone');
+    const invalid = await patch({ mode: 'model', modelId: 'not-connected' }, cookie);
+    assert.equal(invalid.status, 400);
+    assert.deepEqual(readJudgeFallbackSetting(), { mode: 'off' });
+    const saved = await patch({ mode: 'model', modelId: 'glm-5.2' }, cookie);
+    assert.equal(saved.status, 200, await saved.clone().text());
+    const { options, ...choice } = (await saved.json()).judgeFallback;
+    assert.deepEqual(choice, { mode: 'model', modelId: 'glm-5.2', available: true });
+    assert.ok(Array.isArray(options));
+    assert.deepEqual(readJudgeFallbackSetting(), { mode: 'model', modelId: 'glm-5.2' });
+    assert.equal(process.env.CLEMMY_MODEL_ROLES, primary);
+    const snapshot = await fetch(`${h.url}/m/api/settings/models`, { headers: { cookie } });
+    assert.equal((await snapshot.json()).judgeFallback.modelId, 'glm-5.2');
+    assert.equal((await patch({ mode: 'automatic' }, cookie)).status, 200);
+    assert.deepEqual(readJudgeFallbackSetting(), { mode: 'automatic' }, 'an explicit choice supersedes the old off switch');
+    assert.equal((await patch({ mode: 'off' }, cookie)).status, 200);
+    assert.deepEqual(readJudgeFallbackSetting(), { mode: 'off' });
+  } finally {
+    await h.close();
+    const { removeEnvKey } = await import('../tools/shared.js');
+    removeEnvKey('CLEMMY_JUDGE_FALLBACK');
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  }
+});
+
 test('phone role route sets and clears writer and judge through the desktop owner', async () => {
   const keys = [
     'AUTH_MODE', 'MODEL_ROUTING_MODE', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_API_KEY', 'BYO_MODEL_ID',

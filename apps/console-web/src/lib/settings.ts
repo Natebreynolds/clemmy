@@ -179,6 +179,7 @@ export interface ResolvedRole {
   };
 }
 export interface ModelRolesSnapshot {
+  judgeFallback?: JudgeFallbackSetting;
   // writer is absent on daemons that predate the writer role.
   roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole; writer?: ResolvedRole };
   bindings: { role: ModelRoleName; modelId: string; whenIntent?: string; source: string }[];
@@ -220,6 +221,17 @@ export interface ModelRolesSnapshot {
 // switch (setActiveBrain). Applies on the next message, no restart.
 export const patchModelRole = (p: { role: 'worker' | 'judge' | 'writer'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
   patch<{ modelRoles: ModelRolesSnapshot }>('/api/console/settings/models/roles', p);
+
+export interface JudgeFallbackSetting {
+  mode: 'automatic' | 'off' | 'model';
+  modelId?: string;
+  available?: boolean;
+  reason?: string;
+  options?: ModelRolesSnapshot['available'];
+}
+export type JudgeFallbackSelection = Pick<JudgeFallbackSetting, 'mode' | 'modelId'>;
+export const patchJudgeFallback = (selection: JudgeFallbackSelection) =>
+  patch<{ judgeFallback: JudgeFallbackSetting }>('/api/console/settings/models/judge-fallback', selection);
 
 export const getSettings = () => apiGet<SettingsSnapshot>('/api/console/settings');
 

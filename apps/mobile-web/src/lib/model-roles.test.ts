@@ -8,6 +8,9 @@ import {
   isChosen,
   roleSummary,
   sameFamilyWarning,
+  judgeFallbackChoices,
+  judgeFallbackSelection,
+  judgeFallbackValue,
 } from './model-roles';
 
 const groups = [
@@ -32,6 +35,41 @@ function settings(over: Partial<ModelSettings> = {}): ModelSettings {
     ...over,
   };
 }
+
+test('fallback selection distinguishes automatic, off and exact model ids without changing the primary judge', () => {
+  for (const selection of [{ mode: 'automatic' }, { mode: 'off' }, { mode: 'model', modelId: 'host/model:revision' }] as const) {
+    assert.deepEqual(judgeFallbackSelection(judgeFallbackValue(selection)), selection);
+  }
+  assert.throws(() => judgeFallbackSelection('model:'), /Choose/);
+  const snapshot = settings({ judgeFallback: { mode: 'off' } });
+  assert.equal(snapshot.roles?.judge?.modelId, 'claude-model-a');
+});
+
+test('fallback catalog preserves a saved missing model without offering worker-only choices', () => {
+  const snapshot = settings({
+    judgeFallback: { mode: 'model', modelId: 'disconnected-model', available: false },
+    roleOptions: { judge: [groups[0]!], worker: groups },
+  });
+  const choices = judgeFallbackChoices(snapshot);
+  assert.deepEqual(choices, [
+    { id: 'claude-model-a', label: 'Claude — Model A', available: true },
+    { id: 'disconnected-model', label: 'disconnected-model', available: false },
+  ]);
+  assert.equal(judgeFallbackValue(snapshot.judgeFallback!), 'model:disconnected-model');
+  assert.equal(judgeFallbackChoices(settings({ judgeFallback: { mode: 'model', modelId: 'claude-model-a', available: false } }))[0]?.available, false);
+  assert.deepEqual(judgeFallbackChoices(settings({ roleOptions: { worker: groups } })), []);
+});
+
+test('fallback reviewers remain independent of restrictions on the primary judge catalog', () => {
+  const snapshot = settings({
+    roleOptions: { judge: [groups[0]!], worker: groups },
+    judgeFallback: { mode: 'automatic', options: groups },
+  });
+  assert.deepEqual(judgeFallbackChoices(snapshot).map((model) => model.id), ['claude-model-a', 'codex-model-b', 'hosted-model-c'],
+    'connected Codex is offered even when the primary judge list excludes it');
+  assert.deepEqual(judgeFallbackChoices({ ...snapshot, judgeFallback: { mode: 'automatic', options: [] } }), [],
+    'an explicit empty catalog does not fall back to primary judge options');
+});
 
 test('a saved choice is the owner\'s; defaults and learned picks are automatic', () => {
   assert.equal(isChosen({ source: 'settings' }), true);
