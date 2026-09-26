@@ -64,11 +64,23 @@ export interface HostConsentCarrierEvidence {
   requestMethod: 'safe' | 'post' | 'update' | 'delete' | null;
 }
 
+/** Where a learned operation semantic came from: the two models that agreed,
+ * their confidences, and the digests that bind the exact definition. */
+export interface HostConsentSemanticSourceEvidence {
+  origin: 'learned_operation_delivery';
+  sourceDigest: string;
+  definitionDigest: string;
+  learnedAt: string;
+  screen: { model: string; deliveryProbability: number; irreversibleProbability: number };
+  confirm: { role: 'judge'; model: string; confidence: number };
+}
+
 /** Append the private receipt for a decision the harness answered on the
  * carrier's bound (basis exact_carrier_bounded_work, or its planning-turn
- * form plan_preparation_probe). Every other basis is a no-op here: reads,
- * reversible/ordinary work and user grants already have their own ledgers.
- * Best-effort: journaling never changes the decision. */
+ * form plan_preparation_probe), or on a learned operation semantic. Every
+ * other proceed is a no-op here: reads, reversible/ordinary work and user
+ * grants already have their own ledgers. Best-effort: journaling never
+ * changes the decision. */
 export function journalInteractiveConsentDecision(input: {
   sessionId: string;
   /** Chat lanes carry the source turn; a workflow node has none. */
@@ -76,10 +88,15 @@ export function journalInteractiveConsentDecision(input: {
   call: CapabilityRiskAttestationV1;
   decision: InteractiveConsentDecisionV1;
   carrier: HostConsentCarrierEvidence | null;
+  semanticSource?: HostConsentSemanticSourceEvidence | null;
 }): void {
   const { decision } = input;
   if (decision.kind !== 'proceed') return;
-  if (decision.basis !== 'exact_carrier_bounded_work' && decision.basis !== 'plan_preparation_probe') return;
+  if (
+    decision.basis !== 'exact_carrier_bounded_work'
+    && decision.basis !== 'plan_preparation_probe'
+    && !input.semanticSource
+  ) return;
   try {
     appendEvent({
       sessionId: input.sessionId,
@@ -100,6 +117,7 @@ export function journalInteractiveConsentDecision(input: {
         argumentDigest: input.call.argumentDigest,
         carrierHints: { destructive: input.carrier?.destructive ?? null },
         requestMethod: input.carrier?.requestMethod ?? null,
+        ...(input.semanticSource ? { semanticSource: input.semanticSource } : {}),
       },
     });
   } catch {

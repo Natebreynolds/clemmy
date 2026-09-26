@@ -36,6 +36,7 @@ import {
   buildHostConsentEvidence,
   journalInteractiveConsentDecision,
   type HostConsentCarrierEvidence,
+  type HostConsentSemanticSourceEvidence,
 } from './host-consent-evidence.js';
 import { appendEvent, getEvent, openEventLog } from './eventlog.js';
 import {
@@ -775,6 +776,22 @@ interface PreparedConsentSemanticBasis {
   requirementCapabilityIdentity: string;
   /** Carrier declaration + bound method class, for the decision receipt. */
   carrier: HostConsentCarrierEvidence | null;
+  /** Where a learned semantic came from, for the decision receipt. */
+  semanticSource: HostConsentSemanticSourceEvidence | null;
+}
+
+/** The accepted source's own creation time, or null when it cannot be read. */
+function acceptedSourceCreatedAt(
+  binding: Pick<PreparedHostWorkCallV1['hostCapabilityBinding'], 'sessionId' | 'sourceEventId'>,
+): string | null {
+  try {
+    const source = getEvent(binding.sourceEventId);
+    return source && source.sessionId === binding.sessionId && Number.isFinite(Date.parse(source.createdAt))
+      ? source.createdAt
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 type PreparedConsentTarget = Pick<
@@ -991,6 +1008,7 @@ async function semanticBasisForExactCall(input: {
       safety: 'admissible',
       requirementCapabilityIdentity: local.capabilityRef,
       carrier: null,
+      semanticSource: null,
     } };
   }
   if (binding.bindingKind !== 'catalog_manifest') {
@@ -1027,6 +1045,10 @@ async function semanticBasisForExactCall(input: {
   if (!destination) {
     return { status: 'hold', reason: 'bound_catalog_destination_projection_unavailable' };
   }
+  // A learned delivery verdict counts from the source it predates: a card
+  // raised for this source and resumed after its approval is evaluated on the
+  // same facts both times, and a verdict learned meanwhile waits for the next.
+  const learnedSemanticsAsOf = acceptedSourceCreatedAt(binding);
   const loaded = await loadFreshCatalogManifestExternalRiskAttestationV1({
     version: 1,
     binding: {
@@ -1047,6 +1069,7 @@ async function semanticBasisForExactCall(input: {
     destination,
     callSignals: callSignals.callSignals,
     safety: 'admissible' as const,
+    ...(learnedSemanticsAsOf ? { learnedSemanticsAsOf } : {}),
   });
   if (!loaded.ok) {
     return {
@@ -1081,6 +1104,20 @@ async function semanticBasisForExactCall(input: {
       destructive: external.currentDefinition.behaviorHints.destructive,
       requestMethod: callSignals.callSignals.requestMethod,
     },
+    semanticSource: external.semanticSource
+      ? {
+          origin: external.semanticSource.origin,
+          sourceDigest: external.semanticSource.sourceDigest,
+          definitionDigest: external.semanticSource.verdict.definitionDigest,
+          learnedAt: external.semanticSource.verdict.learnedAt,
+          screen: { ...external.semanticSource.verdict.screen },
+          confirm: {
+            role: external.semanticSource.verdict.confirm.role,
+            model: external.semanticSource.verdict.confirm.model,
+            confidence: external.semanticSource.verdict.confirm.confidence,
+          },
+        }
+      : null,
   } };
 }
 
@@ -1234,7 +1271,7 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
   });
   journalInteractiveConsentDecision({
     sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq,
-    call, decision, carrier: semantic.carrier,
+    call, decision, carrier: semantic.carrier, semanticSource: semantic.semanticSource,
   });
   if (decision.kind !== 'proceed') {
     return {
@@ -1399,7 +1436,7 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     });
     journalInteractiveConsentDecision({
       sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
-      call, decision, carrier: semantic.carrier,
+      call, decision, carrier: semantic.carrier, semanticSource: semantic.semanticSource,
     });
     if (binding.bindingKind === 'local_envelope' && decision.kind === 'proceed'
       && (decision.basis === 'exact_reversible_work' || decision.basis === 'exact_ordinary_work')) {

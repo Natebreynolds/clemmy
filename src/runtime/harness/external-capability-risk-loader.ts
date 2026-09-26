@@ -17,7 +17,9 @@
  *
  * Provider/tool names are identity data only. Classification receives the
  * operation-only `semanticName` and normalized declared hints; there are no
- * provider or operation allowlists here.
+ * provider or operation allowlists here. A caller that names its accepted
+ * source's time may also have a learned delivery verdict consulted
+ * (learned-operation-delivery-store.ts); it can only replace a structural send.
  */
 import { createHash } from 'node:crypto';
 
@@ -54,6 +56,7 @@ import {
   type ExternalCapabilityRequestMethodClass,
   EXTERNAL_CAPABILITY_RISK_INPUT_VERSION,
   projectExternalCapabilityRiskV1,
+  structuralExternalCapabilityRiskV1,
   type ExternalCapabilityEffect,
   type ExternalCapabilityProviderKind,
   type ExternalCapabilityRiskInputV1,
@@ -64,6 +67,12 @@ import type {
   CapabilityRiskAttestationV1,
   InteractiveConsentDestination,
 } from './interactive-consent-policy.js';
+import {
+  learnedOperationDeliveryKey,
+  learnedOperationDeliveryVerdict,
+  parseLearnedOperationDeliveryVerdictV1,
+  type LearnedOperationDeliveryVerdictV1,
+} from './learned-operation-delivery-store.js';
 
 export const EXTERNAL_CAPABILITY_RISK_LOADER_VERSION = 1 as const;
 export const EXTERNAL_CAPABILITY_CALL_SIGNAL_VERSION = 1 as const;
@@ -104,6 +113,23 @@ export interface LoadExternalCapabilityRiskAttestationInputV1 {
   /** Exact argument-derived signals, never model-authored labels. */
   callSignals: ExternalCapabilityRiskInputV1['callSignals'];
   safety: CapabilityRiskAttestationV1['safety'];
+  /**
+   * A learned delivery verdict the caller read for this operation. It is
+   * consulted only when the manifest seals no semantic of its own, and it can
+   * only replace a structural send on an ordinary external write whose
+   * current input schema is the one the models read (learnedDeliverySemantic).
+   * Absent means none.
+   */
+  learnedDelivery?: LearnedOperationDeliveryVerdictV1;
+}
+
+/** Where a projected semantic came from, when it was learned rather than
+ * sealed or structural. The source digest is the documented semantic's own,
+ * so the attestation's semantic basis binds this exact verdict. */
+export interface ExternalCapabilityLearnedSemanticSourceV1 {
+  origin: 'learned_operation_delivery';
+  sourceDigest: string;
+  verdict: LearnedOperationDeliveryVerdictV1;
 }
 
 export interface ExternalCapabilityRiskAttestationV1 {
@@ -135,6 +161,8 @@ export interface ExternalCapabilityRiskAttestationV1 {
     behaviorHints: ExternalCapabilityBehaviorHintsV1;
   };
   projection: ExternalCapabilityRiskProjectionV1;
+  /** Present only when the projected semantic came from a learned verdict. */
+  semanticSource?: ExternalCapabilityLearnedSemanticSourceV1;
 }
 
 export type ExternalCapabilityRiskLoaderRefusal =
@@ -174,6 +202,15 @@ export interface LoadCatalogManifestExternalRiskAttestationInputV1 {
   destination: InteractiveConsentDestination;
   callSignals: ExternalCapabilityRiskInputV1['callSignals'];
   safety: CapabilityRiskAttestationV1['safety'];
+  /**
+   * When the accepted source this call belongs to was created (ISO time).
+   * Supplying it consults the learned delivery verdict for the operation, if
+   * one was learned no later than that instant. A verdict learned afterwards
+   * waits for a later source, so a card raised for this source and resumed
+   * after its approval is judged on the same facts both times. Absent means
+   * no learned verdict is consulted.
+   */
+  learnedSemanticsAsOf?: string;
 }
 
 /** Test seam. Production omits it and reopens the installed owners. */
@@ -246,6 +283,7 @@ const TOP_LEVEL_KEYS = new Set([
   'callSignals',
   'safety',
 ]);
+const OPTIONAL_TOP_LEVEL_KEYS = new Set(['learnedDelivery']);
 const CURRENT_DEFINITION_KEYS = new Set([
   'version',
   'providerKind',
@@ -984,7 +1022,11 @@ function closedInput(raw: unknown): LoadExternalCapabilityRiskAttestationInputV1
   } catch {
     return null;
   }
-  if (!isRecord(parsed) || !hasExactKeys(parsed, TOP_LEVEL_KEYS)) return null;
+  if (
+    !isRecord(parsed)
+    || ![...TOP_LEVEL_KEYS].every((key) => Object.hasOwn(parsed, key))
+    || !Object.keys(parsed).every((key) => TOP_LEVEL_KEYS.has(key) || OPTIONAL_TOP_LEVEL_KEYS.has(key))
+  ) return null;
   if (parsed.version !== EXTERNAL_CAPABILITY_RISK_LOADER_VERSION) return null;
   if (!isRecord(parsed.manifest) || !hasOnlyKeys(parsed.manifest, MANIFEST_KEYS)) return null;
 
@@ -1120,6 +1162,22 @@ export function loadExternalCapabilityRiskAttestationV1(
     manifestDefinitionFingerprint: definition.manifestDefinitionFingerprint,
     schemaDigest,
   }));
+  // A semantic the manifest seals always wins. Only without one may a
+  // learned delivery verdict stand in, under learnedDeliverySemantic's rules.
+  const sealedSemantic = sealedSemanticForManifest(manifest);
+  const learned = sealedSemantic || input.learnedDelivery === undefined
+    ? null
+    : learnedDeliverySemantic({
+        manifest,
+        manifestDigest,
+        definitionDigest,
+        schemaDigest,
+        effect,
+        semanticName: definition.semanticName,
+        behaviorHints: definition.behaviorHints,
+        callSignals: input.callSignals,
+        learned: input.learnedDelivery,
+      });
   const projection = projectExternalCapabilityRiskV1({
     version: EXTERNAL_CAPABILITY_RISK_INPUT_VERSION,
     manifest: {
@@ -1149,7 +1207,7 @@ export function loadExternalCapabilityRiskAttestationV1(
     },
     behaviorHints: definition.behaviorHints,
     callSignals: input.callSignals,
-    documentedSemantic: sealedSemanticForManifest(manifest),
+    documentedSemantic: sealedSemantic ?? learned?.semantic ?? null,
     safety: input.safety,
   } satisfies ExternalCapabilityRiskInputV1);
   if (!projection.ok) return { ok: false, reason: projection.reason };
@@ -1185,8 +1243,105 @@ export function loadExternalCapabilityRiskAttestationV1(
         behaviorHints: { ...definition.behaviorHints },
       },
       projection: projection.projection,
+      ...(learned ? { semanticSource: learned.source } : {}),
     },
   };
+}
+
+/**
+ * A learned delivery verdict as a documented semantic, or null. Two models
+ * agreed, from this operation's own definition, that it delivers nothing to
+ * anyone other than the owner and can neither delete nor irreversibly change
+ * anything. That can stand in only where every fact below holds; anything
+ * else keeps the structural projection and therefore its card.
+ */
+function learnedDeliverySemantic(input: {
+  manifest: CapabilityManifestV1;
+  manifestDigest: string;
+  definitionDigest: string;
+  schemaDigest: string;
+  effect: ExternalCapabilityEffect;
+  semanticName: string;
+  behaviorHints: ExternalCapabilityBehaviorHintsV1;
+  callSignals: ExternalCapabilityRiskInputV1['callSignals'];
+  learned: unknown;
+}): {
+  semantic: NonNullable<ExternalCapabilityRiskInputV1['documentedSemantic']>;
+  source: ExternalCapabilityLearnedSemanticSourceV1;
+} | null {
+  const verdict = parseLearnedOperationDeliveryVerdictV1(input.learned);
+  if (!verdict) return null;
+  // The verdict names this exact provider operation...
+  const operationKey = learnedOperationDeliveryKey(input.manifest.providerKind, input.manifest.operationId);
+  if (!operationKey || learnedOperationDeliveryKey(verdict.providerKind, verdict.operationId) !== operationKey) {
+    return null;
+  }
+  // ...and the input schema the loader has just re-digested from the current
+  // definition. A changed definition keeps its card until it is learned again.
+  if (verdict.inputSchemaDigest !== input.schemaDigest.toLowerCase()) return null;
+  if (input.effect !== 'external_write') return null;
+  // The consequence comes from the manifest's own destination posture. With
+  // none, the consequence stays unknown and the call still asks, by design.
+  const posture = input.manifest.destination?.posture;
+  const consequence = posture === 'create_new'
+    ? 'create' as const
+    : posture === 'named_existing'
+      ? 'update' as const
+      : null;
+  if (!consequence) return null;
+  // A carrier's own destructive declaration is never overruled.
+  if (
+    input.behaviorHints.destructive === true
+    || input.manifest.externalDefinition?.behaviorHints.destructive === true
+  ) return null;
+  // A generic method carrier, or a call that names recipients, is judged by
+  // its arguments, which a definition-level verdict cannot see.
+  if (input.callSignals.requestMethod !== null || input.callSignals.recipientsPresent === true) {
+    return null;
+  }
+  // A learned verdict replaces only a structural SEND. It never lowers a
+  // delete, an admin action, a destructive operation or an unknown one.
+  // Outbound delivery in the arguments still forces a send in the projector.
+  const structural = structuralExternalCapabilityRiskV1({
+    semanticName: input.semanticName,
+    behaviorHints: input.behaviorHints,
+    callSignals: input.callSignals,
+  });
+  if (structural.consequence !== 'send' || structural.destructive) return null;
+  const sourceDigest = sha256(closedCanonicalJson({
+    domain: 'learned-external-operation-delivery-semantic',
+    version: EXTERNAL_CAPABILITY_RISK_LOADER_VERSION,
+    manifestDigest: input.manifestDigest,
+    definitionDigest: input.definitionDigest,
+    schemaDigest: input.schemaDigest,
+    consequence,
+    verdict,
+  }));
+  return {
+    semantic: {
+      sourceDigest,
+      effect: 'external_write',
+      reversibility: 'ordinary_non_destructive',
+      consequence,
+      destructive: false,
+    },
+    source: { origin: 'learned_operation_delivery', sourceDigest, verdict },
+  };
+}
+
+/** The learned delivery verdict for this operation, if one was learned no
+ * later than `asOf`. See learnedSemanticsAsOf. */
+function learnedDeliveryAsOf(
+  manifest: CapabilityManifestV1,
+  asOf: string | undefined,
+): LearnedOperationDeliveryVerdictV1 | null {
+  if (asOf === undefined) return null;
+  const asOfMs = Date.parse(asOf);
+  if (!Number.isFinite(asOfMs)) return null;
+  const verdict = learnedOperationDeliveryVerdict(manifest.providerKind, manifest.operationId);
+  if (!verdict) return null;
+  const learnedAtMs = Date.parse(verdict.learnedAt);
+  return Number.isFinite(learnedAtMs) && learnedAtMs <= asOfMs ? verdict : null;
 }
 
 function operationOnlySemanticName(operationId: string): string {
@@ -1404,6 +1559,7 @@ export function loadCatalogManifestExternalRiskAttestationV1(
   const observed = observationMatchesManifest(manifest, resolved.observe(manifest));
   if (!observed.ok) return { ok: false, reason: 'current_definition_unavailable' };
 
+  const learnedDelivery = learnedDeliveryAsOf(manifest, input.learnedSemanticsAsOf);
   return loadExternalCapabilityRiskAttestationV1({
     version: EXTERNAL_CAPABILITY_RISK_LOADER_VERSION,
     manifest,
@@ -1432,6 +1588,7 @@ export function loadCatalogManifestExternalRiskAttestationV1(
     destination: input.destination,
     callSignals: input.callSignals,
     safety: input.safety,
+    ...(learnedDelivery ? { learnedDelivery } : {}),
   });
 }
 

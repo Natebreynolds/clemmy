@@ -2,6 +2,7 @@ import { withDiscoveryDeadline, type DiscoveryDeadline } from './discovery-deadl
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { createProductionMcpReadCarrier, type ProductionMcpRuntime } from '../runtime/harness/production-mcp-read-carrier.js';
 import { learnComposioOperationEffects } from '../integrations/composio/learned-operation-effect.js';
+import { scheduleOperationDeliveryLearning } from '../runtime/harness/learned-operation-delivery.js';
 import { createHash } from 'node:crypto';
 import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
@@ -1667,6 +1668,22 @@ export async function provisionExactWorkflowProviderOperations(input: {
       { sessionId: input.sessionId, deadlineAt: Date.now() + Math.max(2_000, Math.min(totalDeadlineMs, 8_000)) },
     );
   } catch { /* the conservative default stands */ }
+  // Background only: whether a send-shaped operation delivers anything is
+  // learned from the definitions already in hand, off this path.
+  try {
+    scheduleOperationDeliveryLearning(
+      operationIds.map((operation) => {
+        const candidate = materializedBySlug.get(operation);
+        return {
+          providerKind: 'composio' as const,
+          operationId: operation,
+          description: candidate?.description,
+          inputSchema: candidate?.inputParameters,
+        };
+      }),
+      { sessionId: input.sessionId },
+    );
+  } catch { /* learning never blocks discovery */ }
   const selectedAccounts = new Map((input.selectedAccounts ?? []).map(entry => [
     entry.operationId.trim().toUpperCase(), entry.accountId.trim(),
   ]));
@@ -2528,6 +2545,19 @@ export function buildAuthorizedToolSearchCandidateSources(
           { ...(planningIdentity ? { sessionId: planningIdentity.sessionId } : {}), ...(deadlineAt !== undefined ? { deadlineAt } : {}) },
         );
       } catch { /* the conservative write default stands */ }
+      // Whether a send-shaped operation delivers anything is learned from its
+      // own definition in the background; discovery does not wait for it.
+      try {
+        scheduleOperationDeliveryLearning(
+          merged.slice(0, 20).map((candidate) => ({
+            providerKind: 'composio' as const,
+            operationId: candidate.slug,
+            description: candidate.description,
+            inputSchema: candidate.inputParameters,
+          })),
+          planningIdentity ? { sessionId: planningIdentity.sessionId } : {},
+        );
+      } catch { /* learning never blocks discovery */ }
       const liveCandidates = merged
         .map((candidate, index): ToolSearchBrokerCandidate => ({
           name: candidate.slug,
