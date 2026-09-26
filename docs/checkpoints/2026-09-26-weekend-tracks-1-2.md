@@ -1,8 +1,8 @@
 # 2026-09-26 weekend wave: approvals that show and iterate, a checker that fixes, Jev that settles
 
 Branch `claude/checker-evidence` (worktree `~/clem-worktrees/checker-evidence`), based on the
-v3.18.21 tag (07fb6f850), head 722959296 when this was written. Nothing pushed. Installed app: daemon hotpatched at 2ef56dc9d on
-2026-09-25 16:32 PT; everything after that commit is **not installed**.
+v3.18.21 tag (07fb6f850), head 722959296 when this was written. Nothing pushed. Installed app: hotpatched to 2ef56dc9d (09-25 16:32 PT), 6a042ae79 (20:32), the Codex candidate 31ffcf4d0 (21:24) and
+then 49b63344f (22:39 PT, this document's head); commits after 49b63344f are **not installed**.
 
 This checkpoint holds the provenance that framework comments no longer carry: source comments
 state the rule only; the dated incidents, counts and measurements behind each rule live here.
