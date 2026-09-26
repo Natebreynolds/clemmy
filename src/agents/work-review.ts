@@ -75,6 +75,9 @@ export interface WorkReviewItem extends WorkReviewCandidate {
   tickId: string;
   notificationId?: string;
   acknowledgedAt?: string;
+  /** When Jev last applied the owner's rules to this item. Older than the
+   *  rules' last change means the item is judged again next tick. */
+  judgedAt?: string;
   retiredAt?: string;
   retiredReason?: 'resolved' | 'jev_skip' | 'superseded';
 }
@@ -107,6 +110,8 @@ export interface WorkReviewFinding {
   vetoed: number;
   held: number;
   retired: number;
+  /** Live items judged again because the rules changed since they were judged. */
+  reconsidered: number;
   quiet: boolean;
   readFailures: number;
   summary: string;
@@ -158,6 +163,8 @@ export interface WorkReviewDeps {
   config: WorkReviewConfig;
   /** The owner's rules for this heartbeat, in their words. */
   rules: string[];
+  /** When the rules last changed. Items judged before that are judged again. */
+  rulesUpdatedAt?: string;
   notify: 'quiet' | 'push';
   observe: () => Promise<{ observation: WorkObservation; readFailures: number }>;
   /** Null = unavailable or unsure; the caller keeps the item (fail open, quiet). */
@@ -398,7 +405,7 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
     deps.saveState(state);
     const finding: WorkReviewFinding = {
       tickId: deps.tickId, at: new Date(started).toISOString(), source: deps.source, durationMs: deps.now() - started,
-      observed: { runs: 0, chats: 0, drafts: 0 }, candidates: 0, produced: 0, vetoed: 0, held: 0, retired: 0, quiet: true, readFailures: 1,
+      observed: { runs: 0, chats: 0, drafts: 0 }, candidates: 0, produced: 0, vetoed: 0, held: 0, retired: 0, reconsidered: 0, quiet: true, readFailures: 1,
       summary: `work review: read failed (${state.lastError.reason})`,
     };
     state.lastFinding = finding;
@@ -431,12 +438,60 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
   const duplicates = candidates.length - fresh.length;
   state.metrics.duplicatesSuppressed += duplicates;
 
-  // 4. The owner's rules, applied by Jev, within a budget. What the budget
-  //    cannot judge waits for the next tick rather than surfacing unjudged.
-  const surfaced: WorkReviewCandidate[] = [];
+  // 3b. The rules changed since an item was judged, and the item is still
+  //     live: judge it again. A new rule quiets an open item; a removed rule
+  //     brings back one it had skipped. Same budget as new candidates, and
+  //     Jev unavailable leaves the item as it is until a later tick.
   let vetoed = 0;
   let held = 0;
   let judgeCalls = 0;
+  let reconsidered = 0;
+  const quieted: WorkReviewItem[] = [];
+  const reopened: WorkReviewItem[] = [];
+  const rulesChangedMs = ms(deps.rulesUpdatedAt);
+  if (rulesChangedMs !== null) {
+    const live = new Set(candidates.map((c) => c.key));
+    for (const item of Object.values(state.items)) {
+      if (!live.has(item.key)) continue;
+      if (item.retiredAt && item.retiredReason !== 'jev_skip') continue;
+      if ((ms(item.judgedAt) ?? ms(item.createdAt) ?? 0) >= rulesChangedMs) continue;
+      let verdict: WorkReviewJudgeVerdict | null = { surface: true, confidence: 1, model: 'none', durationMs: 0 };
+      if (deps.rules.length > 0) {
+        if (!deps.judge) continue;
+        if (judgeCalls >= cfg.maxJudgeCallsPerTick) { held += 1; continue; }
+        judgeCalls += 1;
+        state.metrics.modelCalls += 1;
+        verdict = null;
+        try { verdict = await deps.judge(item, deps.rules); } catch { state.metrics.modelFailures += 1; }
+        if (!verdict) continue;
+      }
+      reconsidered += 1;
+      item.judgedAt = at;
+      if (!verdict.surface && !item.retiredAt) {
+        vetoed += 1;
+        state.metrics.modelVetoes += 1;
+        item.retiredAt = at;
+        item.retiredReason = 'jev_skip';
+        state.metrics.itemsRetired += 1;
+        if (item.notificationId) { try { deps.markNotificationRead(item.notificationId); } catch { /* the state still says skipped */ } }
+        quieted.push(item);
+      } else if (verdict.surface && item.retiredAt) {
+        const notification = buildWorkReviewNotification(item, at, deps.notify);
+        try { deps.publish(notification); } catch { continue; }
+        delete item.retiredAt;
+        delete item.retiredReason;
+        delete item.acknowledgedAt;
+        item.notificationId = notification.id;
+        state.metrics.itemsProduced += 1;
+        reopened.push(item);
+      }
+    }
+  }
+
+  // 4. The owner's rules, applied by Jev, within a budget. What the budget
+  //    cannot judge waits for the next tick rather than surfacing unjudged.
+  const surfaced: WorkReviewCandidate[] = [];
+  const judged = new Set<string>();
   const rank = (c: WorkReviewCandidate): number => (c.kind === 'run_failed' ? 0 : c.kind === 'run_waiting' ? 1 : c.kind === 'chat_waiting' ? 2 : 3);
   fresh.sort((a, b) => rank(a) - rank(b) || a.subject.localeCompare(b.subject));
   for (const candidate of fresh) {
@@ -449,9 +504,10 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
       if (verdict && !verdict.surface) {
         vetoed += 1;
         state.metrics.modelVetoes += 1;
-        state.items[candidate.key] = { ...candidate, createdAt: at, tickId: deps.tickId, retiredAt: at, retiredReason: 'jev_skip' };
+        state.items[candidate.key] = { ...candidate, createdAt: at, tickId: deps.tickId, judgedAt: at, retiredAt: at, retiredReason: 'jev_skip' };
         continue;
       }
+      if (verdict) judged.add(candidate.key);
     }
     surfaced.push(candidate);
   }
@@ -466,23 +522,34 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
     } catch {
       continue; // nothing recorded, so the next tick can try again
     }
-    const item: WorkReviewItem = { ...candidate, createdAt: at, tickId: deps.tickId, notificationId: notification.id };
+    const item: WorkReviewItem = { ...candidate, createdAt: at, tickId: deps.tickId, notificationId: notification.id, ...(judged.has(candidate.key) ? { judgedAt: at } : {}) };
     state.items[candidate.key] = item;
     produced.push(item);
     state.metrics.itemsProduced += 1;
   }
   held += Math.max(0, surfaced.length - cfg.maxItemsPerTick);
+  produced.push(...reopened);
+  retired.push(...quieted);
 
   // 6. Record the tick.
   const quiet = produced.length === 0 && retired.length === 0;
   if (quiet) state.metrics.quietTicks += 1; else state.metrics.changedTicks += 1;
   const observed = { runs: observation.runs.length, chats: observation.chats.length, drafts: observation.drafts.length };
+  const resolved = retired.length - quieted.length;
+  const parts = [
+    `${produced.length - reopened.length} raised`,
+    vetoed - quieted.length ? `${vetoed - quieted.length} judged routine` : '',
+    quieted.length ? `${quieted.length} now skipped by your rules` : '',
+    reopened.length ? `${reopened.length} back after a rule change` : '',
+    held ? `${held} held` : '',
+    resolved ? `${resolved} resolved` : '',
+  ].filter(Boolean);
   const summary = quiet
     ? `work review: quiet (${observed.runs} runs, ${observed.chats} waiting chats, ${observed.drafts} drafts looked at)`
-    : `work review: ${produced.length} raised${vetoed ? `, ${vetoed} judged routine` : ''}${held ? `, ${held} held` : ''}${retired.length ? `, ${retired.length} resolved` : ''}`;
+    : `work review: ${parts.join(', ')}`;
   const finding: WorkReviewFinding = {
     tickId: deps.tickId, at, source: deps.source, durationMs: deps.now() - started,
-    observed, candidates: candidates.length, produced: produced.length, vetoed, held, retired: retired.length, quiet, readFailures, summary,
+    observed, candidates: candidates.length, produced: produced.length, vetoed, held, retired: retired.length, reconsidered, quiet, readFailures, summary,
   };
   state.lastTickAt = at;
   state.lastTickId = deps.tickId;

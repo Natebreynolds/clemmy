@@ -188,6 +188,7 @@ export function runWorkReviewTickNow(options: { source: string } = { source: 'he
     source: options.source,
     config: DEFAULT_WORK_REVIEW_CONFIG,
     rules: contract.rules.map((r) => r.text),
+    rulesUpdatedAt: contract.updatedAt,
     notify: contract.notify,
     observe: observeWork,
     judge: judgeWorkReviewCandidate,

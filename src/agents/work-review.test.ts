@@ -158,6 +158,45 @@ test("the owner's rules skip an item through Jev, and the judge budget holds wha
   assert.equal(d.produced, 6);
 });
 
+test('a rule added later quiets the open items it covers; removing it brings them back; nothing is judged twice against the same rules', async () => {
+  const h = harness({});
+  const first = await runWorkReviewTick(h.deps);
+  assert.equal(first.produced, 6);
+  const draftKey = 'draft_unsent:drafts/weekly-workflow-priorities-2026-09-28.md';
+  const draftCard = h.state.items[draftKey].notificationId!;
+
+  // The owner says, in chat, to stop raising drafts. Next tick: the open draft item goes quiet.
+  let calls = 0;
+  const judge = async (c: WorkReviewCandidate): Promise<WorkReviewJudgeVerdict> => { calls += 1; return { surface: c.kind !== 'draft_unsent', confidence: 0.9, model: 'jev', durationMs: 3 }; };
+  const withRule = { ...h.deps, tickId: 't2', now: () => NOW + 20 * 60_000, rules: ['Stop telling me about unsent drafts; I file those myself.'], rulesUpdatedAt: iso(10 * 60_000), judge };
+  const second = await runWorkReviewTick(withRule);
+  // Failures are raised once and are not live afterwards; the four waits and drafts are.
+  assert.equal(second.reconsidered, 4, 'every live item is judged once against the new rules');
+  assert.equal(calls, 4);
+  assert.equal(h.state.items[draftKey].retiredReason, 'jev_skip');
+  assert.ok(h.markedRead.includes(draftCard), 'the quieted card leaves Needs you');
+  assert.match(second.summary, /1 now skipped by your rules/);
+  assert.equal(h.state.items['run_failed:r-fail'].retiredAt, undefined);
+  assert.equal(h.state.items['run_failed:r-fail'].judgedAt, undefined, 'a failure already shown is not re-judged');
+  assert.equal(h.state.items['run_waiting:weekly-review'].judgedAt, iso(20 * 60_000));
+
+  // Same rules, another tick: nothing is judged again.
+  const third = await runWorkReviewTick({ ...withRule, tickId: 't3', now: () => NOW + 30 * 60_000 });
+  assert.equal(third.reconsidered, 0);
+  assert.equal(calls, 4);
+  assert.equal(third.quiet, true);
+
+  // The owner removes the rule. No rules means nothing to ask Jev: the draft item comes back on its own.
+  const before = h.published.length;
+  const fourth = await runWorkReviewTick({ ...withRule, tickId: 't4', now: () => NOW + 50 * 60_000, rules: [], rulesUpdatedAt: iso(40 * 60_000) });
+  assert.equal(calls, 4);
+  assert.equal(h.state.items[draftKey].retiredAt, undefined);
+  assert.notEqual(h.state.items[draftKey].notificationId, draftCard, 'a fresh card, the old one was read');
+  assert.equal(h.published.length, before + 1);
+  assert.match(fourth.summary, /1 back after a rule change/);
+  assert.equal(fourth.reconsidered, 4);
+});
+
 test('push mode lets an item travel; an item retires when what it points at resolves; a read card is acknowledged', async () => {
   const h = harness({ notify: 'push' });
   await runWorkReviewTick(h.deps);
