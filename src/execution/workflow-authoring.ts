@@ -181,6 +181,14 @@ function optionalSideEffect(value: unknown): WorkflowStepInput['sideEffect'] | u
   return value === 'read' || value === 'write' || value === 'send' ? value : undefined;
 }
 
+function optionalExecutionRole(value: unknown): WorkflowStepInput['executionRole'] | undefined {
+  return value === 'specialist' || value === 'reducer' || value === 'brain' ? value : undefined;
+}
+
+/** A normalized step names every field, so the compiler catches a field this
+ *  path would otherwise drop on every save (WORKFLOW_STEP_FIELDS lists them). */
+type EveryWorkflowStepField = { [K in keyof Required<WorkflowStepInput>]: WorkflowStepInput[K] };
+
 type WorkflowStepNormalizeInput = Omit<Partial<WorkflowStepInput>, 'transform'> & {
   id: string;
   /** MCP authoring carries the recursive contract as exact JSON text. */
@@ -200,7 +208,7 @@ function optionalTransform(value: unknown): WorkflowStepInput['transform'] | und
 export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): WorkflowStepInput[] {
   return steps.map((raw) => {
     const s = raw as Partial<WorkflowStepInput> & Record<string, unknown>;
-    return {
+    const step: EveryWorkflowStepField = {
       id: typeof s.id === 'string' ? s.id : String(s.id ?? ''),
       prompt: typeof s.prompt === 'string' ? s.prompt : '',
       project: optionalString(s.project),
@@ -226,15 +234,18 @@ export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): Wor
       codifiedFrom: normalizeCodifiedFrom(s),
       allowedTools: optionalStringList(s.allowedTools),
       sideEffect: optionalSideEffect(s.sideEffect),
+      executionRole: optionalExecutionRole(s.executionRole ?? s.execution_role),
       usesSkill: optionalString(s.usesSkill),
       requiresApproval: optionalBoolean(s.requiresApproval),
       approvalPreview: optionalString(s.approvalPreview),
       inputs: optionalObject<WorkflowStepInput['inputs']>(s.inputs),
       output: optionalObject<WorkflowStepInput['output']>(s.output),
       retryBudget: optionalNumber(s.retryBudget),
+      optional: optionalBoolean(s.optional),
       loopUntil: optionalObject<WorkflowStepInput['loopUntil']>(s.loopUntil),
       loopSafe: optionalBoolean(s.loopSafe),
     };
+    return step;
   });
 }
 

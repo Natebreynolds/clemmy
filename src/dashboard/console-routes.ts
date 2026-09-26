@@ -2235,7 +2235,8 @@ function mergeWorkflowStepsForPatch(existingSteps: WorkflowDefinition['steps'], 
  *
  * Edits naming an id that does not exist yet are appended, so the canvas can
  * still add a node. Order is otherwise the stored order; the runner derives
- * execution order from dependsOn and does not read array position.
+ * execution order from dependsOn and does not read array position. Nothing is
+ * deleted here; a removal is named explicitly (removeWorkflowSteps).
  */
 function applyWorkflowStepEdits(existingSteps: WorkflowDefinition['steps'], edits: unknown[]): WorkflowDefinition['steps'] {
   const editsById = new Map<string, Record<string, unknown>>();
@@ -2253,6 +2254,29 @@ function applyWorkflowStepEdits(existingSteps: WorkflowDefinition['steps'], edit
     return (edit ? { ...step, ...edit } : step) as WorkflowDefinition['steps'][number];
   });
   return [...merged, ...appended];
+}
+
+/**
+ * The one way an additive save deletes: the caller names each step it removed.
+ * An id that is already gone is not an error, so a second tab removing the same
+ * step agrees with the first. A kept step still waiting on a removed one is
+ * refused by the graph check that follows, never silently rewired.
+ */
+function removeWorkflowSteps(steps: WorkflowDefinition['steps'], ids: unknown[]): WorkflowDefinition['steps'] {
+  const removed = new Set(ids.filter((id): id is string => typeof id === 'string' && id.length > 0));
+  return removed.size === 0 ? steps : steps.filter((step) => !removed.has(step.id));
+}
+
+/** A malformed step value is the caller's to fix, so it is a 400 with the
+ *  reason; thrown out of an async route it would end the daemon instead. */
+function normalizeRequestSteps(
+  steps: Parameters<typeof normalizeWorkflowSteps>[0],
+): { ok: true; steps: WorkflowDefinition['steps'] } | { ok: false; error: string } {
+  try {
+    return { ok: true, steps: normalizeWorkflowSteps(steps) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function dashboardWorkflowSmokeInputs(body: Record<string, unknown>): Record<string, string> {
@@ -5826,7 +5850,9 @@ export function registerConsoleRoutes(
     if (readWorkflow(slug)) { res.status(409).json({ error: 'workflow already exists' }); return; }
     const description = typeof body.description === 'string' ? body.description : '';
     const project = typeof body.project === 'string' && body.project.trim() ? body.project.trim() : undefined;
-    const steps = Array.isArray(body.steps) ? normalizeWorkflowSteps(body.steps) : [];
+    const normalizedSteps = normalizeRequestSteps(Array.isArray(body.steps) ? body.steps : []);
+    if (!normalizedSteps.ok) { res.status(400).json({ error: normalizedSteps.error }); return; }
+    const steps = normalizedSteps.steps;
     const stepGraphError = validateWorkflowStepGraph(steps);
     if (stepGraphError) { res.status(400).json({ error: stepGraphError }); return; }
     const triggerInput = workflowTriggerCreateInputFromUnknown(body);
@@ -5932,13 +5958,23 @@ export function registerConsoleRoutes(
     // for, so say so instead.
     const authoritativeSteps = Array.isArray(body.steps);
     const additiveStepEdits = Array.isArray(body.stepEdits);
-    if (authoritativeSteps && additiveStepEdits) {
-      res.status(400).json({ error: 'Send steps (the full list) or stepEdits (changes by id), not both.' });
+    const stepRemovals = Array.isArray(body.removeStepIds);
+    if (authoritativeSteps && (additiveStepEdits || stepRemovals)) {
+      res.status(400).json({ error: 'Send steps (the full list) or stepEdits and removeStepIds (changes by id), not both.' });
       return;
     }
-    const stepsChanged = authoritativeSteps || additiveStepEdits;
-    if (authoritativeSteps) next.steps = normalizeWorkflowSteps(mergeWorkflowStepsForPatch(entry.data.steps, body.steps));
-    else if (additiveStepEdits) next.steps = normalizeWorkflowSteps(applyWorkflowStepEdits(entry.data.steps, body.stepEdits));
+    const stepsChanged = authoritativeSteps || additiveStepEdits || stepRemovals;
+    if (stepsChanged) {
+      const incoming = authoritativeSteps
+        ? mergeWorkflowStepsForPatch(entry.data.steps, body.steps)
+        : removeWorkflowSteps(
+          additiveStepEdits ? applyWorkflowStepEdits(entry.data.steps, body.stepEdits) : entry.data.steps,
+          stepRemovals ? body.removeStepIds : [],
+        );
+      const normalizedSteps = normalizeRequestSteps(incoming);
+      if (!normalizedSteps.ok) { res.status(400).json({ error: normalizedSteps.error }); return; }
+      next.steps = normalizedSteps.steps;
+    }
     if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
     if (typeof body.allowSends === 'boolean') next.allowSends = body.allowSends;
     else if (typeof body.allow_sends === 'boolean') next.allowSends = body.allow_sends;
@@ -6020,7 +6056,11 @@ export function registerConsoleRoutes(
         writeWorkflowAndSyncTriggers(entry.name, disabledDef);
         clearWorkflowFailures(entry.name);
         if (verification.missing.length > 0) {
+          // The edit IS written (as off), so say so: a client that treats this
+          // as a failed save would keep showing a workflow that is no longer on.
           res.status(409).json({
+            updated: true,
+            name: patchPrep.def.name,
             error: 'workflow verification missing inputs',
             message: renderMissingSmokeInputs(entry.data.name, verification.missing),
             missingSmokeInputs: verification.missing,
