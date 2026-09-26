@@ -229,6 +229,13 @@ export interface AttemptSignals {
   repairKey?: string;
   /** A bounded structural inspection observed a real envelope contradiction. */
   providerEnvelopeContradicted?: boolean;
+  /**
+   * The provider's own structured reply to a mutation acknowledges the effect
+   * it made (the created or changed object's identity, link or receipt) and
+   * carries no failure or ambiguity marker. Set only by the settlement seam,
+   * only when no flag, status or nominal verdict decided the attempt.
+   */
+  providerAcknowledgedWrite?: boolean;
   /** The host observed a completed execution that failed, but no narrower
    * provider-neutral recovery class is justified. */
   executionFailed?: boolean;
@@ -389,6 +396,10 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     // candidate unproven and recovery inert rather than manufacturing evidence
     // that the capability itself is absent.
     return outcome('unknown', 'structured', 'envelope_failure');
+  }
+  // The provider's reply names what the write created or changed: it landed.
+  if (signals.providerAcknowledgedWrite === true && signals.mutating !== false) {
+    return outcome('succeeded', 'structured', 'provider_acknowledgement');
   }
 
   if (signals.emptyResult) return outcome('empty_result', 'structured', 'empty');

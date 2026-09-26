@@ -32,6 +32,7 @@ import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher
 import { toResultHandle } from './result-handle.js';
 import { deriveResultHandleFactsFromRaw } from './result-facts.js';
 import { inspectProviderEnvelope } from './provider-read-evidence.js';
+import { toolOutputProvesExternalWriteAcknowledgement } from './tool-evidence.js';
 import {
   isShellPolicyDenialResult,
   type ShellExecutionOutcome,
@@ -906,6 +907,24 @@ export function positiveStringEnvelope(result: unknown): boolean {
   return false;
 }
 
+/** A provider reply that is itself structured data: an object or array, or a
+ * string that is exactly one serialized JSON object or array. Prose is not. */
+function structuredProviderReply(result: unknown): unknown {
+  if (result === null || result === undefined) return undefined;
+  if (typeof result === 'object') return result;
+  if (typeof result !== 'string') return undefined;
+  const text = result.trim();
+  if (!(text.startsWith('{') || text.startsWith('[')) || Buffer.byteLength(text, 'utf8') > STRING_ENVELOPE_MAX_BYTES) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return parsed !== null && typeof parsed === 'object' ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function hasTaskIdentity(input: SettleToolAttemptInput): input is SettleToolAttemptInput & {
   sessionId: string; sourceUserSeq: number;
 } {
@@ -1223,6 +1242,32 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // a returned failure as a clean miss is exactly how a send gets repeated.
     const returnedFailure = extracted.envelopeSuccessful === false;
     if (input.thrown !== undefined || returnedFailure) extracted.acknowledged = false;
+  }
+  // THE PROVIDER'S OWN REPLY CONFIRMS A WRITE IT ACKNOWLEDGES. A returned
+  // mutation whose structured reply names what it created or changed (the
+  // object's id, link or receipt) has landed even when no success flag or
+  // transport status came with it; the effect ledger already confirms the write
+  // from that same acknowledgement, so the settlement must agree and no
+  // separate read-back is owed. Every nominal or structured verdict above, any
+  // failure or ambiguity marker in the reply, and a contradicted envelope
+  // below still win. Prose never qualifies.
+  if (
+    settlementMutating
+    && input.thrown === undefined
+    && extracted.preDispatch !== true
+    && extracted.executionFailed !== true
+    && extracted.hostExecuted !== true
+    && extracted.acknowledged === undefined
+    && extracted.envelopeSuccessful === undefined
+    && extracted.providerReportedError === undefined
+    && extracted.httpStatus === undefined
+    && extracted.emptyResult !== true
+    && extracted.outputTruncated !== true
+  ) {
+    const reply = structuredProviderReply(input.result);
+    if (reply !== undefined && toolOutputProvesExternalWriteAcknowledgement(reply)) {
+      extracted.providerAcknowledgedWrite = true;
+    }
   }
 
   let outcome = classifyAttemptOutcome(extracted);

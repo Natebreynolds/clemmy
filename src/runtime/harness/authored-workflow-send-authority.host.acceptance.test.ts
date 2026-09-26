@@ -61,6 +61,8 @@ const acceptedCatalogScope = await import('./accepted-source-catalog-scope.js');
 const composioSchemas = await import('../../tools/composio-schema-cache.js');
 const toolContracts = await import('../../tools/tool-contract-store.js');
 const workflowDefinitions = await import('../../execution/workflow-run-definition.js');
+const workflowWorkspace = await import('../../execution/workflow-run-workspace.js');
+const workflowEventsJournal = await import('../../execution/workflow-events.js');
 const sharedTools = await import('../../tools/shared.js');
 const memoryDatabase = await import('../../memory/db.js');
 
@@ -108,6 +110,8 @@ function installOperation(input: {
   accountId: string;
   schema: Record<string, unknown>;
   readOnly?: boolean;
+  /** The provider's own reply to one call; defaults to an explicit success. */
+  reply?: (body: number) => unknown;
 }) {
   composioSchemas.rememberToolSchema(
     input.operationId,
@@ -175,6 +179,7 @@ function installOperation(input: {
   portBodies[input.operationId] = 0;
   const invoke = async () => {
     portBodies[input.operationId] = (portBodies[input.operationId] ?? 0) + 1;
+    if (input.reply) return input.reply(portBodies[input.operationId]!);
     return input.readOnly
       ? { successful: true, data: { records: Array.from({ length: 100 }, (_, id) => ({ id, text: 'retained'.repeat(10) })) } }
       : { successful: true, data: { id: `msg-${portBodies[input.operationId]}`, delivered: true } };
@@ -224,11 +229,38 @@ const READ = installOperation({
   accountId: 'account:workflow:messages-owner', readOnly: true,
   schema: { type: 'object', properties: { page: { type: 'integer' } }, required: ['page'], additionalProperties: false },
 });
+// A post whose provider reply acknowledges it the way chat providers do: the
+// posted message's own id, timestamp and link, with no success flag.
+const ACK_POST = installOperation({
+  operationId: 'FIXTURE_CHANNEL_POST',
+  capabilityId: 'cap:workflow:channel-post',
+  accountId: 'account:workflow:messages-owner',
+  schema: SEND_SCHEMA,
+  reply: (body) => ({
+    data: {
+      channel: 'C-FIXTURE',
+      ts: `1790000000.00010${body}`,
+      permalink: `https://chat.example.test/archives/C-FIXTURE/p179000000000010${body}`,
+    },
+  }),
+});
+// A post the provider refused in its own reply.
+const REFUSED_POST = installOperation({
+  operationId: 'FIXTURE_CHANNEL_POST_REFUSED',
+  capabilityId: 'cap:workflow:channel-post-refused',
+  accountId: 'account:workflow:messages-owner',
+  schema: SEND_SCHEMA,
+  reply: () => ({ successful: false, error: 'channel_not_found' }),
+});
 manifestStores.installCapabilityManifestStore(
-  manifestStores.createCapabilityManifestStore([SEND.manifest, FOREIGN_SEND.manifest, DELETE.manifest, READ.manifest], { durable: true }),
+  manifestStores.createCapabilityManifestStore([
+    SEND.manifest, FOREIGN_SEND.manifest, DELETE.manifest, READ.manifest, ACK_POST.manifest, REFUSED_POST.manifest,
+  ], { durable: true }),
 );
 catalogs.installHostCapabilityCatalogFactory(
-  catalogs.createHostCapabilityCatalogFactory([SEND.entry, FOREIGN_SEND.entry, DELETE.entry, READ.entry]),
+  catalogs.createHostCapabilityCatalogFactory([
+    SEND.entry, FOREIGN_SEND.entry, DELETE.entry, READ.entry, ACK_POST.entry, REFUSED_POST.entry,
+  ]),
 );
 const sendIdentity = catalogs.canonicalCatalogIdentityOf(SEND.entry)!;
 const foreignIdentity = catalogs.canonicalCatalogIdentityOf(FOREIGN_SEND.entry)!;
@@ -342,6 +374,8 @@ function createSendStepFixture(input: {
   prompt?: string;
   identities?: ReadonlyArray<typeof sendIdentity>;
   record?: boolean;
+  /** A completed upstream step whose recorded output the send step names. */
+  upstream?: { stepId: string; output: unknown };
 }) {
   const suffix = String(++serial);
   const workflowRunId = `run-authored-send-${suffix}`;
@@ -358,12 +392,18 @@ function createSendStepFixture(input: {
     description: 'Exercise exact authored send authority.',
     enabled: true,
     trigger: input.trigger === 'schedule' ? { schedule: '0 8 * * 1-5' } : { manual: true as const },
-    steps: [{
-      id: stepId,
-      prompt,
-      sideEffect: 'send' as const,
-      requiresApproval: input.requiresApproval === true,
-    }],
+    steps: [
+      ...(input.upstream
+        ? [{ id: input.upstream.stepId, prompt: 'Render the fixture summary.', sideEffect: 'read' as const }]
+        : []),
+      {
+        id: stepId,
+        prompt,
+        sideEffect: 'send' as const,
+        requiresApproval: input.requiresApproval === true,
+        ...(input.upstream ? { dependsOn: [input.upstream.stepId] } : {}),
+      },
+    ],
   };
   const snapshot = workflowDefinitions.createWorkflowRunDefinitionSnapshot(
     workflowSlug,
@@ -382,6 +422,31 @@ function createSendStepFixture(input: {
     createdAt: '2026-08-31T00:00:00.000Z',
     startedAt: '2026-08-31T00:00:01.000Z',
   }), 'utf8');
+  if (input.upstream) {
+    // The upstream step's completion is recorded exactly as the runner
+    // records it: an output artifact, then a durable step_completed event.
+    const persisted = workflowWorkspace.recordStepOutput({
+      workflowName: workflowSlug,
+      runId: workflowRunId,
+      stepId: input.upstream.stepId,
+      output: input.upstream.output,
+      nowIso: '2026-08-31T00:00:02.000Z',
+    });
+    assert.ok(persisted.sha256);
+    workflowEventsJournal.appendWorkflowEventDurably(workflowSlug, workflowRunId, {
+      kind: 'step_completed',
+      stepId: input.upstream.stepId,
+      output: input.upstream.output,
+      meta: {
+        stepOutputArtifact: {
+          path: persisted.path,
+          sha256: persisted.sha256,
+          bytes: persisted.bytes,
+          producedAt: persisted.producedAt,
+        },
+      },
+    });
+  }
   const session = eventlog.createSession({
     id: sessionId,
     kind: input.kind ?? 'workflow',
@@ -945,4 +1010,114 @@ test('a refused authored mutation can gather missing evidence through a proven r
   assert.ok(ref);
   const retained = compact.evidence?.resolve(ref!)?.value as { data: { records: unknown[] } };
   assert.equal(retained.data.records.length, 100, 'every record remains available for exact queries');
+});
+
+test('the pre-send review sees the exact upstream output the send step is told to send unchanged', async () => {
+  // A send step's instructions name an upstream value ({{steps.<id>.output…}})
+  // that the step itself receives in its step context. The reviewer must see
+  // that recorded value too, or "send it unchanged" is unverifiable and the
+  // send is held although nothing is wrong with it.
+  const upstreamSummary = 'FRAMEWORK-TEST summary: 3 fictional reps logged 12 fictional calls.';
+  const fixture = createSendStepFixture({
+    trigger: 'schedule',
+    prompt: `Send exactly this upstream summary with ${SEND.manifest.operationId}, unchanged:\n\n{{steps.pull_summary.output.summary}}`,
+    upstream: { stepId: 'pull_summary', output: { summary: upstreamSummary, source: 'fixture' } },
+  });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const before = portBodies[SEND.manifest.operationId]!;
+  const observed: string[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async (review) => {
+    observed.push(review.observations.summary);
+    return review.observations.summary.includes(upstreamSummary)
+      ? { verdict: 'compatible', reason: 'The body equals the recorded upstream summary.', proposalDigest: 'fixture-review' }
+      : { verdict: 'uncertain', reason: 'The upstream summary the instructions name is not in evidence.', proposalDigest: 'fixture-review' };
+  });
+  try {
+    const carrier = carrierTool();
+    const model = stubModel([
+      [sendCall('upstream-send', SEND.manifest.operationId, { ...SEND_ARGS, body: upstreamSummary })],
+      [textMsg('Sent the upstream summary.')],
+    ]);
+    const agent = { model, tools: [carrier.tool] };
+    bindSurface(fixture, agent, [carrier.tool]);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(observed.length, 1, JSON.stringify(outcome.history));
+    assert.match(observed[0]!, /Upstream step output pull_summary/);
+    assert.ok(observed[0]!.includes(upstreamSummary), 'the recorded upstream value is in the review evidence');
+    assert.equal(portBodies[SEND.manifest.operationId], before + 1, 'the send was not held');
+    assert.deepEqual(nonRefusedSettlements(fixture).map((row) => [row.logical_tool_call_id, row.outcome_kind]), [['upstream-send', 'succeeded']]);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
+function writeTerminals(fixture: SendFixture, callId: string): string[] {
+  return db().prepare(`
+    SELECT type FROM events
+     WHERE session_id = ? AND type IN ('external_write_succeeded', 'external_write_failed', 'external_write_orphaned')
+       AND COALESCE(json_extract(data_json, '$.canonicalCallId'), json_extract(data_json, '$.callId')) = ?
+     ORDER BY seq
+  `).all(fixture.session.id, callId).map((row) => (row as { type: string }).type);
+}
+
+test('a post the provider acknowledges in its own reply settles confirmed, with no read-back', async () => {
+  const ackIdentity = catalogs.canonicalCatalogIdentityOf(ACK_POST.entry)!;
+  const fixture = createSendStepFixture({
+    trigger: 'schedule',
+    identities: [ackIdentity],
+    prompt: `Post the fixture standup to the fixture channel with ${ACK_POST.manifest.operationId} and return the provider's timestamp.`,
+  });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const postsBefore = portBodies[ACK_POST.manifest.operationId]!;
+  const readsBefore = portBodies[READ.manifest.operationId]!;
+  const carrier = carrierTool();
+  const model = stubModel([
+    [sendCall('ack-post', ACK_POST.manifest.operationId, SEND_ARGS)],
+    [textMsg('Posted; the provider returned its message timestamp.')],
+  ]);
+  const agent = { model, tools: [carrier.tool] };
+  bindSurface(fixture, agent, [carrier.tool]);
+  const outcome = await runProductionHost(fixture, agent);
+  assert.equal(portBodies[ACK_POST.manifest.operationId], postsBefore + 1, JSON.stringify(outcome.history));
+  assert.equal(portBodies[READ.manifest.operationId], readsBefore, 'no read-back was needed to confirm the post');
+  assert.deepEqual(nonRefusedSettlements(fixture).map((row) => [row.logical_tool_call_id, row.outcome_kind]), [['ack-post', 'succeeded']]);
+  assert.deepEqual(writeTerminals(fixture, 'ack-post'), ['external_write_succeeded'], 'the reply itself confirms the post');
+  const { auditAcceptedSourceSettlementTruth } = await import('./accepted-source-settlement-audit.js');
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: fixture.session.id,
+    sourceUserSeq: fixture.source.seq,
+    requiresBusinessEvidence: true,
+  });
+  assert.equal(audit.status, 'clean', audit.reason);
+  assert.equal(audit.facts.confirmedWrites, 1);
+});
+
+test('a post the provider refused in its own reply never reads as confirmed', async () => {
+  const refusedIdentity = catalogs.canonicalCatalogIdentityOf(REFUSED_POST.entry)!;
+  const fixture = createSendStepFixture({
+    trigger: 'schedule',
+    identities: [refusedIdentity],
+    prompt: `Post the fixture standup to the fixture channel with ${REFUSED_POST.manifest.operationId}.`,
+  });
+  assert.equal(fixture.recorded.status, 'ready', JSON.stringify(fixture.recorded));
+  const before = portBodies[REFUSED_POST.manifest.operationId]!;
+  const carrier = carrierTool();
+  const model = stubModel([
+    [sendCall('refused-post', REFUSED_POST.manifest.operationId, SEND_ARGS)],
+    [textMsg('The provider refused the post.')],
+  ]);
+  const agent = { model, tools: [carrier.tool] };
+  bindSurface(fixture, agent, [carrier.tool]);
+  const outcome = await runProductionHost(fixture, agent);
+  assert.equal(portBodies[REFUSED_POST.manifest.operationId], before + 1, JSON.stringify(outcome.history));
+  const settled = nonRefusedSettlements(fixture);
+  assert.equal(settled.length, 1);
+  assert.notEqual(settled[0]!.outcome_kind, 'succeeded');
+  assert.equal(writeTerminals(fixture, 'refused-post').includes('external_write_succeeded'), false);
+  const { auditAcceptedSourceSettlementTruth } = await import('./accepted-source-settlement-audit.js');
+  const audit = auditAcceptedSourceSettlementTruth({
+    sessionId: fixture.session.id,
+    sourceUserSeq: fixture.source.seq,
+    requiresBusinessEvidence: true,
+  });
+  assert.notEqual(audit.status, 'clean', 'a refused post is not a landed write');
+  assert.equal(audit.facts.confirmedWrites, 0);
 });

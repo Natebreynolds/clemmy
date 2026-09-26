@@ -661,7 +661,12 @@ async function reviewAuthoredWriteConstraints(input: {
     const schema = input.schema ?? (await resolveConfiguredLocalPlanningTool(input.attestation.toolName, 'work_call'))?.parameters;
     if (!schema) return { status: 'hold', retryable: true, reason: 'workflow_write_schema_unavailable' };
     const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
-    const evidence = readWorkflowTargetEvidence(input.reopened.receipt.workflowRunId, { compactResults: true });
+    // The step's own instructions name upstream values it was handed in its
+    // step context; the reviewer sees those exact recorded values too.
+    const evidence = readWorkflowTargetEvidence(input.reopened.receipt.workflowRunId, {
+      compactResults: true,
+      consumerStepId: input.reopened.receipt.stepId,
+    });
     const review = mutationReviewerOverride ?? (await import('./workflow-mutation-review.js')).reviewWorkflowMutation;
     const result = await review({
       sessionId: input.attestation.sessionId,
