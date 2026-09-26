@@ -14,7 +14,7 @@ import { extractJsonCandidate } from './json-repair.js';
 import { estimateMessagesTokens, predictTurnCost } from './budget.js';
 import { renderSkillReference, type SessionSkill } from './skill-execution.js';
 import { effectiveContextWindow } from './model-window-observations.js';
-import { resolveModelCapability } from './model-wire-registry.js';
+import { INSTRUCTION_CACHE_DELIM, resolveModelCapability } from './model-wire-registry.js';
 import {
   JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceReferences, judgeEvidenceTools, type JudgeEvidenceSource,
 } from './judge-evidence-tools.js';
@@ -942,8 +942,14 @@ export async function runRoutedJudgeAttempt<T>(
   // With evidence tools the review is a short conversation: each lookup is a
   // turn, the verdict is the last. The tools refuse past their budget, so the
   // turn ceiling is only a backstop.
+  // A Claude review with evidence tools marks its whole instructions as the
+  // stable prefix, so every review reads them (with the tools) from the prompt
+  // cache. The words and their order are unchanged; the marker never reaches
+  // the model.
   const agent = evidence
-    ? buildJudgeAgent(routing, reviewInstructions, judgeEvidenceTools(evidence))
+    ? buildJudgeAgent(routing,
+      routing.judgeFamily === 'claude' ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : reviewInstructions,
+      judgeEvidenceTools(evidence))
     : buildJudgeAgent(routing, instructions);
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
