@@ -42,6 +42,30 @@ import { readHostCliEnvelope } from '../runtime/harness/json-repair.js';
 import { parseSpaceSourceTransforms, transformSpaceSourceData } from './source-transforms.js';
 
 export interface RunSourceOk { ok: true; data: unknown }
+
+/**
+ * Why a data source did not refresh, named by the layer that refused or
+ * failed it. Set where the failure happens and never read back out of the
+ * error text, so "the same failure again" is a fact, not a comparison.
+ */
+export type SpaceSourceFailureCode =
+  /** A declared local script; Space refreshes never start local processes. */
+  | 'local_runner'
+  /** A declared command line that is not, or cannot be carried by, a reviewed read. */
+  | 'local_command'
+  /** The decision to run this source's script or command was declined or ended. */
+  | 'not_approved'
+  /** The declaration cannot run as saved. */
+  | 'definition'
+  /** The read could not be prepared or authorized; no provider call was made. */
+  | 'read_preparation'
+  /** The app or command was called and returned an error. */
+  | 'provider_error'
+  /** The read returned data but the declared shaping failed. */
+  | 'shaping'
+  /** The result could not be stored. */
+  | 'not_saved';
+
 export interface RunSourceErr {
   ok: false;
   error: string;
@@ -49,6 +73,7 @@ export interface RunSourceErr {
   provenNoDispatch?: true;
   /** Exact legacy migration decision; never shared-kernel call authority. */
   pendingApprovalId?: string;
+  code?: SpaceSourceFailureCode;
 }
 export type RunSourceResult = RunSourceOk | RunSourceErr;
 
@@ -144,13 +169,14 @@ export async function runScript(
   opts: { expectedSha256?: string } = {},
 ): Promise<RunSourceResult> {
   const runnerError = runnerFilenameError(runner);
-  if (runnerError) return { ok: false, error: runnerError, provenNoDispatch: true };
+  if (runnerError) return { ok: false, error: runnerError, provenNoDispatch: true, code: 'definition' };
   void extra;
   void opts;
   return {
     ok: false,
     error: `Workspace "${slug}" local runner "${runner}" is unavailable: no shared durable call authority was supplied. The process was not started.`,
     provenNoDispatch: true,
+    code: 'local_runner',
   };
 }
 
@@ -166,6 +192,7 @@ async function runCliSource(slug: string, cliArgv: string[]): Promise<RunSourceR
     ok: false,
     error: `Workspace "${slug}" local CLI "${commandLabel}" is unavailable: it is not a reviewed CLI read from the catalog, so no shared durable call authority can be minted for it. The process was not started.`,
     provenNoDispatch: true,
+    code: 'local_command',
   };
 }
 
@@ -188,6 +215,7 @@ async function runSpaceComposio(
       ok: false,
       error: `${carrierLabel} is unavailable: no shared durable call authority was supplied. The provider call was not started.`,
       provenNoDispatch: true,
+      code: 'read_preparation',
     };
   }
   if (
@@ -200,6 +228,7 @@ async function runSpaceComposio(
       ok: false,
       error: `${carrierLabel} was refused: the shared durable call authority address is malformed. The provider call was not started.`,
       provenNoDispatch: true,
+      code: 'read_preparation',
     };
   }
 
@@ -217,6 +246,7 @@ async function runSpaceComposio(
       ok: false,
       error: `${carrierLabel} was refused: the shared authority does not bind this exact declared operation and effect. The provider call was not started.`,
       provenNoDispatch: true,
+      code: 'read_preparation',
     };
   }
 
@@ -242,6 +272,9 @@ async function runSpaceComposio(
     ok: false,
     error: `${carrierLabel} was ${outcome.status} by the shared durable call kernel: ${outcome.reason}`,
     ...(outcome.zeroBody ? { provenNoDispatch: true as const } : {}),
+    // A refusal before any provider body is a preparation failure; anything
+    // after the crossing started is the provider's answer.
+    code: outcome.status === 'blocked' && outcome.zeroBody ? 'read_preparation' : 'provider_error',
   };
 }
 
@@ -266,6 +299,7 @@ export function reviewedCliSourceResult(run: RunSourceResult): RunSourceResult {
       error: `reviewed read ${envelope.operationId} ${envelope.status}${
         envelope.exitCode !== null ? ` (exit ${envelope.exitCode})` : ''
       }${stderr ? `: ${stderr}` : ''}`,
+      code: 'provider_error',
     };
   }
   if (envelope.kind === 'clean') return { ok: true, data: envelope.stdoutJson };
@@ -280,7 +314,14 @@ export async function runSpaceDataSource(
 ): Promise<RunSourceResult> {
   if (source.transforms !== undefined) {
     try { parseSpaceSourceTransforms(source.transforms); }
-    catch (error) { return { ok: false, error: `Invalid source transforms: ${(error as Error).message}`, provenNoDispatch: true }; }
+    catch (error) {
+      return {
+        ok: false,
+        error: `Invalid source transforms: ${(error as Error).message}`,
+        provenNoDispatch: true,
+        code: 'definition',
+      };
+    }
   }
   const result = await runSpaceDataSourceRead(slug, source, opts);
   if (!result.ok || source.transforms === undefined) return result;
@@ -289,8 +330,17 @@ export async function runSpaceDataSource(
   } catch (error) {
     // The read happened; do not claim zero dispatch. Failed shaping must never
     // publish partially transformed rows or replace the last good dataset.
-    return { ok: false, error: `Data source "${source.id}" transformation failed: ${(error as Error).message}` };
+    return {
+      ok: false,
+      error: `Data source "${source.id}" transformation failed: ${(error as Error).message}`,
+      code: 'shaping',
+    };
   }
+}
+
+/** A trust decision that is not approved and not waiting on the owner. */
+function trustRefusalCode(state: 'pending' | 'rejected' | 'expired' | 'cancelled' | 'blocked'): SpaceSourceFailureCode {
+  return state === 'blocked' ? 'definition' : 'not_approved';
 }
 
 async function runSpaceDataSourceRead(
@@ -308,6 +358,7 @@ async function runSpaceDataSourceRead(
         error: trust.error,
         provenNoDispatch: true,
         ...(trust.state === 'pending' ? { pendingApprovalId: trust.approvalId } : {}),
+        code: trustRefusalCode(trust.state),
       };
     }
     return runScript(
@@ -327,6 +378,7 @@ async function runSpaceDataSourceRead(
         error: trust.error,
         provenNoDispatch: true,
         ...(trust.state === 'pending' ? { pendingApprovalId: trust.approvalId } : {}),
+        code: trustRefusalCode(trust.state),
       };
     }
     const reviewed = compileReviewedCliArgv(trust.cliArgv);
@@ -340,7 +392,7 @@ async function runSpaceDataSourceRead(
           'read',
         ));
       } catch (err) {
-        return { ok: false, error: `reviewed read call failed: ${(err as Error).message}` };
+        return { ok: false, error: `reviewed read call failed: ${(err as Error).message}`, code: 'provider_error' };
       }
     }
     if (reviewed.status === 'refused') {
@@ -348,12 +400,13 @@ async function runSpaceDataSourceRead(
         ok: false,
         error: `Workspace "${slug}" local CLI "${trust.cliArgv.join(' ')}" names the reviewed read ${reviewed.operationId} but cannot be carried by it: ${reviewed.reason}. The process was not started.`,
         provenNoDispatch: true,
+        code: 'local_command',
       };
     }
     return runCliSource(slug, trust.cliArgv);
   }
   const safetyError = workspaceDataSourceSafetyError(source);
-  if (safetyError) return { ok: false, error: safetyError, provenNoDispatch: true };
+  if (safetyError) return { ok: false, error: safetyError, provenNoDispatch: true, code: 'definition' };
   if (source.composioSlug && source.composioSlug.trim()) {
     try {
       return await runSpaceComposio(
@@ -364,10 +417,14 @@ async function runSpaceDataSourceRead(
         'read',
       );
     } catch (err) {
-      return { ok: false, error: `composio call failed: ${(err as Error).message}` };
+      return { ok: false, error: `composio call failed: ${(err as Error).message}`, code: 'provider_error' };
     }
   }
-  return { ok: false, error: `data source "${source.id}" declares no execution mode (runner, cli_argv, or composio_slug)` };
+  return {
+    ok: false,
+    error: `data source "${source.id}" declares no execution mode (runner, cli_argv, or composio_slug)`,
+    code: 'definition',
+  };
 }
 
 /** Execute one declared action with caller-supplied args merged over its template. */
@@ -432,6 +489,8 @@ export interface RefreshResult {
   ok: boolean;
   sourceId: string;
   error?: string;
+  /** Present on a failed source: which layer refused or failed it. */
+  failureCode?: SpaceSourceFailureCode;
   pendingApprovalId?: string;
   write?: WriteDataResult | WriteDataError;
   observationId?: string;
@@ -496,12 +555,15 @@ registerRunnerTrustRefreshHandler(async ({ spaceSlug, sourceId, approvalId }) =>
 
 async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: RefreshSpaceOptions = {}): Promise<RefreshResult[]> {
   const rec = spaceStore.get(slug);
-  if (!rec) return [{ ok: false, sourceId: sourceId ?? '(none)', error: `no workspace "${slug}"` }];
+  if (!rec) {
+    return [{ ok: false, sourceId: sourceId ?? '(none)', error: `no workspace "${slug}"`, failureCode: 'definition' }];
+  }
   if (rec.manifestErrors && rec.manifestErrors.length > 0) {
     return [{
       ok: false,
       sourceId: sourceId ?? '(manifest)',
       error: `workspace manifest is invalid; fix with space_save before refreshing: ${rec.manifestErrors.join('; ')}`,
+      failureCode: 'definition',
     }];
   }
   if (rec.status === 'archived' || (rec.status === 'paused' && !opts.allowPaused)) {
@@ -511,7 +573,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     ? rec.dataSources.filter((s) => s.id === sourceId)
     : rec.dataSources;
   if (sources.length === 0) {
-    return [{ ok: false, sourceId: sourceId ?? '(none)', error: 'no matching data source' }];
+    return [{ ok: false, sourceId: sourceId ?? '(none)', error: 'no matching data source', failureCode: 'definition' }];
   }
 
   // Existing file-backed Workspaces may predate the temporal index. Preserve
@@ -526,6 +588,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
       ok: false,
       sourceId: source.id,
       error: `workspace history baseline could not be preserved; refresh was not run: ${baseline.error}`,
+      failureCode: 'not_saved' as const,
       write: { ok: false, error: baseline.error, bytes: 0 },
     }));
   }
@@ -578,7 +641,12 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     // its actual cause without running a second gate that obscures it.
     const refusedProviderRead = Boolean(mintRefusal && source.composioSlug && !source.runner && !source.cliArgv?.length);
     const run: RunSourceResult = refusedProviderRead
-      ? { ok: false, error: `Data source "${source.id}" could not refresh. ${mintRefusal}`, provenNoDispatch: true }
+      ? {
+        ok: false,
+        error: `Data source "${source.id}" could not refresh. ${mintRefusal}`,
+        provenNoDispatch: true,
+        code: 'read_preparation',
+      }
       : await runSpaceDataSource(slug, source, {
         composioAuthority,
         requestFreshTrustApproval: cause === 'manual',
@@ -625,6 +693,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
         ok: false,
         sourceId: source.id,
         error: run.error,
+        ...(run.code ? { failureCode: run.code } : {}),
         ...(run.pendingApprovalId ? { pendingApprovalId: run.pendingApprovalId } : {}),
       });
       observations.push({
@@ -648,6 +717,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     const result = results[index]!;
     let committed: CommitWorkspaceObservationBatchResult | null = null;
     let persistenceError = '';
+    let storedAsNotSaved = false;
     try {
       committed = commitWorkspaceObservationBatch({
         workspaceId: slug,
@@ -694,6 +764,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
               error,
             }],
           });
+          storedAsNotSaved = true;
         } catch (fallbackError) {
           persistenceError = fallbackError instanceof Error
             ? fallbackError.message
@@ -710,6 +781,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
       };
       result.ok = false;
       result.error = result.error ? `${result.error}; ${write.error}` : write.error;
+      if (!result.failureCode) result.failureCode = 'not_saved';
       result.write = write;
       appendAudit(slug, {
         method: 'REFRESH',
@@ -729,9 +801,11 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     if (saved.status === 'ok') {
       result.ok = true;
       delete result.error;
+      delete result.failureCode;
     } else {
       result.ok = false;
       result.error = saved.error ?? 'workspace source did not produce a successful observation';
+      if (storedAsNotSaved) result.failureCode = 'not_saved';
       if (
         saved.status === 'awaiting_approval'
         && typeof saved.provenance.approvalId === 'string'

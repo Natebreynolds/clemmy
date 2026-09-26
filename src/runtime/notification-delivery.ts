@@ -231,6 +231,11 @@ function buildPushCopy(notification: NotificationRecord): { title: string; body:
     };
   }
 
+  const spaceTitle = pushFact(meta, 'spaceTitle');
+  if (spaceTitle && typeof meta?.failureCode === 'string') {
+    return { title: `${spaceTitle} isn't refreshing`, body: 'Tap to see why and what would fix it.' };
+  }
+
   if (workflow) {
     if (status === 'error') return { title: `${workflow} failed`, body: 'Tap to see where it stopped.' };
     if (status === 'cancelled') return { title: `${workflow} was cancelled`, body: 'Tap to see how far it got.' };

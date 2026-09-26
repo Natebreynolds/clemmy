@@ -3795,6 +3795,14 @@ export function loneToolkitConnection(toolSlug: string, snapshotConns: Connected
   return distinct.length === 1 ? distinct[0] : undefined;
 }
 
+/** Every connection in the snapshot that serves this operation's toolkit,
+ *  by the same canonical match the dispatch path uses. */
+export function connectionsForOperation(toolSlug: string, snapshotConns: readonly ConnectedToolkit[]): ConnectedToolkit[] {
+  const toolLower = toolSlug.trim().toLowerCase();
+  if (!toolLower) return [];
+  return snapshotConns.filter((c) => c.connectionId && toolMatchesConnection(toolLower, (c.slug ?? '').toLowerCase()));
+}
+
 export interface DistinctIdentity {
   email?: string;
   connectionId: string;

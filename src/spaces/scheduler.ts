@@ -4,11 +4,13 @@
  * Reuses the workflow scheduler's wall-clock + catch-up primitives so a laptop
  * that slept through the fire-minute still refreshes once on wake.
  *
- * Deliberately SILENT: a scheduled refresh just updates data.json (the user
- * sees fresh data when they open the workspace). If a refresh should PING the
- * user, Clem's runner script can POST to /api/console/spaces/<slug>/reengage
- * with trigger:'threshold' when something notable crosses — no special
- * framework needed; the re-engage path already wakes her with context.
+ * A scheduled refresh just updates data.json (the user sees fresh data when
+ * they open the workspace). If a refresh should PING the user, Clem's runner
+ * script can POST to /api/console/spaces/<slug>/reengage with
+ * trigger:'threshold' when something notable crosses — no special framework
+ * needed; the re-engage path already wakes her with context. The one other
+ * thing a scheduled refresh says is that a source keeps failing: once per
+ * failure code, after which it backs off (source-refresh-backoff.ts).
  *
  * Mirrors processWorkflowSchedules (dedupe-by-minute, 24h catch-up, prune).
  */
@@ -17,10 +19,24 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { cronMatches, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
-import { spaceStore } from './store.js';
-import { refreshSpaceData } from './runner.js';
+import { peekConnectedToolkits } from '../integrations/composio/client.js';
+import { addNotification } from '../runtime/notifications.js';
+import { spaceStore, type SpaceDataSource, type SpaceRecord } from './store.js';
+import { refreshSpaceData, type RefreshResult } from './runner.js';
 import { readData } from './data-store.js';
 import { reengageSpace } from './reengage.js';
+import { getCurrentWorkspaceDatasetObservation } from './workspace-db.js';
+import {
+  passOverDueOccurrence,
+  readSourceRefreshStreaks,
+  recordSourceRefreshFailure,
+  restartAfterChange,
+  sourceIdentity,
+  sourceIdentityChanged,
+  sourceStreakNotice,
+  type SourceRefreshStreak,
+  type SourceStreakCode,
+} from './source-refresh-backoff.js';
 
 const STATE_FILE = path.join(BASE_DIR, 'state', 'space-schedule-state.json');
 const PRUNE_AFTER_MS = 2 * 24 * 60 * 60 * 1000;
@@ -34,6 +50,8 @@ interface SpaceScheduleState {
   /** Paused-build auto-retry bookkeeping: slug → attempts + last attempt ms.
    *  Durable so daemon restarts don't reset the retry budget. */
   pausedRetryBySlug: Record<string, { attempts: number; lastAtMs: number }>;
+  /** "space:source" → its current run of failed scheduled refreshes. */
+  sourceStreakByKey: Record<string, SourceRefreshStreak>;
 }
 
 function loadState(): SpaceScheduleState {
@@ -45,10 +63,11 @@ function loadState(): SpaceScheduleState {
         lastRunByMinute: (parsed.lastRunByMinute && typeof parsed.lastRunByMinute === 'object') ? parsed.lastRunByMinute : {},
         lastReengageByKey: (parsed.lastReengageByKey && typeof parsed.lastReengageByKey === 'object') ? parsed.lastReengageByKey : {},
         pausedRetryBySlug: (parsed.pausedRetryBySlug && typeof parsed.pausedRetryBySlug === 'object') ? parsed.pausedRetryBySlug : {},
+        sourceStreakByKey: readSourceRefreshStreaks(parsed.sourceStreakByKey),
       };
     }
   } catch { /* fresh */ }
-  return { lastRunByMinute: {}, lastReengageByKey: {}, pausedRetryBySlug: {} };
+  return { lastRunByMinute: {}, lastReengageByKey: {}, pausedRetryBySlug: {}, sourceStreakByKey: {} };
 }
 
 /**
@@ -99,6 +118,33 @@ export interface SpaceFireResult {
   errors: number;
   /** Due legacy sources held for a pinned-entrypoint decision, not runtime errors. */
   awaitingApproval: number;
+  /** Due occurrences passed over because the source keeps failing. */
+  heldBack: number;
+  /** Failing-source notices written this tick. */
+  told: number;
+}
+
+/** The source's current successful observation, or null when it has none. */
+function currentOkObservationId(spaceId: string, sourceId: string): string | null {
+  try {
+    return getCurrentWorkspaceDatasetObservation(spaceId, sourceId)?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** A refresh from any path succeeded after the streak's last failure. */
+function succeededSince(spaceId: string, sourceId: string, streak: SourceRefreshStreak): boolean {
+  const current = currentOkObservationId(spaceId, sourceId);
+  return current !== null && current !== streak.okObservationId;
+}
+
+function connectionSnapshot() {
+  try {
+    return peekConnectedToolkits();
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -110,10 +156,49 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
   const minutes = scheduleCatchupWindow(state.lastEvaluatedAtMs, now.getTime());
   const lastRun = state.lastRunByMinute;
   const reengageKeys = state.lastReengageByKey;
+  const streaks = state.sourceStreakByKey;
+  const scheduledKeys = new Set<string>();
+  const connections = connectionSnapshot();
   let evaluated = 0;
   let fired = 0;
   let errors = 0;
   let awaitingApproval = 0;
+  let heldBack = 0;
+  let told = 0;
+
+  const recordFailure = (
+    space: SpaceRecord,
+    ds: SpaceDataSource,
+    key: string,
+    failure: { code: SourceStreakCode; error: string },
+  ): void => {
+    const recorded = recordSourceRefreshFailure(streaks[key], {
+      ...failure,
+      at: now,
+      identity: sourceIdentity(ds, connections),
+      okObservationId: currentOkObservationId(space.id, ds.id),
+    });
+    streaks[key] = recorded.streak;
+    if (!recorded.tell) return;
+    try {
+      const notice = sourceStreakNotice({
+        spaceId: space.id,
+        spaceTitle: space.title,
+        source: ds,
+        streak: recorded.streak,
+      });
+      addNotification({
+        id: notice.id,
+        kind: 'system',
+        title: notice.title,
+        body: notice.body,
+        createdAt: now.toISOString(),
+        read: false,
+        metadata: notice.metadata,
+      });
+      told += 1;
+    } catch { /* telling is best-effort; the streak and its backoff still hold */ }
+  };
 
   for (const space of spaceStore.list()) {
     if (space.status !== 'active') continue;
@@ -121,6 +206,7 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
       if (!ds.schedule) continue;
       evaluated += 1;
       const key = `${space.id}:${ds.id}`;
+      scheduledKeys.add(key);
       // Collapse a long absence into ONE refresh (v3.0.1 incident, sibling of
       // the workflow-scheduler stampede). This loop used to refresh once per
       // MATCHED MINUTE: an hourly source missed for a day fired 24 sequential
@@ -135,53 +221,108 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
         matched.push(minute);
       }
       const latest = matched[matched.length - 1];
-      for (const minute of latest ? [latest] : []) {
-        const mk = minuteKey(minute);
+
+      // A failing source: a success from any path ends the streak; a changed
+      // declaration or connection ends the wait and is tried at once.
+      let streak: SourceRefreshStreak | undefined = streaks[key];
+      let changed = false;
+      if (streak && succeededSince(space.id, ds.id, streak)) {
+        delete streaks[key];
+        streak = undefined;
+      }
+      if (streak) {
+        const identity = sourceIdentity(ds, connections);
+        if (sourceIdentityChanged(streak, identity)) {
+          streak = restartAfterChange(streak, identity);
+          changed = true;
+        } else if (streak.connectionDigest === null && identity.connectionDigest !== null) {
+          streak = { ...streak, connectionDigest: identity.connectionDigest };
+        }
+        streaks[key] = streak;
+      }
+
+      let refreshId: string;
+      let batchId: string;
+      let mk: string;
+      if (latest) {
+        mk = minuteKey(latest);
         lastRun[key] = mk;
-        try {
-          const results = await refreshSpaceData(space.id, ds.id, {
-            cause: 'scheduled',
-            // The scheduler's existing authority is one source per UTC minute.
-            // Reuse that same identity in the temporal store so a daemon
-            // restart cannot append a second observation for the occurrence.
-            refreshId: `scheduled:${mk}`,
-            batchId: `scheduled:${space.id}:${ds.id}:${mk}`,
-          });
-          if (results.some((r) => !r.ok)) {
-            if (results.some((r) => !r.ok && !r.pendingApprovalId)) errors += 1;
-            else awaitingApproval += 1;
-          } else {
-            fired += 1;
-            // E2: harvest a proactive re-engage signal, deduped by condition key
-            // (reusing `key` = "space:source") so a persistent threshold pings once.
-            const sig = reengageSignalFor(space.id, ds.id);
-            if (sig) {
-              if (reengageKeys[key] !== sig.key) {
-                reengageKeys[key] = sig.key;
-                try {
-                  await reengageSpace(space.id, {
-                    trigger: 'threshold', message: sig.message,
-                    // include the firing minute so a condition that CLEARS and
-                    // returns wakes again (deliverOutcome is idempotent by sourceId).
-                    actionId: `${ds.id}:${sig.key}:${mk}`, meta: { source: ds.id },
-                  });
-                } catch { /* best-effort; a wake must never break the tick */ }
-              }
-            } else if (reengageKeys[key]) {
-              delete reengageKeys[key]; // condition cleared → a recurrence can re-fire
-            }
+        if (streak && !changed) {
+          const decision = passOverDueOccurrence(streak, { now, occurrences: matched.length });
+          streaks[key] = decision.streak;
+          if (decision.hold) {
+            heldBack += 1;
+            continue;
           }
-        } catch {
-          errors += 1;
+        }
+        // The scheduler's existing authority is one source per UTC minute.
+        // Reuse that same identity in the temporal store so a daemon restart
+        // cannot append a second observation for the occurrence.
+        refreshId = `scheduled:${mk}`;
+        batchId = `scheduled:${space.id}:${ds.id}:${mk}`;
+      } else if (changed) {
+        mk = minuteKey(now);
+        refreshId = `scheduled:changed:${mk}`;
+        batchId = `scheduled:changed:${space.id}:${ds.id}:${mk}`;
+      } else {
+        continue;
+      }
+
+      let results: RefreshResult[];
+      try {
+        results = await refreshSpaceData(space.id, ds.id, { cause: 'scheduled', refreshId, batchId });
+      } catch (error) {
+        errors += 1;
+        recordFailure(space, ds, key, {
+          code: 'unclassified',
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+      const failed = results.find((r) => !r.ok && !r.pendingApprovalId);
+      if (failed) {
+        errors += 1;
+        recordFailure(space, ds, key, {
+          code: failed.failureCode ?? 'unclassified',
+          error: failed.error ?? '',
+        });
+      } else if (results.some((r) => !r.ok)) {
+        // Waiting on the owner's decision is not a failure of the source.
+        awaitingApproval += 1;
+      } else {
+        fired += 1;
+        delete streaks[key];
+        // E2: harvest a proactive re-engage signal, deduped by condition key
+        // (reusing `key` = "space:source") so a persistent threshold pings once.
+        const sig = reengageSignalFor(space.id, ds.id);
+        if (sig) {
+          if (reengageKeys[key] !== sig.key) {
+            reengageKeys[key] = sig.key;
+            try {
+              await reengageSpace(space.id, {
+                trigger: 'threshold', message: sig.message,
+                // include the firing minute so a condition that CLEARS and
+                // returns wakes again (deliverOutcome is idempotent by sourceId).
+                actionId: `${ds.id}:${sig.key}:${mk}`, meta: { source: ds.id },
+              });
+            } catch { /* best-effort; a wake must never break the tick */ }
+          }
+        } else if (reengageKeys[key]) {
+          delete reengageKeys[key]; // condition cleared → a recurrence can re-fire
         }
       }
     }
   }
 
+  // A source that is gone, unscheduled, or in a Space that is not active has
+  // no streak to keep.
+  for (const key of Object.keys(streaks)) {
+    if (!scheduledKeys.has(key)) delete streaks[key];
+  }
   state.lastEvaluatedAtMs = now.getTime();
   state.lastRunByMinute = prune(lastRun, now.getTime());
   saveState(state);
-  return { evaluated, fired, errors, awaitingApproval };
+  return { evaluated, fired, errors, awaitingApproval, heldBack, told };
 }
 
 // ── Paused-build auto-retry ───────────────────────────────────────────────────
