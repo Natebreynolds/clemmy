@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 const { resetMemoryDb } = await import('../memory/db.js');
 const { createFocus, patchFocusWorkstate } = await import('../memory/focus.js');
-const { harnessInstructions, renderHarnessMemoryContext } = await import('./harness-context.js');
+const { harnessInstructions, renderHarnessMemoryContext, renderCurrentTimeForInstructions, renderRightNowStamp } = await import('./harness-context.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const { rememberFact } = await import('../memory/facts.js');
 const { checkpointWorkingMemory } = await import('../memory/working-memory.js');
@@ -666,4 +666,22 @@ test('agent instructions join the stable prefix before the cache boundary, never
   assert.match(stable, /Working as Prospect Research Desk/);
   assert.doesNotMatch(stable, /TURN AUTHORITY/);
   assert.equal(rendered.split(CACHE_BREAK_SENTINEL).length, 2, 'never a second sentinel');
+});
+
+test('the clock is stated twice: first in the Now section, and last, next to the message, as one line', () => {
+  resetMemoryDb();
+  const volatile = renderHarnessMemoryContext({ partition: 'volatile' });
+  const stamp = renderRightNowStamp();
+  assert.match(stamp, /^Right now it is (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{4}-\d{2}-\d{2}, \d{2}:\d{2} \(.+\)\.$/);
+  assert.ok(volatile.trimEnd().endsWith(stamp), 'the stamp is the last thing before the user message');
+  assert.ok(volatile.indexOf('## Now') < volatile.indexOf('Right now it is'), 'the Now section still comes first');
+  // Both lines read the same clock: same weekday and date.
+  const nowLine = renderCurrentTimeForInstructions();
+  const day = nowLine.match(/\((\w+day)\)/)?.[1];
+  const date = nowLine.match(/Today is (\d{4}-\d{2}-\d{2})/)?.[1];
+  assert.ok(day && date);
+  assert.ok(stamp.includes(day) && stamp.includes(date));
+  // The stable half carries neither, so it stays cacheable across days.
+  const stable = renderHarnessMemoryContext({ partition: 'stable' });
+  assert.doesNotMatch(stable, /Right now it is|Today is \d{4}/);
 });

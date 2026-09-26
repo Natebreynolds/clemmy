@@ -118,23 +118,40 @@ export function renderAutonomy(): string {
  * to the system's resolved timezone; if even that fails, the line is
  * just omitted from the persistent context.
  */
-export function renderCurrentTimeForInstructions(): string {
+/** The owner's clock, read once per render so every line of a turn agrees. */
+function currentLocalTime(now = new Date()): { date: string; weekday: string; time: string; tz: string } | null {
   try {
     const profile = loadUserProfile();
     const tz = profile.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    const now = new Date();
     // Use `en-CA` for ISO-style date (YYYY-MM-DD) — most locale-stable
     // option for date formatting across runtimes.
     const dateFmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
     const weekdayFmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' });
     const timeFmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false });
-    const date = dateFmt.format(now);
-    const weekday = weekdayFmt.format(now);
-    const time = timeFmt.format(now);
-    return `Today is ${date} (${weekday}), local time ${time} (${tz}). Use this for any date/time math, never invent or guess.`;
+    return { date: dateFmt.format(now), weekday: weekdayFmt.format(now), time: timeFmt.format(now), tz };
   } catch {
-    return '';
+    return null;
   }
+}
+
+export function renderCurrentTimeForInstructions(): string {
+  const t = currentLocalTime();
+  if (!t) return '';
+  return `Today is ${t.date} (${t.weekday}), local time ${t.time} (${t.tz}). Use this for any date/time math, never invent or guess.`;
+}
+
+/**
+ * The same clock, one line, placed LAST in the per-turn context so it sits
+ * next to the user's message. The Now section above is read first by a model
+ * that reads everything; a small model weights the tokens nearest the message,
+ * and a greeting that named the wrong weekday (live 2026-09-26, "the usual
+ * Friday stuff" on a Saturday, with the Now line 2,700 tokens back) is what
+ * this line prevents. Ten tokens, uncached by design like the rest of the tail.
+ */
+export function renderRightNowStamp(now = new Date()): string {
+  const t = currentLocalTime(now);
+  if (!t) return '';
+  return `Right now it is ${t.weekday}, ${t.date}, ${t.time} (${t.tz}).`;
 }
 
 // Per-line bound for injected memory content (recall bullets, constraint
@@ -260,6 +277,7 @@ function queryRecallEnabled(): boolean {
  */
 const VOLATILE_CONTEXT_TITLES = new Set<string>([
   'Now',
+  'Right Now',
   'Relevant To Your Request',
   'Relevant Skills',
   'Completed Actions This Conversation',
@@ -447,6 +465,8 @@ export function renderHarnessMemoryContext(opts?: {
     { title: 'Current Focus', text: section('Current Focus', activeTask) },
     { title: 'Skill Discovery', text: section('Skill Discovery', skillDiscovery) },
     { title: 'Relevant Skills', text: section('Relevant Skills', relevantSkills) },
+    // Last on purpose: adjacent to the user's message (see renderRightNowStamp).
+    { title: 'Right Now', text: section('Right Now', renderRightNowStamp()) },
   ];
 
   const blocks = tagged
