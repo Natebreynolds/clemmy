@@ -97,6 +97,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [agent, setAgent] = useState<{ id: string; name: string } | null>(
     initialAgentId ? { id: initialAgentId, name: initialAgentName ?? '' } : null,
   );
+  /** The agent the daemon has for this conversation, so a send only reports a real change. */
+  const sessionAgentId = useRef<string | null>(initialAgentId ?? null);
   // The agent a NEW conversation is created in. Frozen once a session exists:
   // the engine is rebuilt when it changes, which must never drop a thread.
   const [openingAgentId, setOpeningAgentId] = useState<string | null>(initialSessionId ? null : initialAgentId ?? null);
@@ -153,6 +155,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           const result = await getChatSession(sessionId);
           setTitle(result.session.title);
           setAgent(result.session.agentId ? { id: result.session.agentId, name: result.session.agentName ?? '' } : null);
+          sessionAgentId.current = result.session.agentId ?? null;
           return { events: result.events, latestSeq: result.latestSeq };
         } catch (err) {
           // Workspace threads use a STABLE session id (space-<slug>) that may
@@ -232,10 +235,16 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
    *  reply runs steers that reply; the choice waits for the next one. */
   async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = []) {
     const sessionId = snapshot?.sessionId;
-    if (sessionId && !busy && takesAgent) {
-      const result = await switchChatAgent(sessionId, agent?.id ?? null);
+    // The daemon is told about the chip only when the chip changed: a plain
+    // follow-up must never wait on, or fail on, a switch to what the
+    // conversation already has (live 09-26: that call failed and every
+    // follow-up in an existing thread was silently dropped).
+    const wanted = agent?.id ?? null;
+    if (sessionId && !busy && takesAgent && wanted !== sessionAgentId.current) {
+      const result = await switchChatAgent(sessionId, wanted);
+      sessionAgentId.current = result.agentId ?? null;
       // Who actually replies (a deleted agent falls back to Clem).
-      if ((result.agentId ?? null) !== (agent?.id ?? null)) {
+      if ((result.agentId ?? null) !== wanted) {
         setAgent(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
       }
     }

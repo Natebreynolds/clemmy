@@ -79,17 +79,33 @@ export function isOfflineError(err: unknown): boolean {
   return Boolean((err as ApiError | undefined)?.offline);
 }
 
+/**
+ * The request headers, with a JSON content-type added only when the caller
+ * did not set one under ANY spelling. Header names are case-insensitive to
+ * fetch, and two spellings of content-type reach the daemon joined as
+ * "application/json, application/json", which its JSON parser refuses; the
+ * body then arrives unparsed and the route answers 400 (live 09-26: every
+ * follow-up in an existing phone thread failed on the agent-switch call).
+ */
+export function requestHeaders(init?: RequestInit): Record<string, string> {
+  const given: Record<string, string> = {};
+  const raw = init?.headers;
+  if (raw instanceof Headers) raw.forEach((value, key) => { given[key] = value; });
+  else if (Array.isArray(raw)) for (const [key, value] of raw) given[key] = value;
+  else if (raw) Object.assign(given, raw as Record<string, string>);
+  const hasContentType = Object.keys(given).some((key) => key.toLowerCase() === 'content-type');
+  return {
+    accept: 'application/json',
+    ...(init?.body && !hasContentType ? { 'content-type': 'application/json' } : {}),
+    ...given,
+  };
+}
+
 export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const opts: RequestInit = {
     credentials: 'same-origin',
     ...init,
-    headers: {
-      'accept': 'application/json',
-      ...(init?.body && !(init.headers as Record<string, string> | undefined)?.['content-type']
-        ? { 'content-type': 'application/json' }
-        : {}),
-      ...(init?.headers ?? {}),
-    },
+    headers: requestHeaders(init),
   };
   Object.assign(
     opts.headers as Record<string, string>,
@@ -952,7 +968,6 @@ export async function listChatSessions(): Promise<{ sessions: ChatSession[] }> {
 export async function switchChatAgent(sessionId: string, agentId: string | null): Promise<{ agentId: string | null; agentName: string | null; changed: boolean }> {
   return api(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}/agent`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ agentId }),
   });
 }
