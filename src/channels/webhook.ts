@@ -655,6 +655,10 @@ function effectiveHarnessStatus(
   if (terminal?.type === 'kill_requested') return 'cancelled';
   if (terminal?.type === 'awaiting_user_input') return 'awaiting_user_input';
   if (terminal?.type === 'approval_requested') return 'awaiting_approval';
+  // An approval that ran out unanswered leaves nothing running or waiting. A
+  // session that outlives it (a Workspace's own) would otherwise read as
+  // running while the expiry event is fresh.
+  if (terminal?.type === 'approval_resolved' && eventRecord(terminal.data).decision === 'expired') return 'idle';
   if (terminal?.type === 'run_paused') return 'awaiting_approval';
   if (terminal?.type === 'conversation_completed' || terminal?.type === 'run_completed') return 'completed';
   if (attempt?.status === 'active') return 'running';

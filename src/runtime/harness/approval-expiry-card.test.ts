@@ -132,6 +132,35 @@ test('a decision that arrives after the card expired settles the card as expired
   assert.equal(listEvents(session.id, { types: ['approval_resolved'] }).length, 1, 'the sweep adds no second mark');
 });
 
+test('an expired approval on a session that outlives it reads as idle, not running or waiting', async () => {
+  const { __test__: activity } = await import('../../channels/webhook.js');
+  const { getSession } = await import('./eventlog.js');
+  // A Workspace's own decision: expiry keeps its session open (reaper.ts).
+  const session = createSession({ id: 'space-expiry-card-runner', kind: 'chat' });
+  const row = reg.register({
+    sessionId: session.id,
+    subject: 'Review the Workspace runner',
+    tool: 'space_trust_data_runner',
+    ttlMs: 24 * 60 * 60_000,
+  });
+  appendEvent({
+    sessionId: session.id,
+    turn: 0,
+    role: 'Clem',
+    type: 'approval_requested',
+    data: { approvalId: row.approvalId, subject: 'Review the Workspace runner', tool: 'space_trust_data_runner' },
+  });
+  assert.equal(activity.effectiveHarnessStatus(getSession(session.id)!, listEvents(session.id), null), 'awaiting_approval');
+  openEventLog().prepare('UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?')
+    .run(ago(60_000), row.approvalId);
+
+  reaper.reapOnce();
+
+  assert.equal(reg.get(row.approvalId)?.status, 'expired');
+  assert.equal(getSession(session.id)?.status, 'active', 'precondition: the Workspace session stays open');
+  assert.equal(activity.effectiveHarnessStatus(getSession(session.id)!, listEvents(session.id), null), 'idle');
+});
+
 test('an answered approval still leaves no card on reopen and no expiry mark', () => {
   const { session, row } = raiseCard('Answered');
   assert.equal(reg.resolve(row.approvalId, 'rejected', 'approval-expiry-card-test').ok, true);
