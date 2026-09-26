@@ -45,9 +45,9 @@ const { closeEventLog, createSession, appendEvent, listEvents } = await import('
 const PINNED = 'claude-sonnet-5';
 const HOUR = 3_600_000;
 
-/** How the Claude wire behaves: it answers, or it refuses the way an
- *  exhausted account does. */
-type ClaudeWire = 'answers' | 'bare_429' | 'out_of_extra_usage';
+/** How the Claude wire behaves: it answers, refuses the way an exhausted
+ *  account does, or fails in a way that has nothing to do with quota. */
+type ClaudeWire = 'answers' | 'bare_429' | 'out_of_extra_usage' | 'transport_error' | 'invalid' | 'hung';
 let claudeWire: ClaudeWire = 'answers';
 const calls: Array<{ provider: 'claude' | 'codex'; modelId?: string }> = [];
 
@@ -70,6 +70,9 @@ function wire(provider: 'claude' | 'codex', modelId?: string): Model {
         // The provider's own words when extra usage is spent (live 2026-09-23).
         throw Object.assign(new Error("You're out of extra usage. Add more at claude.ai/settings/usage and keep going."), { status: 400 });
       }
+      if (provider === 'claude' && claudeWire === 'transport_error') throw new Error('fixture checker transport unavailable');
+      if (provider === 'claude' && claudeWire === 'hung') return new Promise<ModelResponse>(() => {});
+      if (provider === 'claude' && claudeWire === 'invalid') return verdictResponse('not a verdict', 'fixture-claude');
       // Each family rules differently, so a verdict shows who ruled.
       return provider === 'claude'
         ? verdictResponse('INCOMPLETE: the receipts are absent', 'fixture-claude')
@@ -79,13 +82,14 @@ function wire(provider: 'claude' | 'codex', modelId?: string): Model {
   };
 }
 
-function writeAuth(codexSignedIn = true): void {
+function writeAuth(codexSignedIn = true, claudeSignedIn = true): void {
   writeFileSync(path.join(TEST_HOME, 'state', 'auth.json'), JSON.stringify(codexSignedIn
     ? { codexOauth: { accessToken: 'fixture-codex-access', refreshToken: 'fixture-codex-refresh' } }
     : {}));
-  // An explicit subscription token keeps the operator's keychain out of it.
+  // An explicit token keeps the operator's keychain out of it; a non-subscription
+  // token is how a signed-out Claude account looks.
   writeFileSync(path.join(TEST_HOME, 'state', 'claude-auth.json'), JSON.stringify({
-    accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + HOUR,
+    accessToken: claudeSignedIn ? 'sk-ant-oat01-fixture' : 'sk-ant-api03-no-subscription', expiresAt: Date.now() + HOUR,
   }));
 }
 
@@ -126,6 +130,7 @@ beforeEach(() => {
     CLEMMY_CLAUDE_TRANSPORT: 'raw_messages', CLEMMY_DEBATE_JUDGE: '',
     BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '', BYO_PROVIDERS: '',
     CLEMMY_BOUNDARY_JUDGE_CLAUDE_MODEL: '', CLEMMY_BOUNDARY_JUDGE_CODEX_MODEL: '',
+    CLEMMY_EXACT_JUDGE_TIMEOUT_MS: '90000',
   });
   pinJudge(PINNED);
   writeAuth();
@@ -241,6 +246,42 @@ test('a checker refused for quota at call time moves to the next family within t
   ]);
 });
 
+test('a call-time quota refusal with no family left is recorded unreviewed in the provider’s own words', async () => {
+  __setClaudeUsageForTests(claudeReading(100, { extraUsage: true }));
+  claudeWire = 'out_of_extra_usage';
+  exhaustCodex();
+  const verdict = await review();
+  assert.equal(verdict.failedOpen, true);
+  assert.match(verdict.reason, new RegExp(`checker ${PINNED} could not review this answer`));
+  assert.match(verdict.reason, /refused the review for lack of quota or credit/);
+  assert.match(verdict.reason, /out of extra usage/);
+  assert.match(verdict.reason, /No other model family is available/);
+  assert.deepEqual(calls, [{ provider: 'claude', modelId: PINNED }], 'dialed once, refused, nothing else');
+});
+
+// The pin invariants (objective-judge-pin.integration.test.ts) exercise
+// runHedgedJudge directly; these hold them on the completion route itself.
+for (const failure of ['bare_429', 'transport_error', 'invalid', 'hung'] as const) {
+  test(`on the completion route a chosen checker's ${failure} stays unjudged: only a quota refusal moves the review`, async () => {
+    process.env.CLEMMY_EXACT_JUDGE_TIMEOUT_MS = '1000'; // a hung checker times out quickly
+    claudeWire = failure;
+    const verdict = await review();
+    assert.equal(verdict.failedOpen, true);
+    assert.equal(verdict.judgeModelId, undefined, 'no model ruled');
+    assert.equal(verdict.substituteForExactPin, undefined);
+    assert.deepEqual(calls.map((call) => call.provider), failure === 'invalid' ? ['claude', 'claude'] : ['claude'],
+      'no stand-in is dialed; a malformed verdict gets its one repair on the same checker');
+  });
+}
+
+test('on the completion route a pinned checker that cannot sign in is unavailable, and nothing stands in', async () => {
+  writeAuth(true, false);
+  const verdict = await review();
+  assert.equal(verdict.failedOpen, true);
+  assert.match(verdict.reason, new RegExp(`Configured boundary judge ${PINNED} is unavailable`));
+  assert.deepEqual(calls, []);
+});
+
 test('with no family left to review, the verdict is recorded unreviewed with the quota reason', async () => {
   __setClaudeUsageForTests(claudeReading(100));
   claudeWire = 'bare_429';
@@ -298,6 +339,23 @@ test('an old, a spent-window or an extra-usage reading is not evidence of exhaus
   }
 });
 
+test('an unpinned checker’s hedge is never started on an account that is out of quota', async () => {
+  const { resolveCompletionCheckerRoute } = await import('./debate-model.js');
+  pinJudge(null);
+  const selection: import('./debate-model.js').CapturedBoundaryJudgeSelection = {
+    status: 'captured', role: { modelId: 'gpt-5.6-terra', provider: 'codex', source: 'default' },
+    crossFamily: true, defaultModels: { claude: boundaryClaudeJudgeModel(), codex: boundaryCodexJudgeModel() },
+  };
+  assert.equal(resolveCompletionCheckerRoute(selection).hedge?.judgeFamily, 'claude',
+    'with quota to spare, the other family hedges the chosen checker');
+  __setClaudeUsageForTests(claudeReading(100));
+  const route = resolveCompletionCheckerRoute(selection);
+  assert.equal(route.primary.judgeFamily, 'codex', 'the chosen checker is untouched');
+  assert.equal(route.primary.substituteForExactPin, undefined);
+  assert.equal(route.hedge, null, 'a hedge onto the used-up account could not answer');
+  assert.deepEqual(calls, [], 'resolving a route dials nothing');
+});
+
 test('a test run never dials the live Claude usage endpoint, even when the reading is due a refresh', async () => {
   const { __resetClaudeUsageForTests } = await import('./claude-usage.js');
   const { checkerQuotaExhaustion } = await import('./judge-family.js');
@@ -323,7 +381,10 @@ test('the checker’s quota awareness leaves every brain-routing input unchanged
     'the default judge role is unchanged; only the review’s route falls through');
 });
 
-test('the durable verdict of a real review names the stand-in and the checker it stood in for', async () => {
+/** A workflow run the owner asked for, finished and reported back, with the
+ *  owner's Claude checker captured at acceptance. `commit` runs the REAL
+ *  report-back review and commits the answer the owner receives. */
+async function reportedBackWorkflow(name: string) {
   const host = await import('./host-turn-runner.js');
   const { writeWorkflow } = await import('../../memory/workflow-store.js');
   const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
@@ -338,7 +399,6 @@ test('the durable verdict of a real review names the stand-in and the checker it
   const usage = await import('../usage-log.js');
   const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
   reviewer._setWorkflowOriginCompletionJudgeForTests(null);
-  const name = 'checker-quota-durable-verdict';
   writeWorkflow(name, { name, description: 'Summarize supplied text.', enabled: true,
     trigger: { manual: true }, steps: [{ id: 'summary', prompt: 'Summarize {{input.text}}.', sideEffect: 'read' }] });
   const replyTarget = { type: 'origin_chat' } as const;
@@ -364,16 +424,24 @@ test('the durable verdict of a real review names the stand-in and the checker it
     outcome: 'done', detail: 'Southgate is ready.' }), true);
   const observer = queue.readWorkflowRunOriginRecords(runId).find((row) => row.version === 2);
   assert.ok(observer && observer.version === 2);
+  const inWorkflow = { sessionId: `workflow:${name}:step`, sourceUserSeq: 999_999 };
+  return {
+    sessionId: session.id,
+    commit: () => usage.withModelUsageAttribution(inWorkflow, () => brackets.withHarnessRunContext({
+      ...inWorkflow, counter: new brackets.ToolCallsCounter(8), workerScope: true,
+    }, () => terminal.reviewAndCommitWorkflowOriginTerminal({ observer, runId,
+      outcome: 'done', detail: 'Southgate is ready.' }))),
+  };
+}
+
+test('the durable verdict of a real review names the stand-in and the checker it stood in for', async () => {
+  const run = await reportedBackWorkflow('checker-quota-durable-stand-in');
   __setClaudeUsageForTests(claudeReading(100)); // the plan window runs out before the review
   claudeWire = 'bare_429';
-  const inWorkflow = { sessionId: 'workflow:checker-quota:step', sourceUserSeq: 999_999 };
-  const committed = await usage.withModelUsageAttribution(inWorkflow, () => brackets.withHarnessRunContext({
-    ...inWorkflow, counter: new brackets.ToolCallsCounter(8), workerScope: true,
-  }, () => terminal.reviewAndCommitWorkflowOriginTerminal({ observer, runId,
-    outcome: 'done', detail: 'Southgate is ready.' })));
+  const committed = await run.commit();
   assert.ok(committed);
   assert.deepEqual(calls.map((call) => call.provider), ['codex'], 'only the stand-in was dialed');
-  const judged = listEvents(session.id, { types: ['goal_alignment_judged'] });
+  const judged = listEvents(run.sessionId, { types: ['goal_alignment_judged'] });
   assert.equal(judged.length, 1);
   const recorded = judged[0]!.data as Record<string, unknown>;
   assert.equal(recorded.judgeModelId, boundaryCodexJudgeModel());
@@ -386,4 +454,24 @@ test('the durable verdict of a real review names the stand-in and the checker it
   assert.equal(ref.judgeModelId, boundaryCodexJudgeModel());
   assert.equal(ref.requestedJudgeModelId, PINNED);
   assert.equal(ref.substituteForExactPin, true);
+});
+
+test('with no family left, the durable verdict and the delivered answer say unreviewed, with the reason', async () => {
+  const run = await reportedBackWorkflow('checker-quota-durable-unreviewed');
+  __setClaudeUsageForTests(claudeReading(100));
+  claudeWire = 'bare_429';
+  exhaustCodex();
+  const committed = await run.commit();
+  assert.ok(committed);
+  assert.deepEqual(calls, [], 'neither used-up account is dialed');
+  const judged = listEvents(run.sessionId, { types: ['goal_alignment_judged'] });
+  assert.equal(judged.length, 1);
+  const recorded = judged[0]!.data as Record<string, unknown>;
+  assert.equal(recorded.failedOpen, true);
+  assert.match(String(recorded.reason), /five-hour limit is used up/);
+  assert.match(String(recorded.reason), /No other model family is available/);
+  assert.equal(recorded.judgeModelId, undefined);
+  const ref = committed.event.data.completionVerdictRef as Record<string, unknown>;
+  assert.equal(ref.failedOpen, true);
+  assert.match(committed.presentation.text, /stands unreviewed/, 'the owner is told; nothing passes silently');
 });
