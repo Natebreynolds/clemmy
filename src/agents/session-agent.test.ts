@@ -105,3 +105,15 @@ test("an agent's page lists every conversation it answered in, including ones sw
   assert.equal(movedSummary.agentId, null, 'the summary names who answers next, not who answered before');
   assert.deepEqual(movedSummary.agentIds, [research.id]);
 });
+
+test("a conversation whose agent was deleted carries on with Clem", async () => {
+  const { deleteAgentRecord } = await import('./agent-record.js');
+  const gone = agent('Short Lived Desk');
+  const session = createSession({ kind: 'chat', title: 'agent deleted' });
+  setSessionAgent(session.id, gone.id, { by: 'owner' });
+  assert.equal(deleteAgentRecord(gone.id), true);
+  assert.deepEqual(setSessionAgent(session.id, gone.id, { by: 'owner' }), { ok: true, changed: true, agentId: null, agentName: null });
+  assert.deepEqual(sessionAgentFields(session.id), {});
+  assert.deepEqual(setSessionAgent(session.id, gone.id, { by: 'owner' }), { ok: false, reason: 'agent_not_found' },
+    'only the stale pointer falls back; naming a missing agent is still refused');
+});

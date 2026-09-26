@@ -45,9 +45,11 @@ export function setSessionAgent(
   }
   const wanted = typeof agentId === 'string' && agentId.trim() ? agentId.trim() : null;
   const agent = wanted ? getAgentRecord(wanted) : null;
-  if (wanted && !agent) return { ok: false, reason: 'agent_not_found' };
-
   const current = sessionAgentState(row.metadata);
+  // The conversation's own agent was deleted: it carries on with Clem rather
+  // than refusing every message until someone changes the chip.
+  if (wanted && !agent && wanted !== current.agentId) return { ok: false, reason: 'agent_not_found' };
+
   if ((agent?.id ?? null) === current.agentId) {
     return { ok: true, changed: false, agentId: current.agentId, agentName: agent?.name ?? current.agentName };
   }

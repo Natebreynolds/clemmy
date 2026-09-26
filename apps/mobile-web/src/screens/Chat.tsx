@@ -218,7 +218,11 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   async function sendMessage(text: string, mode: TaskMode | undefined) {
     const sessionId = snapshot?.sessionId;
     if (sessionId && !busy && takesAgent) {
-      await switchChatAgent(sessionId, agent?.id ?? null);
+      const result = await switchChatAgent(sessionId, agent?.id ?? null);
+      // Who actually replies (a deleted agent falls back to Clem).
+      if ((result.agentId ?? null) !== (agent?.id ?? null)) {
+        setAgent(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
+      }
     }
     await engine.send(text, mode);
   }
