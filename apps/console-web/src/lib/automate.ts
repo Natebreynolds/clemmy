@@ -209,7 +209,22 @@ export interface WorkflowStep {
   name?: string;
   prompt?: string;
   dependsOn?: string[];
+  /** The step pauses for the owner before it runs. */
+  requiresApproval?: boolean;
+  /** A failure here leaves a gap instead of stopping the run. */
+  optional?: boolean;
+  /** Runs once per item of the named upstream output. */
+  forEach?: string;
+  forEachNewOnly?: boolean;
+  allowedTools?: string[];
+  usesSkill?: string;
+  model?: string;
+  output?: { type?: string; [k: string]: unknown };
   [k: string]: unknown;
+}
+/** Where each step sits on the graph, shared across devices (a sidecar beside the definition). */
+export interface WorkflowLayout {
+  positions: Record<string, { x: number; y: number }>;
 }
 export interface WorkflowCreationTestState {
   runId: string;
@@ -236,6 +251,8 @@ export interface WorkflowDetail {
    * so the canvas draws what the engine compiles rather than a second model.
    */
   graph?: CanvasGraph;
+  /** Saved placement, or null when nobody has arranged this workflow yet. */
+  layout?: WorkflowLayout | null;
 }
 
 /**
@@ -279,6 +296,15 @@ export const patchWorkflow = (name: string, body: { description?: string; enable
   api<WorkflowPatchResult>(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteWorkflow = (name: string) =>
   api(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' });
+/**
+ * Store where the steps sit. A placement write is not a definition change: it
+ * queues no test, emits no change event and never turns a workflow off.
+ */
+export const putWorkflowLayout = (name: string, positions: WorkflowLayout['positions']) =>
+  api<{ name: string; layout: WorkflowLayout }>(`/api/console/workflows/${encodeURIComponent(name)}/layout`, {
+    method: 'PUT',
+    body: JSON.stringify({ positions }),
+  });
 
 export interface CronRow {
   name: string;

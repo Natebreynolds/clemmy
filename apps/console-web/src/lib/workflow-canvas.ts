@@ -59,7 +59,13 @@ export interface CanvasGraphNode {
     sideEffect?: CanvasSideEffect;
     executor?: CanvasExecutor;
     toolCount?: number;
+    tools?: string[];
     forEach?: string | null;
+    model?: string | null;
+    callTool?: string | null;
+    runner?: string | null;
+    outputType?: string | null;
+    approvalPreview?: string | null;
   };
   plan?: {
     levelIndex?: number | null;
@@ -418,7 +424,22 @@ export function writtenButTurnedOff(error: unknown): string | null {
     : 'Saved, and this workflow is now off until its test runs.';
 }
 
-/* ---------- browser-local node placement ---------- */
+/* ---------- node placement: shared sidecar first, this browser second ---------- */
+
+/**
+ * The placement to draw. The daemon's sidecar is what every device sees, so
+ * it wins whenever it has anything; the browser copy is the fallback for a
+ * workflow nobody has arranged since the sidecar existed, and for the legacy
+ * single-file layout the daemon cannot attach a sidecar to.
+ */
+export function choosePositions(
+  shared: Record<string, CanvasPosition> | null | undefined,
+  local: Record<string, CanvasPosition> | null | undefined,
+): Record<string, CanvasPosition> {
+  if (shared && Object.keys(shared).length > 0) return { ...shared };
+  return local ? { ...local } : {};
+}
+
 
 const POSITION_KEY_PREFIX = 'clem:workflow-canvas:positions:';
 

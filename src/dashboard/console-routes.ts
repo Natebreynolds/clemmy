@@ -152,6 +152,7 @@ import { readRunGoal, readWorkspaceManifest, workspaceArtifactBytes, readWorkspa
 import { listSubagentRuns, readSubagentOutput } from '../agents/subagent-runs.js';
 import { checkRunAgainstGoal } from '../execution/workflow-run-checker.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
+import { readWorkflowLayout, writeWorkflowLayout } from '../memory/workflow-layout.js';
 import {
   applyWorkflowVisualContractFixes,
   type WorkflowVisualContractFixKind,
@@ -5839,6 +5840,9 @@ export function registerConsoleRoutes(
           executionPlan,
         }),
         executionPlan,
+        // Where the steps sit on the graph, shared across devices. A sidecar,
+        // never part of the definition, so it changes nothing the engine runs.
+        layout: readWorkflowLayout(entry),
         // Provable dry-run preview: a side-effect-free trace of what this workflow
         // WOULD do (execution waves + every external write/send it would perform)
         // with no inputs supplied, so the UI can show "here is exactly what this
@@ -6095,6 +6099,34 @@ export function registerConsoleRoutes(
 
     writeWorkflowAndSyncTriggers(entry.name, patchPrep.def);
     res.json({ updated: true, name: patchPrep.def.name, repairs: patchPrep.repairs });
+  });
+
+  /**
+   * Save where the steps sit on the graph. Placement is a sidecar beside the
+   * definition, so this write queues no verification test, emits no change
+   * event and never turns a live workflow off; it only has to be a JSON
+   * object of {x, y} pairs keyed by step id.
+   */
+  app.put('/api/console/workflows/:name/layout', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const positions = (req.body ?? {}).positions;
+    if (!positions || typeof positions !== 'object' || Array.isArray(positions)) {
+      res.status(400).json({ error: 'Send { positions: { [stepId]: { x, y } } }.' });
+      return;
+    }
+    try {
+      const written = writeWorkflowLayout(entry, positions);
+      if (!written.ok) {
+        res.status(409).json({ error: 'This workflow is still in the single-file layout; its placement is kept in this browser until it is next saved.' });
+        return;
+      }
+      res.json({ name: entry.data.name, layout: written.layout });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/console/workflows/:name/contract-fixes', async (req, res) => {

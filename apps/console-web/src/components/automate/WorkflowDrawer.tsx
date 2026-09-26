@@ -52,7 +52,7 @@ function EngineMetric({ icon: Icon, label, value, tone = 'neutral' }: { icon: Lu
   );
 }
 
-function WorkflowEnginePanel({
+export function WorkflowEnginePanel({
   certification,
   stepCount,
   resources = {},

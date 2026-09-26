@@ -13,7 +13,6 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { statusTone } from '@/lib/inbox';
 import { humanizeCron } from '@/lib/cron';
-import { WorkflowDrawer } from '@/components/automate/WorkflowDrawer';
 import { ActivityCard } from '@/components/chat/ActivityCard';
 import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
 import { useWorkflowRunActivity } from '@/lib/session-activity';
@@ -99,11 +98,16 @@ export function Automate() {
   const [installing, setInstalling] = useState(false);
   const [checking, setChecking] = useState(false);
   const [busyRecovery, setBusyRecovery] = useState<string | null>(null);
-  // Deep-link: /automate?workflow=<name> opens that workflow's drawer directly
-  // (used by the workspace header's "powered by" chips).
-  const [openWf, setOpenWf] = useState<string | null>(
-    () => new URLSearchParams(window.location.search).get('workflow'),
-  );
+  // A workflow opens on its own page. /automate?workflow=<name> (the
+  // workspace header's "powered by" chips) still lands there.
+  const openWorkflow = (name: string, opts?: { advanced?: boolean }) =>
+    navigate(`/automate/${encodeURIComponent(name)}${opts?.advanced ? '?advanced=1' : ''}`);
+  useEffect(() => {
+    const deepLinked = new URLSearchParams(window.location.search).get('workflow');
+    if (deepLinked) navigate(`/automate/${encodeURIComponent(deepLinked)}`, { replace: true });
+    // Read once on mount: the query string is the deep link, not live state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [openRun, setOpenRun] = useState<{ workflow: string; runId?: string } | null>(null);
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 
@@ -282,12 +286,12 @@ export function Automate() {
                       return (
                         <Card key={w.name} className="flex flex-col p-5">
                           <div className="mb-2 flex items-start justify-between gap-3">
-                            <button type="button" onClick={() => setOpenWf(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
+                            <button type="button" onClick={() => openWorkflow(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
                               {w.name}
                             </button>
                             <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
                           </div>
-                          <button type="button" onClick={() => setOpenWf(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
+                          <button type="button" onClick={() => openWorkflow(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
                           <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
                             {active && (
                               <button
@@ -307,7 +311,7 @@ export function Automate() {
                               <button
                                 type="button"
                                 title={status.detail}
-                                onClick={() => (status.aboutLastRun && w.lastRunId ? setOpenRun({ workflow: w.name, runId: w.lastRunId }) : setOpenWf(w.name))}
+                                onClick={() => (status.aboutLastRun && w.lastRunId ? setOpenRun({ workflow: w.name, runId: w.lastRunId }) : openWorkflow(w.name, { advanced: true }))}
                                 className="cursor-pointer"
                               >
                                 <StatusPill tone={status.tone}>{status.label}</StatusPill>
@@ -329,7 +333,7 @@ export function Automate() {
                                 {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
                               </Button>
                             ) : (
-                              <Button size="sm" variant="secondary" title={w.certification?.summary} onClick={() => setOpenWf(w.name)}>
+                              <Button size="sm" variant="secondary" title={w.certification?.summary} onClick={() => openWorkflow(w.name, { advanced: true })}>
                                 {workflowPrimaryAction(w.certification)}
                               </Button>
                             )}
@@ -338,13 +342,11 @@ export function Automate() {
                                 {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
                               </Button>
                             )}
-                            {(w.stepCount ?? 0) > 0 && (
-                              <Link to={`/automate/${encodeURIComponent(w.name)}/canvas`}>
-                                <Button size="sm" variant="ghost" title={`See ${w.name} as a graph`}>
-                                  <Workflow className="h-4 w-4" aria-hidden /> Canvas
-                                </Button>
-                              </Link>
-                            )}
+                            <Link to={`/automate/${encodeURIComponent(w.name)}`}>
+                              <Button size="sm" variant="ghost" title={`Open ${w.name}: its steps as a graph`}>
+                                <Workflow className="h-4 w-4" aria-hidden /> Open
+                              </Button>
+                            </Link>
                           </div>
                         </Card>
                       );
@@ -394,7 +396,6 @@ export function Automate() {
         </div>
       )}
 
-      {openWf && <WorkflowDrawer key={openWf} name={openWf} onClose={() => setOpenWf(null)} />}
       {openRun && <RunWorkspaceDrawer workflow={openRun.workflow} initialRunId={openRun.runId} onClose={() => setOpenRun(null)} />}
     </Page>
   );
