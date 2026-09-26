@@ -286,3 +286,61 @@ apr-j30j); a rule change while Jev is dark retries every tick within budget (by 
 calls); calendar and workflow-suggestions heartbeats keep their built-in rules (owner rules are
 kept and shown to Clementine, not yet applied by Jev); push delivery to the phone is the next
 phase (no APNs key, PWA web push unverified).
+
+## iOS notifications: why nothing arrives, and what changed (09-26 11:00–11:25 PT, installed 03e05703e)
+
+**Read-only diagnosis (live home, no state touched).** The phone is the native Clem app
+(`apps/ios`, SwiftUI shell around a pinned WKWebView; device `dev-W9RhYmCy`, seen today via the
+relay). It registers for push through APNs only (PushRegistrar.swift → PinnedWebView →
+`window.clemNative.registerApnsToken` → `POST /m/push/apns` → `upsertApnsDestination`). Today:
+
+- `state/notification-destinations.json` does not exist: no phone (APNs or web push) was ever
+  registered; the phone's session record has no `pushSubscribed`. The daemon log has no push
+  line at all. So the token never reached the daemon: permission not granted, or APNs
+  registration failed on the device (that build/App ID may lack the Push capability), or the
+  bridge POST failed (it parks in localStorage `clem.apns.pending`). Which one can only be seen on
+  the phone.
+- `state/apns.json` does not exist and no `APNS_*` env is set: even a registered token could not
+  be used. `src/runtime/apns.ts` needs `{ keyId, teamId, key | keyPath, environment }` with
+  `environment` matching the build (Xcode Debug = sandbox, TestFlight/App Store = production;
+  project.yml drives `aps-environment` from the configuration).
+- Quiet hours are not applied in delivery at all (they gate producers only); live policy has
+  them off.
+
+**Three framework defects fixed (03e05703e), each pinned:**
+1. Chat report-backs resolved only `web_push` destinations (three filters) → the native app's
+   APNs destination was never a report-back target. One helper `phonePushDestinations` names
+   both (`src/runtime/notifications.ts`; pin `runner-notifications.test.ts`).
+2. The two-rules gate before a phone returned silently and the worker recorded that as
+   delivered (`deliveredAt`, receipt). `deliverNotificationToDestination` now returns a
+   `DeliveryOutcome`; a destination reached that chose not to interrupt is written as
+   `deliverySkippedByDestination[id] = 'not_worth_interrupting' | 'channel_rules'`, settled, not
+   retried, no receipt (`notification-delivery.ts`, `runner.ts`; pin in
+   `runner-notifications.test.ts`). Test stubs returning nothing still count as sent.
+3. A heartbeat item classified `neither` (no status, no question) so push mode could never
+   buzz. An open heartbeat item (`heartbeatId` + `itemKey` + `needsAttention:true`) is an ask:
+   `awaiting_you`; a bare `needsAttention` flag still is not (`notification-intent.ts`; pin).
+
+**Legible on the page:** heartbeat status carries `phonePush { ready, reason, phones }`
+(`src/agents/phone-push-readiness.ts`, from `listNotificationDestinations` +
+`isApnsConfigured`); the Heartbeats page shows, under "reach my phone", "No phone is set up for
+notifications yet…" or "…this Mac has no Apple push key yet…". Served now: all three heartbeats
+`no_phone_registered`.
+
+**Owner-side, cannot be done from here:** (a) Apple Developer → Keys → new key with Apple Push
+Notifications service, download the `.p8`, note Key ID + Team ID; write
+`~/.clementine-next/state/apns.json` `{ "keyId", "teamId", "keyPath": "<.p8 path>",
+"environment": "sandbox" | "production" }` (topic defaults to `ai.breakthroughcoaching.clem`);
+(b) on the phone: Settings → Clem → Notifications allowed; the App ID must have Push
+Notifications enabled and the app rebuilt (Debug ↔ sandbox); relaunch Clem so it re-posts the
+token; `notification-destinations.json` appearing is the proof. Then a work-review heartbeat
+set to "reach my phone" is the live test.
+
+**CarPlay (owner's ask for the mobile rebuild):** the native app exists, so CarPlay is
+possible in principle, but Apple grants CarPlay entitlements per category (communication,
+audio, navigation, EV charging, parking, food ordering, fueling, driving task) after an
+application; a general assistant does not fit a category, and CarPlay shows notifications only
+from entitled communication apps. A PWA cannot do CarPlay at all. The realistic path for the
+rebuild: App Intents / Siri ("Hey Siri, ask Clem …", "what needs me") work in any CarPlay car
+today without an entitlement; apply for the communication (messaging) entitlement if the owner
+wants Clem's asks read out and answered by voice in the car. Not started.
