@@ -32,6 +32,7 @@ import {
   sealOpenWrites,
   settleTerminalActivity,
   writeReversibilityLabel,
+  writeRowIsChange,
   writeRowLabel,
   writeRowStatus,
   writeRowTone,
@@ -393,13 +394,14 @@ export interface RunWriteRow {
 
 export function presentRunWrite(row: WriteLedgerRow): RunWriteRow {
   const state = writeRowStatus(row);
+  const tone = writeRowTone(row);
   return {
     key: row.callId,
     what: writeRowLabel(row),
     reversibility: writeReversibilityLabel(row),
     note: state === 'running' ? 'not confirmed yet' : null,
     state,
-    tone: writeRowTone(row),
+    tone: tone === 'muted' ? 'neutral' : tone,
     settled: state !== 'running',
   };
 }
@@ -422,7 +424,10 @@ export function presentRunWrite(row: WriteLedgerRow): RunWriteRow {
  */
 export function runWriteRows(events: readonly RunEventInput[], run: RunLiveness): RunWriteRow[] {
   const folded = foldWriteLedger(events);
-  return [...(run.over ? sealOpenWrites(folded) : folded).values()].map(presentRunWrite);
+  // Only changes belong here; a returned call is already its own tool row.
+  return [...(run.over ? sealOpenWrites(folded) : folded).values()]
+    .filter(writeRowIsChange)
+    .map(presentRunWrite);
 }
 
 /**

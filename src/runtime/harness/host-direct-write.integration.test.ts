@@ -1003,4 +1003,41 @@ test('an approved send is recorded with the reversibility and consequence its co
   assert.equal(rows[0]!.consequence, 'send');
   assert.equal(engine.writeReversibilityLabel(rows[0]!), "can't be undone", 'the receipt says what the card said');
   assert.equal(engine.outsideWorkCards(rows.map((write) => ({ write })))[0]?.kind, 'message_sent');
+  // A named change still counts as one.
+  const { composeRunProgressLine } = await import('./run-progress.js');
+  assert.match(composeRunProgressLine({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, fallback: '' }),
+    /1 write completed/);
+});
+
+// Only an affirmed change reads as a write (live 2026-09-25): research requests
+// through a generic API-request operation are booked as writes because their
+// carrier could not be proven read-only; the progress line said "5 writes
+// completed" and the receipt counted them as changes. Their consent
+// classification never named a change, so a clean return is a completed call.
+test('a carrier-bounded call that returns cleanly reads as a call, never as a write or a change', async () => {
+  const fixture = await directWriteFixture('work_call', 'bounded', 'call-not-change', false, 'args_json', 1, {
+    operationId: 'research_request', schema: RESEARCH_SCHEMA, payloads: [RESEARCH_PAYLOAD],
+  });
+  assert.ok(fixture);
+  const outcome = await fixture.run();
+  assert.equal(Boolean(outcome.hasInterruptions), false);
+  assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(outcome.history));
+  // Safety truth is unchanged: the call is still reserved and settled as a write.
+  const ledger = eventlog.listEvents(fixture.session.id, { types: ['external_write', 'external_write_succeeded'] });
+  assert.deepEqual(ledger.map((event) => event.type), ['external_write', 'external_write_succeeded']);
+  assert.equal(ledger[1]!.data.consequence, 'unknown');
+
+  const { composeRunProgressLine } = await import('./run-progress.js');
+  const line = composeRunProgressLine({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, fallback: '' });
+  assert.match(line, /1 call completed/, line);
+  assert.doesNotMatch(line, /\d+ writes? completed/, line);
+
+  const { projectHarnessEventsForPublic } = await import('./public-presentation.js');
+  const engine = await import('../../../packages/chat-engine/src/index.js');
+  const rows = [...engine.foldWriteLedger(projectHarnessEventsForPublic(ledger)).values()];
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.disposition, 'returned', 'a completed call, not a confirmed write');
+  assert.deepEqual(engine.outsideWorkCards(rows.map((write) => ({ write }))), [], 'no card claims a change');
+  assert.equal(engine.writeRowIsChange(rows[0]!), false, 'not listed under what changed');
+  assert.equal(engine.writeRowTone(rows[0]!), 'muted');
 });

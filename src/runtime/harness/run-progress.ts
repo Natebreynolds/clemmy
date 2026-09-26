@@ -11,6 +11,7 @@
  */
 import { getEvent, getTurnGraphEventForSource, openEventLog } from './eventlog.js';
 import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { recordedConsentAffirmsChange } from './interactive-consent-policy.js';
 import { turnGraphFromShadowEvent } from '../graph/turn-graph-shadow.js';
 import { expectedWorkPlanLines, type ExpectedWorkPlanLine } from './expected-work-admission.js';
 import { heldInventory } from './held-inventory.js';
@@ -50,6 +51,43 @@ function collectionFacts(sessionId: string, sourceUserSeq: number): {
   }
 }
 
+/** Succeeded business operations for one source. A mutating settlement is a
+ *  write only when its ledger row affirms a change; a call classified as a
+ *  write whose own consent classification never named one is a completed
+ *  call (live 2026-09-25: five research requests read as "5 writes
+ *  completed"). */
+function settledOperationCounts(
+  sessionId: string,
+  sourceUserSeq: number,
+): { writes: number; calls: number; reads: number } {
+  const db = openEventLog();
+  const settled = db.prepare(`
+      SELECT logical_tool_call_id AS callId, mutating
+        FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ? AND business_call = 1
+         AND outcome_kind IN ('succeeded', 'empty_result')
+    `).all(sessionId, sourceUserSeq) as Array<{ callId: string; mutating: number }>;
+  const unaffirmed = new Set<string>();
+  const reservations = db.prepare(`
+      SELECT data_json FROM events
+       WHERE session_id = ? AND type = 'external_write'
+         AND json_extract(data_json, '$.sourceUserSeq') = ?
+    `).all(sessionId, sourceUserSeq) as Array<{ data_json: string }>;
+  for (const row of reservations) {
+    let data: Record<string, unknown>;
+    try { data = JSON.parse(row.data_json) as Record<string, unknown>; } catch { continue; }
+    const callId = data.canonicalCallId ?? data.callId;
+    if (typeof callId === 'string' && !recordedConsentAffirmsChange(data)) unaffirmed.add(callId);
+  }
+  const counts = { writes: 0, calls: 0, reads: 0 };
+  for (const row of settled) {
+    if (row.mutating !== 1) counts.reads += 1;
+    else if (unaffirmed.has(row.callId)) counts.calls += 1;
+    else counts.writes += 1;
+  }
+  return counts;
+}
+
 function stepLabel(line: ExpectedWorkPlanLine): string {
   switch (line.effect) {
     case 'read': return 'collecting';
@@ -72,13 +110,7 @@ export function composeRunProgressLine(input: {
     const sourceUserSeq = input.sourceUserSeq ?? latestUserSeq(input.sessionId) ?? undefined;
     if (!sourceUserSeq) return input.fallback;
     const lines = expectedWorkPlanLines({ sessionId: input.sessionId, sourceUserSeq });
-    const counts = openEventLog().prepare(`
-        SELECT SUM(CASE WHEN mutating = 1 THEN 1 ELSE 0 END) AS writes,
-               SUM(CASE WHEN mutating = 0 THEN 1 ELSE 0 END) AS reads
-          FROM logical_call_settlements
-         WHERE session_id = ? AND source_user_seq = ? AND business_call = 1
-           AND outcome_kind IN ('succeeded', 'empty_result')
-      `).get(input.sessionId, sourceUserSeq) as { writes: number | null; reads: number | null };
+    const counts = settledOperationCounts(input.sessionId, sourceUserSeq);
     // WHAT SHE HAS ASSEMBLED, NOT JUST HOW MANY CALLS RETURNED.
     //
     // This line is the only thing a watching person gets between tool rows, and
@@ -111,6 +143,7 @@ export function composeRunProgressLine(input: {
     ].filter(Boolean);
     const completedOperations = [
         counts.writes ? `${counts.writes} write${counts.writes === 1 ? '' : 's'} completed` : '',
+        counts.calls ? `${counts.calls} call${counts.calls === 1 ? '' : 's'} completed` : '',
         counts.reads ? `${counts.reads} result${counts.reads === 1 ? '' : 's'} collected` : '',
     ].filter(Boolean);
     if (lines.length === 0) {

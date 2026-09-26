@@ -59,6 +59,33 @@ export function isInteractiveConsentConsequence(value: unknown): value is Intera
   return typeof value === 'string' && CONSEQUENCE_VALUES.has(value);
 }
 
+const AFFIRMED_CHANGE_CONSEQUENCES: ReadonlySet<InteractiveConsentConsequence> = new Set<InteractiveConsentConsequence>([
+  'create', 'update', 'delete', 'send', 'admin',
+]);
+
+/**
+ * Whether a consent classification affirms that the call changes something
+ * outside Clementine: a named create, update, delete, send or administrative
+ * consequence, or a destructive declaration. The classifier affirms neither
+ * `execute` nor `unknown`. A call that is a write only because its carrier
+ * could not be proven read-only proves, when it returns cleanly, that it ran,
+ * not that anything changed (live 2026-09-25: research requests through a
+ * generic API-request operation read as "5 writes completed").
+ */
+export function consentRiskAffirmsChange(
+  risk: { consequence: InteractiveConsentConsequence; destructive: boolean },
+): boolean {
+  return risk.destructive || AFFIRMED_CHANGE_CONSEQUENCES.has(risk.consequence);
+}
+
+/** The same verdict read back from a write's ledger row. A row recorded
+ *  without a consent classification keeps its historical reading: a change. */
+export function recordedConsentAffirmsChange(data: Readonly<Record<string, unknown>>): boolean {
+  return isInteractiveConsentConsequence(data.consequence)
+    ? consentRiskAffirmsChange({ consequence: data.consequence, destructive: data.destructive === true })
+    : true;
+}
+
 export type InteractiveConsentCardinality =
   | { kind: 'once' }
   | { kind: 'each'; universeDigest: string }

@@ -24,6 +24,7 @@ import {
   narrateActivity,
   reduceActivity,
   writeReversibilityLabel,
+  writeRowIsChange,
   writeRowLabel,
   type ActivityItem,
   type HarnessEvent,
@@ -66,10 +67,11 @@ export function Run({ sessionId, onBack }: Props) {
    * precomputed `receipts`. Two reasons: the events carry `callId`, so a
    * reservation pairs to its own terminal instead of listing the same draft
    * twice; and this is the SAME fold the chat transcript runs, so the run view
-   * and the conversation can no longer disagree about what settled.
+   * and the conversation can no longer disagree about what settled. A call
+   * that returned without an affirmed change is not listed as one.
    */
   const writes = useMemo(
-    () => [...foldWriteLedger(run?.events ?? []).values()],
+    () => [...foldWriteLedger(run?.events ?? []).values()].filter(writeRowIsChange),
     [run?.events],
   );
 

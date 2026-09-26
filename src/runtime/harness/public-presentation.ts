@@ -45,6 +45,7 @@ import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMod
 import {
   isInteractiveConsentConsequence,
   isInteractiveConsentReversibility,
+  recordedConsentAffirmsChange,
 } from './interactive-consent-policy.js';
 
 /** The host-built approval preview (operation + argument values the owner is
@@ -1083,7 +1084,15 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         // The consent classification the ledger recorded, so a surface's
         // receipt states what the consent card stated. Closed values only.
         ...(isInteractiveConsentReversibility(data.reversibility) ? { reversibility: data.reversibility } : {}),
-        ...(isInteractiveConsentConsequence(data.consequence) ? { consequence: data.consequence } : {}),
+        ...(isInteractiveConsentConsequence(data.consequence)
+          ? {
+              consequence: data.consequence,
+              // Decided once, here: whether this write-classified call's own
+              // classification affirmed a change, so no surface counts or
+              // cards a clean return as one when it did not.
+              affirmsChange: recordedConsentAffirmsChange(data),
+            }
+          : {}),
       };
     }
     case 'codemode_program_summary': // historical event presentation

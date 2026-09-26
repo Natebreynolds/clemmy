@@ -56,6 +56,9 @@ export type WriteDisposition =
   | 'reserved'
   /** The provider returned a trusted clean acknowledgement. */
   | 'confirmed'
+  /** The call returned cleanly, but its consent classification never affirmed
+   *  a change: a completed call, not a confirmed write, and never a card. */
+  | 'returned'
   /** A decisive failure terminal. */
   | 'failed'
   /** Dispatched, outcome unobserved — it may have landed. */
@@ -82,6 +85,9 @@ export interface WriteLedgerRow {
   irreversible: boolean | null;
   /** Absent when the public projection did not carry a consent classification. */
   consequence?: WriteConsequence;
+  /** False when the server's verdict on that classification is that it never
+   *  affirmed a change. Absent means the row keeps the historical reading. */
+  affirmsChange?: boolean;
   /** Wire position of the event that set the current disposition. */
   settledAtSeq?: number;
   /** The app the write landed in and its web address, when the server's
@@ -149,12 +155,14 @@ function targetsOf(data: Record<string, unknown>): string[] {
  * order the two arrive in, and never downgrades back to orphaned.
  */
 function settle(prior: WriteDisposition, next: WriteDisposition): WriteDisposition {
-  if (prior === 'confirmed' || prior === 'failed') return prior;
+  if (prior === 'confirmed' || prior === 'returned' || prior === 'failed') return prior;
   return next;
 }
 
-function dispositionFor(type: string): WriteDisposition {
-  if (type === 'external_write_succeeded') return 'confirmed';
+/** A clean return confirms a write only when nothing says its classification
+ *  never affirmed a change; the server decides that once, per row. */
+function dispositionFor(type: string, affirmsChange: boolean | undefined): WriteDisposition {
+  if (type === 'external_write_succeeded') return affirmsChange === false ? 'returned' : 'confirmed';
   if (type === 'external_write_failed') return 'failed';
   if (type === 'external_write_orphaned') return 'orphaned';
   return 'reserved';
@@ -179,7 +187,8 @@ export function applyWriteEvent(
   const data = (ev.data ?? {}) as Record<string, unknown>;
   const callId = writeCallId(data);
   const key = writeRowKey(data, ev.seq);
-  const next = dispositionFor(ev.type);
+  const affirmsChange = typeof data.affirmsChange === 'boolean' ? data.affirmsChange : prior?.affirmsChange;
+  const next = dispositionFor(ev.type, affirmsChange);
   const toolName = stringOf(data.toolName) ?? stringOf(data.tool);
   const irreversible = irreversibleOf(data);
   const consequence = consequenceOf(data);
@@ -193,6 +202,7 @@ export function applyWriteEvent(
       disposition: next,
       irreversible: irreversible ?? null,
       ...(consequence ? { consequence } : {}),
+      ...(affirmsChange !== undefined ? { affirmsChange } : {}),
       ...(next === 'reserved' ? {} : { settledAtSeq: ev.seq }),
       ...appFields(data),
     };
@@ -215,6 +225,7 @@ export function applyWriteEvent(
     ...(next !== 'reserved' ? { targets: targetsOf(data) } : {}),
     ...(irreversible !== undefined ? { irreversible } : {}),
     ...(consequence ? { consequence } : {}),
+    ...(affirmsChange !== undefined ? { affirmsChange } : {}),
     disposition,
     ...(disposition === prior.disposition ? {} : { settledAtSeq: ev.seq }),
     ...appFields(data),
@@ -259,6 +270,8 @@ export function writeRowLabel(row: WriteLedgerRow): string {
       return base;
     case 'confirmed':
       return base;
+    case 'returned':
+      return base;
     case 'failed':
       return `${base} — failed`;
     case 'orphaned':
@@ -273,18 +286,33 @@ export function writeRowStatus(row: WriteLedgerRow): 'running' | 'done' | 'faile
   switch (row.disposition) {
     case 'reserved': return 'running';
     case 'confirmed': return 'done';
+    case 'returned': return 'done';
     case 'failed': return 'failed';
     default: return 'interrupted';
   }
 }
 
-export function writeRowTone(row: WriteLedgerRow): 'success' | 'danger' | 'warning' | 'live' {
+/** A returned call reads like any finished tool call: done, not a success
+ *  claim about the world. */
+export function writeRowTone(row: WriteLedgerRow): 'success' | 'danger' | 'warning' | 'live' | 'muted' {
   switch (row.disposition) {
     case 'reserved': return 'live';
     case 'confirmed': return 'success';
+    case 'returned': return 'muted';
     case 'failed': return 'danger';
     default: return 'warning';
   }
+}
+
+/**
+ * Whether a row belongs under "what changed". A call whose classification never
+ * affirmed a change is listed there only while its outcome is uncertain, since
+ * it may still have landed; returned, failed or still-running, it is a call,
+ * and its own tool row already says so.
+ */
+export function writeRowIsChange(row: WriteLedgerRow): boolean {
+  if (row.affirmsChange !== false) return true;
+  return row.disposition === 'orphaned' || row.disposition === 'unknown';
 }
 
 /**
