@@ -531,6 +531,8 @@ export interface SkillExecutionContext {
   /** The saved agent the reply was written inside: its standing instructions,
    *  as the answerer had them. Absent when Clem answered without an agent. */
   agentInstructions?: string;
+  /** The candidate is a plan, reviewed before anything runs. */
+  reviewsPlan?: boolean;
 }
 
 export interface CompletionEvidenceRow {
@@ -1454,7 +1456,11 @@ export async function judgeObjectiveComplete(
         : {}),
     };
   };
-  if (coverage.complete || directionQuestion) {
+  // A plan is reviewed before anything runs, so it has no delivered result for
+  // Jev's completion reading to find, and that reading would send back every
+  // plan. A plan is left to the configured reviewer alone.
+  const reviewsPlan = skillContext?.reviewsPlan === true;
+  if (!reviewsPlan && (coverage.complete || directionQuestion)) {
     const jevPromise = askJev();
     const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
     hedge.unref?.();
@@ -1499,7 +1505,7 @@ export async function judgeObjectiveComplete(
     // One direction only: a Jev DONE still fails open below, because "the
     // reviewer was unreachable" must never be delivered as "this was reviewed".
     // failedOpen stays set, so nothing downstream claims a completed review.
-    if (!jevSaid) {
+    if (!jevSaid && !reviewsPlan) {
       const late = await askJev();
       if (late) noteJev(late, false);
     }

@@ -4173,6 +4173,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       verdict = await hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
         ...(agentInstructions ? { agentInstructions } : {}),
+        ...(planCandidate ? { reviewsPlan: true } : {}),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
         fullSourceEvidence: true,

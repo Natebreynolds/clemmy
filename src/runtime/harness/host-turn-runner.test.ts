@@ -11335,6 +11335,7 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'wro
     count++;
     assert.equal(reply, publication(false).full_text);
     assert.match(options?.toolCallSummary ?? '', /THIS IS A PLAN TURN/);
+    assert.equal(options?.reviewsPlan, true, 'the reviewer is told it reviews a plan, so no completion reading of results sends it back');
     assert.match(options?.toolCallSummary ?? '', /preparedBindings/);
     assert.match(options?.toolCallSummary ?? '', /structuredPlan.steps is the complete reviewed graph/);
     assert.match(options?.toolCallSummary ?? '', /executionDraft is a host-derived tool-only projection/);
