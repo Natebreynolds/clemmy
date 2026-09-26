@@ -11231,6 +11231,28 @@ const MIGRATIONS: EventLogMigration[] = [
       END;
     `,
   },
+  {
+    // v82: a formal approval still unanswered after its reminder threshold
+    // gets exactly one reminder. The row records when that reminder went out,
+    // so a restart or a pruned notification can never send a second one
+    // (live 2026-09-25: a time-sensitive approval sat unseen for hours).
+    // Existing rows stay NULL; sparse rehearsal tables gain only the column.
+    version: 82,
+    sql: '',
+    backfill: (db) => {
+      const table = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_approvals'`,
+      ).get();
+      if (!table) return;
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(pending_approvals)').all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!columns.has('reminded_at')) {
+        db.exec('ALTER TABLE pending_approvals ADD COLUMN reminded_at TEXT');
+      }
+    },
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

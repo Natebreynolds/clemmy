@@ -89,6 +89,8 @@ export interface PendingApprovalRow {
   consumedAt: string | null;
   /** Durable user-surface contract. Null means a normal formal approval card. */
   presentation: ConversationalApprovalPresentation | null;
+  /** When the one "still waiting" reminder went out. Null until then. */
+  remindedAt: string | null;
 }
 
 export interface ConversationalApprovalPresentation {
@@ -235,6 +237,7 @@ interface ApprovalSqlRow {
   consumed_at: string | null;
   resend_consumed_at: string | null;
   presentation_json: string | null;
+  reminded_at: string | null;
 }
 
 function parseConversationalPresentation(json: string | null): ConversationalApprovalPresentation | null {
@@ -299,6 +302,7 @@ function rowToPublic(row: ApprovalSqlRow): PendingApprovalRow {
     resumeKey: row.resume_key,
     consumedAt: row.consumed_at,
     presentation: parseConversationalPresentation(row.presentation_json),
+    remindedAt: row.reminded_at ?? null,
   };
 }
 
@@ -1613,6 +1617,35 @@ export function expireStaleApprovals(now: Date = new Date()): PendingApprovalRow
   return expired;
 }
 
+/**
+ * Pending rows requested at or before `requestedAtOrBefore` whose one reminder
+ * has not gone out. Which of them deserve a reminder, and what it says, is the
+ * reminder's policy (approval-reminder.ts); this is only the durable read.
+ */
+export function listPendingAwaitingReminder(
+  requestedAtOrBefore: Date,
+  now: Date = new Date(),
+): PendingApprovalRow[] {
+  const db = openEventLog();
+  const rows = db.prepare(`
+    SELECT * FROM pending_approvals
+     WHERE status = 'pending'
+       AND reminded_at IS NULL
+       AND requested_at <= ?
+       AND expires_at > ?
+     ORDER BY requested_at ASC, rowid ASC
+  `).all(requestedAtOrBefore.toISOString(), now.toISOString()) as ApprovalSqlRow[];
+  return rows.map(rowToPublic);
+}
+
+/** Record that the one reminder went out. False when it was already recorded,
+ * so two passes (or a pass after a restart) can never both claim it. */
+export function markApprovalReminded(approvalId: string, at: Date = new Date()): boolean {
+  const db = openEventLog();
+  return db.prepare(
+    'UPDATE pending_approvals SET reminded_at = ? WHERE approval_id = ? AND reminded_at IS NULL',
+  ).run(at.toISOString(), approvalId).changes === 1;
+}
 
 /** Send slugs a HUMAN previously approved in the given sessions (any run).
  *  Standing-consent graduation for scheduled workflows (owner feedback,

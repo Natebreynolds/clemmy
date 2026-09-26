@@ -2435,6 +2435,18 @@ export function requeueNotificationDelivery(notificationId: string): void {
   requestNotificationDeliveryKick();
 }
 
+/** Metadata keys through which one notification names an explicit
+ * destination (read by getNotificationDestinationsForRecord below). A
+ * follow-up notice that must reach the same places as an earlier one copies
+ * exactly these; everything else resolves from configuration. */
+export const EXPLICIT_DESTINATION_METADATA_KEYS = [
+  'discordUserId',
+  'discordChannelId',
+  'slackUserId',
+  'slackChannelId',
+  'slackThreadTs',
+] as const;
+
 /**
  * Resolve where a notification should be delivered.
  *

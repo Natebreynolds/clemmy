@@ -447,12 +447,17 @@ export function formatSlackNotificationMessage(
   if (!approvalId) return `**${title}**\n${body}`;
   const row = approvalRegistry.get(approvalId);
   if (!row || !approvalRegistry.isActionable(row)) return `**${title}**\n${body}`;
+  const request = `_Request ${row.approvalId} · expires ${new Date(row.expiresAt).toLocaleString()}_`;
+  // A reminder already carries what the card holds and how long it has
+  // waited; the generic presentation below would replace both with the
+  // bare subject the owner did not act on the first time.
+  if (metadata?.approvalReminder === true) return [`**${title}**`, body, '', request].join('\n');
   const presentation = presentApproval(row, approvalContextForRow(row));
   return [
     `**Approval needed: ${presentation.title}**`,
     presentation.detail,
     '',
-    `_Request ${row.approvalId} · expires ${new Date(row.expiresAt).toLocaleString()}_`,
+    request,
   ].join('\n');
 }
 

@@ -15,6 +15,8 @@
  *      messages start fresh instead of trying to resume), and posts
  *      a user-facing notification explaining what was lost so the
  *      user can re-ask.
+ *   3. Sends one reminder for a formal approval still unanswered past
+ *      its threshold (approval-reminder.ts).
  *
  * Lifecycle:
  *   - Started from the daemon bootstrap (daemon/runner.ts) via
@@ -45,6 +47,7 @@ import {
 } from './host-tool-invocation.js';
 import { reconcileSilentAcceptedInputSessions } from './session-reconcile.js';
 import { releaseSessionBrainPin } from './model-roles.js';
+import { remindUnansweredApprovals } from './approval-reminder.js';
 
 const logger = pino({ name: 'clementine-next.approval-reaper' });
 
@@ -593,6 +596,23 @@ export function reapOnce(options: { nowMs?: number } = {}): approvalRegistry.Pen
     logger.info(
       { approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject },
       cancelledBySystem ? 'approval closed with ended session' : 'approval expired',
+    );
+  }
+
+  // 3) One reminder for a formal approval still unanswered past its
+  // threshold. Runs after the expiry and closed-session passes above, so
+  // only an approval that is still actionable can be reminded.
+  try {
+    for (const row of remindUnansweredApprovals({ now: new Date(sweepNowMs) })) {
+      logger.info(
+        { approvalId: row.approvalId, sessionId: row.sessionId },
+        'unanswered approval reminded once',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : err },
+      'approval reminder pass failed',
     );
   }
   return expired;

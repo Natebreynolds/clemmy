@@ -1582,6 +1582,11 @@ function staleApprovalNotificationReason(
   if (approval) {
     if (approvalRegistry.isExpired(approval)) return 'approval_expired';
     if (approval.status !== 'pending') return `approval_${approval.status}`;
+    // Once its one reminder went out, the reminder carries this ask. An older
+    // copy still waiting on a delivery leg would land after it saying less.
+    if (approval.remindedAt && notification.metadata?.approvalReminder !== true) {
+      return 'approval_reminded';
+    }
     return null;
   }
   // Fallback to the codex-native runtime's in-memory ApprovalStore. This
@@ -1888,8 +1893,13 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
       // the stale-approval skip, so a promptly-answered approval never
       // reaches Discord/push at all. Fail-open: no presence signal (fresh
       // restart, headless daemon) sends the mirror as before.
+      // A reminder is exempt: it exists because the card sat unanswered past
+      // its threshold, so a live viewer is no evidence the owner saw it
+      // (live 2026-09-25: open chat views held an approval's channel copies
+      // back for 56 minutes and the approval was never answered).
       if (
         notification.kind === 'approval'
+        && notification.metadata?.approvalReminder !== true
         && destination.type !== 'desktop'
         && APPROVAL_MIRROR_PRESENCE_WINDOW_MS > 0
         && anySessionViewerSeenSince(now.getTime() - APPROVAL_MIRROR_PRESENCE_WINDOW_MS)
@@ -2865,6 +2875,8 @@ export async function startDaemon(
   // pending_approvals (default TTL 24h), clears the orphan session's
   // interrupt state, marks the session 'cancelled', and posts a user
   // notification ("Approval on `X` expired — re-ask and I'll redo it").
+  // It also sends the one reminder for a formal approval still unanswered
+  // 30 minutes after it was requested (approval-reminder.ts).
   // Without this, the audit found 3+ paused sessions that sat in
   // __interrupt_state indefinitely; the user had no signal the work
   // was lost. See src/runtime/harness/reaper.ts.

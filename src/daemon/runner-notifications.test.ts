@@ -1089,3 +1089,87 @@ test('an approval mirror DEFERS to non-desktop destinations while a session view
     removeNotificationDestination('dest-discord-nate');
   }
 });
+
+// ── Approval reminder (live 2026-09-25): open chat views held an approval's
+// channel copies back for 56 minutes, the notice went unread, and the ask
+// missed its moment. The one reminder is built by the real reaper sweep and
+// delivered by the real worker and formatters; only the transports are stubbed.
+test('an approval reminder is not held behind an open chat view, carries its words, and drops the original copy still held', async () => {
+  const { createSession, openEventLog } = await import('../runtime/harness/eventlog.js');
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const { attachSessionViewer, resetSessionViewersForTest } =
+    await import('../runtime/harness/session-viewers.js');
+  const { reapOnce } = await import('../runtime/harness/reaper.js');
+  const { _setNotificationDeliverySendersForTests } = await import('../runtime/notification-delivery.js');
+
+  replaceQueuedNotificationDeliveries([]);
+  const session = createSession({ id: 'sess-approval-reminder', kind: 'chat' });
+  const row = approvalRegistry.register({
+    sessionId: session.id,
+    subject: 'Send message',
+    tool: 'work_call',
+    args: {
+      name: 'composio_execute_tool',
+      args_json: JSON.stringify({
+        tool_slug: 'NOTES_SEND_MESSAGE',
+        arguments: JSON.stringify({ channel: 'C-300', markdown_text: 'Can you take the 4:15 review?' }),
+      }),
+    },
+  });
+  for (const destination of [
+    { id: 'dest-reminder-direct', name: 'Owner direct', type: 'discord_user', userId: 'owner-direct-1' },
+    { id: 'dest-reminder-team', name: 'Owner team', type: 'slack_user', userId: 'owner-team-1' },
+  ]) {
+    upsertNotificationDestination({ ...destination, enabled: true, createdAt: new Date().toISOString() } as never);
+  }
+
+  const sent: Array<{ via: string; text: string }> = [];
+  _setNotificationDeliveryForTests(null);
+  _setNotificationDeliverySendersForTests({
+    sendDiscordDirectMessage: async (_userId: string, text: string) => { sent.push({ via: 'direct', text }); },
+    sendSlackDirectMessage: async (_userId: string, text: string) => { sent.push({ via: 'team', text }); },
+  } as never);
+  try {
+    resetSessionViewersForTest();
+    const detach = attachSessionViewer(session.id); // a chat view stays open
+    addNotification({
+      id: `approval-${row.approvalId}`,
+      kind: 'approval',
+      title: 'Approval pending',
+      body: 'Send message',
+      createdAt: new Date().toISOString(),
+      read: false,
+      metadata: { approvalId: row.approvalId, sessionId: session.id, tool: 'work_call' },
+    });
+    await processNotificationDeliveries(assistantStub);
+    assert.equal(sent.length, 0, 'precondition: the original copy waits while a chat view is open');
+
+    openEventLog().prepare('UPDATE pending_approvals SET requested_at = ? WHERE approval_id = ?')
+      .run(new Date(Date.now() - 31 * 60_000).toISOString(), row.approvalId);
+    reapOnce();
+    await processNotificationDeliveries(assistantStub);
+
+    assert.deepEqual(sent.map((message) => message.via).sort(), ['direct', 'team'],
+      'the reminder reaches both chat destinations while the view is still open');
+    for (const message of sent) {
+      assert.match(message.text, /Still waiting on you: Send message/);
+      assert.match(message.text, /waiting 31 minutes for your answer/);
+      assert.match(message.text, /Can you take the 4:15 review\?/);
+    }
+
+    // The owner leaves: the held original must not arrive after the reminder.
+    detach();
+    resetSessionViewersForTest();
+    await new Promise((resolve) => setTimeout(resolve, 1_300));
+    await processNotificationDeliveries(assistantStub);
+    reapOnce();
+    await processNotificationDeliveries(assistantStub);
+    assert.equal(sent.length, 2, 'no late original and no second reminder');
+  } finally {
+    _setNotificationDeliveryForTests(null);
+    _setNotificationDeliverySendersForTests();
+    resetSessionViewersForTest();
+    removeNotificationDestination('dest-reminder-direct');
+    removeNotificationDestination('dest-reminder-team');
+  }
+});
