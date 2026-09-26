@@ -1,4 +1,4 @@
-# Workflow builder, slice 1: a workflow opens to its graph (2026-09-26)
+# Workflow builder, slices 1 and 2: a workflow opens to its graph, and a step is changed in place (2026-09-26)
 
 Branch `claude/wf-builder-slice1` (worktree `~/clem-worktrees/hotpatch-0926`), on top of
 `claude/hotpatch-0926` 10b88cca9 (the installed 09-25 23:01 candidate: checker-evidence +
@@ -48,15 +48,58 @@ agent-desks + wf-builder-save). Plan page: claude.ai/artifact/8N4TwCEwwMn4zzBTiK
 Pins: `src/dashboard/console-workflow-layout.test.ts` (5), `apps/console-web/src/lib/
 workflow-step-view.test.ts` (8). Root and console tsc clean.
 
-## Not in this slice (next)
+## Slice 2: change one step (d7cd9b4d1, a82ca2d0a)
 
-- Slice 2: edit the everyday four in the panel through the shared step-edit path (backup,
-  check, re-test if live), Undo, Test this step.
+- The panel edits the everyday four: what the step does, ask me first, keep going if it
+  fails, run once per item (choosing the step whose items it runs over, from the steps it
+  waits for). Save sends only what changed (`stepPatchFromDraft`); a flag turned off is
+  removed, not stored as false. Discard returns to the stored step.
+- One path for every step edit: `src/execution/workflow-step-edit-live.ts` wraps the
+  snapshot + validate + write of workflow-step-edit.ts and adds the live rule: a workflow
+  that is on and whose execution surface changed is written off, its owner is notified, and
+  a creation test is queued that turns it back on. `workflow_edit_step` (the chat tool) now
+  calls it and still waits for the test; the console route returns at once and the page
+  follows the test through the workflow's `creationTest` state. `optional` is now patchable.
+- Routes: `POST /api/console/workflows/:name/steps/:stepId { patch }` (400 with the daemon's
+  reason for an unknown field, a no-op, an empty prompt; 404 unknown step),
+  `GET /:name/step-edits` (this workflow's reversible edits, newest first, no definitions),
+  `POST /:name/step-edits/:backupId/revert` (404 for another workflow's backup).
+- Undo last change reverts the newest edit of the open step, whoever made it. Test this step
+  queues the one-step run (`POST /:name/run { targetStepId }`), follows it in the panel, and
+  Open run lands on that run over the Automate list (`/automate?workflow=<name>&run=<id>`).
+- The open step stays selected when the graph is redrawn after a save, an undo, or an edit
+  from chat (a82ca2d0a; the first live pass lost the panel on every save).
+
+Pins: `src/dashboard/console-workflow-step-edit.test.ts` (4: the four fields change and
+nothing else moves, revert + listing + cross-workflow refusal, refusals write nothing, a live
+workflow is written off with the test recorded); `workflow-step-view.test.ts` (+1 draft →
+patch); chat tool suites 131/131 after the refactor.
+
+## Live acceptance, slice 2 (09-25 23:56–00:00 PT, installed b6656b09c)
+
+Installed together with the peer session's `claude/agent-switch` (merged --no-ff); build-info
+served b6656b09c. Fixture `FRAMEWORK-TEST step edit fixture` (off; collect → summarize →
+review), created through the API and deleted afterwards. On the served page:
+
+- Changing summarize's wording and turning on Asks me first + Keeps going, then Save step:
+  the panel stayed open, said "Saved.", and GET showed the new prompt, `requiresApproval:
+  true`, `optional: true`, `dependsOn` untouched; `step-edits` listed one reversible edit
+  described as "console step edit summarize (prompt, requiresApproval, optional)".
+- Undo last change: the panel said the daemon's "Reverted … to its pre-edit definition" and
+  GET showed the original step; a second revert of the same id is a 404.
+- Runs once per item offers `collect` (what summarize waits for); Discard drops the draft.
+- Test this step on collect (a no-tool step): the panel showed Queued → Done with Open run;
+  the run record has `targetStepId: collect`, status completed; Open run landed on
+  `/automate?workflow=…&run=…` with the run drawer over the list.
+
+## Not in these slices (next)
+
 - Slice 3: the chat card from the saved definition, live redraw of the open page (the
   refetch half exists), Ask Clementine with the step already in context.
 - Slice 4: the Last run tab and honest run statuses.
-- A trap to keep in mind: git tracks `apps/console-web/src/app.tsx` in lower case while the
-  file on disk is `App.tsx`; `git add App.tsx` stages nothing on this filesystem.
+- Traps: git tracks `apps/console-web/src/app.tsx` in lower case while the file on disk is
+  `App.tsx`, so `git add App.tsx` stages nothing here; and touching ANY file (even under
+  docs/) during `npm run build` fails it with "source changed during candidate build".
 
 ## Live acceptance (09-25 23:29–23:31 PT, installed app, live home)
 
