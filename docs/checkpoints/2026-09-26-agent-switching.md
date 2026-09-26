@@ -74,12 +74,31 @@ memory-durability reviewer.
 - Memory: all four test messages became candidates and were rejected as
   task-scoped; nothing was saved.
 - Collision: another session's install replaced this build four minutes after
-  it went in; the union is being installed by that session (see the git log).
+  it went in; that session then installed the union (`b6656b09c` on
+  `claude/wf-builder-slice1`: its workflow-builder work + this branch through
+  `e5ec4e4e5`, merged `--no-ff`).
+
+On the union install:
+
+- A work turn inside the agent ("look up how many saved workflows I have"):
+  `workflow_list` read, reply a haiku with the right count (138). The owner's
+  selected reviewer, `claude-sonnet-5` (settings), judged it "correctly
+  reports 138 … in the required haiku format" — the request never asked for
+  a haiku, so the reviewer read the agent's instructions. It let an
+  unsupported flourish ("none of them touched") pass.
+- Desktop screenshots: each reply headed by who answered, the "Switched to …"
+  line above the question that moved the conversation, the chip reading the
+  agent's name, the placeholder "Message <agent>…", and the popover "Who
+  answers · Switch any time. Takes effect on your next message."
+- Found while planning cleanup and fixed (`A conversation whose agent was
+  deleted carries on with Clem`): a deleted agent left the conversation's
+  pointer behind, and every send from the chip was refused until someone
+  changed it. Not yet installed.
 
 ## Owed
 
-1. Live check of the union install: desktop chip + switch line on screen, a
-   phone switch, and a completion review on an agent turn that did work.
+1. A phone switch on the device (the phone shares the engine rule and the
+   route; not driven live), and the deleted-agent fallback once installed.
 2. Jev completion screening (`tryJevCompletionVerdict`) does not yet get the
    agent's instructions; the full reviewer does.
 3. Pinned skill bodies stay with the answerer; the reviewer sees names only.
