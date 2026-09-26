@@ -82,3 +82,34 @@ p90 11.1 s); the model-time target runs through reflection and the workflow judg
 Live acceptance in the installed app with named fixtures for: approval preview + labels + change
 by reply; pre-send check conflict; one card for a DM open + send; reminder after 30 minutes;
 expired card; claims removal; Jev settling a read-back; checker stand-in under a used-up plan.
+
+## After the 21:24 PT install (branch commits not yet installed)
+
+The installed candidate became `31ffcf4d0` (a Codex integrator's combined candidate, a fast-forward
+of this branch plus approval amendments, learned-tool freshness, the user-selected fallback judge,
+model handoff, record-query precision, Space source backoff and stale-marker recovery; provenance in
+`2026-09-26-combined-hotpatch.md`). This branch then continued from it:
+
+| Commit | Rule | What we saw live |
+|---|---|---|
+| c99622c98, b3b6e1b76 | One notification per workflow outcome; consent notices, gate auto-approvals and heartbeats are run history, not notifications | 09-25: 36 notifications, 9 of them "Send runs without approval" in two wordings, 2–3 per clean run; Friday replay → 1 row per clean run, 0 consent notices. |
+| 8c2d978bb | A displayed aggregate carries the figure, not floating-point noise (12 significant digits) | The precision commit removed fixed rounding; 0.1 + 0.2 would have reached the model as 0.30000000000000004. |
+| 16b39d03e | A dropped connection is transport: retried once, then a resumable question | 09-26 04:30Z, session sess-desktop-2ad457ee…: the SDK's `APIConnectionError` "Connection error." matched no transport word → runtime.unknown → hard `failed`, not resumable. |
+| 714daabc3, b184284e2, 6ec72a8dc | Landed writes stay landed (repursue / follow_up / gap, never blocked; streak neutral); an exact repeat of a landed write is refused at the consent boundary; a provider's acknowledgement-only reply settles the write | 09-25: 3 of 11 scheduled runs blocked, 2 after their writes landed (`runUnsafeToRepursue` read only the declared step class); the three "no completed business settlement" posts were pre-dispatch constraint refusals. |
+| 0ffe1006e, 5937771ba, d0d2a2bfe | Learned hints keep the shape of the work; suggestions count by shape; people lookup is a built-in skill | 09-25: a "similar past run" hint carried another prospect's URL into a paid call (302338→302386); a suggestion claimed one firm was asked about "5 times"; two addresses took 63 s, 12 calls and a guessed address (302852–303011). |
+| 438653a93 | Checkpoint docs name no home directory | The hygiene gate failed on two docs in the installed candidate. |
+| 220a9c5e3 | A review response is bounded in what it may produce (default 16,384 output tokens) | Codex acceptance 09-26: one completion review on a BYO reasoning model reported 65,536 output tokens in 124 s. |
+
+Live acceptance passes so far on the installed build: approval card shows exact content and revises by
+reply (fixture, both cards rejected); the 30-minute reminder fired once for the stale approval at
+20:33 PT and was recorded; the 11 stale interrupted-chat markers cleared on the 21:24 boot; the
+fallback-judge setting saves, reads back and refuses an unavailable model (Codex fixture).
+Still owed live: a real pre-send conflict, one card for an open-then-send pair, an expired card,
+claims removal, familiar request with zero searches, the fallback judge under primary failure, one
+notification per outcome, landed writes after a goal gap, Jev settling a read-back.
+
+Found and not yet built: standing rules are captured by keyword heuristics (55 active "standing"
+facts live, 27 pinned into every prompt, at least 18 one-off requests, re-prompts or complaints;
+owner review page issued); Clem can set but not list or cancel a reminder, and discovery never
+closes on a missing capability (nine searches in one turn); a child workflow's settlement should
+drive the parent's remaining obligations instead of a promised follow-up.
