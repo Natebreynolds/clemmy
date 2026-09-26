@@ -61,11 +61,14 @@ function cwActionTokens(value: string): string[] {
     .filter(Boolean);
 }
 
+/** Consent consequences that name a change to the destination. */
+const CW_NAMED_CHANGES: ReadonlySet<string> = new Set(['create', 'update', 'delete', 'send']);
+
 export function describeExternalWrite(
   shapeKey: string | undefined,
   toolName: string,
   targets: string[],
-  write?: { irreversible?: boolean; actionKey?: string },
+  write?: { irreversible?: boolean; actionKey?: string; consequence?: string },
 ): string {
   const key = shapeKey || write?.actionKey || toolName || 'action';
   const to = targets.length
@@ -76,13 +79,17 @@ export function describeExternalWrite(
   const deliveryAllowed = write?.irreversible !== false;
   const fileShaped = has('UPLOAD') || has('SAVE') || has('WRITE') || has('FILE');
   const fallback = `Ran ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
-  const consequence = tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
+  // The consent classification's consequence, when the write carries one,
+  // names what changed; one it could not name reads as the call it was.
+  const recorded = write?.consequence;
+  if (recorded !== undefined && !CW_NAMED_CHANGES.has(recorded)) return fallback;
+  const consequence = recorded ?? (tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
     : tokens.some((t) => CW_SEND_VERBS.has(t)) ? 'send'
       : tokens.some((t) => CW_UPDATE_VERBS.has(t)) ? 'update'
         : tokens.some((t) => CW_CREATE_VERBS.has(t)) ? 'create'
-          : 'other';
+          : 'other');
 
-  if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH')) {
+  if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH') && recorded !== 'send') {
     return consequence === 'update' ? `Updated a draft${to}` : `Created a draft${to}`;
   }
   switch (consequence) {

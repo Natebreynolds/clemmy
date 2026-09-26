@@ -120,7 +120,10 @@ export function outsideWorkCards(
   for (const item of activity ?? []) {
     const row = item.write;
     if (!row || row.disposition !== 'confirmed') continue;
-    const kind = externalWriteKind(row.shapeKey, row.toolName ?? '', row.irreversible === null ? undefined : { irreversible: row.irreversible });
+    const kind = externalWriteKind(row.shapeKey, row.toolName ?? '', {
+      ...(row.irreversible === null ? {} : { irreversible: row.irreversible }),
+      ...(row.consequence ? { consequence: row.consequence } : {}),
+    });
     const key = `${row.app ?? ''}|${kind}`;
     const group = groups.get(key) ?? {
       kind,

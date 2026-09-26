@@ -42,6 +42,10 @@ import {
 import { WORK_ID_PATTERN } from '../../shared/work-id.js';
 import { appForWriteAction } from '../../integrations/composio/toolkit-identity.js';
 import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMode } from './task-mode.js';
+import {
+  isInteractiveConsentConsequence,
+  isInteractiveConsentReversibility,
+} from './interactive-consent-policy.js';
 
 /** The host-built approval preview (operation + argument values the owner is
  * approving), admitted only in its exact bounded shape. */
@@ -1076,6 +1080,10 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         ...selected(data, ['shapeKey', 'toolName', 'tool', 'callId', 'call_id', 'preDispatch']),
         targets: stringList(data.targets, 25),
         ...(app ? { app: app.name, ...(app.url ? { appUrl: app.url } : {}) } : {}),
+        // The consent classification the ledger recorded, so a surface's
+        // receipt states what the consent card stated. Closed values only.
+        ...(isInteractiveConsentReversibility(data.reversibility) ? { reversibility: data.reversibility } : {}),
+        ...(isInteractiveConsentConsequence(data.consequence) ? { consequence: data.consequence } : {}),
       };
     }
     case 'codemode_program_summary': // historical event presentation

@@ -27,6 +27,8 @@ import type { EventRow } from './eventlog.js';
 // The console mirror — pure TS, no DOM. Parity is pinned here because
 // console-web cannot import server modules.
 import { describeExternalWrite as consoleDescribeExternalWrite } from '../../../apps/console-web/src/lib/toolLabels.js';
+// The shared chat engine both apps render live rows with.
+import { describeExternalWrite as engineDescribeExternalWrite } from '../../../packages/chat-engine/src/tool-labels.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -128,6 +130,60 @@ test('CONNECTION pin: synthesizeWorkReport passes the recorded irreversible bit 
   assert.ok(report, 'expected a synthesized report');
   assert.doesNotMatch(report, /sent/i, `real callsite still says Sent: ${report}`);
   assert.match(report, /Updated a record/);
+});
+
+// One effect label (live 2026-09-25). A row carrying the consent
+// classification's consequence reads from it, not from verbs in the operation
+// name: a named send reads as delivery even when the name says create, and a
+// consequence the classification could not name reads as the call it was even
+// when the name holds a delivery verb.
+test('CONNECTION pin: synthesizeWorkReport reads the consequence the consent recorded', () => {
+  const reserved = (seq: number, callId: string, shapeKey: string, consequence: string, irreversible: boolean): EventRow[] => [
+    row({
+      seq,
+      id: `reserve-${callId}`,
+      data: {
+        shapeKey, toolName: shapeKey, targets: ['a@example.test'], irreversible,
+        reversibility: irreversible ? 'irreversible' : 'ordinary_non_destructive',
+        consequence, preDispatch: true, canonicalCallId: callId,
+      },
+    }),
+    row({
+      seq: seq + 1,
+      id: `settle-${callId}`,
+      type: 'external_write_succeeded' as EventRow['type'],
+      parentEventId: `reserve-${callId}`,
+      data: { shapeKey, canonicalCallId: callId },
+    }),
+  ];
+  const report = synthesizeWorkReport([
+    ...reserved(30, 'call-named-send', 'PROVIDER_CREATE_EVENT', 'send', true),
+    ...reserved(40, 'call-unnamed', 'provider__api_post_request', 'unknown', false),
+  ]);
+  assert.ok(report, 'expected a synthesized report');
+  assert.match(report, /Sent a message to a@example\.test/, report);
+  assert.doesNotMatch(report, /Created a record/, report);
+  assert.match(report, /Ran provider {2}api post request/, report);
+  assert.doesNotMatch(report, /Published a post/, report);
+});
+
+test('PARITY pin: server, console-web and chat-engine copies agree on a recorded consequence', () => {
+  const fixtures: Array<[string, { irreversible?: boolean; consequence?: string }]> = [
+    ['PROVIDER_CREATE_EVENT', { irreversible: true, consequence: 'send' }],
+    ['provider__api_post_request', { irreversible: false, consequence: 'unknown' }],
+    ['PROVIDER_SEND_MESSAGE', { consequence: 'execute' }],
+    ['MAIL_CREATE_DRAFT', { irreversible: false, consequence: 'create' }],
+    ['MAIL_UPDATE_DRAFT', { consequence: 'update' }],
+    ['PROVIDER_RECORD', { consequence: 'delete' }],
+    ['PROVIDER_UPLOAD_FILE', { consequence: 'create' }],
+  ];
+  for (const [slug, opts] of fixtures) {
+    const server = describeExternalWrite(slug, '', [], opts);
+    assert.equal(consoleDescribeExternalWrite(slug, '', [], opts), server, `console copy diverged on ${slug} (${JSON.stringify(opts)})`);
+    assert.equal(engineDescribeExternalWrite(slug, '', [], opts), server, `engine copy diverged on ${slug} (${JSON.stringify(opts)})`);
+  }
+  assert.match(describeExternalWrite('PROVIDER_SEND_MESSAGE', '', [], { consequence: 'execute' }), /^Ran /,
+    'a consequence that is not a change never reads as one');
 });
 
 test('write resolution gives decisive truth precedence over orphan and fails closed on conflicting decisive terminals', () => {

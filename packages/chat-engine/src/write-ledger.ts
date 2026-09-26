@@ -25,10 +25,15 @@
  *    renders as `failed` until the emitter sets the flag it is already allowed
  *    to send. Inventing the distinction client-side would be a guess wearing a
  *    receipt's clothes.
- *  - `irreversible`. Written durably by the projection, stripped by the public
- *    allowlist, so it is ALWAYS absent here. It stays `null`, and a null must
- *    never be read as "irreversible" — that is the false statement in the
- *    alarming direction that the mobile run view was making about every draft.
+ *  - `irreversible` as a bare bit. Written durably by the projection, stripped
+ *    by the public allowlist. What the bus carries instead, for a write whose
+ *    consent was decided from a risk classification, is that classification's
+ *    own `reversibility` and `consequence` — the words its consent card used.
+ *    Only `irreversible` and `reversible` are claims about undoing; every other
+ *    reversibility (ordinary non-destructive work, unknown) leaves the row's
+ *    `irreversible` null, and a null must never be read as "irreversible" —
+ *    that is the false statement in the alarming direction that the mobile run
+ *    view was making about every draft.
  */
 import { describeExternalWrite } from './tool-labels.js';
 
@@ -58,6 +63,15 @@ export type WriteDisposition =
   /** Ambiguous ownership, or a reservation the turn never settled. */
   | 'unknown';
 
+/** The consequence a write's consent classification named. `unknown` means
+ *  the host could not name what the call changes. */
+export type WriteConsequence =
+  | 'read' | 'create' | 'update' | 'delete' | 'send' | 'execute' | 'admin' | 'unknown';
+
+const WRITE_CONSEQUENCES: ReadonlySet<string> = new Set<WriteConsequence>([
+  'read', 'create', 'update', 'delete', 'send', 'execute', 'admin', 'unknown',
+]);
+
 export interface WriteLedgerRow {
   callId: string;
   shapeKey?: string;
@@ -66,6 +80,8 @@ export interface WriteLedgerRow {
   disposition: WriteDisposition;
   /** null = the public projection did not carry it. NEVER defaults to true. */
   irreversible: boolean | null;
+  /** Absent when the public projection did not carry a consent classification. */
+  consequence?: WriteConsequence;
   /** Wire position of the event that set the current disposition. */
   settledAtSeq?: number;
   /** The app the write landed in and its web address, when the server's
@@ -104,6 +120,21 @@ export function writeCallId(data: Record<string, unknown>): string {
 
 function stringOf(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined;
+}
+
+/** The reversibility claim an event makes: the consent classification's own
+ *  word when the bus carries one, else a bare bit, else nothing. */
+function irreversibleOf(data: Record<string, unknown>): boolean | null | undefined {
+  if (data.reversibility === 'irreversible') return true;
+  if (data.reversibility === 'reversible') return false;
+  if (typeof data.reversibility === 'string') return null;
+  return typeof data.irreversible === 'boolean' ? data.irreversible : undefined;
+}
+
+function consequenceOf(data: Record<string, unknown>): WriteConsequence | undefined {
+  return typeof data.consequence === 'string' && WRITE_CONSEQUENCES.has(data.consequence)
+    ? data.consequence as WriteConsequence
+    : undefined;
 }
 
 function targetsOf(data: Record<string, unknown>): string[] {
@@ -150,6 +181,8 @@ export function applyWriteEvent(
   const key = writeRowKey(data, ev.seq);
   const next = dispositionFor(ev.type);
   const toolName = stringOf(data.toolName) ?? stringOf(data.tool);
+  const irreversible = irreversibleOf(data);
+  const consequence = consequenceOf(data);
 
   if (!prior) {
     return {
@@ -158,7 +191,8 @@ export function applyWriteEvent(
       ...(toolName ? { toolName } : {}),
       targets: targetsOf(data),
       disposition: next,
-      irreversible: typeof data.irreversible === 'boolean' ? data.irreversible : null,
+      irreversible: irreversible ?? null,
+      ...(consequence ? { consequence } : {}),
       ...(next === 'reserved' ? {} : { settledAtSeq: ev.seq }),
       ...appFields(data),
     };
@@ -179,7 +213,8 @@ export function applyWriteEvent(
     // Terminals carry the authoritative descriptor; a reservation's targets can
     // over-state what actually went out.
     ...(next !== 'reserved' ? { targets: targetsOf(data) } : {}),
-    ...(typeof data.irreversible === 'boolean' ? { irreversible: data.irreversible } : {}),
+    ...(irreversible !== undefined ? { irreversible } : {}),
+    ...(consequence ? { consequence } : {}),
     disposition,
     ...(disposition === prior.disposition ? {} : { settledAtSeq: ev.seq }),
     ...appFields(data),
@@ -216,6 +251,7 @@ export function sealOpenWrites(rows: Map<string, WriteLedgerRow>): Map<string, W
 export function writeRowLabel(row: WriteLedgerRow): string {
   const base = describeExternalWrite(row.shapeKey, row.toolName ?? '', row.targets, {
     ...(row.irreversible === null ? {} : { irreversible: row.irreversible }),
+    ...(row.consequence ? { consequence: row.consequence } : {}),
     ...(row.disposition === 'reserved' ? { tense: 'present' as const } : {}),
   });
   switch (row.disposition) {
@@ -253,9 +289,9 @@ export function writeRowTone(row: WriteLedgerRow): 'success' | 'danger' | 'warni
 
 /**
  * Reversibility for display. Three values, because the public bus carries two
- * and silence is the third. `null` means the ledger did not say — which is the
- * current state of every write on the chat plane — and an omitted phrase is the
- * only honest rendering of that.
+ * claims and silence is the third. `null` means the ledger did not say, or said
+ * something that is neither claim — and an omitted phrase is the only honest
+ * rendering of that.
  */
 export function writeReversibilityLabel(row: WriteLedgerRow): string | null {
   if (row.irreversible === null) return null;

@@ -42,6 +42,23 @@ export type InteractiveConsentConsequence =
   | 'admin'
   | 'unknown';
 
+const REVERSIBILITY_VALUES: ReadonlySet<string> = new Set<InteractiveConsentReversibility>([
+  'read_only', 'reversible', 'ordinary_non_destructive', 'irreversible', 'unknown',
+]);
+const CONSEQUENCE_VALUES: ReadonlySet<string> = new Set<InteractiveConsentConsequence>([
+  'read', 'create', 'update', 'delete', 'send', 'execute', 'admin', 'unknown',
+]);
+
+/** Closed-value guards for a consent classification persisted elsewhere
+ *  (the write ledger) and read back from untyped event data. */
+export function isInteractiveConsentReversibility(value: unknown): value is InteractiveConsentReversibility {
+  return typeof value === 'string' && REVERSIBILITY_VALUES.has(value);
+}
+
+export function isInteractiveConsentConsequence(value: unknown): value is InteractiveConsentConsequence {
+  return typeof value === 'string' && CONSEQUENCE_VALUES.has(value);
+}
+
 export type InteractiveConsentCardinality =
   | { kind: 'once' }
   | { kind: 'each'; universeDigest: string }

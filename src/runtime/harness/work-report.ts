@@ -182,6 +182,9 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
   };
 }
 
+/** Consent consequences that name a change to the destination. */
+const NAMED_CHANGE_CONSEQUENCES: ReadonlySet<string> = new Set(['create', 'update', 'delete', 'send']);
+
 function describeUncertainWrite(event: EventRow): string {
   const data = event.data as { shapeKey?: string; slug?: string; toolName?: string; tool?: string; targets?: unknown };
   const shape = data.shapeKey ?? data.slug ?? data.toolName ?? data.tool ?? 'external action';
@@ -206,12 +209,18 @@ function describeUncertainWrite(event: EventRow): string {
  * a write recorded as reversible (`irreversible === false`) may NEVER render
  * as delivery ("Sent…", "Published…") — reversible actions did not deliver
  * anything. Legacy rows without the bit keep their historical reading.
+ *
+ * A row that carries the consent classification's `consequence` reads from it
+ * instead of from slug verbs, so the report says what the consent card said.
+ * A consequence that classification could not name (or one that is not a
+ * change, such as execute) reads as the call it was: a verb in an operation's
+ * name cannot supply a change nothing proved (live 2026-09-25).
  */
 export function describeExternalWrite(
   shapeKey: string | undefined,
   toolName: string,
   targets: string[],
-  write?: { irreversible?: boolean; actionKey?: string },
+  write?: { irreversible?: boolean; actionKey?: string; consequence?: string },
 ): string {
   const key = shapeKey || write?.actionKey || toolName || 'action';
   const to = targets.length
@@ -221,13 +230,15 @@ export function describeExternalWrite(
   const deliveryAllowed = write?.irreversible !== false;
   const fileShaped = tokens.includes('UPLOAD') || tokens.includes('SAVE') || tokens.includes('WRITE') || tokens.includes('FILE');
   const fallback = `Ran ${key.toLowerCase().replace(/[_:]/g, ' ')}${to}`;
+  const recorded = write?.consequence;
+  if (recorded !== undefined && !NAMED_CHANGE_CONSEQUENCES.has(recorded)) return fallback;
 
-  if (actionTargetsUnsentDraft(key)) {
-    return classifyComposioActionConsequence(key) === 'update'
+  if (actionTargetsUnsentDraft(key) && recorded !== 'send') {
+    return (recorded ?? classifyComposioActionConsequence(key)) === 'update'
       ? `Updated a draft${to}`
       : `Created a draft${to}`;
   }
-  switch (classifyComposioActionConsequence(key)) {
+  switch (recorded ?? classifyComposioActionConsequence(key)) {
     case 'delete':
       return `Deleted a record${to}`;
     case 'send': {
@@ -317,12 +328,13 @@ export function synthesizeWorkReport(evidence: readonly EventRow[]): string | nu
   for (const w of writes) {
     const d = (w.data ?? {}) as {
       shapeKey?: string; toolName?: string; targets?: unknown;
-      irreversible?: unknown; actionKey?: unknown;
+      irreversible?: unknown; actionKey?: unknown; consequence?: unknown;
     };
     const targets = Array.isArray(d.targets) ? d.targets.filter((t): t is string => typeof t === 'string') : [];
     const line = `• ${describeExternalWrite(d.shapeKey, d.toolName ?? '', targets, {
       irreversible: typeof d.irreversible === 'boolean' ? d.irreversible : undefined,
       actionKey: typeof d.actionKey === 'string' ? d.actionKey : undefined,
+      consequence: typeof d.consequence === 'string' ? d.consequence : undefined,
     })}`;
     if (seen.has(line)) continue;
     seen.add(line);

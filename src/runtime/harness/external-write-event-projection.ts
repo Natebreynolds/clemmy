@@ -11,6 +11,13 @@ import {
   extractDuplicateIdentityKeys,
   extractExternalWriteIdentityKeys,
 } from './grounding-gate.js';
+import {
+  isInteractiveConsentConsequence,
+  isInteractiveConsentReversibility,
+  type CapabilityRiskAttestationV1,
+  type InteractiveConsentConsequence,
+  type InteractiveConsentReversibility,
+} from './interactive-consent-policy.js';
 import { toolCallCorrelationFingerprint } from './tool-correlation.js';
 
 export type ExternalWriteTerminalEventType =
@@ -26,6 +33,12 @@ export interface ExternalWriteEventDescriptor {
   correlationFingerprint: string;
   semanticFingerprint: string;
   irreversible: boolean;
+  /** The consent classification the host decided this exact call under,
+   *  recorded whole or not at all. Absent on lanes that classify by operation
+   *  shape alone. */
+  reversibility?: InteractiveConsentReversibility;
+  consequence?: InteractiveConsentConsequence;
+  destructive?: boolean;
   targets: string[];
   duplicateIdentityKeys: string[];
 }
@@ -58,6 +71,8 @@ export function describeExternalWriteEvent(input: {
   forceMutating?: boolean;
   shapeKey?: string;
   irreversible?: boolean;
+  /** The risk the host's consent decision classified this exact call with. */
+  consentRisk?: CapabilityRiskAttestationV1['risk'];
   targets?: readonly string[];
   duplicateIdentityKeys?: readonly string[];
 }): ExternalWriteEventDescriptor | null {
@@ -68,6 +83,7 @@ export function describeExternalWriteEvent(input: {
   const shapeKey = input.shapeKey?.trim() || shape.shapeKey?.trim() || toolName;
   const actionKey = canonicalExternalWriteActionKey(toolName, shapeKey);
   const semanticFingerprint = externalWriteSemanticFingerprint(actionKey, input.args);
+  const consent = input.consentRisk;
   return {
     toolName,
     args: input.args,
@@ -75,7 +91,18 @@ export function describeExternalWriteEvent(input: {
     actionKey,
     correlationFingerprint: toolCallCorrelationFingerprint(toolName, input.args),
     semanticFingerprint,
-    irreversible: input.irreversible ?? shape.irreversible,
+    // The consent card and the ledger state one reversibility. The shape
+    // classifier reads a materialized manifest's semantics alone, so a send
+    // whose manifest declares none recorded irreversible=false while its
+    // consent, which also sees the definition and the bound arguments, said
+    // irreversible (live 2026-09-25). It stays the fallback for lanes that
+    // never decided consent from a risk classification.
+    irreversible: consent
+      ? consent.reversibility === 'irreversible'
+      : input.irreversible ?? shape.irreversible,
+    ...(consent
+      ? { reversibility: consent.reversibility, consequence: consent.consequence, destructive: consent.destructive }
+      : {}),
     targets: [...new Set(input.targets ?? extractExternalWriteIdentityKeys(input.args))],
     duplicateIdentityKeys: externalWriteDuplicateIdentityKeys(
       input.duplicateIdentityKeys ?? extractDuplicateIdentityKeys(input.args),
@@ -92,6 +119,27 @@ function eventCallId(event: EventRow): string {
 function eventDataString(event: EventRow, key: string): string {
   const value = event.data[key];
   return typeof value === 'string' ? value.trim() : '';
+}
+
+type ConsentClassification = Required<Pick<ExternalWriteEventDescriptor, 'reversibility' | 'consequence' | 'destructive'>>;
+
+function consentClassificationData(
+  descriptor: Pick<ExternalWriteEventDescriptor, 'reversibility' | 'consequence' | 'destructive'>,
+): ConsentClassification | Record<string, never> {
+  return descriptor.reversibility && descriptor.consequence
+    ? {
+        reversibility: descriptor.reversibility,
+        consequence: descriptor.consequence,
+        destructive: descriptor.destructive === true,
+      }
+    : {};
+}
+
+function reservedConsentClassification(reservation: EventRow): ConsentClassification | null {
+  const { reversibility, consequence } = reservation.data;
+  return isInteractiveConsentReversibility(reversibility) && isInteractiveConsentConsequence(consequence)
+    ? { reversibility, consequence, destructive: reservation.data.destructive === true }
+    : null;
 }
 
 /**
@@ -125,6 +173,7 @@ export function externalWriteProjectionIdentityFromReservation(
       correlationFingerprint: eventDataString(event, 'correlationFingerprint'),
       semanticFingerprint,
       irreversible: event.data.irreversible === true,
+      ...reservedConsentClassification(event),
       targets: Array.isArray(event.data.targets)
         ? event.data.targets.filter((value): value is string => typeof value === 'string')
         : [],
@@ -280,6 +329,7 @@ export function projectExternalWriteReservation(input: {
         correlationFingerprint: input.descriptor.correlationFingerprint,
         semanticFingerprint: input.descriptor.semanticFingerprint,
         irreversible: input.descriptor.irreversible,
+        ...consentClassificationData(input.descriptor),
         preDispatch: true,
         targets: input.descriptor.targets,
         duplicateIdentityKeys: input.descriptor.duplicateIdentityKeys,
@@ -420,6 +470,14 @@ export function projectExternalWriteTerminal(input: {
       'external-write terminal conflicts with durable reservation authority',
     );
   }
+  // A terminal restates the classification its reservation recorded. Replay
+  // and restart producers rebuild the descriptor without the consent decision
+  // that admitted the call, and one call must not settle under a different
+  // label than it was reserved under.
+  const reservedConsent = reservedConsentClassification(durable);
+  const classification = reservedConsent
+    ? { irreversible: durable.data.irreversible === true, ...reservedConsent }
+    : { irreversible: descriptor.irreversible, ...consentClassificationData(descriptor) };
   const lifecycle = exactTerminalLifecycle({
     sessionId: input.sessionId,
     reservation,
@@ -464,7 +522,7 @@ export function projectExternalWriteTerminal(input: {
         ...(descriptor.semanticFingerprint
           ? { semanticFingerprint: descriptor.semanticFingerprint }
           : {}),
-        irreversible: descriptor.irreversible,
+        ...classification,
         targets: descriptor.targets,
         duplicateIdentityKeys: descriptor.duplicateIdentityKeys,
         ...(input.type === 'external_write_succeeded'

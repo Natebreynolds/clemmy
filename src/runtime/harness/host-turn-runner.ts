@@ -3145,6 +3145,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // invocation books a planning turn's preparation probe like a read from
   // this; every other basis leaves the effect-derived accounting untouched.
   const consentBases = new Map<string, InteractiveConsentProceedBasis>();
+  // The risk that same decision classified each call with. A host-owned write
+  // records it, so its ledger row states what its consent card stated.
+  const consentRisks = new Map<string, CapabilityRiskAttestationV1['risk']>();
   const freshPlanControlConfigured = (): boolean => {
     const controls = [...configuredToolRefs].filter((tool) => (
       tool.name === 'plan_task'
@@ -6532,6 +6535,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             ...(consentBases.has(call.callId)
               ? { consentBasis: consentBases.get(call.callId)! }
               : {}),
+            ...(consentRisks.has(call.callId)
+              ? { consentRisk: consentRisks.get(call.callId)! }
+              : {}),
             trustedEffectCarrier: exactProduction?.trustedEffectCarrier,
             deadlineMs,
             callerSignal: signal,
@@ -8605,6 +8611,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         nestedCallAdmissions.set(pending.callId, consent.nestedAdmission);
       }
       consentBases.set(pending.callId, consent.decision.basis);
+      consentRisks.set(pending.callId, consent.call.risk);
       if (exactProduction.boundary === 'host_owned_external' && consent.coverage) {
         consentCallGrants.set(pending.callId, { coverageContractId: consent.coverage.contractId });
       }
@@ -8629,6 +8636,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       for (const pending of pendingFromResume) {
         nestedCallAdmissions.delete(pending.callId);
         consentBases.delete(pending.callId);
+        consentRisks.delete(pending.callId);
       }
       if (!released) {
         return approvalRecoveryOutcome(
@@ -10525,6 +10533,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               nestedCallAdmissions.set(call.callId, consent.nestedAdmission);
             }
             consentBases.set(call.callId, consent.decision.basis);
+            consentRisks.set(call.callId, consent.call.risk);
             // Both authored and exact accepted-call consent use the same
             // existing adapter authority. The ledger owns dispatch lineage.
             if (
@@ -10629,6 +10638,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       for (const call of canonicalCalls) {
         nestedCallAdmissions.delete(call.callId);
         consentBases.delete(call.callId);
+        consentRisks.delete(call.callId);
       }
       if (!released) {
         throw new HostCallAuthorityBoundaryError('prepared_frame_release_failed');

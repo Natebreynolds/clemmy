@@ -68,26 +68,34 @@ export type ExternalWriteKind =
   | 'file_saved'
   | 'other';
 
+/** Consent consequences that name a change to the destination. */
+const CW_NAMED_CHANGES: ReadonlySet<string> = new Set(['create', 'update', 'delete', 'send']);
+
 /** The one reading of an external write's action that both the feed line
  *  (describeExternalWrite) and the turn's outside-work cards use. A write
- *  recorded reversible may never read as delivery. */
+ *  recorded reversible may never read as delivery. A write carrying its
+ *  consent classification's `consequence` reads from it, so the receipt says
+ *  what the consent card said; one that classification could not name reads
+ *  as the call it was, whatever verbs its operation name holds. */
 export function externalWriteKind(
   shapeKey: string | undefined,
   toolName: string,
-  write?: { irreversible?: boolean; actionKey?: string },
+  write?: { irreversible?: boolean; actionKey?: string; consequence?: string },
 ): ExternalWriteKind {
   const key = shapeKey || write?.actionKey || toolName || 'action';
   const tokens = cwActionTokens(key);
   const has = (token: string): boolean => tokens.includes(token);
   const deliveryAllowed = write?.irreversible !== false;
   const fileShaped = has('UPLOAD') || has('SAVE') || has('WRITE') || has('FILE');
-  const consequence = tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
+  const recorded = write?.consequence;
+  if (recorded !== undefined && !CW_NAMED_CHANGES.has(recorded)) return 'other';
+  const consequence = recorded ?? (tokens.some((t) => CW_DELETE_VERBS.has(t)) ? 'delete'
     : tokens.some((t) => CW_SEND_VERBS.has(t)) ? 'send'
       : tokens.some((t) => CW_UPDATE_VERBS.has(t)) ? 'update'
         : tokens.some((t) => CW_CREATE_VERBS.has(t)) ? 'create'
-          : 'other';
+          : 'other');
 
-  if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH')) {
+  if ((has('DRAFT') || has('DRAFTS')) && !has('SEND') && !has('PUBLISH') && recorded !== 'send') {
     return consequence === 'update' ? 'draft_updated' : 'draft_created';
   }
   switch (consequence) {
@@ -112,7 +120,7 @@ export function describeExternalWrite(
   /** `tense: 'present'` is for a write that has been RESERVED but has not
    *  settled — "Creating a draft to …". Past tense is a claim about the world
    *  and must never be made before a terminal says so. */
-  write?: { irreversible?: boolean; actionKey?: string; tense?: 'past' | 'present' },
+  write?: { irreversible?: boolean; actionKey?: string; consequence?: string; tense?: 'past' | 'present' },
 ): string {
   const key = shapeKey || write?.actionKey || toolName || 'action';
   const to = targets.length

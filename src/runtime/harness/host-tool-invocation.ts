@@ -45,7 +45,10 @@ import {
 } from './brackets.js';
 import type { RuntimeToolEffect, TrustedRuntimeEffectCarrier } from './tool-effect.js';
 import { getToolOutput, listEvents, openEventLog, writeToolOutput } from './eventlog.js';
-import type { InteractiveConsentProceedBasis } from './interactive-consent-policy.js';
+import type {
+  CapabilityRiskAttestationV1,
+  InteractiveConsentProceedBasis,
+} from './interactive-consent-policy.js';
 import { openCanonicalArguments } from './authority-argument-seal.js';
 import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
 import {
@@ -146,6 +149,10 @@ export interface InvokeHostToolCallInput<T> {
    * reservation, no orphan projection, a non-mutating settlement. Every other
    * basis leaves the effect-derived accounting untouched. */
   consentBasis?: InteractiveConsentProceedBasis;
+  /** The risk that same consent decision classified this exact call with.
+   * A host-owned write records it in the ledger, so the ledger and the consent
+   * card never state two different reversibilities for one call. */
+  consentRisk?: CapabilityRiskAttestationV1['risk'];
   /** Opaque provenance for an exact provider operation whose transport
    * envelope was peeled by the trusted host before this shared kernel. */
   trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
@@ -598,6 +605,7 @@ function hostExternalWriteDescriptor(
     toolName: input.identity.toolName,
     args: input.identity.args,
     forceMutating: true,
+    ...(input.consentRisk ? { consentRisk: input.consentRisk } : {}),
   });
   if (!descriptor) {
     throw new HostToolInvocationAuthorityError(

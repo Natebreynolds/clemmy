@@ -960,3 +960,47 @@ test('a settled write-classified result opens in file_query through the real hos
   assert.equal(parsed.source, 'tool output exact-draft');
   assert.ok(parsed.hits.some((hit) => hit.text.includes(needle)), text);
 });
+
+// One effect label (live 2026-09-25): a send approved on a card that said
+// irreversible was recorded irreversible=false, because the ledger asked the
+// shape classifier, which reads only a materialized manifest's semantics, and
+// that manifest declared none. The ledger now records the consent's own risk.
+test('an approved send is recorded with the reversibility and consequence its consent card stated', async () => {
+  const fixture = await directWriteFixture('call_tool', 'send', 'one-effect-label');
+  assert.ok(fixture);
+  const paused = await fixture.run();
+  assert.equal(paused.hasInterruptions, true);
+  const { classifyExternalWrite } = await import('./confirm-first-gate.js');
+  assert.equal(classifyExternalWrite(fixture.operationId, ARGS).irreversible, false,
+    'precondition as live: with its manifest materialized, the shape classifier calls this send reversible');
+  const interruption = paused.interruptions![0]!;
+  assert.deepEqual((interruption as any).consentCall.risk,
+    { consequence: 'send', reversibility: 'irreversible', destructive: false });
+  const approval = approvals.registerResumable({ sessionId: fixture.session.id,
+    subject: 'Send this exact message.', tool: interruption.toolName, args: interruption.args,
+    resumeKey: interruption.approvalResumeKey! }).row;
+  assert.equal(approvals.resolve(approval.approvalId, 'approved', 'direct-host-fixture').ok, true);
+  eventlog.closeEventLog();
+  const state = HostInterruptState.fromString(paused.serializedState!);
+  state.approve(state.getInterruptions()[0]);
+  const resumed = await fixture.run(state, { hostApprovalIds: [approval.approvalId] });
+  assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(resumed.history));
+  const ledger = eventlog.listEvents(fixture.session.id, { types: ['external_write', 'external_write_succeeded'] });
+  assert.deepEqual(ledger.map((event) => event.type), ['external_write', 'external_write_succeeded']);
+  for (const event of ledger) {
+    assert.equal(event.data.irreversible, true, `${event.type} states what the consent card stated`);
+    assert.equal(event.data.reversibility, 'irreversible');
+    assert.equal(event.data.consequence, 'send');
+    assert.equal(event.data.destructive, false);
+  }
+  // The receipt both apps render reads the same classification off the public
+  // bus: the shared ledger fold over the real public projection.
+  const { projectHarnessEventsForPublic } = await import('./public-presentation.js');
+  const engine = await import('../../../packages/chat-engine/src/index.js');
+  const rows = [...engine.foldWriteLedger(projectHarnessEventsForPublic(ledger)).values()];
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.disposition, 'confirmed');
+  assert.equal(rows[0]!.consequence, 'send');
+  assert.equal(engine.writeReversibilityLabel(rows[0]!), "can't be undone", 'the receipt says what the card said');
+  assert.equal(engine.outsideWorkCards(rows.map((write) => ({ write })))[0]?.kind, 'message_sent');
+});
