@@ -10,7 +10,7 @@ import {
 } from '../harness/host-capability-catalog-factory.js';
 import { listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyKeywords, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
 import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
-import { peekConnectedToolkits } from '../../integrations/composio/client.js';
+import { peekConnectedToolkits, peekCurrentConnectedToolkits } from '../../integrations/composio/client.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
 import { classifyComposioSlugEffect } from '../../integrations/composio/slug-effect.js';
 import type { CapabilityResolutionEntry } from '../harness/capability-resolution.js';
@@ -20,19 +20,33 @@ import type { HostCapabilityDescriptorV1 } from '../semantic-boundary/turn-seman
 import { getCachedToolSchema } from '../../tools/composio-schema-cache.js';
 import { TOOL_REGISTRY, isRegistryDeclaredRead } from '../../tools/tool-registry.js';
 import { renderCarrierInvocationExample } from '../../tools/tool-search-tool.js';
-import { decideTurnStartWithJev } from './control-plane.js';
+import {
+  decideTurnStartWithJev,
+  type ProvenStrategyCandidate,
+  type RoutableOperation,
+  type TurnStartDecision,
+} from './control-plane.js';
 import { DISCOVERY_SIBLING_DOORS, TOOL_SEARCH_ALWAYS_LOADED, rankCatalogEntriesLexically } from '../../agents/tool-catalog.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 
 /** Bound so a slow provider refresh cannot stall the first model step. */
 const PROVEN_PROVISION_BUDGET_MS = 10_000;
 /** The most a request's first model frame waits on the turn-start Jev
- *  decision. Live answers at the turn start: half by 0.8 s, 83% by 1.5 s. Over
- *  three days most strategy picks found nothing to reuse, and the wait they
- *  added outweighed the model rounds the hits saved. */
+ *  decision. It is a hard cut on the turn's wait, not only on the transport:
+ *  an answer that arrives later is not used. */
 export const PROVEN_PICK_BUDGET_MS = 1_500;
 /** One request's candidates: every operation a named family holds, as a rule. */
 const OPERATION_ROUTE_CANDIDATES = 10;
+/** Remembered kinds of work offered to Jev for one request. */
+const FAMILIAR_RUN_CANDIDATES = 8;
+
+/** How the turn's remembered run was chosen:
+ *  - keywords: the request restates the run (keyword coverage);
+ *  - jev: Jev judged, inside the budget, that the run did the same kind of work;
+ *  - jev_route: Jev routed the request to one operation the host can hand over;
+ *  - keywords_unconfirmed: Jev was unavailable, so the nearest keyword match is
+ *    offered as guidance only and nothing is bound on it. */
+export type ProvenPickSource = 'keywords' | 'jev' | 'jev_route' | 'keywords_unconfirmed';
 
 export interface ProvenLiveRead {
   operation: string;
@@ -67,6 +81,10 @@ export interface ProvenOperationPreparation {
    * this source's proven resolution before the first frame; callable by name. */
   liveReads: ProvenLiveRead[];
   liveReadOutcomes: ProvenLiveReadOutcome[];
+  /** How the remembered run was chosen; absent when none was. */
+  pickedBy?: ProvenPickSource;
+  /** How long the first frame waited on the turn-start decision, when asked. */
+  decisionWaitMs?: number;
 }
 
 export interface ProvenOperationDependencies {
@@ -215,9 +233,13 @@ function descriptorFromCatalogEntry(entry: {
   };
 }
 
+/** A bind before the first frame skips the discovery that would have listed
+ *  connections afresh, so it holds the connection to the same freshness an
+ *  execution preparation does: a current observation, never a last-good one of
+ *  any age. Without one, the provisioning path lists connections afresh. */
 function uniqueActiveConnection(toolkit: string): { connectionId: string } | null {
   try {
-    const rows = peekConnectedToolkits().filter((row) => (
+    const rows = (peekCurrentConnectedToolkits() ?? []).filter((row) => (
       row.slug.trim().toLowerCase() === toolkit.trim().toLowerCase()
       && /^active$/i.test(row.status.trim())
     ));
@@ -368,7 +390,7 @@ export function renderProvenOperationGuidance(
   invocations: readonly unknown[] = [],
   boundAccounts: readonly ProvenBoundAccount[] = [],
   liveReads: readonly ProvenLiveRead[] = [],
-  opts: { routed?: boolean } = {},
+  opts: { routed?: boolean; sameKind?: boolean } = {},
 ): string {
   const tools = strategy.toolsUsed;
   if (opts.routed === true && tools.every(isHandoverRegistryTool)) {
@@ -394,7 +416,11 @@ export function renderProvenOperationGuidance(
       : (callable ? '[PROVEN OPERATION — skip tool_search]' : '[PROVEN OPERATION]'),
     opts.routed
       ? `This request most likely needs ${tools.join(', ')}: ${strategy.objective}`
-      : `A prior successful run ("${strategy.objective}") already proved these tools: ${tools.join(', ')}.`,
+      // A run of the same kind was about another target or wording; its
+      // request text carries that instance's values, which are not this one's.
+      : opts.sameKind
+        ? `A prior successful run of this same kind of request already proved these tools: ${tools.join(', ')}. Use this request's own targets and values.`
+        : `A prior successful run ("${strategy.objective}") already proved these tools: ${tools.join(', ')}.`,
     callable
       ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
       : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
@@ -541,6 +567,85 @@ export function routableOperationsForRequest(
     .map((row) => ({ id: row.name, purpose: row.oneLiner.replace(/\s+/g, ' ').slice(0, 200) }));
 }
 
+/** The operations of a remembered run that the host can hand over before the
+ *  first frame: provider operations it provisions or re-attests, and registry
+ *  tools the orchestrator loads by name. A tool already on every surface, or a
+ *  discovery door, is no reason to recall a run. */
+function bindableStrategyTools(toolsUsed: readonly string[]): string[] {
+  return selectLearnedStrategyTools(toolsUsed).filter((name) => {
+    const row = TOOL_REGISTRY.find((entry) => entry.name === name || entry.name === name.toLowerCase());
+    if (!row) return true;
+    return isHandoverRegistryTool(row.name)
+      && !TOOL_SEARCH_ALWAYS_LOADED.has(row.name)
+      && !DISCOVERY_SIBLING_DOORS.has(row.name);
+  });
+}
+
+/**
+ * The kinds of work this owner has already done successfully, offered to Jev
+ * as candidates for this request: every verified run in scope that has an
+ * operation to hand over, one per distinct set of operations. A familiar
+ * request is usually worded differently from the run that proved it (another
+ * target, another phrasing), so recall is not gated on shared words. Words
+ * only ORDER the window: runs that share informative words with the request
+ * come first, then the most recently used. Jev decides relevance; the host
+ * then checks that each operation is still connected and callable.
+ */
+export function familiarRunStrategiesForRequest(
+  query: string,
+  scope: 'chat' | 'any',
+  limit = FAMILIAR_RUN_CANDIDATES,
+): RunStrategyRecord[] {
+  const offered = listVerifiedRunStrategies()
+    .filter((strategy) => scope === 'any' || (strategy.scope ?? 'chat') === 'chat')
+    .filter((strategy) => bindableStrategyTools(strategy.toolsUsed).length > 0);
+  if (offered.length === 0) return [];
+  const ranked = rankCatalogEntriesLexically(query, offered.map((strategy, recency) => ({
+    name: selectLearnedStrategyTools(strategy.toolsUsed).join(' '),
+    oneLiner: strategy.objective,
+    strategy,
+    recency,
+  })));
+  const ordered = [
+    ...ranked.filter((row) => row.score > 0),
+    ...ranked.filter((row) => !(row.score > 0)).sort((left, right) => left.recency - right.recency),
+  ];
+  const seen = new Set<string>();
+  const picked: RunStrategyRecord[] = [];
+  for (const row of ordered) {
+    const signature = toolSignature(row.strategy.toolsUsed);
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    picked.push(row.strategy);
+    if (picked.length >= limit) break;
+  }
+  return picked;
+}
+
+type TurnStartDecisionFor = TurnStartDecision<ProvenStrategyCandidate, RoutableOperation>;
+
+/** The first frame waits on the turn-start decision for at most the budget,
+ *  whatever the transport does; a later answer is not used. */
+async function decideWithinBudget(
+  decide: () => Promise<TurnStartDecisionFor>,
+  budgetMs: number,
+): Promise<TurnStartDecisionFor> {
+  const unavailable: TurnStartDecisionFor = {
+    strategy: null,
+    route: { pick: null, outcome: 'unavailable' },
+    failedOpen: true,
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<TurnStartDecisionFor>((resolve) => {
+    timer = setTimeout(() => resolve(unavailable), budgetMs);
+  });
+  try {
+    return await Promise.race([decide().catch(() => unavailable), expired]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function prepareProvenOperationForRequest(input: {
   query: string;
   sessionId?: string;
@@ -573,31 +678,45 @@ export async function prepareProvenOperationForRequest(input: {
   // tools were then recommended while routing to the space tools never ran.
   const lexical = pickProvenRunStrategy(matches);
   let strategy = lexical && provenStrategyCoversRequest(input.query, lexical) ? lexical : null;
-  // Whether a remembered run fits and which operation would do the core of
-  // the request go to Jev together, in one bounded wait before the first model
-  // frame. A late answer is not used. A routed pick stands only when Jev is
-  // sure of it and of its fit; it is advisory until the host hands the
-  // operation over below.
+  let pickedBy: ProvenPickSource | undefined = strategy ? 'keywords' : undefined;
+  let decisionWaitMs: number | undefined;
+  // Whether a remembered kind of work fits and which operation would do the
+  // core of the request go to Jev together, in one bounded wait before the
+  // first model frame. A late answer is not used. Jev's pick of a remembered
+  // run is the relevance decision: the host binds that run's operations below
+  // exactly as it binds a run the request restates. A routed pick stands only
+  // when Jev is sure of it and of its fit; it is advisory until the host hands
+  // the operation over below.
   let routed = false;
   if (!strategy) {
+    const familiar = familiarRunStrategiesForRequest(input.query, strategyScope);
     const operations = routableOperationsForRequest(input.query, strategyScope);
-    if (matches.length > 0 || operations.length > 0) {
-      const decision = await (dependencies.decideTurnStart ?? decideTurnStartWithJev)(
+    if (familiar.length > 0 || operations.length > 0) {
+      const startedAt = Date.now();
+      const decision = await decideWithinBudget(() => (dependencies.decideTurnStart ?? decideTurnStartWithJev)(
         input.query,
-        matches.map((row) => ({
-          id: row.strategy.id,
-          objective: row.strategy.objective,
-          toolsUsed: row.strategy.toolsUsed,
+        familiar.map((row) => ({
+          id: row.id,
+          objective: row.objective,
+          toolsUsed: row.toolsUsed,
         })),
         operations,
         { timeoutMs: PROVEN_PICK_BUDGET_MS, ...(input.sessionId ? { sessionId: input.sessionId } : {}) },
-      );
-      strategy = (decision.strategy
-        ? matches.find((row) => row.strategy.id === decision.strategy!.id)?.strategy
-        : null)
-        ?? (decision.failedOpen && matches.length > 0 ? matches[0]!.strategy : null);
+      ), PROVEN_PICK_BUDGET_MS);
+      decisionWaitMs = Date.now() - startedAt;
+      const judged = decision.strategy
+        ? familiar.find((row) => row.id === decision.strategy!.id) ?? null
+        : null;
+      if (judged) {
+        strategy = judged;
+        pickedBy = 'jev';
+      } else if (decision.failedOpen && matches.length > 0) {
+        strategy = matches[0]!.strategy;
+        pickedBy = 'keywords_unconfirmed';
+      }
       if (!strategy && decision.route.pick) {
         routed = true;
+        pickedBy = 'jev_route';
         strategy = {
           id: `route:${decision.route.pick.id}`,
           objective: decision.route.pick.purpose,
@@ -611,7 +730,7 @@ export async function prepareProvenOperationForRequest(input: {
       }
     }
   }
-  if (!strategy) return empty;
+  if (!strategy) return { ...empty, ...(decisionWaitMs !== undefined ? { decisionWaitMs } : {}) };
   const schemas: Record<string, unknown> = {};
   for (const name of strategy.toolsUsed) {
     const schema = schemaForTool(name);
@@ -625,12 +744,11 @@ export async function prepareProvenOperationForRequest(input: {
   let boundAccounts: ProvenBoundAccount[] = [];
   const composioSlugs = composioSlugsFromStrategy(strategy.toolsUsed);
   // A strategy that does not cover the request must not spend the request's
-  // time provisioning its operations. Live 2026-09-24 (source 299433): "I just
-  // connected monday.com, check that" matched a calendar strategy and spent
-  // 19 s publishing Outlook operations before the brain's first frame.
-  // A routed pick was judged to do the core of this request; a remembered run
-  // must cover it by its own keywords.
-  const coversRequest = routed || provenStrategyCoversRequest(input.query, strategy);
+  // time provisioning its operations: a run that merely shares words with the
+  // request is guidance only. Coverage is either the request restating the run
+  // (its own keywords), or a turn-start judgement inside the budget that the
+  // run did this same kind of work or that the routed operation does its core.
+  const coversRequest = routed || pickedBy === 'jev' || provenStrategyCoversRequest(input.query, strategy);
   if (
     coversRequest
     && composioSlugs.length > 0
@@ -768,7 +886,10 @@ export async function prepareProvenOperationForRequest(input: {
   }
 
   return {
-    text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads, { routed }),
+    text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads, {
+      routed,
+      sameKind: pickedBy === 'jev',
+    }),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
     nativeTools: coversRequest ? strategy.toolsUsed.filter(isHandoverRegistryTool) : [],
@@ -778,5 +899,7 @@ export async function prepareProvenOperationForRequest(input: {
     descriptors,
     liveReads,
     liveReadOutcomes,
+    ...(pickedBy ? { pickedBy } : {}),
+    ...(decisionWaitMs !== undefined ? { decisionWaitMs } : {}),
   };
 }

@@ -189,11 +189,9 @@ export interface ProvenStrategyCandidate {
   toolsUsed: string[];
 }
 
-const PROVEN_STRATEGY_CONFIDENCE_MIN = 0.6;
-// This call sits on the critical path before the first model frame. Live
-// 2026-09-21/22: median 740 ms, p90 2,980 ms across ten calls. Past 2 s the
-// caller keeps the top lexical match (failedOpen), and a wrong pick is
-// recoverable in-turn now that tool_search stays on the proven-skip surface.
+// This call sits on the critical path before the first model frame. Past this
+// the caller treats the decision as unavailable, and a wrong pick is
+// recoverable in-turn because tool_search stays on the proven-skip surface.
 // The caller may shorten it to what the pick is worth at the turn start.
 const PROVEN_STRATEGY_TIMEOUT_MS = 2_000;
 
@@ -212,6 +210,14 @@ const OPERATION_ROUTE_CONFIDENCE_MIN = 0.6;
 const OPERATION_ROUTE_FIT_MIN = 0.8;
 const OPERATION_ROUTE_WINDOW = 10;
 const PROVEN_STRATEGY_WINDOW = 8;
+// A past run is asked about twice: which run did this kind of work (a choice
+// across runs) and, for each run on its own, whether its operations would do
+// the core of this request (a yes/no that no other run can dilute). Runs of
+// the same kind share the choice between them, so the choice only has to lean
+// toward the run; its own fit has to be sure, because a remembered run is
+// bound before the first frame and the brain is told discovery already ran.
+const PROVEN_STRATEGY_CHOICE_MIN = 0.35;
+const PROVEN_STRATEGY_FIT_MIN = 0.8;
 
 export interface RoutableOperation {
   id: string;
@@ -225,9 +231,18 @@ export interface OperationRoute<T extends RoutableOperation> {
   fit?: number;
 }
 
+/** How the remembered-run question was settled, for the decision receipt. */
+export interface StrategyJudgement {
+  outcome: 'picked' | 'none' | 'low_confidence' | 'low_fit' | 'unavailable';
+  confidence?: number;
+  fit?: number;
+}
+
 export interface TurnStartDecision<S extends ProvenStrategyCandidate, O extends RoutableOperation> {
   /** A remembered run Jev judged to fit; it wins over a routed operation. */
   strategy: S | null;
+  /** Why the remembered run was or was not taken. Absent when none was offered. */
+  strategyJudgement?: StrategyJudgement;
   route: OperationRoute<O>;
   /** Transport/timeout/disabled: the caller may keep its top memory match. */
   failedOpen: boolean;
@@ -237,12 +252,13 @@ export interface TurnStartDecision<S extends ProvenStrategyCandidate, O extends 
  * Both turn-start questions read the same state (the request) and neither
  * depends on the other's answer, so they go to Jev as ONE request, as its
  * documentation recommends for independent questions over shared state:
- * which remembered run fits well enough to skip discovery, if any, and which
- * single operation would do the core of the request. Asked separately they
- * cost two round trips and let the first spend the budget the second needed.
- * The host prefers a fitting remembered run, which carries proven tools and
- * request shapes, then a sure, well-fitting operation. The request text is the
- * whole state: tool output never becomes the decision task.
+ * which remembered run did the same kind of work, so its operations can be
+ * called without discovery, if any, and which single operation would do the
+ * core of the request. Asked separately they cost two round trips and let the
+ * first spend the budget the second needed. The host prefers a fitting
+ * remembered run, which carries proven tools and request shapes, then a sure,
+ * well-fitting operation. The request text is the whole state: tool output
+ * never becomes the decision task.
  */
 export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, O extends RoutableOperation>(
   request: string,
@@ -256,15 +272,25 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
   if (runs.length === 0 && ops.length === 0) return { strategy: null, route: none, failedOpen: false };
   const questions: SystemOneQuestions = {};
   if (runs.length > 0) {
-    const criteria: Record<string, string | null> = { none: 'New work, extra tools needed, or not sure.' };
+    const criteria: Record<string, string | null> = { none: 'A different kind of work, other operations needed, or not sure.' };
     for (const run of runs) {
       criteria[run.id] = `${run.objective.slice(0, 160)} · ${run.toolsUsed.join(', ')}`.slice(0, 240);
     }
     questions.which = {
       type: 'choice',
-      instructions: 'Which proven past run matches this request well enough to skip tool discovery? Choose none unless the same tools will fulfill it.',
+      instructions: 'Which past run did the same kind of work this request asks for, so the operations it used can be called directly? The request may name a different target, date or wording. Choose none unless one clearly does.',
       criteria,
     };
+    runs.forEach((run, index) => {
+      questions[`run_${index}`] = {
+        type: 'noul',
+        instructions: `Would calling ${run.toolsUsed.join(', ')} directly do the core of this request? A past run used them for: ${run.objective.replace(/\s+/g, ' ').slice(0, 160)}`,
+        criteria: {
+          true: 'Same kind of work: they perform the main thing this request asks for, whatever target it names.',
+          false: 'Different work, only a side step, or not sure.',
+        },
+      };
+    });
   }
   if (ops.length > 0) {
     const criteria: Record<string, string | null> = {
@@ -298,12 +324,35 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
       ...(ops.length > 0 ? { candidates: ops.map((operation) => operation.id) } : {}),
     },
   });
-  if (!result.ok) return { strategy: null, route: { pick: null, outcome: 'unavailable' }, failedOpen: true };
+  if (!result.ok) {
+    return {
+      strategy: null,
+      ...(runs.length > 0 ? { strategyJudgement: { outcome: 'unavailable' as const } } : {}),
+      route: { pick: null, outcome: 'unavailable' },
+      failedOpen: true,
+    };
+  }
 
-  const which = result.answers.which as ChoiceAnswer | undefined;
-  const strategy = which && which.choice !== 'none' && which.confidence >= PROVEN_STRATEGY_CONFIDENCE_MIN
-    ? runs.find((run) => run.id === which.choice) ?? null
-    : null;
+  const judged = ((): { strategy: S | null; judgement: StrategyJudgement } | null => {
+    if (runs.length === 0) return null;
+    const which = result.answers.which as ChoiceAnswer | undefined;
+    if (!which) return { strategy: null, judgement: { outcome: 'unavailable' } };
+    if (which.choice === 'none') return { strategy: null, judgement: { outcome: 'none', confidence: which.confidence } };
+    const index = runs.findIndex((run) => run.id === which.choice);
+    if (index < 0) return { strategy: null, judgement: { outcome: 'unavailable' } };
+    if (which.confidence < PROVEN_STRATEGY_CHOICE_MIN) {
+      return { strategy: null, judgement: { outcome: 'low_confidence', confidence: which.confidence } };
+    }
+    const fit = (result.answers[`run_${index}`] as NoulAnswer | undefined)?.noul;
+    if (typeof fit !== 'number' || fit < PROVEN_STRATEGY_FIT_MIN) {
+      return {
+        strategy: null,
+        judgement: { outcome: 'low_fit', confidence: which.confidence, ...(typeof fit === 'number' ? { fit } : {}) },
+      };
+    }
+    return { strategy: runs[index]!, judgement: { outcome: 'picked', confidence: which.confidence, fit } };
+  })();
+  const strategy = judged?.strategy ?? null;
   const route = ((): OperationRoute<O> => {
     if (ops.length === 0) return none;
     const answer = result.answers.select as ChoiceAnswer | undefined;
@@ -326,10 +375,16 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
     strategy ? 'strategy' : route.pick ? 'routed' : 'none',
     {
       ...(strategy ? { strategy: strategy.id } : {}),
+      ...(judged ? { run: judged.judgement.outcome } : {}),
       ...(ops.length > 0 ? { route: route.outcome, ...(route.pick ? { pick: route.pick.id } : {}) } : {}),
     },
   );
-  return { strategy, route, failedOpen: false };
+  return {
+    strategy,
+    ...(judged ? { strategyJudgement: judged.judgement } : {}),
+    route,
+    failedOpen: false,
+  };
 }
 
 export type OpenQuestionReplyKind = 'answers' | 'asks' | 'other';

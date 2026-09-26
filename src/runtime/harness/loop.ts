@@ -6237,6 +6237,8 @@ async function runConversationWithinRuntimeConfig(
                 boundAccounts: proven.boundAccounts,
                 liveReads: proven.liveReads,
                 liveReadOutcomes: proven.liveReadOutcomes,
+                ...(proven.pickedBy ? { pickedBy: proven.pickedBy } : {}),
+                ...(proven.decisionWaitMs !== undefined ? { decisionWaitMs: proven.decisionWaitMs } : {}),
               },
             });
           }

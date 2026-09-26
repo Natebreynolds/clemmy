@@ -136,7 +136,10 @@ test('selectProvenRunStrategyWithJev picks a matching past run and fails open to
     ok: true,
     text: async () => JSON.stringify({
       model: 'jev-1.13.0',
-      answers: { which: { type: 'choice', choice: 'strat-cal', probabilities: { 'strat-cal': 0.82, none: 0.18 }, confidence: 0.82 } },
+      answers: {
+        which: { type: 'choice', choice: 'strat-cal', probabilities: { 'strat-cal': 0.82, none: 0.18 }, confidence: 0.82 },
+        run_0: { type: 'noul', noul: 0.9 },
+      },
       usage: { input_tokens: 20, output_tokens: 2 },
     }),
   }));
@@ -158,6 +161,8 @@ test('selectProvenRunStrategyWithJev picks a matching past run and fails open to
           probabilities: { none: 0.7, 'strat-cal': 0.3 },
           confidence: 0.8,
         },
+        run_0: { type: 'noul', noul: 0.1 },
+        run_1: { type: 'noul', noul: 0.05 },
       },
       usage: { input_tokens: 20, output_tokens: 2 },
     }),
@@ -514,6 +519,7 @@ test('decideTurnStartWithJev asks both turn-start questions in one request', asy
         model: 'jev-1.13.0',
         answers: {
           which: { type: 'choice', choice: which, confidence: 0.88, probabilities: { [which]: 0.88 } },
+          run_0: { type: 'noul', noul: 0.9 },
           select: { type: 'choice', choice: 'op_1', confidence: 0.9, probabilities: { op_1: 0.9 } },
           fit_0: { type: 'noul', noul: 0.1 },
           fit_1: { type: 'noul', noul: 0.92 },
@@ -537,11 +543,70 @@ test('decideTurnStartWithJev asks both turn-start questions in one request', asy
   which = 'strat-build';
   const remembered = await decideTurnStartWithJev('Show me the brief space', runs, operations, { timeoutMs: 1_000 });
   assert.equal(remembered.strategy?.id, 'strat-build', 'a fitting remembered run wins');
+  assert.deepEqual(remembered.strategyJudgement, { outcome: 'picked', confidence: 0.88, fit: 0.9 });
 
   _setSystemOneFetchForTests(async () => ({ status: 504, ok: false, text: async () => '' }));
   const unreachable = await decideTurnStartWithJev('Show me the brief space', runs, operations, { timeoutMs: 1_000 });
   assert.equal(unreachable.failedOpen, true);
   assert.equal(unreachable.route.pick, null);
+  assert.equal(unreachable.strategyJudgement?.outcome, 'unavailable');
+});
+
+// A familiar request is worded differently from the run that proved it, and
+// runs of the same kind split the choice between them. The choice only has to
+// lean toward a run; that run's own yes/no fit has to be sure.
+test('a remembered run is taken on a leaning choice and a sure fit of its own, and on nothing less', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Array<Record<string, any>> = [];
+  const answer = (which: { choice: string; confidence: number }, fits: number[]) => {
+    _setSystemOneFetchForTests(async (_url, init) => {
+      posted.push(JSON.parse(String(init.body)));
+      return {
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({
+          model: 'jev-1.13.0',
+          answers: {
+            which: { type: 'choice', choice: which.choice, confidence: which.confidence, probabilities: { [which.choice]: which.confidence } },
+            ...Object.fromEntries(fits.map((noul, index) => [`run_${index}`, { type: 'noul', noul }])),
+          },
+          usage: { input_tokens: 40, output_tokens: 4 },
+        }),
+      };
+    });
+  };
+  const runs = [
+    { id: 'strat-links', objective: 'how many backlinks does https://first-firm.example have', toolsUsed: ['metrics__links_summary'] },
+    { id: 'strat-rank', objective: 'quick rank overview for https://other-firm.example', toolsUsed: ['metrics__api_request', 'metrics__links_summary'] },
+    { id: 'strat-cal', objective: 'whats on my calendar today', toolsUsed: ['calendar_view'] },
+  ];
+  const request = "what's the backlink count on https://third-firm.example?";
+
+  answer({ choice: 'strat-links', confidence: 0.41 }, [0.93, 0.88, 0.02]);
+  const leaning = await decideTurnStartWithJev(request, runs, [], { timeoutMs: 1_000 });
+  assert.equal(leaning.strategy?.id, 'strat-links', 'a split choice still picks the run whose own fit is sure');
+  assert.deepEqual(leaning.strategyJudgement, { outcome: 'picked', confidence: 0.41, fit: 0.93 });
+  const questions = posted.at(-1)!.questions as Record<string, { type: string; instructions: string }>;
+  assert.equal(questions.run_0?.type, 'noul', 'each run is asked about on its own');
+  assert.match(questions.run_0!.instructions, /metrics__links_summary/);
+  assert.equal(Object.keys(questions).filter((key) => key.startsWith('run_')).length, runs.length);
+  assert.equal(JSON.stringify(posted.at(-1)!.state), JSON.stringify({ request }), 'the request alone is the decision state');
+
+  answer({ choice: 'strat-links', confidence: 0.9 }, [0.55, 0.3, 0.02]);
+  const unsure = await decideTurnStartWithJev(request, runs, [], { timeoutMs: 1_000 });
+  assert.equal(unsure.strategy, null, 'a sure choice whose own fit is weak binds nothing');
+  assert.deepEqual(unsure.strategyJudgement, { outcome: 'low_fit', confidence: 0.9, fit: 0.55 });
+
+  answer({ choice: 'strat-cal', confidence: 0.3 }, [0.2, 0.2, 0.95]);
+  const faint = await decideTurnStartWithJev(request, runs, [], { timeoutMs: 1_000 });
+  assert.equal(faint.strategy, null);
+  assert.equal(faint.strategyJudgement?.outcome, 'low_confidence');
+
+  answer({ choice: 'none', confidence: 0.8 }, [0.9, 0.9, 0.9]);
+  const declined = await decideTurnStartWithJev(request, runs, [], { timeoutMs: 1_000 });
+  assert.equal(declined.strategy, null, 'a chosen none is a real no');
+  assert.equal(declined.strategyJudgement?.outcome, 'none');
+  assert.equal(declined.failedOpen, false);
 });
 
 

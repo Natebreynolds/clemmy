@@ -497,7 +497,9 @@ test('one Jev request decides both turn-start questions, and a routed operation 
       { decideTurnStart: decideWith(calls, () => ({ route: 'workflow_create' })) },
     );
     assert.equal(calls.length, 1, 'one Jev request, not one per question');
-    assert.deepEqual([...calls[0]!.strategies].sort(), ['zephyr ledger export report', 'zephyr ledger reconciliation report']);
+    assert.deepEqual([...calls[0]!.strategies.slice(0, 2)].sort(), ['zephyr ledger export report', 'zephyr ledger reconciliation report'],
+      'the remembered runs that share the request\'s words lead the window');
+    assert.equal(new Set(calls[0]!.strategies).size, calls[0]!.strategies.length);
     assert.ok(calls[0]!.operations.includes('workflow_create'));
     assert.equal(calls[0]!.timeoutMs, PROVEN_PICK_BUDGET_MS);
     assert.equal(routedWorkflow.strategyId, 'route:workflow_create');
@@ -521,6 +523,7 @@ test('one Jev request decides both turn-start questions, and a routed operation 
       { decideTurnStart: decideWith(calls, () => ({ failedOpen: true })) },
     );
     assert.ok(unreachable.strategyId && !unreachable.strategyId.startsWith('route:'), 'unreachable Jev keeps the top memory match, as before');
+    assert.equal(unreachable.pickedBy, 'keywords_unconfirmed', 'and says it was not confirmed, so nothing is bound on it');
 
     calls.length = 0;
     const none = await prepareProvenOperationForRequest(
@@ -528,16 +531,10 @@ test('one Jev request decides both turn-start questions, and a routed operation 
       { decideTurnStart: decideWith(calls, () => ({})) },
     );
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0]!.strategies, [], 'no proven run matched, so only the routing question is asked');
+    assert.ok(calls[0]!.strategies.length > 0, 'every remembered kind of work is offered, whatever the wording');
     assert.equal(none.text, undefined, 'a confident "none" hands nothing over');
     assert.deepEqual(none.nativeTools, []);
-
-    calls.length = 0;
-    await prepareProvenOperationForRequest(
-      { query: 'thanks, that is all' },
-      { decideTurnStart: decideWith(calls, () => ({ route: 'workflow_create' })) },
-    );
-    assert.equal(calls.length, 0, 'with nothing to offer, Jev is not asked');
+    assert.equal(typeof none.decisionWaitMs, 'number', 'the wait on the decision is measured');
   } finally {
     _setToolSchemaLoaderForTests(null);
   }
@@ -560,5 +557,136 @@ test('a remembered run that only shares words is checked, and a rejected one lea
     assert.doesNotMatch(prepared.text ?? '', /outlook_get_calendar_view/, 'the rejected run recommends nothing');
   } finally {
     _setToolSchemaLoaderForTests(null);
+  }
+});
+
+// A familiar request is worded differently from the run that proved it: another
+// target, another phrasing, few shared words. Recall must not be gated on
+// shared words; words only order the window Jev reads.
+test('every remembered kind of work with an operation to hand over is offered, one per operation set', async () => {
+  const { familiarRunStrategiesForRequest } = await import('./proven-operation.js');
+  recordZephyrStrategy('how many backlinks does https://first-firm.example have', 'linkscope__backlinks_summary', 'links-a');
+  recordZephyrStrategy('pull the backlink summary for https://second-firm.example please', 'linkscope__backlinks_summary', 'links-b');
+  recordZephyrStrategy('read the fixture notes file', 'read_file', 'notes-a');
+  const request = "what's the referring-domain picture for https://third-firm.example?";
+  const offered = familiarRunStrategiesForRequest(request, 'chat');
+  const links = offered.filter((row) => row.toolsUsed.includes('linkscope__backlinks_summary'));
+  assert.equal(links.length, 1, 'runs that used the same operations are one kind of work, offered once');
+  assert.ok(!offered.some((row) => row.toolsUsed.join() === 'read_file'), 'a tool already on every surface is no reason to recall a run');
+  const { listMatchingRunStrategies } = await import('../../memory/run-strategy-store.js');
+  assert.ok(!listMatchingRunStrategies(request, 4).some((row) => row.strategy.toolsUsed.includes('linkscope__backlinks_summary')),
+    'this wording clears no keyword floor, so a keyword gate would never have offered it');
+  assert.ok(offered.length <= 8);
+});
+
+test('a remembered run Jev judges to be the same kind of work is bound before the first frame, whatever the wording', async () => {
+  const { createSession, appendEvent } = await import('../harness/eventlog.js');
+  const { provenCapabilityEntriesForTurn } = await import('../harness/capability-resolution.js');
+  recordZephyrStrategy('how many backlinks does https://first-firm.example have', 'linkscope__backlinks_summary', 'links-bind');
+  const request = "what's the referring-domain picture for https://third-firm.example?";
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'familiar links' });
+  const accepted = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: request } });
+  const calls: DecisionCall[] = [];
+  const acquired: string[] = [];
+  const prepared = await prepareProvenOperationForRequest(
+    { query: request, sessionId: session.id, sourceUserSeq: accepted.seq, acceptedInput: request },
+    {
+      decideTurnStart: decideWith(calls, (strategies) => ({
+        strategy: strategies.find((row) => /backlink/.test(row.objective))?.id,
+      })),
+      acquireLiveRead: async ({ operation }) => {
+        acquired.push(operation);
+        return { status: 'installed', kind: 'mcp', operation, accountId: 'native_mcp:linkscope:acct' };
+      },
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0]!.strategies.some((objective) => /backlink/.test(objective)), 'the familiar run is offered despite the wording');
+  assert.equal(prepared.pickedBy, 'jev');
+  assert.deepEqual(acquired, ['linkscope__backlinks_summary'], 'Jev\'s pick counts as coverage: the operation is re-attested on the request\'s clock');
+  assert.deepEqual(prepared.liveReads.map((row) => row.operation), ['linkscope__backlinks_summary']);
+  assert.ok(provenCapabilityEntriesForTurn({ sessionId: session.id, sourceUserSeq: accepted.seq })
+    .some((entry) => entry.identifier === 'linkscope__backlinks_summary' && entry.status === 'proven'));
+  assert.match(prepared.text ?? '', /same kind of request already proved these tools: linkscope__backlinks_summary/);
+  assert.match(prepared.text ?? '', /Use this request's own targets and values/);
+  assert.doesNotMatch(prepared.text ?? '', /first-firm|second-firm/, 'another instance\'s values never reach the brain as guidance');
+
+  // Unconfirmed: Jev unavailable. The nearest keyword match, if any, is
+  // guidance only; nothing is re-attested or bound on it.
+  const other = createSession({ kind: 'chat', channel: 'desktop', title: 'familiar links unconfirmed' });
+  const otherAccepted = appendEvent({ sessionId: other.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: request } });
+  const unconfirmed: string[] = [];
+  const guessed = await prepareProvenOperationForRequest(
+    { query: request, sessionId: other.id, sourceUserSeq: otherAccepted.seq, acceptedInput: request },
+    {
+      decideTurnStart: decideWith([], () => ({ failedOpen: true })),
+      acquireLiveRead: async ({ operation }) => {
+        unconfirmed.push(operation);
+        return { status: 'installed', kind: 'mcp', operation, accountId: 'native_mcp:linkscope:acct' };
+      },
+    },
+  );
+  assert.deepEqual(unconfirmed, [], 'an unconfirmed guess binds nothing');
+  assert.notEqual(guessed.pickedBy, 'jev');
+  assert.equal(guessed.skipDiscoverySearch, false);
+});
+
+test('the first frame waits on the turn-start decision for at most the budget, whatever the transport does', async () => {
+  recordZephyrStrategy('how many backlinks does https://first-firm.example have', 'linkscope__backlinks_summary', 'links-slow');
+  const started = Date.now();
+  const prepared = await prepareProvenOperationForRequest(
+    { query: "what's the referring-domain picture for https://third-firm.example?" },
+    {
+      // A transport that ignores its own deadline and answers long after it.
+      decideTurnStart: (_request, strategies) => new Promise((resolve) => {
+        setTimeout(() => resolve({
+          strategy: strategies.find((row) => row.toolsUsed.includes('linkscope__backlinks_summary')) ?? null,
+          route: { pick: null, outcome: 'none' },
+          failedOpen: false,
+        }), PROVEN_PICK_BUDGET_MS + 2_500);
+      }),
+    },
+  );
+  const waited = Date.now() - started;
+  assert.ok(waited >= PROVEN_PICK_BUDGET_MS - 50, `waited ${waited} ms`);
+  assert.ok(waited < PROVEN_PICK_BUDGET_MS + 1_000, `a stalled decision is cut at the budget (waited ${waited} ms)`);
+  assert.notEqual(prepared.pickedBy, 'jev', 'a late answer is not a pick');
+  assert.equal(prepared.skipDiscoverySearch, false);
+  assert.ok((prepared.decisionWaitMs ?? 0) >= PROVEN_PICK_BUDGET_MS - 50);
+});
+
+test('a bind before the first frame trusts a current connection observation, never a last-good one of any age', async () => {
+  const composio = await import('../../integrations/composio/client.js');
+  const schemaCache = await import('../../tools/composio-schema-cache.js');
+  const operation = 'GOOGLEDRIVE_FIND_FILE';
+  schemaCache._setToolSchemaLoaderForTests(async (identifier: string) => (identifier === operation
+    ? { inputParameters: { type: 'object', properties: { query: { type: 'string' } } }, outputParameters: { type: 'object' },
+        providerObservedAt: Date.now(), providerOperationVersion: 'fixture-1' }
+    : null));
+  composio.__test__.setComposioApiKeyOverride('fixture-composio-key');
+  const realNow = Date.now;
+  try {
+    await schemaCache.ensureToolSchema(operation);
+    composio.__test__.setConnectedAccountsLoader(async () => [
+      { id: 'conn-drive', status: 'ACTIVE', user_id: 'fixture-user', toolkit: { slug: 'googledrive' } },
+    ]);
+    // The only observation of the owner's connections is older than any
+    // execution preparation would accept.
+    Date.now = () => realNow() - 20 * 60_000;
+    try { await composio.listUsableConnectedToolkits({ requireFresh: true }); } finally { Date.now = realNow; }
+    assert.equal(composio.peekCurrentConnectedToolkits(), null);
+    assert.equal(composio.peekConnectedToolkits().length, 1, 'the old observation is still held as last-good');
+    assert.deepEqual(buildCachedProvenResolutionEntries([operation]), [], 'an old observation never binds');
+    await composio.listUsableConnectedToolkits({ requireFresh: true });
+    const current = buildCachedProvenResolutionEntries([operation]);
+    assert.equal(current.length, 1, 'a current observation of one active connection does');
+    assert.equal(current[0]!.accountIdentity, 'conn-drive');
+  } finally {
+    Date.now = realNow;
+    schemaCache._setToolSchemaLoaderForTests(null);
+    schemaCache.resetToolSchemaCache();
+    composio.__test__.setConnectedAccountsLoader(null);
+    composio.__test__.setComposioApiKeyOverride(null);
+    composio.resetComposioClient();
   }
 });

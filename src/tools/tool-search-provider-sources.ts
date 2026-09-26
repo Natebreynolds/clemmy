@@ -1164,17 +1164,29 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
   const refs: Record<string, string> = {};
   const blockers: Record<string, ToolSearchPlanningBlocker> = {};
   const routingByToolkit = new Map<string, Awaited<ReturnType<typeof resolveSourceAccountRouting>>>();
-  for (const candidate of composioCandidates.slice(0, 20)) {
-    if (!discoveryStillActive(guard)) return empty();
+  const reviewWindow = composioCandidates.slice(0, 20).map((candidate) => {
     const slug = candidate.name.trim();
     const toolkit = registeredToolkitOfSlug(slug).trim().toLowerCase();
-    const routingEffect = classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write';
+    const routingEffect: 'read' | 'write' = classifyComposioSlugEffect(slug) === 'read' ? 'read' : 'write';
     // Read routing deliberately does not require a semantic account review.
     // A mixed search must not reuse that read-only decision for a write (or
     // let an unavailable write review suppress an otherwise usable read).
-    const routingKey = `${toolkit}:${routingEffect}`;
-    let routing = routingByToolkit.get(routingKey);
-    if (!routing) {
+    return { candidate, slug, toolkit, routingEffect, routingKey: `${toolkit}:${routingEffect}` };
+  });
+  // One review per toolkit and effect, for the first candidate that needs it.
+  // Reviews of different toolkits are independent model work, so they run
+  // together and the search waits for the slowest, not for their sum; within
+  // one toolkit they keep candidate order.
+  const reviewsByToolkit = new Map<string, Array<(typeof reviewWindow)[number]>>();
+  const firstForKey = new Set<string>();
+  for (const row of reviewWindow) {
+    if (firstForKey.has(row.routingKey)) continue;
+    firstForKey.add(row.routingKey);
+    reviewsByToolkit.set(row.toolkit, [...(reviewsByToolkit.get(row.toolkit) ?? []), row]);
+  }
+  await Promise.all([...reviewsByToolkit.values()].map(async (rows) => {
+    for (const { slug, toolkit, routingEffect, routingKey } of rows) {
+      if (!discoveryStillActive(guard)) return;
       // This is model work, not provider metadata I/O. Keep the current tool
       // pending until the review returns or its invocation is cancelled.
       const review = () => awaitBounded({
@@ -1186,15 +1198,19 @@ export async function stageDisclosedPlanningProviderCandidates(input: {
         signal: input.signal,
       });
       const outcome = input.awaitModelReview ? await input.awaitModelReview(review) : await review();
-      if (!discoveryStillActive(guard)) return empty();
-      routing = outcome.kind === 'settled' ? outcome.value : {
+      routingByToolkit.set(routingKey, outcome.kind === 'settled' ? outcome.value : {
         kind: 'account_selection_required', reason: 'review_unavailable',
         labels: accountChoiceLabels(connections.filter(connection => connection.slug.trim().toLowerCase() === toolkit)),
         choices: [...new Set(connections.filter(connection => connection.slug.trim().toLowerCase() === toolkit)
           .map(connection => normalizedAccountEmail(connection.accountEmail) || connection.connectionId))],
-      };
-      routingByToolkit.set(routingKey, routing);
+      });
     }
+  }));
+  if (!discoveryStillActive(guard)) return empty();
+  for (const { candidate, slug, routingKey } of reviewWindow) {
+    if (!discoveryStillActive(guard)) return empty();
+    const routing = routingByToolkit.get(routingKey);
+    if (!routing) return empty();
     // Checked nominations and established routes precede legacy prose hints;
     // uncertainty never silently falls back to grammar or account memory.
     const selection = routing.kind !== 'none' ? routing
