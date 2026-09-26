@@ -80,6 +80,20 @@ test('a Claude review without evidence tools is unchanged', async () => {
   assert.equal(requests[0]!.systemInstructions, JUDGE_SYSTEM_PROMPT);
 });
 
+test('a review effort reaches a Claude reviewer and no other provider', async () => {
+  const claude = capturingModel();
+  await runRoutedJudgeAttempt(route('claude', claude.model) as never, JUDGE_SYSTEM_PROMPT, prompt, parseCompletionVerdict, true, evidence, undefined, 'medium');
+  assert.equal(claude.requests[0]!.modelSettings?.reasoning?.effort, 'medium');
+  for (const family of ['codex', 'byo'] as const) {
+    const other = capturingModel();
+    await runRoutedJudgeAttempt(route(family, other.model) as never, JUDGE_SYSTEM_PROMPT, prompt, parseCompletionVerdict, true, evidence, undefined, 'medium');
+    assert.equal(other.requests[0]!.modelSettings?.reasoning?.effort, undefined, `${family} keeps its own default`);
+  }
+  const unset = capturingModel();
+  await runRoutedJudgeAttempt(route('claude', unset.model) as never, JUDGE_SYSTEM_PROMPT, prompt, parseCompletionVerdict, true, evidence);
+  assert.equal(unset.requests[0]!.modelSettings?.reasoning?.effort, undefined, 'no effort asked, none sent');
+});
+
 test('on the Anthropic wire the instructions are a cache point and no marker text is sent', async () => {
   const bodies: Record<string, unknown>[] = [];
   const provider = createAnthropic({

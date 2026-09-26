@@ -4240,6 +4240,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         done: true,
         reason: `The completion reviewer failed; no review was completed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300),
         failedOpen: true,
+        reviewFailure: 'unavailable',
       };
     }
     const awaitingInput = verdict.awaitingUser === true && !verdict.failedOpen;
@@ -4272,6 +4273,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           reason: verdict.reason.slice(0, 1_600),
           ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
+          ...(verdict.failedOpen && verdict.reviewFailure ? { reviewFailure: verdict.reviewFailure } : {}),
           ...(verdict.selfJudge ? { selfJudge: true } : {}),
           // Requested-vs-actual judge identity on the durable event, so a
           // substitute is never read back as the pinned model's judgment. A
@@ -11216,6 +11218,8 @@ export function completionVerdictForAcceptedSource(input: {
   // unqualified positive.
   failedOpen?: boolean;
   reviewUnavailableReason?: string;
+  /** Why the review produced no verdict: timeout, unreadable, or unavailable. */
+  reviewFailure?: 'timeout' | 'invalid' | 'unavailable';
   selfJudge?: boolean;
   ownerSelectedJudge?: boolean;
   substituteForExactPin?: boolean;
@@ -11249,6 +11253,9 @@ export function completionVerdictForAcceptedSource(input: {
         ...(data.failedOpen === true ? { failedOpen: true } : {}),
         ...(data.failedOpen === true && typeof data.reason === 'string'
           ? { reviewUnavailableReason: data.reason } : {}),
+        ...(data.failedOpen === true
+          && (data.reviewFailure === 'timeout' || data.reviewFailure === 'invalid' || data.reviewFailure === 'unavailable')
+          ? { reviewFailure: data.reviewFailure } : {}),
         ...(data.selfJudge === true ? { selfJudge: true } : {}),
         ...(data.ownerSelectedJudge === true ? { ownerSelectedJudge: true } : {}),
         ...(data.substituteForExactPin === true ? { substituteForExactPin: true } : {}),

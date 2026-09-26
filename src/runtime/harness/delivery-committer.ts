@@ -1525,10 +1525,16 @@ export function commitTurnOutcome(
     const blockedFinding = detail === 'completion_review_blocked'
       ? (publishedVerdict?.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 400)
       : '';
+    // A reviewer that ran out of time was reached; it did not finish. Saying
+    // it could not be reached sends the owner to change a working setup.
+    const reviewTimedOut = detail === 'completion_review_failed_open' && publishedVerdict?.reviewFailure === 'timeout';
     const note = blockedFinding
       ? `Verification note: ${blockedFinding}`
-      : NOTES[detail]
-        ?? (detail === 'completion_review_blocked' ? NOTES.completion_review_negative! : NOTES.completion_review_did_not_stand!);
+      : reviewTimedOut
+        ? 'Verification note: the review of this result did not finish within its time limit, so it stands unreviewed. '
+          + 'Ask me to re-check it.'
+        : NOTES[detail]
+          ?? (detail === 'completion_review_blocked' ? NOTES.completion_review_negative! : NOTES.completion_review_did_not_stand!);
     const authored = effectiveOutcome.presentation.text.trim();
     const reviewedPresentation = completionReviewPresentation({
       authored, note, blockedFinding, objectiveMatches, replyMatches,

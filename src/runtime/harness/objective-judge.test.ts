@@ -533,6 +533,22 @@ test('an unreachable reviewer still gets Jev\'s reading of a reply Jev was not a
   assert.equal(v.jevAttempt?.accepted, false);
 });
 
+test('a review with no verdict says why: out of time, unreadable, or unreachable', async () => {
+  _setTypesafeKeyForTests(null);
+  try {
+    for (const [failure, expected] of [['timeout', 'timeout'], ['invalid', 'invalid'], ['error', 'unavailable']] as const) {
+      _setCompletionJudgeForTests(async () => ({ verdict: null, failure }));
+      const v = await judgeObjectiveComplete('Summarize the report.', 'The report says revenue rose.',
+        { sessionId: `probe-failure-${failure}`, skills: [], toolCallSummary: 'none' });
+      assert.equal(v.failedOpen, true);
+      assert.equal(v.reviewFailure, expected);
+    }
+  } finally {
+    _setCompletionJudgeForTests(unavailableSettingsJudge);
+    _setTypesafeKeyForTests(undefined);
+  }
+});
+
 test('a plan is not sent back on Jev\'s reading when the reviewer cannot run', async () => {
   _setTypesafeKeyForTests('ts_test');
   const jev = { count: 0 };
