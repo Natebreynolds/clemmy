@@ -171,3 +171,25 @@ test('landed-write facts for the next attempt name each write once and never a c
   assert.match(text, /do not repeat them/);
   assert.equal(facts.renderLandedWritesForFollowUp([{ runId: 'r', facts: { available: true, steps: [stepFacts('x', {})] } }]), '');
 });
+
+test('recurrence never counts a finished run with a goal gap as a clean pilot success', async () => {
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  const { projectAutomationRecurrencePilotSuccess } = await import('./automation-recurrence-runtime.js');
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'pilot-gap-1.json'), JSON.stringify({
+    id: 'pilot-gap-1',
+    workflow: 'FRAMEWORK-TEST pilot',
+    source: 'automation_pilot',
+    acceptDisabled: true,
+    status: 'completed',
+    terminalOutcome: 'succeeded',
+    goalOutcome: 'gap',
+    goalReason: 'the run\'s writes landed; the goal review still found a gap',
+    finishedAt: '2026-09-26T00:00:00.000Z',
+    triggerReceiptId: 'automation-pilot:v1:fixture',
+  }));
+  const result = projectAutomationRecurrencePilotSuccess('pilot-gap-1');
+  assert.equal(result.ok, false);
+  assert.equal(result.ok === false ? result.code : '', 'pilot_not_successful');
+});

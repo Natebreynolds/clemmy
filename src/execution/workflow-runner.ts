@@ -9677,12 +9677,24 @@ export function settlementGuardedStepOutput(input: {
   toolUses: string[] | undefined;
   output: unknown;
   /** This step continues a pinned-goal follow-up: its writes landed in the
-   *  earlier attempt, which is where its business evidence lives. Finding
-   *  nothing more to change completes it; a failed or unresolved call in this
-   *  attempt still blocks it. */
+   *  earlier attempt, which is where its business evidence lives. A re-check
+   *  it can prove that finds nothing more to change completes it; no re-check
+   *  at all, or a failed or unresolved call in this attempt, still blocks it. */
   continuesLandedWork?: boolean;
 }): unknown {
-  if (input.continuesLandedWork !== true && isPhantomStepCompletion(input.step, input.toolUses, input.output)) {
+  // A continued step's earlier writes are done; what this attempt owes is the
+  // re-check the goal review asked for, and a re-check leaves settled reads
+  // behind. A write it proposed again that the host did not repeat is not a
+  // new attempt at anything.
+  const continuedNoRecheckReason = (): string => {
+    const refusals = readPreDispatchRefusals(input.sessionId, input.sourceUserSeq);
+    const repeated = refusals.count > 0
+      ? ` It proposed ${refusals.tools.join(', ') || 'its write'} again and the host did not repeat it${refusals.details.length > 0 ? ` (${refusals.details.join(', ')})` : ''}.`
+      : '';
+    return `Step "${input.step.id}" continues work whose writes landed in the earlier attempt, but this attempt made no re-check: it settled no read and changed nothing, so what the goal review found missing is still missing.${repeated}`;
+  };
+  if (isPhantomStepCompletion(input.step, input.toolUses, input.output)) {
+    if (input.continuesLandedWork === true) return { blocked: true, reason: continuedNoRecheckReason() };
     // The true reason: a refused write is not "no tool was called".
     const refusals = readPreDispatchRefusals(input.sessionId, input.sourceUserSeq);
     const cls = stepSideEffectClass(input.step);
@@ -9736,9 +9748,20 @@ export function settlementGuardedStepOutput(input: {
     && audit.facts.successfulReads > 0
     && audit.facts.attemptedMutations === 0
   ) return input.output;
-  // A continued step's writes landed in the earlier attempt; re-checking and
-  // changing nothing more is a complete continuation, never "no evidence".
-  if (audit.status === 'no_business_evidence' && input.continuesLandedWork === true) return input.output;
+  // A continued step whose re-check settled at least one read and dispatched
+  // no new mutation found nothing more to change: a complete continuation.
+  // Its declared deliverable was produced by the attempt whose writes landed.
+  if (
+    audit.status === 'no_business_evidence'
+    && input.continuesLandedWork === true
+    && audit.facts.successfulReads > 0
+    && audit.facts.dispatchedMutations === 0
+  ) return input.output;
+  if (
+    audit.status === 'no_business_evidence'
+    && input.continuesLandedWork === true
+    && audit.facts.successfulReads === 0
+  ) return { blocked: true, reason: continuedNoRecheckReason() };
   return {
     blocked: true,
     reason: `Step "${input.step.id}" is not complete yet: ${audit.reason}. Its captured output remains in the run record for recovery.`,
@@ -16417,18 +16440,25 @@ async function processOneRunFile(
       // Compute the breaker preview without mutating it so report copy remains
       // deterministic before publication. A run whose landed writes the goal
       // decision kept is not a failure (see goalAttemptCountsAsFailure).
+      // A run whose landed writes the goal decision kept is neither a clean
+      // success nor a failure: it neither grows nor clears the failure streak.
+      const landedOutcome = landedWritesKept && !needsAttention;
       const prospectiveConsecutiveFailures = isCompiledProjectRun
         ? (needsAttention || goalRepursuing ? 1 : 0)
-        : !needsAttention && !goalAttemptCountsAsFailure
-          ? 0
-          : getConsecutiveFailures(workflow.name) + 1;
+        : landedOutcome
+          ? getConsecutiveFailures(workflow.name)
+          : !needsAttention && !goalAttemptCountsAsFailure
+            ? 0
+            : getConsecutiveFailures(workflow.name) + 1;
       const recordPublishedOutcomeLearning = (): void => {
         if (definitionResolution.definitionSource === 'compiled_snapshot') return;
-        recordWorkflowOutcome(
-          workflow.name,
-          !needsAttention && !goalAttemptCountsAsFailure,
-          needsAttention ? attentionReason : goalAttemptCountsAsFailure ? 'pinned goal unmet — re-pursuing' : undefined,
-        );
+        if (!landedOutcome) {
+          recordWorkflowOutcome(
+            workflow.name,
+            !needsAttention && !goalAttemptCountsAsFailure,
+            needsAttention ? attentionReason : goalAttemptCountsAsFailure ? 'pinned goal unmet — re-pursuing' : undefined,
+          );
+        }
         // Learning (skills, patterns, contract tightening) comes only from a
         // run whose goal is met or that has none; a kept gap is not a model
         // of success.
@@ -16714,8 +16744,15 @@ async function processOneRunFile(
       // empty-deliverable-read notes from 2.1). Keep result counts in that record;
       // append file and URL locations so users can still access produced artifacts.
       const runArtifacts = summarizeRunArtifacts(publicExecutionSteps, publicRawStepOutputs);
+      const goalScore = typeof goalVerdict?.successRatePercent === 'number'
+        ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)`
+        : '';
       const succeededBecause = (runGoal && goalDecision?.action === 'satisfied')
-        ? `goal met${typeof goalVerdict?.successRatePercent === 'number' ? ` (${goalVerdict.successRatePercent}%, ${goalVerdict.criteriaMet ?? '?'}/${goalVerdict.criteriaTotal ?? '?'} criteria)` : ''}`
+        ? `goal met${goalScore}`
+        : (runGoal && goalDecision?.action === 'gap')
+          ? `finished, with a goal gap${goalScore} — what it changed landed and stays; the review found something still missing`
+          : (runGoal && goalDecision?.action === 'follow_up')
+            ? `finished, with a goal gap${goalScore} — a follow-up attempt re-checks what is missing`
         : (targetVerdict?.judged && targetVerdict.reached)
           ? 'reached the workflow target'
           : (() => {

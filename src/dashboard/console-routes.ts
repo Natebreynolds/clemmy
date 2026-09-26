@@ -2458,6 +2458,10 @@ function normalizeWorkflowRunRecord(raw: Record<string, unknown>): WorkflowRunRe
       || raw.status === 'blocked_mutation'
       || workflowTerminalOutcomeNeedsAttention(terminalOutcome),
     ...(terminalOutcome ? { terminalOutcome } : {}),
+    // The pinned goal's own verdict rides beside the execution outcome, so a
+    // finished run with a goal gap never reads as clean success in a list.
+    ...(stringField(raw.goalOutcome) ? { goalOutcome: stringField(raw.goalOutcome)! } : {}),
+    ...(stringField(raw.goalReason) ? { goalReason: stringField(raw.goalReason)!.slice(0, 300) } : {}),
     ...(recoveryIntent ? { recoveryIntent } : {}),
   };
 }
@@ -5506,6 +5510,7 @@ export function registerConsoleRoutes(
             ? (lastRun.needsAttention ? 'needs_attention' : lastRun.status)
             : null,
           lastRunOutcome: lastRun?.terminalOutcome ?? null,
+          lastRunGoalOutcome: lastRun?.goalOutcome ?? null,
           lastRunNeedsAttention: lastRun?.needsAttention === true || undefined,
           lastRunId: lastRun?.id ?? null,
           lastRunFailedItemCount: lastRunFailedItems.length,

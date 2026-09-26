@@ -1231,6 +1231,8 @@ export interface MobileWorkflow {
   lastRunId: string | null;
   lastRunStatus: string | null;
   lastRunOutcome: 'succeeded' | 'partial' | 'blocked' | 'failed' | 'cancelled' | null;
+  /** The last run's pinned-goal verdict: a finished run may still carry a goal gap. */
+  lastRunGoalOutcome?: 'satisfied' | 'repursue' | 'follow_up' | 'gap' | 'escalate' | 'advisory' | null;
   lastRunAt: string | null;
 }
 

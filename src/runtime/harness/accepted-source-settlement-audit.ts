@@ -74,6 +74,9 @@ export interface AcceptedSourceSettlementAudit {
     /** Mutating settlements of any outcome: the step tried to change
      * something. Present → "found nothing to change" can never apply. */
     attemptedMutations: number;
+    /** Attempted mutations that actually left for their target: everything
+     * above except calls the host refused before dispatch. */
+    dispatchedMutations: number;
     unrecoveredBusinessFailures: number;
     confirmedWrites: number;
     /** Successful direct host provider mutations which require one exact
@@ -414,6 +417,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
     successfulLocalMutations: 0,
     successfulReads: 0,
     attemptedMutations: 0,
+    dispatchedMutations: 0,
     unrecoveredBusinessFailures: 0,
     confirmedWrites: 0,
     requiredHostExternalWriteProjections: 0,
@@ -690,6 +694,8 @@ export function auditAcceptedSourceSettlementTruth(input: {
       successfulLocalMutations: localMutations.filter(succeeded).length,
       successfulReads: [...settlements, ...localSettlements].filter((row) => succeeded(row) && !localMutates(row) && row.mutating === 0).length,
       attemptedMutations: [...settlements.filter((row) => row.mutating === 1), ...localMutations].length,
+      dispatchedMutations: [...settlements.filter((row) => row.mutating === 1), ...localMutations]
+        .filter((row) => row.execution_kind !== 'refused_pre_dispatch').length,
       unrecoveredBusinessFailures: unrecovered.length,
       confirmedWrites: writeEvidence.confirmed.length,
       requiredHostExternalWriteProjections: requiredHostExternalWriteProjections.length,

@@ -91,3 +91,43 @@ test('approved pilot criterion identities stay exact while objective review rema
   assert.equal(receipt.objectiveReview?.pass, false);
   assert.equal(receipt.pass, false, 'passing approved structural criteria cannot conceal a failed whole objective');
 });
+
+test('a follow-up reviewer opens an earlier attempt\'s retained receipts under that attempt\'s own namespace', async () => {
+  const { workflowGoalExecutionEvidence } = await import('./workflow-goal-review.js');
+  const { judgeEvidenceTools } = await import('../runtime/harness/judge-evidence-tools.js');
+  const rows = Array.from({ length: 400 }, (_, index) => ({ id: `row-${index}`, note: 'retained '.repeat(8) }));
+  const receipt = JSON.stringify({ data: { rows } });
+  assert.ok(receipt.length > 12_000, 'the prior receipt is larger than one lookup shows');
+  const earlier = {
+    available: true,
+    summary: 'earlier attempt: one tracker write landed (rh_prior)',
+    results: [{ toolName: 'provider_update', logicalToolCallId: 'write-1', status: 'verified' as const, outcome: 'succeeded' }],
+    evidence: { refKind: 'result', refs: () => ['rh_prior'], resolve: (ref: string) => ref === 'rh_prior' ? { text: receipt, value: JSON.parse(receipt) } : undefined },
+  };
+  // This run retains a result under the same bare ref name; the namespace keeps them apart.
+  const current = {
+    available: true,
+    summary: 'this attempt: one read',
+    results: [],
+    evidence: { refKind: 'result', refs: () => ['rh_prior'], resolve: (ref: string) => ref === 'rh_prior' ? { text: 'THIS RUN' } : undefined },
+  };
+  const context = workflowGoalExecutionEvidence(current, { steps: [] }, {
+    attempts: [{ runId: 'run-1', target: earlier }], carriedStepIds: ['append'], landedSummary: 'Already done by earlier attempts of this goal: run run-1, step "append": provider_update',
+  });
+  assert.ok(context.evidence.refs().includes('earlier_attempt:run-1/rh_prior'));
+  assert.ok(context.evidence.refs().includes('earlier_attempt_execution:run-1'));
+  assert.equal(context.evidence.resolve('rh_prior')?.text, 'THIS RUN', 'this run\'s own ref keeps its own content');
+  assert.equal(context.evidence.resolve('earlier_attempt:run-1/rh_prior')?.text, receipt);
+  assert.match(context.summary, /carried as completed .*: append/);
+  assert.match(context.summary, /earlier_attempt:<run id>\/<ref>/);
+
+  type Invokable = { name: string; invoke: (ctx: unknown, input: string) => Promise<unknown> };
+  const tools = judgeEvidenceTools(context.evidence) as unknown as Invokable[];
+  const opened = String(await tools.find((tool) => tool.name === 'open_evidence')!
+    .invoke({ context: {} }, JSON.stringify({ ref: 'earlier_attempt:run-1/rh_prior', max_chars: 400 })));
+  assert.ok(opened.includes(`of ${receipt.length}`), opened.slice(0, 200));
+  const queried = String(await tools.find((tool) => tool.name === 'query_evidence')!
+    .invoke({ context: {} }, JSON.stringify({ ref: 'earlier_attempt:run-1/rh_prior', path: 'data.rows', where_field: 'id', equals: 'row-377', fields: ['id'] })));
+  assert.match(queried, /1 of 400 records/);
+  assert.match(queried, /row-377/);
+});

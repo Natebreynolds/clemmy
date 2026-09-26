@@ -2342,6 +2342,8 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .workflow-row-status.status-running,
 .workflow-row-status.status-received,
 .workflow-row-status.status-queued { background: var(--accent-soft) !important; color: var(--accent-deep); }
+/* Finished, with a goal gap: done work with a note, neither success green nor failure red. */
+.workflow-row-status.status-gap { background: var(--accent-soft) !important; color: var(--accent-deep); }
 .chat-row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-row-meta { font-size: var(--t-xs); color: var(--fg-3); margin-top: 3px; display: flex; gap: var(--sp-2); }
 /* "needs input" / "needs binding" are asks, not successes: warning tone, and

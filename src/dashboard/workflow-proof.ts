@@ -17,6 +17,10 @@ export interface WorkflowProofRun {
   targetStepId: string | null;
   needsAttention: boolean;
   terminalOutcome?: WorkflowTerminalOutcome;
+  /** The pinned goal's retained verdict (satisfied, repursue, follow_up, gap,
+   *  escalate, advisory) and its one-line reason, when the run had a goal. */
+  goalOutcome?: string;
+  goalReason?: string;
 }
 
 export interface WorkflowProof {

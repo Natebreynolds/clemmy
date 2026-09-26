@@ -85,6 +85,10 @@ interface RawRunRecordLike {
   error?: unknown;
   needsAttention?: unknown;
   terminalOutcome?: unknown;
+  /** The pinned goal's retained verdict and reason; a finished run may carry
+   *  a goal gap that execution success must not hide. */
+  goalOutcome?: unknown;
+  goalReason?: unknown;
   reportBack?: { outcome?: unknown } | null;
   capabilityBlock?: unknown;
   mutationBlock?: unknown;
@@ -161,8 +165,29 @@ function workflowTerminalForOutcome(
   raw: RawRunRecordLike,
 ): SurfaceTerminal | undefined {
   switch (outcome) {
-    case 'succeeded':
+    case 'succeeded': {
+      // Execution finished either way. A goal gap the review found stays on
+      // the surface as such: not a block, not clean success.
+      const goal = text(raw.goalOutcome);
+      const reason = text(raw.goalReason)?.slice(0, 300);
+      if (goal === 'gap') {
+        return {
+          status: 'completed',
+          kind: 'succeeded_goal_gap',
+          text: `Run completed; the goal review found a gap${reason ? `: ${reason}` : '.'}`,
+          resumable: false,
+        };
+      }
+      if (goal === 'follow_up') {
+        return {
+          status: 'completed',
+          kind: 'succeeded_follow_up',
+          text: 'Run completed; a follow-up attempt re-checks what the goal review found missing.',
+          resumable: false,
+        };
+      }
       return { status: 'completed', kind: 'succeeded', text: 'Run completed.', resumable: false };
+    }
     case 'partial':
       return { status: 'failed', kind: 'partial', text: 'Run completed with partial results.', resumable: true };
     case 'failed':

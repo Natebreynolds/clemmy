@@ -62,7 +62,10 @@ import {
   type HostConsentCoverageScope,
 } from './host-consent-evidence.js';
 
-import { durableLogicalCallContract } from './logical-call-contract.js';
+import { canonicalLogicalToolName, durableLogicalCallContract } from './logical-call-contract.js';
+import { callableContractIdentity, normalizeCallableArguments } from './callable-contract.js';
+import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispatch-ledger.js';
+import { normalizeWorkflowGoalFollowUpLineage } from '../../execution/workflow-run-write-facts.js';
 import type { reviewWorkflowMutation } from './workflow-mutation-review.js';
 
 let mutationReviewerOverride: typeof reviewWorkflowMutation | null = null;
@@ -644,6 +647,98 @@ function reopenAuthoredStepAuthority(
   return { receipt, step, planScope };
 }
 
+/** One identity for "the same write": the canonical operation and its
+ * canonical arguments, the same normalization every carrier shape passes
+ * through. Never salted, so two attempts of one goal can be compared. */
+function crossAttemptWriteIdentity(toolName: string, args: unknown): string | null {
+  const canonical = canonicalLogicalToolName(toolName);
+  if (!canonical) return null;
+  const contract = normalizeCallableArguments({ kind: 'direct', toolName: canonical, args });
+  if (contract.error) return null;
+  return callableContractIdentity({ ...contract, toolName: canonical });
+}
+
+/**
+ * A goal follow-up continues a model-driven step whose writes landed in the
+ * attempt before it. That step may re-check and do what is missing; the exact
+ * write it already landed is a fact the run keeps, never a call to repeat.
+ * Read from the durable ledger: the earlier attempts' landed mutations of the
+ * same step, each with the arguments its dispatch sealed, compared by
+ * canonical identity with the proposed call. Anything unreadable matches
+ * nothing, so this can refuse only a write the ledger proves landed.
+ */
+function landedWriteInEarlierAttempt(input: {
+  reopened: ReopenedAuthoredStep;
+  attestation: HostCallAttestation;
+  args: Record<string, unknown>;
+}): HostInteractiveConsentResult | null {
+  try {
+    const { receipt } = input.reopened;
+    const record = readWorkflowRunRecord<Record<string, unknown>>(
+      path.join(WORKFLOW_RUNS_DIR, `${receipt.workflowRunId}.json`),
+    );
+    let lineage = normalizeWorkflowGoalFollowUpLineage(record?.goalFollowUp);
+    if (!lineage || !lineage.continuedStepIds.includes(receipt.stepId)) return null;
+    const proposed = crossAttemptWriteIdentity(input.attestation.toolName, input.args);
+    if (!proposed) return null;
+    const db = openEventLog();
+    const landedQuery = db.prepare(`
+      SELECT s.session_id AS sessionId, s.source_user_seq AS sourceUserSeq,
+             s.logical_tool_call_id AS logicalToolCallId, l.tool_name AS toolName,
+             p.physical_dispatch_id AS physicalDispatchId
+        FROM logical_call_settlements s
+        JOIN logical_tool_calls l ON l.session_id = s.session_id
+         AND l.source_user_seq = s.source_user_seq AND l.logical_tool_call_id = s.logical_tool_call_id
+        JOIN physical_dispatches p ON p.session_id = s.session_id
+         AND p.source_user_seq = s.source_user_seq AND p.logical_tool_call_id = s.logical_tool_call_id
+         AND p.state = 'returned'
+       WHERE (s.session_id = ? OR substr(s.session_id, 1, ?) = ?)
+         AND s.mutating = 1
+         AND s.execution_kind IN ('local_execution', 'provider_execution')
+         AND s.outcome_kind IN ('succeeded', 'empty_result')
+       ORDER BY s.rowid, p.ordinal DESC
+    `);
+    const seen = new Set<string>([receipt.workflowRunId]);
+    for (let hop = 0; lineage && hop < 4 && !seen.has(lineage.fromRunId); hop += 1) {
+      const earlierRunId = lineage.fromRunId;
+      seen.add(earlierRunId);
+      const exact = `workflow:${earlierRunId}:${receipt.stepId}`;
+      const childPrefix = `${exact}:`;
+      const rows = landedQuery.all(exact, childPrefix.length, childPrefix) as Array<{
+        sessionId: string; sourceUserSeq: number; logicalToolCallId: string; toolName: string; physicalDispatchId: string;
+      }>;
+      for (const row of rows) {
+        const sealed = loadPersistedCallAuthority({
+          sessionId: row.sessionId, sourceUserSeq: row.sourceUserSeq, physicalDispatchId: row.physicalDispatchId,
+        });
+        const landedArgs = sealed.ok && sealed.authority.logicalCallId === row.logicalToolCallId
+          ? sealed.authority.canonicalArgs
+          : loadPhysicalRequestEvidence({
+              sessionId: row.sessionId,
+              sourceUserSeq: row.sourceUserSeq,
+              logicalToolCallId: row.logicalToolCallId,
+              physicalDispatchId: row.physicalDispatchId,
+            })?.args;
+        if (landedArgs === undefined) continue;
+        const landedTool = sealed.ok && sealed.authority.logicalCallId === row.logicalToolCallId
+          ? sealed.authority.operationId
+          : row.toolName;
+        if (crossAttemptWriteIdentity(landedTool, landedArgs) !== proposed) continue;
+        return {
+          status: 'conflict',
+          reason: `workflow_write_already_landed: this exact ${input.attestation.toolName} write already landed in the earlier attempt of this goal (run ${earlierRunId}, call ${row.logicalToolCallId}) and stays as it is; it was not repeated. Do only what the goal review found missing.`,
+        };
+      }
+      const earlier = readWorkflowRunRecord<Record<string, unknown>>(path.join(WORKFLOW_RUNS_DIR, `${earlierRunId}.json`));
+      lineage = normalizeWorkflowGoalFollowUpLineage(earlier?.goalFollowUp);
+      if (lineage && !lineage.continuedStepIds.includes(receipt.stepId)) break;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /** Constraint review is a refusal boundary, never a replacement for consent.
  * Run before reserving an authored send, so a corrected proposal can still use
  * its one occurrence. Errors return a non-null hold and cannot fall through. */
@@ -1091,6 +1186,10 @@ async function evaluateAuthoredCatalogWrite(input: {
   });
   if (decision.kind === 'proceed' && ['exact_user_grant', 'settled_replay'].includes(decision.basis)) {
     if (decision.basis !== 'settled_replay') {
+      // A send keeps its own once-per-attempt floor; the landed-write check
+      // covers the ordinary writes a follow-up may continue.
+      const landed = gate === 'send' ? null : landedWriteInEarlierAttempt({ reopened, attestation, args: input.args });
+      if (landed) return landed;
       const refusal = await reviewAuthoredWriteConstraints({ ...input, schema });
       if (refusal) return refusal;
     }
@@ -1275,6 +1374,8 @@ async function evaluateAuthoredLocalWrite(input: {
     || !['exact_reversible_work', 'exact_ordinary_work', 'settled_replay'].includes(decision.basis)
   ) return null;
   if (decision.basis !== 'settled_replay') {
+    const landed = landedWriteInEarlierAttempt({ reopened, attestation, args: input.args });
+    if (landed) return landed;
     const refusal = await reviewAuthoredWriteConstraints(input);
     if (refusal) return refusal;
   }

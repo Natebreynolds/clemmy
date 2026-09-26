@@ -118,6 +118,7 @@ export function workflowCardStatus(w: {
   certification?: WorkflowCertification | null;
   lastRunStatus?: string | null;
   lastRunOutcome?: string | null;
+  lastRunGoalOutcome?: string | null;
   lastRunNeedsAttention?: boolean;
   lastRunFailedItemCount?: number;
 }): WorkflowCardStatus | null {
@@ -138,6 +139,24 @@ export function workflowCardStatus(w: {
   if (outcome === 'blocked') return { tone: 'warning', label: 'Last run blocked', aboutLastRun: true };
   if (outcome === 'partial') return { tone: 'warning', label: 'Last run partial', aboutLastRun: true };
   if (outcome === 'cancelled') return { tone: 'neutral', label: 'Last run cancelled', aboutLastRun: true };
+  // Execution finished, but the pinned goal review found a gap: done work
+  // with a note, never shown as clean success.
+  if (outcome === 'succeeded' && w.lastRunGoalOutcome === 'gap') {
+    return {
+      tone: 'info',
+      label: 'Last run done, with a gap',
+      detail: 'The run finished and what it changed landed. Its goal review found something still missing; the run report names it.',
+      aboutLastRun: true,
+    };
+  }
+  if (outcome === 'succeeded' && w.lastRunGoalOutcome === 'follow_up') {
+    return {
+      tone: 'info',
+      label: 'Last run done, re-checking',
+      detail: 'The run finished and what it changed landed. A follow-up attempt is re-checking what its goal review found missing.',
+      aboutLastRun: true,
+    };
+  }
   const s = (w.lastRunStatus ?? '').toLowerCase();
   // Once canonical outcome exists it is authoritative; status is only the
   // backwards-compatible lifecycle fallback for legacy records.

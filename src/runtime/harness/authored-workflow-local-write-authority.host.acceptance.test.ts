@@ -213,6 +213,9 @@ function createStepFixture(input: {
   sideEffect: 'read' | 'write' | 'send';
   requiresApproval?: boolean;
   prompt?: string;
+  /** This run is a pinned-goal follow-up continuing the named steps of an
+   *  earlier attempt whose writes landed. */
+  followUp?: { fromRunId: string; continuedStepIds: string[] };
 }) {
   const suffix = String(++serial);
   const workflowRunId = `run-local-write-${suffix}`;
@@ -249,6 +252,17 @@ function createStepFixture(input: {
     inputs: {},
     createdAt: '2026-08-31T00:00:00.000Z',
     startedAt: '2026-08-31T00:00:01.000Z',
+    ...(input.followUp
+      ? {
+          goalAttempt: 1,
+          requeuedFromRunId: input.followUp.fromRunId,
+          goalFollowUp: {
+            fromRunId: input.followUp.fromRunId,
+            carriedSteps: [],
+            continuedStepIds: input.followUp.continuedStepIds,
+          },
+        }
+      : {}),
   }), 'utf8');
   const session = eventlog.createSession({
     id: sessionId,
@@ -789,3 +803,76 @@ test(`real workflow host repairs an off-surface native call through ${repairedCa
 });
 
 }
+
+// ─── goal follow-ups: a landed write is a fact, never a call to repeat ──────
+
+const APPEND = { path: 'notes/tracker.md', content: 'row for today', mode: 'append', append: true };
+
+async function appendOnce(fixture: StepFixture, callId: string, args: Record<string, unknown>) {
+  const { bodies, tools } = fixtureTools(['write_file']);
+  const model = stubModel([[toolCall(callId, 'write_file', args)], [textMsg('appended')]]);
+  const agent = { model, tools };
+  bindSurface(fixture, agent, tools);
+  const outcome = await runProductionHost(fixture, agent);
+  return { bodies, outcome };
+}
+
+test('a follow-up continuing a step never repeats the write that landed in the earlier attempt; a distinct write still proceeds', async () => {
+  const first = createStepFixture({ kind: 'workflow', sideEffect: 'write' });
+  assert.equal(first.recorded.status, 'ready');
+  const landed = await appendOnce(first, 'append-1', APPEND);
+  assert.equal(landed.bodies.write_file, 1, JSON.stringify(landed.outcome.history));
+  assert.deepEqual(
+    nonRefusedSettlements(first).map((row) => [row.logical_tool_call_id, row.outcome_kind]),
+    [['append-1', 'succeeded']],
+  );
+
+  const followUp = createStepFixture({
+    kind: 'workflow',
+    sideEffect: 'write',
+    followUp: { fromRunId: first.workflowRunId, continuedStepIds: [first.stepId] },
+  });
+  assert.equal(followUp.recorded.status, 'ready');
+  const { bodies, tools } = fixtureTools(['write_file']);
+  const distinct = { ...APPEND, content: 'row the review found missing' };
+  const model = stubModel([
+    [toolCall('append-again', 'write_file', APPEND)],
+    [toolCall('append-missing', 'write_file', distinct)],
+    [textMsg('did only what was missing')],
+  ]);
+  const agent = { model, tools };
+  bindSurface(followUp, agent, tools);
+  const outcome = await runProductionHost(followUp, agent);
+  assert.equal(bodies.write_file, 1, `exactly one physical effect: the distinct append; history=${JSON.stringify(outcome.history).slice(0, 2000)}`);
+  const history = JSON.stringify(outcome.history);
+  assert.match(history, /workflow_write_already_landed/);
+  assert.ok(history.includes(first.workflowRunId), 'the refusal names the attempt where the write landed');
+  assert.deepEqual(
+    nonRefusedSettlements(followUp).map((row) => [row.logical_tool_call_id, row.outcome_kind]),
+    [['append-missing', 'succeeded']],
+    'the repeated append never dispatched; the missing one settled once',
+  );
+  assert.deepEqual(dispositionMarkers(outcome.history), [{ disposition: 'refused_pre_dispatch', retry: 'replan' }]);
+  assert.equal(pendingApprovalCount(followUp), 0, 'a landed write is refused by the host, never turned into a card');
+});
+
+test('the landed-write refusal is scoped to a follow-up continuing that step: a fresh run may make the same write', async () => {
+  const earlier = createStepFixture({ kind: 'workflow', sideEffect: 'write' });
+  const landed = await appendOnce(earlier, 'append-fresh-1', APPEND);
+  assert.equal(landed.bodies.write_file, 1);
+
+  const fresh = createStepFixture({ kind: 'workflow', sideEffect: 'write' });
+  const again = await appendOnce(fresh, 'append-fresh-2', APPEND);
+  assert.equal(again.bodies.write_file, 1, 'a run that follows up on nothing writes on its own authority');
+  assert.doesNotMatch(JSON.stringify(again.outcome.history), /workflow_write_already_landed/);
+
+  // A follow-up that carried the step (not continued it) never re-runs it at
+  // all; a follow-up that continues a DIFFERENT step is not protected for this one.
+  const other = createStepFixture({
+    kind: 'workflow',
+    sideEffect: 'write',
+    followUp: { fromRunId: earlier.workflowRunId, continuedStepIds: ['some_other_step'] },
+  });
+  const otherRun = await appendOnce(other, 'append-other', APPEND);
+  assert.equal(otherRun.bodies.write_file, 1, 'only the continued step\'s own landed writes are held');
+});

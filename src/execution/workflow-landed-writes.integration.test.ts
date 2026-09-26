@@ -33,6 +33,8 @@ const spaces = await import('../spaces/store.js');
 const workspaceDb = await import('../spaces/workspace-db.js');
 const shared = await import('../tools/shared.js');
 const notifications = await import('../runtime/notifications.js');
+const planProposals = await import('../agents/plan-proposals.js');
+const workflowEvents = await import('./workflow-events.js');
 
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
@@ -165,7 +167,7 @@ test('FRAMEWORK-TEST-landed-dataset: a gap after a landed, repeat-safe write re-
   assert.equal(first.reportBack?.outcome, 'done');
   assert.doesNotMatch(String(first.reportBack?.detail), /auto-heal is PAUSED|reconcile any completed writes|re-running could double/);
   assert.match(String(first.reportBack?.detail), /landed and stays as it is/);
-  assert.equal(failureLedger.getConsecutiveFailures(persisted.name), 0, 'a landed-write run is not a failure');
+  assert.equal(failureLedger.getConsecutiveFailures(persisted.name), 2, 'a landed-write run neither grows nor clears the failure streak');
   const observationsAfterFirst = workspaceDb.listWorkspaceDatasetObservations(slug, { limit: 20 }).length;
   assert.equal(observationsAfterFirst, 1, 'the first run committed the dataset once');
 
@@ -191,8 +193,10 @@ test('FRAMEWORK-TEST-landed-dataset: a gap after a landed, repeat-safe write re-
     observationsAfterFirst,
     'the content-addressed replay added no second write',
   );
-  assert.equal(failureLedger.getConsecutiveFailures(persisted.name), 0);
+  assert.equal(failureLedger.getConsecutiveFailures(persisted.name), 2, 'done-with-a-gap leaves the streak as it was');
   assert.equal(reviewer.calls(), 2, 'the goal reviewer judged both attempts');
+  const summaries = workflowEvents.readWorkflowEvents(persisted.name, followUp.id).filter((event) => event.kind === 'run_summary');
+  assert.match(String(summaries.at(-1)?.meta?.because ?? ''), /finished, with a goal gap/, 'the run list summary names the gap');
   const pausedNotices = notifications.loadNotifications()
     .filter((row) => String(row.body ?? '').includes('auto-heal is PAUSED'));
   assert.equal(pausedNotices.length, 0, 'self-healing never paused for landed work');
@@ -333,7 +337,17 @@ test('FRAMEWORK-TEST-landed-tracker: a gap after a landed write that cannot repe
     0,
     'a write that cannot repeat is never re-run automatically',
   );
-  assert.equal(failureLedger.getConsecutiveFailures(persisted.name), 0);
+  assert.equal(failureLedger.getConsecutiveFailures(persisted.name), 2, 'the streak is left as it was');
+  // The goal contract keeps the gap: the goal is not satisfied, and the
+  // retired contract carries the reason a person or /goal can read.
+  const goalSession = planProposals.workflowGoalSessionId(persisted.data.name);
+  assert.equal(planProposals.getActiveGoalForSession(goalSession), null, 'no goal stays active behind a named gap');
+  const retired = planProposals.listPlanProposals({ status: 'expired', sessionId: goalSession });
+  assert.equal(retired.length, 1);
+  assert.match(String(retired[0]?.doneReason ?? ''), /writes landed/);
+  assert.equal(planProposals.listPlanProposals({ status: 'satisfied', sessionId: goalSession }).length, 0);
+  const summaries = workflowEvents.readWorkflowEvents(persisted.name, queued.id!).filter((event) => event.kind === 'run_summary');
+  assert.match(String(summaries.at(-1)?.meta?.because ?? ''), /finished, with a goal gap/);
 });
 
 test('FRAMEWORK-TEST-unconfirmed-tracker: a write whose provider reply never came back does not read as landed or done', async () => {
@@ -380,8 +394,9 @@ const attemptSettlement = await import('../runtime/harness/attempt-settlement.js
 const stepResults = await import('../tools/step-result-tool.js');
 
 /** What the stubbed model does in one step attempt. Every tool call it makes
- *  is admitted and settled through the same ledger path the host uses. */
-type ModelAction = { tool: string; mutating: boolean; result: unknown };
+ *  is admitted and settled through the same ledger path the host uses. A
+ *  call marked `business: false` is one of Clem's own local reads. */
+type ModelAction = { tool: string; mutating: boolean; result: unknown; business?: boolean };
 
 function stubModelStep(plan: (attempt: number, input: string) => { calls: ModelAction[]; output: unknown }) {
   const prompts: string[] = [];
@@ -420,7 +435,7 @@ function stubModelStep(plan: (attempt: number, input: string) => { calls: ModelA
             callId: logicalToolCallId,
             args,
             mutating: call.mutating,
-            businessCall: true,
+            businessCall: call.business ?? true,
             result: call.result,
           });
         });
@@ -438,16 +453,23 @@ function stubModelStep(plan: (attempt: number, input: string) => { calls: ModelA
   return { prompts };
 }
 
-/** First review finds a gap; the second finds the goal met. */
-function stubReviewerGapThenMet(note: string): void {
-  let reviews = 0;
+/** First review finds a gap; the second finds the goal met. Each review's
+ *  evidence text and evidence source are kept for the pins. */
+type ReviewerEvidence = { refs(): readonly string[]; resolve(ref: string): { text: string } | undefined };
+function stubReviewerGapThenMet(note: string): { reviews: Array<{ evidenceText: string; evidence?: ReviewerEvidence }> } {
+  const reviews: Array<{ evidenceText: string; evidence?: ReviewerEvidence }> = [];
   runner._setWorkflowRunGoalJudgeForTests({
-    judge: async () => ({ done: reviews++ > 0, reason: note }),
-    judgeCriteria: async (_objective: string, criteria: string[]) => {
-      const met = reviews++ > 0;
+    judge: async (_objective: string, evidenceText: string) => {
+      reviews.push({ evidenceText });
+      return { done: reviews.length > 1, reason: note };
+    },
+    judgeCriteria: async (_objective: string, criteria: string[], evidenceText: string, evidence?: ReviewerEvidence) => {
+      reviews.push({ evidenceText, evidence });
+      const met = reviews.length > 1;
       return criteria.map((criterion) => ({ criterion, pass: met, note: met ? 'met under test' : note }));
     },
   } as never);
+  return { reviews };
 }
 
 function modelWriteWorkflow(name: string): WorkflowDefinition {
@@ -489,7 +511,7 @@ test('FRAMEWORK-TEST-landed-review: a model step whose write landed re-checks on
         calls: [{ tool: 'framework_test_tracker_read', mutating: false, result: { ok: true, data: { rows: [{ id: 'row-7' }] } } }],
         output: { url: 'https://tracker.example.test/sheet', leads: 0, rechecked: 7 },
       });
-  stubReviewerGapThenMet('The seven-day re-check was skipped.');
+  const reviewer = stubReviewerGapThenMet('The seven-day re-check was skipped.');
   const persisted = workflowStore.writeWorkflow('FRAMEWORK-TEST-landed-review', modelWriteWorkflow('FRAMEWORK-TEST-landed-review'));
   const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
     source: 'schedule',
@@ -528,37 +550,138 @@ test('FRAMEWORK-TEST-landed-review: a model step whose write landed re-checks on
     assert.equal(second.terminalOutcome, 'succeeded');
     assert.equal(second.goalOutcome, 'satisfied');
     assert.equal(mutatingSettlementsFor(followUp.id, 'review'), 0, 'the landed write was not repeated');
+    // The follow-up's reviewer saw the earlier attempt: its landed write and
+    // its receipts, under that attempt's own namespace.
+    assert.equal(reviewer.reviews.length, 2);
+    const secondReview = reviewer.reviews[1]!;
+    assert.match(secondReview.evidenceText, /follows up on earlier attempts of the same goal/);
+    assert.match(secondReview.evidenceText, /Already done by earlier attempts of this goal/);
+    const refs = [...(secondReview.evidence?.refs() ?? [])];
+    assert.ok(refs.includes(`earlier_attempt_execution:${queued.id}`), refs.join(', '));
+    const earlierExecution = secondReview.evidence?.resolve(`earlier_attempt_execution:${queued.id}`)?.text ?? '';
+    assert.match(earlierExecution, new RegExp(`Exact workflow run ${queued.id}`), 'the earlier attempt\'s own execution receipts open under its ref');
+    assert.match(earlierExecution, /framework_test_tracker_update/);
+    // Nothing of this size was retained behind a ref here; the large-receipt
+    // case opens through the same namespace in the host acceptance pin.
+    assert.equal(refs.filter((ref) => ref.startsWith('earlier_attempt:')).every((ref) => ref.startsWith(`earlier_attempt:${queued.id}/`)), true);
+    // One goal contract spans the attempts and ends satisfied, not expired.
+    const goalSession = planProposals.workflowGoalSessionId(persisted.data.name);
+    assert.equal(planProposals.listPlanProposals({ status: 'satisfied', sessionId: goalSession }).length, 1);
+    assert.equal(planProposals.listPlanProposals({ status: 'expired', sessionId: goalSession }).length, 0);
   } finally {
     runner._setWorkflowHarnessLoopImplsForTests();
   }
 });
 
-test('FRAMEWORK-TEST-landed-review-idle: a continued step that finds nothing more to change completes instead of blocking', async () => {
+/** A first attempt that lands one tracker write, then a follow-up whose
+ *  continued step does what `secondAttempt` says. */
+async function runFollowUpOf(name: string, occurrence: number, secondAttempt: { calls: ModelAction[]; output: unknown }) {
   installQuietReportSeams();
   stubModelStep((attempt) => attempt === 1
     ? {
-        calls: [{ tool: 'framework_test_tracker_update', mutating: true, result: { ok: true, data: { id: 'row-9' } } }],
+        calls: [{ tool: 'framework_test_tracker_update', mutating: true, result: { ok: true, data: { id: `row-${occurrence}` } } }],
         output: { url: 'https://tracker.example.test/sheet', leads: 1 },
       }
-    : { calls: [], output: { url: 'https://tracker.example.test/sheet', leads: 0, note: 'nothing more to change' } });
+    : secondAttempt);
   stubReviewerGapThenMet('The seven-day re-check was not evidenced.');
-  const persisted = workflowStore.writeWorkflow('FRAMEWORK-TEST-landed-review-idle', modelWriteWorkflow('FRAMEWORK-TEST-landed-review-idle'));
+  const persisted = workflowStore.writeWorkflow(name, modelWriteWorkflow(name));
   const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
     source: 'schedule',
     workflowSlug: persisted.name,
-    triggerReceiptId: `workflow-schedule:v1:${persisted.name}:1790040000000`,
+    triggerReceiptId: `workflow-schedule:v1:${persisted.name}:${1790040000000 + occurrence}`,
+    dedupe: false,
+  });
+  assert.equal(queued.status, 'queued', queued.message);
+  await runner.processWorkflowRuns({} as never);
+  const followUp = queuedRunsFor(persisted.data.name).find((record) => record.id !== queued.id);
+  assert.ok(followUp, 'a follow-up was queued');
+  assert.deepEqual(followUp!.goalFollowUp?.continuedStepIds, ['review']);
+  await runner.processWorkflowRuns({} as never);
+  return { first: readRun(queued.id!), second: readRun(followUp!.id) };
+}
+
+test('FRAMEWORK-TEST-landed-review-idle: a continued step that makes no re-check at all is not complete', async () => {
+  try {
+    const { second } = await runFollowUpOf('FRAMEWORK-TEST-landed-review-idle', 1, {
+      calls: [],
+      output: { url: 'https://tracker.example.test/sheet', leads: 0, note: 'nothing more to change' },
+    });
+    assert.equal(second.status, 'blocked', JSON.stringify({ status: second.status, blockedSteps: second.blockedSteps }));
+    assert.equal(second.blockedSteps?.[0]?.stepId, 'review');
+    assert.match(String(second.blockedSteps?.[0]?.reason), /made no re-check/);
+    assert.match(String(second.blockedSteps?.[0]?.reason), /settled no read and changed nothing/);
+    assert.notEqual(second.goalOutcome, 'satisfied');
+  } finally {
+    runner._setWorkflowHarnessLoopImplsForTests();
+  }
+});
+
+test('FRAMEWORK-TEST-landed-review-recheck: a continued step whose own read proves nothing remains completes without a new write', async () => {
+  try {
+    const { second } = await runFollowUpOf('FRAMEWORK-TEST-landed-review-recheck', 2, {
+      // A local re-check (one of Clem's own reads, no business call) that finds
+      // the tracker already current.
+      calls: [{ tool: 'read_file', mutating: false, business: false, result: { ok: true, path: 'tracker-cache.json', rows: 7 } }],
+      output: { url: 'https://tracker.example.test/sheet', leads: 0, rechecked: 7 },
+    });
+    assert.equal(second.status, 'completed', JSON.stringify({ status: second.status, blockedSteps: second.blockedSteps, error: second.error }));
+    assert.notEqual(second.needsAttention, true);
+    assert.equal(second.terminalOutcome, 'succeeded');
+    assert.equal(second.goalOutcome, 'satisfied');
+    assert.equal(mutatingSettlementsFor(second.id, 'review'), 0, 'nothing was written again');
+  } finally {
+    runner._setWorkflowHarnessLoopImplsForTests();
+  }
+});
+
+test('FRAMEWORK-TEST-landed-carry: a follow-up carries the exact-call step whose write cannot repeat and re-runs only the model step', async () => {
+  installQuietReportSeams();
+  const provider = installFictionalProviderWrite('landed-carry');
+  const model = stubModelStep((attempt) => attempt === 1
+    ? {
+        calls: [{ tool: 'framework_test_tracker_update', mutating: true, result: { ok: true, data: { id: 'row-carry' } } }],
+        output: { url: 'https://tracker.example.test/sheet', leads: 1 },
+      }
+    : {
+        calls: [{ tool: 'framework_test_tracker_read', mutating: false, result: { ok: true, data: { rows: [{ id: 'row-carry' }] } } }],
+        output: { url: 'https://tracker.example.test/sheet', leads: 0, rechecked: 7 },
+      });
+  stubReviewerGapThenMet('The seven-day re-check was skipped.');
+  const definition = modelWriteWorkflow('FRAMEWORK-TEST-landed-carry');
+  definition.steps = [
+    { id: 'append_row', prompt: '', sideEffect: 'write', call: { tool: provider.operationId, args: { scope: 'fixture-tracker' } } },
+    { ...definition.steps[0]!, dependsOn: ['append_row'] },
+  ];
+  const persisted = workflowStore.writeWorkflow(definition.name, definition);
+  const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
+    source: 'schedule',
+    workflowSlug: persisted.name,
+    triggerReceiptId: `workflow-schedule:v1:${persisted.name}:1790050000000`,
     dedupe: false,
   });
   assert.equal(queued.status, 'queued', queued.message);
   try {
     await runner.processWorkflowRuns({} as never);
+    const first = readRun(queued.id!);
+    assert.equal(first.status, 'completed', JSON.stringify({ blockedSteps: first.blockedSteps, error: first.error }));
+    assert.equal(first.goalOutcome, 'follow_up', first.goalReason);
+    assert.equal(provider.bodies(), 1);
     const followUp = queuedRunsFor(persisted.data.name).find((record) => record.id !== queued.id);
-    assert.ok(followUp, 'a follow-up was queued');
+    assert.ok(followUp);
+    assert.deepEqual(followUp!.goalFollowUp?.carriedSteps, [{ stepId: 'append_row', disposition: 'landed' }]);
+    assert.deepEqual(followUp!.goalFollowUp?.continuedStepIds, ['review']);
+
     await runner.processWorkflowRuns({} as never);
+
     const second = readRun(followUp!.id);
     assert.equal(second.status, 'completed', JSON.stringify({ blockedSteps: second.blockedSteps, error: second.error }));
-    assert.notEqual(second.needsAttention, true);
-    assert.equal(second.terminalOutcome, 'succeeded');
+    assert.equal(second.goalOutcome, 'satisfied');
+    assert.equal(provider.bodies(), 1, 'the carried step never dispatched again');
+    assert.equal(model.prompts.length, 2, 'only the model step ran again');
+    assert.deepEqual(second.stepOutputs?.append_row, first.stepOutputs?.append_row, 'the carried step\'s recorded output fed the follow-up');
+    const events = workflowEvents.readWorkflowEvents(persisted.name, followUp!.id);
+    const carried = events.find((event) => event.kind === 'step_completed' && event.stepId === 'append_row');
+    assert.equal(carried?.meta?.inheritedFromRunId, queued.id);
   } finally {
     runner._setWorkflowHarnessLoopImplsForTests();
   }

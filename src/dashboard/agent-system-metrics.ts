@@ -929,7 +929,14 @@ function runDurationSeconds(run: RawWorkflowRunRecord): number | null {
 }
 
 function workflowRunClean(run: RawWorkflowRunRecord): boolean {
-  return run.status === 'completed' && !run.needsAttention && !run.goalOutcome?.includes('repursue');
+  // A finished run whose goal review found a gap did its work but is not a
+  // clean success, whether a follow-up re-checks the gap or it was named.
+  const goal = run.goalOutcome ?? '';
+  return run.status === 'completed'
+    && !run.needsAttention
+    && !goal.includes('repursue')
+    && goal !== 'follow_up'
+    && goal !== 'gap';
 }
 
 function workflowRunTerminal(run: RawWorkflowRunRecord): boolean {
@@ -1023,7 +1030,11 @@ function scanWorkflowEvents(records: RawWorkflowRunRecord[]): {
   for (const run of records) {
     if (!run.workflow || !run.id) continue;
     if (run.error) addLoopCause(causes, 'run', run.error, `${run.workflow}/${run.id}: ${run.error}`);
-    if ((run.goalOutcome === 'escalate' || run.goalOutcome === 'repursue') && run.goalReason) {
+    if (
+      (run.goalOutcome === 'escalate' || run.goalOutcome === 'repursue'
+        || run.goalOutcome === 'follow_up' || run.goalOutcome === 'gap')
+      && run.goalReason
+    ) {
       addLoopCause(causes, 'goal', run.goalReason, `${run.workflow}/${run.id}: ${run.goalReason}`);
     }
     const events = readWorkflowRunEvents(run.workflow, run.id, aliases);

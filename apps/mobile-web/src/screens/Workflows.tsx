@@ -25,6 +25,26 @@ const TERMINAL_RUN_STATUSES = new Set([
   'completed', 'completed_with_errors', 'error', 'failed', 'cancelled', 'dry_run', 'creation_test',
 ]);
 
+/** A finished run whose goal review found a gap is done work with a note:
+ *  its pill says so instead of reading as plain success. */
+function workflowRowGoalGap(wf: Pick<MobileWorkflow, 'lastRunOutcome' | 'lastRunGoalOutcome'>): 'gap' | 'follow_up' | null {
+  if (wf.lastRunOutcome !== 'succeeded') return null;
+  return wf.lastRunGoalOutcome === 'gap' || wf.lastRunGoalOutcome === 'follow_up' ? wf.lastRunGoalOutcome : null;
+}
+
+function workflowRowStatusKey(wf: Pick<MobileWorkflow, 'lastRunOutcome' | 'lastRunStatus' | 'lastRunGoalOutcome'>): string {
+  if (workflowRowGoalGap(wf)) return 'gap';
+  return (wf.lastRunOutcome ?? wf.lastRunStatus ?? 'unknown').toLowerCase();
+}
+
+function workflowRowStatusLabel(wf: Pick<MobileWorkflow, 'enabled' | 'lastRunOutcome' | 'lastRunStatus' | 'lastRunGoalOutcome'>): string {
+  if (!wf.enabled) return 'disabled';
+  const gap = workflowRowGoalGap(wf);
+  if (gap === 'gap') return 'done, with a gap';
+  if (gap === 'follow_up') return 'done, re-checking';
+  return wf.lastRunOutcome ?? wf.lastRunStatus ?? 'idle';
+}
+
 export function Workflows() {
   const [selected, setSelected] = useState<MobileWorkflow | null>(null);
   useBackGesture(selected !== null, () => setSelected(null));
@@ -61,8 +81,8 @@ export function Workflows() {
         <button key={wf.name} class="workflow-row" onClick={() => setSelected(wf)}>
           <div class="workflow-row-head">
             <span class="workflow-row-name">{wf.name}</span>
-            <span class={`workflow-row-status status-${(wf.lastRunOutcome ?? wf.lastRunStatus ?? 'unknown').toLowerCase()}`}>
-              {wf.enabled ? (wf.lastRunOutcome ?? wf.lastRunStatus ?? 'idle') : 'disabled'}
+            <span class={`workflow-row-status status-${workflowRowStatusKey(wf)}`}>
+              {workflowRowStatusLabel(wf)}
             </span>
           </div>
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}

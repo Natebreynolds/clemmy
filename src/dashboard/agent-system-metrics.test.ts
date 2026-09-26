@@ -87,6 +87,17 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
     startedAt: '2026-06-26T12:00:10.000Z',
     needsAttention: true,
   });
+  // Finished, writes landed, goal review found a gap: terminal, not clean.
+  writeWorkflowRun({
+    id: 'run-gap',
+    workflow: 'Metric Workflow',
+    status: 'completed',
+    createdAt: '2026-06-26T13:00:00.000Z',
+    startedAt: '2026-06-26T13:00:10.000Z',
+    finishedAt: '2026-06-26T13:01:10.000Z',
+    goalOutcome: 'gap',
+    goalReason: 'the run\'s writes landed; the goal review still found a gap',
+  });
 
   appendWorkflowEvent('metric-wf', 'run-bad', {
     kind: 'attempt_record',
@@ -272,8 +283,12 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
   assert.equal(researcher?.comms24h.received, 1);
   assert.match(researcher?.recommendation ?? '', /last error/i);
 
-  assert.equal(metrics.loops.workflowRuns.total, 2, 'only terminal runs enter the loop-effectiveness denominator');
-  assert.equal(metrics.loops.workflowRuns.clean, 1);
+  assert.equal(metrics.loops.workflowRuns.total, 3, 'only terminal runs enter the loop-effectiveness denominator');
+  assert.equal(metrics.loops.workflowRuns.clean, 1, 'a finished run with a goal gap is terminal but never clean');
+  assert.ok(
+    metrics.loops.issueCauses.some((cause) => /goal review still found a gap/.test(cause.label) || cause.examples.some((example) => /goal review still found a gap/.test(example))),
+    `a goal gap is a visible loop cause: ${JSON.stringify(metrics.loops.issueCauses).slice(0, 600)}`,
+  );
   assert.equal(metrics.loops.workflowRuns.needsAttention, 1, 'an expected non-terminal approval park is not an attention-needed outcome');
   assert.equal(metrics.loops.attemptRecords, 1);
   assert.equal(metrics.loops.retryEvents, 1);
@@ -286,7 +301,9 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
   assert.ok(metrics.loops.loopEffectivenessScore < 80);
   assert.equal(metrics.loops.interventions.status, 'thrashing');
   assert.ok(metrics.loops.interventions.score < 20);
-  assert.equal(metrics.loops.interventions.retryPressurePct, 50);
+  // One retry across three terminal runs: the finished-with-a-gap run is a
+  // terminal run like any other.
+  assert.equal(metrics.loops.interventions.retryPressurePct, 33);
   assert.equal(metrics.loops.interventions.retryEvents, 1);
   assert.equal(metrics.loops.interventions.attemptRecords, 1);
   assert.deepEqual(metrics.loops.interventions.selfHeal, { runs: 1, clean: 0, needsAttention: 1, successRatePct: 0 });

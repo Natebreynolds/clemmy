@@ -788,3 +788,28 @@ test('a run the boot-resume cap parked projects as paused with its own reason â€
   assert.notEqual(entry.lifecycle, 'awaiting_approval');
   rmSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), { force: true });
 });
+
+test('a finished run with a goal gap reads as completed with the gap on the shared surface, never as a block or clean success', () => {
+  const observedAt = '2026-08-04T12:00:00.000Z';
+  const base = {
+    workflow: 'Gap workflow',
+    status: 'completed',
+    terminalOutcome: 'succeeded',
+    createdAt: '2026-08-04T10:00:00.000Z',
+    finishedAt: '2026-08-04T10:05:00.000Z',
+  };
+  const gap = projectWorkflowRunActivity({
+    ...base, id: 'goal-gap', goalOutcome: 'gap', goalReason: 'the run\'s writes landed; the goal review still found a gap after 2/2 attempts',
+  }, observedAt)!;
+  assert.equal(gap.lifecycle, 'completed');
+  assert.equal(gap.terminal?.status, 'completed');
+  assert.equal(gap.terminal?.kind, 'succeeded_goal_gap');
+  assert.match(gap.terminal?.text ?? '', /found a gap: the run's writes landed/);
+  assert.equal(shouldSurfaceInWorkingNow(gap, Date.parse(observedAt)), false, 'done work with a note is history, not current');
+  const followUp = projectWorkflowRunActivity({ ...base, id: 'goal-follow-up', goalOutcome: 'follow_up' }, observedAt)!;
+  assert.equal(followUp.lifecycle, 'completed');
+  assert.equal(followUp.terminal?.kind, 'succeeded_follow_up');
+  const met = projectWorkflowRunActivity({ ...base, id: 'goal-met', goalOutcome: 'satisfied' }, observedAt)!;
+  assert.equal(met.terminal?.kind, 'succeeded');
+  assert.equal(met.terminal?.text, 'Run completed.');
+});

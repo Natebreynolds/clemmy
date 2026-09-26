@@ -39,7 +39,17 @@ export function workflowGoalExecutionEvidence(
   }
   const entries = [...counts].map(([key, count]) => `${key}: ${count}`);
   const refs = new Map((target.evidence?.refs() ?? []).map(ref => [ref, ref]));
-  const earlierRefs = new Map((earlier?.attempts ?? []).map((attempt) => [`earlier_attempt_execution:${attempt.runId}`, attempt.target]));
+  // An earlier attempt exposes its execution summary and, under its own run
+  // id, every retained receipt its evidence holds. The reviewer opens those
+  // with the same tools as this run's, and an earlier attempt's ref name can
+  // never shadow one of this run's.
+  const earlierSummaries = new Map((earlier?.attempts ?? []).map((attempt) => [`earlier_attempt_execution:${attempt.runId}`, attempt.target]));
+  const earlierRetained = new Map<string, { target: WorkflowTargetEvidence; ref: string }>();
+  for (const attempt of earlier?.attempts ?? []) {
+    for (const ref of attempt.target.evidence?.refs() ?? []) {
+      earlierRetained.set(`earlier_attempt:${attempt.runId}/${ref}`, { target: attempt.target, ref });
+    }
+  }
   const earlierLines = earlier && earlier.attempts.length > 0
     ? [
         `This run follows up on earlier attempts of the same goal (${earlier.attempts.map((attempt) => attempt.runId).join(', ')}). Their writes landed and stay; this run was not asked to repeat them.`,
@@ -47,7 +57,9 @@ export function workflowGoalExecutionEvidence(
           ? [`Steps carried as completed from the attempt before this one, not re-executed here: ${earlier.carriedStepIds.join(', ')}. Their outputs above are the recorded outputs of that attempt.`]
           : []),
         ...(earlier.landedSummary ? [earlier.landedSummary] : []),
-        `Open ${[...earlierRefs.keys()].join(', ')} for the authenticated receipts of those attempts.`,
+        `Open ${[...earlierSummaries.keys()].join(', ')} for the authenticated receipts of those attempts${earlierRetained.size > 0
+          ? `; their ${earlierRetained.size} retained result${earlierRetained.size === 1 ? '' : 's'} open under refs of the form earlier_attempt:<run id>/<ref>`
+          : ''}.`,
       ]
     : [];
   return {
@@ -60,12 +72,14 @@ export function workflowGoalExecutionEvidence(
     ].join('\n'),
     evidence: {
       refKind: 'the saved workflow contract, authenticated execution receipts, and retained result contents',
-      refs: () => ['workflow_contract', 'workflow_execution', ...earlierRefs.keys(), ...refs.keys()],
+      refs: () => ['workflow_contract', 'workflow_execution', ...earlierSummaries.keys(), ...earlierRetained.keys(), ...refs.keys()],
       resolve(ref) {
         if (ref === 'workflow_contract') return { text: JSON.stringify(definition), value: definition };
         if (ref === 'workflow_execution') return { text: target.summary };
-        const earlierTarget = earlierRefs.get(ref);
+        const earlierTarget = earlierSummaries.get(ref);
         if (earlierTarget) return { text: earlierTarget.summary };
+        const retained = earlierRetained.get(ref);
+        if (retained) return retained.target.evidence?.resolve(retained.ref);
         const original = refs.get(ref);
         return original === undefined ? undefined : target.evidence?.resolve(original);
       },

@@ -1121,3 +1121,60 @@ test('a post the provider refused in its own reply never reads as confirmed', as
   assert.notEqual(audit.status, 'clean', 'a refused post is not a landed write');
   assert.equal(audit.facts.confirmedWrites, 0);
 });
+
+test('a follow-up reviewer opens a large retained receipt of an earlier attempt through the evidence tools', async () => {
+  const readIdentity = catalogs.canonicalCatalogIdentityOf(READ.entry)!;
+  const fixture = createSendStepFixture({
+    identities: [readIdentity],
+    prompt: `Read ${READ.manifest.operationId} for two pages and report what you found.`,
+  });
+  const carrier = brackets.wrapToolForHarness({ type: 'function', name: 'composio_execute_tool',
+    description: 'Invoke an exact catalog operation.',
+    parameters: { type: 'object', properties: { tool_slug: { type: 'string' }, arguments: { type: 'string' } },
+      required: ['tool_slug', 'arguments'] }, needsApproval: async () => false,
+    invoke: async () => { throw new Error('Only the bound production port may execute.'); },
+  });
+  const call = (id: string, op: string, args: object) => toolCall(id, carrier.name,
+    { tool_slug: op, arguments: JSON.stringify(args) });
+  const model = stubModel([
+    [call('prior-page-1', READ.manifest.operationId, { page: 1 })],
+    [call('prior-page-2', READ.manifest.operationId, { page: 2 })],
+    [textMsg('Read both pages.')],
+  ]);
+  const agent = { model, tools: [carrier] };
+  bindSurface(fixture, agent, agent.tools);
+  const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 4 });
+  assert.deepEqual(
+    nonRefusedSettlements(fixture).map((row) => row.logical_tool_call_id),
+    ['prior-page-1', 'prior-page-2'],
+    JSON.stringify(outcome.history).slice(0, 1500),
+  );
+
+  // The earlier attempt as the follow-up's reviewer receives it: compact, with
+  // its large results behind refs.
+  const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
+  const { workflowGoalExecutionEvidence } = await import('../../execution/workflow-goal-review.js');
+  const { judgeEvidenceTools } = await import('./judge-evidence-tools.js');
+  const earlier = readWorkflowTargetEvidence(fixture.workflowRunId, { compactResults: true });
+  const priorReceipt = (earlier.evidence?.refs() ?? []).find((ref) => ref.startsWith('rh_'));
+  assert.ok(priorReceipt, `the earlier attempt keeps its large receipts behind refs: ${(earlier.evidence?.refs() ?? []).join(', ')}`);
+  const context = workflowGoalExecutionEvidence(
+    { available: true, summary: 'Exact workflow run follow-up: 0 logical settlements.', results: [] },
+    { steps: [] },
+    { attempts: [{ runId: fixture.workflowRunId, target: earlier }], carriedStepIds: [], landedSummary: '' },
+  );
+  const namespaced = `earlier_attempt:${fixture.workflowRunId}/${priorReceipt}`;
+  assert.ok(context.evidence.refs().includes(namespaced), context.evidence.refs().join(', '));
+  assert.match(context.summary, /earlier_attempt:<run id>\/<ref>/);
+
+  type Invokable = { name: string; invoke: (ctx: unknown, input: string) => Promise<unknown> };
+  const tools = judgeEvidenceTools(context.evidence) as unknown as Invokable[];
+  const opened = String(await tools.find((tool) => tool.name === 'open_evidence')!
+    .invoke({ context: {} }, JSON.stringify({ ref: namespaced, max_chars: 300 })));
+  const total = Number(/of (\d+)/.exec(opened)?.[1] ?? 0);
+  assert.ok(total > 6_000, `the prior receipt is larger than what the review prompt inlines (${total} chars): ${opened.slice(0, 200)}`);
+  const queried = String(await tools.find((tool) => tool.name === 'query_evidence')!
+    .invoke({ context: {} }, JSON.stringify({ ref: namespaced, path: 'data.records', where_field: 'id', equals: '77', fields: ['id'] })));
+  assert.match(queried, /1 of 100 records/, queried.slice(0, 300));
+  assert.equal(context.evidence.resolve(priorReceipt!), undefined, 'an earlier attempt\'s bare ref name is not this run\'s evidence');
+});
