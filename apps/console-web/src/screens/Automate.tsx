@@ -102,13 +102,22 @@ export function Automate() {
   // workspace header's "powered by" chips) still lands there.
   const openWorkflow = (name: string, opts?: { advanced?: boolean }) =>
     navigate(`/automate/${encodeURIComponent(name)}${opts?.advanced ? '?advanced=1' : ''}`);
+  // /automate?workflow=<name>&run=<id> opens that run over the list (the
+  // workflow page's "Open run" after a step test); without a run it forwards
+  // to the workflow's page.
+  const [openRun, setOpenRun] = useState<{ workflow: string; runId?: string } | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const workflow = params.get('workflow');
+    const runId = params.get('run');
+    return workflow && runId ? { workflow, runId } : null;
+  });
   useEffect(() => {
-    const deepLinked = new URLSearchParams(window.location.search).get('workflow');
-    if (deepLinked) navigate(`/automate/${encodeURIComponent(deepLinked)}`, { replace: true });
+    const params = new URLSearchParams(window.location.search);
+    const deepLinked = params.get('workflow');
+    if (deepLinked && !params.get('run')) navigate(`/automate/${encodeURIComponent(deepLinked)}`, { replace: true });
     // Read once on mount: the query string is the deep link, not live state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [openRun, setOpenRun] = useState<{ workflow: string; runId?: string } | null>(null);
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 
   const wf = workflows.data?.workflows ?? [];

@@ -377,7 +377,7 @@ export const WORKFLOW_STEP_FIELDS = {
   inputs: { kept: true, patch: true },
   output: { kept: true, patch: true },
   retryBudget: { kept: true, patch: true },
-  optional: { kept: true, patch: false },
+  optional: { kept: true, patch: true },
   loopUntil: { kept: true, patch: true },
   loopSafe: { kept: true, patch: true },
 } as const satisfies { [K in keyof WorkflowStepInput]-?: WorkflowStepFieldRule };

@@ -24,7 +24,8 @@ import {
 } from '../memory/workflow-store.js';
 import { workflowExecutionSurfaceChanged, workflowNeedsCreationTest } from '../execution/workflow-enforce.js';
 import { describeWorkflowPlainEnglish, describeWorkflowOneLine, describeCron, deriveStepDataSources, renderWorkflowDataSources } from '../execution/workflow-describe.js';
-import { applyStepPatch, applyStepPromptEdit, revertStepEdit } from '../execution/workflow-step-edit.js';
+import { revertStepEdit } from '../execution/workflow-step-edit.js';
+import { editWorkflowStepLive } from '../execution/workflow-step-edit-live.js';
 import { validateCronExpression, getNextRun } from '../shared/cron.js';
 import { deriveRunnerProvenance } from '../shared/runner-provenance.js';
 import { draftWorkflowFromSession, type WorkflowDraft } from '../execution/trace-to-workflow.js';
@@ -2218,12 +2219,17 @@ export function registerOrchestrationTools(server: McpServer): void {
       const displayMessage = (message: string): string => workflowSlug === displayName
         ? message
         : message.replaceAll(`"${workflowSlug}"`, `"${displayName}"`);
-      await warmExactScheduledSendSchemaAuthorityForWrite(before);
-      const result = parsedPatch
-        ? applyStepPatch(workflowSlug, step_id, parsedPatch, { description: `workflow_edit_step ${step_id} patch` })
-        : applyStepPromptEdit(workflowSlug, step_id, find as string, replace as string, {
-          description: `workflow_edit_step ${step_id}`,
-        });
+      const live = await editWorkflowStepLive(
+        workflowSlug,
+        step_id,
+        parsedPatch ? { patch: parsedPatch } : { find: find as string, replace: replace as string },
+        {
+          description: parsedPatch ? `workflow_edit_step ${step_id} patch` : `workflow_edit_step ${step_id}`,
+          originSessionId: getToolOutputContext()?.sessionId,
+          displayName,
+        },
+      );
+      const result = live.result;
       const resultMessage = displayMessage(result.message);
       if (!result.ok) {
         // Structured, NON-silent failure (change #4): the user AND the model see
@@ -2233,37 +2239,22 @@ export function registerOrchestrationTools(server: McpServer): void {
             + (result.errors?.length ? `\n- ${result.errors.join('\n- ')}` : ''),
         );
       }
-      // Re-smoke parity with workflow_update: if the workflow is ENABLED and this
-      // edit changed what it executes, re-verify by running (saved disabled,
-      // auto-enables on pass) instead of trusting the edited config. Schedule/copy
-      // edits that don't change execution skip the test.
-      const updated = listWorkflowFiles().find((w) => w.name === workflowSlug)?.data;
+      // Re-smoke parity with workflow_update: the shared path wrote the
+      // workflow off and queued the creation test when the edit changed what
+      // an enabled workflow executes. The edit is not done until the host has
+      // watched the edited workflow run: wait for the re-test (bounded) and
+      // report it here.
       let reSmokeMsg = '';
-      if (updated && before.enabled && workflowExecutionSurfaceChanged(before, updated)) {
-        const runTest = workflowNeedsCreationTest(updated);
-        if (runTest) {
-          const testInputs = workflowSmokeInputs(updated, {});
-          const missingSmokeInputs = missingWorkflowRunInputs(updated, testInputs);
-          writeWorkflowAndSyncTriggers(workflowSlug, { ...updated, enabled: false });
-          // It was RUNNING before this edit and it is not running now. Whoever
-          // owns it hears that from the product, not from whether they happened
-          // to read the reply.
-          notifyWorkflowAwaitingEnable({
-            workflowName: workflowSlug,
-            displayName,
-            cause: 'edit_needs_verification',
-          });
-          if (missingSmokeInputs.length > 0) {
-            reSmokeMsg = `\n\n${renderMissingSmokeInputs(workflowSlug, missingSmokeInputs)}`;
-          } else {
-            const queued = queueWorkflowCreationTest(workflowSlug, testInputs, { originSessionId: getToolOutputContext()?.sessionId });
-            // The edit is not done until the host has watched the edited
-            // workflow run: wait for the re-test (bounded) and report it here.
-            const settled = queued.id ? await awaitWorkflowCreationTestSettlement(queued.id, workflowSlug) : null;
-            reSmokeMsg = settled
-              ? `\n\n${renderCreationTestSettlementReceipt(settled, readWorkflow(workflowSlug)?.data ?? updated, displayName)}`
-              : `\n\n${displayMessage(queued.message)}`;
-          }
+      if (live.verification.turnedOff) {
+        if (live.verification.missingInputs?.length) {
+          reSmokeMsg = `\n\n${live.verification.message ?? renderMissingSmokeInputs(workflowSlug, live.verification.missingInputs)}`;
+        } else if (live.verification.runId) {
+          const settled = await awaitWorkflowCreationTestSettlement(live.verification.runId, workflowSlug);
+          reSmokeMsg = settled
+            ? `\n\n${renderCreationTestSettlementReceipt(settled, readWorkflow(workflowSlug)?.data ?? live.after ?? before, displayName)}`
+            : `\n\n${displayMessage(live.verification.message ?? '')}`;
+        } else if (live.verification.message) {
+          reSmokeMsg = `\n\n${displayMessage(live.verification.message)}`;
         }
       }
       addNotification({

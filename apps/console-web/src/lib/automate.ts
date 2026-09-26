@@ -296,6 +296,48 @@ export const patchWorkflow = (name: string, body: { description?: string; enable
   api<WorkflowPatchResult>(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify(body) });
 export const deleteWorkflow = (name: string) =>
   api(`/api/console/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' });
+/** What the daemon did with a step edit. `turnedOff` means the workflow was on,
+ *  the edit changed what runs, and it stays off until the queued test passes. */
+export interface StepEditVerification {
+  turnedOff: boolean;
+  runId?: string;
+  missingInputs?: string[];
+  message?: string;
+}
+export interface StepEditResult {
+  ok: true;
+  name: string;
+  stepId: string;
+  message: string;
+  /** Pass to revertWorkflowStepEdit to undo this edit. Null when no backup could be kept. */
+  backupId: string | null;
+  enabled: boolean;
+  verification: StepEditVerification;
+}
+/**
+ * Change one step the way Clementine does: only the named fields, a snapshot
+ * first, validated, and re-tested when a live workflow's execution changed.
+ * `null` removes a field.
+ */
+export const editWorkflowStep = (name: string, stepId: string, patch: Record<string, unknown>) =>
+  api<StepEditResult>(`/api/console/workflows/${encodeURIComponent(name)}/steps/${encodeURIComponent(stepId)}`, {
+    method: 'POST',
+    body: JSON.stringify({ patch }),
+  });
+export interface StepEditRecord { id: string; stepId: string; description: string; createdAt: string }
+export const listWorkflowStepEdits = (name: string) =>
+  apiGet<{ name: string; edits: StepEditRecord[] }>(`/api/console/workflows/${encodeURIComponent(name)}/step-edits`);
+export const revertWorkflowStepEdit = (name: string, backupId: string) =>
+  apiPost<{ ok: true; stepId: string; message: string; enabled: boolean }>(
+    `/api/console/workflows/${encodeURIComponent(name)}/step-edits/${encodeURIComponent(backupId)}/revert`,
+  );
+/** Run one step by itself, without its upstream chain, to see what it does. */
+export const runWorkflowStep = (name: string, stepId: string) =>
+  apiPost<{ queued?: boolean; held?: boolean; id?: string; message?: string; targetStepId?: string | null }>(
+    `/api/console/workflows/${encodeURIComponent(name)}/run`,
+    { targetStepId: stepId },
+  );
+
 /**
  * Store where the steps sit. A placement write is not a definition change: it
  * queues no test, emits no change event and never turns a workflow off.

@@ -5,9 +5,12 @@ import {
   askAboutStepPrompt,
   dependentsOf,
   describeStepRun,
+  draftChanged,
   firstSentence,
   shortModelName,
+  stepDraftFrom,
   stepFlags,
+  stepPatchFromDraft,
   workflowShape,
 } from './workflow-step-view.js';
 
@@ -76,4 +79,27 @@ test('shared placement wins, the browser copy is the fallback, and nothing is sh
   const chosen = choosePositions(shared, null);
   chosen.a = { x: 0, y: 0 };
   assert.equal(shared.a.x, 1);
+});
+
+test('a draft starts from the stored step, and only what changed is sent', () => {
+  const base = stepDraftFrom(graph.nodes[1], { id: 'caption', prompt: 'Write a caption for each post.', forEach: 'pull' });
+  assert.deepEqual(base, { prompt: 'Write a caption for each post.', asksFirst: false, keepGoing: false, perItem: 'pull' });
+  assert.equal(draftChanged(base, { ...base }), false);
+  assert.equal(draftChanged(base, { ...base, prompt: 'Write a caption for each post. ' }), false, 'whitespace is not a change');
+
+  const draft = { prompt: 'Write a short caption for each post.', asksFirst: true, keepGoing: true, perItem: '' };
+  assert.equal(draftChanged(base, draft), true);
+  assert.deepEqual(stepPatchFromDraft(base, draft), {
+    prompt: 'Write a short caption for each post.',
+    requiresApproval: true,
+    optional: true,
+    forEach: null,
+  });
+  // Turning flags off removes them; turning per-item on names the source.
+  assert.deepEqual(stepPatchFromDraft({ ...base, asksFirst: true, keepGoing: true, perItem: '' }, { ...base, asksFirst: false, keepGoing: false, perItem: 'pull' }), {
+    requiresApproval: null,
+    optional: null,
+    forEach: 'pull',
+  });
+  assert.deepEqual(stepPatchFromDraft(base, base), {});
 });

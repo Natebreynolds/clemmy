@@ -109,3 +109,47 @@ export function workflowShape(graph: CanvasGraph): WorkflowShape {
     approvals: nodes.filter((n) => n.flags?.approval === true).length,
   };
 }
+
+/* ---------- editing the everyday four ---------- */
+
+/** The four things a person changes on a step without going through Clementine. */
+export interface StepDraft {
+  prompt: string;
+  asksFirst: boolean;
+  keepGoing: boolean;
+  /** The upstream output to run once per item of; '' when the step runs once. */
+  perItem: string;
+}
+
+export function stepDraftFrom(node: CanvasGraphNode, step?: WorkflowStep): StepDraft {
+  const flags = stepFlags(node, step);
+  return {
+    prompt: step?.prompt ?? '',
+    asksFirst: flags.asksFirst,
+    keepGoing: flags.keepGoing,
+    perItem: flags.perItem ?? '',
+  };
+}
+
+export function draftChanged(base: StepDraft, draft: StepDraft): boolean {
+  return base.prompt.trim() !== draft.prompt.trim()
+    || base.asksFirst !== draft.asksFirst
+    || base.keepGoing !== draft.keepGoing
+    || base.perItem.trim() !== draft.perItem.trim();
+}
+
+/**
+ * The patch to send: only what changed. A flag turned off is removed (`null`)
+ * rather than stored as false, so the file reads the way an author writes it.
+ */
+export function stepPatchFromDraft(base: StepDraft, draft: StepDraft): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  if (base.prompt.trim() !== draft.prompt.trim()) patch.prompt = draft.prompt.trim();
+  if (base.asksFirst !== draft.asksFirst) patch.requiresApproval = draft.asksFirst ? true : null;
+  if (base.keepGoing !== draft.keepGoing) patch.optional = draft.keepGoing ? true : null;
+  if (base.perItem.trim() !== draft.perItem.trim()) patch.forEach = draft.perItem.trim() ? draft.perItem.trim() : null;
+  return patch;
+}
+
+/** The statuses under which a run is still going, for polling a step test. */
+export const RUN_STILL_GOING = new Set(['queued', 'running', 'finalizing', 'parked', 'blocked_capability', 'blocked_mutation']);

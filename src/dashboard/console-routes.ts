@@ -153,6 +153,8 @@ import { listSubagentRuns, readSubagentOutput } from '../agents/subagent-runs.js
 import { checkRunAgainstGoal } from '../execution/workflow-run-checker.js';
 import { buildWorkflowGraph } from './workflow-graph.js';
 import { readWorkflowLayout, writeWorkflowLayout } from '../memory/workflow-layout.js';
+import { editWorkflowStepLive } from '../execution/workflow-step-edit-live.js';
+import { listStepEditBackups, revertStepEdit } from '../execution/workflow-step-edit.js';
 import {
   applyWorkflowVisualContractFixes,
   type WorkflowVisualContractFixKind,
@@ -6099,6 +6101,79 @@ export function registerConsoleRoutes(
 
     writeWorkflowAndSyncTriggers(entry.name, patchPrep.def);
     res.json({ updated: true, name: patchPrep.def.name, repairs: patchPrep.repairs });
+  });
+
+  /**
+   * Change one step the way Clementine's workflow_edit_step does: only the
+   * named fields change, the prior definition is snapshotted (revert below),
+   * the merged step is validated, and a live workflow whose execution changed
+   * is written off with a creation test queued that turns it back on. The
+   * page follows that test through the workflow's creationTest state.
+   */
+  app.post('/api/console/workflows/:name/steps/:stepId', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const stepId = req.params.stepId;
+    if (!entry.data.steps.some((s) => s.id === stepId)) { res.status(404).json({ error: `step "${stepId}" is not in this workflow` }); return; }
+    const patch = (req.body ?? {}).patch;
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+      res.status(400).json({ error: 'Send { patch: { <step field>: value, ... } }; null removes a field.' });
+      return;
+    }
+    try {
+      const outcome = await editWorkflowStepLive(entry.name, stepId, { patch: patch as Record<string, unknown> }, {
+        description: `console step edit ${stepId} (${Object.keys(patch as Record<string, unknown>).join(', ')})`,
+        displayName: entry.data.name,
+      });
+      if (!outcome.result.ok) {
+        res.status(400).json({ error: outcome.result.message, errors: outcome.result.errors ?? [] });
+        return;
+      }
+      res.json({
+        ok: true,
+        name: entry.data.name,
+        stepId,
+        message: outcome.result.message,
+        backupId: outcome.result.backupId ?? null,
+        enabled: outcome.after?.enabled === true,
+        verification: outcome.verification,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /** The reversible step edits this workflow still has, newest first. */
+  app.get('/api/console/workflows/:name/step-edits', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const edits = listStepEditBackups()
+      .filter((b) => b.workflow === entry.name)
+      .map((b) => ({ id: b.id, stepId: b.stepId, description: b.description, createdAt: b.createdAt }));
+    res.json({ name: entry.data.name, edits });
+  });
+
+  /** Undo one step edit: the workflow goes back to the definition it had before it. */
+  app.post('/api/console/workflows/:name/step-edits/:backupId/revert', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+    if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+    const backupId = req.params.backupId;
+    const backup = listStepEditBackups().find((b) => b.id === backupId);
+    if (!backup || backup.workflow !== entry.name) { res.status(404).json({ error: 'no such step edit for this workflow' }); return; }
+    try {
+      const result = revertStepEdit(backupId);
+      if (!result.ok) { res.status(409).json({ error: result.message }); return; }
+      const after = readWorkflow(entry.name);
+      res.json({ ok: true, name: entry.data.name, stepId: backup.stepId, message: result.message, enabled: after?.data.enabled === true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   /**

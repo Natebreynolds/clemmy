@@ -33,8 +33,9 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import {
-  AlertTriangle, ArrowLeft, Bot, Check, ChevronRight, Clock, Loader2, Lock, MessageSquare, PenLine, Play, Plus,
-  Puzzle, Repeat, RotateCcw, Save, ScrollText, Send, ShieldCheck, Trash2, Wrench, Zap, type LucideIcon,
+  AlertTriangle, ArrowLeft, Bot, Check, ChevronRight, Clock, ExternalLink, FlaskConical, Loader2, Lock, MessageSquare,
+  PenLine, Play, Plus, Puzzle, Repeat, RotateCcw, Save, ScrollText, Send, ShieldCheck, Trash2, Undo2, Wrench, Zap,
+  type LucideIcon,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
@@ -55,9 +56,11 @@ import { detectedTimezone, humanizeCron } from '@/lib/cron';
 import { cn } from '@/lib/cn';
 import { certPrimaryAction, certificationTone, sentenceCaseLabel } from '@/lib/workflowCertification';
 import {
-  deleteWorkflow, getWorkflow, patchWorkflow, putWorkflowLayout, runWorkflow, setWorkflowEnabled,
+  deleteWorkflow, editWorkflowStep, getWorkflow, listWorkflowRuns, listWorkflowStepEdits, patchWorkflow, putWorkflowLayout,
+  revertWorkflowStepEdit, runWorkflow, runWorkflowStep, setWorkflowEnabled,
   type WorkflowCertification, type WorkflowDetail, type WorkflowStep,
 } from '@/lib/automate';
+import { statusTone } from '@/lib/inbox';
 import {
   choosePositions,
   findCycle,
@@ -77,7 +80,8 @@ import {
   type CanvasPosition,
 } from '@/lib/workflow-canvas';
 import {
-  askAboutStepPrompt, dependentsOf, describeStepRun, firstSentence, stepFlags, workflowShape,
+  askAboutStepPrompt, dependentsOf, describeStepRun, draftChanged, RUN_STILL_GOING, stepDraftFrom,
+  stepPatchFromDraft, workflowShape, type StepDraft,
 } from '@/lib/workflow-step-view';
 
 const nodeTypes = { workflowStep: WorkflowCanvasNode };
@@ -303,27 +307,42 @@ function WorkflowView({ name }: { name: string }) {
     finally { setBusy(null); }
   };
 
-  // Turning on IS the creation test: when the daemon queues one, follow it
-  // to its settled result instead of showing the switch flip back with no
-  // explanation.
+  // A queued creation test is followed to its settled result (passed → on,
+  // needs review → the daemon's report) instead of leaving the switch off with
+  // nothing saying why. Used by turning on and by a step save that changed
+  // what a live workflow runs.
+  const followCreationTest = useCallback(async () => {
+    setTesting(true);
+    try {
+      let fresh = await getWorkflow(name);
+      const deadline = Date.now() + 4 * 60_000;
+      while (Date.now() < deadline && !fresh.enabled && fresh.creationTest?.status === 'running') {
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        fresh = await getWorkflow(name);
+      }
+    } finally {
+      setTesting(false);
+      invalidateAll();
+    }
+  }, [invalidateAll, name]);
+
+  // Turning on IS the creation test.
   const setEnabled = async (enabled: boolean) => {
     setBusy('enable'); setControlError(null);
     try {
       const result = await setWorkflowEnabled(name, enabled);
-      if (enabled && result.verificationQueued) {
-        setTesting(true);
-        let fresh = await getWorkflow(name);
-        const deadline = Date.now() + 4 * 60_000;
-        while (Date.now() < deadline && !fresh.enabled && fresh.creationTest?.status === 'running') {
-          await new Promise((resolve) => setTimeout(resolve, 3_000));
-          fresh = await getWorkflow(name);
-        }
-        setTesting(false);
-      }
+      if (enabled && result.verificationQueued) await followCreationTest();
       invalidateAll();
     } catch (e) { setControlError((e as Error).message); setTesting(false); }
     finally { setBusy(null); }
   };
+
+  // After a step save: the graph is redrawn from the daemon unless it holds
+  // unsaved rewiring, in which case only the detail (and so the panel) refreshes.
+  const afterStepChange = useCallback(async () => {
+    if (dirtyRef.current) invalidateAll();
+    else await reloadFromDaemon();
+  }, [invalidateAll, reloadFromDaemon]);
 
   const remove = async () => {
     if (!window.confirm(`Delete "${name}"? This can't be undone.`)) return;
@@ -525,12 +544,16 @@ function WorkflowView({ name }: { name: string }) {
         <Card className="flex min-h-0 flex-col overflow-hidden p-0 lg:h-[min(70vh,760px)]">
           {selectedNode ? (
             <StepPanel
+              key={selectedNode.id}
               workflowName={detail.name}
               node={selectedNode}
               step={selectedStep}
               trace={selectedTrace}
               graph={canvasGraph}
               isNew={createdIds.includes(selectedNode.id)}
+              workflowOn={enabled}
+              onChanged={afterStepChange}
+              onTestQueued={followCreationTest}
             />
           ) : (
             <ShapePanel graph={canvasGraph} certification={detail.certification} />
@@ -615,16 +638,22 @@ const RUN_ICON: Record<ReturnType<typeof describeStepRun>['kind'], LucideIcon> =
   model: Bot, skill: Puzzle, script: ScrollText, call: Zap,
 };
 
-function StepPanel({ workflowName, node, step, trace, graph, isNew }: {
+function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, onChanged, onTestQueued }: {
   workflowName: string;
   node: CanvasGraphNode;
   step?: WorkflowStep;
   trace?: DryRunTraceStep;
   graph: CanvasGraph;
   isNew: boolean;
+  /** The workflow is on, so a change to what runs pauses it for a test. */
+  workflowOn: boolean;
+  /** The step was saved or undone; the page refreshes what it shows. */
+  onChanged: () => Promise<void>;
+  /** A save turned the workflow off and queued its test; the page follows it. */
+  onTestQueued: () => Promise<void>;
 }) {
+  const queryClient = useQueryClient();
   const runAs = describeStepRun(node, step);
-  const flags = stepFlags(node, step);
   const RunIcon = RUN_ICON[runAs.kind];
   const waitsFor = Array.isArray(node.dependsOn) ? node.dependsOn : [];
   const then = dependentsOf(graph, node.id);
@@ -634,6 +663,109 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew }: {
   const effect = node.meta?.sideEffect;
   const verdict = node.verdict;
   const askHref = `/chat?prompt=${encodeURIComponent(askAboutStepPrompt(workflowName, node.id))}`;
+
+  /* ---- the everyday four, as a draft against the stored step ---- */
+  const base = useMemo(() => stepDraftFrom(node, step), [node, step]);
+  const [draft, setDraft] = useState<StepDraft>(base);
+  const [baseSeen, setBaseSeen] = useState(base);
+  // A fresh stored step (after a save, undo, or Clementine's own edit) resets a
+  // draft that has no unsaved changes; unsaved typing is kept.
+  useEffect(() => {
+    if (base === baseSeen) return;
+    setBaseSeen(base);
+    setDraft((current) => (draftChanged(baseSeen, current) ? current : base));
+  }, [base, baseSeen]);
+  const changed = draftChanged(base, draft);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveNote, setSaveNote] = useState<string | null>(null);
+
+  const save = async () => {
+    const patch = stepPatchFromDraft(base, draft);
+    if (Object.keys(patch).length === 0) return;
+    setSaving(true); setSaveError(null); setSaveNote(null);
+    try {
+      const result = await editWorkflowStep(workflowName, node.id, patch);
+      void queryClient.invalidateQueries({ queryKey: ['workflow-step-edits', workflowName] });
+      await onChanged();
+      if (result.verification.turnedOff) {
+        if (result.verification.runId) {
+          setSaveNote('Saved. The workflow is paused while its quick test runs; it turns back on when the test passes.');
+          void onTestQueued();
+        } else {
+          setSaveNote(result.verification.message ?? 'Saved, and the workflow is now off until its test can run.');
+        }
+      } else {
+        setSaveNote('Saved.');
+      }
+    } catch (e) {
+      const body = (e as { body?: { error?: string; errors?: string[] } }).body;
+      setSaveError(body?.error ? [body.error, ...(body.errors ?? [])].join(' ') : (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+  useEffect(() => {
+    if (saveNote !== 'Saved.') return;
+    const t = window.setTimeout(() => setSaveNote(null), 3000);
+    return () => window.clearTimeout(t);
+  }, [saveNote]);
+
+  /* ---- undo: the newest reversible edit of this step ---- */
+  const editsQuery = useQuery({
+    queryKey: ['workflow-step-edits', workflowName],
+    queryFn: () => listWorkflowStepEdits(workflowName),
+    staleTime: 10_000,
+  });
+  const lastEdit = editsQuery.data?.edits.find((edit) => edit.stepId === node.id) ?? null;
+  const [undoing, setUndoing] = useState(false);
+  const undo = async () => {
+    if (!lastEdit) return;
+    setUndoing(true); setSaveError(null);
+    try {
+      const result = await revertWorkflowStepEdit(workflowName, lastEdit.id);
+      void queryClient.invalidateQueries({ queryKey: ['workflow-step-edits', workflowName] });
+      await onChanged();
+      setSaveNote(result.message);
+    } catch (e) { setSaveError((e as Error).message); }
+    finally { setUndoing(false); }
+  };
+
+  /* ---- test this step: one run of just this step, followed here ---- */
+  const [testRunId, setTestRunId] = useState<string | null>(null);
+  const [testNote, setTestNote] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const runsQuery = useQuery({
+    queryKey: ['workflow-runs-follow', workflowName, testRunId],
+    queryFn: () => listWorkflowRuns(workflowName, 30),
+    enabled: testRunId !== null,
+    refetchInterval: (query) => {
+      const run = query.state.data?.runs.find((r) => r.id === testRunId);
+      return !run || RUN_STILL_GOING.has(String(run.status ?? 'queued')) ? 3000 : false;
+    },
+  });
+  const testRun = testRunId ? runsQuery.data?.runs.find((r) => r.id === testRunId) ?? null : null;
+  const testTone = statusTone(testRun?.status ?? (testRunId ? 'queued' : undefined));
+  const testThisStep = async () => {
+    setStarting(true); setTestNote(null); setTestRunId(null);
+    try {
+      const result = await runWorkflowStep(workflowName, node.id);
+      if (result.id) setTestRunId(result.id);
+      else setTestNote(result.message ?? 'The test could not start.');
+    } catch (e) {
+      const body = (e as { body?: { error?: string; message?: string } }).body;
+      setTestNote(body?.message ?? body?.error ?? (e as Error).message);
+    } finally {
+      setStarting(false);
+    }
+  };
+  const openRunHref = testRunId ? `/automate?workflow=${encodeURIComponent(workflowName)}&run=${encodeURIComponent(testRunId)}` : null;
+
+  const perItemOptions = useMemo(() => {
+    const ids = [...waitsFor];
+    if (draft.perItem && !ids.includes(draft.perItem)) ids.push(draft.perItem);
+    return ids;
+  }, [waitsFor, draft.perItem]);
 
   return (
     <>
@@ -649,22 +781,102 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew }: {
       </div>
 
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-3">
-        <section>
-          <div className="mb-1 text-label text-fg">What this step does</div>
-          {isNew ? (
-            <p className="text-small text-muted">A new step has no instructions yet. Save the graph, then ask Clementine what it should do.</p>
-          ) : step?.prompt ? (
-            <p className="whitespace-pre-wrap text-small leading-relaxed text-fg">{step.prompt}</p>
-          ) : (
-            <p className="text-small text-muted">{firstSentence(node.label) || 'No instructions stored for this step.'}</p>
-          )}
-        </section>
+        {isNew ? (
+          <p className="text-small text-muted">A new step has no instructions yet. Save the graph first, then write what this step should do here.</p>
+        ) : (
+          <>
+            <section>
+              <label className="mb-1 block text-label text-fg" htmlFor={`step-prompt-${node.id}`}>What this step does</label>
+              <Textarea
+                id={`step-prompt-${node.id}`}
+                value={draft.prompt}
+                onChange={(e) => setDraft({ ...draft, prompt: e.target.value })}
+                rows={Math.min(14, Math.max(4, draft.prompt.split('\n').length + 1))}
+                placeholder="Say what this step should do, in your own words."
+                className="text-small leading-relaxed"
+              />
+            </section>
 
-        <section className="space-y-2">
-          <FlagRow icon={Lock} label="Asks me first" on={flags.asksFirst} detail={node.meta?.approvalPreview ?? undefined} />
-          <FlagRow icon={ShieldCheck} label="Keeps going if this fails" on={flags.keepGoing} />
-          <FlagRow icon={Repeat} label="Runs once per item" on={flags.perItem !== null} detail={flags.perItem ? `each of ${flags.perItem}${flags.newItemsOnly ? ', new ones only' : ''}` : undefined} />
-        </section>
+            <section className="space-y-2.5">
+              <EditRow icon={Lock} label="Asks me first" hint={node.meta?.approvalPreview ?? 'The run pauses here until you approve.'}>
+                <Switch checked={draft.asksFirst} onChange={(v) => setDraft({ ...draft, asksFirst: v })} label="Asks me first" />
+              </EditRow>
+              <EditRow icon={ShieldCheck} label="Keeps going if this fails" hint="A failure here leaves a gap; the rest of the run continues.">
+                <Switch checked={draft.keepGoing} onChange={(v) => setDraft({ ...draft, keepGoing: v })} label="Keeps going if this fails" />
+              </EditRow>
+              <EditRow
+                icon={Repeat}
+                label="Runs once per item"
+                hint={waitsFor.length === 0 ? 'Needs a step to wait for: its items are what this step runs over.' : 'Runs once for each item the chosen step produced.'}
+              >
+                <Switch
+                  checked={draft.perItem !== ''}
+                  disabled={waitsFor.length === 0 && draft.perItem === ''}
+                  onChange={(v) => setDraft({ ...draft, perItem: v ? (perItemOptions[0] ?? '') : '' })}
+                  label="Runs once per item"
+                />
+              </EditRow>
+              {draft.perItem !== '' ? (
+                <div className="pl-6">
+                  <label className="mb-1 block text-caption text-muted" htmlFor={`step-per-item-${node.id}`}>Items from</label>
+                  <select
+                    id={`step-per-item-${node.id}`}
+                    className="w-full rounded-md border border-border bg-canvas px-2 py-1.5 text-small text-fg"
+                    value={draft.perItem}
+                    onChange={(e) => setDraft({ ...draft, perItem: e.target.value })}
+                  >
+                    {perItemOptions.map((id) => <option key={id} value={id}>{id}</option>)}
+                  </select>
+                </div>
+              ) : null}
+            </section>
+
+            {changed && workflowOn ? (
+              <p className="rounded-md border border-warning/30 bg-warning-tint px-3 py-2 text-caption text-fg">
+                This workflow is on. Saving pauses it for a quick test of the new step, then turns it back on.
+              </p>
+            ) : null}
+            {saveError ? <p className="text-small text-danger">{saveError}</p> : null}
+            {saveNote ? <p className="text-small text-success">{saveNote}</p> : null}
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" onClick={() => void save()} disabled={!changed || saving || undoing}>
+                {saving ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Save size={16} aria-hidden />}
+                Save step
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setDraft(base)} disabled={!changed || saving}>Discard</Button>
+              {lastEdit ? (
+                <Button size="sm" variant="ghost" onClick={() => void undo()} disabled={undoing || saving} title={`${lastEdit.description} · ${new Date(lastEdit.createdAt).toLocaleString()}`}>
+                  {undoing ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Undo2 size={16} aria-hidden />}
+                  Undo last change
+                </Button>
+              ) : null}
+            </div>
+
+            <section className="rounded-md border border-border bg-subtle px-3 py-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-small font-medium text-fg">Try just this step</div>
+                <Button size="sm" variant="secondary" onClick={() => void testThisStep()} disabled={starting || changed} title={changed ? 'Save the step first' : 'Runs this step alone, with no upstream chain'}>
+                  {starting ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <FlaskConical size={16} aria-hidden />}
+                  Test this step
+                </Button>
+              </div>
+              {testRunId ? (
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-small">
+                  <StatusPill tone={testTone.tone}>{testTone.label}</StatusPill>
+                  {testRun?.error ? <span className="text-danger">{testRun.error}</span> : null}
+                  {openRunHref ? (
+                    <Link to={openRunHref} className="inline-flex items-center gap-1 text-muted underline-offset-2 hover:text-fg hover:underline">
+                      Open run <ExternalLink size={12} aria-hidden />
+                    </Link>
+                  ) : null}
+                </div>
+              ) : null}
+              {testNote ? <p className="mt-2 text-small text-muted">{testNote}</p> : null}
+              <p className="mt-1 text-caption text-faint">Runs the saved step by itself, using the real tools. Nothing upstream runs.</p>
+            </section>
+          </>
+        )}
 
         <section>
           <div className="mb-1 text-label text-fg">Waits for</div>
@@ -713,23 +925,23 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew }: {
             Ask Clementine about this step
           </Button>
         </Link>
-        <p className="mt-2 text-caption text-faint">Changing a step here is coming next. Until then, Clementine rewrites it for you.</p>
+        <p className="mt-2 text-caption text-faint">Tools, model and output shape change through Clementine or Advanced.</p>
       </div>
     </>
   );
 }
 
-function FlagRow({ icon: Icon, label, on, detail }: { icon: LucideIcon; label: string; on: boolean; detail?: string }) {
+function EditRow({ icon: Icon, label, hint, children }: { icon: LucideIcon; label: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-start justify-between gap-3 text-small">
-      <span className={cn('inline-flex items-center gap-1.5', on ? 'text-fg' : 'text-muted')}>
-        <Icon size={14} aria-hidden />
+    <div className="flex items-start justify-between gap-3">
+      <span className="inline-flex min-w-0 items-start gap-1.5 text-small text-fg">
+        <Icon size={14} className="mt-0.5 shrink-0" aria-hidden />
         <span>
           {label}
-          {on && detail ? <span className="block text-caption text-faint">{detail}</span> : null}
+          {hint ? <span className="block text-caption text-faint">{hint}</span> : null}
         </span>
       </span>
-      <span className={cn('shrink-0 text-caption font-semibold', on ? 'text-success' : 'text-faint')}>{on ? 'Yes' : 'No'}</span>
+      <span className="shrink-0 pt-0.5">{children}</span>
     </div>
   );
 }
