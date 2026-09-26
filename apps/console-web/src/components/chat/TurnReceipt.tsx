@@ -8,7 +8,7 @@
  * unchecked answer must not borrow a pass. A card for work outside Clem
  * appears only for writes the provider confirmed.
  */
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { AlertCircle, Check, CheckCircle2, Copy, FileText, Mail, PenLine, Send } from 'lucide-react';
 import { outsideWorkCards, turnByline, turnReview, type OutsideWorkCard } from '@clem/chat-engine';
 import type { ActivityItem } from '@/lib/useChat';
@@ -112,6 +112,21 @@ function CopyAnswer({ text }: { text: string }) {
   );
 }
 
+/** Changes the provider confirmed in other apps, one card per app and kind.
+ *  They show the moment a write is confirmed, while the answer is still being
+ *  written and checked: once something has gone out, the owner sees it right
+ *  away. The finished receipt keeps them in the same place. */
+export function OutsideWorkCards({ activity, children }: { activity?: ActivityItem[]; children?: ReactNode }) {
+  const outside = outsideWorkCards(activity);
+  if (outside.length === 0 && !children) return null;
+  return (
+    <div className="grid gap-2.5 sm:grid-cols-2">
+      {outside.map((card) => <OutsideWorkCardView key={card.key} card={card} />)}
+      {children}
+    </div>
+  );
+}
+
 export function TurnReceipt({
   activity,
   terminal,
@@ -124,15 +139,9 @@ export function TurnReceipt({
   const review = turnReview(activity);
   const byline = turnByline(activity);
   const saved = activity?.find((row) => row.id === 'deliverables' && row.deliverable);
-  const outside = outsideWorkCards(activity);
   return (
     <>
-      {(saved || outside.length > 0) && (
-        <div className="grid gap-2.5 sm:grid-cols-2">
-          {outside.map((card) => <OutsideWorkCardView key={card.key} card={card} />)}
-          {saved && <DeliverableCard row={saved} />}
-        </div>
-      )}
+      <OutsideWorkCards activity={activity}>{saved ? <DeliverableCard row={saved} /> : null}</OutsideWorkCards>
       <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
         {review === 'checked' && (
           <span className="inline-flex items-center gap-1 font-semibold text-success">

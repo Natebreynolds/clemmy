@@ -654,7 +654,7 @@ function MessageRow({
       {message.status === 'awaiting-reply' && message.options?.length && onAnswer ? (
         <AnswerChoices options={message.options} onAnswer={onAnswer} />
       ) : null}
-      {thinking ? null : <TurnReceipt message={message} />}
+      {thinking ? <OutsideWork activity={message.activity} /> : <TurnReceipt message={message} />}
       {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (
         <div class="plan-actions">
           <button
@@ -846,6 +846,29 @@ function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (te
  * way until asked for on the phone's narrow width. "Checked" appears only when
  * a review passed; a turn whose reviewer never ran says so.
  */
+/** Changes the provider confirmed in other apps. Shown the moment a write is
+ *  confirmed, while the answer is still being written and checked; the
+ *  finished receipt keeps them in the same place. */
+function OutsideWork({ activity }: { activity: ChatMessage['activity'] }) {
+  const outside = outsideWorkCards(activity);
+  if (outside.length === 0) return null;
+  return (
+    <div class="reply-outside">
+      {outside.map((card) => (
+        <div key={card.key} class="reply-outside-card">
+          <span class="reply-outside-text">
+            <span class="reply-outside-title">{card.title}</span>
+            <span class="reply-outside-sub">{card.subtitle}</span>
+          </span>
+          {card.appUrl ? (
+            <a class="reply-outside-open" href={card.appUrl} target="_blank" rel="noopener noreferrer" aria-label={`Open ${card.app ?? 'the app'}`}>Open ↗</a>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function TurnReceipt({ message }: { message: ChatMessage }) {
   const [reveal, setReveal] = useState(false);
   const review = turnReview(message.activity);
@@ -857,21 +880,7 @@ function TurnReceipt({ message }: { message: ChatMessage }) {
   if (!review && !touched && !byline && outside.length === 0) return null;
   return (
     <>
-      {outside.length > 0 ? (
-        <div class="reply-outside">
-          {outside.map((card) => (
-            <div key={card.key} class="reply-outside-card">
-              <span class="reply-outside-text">
-                <span class="reply-outside-title">{card.title}</span>
-                <span class="reply-outside-sub">{card.subtitle}</span>
-              </span>
-              {card.appUrl ? (
-                <a class="reply-outside-open" href={card.appUrl} target="_blank" rel="noopener noreferrer" aria-label={`Open ${card.app ?? 'the app'}`}>Open ↗</a>
-              ) : null}
-            </div>
-          ))}
-        </div>
-      ) : null}
+      <OutsideWork activity={message.activity} />
       {review || touched || byline ? (
         <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
           {review === 'checked' ? <span class="receipt-ok">✓ Checked</span> : null}

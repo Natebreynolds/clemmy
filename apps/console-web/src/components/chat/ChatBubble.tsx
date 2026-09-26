@@ -11,7 +11,7 @@ import { ActivityCard } from '@/components/chat/ActivityCard';
 import { RememberedStrip } from '@/components/chat/RememberedStrip';
 import { useNowTick } from '@/components/chat/ActivityFeed';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
-import { TurnReceipt } from '@/components/chat/TurnReceipt';
+import { OutsideWorkCards, TurnReceipt } from '@/components/chat/TurnReceipt';
 import { WorkLine } from '@/components/chat/WorkLine';
 import { cn } from '@/lib/cn';
 import { linkify } from '@/lib/linkify';
@@ -574,8 +574,11 @@ export function ChatBubble({
         })()}
 
         {/* What she made, whether it was checked, what the turn touched, and
-            (on hover) which model did the work. */}
-        {!live && <TurnReceipt activity={message.activity} terminal={message.terminal} text={hasReplyText ? message.text : ''} />}
+            (on hover) which model did the work. A confirmed change in another
+            app shows as soon as it lands; the rest waits for the turn's end. */}
+        {live
+          ? <OutsideWorkCards activity={message.activity} />
+          : <TurnReceipt activity={message.activity} terminal={message.terminal} text={hasReplyText ? message.text : ''} />}
     </article>
   );
 }

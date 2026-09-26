@@ -55,3 +55,12 @@ test('an expired card says so instead of offering its controls, queued action or
   assert.match(SOURCE, /resolution === 'expired' \? 'Expired without an answer — it did not run\.'/);
   assert.match(SOURCE, /message\.approval\?\.resolution && \(!pendingAction \|\| message\.approval\.resolution === 'expired'\) \?/);
 });
+
+test('a confirmed change in another app shows while the turn is still live', () => {
+  assert.match(SOURCE, /live\s*\?\s*<OutsideWorkCards activity=\{message\.activity\} \/>\s*:\s*<TurnReceipt/,
+    'while the answer is written and checked, confirmed writes already show; the full receipt waits for the end');
+  assert.match(RECEIPT, /export function OutsideWorkCards/);
+  assert.match(RECEIPT, /<OutsideWorkCards activity=\{activity\}>/, 'the finished receipt keeps the cards in the same place');
+  assert.match(RECEIPT, /const outside = outsideWorkCards\(activity\);\s*if \(outside\.length === 0 && !children\) return null;/,
+    'only writes the provider confirmed become cards');
+});
