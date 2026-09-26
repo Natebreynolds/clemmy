@@ -23,13 +23,13 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
-import { listVerifiedRunStrategies, overlapScore, strategyKeywords, type RunStrategyRecord } from '../memory/run-strategy-store.js';
+import { describeProvenShapeRoles, listVerifiedRunStrategies, overlapScore, strategyKeywords, type ProvenCallShape, type RunStrategyRecord } from '../memory/run-strategy-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { composioSlugLooksWellFormed } from '../integrations/composio/toolkit-slug.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { isQuietHoursActive, loadProactivityPolicy, saveProactivityPolicy } from './proactivity-policy.js';
-import { getPlanProposal, surfacePlan } from './plan-proposals.js';
+import { getPlanProposal, restatePendingPlanProposal, surfacePlan } from './plan-proposals.js';
 import { PlanSchema, type Plan } from './planner.js';
 
 const logger = pino({ name: 'workflow-suggestions' });
@@ -59,9 +59,16 @@ export interface RepeatObservation {
 
 export interface SuggestionCandidate {
   strategyId: string;
+  /** The strategy's recorded request, kept for audit only. It is one
+   *  instance's wording and values and is never shown as the routine. */
   objective: string;
   tools: string[];
   workTools: string[];
+  /** The routine as the owner sees it: the tools, as words. */
+  label: string;
+  /** The role of each argument in the proven calls (`data[].target`),
+   *  never a value. */
+  roles: string;
   turns: number;
   distinctDays: number;
   sessions: number;
@@ -76,8 +83,12 @@ export type WorkflowSuggestionStatus = 'pending' | 'approved' | 'declined' | 'ex
 export interface WorkflowSuggestionRecord {
   id: string;
   strategyId: string;
+  /** One instance's request, for audit; the card never quotes it. */
   objective: string;
   tools: string[];
+  /** The routine described by its shape (absent on records written before
+   *  suggestions kept only the shape). */
+  label?: string;
   suggestedName: string;
   planProposalId: string;
   sessionId: string;
@@ -85,6 +96,8 @@ export interface WorkflowSuggestionRecord {
   createdAt: string;
   resolvedAt?: string;
   evidence: { turns: number; distinctDays: number; sessions: number; firstAt: string; lastAt: string };
+  /** 2 = the card describes the shape of the work; absent = it quoted one request. */
+  textVersion?: 2;
 }
 
 export interface WorkflowSuggestionsFinding {
@@ -189,7 +202,7 @@ export function isWorkTool(tool: string): boolean {
 }
 
 export function deriveSuggestionCandidates(input: {
-  strategies: readonly Pick<RunStrategyRecord, 'id' | 'objective' | 'toolsUsed'>[];
+  strategies: readonly Pick<RunStrategyRecord, 'id' | 'objective' | 'toolsUsed' | 'provenShapes'>[];
   observations: readonly RepeatObservation[];
   existingWorkflows: readonly ExistingWorkflowCoverage[];
   isWorkTool?: (tool: string) => boolean;
@@ -221,11 +234,14 @@ export function deriveSuggestionCandidates(input: {
     if (workTools.length === 0) continue;
     const objectiveKeywords = strategyKeywords(strategy.objective);
     if (input.existingWorkflows.some((workflow) => workflowCovers(workflow, workTools, objectiveKeywords))) { covered += 1; continue; }
+    const shape = describeSuggestionShape(workTools, strategy.provenShapes);
     candidates.push({
       strategyId: strategy.id,
       objective: strategy.objective,
       tools: [...strategy.toolsUsed],
       workTools,
+      label: shape.label,
+      roles: shape.roles,
       turns: rows.length,
       distinctDays: days.size,
       sessions: new Set(rows.map((row) => row.sessionId)).size,
@@ -239,10 +255,27 @@ export function deriveSuggestionCandidates(input: {
   return { candidates, covered };
 }
 
-/** A workflow name from the objective: the user's own words, trimmed to a
- *  title, never invented. */
-export function suggestedWorkflowName(objective: string): string {
-  const words = objective.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+/** A tool's name as words: the operation the owner keeps reaching for. */
+export function humanizeToolName(tool: string): string {
+  return tool.replace(/^cap:[a-z]+:/i, '').replace(/[_:]+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** The repeated work as the owner sees it: the tools it ran and the role of
+ *  each argument. Repeats are counted by the shape of the work, so one run's
+ *  request text (its target, names and figures) is never what "you asked
+ *  for": every run had its own. */
+export function describeSuggestionShape(tools: readonly string[], shapes?: readonly ProvenCallShape[]): { label: string; roles: string } {
+  const label = tools.map(humanizeToolName).filter(Boolean).join(' + ') || 'saved routine';
+  const roles = tools.map((tool) => {
+    const described = describeProvenShapeRoles(shapes, tool, { maxRoles: 8, maxChars: 160 });
+    return described ? `${humanizeToolName(tool)}: ${described}` : '';
+  }).filter(Boolean).join('; ');
+  return { label, roles };
+}
+
+/** A workflow name from the work itself, trimmed to a title. */
+export function suggestedWorkflowName(tools: readonly string[]): string {
+  const words = tools.map(humanizeToolName).filter(Boolean).join(' + ').split(' ').filter(Boolean);
   let out = '';
   for (const word of words) {
     const next = out ? `${out} ${word}` : word;
@@ -250,18 +283,29 @@ export function suggestedWorkflowName(objective: string): string {
     out = next;
   }
   const base = out || words.slice(0, 6).join(' ') || 'Saved routine';
-  return base.charAt(0).toUpperCase() + base.slice(1).replace(/[?.!]+$/, '');
+  return base.charAt(0).toUpperCase() + base.slice(1);
+}
+
+/** The card's one-line ask. */
+export function suggestionRequestText(candidate: Pick<SuggestionCandidate, 'label' | 'roles' | 'turns' | 'distinctDays'>): string {
+  const roles = candidate.roles ? ` (${candidate.roles})` : '';
+  return `Workflow suggestion: the same kind of request has come up ${candidate.turns} times over ${candidate.distinctDays} days: work done with ${candidate.label}${roles}, each time with its own target. Save it as a workflow you can run with new inputs or schedule?`;
+}
+
+export function suggestionContextText(candidate: Pick<SuggestionCandidate, 'strategyId' | 'turns' | 'sessions' | 'firstAt' | 'lastAt' | 'workTools'>): string {
+  return `Evidence: proven strategy ${candidate.strategyId}, ${candidate.turns} turns across ${candidate.sessions} chats, ${candidate.firstAt.slice(0, 10)} → ${candidate.lastAt.slice(0, 10)}, tools ${candidate.workTools.join(', ')}. Counted by the shape of the work, not by wording; each run had its own targets.`;
 }
 
 export function buildSuggestionPlan(candidate: SuggestionCandidate, name: string): Plan {
   const tools = candidate.workTools.join(', ');
+  const roles = candidate.roles ? ` Arguments those runs used: ${candidate.roles}.` : '';
   return PlanSchema.parse({
-    objective: `Save "${candidate.objective}" as a reusable workflow named "${name}", built from the exact tools that chat already used (${tools}).`,
+    objective: `Save this kind of request as a reusable workflow named "${name}", built from the exact tools that chat already used (${tools}).${roles}`,
     steps: [
       {
         n: 1,
-        action: `Call workflow_from_session with name "${name}" and sessionId "${candidate.latestSessionId}" to reconstruct the steps from that chat's proven tool calls (${tools}). Keep it manual-only; do not add a schedule unless the user asks for one.`,
-        rationale: `The same request ran ${candidate.turns} times on ${candidate.distinctDays} days. A saved workflow makes it one tap, or a schedule, instead of a fresh conversation each time.`,
+        action: `Call workflow_from_session with name "${name}" and sessionId "${candidate.latestSessionId}" to reconstruct the steps from that chat's proven tool calls (${tools}). The values that changed between runs (a target, a name, a date range) become workflow inputs, not fixed values. Keep it manual-only; do not add a schedule unless the user asks for one.`,
+        rationale: `The same kind of request ran ${candidate.turns} times on ${candidate.distinctDays} days, each time with its own values. A saved workflow makes it one tap with new inputs, or a schedule, instead of a fresh conversation each time.`,
         verification: 'The workflow exists, its creation test passed, it is enabled, and the reply names the workflow and how to run or schedule it.',
       },
     ],
@@ -278,6 +322,11 @@ export function buildSuggestionPlan(candidate: SuggestionCandidate, name: string
     appliedInstructions: [],
     externalSends: null,
   });
+}
+
+/** A record written before labels existed is described by its tools. */
+function recordLabel(record: Pick<WorkflowSuggestionRecord, 'label' | 'tools'>): string {
+  return record.label ?? describeSuggestionShape(record.tools).label;
 }
 
 // ── state ────────────────────────────────────────────────────────────────────
@@ -335,6 +384,8 @@ export interface WorkflowSuggestionsDeps {
   surface: (candidate: SuggestionCandidate, name: string) => string;
   /** The card's current decision, from the plan-proposal store. */
   proposalStatus: (planProposalId: string) => 'pending' | 'approved' | 'rejected' | 'missing';
+  /** Restate a still-pending card in place (no new notification); false when it is gone or answered. */
+  restateProposal: (planProposalId: string, patch: { originatingRequest: string; plan: Plan; context: string }) => boolean;
   loadState: () => WorkflowSuggestionsState;
   saveState: (state: WorkflowSuggestionsState) => void;
 }
@@ -351,10 +402,10 @@ export function productionWorkflowSuggestionsDeps(): WorkflowSuggestionsDeps {
     isWorkTool,
     surface: (candidate, name) => surfacePlan({
       plan: buildSuggestionPlan(candidate, name),
-      originatingRequest: `Workflow suggestion: you asked for "${candidate.objective}" ${candidate.turns} times over ${candidate.distinctDays} days. Save it as a workflow you can run or schedule?`,
+      originatingRequest: suggestionRequestText(candidate),
       proposedByAgent: 'workflow-suggestions',
       sessionId: candidate.latestSessionId,
-      context: `Evidence: proven strategy ${candidate.strategyId}, ${candidate.turns} turns across ${candidate.sessions} chats, ${candidate.firstAt.slice(0, 10)} → ${candidate.lastAt.slice(0, 10)}, tools ${candidate.workTools.join(', ')}.`,
+      context: suggestionContextText(candidate),
     }).id,
     proposalStatus: (id) => {
       const proposal = getPlanProposal(id);
@@ -363,6 +414,7 @@ export function productionWorkflowSuggestionsDeps(): WorkflowSuggestionsDeps {
       if (proposal.status === 'rejected') return 'rejected';
       return 'approved';
     },
+    restateProposal: (id, patch) => restatePendingPlanProposal(id, patch) !== null,
     loadState: loadWorkflowSuggestionsState,
     saveState: saveWorkflowSuggestionsState,
   };
@@ -389,6 +441,7 @@ export function processWorkflowSuggestionsTick(
   // Reconcile what the owner decided on the cards since the last tick, and
   // retire proposals nobody answered.
   let expired = 0;
+  let strategiesById: Map<string, Pick<RunStrategyRecord, 'id' | 'objective' | 'toolsUsed' | 'provenShapes'>> | null = null;
   for (const record of state.records) {
     if (record.status !== 'pending') continue;
     const status = deps.proposalStatus(record.planProposalId);
@@ -397,7 +450,28 @@ export function processWorkflowSuggestionsTick(
     const age = started.getTime() - Date.parse(record.createdAt);
     if (status === 'missing' || age > SUGGESTION_PENDING_EXPIRY_DAYS * DAY_MS) {
       record.status = 'expired'; record.resolvedAt = at; state.metrics.expired += 1; expired += 1;
+      continue;
     }
+    // A card raised before suggestions kept only the shape quoted one run's
+    // request as if every run had asked for it. While it is still waiting it
+    // is restated once from the shape of the work; the owner's answer, when
+    // it comes, is about the same card.
+    if (record.textVersion === 2) continue;
+    strategiesById ??= new Map(deps.strategies().map((strategy) => [strategy.id, strategy]));
+    const shape = describeSuggestionShape(record.tools, strategiesById.get(record.strategyId)?.provenShapes);
+    const name = suggestedWorkflowName(record.tools);
+    const candidate: SuggestionCandidate = {
+      strategyId: record.strategyId, objective: record.objective, tools: record.tools, workTools: record.tools,
+      label: shape.label, roles: shape.roles,
+      turns: record.evidence.turns, distinctDays: record.evidence.distinctDays, sessions: record.evidence.sessions,
+      firstAt: record.evidence.firstAt, lastAt: record.evidence.lastAt, latestSessionId: record.sessionId, latestSourceUserSeq: 0,
+    };
+    const restated = deps.restateProposal(record.planProposalId, {
+      originatingRequest: suggestionRequestText(candidate),
+      plan: buildSuggestionPlan(candidate, name),
+      context: suggestionContextText(candidate),
+    });
+    if (restated) { record.label = shape.label; record.suggestedName = name; record.textVersion = 2; }
   }
 
   const policy = deps.policy();
@@ -435,19 +509,21 @@ export function processWorkflowSuggestionsTick(
   let proposedRecord: WorkflowSuggestionRecord | undefined;
   if (eligible.length > 0 && pending < SUGGESTION_MAX_PENDING) {
     const candidate = eligible[0];
-    const name = suggestedWorkflowName(candidate.objective);
+    const name = suggestedWorkflowName(candidate.workTools);
     const planProposalId = deps.surface(candidate, name);
     proposedRecord = {
       id: `wsug-${started.getTime().toString(36)}-${candidate.strategyId.slice(-6)}`,
       strategyId: candidate.strategyId,
       objective: candidate.objective,
       tools: candidate.workTools,
+      label: candidate.label,
       suggestedName: name,
       planProposalId,
       sessionId: candidate.latestSessionId,
       status: 'pending',
       createdAt: at,
       evidence: { turns: candidate.turns, distinctDays: candidate.distinctDays, sessions: candidate.sessions, firstAt: candidate.firstAt, lastAt: candidate.lastAt },
+      textVersion: 2,
     };
     state.records.push(proposedRecord);
     state.metrics.proposed += 1;
@@ -457,7 +533,7 @@ export function processWorkflowSuggestionsTick(
   if (state.records.length > 60) state.records = state.records.slice(-60);
 
   const summary = proposedRecord
-    ? `Suggested saving "${proposedRecord.objective}" as a workflow (${proposedRecord.evidence.turns} times on ${proposedRecord.evidence.distinctDays} days).`
+    ? `Suggested saving the repeated ${recordLabel(proposedRecord)} work as a workflow (${proposedRecord.evidence.turns} times on ${proposedRecord.evidence.distinctDays} days).`
     : eligible.length > 0
       ? `${eligible.length} repeat${eligible.length === 1 ? '' : 's'} noticed; a suggestion is already waiting for your answer.`
       : `Nothing repeated enough to suggest (${observations.length} proven turns in ${SUGGESTION_WINDOW_DAYS} days${covered > 0 ? `, ${covered} already covered by a saved workflow` : ''}).`;
@@ -571,7 +647,7 @@ export function workflowSuggestionsStatus(now = new Date()): WorkflowSuggestions
     key: record.id,
     kind: 'suggestion' as const,
     signal: 'low' as const,
-    subject: `Save "${record.objective}" as the workflow "${record.suggestedName}" (${record.evidence.turns}× on ${record.evidence.distinctDays} days)`,
+    subject: `Save the repeated ${recordLabel(record)} work as the workflow "${record.suggestedName}" (${record.evidence.turns}× on ${record.evidence.distinctDays} days)`,
     eventStartMs: Date.parse(record.createdAt),
     eventEndMs: Date.parse(record.createdAt) + SUGGESTION_PENDING_EXPIRY_DAYS * DAY_MS,
     createdAt: record.createdAt,

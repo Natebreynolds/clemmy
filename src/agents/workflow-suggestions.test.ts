@@ -19,9 +19,10 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 const {
   deriveSuggestionCandidates, processWorkflowSuggestionsTick, emptyWorkflowSuggestionsState,
   suggestedWorkflowName, buildSuggestionPlan, isWorkTool, workflowSuggestionsStatus, workflowCovers,
+  suggestionRequestText, suggestionContextText, describeSuggestionShape,
   SUGGESTION_MIN_TURNS, SUGGESTION_PENDING_EXPIRY_DAYS, SUGGESTION_DECLINE_COOLDOWN_DAYS,
 } = await import('./workflow-suggestions.js');
-import type { RepeatObservation, WorkflowSuggestionsDeps, WorkflowSuggestionsState, SuggestionCandidate } from './workflow-suggestions.js';
+import type { RepeatObservation, WorkflowSuggestionsDeps, WorkflowSuggestionsState, SuggestionCandidate, WorkflowSuggestionRecord } from './workflow-suggestions.js';
 
 const NOW = new Date('2026-09-22T16:00:00.000Z');
 const DAY = 86_400_000;
@@ -75,20 +76,92 @@ test('coverage needs every work tool AND the same subject; one shared tool is no
   assert.equal(workflowCovers({ name: 'Tomorrow plan', tools: new Set(['GOOGLECALENDAR_LIST_EVENTS']), keywords: ['tomorrow', 'calendar'] }, routine, words), false, 'same subject, different tool');
 });
 
-test('the suggested name is the user\'s own words as a title; the plan is one workflow_from_session step', () => {
-  assert.equal(suggestedWorkflowName('whats on my calendar tomorrow?'), 'Whats on my calendar tomorrow');
-  assert.equal(suggestedWorkflowName('   '), 'Saved routine');
+test('the suggested name comes from the work itself; the plan is one workflow_from_session step', () => {
+  assert.equal(suggestedWorkflowName(['outlook_get_calendar_view']), 'Outlook get calendar view');
+  assert.equal(suggestedWorkflowName(['salesforce_sf_soql_query', 'outlook_create_draft']), 'Salesforce sf soql query + outlook create draft');
+  assert.equal(suggestedWorkflowName([]), 'Saved routine');
   const candidate: SuggestionCandidate = {
     strategyId: 'strat-cal', objective: 'whats on my calendar tomorrow', tools: ['outlook_get_calendar_view'], workTools: ['outlook_get_calendar_view'],
+    label: 'outlook get calendar view', roles: 'outlook get calendar view: start_datetime, end_datetime',
     turns: 4, distinctDays: 2, sessions: 3, firstAt: '2026-09-21T09:00:00.000Z', lastAt: '2026-09-22T09:00:00.000Z', latestSessionId: 'sess-cal-b', latestSourceUserSeq: 200,
   };
-  const plan = buildSuggestionPlan(candidate, 'Whats on my calendar tomorrow');
+  const plan = buildSuggestionPlan(candidate, 'Outlook get calendar view');
   assert.equal(plan.steps.length, 1);
-  assert.match(plan.steps[0].action, /workflow_from_session with name "Whats on my calendar tomorrow" and sessionId "sess-cal-b"/);
+  assert.match(plan.steps[0].action, /workflow_from_session with name "Outlook get calendar view" and sessionId "sess-cal-b"/);
   assert.match(plan.steps[0].action, /manual-only/);
+  assert.match(plan.steps[0].action, /become workflow inputs, not fixed values/);
+  assert.match(plan.objective, /Arguments those runs used: outlook get calendar view: start_datetime, end_datetime/);
   assert.deepEqual(plan.needsUserInput, []);
   assert.equal(plan.estimatedComplexity, 'trivial');
   assert.match(plan.successCriteria[0], /enabled after a passing creation test/);
+});
+
+test('a suggestion built from asks about different targets describes the shape of the work and never quotes one ask as if it were all of them', () => {
+  // Five asks of one kind, each about its own firm: the strategy record holds
+  // the first firm's request text; the observations are the five re-selections.
+  const firstAsk = 'give me the organic traffic value for this firm over the last 6 months https://first-firm.example/';
+  const strategy = {
+    id: 'strat-seo', objective: firstAsk, toolsUsed: ['seotool__api_request'],
+    provenShapes: [
+      { tool: 'seotool__api_request', shape: '{"method":"POST","path":"/v3/labs/historical_rank_overview/live","data":[{"target":"string","date_from":"string","date_to":"string"}]}' },
+      { tool: 'seotool__api_request', shape: '{"method":"POST","path":"/v3/labs/domain_rank_overview/live","data":[{"target":"string","location_code":"number"}]}' },
+    ],
+  };
+  const observations = [obs('strat-seo', 0), obs('strat-seo', 0, 's2', 2), obs('strat-seo', 1, 's3', 3), obs('strat-seo', 1, 's4', 4), obs('strat-seo', 1, 's5', 5)];
+  const { candidates } = deriveSuggestionCandidates({ strategies: [strategy], observations, now: NOW, isWorkTool: () => true, existingWorkflows: [] });
+  assert.equal(candidates.length, 1);
+  const candidate = candidates[0];
+  assert.equal(candidate.turns, 5);
+  assert.equal(candidate.distinctDays, 2);
+  assert.equal(candidate.label, 'seotool api request');
+  // The card keeps the role list short; the roles are the union across the runs' shapes.
+  assert.match(candidate.roles, /^seotool api request: method=POST, path=\/v3\/labs\/historical_rank_overview\/live \| \/v3\/labs\/domain_rank_overview\/live, data\[\]\.target, data\[\]\.date_from/);
+  const name = suggestedWorkflowName(candidate.workTools);
+  const texts = [
+    suggestionRequestText(candidate),
+    suggestionContextText(candidate),
+    JSON.stringify(buildSuggestionPlan(candidate, name)),
+    name,
+  ];
+  assert.match(texts[0]!, /the same kind of request has come up 5 times over 2 days/);
+  assert.match(texts[0]!, /work done with seotool api request \(seotool api request: method=POST, path=/);
+  assert.match(texts[0]!, /each time with its own target/);
+  assert.match(texts[1]!, /Counted by the shape of the work, not by wording/);
+  for (const text of texts) {
+    assert.doesNotMatch(text, /first-firm|organic traffic value|last 6 months|you asked for/, `one instance's request never stands for the routine: ${text}`);
+  }
+});
+
+test('a pending card raised before suggestions kept only the shape is restated once from the shape; answered cards are history', () => {
+  const restated: Array<{ id: string; originatingRequest: string; plan: unknown; context: string }> = [];
+  const legacy = (id: string, status: WorkflowSuggestionRecord['status']): WorkflowSuggestionRecord => ({
+    id: `wsug-${id}`, strategyId: 'strat-seo', objective: 'give me the organic traffic value for this firm over the last 6 months https://first-firm.example/',
+    tools: ['seotool__api_request'], suggestedName: 'Give me the organic traffic value for this firm', planProposalId: id, sessionId: 'sess-seo',
+    status, createdAt: NOW.toISOString(), evidence: { turns: 5, distinctDays: 2, sessions: 5, firstAt: NOW.toISOString(), lastAt: NOW.toISOString() },
+    ...(status === 'approved' ? { resolvedAt: NOW.toISOString() } : {}),
+  });
+  const { deps, state } = makeDeps({
+    observations: () => [],
+    strategies: () => [{ id: 'strat-seo', objective: 'x', toolsUsed: ['seotool__api_request'], provenShapes: [{ tool: 'seotool__api_request', shape: '{"method":"POST","path":"/v3/labs/live","data":[{"target":"string"}]}' }] }],
+    proposalStatus: (id) => (id === 'plan-legacy' ? 'pending' : 'approved'),
+    restateProposal: (id, patch) => { restated.push({ id, ...patch }); return true; },
+    loadState: () => ({ ...emptyWorkflowSuggestionsState(), records: [legacy('plan-legacy', 'pending'), legacy('plan-old-approved', 'approved')] }),
+  });
+  let saved: WorkflowSuggestionsState | null = null;
+  processWorkflowSuggestionsTick({ ...deps, saveState: (next) => { saved = next; } }, { source: 'heartbeat' });
+  assert.equal(restated.length, 1, 'only the waiting card is restated');
+  assert.equal(restated[0]!.id, 'plan-legacy');
+  assert.match(restated[0]!.originatingRequest, /the same kind of request has come up 5 times over 2 days: work done with seotool api request \(seotool api request: method=POST, path=\/v3\/labs\/live, data\[\]\.target\)/);
+  assert.doesNotMatch(`${restated[0]!.originatingRequest} ${JSON.stringify(restated[0]!.plan)} ${restated[0]!.context}`, /first-firm|organic traffic|you asked for/);
+  const pending = saved!.records.find((record) => record.planProposalId === 'plan-legacy')!;
+  assert.equal(pending.textVersion, 2);
+  assert.equal(pending.label, 'seotool api request');
+  assert.equal(pending.suggestedName, 'Seotool api request');
+  assert.equal(saved!.records.find((record) => record.planProposalId === 'plan-old-approved')!.textVersion, undefined, 'an answered card is left as it was');
+  // The restated card is not restated again on the next tick.
+  processWorkflowSuggestionsTick({ ...deps, loadState: () => structuredClone(saved!), saveState: () => {} }, { source: 'heartbeat' });
+  assert.equal(restated.length, 1);
+  void state;
 });
 
 test('isWorkTool: discovery, planning and control tools are never the work; local adapters and provider operations are', () => {
@@ -112,6 +185,7 @@ function makeDeps(overrides: Partial<WorkflowSuggestionsDeps> = {}): { deps: Wor
     isWorkTool: work,
     surface: (candidate, name) => { surfaced.push({ candidate, name }); const id = `plan-${surfaced.length}`; statuses.set(id, 'pending'); return id; },
     proposalStatus: (id) => statuses.get(id) ?? 'missing',
+    restateProposal: () => true,
     loadState: () => structuredClone(state),
     saveState: (next) => { state = structuredClone(next); },
     ...overrides,
@@ -126,8 +200,11 @@ test('a tick raises ONE suggestion for the most repeated request and stays quiet
   assert.equal(first.candidates, 2, 'two routines qualified');
   assert.equal(surfaced.length, 1);
   assert.equal(surfaced[0].candidate.strategyId, 'strat-cal', 'the most repeated first');
-  assert.equal(surfaced[0].name, 'Whats on my calendar tomorrow');
-  assert.match(first.summary, /Suggested saving "whats on my calendar tomorrow" as a workflow \(3 times on 2 days\)/);
+  assert.equal(surfaced[0].name, 'Outlook get calendar view');
+  assert.match(first.summary, /Suggested saving the repeated outlook get calendar view work as a workflow \(3 times on 2 days\)/);
+  assert.doesNotMatch(first.summary, /whats on my calendar tomorrow/, 'one ask\'s words never stand for the routine');
+  assert.equal(state().records[0].textVersion, 2);
+  assert.equal(state().records[0].label, 'outlook get calendar view');
   const second = processWorkflowSuggestionsTick(deps, { source: 'heartbeat' });
   assert.equal(second.proposed, 0, 'one open suggestion at a time');
   assert.equal(surfaced.length, 1);

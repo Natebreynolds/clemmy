@@ -525,6 +525,29 @@ export function getPlanProposal(id: string): PlanProposal | null {
   return readProposal(id);
 }
 
+/**
+ * Restate a pending proposal's owner-facing text and plan in place: the same
+ * card with better words, and no new notification. A proposal the owner has
+ * already answered is history and is left as it was.
+ */
+export function restatePendingPlanProposal(
+  id: string,
+  patch: { originatingRequest: string; plan: Plan; context?: string },
+): PlanProposal | null {
+  const proposal = readProposal(id);
+  if (!proposal || proposal.status !== 'pending') return null;
+  const originatingRequest = patch.originatingRequest.trim();
+  if (originatingRequest.length < 4 || !patch.plan.objective || patch.plan.steps.length === 0) return null;
+  const updated: PlanProposal = {
+    ...proposal,
+    originatingRequest,
+    plan: patch.plan,
+    ...(patch.context?.trim() ? { context: patch.context.trim() } : {}),
+  };
+  writeProposal(updated);
+  return updated;
+}
+
 export interface ListPlanProposalsFilter {
   status?: PlanProposalStatus | 'all';
   sessionId?: string;
