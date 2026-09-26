@@ -36,6 +36,11 @@ export function useConversationAgent(initial: ConversationAgent | null, opts?: {
     try {
       const result = await setConversationAgent(sessionId, agent?.id ?? null);
       if (result.changed) onSwitched?.();
+      // The server's answer is who actually replies (a deleted agent falls
+      // back to Clem); the chip follows it.
+      if ((result.agentId ?? null) !== (agent?.id ?? null)) {
+        setChosen(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
+      }
       return { agentName: result.agentName };
     } catch (error) {
       // A conversation that takes no agent (a Space dock) still takes a plain
