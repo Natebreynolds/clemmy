@@ -74,6 +74,10 @@ test('the public approval event carries a well-formed preview and drops a malfor
   assert.deepEqual((projectHarnessEventForPublic(event({ preview: named }) as never)?.data as Record<string, unknown>)?.preview, named);
   const badName = { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1', label: 'x'.repeat(121) }] };
   assert.equal((projectHarnessEventForPublic(event({ preview: badName }) as never)?.data as Record<string, unknown>)?.preview, undefined);
+  const checked = { ...preview, check: { status: 'conflicts', conflicts: ['It names the research tool; you asked never to.'] } };
+  assert.deepEqual((projectHarnessEventForPublic(event({ preview: checked }) as never)?.data as Record<string, unknown>)?.preview, checked);
+  const badCheck = { ...preview, check: { status: 'maybe' } };
+  assert.equal((projectHarnessEventForPublic(event({ preview: badCheck }) as never)?.data as Record<string, unknown>)?.preview, undefined);
 });
 
 test('a name the host found rides beside its id, never beside a withheld secret; call_tool unwraps like work_call', () => {
@@ -92,4 +96,12 @@ test('a name the host found rides beside its id, never beside a withheld secret;
   });
   assert.equal(mcp?.operation, 'fixture__send_message');
   assert.deepEqual(mcp?.fields.map((field) => field.name), ['recipient', 'message']);
+});
+
+test('the pre-send check rides on the preview beside the fields', () => {
+  const previewed = approvalCallPreview({
+    ...workCall('SLACK_SEND_MESSAGE', { channel: 'D0FIXTURE1', markdown_text: message }),
+    previewCheck: { status: 'clear' },
+  });
+  assert.deepEqual(previewed?.check, { status: 'clear' });
 });

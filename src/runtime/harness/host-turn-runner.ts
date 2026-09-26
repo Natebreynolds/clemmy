@@ -85,6 +85,7 @@ import {
 import type { InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
 import { approvalCallPreview } from './approval-call-preview.js';
 import { approvalPreviewLabels } from './approval-preview-labels.js';
+import { approvalPrecheck } from './approval-precheck.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
@@ -10616,11 +10617,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           args: parsedArgs(pending.rawItem.arguments),
           rawArgs: pending.rawItem.arguments,
         };
-        const previewLabels = await approvalPreviewLabels({
-          sessionId: approvalIdentity.sessionId,
-          sourceUserSeq: approvalIdentity.sourceUserSeq,
-          preview: approvalCallPreview(info),
-        }).catch(() => undefined);
+        const preview = approvalCallPreview(info);
+        const [previewLabels, previewCheck] = await Promise.all([
+          approvalPreviewLabels({
+            sessionId: approvalIdentity.sessionId,
+            sourceUserSeq: approvalIdentity.sourceUserSeq,
+            preview,
+          }).catch(() => undefined),
+          // The owner's checker reads the exact content against their standing
+          // rules before the card; the card shows what it found.
+          approvalPrecheck({
+            sessionId: approvalIdentity.sessionId,
+            sourceUserSeq: approvalIdentity.sourceUserSeq,
+            preview,
+          }).catch(() => undefined),
+        ]);
         return {
           ...info,
           ...(pending.consentCall ? { consentCall: pending.consentCall } : {}),
@@ -10631,6 +10642,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               }
             : {}),
           ...(previewLabels ? { previewLabels } : {}),
+          ...(previewCheck ? { previewCheck } : {}),
         };
       }));
       return {

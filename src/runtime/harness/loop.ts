@@ -3182,6 +3182,9 @@ export interface InterruptionInfo {
   /** Display only: a human name for an argument value, found in this
    *  conversation's own evidence (value -> name). Never authority. */
   previewLabels?: Readonly<Record<string, string>>;
+  /** Display only: the pre-send check of this exact content against the
+   *  owner's standing rules. Advisory; never authority. */
+  previewCheck?: import('./approval-precheck.js').ApprovalPrecheck;
   /** Reducer facts for presentation only; never an approval/dispatch grant. */
   consentCall?: Pick<CapabilityRiskAttestationV1, 'effect' | 'accountId' | 'risk'>;
 }

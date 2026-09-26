@@ -94,6 +94,8 @@ test('an approval preview reaches the card on live delivery and replay; a malfor
     assert.deepEqual(foldTranscript([approval])[0]?.approval?.preview, preview);
     const malformed = ev(3, 'approval_requested', { approvalId: 'apr-bad', subject: 'x', preview: { operation: 'x', fields: [{ name: 1 }] } });
     assert.equal(foldTranscript([malformed])[0]?.approval?.preview, undefined);
+    const checkedPreview = { operation: 'Send email', fields: [{ name: 'body', value: 'Hello there' }], check: { status: 'conflicts', conflicts: ['It names a tool you asked never to name.'] } };
+    assert.deepEqual(foldTranscript([ev(5, 'approval_requested', { approvalId: 'apr-chk1', subject: 'x', preview: checkedPreview })])[0]?.approval?.preview, checkedPreview);
     const named = { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1', label: 'Sam Rivera' }] };
     assert.deepEqual(foldTranscript([ev(4, 'approval_requested', { approvalId: 'apr-named', subject: 'x', preview: named })])[0]?.approval?.preview, named);
   } finally { engine.dispose(); }

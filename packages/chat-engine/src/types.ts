@@ -34,6 +34,8 @@ export interface ApprovalPreview {
   operation: string;
   /** `label` is the name the host found for an id-like value, display only. */
   fields: Array<{ name: string; value: string; label?: string }>;
+  /** The pre-send check of this content against the owner's standing rules. */
+  check?: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 }
 
 export type ApprovalResolution = 'approved' | 'declined' | 'changed';
@@ -58,7 +60,20 @@ export function approvalPreviewFrom(value: unknown): ApprovalPreview | undefined
     if (typeof name !== 'string' || typeof shown !== 'string') return undefined;
     fields.push({ name, value: shown, ...(typeof label === 'string' && label.trim() ? { label } : {}) });
   }
-  return { operation: record.operation, fields };
+  const check = record.check && typeof record.check === 'object' && !Array.isArray(record.check)
+    ? record.check as Record<string, unknown>
+    : null;
+  const status = check && (check.status === 'clear' || check.status === 'conflicts' || check.status === 'unavailable')
+    ? check.status
+    : null;
+  const conflicts = check && Array.isArray(check.conflicts)
+    ? check.conflicts.filter((line): line is string => typeof line === 'string' && line.trim().length > 0).slice(0, 3)
+    : [];
+  return {
+    operation: record.operation,
+    fields,
+    ...(status ? { check: { status, ...(conflicts.length ? { conflicts } : {}) } } : {}),
+  };
 }
 
 export type MessageStatus =

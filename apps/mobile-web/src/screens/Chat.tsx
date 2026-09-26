@@ -532,6 +532,21 @@ function MessageRow({
       <div class="turn turn-approval">
         <div class="approval-head">Waiting on you — {message.approval.subject}</div>
         {message.approval.reason ? <div class="approval-reason">{message.approval.reason}</div> : null}
+        {message.approval.preview?.check?.status === 'conflicts' && message.approval.preview.check.conflicts?.length ? (
+          <div class="approval-check approval-check-warn" role="note">
+            <div class="approval-check-title">Before you approve</div>
+            <ul>
+              {message.approval.preview.check.conflicts.map((line) => <li key={line}>{line}</li>)}
+            </ul>
+            <div class="approval-check-hint">Reply with a change, or approve it as it is.</div>
+          </div>
+        ) : message.approval.preview?.check ? (
+          <div class="approval-check">
+            {message.approval.preview.check.status === 'clear'
+              ? 'Checked against your standing rules — no conflicts.'
+              : 'Couldn’t check this against your standing rules.'}
+          </div>
+        ) : null}
         {message.approval.preview && message.approval.preview.fields.length > 0 ? (
           // What approving would actually send, from the host's frozen call.
           <dl class="approval-preview">

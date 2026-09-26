@@ -46,8 +46,20 @@ import { parsePlanRevisionRef, parseTaskMode, type PlanRevisionRef, type TaskMod
 /** The host-built approval preview (operation + argument values the owner is
  * approving), admitted only in its exact bounded shape. */
 type ApprovalPreviewField = { name: string; value: string; label?: string };
+type ApprovalPreviewCheck = { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 
-export function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: ApprovalPreviewField[] } } | null {
+function approvalPreviewCheck(value: unknown): ApprovalPreviewCheck | null | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const { status, conflicts } = value as Record<string, unknown>;
+  if (status !== 'clear' && status !== 'conflicts' && status !== 'unavailable') return null;
+  if (conflicts === undefined) return { status };
+  if (!Array.isArray(conflicts) || conflicts.length > 3
+    || conflicts.some((line) => typeof line !== 'string' || !line.trim() || line.length > 300)) return null;
+  return { status, conflicts: conflicts as string[] };
+}
+
+export function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck } } | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (typeof record.operation !== 'string' || !record.operation.trim() || record.operation.length > 80) return null;
@@ -60,7 +72,9 @@ export function approvalPreviewProjection(value: unknown): { preview: { operatio
     if (label !== undefined && (typeof label !== 'string' || !label.trim() || label.length > 120)) return null;
     fields.push({ name, value: shown, ...(typeof label === 'string' ? { label } : {}) });
   }
-  return { preview: { operation: record.operation, fields } };
+  const check = approvalPreviewCheck(record.check);
+  if (check === null) return null;
+  return { preview: { operation: record.operation, fields, ...(check ? { check } : {}) } };
 }
 
 export function publicPlanArtifactRef(value: unknown): PlanRevisionRef | undefined {

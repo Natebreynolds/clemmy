@@ -32,6 +32,8 @@ export function approvalJsonRecord(value: unknown): Record<string, unknown> | nu
 export interface ApprovalCallPreview {
   operation: string;
   fields: Array<{ name: string; value: string; label?: string }>;
+  /** The pre-send check against the owner's standing rules, when one ran. */
+  check?: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 }
 
 const APPROVAL_PREVIEW_MAX_FIELDS = 16;
@@ -98,7 +100,18 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
       ...(label ? { label: truncate(label, 120) } : {}),
     });
   }
-  return { operation, fields };
+  return {
+    operation,
+    fields,
+    ...(info.previewCheck
+      ? {
+          check: {
+            status: info.previewCheck.status,
+            ...(info.previewCheck.conflicts?.length ? { conflicts: [...info.previewCheck.conflicts] } : {}),
+          },
+        }
+      : {}),
+  };
 }
 
 /**

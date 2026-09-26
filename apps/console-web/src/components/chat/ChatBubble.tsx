@@ -36,6 +36,31 @@ import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presenta
  * caret (styles.css `.chat-prose.is-streaming`).
  */
 /** "markdown_text" → "Markdown text": an argument name as a label. */
+/** What the pre-send check found in this exact content, before approval.
+ *  Advisory: the owner decides either way. */
+function ApprovalCheckNote({ check }: {
+  check: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
+}) {
+  if (check.status === 'conflicts' && check.conflicts?.length) {
+    return (
+      <div className="mt-2 rounded-md border border-warning bg-warning-tint px-2.5 py-2 text-caption" role="note">
+        <p className="font-semibold text-warning">Before you approve</p>
+        <ul className="mt-1 list-disc space-y-0.5 pl-4 text-fg">
+          {check.conflicts.map((line) => <li key={line}>{line}</li>)}
+        </ul>
+        <p className="mt-1 text-muted">Reply with a change, or approve it as it is.</p>
+      </div>
+    );
+  }
+  return (
+    <p className="mt-2 text-caption text-muted">
+      {check.status === 'clear'
+        ? 'Checked against your standing rules — no conflicts.'
+        : 'Couldn’t check this against your standing rules.'}
+    </p>
+  );
+}
+
 function approvalResolutionText(resolution: 'approved' | 'declined' | 'changed'): string {
   return resolution === 'changed'
     ? 'You asked for a change — the revised version is below. Nothing was sent from this one.'
@@ -402,6 +427,9 @@ export function ChatBubble({
               </div>
             )}
             {message.approval?.reason && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
+            {!pendingAction && message.approval?.preview?.check && (
+              <ApprovalCheckNote check={message.approval.preview.check} />
+            )}
             {!pendingAction && message.approval?.preview && message.approval.preview.fields.length > 0 && (
               // What approving would actually send: each argument the tool
               // receives, from the host's frozen call (live 2026-09-25: a

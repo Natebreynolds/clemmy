@@ -1425,6 +1425,11 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .approval-preview dt { color: var(--fg-2); }
 .approval-preview dd { margin: 0; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
 .approval-preview-id { color: var(--fg-2); }
+.approval-check { margin: 8px 0 0; font-size: var(--t-sm); color: var(--fg-2); }
+.approval-check-warn { color: var(--fg); padding: 8px 10px; border-radius: 8px; border: 1px solid var(--clem-warning); background: var(--warn-soft); }
+.approval-check-title { font-weight: 600; color: var(--clem-warning); }
+.approval-check-warn ul { margin: 4px 0 0; padding-left: 18px; }
+.approval-check-hint { margin-top: 4px; color: var(--fg-2); }
 
 /* ── markdown inside a reply ────────────────────────────────────── */
 /* Replies carry markdown; the engine renders it sanitized. Spacing stays

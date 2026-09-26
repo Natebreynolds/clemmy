@@ -68,6 +68,7 @@ const dispatch = await import('./dispatch-ledger.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const outcomes = await import('./attempt-outcome.js');
 const jevClient = await import('../jev/client.js');
+const approvalPrechecks = await import('./approval-precheck.js');
 const brackets = await import('./brackets.js');
 const dispatchLeases = await import('./dispatch-lease.js');
 const guardrails = await import('./guardrails.js');
@@ -5783,13 +5784,24 @@ test('an approval pause names an id from this conversation\'s own results when J
     const agent = { model, tools: [carrier] };
     mcpToolAuthority.bindAgentMcpToolScope(agent as never, exactScope);
     bindHostCanarySurface(fixture, agent, [carrier]);
+    // Live 2026-09-25: a rule-breaking email reached its card unchecked. The
+    // owner's checker reads the exact content before the card.
+    const checked: string[] = [];
+    approvalPrechecks._setApprovalPrecheckRunForTests(async (input) => {
+      checked.push(input.content);
+      return { conflicts: [{ problem: 'It asks them to run it alone; you asked to join.' }] };
+    });
     const paused = await runProductionHost(fixture, agent);
     if (!paused.hasInterruptions) throw new Error(`Expected write approval: ${JSON.stringify(paused.history)}`);
     assert.equal(sendRuns, 0, 'nothing is sent before approval');
     assert.deepEqual(paused.interruptions?.[0]?.previewLabels, { U0FIXTURE1: 'Sam Rivera' });
+    assert.deepEqual(paused.interruptions?.[0]?.previewCheck,
+      { status: 'conflicts', conflicts: ['It asks them to run it alone; you asked to join.'] });
+    assert.match(checked[0] ?? '', /Could you run the 4:15 review on your own\?/, 'the checker read the exact message');
     assert.equal(asked.length, 1, 'only the id is named; the message text is not');
     assert.ok(!Object.values(asked[0]!).some((text) => text?.includes('://')), 'a URL is never offered as a name');
   } finally {
+    approvalPrechecks._setApprovalPrecheckRunForTests(null);
     jevClient._setTypesafeKeyForTests(undefined);
     jevClient._setSystemOneFetchForTests(undefined);
     productionPorts.clearProductionCapabilityPorts();
