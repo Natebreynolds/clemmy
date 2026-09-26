@@ -2737,6 +2737,35 @@ test('runTurn skips only the optional query primer for an explicit coordinated n
   assert.equal(primerEvent.data.skippedReason, 'explicit_request_opt_out');
 });
 
+test('runTurn records the turn anchor as the opening user message, not the system items the filter appends', async () => {
+  resetEventLog();
+  const sess = HarnessSession.create({ kind: 'chat' });
+  let observedAnchor: string | undefined;
+  let filteredTail: AgentInputItem | undefined;
+  const runRunner: RunRunnerFn = async (_runner, _agent, items, opts) => {
+    const filter = opts.callModelInputFilter as
+      | ((args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => { input: AgentInputItem[]; instructions?: string })
+      | undefined;
+    const filtered = filter!({ modelData: { input: [...items], instructions: 'base' } }).input;
+    filteredTail = filtered[filtered.length - 1];
+    observedAnchor = harnessRunContextStorage.getStore()?.modelTurnAnchor;
+    return {
+      history: [...items, { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'done' }] }],
+      finalOutput: 'done',
+    };
+  };
+  await runTurn({
+    agent: makeAgentStub(),
+    sessionId: sess.id,
+    input: 'summarize the open invoices',
+    provenOperationText: '[PROVEN OPERATION] Use the validated invoices contract.',
+    makeRunner: makeRunnerStub,
+    runRunner,
+  });
+  assert.equal((filteredTail as { role?: string } | undefined)?.role, 'system', 'the filter appends system items after the user message');
+  assert.equal(observedAnchor, createHash('sha256').update('summarize the open invoices', 'utf8').digest('hex'));
+});
+
 test('runTurn compacts oversized same-turn tool results only in model-facing input', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

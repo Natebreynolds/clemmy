@@ -38,12 +38,18 @@ import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
 import { withResilience } from './resilient-model.js';
-import { resolveModelCapability, modelParityEnabled, stripPromptCacheLayerSentinels } from './model-wire-registry.js';
+import { resolveModelCapability, modelParityEnabled, stripPromptCacheLayerSentinels, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
+import {
+  PROMPT_LAYOUT_PROBE_CHANNEL,
+  placeTurnContextAtAnchor,
+  promptLayoutFor,
+  schedulePromptLayoutProbe,
+} from './byo-prompt-layout.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'clementine.byo-model' });
@@ -309,6 +315,13 @@ export interface WrapCompletionsCreateOptions {
    * follows in one closing chunk; structured requests buffer whole.
    */
   nativeChatCompletionsStream?: boolean;
+  /**
+   * The endpoint this client sends to. When set, a request whose instructions
+   * carry the stable / per-turn boundary uses the layout measured for this
+   * endpoint and model (see byo-prompt-layout.ts); unset keeps the system
+   * layout.
+   */
+  promptLayout?: { baseURL: string };
 }
 
 /**
@@ -691,12 +704,50 @@ export function wrapCompletionsCreate(
   const nativeChatCompletionsStream = wrapOptions.nativeChatCompletionsStream === true;
   return async (params: Record<string, unknown>, options?: unknown) => {
     try {
-      return await wrappedCompletionsCreate(original, params, options, nativeChatCompletionsStream);
+      const placed = wrapOptions.promptLayout
+        ? withMeasuredPromptLayout(original, params, wrapOptions.promptLayout.baseURL)
+        : params;
+      return await wrappedCompletionsCreate(original, placed, options, nativeChatCompletionsStream);
     } catch (err) {
       noteContextOverflow(err, (params as { model?: unknown }).model);
       throw err;
     }
   };
+}
+
+/** Context under which a layout measurement records its own spend. */
+const PROMPT_LAYOUT_PROBE_CONTEXT = { sessionId: PROMPT_LAYOUT_PROBE_CHANNEL } as unknown as ReturnType<typeof harnessRunContextStorage.getStore>;
+
+/**
+ * Apply the measured per-turn context layout to a request that carries the
+ * stable / per-turn boundary, and measure the layout in the background when
+ * this endpoint and model have no current measurement. Any other request, and
+ * any request whose turn anchor is not present, is returned unchanged.
+ */
+function withMeasuredPromptLayout(
+  original: CreateFn,
+  params: Record<string, unknown>,
+  baseURL: string,
+): Record<string, unknown> {
+  try {
+    const model = typeof params.model === 'string' ? params.model : '';
+    const messages = Array.isArray(params.messages) ? params.messages as Array<Record<string, unknown>> : [];
+    const first = messages[0];
+    if (!model || first?.role !== 'system' || typeof first.content !== 'string'
+      || !first.content.includes(INSTRUCTION_CACHE_DELIM)) return params;
+    schedulePromptLayoutProbe({
+      baseURL,
+      model,
+      create: original,
+      onUsage: (completion, startedAt) => recordByoUsage(
+        completion as CompatCompletion, model, PROMPT_LAYOUT_PROBE_CONTEXT, startedAt,
+      ),
+    });
+    if (promptLayoutFor(baseURL, model) !== 'turn_anchor') return params;
+    return placeTurnContextAtAnchor(params, harnessRunContextStorage.getStore()?.modelTurnAnchor) ?? params;
+  } catch {
+    return params;
+  }
 }
 
 async function wrappedCompletionsCreate(
@@ -1213,6 +1264,7 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // structured JSON responses. The SDK calls client.chat.completions.create.
   (completions as unknown as { create: CreateFn }).create = wrapCompletionsCreate(original, {
     nativeChatCompletionsStream: byoBackendStreamsChatCompletions(byo),
+    promptLayout: { baseURL: byo.baseURL },
   });
   return client;
 }

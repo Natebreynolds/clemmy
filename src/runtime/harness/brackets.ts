@@ -1382,6 +1382,10 @@ export interface HarnessRunContext {
    * adapters attach this to usage events so prompt cost is attributable instead
    * of appearing as one opaque input-token number. Refreshed before every call. */
   promptComponents?: Record<string, number>;
+  /** Digest of the user message that opened the turn behind the model call in
+   * flight. An adapter that places per-turn context beside that message finds
+   * it by this digest. Refreshed before every call with the prompt components. */
+  modelTurnAnchor?: string;
   /** Run-scoped account stickiness: toolkit → connectionId → use. One answered
    * account choice (explicit pin/alias or a positively resolved identity) holds
    * for the rest of the run; two DISTINCT accounts used in one run means later

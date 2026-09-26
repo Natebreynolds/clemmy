@@ -723,6 +723,30 @@ for (const livePolicy of ['on', 'off']) {
 }
 
 
+test('a review that ran out of time says so, and never sends the owner to fix a reviewer that works', () => {
+  const sessionId = 'timed-out-unreviewed-publication';
+  createSession({ id: sessionId, kind: 'chat' });
+  const outcome = acceptedAnswer(sessionId, 'Here is the requested answer.');
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+    version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+  } });
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+    lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+    fulfills: true, failedOpen: true, reviewFailure: 'timeout',
+    reason: 'The completion reviewer timed out; no review was completed.',
+    objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+    replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+  } });
+  const committed = commitTurnOutcome(outcome);
+  assert.equal(committed.presentation.status, 'done');
+  assert.match(committed.presentation.text, /did not finish within its time limit, so it stands unreviewed/);
+  assert.doesNotMatch(committed.presentation.text, /not reachable|choose a reachable review model/);
+  const verdict = committed.event.data.completionVerdictRef as Record<string, unknown>;
+  assert.equal(verdict.verified, false);
+  assert.equal(verdict.disposition, 'enabled_unavailable');
+  assert.equal(committed.event.data.verificationDetail, 'completion_review_failed_open');
+});
+
 for (const [label, reason, expected] of [
   ['quota', 'The selected reviewer is rate-limited; no review was completed.', /reviewer is rate-limited/],
   ['retained-timeout', 'judge timed out — accepting completion', /judge timed out; no review was completed/],
