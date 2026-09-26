@@ -8230,6 +8230,33 @@ export function resolveToolOutputForAuthority(
   sessionId: string,
   callId: string,
 ): AuthorityToolOutputResolution {
+  return resolveDurableToolOutput(sessionId, callId, 'authority');
+}
+
+/**
+ * Read one settled result as DATA for a tool that queries it on the model's
+ * behalf. The occurrence proof is the authority proof: one parented lifecycle,
+ * bytes written inside it, complete and not failure-shaped. What differs is the
+ * nonce-less branch, which authority keeps to reads because an unproven write
+ * confirmation must never become evidence for a later action. A query only
+ * shows the model bytes its own session already received, so the producer's
+ * effect class cannot decide whether they open (live 2026-09-25: research
+ * calls through a generic API-request operation were classified as writes,
+ * file_query refused every result, and the model paged raw text instead and
+ * misread numbers). `effect` still travels with the record.
+ */
+export function resolveToolOutputForQuery(
+  sessionId: string,
+  callId: string,
+): AuthorityToolOutputResolution {
+  return resolveDurableToolOutput(sessionId, callId, 'query');
+}
+
+function resolveDurableToolOutput(
+  sessionId: string,
+  callId: string,
+  purpose: 'authority' | 'query',
+): AuthorityToolOutputResolution {
   const db = openEventLog();
   return db.transaction((): AuthorityToolOutputResolution => {
     const count = (db.prepare(
@@ -8295,10 +8322,16 @@ export function resolveToolOutputForAuthority(
     // Migrated pre-v19 rows have no nonce. They retain authority only when one
     // parented lifecycle pair proves the producer was the same READ/COMPUTE tool
     // and the longest-wins row was actually written inside that occurrence.
-    // Anything less would let a reused id promote stale provider bytes.
+    // Anything less would let a reused id promote stale provider bytes. A
+    // host-owned write's result is also stored without a nonce, by the
+    // lifecycle hook alone, so a query opens it on the same occurrence proof.
     if (
       lifecycle.occurrence
-      && (lifecycle.occurrence.effect === 'read' || lifecycle.occurrence.effect === 'compute')
+      && (
+        purpose === 'query'
+        || lifecycle.occurrence.effect === 'read'
+        || lifecycle.occurrence.effect === 'compute'
+      )
       && outputFallsWithinOccurrence(legacy, lifecycle.occurrence)
     ) {
       const failureReason = authorityOutputFailureReason(legacy, lifecycle.occurrence);
@@ -8313,7 +8346,9 @@ export function resolveToolOutputForAuthority(
     }
     return unusableAuthorityResolution(
       lifecycle,
-      'legacy output lacks one matching read/compute lifecycle occurrence',
+      purpose === 'query'
+        ? 'legacy output lacks one matching lifecycle occurrence'
+        : 'legacy output lacks one matching read/compute lifecycle occurrence',
     );
   })();
 }

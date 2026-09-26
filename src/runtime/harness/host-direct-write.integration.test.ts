@@ -916,3 +916,47 @@ test('a carrier-bounded call in Plan mode dispatches once as a preparation probe
   assert.equal(row.mutating, 0);
   assert.notEqual(row.recovery_action, 'stop_and_explain');
 });
+
+// A generic API-request call the host could not prove read-only is booked as a
+// write, but its response is data (live 2026-09-25: research POSTs through one
+// such operation; file_query refused every result and the model paged raw text
+// instead). The durable shape here is the one the live host wrote: a top-level
+// write lifecycle and a result the lifecycle hook stored without a nonce.
+const RESEARCH_SCHEMA = { type: 'object', properties: { method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] }, path: { type: 'string' }, data: { type: 'array', items: { type: 'object' } } }, required: ['method', 'path', 'data'], additionalProperties: false };
+const RESEARCH_PAYLOAD = { method: 'POST', path: '/v1/query', data: [{ query: 'fixture research' }] };
+
+test('a settled write-classified result opens in file_query through the real host turn', async () => {
+  const needle = 'fixture keyword ranked thirty seventh';
+  const fixture = await directWriteFixture('work_call', 'bounded', 'query-write-result', false, 'args_json', 1, {
+    operationId: 'research_request', schema: RESEARCH_SCHEMA, payloads: [RESEARCH_PAYLOAD],
+    result: { status_code: 20000, items: [{ keyword: needle, search_volume: 49500, position: 37 }] },
+  });
+  assert.ok(fixture);
+  const { runConversation } = await import('./loop.js');
+  const agent = await fixture.useProductionAgent();
+  const done = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+    sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+    suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+  assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(done));
+  const called = eventlog.listEvents(fixture.session.id, { types: ['tool_called'] })
+    .find((event) => event.data.callId === 'exact-draft' && event.data.accounting === 'top_level');
+  assert.equal(called?.data.effect, 'external_write', 'the call is booked as a write');
+  const db = eventlog.openEventLog();
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM tool_output_invocations WHERE session_id = ? AND call_id = ?')
+    .get(fixture.session.id, 'exact-draft') as { n: number }).n, 0, 'the host stored this result without a nonce, as live');
+  assert.equal((db.prepare('SELECT COUNT(*) AS n FROM tool_outputs WHERE session_id = ? AND call_id = ?')
+    .get(fixture.session.id, 'exact-draft') as { n: number }).n, 1);
+
+  const { registerFileQueryTools } = await import('../../tools/file-query-tools.js');
+  const { withToolOutputContext } = await import('./tool-output-context.js');
+  let handler: ((args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>) | undefined;
+  registerFileQueryTools({ tool: (_name: string, _description: string, _shape: unknown, h: typeof handler) => { handler = h; } } as never);
+  assert.ok(handler);
+  const result = await withToolOutputContext({ sessionId: fixture.session.id }, () =>
+    handler!({ query: needle, call_id: 'exact-draft' }));
+  const text = result.content[0]!.text;
+  assert.notEqual(result.isError, true, text);
+  const parsed = JSON.parse(text) as { source: string; hits: Array<{ text: string }> };
+  assert.equal(parsed.source, 'tool output exact-draft');
+  assert.ok(parsed.hits.some((hit) => hit.text.includes(needle)), text);
+});

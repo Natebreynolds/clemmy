@@ -22,7 +22,7 @@ import { Agent, Runner } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { MODELS } from '../config.js';
-import { resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
+import { resolveToolOutputForQuery } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
 import { repairToParseableJson } from '../runtime/harness/json-repair.js';
@@ -159,7 +159,7 @@ export function registerExtractStructuredTools(server: McpServer, extractorOverr
         } else {
           const sessionId = getToolOutputContext()?.sessionId;
           if (!sessionId) return textResult('ERROR: call_id needs a live session context — pass text or file instead.');
-          const resolution = resolveToolOutputForAuthority(sessionId, args.call_id!.trim());
+          const resolution = resolveToolOutputForQuery(sessionId, args.call_id!.trim());
           if (resolution.status === 'ambiguous') return textResult(`ERROR: call id "${args.call_id}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
           if (resolution.status === 'missing') return textResult(`ERROR: no stored output for call id "${args.call_id}" in this session.`);
           if (resolution.status === 'failed') return textResult(`ERROR: stored output for call id "${args.call_id}" cannot be used because ${resolution.reason}. Re-run the source read.`);

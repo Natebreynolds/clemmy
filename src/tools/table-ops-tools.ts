@@ -17,7 +17,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
-import { resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
+import { resolveToolOutputForQuery } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
 import {
@@ -53,7 +53,7 @@ function loadSide(
   if (input.callId?.trim()) {
     const sessionId = getToolOutputContext()?.sessionId;
     if (!sessionId) throw new Error(`${side}_call_id needs a live session context — pass ${side}_rows or ${side}_file instead.`);
-    const resolution = resolveToolOutputForAuthority(sessionId, input.callId.trim());
+    const resolution = resolveToolOutputForQuery(sessionId, input.callId.trim());
     if (resolution.status === 'ambiguous') throw new Error(`call id "${input.callId}" was reused by ${resolution.invocationCount} invocations — pass a fresh unique call id.`);
     if (resolution.status === 'missing') throw new Error(`no stored output for call id "${input.callId}" in this session — check the id (it appears in the tool result footer).`);
     if (resolution.status === 'failed') throw new Error(`stored output for call id "${input.callId}" cannot be used because ${resolution.reason} — re-run the source read.`);

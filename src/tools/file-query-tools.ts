@@ -10,7 +10,7 @@ import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
+import { resolveToolOutputForQuery } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { convertToMarkdown, isConvertibleExtension } from '../runtime/markitdown.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
@@ -67,7 +67,7 @@ export function registerFileQueryTools(server: McpServer): void {
         } else {
           const sessionId = getToolOutputContext()?.sessionId;
           if (!sessionId) return invalidArgumentsTextResult('ERROR: call_id needs a live session context — pass `file` instead.');
-          const resolution = resolveToolOutputForAuthority(sessionId, callIdSource!);
+          const resolution = resolveToolOutputForQuery(sessionId, callIdSource!);
           if (resolution.status === 'ambiguous') return invalidArgumentsTextResult(`ERROR: call id "${callIdSource}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
           if (resolution.status === 'missing') return invalidArgumentsTextResult(`ERROR: no stored output for call id "${callIdSource}" in this session.`);
           if (resolution.status === 'failed') {

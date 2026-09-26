@@ -40,6 +40,7 @@ const {
   getToolOutput,
   getToolOutputForInvocation,
   resolveToolOutputForAuthority,
+  resolveToolOutputForQuery,
   resolveToolOutputsForAuthority,
   TOOL_OUTPUT_MAX_BYTES,
   getLatestEventSeq,
@@ -2298,6 +2299,55 @@ test('authority fallback admits one provable legacy read occurrence', () => {
   if (resolution.status !== 'ok') assert.fail('expected one legacy occurrence to resolve');
   assert.equal(resolution.source, 'legacy');
   assert.equal(resolution.record.output, 'one durable legacy result');
+});
+
+test('a query opens one provable write occurrence that authority still never promotes', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  // The host-owned write lifecycle as recorded live on 2026-09-25: a parented
+  // top-level carrier pair whose result the lifecycle hook stored with no nonce.
+  const called = appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_called',
+    data: {
+      callId: 'write-classified', tool: 'work_call', effect: 'external_write',
+      effectiveTool: 'provider__api_request', accounting: 'top_level', sourceUserSeq: 7,
+    },
+  });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'write-classified',
+    tool: 'work_call',
+    output: '{"status_code":20000,"items":[{"keyword":"alpha","position":6}]}',
+  });
+  appendEvent({
+    sessionId: sess.id,
+    turn: 1,
+    role: 'Clem',
+    type: 'tool_returned',
+    parentEventId: called.id,
+    data: {
+      callId: 'write-classified', tool: 'work_call', effect: 'external_write',
+      effectiveTool: 'provider__api_request', accounting: 'top_level', sourceUserSeq: 7,
+    },
+  });
+
+  const query = resolveToolOutputForQuery(sess.id, 'write-classified');
+  assert.equal(query.status, 'ok', JSON.stringify(query));
+  if (query.status !== 'ok') assert.fail('a settled write result is data too');
+  assert.equal(query.source, 'legacy');
+  assert.equal(query.effect, 'external_write', 'the producer effect still travels with the bytes');
+  assert.equal(query.sourceUserSeq, 7);
+  assert.match(query.record.output, /"position":6/);
+  assert.equal(resolveToolOutputForAuthority(sess.id, 'write-classified').status, 'failed',
+    'evidence authority keeps refusing a nonce-less write');
+  assert.deepEqual(
+    resolveToolOutputsForAuthority(sess.id, [{ callId: 'write-classified' }]),
+    [],
+    'bulk evidence retrieval keeps excluding it',
+  );
 });
 
 test('authority resolution requires effective identity parity across a lifecycle occurrence', () => {
