@@ -2281,6 +2281,54 @@ export function registerOrchestrationTools(server: McpServer): void {
   );
 
   server.tool(
+    'heartbeat_refine',
+    [
+      'Change one of the owner\'s heartbeats (the checks Clementine runs on her own: work review, calendar watch, workflow suggestions) the way the owner just asked.',
+      'Use when the owner says how a heartbeat should behave: "stop telling me about fixture runs", "check every two hours", "push those to my phone", "turn the calendar watch off".',
+      'add_rule stores the owner\'s wish in plain words and Jev applies it to every future item; remove_rule takes one back; cadence_minutes, notify and enabled change the contract directly. Read the current contract first with action "status" when unsure.',
+    ].join(' '),
+    {
+      heartbeat: z.enum(['work-review', 'calendar', 'workflow-suggestions']).describe('Which heartbeat.'),
+      action: z.enum(['status', 'add_rule', 'remove_rule', 'set']).describe('status = read it; add_rule / remove_rule = the rules in the owner\'s words; set = cadence, notify or on/off.'),
+      rule: z.string().max(400).optional().describe('add_rule: the rule in the owner\'s own words, one sentence. remove_rule: the rule id or its exact text.'),
+      cadence_minutes: z.number().int().min(5).max(1440).optional(),
+      notify: z.enum(['quiet', 'push']).optional().describe('quiet = in the app only; push = delivered like anything else that needs an answer.'),
+      enabled: z.boolean().optional(),
+    },
+    async ({ heartbeat, action, rule, cadence_minutes, notify, enabled }) => {
+      const { addRule, heartbeatStatus, patchHeartbeat, removeRule } = await import('../agents/heartbeats.js');
+      const render = (s: Awaited<ReturnType<typeof heartbeatStatus>>): string => [
+        `${s.title}: ${s.enabled ? 'on' : 'off'}, every ${s.cadenceMinutes} min, items ${s.contract.notify === 'push' ? 'pushed' : 'kept in the app'}.`,
+        s.lastFinding ? `Last check ${s.lastFinding.at}: ${s.lastFinding.summary}` : 'Not checked yet.',
+        s.contract.rules.length
+          ? `Rules:\n${s.contract.rules.map((r, i) => `${i + 1}. ${r.text} (${r.id})`).join('\n')}`
+          : 'No rules yet: everything it notices is raised.',
+        s.openItems.length ? `Open items: ${s.openItems.slice(0, 6).map((i) => i.subject).join('; ')}` : 'No open items.',
+      ].join('\n');
+      if (action === 'status') return textResult(render(await heartbeatStatus(heartbeat)));
+      if (action === 'add_rule') {
+        if (!rule?.trim()) return textResult('Say the rule in one sentence, in the owner\'s words.');
+        const added = addRule(heartbeat, rule, 'clementine');
+        if (!added.ok) return textResult(`Rule not added: ${added.reason.replace('_', ' ')}.`);
+        return textResult(`Added: "${added.rule.text}". It applies from the next check.\n${render(await heartbeatStatus(heartbeat))}`);
+      }
+      if (action === 'remove_rule') {
+        const current = await heartbeatStatus(heartbeat);
+        const target = current.contract.rules.find((r) => r.id === rule?.trim() || r.text.toLowerCase() === (rule ?? '').trim().toLowerCase());
+        if (!target) return textResult(`No rule matches "${rule ?? ''}". Current rules:\n${current.contract.rules.map((r) => `${r.text} (${r.id})`).join('\n') || '(none)'}`);
+        removeRule(heartbeat, target.id);
+        return textResult(`Removed: "${target.text}".\n${render(await heartbeatStatus(heartbeat))}`);
+      }
+      const patched = await patchHeartbeat(heartbeat, {
+        ...(enabled !== undefined ? { enabled } : {}),
+        ...(cadence_minutes !== undefined ? { cadenceMinutes: cadence_minutes } : {}),
+        ...(notify ? { notify } : {}),
+      });
+      return textResult(`Updated.\n${render(patched)}`);
+    },
+  );
+
+  server.tool(
     'workflow_revert_step',
     'Undo the most recent workflow_edit_step / step edit, restoring the workflow to its pre-edit definition. Pass the backup id returned by workflow_edit_step.',
     {

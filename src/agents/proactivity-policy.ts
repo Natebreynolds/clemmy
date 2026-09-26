@@ -68,6 +68,11 @@ export interface ProactivityPolicy {
    *  save it as a workflow. Read-only; one open suggestion at a time. */
   workflowSuggestionsEnabled: boolean;
   workflowSuggestionsMinutes: number; // how often to check, 30–1440
+  /** Work review heartbeat: looks at the work that ran (failed runs, long
+   *  waits, drafts nobody sent) and raises one item per thing worth a line,
+   *  under the owner's own rules. Read-only. */
+  workReviewEnabled: boolean;
+  workReviewMinutes: number; // how often to check, 15–1440
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
@@ -128,6 +133,8 @@ export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   calendarWatchMax: 5,
   workflowSuggestionsEnabled: true,
   workflowSuggestionsMinutes: 360,
+  workReviewEnabled: true,
+  workReviewMinutes: 60,
   quietHoursEnabled: false,
   quietHoursStart: '22:00',
   quietHoursEnd: '07:00',
@@ -190,6 +197,8 @@ function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {
     calendarWatchMax: clampInteger(input.calendarWatchMax, DEFAULT_PROACTIVITY_POLICY.calendarWatchMax, 1, 20),
     workflowSuggestionsEnabled: input.workflowSuggestionsEnabled !== false,
     workflowSuggestionsMinutes: clampInteger(input.workflowSuggestionsMinutes, DEFAULT_PROACTIVITY_POLICY.workflowSuggestionsMinutes, 30, 1440),
+    workReviewEnabled: input.workReviewEnabled !== false,
+    workReviewMinutes: clampInteger(input.workReviewMinutes, DEFAULT_PROACTIVITY_POLICY.workReviewMinutes, 15, 1440),
     quietHoursEnabled: input.quietHoursEnabled === true,
     quietHoursStart: normalizeTime(input.quietHoursStart, DEFAULT_PROACTIVITY_POLICY.quietHoursStart),
     quietHoursEnd: normalizeTime(input.quietHoursEnd, DEFAULT_PROACTIVITY_POLICY.quietHoursEnd),

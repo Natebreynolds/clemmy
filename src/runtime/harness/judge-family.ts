@@ -269,7 +269,7 @@ export async function withJudgeHedge<T>(
   });
 }
 
-export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding' | 'certify' | 'watcher' | 'calendar_watch' | 'revision' | 'mutation_constraints';
+export type JudgeMetricLane = 'completion' | 'grounding' | 'goal_fidelity' | 'output_grounding' | 'certify' | 'watcher' | 'calendar_watch' | 'revision' | 'mutation_constraints' | 'heartbeat_rules';
 export type JudgeMetricOutcome = 'passed' | 'blocked' | 'advisory' | 'timeout' | 'invalid' | 'error';
 
 export interface JudgeMetricRecord {

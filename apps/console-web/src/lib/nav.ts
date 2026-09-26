@@ -2,7 +2,7 @@ import {
   Home, MessageCircle, Inbox, Zap, Plug, Brain, Video, LayoutDashboard,
   BarChart3, Wrench, Stethoscope, Gauge, Sliders, Sparkles,
   Settings, HelpCircle, Users, FlaskConical, Goal, Activity, GitBranch,
-  FolderOpen, Workflow,
+  FolderOpen, Workflow, HeartPulse,
   type LucideIcon,
 } from 'lucide-react';
 import { primaryHomeNavigation, type HomePreferences } from './home-prefs';
@@ -40,6 +40,7 @@ export const PRIMARY_NAV: NavDest[] = [
   { path: '/tasks', label: 'Running', icon: Activity, hint: 'Everything Clementine is working on right now' },
   { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
   { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows & skills' },
+  { path: '/heartbeats', label: 'Heartbeats', icon: HeartPulse, hint: 'What Clementine checks on her own, and how often' },
   { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },
   { path: '/memory', label: 'Memory', icon: Brain, hint: 'What Clementine knows about you' },
   { path: '/meetings', label: 'Meetings', icon: Video, hint: 'Recorded meetings & summaries' },

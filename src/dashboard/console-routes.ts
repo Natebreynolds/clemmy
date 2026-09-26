@@ -9070,6 +9070,84 @@ export function registerConsoleRoutes(
   // Watches: what each background watch is for, its last finding, its open
   // items and its controls. The calendar watch is the first one on the
   // heartbeat contract (calendar-watch.ts). "Check now" runs one tick.
+  /**
+   * Heartbeats: everything Clementine checks on her own, with the owner's
+   * contract for each (on/off, cadence, how items reach them, the rules in
+   * their words). The older /watches routes stay for the settings card.
+   */
+  app.get('/api/console/heartbeats', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listHeartbeats } = await import('../agents/heartbeats.js');
+      res.json({ heartbeats: await listHeartbeats() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch('/api/console/heartbeats/:id', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { isHeartbeatId, patchHeartbeat } = await import('../agents/heartbeats.js');
+      if (!isHeartbeatId(req.params.id)) { res.status(404).json({ error: 'unknown heartbeat' }); return; }
+      const body = (req.body ?? {}) as { enabled?: unknown; cadenceMinutes?: unknown; notify?: unknown };
+      const heartbeat = await patchHeartbeat(req.params.id, {
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+        ...(typeof body.cadenceMinutes === 'number' && Number.isFinite(body.cadenceMinutes) ? { cadenceMinutes: body.cadenceMinutes } : {}),
+        ...(body.notify === 'quiet' || body.notify === 'push' ? { notify: body.notify } : {}),
+      });
+      res.json({ heartbeat });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/heartbeats/:id/tick', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { isHeartbeatId, tickHeartbeat } = await import('../agents/heartbeats.js');
+      if (!isHeartbeatId(req.params.id)) { res.status(404).json({ error: 'unknown heartbeat' }); return; }
+      const result = await tickHeartbeat(req.params.id, 'manual');
+      res.json({ tick: { summary: result.summary, produced: result.produced, quiet: result.quiet }, heartbeat: result.status });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/console/heartbeats/:id/rules', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { addRule, heartbeatStatus, isHeartbeatId } = await import('../agents/heartbeats.js');
+      if (!isHeartbeatId(req.params.id)) { res.status(404).json({ error: 'unknown heartbeat' }); return; }
+      const text = typeof (req.body ?? {}).text === 'string' ? (req.body as { text: string }).text : '';
+      const added = addRule(req.params.id, text, 'owner');
+      if (!added.ok) {
+        const reason = added.reason === 'empty' ? 'Write the rule in a sentence.'
+          : added.reason === 'too_long' ? 'Keep a rule under 400 characters.'
+            : added.reason === 'too_many' ? 'This heartbeat already has 24 rules; remove one first.'
+              : 'That rule is already there.';
+        res.status(400).json({ error: reason });
+        return;
+      }
+      res.json({ rule: added.rule, heartbeat: await heartbeatStatus(req.params.id) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/console/heartbeats/:id/rules/:ruleId', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { heartbeatStatus, isHeartbeatId, removeRule } = await import('../agents/heartbeats.js');
+      if (!isHeartbeatId(req.params.id)) { res.status(404).json({ error: 'unknown heartbeat' }); return; }
+      const contract = removeRule(req.params.id, req.params.ruleId);
+      if (!contract) { res.status(404).json({ error: 'no such rule' }); return; }
+      res.json({ heartbeat: await heartbeatStatus(req.params.id) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/watches', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

@@ -3372,6 +3372,10 @@ export async function startDaemon(
     // when a request keeps repeating, nothing on a quiet tick.
     const { startWorkflowSuggestionsHeartbeat } = await import('../agents/workflow-suggestions.js');
     startWorkflowSuggestionsHeartbeat();
+    // Work review rides the same contract: what ran while the owner was away,
+    // one line per thing worth their attention, under the rules they wrote.
+    const { startWorkReviewHeartbeat } = await import('../agents/work-review-runtime.js');
+    startWorkReviewHeartbeat();
     logger.info(
       { enabled: watchPolicy.enabled, cadenceMinutes: watchPolicy.cadenceMinutes },
       watchPolicy.enabled ? 'Calendar watch armed on the prepared read path' : 'Calendar watch heartbeat armed (watch disabled by policy)',

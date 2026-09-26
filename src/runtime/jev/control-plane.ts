@@ -965,6 +965,61 @@ export async function tryJevWatchChangeVerdict(input: {
   return { surface: choice === 'surface', confidence: answer.confidence, model: result.model, durationMs };
 }
 
+export interface JevHeartbeatItemVerdict {
+  surface: boolean;
+  confidence: number;
+  model: string;
+  durationMs: number;
+}
+
+/**
+ * "Given what the owner told this heartbeat, is this item worth their
+ * attention?" The rules are the owner's own sentences; the item is the facts
+ * the heartbeat observed. Asked only when the owner has written rules, once
+ * per new item, within the heartbeat's per-tick budget. Null = unavailable or
+ * unsure, and the caller keeps the item.
+ */
+export async function tryJevHeartbeatItemVerdict(input: {
+  heartbeat: string;
+  rules: string[];
+  item: Record<string, unknown>;
+  sessionId?: string;
+}): Promise<JevHeartbeatItemVerdict | null> {
+  if (input.rules.length === 0) return null;
+  const questions: SystemOneQuestions = {
+    verdict: {
+      type: 'choice',
+      instructions: [
+        `The owner runs a ${input.heartbeat} heartbeat that raises items about work Clementine did or is waiting on.`,
+        'The owner wrote rules, in their own words, about what they do and do not want raised. Apply them to this item.',
+        'SURFACE when no rule excludes the item, or a rule asks for exactly this kind of thing.',
+        'SKIP when a rule plainly covers it: a source they said to ignore, a kind of item they said not to raise, a time they said to hold.',
+        'When the rules do not speak to the item, surface it.',
+      ].join(' '),
+      criteria: {
+        surface: 'No rule excludes this item, or a rule asks for it.',
+        skip: 'A rule the owner wrote plainly excludes this item.',
+      },
+    },
+  };
+  const started = Date.now();
+  const result = await evaluateSystemOne({
+    state: { heartbeat: input.heartbeat, ownerRules: input.rules, item: input.item },
+    questions,
+    timeoutMs: WATCH_CHANGE_TIMEOUT_MS,
+    sessionId: input.sessionId,
+    channel: 'jev-heartbeat',
+  });
+  if (!result.ok) return null;
+  const answer = result.answers.verdict as ChoiceAnswer | undefined;
+  if (!answer || answer.confidence < WATCH_CHANGE_CONFIDENCE_MIN) return null;
+  const choice = String(answer.choice).trim().toLowerCase();
+  if (choice !== 'surface' && choice !== 'skip') return null;
+  const durationMs = Date.now() - started;
+  await recordJevJudgeMetric('heartbeat_rules', choice === 'surface' ? 'passed' : 'blocked', result.model, durationMs);
+  return { surface: choice === 'surface', confidence: answer.confidence, model: result.model, durationMs };
+}
+
 export async function tryJevOutputGroundingVerdict(
   claims: Array<{ raw: string; context?: string }>,
   sources: Array<{ excerpt: string }>,
@@ -1010,7 +1065,7 @@ export async function tryJevOutputGroundingVerdict(
 }
 
 async function recordJevJudgeMetric(
-  lane: 'completion' | 'grounding' | 'output_grounding' | 'calendar_watch',
+  lane: 'completion' | 'grounding' | 'output_grounding' | 'calendar_watch' | 'heartbeat_rules',
   outcome: 'passed' | 'blocked' | 'advisory',
   modelId: string,
   durationMs: number,
