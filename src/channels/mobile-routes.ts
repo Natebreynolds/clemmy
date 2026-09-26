@@ -5564,16 +5564,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
-  // NAMED AGENTS — a person's own standing helpers. Reads and edits only; a
-  // message to an agent is an ordinary chat turn (see /api/chat), so nothing
-  // here grants authority a plain turn would not have.
+  // AGENTS — the same records the desktop Agents page edits. Reads and edits
+  // only; a message inside an agent is an ordinary chat turn (see /api/chat),
+  // so nothing here grants authority a plain turn would not have.
   router.get('/api/agents', requireMobileSession, async (_req, res) => {
     try {
-      const { listAgents } = await import('../memory/agent-store.js');
+      const { listAgentRecords } = await import('../agents/agent-record.js');
       const { listSkills } = await import('../memory/skill-store.js');
       const { listWorkflows } = await import('../memory/workflow-store.js');
       res.json({
-        agents: listAgents(),
+        agents: listAgentRecords(),
         // The pinnable inventory travels with the list so the phone can build
         // an agent without a second round trip on a slow connection.
         available: {
@@ -5588,14 +5588,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/agents', requireMobileSession, async (req, res) => {
     try {
-      const { createAgent } = await import('../memory/agent-store.js');
+      const { createAgentRecord } = await import('../agents/agent-record.js');
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const created = createAgent({
+      const created = createAgentRecord({
         name: String(body.name ?? ''),
-        description: typeof body.description === 'string' ? body.description : '',
+        handles: typeof body.handles === 'string' ? body.handles : '',
+        instructions: typeof body.instructions === 'string' ? body.instructions : '',
         skills: Array.isArray(body.skills) ? body.skills as string[] : [],
         workflows: Array.isArray(body.workflows) ? body.workflows as string[] : [],
         model: typeof body.model === 'string' ? body.model : null,
+        createdFrom: 'phone',
       });
       if (!created.ok) {
         res.status(created.reason === 'name_taken' ? 409 : 400).json({ error: created.reason });
@@ -5609,11 +5611,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/agents/:id', requireMobileSession, async (req, res) => {
     try {
-      const { updateAgent } = await import('../memory/agent-store.js');
+      const { updateAgentRecord } = await import('../agents/agent-record.js');
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const updated = updateAgent(String(req.params.id ?? ''), {
+      const updated = updateAgentRecord(String(req.params.id ?? ''), {
         ...(typeof body.name === 'string' ? { name: body.name } : {}),
-        ...(typeof body.description === 'string' ? { description: body.description } : {}),
+        ...(typeof body.handles === 'string' ? { handles: body.handles } : {}),
+        ...(typeof body.instructions === 'string' ? { instructions: body.instructions } : {}),
         ...(Array.isArray(body.skills) ? { skills: body.skills as string[] } : {}),
         ...(Array.isArray(body.workflows) ? { workflows: body.workflows as string[] } : {}),
         ...(body.model === null || typeof body.model === 'string' ? { model: body.model as string | null } : {}),
@@ -5630,8 +5633,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.post('/api/agents/:id/delete', requireMobileSession, async (req, res) => {
     try {
-      const { deleteAgent } = await import('../memory/agent-store.js');
-      res.json({ deleted: deleteAgent(String(req.params.id ?? '')) });
+      const { deleteAgentRecord } = await import('../agents/agent-record.js');
+      res.json({ deleted: deleteAgentRecord(String(req.params.id ?? '')) });
     } catch (error) {
       res.status(500).json({ error: String((error as Error)?.message ?? error) });
     }

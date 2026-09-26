@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ModelBehaviorError } from '@openai/agents';
@@ -814,12 +814,18 @@ export interface TeamAgentRecord {
   proactive?: boolean;
   cadenceMinutes?: number;
   wakeTriggers?: string[];
-  /** Skills this agent is expert in. Their SKILL.md is injected into the
-   *  agent's instructions at build time (Slice 4). Empty = none bound. */
+  /** Skills this agent reaches for first; bound into a turn by agent-record.ts. */
   skills?: string[];
-  /** Workflows this agent owns / may trigger (Slice 4). Surfaced in the
-   *  agent's instructions so it reaches for them via workflow_run. */
+  /** Workflows this agent reaches for first; bound into a turn by agent-record.ts. */
   workflows?: string[];
+  /** Tool families a turn inside this agent is narrowed to. Empty = the turn's usual surface. */
+  tools?: string[];
+  /** Space or project whose memory this agent works within. */
+  memoryScope?: string;
+  /** Where the record came from: chat, console, phone, plugin. */
+  createdFrom?: string;
+  createdAt?: string;
+  updatedAt?: string;
   personality: string;
 }
 
@@ -855,12 +861,19 @@ export function loadTeamAgents(): TeamAgentRecord[] {
         model: typeof data.model === 'string' ? data.model : undefined,
         project: typeof data.project === 'string' ? data.project : undefined,
         tier: typeof data.tier === 'number' ? data.tier : undefined,
-        autonomyEnabled: typeof data.autonomyEnabled === 'boolean' ? data.autonomyEnabled : true,
-        proactive: typeof data.proactive === 'boolean' ? data.proactive : true,
-        cadenceMinutes: typeof data.cadenceMinutes === 'number' ? data.cadenceMinutes : 30,
-        wakeTriggers: Array.isArray(data.wakeTriggers) ? data.wakeTriggers.map(String).filter(Boolean) : ['inbox', 'delegation', 'request', 'stale_tasks', 'daily_review'],
+        // A record that says nothing about waking gets no cadence. Fields the
+        // file leaves unsaid stay unsaid; the runtime that reads them decides.
+        autonomyEnabled: typeof data.autonomyEnabled === 'boolean' ? data.autonomyEnabled : undefined,
+        proactive: typeof data.proactive === 'boolean' ? data.proactive : false,
+        cadenceMinutes: typeof data.cadenceMinutes === 'number' ? data.cadenceMinutes : undefined,
+        wakeTriggers: Array.isArray(data.wakeTriggers) ? data.wakeTriggers.map(String).filter(Boolean) : undefined,
         skills: Array.isArray(data.skills) ? data.skills.map(String).filter(Boolean) : [],
         workflows: Array.isArray(data.workflows) ? data.workflows.map(String).filter(Boolean) : [],
+        tools: Array.isArray(data.tools) ? data.tools.map(String).filter(Boolean) : [],
+        memoryScope: typeof data.memoryScope === 'string' ? data.memoryScope : undefined,
+        createdFrom: typeof data.createdFrom === 'string' ? data.createdFrom : undefined,
+        createdAt: typeof data.createdAt === 'string' ? data.createdAt : undefined,
+        updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : undefined,
         personality: parsed.content.trim(),
       });
     } catch {
@@ -892,6 +905,15 @@ export function writeTeamAgent(agent: TeamAgentRecord): void {
   if (agent.wakeTriggers && agent.wakeTriggers.length > 0) frontmatter.wakeTriggers = agent.wakeTriggers;
   if (agent.skills && agent.skills.length > 0) frontmatter.skills = agent.skills;
   if (agent.workflows && agent.workflows.length > 0) frontmatter.workflows = agent.workflows;
+  if (agent.tools && agent.tools.length > 0) frontmatter.tools = agent.tools;
+  if (agent.memoryScope) frontmatter.memoryScope = agent.memoryScope;
+  if (agent.createdFrom) frontmatter.createdFrom = agent.createdFrom;
+  if (agent.createdAt) frontmatter.createdAt = agent.createdAt;
+  if (agent.updatedAt) frontmatter.updatedAt = agent.updatedAt;
 
-  writeFileSync(filePath, matter.stringify(agent.personality || `You are ${agent.name}.`, frontmatter), 'utf-8');
+  // Write-then-rename: a torn agent.md would make the agent vanish from the
+  // list, and these are the user's own definitions.
+  const temp = `${filePath}.${process.pid}.tmp`;
+  writeFileSync(temp, matter.stringify(agent.personality || `You are ${agent.name}.`, frontmatter), 'utf-8');
+  renameSync(temp, filePath);
 }

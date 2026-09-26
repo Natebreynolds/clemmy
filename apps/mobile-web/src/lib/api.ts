@@ -1234,15 +1234,20 @@ export interface MobileWorkflow {
   lastRunAt: string | null;
 }
 
+/** The same record the desktop Agents page edits. */
 export interface MobileAgent {
   id: string;
   name: string;
-  description: string;
+  /** One line: what it handles. */
+  handles: string;
+  /** Standing instructions applied to every turn inside it. */
+  instructions: string;
   skills: string[];
   workflows: string[];
+  tools: string[];
   model: string | null;
-  createdAt: string;
-  updatedAt: string;
+  createdAt: string | null;
+  updatedAt: string | null;
 }
 
 export interface MobileAgentsResponse {
@@ -1256,7 +1261,8 @@ export async function listAgents(): Promise<MobileAgentsResponse> {
 
 export async function createAgent(draft: {
   name: string;
-  description?: string;
+  handles?: string;
+  instructions?: string;
   skills?: string[];
   workflows?: string[];
   model?: string | null;
@@ -1270,7 +1276,8 @@ export async function createAgent(draft: {
 
 export async function updateAgent(id: string, patch: {
   name?: string;
-  description?: string;
+  handles?: string;
+  instructions?: string;
   skills?: string[];
   workflows?: string[];
   model?: string | null;
