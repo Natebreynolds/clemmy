@@ -603,3 +603,68 @@ test('query projects records from an unfamiliar single-array envelope without pa
   assert.match(text, /Fixture 113/);
   assert.doesNotMatch(text, /details|None of/);
 });
+
+test('tool_output_query computes exact counts, rankings and totals over every stored record', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const keywords = Array.from({ length: 120 }, (_, i) => ({
+    keyword: `fixture keyword ${i}`,
+    position: i % 40 === 0 ? null : (i % 37) + 1,
+    volume: (i * 7919) % 5000,
+  }));
+  writeToolOutput({ sessionId: sess.id, callId: 'call_rankings', tool: 'composio_execute_tool', output: JSON.stringify({ data: { items: keywords } }) });
+  const deals = [
+    { name: 'Fixture deal 1', stage: 'Closed Won', owner: 'Rep One', amount: 1200, closed: '2026-09-22' },
+    { name: 'Fixture deal 2', stage: 'closed won', owner: 'Rep Two', amount: '3,230', closed: '2026-09-24' },
+    { name: 'Fixture deal 3', stage: 'Closed Won', owner: 'Rep One', amount: 900, closed: '2026-09-12' },
+    { name: 'Fixture deal 4', stage: 'Negotiation', owner: 'Rep Two', amount: 5000, closed: '2026-09-23' },
+  ];
+  writeToolOutput({ sessionId: sess.id, callId: 'call_deals', tool: 'composio_execute_tool', output: JSON.stringify(deals) });
+  const query = captureToolOutputQueryHandler();
+  const run = (input: Record<string, unknown>) => withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(20), recallBudget: new RecallBudget(10, 200_000) },
+    () => query(input),
+  ).then((res) => res.content[0].text);
+
+  const expectedTop3 = keywords.filter((row) => typeof row.position === 'number' && row.position <= 3).length;
+  const count = await run({ call_id: 'call_rankings', where: [{ field: 'position', op: 'lte', value: 3 }], aggregate: 'count' });
+  assert.match(count, new RegExp(`count = ${expectedTop3}\\b`), 'the count is computed over all 120 records, not a page');
+  assert.match(count, /of 120 total from data\.items\[\*\]/, 'the provider wrapper is unwrapped for aggregates too');
+  assert.match(count, /3 record\(s\) were left out/, 'records with no position are named as left out');
+
+  const top = await run({ call_id: 'call_rankings', sort_by: 'volume', order: 'desc', limit: 3, fields: ['keyword', 'volume'] });
+  const expected = [...keywords].sort((a, b) => b.volume - a.volume).slice(0, 3).map((row) => row.keyword);
+  for (const keyword of expected) assert.ok(top.includes(keyword), `${keyword} is in the exact top 3`);
+  assert.match(top, /ordered by volume descending/);
+
+  const closedThisWeek = await run({
+    call_id: 'call_deals',
+    where: [{ field: 'stage', op: 'eq', value: 'closed won' }, { field: 'closed', op: 'gte', value: '2026-09-21' }],
+    aggregate: 'sum', value_field: 'amount', group_by: 'owner',
+  });
+  assert.match(closedThisWeek, /sum of amount = 4430 \(over 2 record\(s\)\)/);
+  assert.match(closedThisWeek, /Rep Two: sum of amount = 3230[\s\S]*Rep One: sum of amount = 1200/, 'groups come largest first');
+
+  const missingField = await run({ call_id: 'call_deals', aggregate: 'sum' });
+  assert.match(missingField, /needs value_field/);
+});
+
+test('tool_output_query refuses an exact figure over a clipped prefix instead of stating a partial one', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({
+    sessionId: sess.id,
+    callId: 'call_clipped_rows',
+    tool: 'run_shell_command',
+    output: ['exit_code: 0', '', 'stdout:', '[', '{"id":"a","amount":5},', '{"id":"b","amount":7},', '{"id":"partial"'].join('\n'),
+  });
+  const query = captureToolOutputQueryHandler();
+  const run = (input: Record<string, unknown>) => withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(5, 200_000) },
+    () => query(input),
+  ).then((res) => res.content[0].text);
+  assert.match(await run({ call_id: 'call_clipped_rows', aggregate: 'sum', value_field: 'amount' }), /needs the complete set/);
+  assert.match(await run({ call_id: 'call_clipped_rows', sort_by: 'amount' }), /needs the complete set/);
+  assert.match(await run({ call_id: 'call_clipped_rows', filter_field: 'id', filter_equals: 'b' }), /full total unknown/,
+    'a plain lookup over the recovered records still works and says the total is unknown');
+});

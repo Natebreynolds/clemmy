@@ -13,6 +13,14 @@ import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
 import { projectProviderResultEvidenceView } from '../runtime/harness/result-facts.js';
 import { describeMissingRetainedOutputForSession } from '../runtime/harness/retained-output-redirect.js';
+import {
+  aggregateRows,
+  applyWhere,
+  sortRows,
+  type AggregateFigure,
+  type RecordAggregateOp,
+  type RecordCondition,
+} from './record-query.js';
 
 /**
  * recall_tool_result — retrieve the verbatim output of a prior tool
@@ -112,7 +120,30 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
   filter_equals: z.string().optional().describe('Exact match for filter_field.'),
   offset: z.number().int().min(0).optional().describe('Matching records to skip (default 0).'),
   limit: z.number().int().min(1).max(200).optional().describe('Max records to return (default 50).'),
+  where: z
+    .array(z.object({
+      field: z.string().min(1).describe('Record field; a dotted path reaches nested values.'),
+      op: z.enum(['eq', 'ne', 'contains', 'lt', 'lte', 'gt', 'gte']),
+      value: z.union([z.string(), z.number()]),
+    }))
+    .optional()
+    .describe('Conditions every record must meet. Numbers compare as numbers and ISO dates as dates; text compares case-insensitively.'),
+  sort_by: z.string().optional().describe('Order matching records by this field, for a ranking or a top N.'),
+  order: z.enum(['asc', 'desc']).optional().describe('Sort direction (default asc).'),
+  aggregate: z
+    .enum(['count', 'sum', 'avg', 'min', 'max'])
+    .optional()
+    .describe('Return this exact figure over EVERY matching record instead of listing them: count, or sum/avg/min/max of value_field.'),
+  value_field: z.string().optional().describe('The numeric field sum/avg/min/max read.'),
+  group_by: z.string().optional().describe('Compute the aggregate per distinct value of this field.'),
 };
+
+function aggregateLine(label: string, op: RecordAggregateOp, valueField: string | undefined, result: AggregateFigure): string {
+  const what = op === 'count' ? 'count' : `${op} of ${valueField}`;
+  const value = result.value === null ? 'no numeric values' : String(result.value);
+  const lacking = result.lackedNumber > 0 ? `; ${result.lackedNumber} matching record(s) had no number in ${valueField}` : '';
+  return `${label}${what} = ${value}${op === 'count' ? '' : ` (over ${result.counted} record(s)${lacking})`}`;
+}
 
 /** Normalize the widened `fields` input to a clean array (or undefined). One
  * canonical spelling past this boundary — so downstream projection logic and
@@ -291,6 +322,7 @@ export function registerRecallTools(server: McpServer): void {
     'tool_output_query',
     [
       'Query a slice of a large prior tool output by the call_id a `[digest: …]` footer or `[clipped: …]` stub names, without loading it all: filter rows, project fields and paginate a JSON array, or project the top-level keys of an object.',
+      'Compute exact figures here instead of reading rows: `where` conditions (eq/ne/contains/lt/lte/gt/gte), `sort_by` + `order` + `limit` for a ranking or top N, and `aggregate` (count, or sum/avg/min/max of `value_field`, optionally per `group_by`) over every matching record. Any count, total, average or ranking you state should come from here.',
       'The result is parked losslessly — never say the data is unavailable.',
       `E.g. ${toolCallHint('tool_output_query', { call_id: 'call_abc123', fields: ['name', 'id'], limit: 50 })}.`,
     ].join(' '),
@@ -380,7 +412,8 @@ export function registerRecallTools(server: McpServer): void {
       if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
         const wantsRecordQuery = Boolean(
           input.filter_field !== undefined || input.offset !== undefined || input.limit !== undefined
-          || fields !== undefined,
+          || fields !== undefined || input.where !== undefined || input.sort_by !== undefined
+          || input.aggregate !== undefined || input.group_by !== undefined,
         );
         const dom = resolveDominantArray(parsed);
         if (dom && dom.path && wantsRecordQuery) {
@@ -410,10 +443,54 @@ export function registerRecallTools(server: McpServer): void {
             return s.toLowerCase().includes(contains as string);
           });
         }
+        const conditions = Array.isArray(input.where) ? input.where as RecordCondition[] : [];
+        let skipped = 0;
+        if (conditions.length > 0) {
+          const filtered = applyWhere(rows, conditions);
+          rows = filtered.rows;
+          skipped = filtered.skipped;
+        }
+        const skippedNote = skipped > 0
+          ? ` ${skipped} record(s) were left out because a condition's field held no value comparable with it (missing, empty, or a different kind: number, date or text).`
+          : '';
+        const sortBy = typeof input.sort_by === 'string' && input.sort_by.trim() ? input.sort_by.trim() : undefined;
+        const aggregate = typeof input.aggregate === 'string' ? input.aggregate as RecordAggregateOp : undefined;
+        // An exact figure or a ranking needs the complete set: over a clipped
+        // prefix it would read as the answer while missing records.
+        if ((aggregate || sortBy) && recoveredClippedArrayPrefix) {
+          const bodyText = `ERROR: tool output "${callId}" holds only ${(parsed as unknown[]).length} complete record(s) recovered from a clipped prefix; `
+            + 'an exact count, total or ranking needs the complete set. Re-read the source whole (or page it) and query that result.';
+          return textResult(bodyText, { maxChars: bodyText.length });
+        }
+        if (aggregate) {
+          const valueField = typeof input.value_field === 'string' && input.value_field.trim() ? input.value_field.trim() : undefined;
+          if (aggregate !== 'count' && !valueField) {
+            const bodyText = `aggregate "${aggregate}" needs value_field: the numeric field to ${aggregate}. The records are an ${describeJsonShape(parsed)}.`;
+            return textResult(bodyText, { maxChars: bodyText.length });
+          }
+          const groupBy = typeof input.group_by === 'string' && input.group_by.trim() ? input.group_by.trim() : undefined;
+          const result = aggregateRows(rows, aggregate, { ...(valueField ? { valueField } : {}), ...(groupBy ? { groupBy } : {}) });
+          const scope = `${rows.length} matching record(s) of ${(parsed as unknown[]).length} total${unwrappedPath ? ` from ${unwrappedPath}[*]` : ''}`;
+          const lines = [`Exact over ${scope}.${skippedNote}`, aggregateLine('', aggregate, valueField, result.overall)];
+          if (result.groups) {
+            const shown = result.groups.slice(0, 100);
+            lines.push('', `Per ${groupBy} (${result.groups.length} group(s), largest first):`);
+            for (const group of shown) lines.push(aggregateLine(`${group.group}: `, aggregate, valueField, group.figure));
+            if (result.groups.length > shown.length) lines.push(`…and ${result.groups.length - shown.length} more group(s)`);
+          }
+          const bodyText = clipQueryBody(lines.join('\n'));
+          return textResult(bodyText, { maxChars: bodyText.length });
+        }
+        if (sortBy) rows = sortRows(rows, sortBy, input.order === 'desc' ? 'desc' : 'asc');
         const matched = rows.length;
         // Zero matches must TEACH, not stonewall: name the fields that exist so
         // the next filter lands (weakest-model rule — every dead end escapable
         // from its text alone).
+        if (matched === 0 && conditions.length > 0) {
+          const bodyText = `0 records met the conditions ${JSON.stringify(conditions)}.${skippedNote} The result is an ${describeJsonShape(parsed)}. `
+            + 'Check the field names, values and value kinds, and re-query.';
+          return textResult(bodyText, { maxChars: bodyText.length });
+        }
         if (matched === 0 && ff) {
           const shape = describeJsonShape(parsed);
           const bodyText = `0 records matched filter_field=${JSON.stringify(ff)}. The result is an ${shape}. `
@@ -433,7 +510,7 @@ export function registerRecallTools(server: McpServer): void {
         const from = unwrappedPath ? ` from ${unwrappedPath}[*]` : '';
         const header = recoveredClippedArrayPrefix
           ? `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
-          : `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total${from})`;
+          : `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total${from})${sortBy ? `, ordered by ${sortBy} ${input.order === 'desc' ? 'descending' : 'ascending'}` : ''}${skippedNote ? `.${skippedNote}` : ''}`;
         // Hand the model the EXACT, copy-paste reference for these values, so a
         // downstream send binds them by reference instead of retyping (which is
         // how a value gets invented or dropped). Root array + single projected

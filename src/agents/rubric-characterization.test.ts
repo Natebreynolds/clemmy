@@ -176,10 +176,14 @@ const GOLDEN = {
   // what it grew so the action-lean rubric stays under its 5,500-byte ceiling.
   // 2026-09-24: retain read-scope semantics and shorten repeated readiness,
   // consent and status wording; existing size ceilings are unchanged.
+  // 2026-09-26: FIGURES FROM THE DATA joins the shared lean lines: a stated
+  // count, total, average or ranking is computed by tool_output_query over the
+  // stored result, never read off rows (live 09-25: miscounted figures drove
+  // most factual rejections). Legacy, native and fresh-action are unchanged.
   instructions: { len: 31829, sha16: '69eb4212bed8c8a1' },
   native: { len: 30936, sha16: 'e13ee9cdb94fb22a' },
-  claudeBrain: { len: 8892, sha16: 'e81b768c1221880c' },
-  lean: { len: 10897, sha16: '2b45d178b1be2374' },
+  claudeBrain: { len: 9095, sha16: 'eccdec0053e125e4' },
+  lean: { len: 11100, sha16: '8e6dea1f165b21d3' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -213,6 +217,13 @@ test('every lane tells the model that which account/mailbox/calendar is never th
     ['full', ORCHESTRATOR_INSTRUCTIONS],
   ] as const) {
     assert.match(text, /Which connected account, mailbox, or calendar is never that question: attempt the call/, name);
+  }
+});
+
+test('both lean lanes tell the model to compute stated figures from the stored result', () => {
+  for (const [name, text] of [['claude-brain', CLAUDE_BRAIN_RUBRIC], ['lean', ORCHESTRATOR_INSTRUCTIONS_LEAN]] as const) {
+    assert.match(text, /FIGURES FROM THE DATA/, name);
+    assert.match(text, /`tool_output_query` \(where \/ sort_by \/ aggregate\)/, name);
   }
 });
 
