@@ -415,6 +415,7 @@ import {
   type WorkflowOriginGroupClosedBatchReceipt,
 } from '../../execution/workflow-origin-group.js';
 import { workflowOriginReplyTargetForSource } from '../workflow-origin-authority.js';
+import { turnAnchorDigest } from './byo-prompt-layout.js';
 import {
   exactOriginDeliveryTargetDigest,
   sameExactOriginDeliveryTarget,
@@ -11461,6 +11462,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
               history: estimateInputTokens(value.input),
               ...toolPromptComponents,
             };
+        // This filter appends only system items, and single-request host
+        // guidance is appended after it, so the last user message here is the
+        // one that opened the turn.
+        harnessContext.modelTurnAnchor = turnAnchorDigest(value.input);
       }
       // Composition as CACHEABILITY (parity with the Claude lane): per-step
       // prompt cost is paid once per step and ~100x per task, and the lever is
