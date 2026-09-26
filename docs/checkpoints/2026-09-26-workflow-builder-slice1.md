@@ -217,3 +217,72 @@ afterwards (404 and directory gone). Checked on the served page (headless Chromi
 - Dragging `review` 120 px down wrote the shared sidecar within 1.5 s: GET returned
   `review: {x: 600, y: 167}`; SKILL.md untouched; no `workflow_changed` (the list did not refetch).
 - The PUT dropped a position for an unknown step id (`ghost`) as designed.
+
+## The clock stamp (221db7398) and the heartbeats slice (09-26 morning, installed 999df3f92 → fbf740226 → b6541b6a8 → 689cce57c)
+
+**Clem said Friday on Saturday (09:50 PT greeting).** The per-turn context was right (the Now
+line is first); the model slipped and review let it through. Fix, not a regex: the same snapshot
+is now also stamped LAST in the per-turn context as `## Right Now` ("Right now it is Saturday,
+26 September 2026, 9:50 AM (PDT)."), minute precision, in the volatile tail so the cached prefix
+is untouched (`src/agents/harness-context.ts`, `renderRightNowStamp`, VOLATILE_CONTEXT_TITLES).
+
+**Heartbeats: one place for everything Clementine checks on her own.** Owner's brief: proactive
+heartbeats that look at work done and offer help; the owner must be able to refine them along
+with Clem; intelligence + token efficiency; Clem still a partner.
+
+- Registry `src/agents/heartbeats.ts`: `work-review`, `calendar`, `workflow-suggestions`; one
+  status shape (enabled, cadence in a per-heartbeat range, quiet hours, last tick, last finding,
+  metrics, open items, recently retired, contract); `tickHeartbeat(id, source)` for Check now.
+- Contract per heartbeat `src/agents/heartbeat-contracts.ts` → `state/heartbeats.json`: notify
+  `quiet` (items stay in the app) | `push`, and rules in the owner's words, each marked `by:
+  owner | clementine`. Duplicate / empty / too long / too many are refused, not silently kept.
+- Work review `src/agents/work-review.ts` (pure) + `work-review-runtime.ts` (reads, Jev, state
+  `state/work-review.json`). Deterministic reads: workflow run records (waiting statuses blocked*/
+  parked/paused/awaiting_*; failures `failed`/`error` within 24 h; `creation_test`, completed,
+  cancelled and one-step tries ignored), waiting chats from run-events, unsent drafts under
+  `drafts/`. Waits are grouped per workflow / per chat title (one item, several refs), a wait
+  counts after 2 h, a draft after 1 h, nothing older than 7 days. Each new item goes through
+  Jev ONLY when the owner has rules (`tryJevHeartbeatItemVerdict`, channel `jev-heartbeat`,
+  metric lane `heartbeat_rules`), 12 calls per tick, the rest held for the next tick rather
+  than surfacing unjudged; Jev unavailable = keep the item (fail open, quiet). An item is a
+  notification kind `execution` with `metadata.heartbeatId/itemKey/changeKind/refs/count`,
+  `inboxOnly` when quiet; it retires on its own when the run resumes / chat is answered /
+  draft leaves, and its card is marked read so it leaves Needs you. Needs you admits open
+  heartbeat items (`src/dashboard/needs-you.ts`; note the older boolean `metadata.heartbeat`
+  convention is skipped there, hence `heartbeatId`).
+- Rules change → live items are judged again (689cce57c): a rule added later quiets open items
+  it covers ("2 now skipped by your rules"), a removed rule brings them back with a fresh card
+  ("2 back after a rule change"); once per rules version (`judgedAt` vs contract `updatedAt`);
+  no rules = no model call; failures already shown are not live and are left alone.
+- Surfaces: `/heartbeats` page (`apps/console-web/src/screens/Heartbeats.tsx`; nav entry lands
+  under More for saved prefs): on/off, cadence words, delivery, last finding + metrics, open
+  items, rules add/remove, Check now, Refine with Clementine (opens chat with the heartbeat
+  named). Routes `GET /api/console/heartbeats`, `PATCH /:id`, `POST /:id/tick`, `POST /:id/rules`,
+  `DELETE /:id/rules/:ruleId`. Tool `heartbeat_refine` (status | add_rule | remove_rule | set)
+  edits the SAME contract, so a sentence in chat and a rule typed on the page land in one place.
+  Registered in `src/tools/tool-registry.ts` (b6541b6a8): without the static registry entry the
+  brain never saw the tool (10:48 live: it searched, then tried to hand-write
+  `state/heartbeats.json` and the write boundary refused it, which is the right floor).
+- Daemon: `startWorkReviewHeartbeat()` in `src/daemon/runner.ts`; policy `workReviewEnabled`
+  / `workReviewMinutes` (60, 15–1440) in `proactivity-policy.ts`.
+
+**Live acceptance (installed app, live home, headless Chrome):**
+- First tick raised 3 duplicate chat items, no failures (records say `error`), 5 held on a
+  budget of 6, Needs you empty → grouping, both failure spellings, 7-day cap, budget 12,
+  Needs you admission, mark-read on retire (fbf740226). Second tick: "6 raised, 4 judged
+  routine, 6 resolved"; Needs you showed 4 Still waiting + 2 Unsent draft.
+- 11:00 PT chat: `About my "Work review" heartbeat: stop telling me about unsent drafts, I file
+  those myself. Keep everything else.` → Clementine (DeepSeek V4.1 Flash as writer) called
+  `heartbeat_refine`, rule landed in 34 s marked "Added by Clementine, from what you said", reply
+  in 21 s / 2 steps and honest about what stayed. Tick: `0 raised` (drafts still open) → gap →
+  689cce57c → tick: "2 now skipped by your rules"; rule removed → "2 back after a rule change".
+  The test rule was removed afterwards; the owner-side fixture rule "Skip anything from test or
+  fixture workflows (FRAMEWORK-TEST, harness-, clemmy-)" was left in place (added during
+  acceptance; useful, owner may delete it on the page).
+- Test chats archived; no fixtures left.
+
+**Owed:** cancelling a workflow run leaves its approval card pending (rejected by hand,
+apr-j30j); a rule change while Jev is dark retries every tick within budget (by design, costs
+calls); calendar and workflow-suggestions heartbeats keep their built-in rules (owner rules are
+kept and shown to Clementine, not yet applied by Jev); push delivery to the phone is the next
+phase (no APNs key, PWA web push unverified).

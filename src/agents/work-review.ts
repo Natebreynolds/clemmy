@@ -536,8 +536,9 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
   if (quiet) state.metrics.quietTicks += 1; else state.metrics.changedTicks += 1;
   const observed = { runs: observation.runs.length, chats: observation.chats.length, drafts: observation.drafts.length };
   const resolved = retired.length - quieted.length;
+  const raised = produced.length - reopened.length;
   const parts = [
-    `${produced.length - reopened.length} raised`,
+    raised ? `${raised} raised` : '',
     vetoed - quieted.length ? `${vetoed - quieted.length} judged routine` : '',
     quieted.length ? `${quieted.length} now skipped by your rules` : '',
     reopened.length ? `${reopened.length} back after a rule change` : '',
