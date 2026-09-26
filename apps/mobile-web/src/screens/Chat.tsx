@@ -28,7 +28,11 @@ import {
   observedEvidenceChips,
   outsideWorkCards,
   renderMarkdown,
+  timelineBounds,
+  timelineSpan,
   turnByline,
+  turnProgress,
+  type TimelineBounds,
   turnModelOffer,
   turnReview,
   type ActivityItem,
@@ -63,6 +67,7 @@ import { ChatBackButton } from '../components/ChatBackButton';
 import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
+import { ProgressRail } from '../components/ProgressRail';
 
 interface Props {
   sessionId?: string;
@@ -733,10 +738,13 @@ function MessageRow({
           ) : null}
         </>
       ) : thinking && activity.length === 0 ? (
-        <div class="work"><div class="work-line work-live" role="status">
-          <span class="work-orb" aria-hidden="true" />
-          <span class="work-summary work-shimmer">{message.progress ?? 'Thinking…'}</span>
-        </div></div>
+        <div class="work">
+          <div class="work-line work-live" role="status">
+            <span class="work-orb" aria-hidden="true" />
+            <span class="work-summary work-shimmer">{message.progress ?? 'Thinking…'}</span>
+          </div>
+          <ProgressRail progress={turnProgress({ activity, live: true, draft: message.answerDraft, hasText: Boolean(message.text) })} />
+        </div>
       ) : null}
       {/* Mirror the backend's TYPED terminal (desktop shows the same pills).
           Without this the phone showed a blocked or paused turn as plain prose,
@@ -826,8 +834,12 @@ function WorkLine({
   const unfinished = !live && !failed && !waiting
     && Boolean(message.terminal) && message.terminal?.status !== 'done';
   const [open, setOpen] = useState(failed);
-  const elapsed = useElapsed(activity, live);
+  const now = useNowTick(live);
+  const elapsed = turnElapsed(activity, live, now);
   const delegatedControl = delegatedRunControlForExpandedWork(message, open);
+  // The four-phase rail while live; the step bars share one time window.
+  const progress = live ? turnProgress({ activity, live, draft: message.answerDraft, hasText: Boolean(message.text) }) : null;
+  const bounds = timelineBounds(activity, live, now);
 
   // While live, a running step names itself; between steps the engine's own
   // rolling line ("Reading your calendar…") says what she is doing.
@@ -857,26 +869,33 @@ function WorkLine({
           <div class="delegated-work-state" role="status">Stopped</div>
         ) : null}
       </div>
+      {progress ? <ProgressRail progress={progress} /> : null}
       {open ? (
         <div class="work-detail">
-          {activity.map((item) => <ActivityRow key={item.id} item={item} />)}
+          {activity.map((item) => <ActivityRow key={item.id} item={item} bounds={bounds} now={now} live={live} />)}
         </div>
       ) : null}
     </div>
   );
 }
 
+/** Tick once a second while live, so the clock and the step bars move together. */
+function useNowTick(live: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!live) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [live]);
+  return now;
+}
+
 /** Human elapsed for the turn, from the earliest step that carried a start. */
-function useElapsed(activity: ActivityItem[], live: boolean): string {
+function turnElapsed(activity: ActivityItem[], live: boolean, now: number): string {
   const startedAt = activity.reduce<number | undefined>((earliest, item) => (
     item.startedAt && (earliest === undefined || item.startedAt < earliest) ? item.startedAt : earliest
   ), undefined);
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!live || startedAt === undefined) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [live, startedAt]);
   if (startedAt === undefined) return '';
   const seconds = Math.max(0, Math.round(((live ? now : Math.max(now, startedAt)) - startedAt) / 1000));
   if (!live && seconds < 1) return '';
@@ -885,12 +904,16 @@ function useElapsed(activity: ActivityItem[], live: boolean): string {
   return `${minutes}m ${seconds % 60}s`;
 }
 
-function ActivityRow({ item }: { item: ActivityItem }) {
+/** One step, with where it sat in the turn drawn as a hairline under it. */
+function ActivityRow({ item, bounds, now, live }: { item: ActivityItem; bounds: TimelineBounds | null; now: number; live: boolean }) {
   const icon = item.status === 'running' ? <span class="act-spinner" aria-label="running" />
     : item.status === 'failed' ? <span class="act-mark act-fail">✗</span>
       : item.status === 'interrupted' ? <span class="act-mark act-warn">–</span>
         : <span class="act-mark act-ok">✓</span>;
+  const span = bounds ? timelineSpan(item, bounds, live, now) : null;
+  const running = live && item.status === 'running';
   return (
+    <div class="act-step">
     <div class={`activity-row act-${item.status}${item.tone ? ` tone-${item.tone}` : ''}`}>
       {icon}
       <span class="act-label">
@@ -906,6 +929,12 @@ function ActivityRow({ item }: { item: ActivityItem }) {
       ) : item.detail ? (
         <span class="act-detail">{item.detail}</span>
       ) : null}
+    </div>
+    {span ? (
+      <span class="step-track" aria-hidden="true">
+        <span class={`step-fill ${running ? 'is-running' : `is-${item.status}`}`} style={{ left: `${span.left}%`, width: `${span.width}%` }} />
+      </span>
+    ) : null}
     </div>
   );
 }

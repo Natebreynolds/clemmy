@@ -313,6 +313,31 @@
 @keyframes work-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 .work-reveal { animation: work-reveal var(--clem-dur-base) var(--clem-ease) both; }
 @keyframes work-reveal { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+/* The beat she is on: up to two lines, never a truncated clause. */
+.work-beat { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+
+/* The progress rail: one segment per phase. Done is filled, current sweeps
+   (or fills to a declared fraction), pending waits, skipped is a dashed gap. */
+.rail-seg { position: relative; display: block; height: 3px; overflow: hidden; border-radius: 9999px; background: var(--border); }
+.rail-fill { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--primary); transition: width var(--clem-dur-base) var(--clem-ease); }
+.rail-seg.is-done .rail-fill { width: 100%; opacity: 0.55; }
+.rail-seg.is-current .rail-fill {
+  width: 100%;
+  background: linear-gradient(90deg, var(--primary) 0%, var(--primary) 35%, color-mix(in srgb, var(--primary) 25%, var(--border)) 50%, var(--primary) 65%, var(--primary) 100%);
+  background-size: 200% 100%;
+  animation: rail-sweep 1.6s linear infinite;
+}
+.rail-seg.is-current.is-determinate .rail-fill { background: var(--primary); animation: none; }
+.rail-seg.is-skipped { height: 0; margin-block: 1px; background: transparent; border-top: 1px dashed var(--border-strong); }
+@keyframes rail-sweep { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+
+/* A step's place in the turn: a hairline under the label whose offset and
+   length are its share of the time. Running reaches the right edge. */
+.step-track { position: relative; display: block; height: 2px; margin-top: 5px; overflow: hidden; border-radius: 9999px; background: var(--border); }
+.step-fill { position: absolute; top: 0; bottom: 0; min-width: 3px; border-radius: inherit; background: var(--text-subtle); opacity: 0.7; transition: left 1s linear, width 1s linear; }
+.step-fill.is-running { background: var(--primary); opacity: 1; }
+.step-fill.is-failed { background: var(--danger); opacity: 1; }
+.step-fill.is-interrupted { background: var(--warning); opacity: 1; }
 
 /* The composer floats over the thread, so it is one of the few things that
    earns a shadow. */
@@ -323,4 +348,6 @@
   .work-shimmer { animation: none; background: none; color: var(--text-muted); }
   .work-orb::after { display: none; }
   .work-reveal { animation: none; }
+  .rail-seg.is-current .rail-fill { animation: none; background: var(--primary); opacity: 0.8; }
+  .step-fill { transition: none; }
 }

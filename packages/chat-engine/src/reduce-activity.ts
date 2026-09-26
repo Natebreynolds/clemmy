@@ -282,7 +282,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         batch: meter,
         manifest: { id: manifestId, itemStatus },
         ...(phase ? { detail: phase.replace(/[_-]+/g, ' ') } : {}),
-        ...(settled ? { status: meter.failed > 0 ? 'failed' as const : 'done' as const } : {}),
+        ...(settled ? { status: meter.failed > 0 ? 'failed' as const : 'done' as const, finishedAt: now() } : {}),
       } : a));
     }
     case 'batch_started': {
@@ -316,6 +316,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         ? {
             ...a,
             status: failed > 0 || halted ? 'failed' : 'done',
+            finishedAt: now(),
             detail: undefined,
             batch: a.batch ? { ...a.batch, done: typeof d.succeeded === 'number' ? (d.succeeded as number) + failed : a.batch.done, failed } : a.batch,
           }
@@ -394,6 +395,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         return {
           ...a,
           status,
+          finishedAt: now(),
           ...(reused ? { label: REUSED_RESULT_LABEL } : {}),
           ...(glimpseDetail
             ? { detail: glimpseDetail }
@@ -455,6 +457,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
           ? {
               ...a,
               status,
+              finishedAt: now(),
               // Keep the worker_started label (it carries the role); on failure
               // append the short reason so "<item> ✗ <reason>" reads by default.
               ...(status === 'failed' && reason ? { label: `${a.label} — ${reason.slice(0, 80)}` } : {}),
@@ -468,7 +471,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       const label = status === 'failed' && reason ? `${base} — ${reason.slice(0, 80)}` : base;
       const modelName = helperModelName(model);
       return [...prev, {
-        id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status,
+        id, kind: 'agent', label, detail: model || undefined, provider: providerFor(d, model), status, finishedAt: now(),
         ...(modelName ? { modelName } : {}),
         ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
       }];
@@ -536,7 +539,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       return prev.map((a) => (a.offer?.offerId === offerId ? { ...a, offer: { ...a.offer, resolved: action } } : a));
     }
     case 'worker_capped':
-      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed' } : a));
+      return prev.map((a) => (a.kind === 'agent' && a.id === `a-${item}` ? { ...a, status: 'failed', finishedAt: now() } : a));
     // Trust cockpit: judge verdicts + watcher steers appear as 'check' rows so
     // the strip shows not only what the agent DID but what verified it.
     case 'verdict_recorded': {
@@ -647,7 +650,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
     case 'coding_run_activity':
       return foldCodingRunActivity(prev, d, now);
     case 'coding_run_settled':
-      return foldCodingRunSettled(prev, d);
+      return foldCodingRunSettled(prev, d, now);
     default:
       return prev;
   }
@@ -720,7 +723,7 @@ function foldCodingRunActivity(prev: ActivityItem[], d: Record<string, unknown>,
   return prev.map((row) => (row.id === id ? { ...row, detail } : row));
 }
 
-function foldCodingRunSettled(prev: ActivityItem[], d: Record<string, unknown>): ActivityItem[] {
+function foldCodingRunSettled(prev: ActivityItem[], d: Record<string, unknown>, now: () => number): ActivityItem[] {
   const id = codingRowId(d);
   if (!id) return prev;
   const outcome = typeof d.outcome === 'string' ? d.outcome : '';
@@ -738,5 +741,5 @@ function foldCodingRunSettled(prev: ActivityItem[], d: Record<string, unknown>):
   if (!prev.some((row) => row.id === id)) {
     return [...prev, { id, kind: 'agent', label: codingAgentName(d.agent), detail, provider: d.agent === 'codex' ? 'codex' : 'claude', status, tone }];
   }
-  return prev.map((row) => (row.id === id ? { ...row, status, detail, tone } : row));
+  return prev.map((row) => (row.id === id ? { ...row, status, detail, tone, finishedAt: now() } : row));
 }

@@ -389,6 +389,8 @@ export function ChatBubble({
           items={message.activity ?? []}
           live={live}
           progress={message.progress}
+          draft={message.answerDraft}
+          hasText={hasReplyText}
           terminalOutcome={live ? undefined : activityTerminalOutcomeForMessageStatus(message.status)}
           traceHref={traceHref}
           onBackground={live ? onBackground : undefined}

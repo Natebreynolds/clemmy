@@ -17,6 +17,31 @@ import type { ActivityItem } from '@/lib/useChat';
 import { BatchRow, PROVIDER_DOT, useNowTick } from '@/components/chat/ActivityFeed';
 import { narrateActivity, settleTerminalActivity, type ActivityTerminalOutcome } from '@/lib/activity-presentation';
 import { activityCardHead, clockLabel, groupActivityByParent, stepElapsed } from '@/lib/activity-card';
+import { timelineSpan, type TimelineBounds } from '@clem/chat-engine';
+
+/** The turn's time window a step row draws its bar against. Absent = no bar
+ *  (the Space and background cards keep the plain list). */
+export interface StepTimeline {
+  bounds: TimelineBounds;
+  now: number;
+  live: boolean;
+}
+
+/** Where this step sat in the turn: a thin bar under the label whose offset
+ *  and length are its share of the whole, so the list reads as a timeline. */
+function StepBar({ a, timeline }: { a: ActivityItem; timeline: StepTimeline }) {
+  const span = timelineSpan(a, timeline.bounds, timeline.live, timeline.now);
+  if (!span) return null;
+  const running = timeline.live && a.status === 'running';
+  return (
+    <span className="step-track" aria-hidden>
+      <span
+        className={cn('step-fill', running ? 'is-running' : `is-${a.status}`)}
+        style={{ left: `${span.left}%`, width: `${span.width}%` }}
+      />
+    </span>
+  );
+}
 
 function Spinner({ className }: { className?: string }) {
   return <span className={cn('inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-[1.5px] border-primary/30 border-t-primary', className)} aria-hidden />;
@@ -82,7 +107,7 @@ function OpenDeliverable({ file }: { file: { name: string; dir: string } }) {
   );
 }
 
-export function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number; live: boolean; nested?: boolean }) {
+export function StepRow({ a, now, live, nested, timeline }: { a: ActivityItem; now: number; live: boolean; nested?: boolean; timeline?: StepTimeline }) {
   const running = live && a.status === 'running';
   const [peek, setPeek] = useState<boolean | null>(null);
   // While live, only the current step opens its excerpt — auto-opening every
@@ -98,6 +123,7 @@ export function StepRow({ a, now, live, nested }: { a: ActivityItem; now: number
         {a.kind === 'agent' && a.modelName
           ? <span className={cn('block text-caption text-faint', running ? 'whitespace-normal' : 'truncate')}>{a.modelName}</span>
           : a.detail && <span className={cn('block font-mono text-caption text-faint', running ? 'whitespace-normal' : 'truncate')}>{a.detail}</span>}
+        {timeline && <StepBar a={a} timeline={timeline} />}
         {showExcerpt && (
           <pre className="mt-1 max-h-36 overflow-y-auto whitespace-pre-wrap rounded-sm bg-subtle px-2.5 py-2 font-sans text-caption leading-relaxed text-muted">{a.excerpt}</pre>
         )}

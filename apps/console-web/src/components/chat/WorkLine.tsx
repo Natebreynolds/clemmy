@@ -1,9 +1,10 @@
 /**
  * WorkLine — how a chat turn shows Clem's work.
  *
- * While she works it is one quiet line: a live mark, what she is doing now,
- * and the clock, with the steps settling in underneath. When the answer lands
- * it folds to "Worked 58s · 4 steps", which opens to the same steps. The
+ * While she works it is a progress rail (thinking → working → writing →
+ * checking), the beat she is on right now, and the clock, with the steps
+ * settling in underneath as a timeline of where the time went. When the answer
+ * lands it folds to "Worked 58s · 4 steps", which opens to the same steps. The
  * answer is the page; the work is its footnote.
  *
  * Rows come from the same narration the activity card uses (discovery hidden,
@@ -15,8 +16,11 @@ import { Link } from 'react-router-dom';
 import { AlertCircle, ArrowUpRight, CheckCircle2, ChevronRight, PauseCircle, XCircle } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
+import type { LiveAnswerDraft } from '@clem/chat-engine';
+import { timelineBounds, turnProgress } from '@clem/chat-engine';
 import { BatchRow, useNowTick } from '@/components/chat/ActivityFeed';
-import { LiveStepList, StepRow } from '@/components/chat/ActivityCard';
+import { LiveStepList, StepRow, type StepTimeline } from '@/components/chat/ActivityCard';
+import { ProgressRail } from '@/components/chat/ProgressRail';
 import { narrateActivity, settleTerminalActivity, type ActivityTerminalOutcome } from '@/lib/activity-presentation';
 import { activityCardHead, clockLabel, groupActivityByParent } from '@/lib/activity-card';
 
@@ -56,6 +60,8 @@ export function WorkLine({
   items,
   live,
   progress,
+  draft,
+  hasText = false,
   terminalOutcome,
   traceHref,
   onBackground,
@@ -64,6 +70,11 @@ export function WorkLine({
   live: boolean;
   /** The engine's rolling human line ("Reading your calendar…"). */
   progress?: string;
+  /** The provisional answer while it streams or is checked — the writing and
+   *  checking phases of the rail come from it. */
+  draft?: LiveAnswerDraft;
+  /** Reply text is already on screen (streamed or delivered). */
+  hasText?: boolean;
   terminalOutcome?: ActivityTerminalOutcome;
   traceHref?: string;
   /** Detach the running turn to the background; offered while live. */
@@ -78,6 +89,10 @@ export function WorkLine({
   const { top, children } = groupActivityByParent(view);
   const anyRunning = live && view.some((row) => row.status === 'running');
   const current = anyRunning ? head.title : (progress ?? head.title);
+  // The timeline window every step bar is drawn against: first start → now
+  // while live, → the last settle once done.
+  const bounds = timelineBounds(view, live, now);
+  const timeline: StepTimeline | undefined = bounds ? { bounds, now, live } : undefined;
   const steps = (
     <LiveStepList live={live}>
       <ol className="ml-[7px] mt-1 list-none border-l border-border py-0.5 pl-4">
@@ -86,10 +101,10 @@ export function WorkLine({
             ? <BatchRow key={a.id} a={a} now={now} live={live} />
             : (
               <li key={a.id} className="list-none">
-                <ol className="list-none p-0"><StepRow a={a} now={now} live={live} /></ol>
+                <ol className="list-none p-0"><StepRow a={a} now={now} live={live} timeline={timeline} /></ol>
                 {children.get(a.id) && (
                   <ol className="list-none p-0">
-                    {children.get(a.id)!.map((c) => <StepRow key={c.id} a={c} now={now} live={live} nested />)}
+                    {children.get(a.id)!.map((c) => <StepRow key={c.id} a={c} now={now} live={live} timeline={timeline} nested />)}
                   </ol>
                 )}
               </li>
@@ -100,34 +115,47 @@ export function WorkLine({
   );
 
   if (live) {
+    const rail = turnProgress({ activity: view, live: true, draft, hasText });
+    // The beat line carries what no step row does: the wait before the first
+    // step, or the engine's own line between steps. While a step is running
+    // it IS the beat, bold in the list, so saying it twice is noise.
+    const beat = view.length === 0 ? (current || 'Thinking…') : (!anyRunning && progress ? progress : '');
+    const actions = Boolean(onBackground || traceHref);
     return (
       <section aria-label="What Clem is doing" className="min-w-0">
-        <div className="flex min-h-7 items-center gap-2.5 text-small">
-          <span className="work-orb shrink-0" aria-hidden />
-          <span role="status" aria-live="polite" className="work-shimmer min-w-0 truncate font-semibold">
-            {current || 'Thinking…'}
-          </span>
+        <div className="flex items-start gap-2.5">
+          <span className="work-orb mt-[3px] shrink-0" aria-hidden />
+          <ProgressRail progress={rail} className="min-w-0 flex-1" />
           {head.startedAt !== undefined && (
-            <span className="shrink-0 font-mono text-caption tabular-nums text-faint">{clockLabel(head.startedAt, now)}</span>
+            <span className="shrink-0 pl-1 font-mono text-caption leading-none tabular-nums text-faint">{clockLabel(head.startedAt, now)}</span>
           )}
-          <span className="ml-auto flex shrink-0 items-center gap-3 text-caption text-faint">
-            {onBackground && (
-              <button
-                type="button"
-                onClick={onBackground}
-                title="Keeps working, reports back here, and frees the chat"
-                className="transition-colors hover:text-fg"
-              >
-                Move to background
-              </button>
-            )}
-            {traceHref && (
-              <Link to={traceHref} className="inline-flex items-center gap-0.5 transition-colors hover:text-fg">
-                Full trace <ArrowUpRight className="h-3 w-3" aria-hidden />
-              </Link>
-            )}
-          </span>
         </div>
+        {(beat || actions) && (
+          <div className="ml-[18.5px] mt-2 flex items-start gap-3">
+            <p role="status" aria-live="polite" className={cn('min-w-0 flex-1 text-small font-semibold', beat && 'work-shimmer work-beat')}>
+              {beat}
+            </p>
+            {actions && (
+              <span className="flex shrink-0 items-center gap-3 pt-0.5 text-caption leading-none text-faint">
+                {onBackground && (
+                  <button
+                    type="button"
+                    onClick={onBackground}
+                    title="Keeps working, reports back here, and frees the chat"
+                    className="transition-colors hover:text-fg"
+                  >
+                    Move to background
+                  </button>
+                )}
+                {traceHref && (
+                  <Link to={traceHref} className="inline-flex items-center gap-0.5 transition-colors hover:text-fg">
+                    Full trace <ArrowUpRight className="h-3 w-3" aria-hidden />
+                  </Link>
+                )}
+              </span>
+            )}
+          </div>
+        )}
         {view.length > 0 && steps}
       </section>
     );
