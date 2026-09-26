@@ -581,11 +581,15 @@ const TRAJECTORY_TIMEOUT_MS = 1_500;
 const WATCH_CHANGE_TIMEOUT_MS = 1_500;
 const WATCH_CHANGE_CONFIDENCE_MIN = 0.6;
 
+export type JevDriftKind = 'unrelated' | 'abandoned' | 'repeating';
+
 export interface JevTrajectoryVerdict {
   onTrack: boolean;
   confidence: number;
   model: string;
   durationMs: number;
+  /** How the work left the goal, when Jev named one. */
+  driftKind?: JevDriftKind;
 }
 
 /**
@@ -611,12 +615,23 @@ export async function tryJevTrajectoryVerdict(input: {
       instructions: [
         'You are watching an assistant work toward a user goal, mid-run.',
         'Judge only whether the work so far is heading toward the stated goal. This is advisory, never completion certification.',
-        'Drift means the assistant is doing something the goal did not ask for, has abandoned a required part, or is repeating a failing step.',
-        'Ordinary preparation, discovery, reading, or partial progress toward the goal is on track.',
+        'Judge against the goal only; never demand steps, tools or formats the goal does not name. Incomplete work is expected mid-run, and the order of steps is the assistant\'s choice.',
+        'Drift means the assistant is doing something the goal did not ask for, has abandoned a required part, is repeating a failing step, or keeps re-reading evidence it already has without resolving what is left.',
+        'Ordinary preparation, discovery, reading, or partial progress toward the goal is on track. When unsure, it is on track.',
       ].join(' '),
       criteria: {
         on_track: 'The tool calls and the assistant\'s latest note are consistent with reaching the stated goal.',
         drift: 'The work has left the goal: unrelated actions, an abandoned required part, or the same failing step repeated.',
+      },
+    },
+    driftKind: {
+      type: 'choice',
+      instructions: 'If the work has left the goal, how has it left it?',
+      criteria: {
+        unrelated: 'It is doing things the goal did not ask for.',
+        abandoned: 'It has dropped a required part of the goal.',
+        repeating: 'It keeps repeating a step that fails, or re-reading what it already has.',
+        none: 'It has not left the goal.',
       },
     },
   };
@@ -637,7 +652,14 @@ export async function tryJevTrajectoryVerdict(input: {
   if (!result.ok) return null;
   const answer = result.answers.verdict as ChoiceAnswer | undefined;
   if (!answer || (answer.choice !== 'on_track' && answer.choice !== 'drift')) return null;
-  return { onTrack: answer.choice === 'on_track', confidence: answer.confidence, model: result.model, durationMs: Date.now() - started };
+  const kind = (result.answers.driftKind as ChoiceAnswer | undefined)?.choice;
+  return {
+    onTrack: answer.choice === 'on_track',
+    confidence: answer.confidence,
+    model: result.model,
+    durationMs: Date.now() - started,
+    ...(kind === 'unrelated' || kind === 'abandoned' || kind === 'repeating' ? { driftKind: kind } : {}),
+  };
 }
 
 export interface JevCompletionVerdict {

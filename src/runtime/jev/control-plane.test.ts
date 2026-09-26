@@ -356,7 +356,10 @@ test('tryJevTrajectoryVerdict returns a typed on_track/drift reading and fails o
     status: 200, ok: true,
     text: async () => JSON.stringify({
       model: 'jev-1.13.0',
-      answers: { verdict: { type: 'choice', choice: 'drift', probabilities: { on_track: 0.2, drift: 0.8 }, confidence: 0.77 } },
+      answers: {
+        verdict: { type: 'choice', choice: 'drift', probabilities: { on_track: 0.2, drift: 0.8 }, confidence: 0.77 },
+        driftKind: { type: 'choice', choice: 'repeating', probabilities: { repeating: 0.9 }, confidence: 0.9 },
+      },
       usage: { input_tokens: 40, output_tokens: 3 },
     }),
   }));
@@ -367,6 +370,7 @@ test('tryJevTrajectoryVerdict returns a typed on_track/drift reading and fails o
   assert.equal(drift?.onTrack, false);
   assert.equal(drift?.confidence, 0.77);
   assert.equal(drift?.model, 'jev-1.13.0');
+  assert.equal(drift?.driftKind, 'repeating', 'Jev names how the work left the goal');
 
   _setSystemOneFetchForTests(async () => ({ status: 500, ok: false, text: async () => 'nope' }));
   assert.equal(await tryJevTrajectoryVerdict({

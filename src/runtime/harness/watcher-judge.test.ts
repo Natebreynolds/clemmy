@@ -2,21 +2,18 @@
  * Run: npx tsx --test src/runtime/harness/watcher-judge.test.ts
  *
  * WATCHER judge (trajectory co-pilot). Pins the pure contract: the cadence
- * gate, the one-line ON-TRACK/DRIFT|STEER verdict parse, and the goal-only
- * rubric/prompt (never demands artifacts the goal doesn't name).
+ * gate, the knobs, and the evidence window. The verdict itself is Jev's
+ * (watcher-judge-jev-first.test.ts).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildWatcherPrompt,
   latestWatcherAssistantNote,
   lastCoveredWatcherReview,
   MAX_WATCHER_CHECKS,
   MAX_WATCHER_INJECTIONS,
-  parseWatcherVerdict,
   rearmedWatcherCadence,
   shouldStartWatcherCheck,
-  WATCHER_JUDGE_SYSTEM_PROMPT,
   watcherCheckIntervalTools,
   watcherJudgeEnabled,
   workflowWatcherJudgeEnabled,
@@ -49,54 +46,6 @@ test('gate: silent below the interval, when disabled, mid-flight, or out of inje
 test('gate: interval measures from the LAST check, not zero', () => {
   assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 23, lastCheckedAtToolCalls: 12 }), false);
   assert.equal(shouldStartWatcherCheck({ ...baseGate, totalToolCalls: 24, lastCheckedAtToolCalls: 12 }), true);
-});
-
-test('parse: ON-TRACK is silent (no miss, no steer)', () => {
-  const v = parseWatcherVerdict('ON-TRACK: steady progress');
-  assert.deepEqual(v, { onTrack: true, miss: '', steer: '' });
-  assert.deepEqual(parseWatcherVerdict('ONTRACK: fine'), { onTrack: true, miss: '', steer: '' });
-});
-
-test('parse: DRIFT carries the miss and the steer', () => {
-  const v = parseWatcherVerdict('DRIFT: criterion 3 (per-firm research) untouched after 12 calls | STEER: research each firm before drafting its email.');
-  assert.equal(v?.onTrack, false);
-  assert.match(v?.miss ?? '', /per-firm research/);
-  assert.match(v?.steer ?? '', /research each firm/);
-});
-
-test('parse: DRIFT without an explicit STEER falls back to the miss as the instruction', () => {
-  const v = parseWatcherVerdict('DRIFT: the sheet was created in the wrong workspace');
-  assert.equal(v?.onTrack, false);
-  assert.equal(v?.steer, v?.miss);
-});
-
-test('parse: garbage, prose, and a bare DRIFT are null — the watcher says nothing it cannot back', () => {
-  assert.equal(parseWatcherVerdict('here are my thoughts on the trajectory...'), null);
-  assert.equal(parseWatcherVerdict('DRIFT:'), null);
-  assert.equal(parseWatcherVerdict(''), null);
-  assert.equal(parseWatcherVerdict(undefined), null);
-});
-
-test('rubric: goal-only + mid-run tolerance + silence-by-default are pinned', () => {
-  assert.match(WATCHER_JUDGE_SYSTEM_PROMPT, /Judge against the GOAL ONLY/);
-  assert.match(WATCHER_JUDGE_SYSTEM_PROMPT, /Never demand artifacts, steps, tools, or formats the goal does not name/);
-  assert.match(WATCHER_JUDGE_SYSTEM_PROMPT, /incomplete work is EXPECTED and is NOT drift/);
-  assert.match(WATCHER_JUDGE_SYSTEM_PROMPT, /ON-TRACK/);
-  assert.doesNotMatch(WATCHER_JUDGE_SYSTEM_PROMPT, /URL|file path/, 'no artifact-shape prescriptions (the clean-rubric contract)');
-});
-
-test('prompt: renders goal, declared criteria, tool evidence, and the latest note', () => {
-  const p = buildWatcherPrompt({
-    objective: 'send tailored outreach to the 5 warm leads',
-    successCriteria: ['each email references the firm\'s recent case', 'all 5 sends confirmed'],
-    toolCallSummary: 'salesforce_query ×1, web_search ×3, outlook_draft ×2',
-    latestAssistantNote: 'Drafting the remaining three now.',
-    toolCallCount: 9,
-  });
-  assert.match(p, /Goal: send tailored outreach/);
-  assert.match(p, /1\. each email references/);
-  assert.match(p, /Tool calls so far \(9\)/);
-  assert.match(p, /Drafting the remaining three/);
 });
 
 test('knobs: chat defaults on, workflow mount defaults off, and the global kill-switch wins', () => {
@@ -140,8 +89,7 @@ test('gate: a fan-out re-arm waives only the interval — every other cap still 
   assert.equal(midBatch.lastCheckedAtToolCalls, 0);
 });
 
-test('watcher evidence and public notes survive whole while prior turns and reasoning are excluded', () => {
-  const source = 'Prefix ' + 'evidence '.repeat(1000) + 'TAIL: source contradicts the claimed price.';
+test('the watcher reads only this turn\'s public progress note, never prior turns or reasoning', () => {
   const note = 'Public progress ' + 'context '.repeat(300) + 'TAIL: checking the comparison.';
   const history = [
     { type: 'message', role: 'assistant', content: 'Old request note.' },
@@ -152,11 +100,6 @@ test('watcher evidence and public notes survive whole while prior turns and reas
   ];
   assert.equal(latestWatcherAssistantNote(history, 2), note);
   assert.equal(latestWatcherAssistantNote(history.slice(0, 3), 2), '');
-  const prompt = buildWatcherPrompt({ objective: 'Compare the two offers.', sourceEvidence: source,
-    latestAssistantNote: note, toolCallSummary: 'read_file ×2', toolCallCount: 2 });
-  assert.ok(prompt.includes(source));
-  assert.ok(prompt.includes(note));
-  assert.doesNotMatch(prompt, /Old request note|Private reasoning/);
 });
 
 
