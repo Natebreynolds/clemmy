@@ -51,6 +51,7 @@ import type {
 } from './interactive-consent-policy.js';
 import { openCanonicalArguments } from './authority-argument-seal.js';
 import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
+import { learnedReadRequest } from './execution-gate.js';
 import {
   persistHostCallCapabilityBinding,
   verifyHostCallCapabilityBindingForReplay,
@@ -585,16 +586,41 @@ function preparationProbeInvocation(
   return input.consentBasis === 'plan_preparation_probe';
 }
 
+/**
+ * How a host-owned call is BOOKED, as distinct from the sealed effect the
+ * authority chain carries. A generic native tool's request shape that two
+ * models found to read only (learnedReadRequest) keeps its sealed
+ * external_write for the carrier and the consent record, but it settles as
+ * a read and reserves no write: the settlement audit requires a write
+ * lifecycle only for settlements booked mutating, so the two must move
+ * together. Live 2026-09-26 15:21: two ranked_keywords reads settled as
+ * writes minutes after that shape was learned.
+ */
+export function hostCallAccounting(
+  input: Pick<InvokeHostToolCallInput<unknown>, 'identity' | 'effect' | 'boundary' | 'consentBasis'>,
+): { mutating: boolean; projectsExternalWrite: boolean; learnedRead: boolean } {
+  const probe = preparationProbeInvocation(input);
+  const learnedRead = input.boundary === 'host_owned_external'
+    && input.effect === 'external_write'
+    && learnedReadRequest(input.identity.toolName, input.identity.args);
+  return {
+    learnedRead,
+    mutating: !probe && mutatingEffect(input.effect) && !learnedRead,
+    projectsExternalWrite: input.boundary === 'host_owned_external'
+      && (input.effect === 'external_write' || input.effect === 'admin')
+      && !probe
+      && !learnedRead,
+  };
+}
+
 function invocationMutating(
-  input: Pick<InvokeHostToolCallInput<unknown>, 'effect' | 'consentBasis'>,
+  input: Pick<InvokeHostToolCallInput<unknown>, 'identity' | 'effect' | 'boundary' | 'consentBasis'>,
 ): boolean {
-  return !preparationProbeInvocation(input) && mutatingEffect(input.effect);
+  return hostCallAccounting(input).mutating;
 }
 
 function projectsHostExternalWrite(input: InvokeHostToolCallInput<unknown>): boolean {
-  return input.boundary === 'host_owned_external'
-    && (input.effect === 'external_write' || input.effect === 'admin')
-    && !preparationProbeInvocation(input);
+  return hostCallAccounting(input).projectsExternalWrite;
 }
 
 function hostExternalWriteDescriptor(
@@ -1241,7 +1267,10 @@ export async function invokeHostToolCall<T>(
       prior.settlement.toolName !== contract.toolName
       || prior.settlement.argumentDigest !== contract.argumentDigest
       || prior.settlement.recovery.businessCall !== frozenBusinessCall
-      || prior.settlement.recovery.mutating !== invocationMutating(input)
+      // A settlement booked as a write before its request shape was learned
+      // to read only is the same contract; only what was known has changed.
+      || (prior.settlement.recovery.mutating !== invocationMutating(input)
+        && !(prior.settlement.recovery.mutating && hostCallAccounting(input).learnedRead))
     ) {
       throw new HostToolInvocationAuthorityError(
         'settled logical call conflicts with the current invocation contract',

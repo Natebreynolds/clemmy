@@ -500,6 +500,23 @@ export function requestEffectLearnable(toolName: string, rawArgs: unknown): bool
 }
 
 /**
+ * Whether this exact call is a learned read: a native generic tool whose
+ * request shape two models found to read only, under a manifest that
+ * sealed a bare "may write" declaration. The authority chain keeps the
+ * sealed effect (the carrier verifies manifest, attestation and binding
+ * agree), so this is the ACCOUNTING truth for such a call: it settles as a
+ * read, reserves no write, and the review protects a read.
+ */
+export function learnedReadRequest(toolName: string, rawArgs: unknown): boolean {
+  const operationId = nativeRequestOperationId(toolName);
+  if (!operationId) return false;
+  const shape = requestShapeOf(rawArgs);
+  if (!shape || !learnedRequestEffectVerdict('native_mcp', operationId, shape)) return false;
+  const effect = classifyCanonicalExternalEffect(`mcp__${operationId}`, rawArgs);
+  return effect.external && !effect.mutating;
+}
+
+/**
  * The operation id a native provider tool's learned request effects are
  * keyed by: `server__tool`, for a namespaced tool that is neither a
  * Clementine-local control nor a Composio carrier. Null for anything else.
