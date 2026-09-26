@@ -141,19 +141,27 @@ function WorkflowView({ name }: { name: string }) {
   const baseline = useRef<CanvasGraph>(EMPTY_GRAPH);
   /** The last detail the graph was drawn from, so a refetch is applied once. */
   const drawnFrom = useRef<WorkflowDetail | null>(null);
+  // Redrawing the graph (after a save, an undo, or Clementine's own edit)
+  // keeps the step that was open: a fresh node set otherwise reads as "nothing
+  // selected" and the panel you were working in would vanish mid-thought.
+  const selectedRef = useRef<string | null>(null);
+  selectedRef.current = selectedId;
 
   const applyGraph = useCallback(
     (graph: CanvasGraph, shared?: Record<string, CanvasPosition> | null) => {
       baseline.current = graph;
       const positions = resolvePositions(graph, choosePositions(shared, loadPositions(name)));
+      const keep = selectedRef.current;
       setNodes(
         graph.nodes.map((node) => ({
           id: node.id,
           type: 'workflowStep' as const,
           position: positions[node.id] ?? { x: 0, y: 0 },
           data: { node },
+          selected: node.id === keep,
         })),
       );
+      if (keep && !graph.nodes.some((node) => node.id === keep)) setSelectedId(null);
       setEdges(graph.edges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target })));
       setCreatedIds([]);
       setChangedElsewhere(false);
