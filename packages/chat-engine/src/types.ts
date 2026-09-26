@@ -38,13 +38,15 @@ export interface ApprovalPreview {
   check?: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 }
 
-export type ApprovalResolution = 'approved' | 'declined' | 'changed';
+export type ApprovalResolution = 'approved' | 'declined' | 'changed' | 'expired';
 
 /** The card state an approval_resolved event records, or undefined. */
 export function approvalResolutionFrom(data: Record<string, unknown>): ApprovalResolution | undefined {
   if (data.changeRequested === true) return 'changed';
   if (data.decision === 'approve' || data.decision === 'approve_with_edits') return 'approved';
   if (data.decision === 'reject') return 'declined';
+  // Written by the host when the card's lifetime ran out unanswered.
+  if (data.decision === 'expired') return 'expired';
   return undefined;
 }
 
@@ -192,7 +194,8 @@ export interface ChatMessage {
      *  values it receives, from the host's frozen arguments. Display only. */
     preview?: ApprovalPreview;
     /** How the card was answered, from the host's resolution record.
-     *  'changed' means the owner asked for a change; a new card follows. */
+     *  'changed' means the owner asked for a change; a new card follows.
+     *  'expired' means nobody answered in time, so it did not run. */
     resolution?: ApprovalResolution;
     /** Host reducer facts, passed through unchanged for display, not authority. */
     consentCall?: {

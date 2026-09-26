@@ -44,6 +44,7 @@ function historyMessage(turn: Turn): ChatMessage {
         approvalId: turn.approval.approvalId,
         pendingAction: pendingActionFromEvent(turn.approval.pendingAction),
         ...(approvalPreviewFrom(turn.approval.preview) ? { preview: approvalPreviewFrom(turn.approval.preview) } : {}),
+        ...(turn.approval.resolution === 'expired' ? { resolution: 'expired' as const } : {}),
       },
     };
   }

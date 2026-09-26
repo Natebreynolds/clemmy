@@ -61,10 +61,11 @@ function ApprovalCheckNote({ check }: {
   );
 }
 
-function approvalResolutionText(resolution: 'approved' | 'declined' | 'changed'): string {
+function approvalResolutionText(resolution: 'approved' | 'declined' | 'changed' | 'expired'): string {
   return resolution === 'changed'
     ? 'You asked for a change — the revised version is below. Nothing was sent from this one.'
-    : resolution === 'declined' ? 'Declined — nothing was sent.' : 'Approved.';
+    : resolution === 'declined' ? 'Declined — nothing was sent.'
+      : resolution === 'expired' ? 'Expired without an answer — it did not run.' : 'Approved.';
 }
 
 function approvalFieldLabel(name: string): string {

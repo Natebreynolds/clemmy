@@ -12,9 +12,9 @@
  *   1. Calls approvalRegistry.expireStaleApprovals() every TICK_MS.
  *   2. For each row that just expired, clears the session's
  *      interrupt state, marks the session 'cancelled' (so future
- *      messages start fresh instead of trying to resume), and posts
- *      a user-facing notification explaining what was lost so the
- *      user can re-ask.
+ *      messages start fresh instead of trying to resume), settles the
+ *      chat card as expired, and posts a user-facing notification
+ *      explaining what was lost so the user can re-ask.
  *   3. Sends one reminder for a formal approval still unanswered past
  *      its threshold (approval-reminder.ts).
  *
@@ -38,7 +38,7 @@ import path from 'node:path';
 import { BASE_DIR, getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { reapSettledAuthorityPayloads } from './dispatch-ledger.js';
-import { openEventLog } from './eventlog.js';
+import { appendEvent, openEventLog } from './eventlog.js';
 import { ASYNC_READ_REFINEMENT_INTENTS_TABLE } from './async-read-refinement-schema.js';
 import {
   reconcileHostExternalWriteProjections,
@@ -52,6 +52,38 @@ import { remindUnansweredApprovals } from './approval-reminder.js';
 const logger = pino({ name: 'clementine-next.approval-reaper' });
 
 const DEFAULT_TICK_MS = 60_000; // sweep once a minute
+
+/**
+ * The card itself must say it expired, however it expired: this sweep, or a
+ * decision that arrived after the card's lifetime (the registry records that
+ * as an expiry too). The chat engine settles a card only from
+ * approval_resolved, so without this an open chat kept live Approve buttons
+ * and a chat reopened from its events drew them again. The registry row and
+ * the Inbox notice say it expired either way; this is the card's copy.
+ */
+function markExpiredApprovalCard(row: approvalRegistry.PendingApprovalRow): void {
+  if (row.resolution !== 'expired') return;
+  try {
+    appendEvent({
+      sessionId: row.sessionId,
+      turn: 0,
+      role: 'system',
+      type: 'approval_resolved',
+      data: {
+        approvalId: row.approvalId,
+        tool: row.tool,
+        decision: 'expired',
+        resolution: 'expired',
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : err, approvalId: row.approvalId },
+      'could not mark the expired approval card',
+    );
+  }
+}
+approvalRegistry.onApprovalResolved(markExpiredApprovalCard);
 
 let activeInterval: NodeJS.Timeout | null = null;
 

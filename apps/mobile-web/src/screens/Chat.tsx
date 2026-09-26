@@ -585,6 +585,8 @@ function MessageRow({
           <div class="approval-reason">You asked for a change — the revised version is below. Nothing was sent from this one.</div>
         ) : message.approval.resolution === 'declined' ? (
           <div class="approval-reason">Declined — nothing was sent.</div>
+        ) : message.approval.resolution === 'expired' ? (
+          <div class="approval-reason">Expired without an answer — it did not run.</div>
         ) : null}
       </div>
     );

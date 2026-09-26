@@ -39,6 +39,8 @@ export interface Turn {
     approvalId: string;
     pendingAction?: unknown;
     preview?: unknown;
+    /** 'expired': nobody answered in time; render the card settled. */
+    resolution?: unknown;
   };
 }
 

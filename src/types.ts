@@ -187,6 +187,9 @@ export interface UnifiedSessionTurn {
     /** What approving would do (operation and argument values), display only. */
     preview?: { operation: string; fields: Array<{ name: string; value: string; label?: string }> };
     pendingAction?: unknown;
+    /** Present when nobody answered before the card's lifetime ran out: the
+     *  card renders settled, without controls. */
+    resolution?: 'expired';
   };
 }
 

@@ -556,7 +556,10 @@ function appendPendingPlanProposalTurns(sessionId: string, turns: UnifiedSession
  * reconstructed transcript is turn-level, so on reopen the user saw only the
  * prose "reply approve apr-x" while the card existed nowhere in the chat
  * (live 2026-07-23). Attach one synthetic assistant turn per approval that is
- * still pending; resolved/expired approvals render nothing.
+ * still pending. A formal card whose lifetime ran out unanswered stays too,
+ * marked expired: otherwise the chat ended on Clem's question with no sign of
+ * what became of it. Answered or closed approvals render nothing; the turns
+ * after them tell that story.
  */
 function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn[]): void {
   try {
@@ -569,8 +572,11 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
       if (!approvalId || seen.has(approvalId)) continue;
       seen.add(approvalId);
       const rowNow = approvalRegistry.get(approvalId);
-      if (!rowNow || rowNow.status !== 'pending') continue;
+      if (!rowNow) continue;
+      const expiredUnanswered = rowNow.status === 'expired' && rowNow.resolution === 'expired';
+      if (rowNow.status !== 'pending' && !expiredUnanswered) continue;
       if (!approvalRegistry.isFormalApprovalSurface(rowNow)) {
+        if (rowNow.status !== 'pending') continue;
         turns.push({
           role: 'assistant',
           text: rowNow.presentation?.question ?? '',
@@ -592,6 +598,7 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
           pendingAction: pendingActionApprovalViewFromArgs(rowNow.args ?? null),
           // What approving would do, as the live card showed it.
           ...(approvalPreviewProjection(d.preview) ?? {}),
+          ...(expiredUnanswered ? { resolution: 'expired' as const } : {}),
         },
       });
     }
