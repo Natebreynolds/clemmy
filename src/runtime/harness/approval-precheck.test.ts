@@ -18,7 +18,7 @@ process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
 
 const eventlog = await import('./eventlog.js');
-const { approvalPrecheck, parseApprovalPrecheck, _setApprovalPrecheckRunForTests } = await import('./approval-precheck.js');
+const { approvalPrecheck, parseApprovalPrecheck, _setApprovalPrecheckRunForTests, APPROVAL_PRECHECK_INSTRUCTIONS } = await import('./approval-precheck.js');
 
 test.after(() => {
   _setApprovalPrecheckRunForTests(null);
@@ -82,4 +82,12 @@ test('conflict lines are bounded to three short sentences', () => {
   assert.equal(lines.length, 3);
   assert.ok(lines[0]!.length <= 240);
   assert.throws(() => parseApprovalPrecheck({ nope: true }));
+});
+
+test('the check judges against what the owner wants now: a later message replaces an earlier one', () => {
+  // Live regression: a card revised by the owner's written change was flagged
+  // as contradicting the original request the change had replaced.
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /recent messages oldest first/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /A later message changes or replaces what an earlier one asked/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /not a conflict with the earlier request/);
 });
