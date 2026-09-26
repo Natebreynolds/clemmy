@@ -58,12 +58,33 @@ const logger = pino({ name: 'clementine.claude-model' });
 // ping stream); body 120s (max gap between SSE events, not total turn time).
 const CLAUDE_HEADERS_TIMEOUT_MS = 30_000;
 const CLAUDE_BODY_TIMEOUT_MS = 120_000;
-let claudeDispatcher: Agent | null = null;
-function getClaudeDispatcher(): Agent {
-  if (!claudeDispatcher) {
-    claudeDispatcher = new Agent({ headersTimeout: CLAUDE_HEADERS_TIMEOUT_MS, bodyTimeout: CLAUDE_BODY_TIMEOUT_MS });
+// A buffered (non-streaming) response sends its headers only once the whole
+// answer, thinking included, is written, so the streamed-headers bound would
+// abort every buffered answer that needs longer than it, and the transparent
+// retry would start that answer again from nothing. A buffered request waits
+// for its headers as long as a complete answer may take; the caller's own
+// deadline still bounds how long anyone waits for it.
+const CLAUDE_BUFFERED_HEADERS_TIMEOUT_MS = 300_000;
+const claudeDispatchers = new Map<number, Agent>();
+function getClaudeDispatcher(headersTimeoutMs: number): Agent {
+  let dispatcher = claudeDispatchers.get(headersTimeoutMs);
+  if (!dispatcher) {
+    dispatcher = new Agent({ headersTimeout: headersTimeoutMs, bodyTimeout: CLAUDE_BODY_TIMEOUT_MS });
+    claudeDispatchers.set(headersTimeoutMs, dispatcher);
   }
-  return claudeDispatcher;
+  return dispatcher;
+}
+
+/** How long a Claude request may wait for its response headers. */
+export function claudeHeadersTimeoutMs(body: unknown): number {
+  if (typeof body !== 'string') return CLAUDE_HEADERS_TIMEOUT_MS;
+  try {
+    return (JSON.parse(body) as { stream?: unknown }).stream === true
+      ? CLAUDE_HEADERS_TIMEOUT_MS
+      : CLAUDE_BUFFERED_HEADERS_TIMEOUT_MS;
+  } catch {
+    return CLAUDE_HEADERS_TIMEOUT_MS;
+  }
 }
 
 // The first system block must establish the Claude-Code identity for the
@@ -569,7 +590,7 @@ export function makeClaudeFetch(): typeof fetch {
     assertLiveModelTransportAllowed('Claude Messages API');
     const token = await freshClaudeToken();
     const { headers, body } = applyClaudeEnvelope(init, token);
-    const dispatcher = modelParityEnabled() ? getClaudeDispatcher() : undefined;
+    const dispatcher = modelParityEnabled() ? getClaudeDispatcher(claudeHeadersTimeoutMs(body)) : undefined;
     const debug = claudeWireDebugEnabled();
     if (debug) logClaudeRequestShape(body);
     const res = await fetch(input, {
