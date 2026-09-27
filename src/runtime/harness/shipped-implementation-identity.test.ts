@@ -161,7 +161,7 @@ test('npm pack file list includes implementation artifacts and manifest', () => 
     encoding: 'utf8',
     cwd: repoRoot,
   });
-  assert.equal(packed.status, 0, packed.stderr);
+  assert.equal(packed.status, 0, `${packed.stdout}\n${packed.stderr}`);
   const listing = packed.stdout + packed.stderr;
   assert.match(listing, /implementation-artifacts/);
   assert.match(listing, /manifest\.json/);

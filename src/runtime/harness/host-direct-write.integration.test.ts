@@ -1237,18 +1237,25 @@ for (const answer of ['button', 'reply'] as const) {
       assert.notEqual(accepting.seq, fixture.source.seq, 'the answer is accepted by a source other than the parked request');
       assert.equal((accepting.data as { synthetic?: unknown }).synthetic === true, answer === 'button',
         'a button answer is accepted by the runtime\'s control edge; a reply by the owner\'s own words');
-      // What the later step was told from memory, as the runtime recorded it.
-      // A button answer's later step runs under the control edge, which the
-      // model-request provenance gate does not accept as a request source, so
-      // only a reply's later step also reaches the brain.
-      assert.ok(judgeMemoryFor(fixture.session.id).includes(RESUME_FACT), 'the later step\'s memory carries the parked request\'s fact');
-      if (answer === 'reply') {
-        const resumed = sent.slice(before);
-        assert.equal(resumed.length, 2, 'the resumed step and the re-ask reached the brain');
-        assert.ok(resumed[1]!.includes(RESUME_FACT), 'the re-ask\'s model request carries the parked request\'s fact');
-      }
+      // Both paths must reach a second model frame, not merely record memory
+      // before a provenance refusal. The write already settled once.
+      assert.equal(result.status, 'completed', JSON.stringify(result));
+      assert.ok(judgeMemoryFor(fixture.session.id).includes(RESUME_FACT));
+      const resumed = sent.slice(before);
+      assert.equal(resumed.length, 2, 'the resumed step and the re-ask reached the brain');
+      assert.ok(resumed[1]!.includes(RESUME_FACT));
+      assert.equal(fixture.counts().providerCalls, 1, 'continuation never replays the approved write');
+      const completed = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+        .filter(event => event.data.sourceUserSeq === accepting.seq);
+      assert.equal(completed.length, 1, 'one terminal settles the accepted approval answer');
+      const replay = await runConversationFromResume({ agent, sessionId: fixture.session.id,
+        sourceUserSeq: accepting.seq, approvalId: approval.approvalId, decision: 'approve',
+        resolver: `resume-memory-${answer}`, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+      assert.equal(replay.status, 'completed', JSON.stringify(replay));
+      assert.equal(sent.length, before + 2, 'a replayed answer needs no additional brain call');
+      assert.equal(fixture.counts().providerCalls, 1, 'a replayed answer cannot repeat the effect');
       const later = eventlog.listEvents(fixture.session.id, { types: ['turn_memory_primer'] }).at(-1)!.data as Record<string, unknown>;
-      assert.equal(later.sourceUserSeq, accepting.seq, 'the last primer is the later step\'s');
+      assert.equal(later.sourceUserSeq, fixture.source.seq, 'the later frame belongs to the original business request');
       assert.ok(String(later.queryPreview).startsWith(fixture.prompt.slice(0, 60)),
         `the later step ranks memory by the parked request: ${JSON.stringify(later)}`);
     } finally {

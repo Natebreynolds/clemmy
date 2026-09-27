@@ -660,6 +660,7 @@ test('run_worker requires a structured parent-planned job packet', async () => {
     'expectedOutput',
     'intent',
     'model',
+    'agent',
     'workManifest',
     // 2026-08-11 contracted fan-out: expectedWork carries the frozen-plan
     // requirement so workers bind instead of concluding a capability is

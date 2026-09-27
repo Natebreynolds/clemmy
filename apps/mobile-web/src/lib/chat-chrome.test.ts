@@ -50,7 +50,7 @@ test('chat preview is gated behind ?preview=chat and never the default render', 
 
 test('the phone shows a confirmed change in another app while the turn is still live', () => {
   const chat = read('../screens/Chat.tsx');
-  assert.match(chat, /\{thinking \? <OutsideWork activity=\{message\.activity\} \/> : <TurnReceipt message=\{message\} \/>\}/,
+  assert.match(chat, /\{thinking \? <OutsideWork activity=\{message\.activity\} \/> : <TurnReceipt message=\{message\} sessionId=\{sessionId\} \/>\}/,
     'desktop parity: confirmed writes show at once; the receipt line waits for the end');
   assert.match(chat, /function TurnReceipt[\s\S]*?<OutsideWork activity=\{message\.activity\} \/>/,
     'the finished receipt keeps the cards in the same place');

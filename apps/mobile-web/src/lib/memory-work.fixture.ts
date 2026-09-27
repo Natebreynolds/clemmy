@@ -30,7 +30,7 @@ function zeroTotals() {
 function job(id: MemoryJobId, patch: Partial<MemoryJobStatus>): MemoryJobStatus {
   const owner: Record<MemoryJobId, MemoryJobStatus['modelOwner']> = {
     learn: 'memory', reconcile: 'memory', patterns: 'memory', skills: 'memory', identity: 'memory', import: 'memory',
-    standing: 'checker', verify: 'checker', index: 'local', tidy: 'none',
+    standing: 'checker', verify: 'checker', index: 'local', tidy: 'none', backup: 'none', connect: 'none',
   };
   return { id, modelOwner: owner[id], state: 'idle', today: zeroTotals(), ...patch };
 }

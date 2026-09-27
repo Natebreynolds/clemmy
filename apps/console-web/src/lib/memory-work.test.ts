@@ -160,7 +160,7 @@ test('unknown: every count is "—" though the daemon sends zeros, and nothing i
 test('unknown: the job roster says "—", never "hasn’t run", "none available" or "none yet"', () => {
   const view = memoryWorkViewModel(memoryWorkFixture('unknown', NOW), NOW);
   const rows = [...view.jobs.learning, ...view.jobs.upkeep];
-  assert.deepEqual(rows.map((j) => j.id), ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'standing', 'verify', 'index', 'tidy'],
+  assert.deepEqual(rows.map((j) => j.id), ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'standing', 'verify', 'index', 'tidy', 'backup', 'connect'],
     'every job the daemon listed, in the shared order; importing still waits for a recorded run');
   for (const job of rows) {
     assert.equal(job.unknown, true);
@@ -249,7 +249,7 @@ test('a stand-in is marked from the daemon’s evidence, and a different served 
 test('jobs come in the shared order, learning before upkeep, and importing hides until it has run', () => {
   const view = memoryWorkViewModel(snapshot(), NOW);
   assert.deepEqual(view.jobs.learning.map((j) => j.id), ['learn', 'reconcile', 'patterns', 'skills', 'identity']);
-  assert.deepEqual(view.jobs.upkeep.map((j) => j.id), ['standing', 'verify', 'index', 'tidy']);
+  assert.deepEqual(view.jobs.upkeep.map((j) => j.id), ['standing', 'verify', 'index', 'tidy', 'backup', 'connect']);
   const jobs = memoryWorkFixture('resting', NOW).jobs.map((j) => (j.id === 'import' ? { ...j, lastRun: { at: iso(NOW - HOUR), outcome: 'ok' as const } } : j));
   assert.ok(memoryWorkViewModel(snapshot({ jobs }), NOW).jobs.learning.some((j) => j.id === 'import'));
 });

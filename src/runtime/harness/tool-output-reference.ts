@@ -97,14 +97,14 @@ export function extractByPath(value: unknown, path?: string): unknown {
 
 /** Parse a parked tool output as JSON, transparently unwrapping the
  *  `run_shell_command` `exit_code:/stdout:` wrapper around a `--json` payload. */
-function parseParkedOutput(raw: string): { value: unknown; partialPrefix: boolean } {
+function parseParkedOutput(raw: string, producerTool?: string): { value: unknown; partialPrefix: boolean } {
   // Same canonical recovery tool_output_query uses. A parked output may carry
   // harness prose around the provider payload (route notes, a recall
   // preamble); a bare JSON.parse rejects data that is demonstrably JSON, and a
   // reference that "cannot resolve" from a payload it could read is a
   // fabricated dead end. A recovered prefix of a clipped list is reported as
   // one, so it is never bound as if it were the whole list.
-  const recovered = parseStoredToolOutputJson(raw, { shell: parseShellToolOutput });
+  const recovered = parseStoredToolOutputJson(raw, { shell: parseShellToolOutput, producerTool });
   return { value: recovered?.value, partialPrefix: recovered?.partialArrayPrefix === true };
 }
 
@@ -136,7 +136,7 @@ function resolveOne(sessionId: string, ref: ToolOutputRef, trustedCallIds: Set<s
     return undefined;
   }
   const row = resolution.record;
-  const parked = parseParkedOutput(row.output);
+  const parked = parseParkedOutput(row.output, row.tool ?? undefined);
   if (parked.partialPrefix) {
     errors.push(`$fromToolOutput: output for "${ref.callId}" holds only the first rows of a list that was cut off — a reference would silently drop the rest. Re-run it so the whole output is kept (paged, or written to a file), then reference that.`);
     return undefined;

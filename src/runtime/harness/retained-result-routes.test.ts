@@ -30,11 +30,11 @@ const eventlog = await import('./eventlog.js');
 const { retainedResultRoutes, retainedResultWayThrough, authenticRetainedAlternatives } = await import('./retained-result-routes.js');
 after(() => { eventlog.closeEventLog(); rmSync(HOME, { recursive: true, force: true }); });
 
-function stored(callId: string, output: string) {
+function stored(callId: string, output: string, tool = 'work_call') {
   const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: callId });
   eventlog.writeToolOutput({
     sessionId: s.id, callId, invocationNonce: `nonce-${callId}`,
-    tool: 'work_call', output,
+    tool, output,
   });
   return s.id;
 }
@@ -348,4 +348,19 @@ test('a carrier formatting its own result after the inner tool returned still of
   assert.equal(eventlog.resolveToolOutputForQuery(s.id, callId).status, 'ok', 'the offered reader accepts the settled output');
   const settled = retainedResultRoutes({ sessionId: s.id, callId });
   assert.deepEqual(settled.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(settled));
+});
+
+
+test('actual space_get data remains queryable after recall is spent', () => {
+  const sessionId = stored('toolu_space_data', [
+    'Workspace "Board" (board) — active, v1.',
+    'View source: space_get_view({slug:"board"}) returns HTML.',
+    'Snapshot revision: fixture',
+    'Content mode: static_snapshot.',
+    'Dataset (complete JSON): {"rows":[{"id":1},{"id":2}]}',
+    'No notes yet.',
+  ].join('\n'), 'space_get');
+  const routes = retainedResultRoutes({ sessionId, callId: 'toolu_space_data', recallCallsRemaining: 0 });
+  assert.ok(routes.some(route => route.tool === 'tool_output_query'), JSON.stringify(routes));
+  assert.ok(!routes.some(route => route.tool === 'recall_tool_result'));
 });

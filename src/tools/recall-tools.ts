@@ -606,7 +606,7 @@ export function registerRecallTools(server: McpServer): void {
       // One canonical recovery for every reader of a parked output. The store
       // may hold the provider payload PLUS harness prose (composio route
       // notes, a recall preamble), so a bare JSON.parse is not the question.
-      const recovered = parseStoredToolOutputJson(row.output, { shell: parseShellToolOutput });
+      const recovered = parseStoredToolOutputJson(row.output, { shell: parseShellToolOutput, producerTool: row.tool ?? undefined });
       if (!recovered) {
         // Text never dead-ends. Asked for the output itself (no projection,
         // filter or figure), answer with the text exactly as recall would,

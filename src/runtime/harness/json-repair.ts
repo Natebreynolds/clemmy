@@ -314,7 +314,7 @@ function storedJsonValue(value: unknown, via: StoredToolOutputJsonVia): StoredTo
 /** Stored evidence is not a model's requested structured answer. Recover only
  * an entire value with recognized host framing; never promote a JSON example
  * inside documentation, an error, or other prose into the result's dataset. */
-function storedJsonCandidate(raw: string): string | null {
+function storedJsonCandidate(raw: string, producerTool?: string): string | null {
   let text = raw.trim();
   const recalled = /^Recalled chars (\d+)[–-](\d+) of (\d+)[^\n]*\n\n/.exec(text);
   if (recalled) {
@@ -324,6 +324,20 @@ function storedJsonCandidate(raw: string): string | null {
   // Legacy host annotations occupy separate trailing lines. Current outputs
   // retain the payload separately, but historical records must stay readable.
   text = text.replace(/(?:\n\s*\[(?:account-route|sender-verify)\][^\n]*)+\s*$/, '').trim();
+  // space_get owns this envelope. Never apply its labels to foreign prose:
+  // documentation can quote the very same example without becoming records.
+  if (producerTool === 'space_get' && text.startsWith('Workspace "')) {
+    const marker = /\nContent mode: [^\n]+\.\nDataset \(complete JSON\): /.exec(text);
+    if (marker) {
+      const dataset = text.slice(marker.index + marker[0].length).trimStart();
+      const candidate = /^[{[]/.test(dataset) ? extractJsonCandidate(dataset) : null;
+      if (candidate && dataset.startsWith(candidate)) {
+        const remainder = dataset.slice(candidate.length).trim();
+        if (!remainder || /^(?:Canonical records:|Canonical records \(|Recent notes:|No notes yet\.)/.test(remainder)) return candidate;
+      }
+      return null; // a clipped or malformed dataset is never complete evidence
+    }
+  }
   const wholeFence = /^```(?:json)?\s*\n([\s\S]*?)\n```$/.exec(text);
   if (wholeFence) text = wholeFence[1]!.trim();
   return isParseableJson(text) ? text : null;
@@ -351,7 +365,11 @@ function storedJsonCandidate(raw: string): string | null {
  */
 export function parseStoredToolOutputJson(
   raw: string,
-  options: { shell?: (raw: string) => StoredToolOutputShell | null | undefined } = {},
+  options: {
+    shell?: (raw: string) => StoredToolOutputShell | null | undefined;
+    /** Canonical producer from the retained record, never a reader's argument. */
+    producerTool?: string;
+  } = {},
 ): StoredToolOutputJson | null {
   if (typeof raw !== 'string' || raw.trim() === '') return null;
   try {
@@ -361,21 +379,23 @@ export function parseStoredToolOutputJson(
   const shell = options.shell?.(raw) ?? null;
   // A run_shell_command wrapper (`exit_code:/stdout:/stderr:`) around a
   // `--json` payload (sf, gh, aws…): the data is structured, the envelope is not.
-  if (shell?.stdout_json !== undefined) {
-    return { value: shell.stdout_json, via: 'shell_stdout' };
-  }
+  // The legacy shell adapter's stdout_json may itself come from broad model
+  // JSON repair. Re-parse the bytes here; a derived example is not a dataset.
   if (shell) {
     const embeddedStdout = storedJsonCandidate(shell.stdout);
     if (embeddedStdout !== null) {
       try {
-        return { value: JSON.parse(embeddedStdout) as unknown, via: 'shell_embedded' };
+        return {
+          value: JSON.parse(embeddedStdout) as unknown,
+          via: isParseableJson(shell.stdout.trim()) ? 'shell_stdout' : 'shell_embedded',
+        };
       } catch { /* keep looking */ }
     }
   }
 
   // A complete value carrying only recognized host framing. Model-output
   // JSON repair is deliberately broader and must not classify retained data.
-  const embedded = storedJsonCandidate(raw);
+  const embedded = storedJsonCandidate(raw, options.producerTool);
   if (embedded !== null) {
     try {
       return storedJsonValue(JSON.parse(embedded) as unknown, 'embedded');
@@ -383,7 +403,7 @@ export function parseStoredToolOutputJson(
   }
 
   // Last resort: a clipped array — recover the complete objects written so far.
-  if (shell?.stdout.trimStart().startsWith('[')) {
+  if (shell && /^\[\s*\{/.test(shell.stdout.trimStart()) && extractJsonCandidate(shell.stdout) === null) {
     const objects = extractCompleteJsonObjects(shell.stdout, 200);
     if (objects.length > 0) {
       return { value: objects, via: 'shell_objects', partialArrayPrefix: true };

@@ -26,7 +26,7 @@ import {
   resolveToolOutputForAuthority,
 } from '../runtime/harness/eventlog.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
-import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
 import { deriveInnerDispatchSets } from './tool-registry.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope, stripMcpToolCarrier } from '../runtime/mcp-tool-authority.js';
@@ -95,10 +95,9 @@ function strictJsonParse(value: string): { ok: true; value: unknown } | { ok: fa
 function parseStdoutJson(stdout: string): unknown | undefined {
   const direct = strictJsonParse(stdout.trim());
   if (direct.ok) return direct.value;
-  const candidate = extractJsonCandidate(stdout);
-  if (!candidate) return undefined;
-  const repaired = strictJsonParse(candidate);
-  return repaired.ok ? repaired.value : undefined;
+  // A CLI's documentation/example is text, not its returned records. Use the
+  // same conservative stored-evidence parser as recall and reference binding.
+  return parseStoredToolOutputJson(stdout)?.value;
 }
 
 function sectionAfter(label: 'stdout' | 'stderr', body: string): string {
@@ -118,10 +117,13 @@ export function parseShellToolOutput(raw: string, opts: { callId?: string; trunc
   let stderr = '';
 
   if (rest.startsWith('stdout:\n')) {
-    const stderrBoundary = rest.indexOf('\n\nstderr:\n');
-    if (stderrBoundary >= 0) {
-      stdout = sectionAfter('stdout', rest.slice(0, stderrBoundary));
-      stderr = sectionAfter('stderr', rest.slice(stderrBoundary + 2));
+    // Historical host wrappers used one newline before stderr; current ones
+    // use a blank line. Decode both envelopes rather than relying on broad
+    // JSON repair to accidentally discard the unparsed stderr marker.
+    const stderrBoundary = /\n{1,2}stderr:\n/.exec(rest);
+    if (stderrBoundary) {
+      stdout = sectionAfter('stdout', rest.slice(0, stderrBoundary.index));
+      stderr = rest.slice(stderrBoundary.index + stderrBoundary[0].length);
     } else {
       stdout = sectionAfter('stdout', rest);
     }

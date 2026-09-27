@@ -2,7 +2,7 @@
  *  talk about the same job look alike. */
 import type { LucideIcon } from 'lucide-react';
 import {
-  Brain, Download, Fingerprint, GraduationCap, Leaf, MessageSquareText, Scale, ScrollText, Search, ShieldCheck, Waypoints,
+  Archive, Brain, Download, Link2, Fingerprint, GraduationCap, Leaf, MessageSquareText, Scale, ScrollText, Search, ShieldCheck, Waypoints,
 } from 'lucide-react';
 import type { MemoryJobId } from '@/lib/memory-work';
 
@@ -17,6 +17,8 @@ export const JOB_ICON: Record<MemoryJobId, LucideIcon> = {
   verify: ShieldCheck,
   index: Search,
   tidy: Leaf,
+  backup: Archive,
+  connect: Link2,
 };
 
 /** The glyph for a job id as the daemon sent it. The console is swapped apart

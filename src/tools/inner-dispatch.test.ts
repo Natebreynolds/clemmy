@@ -326,3 +326,22 @@ test('accounting mirrors cannot exempt another call, source or session', async (
     });
   }));
 });
+
+
+test('shell dispatch retains documentation verbatim without inventing structured customers', () => {
+  const stdout = 'Example request: {"email":"sample@example.test"}\nActual lookup returned no customer.';
+  const parsed = parseShellToolOutput('exit_code: 0\n\nstdout:\n' + stdout);
+  assert.ok(parsed);
+  assert.equal(parsed.stdout, stdout);
+  assert.equal(parsed.stdout_json, undefined);
+});
+
+
+test('current and historical shell section separators retain the same complete JSON', () => {
+  for (const separator of ['\n', '\n\n']) {
+    const parsed = parseShellToolOutput('exit_code: 0\n\nstdout:\n{"rows":[{"id":1}]}' + separator + 'stderr:\nwarning only');
+    assert.deepEqual(parsed?.stdout_json, { rows: [{ id: 1 }] });
+    assert.equal(parsed?.stdout, '{"rows":[{"id":1}]}');
+    assert.equal(parsed?.stderr, 'warning only');
+  }
+});

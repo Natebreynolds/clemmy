@@ -29,6 +29,6 @@ test('the nightly jobs keep their clock; jobs started by an event have none', as
   assert.deepEqual(MEMORY_JOB_CLOCKS.tidy, { hour: 4, minute: 0 });
   assert.deepEqual(MEMORY_JOB_CLOCKS.verify, { hour: 4, minute: 35 });
   for (const id of MEMORY_JOB_IDS) {
-    assert.equal(memoryJobClock(id) !== null, id === 'patterns' || id === 'tidy' || id === 'verify', id);
+    assert.equal(memoryJobClock(id) !== null, ['patterns', 'tidy', 'verify', 'backup', 'connect'].includes(id), id);
   }
 });

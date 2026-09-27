@@ -13718,6 +13718,10 @@ async function runConversationFromResumeCore(opts: {
   // by the source that accepted the answer or the host's own directive.
   // Without a dedicated query the agent's own focus leads the ranking, as on
   // the resumed step: a chat-dock agent is focused on the owner's answer.
+  // The approval answer owns the outer delivery. Further model steps still
+  // execute the parked business request, exactly as the first resumed step
+  // does; a synthetic button event is never a new model/effect authority.
+  const continuationSourceUserSeq = opts.requestSourceUserSeq ?? activeSourceUserSeq;
   const continuationMemoryQuery = opts.memoryPrimerQuery
     ?? acceptedRequestText(opts.sessionId, opts.requestSourceUserSeq ?? activeSourceUserSeq);
   let lastCheckInAt = startedAt;
@@ -13860,7 +13864,7 @@ async function runConversationFromResumeCore(opts: {
     && activeSourceUserSeq
     && checkpointContinuationIsReady(
       { status: 'held', hold: firstResult.hold },
-      { sessionId: opts.sessionId, sourceUserSeq: activeSourceUserSeq },
+      { sessionId: opts.sessionId, sourceUserSeq: continuationSourceUserSeq },
     )
   ) {
     safeAppend({
@@ -13884,7 +13888,7 @@ async function runConversationFromResumeCore(opts: {
       internalContinuation: true,
       ...(continuationMemoryQuery !== undefined ? { memoryPrimerQuery: continuationMemoryQuery } : {}),
       ...(opts.memoryPrimerQuery === undefined ? { memoryFocusLeads: true as const } : {}),
-      sourceUserSeq: activeSourceUserSeq,
+      sourceUserSeq: continuationSourceUserSeq,
       runAttemptId: opts.runAttemptId,
       ...(opts.deferToolCallsLimitTerminal
         ? { deferToolCallsLimitTerminal: true as const }
@@ -14507,7 +14511,7 @@ async function runConversationFromResumeCore(opts: {
       internalContinuation: true,
       ...(continuationMemoryQuery !== undefined ? { memoryPrimerQuery: continuationMemoryQuery } : {}),
       ...(opts.memoryPrimerQuery === undefined ? { memoryFocusLeads: true as const } : {}),
-      sourceUserSeq: activeSourceUserSeq,
+      sourceUserSeq: continuationSourceUserSeq,
       runAttemptId: opts.runAttemptId,
       infraRecoveryEpisodeId,
       ...(opts.deferToolCallsLimitTerminal

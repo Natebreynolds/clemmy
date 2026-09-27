@@ -832,3 +832,28 @@ test('a displayed aggregate carries the figure, not floating-point noise, and ke
   assert.match(await run({ call_id: 'call_tiny', aggregate: 'sum', value_field: 'share' }), /sum of share = 3e-12 \(/,
     'a very small figure is still shown, not rounded to 0');
 });
+
+
+test('tool_output_query ranks a saved Space dataset without another provider pull', async () => {
+  const session = createSession({ kind: 'chat' });
+  const output = 'Workspace "Stored analysis" (stored-analysis) — active, v1.\nView source: space_get_view({slug:"stored-analysis"}) returns HTML.\nSnapshot revision: fixture\nContent mode: static_snapshot.\nDataset (complete JSON): {"rows":[{"term":"low","cpc":0.12},{"term":"high","cpc":197.11},{"term":"middle","cpc":140.32}]}\nNo notes yet.';
+  writeToolOutput({ sessionId: session.id, callId: 'saved-space-query', tool: 'space_get', output });
+  const result = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 60_000) },
+    () => captureToolOutputQueryHandler()({ call_id: 'saved-space-query', fields: ['term', 'cpc'], sort_by: 'cpc', order: 'desc', limit: 2 }));
+  const text = result.content[0].text;
+  assert.match(text, /high/);
+  assert.match(text, /197\.11/);
+  assert.match(text, /140\.32/);
+  assert.doesNotMatch(text, /No JSON|not structured|"low"/);
+});
+
+
+test('actual shell reader does not turn a CLI help example into a customer result', async () => {
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'shell-example', tool: 'run_shell_command',
+    output: 'exit_code: 0\n\nstdout:\nExample request: {"email":"sample@example.test"}\nActual lookup returned no customer.' });
+  const result = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10) },
+    () => captureToolOutputQueryHandler()({ call_id: 'shell-example', fields: ['email'] }));
+  assert.match(result.content[0].text, /No JSON value could be recovered/);
+  assert.doesNotMatch(result.content[0].text, /sample@example\.test/);
+});

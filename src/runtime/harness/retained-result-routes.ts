@@ -102,7 +102,7 @@ function judgeBytes(
   }
   const recovered = (() => {
     try {
-      return parseStoredToolOutputJson(record.output, {});
+      return parseStoredToolOutputJson(record.output, { producerTool: record.tool ?? undefined });
     } catch {
       return null;
     }

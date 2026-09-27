@@ -247,3 +247,12 @@ test('capability policy: a reference to a WRITE/SEND output is refused (no laund
   assert.equal(out.errors.length, 1, 'a reference cannot bind from a send output');
   assert.match(out.errors[0], /not a trusted read\/compute result/);
 });
+
+
+test('a settled Space dataset supplies exact references without parsing its view-call example', () => {
+  writeTrustedOutput({ callId: 'stored-space', invocationNonce: 'space-one', tool: 'space_get', effect: 'read',
+    output: 'Workspace "Board" (board) — active, v1.\nView source: space_get_view({slug:"board"}) returns HTML.\nSnapshot revision: fixture\nContent mode: static_snapshot.\nDataset (complete JSON): {"rows":[{"value":197.11},{"value":140.32}]}\nNo notes yet.' });
+  const result = resolveToolOutputReferences(S, { values: { $fromToolOutput: { callId: 'stored-space', path: 'rows[*].value' } } });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.resolved, { values: [197.11, 140.32] });
+});

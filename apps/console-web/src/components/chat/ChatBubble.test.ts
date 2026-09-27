@@ -61,6 +61,6 @@ test('a confirmed change in another app shows while the turn is still live', () 
     'while the answer is written and checked, confirmed writes already show; the full receipt waits for the end');
   assert.match(RECEIPT, /export function OutsideWorkCards/);
   assert.match(RECEIPT, /<OutsideWorkCards activity=\{activity\}>/, 'the finished receipt keeps the cards in the same place');
-  assert.match(RECEIPT, /const outside = outsideWorkCards\(activity\);\s*if \(outside\.length === 0 && !children\) return null;/,
+  assert.match(RECEIPT, /const outside = outsideWorkCards\(activity\);\s*const workflows = workflowCards\(activity\);\s*if \(outside\.length === 0 && workflows\.length === 0 && !children\) return null;/,
     'only writes the provider confirmed become cards');
 });

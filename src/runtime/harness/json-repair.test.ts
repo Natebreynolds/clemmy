@@ -334,3 +334,30 @@ test('stored prose containing JSON examples remains text, including shell stdout
   assert.equal(extractJsonCandidate('Here is the requested answer: {"ok":true}'), '{"ok":true}',
     'model answer recovery remains independent');
 });
+
+
+test('a complete Space dataset is structured only under its actual producer identity', () => {
+  const data = { rows: [{ name: 'alpha', cpc: 197.11 }, { name: 'beta', cpc: 140.32 }], note: 'braces } and \"quoted\" examples' };
+  const prefix = 'Workspace "Board" (board) — active, v1.\nView source: space_get_view({slug:"board"}) returns HTML.\nSnapshot revision: fixture\nContent mode: static_snapshot.\nDataset (complete JSON): ';
+  const raw = prefix + JSON.stringify(data) + '\nRecent notes:\n  - [note] Keep the stored numbers.';
+  assert.deepEqual(parseStoredToolOutputJson(raw, { producerTool: 'space_get' })?.value, data);
+  assert.equal(parseStoredToolOutputJson(raw), null);
+  assert.equal(parseStoredToolOutputJson(raw, { producerTool: 'web_read' }), null);
+  assert.equal(parseStoredToolOutputJson(prefix + '{"rows":[{"id":1}', { producerTool: 'space_get' }), null);
+  assert.equal(parseStoredToolOutputJson(raw.replace('Dataset (complete JSON):', 'Dataset (summarized):'), { producerTool: 'space_get' }), null);
+});
+
+
+test('legacy shell parsing cannot promote an example back into stored records', () => {
+  const stdout = 'Example request: {"email":"sample@example.test"}\nActual lookup returned no customer.';
+  assert.equal(parseStoredToolOutputJson('exit_code: 0\n\nstdout:\n' + stdout, {
+    shell: () => ({ stdout, stdout_json: { email: 'sample@example.test' } }),
+  }), null);
+});
+
+
+test('shell prose beginning with a link or a complete example array stays text', () => {
+  for (const stdout of ['[Documentation](#docs)\nExample: {"id":1}', '[{"id":1}]\nThis is an example, not returned data.']) {
+    assert.equal(parseStoredToolOutputJson('shell', { shell: () => ({ stdout }) }), null);
+  }
+});

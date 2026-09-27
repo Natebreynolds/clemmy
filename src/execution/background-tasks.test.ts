@@ -81,7 +81,7 @@ const {
   openEventLog,
   writeToolOutput,
 } = await import('../runtime/harness/eventlog.js');
-const { renderRunStrategiesForContext } = await import('../memory/run-strategy-store.js');
+const { renderRunStrategiesForContext, listVerifiedRunStrategies } = await import('../memory/run-strategy-store.js');
 const { listNotifications, getNotificationDestinationsForRecord } = await import('../runtime/notifications.js');
 const { markBackgroundTaskBlocked } = await import('./background-tasks.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
@@ -3819,7 +3819,12 @@ test('strategy capture remembers only exactly-settled deliverables, never a late
   markBackgroundTaskDone(task.id, 'The lunar kelp settlement atlas was saved.');
 
   const strategy = renderRunStrategiesForContext('lunar kelp settlement atlas');
-  assert.match(strategy, /spreadsheet:lunar-kelp-confirmed/);
+  const retained = listVerifiedRunStrategies().filter(row => JSON.stringify(row).includes('lunar kelp settlement atlas'));
+  assert.ok(retained.length > 0, 'the completed run remains learned');
+  assert.match(JSON.stringify(retained), /spreadsheet:lunar-kelp-confirmed/);
+  assert.doesNotMatch(JSON.stringify(retained), /spreadsheet:lunar-kelp-failed-reservation/);
+  assert.match(strategy, /composio_execute_tool/, "the remembered tool remains available as a candidate");
+  assert.doesNotMatch(strategy, /spreadsheet:lunar-kelp-confirmed/, 'prior destinations are receipts, not arguments for the next task');
   assert.doesNotMatch(strategy, /spreadsheet:lunar-kelp-failed-reservation/);
 });
 

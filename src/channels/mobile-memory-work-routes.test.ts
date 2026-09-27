@@ -63,7 +63,7 @@ test('behind a session the phone gets the snapshot and can undo a run', async ()
     const res = await fetch(`${url}/m/api/memory/work`);
     assert.equal(res.status, 200);
     const snap = await res.json() as { state: string; jobs: unknown[]; recent: Array<{ id: string; undo: unknown }> };
-    assert.equal(snap.jobs.length, 10);
+    assert.equal(snap.jobs.length, 12);
     assert.deepEqual(snap.recent[0].undo, { kind: 'forget', count: 1 });
 
     const undo = await fetch(`${url}/m/api/memory/work/${snap.recent[0].id}/undo`, { method: 'POST' });

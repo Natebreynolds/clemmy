@@ -40,7 +40,7 @@ test('GET /api/console/memory/work serves the snapshot; auth gated', async () =>
     for (const key of ['generatedAt', 'state', 'running', 'queue', 'model', 'jobs', 'today', 'hourly', 'daily', 'recent', 'retention']) {
       assert.ok(key in body, key);
     }
-    assert.equal((body.jobs as unknown[]).length, 10);
+    assert.equal((body.jobs as unknown[]).length, 12);
     auth.v = false;
     assert.equal((await fetch(`${url}/api/console/memory/work`)).status, 401);
   } finally {

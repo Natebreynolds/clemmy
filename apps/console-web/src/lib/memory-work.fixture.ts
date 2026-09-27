@@ -35,12 +35,12 @@ function dayKey(t: number): string {
 
 const OWNER: Record<MemoryJobId, MemoryJobStatus['modelOwner']> = {
   learn: 'memory', reconcile: 'memory', patterns: 'memory', skills: 'memory', identity: 'memory', import: 'memory',
-  standing: 'checker', verify: 'checker', index: 'local', tidy: 'none',
+  standing: 'checker', verify: 'checker', index: 'local', tidy: 'none', backup: 'none', connect: 'none',
 };
 
 const TRIGGER: Record<MemoryJobId, NonNullable<MemoryJobStatus['next']>['trigger']> = {
   learn: 'after_conversation', reconcile: 'on_save', patterns: 'nightly', skills: 'after_success', identity: 'daily',
-  import: 'on_request', standing: 'after_message', verify: 'nightly', index: 'every_few_minutes', tidy: 'nightly',
+  import: 'on_request', standing: 'after_message', verify: 'nightly', index: 'every_few_minutes', tidy: 'nightly', backup: 'nightly', connect: 'nightly',
 };
 
 function zeroTotals() {
