@@ -75,7 +75,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
 import { classifyModelError } from './resilient-model.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
-import { serializeAdvertisedTools, toolsOnAdvertisedWire } from './advertised-tool-wire.js';
+import { serializeAdvertisedTools, toolsOnAdvertisedWire, usesSessionWireOrder } from './advertised-tool-wire.js';
 import type { PromptReadingPublisher } from './prompt-composition.js';
 import { getBuildInfo } from '../build-info.js';
 import type { Agent, AgentInputItem, Model, ModelRequest } from '@openai/agents';
@@ -2447,8 +2447,44 @@ function advertisedSurfaceMemoryFor(key: string): AdvertisedSurfaceMemory {
   }
   return fresh;
 }
+/**
+ * Wire positions per session, for the agents the round-one desk governs
+ * (bindSessionWireOrder). A new accepted source seeds each tool's wire
+ * position from the session: a tool the session already advertised keeps its
+ * place, and a tool new to the session joins at the tail. The tools block of
+ * a session's later turns is therefore byte-identical to its earlier turns
+ * while the surface holds, and a surface that grows (the round-one desk
+ * climbing a rung, agents/turn-desk.ts) extends the block instead of
+ * reordering the prefix behind it. Positions only; what is advertised and
+ * callable is still decided per source. Bounded and process-local: a restart
+ * starts from the configured first-seen order.
+ */
+const SESSION_WIRE_POSITION_SESSIONS_MAX = 512;
+const SESSION_WIRE_POSITION_NAMES_MAX = 256;
+const sessionWirePositions = new Map<string, Map<string, number>>();
+function sessionWirePositionsFor(sessionId: string): Map<string, number> {
+  const existing = sessionWirePositions.get(sessionId);
+  if (existing) {
+    sessionWirePositions.delete(sessionId); // re-insert to keep LRU recency
+    sessionWirePositions.set(sessionId, existing);
+    return existing;
+  }
+  const fresh = new Map<string, number>();
+  sessionWirePositions.set(sessionId, fresh);
+  if (sessionWirePositions.size > SESSION_WIRE_POSITION_SESSIONS_MAX) {
+    const oldest = sessionWirePositions.keys().next().value;
+    if (oldest !== undefined) sessionWirePositions.delete(oldest);
+  }
+  return fresh;
+}
+function nextWirePosition(positions: ReadonlyMap<string, number>): number {
+  let next = 0;
+  for (const position of positions.values()) next = Math.max(next, position + 1);
+  return next;
+}
 export function _resetAdvertisedSurfaceMemoryForTests(): void {
   advertisedSurfaceMemories.clear();
+  sessionWirePositions.clear();
 }
 
 function serializedTools(tools: FunctionToolLike[]): unknown[] {
@@ -2852,13 +2888,34 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       return localSurfaceMemory;
     }
   };
+  const sessionPositions = (): Map<string, number> | null => {
+    if (!usesSessionWireOrder(agent)) return null;
+    try {
+      return sessionWirePositionsFor(exactHostIdentity().sessionId);
+    } catch {
+      return null;
+    }
+  };
   const inFirstSeenOrder = (enabled: FunctionToolLike[]): FunctionToolLike[] => {
     const toolWirePosition = surfaceMemory().position;
+    const session = sessionPositions();
+    // With session order, only a tool whose schema is sent takes a wire
+    // position: a deferred tool that later rides the request joins the tail.
+    const onWire = session ? new Set(toolsOnAdvertisedWire(enabled).map((tool) => tool.name)) : null;
     for (const tool of enabled) {
-      if (!toolWirePosition.has(tool.name)) toolWirePosition.set(tool.name, toolWirePosition.size);
+      if (toolWirePosition.has(tool.name)) continue;
+      if (onWire && !onWire.has(tool.name)) continue;
+      let position = session?.get(tool.name);
+      if (position === undefined) {
+        // Past the session cap a new tool is not stored, so its position also
+        // clears every position this source already holds.
+        position = Math.max(nextWirePosition(toolWirePosition), session ? nextWirePosition(session) : 0);
+        if (session && session.size < SESSION_WIRE_POSITION_NAMES_MAX) session.set(tool.name, position);
+      }
+      toolWirePosition.set(tool.name, position);
     }
-    return [...enabled].sort((left, right) =>
-      toolWirePosition.get(left.name)! - toolWirePosition.get(right.name)!);
+    const positionOf = (tool: FunctionToolLike): number => toolWirePosition.get(tool.name) ?? Number.MAX_SAFE_INTEGER;
+    return [...enabled].sort((left, right) => positionOf(left) - positionOf(right));
   };
   /** The wire surface for the next model request: every tool shown in this
    *  source so far, in first-seen order, each with its last shown schema. */

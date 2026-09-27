@@ -6446,6 +6446,42 @@ function canonicalOutputChunks(
   ).all(sessionId, callId) as StoredOutputChunkRow[];
 }
 
+/** Does this session hold any retained tool output a reader could open?
+ * The retained-output readers read exactly these rows by call_id. */
+export function sessionHasRetainedToolOutputs(sessionId: string): boolean {
+  const id = sessionId.trim();
+  if (!id) return false;
+  const row = openEventLog().prepare(
+    'SELECT 1 AS present FROM tool_outputs WHERE session_id = ? LIMIT 1',
+  ).get(id) as { present?: number } | undefined;
+  return row?.present === 1;
+}
+
+/** Which of these exact tools this session dispatched after `afterSeq`,
+ * directly or carried by a dispatcher (the call's recorded effective tool). */
+export function sessionDispatchedToolsSince(
+  sessionId: string,
+  afterSeq: number,
+  toolNames: readonly string[],
+): string[] {
+  const id = sessionId.trim();
+  const names = [...new Set(toolNames.filter((name) => name.length > 0))];
+  if (!id || names.length === 0) return [];
+  const placeholders = names.map(() => '?').join(', ');
+  const rows = openEventLog().prepare(
+    `SELECT DISTINCT coalesce(
+        CASE WHEN json_extract(data_json, '$.effectiveTool') IN (${placeholders})
+          THEN json_extract(data_json, '$.effectiveTool') END,
+        CASE WHEN json_extract(data_json, '$.tool') IN (${placeholders})
+          THEN json_extract(data_json, '$.tool') END) AS name
+       FROM events
+      WHERE session_id = ?
+        AND type = 'tool_called'
+        AND seq > ?`,
+  ).all(...names, ...names, id, Math.max(0, Math.trunc(afterSeq))) as Array<{ name?: string | null }>;
+  return rows.flatMap((row) => (typeof row.name === 'string' ? [row.name] : []));
+}
+
 /** Resolve an already-parked complete payload by its exact content identity.
  * This is a read-only alias target for evidence-backed worker replays: the new
  * logical replay may point at the original bytes without writing a second full

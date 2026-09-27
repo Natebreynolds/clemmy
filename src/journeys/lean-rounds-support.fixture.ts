@@ -192,6 +192,9 @@ export interface RequestView {
   calls: Array<{ name: string; args: string }>;
   readCatalog: Set<string>;
   authoringCatalog: Set<string>;
+  /** Tools named on the round-one desk's names-only line: callable this turn,
+   *  their schemas not on the request. */
+  onRequest: Set<string>;
 }
 
 function strings(value: unknown, sink: string[]): void {
@@ -242,7 +245,14 @@ export function requestView(raw: unknown): RequestView {
     calls,
     readCatalog: catalogSection(instructions, '[native-read-catalog]'),
     authoringCatalog: catalogSection(instructions, '[native-authoring-catalog]'),
+    onRequest: onRequestTools(instructions),
   };
+}
+
+/** Names on the round-one desk's names-only line (agents/turn-desk.ts). */
+export function onRequestTools(instructions: string): Set<string> {
+  const line = instructions.split('\n').find((entry) => entry.startsWith('[on-request tools]')) ?? '';
+  return new Set([...line.matchAll(/(?::|;) ([a-z][a-z0-9_]*) \(/g)].map((match) => match[1]!));
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +615,8 @@ export interface CaseMetrics {
   round1BucketTokens: Record<string, number>;
   round1BucketBytes: Record<string, number>;
   round1WireTools: string[];
+  /** Tools named on round 1's names-only line (callable, schema not sent). */
+  round1OnRequestTools: string[];
   totalRequestBytes: number;
   toolRoute: string[];
   jevRouterRows: number;
@@ -620,6 +632,8 @@ export interface BaselineEntry {
   round1Bytes: number;
   totalRequestBytes: number;
   round1WireTools: string[];
+  /** Round-1 tools deferred by the round-one desk and named on its line. */
+  round1OnRequestTools?: string[];
 }
 
 /** Round-1 and per-turn bytes may grow by at most this fraction (plus a
