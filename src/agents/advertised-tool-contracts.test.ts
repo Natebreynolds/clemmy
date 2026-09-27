@@ -102,3 +102,14 @@ test('recall_tool_result advertises its read contract; the next offset lives in 
   assert.match(tool.description, /one slice from `offset`/);
   assert.match(tool.description, /recall_tool_result \{"call_id":"call_abc123"\}/);
 });
+
+test('tool_search keeps the account nomination contract and drops what its results already teach', async () => {
+  // 2,255 -> 1,835 B.
+  const tool = withinCeiling((await builtWire()).get('tool_search'), 'tool_search', 1_900);
+  const fields = tool.parameters.properties as Record<string, { description?: string }>;
+  assert.match(fields.account_selection!.description ?? '', /never approval/i);
+  assert.match(fields.account_selection!.description ?? '', /verbatim source_quote/);
+  assert.match(fields.account_selection!.description ?? '', /Recipients, attendees, third parties/);
+  assert.doesNotMatch(fields.account_selection!.description ?? '', /account_selection_required/,
+    'the blocked result names the recovery where it arises');
+});
