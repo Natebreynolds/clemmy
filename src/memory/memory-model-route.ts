@@ -47,6 +47,7 @@ import { checkerQuotaExhaustion, judgeCrossFamilyEnabled } from '../runtime/harn
 import { resolveByoProviderForModel } from '../runtime/harness/byo-providers.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { creditRefusal } from '../runtime/provider-credit.js';
+import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
 import { reflectionExtractorPause } from './reflection.js';
 
 /** Why a model call could not run. Never a provider name. Mirrors
@@ -180,14 +181,32 @@ export function resolveMemoryModelRoute(job: MemoryJobId): MemoryModelRoute | nu
   }
 }
 
+/** When a used-up Codex plan serves again, from the same reading that proved it
+ *  used up: the refusal latch's end, else the latest reset among the windows
+ *  at their limit. Undefined when the reading names no time (never guessed). */
+function codexQuotaResetAt(now: number): number | undefined {
+  try {
+    const codex = getRateLimitSnapshot().codex;
+    if (!codex) return undefined;
+    if (typeof codex.exhaustedUntil === 'number' && codex.exhaustedUntil > now) return codex.exhaustedUntil;
+    const resets = [codex.primary, codex.secondary]
+      .map((window) => (window && window.usedPercent >= 100 ? window.resetAt : undefined))
+      .filter((resetAt): resetAt is number => typeof resetAt === 'number' && resetAt > now);
+    return resets.length ? Math.max(...resets) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** The best reason a model on `provider` cannot be served, from signals the
  *  app already keeps: a used-up plan (with its reset), a refused prepaid
  *  balance, or a missing connection. */
 function problemForModel(provider: ModelProviderClass, modelId: string): MemoryModelUnavailable {
   if (provider === 'claude' || provider === 'codex') {
-    const exhausted = checkerQuotaExhaustion(provider);
+    const now = Date.now();
+    const exhausted = checkerQuotaExhaustion(provider, now);
     if (exhausted) {
-      const until = isoTime(exhausted.resetAt);
+      const until = isoTime(exhausted.resetAt ?? (provider === 'codex' ? codexQuotaResetAt(now) : undefined));
       return { problem: 'quota', ...(until ? { until } : {}) };
     }
     return { problem: 'not_connected' };

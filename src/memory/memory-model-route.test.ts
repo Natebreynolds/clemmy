@@ -23,7 +23,8 @@ const { Usage } = await import('@openai/agents');
 const { ClaudeModelProvider } = await import('../runtime/harness/claude-model.js');
 const { CodexModelProvider } = await import('../runtime/harness/codex-model.js');
 const { resolveBoundaryJudge } = await import('../runtime/harness/debate-model.js');
-const { defaultForRole, resolveRoleModel } = await import('../runtime/harness/model-roles.js');
+const { defaultForRole, pinnedBrainForSession, resolveRoleModel, __sessionBrainPinTest__ } = await import('../runtime/harness/model-roles.js');
+const { __resetRateLimitStoreForTests, getRateLimitSnapshot, recordCodexUsageExhausted } = await import('../runtime/harness/rate-limit-store.js');
 const { _setDiscoveredModelsForTest } = await import('../runtime/harness/model-discovery.js');
 const { MODELS, DEFAULT_CODEX_FAST_MODEL } = await import('../config.js');
 const {
@@ -295,4 +296,91 @@ test('a failed extraction pauses learning with the kind of trouble the provider 
     }
   }
   setReflectionExtractorPauseForTest(null);
+});
+
+test('memory work never pins the brain: after the owner switches it, the route and the row still agree', () => {
+  // Same-family automatic memory follows the brain's family, so a stale brain
+  // would put memory work on the wrong family's model.
+  process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off';
+  __sessionBrainPinTest__.reset();
+  __sessionBrainPinTest__.setValidatorForTests(() => true);
+  try {
+    // The journal's scope: a fixed label, no accepted user input.
+    const scope = { sessionId: 'memory', sourceUserSeq: 0, channel: 'memory:learn', role: 'memory' as const };
+    const inJob = () => withModelUsageAttribution(scope, () => ({
+      brain: resolveRoleModel('brain'),
+      learn: resolveMemoryModelRoute('learn')?.modelId,
+    }));
+    const before = inJob();
+    assert.ok(before.learn, 'fixture: the automatic route resolves');
+    process.env.AUTH_MODE = 'claude_oauth'; // the owner switches the brain
+    const after = inJob();
+    assert.notEqual(after.brain.source, 'session', 'a memory job is not a served turn');
+    assert.equal(after.brain.modelId, resolveRoleModel('brain').modelId, 'memory work sees the brain the owner chose');
+    assert.equal(after.learn, describeMemoryModel().modelId, 'the job runs on the model the Memory tab names');
+    assert.notEqual(after.learn, before.learn, 'the switch reached memory work');
+    assert.equal(pinnedBrainForSession('memory'), null, 'nothing was pinned under the job label');
+  } finally {
+    __sessionBrainPinTest__.reset();
+  }
+});
+
+test('an automatic model that is the brain\'s own model says it follows the brain', () => {
+  // A same-family checker whose cheap model is the brain's model.
+  Object.assign(process.env, {
+    AUTH_MODE: 'claude_oauth', CLEMMY_JUDGE_CROSS_FAMILY: 'off',
+    CLAUDE_MODEL: 'claude-test-model', CLEMMY_BOUNDARY_JUDGE_CLAUDE_MODEL: 'claude-test-model',
+  });
+  try {
+    assert.notEqual(resolveRoleModel('judge').modelId, 'claude-test-model', 'fixture: the checker row names another model');
+    const route = resolveMemoryModelRoute('learn');
+    assert.equal(route?.modelId, resolveBoundaryJudge().modelId, 'still exactly the boundary selection');
+    assert.equal(route?.modelId, 'claude-test-model');
+    assert.equal(route?.follows, 'brain');
+    const described = describeMemoryModel();
+    assert.deepEqual({ source: described.source, modelId: described.modelId, follows: described.follows },
+      { source: 'automatic', modelId: 'claude-test-model', follows: 'brain' });
+    assert.equal(memoryRoleSettingsView().follows, 'brain');
+  } finally {
+    delete process.env.CLAUDE_MODEL;
+  }
+});
+
+test('when the automatic route cannot be built, nothing is named and the row says why', () => {
+  // The owner pinned the checker; its account is signed out.
+  const codexJudge = resolveRoleModel('worker').modelId;
+  process.env.CLEMMY_MODEL_ROLES = JSON.stringify([{ role: 'judge', modelId: codexJudge, scope: 'durable', source: 'settings' }]);
+  assert.equal(resolveMemoryModelRoute('learn')?.modelId, codexJudge, 'fixture: the pin serves while signed in');
+  writeAuth({ codex: false });
+  assert.equal(resolveMemoryModelRoute('learn'), null, 'learning waits; the checker pin is never substituted');
+  const described = describeMemoryModel();
+  assert.deepEqual(
+    { source: described.source, modelId: described.modelId, follows: described.follows, unavailable: described.unavailable },
+    { source: 'automatic', modelId: null, follows: null, unavailable: { problem: 'not_connected' } },
+  );
+  assert.deepEqual(memoryModelAvailability('learn'), { ok: false, reason: 'model_unavailable', problem: 'not_connected' });
+  const view = memoryRoleSettingsView();
+  assert.deepEqual({ modelId: view.modelId, source: view.source, unavailable: view.unavailable },
+    { modelId: '', source: 'default', unavailable: { problem: 'not_connected' } });
+});
+
+test('a checker out of plan quota makes automatic learning wait until the plan serves again', () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'test'; // the quota store stays in memory
+  __resetRateLimitStoreForTests();
+  try {
+    const codexJudge = resolveRoleModel('worker').modelId;
+    process.env.CLEMMY_MODEL_ROLES = JSON.stringify([{ role: 'judge', modelId: codexJudge, scope: 'durable', source: 'settings' }]);
+    recordCodexUsageExhausted(60 * 60_000); // the provider refused for its usage limit
+    const until = new Date(getRateLimitSnapshot().codex!.exhaustedUntil!).toISOString();
+    assert.equal(resolveMemoryModelRoute('learn'), null);
+    const described = describeMemoryModel();
+    assert.deepEqual({ modelId: described.modelId, unavailable: described.unavailable },
+      { modelId: null, unavailable: { problem: 'quota', until } });
+    assert.deepEqual(memoryModelAvailability('learn'), { ok: false, reason: 'model_unavailable', problem: 'quota', until });
+  } finally {
+    __resetRateLimitStoreForTests();
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+  }
 });
