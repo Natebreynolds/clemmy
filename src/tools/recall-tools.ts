@@ -437,7 +437,9 @@ export function registerRecallTools(server: McpServer): void {
         // filter or figure), answer with the text exactly as recall would,
         // spending the same recall budget, instead of a refusal round.
         if (!asksForRecordShaping(input)) {
-          const read = readRetainedTextSlice(ctx, resolved, 0, recallSliceCeiling(ctx.routedModelId));
+          // One inline result, exactly what a bare recall returns: the header
+          // names the next offset, and a larger slice is recall's explicit ask.
+          const read = readRetainedTextSlice(ctx, resolved, 0, recallSliceChars(undefined, ctx.routedModelId));
           if (read.status === 'ok') {
             const bodyText = `Tool output "${callId}" is text, not structured records, so here is its text as recall_tool_result returns it (fields, filters and figures need records).\n${read.body}`;
             return textResult(bodyText, { maxChars: bodyText.length });
