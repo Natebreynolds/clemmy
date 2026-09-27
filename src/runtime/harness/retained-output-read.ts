@@ -3,6 +3,7 @@ import {
   getToolOutput,
   listToolCalledEventsForCallId,
   openEventLog,
+  toolOutputStoredIdentity,
   type EventRow,
   type ToolOutputRecord,
 } from './eventlog.js';
@@ -24,7 +25,9 @@ export function resolveRetainedOutputRead(sessionId: string, requestedId: string
   receipt?: ToolOutputRecord;
 } {
   const local = resolveLocalRetainedOutputRead(sessionId, requestedId);
-  if (local.receipt || getToolOutput(sessionId, local.callId)) return local;
+  // Whether the id is stored here is a metadata question; the bytes are for
+  // the reader that reads them.
+  if (local.receipt || toolOutputStoredIdentity(sessionId, local.callId)) return local;
   const session = getSession(sessionId);
   if (session?.kind !== 'agent' || session.metadata.source !== 'delegated_worker') return local;
   const readParent = (parentId: string, id: string): ToolOutputRecord | null => {

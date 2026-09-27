@@ -220,3 +220,40 @@ test('file_query is offered exactly when its own query-authority check accepts t
   const openRoutes = retainedResultRoutes({ sessionId: open.id, callId: 'toolu_open_failure', inFlight: true });
   assert.ok(!openRoutes.some((r) => r.tool === 'file_query'), JSON.stringify(openRoutes));
 });
+
+test('routing a long output loads its bytes at most once, and not again while nothing changed', () => {
+  // A long recall pages through the router on every page, and a text digest
+  // routes the result it has just stored. The route is judged from the bytes
+  // once; the same unchanged output is routed again from its metadata.
+  const output = 'A long plain narrative line about the orchard walk.\n'.repeat(4_000);
+  const sessionId = stored('toolu_long_routed', output);
+  const db = eventlog.openEventLog();
+  const prepare = db.prepare.bind(db);
+  let payloadReads = 0;
+  (db as { prepare: typeof db.prepare }).prepare = ((source: string) => {
+    // One load of a stored output reads its row's inline payload once.
+    if (/^\s*SELECT\s+output_full\b/i.test(source)) payloadReads += 1;
+    return prepare(source);
+  }) as typeof db.prepare;
+  try {
+    const first = retainedResultRoutes({ sessionId, callId: 'toolu_long_routed', exclude: ['recall_tool_result'] });
+    assert.deepEqual(first.map((r) => r.tool), ['file_query']);
+    assert.ok(payloadReads <= 1, `the first route loads the stored bytes at most once: ${payloadReads}`);
+    payloadReads = 0;
+    const again = retainedResultRoutes({ sessionId, callId: 'toolu_long_routed', exclude: ['recall_tool_result'] });
+    assert.deepEqual(again, first);
+    assert.equal(payloadReads, 0, 'an unchanged output is routed again without loading its bytes');
+  } finally {
+    (db as { prepare: typeof db.prepare }).prepare = prepare;
+  }
+
+  // A change to the stored output or its lifecycle is judged afresh.
+  const called = eventlog.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_called', data: {
+    callId: 'toolu_long_routed', tool: 'work_call', arguments: '{}',
+  } });
+  eventlog.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_returned', parentEventId: called.id, data: {
+    callId: 'toolu_long_routed', tool: 'work_call', ok: false,
+  } });
+  const afterFailure = retainedResultRoutes({ sessionId, callId: 'toolu_long_routed', exclude: ['recall_tool_result'] });
+  assert.ok(!afterFailure.some((r) => r.tool === 'file_query'), JSON.stringify(afterFailure));
+});

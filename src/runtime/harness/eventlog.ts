@@ -7465,6 +7465,55 @@ export function unsettledToolOutputQueryRefusal(record: ToolOutputRecord): strin
   return authorityOutputFailureReason(record, null);
 }
 
+export interface ToolOutputStoredIdentity {
+  /** Equal keys mean the same stored bytes, the same invocation rows and the
+   *  same lifecycle, so every reader resolves the id to the same verdict. */
+  key: string;
+  /** Digest of the canonical stored bytes; null for a row without one. */
+  canonicalSha256: string | null;
+  /** Digest of each invocation row's bytes, by invocation nonce. */
+  invocationSha256: ReadonlyMap<string, string | null>;
+}
+
+/** A metadata-only identity of one call id's stored output: the canonical
+ *  manifest, its invocation rows and its lifecycle events. No payload is read
+ *  or hashed. Null when nothing is stored under the id. A caller that judged
+ *  the bytes may reuse that judgement while the identity is unchanged. */
+export function toolOutputStoredIdentity(sessionId: string, callId: string): ToolOutputStoredIdentity | null {
+  const db = openEventLog();
+  return db.transaction((): ToolOutputStoredIdentity | null => {
+    const canonical = prepareCached(db, `
+      SELECT content_bytes, truncated_at_write, output_sha256, tool, created_at
+        FROM tool_outputs
+       WHERE session_id = ? AND call_id = ?
+    `).get(sessionId, callId) as {
+      content_bytes: number; truncated_at_write: number; output_sha256: string | null;
+      tool: string | null; created_at: string;
+    } | undefined;
+    if (!canonical) return null;
+    const invocations = prepareCached(db, `
+      SELECT invocation_nonce, output_sha256, content_bytes, created_at
+        FROM tool_output_invocations
+       WHERE session_id = ? AND call_id = ?
+       ORDER BY invocation_nonce ASC
+    `).all(sessionId, callId) as Array<{
+      invocation_nonce: string; output_sha256: string | null; content_bytes: number; created_at: string;
+    }>;
+    const lifecycle = prepareCached(db, `
+      SELECT COUNT(*) AS events, MAX(seq) AS last_seq
+        FROM events
+       WHERE session_id = ?
+         AND type IN ('tool_called', 'tool_returned')
+         AND json_extract(data_json, '$.callId') = ?
+    `).get(sessionId, callId) as { events: number; last_seq: number | null };
+    return {
+      key: JSON.stringify([canonical, invocations, lifecycle]),
+      canonicalSha256: canonical.output_sha256,
+      invocationSha256: new Map(invocations.map((row) => [row.invocation_nonce, row.output_sha256])),
+    };
+  })();
+}
+
 function authorityOutputFailureReason(
   record: ToolOutputRecord,
   occurrence: DurableToolOutputOccurrence | null,

@@ -32,8 +32,11 @@ import {
   listToolOutputCallIds,
   resolveToolOutputForAuthority,
   resolveToolOutputForQuery,
+  toolOutputStoredIdentity,
   unsettledToolOutputQueryRefusal,
+  type AuthorityToolOutputResolution,
   type ToolOutputRecord,
+  type ToolOutputStoredIdentity,
 } from './eventlog.js';
 import { parseStoredToolOutputJson } from './json-repair.js';
 import { resolveRetainedOutputRead } from './retained-output-read.js';
@@ -61,6 +64,130 @@ export interface RetainedResultRouteInput {
   readonly inFlight?: boolean;
 }
 
+/** What the readers can do with one retained output, judged from its bytes
+ * and from file_query's own query check. */
+interface RetainedOutputJudgement {
+  readonly readId: string;
+  /** Non-empty and complete: something a reader can serve. */
+  readonly readable: boolean;
+  readonly structured: boolean;
+  /** Structured data embedded in prose (a host document with its dataset
+   * inside): the query reaches the data, and only recall reaches the prose. */
+  readonly proseAroundData: boolean;
+  readonly fileQuery: boolean;
+}
+
+/** Judgements of unchanged outputs, keyed by the output's metadata identity.
+ * A recall pages through the router on every page; the bytes are judged once
+ * and the same stored output is routed again without loading them. */
+const JUDGEMENT_MEMO_LIMIT = 256;
+const judgementMemo = new Map<string, { identity: string; judgement: RetainedOutputJudgement }>();
+
+function rememberJudgement(key: string, identity: string, judgement: RetainedOutputJudgement): void {
+  judgementMemo.delete(key);
+  judgementMemo.set(key, { identity, judgement });
+  while (judgementMemo.size > JUDGEMENT_MEMO_LIMIT) {
+    const oldest = judgementMemo.keys().next().value;
+    if (oldest === undefined) break;
+    judgementMemo.delete(oldest);
+  }
+}
+
+function judgeBytes(
+  record: ToolOutputRecord | null,
+  readId: string,
+  fileQuery: boolean,
+): RetainedOutputJudgement {
+  // Without the stored bytes there is nothing to route to, and a prefix is
+  // not authoritative data that any reader can make whole.
+  if (!record || typeof record.output !== 'string' || record.output.length === 0 || record.truncatedAtWrite) {
+    return { readId, readable: false, structured: false, proseAroundData: false, fileQuery: false };
+  }
+  const recovered = (() => {
+    try {
+      return parseStoredToolOutputJson(record.output, {});
+    } catch {
+      return null;
+    }
+  })();
+  return {
+    readId,
+    readable: true,
+    structured: Boolean(recovered),
+    proseAroundData: recovered?.via === 'embedded',
+    fileQuery,
+  };
+}
+
+/** The resolver's record carries the canonical bytes when it is the canonical
+ * row itself or an invocation row with the same digest. */
+function resolvedRecordIsCanonical(
+  resolution: AuthorityToolOutputResolution,
+  identity: ToolOutputStoredIdentity,
+): resolution is Extract<AuthorityToolOutputResolution, { status: 'ok' }> {
+  if (resolution.status !== 'ok') return false;
+  if (resolution.source === 'legacy') return true;
+  const nonce = resolution.record.invocationNonce;
+  if (!nonce || !identity.canonicalSha256) return false;
+  return identity.invocationSha256.get(nonce) === identity.canonicalSha256;
+}
+
+function judgeRetainedOutput(input: RetainedResultRouteInput): RetainedOutputJudgement | null {
+  // Route to what the readers will actually read: a recall's id resolves to
+  // its producer and a receipt to its own redeemed bytes, exactly as each
+  // reader resolves it. Naming the producer id means no route reads a copy of
+  // a copy.
+  let resolved: ReturnType<typeof resolveRetainedOutputRead>;
+  try {
+    resolved = resolveRetainedOutputRead(input.sessionId, input.callId);
+  } catch {
+    return null;
+  }
+  const readId = resolved.callId;
+  // A redeemed receipt is read under its own exact identity, as file_query reads it.
+  if (resolved.receipt) return judgeBytes(resolved.receipt, readId, true);
+
+  let identity: ToolOutputStoredIdentity | null = null;
+  try {
+    identity = toolOutputStoredIdentity(input.sessionId, readId);
+  } catch {
+    identity = null;
+  }
+  if (!identity) return null;
+  // The formatter of a result whose call has not returned yet: the query
+  // check cannot pass before the return exists, so the output is judged as
+  // that check will judge it once the call settles.
+  const inFlight = Boolean(input.inFlight && readId === input.callId);
+  const memoKey = `${input.sessionId}\u0000${readId}\u0000${inFlight ? 'in-flight' : 'settled'}`;
+  const remembered = judgementMemo.get(memoKey);
+  if (remembered && remembered.identity === identity.key) {
+    rememberJudgement(memoKey, identity.key, remembered.judgement);
+    return remembered.judgement;
+  }
+
+  let record: ToolOutputRecord | null = null;
+  let fileQuery = false;
+  try {
+    if (inFlight) {
+      record = getToolOutput(input.sessionId, readId);
+      fileQuery = record !== null && unsettledToolOutputQueryRefusal(record) === null;
+    } else {
+      // file_query applies this resolver; its verified record doubles as the
+      // bytes to judge when it is the canonical row the other readers read.
+      const resolution = resolveToolOutputForQuery(input.sessionId, readId);
+      fileQuery = resolution.status === 'ok';
+      record = resolvedRecordIsCanonical(resolution, identity)
+        ? resolution.record
+        : getToolOutput(input.sessionId, readId);
+    }
+  } catch {
+    // A failed read leaves whatever was read before it; judged as found.
+  }
+  const judgement = judgeBytes(record, readId, fileQuery);
+  if (identity.canonicalSha256) rememberJudgement(memoKey, identity.key, judgement);
+  return judgement;
+}
+
 /**
  * The routes that can serve this exact retained output, best first. Empty when
  * nothing can — which is itself the honest answer, and must be reported as
@@ -71,38 +198,11 @@ export function retainedResultRoutes(
 ): RetainedResultRoute[] {
   const excluded = new Set((input.exclude ?? []).map((name) => name.trim()));
   const routes: RetainedResultRoute[] = [];
-  // Route to what the readers will actually read: a recall's id resolves to
-  // its producer and a receipt to its own redeemed bytes, exactly as each
-  // reader resolves it. Naming the producer id means no route reads a copy of
-  // a copy.
-  let readId = input.callId;
-  let receipt = false;
-  let record: ToolOutputRecord | null = null;
-  try {
-    const resolved = resolveRetainedOutputRead(input.sessionId, input.callId);
-    readId = resolved.callId;
-    receipt = Boolean(resolved.receipt);
-    record = resolved.receipt ?? getToolOutput(input.sessionId, readId);
-  } catch {
-    record = null;
-  }
-  // Without the stored bytes there is nothing to route to. Say so; do not
-  // invent a reader that will refuse for a different reason.
-  if (!record || typeof record.output !== 'string' || record.output.length === 0) return routes;
-  // A prefix is not authoritative data, and no reader can make it so.
-  if (record.truncatedAtWrite) return routes;
-
-  const recovered = (() => {
-    try {
-      return parseStoredToolOutputJson(record.output, {});
-    } catch {
-      return null;
-    }
-  })();
-  const structured = Boolean(recovered);
-  // Structured data embedded in prose (a host document with its dataset
-  // inside): the query reaches the data, and only recall reaches the prose.
-  const proseAroundData = recovered?.via === 'embedded';
+  const judged = judgeRetainedOutput(input);
+  // Say so when nothing can read it; do not invent a reader that will refuse
+  // for a different reason.
+  if (!judged || !judged.readable) return routes;
+  const { readId, structured, proseAroundData } = judged;
 
   // Structured rows: the server-side query is the cheap, unclipped read.
   if (structured && !excluded.has('tool_output_query')) {
@@ -130,7 +230,7 @@ export function retainedResultRoutes(
   // serves plain text with recall already exhausted. It is offered only when
   // its own query check accepts this id; advertising a reader that will
   // refuse is a dead end.
-  if (!excluded.has('file_query') && fileQueryServes(input, readId, receipt, record)) {
+  if (!excluded.has('file_query') && judged.fileQuery) {
     routes.push({
       tool: 'file_query',
       call: `file_query {"call_id":"${readId}","query":"<what you need>"}`,
@@ -139,23 +239,6 @@ export function retainedResultRoutes(
   }
 
   return routes;
-}
-
-/** file_query's own acceptance, from the one resolver it applies. A redeemed
- * receipt is read under its own exact identity, as file_query reads it. */
-function fileQueryServes(
-  input: RetainedResultRouteInput,
-  readId: string,
-  receipt: boolean,
-  record: ToolOutputRecord,
-): boolean {
-  if (receipt) return true;
-  try {
-    if (input.inFlight && readId === input.callId) return unsettledToolOutputQueryRefusal(record) === null;
-    return resolveToolOutputForQuery(input.sessionId, readId).status === 'ok';
-  } catch {
-    return false;
-  }
 }
 
 /**
