@@ -25,6 +25,7 @@ import assert from 'node:assert/strict';
 const { buildOrchestratorAgent } = await import('./orchestrator.js');
 const { serializeAdvertisedTools } = await import('../runtime/harness/advertised-tool-wire.js');
 const { closeEventLog } = await import('../runtime/harness/eventlog.js');
+const { buildWorkCall } = await import('../tools/work-call.js');
 
 after(() => {
   try { closeEventLog(); } catch { /* not opened */ }
@@ -64,4 +65,19 @@ test('session_search advertises its call contract; paging, coverage and authorit
     assert.equal(branch.format, 'date-time', `${field} states its grammar by format name`);
     assert.equal(Object.hasOwn(branch, 'pattern'), false, `${field} no longer carries zod's date-time regex`);
   }
+});
+
+test('the proposal-free work_call states its call contract; planning policy stays with its one owner', () => {
+  // 4,427 -> 2,969 B.
+  const tool = withinCeiling(wireOf([buildWorkCall({ requireHostPlan: true })]).get('work_call'), 'work_call', 3_050);
+  assert.match(tool.description, /consent and dispatch boundary/);
+  assert.match(tool.description, /plan_task/, 'a pre-plan carrier names where graph work goes');
+  assert.match(tool.description, /plan_step_result/);
+  assert.doesNotMatch(tool.description, /source_call_ids|broad-search/,
+    'lineage and discovery policy live in the [action-planning] line, the field contract and the rubric');
+  const fields = tool.parameters.properties as Record<string, { description?: string }>;
+  assert.match(fields.requirement_id!.description ?? '', /never search again/,
+    'a disclosed capabilityRef is not re-obtained through tool_search');
+  assert.match(fields.source_call_ids!.description ?? '', /null when a read only informed order, a condition or a decision/);
+  assert.match(fields.universe_item_id!.description ?? '', /JSON null, not "null"/);
 });

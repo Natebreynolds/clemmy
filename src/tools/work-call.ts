@@ -170,32 +170,32 @@ export const WorkCallInputSchema = z.object({
     'Complete provider-neutral work topology. Null when the host already froze the contract, and null after the first successful freeze. Required only when no contract exists yet.',
   ),
   requirement_id: IdSchema.describe(
-    'Binding selector: a cap:… capabilityRef disclosed by tool_search OR by the host\'s PROVEN OPERATION note for this turn (both are already disclosed; do not run tool_search to re-obtain one); frozen graph uses its open operation id; read/compute uses its requirement label.',
+    'A cap:… capabilityRef already disclosed by tool_search or the PROVEN OPERATION note (never search again for it), a frozen plan\'s open operation id, or a read/compute requirement label.',
   ),
   universe_item_id: MemberSchema.nullable().describe(
-    'Exact accepted universe member for cardinality=each; otherwise use JSON null (not the string "null").',
+    'The universe member for cardinality=each; else JSON null, not "null".',
   ),
   universe_selector: z.object({
     argument_pointer: z.string().max(512),
     member_id_pointer: z.string().max(512).nullable(),
   }).strict().nullable().describe(
-    'RFC 6901 pointer selecting the exact member or finite member array in normalized inner arguments.',
+    'RFC 6901 pointers to the member (or member array) in the inner arguments.',
   ),
   seal_amendment: z.object({
     universe_id: IdSchema,
     member_id_pointer: z.string().max(512),
   }).strict().nullable().optional().describe(
-    'ONE correction to a source-derived universe\'s memberIdPointer, allowed only after a seal refusal named the record\'s actual keys and only before any member is bound. The frozen proposal itself never changes.',
+    'One memberIdPointer correction, only after a seal refusal named the record\'s keys and before any member is bound.',
   ),
   source_call_ids: z.array(IdSchema).length(1).nullable().optional().describe(
-    'Content lineage: name one settled call only when args consume its result bytes; ordering/condition/decision reads use null. Evidence only, never authority.',
+    'The one settled call whose result bytes these args consume; null when a read only informed order, a condition or a decision.',
   ),
   source_record_ids: z.array(z.string().min(1).max(2_048)).min(1).max(64)
     .refine((values) => new Set(values).size === values.length, 'source record ids must be unique')
     .nullable().optional().describe(
-      'When the frozen read refinement or structured deliverable has a typed source-evidence contract, name the exact source record identities selected from the nominated result. For recent-article evidence these are canonical source URLs. Otherwise use JSON null.',
+      'Under a typed source-evidence contract only: the exact source record ids chosen from the nominated result (canonical URLs for articles); else null.',
     ),
-  name: z.string().min(1).describe('Exact reachable inner tool name returned by tool_search/catalog, or named in the host\'s proven-operation disclosure for this turn.'),
+  name: z.string().min(1).describe('Exact inner tool name from tool_search, the catalog, or the proven-operation note.'),
   args_json: z.string().describe('JSON object string matching the inner tool schema.'),
 }).strict();
 
@@ -1993,7 +1993,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         : 'Invoke one exact disclosed local or provider operation through its existing consent and dispatch boundary.',
       frozenAuthority
         ?? (requireHostPlan
-          ? 'This is the proposal-free foreground carrier. Exact calls are decided at the tool edge by the existing allow/deny/ask and dispatch path; this carrier does not compile a hidden plan_task. Pass source_call_ids only when arguments consume or copy one settled result\'s bytes; a read used only for ordering, a condition, or a decision is not content lineage. Coordinated business dependencies, each/set, ambiguous, admin, destructive, and unknown-effect work still follows the explicit planning surface. Contextual reads, one authorized reversible write and ordinary readback can run directly; their order alone does not require planning.'
+          ? 'Proposal-free: the tool edge decides consent for each call, and work that needs a graph goes through plan_task.'
           : [
               'If the host already froze a contract, pass proposal:null and bind the exact requirement id. Otherwise the FIRST call provides the complete provider-neutral proposal plus the first requirement binding.',
               'The proposal describes only effects, dependencies, coverage, cardinality and universes—never tool names, providers, services or slugs.',
@@ -2047,10 +2047,15 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           })()
         : []),
       requireHostPlan
-        ? 'For an approved plan with a model-authored compute step, record its actual output with plan_step_result after its dependencies succeed. Then invoke the consuming work_call with its exact plan requirement id; the host fills declared dynamicBindings from that retained output, so omit the bound argument fields. For ordinary direct work without a reviewed compute step, compose the content in the consuming write\'s arguments.'
+        ? 'Compose content you write yourself in the consuming call\'s args; after a reviewed compute step is recorded with plan_step_result, call its consumer with the plan requirement id and omit the bound fields.'
         : 'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
-      'Invoke a runtime-resolved inner name/schema directly. When a requirement is unresolved, use tool_search once for that requirement; when only an exact schema is missing, describe that exact tool once instead of broad-searching. Ask the user naturally if the intended work itself is ambiguous.',
-    ].join(' '),
+      // The discovery and ambiguity policy for the proposal-free carrier has
+      // one owner, the [action-planning] instruction line and the rubric; an
+      // invalid inner call returns its exact schema.
+      requireHostPlan
+        ? null
+        : 'Invoke a runtime-resolved inner name/schema directly. When a requirement is unresolved, use tool_search once for that requirement; when only an exact schema is missing, describe that exact tool once instead of broad-searching. Ask the user naturally if the intended work itself is ambiguous.',
+    ].filter(Boolean).join(' '),
     parameters: (requireHostPlan
       ? HostPlannedWorkCallInputSchema
       : WorkCallInputSchema) as typeof WorkCallInputSchema,
