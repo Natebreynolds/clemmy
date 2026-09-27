@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
-import { compactUsageText, creditRefusalSentence, formatBalance, formatTokenCount, presentUsageMeters, resetsInText } from '@clem/chat-engine';
+import { accountStatus, creditRefusalSentence, presentUsageMeters } from '@clem/chat-engine';
 import {
   getCompletionReview,
   getConnectionsHealth,
@@ -623,61 +623,46 @@ function UsageCard() {
         <p class="card-note">Could not load usage right now.</p>
       ) : meters.length === 0 ? (
         <p class="card-note">No model account is connected yet.</p>
-      ) : meters.map((meter) => (
-        <div key={meter.id} class={`usage-meter${meter.outOfCredit ? ' usage-meter-out' : ''}`}>
-          <div class="usage-meter-head">
-            <span class="settings-row-label">{meter.label}</span>
-            <span class={`usage-meter-compact${meter.outOfCredit ? ' usage-tone-danger' : ''}`}>{compactUsageText(meter)}</span>
-          </div>
-          {meter.uses?.length ? <p class="settings-row-note">{sentenceCase(meter.uses.join(' · '))}</p> : null}
-          {meter.outOfCredit ? <p class="usage-out-note">{creditRefusalSentence(meter, clockTime)}</p> : null}
-          {meter.outOfCredit && meter.monthSpend ? (
-            <p class="settings-row-note">{formatBalance(meter.monthSpend)} billed this month</p>
-          ) : null}
-          {!meter.outOfCredit && meter.windows.length === 0 && (meter.balance ?? meter.monthSpend) ? (
-            <p class="settings-row-note">
-              {meter.balance ? 'Balance' : `${meter.label}’s figure`} as of {clockTime((meter.balance ?? meter.monthSpend)!.capturedAt)}
-            </p>
-          ) : null}
-          {meter.outOfCredit ? null : meter.windows.map((w) => {
-            const reset = resetsInText(w.resetAt, now);
-            return (
-              <div key={w.id} class="usage-window">
-                <div class="usage-window-line">
-                  <span>{w.label}</span>
-                  <span class={`usage-tone-${w.tone}`}>{w.usedPercent}%{reset ? ` · ${reset}` : ''}</span>
-                </div>
-                <div class="usage-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={w.usedPercent} aria-label={`${meter.label} ${w.label}`}>
-                  <div class={`usage-bar-fill usage-fill-${w.tone}`} style={{ width: `${w.usedPercent}%` }} />
-                </div>
+      ) : meters.map((meter) => {
+        // One grammar for every account, the same words as the Mac: what is
+        // left, when it resets, what it does. One bar, for the window the
+        // headline speaks about; the rest is in the Mac's Settings.
+        const status = accountStatus(meter, now);
+        const refusal = creditRefusalSentence(meter, clockTime);
+        const bar = status.window;
+        return (
+          <div key={meter.id} class={`usage-meter${meter.outOfCredit ? ' usage-meter-out' : ''}`}>
+            <div class="usage-meter-head">
+              <span class="settings-row-label">{meter.label}</span>
+              <span class={`usage-meter-compact usage-tone-${status.tone}`}>
+                {[status.left, status.resets].filter(Boolean).join(' · ')}
+              </span>
+            </div>
+            {bar ? (
+              <div class="usage-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={bar.usedPercent} aria-label={`${meter.label} ${bar.label}`}>
+                <div class={`usage-bar-fill usage-fill-${bar.tone}`} style={{ width: `${bar.usedPercent}%` }} />
               </div>
-            );
-          })}
-          <p class="settings-row-note">
-            {meter.windows.length === 0 && meter.note && !meter.outOfCredit && !meter.balance && !meter.monthSpend ? `${meter.note} ` : ''}
-            {meter.spend
-              ? `Today: ${formatTokenCount(meter.spend.tokens)} tokens · ${meter.spend.calls} call${meter.spend.calls === 1 ? '' : 's'}`
-              : 'Today: nothing yet'}
-          </p>
-          {meter.billing ? (
-            <a
-              class={`usage-billing-link${meter.outOfCredit ? ' urgent' : ''}`}
-              href={meter.billing.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label={`${meter.billing.action} for ${meter.label} on the provider's billing page`}
-            >
-              {meter.billing.action} ↗
-            </a>
-          ) : null}
-        </div>
-      ))}
+            ) : null}
+            <p class="settings-row-note">
+              {status.doing} · {status.today ?? 'nothing today'}{status.age ? ` · ${status.age}` : ''}
+            </p>
+            {refusal ? <p class="usage-out-note">{refusal}</p> : null}
+            {meter.billing ? (
+              <a
+                class={`usage-billing-link${meter.outOfCredit ? ' urgent' : ''}`}
+                href={meter.billing.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label={`${meter.billing.action} for ${meter.label} on the provider's billing page`}
+              >
+                {meter.billing.action} ↗
+              </a>
+            ) : null}
+          </div>
+        );
+      })}
     </section>
   );
-}
-
-function sentenceCase(text: string): string {
-  return text ? text[0].toUpperCase() + text.slice(1) : text;
 }
 
 function clockTime(epochMs: number): string {

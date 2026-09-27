@@ -157,3 +157,36 @@ test('a readable balance becomes the meter line; the OpenAI key and Jev get mete
   // Disconnected accounts stay off the list.
   assert.deepEqual(presentUsageMeters({ codex: { connected: false }, claude: { connected: false }, jev: { connected: false } }), []);
 });
+
+test('every account speaks one grammar: what is left, when it resets, what it does', async () => {
+  const { accountStatus, accountHeadline, accountCaption } = await import('./usage-presentation.js');
+  const now = Date.parse('2026-09-26T20:00:00Z');
+  const codex = {
+    id: 'codex', label: 'Codex', capturedAt: now,
+    windows: [{ id: 'week', label: 'week', usedPercent: 87, tone: 'warning' as const, resetAt: now + 3 * 86_400_000 }],
+  };
+  assert.equal(accountHeadline(codex, now), '13% left this week · resets in 3d');
+  assert.equal(accountCaption(codex, now), 'Idle · nothing today');
+  const claude = {
+    id: 'claude', label: 'Claude', capturedAt: now, uses: ['checks the work'], spend: { tokens: 747_000, calls: 54 },
+    windows: [
+      { id: 'five', label: '5h', usedPercent: 18, tone: 'ok' as const },
+      { id: 'week', label: 'week', usedPercent: 48, tone: 'ok' as const },
+      { id: 'fable', label: 'Fable week', usedPercent: 82, tone: 'warning' as const, resetAt: now + 2 * 86_400_000 },
+    ],
+  };
+  assert.equal(accountHeadline(claude, now), '18% left of Fable week · resets in 2d');
+  assert.equal(accountStatus(claude, now).window?.id, 'fable', 'the card draws the bar the headline speaks about');
+  assert.equal(accountCaption(claude, now), 'Checks the work · 747k tokens today · 54 calls');
+  const grok = { id: 'xai', label: 'Grok', capturedAt: now, windows: [{ id: 'req', label: 'requests', usedPercent: 0, tone: 'ok' as const }] };
+  assert.equal(accountHeadline(grok, now), '100% left of the request limit');
+  const glm = { id: 'glm', label: 'GLM (Z.ai)', windows: [] };
+  assert.equal(accountHeadline(glm, now), 'No limit reported');
+  const kimi = { id: 'kimi', label: 'Moonshot', windows: [], balance: { amount: 10.62, currency: 'USD', capturedAt: now } };
+  assert.equal(accountHeadline(kimi, now), '$10.62 left');
+  const openai = { id: 'openai', label: 'OpenAI API', windows: [], uses: ['memory search'], outOfCredit: { since: now - 3600_000, lastSeenAt: now } };
+  assert.equal(accountHeadline(openai, now), 'Refusing requests');
+  assert.equal(accountStatus(openai, now).tone, 'danger');
+  const old = { ...codex, capturedAt: now - 50 * 3_600_000 };
+  assert.equal(accountHeadline(old, now), '13% left this week · resets in 3d · reading 2d old');
+});

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, ChevronDown, ExternalLink, KeyRound, Plus } from 'lucide-react';
-import { creditRefusalSentence, formatBalance, formatTokenCount, meterTone, resetsInText, usageChipText, type UsageMeter } from '@clem/chat-engine';
+import { accountCaption, accountHeadline, creditRefusalSentence, meterTone, resetsInText, type UsageMeter } from '@clem/chat-engine';
 import { cn } from '@/lib/cn';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Field';
@@ -111,22 +111,11 @@ function MeterDetail({ meter, now }: { meter: UsageMeter; now: number }) {
   );
 }
 
-/** The grey line under the name: sign-in or key, the jobs it does, and
- *  whatever the headline did not already say. */
-function captionFor(meter: UsageMeter | undefined, kind: string, notConnectedNote: string | undefined): string {
+/** The grey line under the name: sign-in or key, then the shared grammar's
+ *  "what it does · today's spend" (accountCaption), the same words the phone says. */
+function captionFor(meter: UsageMeter | undefined, kind: string, notConnectedNote: string | undefined, now: number): string {
   if (!meter) return notConnectedNote ?? '';
-  const parts = [kind, meter.uses?.length ? meter.uses.join(' · ') : 'not doing a job right now'];
-  // Mirrors usageChipText's order: refusal, windows, balance, month spend, tokens.
-  const headline = meter.outOfCredit ? 'refusal'
-    : meter.windows.length ? 'windows'
-      : meter.balance ? 'balance'
-        : meter.monthSpend ? 'monthSpend'
-          : 'tokens';
-  if (meter.monthSpend && headline !== 'monthSpend') parts.push(`${formatBalance(meter.monthSpend)} billed this month`);
-  if (meter.spend && headline !== 'tokens') parts.push(`today ${formatTokenCount(meter.spend.tokens)} tokens`);
-  if (headline === 'balance' && meter.balance) parts.push(`balance as of ${timeOfDay(meter.balance.capturedAt)}`);
-  if (headline === 'monthSpend' && meter.monthSpend) parts.push(`${meter.label}’s figure as of ${timeOfDay(meter.monthSpend.capturedAt)}`);
-  return parts.join(' · ');
+  return `${kind} · ${accountCaption(meter, now)}`;
 }
 
 function OpenAiKeyForm({ connected, onSaved }: { connected: boolean; onSaved: () => void }) {
@@ -186,7 +175,7 @@ function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, on
   const connected = Boolean(meter);
   const out = Boolean(meter?.outOfCredit);
   const tone = meter ? meterTone(meter) : 'ok';
-  const summary = meter ? usageChipText(meter, now) : null;
+  const summary = meter ? accountHeadline(meter, now) : null;
   return (
     <li id={`account-${id}`} className={cn('scroll-mt-16 rounded-lg border bg-surface px-4 py-3', out ? 'border-danger/50' : 'border-border')}>
       <div className="flex items-center gap-3">
@@ -194,9 +183,9 @@ function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, on
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-baseline gap-x-2">
             <span className={cn('font-semibold', connected ? 'text-fg' : 'text-muted')}>{label}</span>
-            {summary && <span className={cn('text-small tabular-nums', out || tone !== 'ok' ? TONE_TEXT[tone] : 'text-muted')}>{summary.text}</span>}
+            {summary && <span className={cn('text-small tabular-nums', out || tone !== 'ok' ? TONE_TEXT[tone] : 'text-muted')}>{summary}</span>}
           </div>
-          <div className="truncate text-caption text-muted" title={captionFor(meter, kind, notConnectedNote)}>{captionFor(meter, kind, notConnectedNote)}</div>
+          <div className="truncate text-caption text-muted" title={captionFor(meter, kind, notConnectedNote, now)}>{captionFor(meter, kind, notConnectedNote, now)}</div>
         </div>
         {meter && <BillingLink meter={meter} emphasis={out} />}
         <Button size="sm" variant={connected ? 'ghost' : 'secondary'} onClick={onToggle} aria-expanded={open} aria-controls={`account-${id}-panel`}>

@@ -328,3 +328,81 @@ export function creditRefusalSentence(meter: UsageMeter, formatTime: (epochMs: n
   return `${meter.label} turned down Clem’s last request at ${formatTime(refusal.lastSeenAt)}${said} `
     + `Clem uses another model where it can until ${meter.label} answers again.`;
 }
+
+// ── one grammar for every account ─────────────────────────────────────────────
+//
+// Every account used to speak its own language: "87% of week", "82% of Fable
+// week", "0% of request limit", "connected", "941k tokens today", "$10.62
+// left", "refusing requests". Both apps now say the same three things in the
+// same order: what is LEFT, when it RESETS, what the account is DOING.
+
+export interface AccountStatus {
+  /** What is left, in the owner's words: "13% left this week", "$10.62 left",
+   *  "No limit reported", "Refusing requests". */
+  left: string;
+  /** "resets in 3d" when the tightest window says so. */
+  resets: string | null;
+  /** The jobs it does for Clem, sentence-cased: "Checks the work", or "Idle". */
+  doing: string;
+  /** Today's spend, when any: "941k tokens today · 36 calls". */
+  today: string | null;
+  tone: UsageTone;
+  /** The reading is older than USAGE_READING_STALE_MS: "reading 2d old". */
+  age: string | null;
+  /** The window `left` speaks about, so a card can draw exactly that bar. */
+  window: UsageMeterWindow | null;
+}
+
+const LEFT_WORDS: Record<string, string> = {
+  '5h': 'in this 5-hour window',
+  week: 'this week',
+  requests: 'of the request limit',
+  tokens: 'of the token limit',
+};
+
+function windowLeftWords(label: string): string {
+  return LEFT_WORDS[label] ?? `of ${label}`;
+}
+
+function sentenceCase(text: string): string {
+  return text ? text[0].toUpperCase() + text.slice(1) : text;
+}
+
+export function accountStatus(meter: UsageMeter, now: number): AccountStatus {
+  const doing = meter.uses?.length ? sentenceCase(meter.uses.join(' · ')) : 'Idle';
+  const today = meter.spend
+    ? `${formatTokenCount(meter.spend.tokens)} tokens today · ${meter.spend.calls} call${meter.spend.calls === 1 ? '' : 's'}`
+    : null;
+  const stale = typeof meter.capturedAt === 'number' && now - meter.capturedAt > USAGE_READING_STALE_MS;
+  const age = stale && typeof meter.capturedAt === 'number' ? `reading ${ageWords(now - meter.capturedAt)}` : null;
+  if (meter.outOfCredit) {
+    return { left: sentenceCase(CREDIT_REFUSAL_WORDS), resets: null, doing, today, tone: 'danger', age: null, window: null };
+  }
+  const tightest = meter.windows.reduce<UsageMeterWindow | null>(
+    (best, w) => (!best || w.usedPercent > best.usedPercent ? w : best),
+    null,
+  );
+  if (tightest) {
+    const remaining = Math.max(0, 100 - tightest.usedPercent);
+    return {
+      left: `${remaining}% left ${windowLeftWords(tightest.label)}`,
+      resets: resetsInText(tightest.resetAt, now),
+      doing, today, tone: meterTone(meter), age, window: tightest,
+    };
+  }
+  if (meter.balance) return { left: `${formatBalance(meter.balance)} left`, resets: null, doing, today, tone: 'ok', age, window: null };
+  if (meter.monthSpend) return { left: `${formatBalance(meter.monthSpend)} billed this month`, resets: null, doing, today, tone: 'ok', age, window: null };
+  return { left: 'No limit reported', resets: null, doing, today, tone: 'ok', age: null, window: null };
+}
+
+/** The one-line headline beside the account's name: "13% left this week · resets in 3d". */
+export function accountHeadline(meter: UsageMeter, now: number): string {
+  const s = accountStatus(meter, now);
+  return [s.left, s.resets, s.age].filter(Boolean).join(' · ');
+}
+
+/** The grey line under it: what it does, and today's spend. "Checks the work · 747k tokens today · 54 calls". */
+export function accountCaption(meter: UsageMeter, now: number): string {
+  const s = accountStatus(meter, now);
+  return [s.doing, s.today ?? 'nothing today'].join(' · ');
+}
