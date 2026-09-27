@@ -894,9 +894,15 @@ export function renderTurnMemoryTail(
  * ranker then sees every text the per-block memory would have ranked by, so
  * the tail does not lose a fact the blocks showed for want of the words that
  * ranked it. The request leads, since a lexical leg reads only the first
- * words.
+ * words; with `focusLeads` the agent's focus input leads instead (a resumed
+ * request whose agent is focused on the owner's answer to its card, the
+ * newest words of that request).
  */
-export function memoryRankingQuery(scope: MemoryTailScope, request: string): string {
+export function memoryRankingQuery(
+  scope: MemoryTailScope,
+  request: string,
+  options: { focusLeads?: boolean } = {},
+): string {
   const focusInput = scope.focusInput ?? request;
   let focusObjective = '';
   try {
@@ -904,7 +910,9 @@ export function memoryRankingQuery(scope: MemoryTailScope, request: string): str
   } catch {
     focusObjective = '';
   }
-  const ordered = [request, focusInput, focusObjective];
+  const ordered = options.focusLeads
+    ? [focusInput, request, focusObjective]
+    : [request, focusInput, focusObjective];
   const seen = new Set<string>();
   const parts: string[] = [];
   for (const part of ordered) {

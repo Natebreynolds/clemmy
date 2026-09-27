@@ -3450,6 +3450,11 @@ export interface RunTurnOptions {
    * confirmation, or task authority. Workflow steps use it to search by their
    * authored topic without turning synthetic runner prose into task control. */
   memoryPrimerQuery?: string;
+  /** The agent's focus input leads the memory ranking ahead of
+   *  `memoryPrimerQuery`: a later step of a resumed request whose query is the
+   *  parked request's text, while the agent is focused on the owner's answer
+   *  to its card. */
+  memoryFocusLeads?: true;
   /** Exact accepted-source continuation classification. A declined answer
    * keeps its parent/question here for conversation continuity, while semantic
    * preflight is deliberately limited to the literal current answer. */
@@ -5596,8 +5601,13 @@ async function resumedActivationMemoryPrimer(input: {
   const query = input.memoryPrimerQuery ?? (source.synthetic ? undefined : source.text) ?? '';
   if (source.declined === true) return primerWithoutRanker(query, EXPLICIT_MEMORY_RECALL_OPTOUT_REASON, scope);
   if (source.declined === undefined) return primerWithoutRanker(query, 'source_unreadable', scope);
+  // Without a dedicated query the agent's own focus leads: the chat dock
+  // focuses a resume agent on the owner's answer (a change in their words),
+  // which the prompt's per-block memory ranked the resumed request by.
   const settled = await Promise.race([
-    buildTurnMemoryPrimer(query, input.sessionId, scope).catch(() => null),
+    buildTurnMemoryPrimer(query, input.sessionId, scope, {
+      focusLeads: input.memoryPrimerQuery === undefined,
+    }).catch(() => null),
     new Promise<null>((resolve) => {
       const t = setTimeout(() => resolve(null), TURN_MEMORY_ASSEMBLY_TIMEOUT_MS);
       (t as unknown as { unref?: () => void }).unref?.();
@@ -5669,7 +5679,12 @@ function assemblyTimeoutPrimer(input: string, scope: MemoryTailScope | undefined
  *  ranker ranks by the request together with the objective the prompt's
  *  per-block memory ranks by (memoryRankingQuery); whether it runs at all is
  *  decided by the request alone. Any other agent keeps the plain primer. */
-async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: MemoryTailScope): Promise<TurnMemoryPrimer> {
+async function buildTurnMemoryPrimer(
+  input: string,
+  sessionId = '',
+  scope?: MemoryTailScope,
+  ranking: { focusLeads?: boolean } = {},
+): Promise<TurnMemoryPrimer> {
   if (!scope) return buildPlainTurnMemoryPrimer(input, sessionId);
   const query = input.replace(/\s+/g, ' ').trim();
   const withTail = (primer: TurnMemoryPrimer, signal: TurnMemorySignal, sessionPointers = ''): TurnMemoryPrimer => {
@@ -5696,7 +5711,7 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
   scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
   try {
     const sessionPointers = episodicBlockForPrimer(sessionId);
-    const rankingQuery = memoryRankingQuery(scope, query);
+    const rankingQuery = memoryRankingQuery(scope, query, ranking);
     const unified = await buildUnifiedTurnPrimer({
       query: rankingQuery,
       surface: 'automatic_primer',
@@ -10995,7 +11010,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         memoryTailScope,
       ))
     : Promise.race([
-        buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId, memoryTailScope),
+        buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId, memoryTailScope, {
+          focusLeads: options.memoryFocusLeads === true,
+        }),
         new Promise<null>((resolve) => {
           const t = setTimeout(() => resolve(null), TURN_MEMORY_ASSEMBLY_TIMEOUT_MS);
           (t as unknown as { unref?: () => void }).unref?.();
@@ -13698,7 +13715,9 @@ async function runConversationFromResumeCore(opts: {
       })();
   // A later step of this resume continues the request the card belongs to, so
   // it ranks memory by that request (or the caller's dedicated query), never
-  // by the answer that accepted the card or the host's own directive.
+  // by the source that accepted the answer or the host's own directive.
+  // Without a dedicated query the agent's own focus leads the ranking, as on
+  // the resumed step: a chat-dock agent is focused on the owner's answer.
   const continuationMemoryQuery = opts.memoryPrimerQuery
     ?? acceptedRequestText(opts.sessionId, opts.requestSourceUserSeq ?? activeSourceUserSeq);
   let lastCheckInAt = startedAt;
@@ -13864,6 +13883,7 @@ async function runConversationFromResumeCore(opts: {
       suppressMemoryCapture: true,
       internalContinuation: true,
       ...(continuationMemoryQuery !== undefined ? { memoryPrimerQuery: continuationMemoryQuery } : {}),
+      ...(opts.memoryPrimerQuery === undefined ? { memoryFocusLeads: true as const } : {}),
       sourceUserSeq: activeSourceUserSeq,
       runAttemptId: opts.runAttemptId,
       ...(opts.deferToolCallsLimitTerminal
@@ -14486,6 +14506,7 @@ async function runConversationFromResumeCore(opts: {
       suppressMemoryCapture: true,
       internalContinuation: true,
       ...(continuationMemoryQuery !== undefined ? { memoryPrimerQuery: continuationMemoryQuery } : {}),
+      ...(opts.memoryPrimerQuery === undefined ? { memoryFocusLeads: true as const } : {}),
       sourceUserSeq: activeSourceUserSeq,
       runAttemptId: opts.runAttemptId,
       infraRecoveryEpisodeId,

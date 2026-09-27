@@ -1152,3 +1152,80 @@ for (const [decision, ranker] of [['approve', 'on'], ['approve', 'off'], ['chang
     }
   });
 }
+
+// The chat dock answers a card with a change in the owner's own words: the
+// reply owns the approval and the resume agent is built with the reply as its
+// focus. The prompt's per-block memory ranked the resumed request by that
+// reply; the shared ranker must see it too, together with the parked request,
+// or memory that fits the change never reaches the model. Notes that share
+// the parked request's words are stored first, so memory ranked by the parked
+// request alone shows them instead. Regression: the resumed request's ranked
+// memory searched with the parked request's text only.
+const CHANGE_FACT = 'The Pemberton finance alias for board memos is pemberton-fin@example.test and it wants the subject prefixed BOARD.';
+test('a change answered in chat carries the memory that fits the change to the resumed request', async () => {
+  const { rememberFact } = await import('../../memory/facts.js');
+  for (let n = 1; n <= 14; n += 1) {
+    rememberFact({ kind: 'reference', importance: 5,
+      content: `Exact operation ${n} on the connected owner account performs validated content checks for batch ${n}.` });
+  }
+  rememberFact({ kind: 'reference', content: CHANGE_FACT });
+  const previous = { primer: process.env.CLEMMY_UNIFIED_TURN_PRIMER, recall: process.env.CLEMMY_UNIFIED_RECALL, embeddings: process.env.EMBEDDINGS_DISABLED };
+  process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'on';
+  process.env.CLEMMY_UNIFIED_RECALL = 'on';
+  process.env.EMBEDDINGS_DISABLED = 'true';
+  try {
+    const fixture = await directWriteFixture('work_call', 'opaque', 'resume-memory-chat-change', false, 'args_json', 1, {
+      operationId: 'MEMORY_RESUME_CHAT_CHANGE', schema: INPUT_SCHEMA, payloads: [ARGS],
+    });
+    assert.ok(fixture);
+    const sent: string[] = [];
+    const respond = fixture.model.getResponse.bind(fixture.model);
+    fixture.model.getResponse = async (request: any) => {
+      sent.push([request.systemInstructions ?? '', JSON.stringify(request.input ?? [])].join('\n'));
+      return respond(request);
+    };
+    const { runConversation, runConversationFromResume } = await import('./loop.js');
+    const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+    const agent = await fixture.useProductionAgent();
+    const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+      sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+      suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+    assert.equal(paused.status, 'awaiting_approval', JSON.stringify(paused));
+    const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+    assert.ok(approval);
+    const reply = 'No, address it to the Pemberton finance alias for board memos instead.';
+    const replySource = eventlog.appendEvent({ sessionId: fixture.session.id, turn: 2, role: 'user', type: 'user_input_received',
+      data: { text: reply, approvalId: approval.approvalId, decision: 'reject' } });
+    assert.equal(approvals.resolve(approval.approvalId, 'rejected', 'chat-dock-change').ok, true);
+    const before = sent.length;
+    eventlog.closeEventLog();
+    await runConversationFromResume({ sessionId: fixture.session.id,
+      approvalId: approval.approvalId, sourceUserSeq: replySource.seq,
+      decision: 'reject', changeRequest: reply,
+      resolver: 'chat-dock-change', turnEngine: 'host_v1',
+      makeRunner: () => fixture.runner as never, maxTurns: 3,
+      judgeFn: async () => ({ done: true, reason: 'fixture reply' }),
+      // The chat dock builds the resume agent with the reply as its focus.
+      buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+        userInput: reply,
+        sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+        ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+        model: fixture.model as never, allowToolJit: true,
+      }),
+    });
+    assert.equal(fixture.counts().providerCalls, 0, 'the rejected write was never sent');
+    const resumed = sent.slice(before);
+    assert.ok(resumed.length > 0, 'the resumed request reached the brain');
+    assert.ok(resumed[0]!.includes('pemberton-fin@example.test'), 'the memory that fits the change reaches the resumed request');
+    const primer = eventlog.listEvents(fixture.session.id, { types: ['turn_memory_primer'] })
+      .filter((event) => event.data.sourceUserSeq === fixture.source.seq).at(-1)?.data as Record<string, unknown> | undefined;
+    assert.equal(primer?.source, 'unified', 'the shared ranker ran for the resumed request');
+    const query = String(primer?.queryPreview ?? '');
+    assert.ok(query.startsWith(reply), `the owner's answer leads the ranking: ${query}`);
+    assert.ok(query.includes(fixture.prompt.slice(0, 40)), `the parked request is ranked by too: ${query}`);
+  } finally {
+    for (const [key, value] of [['CLEMMY_UNIFIED_TURN_PRIMER', previous.primer], ['CLEMMY_UNIFIED_RECALL', previous.recall], ['EMBEDDINGS_DISABLED', previous.embeddings]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
