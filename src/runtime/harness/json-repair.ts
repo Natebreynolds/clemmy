@@ -473,7 +473,7 @@ function largestEmbeddedStoredJson(raw: string): string | null {
 function leadingArrayObjects(
   raw: string,
   maxObjects: number,
-): { objects: Array<Record<string, unknown>>; complete: boolean } {
+): { objects: Array<Record<string, unknown>>; complete: boolean; open: number } {
   const isSpace = (char: string | undefined) => char === ' ' || char === '\n' || char === '\r' || char === '\t';
   for (let open = raw.indexOf('['); open >= 0; open = raw.indexOf('[', open + 1)) {
     let index = open + 1;
@@ -498,13 +498,37 @@ function leadingArrayObjects(
       objects.push(value as Record<string, unknown>);
       index = end + 1;
       while (isSpace(raw[index])) index += 1;
-      if (raw[index] === ']') return { objects, complete: true };
+      if (raw[index] === ']') return { objects, complete: true, open };
       if (raw[index] !== ',') break;
       index += 1;
     }
-    return { objects, complete: false };
+    return { objects, complete: false, open };
   }
-  return { objects: [], complete: false };
+  return { objects: [], complete: false, open: -1 };
+}
+
+/**
+ * The outermost JSON value that encloses `index`, if any: its opener, and
+ * whether it closes. String contents are skipped, so brackets inside strings
+ * never count.
+ */
+function enclosingJsonValue(raw: string, index: number): { opener: number; closed: boolean } | null {
+  const stack: number[] = [];
+  let inString = false;
+  for (let i = 0; i < index; i += 1) {
+    const ch = raw[i];
+    if (inString) {
+      if (ch === '\\') i += 1;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') stack.push(i);
+    else if ((ch === '}' || ch === ']') && stack.length > 0) stack.pop();
+  }
+  if (stack.length === 0) return null;
+  const opener = stack[0]!;
+  return { opener, closed: balancedJsonEnd(raw, opener) !== -1 };
 }
 
 function stdoutIsExactJson(stdout: string): boolean {
@@ -589,9 +613,16 @@ export function parseStoredToolOutputJson(
     // so far, and say they are a prefix. An array read to its closing bracket
     // is the whole array, not a prefix.
     const leading = leadingArrayObjects(shell.stdout, 200);
-    if (leading.complete) return { value: leading.objects, via: 'shell_embedded' };
     if (leading.objects.length > 0) {
-      return { value: leading.objects, via: 'shell_objects', partialArrayPrefix: true };
+      // An array inside a larger value that closes but did not parse is part
+      // of an invalid document: text, never its payload. Inside a value that
+      // never closes it is an honest prefix of a clipped result. Only an array
+      // that is itself a top-level value and closes is the whole array.
+      const enclosing = enclosingJsonValue(shell.stdout, leading.open);
+      if (!enclosing?.closed) {
+        if (leading.complete && enclosing === null) return { value: leading.objects, via: 'shell_embedded' };
+        return { value: leading.objects, via: 'shell_objects', partialArrayPrefix: true };
+      }
     }
     const scanned = largestEmbeddedStoredJson(shell.stdout);
     return scanned === null ? null : { value: JSON.parse(scanned) as unknown, via: 'shell_embedded' };

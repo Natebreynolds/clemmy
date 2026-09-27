@@ -478,3 +478,22 @@ test('stored output: a bracketed number in shell prose is not the shell payload'
   assert.equal(scalar.via, 'shell_stdout', 'stdout that is exactly JSON is taken whole, whatever its shape');
   assert.equal(scalar.value, 42);
 });
+
+test('stored output: an array inside an invalid shell document is never taken for the whole result', () => {
+  const shell = (stdout: string) => ['exit_code: 0', 'stdout:', stdout].join('\n');
+  // The envelope closes but does not parse (NaN): the array inside it is part
+  // of an invalid document, not the payload, whole or partial.
+  const invalid = parseStoredToolOutputJson(
+    shell('{"items":[{"id":1},{"id":2}],"total":NaN}'), { shell: parseShellToolOutput });
+  assert.equal(invalid, null, JSON.stringify(invalid));
+  // A clipped envelope never closes: the rows written so far are an honest prefix.
+  const clipped = parseStoredToolOutputJson(
+    shell('{"items":[{"id":1},{"id":2},{"id":3,"na'), { shell: parseShellToolOutput });
+  assert.deepEqual(clipped?.value, [{ id: 1 }, { id: 2 }]);
+  assert.equal(clipped?.partialArrayPrefix, true);
+  // A top-level array after prose that closes is the whole array.
+  const whole = parseStoredToolOutputJson(
+    shell('Fetched rows.\n[{"id":1},{"id":2}]'), { shell: parseShellToolOutput });
+  assert.deepEqual(whole?.value, [{ id: 1 }, { id: 2 }]);
+  assert.notEqual(whole?.partialArrayPrefix, true);
+});
