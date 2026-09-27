@@ -376,8 +376,8 @@ export interface HourStrip {
   /** What a bar's height measures: model calls, or runs on a day without any. */
   metric: 'modelCalls' | 'runs';
   totals: { runs: number; modelCalls: number; learned: number };
-  /** When fewer hours than the strip were measured (the journal began
-   *  inside it): the instant counting began. */
+  /** When the journal began inside the strip's 24 hours: the instant
+   *  counting began. */
   since: string | null;
 }
 
@@ -423,10 +423,10 @@ export function hourStrip(snapshot: MemoryWorkView | null, now: number): HourStr
     totals.learned += bar.learned;
     return bar;
   });
-  const first = placed[0]?.start;
-  const since = bars.length < HOUR_SLOTS && first !== undefined
-    ? measuredSinceWithin(snapshot, first, first + HOUR) ?? new Date(first).toISOString()
-    : null;
+  // The journal began inside the strip: say the span measured. Decided from
+  // when it began, never from how many bars came back (a read older than
+  // this clock loses its oldest hours too).
+  const since = measuredSinceWithin(snapshot, anchor + HOUR - HOUR_SLOTS * HOUR, anchor + HOUR);
   return { bars, slots: HOUR_SLOTS, metric, totals, since };
 }
 

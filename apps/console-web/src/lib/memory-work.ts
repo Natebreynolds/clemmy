@@ -517,12 +517,12 @@ function hourlyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: Activity
   const total = values.reduce((n, v) => n + v, 0);
   const learned = bars.reduce((n, b) => n + b.learned, 0);
   const lead = useCalls ? plural(total, 'model call', 'model calls') : plural(total, 'run', 'runs');
-  // Fewer hours than the strip: the journal began inside it. Say the span
-  // measured, not "the last 24 hours".
-  const first = placed[0]?.start;
-  const since = bars.length < HOURLY_SLOTS && first !== undefined
-    ? `since ${timeOfDay(measuredSinceWithin(snapshot, first, first + HOUR_MS) ?? first)}`
-    : 'in the last 24 hours';
+  // The journal began inside the strip: say the span measured, not "the
+  // last 24 hours". Decided from when it began, never from how many bars
+  // came back (a read older than this clock loses its oldest hours too).
+  const stripEnd = (Number.isFinite(anchor) ? anchor : new Date(now).setMinutes(0, 0, 0)) + HOUR_MS;
+  const began = measuredSinceWithin(snapshot, stripEnd - HOURLY_SLOTS * HOUR_MS, stripEnd);
+  const since = began !== null ? `since ${timeOfDay(began)}` : 'in the last 24 hours';
   const summary = empty
     ? `No memory work ${since}.`
     : `${lead}${learned ? ` · ${learned.toLocaleString()} learned` : ''} ${since}. Point at a bar for its hour.`;

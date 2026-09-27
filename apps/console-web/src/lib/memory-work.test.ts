@@ -510,6 +510,16 @@ test('a new journal\'s one hour and one day sit at the right of their strips, an
     hourly: [{ hourStart: iso(start.getTime() - 5 * HOUR), runs: 1, modelCalls: 2, learned: 0 }, { hourStart: iso(start.getTime()), runs: 0, modelCalls: 0, learned: 0 }],
   }), NOW);
   assert.deepEqual(gappy.hourly.map((b) => b.slot), [18, 23]);
+  assert.equal(gappy.hourlySummary, '2 model calls in the last 24 hours. Point at a bar for its hour.', 'missing hours are not a young journal');
+  // A three-day-old journal read two hours before this clock: its oldest
+  // hours fall off the strip, but counting did not begin inside it.
+  const readHour = new Date(NOW - 2 * HOUR); readHour.setMinutes(0, 0, 0);
+  const stale = memoryWorkViewModel(snapshot({
+    measuredSince: iso(NOW - 72 * HOUR),
+    hourly: Array.from({ length: 24 }, (_, i) => ({ hourStart: iso(readHour.getTime() - (23 - i) * HOUR), runs: 0, modelCalls: 0, learned: 0 })),
+  }), NOW);
+  assert.equal(stale.hourly.length, 22, 'fixture: the oldest hours fell off');
+  assert.equal(stale.hourlySummary, 'No memory work in the last 24 hours.');
   assert.equal(memoryWorkViewModel(snapshot({ measuredSince: null }), NOW).todayCaption, 'Counts since midnight');
 });
 

@@ -296,6 +296,23 @@ test('a new journal\'s one hour and one day are one slot each, not the whole str
   assert.equal(todaySinceText(view('resting', { measuredSince: null }), NOW), null, 'a full day needs no "since"');
 });
 
+test('"since" comes from when the journal began, not from how many hours came back', () => {
+  // A three-day-old journal read two hours before this clock (a cached read
+  // shown while the Mac is out of reach): its two oldest hours fall off the
+  // strip, but counting did not begin inside it.
+  const readAt = NOW - 2 * HOUR;
+  const readHour = new Date(readAt); readHour.setMinutes(0, 0, 0);
+  const hourly = Array.from({ length: 24 }, (_, i) => ({ hourStart: new Date(readHour.getTime() - (23 - i) * HOUR).toISOString(), runs: 0, modelCalls: 0, learned: 0 }));
+  const stale = hourStrip(view('resting', { measuredSince: new Date(NOW - 3 * 24 * HOUR).toISOString(), hourly }), NOW)!;
+  assert.equal(stale.bars.length, 22, 'fixture: the oldest hours fell off');
+  assert.equal(stale.since, null);
+  assert.equal(hourStripSummary(stale), 'Last 24 hours · no memory work');
+  // A journal whose start the daemon could not read sends only the hours
+  // with work; that is not a young journal either.
+  const sparse = hourStrip(view('resting', { measuredSince: null, hourly: hourly.slice(-3) }), NOW)!;
+  assert.equal(sparse.since, null);
+});
+
 // ───────────────────────────── runs and undo ─────────────────────────────
 
 test('a run reads in plain words with only what was measured', () => {
