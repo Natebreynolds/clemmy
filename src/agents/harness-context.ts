@@ -781,7 +781,8 @@ function countsPointer(scope: MemoryTailScope): string {
  *   - ranked: the ranker's hits (at most RANKED_TAIL_MAX_CHARS with one
  *     proven run that covers the request), then a counts pointer;
  *   - empty: the counts pointer alone;
- *   - no signal: whatever fallback primer the host built.
+ *   - no signal: the per-block rendering exactly as before, then whatever
+ *     fallback primer the host built, so a blind ranker costs nothing.
  * Session breadcrumbs (`sessionPointers`) ride along in every case.
  */
 export function renderTurnMemoryTail(
@@ -791,6 +792,20 @@ export function renderTurnMemoryTail(
 ): TurnMemoryTail {
   const parts: Array<{ section: string; tier: MemoryTier; text: string; refs?: MemoryManifestEntry['refs'] }> = [];
   if (signal.kind === 'no_signal') {
+    // A blind ranker must cost nothing: the per-block rendering stands in,
+    // ranked by the same objective the prompt used before, minus the
+    // policies the memory core already carries.
+    const acceptedInput = scope.focusInput ?? options.request ?? '';
+    const { scopedFocus, requestObjective } = resolveRequestObjective(scope.sessionId, acceptedInput);
+    for (const block of renderRequestRankedBlocks({
+      requestObjective,
+      acceptedInput,
+      scopedFocus,
+      includeRememberedToolChoices: scope.includeRememberedToolChoices,
+      omitCoreGroups: true,
+    })) {
+      if (block.text) parts.push({ section: block.title, tier: 'relevant', text: block.text });
+    }
     if (signal.primerText) parts.push({ section: 'Memory Primer', tier: 'relevant', text: signal.primerText });
   } else {
     if (signal.kind === 'ranked' && signal.text) {

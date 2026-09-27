@@ -11,6 +11,9 @@
  *     and requests;
  *   - request-ranked memory reaches the model once, as one tail built by the
  *     shared ranker, instead of per-block rankers plus a separate primer;
+ *   - when the ranker gives no signal (switched off, failing, out of time)
+ *     the per-block rendering stands in, and when it finds nothing only the
+ *     counts pointer is sent;
  * Each later tier adds its own pins below.
  */
 import assert from 'node:assert/strict';
@@ -48,6 +51,7 @@ const eventlog = await import('./eventlog.js');
 const { runConversation } = await import('./loop.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
 const { rememberFact } = await import('../../memory/facts.js');
+const turnPrimer = await import('../../memory/turn-primer.js');
 const semanticPorts = await import('../semantic-boundary/turn-semantic-port-registry.js');
 const {
   CACHE_BREAK_SENTINEL,
@@ -187,4 +191,77 @@ test('request-ranked memory arrives once, as one bounded tail from the shared ra
   const recorded = run.trace.filter((event) => event.type === 'turn_memory_primer').at(-1)?.data as Record<string, unknown>;
   assert.equal(recorded?.source, 'unified', 'the shared ranker produced it');
   assert.equal(recorded?.injected, true);
+});
+
+/** The system input item that carries memory from the turn's tail. */
+function memoryItem(frame: Frame, marker: string): string | undefined {
+  for (const item of frame.input) {
+    const row = item as { role?: string; content?: unknown };
+    const text = typeof row.content === 'string'
+      ? row.content
+      : Array.isArray(row.content) ? row.content.map((part) => (part as { text?: string }).text ?? '').join('') : '';
+    if (row.role === 'system' && text.includes(marker)) return text;
+  }
+  return undefined;
+}
+
+async function assertNoSignalFallback(label: string, arrange: () => void, restore: () => void) {
+  arrange();
+  let run: Awaited<ReturnType<typeof hostTurn>>;
+  try {
+    run = await hostTurn(label, 'When does the quokka ledger close each month?');
+  } finally {
+    restore();
+  }
+  const frame = run.frames[0]!;
+  const all = requestText(frame);
+  const fallback = memoryItem(frame, '## Persistent Facts');
+  assert.ok(fallback, `${label}: the per-block rendering stands in: ${all.slice(-2500)}`);
+  assert.match(fallback!, /quokka ledger lives in the finance workspace/, `${label}: ranked by the request as before`);
+  assert.doesNotMatch(fallback!, /owner@example\.com/, `${label}: the core's rule is not repeated`);
+  assert.equal(all.includes('## Relevant To This Request'), false, `${label}: no ranked tail without a ranker`);
+  const cacheBoundary = frame.system.indexOf(CACHE_BREAK_SENTINEL);
+  assert.equal(frame.system.slice(cacheBoundary).includes('## Persistent Facts'), false,
+    `${label}: the fallback rides with the tail, not in the instructions`);
+}
+
+test('no signal: with the ranker switched off, the per-block memory stands in', async () => {
+  const previous = process.env.CLEMMY_UNIFIED_TURN_PRIMER;
+  await assertNoSignalFallback('ranker-off',
+    () => { process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off'; },
+    () => { if (previous === undefined) delete process.env.CLEMMY_UNIFIED_TURN_PRIMER; else process.env.CLEMMY_UNIFIED_TURN_PRIMER = previous; });
+});
+
+test('no signal: when the ranker fails, the per-block memory stands in', async () => {
+  await assertNoSignalFallback('ranker-error',
+    () => turnPrimer._setUnifiedTurnPrimerRecallForTest(async () => { throw new Error('ranker unavailable'); }),
+    () => turnPrimer._setUnifiedTurnPrimerRecallForTest(null));
+});
+
+test('no signal: when the ranker runs out of time, the per-block memory stands in', async () => {
+  await assertNoSignalFallback('ranker-timeout',
+    () => turnPrimer._setUnifiedTurnPrimerRecallForTest(async () => await new Promise(() => { /* never answers */ })),
+    () => turnPrimer._setUnifiedTurnPrimerRecallForTest(null));
+});
+
+test('an empty ranked result sends only the counts pointer', async () => {
+  turnPrimer._setUnifiedTurnPrimerRecallForTest(async (objective) => ({
+    objective, hits: [], perStore: {}, answerability: 'insufficient', purpose: 'ambient',
+    diagnostics: { candidates: 0, stores: [], elapsedMs: 1 },
+  }));
+  let run: Awaited<ReturnType<typeof hostTurn>>;
+  try {
+    run = await hostTurn('ranker-empty', 'When does the quokka ledger close each month?');
+  } finally {
+    turnPrimer._setUnifiedTurnPrimerRecallForTest(null);
+  }
+  const frame = run.frames[0]!;
+  const pointer = memoryItem(frame, '_Memory on file beyond this view');
+  assert.ok(pointer, `the pointer is sent: ${requestText(frame).slice(-2000)}`);
+  assert.match(pointer!, /^_Memory on file beyond this view: \d+ facts?[^\n]*memory_recall_all searches all of it for this request\._$/,
+    'the pointer alone: nothing ranked, no per-block rendering');
+  const all = requestText(frame);
+  for (const absent of ['## Relevant To This Request', '## Persistent Facts', '[MEMORY PRIMER]', 'quokka ledger lives']) {
+    assert.equal(all.includes(absent), false, `nothing ranked rides the empty turn: ${absent}`);
+  }
 });
