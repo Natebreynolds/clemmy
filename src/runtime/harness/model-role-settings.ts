@@ -6,11 +6,12 @@ import { readDurableBindings, type ModelRole, type RoleBinding } from './model-r
 
 /** The roles a settings door binds to a model. The brain has its own door (the
  * active-brain switch), because choosing it also moves the auth mode and the
- * provider slots. */
+ * provider slots. Memory is bound only from Settings (desktop or phone); the
+ * chat tool stays worker-only. */
 export type BindableModelRole = Exclude<ModelRole, 'brain'>;
 
 export function isBindableModelRole(value: unknown): value is BindableModelRole {
-  return value === 'worker' || value === 'judge' || value === 'writer';
+  return value === 'worker' || value === 'judge' || value === 'writer' || value === 'memory';
 }
 
 export type ModelRoleSettingErrorCode =
@@ -55,6 +56,11 @@ export function persistModelRoleSetting(change: ModelRoleSettingChange): RoleBin
   const slug = whenIntent ? slugifyIntent(whenIntent) : '';
   if (whenIntent && !slug) {
     throw new ModelRoleSettingError('INVALID_INTENT', 'whenIntent is empty after normalization');
+  }
+  // Memory work reads only the role-wide pick, so a per-kind memory rule would
+  // be saved, listed and never used.
+  if (role === 'memory' && slug) {
+    throw new ModelRoleSettingError('INVALID_INTENT', 'The memory model is chosen for all memory work, not per kind of work.');
   }
   const clear = change.clear === true || !modelId;
   if (!clear) {

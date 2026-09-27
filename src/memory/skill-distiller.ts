@@ -17,8 +17,9 @@
 import pino from 'pino';
 import { z } from 'zod';
 import { Agent, Runner } from '@openai/agents';
+import type { Model } from '@openai/agents-core';
 import path from 'node:path';
-import { getRuntimeEnv, MODELS } from '../config.js';
+import { getRuntimeEnv } from '../config.js';
 import { withFileLock } from '../runtime/atomic-json.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { isPackageRunnerMaterializationFailure } from '../runtime/shell-execution-outcome.js';
@@ -39,6 +40,17 @@ import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
 import { publishLearnedSkillOffer } from './skill-proactive-offer.js';
 import { consolidateFact } from './reflection.js';
+import {
+  memoryJobFailed,
+  memoryJobRoute,
+  memoryJobUnavailableProblem,
+  memoryWorkSourceForSession,
+  noteMemoryModelFailure,
+  runMemoryModelJob,
+  type MemoryJobNote,
+} from './memory-job-context.js';
+import type { MemoryJobOutcome } from './memory-work-journal.js';
+import type { MemoryWorkSource } from './memory-work-types.js';
 import { recordMemoryEpisode } from './temporal-memory.js';
 
 const logger = pino({ name: 'clementine-next.skill-distiller' });
@@ -419,10 +431,12 @@ const DistilledSchema = z.object({
 });
 export type DistilledSkill = z.infer<typeof DistilledSchema>;
 
-function buildDistillerAgent(): Agent<unknown> {
+/** The distiller runs on the "Keeps your memory" route: the owner's pick when
+ *  one is chosen, else today's fast-tier model string. */
+function buildDistillerAgent(model: Model | string): Agent<unknown> {
   return new Agent({
     name: 'SkillDistiller',
-    model: MODELS.fast,
+    model,
     modelSettings: { reasoning: { effort: 'low' } },
     instructions: [
       'You distill a REUSABLE skill from a successful run. Output a SKILL.md draft that lets the agent repeat this capability next time without re-discovering it.',
@@ -679,6 +693,15 @@ async function claimDistilledCapability(input: DistilledCapabilityClaim): Promis
   });
 }
 
+/** Test-only: the distillation core as the `skills` memory job runs it. */
+export async function _testOnly_distillFromCalls(
+  calls: TraceToolCall[],
+  context: SkillDistillContext & { learningReceipt: LearningReceipt },
+  source: MemoryWorkSource | null = null,
+): Promise<DistillResult> {
+  return distillFromCalls(calls, context, new Map(), source);
+}
+
 export async function _testOnly_claimDistilledCapability(
   input: DistilledCapabilityClaim,
 ): Promise<DistillResult> {
@@ -725,26 +748,56 @@ export async function distillSkillFromSession(
       if (!novelty.novel) return { status: 'skipped_not_novel', detail: novelty.reason };
     }
     if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
-    return distillFromCalls(calls, verifiedContext, returnsByCallId);
+    return distillFromCalls(calls, verifiedContext, returnsByCallId, skillSource(sessionId, context.origin.kind));
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err, sessionId }, 'skill distillation failed');
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
   }
 }
 
-/** The LLM + dedup + write core, shared by the chat and workflow entry points.
- *  Assumes the caller already passed the novelty gate (or force). */
+/** Where a distilled run came from: its conversation or workflow; the owner
+ *  when they asked for the skill themselves. */
+function skillSource(sessionId: string, origin: SkillDistillContext['origin']['kind']): MemoryWorkSource | null {
+  if (origin === 'manual') return { kind: 'owner', sessionId };
+  return memoryWorkSourceForSession(sessionId, { kind: origin === 'workflow' ? 'workflow' : 'conversation', sessionId });
+}
+
+/** The skills job's record of one distillation: a skill written, or why it
+ *  did not finish (the model's problem when known). */
+function skillsOutcome(result: DistillResult, note: MemoryJobNote): MemoryJobOutcome {
+  if (result.status === 'written') return { outcome: 'ok', produced: { skills: 1 } };
+  if (result.status !== 'failed') return { outcome: 'nothing_new' };
+  return note.requestedModelId === null
+    ? memoryJobFailed(note, {}, memoryJobUnavailableProblem('skills'))
+    : memoryJobFailed(note);
+}
+
+/** The LLM + dedup + write core, shared by the chat and workflow entry points,
+ *  run as the `skills` memory job. Assumes the caller already passed the
+ *  novelty gate (or force). */
 async function distillFromCalls(
   calls: TraceToolCall[],
   context: SkillDistillContext & { learningReceipt: LearningReceipt },
   returnsByCallId: Map<string, string> = new Map(),
+  source: MemoryWorkSource | null = null,
+): Promise<DistillResult> {
+  if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
+  return runMemoryModelJob('skills', { source }, () => distillSkillDraft(calls, context, returnsByCallId), skillsOutcome);
+}
+
+async function distillSkillDraft(
+  calls: TraceToolCall[],
+  context: SkillDistillContext & { learningReceipt: LearningReceipt },
+  returnsByCallId: Map<string, string>,
 ): Promise<DistillResult> {
   try {
-    if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
-
+    // A chosen memory model that cannot be served skips this run; nothing
+    // stands in for it.
+    const route = memoryJobRoute('skills');
+    if (!route) return { status: 'failed', detail: 'the memory model is unavailable right now' };
     const runner = new Runner({ workflowName: 'clementine-skill-distiller' });
     const result = await runner.run(
-      buildDistillerAgent(),
+      buildDistillerAgent(route.model),
       renderDistillerPrompt({ objective: context.objective, evidence: context.evidence ?? '', calls }),
       { maxTurns: 1 },
     );
@@ -799,6 +852,7 @@ async function distillFromCalls(
     logger.info({ name, origin: context.origin.kind }, 'distilled a draft skill');
     return { status: 'written', name };
   } catch (err) {
+    noteMemoryModelFailure(err);
     logger.warn({ err: err instanceof Error ? err.message : err, origin: context.origin.kind }, 'skill distillation failed');
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
   }
@@ -847,7 +901,7 @@ export async function distillSkillFromSessions(
       evidence: context.evidence ?? '',
       origin: { kind: 'workflow', sourceId: context.sourceId },
       learningReceipt,
-    }, returnsByCallId);
+    }, returnsByCallId, sessionIds[0] ? skillSource(sessionIds[0], 'workflow') : { kind: 'workflow' });
   } catch (err) {
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
   }

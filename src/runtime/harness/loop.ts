@@ -107,7 +107,14 @@ import {
 import { buildCanonicalContextPack } from './canonical-context.js';
 import { renderCapabilityResolutionForContext } from './capability-resolution.js';
 import { discoveryGovernor } from './discovery-governor.js';
-import { measureToolPromptSurface, recordPromptComposition, summarizePromptComposition } from './prompt-composition.js';
+import {
+  measureAdvertisedToolSurface,
+  measureToolPromptSurface,
+  promptComponentsFromComposition,
+  recordPromptComposition,
+  summarizePromptComposition,
+  type PromptReadingPublisher,
+} from './prompt-composition.js';
 import {
   renderTurnOpennessForContext,
   resolveTurnOpenness,
@@ -416,7 +423,8 @@ import {
   type WorkflowOriginGroupClosedBatchReceipt,
 } from '../../execution/workflow-origin-group.js';
 import { workflowOriginReplyTargetForSource } from '../workflow-origin-authority.js';
-import { turnAnchorDigest } from './byo-prompt-layout.js';
+import { turnAnchorDigest, turnAnchorItem } from './byo-prompt-layout.js';
+import { nextModelRequestOrdinal } from './model-request-provenance.js';
 import {
   exactOriginDeliveryTargetDigest,
   sameExactOriginDeliveryTarget,
@@ -11323,16 +11331,51 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const inFlightCompaction = createInFlightCompactionState();
   let archiveReferences: Map<string, ArchivedTaskMessageReference> | undefined;
   const archivedMessages = new Map<string, ArchivedTaskMessageReference>();
+  const toolComponentsOf = (surface: ReturnType<typeof measureAdvertisedToolSurface>) => ({
+    ...(surface.measuredToolSchemaTokens > 0 ? { toolSchemas: surface.measuredToolSchemaTokens } : {}),
+    ...(surface.deferredToolIndexTokens > 0 ? { deferredToolIndex: surface.deferredToolIndexTokens } : {}),
+  });
+  // The turn's tool surface as the host would advertise it, for readings
+  // without a runner wire. Each request's reading below prefers the exact wire.
   const toolSurface = measureToolPromptSurface(options.agent.tools ?? []);
-  const toolPromptComponents = {
-    ...(toolSurface.measuredToolSchemaTokens > 0 ? { toolSchemas: toolSurface.measuredToolSchemaTokens } : {}),
-    ...(toolSurface.deferredToolIndexTokens > 0 ? { deferredToolIndex: toolSurface.deferredToolIndexTokens } : {}),
+  // The in-flight compaction and archive budget keeps its own estimate of the
+  // agent's tools; the meter's reading does not decide when history shrinks.
+  const agentToolBudgetTokens = toolSurface.compactionBudgetTokens;
+  // Readings count requests within the accepted source, so each one joins the
+  // request's provenance row by ordinal. A host re-entry resumes the count
+  // from the provenance the source already has.
+  let compositionOrdinal = 0;
+  const nextCompositionOrdinal = (): number => {
+    let recorded = 1;
+    if (sourceUserSeq) {
+      try { recorded = nextModelRequestOrdinal(options.sessionId, sourceUserSeq); } catch { recorded = 1; }
+    }
+    compositionOrdinal = Math.max(compositionOrdinal + 1, recorded);
+    return compositionOrdinal;
   };
   const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
+    advertisedTools?: readonly unknown[];
+    /** A sender that decides after this filter what it actually sends takes
+     *  the reading's publisher and publishes once it has decided. Without it,
+     *  the reading is published here. */
+    holdReading?: (publish: PromptReadingPublisher) => void;
   }) => {
     let modelData = args.modelData;
+    // Estimated tokens per component, measured BEFORE any per-round append so
+    // history is only the transcript; every appended item is its own entry.
     let promptComponents: Record<string, number> = {};
+    // The text behind each separately measured item, for bytes and digests.
+    const composedTexts: {
+      contextPacket?: string; memoryPrimer?: string; provenOperation?: string;
+      retryContext?: string; currentMessage?: string;
+    } = {};
+    // What this request actually advertises: retained tools included, tools
+    // left off the wire excluded, schemas as compacted for the provider.
+    const requestToolSurface = Array.isArray(args.advertisedTools)
+      ? measureAdvertisedToolSurface(args.advertisedTools)
+      : toolSurface;
+    const requestToolComponents = toolComponentsOf(requestToolSurface);
     const publishPromptComponents = <T extends { input: AgentInputItem[]; instructions?: string }>(value: T): T => {
       try {
         const projectedExecuteInput = executeHistoryProjection?.(value.input);
@@ -11392,8 +11435,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             : value.input;
           const outgoingInputTokens = estimateInputTokens(workingInput)
             + estimateTokens(value.instructions)
-            + (toolPromptComponents.toolSchemas ?? 0)
-            + (toolPromptComponents.deferredToolIndex ?? 0);
+            + agentToolBudgetTokens;
           const { thresholds, capacityPressure } = capacityAwareCompactionThresholds(
             normalThresholds, turnInputBudgetTokens, outgoingInputTokens,
           );
@@ -11442,7 +11484,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
             }
           }
           const overhead = estimateTokens(value.instructions)
-            + (toolPromptComponents.toolSchemas ?? 0) + (toolPromptComponents.deferredToolIndex ?? 0);
+            + agentToolBudgetTokens;
           const targetHistoryTokens = Math.max(0, Math.floor(turnInputBudgetTokens * 0.9) - overhead);
           if (sourceUserSeq && estimateInputTokens(value.input) > targetHistoryTokens) {
             archiveReferences ??= archivedTaskMessageReferences(options.sessionId, sourceUserSeq);
@@ -11464,58 +11506,87 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 
       const harnessContext = harnessRunContextStorage.getStore();
       if (harnessContext) {
-        harnessContext.promptComponents = Object.keys(promptComponents).length > 0
-          ? { ...promptComponents }
-          : {
-              instructions: estimateTokens(value.instructions),
-              history: estimateInputTokens(value.input),
-              ...toolPromptComponents,
-            };
         // This filter appends only system items, and single-request host
         // guidance is appended after it, so the last user message here is the
         // one that opened the turn.
         harnessContext.modelTurnAnchor = turnAnchorDigest(value.input);
       }
-      // Composition as CACHEABILITY (parity with the Claude lane): per-step
-      // prompt cost is paid once per step and ~100x per task, and the lever is
-      // keeping the large part invariant rather than making everything small.
-      // Observation only — this reads what is already being sent.
-      recordPromptComposition(options.sessionId, 'host', summarizePromptComposition({
-        toolNames: toolSurface.toolNames,
-        toolSchemaCosts: toolSurface.toolSchemaCosts,
-        instructions: value.instructions ?? '',
-        // The MEASURED costs. This call previously passed neither tools nor
-        // history, so a wire carrying 9,198 tokens was recorded as 6,850 — the
-        // meter was off by 34% of its own figure on the very turn used to
-        // justify a prompt trim. The measured components were already computed
-        // two lines up and thrown away for this event.
-        ...(typeof toolPromptComponents.toolSchemas === 'number'
-          ? { measuredToolSchemaTokens: toolPromptComponents.toolSchemas }
-          : {}),
-        ...(typeof toolPromptComponents.deferredToolIndex === 'number'
-          ? { deferredToolIndexTokens: toolPromptComponents.deferredToolIndex }
-          : {}),
-        measuredHistoryTokens: estimateInputTokens(value.input),
-        contextPacket: [
-          contextPacket.text,
-          opennessBlock,
-          sameTurnPreamble
-            ? `[pre-execution opening already delivered for this exact request]\n${sameTurnPreamble}\nContinue the requested work now; do not repeat this opening or ask for generic permission.`
-            : '',
-          options.continuationSteer,
-        ]
-          .filter(Boolean).join('\n\n'),
-        currentMessage: typeof options.input === 'string' ? options.input : '',
-      }), sourceUserSeq);
+      const composed = value;
+      let published = false;
+      const publish: PromptReadingPublisher = (replaced) => {
+        if (published) return;
+        published = true;
+        publishReading(composed, replaced);
+      };
+      if (args.holdReading) args.holdReading(publish);
+      else publish();
       return value;
+    };
+    // Composition as CACHEABILITY (parity with the Claude lane): per-step
+    // prompt cost is paid once per step and ~100x per task, and the lever is
+    // keeping the large part invariant rather than making everything small.
+    // Observation only — this reads what is being sent. One summary feeds both
+    // the composition event and the ledger's prompt components. A step that
+    // sends another request in place of the composed one (its own input and
+    // instructions, its own tool wire) is measured as that request.
+    const publishReading = (
+      value: { input: AgentInputItem[]; instructions?: string },
+      replaced?: Parameters<PromptReadingPublisher>[0],
+    ): void => {
+      const replacedSurface = replaced ? measureAdvertisedToolSurface(replaced.advertisedTools) : undefined;
+      const measured = Object.keys(promptComponents).length > 0;
+      const composition = replaced && replacedSurface ? summarizePromptComposition({
+        toolNames: replacedSurface.toolNames,
+        toolSchemaCosts: replacedSurface.toolSchemaCosts,
+        instructions: replaced.instructions ?? '',
+        measuredToolSchemaTokens: replacedSurface.measuredToolSchemaTokens,
+        measuredHistoryTokens: estimateInputTokens(replaced.input as AgentInputItem[]),
+      }) : summarizePromptComposition({
+        toolNames: requestToolSurface.toolNames,
+        toolSchemaCosts: requestToolSurface.toolSchemaCosts,
+        instructions: value.instructions ?? '',
+        // The measured tool schema and history costs, never an estimate from
+        // names: a reading that leaves either out under-reports the request.
+        measuredToolSchemaTokens: requestToolSurface.measuredToolSchemaTokens,
+        ...(typeof requestToolComponents.deferredToolIndex === 'number'
+          ? { deferredToolIndexTokens: requestToolComponents.deferredToolIndex }
+          : {}),
+        measuredHistoryTokens: measured && typeof promptComponents.history === 'number'
+          ? promptComponents.history
+          : estimateInputTokens(value.input),
+        ...(measured ? {
+          ...composedTexts,
+          measuredItemTokens: {
+            contextPacket: promptComponents.contextPacket,
+            memoryPrimer: promptComponents.memoryPrimer,
+            provenOperation: promptComponents.provenOperation,
+            retryContext: promptComponents.retryContext,
+            currentMessage: promptComponents.currentMessage,
+          },
+        } : {}),
+      });
+      const harnessContext = harnessRunContextStorage.getStore();
+      if (harnessContext) harnessContext.promptComponents = promptComponentsFromComposition(composition);
+      const model = replaced ? replaced.model : routedModelIdForBudget;
+      recordPromptComposition(options.sessionId, 'host', composition, sourceUserSeq, {
+        requestOrdinal: nextCompositionOrdinal(),
+        ...(model ? { model } : {}),
+      });
     };
     try {
 
+      // The turn's opening user message is its own entry, not history.
+      const openingUserItem = turnAnchorItem(modelData.input);
+      const currentMessageTokens = openingUserItem ? estimateInputTokens([openingUserItem]) : 0;
       promptComponents = {
         instructions: estimateTokens(modelData.instructions),
-        history: estimateInputTokens(modelData.input),
-        ...toolPromptComponents,
+        history: Math.max(0, estimateInputTokens(modelData.input) - currentMessageTokens),
+        ...(currentMessageTokens > 0 ? { currentMessage: currentMessageTokens } : {}),
+        ...requestToolComponents,
       };
+      if (currentMessageTokens > 0) {
+        composedTexts.currentMessage = typeof options.input === 'string' ? options.input : '';
+      }
 
       const contextPacketText = [
         contextPacket.text,
@@ -11526,37 +11597,20 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         options.continuationSteer,
       ]
         .filter(Boolean).join('\n\n');
-      if (contextPacketText) {
-        promptComponents.contextPacket = estimateTokens(contextPacketText);
-        modelData = {
-          input: [
-            ...modelData.input,
-            { role: 'system', content: contextPacketText } as AgentInputItem,
-          ],
-          instructions: modelData.instructions,
-        };
-      }
-
-      if (turnMemoryPrimer.text) {
-        promptComponents.memoryPrimer = estimateTokens(turnMemoryPrimer.text);
-        modelData = {
-          input: [
-            ...modelData.input,
-            { role: 'system', content: turnMemoryPrimer.text } as AgentInputItem,
-          ],
-          instructions: modelData.instructions,
-        };
-      }
-      if (options.provenOperationText) {
-        promptComponents.provenOperation = estimateTokens(options.provenOperationText);
-        modelData = {
-          input: [
-            ...modelData.input,
-            { role: 'system', content: options.provenOperationText } as AgentInputItem,
-          ],
-          instructions: modelData.instructions,
-        };
-      }
+      // Each appended system item is measured as the item it rides as, so the
+      // entries add up to the composed input without counting anything twice.
+      const appendSystemItem = (
+        component: 'contextPacket' | 'memoryPrimer' | 'provenOperation',
+        text: string,
+      ): void => {
+        const item = { role: 'system', content: text } as AgentInputItem;
+        promptComponents[component] = estimateInputTokens([item]);
+        composedTexts[component] = text;
+        modelData = { input: [...modelData.input, item], instructions: modelData.instructions };
+      };
+      if (contextPacketText) appendSystemItem('contextPacket', contextPacketText);
+      if (turnMemoryPrimer.text) appendSystemItem('memoryPrimer', turnMemoryPrimer.text);
+      if (options.provenOperationText) appendSystemItem('provenOperation', options.provenOperationText);
 
       if ((getRuntimeEnv('CLEMMY_RETRY_CONTEXT_INJECT', 'on') ?? 'on').toLowerCase() === 'off') {
         return publishPromptComponents(modelData);
@@ -11592,6 +11646,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
           `\`ask_user_question\` to clarify — do not silently change resources or scope.`,
       } as AgentInputItem;
       promptComponents.retryContext = estimateInputTokens([retryMsg]);
+      composedTexts.retryContext = String((retryMsg as { content?: unknown }).content ?? '');
       return publishPromptComponents({
         input: [...modelData.input, retryMsg],
         instructions: modelData.instructions,

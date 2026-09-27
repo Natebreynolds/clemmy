@@ -1,17 +1,13 @@
 /**
  * Work episodes: what Clementine finished, kept like a cache.
  *
- * A finished plan or a reviewed answer left no trace a later chat could find.
- * Live 2026-09-26: the same request ("scrape 10 DUI law firms in Austin") was
- * planned four times, 35–40 investigation calls each, because a plan turn
- * never records what it learned; three audits of the same site were fetched
- * again from a fresh chat because the earlier results were in another
- * session. Executed runs already leave a run strategy; plans and answers now
- * leave an episode in memory, which the turn-start primer already surfaces
- * with its age.
+ * A finished plan or a reviewed answer left no trace a later chat could find,
+ * so the same request was investigated again from scratch and results that
+ * lived in another session were fetched again. Executed runs already leave a
+ * run strategy; plans and answers now leave an episode in memory, which recall
+ * surfaces with its age.
  *
- * Cache mentality (owner, 2026-09-26): everything is tracked, and everything
- * decays. A work episode is FRESH for a few days (its handles are offered for
+ * Cache mentality: everything is tracked, and everything decays. A work episode is FRESH for a few days (its handles are offered for
  * reuse, with the age shown), then SUMMARIZED (one line of what was done,
  * handles gone), then DELETED. The sweep runs with the other retention passes.
  */

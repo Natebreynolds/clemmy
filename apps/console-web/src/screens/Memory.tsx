@@ -40,6 +40,7 @@ import { HealthStrip } from '@/components/memory/HealthStrip';
 import { ReviewPane } from '@/components/memory/ReviewPane';
 import { LearnedPane } from '@/components/memory/LearnedPane';
 import { MemoryDetail } from '@/components/memory/MemoryDetail';
+import { MemoryWorkPanel } from '@/components/memory/work/MemoryWorkPanel';
 import type { MemoryStore } from '@/lib/memory';
 
 type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources';
@@ -163,6 +164,7 @@ export function Memory() {
             )
           ) : (
             <div className="space-y-5">
+              <MemoryWorkPanel />
               <HealthStrip health={health.data} review={counts.review} duplicates={counts.duplicates} unavailable={health.isError && !health.data} />
               <div className="grid gap-4 lg:grid-cols-2">
                 <ReviewPane onCounts={(n) => { if (n.review !== counts.review || n.duplicates !== counts.duplicates) setCounts(n); }} />

@@ -7,7 +7,8 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { discoveryNavigation } from './discovered-tool-context.js';
-import { DEFAULT_TOOL_RESULT_MAX_CHARS, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
+import { answererViewBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
+import { harnessRunContextStorage } from './brackets.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
 import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispatch-ledger.js';
@@ -218,27 +219,30 @@ export function completionReadPresentation(rawPayloadJson: string): { text: stri
 }
 
 /** What the answerer saw of a result is what it could have based a claim on.
- * A result over the per-result bound reached the model as a bounded,
+ * A result over its presentation budget reached the model as a bounded,
  * structure-aware view — the head and tail of text, whole records and true
  * counts of JSON — and the rest only through a later read. A reviewer is shown
- * that same view and told when it is bounded, so a claim resting on unseen
- * content, including a claim that something is absent, reads as unverified
- * instead of being checked against bytes the answerer never had. */
+ * that same view, bounded through the SAME presentation-budget resolver the
+ * answerer's invocation used (the tool, its arguments and the routed window;
+ * answererViewBudgetFor), and told when it is bounded, so a claim resting on unseen content, including
+ * a claim that something is absent, reads as unverified instead of being
+ * checked against bytes the answerer never had. */
 function answererView(
   text: string,
   toolName: string,
   callId: string,
   reference: string,
+  maxChars: number,
 ): { text: string; bounded: boolean } {
-  if (text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS) return { text, bounded: false };
+  if (text.length <= maxChars) return { text, bounded: false };
   // The same resource-id index the answerer's view carried above its body.
   const idIndex = extractResourceIdIndex(text);
   const structured = compactStructuredJsonToolOutput(text, {
-    maxChars: DEFAULT_TOOL_RESULT_MAX_CHARS, toolName, callId, exactOutputReceipt: reference,
+    maxChars, toolName, callId, exactOutputReceipt: reference,
     resourceIndex: idIndex || undefined,
   });
   if (structured) return { text: structured, bounded: true };
-  const digest = digestToolOutput(densifyMarkdownForModelHead(text), { maxChars: DEFAULT_TOOL_RESULT_MAX_CHARS, toolName, callId });
+  const digest = digestToolOutput(densifyMarkdownForModelHead(text), { maxChars, toolName, callId });
   return { text: idIndex ? `${idIndex}\n\n${digest}` : digest, bounded: true };
 }
 
@@ -475,7 +479,13 @@ export function sourceSettledReadEvidence(input: {
   /** Parent completion can inspect already-settled writes. This is evidence,
    * never permission to execute again or proof of later scheduled effects. */
   includeWriteReceipts?: boolean;
+  /** The model the answerer's results were presented to. Defaults to the
+   * active run's routed model. */
+  routedModelId?: string | null;
 }, sharedContent: Map<string, string> = new Map()): CompletionReadEvidence {
+  const routedModelId = input.routedModelId !== undefined
+    ? input.routedModelId
+    : harnessRunContextStorage.getStore()?.routedModelId;
   try {
     const rows = openEventLog().prepare(`
       SELECT s.rowid AS settlementIndex, s.logical_tool_call_id AS callId, l.tool_name AS toolName,
@@ -662,7 +672,8 @@ export function sourceSettledReadEvidence(input: {
       const view = evidenceKind === 'retained_projection'
         ? { text: shown.text, bounded: false }
         : answererView(shown.text, row.toolName, row.callId,
-          `[review evidence: complete result handle=${value.resultHandleId} sha256=${value.rawPayloadSha256}]`);
+          `[review evidence: complete result handle=${value.resultHandleId} sha256=${value.rawPayloadSha256}]`,
+          answererViewBudgetFor({ toolName: row.toolName, args: requestArgs, routedModelId }));
       const bytes = Buffer.from(view.text, 'utf8');
       results.push({ ...base, ...projectedSource, status: 'verified', resultHandleId: value.resultHandleId,
         physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,
@@ -689,7 +700,9 @@ export function sourceSettledReadEvidence(input: {
     let throughSettlementIndex = rows.at(-1)?.settlementIndex ?? input.afterSettlementIndex ?? 0;
     if (input.includeWorkerResults !== false) {
       for (const worker of sourceWorkerEvidenceScopes(input)) {
-        const evidence = sourceSettledReadEvidence({ ...input, ...worker, includeWorkerResults: false, includeWriteReceipts: false }, seenContent);
+        // A worker's results were presented to the model that worker ran.
+        const evidence = sourceSettledReadEvidence({ ...input, ...worker, includeWorkerResults: false, includeWriteReceipts: false,
+          routedModelId: worker.executedRoute?.model ?? routedModelId }, seenContent);
         evidenceAvailable = evidenceAvailable && evidence.evidenceAvailable;
         throughSettlementIndex = Math.max(throughSettlementIndex, evidence.throughSettlementIndex ?? 0);
         results.push(...evidence.results);

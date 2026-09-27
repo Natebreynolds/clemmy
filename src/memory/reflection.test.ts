@@ -15,7 +15,7 @@
  * facts.test.ts roundtrip — see also harness/compaction.test.ts for the
  * tool_outputs storage that recall_tool_result reads from.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
@@ -95,7 +95,11 @@ test.afterEach(() => {
   _testOnly_resetReflectionScopeBudgets();
 });
 
-test('reflection extractor binds to the active provider instead of a gpt-shaped global model string', () => {
+test('reflection extractor binds to the active provider instead of a gpt-shaped global model string', (t) => {
+  // Signed in: a route whose provider is signed out resolves nothing.
+  const claudeAuth = path.join(TMP_HOME, 'state', 'claude-auth.json');
+  writeFileSync(claudeAuth, JSON.stringify({ accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 }));
+  t.after(() => rmSync(claudeAuth, { force: true }));
   const common = {
     CLEMMY_JUDGE_CROSS_FAMILY: 'off',
     CLEMMY_MODEL_ROLES: undefined,
@@ -474,6 +478,29 @@ test('reflectOnToolReturn: disabled via CLEMMY_REFLECTION=off', async () => {
   } finally {
     if (prev === undefined) delete process.env.CLEMMY_REFLECTION;
     else process.env.CLEMMY_REFLECTION = prev;
+  }
+});
+
+test('reflectOnToolReturn: disabled by CLEMMY_REFLECTION=off in the env file too', async () => {
+  // The nightly patterns tick reads the env file; the extractor must obey
+  // the same switch, not only one that reached the process environment.
+  resetMemoryDb();
+  const { BASE_DIR } = await import('../config.js');
+  const envFile = path.join(BASE_DIR, '.env');
+  const prev = process.env.CLEMMY_REFLECTION;
+  delete process.env.CLEMMY_REFLECTION;
+  writeFileSync(envFile, 'CLEMMY_REFLECTION=off\n');
+  try {
+    const result = await reflectOnToolReturn({
+      sessionId: 'sess-disabled-env',
+      callId: 'call_env',
+      tool: 't',
+      output: 'x'.repeat(REFLECTION_MIN_CONTENT_CHARS + 1),
+    });
+    assert.equal(result.skipped, 'disabled');
+  } finally {
+    rmSync(envFile, { force: true });
+    if (prev !== undefined) process.env.CLEMMY_REFLECTION = prev;
   }
 });
 

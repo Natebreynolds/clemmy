@@ -196,8 +196,21 @@ export interface ModelCapability {
   /** True when the model accepts a reasoning-effort knob at all. */
   supportsEffort: boolean;
   /** Generic harness tier -> provider wire value (null = omit / use default).
-   *  For anthropic_messages this is the `output_config.effort` string. */
+   *  For anthropic_messages this is the `output_config.effort` string. An
+   *  openai_completions wire declares `completionsEffortValues` instead. */
   effortMap: Record<ReasoningEffort, string | null>;
+  /** openai_completions only: the `reasoning_effort` values this model accepts,
+   *  cheapest first, each a rung of the shared effort ladder. Absent = the wire
+   *  does not take the field, so the compat relax strips it. Declaring it is
+   *  the whole opt-in: `completionsReasoningEffort` places the harness tier on
+   *  these values for any model that declares them. */
+  completionsEffortValues?: readonly string[];
+  /** openai_completions only: the model's reasoning control is a binary
+   *  `thinking` switch (`{ type: 'enabled' | 'disabled' }`) rather than
+   *  `reasoning_effort`. Absent = the wire does not take the field (an unknown
+   *  field 400s these backends). Declaring it is the whole opt-in: the compat
+   *  relax sets the switch for any model that declares it. */
+  completionsThinkingSwitch?: boolean;
   /** How effort is delivered. 'effort' = output_config.effort (Anthropic GA);
    *  'budget_tokens' = legacy thinking budget (older Sonnet only); 'none'. */
   thinkingMode: ThinkingMode;
@@ -266,48 +279,50 @@ interface RegistryRow {
   cap: ModelCapability;
 }
 
+// One capability shared by both rows of this family; the reasoning releases
+// additionally accept `reasoning_effort`.
+const GROK_CAPABILITY: ModelCapability = {
+  family: 'grok', apiShape: 'openai_completions',
+  contextWindow: 256_000, maxOutput: 32_000, supportsEffort: false,
+  effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+  thinkingMode: 'none',
+  supportsPromptCache: true, cacheMinTokens: 1_024, retryClass: 'openai_compat',
+};
+
 // Order matters: first match wins. More specific families first.
 const REGISTRY: RegistryRow[] = [
   // ---- xAI Grok (openai_chat via BYO/native OAuth) --------------------------
-  // ONE LOOP, MANY BRAINS (2026-08-20): grok ids previously fell to
-  // DEFAULT_CAPABILITY (128K/8K, generic retry) — mis-budgeted for fleet
-  // work. grok-4 family: 256K window per xAI docs; no effort knob on the chat
-  // shape.
+  // Releases whose provider documentation lists `reasoning_effort`. Reasoning
+  // on these cannot be switched off and defaults to the top of the range when
+  // the field is absent, so the declared values are what let the harness tier
+  // reach the wire. Other releases in the family reject the field and fall to
+  // the family row below.
+  {
+    idMatch: /grok-4[.-](5|6|7)(?![0-9])/i,
+    cap: {
+      ...GROK_CAPABILITY,
+      supportsEffort: true,
+      completionsEffortValues: ['low', 'medium', 'high', 'xhigh'],
+    },
+  },
+  // The family row: a 256K window per the provider's documentation, so an id
+  // in this family is budgeted for fleet work rather than falling to the
+  // conservative default.
   //
-  // PROMPT CACHE: corrected 2026-09-12 from MEASUREMENT, not doctrine. The
-  // 2026-08-20 seed said "no server-side prompt cache contract we can rely
-  // on", which was a judgement rather than an observation, and it was wrong.
-  // Two days of this machine's own usage log
-  // (~/.clementine-next/state/token-usage):
+  // PROMPT CACHE: the provider caches prompt prefixes server-side, and the
+  // adapter records the cached subset and its dialect on every call. The
+  // cacheable floor is about 1,024 tokens; a larger prompt without a hit is a
+  // cold prefix, not one below a size threshold. The cache seed is set from
+  // the usage log's own record of cached tokens, never from an assumption.
   //
-  //     grok usage events        690
-  //     calls reporting cache    673  (97.5%)
-  //     input tokens          11,449,913
-  //     cached tokens          3,457,024  (30.2% hit rate)
-  //     cacheDialect          'inclusive' on all 690
-  //
-  // The adapter has been stamping the dialect and recording the cached subset
-  // on every call the whole time. Smallest prompt observed WITH a cache hit
-  // was 1,093 tokens, so the floor is ~1024; the 17 calls without a hit
-  // include a 40,888-token prompt, i.e. they are cold prefixes, not a size
-  // threshold.
-  //
-  // This flag is load-bearing twice over. inFlightCompactionThresholds gates
-  // mid-turn collapse on it: reading false pinned grok to the absolute 32k
-  // trigger, so a 256k-window brain compacted at 13% of its context — and
-  // every collapse rewrote a prefix the provider was caching, the exact
-  // arithmetic that cost ~126k of one 2026-09-03 run's ~139k uncached tokens.
-  // Non-caching wires (GLM, gpt, kimi) keep the absolute trigger untouched,
-  // so the 2026-09-01 first-byte timeout that motivated it is unaffected.
+  // inFlightCompactionThresholds gates mid-turn collapse on this flag. A
+  // caching wire compacts on a window-scaled trigger, because every collapse
+  // rewrites a prefix the provider is caching and turns a cache hit into a
+  // full cold prefill. A non-caching wire keeps the absolute trigger, which
+  // bounds how large a prompt it composes before its first byte.
   {
     idMatch: /grok-4|grok-3|grok-beta|grok-/i,
-    cap: {
-      family: 'grok', apiShape: 'openai_completions',
-      contextWindow: 256_000, maxOutput: 32_000, supportsEffort: false,
-      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
-      thinkingMode: 'none',
-      supportsPromptCache: true, cacheMinTokens: 1_024, retryClass: 'openai_compat',
-    },
+    cap: GROK_CAPABILITY,
   },
   // ---- Claude (anthropic_messages) ------------------------------------------
   // Opus 4.7/4.8 + Fable 5: budget_tokens thinking is REMOVED (HTTP 400) — must
@@ -448,6 +463,7 @@ const REGISTRY: RegistryRow[] = [
       family: 'glm-5.2', apiShape: 'openai_completions',
       contextWindow: 512_000, maxOutput: 16_000, supportsEffort: false,
       effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      completionsThinkingSwitch: true,
       thinkingMode: 'none',
       supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
     },
@@ -459,6 +475,7 @@ const REGISTRY: RegistryRow[] = [
       family: 'glm', apiShape: 'openai_completions',
       contextWindow: 202_752, maxOutput: 16_000, supportsEffort: false,
       effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      completionsThinkingSwitch: true,
       thinkingMode: 'none',
       supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
     },
@@ -475,20 +492,86 @@ const REGISTRY: RegistryRow[] = [
   },
 ];
 
+/** Unknown ids already warned about in this process. */
+const warnedUnknownModelIds = new Set<string>();
+
 /**
  * Resolve the wire capability for a model id. First family match wins; an
  * unknown id warns LOUD and returns a conservative default (never a silent
- * wrong assumption). Pure + cheap — safe to call per request.
+ * wrong assumption). Pure + cheap — safe to call per request, so the warning
+ * fires once per unknown id per process rather than on every call.
  */
 export function resolveModelCapability(modelId: string | undefined | null): ModelCapability {
   const id = (modelId ?? '').trim();
-  if (id) {
-    for (const row of REGISTRY) {
-      if (row.idMatch.test(id)) return row.cap;
-    }
+  const matched = matchCapability(id);
+  if (matched) return matched;
+  const warnKey = id || '(empty)';
+  if (!warnedUnknownModelIds.has(warnKey)) {
+    warnedUnknownModelIds.add(warnKey);
+    logger.warn({ modelId: warnKey }, 'model-wire-registry: unknown model id — using conservative defaults');
   }
-  logger.warn({ modelId: id || '(empty)' }, 'model-wire-registry: unknown model id — using conservative defaults');
   return DEFAULT_CAPABILITY;
+}
+
+/** First family row matching `id`, or undefined. Silent: callers that treat an
+ *  unrecognized id as legitimate (any BYO model) use this directly. */
+function matchCapability(id: string): ModelCapability | undefined {
+  if (!id) return undefined;
+  for (const row of REGISTRY) {
+    if (row.idMatch.test(id)) return row.cap;
+  }
+  return undefined;
+}
+
+/** The shared reasoning-effort ladder, cheapest first. Harness tiers occupy the
+ *  lower rungs; a caller may carry a higher one on the request. */
+const EFFORT_LADDER_RANK: Readonly<Record<string, number>> = {
+  none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6,
+};
+
+/**
+ * The `reasoning_effort` value an openai_completions request for `modelId`
+ * carries, or undefined when the field stays off the wire.
+ *
+ * - A model that declares no `completionsEffortValues` never carries it.
+ * - A structured (json) call carries the cheapest declared value: the shape is
+ *   the contract, and reasoning depth adds latency without improving it.
+ * - No tier chosen leaves the wire's own default in place.
+ * - Otherwise the tier becomes the most expensive declared value that does not
+ *   exceed it, and a tier cheaper than every declared value becomes the
+ *   cheapest. A tier above every declared value, or off the ladder, is not
+ *   translated.
+ *
+ * Unknown ids are legitimate BYO models here, so the lookup does not warn.
+ */
+export function completionsReasoningEffort(
+  modelId: string | undefined | null,
+  tier: string | undefined,
+  options: { structured: boolean },
+): string | undefined {
+  const cap = matchCapability((modelId ?? '').trim());
+  if (!cap || cap.apiShape !== 'openai_completions') return undefined;
+  const values = (cap.completionsEffortValues ?? [])
+    .filter((value) => EFFORT_LADDER_RANK[value] !== undefined);
+  if (values.length === 0) return undefined;
+  if (options.structured) return values[0];
+  const rank = tier ? EFFORT_LADDER_RANK[tier.toLowerCase()] : undefined;
+  if (rank === undefined) return undefined;
+  const top = EFFORT_LADDER_RANK[values[values.length - 1]!]!;
+  if (rank > top) return undefined;
+  let chosen = values[0];
+  for (const value of values) {
+    if (EFFORT_LADDER_RANK[value]! <= rank) chosen = value;
+  }
+  return chosen;
+}
+
+/** Whether an openai_completions request for `modelId` takes its reasoning
+ *  control through the binary `thinking` switch its registry row declares.
+ *  Unknown ids are legitimate BYO models here, so the lookup does not warn. */
+export function completionsThinkingSwitch(modelId: string | undefined | null): boolean {
+  const cap = matchCapability((modelId ?? '').trim());
+  return cap?.apiShape === 'openai_completions' && cap.completionsThinkingSwitch === true;
 }
 
 /** The PROVIDER class that serves a model. Derived from the model's wire shape,
@@ -504,19 +587,11 @@ export type ModelProviderClass = 'codex' | 'claude' | 'byo';
  * legitimate BYO model, not a misconfiguration.
  */
 export function resolveProvider(modelId: string | undefined | null): ModelProviderClass {
-  const id = (modelId ?? '').trim();
-  if (id) {
-    for (const row of REGISTRY) {
-      if (row.idMatch.test(id)) {
-        switch (row.cap.apiShape) {
-          case 'anthropic_messages': return 'claude';
-          case 'codex_responses': return 'codex';
-          default: return 'byo';
-        }
-      }
-    }
+  switch (matchCapability((modelId ?? '').trim())?.apiShape) {
+    case 'anthropic_messages': return 'claude';
+    case 'codex_responses': return 'codex';
+    default: return 'byo';
   }
-  return 'byo';
 }
 
 /** Rough token estimate (chars/4) for cache-min gating. Intentionally cheap +

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { RouterModelProvider, brainFalloverFirstByteMsForProvider } from './router-model.js';
+import { RouterModelProvider, brainFalloverFirstByteMsForProvider, routedPrimaryModel } from './router-model.js';
 import { resetByoModelCache } from './byo-model.js';
 import { ToolCallsCounter, withHarnessRunContext } from './brackets.js';
 import { modelFirstByteStallMs } from './model-stall-policy.js';
@@ -208,5 +208,44 @@ test('router rejects an unqualified id exposed by multiple BYO providers', () =>
       () => new RouterModelProvider().getModel('shared-model'),
       /multiple connected BYO providers/,
     );
+  });
+});
+
+test('routedPrimaryModel names what the router serves, and the router serves exactly that', () => {
+  withEnv({
+    AUTH_MODE: 'api_key',
+    MODEL_ROUTING_MODE: 'all_in',
+    BYO_MODEL_BASE_URL: 'https://byo.example.test/v1',
+    BYO_MODEL_ID: 'byo-primary',
+    BYO_MODEL_API_KEY: 'test-key',
+    CLEMMY_BRAIN_FALLOVER: 'off',
+  }, () => {
+    // all-in: an undeclared built-in-shaped id collapses to the BYO primary.
+    const routed = routedPrimaryModel('codex-test-fast');
+    assert.equal(routed.provider, 'byo');
+    assert.equal(routed.modelId, 'byo-primary');
+    assert.equal(routed.via, 'all_in');
+    assert.equal(routed.requested, 'codex-test-fast');
+    const model = new RouterModelProvider().getModel('codex-test-fast') as unknown as { context?: { provider?: string; resolvedModel?: string } };
+    assert.equal(model.context?.provider, routed.provider);
+    assert.equal(model.context?.resolvedModel, routed.modelId);
+    // A model the BYO backend names is served as asked.
+    assert.deepEqual(
+      (({ provider, modelId, via }) => ({ provider, modelId, via }))(routedPrimaryModel('byo-primary')),
+      { provider: 'byo', modelId: 'byo-primary', via: undefined },
+    );
+  });
+  // An active Claude sign-in with no Codex: a Codex-shaped id reaches Claude's brain.
+  withEnv({ AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'off' }, () => {
+    const deps = { resolveEffectiveProvider: () => 'codex' as const, codexAvailable: () => false };
+    const routed = routedPrimaryModel('codex-test-fast', deps);
+    assert.equal(routed.provider, 'claude');
+    assert.equal(routed.via, 'claude_no_codex');
+    assert.notEqual(routed.modelId, 'codex-test-fast');
+    assert.equal(routedPrimaryModel('codex-test-fast', { ...deps, codexAvailable: () => true }).provider, 'codex');
+  });
+  // No BYO backend: the router refuses, and so does the helper.
+  withEnv({ AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'off' }, () => {
+    assert.throws(() => routedPrimaryModel('codex-test-fast', { resolveEffectiveProvider: () => 'byo' }), /no BYO backend is configured/);
   });
 });

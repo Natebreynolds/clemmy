@@ -11,6 +11,7 @@ delete process.env.CLEMMY_JEV;
 
 const {
   evaluateSystemOne,
+  jevAvailable,
   jevEnabled,
   _setSystemOneFetchForTests,
   _setTypesafeKeyForTests,
@@ -43,6 +44,15 @@ test('evaluateSystemOne fail-opens when the key is missing or Jev is killed', as
   });
   assert.equal(disabled.ok, false);
   if (!disabled.ok) assert.equal(disabled.reason, 'disabled');
+});
+
+test('jevAvailable is false when Jev is turned off or has no key, and true only with both', async () => {
+  _setTypesafeKeyForTests(null);
+  assert.equal(await jevAvailable(), false, 'no key');
+  _setTypesafeKeyForTests('ts_test');
+  assert.equal(await jevAvailable(), true);
+  process.env.CLEMMY_JEV = 'off';
+  assert.equal(await jevAvailable(), false, 'turned off, even with a key');
 });
 
 test('evaluateSystemOne records a typed answer when the transport returns System One JSON', async () => {

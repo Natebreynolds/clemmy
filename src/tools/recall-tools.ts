@@ -1,9 +1,14 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
+import { retainedResultRoutes, retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { z } from 'zod';
-import { getToolOutput, getToolOutputSlice } from '../runtime/harness/eventlog.js';
-import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { getToolOutput, getToolOutputSlice, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
+import { harnessRunContextStorage, RecallBudget, type HarnessRunContext } from '../runtime/harness/brackets.js';
 import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
+import {
+  RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
+  inlineResultBudgetForModel,
+  retainedReaderMaxChars,
+} from '../runtime/harness/tool-output-format.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
 import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
@@ -48,8 +53,7 @@ import {
  *
  * A fixed 30KB slice is a long-horizon cliff: paging one large parked payload
  * costs a tool call per 30KB, those calls credit no business progress, and the
- * no-progress governor ends the run before the work starts (live platform-49
- * run 2026-09-02: 19 recalls, zero business calls, the sheet never touched).
+ * no-progress governor ends the run before the work starts.
  * A 1M-window brain can hold far more than 30KB per step, so the slice now
  * rides the same window scale the recall BUDGET already uses rather than
  * pinning every model to the smallest one's ceiling.
@@ -57,26 +61,215 @@ import {
 const BASE_RECALL_MAX_CHARS = 30_000;
 /** Schema bound: BASE × the maximum window scale (4). Static so the tool
  *  contract — and therefore the prompt cache — never churns per model. */
-const RECALL_MAX_CHARS_CEILING = 120_000;
+const RECALL_MAX_CHARS_CEILING = RETAINED_OUTPUT_READER_MAX_SLICE_CHARS;
 
 function recallSliceCeiling(routedModelId?: string): number {
   return Math.min(
     RECALL_MAX_CHARS_CEILING,
+    retainedReaderMaxChars(routedModelId),
     Math.max(BASE_RECALL_MAX_CHARS, Math.round(BASE_RECALL_MAX_CHARS * windowScaleForModel(routedModelId))),
   );
 }
 
-// Cap a single tool_output_query response. The store now holds up to 2MB, and
-// tool_output_query intentionally bypasses the digest clip (it returns exactly
-// the page/projection asked for) — so without this bound an UNFILTERED query on
-// a large parked object (or a big array page) could dump the whole payload into
-// context. A page/projection is an explicit ask, so this sits a bit above
-// recall's per-call 30KB; the marker tells the model how to narrow further.
+/**
+ * The slice one recall returns. An explicit max_chars is honored up to the
+ * window's slice ceiling. Without one, a recall shows one whole inline result
+ * for this window (the same budget a Clementine state read gets), never the
+ * much larger ceiling, so a bare recall costs what the original read would
+ * have cost and pages on with an exact next offset.
+ */
+export function recallSliceChars(requested: unknown, routedModelId?: string): number {
+  const ceiling = recallSliceCeiling(routedModelId);
+  if (typeof requested === 'number' && Number.isFinite(requested)) {
+    return Math.min(ceiling, Math.max(100, Math.trunc(requested)));
+  }
+  return Math.min(ceiling, inlineResultBudgetForModel(routedModelId));
+}
+
+/** The most one tool_output_query reply returns when the caller names a page
+ * size or a projection: that page was asked for explicitly, so it may run
+ * past one inline result. The marker tells the model how to narrow further. */
 const QUERY_MAX_CHARS = 50_000;
-const clipQueryBody = (text: string): string =>
-  text.length <= QUERY_MAX_CHARS
-    ? text
-    : `${text.slice(0, QUERY_MAX_CHARS)}\n…[clipped to ${QUERY_MAX_CHARS} chars — narrow with fields:[...], a filter, or a smaller limit]`;
+
+/**
+ * What one query reply may hold, in both units that bound it: characters for
+ * the reply's shape, and UTF-8 bytes for what the turn's reading budget still
+ * allows (the unit that budget charges). A reply is sized against both, so a
+ * reply sized to fit is never refused when it is charged.
+ */
+interface QueryReplyBound {
+  chars: number;
+  bytes: number;
+  /** Whether the reply spends the turn's reading bytes (a bare query). */
+  charged: boolean;
+}
+
+const fitsQueryBound = (text: string, bound: QueryReplyBound): boolean =>
+  text.length <= bound.chars
+  && (!Number.isFinite(bound.bytes) || Buffer.byteLength(text, 'utf8') <= bound.bytes);
+
+/** The longest prefix of `text` within `chars` characters and `bytes` UTF-8
+ * bytes, never splitting a code point. */
+function prefixWithin(text: string, chars: number, bytes: number): string {
+  let end = 0;
+  let used = 0;
+  const limit = Math.max(0, Math.min(chars, text.length));
+  while (end < limit) {
+    const code = text.codePointAt(end) as number;
+    const width = code > 0xffff ? 2 : 1;
+    const size = code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    if (end + width > limit || used + size > bytes) break;
+    end += width;
+    used += size;
+  }
+  return text.slice(0, end);
+}
+
+/** The least of a record a clipped query reply shows beside its header. */
+const QUERY_MIN_RECORD_SLICE_CHARS = 200;
+
+const clipMarker = (keptChars: number): string =>
+  `\n…[clipped to ${keptChars} chars — narrow with fields:[...], a filter, or a smaller limit]`;
+
+/**
+ * `body` followed by `tail`, within `bound`. A body that does not fit is cut
+ * (never inside a code point) and marked, and the marker and the tail are
+ * reserved inside the bound, so the tail (a continuation or a reference) is
+ * never the part that is lost.
+ */
+function clipQueryBody(body: string, bound: QueryReplyBound, tail = ''): string {
+  if (fitsQueryBound(body + tail, bound)) return body + tail;
+  const reserved = clipMarker(bound.chars) + tail;
+  const kept = prefixWithin(
+    body,
+    bound.chars - reserved.length,
+    Number.isFinite(bound.bytes) ? bound.bytes - Buffer.byteLength(reserved, 'utf8') : Number.POSITIVE_INFINITY,
+  );
+  return `${kept}${clipMarker(kept.length)}${tail}`;
+}
+
+/** Whether the caller named a page size or a projection. */
+function queryNamesItsPage(input: Record<string, unknown>): boolean {
+  if (normalizeFieldsInput(input.fields) !== undefined) return true;
+  return typeof input.limit === 'number' && Number.isFinite(input.limit);
+}
+
+/**
+ * The most one tool_output_query reply may hold. A bare query (no limit, no
+ * fields) is the call every digest suggests: one inline result for the routed
+ * window, the same default a bare recall gets, and it spends the turn's
+ * reading bytes. A named page or projection is an explicit ask to page a
+ * structured result to its end: it may use QUERY_MAX_CHARS per reply and is
+ * not charged to the turn's reading bytes.
+ */
+function queryReplyBound(input: Record<string, unknown>, ctx: HarnessRunContext): QueryReplyBound {
+  const pageMax = Math.min(QUERY_MAX_CHARS, retainedReaderMaxChars(ctx.routedModelId));
+  if (queryNamesItsPage(input)) return { chars: pageMax, bytes: Number.POSITIVE_INFINITY, charged: false };
+  return {
+    chars: Math.min(pageMax, inlineResultBudgetForModel(ctx.routedModelId)),
+    bytes: ctx.recallBudget?.remainingBytes() ?? Number.POSITIVE_INFINITY,
+    charged: true,
+  };
+}
+
+/** The refusal when the turn's reading budget cannot hold even a minimal bare
+ *  reply; a named page is never refused for bytes. */
+function queryBoundRefusal(bound: QueryReplyBound, ctx: HarnessRunContext, callId: string) {
+  if (!bound.charged) return null;
+  if (bound.chars >= RecallBudget.QUERY_MIN_REPLY_BYTES && (ctx.recallBudget?.canServeQuery() ?? true)) return null;
+  const refusal = ctx.recallBudget?.queryRefusal(RecallBudget.QUERY_MIN_REPLY_BYTES, callId);
+  return refusal ? textResult(`ERROR: ${refusal}`) : null;
+}
+
+const QUERY_CONTINUATION_KEYS = [
+  'fields', 'filter_field', 'filter_contains', 'filter_equals', 'where', 'sort_by', 'order', 'limit',
+] as const;
+
+/** The exact next query for the records a reply had no room for. */
+function nextQueryCall(callId: string, input: Record<string, unknown>, offset: number): string {
+  const args: Record<string, unknown> = { call_id: callId };
+  for (const key of QUERY_CONTINUATION_KEYS) {
+    const value = input[key];
+    if (value !== undefined && value !== null) args[key] = value;
+  }
+  args.offset = offset;
+  return `tool_output_query ${JSON.stringify(args)}`;
+}
+
+/**
+ * The largest leading run of a page that fits `bound` together with `suffix`,
+ * cut on a record boundary, never inside a record. When not even one record
+ * fits, that record is clipped with the narrowing marker, and the page's
+ * continuation and the suffix still follow it inside the bound.
+ *
+ * The continuation echoes the caller's shaping arguments, so it can outgrow a
+ * small bound on its own. The tail is then shortened, never overshot: the
+ * suffix goes first, then the exact next query gives way to one naming only
+ * the next offset.
+ */
+function fitRecordPage(
+  pageLength: number,
+  render: (count: number) => { body: string; continuation: string; shortContinuation: string },
+  bound: QueryReplyBound,
+  suffix: string,
+): { count: number; text: string } {
+  const tails: Array<(parts: ReturnType<typeof render>) => string> = [
+    (parts) => parts.continuation + suffix,
+    (parts) => parts.continuation,
+    (parts) => parts.shortContinuation,
+  ];
+  // The first tail that still leaves room for the header and a real slice of
+  // the first record beside the clip marker: a continuation must never crowd
+  // out the record it continues from.
+  const first = render(Math.min(1, pageLength));
+  const headerEnd = first.body.indexOf('\n\n');
+  const minimalBody = first.body.slice(0, Math.min(first.body.length,
+    (headerEnd < 0 ? 0 : headerEnd + 2) + QUERY_MIN_RECORD_SLICE_CHARS));
+  const tailFits = (tail: (parts: ReturnType<typeof render>) => string): boolean =>
+    fitsQueryBound(minimalBody + clipMarker(minimalBody.length) + tail(first), bound);
+  const tail = tails.find(tailFits);
+  if (!tail) {
+    // Not even a slice of one record fits beside its continuation: serve no
+    // record rather than a header whose continuation skips the unseen one,
+    // and point back at this same offset with the way to narrow.
+    const none = render(0);
+    const headerOnly = none.body.slice(0, Math.max(0, none.body.indexOf('\n\n')));
+    const note = '\n\n[No record of this page fits the reading bytes left. Narrow the query (fields:[...], a filter, or a smaller limit) and repeat it from this same offset.]';
+    return { count: 0, text: clipQueryBody(headerOnly + note, bound) };
+  }
+  const full = (count: number): string => {
+    const parts = render(count);
+    return parts.body + tail(parts);
+  };
+  const whole = full(pageLength);
+  if (fitsQueryBound(whole, bound)) return { count: pageLength, text: whole };
+  let fits = 0;
+  let low = 1;
+  let high = pageLength - 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (fitsQueryBound(full(middle), bound)) {
+      fits = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (fits === 0) {
+    const count = Math.min(1, pageLength);
+    const parts = render(count);
+    return { count, text: clipQueryBody(parts.body, bound, tail(parts)) };
+  }
+  return { count: fits, text: full(fits) };
+}
+
+/** Serve a query reply, charging a bare reply to the turn's reading bytes. */
+function chargeQueryReply(ctx: HarnessRunContext, callId: string, bodyText: string, bound: QueryReplyBound) {
+  const refusal = bound.charged
+    ? ctx.recallBudget?.consumeQueryBytes(Buffer.byteLength(bodyText, 'utf8'), callId)
+    : null;
+  return refusal ? textResult(`ERROR: ${refusal}`) : textResult(bodyText, { maxChars: bodyText.length });
+}
 
 /** Zod shapes exported so the tool-call-hint pin can validate every emitted
  * hint example against the REAL registered contract (single source of truth —
@@ -98,7 +291,7 @@ export const RECALL_TOOL_RESULT_SHAPE = {
     .min(100)
     .max(RECALL_MAX_CHARS_CEILING)
     .optional()
-    .describe('Optional cap on the returned slice (default: the largest this context window allows).'),
+    .describe('Optional slice size; a larger value up to this context window\'s ceiling is returned whole (default: one inline result).'),
 };
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
@@ -203,11 +396,9 @@ function editDistanceWithin(a: string, b: string, max: number): number | null {
  * The exact correction for a call_id that does not exist.
  *
  * The harness knows every real id, so a transposition should be answered with
- * the right one rather than a dead end. Live 2026-09-03, platform-49 run 10:
- * the model asked for `toulu_016PctF8QXsnvKo5ZKasu1ri` (a two-letter swap of
- * `toolu_…`), got a bare "no tool output found", and spent the rest of the turn
- * recovering. Run 5 proved the opposite works — an exact correction repaired the
- * very next frame.
+ * the right one rather than a dead end: a bare "no tool output found" for a
+ * two-letter swap costs the rest of the turn, while an exact correction repairs
+ * the very next frame.
  */
 export function nearestToolOutputCallId(
   wanted: string,
@@ -227,6 +418,96 @@ export function nearestToolOutputCallId(
   return best ? best.id : null;
 }
 
+type RetainedTextSlice =
+  | { status: 'missing' }
+  | { status: 'incomplete'; contentBytes: number }
+  | { status: 'budget'; error: string }
+  | { status: 'ok'; body: string };
+
+/**
+ * One verbatim slice of a retained output, with the header that names the
+ * exact next call. The single owner of reading retained TEXT: recall_tool_result
+ * returns it, and tool_output_query returns it for an output that holds no
+ * structured records. Either way it spends the turn's recall budget.
+ */
+function readRetainedTextSlice(
+  ctx: HarnessRunContext,
+  resolved: { callId: string; receipt?: ToolOutputRecord },
+  offset: number,
+  maxChars: number,
+): RetainedTextSlice {
+  const callId = resolved.callId;
+  const start = resolved.receipt ? Math.min(offset, resolved.receipt.output.length) : 0;
+  const row = resolved.receipt
+    ? { ...resolved.receipt, start, end: Math.min(start + maxChars, resolved.receipt.output.length),
+        totalChars: resolved.receipt.output.length, output: resolved.receipt.output.slice(start, start + maxChars) }
+    : getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
+  if (!row) return { status: 'missing' };
+  if (row.truncatedAtWrite) return { status: 'incomplete', contentBytes: row.contentBytes };
+
+  // The range reader uses persisted UTF-16 offsets and fetches only BLOBs
+  // intersecting this page; it does not rebuild/hash an unrelated tail on
+  // every slice.
+  const total = row.totalChars;
+  const sliceStart = row.start;
+  const slice = row.output;
+  const sliceBytes = Buffer.byteLength(slice, 'utf8');
+
+  // Budget check — only when a HarnessRunContext provided one.
+  if (ctx.recallBudget) {
+    const err = ctx.recallBudget.consume(sliceBytes, callId);
+    if (err) return { status: 'budget', error: err };
+  }
+
+  const end = row.end;
+  // When a lot is left, paging is the wrong instrument entirely: a reader that
+  // answers over the SAME stored output beats walking it a slice at a time.
+  // Which reader that is depends on the output's shape, so the one reader
+  // router names it (a query for records, a passage search for text).
+  const answerRoute = end < total && (total - end) > maxChars * 2
+    ? retainedResultRoutes({
+      sessionId: ctx.sessionId,
+      callId,
+      exclude: ctx.recallBudget?.refusedAfterRecall() ?? ['recall_tool_result'],
+      readingBytesSpent: !(ctx.recallBudget?.canServeQuery() ?? true),
+    })[0]
+    : undefined;
+  const header = [
+    `Recalled chars ${sliceStart}–${end} of ${total} (${row.contentBytes} total bytes)`,
+    row.tool ? `tool=${row.tool}` : null,
+    `recorded at ${row.createdAt}`,
+    end < total
+      // Name the EXACT next call. A model that has to reconstruct it guesses
+      // offsets, and blind paging spends a turn per slice while crediting no
+      // business progress until the governor ends the run.
+      ? `(more remains — continue with recall_tool_result {"call_id":"${callId}","offset":${end}}`
+        + (answerRoute
+          ? `; that is ~${Math.ceil((total - end) / maxChars)} more slices, so if you need an ANSWER rather than `
+            + `the raw text, ${answerRoute.call} — ${answerRoute.why}`
+          : '')
+        + ')'
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' • ');
+  return { status: 'ok', body: `${header}\n\n${slice}` };
+}
+
+/** Whether a tool_output_query asks for record shaping (a projection, filter,
+ * ordering or figure) rather than just the stored output. Strict-schema
+ * transports send unused optional arguments as null. */
+function asksForRecordShaping(input: Record<string, unknown>): boolean {
+  if (normalizeFieldsInput(input.fields) !== undefined) return true;
+  return ['filter_field', 'filter_contains', 'filter_equals', 'where', 'sort_by', 'aggregate', 'value_field', 'group_by']
+    .some((key) => {
+      const value = input[key];
+      if (value === undefined || value === null) return false;
+      if (typeof value === 'string') return value.trim().length > 0;
+      if (Array.isArray(value)) return value.length > 0;
+      return true;
+    });
+}
+
 export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
@@ -239,10 +520,7 @@ export function registerRecallTools(server: McpServer): void {
     async (input: Record<string, unknown>) => {
       let callId = String(input.call_id ?? '');
       const ctx = harnessRunContextStorage.getStore();
-      const sliceCeiling = recallSliceCeiling(ctx?.routedModelId);
-      const maxChars = Number.isFinite(input.max_chars as number)
-        ? Math.min(sliceCeiling, Math.max(100, Math.trunc(input.max_chars as number)))
-        : sliceCeiling;
+      const maxChars = recallSliceChars(input.max_chars, ctx?.routedModelId);
       const offset = Number.isFinite(input.offset as number)
         ? Math.max(0, Math.trunc(input.offset as number))
         : 0;
@@ -254,15 +532,11 @@ export function registerRecallTools(server: McpServer): void {
 
       const resolved = resolveRetainedOutputRead(ctx.sessionId, callId);
       callId = resolved.callId;
-      const start = resolved.receipt ? Math.min(offset, resolved.receipt.output.length) : 0;
-      const row = resolved.receipt
-        ? { ...resolved.receipt, start, end: Math.min(start + maxChars, resolved.receipt.output.length),
-            totalChars: resolved.receipt.output.length, output: resolved.receipt.output.slice(start, start + maxChars) }
-        : getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
-      if (!row) {
+      const read = readRetainedTextSlice(ctx, resolved, offset, maxChars);
+      if (read.status === 'missing') {
         // A capability reference is not a result handle, and "not found" is
         // not "empty": name what the id is, how to invoke it, and what this
-        // turn has actually retained (live 2026-09-21 source 277962).
+        // turn has actually retained.
         return textResult(describeMissingRetainedOutputForSession({
           sessionId: ctx.sessionId,
           sourceUserSeq: ctx.sourceUserSeq,
@@ -270,54 +544,15 @@ export function registerRecallTools(server: McpServer): void {
           readerTool: 'recall_tool_result',
         }));
       }
-      if (row.truncatedAtWrite) {
+      if (read.status === 'incomplete') {
         return textResult(
-          `ERROR: tool output "${callId}" is incomplete (${row.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be recalled as authoritative data.`,
+          `ERROR: tool output "${callId}" is incomplete (${read.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be recalled as authoritative data.`,
         );
       }
-
-      // The range reader uses persisted UTF-16 offsets and fetches only BLOBs
-      // intersecting this page; it does not rebuild/hash an unrelated 100MB
-      // tail on every 30KB recall call.
-      const total = row.totalChars;
-      const sliceStart = row.start;
-      const slice = row.output;
-      const sliceBytes = Buffer.byteLength(slice, 'utf8');
-
-      // Budget check — only when a HarnessRunContext provided one.
-      if (ctx.recallBudget) {
-        const err = ctx.recallBudget.consume(sliceBytes, callId);
-        // Unmistakably an ERROR, never data (live 2026-07-24: a program
-        // JSON.parsed the bare budget message and called good data malformed).
-        if (err) return textResult(`ERROR: ${err}`);
-      }
-
-      const end = row.end;
-      const header = [
-        `Recalled chars ${sliceStart}–${end} of ${total} (${row.contentBytes} total bytes)`,
-        row.tool ? `tool=${row.tool}` : null,
-        `recorded at ${row.createdAt}`,
-        end < total
-          // Name the EXACT next call. A model that has to reconstruct it
-          // guesses offsets, and blind paging spends a turn per slice while
-          // crediting no business progress until the governor ends the run.
-          ? `(more remains — continue with recall_tool_result {"call_id":"${callId}","offset":${end}}`
-            // When a lot is left, paging is the wrong instrument entirely:
-            // tool_output_query answers over the SAME stored output instead of
-            // walking it a slice at a time.
-            + ((total - end) > maxChars * 2
-              ? `; that is ~${Math.ceil((total - end) / maxChars)} more slices, so if you need an ANSWER rather than `
-                + `the raw text, tool_output_query {"call_id":"${callId}"} reads the same stored output server-side `
-                + `and does not page`
-              : '')
-            + ')'
-          : null,
-      ]
-        .filter(Boolean)
-        .join(' • ');
-
-      const body = `${header}\n\n${slice}`;
-      return textResult(body, { maxChars: body.length });
+      // Unmistakably an ERROR, never data: a program must not JSON.parse a
+      // budget message and call good data malformed.
+      if (read.status === 'budget') return textResult(`ERROR: ${read.error}`);
+      return textResult(read.body, { maxChars: read.body.length });
     },
   );
 
@@ -375,12 +610,29 @@ export function registerRecallTools(server: McpServer): void {
       // notes, a recall preamble), so a bare JSON.parse is not the question.
       const recovered = parseStoredToolOutputJson(row.output, { shell: parseShellToolOutput });
       if (!recovered) {
+        // Text never dead-ends. Asked for the output itself (no projection,
+        // filter or figure), answer with the text exactly as recall would,
+        // spending the same recall budget, instead of a refusal round.
+        if (!asksForRecordShaping(input)) {
+          // One inline result, exactly what a bare recall returns: the header
+          // names the next offset, and a larger slice is recall's explicit ask.
+          const read = readRetainedTextSlice(ctx, resolved, 0, recallSliceChars(undefined, ctx.routedModelId));
+          if (read.status === 'ok') {
+            const bodyText = `Tool output "${callId}" is text, not structured records, so here is its text as recall_tool_result returns it (fields, filters and figures need records).\n${read.body}`;
+            return textResult(bodyText, { maxChars: bodyText.length });
+          }
+          if (read.status === 'budget') {
+            return textResult(
+              `ERROR: tool output "${callId}" is text, and this turn's recall budget is spent, so its text cannot be returned here. `
+              + retainedResultWayThrough({ sessionId: ctx.sessionId, callId,
+                exclude: ['tool_output_query', 'recall_tool_result'], recallCallsRemaining: 0 }),
+            );
+          }
+        }
         // Say what is true: recovery failed. Never tell the model its own
         // valid JSON "is not JSON" — it obeys, comes back, and burns the turn.
-        // The successor is COMPUTED. This used to say "use recall_tool_result"
-        // unconditionally, while recall's own exhaustion message said "call
-        // tool_output_query instead" — a closed loop with no exit (live
-        // 2026-09-07 source 146537, the Platform 49 plan that never published).
+        // The successor is COMPUTED by the one reader router, never named
+        // here, so no two readers can point at each other.
         return textResult(
           `No JSON value could be recovered from tool output "${callId}" (${row.output.length.toLocaleString()} chars). `
           + 'It is text, not structured data. '
@@ -404,11 +656,9 @@ export function registerRecallTools(server: McpServer): void {
         && (view.owner === 'mcp_structured_content' || view.owner === 'mcp_text_json');
       if (decodedMcpPayload) parsed = view.payload;
       // A dotted field reaches into nested objects, as `where` and `sort_by`
-      // already do; the projected key is the path as written. Live 2026-09-26:
-      // `fields: "keyword_data.keyword"` projected every record to {} and the
-      // tool answered "None of [...] exist on these records" while the same
-      // path sorted fine — six wasted rounds in one turn, the model re-guessing
-      // field names the tool had just used.
+      // already do; the projected key is the path as written. A projection
+      // that ignored the path would empty every record and tell the model a
+      // field it can sort by does not exist.
       const project = (rec: unknown): unknown => {
         if (!fields || !rec || typeof rec !== 'object' || Array.isArray(rec)) return rec;
         const out: Record<string, unknown> = {};
@@ -423,8 +673,7 @@ export function registerRecallTools(server: McpServer): void {
       // `{ data: { value: [...] } }` (Graph), `{ data: { records: [...] } }`
       // (composio/Airtable) — and the object path below can only project
       // TOP-LEVEL keys, so every filter/project/paginate query against a
-      // wrapped result missed (2026-07-31 calendar run: the miss cost 3 extra
-      // calls and a full 26KB recall). The records ARE the result; query them.
+      // wrapped result would miss. The records ARE the result; query them.
       let unwrappedPath = '';
       if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
         const wantsRecordQuery = Boolean(
@@ -495,8 +744,14 @@ export function registerRecallTools(server: McpServer): void {
             for (const group of shown) lines.push(aggregateLine(`${group.group}: `, aggregate, valueField, group.figure));
             if (result.groups.length > shown.length) lines.push(`…and ${result.groups.length - shown.length} more group(s)`);
           }
-          const bodyText = clipQueryBody(lines.join('\n'));
-          return textResult(bodyText, { maxChars: bodyText.length });
+          // An aggregate is an explicit computation over the records, like a
+          // named page: bounded per reply, not charged to the reading bytes.
+          const aggregateBound: QueryReplyBound = {
+            chars: Math.min(QUERY_MAX_CHARS, retainedReaderMaxChars(ctx.routedModelId)),
+            bytes: Number.POSITIVE_INFINITY,
+            charged: false,
+          };
+          return chargeQueryReply(ctx, callId, clipQueryBody(lines.join('\n'), aggregateBound), aggregateBound);
         }
         if (sortBy) rows = sortRows(rows, sortBy, input.order === 'desc' ? 'desc' : 'asc');
         const matched = rows.length;
@@ -524,26 +779,42 @@ export function registerRecallTools(server: McpServer): void {
           const bodyText = `None of ${JSON.stringify(fields)} exist on these records. The result is an ${describeJsonShape(rows)}. Re-query with fields that exist.`;
           return textResult(bodyText, { maxChars: bodyText.length });
         }
+        const bound = queryReplyBound(input, ctx);
+        const boundRefusal = queryBoundRefusal(bound, ctx, callId);
+        if (boundRefusal) return boundRefusal;
         const from = unwrappedPath ? ` from ${unwrappedPath}[*]` : '';
-        const header = recoveredClippedArrayPrefix
-          ? `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
-          : `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total${from})${sortBy ? `, ordered by ${sortBy} ${input.order === 'desc' ? 'descending' : 'ascending'}` : ''}${skippedNote ? `.${skippedNote}` : ''}`;
         // Hand the model the EXACT, copy-paste reference for these values, so a
         // downstream send binds them by reference instead of retyping (which is
         // how a value gets invented or dropped). Root array + single projected
         // field → a precise path.
         const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
-        const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
-        const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`) + refHint;
-        return textResult(bodyText, { maxChars: bodyText.length });
+        const refHint = resolved.receipt || decodedMcpPayload || recoveredClippedArrayPrefix ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
+        // A page that does not fit the reply is cut on a record boundary, and
+        // the header counts only the records shown and names the exact query
+        // for the rest, so paging never skips a record the model did not see.
+        const render = (count: number): { body: string; continuation: string; shortContinuation: string } => {
+          const header = recoveredClippedArrayPrefix
+            ? `Showing ${count} record(s) [${offset}–${offset + count}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
+            : `Showing ${count} record(s) [${offset}–${offset + count}] of ${matched} matching (${(parsed as unknown[]).length} total${from})${sortBy ? `, ordered by ${sortBy} ${input.order === 'desc' ? 'descending' : 'ascending'}` : ''}${skippedNote ? `.${skippedNote}` : ''}`;
+          const rest = page.length - count;
+          const continuation = count < page.length
+            ? `\n\n[${rest} more record(s) of this page did not fit this reply. Next: ${nextQueryCall(callId, input, offset + count)}; fields:[...] fits more records per reply.]`
+            : '';
+          const shortContinuation = count < page.length
+            ? `\n\n[${rest} more record(s) did not fit. Next: repeat this tool_output_query with "offset":${offset + count}, all other arguments unchanged.]`
+            : '';
+          return { body: `${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}`, continuation, shortContinuation };
+        };
+        const fitted = fitRecordPage(page.length, render, bound, refHint);
+        return chargeQueryReply(ctx, callId, fitted.text, bound);
       }
 
       if (parsed && typeof parsed === 'object') {
         const projected = project(parsed);
-        // A projection that matched NOTHING must return the map, not "{}" —
-        // the 2026-07-31 calendar run got the empty object, learned nothing,
-        // and fell back to recalling the entire 26KB raw payload.
+        // A projection that matched NOTHING must return the map, not "{}": an
+        // empty object teaches nothing and sends the model to recall the whole
+        // raw payload.
         const projectionMissed = fields && fields.length > 0
           && Object.keys(projected as Record<string, unknown>).length === 0;
         if (projectionMissed) {
@@ -552,9 +823,15 @@ export function registerRecallTools(server: McpServer): void {
             + `Re-query with the fields/filter of the records themselves — this tool queries the record list directly.`;
           return textResult(bodyText, { maxChars: bodyText.length });
         }
+        const bound = queryReplyBound(input, ctx);
+        const boundRefusal = queryBoundRefusal(bound, ctx, callId);
+        if (boundRefusal) return boundRefusal;
         const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
-        const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`) + refHint;
-        return textResult(bodyText, { maxChars: bodyText.length });
+        return chargeQueryReply(ctx, callId, clipQueryBody(
+          `Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`,
+          bound,
+          refHint,
+        ), bound);
       }
 
       return textResult(`Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`);

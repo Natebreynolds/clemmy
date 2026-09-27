@@ -23,6 +23,7 @@ const {
   bootModelWarmupEnabled,
   cliDiscoveryWarmupEnabled,
   daemonRecursiveReflectionEnabled,
+  recursiveReflectionModelReady,
   resolveBootModelWarmupGate,
 } = await import('./runner.js');
 
@@ -114,6 +115,16 @@ test('recursive-reflection kill switch disables the entire daemon tick owner', (
     if (prior === undefined) delete process.env.CLEMMY_REFLECTION;
     else process.env.CLEMMY_REFLECTION = prior;
   }
+});
+
+test('the nightly pattern run waits, day unspent, while no memory model can take it', () => {
+  // Nothing is signed in to this home: the run must not start (and stamp the
+  // day) only to record that it could not.
+  assert.equal(recursiveReflectionModelReady(), false);
+  const tick = RUNNER_SOURCE.slice(RUNNER_SOURCE.indexOf('async function processRecursiveReflectionTick'));
+  const ready = tick.indexOf('recursiveReflectionModelReady()');
+  const stamp = tick.indexOf('state.lastRecursiveReflectionDay = day');
+  assert.ok(ready > 0 && stamp > ready, 'the model is checked before the day is stamped');
 });
 
 test('boot model warmup is explicit opt-in', () => {

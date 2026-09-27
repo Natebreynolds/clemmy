@@ -95,7 +95,7 @@ test('boundaryJudgeTimeoutMs defaults to a bounded hot-path cap and rejects tiny
 test('withJudgeTimeout returns null instead of waiting for a hung judge', async () => {
   const never = new Promise<string>(() => {});
   const t0 = Date.now();
-  const result = await withJudgeTimeout(never, 5);
+  const result = await withJudgeTimeout('grounding', () => never, 5);
   assert.equal(result, null);
   assert.ok(Date.now() - t0 < 1000, 'timeout returned promptly');
 });
@@ -193,7 +193,7 @@ test('withJudgeHedge: fast primary wins, hedge never fires (zero extra cost on t
   const r = await withJudgeHedge(
     async () => 'primary-verdict',
     async () => { hedgeStarted = true; return 'hedge-verdict'; },
-    { hedgeDelayMs: 50, timeoutMs: 1000 },
+    { lane: 'grounding', hedgeDelayMs: 50, timeoutMs: 1000 },
   );
   assert.equal(r.value, 'primary-verdict');
   assert.equal(r.winner, 'primary');
@@ -212,7 +212,7 @@ test('withJudgeHedge: slow primary → hedge fires at the delay and its verdict 
   const slow = () => new Promise<string>((resolve) => {
     releasePrimary = () => { primaryResolved = true; resolve('late'); };
   });
-  const r = await withJudgeHedge(slow, async () => 'hedge-verdict', { hedgeDelayMs: 20, timeoutMs: 5000 });
+  const r = await withJudgeHedge(slow, async () => 'hedge-verdict', { lane: 'grounding', hedgeDelayMs: 20, timeoutMs: 5000 });
   assert.equal(r.value, 'hedge-verdict');
   assert.equal(r.winner, 'hedge');
   assert.equal(r.hedgeFired, true);
@@ -226,7 +226,7 @@ test('withJudgeHedge: primary dies before the delay → hedge starts immediately
   const r = await withJudgeHedge(
     async () => { throw new Error('transport'); },
     async () => 'hedge-verdict',
-    { hedgeDelayMs: 5000, timeoutMs: 8000 },
+    { lane: 'grounding', hedgeDelayMs: 5000, timeoutMs: 8000 },
   );
   assert.equal(r.value, 'hedge-verdict');
   assert.equal(r.winner, 'hedge');
@@ -239,7 +239,7 @@ test('withJudgeHedge: both attempts fail → null value with the errors surfaced
   const r = await withJudgeHedge(
     async () => { throw new Error('a'); },
     async () => { throw new Error('b'); },
-    { hedgeDelayMs: 10, timeoutMs: 500 },
+    { lane: 'grounding', hedgeDelayMs: 10, timeoutMs: 500 },
   );
   assert.equal(r.value, null);
   assert.equal(r.winner, null);
@@ -250,7 +250,7 @@ test('withJudgeHedge: pure deadline miss (both hung) → null with NO errors (cl
   const { withJudgeHedge } = await import('./judge-family.js');
   const hang = () => new Promise<string>(() => {});
   const t0 = Date.now();
-  const r = await withJudgeHedge(hang, hang, { hedgeDelayMs: 5, timeoutMs: 60 });
+  const r = await withJudgeHedge(hang, hang, { lane: 'grounding', hedgeDelayMs: 5, timeoutMs: 60 });
   assert.equal(r.value, null);
   assert.equal(r.errors.length, 0);
   assert.equal(r.hedgeFired, true);
@@ -260,7 +260,7 @@ test('withJudgeHedge: pure deadline miss (both hung) → null with NO errors (cl
 test('withJudgeHedge: no hedge available → primary-only, still bounded by the deadline', async () => {
   const { withJudgeHedge } = await import('./judge-family.js');
   const hang = () => new Promise<string>(() => {});
-  const r = await withJudgeHedge(hang, null, { hedgeDelayMs: 5, timeoutMs: 40 });
+  const r = await withJudgeHedge(hang, null, { lane: 'grounding', hedgeDelayMs: 5, timeoutMs: 40 });
   assert.equal(r.value, null);
   assert.equal(r.hedgeFired, false);
 });
@@ -272,7 +272,7 @@ test('withJudgeHedge: kill-switch CLEMMY_JUDGE_HEDGE=off runs unhedged', async (
     process.env.CLEMMY_JUDGE_HEDGE = 'off';
     let hedgeStarted = false;
     const slow = () => new Promise<string>((resolve) => { setTimeout(() => resolve('late-primary'), 100); });
-    const r = await withJudgeHedge(slow, async () => { hedgeStarted = true; return 'hedge'; }, { hedgeDelayMs: 5, timeoutMs: 2000 });
+    const r = await withJudgeHedge(slow, async () => { hedgeStarted = true; return 'hedge'; }, { lane: 'grounding', hedgeDelayMs: 5, timeoutMs: 2000 });
     assert.equal(r.value, 'late-primary');
     assert.equal(hedgeStarted, false);
   } finally {

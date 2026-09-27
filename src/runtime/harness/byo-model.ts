@@ -1,7 +1,7 @@
 /**
  * BYO (bring-your-own) model adapter — run worker/all-in roles on a
- * user-supplied OpenAI-compatible Chat-Completions backend (MiniMax,
- * DeepSeek, OpenRouter, or any compatible endpoint).
+ * user-supplied OpenAI-compatible Chat-Completions backend (any compatible
+ * endpoint).
  *
  * The harness's Agents SDK ships `OpenAIChatCompletionsModel`, which
  * already implements the SDK `Model` interface end to end. We don't
@@ -19,7 +19,8 @@
  *
  *   2. OpenAI-only request fields (`store`, `prompt_cache_retention`,
  *      `reasoning_effort`, `verbosity`) that compatible backends 400 on.
- *      We strip them.
+ *      We strip them. `reasoning_effort` returns only for a model whose
+ *      wire-registry row declares the values it accepts.
  *
  * The interception point is the OpenAI client's
  * `chat.completions.create` — the exact method the SDK model calls
@@ -38,7 +39,14 @@ import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
 import { withResilience } from './resilient-model.js';
-import { resolveModelCapability, modelParityEnabled, stripPromptCacheLayerSentinels, INSTRUCTION_CACHE_DELIM } from './model-wire-registry.js';
+import {
+  completionsReasoningEffort,
+  completionsThinkingSwitch,
+  resolveModelCapability,
+  modelParityEnabled,
+  stripPromptCacheLayerSentinels,
+  INSTRUCTION_CACHE_DELIM,
+} from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
@@ -71,37 +79,22 @@ function dropResponseFormatWithToolsEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_BYO_TOOLS_DROP_RESPONSE_FORMAT', 'on') || 'on') !== 'off';
 }
 
-/** Map the harness's per-turn reasoning-effort tier onto GLM (Z.ai)'s
- *  OpenAI-compatible `thinking` switch, so a GLM brain/worker actually responds
- *  to Clementine's dynamic effort instead of running at the backend default.
- *  `reasoning_effort` is otherwise stripped as an OpenAI-only field and silently
- *  lost. none/minimal → disabled (fast; don't burn the output budget on
- *  reasoning_content); low/medium/high → enabled. GATED to GLM model ids — other
- *  compat backends 400 on an unknown `thinking` param. No-op if the caller
- *  already set `thinking`, or if the harness sent no effort (leave GLM's
+/** Carry the harness's per-turn effort decision onto a wire whose reasoning
+ *  control is a binary `thinking` switch rather than `reasoning_effort`. Only
+ *  a model whose wire-registry row declares the switch gets it; other compat
+ *  backends 400 on an unknown `thinking` param. No-op if the caller already
+ *  set `thinking`, or if the harness sent no effort (the wire keeps its
  *  default). Mutates `body` in place. Exported for unit tests.
  *
- *  STRUCTURED-OUTPUT OVERRIDE: when the request asks for structured output
- *  (json_schema / json_object — i.e. the orchestrator decision, judges, every
- *  contract-bound call), thinking is forced DISABLED regardless of effort.
- *  GLM extended thinking + structured output corrupt each other — the thinking
- *  stream bleeds into the answer and yields malformed JSON (the live
- *  "reply: expected string, received …" failure → repair/re-ask/degraded turn)
- *  AND adds latency to every decision. This mirrors the Claude
- *  `withThinkingDisabled` fix on the verify/judge path. Free-form turns (no
- *  structured contract) keep effort-driven thinking, where it actually helps.
- *
- *  W2 (decision-quality parity) note: keeping thinking OFF here IS the chosen
- *  reconciliation — the plan's "guarantee a clean structured decision" option,
- *  not "reverse it to allow reasoning." The decision envelope is the FINAL
- *  summary of a turn whose reasoning already happened (during tool/free-form
- *  work); thinking on the envelope corrupts the JSON without improving the
- *  decision. Decision RELIABILITY across brains is instead raised at the
- *  response side (schema-shape validate + targeted re-ask), which is brain-
- *  AGNOSTIC and applies to every compat backend — not just GLM. */
-export function applyGlmThinking(body: Record<string, unknown>, effort: string | undefined): void {
-  const modelId = typeof body.model === 'string' ? body.model : '';
-  if (!/glm/i.test(modelId)) return;
+ *  A structured-output call (json_schema / json_object) always runs with
+ *  thinking disabled: extended thinking and a structured contract corrupt each
+ *  other (the thinking stream bleeds into the JSON) and add latency to every
+ *  decision. The structured envelope summarizes reasoning that already
+ *  happened during the turn; its reliability is raised on the response side
+ *  (schema-shape validation + targeted re-ask), which applies to every compat
+ *  backend. */
+export function applyDeclaredThinkingSwitch(body: Record<string, unknown>, effort: string | undefined): void {
+  if (!completionsThinkingSwitch(typeof body.model === 'string' ? body.model : undefined)) return;
   if (body.thinking != null) return;
   const rfType = (body.response_format as { type?: string } | undefined)?.type;
   if (rfType === 'json_schema' || rfType === 'json_object') {
@@ -117,29 +110,21 @@ export function applyGlmThinking(body: Record<string, unknown>, effort: string |
   body.thinking = { type: 'disabled' };
 }
 
-/** xAI (Grok 4.5+): reasoning cannot be switched off and DEFAULTS TO "high"
- *  when `reasoning_effort` is absent — and the compat relax strips that field.
- *  Live 2026-09-26: every brain round on grok-4.7 thought at "high" (84 visible
- *  output tokens in 20.6 s; 290 in 56 s), 22 s per round against 6 s on the
- *  previous brain, while the harness had decided effort "none" for the turn.
- *  Send the harness tier in xAI's vocabulary; "none"/"minimal" become "low",
- *  the cheapest depth the wire allows. A structured (json) call is always
- *  "low": the shape is the contract, not the reasoning. Only the models whose
- *  documentation lists the parameter (4.5, 4.6, 4.7); older Grok releases
- *  reject it. A caller that set the field itself is honored. */
-const GROK_EFFORT_MODEL = /grok-4[.-](5|6|7)(?![0-9])/i;
-export function applyGrokReasoningEffort(body: Record<string, unknown>, effort: string | undefined): void {
-  const modelId = typeof body.model === 'string' ? body.model : '';
-  if (!GROK_EFFORT_MODEL.test(modelId)) return;
+/** Put the harness's effort decision back on a wire that accepts
+ *  `reasoning_effort`, in the values the model's wire-registry row declares.
+ *  A wire whose reasoning cannot be switched off runs at its own default when
+ *  the field is absent, which is usually the top of its range, so a decision
+ *  that is stripped and not restored is a decision silently overruled. The
+ *  registry owns which models accept the field and how a tier lands on their
+ *  values; this only reads the request shape. Mutates `body` in place. */
+export function applyDeclaredReasoningEffort(body: Record<string, unknown>, effort: string | undefined): void {
   if (typeof body.reasoning_effort === 'string') return;
   const rfType = (body.response_format as { type?: string } | undefined)?.type;
-  if (rfType === 'json_schema' || rfType === 'json_object') { body.reasoning_effort = 'low'; return; }
-  const tier = (effort ?? '').toLowerCase();
-  const mapped = tier === 'none' || tier === 'minimal' || tier === 'low' ? 'low'
-    : tier === 'medium' ? 'medium'
-    : tier === 'high' ? 'high'
-    : tier === 'xhigh' ? 'xhigh'
-    : undefined;
+  const mapped = completionsReasoningEffort(
+    typeof body.model === 'string' ? body.model : undefined,
+    effort,
+    { structured: rfType === 'json_schema' || rfType === 'json_object' },
+  );
   if (mapped) body.reasoning_effort = mapped;
 }
 
@@ -157,12 +142,6 @@ const downgradedBodies = new WeakSet<object>();
 // records its schema here.
 const downgradedSchemas = new WeakMap<object, unknown>();
 
-/** Backends whose reasoning depth the harness can actually steer. Anything not
- *  listed here silently runs at its own default once `reasoning_effort` is
- *  stripped, and that is what gets reported. Keyed on the model id because the
- *  control is a property of the model family, not of the transport. */
-const COMPAT_EFFORT_STEERABLE = /glm/i;
-
 /** Observed-once-per-body report that the harness chose an effort tier and this
  *  wire had no way to carry it. Telemetry only — it never touches the body and
  *  never blocks a turn. */
@@ -172,8 +151,8 @@ function noteDroppedCompatEffort(
 ): void {
   if (!effort) return;
   const modelId = typeof body.model === 'string' ? body.model : '';
-  if (!modelId || COMPAT_EFFORT_STEERABLE.test(modelId)) return;
-  if (body.thinking != null) return;
+  if (!modelId || completionsThinkingSwitch(modelId)) return;
+  if (body.thinking != null || typeof body.reasoning_effort === 'string') return;
   try {
     logger.debug(
       { model: modelId, effort },
@@ -191,27 +170,23 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
   const next: Record<string, unknown> = { ...(body as Record<string, unknown>) };
 
   // Capture the harness's per-turn reasoning effort BEFORE stripping it, so a
-  // backend with its own thinking switch (GLM) can honor it (below).
+  // wire with its own reasoning control can honor it (below).
   const requestedEffort = typeof next.reasoning_effort === 'string' ? next.reasoning_effort : undefined;
 
   for (const field of OPENAI_ONLY_FIELDS) {
     if (field in next) delete next[field];
   }
 
-  // GLM (Z.ai): drive its `thinking` switch from the (now-stripped) effort tier.
-  applyGlmThinking(next, requestedEffort);
-  // xAI (Grok 4.5+): put the tier back in xAI's vocabulary, or it thinks at "high".
-  applyGrokReasoningEffort(next, requestedEffort);
-  // Every OTHER compat backend has just had the harness's effort decision
-  // deleted with nothing put in its place, so the brain runs at whatever depth
-  // the backend defaults to. That is a real, invisible latency cost: live
-  // 2026-09-11 a grok-4.6 chat turn spent 130s — including one 77s gap — to
-  // emit 243 visible output tokens, which is the signature of backend-default
-  // reasoning nobody asked for. We do NOT guess a wire parameter here: an
-  // unknown field 400s these backends, and which control (if any) a given
-  // backend accepts has to be verified per provider. But a decision that is
-  // dropped has to SAY it was dropped, or the next person measures a two-minute
-  // turn with no way to see why.
+  // A wire with a binary thinking switch takes the tier through that switch.
+  applyDeclaredThinkingSwitch(next, requestedEffort);
+  // A wire that accepts `reasoning_effort` gets the tier back in the values
+  // its registry row declares.
+  applyDeclaredReasoningEffort(next, requestedEffort);
+  // Every other compat backend has had the harness's effort decision removed
+  // with nothing in its place, so it runs at its own default depth. No wire
+  // parameter is guessed here: an unknown field 400s these backends, and which
+  // control a backend accepts is declared in the wire registry once verified.
+  // A dropped decision is still reported, so a slow turn can be explained.
   noteDroppedCompatEffort(next, requestedEffort);
 
   // Strict compat backends (Moonshot/Kimi) reject ANY assistant message with
@@ -246,11 +221,9 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
   // server-side cache keys on a STABLE PREFIX, so putting per-turn memory at
   // byte 0 means no prefix is ever repeated and nothing can ever hit.
   //
-  // Measured on the installed build, live 2026-09-20 source for "how many
-  // meetings does tim have tomorrow...": six grok-4.6 calls, 25,007 -> 38,353
-  // input tokens each, 236,961 input total, CACHED 0 — for 2,087 output tokens.
-  // The judge, whose prompt does not carry this reordered block, was caching on
-  // the same provider in the same period.
+  // With per-turn memory first, every call of a tool loop re-bills its whole
+  // input uncached, while a prompt without the reordered block caches on the
+  // same provider.
   //
   // Byte-identity with the pre-parity wire was a migration guarantee, not a
   // correctness one. The content is unchanged; only the order of two blocks
@@ -1238,7 +1211,7 @@ function recordByoUsage(
         ? { durationMs: Math.max(0, Date.now() - startedAt) }
         : {}),
       ...byoWireObservations(u, wire, startedAt),
-      promptComponents: harnessContext?.promptComponents,
+      framePromptComponents: harnessContext?.promptComponents,
     });
     // Proven-acceptance learning: an accepted request above our believed
     // window raises the budgeting floor (writes only when it beats the

@@ -13,6 +13,7 @@
  * is refusing work for lack of credit, the balance when the provider lets the
  * key read it, and what the account is doing for Clem right now.
  */
+import { MEMORY_ROLE_WORDS } from './memory-work.js';
 
 export interface UsageWindowLike { usedPercent: number; resetAt?: number; windowMinutes?: number }
 export interface UsageLimitLike { limit: number; remaining: number; resetAt?: number }
@@ -20,8 +21,8 @@ export interface UsageLimitsLike { requests?: UsageLimitLike; tokens?: UsageLimi
 export interface UsageSpendLike { tokens: number; calls: number }
 
 /** An account's money side, as the daemon reports it. `roles` are the jobs
- *  the account is doing right now (brain, writer, judge, worker, quick_checks,
- *  memory_search). */
+ *  the account is doing right now (brain, writer, judge, worker, memory,
+ *  quick_checks, memory_search). */
 export interface UsageBillingLike {
   url?: string;
   kind?: 'prepaid' | 'plan';
@@ -149,6 +150,8 @@ const ROLE_WORDS: Record<string, string> = {
   writer: 'writes the final answer',
   judge: 'checks the work',
   worker: 'helps in parallel',
+  // The memory role's own title, in the same lower-case voice as its siblings.
+  memory: MEMORY_ROLE_WORDS.title.toLowerCase(),
   quick_checks: 'quick checks',
   memory_search: 'memory search',
 };

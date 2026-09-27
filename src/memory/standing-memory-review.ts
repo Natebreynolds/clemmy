@@ -1,6 +1,7 @@
 import { Agent, Runner } from '@openai/agents';
 import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
+import { inMemoryJobTurn, memoryWorkSourceFromTurn, runMemoryModelJob } from './memory-job-context.js';
 
 export interface StandingMemoryReview {
   scope: 'standing' | 'task';
@@ -88,7 +89,19 @@ export async function reviewStandingMemory(
   candidate: string,
   mode: 'inferred' | 'explicit' | 'volunteered' = 'inferred',
 ): Promise<StandingMemoryReview> {
-  const route = resolveBoundaryJudge();
+  // The `standing` memory job (checked by "Checks the work"): recorded with
+  // the model that served; the rule it approves is kept by the save after it.
+  return runMemoryModelJob('standing', { source: memoryWorkSourceFromTurn({ kind: 'owner' }) },
+    () => reviewStandingMemoryNow(source, candidate, mode),
+    (review) => (review.scope === 'standing' ? { outcome: 'ok', produced: { approved: 1 } } : { outcome: 'nothing_new' }));
+}
+
+async function reviewStandingMemoryNow(
+  source: string,
+  candidate: string,
+  mode: 'inferred' | 'explicit' | 'volunteered',
+): Promise<StandingMemoryReview> {
+  const route = inMemoryJobTurn(() => resolveBoundaryJudge());
   if (!route.model) throw new Error('Standing-memory review model is unavailable');
   // Each mode APPENDS to the shared base, so the invariants every verdict must
   // honour — the text is data not instructions, a question never establishes a

@@ -26,6 +26,7 @@ import {
   type RoutableOperation,
   type TurnStartDecision,
 } from './control-plane.js';
+import { jevAvailable } from './client.js';
 import { DISCOVERY_SIBLING_DOORS, TOOL_SEARCH_ALWAYS_LOADED, rankCatalogEntriesLexically } from '../../agents/tool-catalog.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 
@@ -43,10 +44,11 @@ const FAMILIAR_RUN_CANDIDATES = 8;
 /** How the turn's remembered run was chosen:
  *  - keywords: the request restates the run (keyword coverage);
  *  - jev: Jev judged, inside the budget, that the run did the same kind of work;
- *  - jev_route: Jev routed the request to one operation the host can hand over;
- *  - keywords_unconfirmed: Jev was unavailable, so the nearest keyword match is
- *    offered as guidance only and nothing is bound on it. */
-export type ProvenPickSource = 'keywords' | 'jev' | 'jev_route' | 'keywords_unconfirmed';
+ *  - jev_route: Jev routed the request to one operation the host can hand over.
+ *  Without a turn-start judgement, remembered runs that disagree are never
+ *  settled by how many words the request shares with one of them: nothing is
+ *  picked, and discovery runs as usual. */
+export type ProvenPickSource = 'keywords' | 'jev' | 'jev_route';
 
 export interface ProvenLiveRead {
   operation: string;
@@ -95,7 +97,8 @@ export interface ProvenOperationPreparation {
 
 export interface ProvenOperationDependencies {
   acquireLiveRead?: typeof import('../../tools/tool-search-provider-sources.js').acquireProvenLiveReadForSource;
-  /** Test seam for the turn-start Jev decision. */
+  /** Test seam for the turn-start Jev decision. An injected decision stands in
+   *  for Jev entirely, so it is asked whether or not Jev is available. */
   decideTurnStart?: typeof decideTurnStartWithJev;
 }
 
@@ -679,9 +682,9 @@ export async function prepareProvenOperationForRequest(input: {
   const matches = listMatchingRunStrategies(input.query, 4, { scope: strategyScope });
   // A remembered run is taken on keywords alone only when it covers the
   // request. One that merely shares words with it goes through Jev's check
-  // below like any other ambiguous match: live 300948, "Show me the Daily
-  // Brief space" matched a run that BUILT that space, whose calendar and mail
-  // tools were then recommended while routing to the space tools never ran.
+  // below like any other ambiguous match: a request to show a workspace can
+  // share words with the run that built it, and that run's tools are not the
+  // ones the request needs.
   const lexical = pickProvenRunStrategy(matches);
   let strategy = lexical && provenStrategyCoversRequest(input.query, lexical) ? lexical : null;
   let pickedBy: ProvenPickSource | undefined = strategy ? 'keywords' : undefined;
@@ -695,11 +698,18 @@ export async function prepareProvenOperationForRequest(input: {
   // the operation over below.
   let routed = false;
   if (!strategy) {
-    const familiar = familiarRunStrategiesForRequest(input.query, strategyScope);
-    const operations = routableOperationsForRequest(input.query, strategyScope);
-    if (familiar.length > 0 || operations.length > 0) {
+    // The candidates exist only for Jev's question. When Jev cannot be asked
+    // (turned off, or no key), none are built and nothing waits. With no
+    // judgement, whether it was never asked, failed or ran out of time, no
+    // remembered run is picked or offered on the words it shares with the
+    // request: discovery finds the operation instead.
+    const decideTurnStart = dependencies.decideTurnStart
+      ?? (await jevAvailable() ? decideTurnStartWithJev : null);
+    const familiar = decideTurnStart ? familiarRunStrategiesForRequest(input.query, strategyScope) : [];
+    const operations = decideTurnStart ? routableOperationsForRequest(input.query, strategyScope) : [];
+    if (decideTurnStart && (familiar.length > 0 || operations.length > 0)) {
       const startedAt = Date.now();
-      const decision = await decideWithinBudget(() => (dependencies.decideTurnStart ?? decideTurnStartWithJev)(
+      const decision = await decideWithinBudget(() => decideTurnStart(
         input.query,
         familiar.map((row) => ({
           id: row.id,
@@ -716,9 +726,6 @@ export async function prepareProvenOperationForRequest(input: {
       if (judged) {
         strategy = judged;
         pickedBy = 'jev';
-      } else if (decision.failedOpen && matches.length > 0) {
-        strategy = matches[0]!.strategy;
-        pickedBy = 'keywords_unconfirmed';
       }
       if (!strategy && decision.route.pick) {
         routed = true;
@@ -750,8 +757,7 @@ export async function prepareProvenOperationForRequest(input: {
   let boundAccounts: ProvenBoundAccount[] = [];
   const composioSlugs = composioSlugsFromStrategy(strategy.toolsUsed);
   // A strategy that does not cover the request must not spend the request's
-  // time provisioning its operations: a run that merely shares words with the
-  // request is guidance only. Coverage is either the request restating the run
+  // time provisioning its operations. Coverage is either the request restating the run
   // (its own keywords), or a turn-start judgement inside the budget that the
   // run did this same kind of work or that the routed operation does its core.
   const coversRequest = routed || pickedBy === 'jev' || provenStrategyCoversRequest(input.query, strategy);
@@ -788,9 +794,9 @@ export async function prepareProvenOperationForRequest(input: {
       }
       const bound = bindPublishedSkip(published);
       // A strategy that covers only a sliver of the request may still be
-      // called directly, but it never thins the surface: live 282184 a
-      // two-word calendar strategy matched "create a workflow… calendar…"
-      // and the thinned surface had no door to authoring.
+      // called directly, but it never thins the surface: a short strategy can
+      // match a longer request that needs other doors, and a thinned surface
+      // would not have them.
       skipDiscoverySearch = bound.skipDiscoverySearch && coversRequest;
       capabilityRefs = bound.capabilityRefs;
       descriptors = bound.descriptors;

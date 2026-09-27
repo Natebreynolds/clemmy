@@ -67,6 +67,49 @@ test('queries of a recall call recover the original data, not the JSON example i
   assert.doesNotMatch(result.content[0].text, /None of|No tool output/);
 });
 
+test('a recall that travelled through a carrier maps back to its producer, for recall and query alike', async () => {
+  // Regression: a recall dispatched through call_tool / work_call records the
+  // carrier as `tool`; the lineage walk stopped there, so the model paged the
+  // recall's own clipped copy instead of the original result.
+  const session = createSession({ kind: 'chat' });
+  const producer = `${'H'.repeat(4_000)}${JSON.stringify([{ Name: 'Carrier Lineage Row' }])}`;
+  writeToolOutput({ sessionId: session.id, callId: 'carrier-producer', tool: 'space_get', output: producer });
+  for (const carrier of ['call_tool', 'work_call'] as const) {
+    const recallId = `carrier-recall-${carrier}`;
+    appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+      callId: recallId, tool: carrier, effectiveTool: 'recall_tool_result', accounting: 'top_level',
+      arguments: JSON.stringify({ name: 'recall_tool_result', args_json: JSON.stringify({ call_id: 'carrier-producer', max_chars: 500 }) }),
+    } });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+      callId: recallId, tool: 'recall_tool_result', accounting: 'transport_mirror', canonicalCallId: recallId,
+      args: JSON.stringify({ call_id: 'carrier-producer', max_chars: 500, offset: null }),
+    } });
+    writeToolOutput({ sessionId: session.id, callId: recallId, tool: carrier,
+      output: `Recalled chars 0–500 of ${producer.length} (more remains — continue with recall_tool_result {"call_id":"carrier-producer","offset":500})\n\n${'H'.repeat(500)}` });
+    const recalled = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+      () => captureRecallHandler()({ call_id: recallId, offset: 4_000 }));
+    assert.match(recalled.content[0].text, new RegExp(`Recalled chars 4000–${producer.length} of ${producer.length}\\b`));
+    assert.match(recalled.content[0].text, /Carrier Lineage Row/);
+    const queried = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+      () => captureToolOutputQueryHandler()({ call_id: recallId, fields: ['Name'] }));
+    assert.match(queried.content[0].text, /Carrier Lineage Row/);
+  }
+});
+
+test('lineage never follows a foreign tool that only shares the recall name', async () => {
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'foreign-target', tool: 'work_call', output: 'the target text' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+    callId: 'foreign-recall', tool: 'recall_tool_result', effectiveTool: 'othersrv__recall_tool_result',
+    accounting: 'top_level', arguments: JSON.stringify({ call_id: 'foreign-target' }),
+  } });
+  writeToolOutput({ sessionId: session.id, callId: 'foreign-recall', tool: 'recall_tool_result', output: 'the foreign tool own output' });
+  const recalled = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+    () => captureRecallHandler()({ call_id: 'foreign-recall' }));
+  assert.match(recalled.content[0].text, /the foreign tool own output/);
+  assert.doesNotMatch(recalled.content[0].text, /the target text/);
+});
+
 test('old or failed projections do not permanently exhaust a retained result for later turns', async () => {
   const session = createSession({ kind: 'chat' });
   writeToolOutput({ sessionId: session.id, callId: 'long-lived-result', tool: 'work_call',
@@ -153,13 +196,22 @@ test('recall_tool_result pages with offset and signals when more remains', async
     () => handler({ call_id: 'call_page' }),
   );
   const t1 = page1.content[0].text;
-  assert.match(t1, /Recalled chars 0.30000 of 50000/);
+  // A bare recall shows one whole inline result for the window, not the much
+  // larger slice ceiling.
+  assert.match(t1, /Recalled chars 0.20000 of 50000/);
   // The paging signal must name the EXACT next call, not just "more remains".
   // A model that has to reconstruct the call guesses offsets, and blind paging
   // spends a turn per slice while crediting no business progress until the
   // no-progress governor ends the run (live platform-49 run, 2026-09-02).
   assert.match(t1, /more remains/);
-  assert.match(t1, /recall_tool_result \{"call_id":"call_page","offset":30000\}/);
+  assert.match(t1, /recall_tool_result \{"call_id":"call_page","offset":20000\}/);
+
+  const explicit = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => handler({ call_id: 'call_page', max_chars: 30_000 }),
+  );
+  assert.match(explicit.content[0].text, /Recalled chars 0.30000 of 50000/,
+    'an explicit larger slice is honored up to the ceiling');
 
   const page2 = await withHarnessRunContext(
     { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
@@ -291,26 +343,74 @@ test('tool_output_query recovers complete records from a clipped shell JSON-arra
   assert.match(text, /site-target/);
 });
 
-test('tool_output_query still bounces genuinely non-JSON output to recall_tool_result', async () => {
+test('tool_output_query on genuinely non-JSON text answers with the text, never a refusal round', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   writeToolOutput({ sessionId: sess.id, callId: 'call_txt', tool: 'run_shell_command', output: 'exit_code: 0\n\nstdout:\njust some log lines, not json\n' });
   const query = captureToolOutputQueryHandler();
+  const budget = new RecallBudget(3, 200_000);
+  // Strict transports send every unused optional argument as null; a bare
+  // query (the old digest footer even suggested a limit) still means "show it".
   const res = await withHarnessRunContext(
-    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
-    () => query({ call_id: 'call_txt' }),
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: budget },
+    () => query({ call_id: 'call_txt', fields: null, filter_field: null, where: null, limit: 50 }),
   );
-  // Genuinely non-JSON text still routes to recall_tool_result — but the
-  // message states what is TRUE (recovery found no JSON value) rather than
-  // asserting the output "is not JSON", which was a falsehood whenever the
-  // payload was JSON carrying harness prose (live 2026-09-03, platform-49
-  // run 6: the model obeyed that falsehood twice and the run died).
-  assert.match(res.content[0].text, /No JSON value could be recovered/);
-  // The PROPERTY, not the sentence: genuinely non-JSON output routes to the
-  // reader that can read text. The exact call is now computed (and a fallback
-  // named) rather than hardcoded, so assert the routing, not the phrasing.
-  assert.match(res.content[0].text, /recall_tool_result \{"call_id":"call_txt"\}/);
-  assert.doesNotMatch(res.content[0].text, /is not JSON/);
+  const text = res.content[0].text;
+  assert.match(text, /is text, not structured records/);
+  assert.match(text, /Recalled chars 0–\d+ of \d+/);
+  assert.match(text, /just some log lines, not json/);
+  assert.doesNotMatch(text, /No JSON value could be recovered|is not JSON/);
+  assert.equal(budget.snapshot().calls, 1, 'the text answer spends recall budget like recall does');
+
+  // A projection or filter needs records; text still gets a computed route,
+  // never a claim that the output "is not JSON".
+  const filtered = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_txt', filter_field: 'level', filter_contains: 'warn' }),
+  );
+  assert.match(filtered.content[0].text, /No JSON value could be recovered/);
+  assert.match(filtered.content[0].text, /recall_tool_result \{"call_id":"call_txt"\}/);
+  assert.doesNotMatch(filtered.content[0].text, /is not JSON/);
+});
+
+test('tool_output_query on text with recall spent routes to a reader that still serves, never back to itself', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_txt_spent', tool: 'work_call', invocationNonce: 'nonce-txt-spent',
+    output: 'plain narrative text with no records at all' });
+  const budget = new RecallBudget(0, 200_000, sess.id);
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: budget },
+    () => captureToolOutputQueryHandler()({ call_id: 'call_txt_spent' }),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /^ERROR: /);
+  assert.match(text, /file_query \{"call_id":"call_txt_spent"/);
+  assert.doesNotMatch(text, /tool_output_query \{|recall_tool_result \{/);
+});
+
+test('a long text slice never points an ANSWER at the record query', async () => {
+  // The paging header's "answer instead of paging" route is computed from the
+  // output's shape: a record query for records, a passage search for text.
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_long_text', tool: 'work_call', invocationNonce: 'nonce-long-text',
+    output: 'narrative line without records\n'.repeat(2_000) });
+  for (const [reader, input] of [
+    [captureRecallHandler(), { call_id: 'call_long_text', max_chars: 1_000 }],
+    [captureToolOutputQueryHandler(), { call_id: 'call_long_text' }],
+  ] as const) {
+    const res = await withHarnessRunContext(
+      { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(5, 400_000) },
+      () => reader({ ...input }),
+    );
+    assert.doesNotMatch(res.content[0].text, /tool_output_query \{/);
+  }
+  const paged = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(5, 400_000) },
+    () => captureRecallHandler()({ call_id: 'call_long_text', max_chars: 1_000 }),
+  );
+  assert.match(paged.content[0].text, /if you need an ANSWER rather than the raw text, file_query \{"call_id":"call_long_text"/);
 });
 
 test('tool_output_query bounds an unfiltered large-object response (no full-payload context dump)', async () => {
@@ -330,8 +430,17 @@ test('tool_output_query bounds an unfiltered large-object response (no full-payl
     () => query({ call_id: 'call_obj' }),
   );
   const text = res.content[0].text;
-  assert.ok(text.length <= 51_000, `response must be bounded, got ${text.length}`);
-  assert.match(text, /clipped to 50000 chars/);
+  // A bare query is one inline result, the same default a bare recall gets.
+  assert.ok(text.length <= 21_000, `response must be bounded, got ${text.length}`);
+  assert.match(text, /clipped to \d+ chars/);
+  // A named page is an explicit ask, bounded by the query's own maximum.
+  const named = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_obj', limit: 50 }),
+  );
+  assert.ok(named.content[0].text.length > 21_000 && named.content[0].text.length <= 51_000,
+    `named page bounded by the query maximum, got ${named.content[0].text.length}`);
+  assert.match(named.content[0].text, /clipped to \d+ chars/);
 });
 
 test('tool_output_query hands the model the exact copy-paste $fromToolOutput reference for record values', async () => {
@@ -377,11 +486,19 @@ test('a recall budget refusal hands back the exact next call, never prose only',
   assert.match(callErr, /tool_output_query \{"call_id":"call_abc123"\}/);
   assert.match(callErr, /Do NOT retry recall_tool_result/);
 
-  const byteBudget = new RecallBudget(9, 150);
-  const byteErr = byteBudget.consume(200, 'call_xyz789');
+  const byteBudget = new RecallBudget(9, 2_000);
+  const byteErr = byteBudget.consume(3_000, 'call_xyz789');
   assert.ok(byteErr, 'an oversized slice exhausts the byte budget');
   assert.match(byteErr, /^recall byte budget exhausted/);
   assert.match(byteErr, /tool_output_query \{"call_id":"call_xyz789"\}/);
+
+  // Once too few bytes remain for a bare query reply, the exact next call is
+  // a named page, which spends no reading bytes; the query is never closed.
+  const spentBudget = new RecallBudget(9, 150);
+  const spentErr = spentBudget.consume(200, 'call_xyz789');
+  assert.ok(spentErr);
+  assert.match(spentErr, /tool_output_query \{"call_id":"call_xyz789","limit":20\}/);
+  assert.match(spentErr, /Do NOT retry recall_tool_result or a bare tool_output_query/);
 
   // Without a call_id the refusal still points at the tool rather than dead-ending.
   const bare = new RecallBudget(0, 60_000).consume(10);

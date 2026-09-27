@@ -16,7 +16,11 @@ const {
   parseWorkflowSource,
   reconcilePromptComponents,
   uncachedTokensForAccrual,
+  recordModelUsage,
+  usageRoleFromChannel,
+  withModelUsageAttribution,
 } = await import('./usage-log.js');
+const { listOperationalEvents } = await import('./operational-telemetry.js');
 
 function ev(over: Partial<import('./usage-log.js').UsageEvent>): import('./usage-log.js').UsageEvent {
   return {
@@ -413,4 +417,123 @@ test('usageEfficiencyForEvents: the brain is the model that carried the prompt b
   assert.equal(efficiency.sideFrames, 8);
   assert.equal(efficiency.sideInputTokens, 6_400);
   assert.ok(efficiency.prefixReuse > 0.8, `brain frames reused the previous prompt: ${efficiency.prefixReuse}`);
+});
+
+test('a memory job channel names the role of the model the job registry gives it', () => {
+  for (const job of ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import']) {
+    assert.equal(usageRoleFromChannel(`memory:${job}`), 'memory', `${job} runs on the memory model`);
+  }
+  assert.equal(usageRoleFromChannel('Memory:Reconcile'), 'memory', 'case does not change the job');
+  // Checking stays with "Checks the work" on purpose; its calls are review.
+  assert.equal(usageRoleFromChannel('memory:standing'), 'reviewer');
+  assert.equal(usageRoleFromChannel('memory:verify'), 'reviewer');
+  // The local index and model-free upkeep are not memory model work.
+  assert.equal(usageRoleFromChannel('memory:index'), undefined);
+  assert.equal(usageRoleFromChannel('Memory:Tidy'), undefined);
+  assert.equal(usageRoleFromChannel('memory:not-a-job'), undefined, 'an unknown job is not guessed');
+  assert.equal(usageRoleFromChannel('memory_search'), undefined, 'the embedder lane is not memory model work');
+  assert.equal(usageRoleFromChannel('memorable'), undefined);
+});
+
+test('a checker memory job books an unrouted call as review, never as the memory model', () => {
+  const read = (sessionId: string) => listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId, limit: 5 })[0]?.payload;
+  // The journal's scope shape: a governed job adds role memory, a checker job only its channel.
+  for (const [job, role] of [['verify', 'reviewer'], ['standing', 'reviewer'], ['index', undefined], ['learn', 'memory']] as const) {
+    const sessionId = `usage-memory-owner-${job}`;
+    withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, channel: `memory:${job}`,
+      ...(job === 'learn' ? { role: 'memory' as const } : {}) }, () =>
+      recordModelUsage({ sessionId, model: 'test-model', inputTokens: 5, outputTokens: 1 }));
+    assert.equal(read(sessionId)?.channel, `memory:${job}`);
+    assert.equal(read(sessionId)?.role, role, `${job} books as ${role ?? 'no role'}`);
+  }
+});
+
+test('memory work is background usage, never the chat lane of the conversation it read', () => {
+  const r = resolveUsageKind('0a1b2c3d-cli-session', { channel: 'memory:learn', sessionRowKind: 'chat' });
+  assert.deepEqual(r, { kind: 'background', reason: 'channel:memory:learn' });
+  assert.equal(resolveUsageKind('warmup-1', { channel: 'memory:learn' }).kind, 'warmup', 'warmup still outranks');
+  assert.equal(resolveUsageKind('x', { channel: 'workflow' }).kind, 'workflow', 'exact channels are unchanged');
+});
+
+test('the model_call_completed event carries the resolved channel and role, in the same order the row uses', () => {
+  const read = (sessionId: string) => listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId, limit: 5 })[0]?.payload;
+
+  // An adapter passes no channel: the job scope's channel and the channel role land on the event.
+  withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, channel: 'memory:reconcile' }, () =>
+    recordModelUsage({ sessionId: 'usage-memory-channel', model: 'memory-model', inputTokens: 10, outputTokens: 2 }));
+  assert.deepEqual(
+    { channel: read('usage-memory-channel')?.channel, role: read('usage-memory-channel')?.role, roleReason: read('usage-memory-channel')?.roleReason },
+    { channel: 'memory:reconcile', role: 'memory', roleReason: 'channel' },
+  );
+
+  // A scope role outranks the channel convention (explicit > scope > channel is untouched).
+  withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, channel: 'memory:learn', role: 'reviewer' }, () =>
+    recordModelUsage({ sessionId: 'usage-memory-scope', model: 'memory-model', inputTokens: 10, outputTokens: 2 }));
+  assert.equal(read('usage-memory-scope')?.role, 'reviewer');
+  assert.equal(read('usage-memory-scope')?.roleReason, 'scope');
+  assert.equal(read('usage-memory-scope')?.channel, 'memory:learn');
+
+  recordModelUsage({ sessionId: 'usage-memory-explicit', channel: 'memory:patterns', role: 'memory', model: 'm', inputTokens: 1, outputTokens: 1 });
+  assert.equal(read('usage-memory-explicit')?.roleReason, 'explicit');
+  assert.equal(read('usage-memory-explicit')?.usageKind, 'background');
+});
+
+test('a call that declares its own request never inherits the frame role or the frame prompt components', async () => {
+  const { recordModelUsage, readUsageEventsForDate, withModelUsageAttribution, withOwnModelRequestAttribution } =
+    await import('./usage-log.js');
+  const source = `own-request-fixture-${Date.now()}`;
+  const frame = { instructions: 5_000, toolSchemas: 40_000 };
+  // What an adapter (BYO, Codex, Claude, headless CLI) passes: the ambient
+  // harness measurement of the brain round in flight.
+  const record = (responseId: string) => recordModelUsage({
+    sessionId: source, model: 'fixture', cacheDialect: 'inclusive', inputTokens: 1_000, outputTokens: 5,
+    responseId, framePromptComponents: frame,
+  });
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, role: 'brain' }, () => {
+    record('frame-round');
+    withOwnModelRequestAttribution({}, () => record('nested-unlabelled'));
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:fixture' }, () => record('nested-judge'));
+  });
+  const rows = new Map(readUsageEventsForDate().filter((row) => row.source === source).map((row) => [row.responseId, row]));
+  assert.equal(rows.get('frame-round')?.role, 'brain');
+  assert.equal(rows.get('frame-round')?.promptComponents?.toolSchemas, 40_000, 'the frame round keeps its measurement');
+  assert.equal(rows.get('nested-unlabelled')?.role, undefined);
+  assert.equal(rows.get('nested-unlabelled')?.roleReason, 'unset');
+  assert.equal(rows.get('nested-unlabelled')?.promptComponents, undefined, 'no inherited measurement');
+  assert.equal(rows.get('nested-judge')?.role, 'reviewer');
+  assert.equal(rows.get('nested-judge')?.channel, 'judge:fixture');
+  assert.equal(rows.get('nested-judge')?.promptComponents, undefined);
+  for (const row of rows.values()) assert.equal(row.inputTokens, 1_000, 'provider totals are untouched');
+});
+
+test('a judge or interpretation made inside a memory job stays on the job lane with the job role', async () => {
+  const { recordModelUsage, readUsageEventsForDate, withModelUsageAttribution, withOwnModelRequestAttribution } =
+    await import('./usage-log.js');
+  const source = `memory-job-own-request-${Date.now()}`;
+  const record = (responseId: string) => recordModelUsage({
+    sessionId: source, model: 'fixture', cacheDialect: 'inclusive', inputTokens: 700, outputTokens: 5, responseId,
+  });
+  // The checker's job (role reviewer) and the memory model's job (role memory).
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, channel: 'memory:verify', role: 'reviewer' }, () => {
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:memory_fix' }, () => record('verify-judge'));
+  });
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, channel: 'memory:learn', role: 'memory' }, () => {
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:fixture' }, () => record('learn-judge'));
+    withOwnModelRequestAttribution({ channel: 'semantic:fixture', promptComponents: { history: 40 } },
+      () => record('learn-interpretation'));
+  });
+  // Outside any memory job, a declared lane still replaces an ordinary one.
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, channel: 'chat', role: 'brain' }, () => {
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:fixture' }, () => record('chat-judge'));
+  });
+  const rows = new Map(readUsageEventsForDate().filter((row) => row.source === source).map((row) => [row.responseId, row]));
+  assert.equal(rows.get('verify-judge')?.channel, 'memory:verify', 'the repair check is the verify job\'s work');
+  assert.equal(rows.get('verify-judge')?.role, 'reviewer');
+  assert.equal(rows.get('learn-judge')?.channel, 'memory:learn');
+  assert.equal(rows.get('learn-judge')?.role, 'memory', 'the job scope names whose model does its thinking');
+  assert.equal(rows.get('learn-interpretation')?.channel, 'memory:learn');
+  assert.equal(rows.get('learn-interpretation')?.role, 'memory');
+  assert.equal(rows.get('learn-interpretation')?.promptComponents?.history, 40, 'its own measurements still apply');
+  assert.equal(rows.get('chat-judge')?.channel, 'judge:fixture');
+  assert.equal(rows.get('chat-judge')?.role, 'reviewer');
 });

@@ -390,7 +390,8 @@ export async function evaluateTerminalDelivery(
   try {
     const { withJudgeTimeout } = await import('./judge-family.js');
     timed = await withJudgeTimeout(
-      port.run({
+      'terminal_delivery',
+      () => port.run({
         route,
         instructions: TERMINAL_DELIVERY_JUDGE_SYSTEM_PROMPT,
         prompt: buildTerminalDeliveryJudgePrompt(input),

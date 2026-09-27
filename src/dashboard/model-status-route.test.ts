@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -198,11 +198,20 @@ interface BillingView {
   roles?: string[];
 }
 
+/** A stand-in embedder, so which account does memory search never depends on
+ *  the machine's keys or on loading a local model. */
+function fixtureEmbedder(name: 'local' | 'openai') {
+  return { name, model: `${name}-embedding-model`, dim: 8, embed: async (texts: string[]) => texts.map(() => new Float32Array(8)) };
+}
+
 test('each account carries its billing page, whether its provider refused for credit, and the money figures the key can read', async () => {
   const { noteCreditRefused, __resetProviderCreditForTests } = await import('../runtime/provider-credit.js');
   const { __setBalanceFetchForTests, __resetProviderBillingForTests, recentCreditRefusalNotice } = await import('../runtime/harness/provider-billing.js');
+  const { _setEmbeddingProviderForTest } = await import('../memory/embeddings.js');
   __resetProviderCreditForTests();
   __resetProviderBillingForTests();
+  // Memory search runs on the local embedder (the default).
+  _setEmbeddingProviderForTest(fixtureEmbedder('local'));
   const balanceReads: string[] = [];
   __setBalanceFetchForTests(async (url) => {
     balanceReads.push(url);
@@ -228,7 +237,10 @@ test('each account carries its billing page, whether its provider refused for cr
     ]),
     BYO_PROVIDER_TOGETHER_API_KEY: 'together-secret',
     BYO_PROVIDER_MOONSHOT_API_KEY: 'moonshot-secret',
-    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'zai-org/GLM-5.2', scope: 'durable', source: 'settings' }]),
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'zai-org/GLM-5.2', scope: 'durable', source: 'settings' },
+      { role: 'memory', modelId: 'kimi-k3', scope: 'durable', source: 'settings' },
+    ]),
   }, async () => {
     noteCreditRefused('together', { status: 402, detail: 'Credit limit exceeded' });
     const h = await boot();
@@ -255,6 +267,9 @@ test('each account carries its billing page, whether its provider refused for cr
         'Together serves its billed spend for the month, summed from its own line items');
       assert.ok(together?.roles?.includes('worker'), 'the account names the job it is doing');
       assert.ok(!body.byoProviders.find((p) => p.id === 'moonshot')?.billing?.roles?.includes('worker'));
+      assert.ok(body.byoProviders.find((p) => p.id === 'moonshot')?.billing?.roles?.includes('memory'),
+        'the account serving the chosen memory model says it keeps the memory');
+      assert.ok(!together?.roles?.includes('memory'));
 
       const moonshot = body.byoProviders.find((p) => p.id === 'moonshot')?.billing;
       assert.deepEqual(moonshot?.balance && { amount: moonshot.balance.amount, currency: moonshot.balance.currency }, { amount: 49.5, currency: 'USD' });
@@ -271,6 +286,7 @@ test('each account carries its billing page, whether its provider refused for cr
       // Memory runs on the local embedder by default, so the OpenAI key does
       // no job and says so; it is "memory search" only while it embeds.
       assert.equal(body.openai.billing?.roles, undefined, 'the OpenAI key does no job while memory runs locally');
+      assert.ok(!body.openai.billing?.roles?.includes('memory'), 'the embeddings key never serves the memory model');
       assert.equal(body.jev.connected, false);
       assert.equal(body.jev.billing?.url, 'https://console.typesafe.ai/settings/billing');
 
@@ -283,8 +299,62 @@ test('each account carries its billing page, whether its provider refused for cr
       await h.close();
       __resetProviderBillingForTests();
       __resetProviderCreditForTests();
+      _setEmbeddingProviderForTest(undefined);
     }
   });
+});
+
+test('the OpenAI key does memory search only while it embeds, and every account doing memory work keeps the memory', async () => {
+  const { _setEmbeddingProviderForTest } = await import('../memory/embeddings.js');
+  const { describeMemoryModel } = await import('../memory/memory-model-route.js');
+  const { __resetProviderBillingForTests } = await import('../runtime/harness/provider-billing.js');
+  const saved = { AUTH_MODE: process.env.AUTH_MODE, MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE };
+  const authFiles = [path.join(TMP_HOME, 'state', 'auth.json'), path.join(TMP_HOME, 'state', 'claude-auth.json')];
+  writeFileSync(authFiles[0], JSON.stringify({ codexOauth: { accessToken: 'fixture-codex-access', refreshToken: 'fixture-codex-refresh' } }));
+  writeFileSync(authFiles[1], JSON.stringify({ accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 }));
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  __resetProviderBillingForTests();
+  _setEmbeddingProviderForTest(fixtureEmbedder('openai'));
+  try {
+    await withEnv({ CLEMMY_MODEL_ROLES: '[]' }, async () => {
+      const h = await boot();
+      try {
+        type Account = { billing?: BillingView };
+        const body = await (await fetch(`${h.url}/api/console/model-status`)).json() as {
+          byoProviders: Array<{ id: string } & Account>;
+          codex: Account; claude: Account; openai: Account; jev: Account;
+        };
+        assert.deepEqual(body.openai.billing?.roles, ['memory_search'], 'the embedding key embeds, and that is all it does');
+
+        const memory = describeMemoryModel();
+        assert.equal(memory.source, 'automatic');
+        assert.ok(memory.modelId && memory.provider, 'fixture: the automatic memory route resolves');
+        const keepers = (['codex', 'claude', 'openai', 'jev'] as const)
+          .filter((account) => body[account].billing?.roles?.includes('memory'));
+        // Learning runs on the memory route's model; skills, profile and
+        // import keep the fast-tier model, here another account's.
+        const { memoryJobServing } = await import('../memory/memory-model-route.js');
+        const serving = new Set((['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const)
+          .map((job) => memoryJobServing(job, memory)?.provider)
+          .filter((provider): provider is NonNullable<typeof provider> => Boolean(provider)));
+        assert.ok(serving.has(memory.provider!), 'the automatic memory model\'s account is among them');
+        assert.ok(serving.size > 1, 'fixture: memory work runs on two accounts here');
+        assert.deepEqual([...keepers].sort(), [...serving].sort(), 'every account doing memory work keeps the memory');
+        assert.ok(body.byoProviders.every((provider) => !provider.billing?.roles?.includes('memory')));
+      } finally {
+        await h.close();
+      }
+    });
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
+    __resetProviderBillingForTests();
+    for (const file of authFiles) rmSync(file, { force: true });
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('a Coding Plan endpoint and a pay-as-you-go endpoint on one host get their own pages', async () => {

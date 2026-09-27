@@ -593,8 +593,8 @@ function preparationProbeInvocation(
  * external_write for the carrier and the consent record, but it settles as
  * a read and reserves no write: the settlement audit requires a write
  * lifecycle only for settlements booked mutating, so the two must move
- * together. Live 2026-09-26 15:21: two ranked_keywords reads settled as
- * writes minutes after that shape was learned.
+ * together; otherwise a shape already learned to read only would still
+ * settle as a write.
  */
 export function hostCallAccounting(
   input: Pick<InvokeHostToolCallInput<unknown>, 'identity' | 'effect' | 'boundary' | 'consentBasis'>,

@@ -64,10 +64,11 @@ function codexJudgeId(): string {
   return id;
 }
 
-test('only the writer, the judge and the workers are bindable here', () => {
+test('the writer, the judge, the workers and the memory model are bindable here; the brain is not', () => {
   assert.equal(isBindableModelRole('writer'), true);
   assert.equal(isBindableModelRole('judge'), true);
   assert.equal(isBindableModelRole('worker'), true);
+  assert.equal(isBindableModelRole('memory'), true);
   assert.equal(isBindableModelRole('brain'), false);
   assert.equal(isBindableModelRole('Writer'), false);
   assert.equal(isBindableModelRole(undefined), false);
@@ -79,6 +80,8 @@ test('a refused change writes nothing', () => {
     [{ role: 'writer', modelId: 'glm 5.2; rm', source: 'settings' }, 'INVALID_MODEL_ID'],
     [{ role: 'writer', modelId: 'not-a-connected-model', source: 'settings' }, 'MODEL_UNAVAILABLE'],
     [{ role: 'worker', modelId: 'glm-5.2', whenIntent: '!!!', source: 'chat-rule' }, 'INVALID_INTENT'],
+    // Memory work reads only the role-wide pick; a per-kind rule would never be used.
+    [{ role: 'memory', modelId: 'glm-5.2', whenIntent: 'design', source: 'settings' }, 'INVALID_INTENT'],
   ];
   for (const [change, code] of refusals) {
     assert.throws(
@@ -133,4 +136,27 @@ test('a role-wide judge keeps the legacy judge branch in step; an intent-scoped 
   assert.equal(process.env.CLEMMY_DEBATE_JUDGE, undefined);
   assert.equal(persistedEnv('CLEMMY_DEBATE_JUDGE'), '');
   assert.deepEqual(readDurableBindings().map((binding) => binding.whenIntent ?? null), ['legal']);
+});
+
+test('the memory model binds through the same owner, touches no side key, and survives a read', () => {
+  resetBindings();
+  const catalog = modelRoleOptionCatalogSnapshot();
+  assert.deepEqual(catalog.roleOptions.memory, catalog.roleOptions.judge,
+    'the memory picker offers the same connected models the checker picker does');
+  assert.throws(
+    () => persistModelRoleSetting({ role: 'memory', modelId: 'not-a-connected-model', source: 'settings' }),
+    (err: unknown) => err instanceof ModelRoleSettingError && err.code === 'MODEL_UNAVAILABLE',
+  );
+  persistModelRoleSetting({ role: 'memory', modelId: 'glm-5.2', source: 'settings' });
+  assert.deepEqual(readDurableBindings(), [{ role: 'memory', modelId: 'glm-5.2', scope: 'durable', source: 'settings' }],
+    'a saved memory binding is kept on read, not filtered out');
+  assert.equal(resolveRoleModel('memory').source, 'settings');
+  assert.equal(resolveRoleModel('memory').modelId, 'glm-5.2');
+  assert.equal(process.env.CLEMMY_DEBATE_JUDGE, undefined, 'the memory model never moves the judge branch');
+
+  persistModelRoleSetting({ role: 'memory', clear: true, source: 'settings' });
+  assert.deepEqual(readDurableBindings(), []);
+  const automatic = resolveRoleModel('memory');
+  assert.equal(automatic.source, 'default');
+  assert.ok(automatic.modelId, 'the automatic memory model resolves without throwing');
 });

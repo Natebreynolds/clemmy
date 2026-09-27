@@ -1,3 +1,4 @@
+import type { MemoryModelProblem } from '@clem/chat-engine';
 import { apiGet, apiPost, apiDelete, api } from './api';
 
 // ─── Scoped send-trust ───────────────────────────────────────────────────────
@@ -164,9 +165,10 @@ export const getDeveloperFlags = () =>
 export const patchDeveloperFlags = (p: { devMode?: boolean; key?: string; value?: string; clear?: boolean }) =>
   patch<{ developerFlags: DevFlagsSnapshot }>('/api/console/settings/developer-flags', p);
 
-// Role→model registry: which model serves each role (brain/worker/judge/writer),
-// the source of that choice, and the models available grouped by CONNECTED provider.
-export type ModelRoleName = 'brain' | 'worker' | 'judge' | 'writer';
+// Role→model registry: which model serves each role (brain/worker/judge/writer/
+// memory), the source of that choice, and the models available grouped by
+// CONNECTED provider.
+export type ModelRoleName = 'brain' | 'worker' | 'judge' | 'writer' | 'memory';
 export interface ResolvedRole {
   modelId: string;
   provider: 'codex' | 'claude' | 'byo';
@@ -178,16 +180,28 @@ export interface ResolvedRole {
     reason: string;
   };
 }
+/** "Keeps your memory" — Settings-only. `source: 'default'` is Automatic, and
+ *  then `follows` says whose model memory work borrows today; `modelId` is ''
+ *  when no model can serve (a chosen model that is disconnected: learning
+ *  waits, and `inactiveBinding` names the pick). The model shown is the memory
+ *  route's own resolution, never the checker's. */
+export type MemoryResolvedRole = ResolvedRole & {
+  follows?: 'checker' | 'brain' | null;
+  /** Why the memory model cannot serve right now (a disconnected account, a
+   *  used-up plan, a provider backoff), with its end when known. */
+  unavailable?: { problem: MemoryModelProblem; until?: string } | null;
+};
 export interface ModelRolesSnapshot {
   judgeFallback?: JudgeFallbackSetting;
-  // writer is absent on daemons that predate the writer role.
-  roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole; writer?: ResolvedRole };
+  // writer and memory are absent on daemons that predate those roles.
+  roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole; writer?: ResolvedRole; memory?: MemoryResolvedRole };
   bindings: { role: ModelRoleName; modelId: string; whenIntent?: string; source: string }[];
   available: { provider: string; label: string; models: { id: string; label: string }[] }[];
   roleOptions?: {
     worker: { provider: string; label: string; models: { id: string; label: string }[] }[];
     judge: { provider: string; label: string; models: { id: string; label: string }[] }[];
     writer?: { provider: string; label: string; models: { id: string; label: string }[] }[];
+    memory?: { provider: string; label: string; models: { id: string; label: string }[] }[];
   };
   // The brain picker: Codex / Claude / every connected BYO model, each flagged by
   // availability. `value` is the unique selector (BYO models = `api_key:<modelId>`).
@@ -217,9 +231,10 @@ export interface ModelRolesSnapshot {
     };
   };
 }
-// Set (or clear) a worker/judge/writer role model. Brain is a provider login
-// switch (setActiveBrain). Applies on the next message, no restart.
-export const patchModelRole = (p: { role: 'worker' | 'judge' | 'writer'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
+// Set (or clear) a worker/judge/writer/memory role model. Brain is a provider
+// login switch (setActiveBrain). Applies on the next message (memory: the next
+// memory job), no restart.
+export const patchModelRole = (p: { role: 'worker' | 'judge' | 'writer' | 'memory'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
   patch<{ modelRoles: ModelRolesSnapshot }>('/api/console/settings/models/roles', p);
 
 export interface JudgeFallbackSetting {

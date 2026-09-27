@@ -6,7 +6,7 @@
  * re-pins THAT conversation; worker and judge are global today (the daemon has
  * no per-session scope for them), and the UI says so rather than pretending.
  */
-import { modelDisplayName } from '@clem/chat-engine';
+import { MEMORY_ROLE_WORDS, modelDisplayName } from '@clem/chat-engine';
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePoll } from './poll';
@@ -38,6 +38,9 @@ export const ROLE_WORDS = {
   writer: { title: 'Writes the final answer', hint: 'When a request gathers a lot of material, this model writes your reply from it. Short replies come from the model that does the work.' },
   judge: { title: 'Checks the work', hint: 'Reviews finished work before Clem calls it done.' },
   fallback: { title: 'Backup checker', hint: 'Used only when the checker cannot complete a review. A completed verdict is kept.' },
+  // The memory words are the shared contract's, so the phone's Models card and
+  // the Memory tab say exactly this.
+  memory: { title: MEMORY_ROLE_WORDS.title, hint: MEMORY_ROLE_WORDS.explain },
 } as const;
 
 const ID_SHAPED = /^[A-Za-z0-9][A-Za-z0-9_.:-]*(?:\/[A-Za-z0-9][A-Za-z0-9_.:-]*)?$/;
@@ -176,8 +179,12 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeAuth?.configured, claudeAuth?.degraded]);
-  const onRole = (role: 'worker' | 'judge' | 'writer', v: string) =>
-    run(role, () => patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v }));
+  const onRole = (role: 'worker' | 'judge' | 'writer' | 'memory', v: string) =>
+    run(role, async () => {
+      await patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v });
+      // The Memory tab names the memory model; let it say the new one now.
+      if (role === 'memory') void qc.invalidateQueries({ queryKey: ['memory-work'] });
+    });
   const onJudgeFallback = (value: string) =>
     run('judge-fallback', () => patchJudgeFallback(judgeFallbackSelection(value)));
 
@@ -195,6 +202,9 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     workers: mr ? flatChoices(mr.roleOptions?.worker ?? mr.available) : [],
     judges: mr ? flatChoices(mr.roleOptions?.judge ?? mr.available) : [],
     writers: mr ? flatChoices(mr.roleOptions?.writer ?? mr.roleOptions?.judge ?? mr.available) : [],
+    // Only the daemon's own memory catalog: a daemon without one predates the
+    // role, and the row is not shown at all.
+    memories: mr ? flatChoices(mr.roleOptions?.memory) : [],
   };
 }
 

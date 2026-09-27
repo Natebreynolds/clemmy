@@ -274,6 +274,7 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
   | 'dispatchLease'
   | 'runAttemptId'
   | 'hostOwnsToolAccounting'
+  | 'routedModelId'
 >> {
   const parent = harnessRunContextStorage.getStore();
   if (!parent || parent.sessionId !== sessionId) return {};
@@ -293,13 +294,19 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
     // ambient parent flag cannot exempt arbitrary child work.
     ...((exactHostAdmission || hostOwnsLogicalCallAccounting(sessionId, mirroredCallId)) && parent.hostOwnsToolAccounting === true
       ? { hostOwnsToolAccounting: true } : {}),
-    // recallBudget is deliberately NOT inherited (live 2026-07-24): the budget
-    // protects the MODEL's context window, but an inner recall never enters
-    // model context — only the carrier's clipped output does. Inheriting
-    // it capped a 100-item resume at 3 recalls; calls 4+ returned the budget
-    // error, and 60 accounts of good banked data were declared "malformed" —
-    // triggering a full wasteful re-scrape. Inner recalls stay bounded by the
-    // tool-call counter and carrier timeout.
+    // A transport mirror is the model's own call seen through its carrier: its
+    // result is presented into the same model window, so child and carrier
+    // must resolve their presentation budget against the same model.
+    ...(mirroredCallId && parent.routedModelId ? { routedModelId: parent.routedModelId } : {}),
+    // recallBudget protects the MODEL's context window, so only a child whose
+    // result enters that window is charged. A transport mirror's result is
+    // the model's own call, presented whole through its carrier: it spends
+    // the same per-turn budget as a direct recall. A batch item's inner
+    // recall never enters model context (only the runner's aggregate does),
+    // so it is NOT charged: charging it would starve a long resume of the
+    // recalls it needs. Batch recalls stay bounded by the tool-call counter
+    // and carrier timeout.
+    ...(mirroredCallId && parent.recallBudget ? { recallBudget: parent.recallBudget } : {}),
     ...(parent.turnRecallRunIds ? { turnRecallRunIds: parent.turnRecallRunIds } : {}),
   };
 }

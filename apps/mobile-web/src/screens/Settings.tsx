@@ -37,6 +37,7 @@ import {
   ROLE_COPY,
   brainSummary,
   inactiveNote,
+  roleNote,
   roleSummary,
   sameFamilyWarning,
   judgeFallbackChoices,
@@ -445,9 +446,10 @@ function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError
 /**
  * Who handles each part of a request, in plain words: the model that does the
  * work, the one that writes the final answer, the one that checks it, and the
- * helpers that run side tasks. Each row names the model that will actually
- * run and opens a picker over the daemon's connected catalog. Rarely changed
- * options sit under Advanced.
+ * helpers that run side tasks; then the model that keeps your memory in the
+ * background. Each row names the model that will actually run and opens a
+ * picker over the daemon's connected catalog. Rarely changed options sit
+ * under Advanced.
  */
 function ModelsCard({ loaded, onRefresh }: {
   loaded: ModelSettings | null;
@@ -486,7 +488,7 @@ function ModelsCard({ loaded, onRefresh }: {
 
   return (
     <section class="card settings-card" aria-label="Models">
-      <p class="card-note">Which model handles each part of a request.</p>
+      <p class="card-note">Which model handles each part of a request, and which keeps your memory.</p>
       {!settings ? (
         <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
       ) : (
@@ -497,13 +499,13 @@ function ModelsCard({ loaded, onRefresh }: {
             warning={inactiveNote(settings.brain, settings)}
             onOpen={() => setBrainOpen(true)}
           />
-          {(['writer', 'judge', 'worker'] as const).map((role) => settings.roles?.[role] ? (
+          {(['writer', 'judge', 'worker', 'memory'] as const).map((role) => settings.roles?.[role] ? (
             <Fragment key={role}>
               <RoleRow
                 title={ROLE_COPY[role].title}
                 summary={roleSummary(role, settings)}
-                warning={inactiveNote(settings.roles[role], settings)}
-                note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : null}
+                warning={inactiveNote(settings.roles[role], settings, role)}
+                note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : roleNote(role, settings)}
                 onOpen={() => setSheet(role)}
               />
               {role === 'judge' && settings.judgeFallback ? (

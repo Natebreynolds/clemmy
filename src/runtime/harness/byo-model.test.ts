@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { protocol, withTrace } from '@openai/agents-core';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
-import { relaxRequestForCompatBackend, wrapCompletionsCreate, byoBackendStreamsChatCompletions, liftReasoning, liftReasoningChunk, applyGlmThinking, repairToolCallArguments } from './byo-model.js';
+import { relaxRequestForCompatBackend, wrapCompletionsCreate, byoBackendStreamsChatCompletions, liftReasoning, liftReasoningChunk, applyDeclaredThinkingSwitch, repairToolCallArguments } from './byo-model.js';
 
 // --- test helpers for the wrapped-create repair layer ---------------------
 type AnyObj = Record<string, unknown>;
@@ -378,40 +378,40 @@ test('wrap: a structured streaming turn carries reasoning + repaired JSON', asyn
 
 // --- GLM (Z.ai) thinking control: effort -> `thinking` switch --------------
 
-test('applyGlmThinking: GLM id + reasoning effort enables/disables thinking by tier', () => {
-  const high: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(high, 'high');
+test('applyDeclaredThinkingSwitch: GLM id + reasoning effort enables/disables thinking by tier', () => {
+  const high: AnyObj = { model: 'glm-5.2' }; applyDeclaredThinkingSwitch(high, 'high');
   assert.deepEqual(high.thinking, { type: 'disabled' }, 'no harness tier switches extended thinking on');
-  const explicit: AnyObj = { model: 'glm-5.2', thinking: { type: 'enabled' } }; applyGlmThinking(explicit, 'high');
+  const explicit: AnyObj = { model: 'glm-5.2', thinking: { type: 'enabled' } }; applyDeclaredThinkingSwitch(explicit, 'high');
   assert.deepEqual(explicit.thinking, { type: 'enabled' }, 'a caller-set thinking switch is honored');
-  const medium: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(medium, 'medium');
+  const medium: AnyObj = { model: 'glm-5.2' }; applyDeclaredThinkingSwitch(medium, 'medium');
   assert.deepEqual(medium.thinking, { type: 'disabled' }, 'the ordinary tier never switches extended thinking on');
-  const low: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(low, 'low');
+  const low: AnyObj = { model: 'glm-5.2' }; applyDeclaredThinkingSwitch(low, 'low');
   assert.deepEqual(low.thinking, { type: 'disabled' });
-  const minimal: AnyObj = { model: 'glm-4.6' }; applyGlmThinking(minimal, 'minimal');
+  const minimal: AnyObj = { model: 'glm-4.6' }; applyDeclaredThinkingSwitch(minimal, 'minimal');
   assert.deepEqual(minimal.thinking, { type: 'disabled' });
-  const none: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(none, 'none');
+  const none: AnyObj = { model: 'glm-5.2' }; applyDeclaredThinkingSwitch(none, 'none');
   assert.deepEqual(none.thinking, { type: 'disabled' });
 });
 
-test('applyGlmThinking: non-GLM backend never gets a `thinking` field (would 400)', () => {
-  const ds: AnyObj = { model: 'deepseek-chat' }; applyGlmThinking(ds, 'high');
+test('applyDeclaredThinkingSwitch: non-GLM backend never gets a `thinking` field (would 400)', () => {
+  const ds: AnyObj = { model: 'deepseek-chat' }; applyDeclaredThinkingSwitch(ds, 'high');
   assert.equal('thinking' in ds, false);
-  const mm: AnyObj = { model: 'MiniMax-M3' }; applyGlmThinking(mm, 'low');
+  const mm: AnyObj = { model: 'MiniMax-M3' }; applyDeclaredThinkingSwitch(mm, 'low');
   assert.equal('thinking' in mm, false);
 });
 
-test('applyGlmThinking: structured output (json_schema/json_object) forces thinking OFF regardless of effort', () => {
+test('applyDeclaredThinkingSwitch: structured output (json_schema/json_object) forces thinking OFF regardless of effort', () => {
   // The orchestrator decision + judges are structured; GLM thinking corrupts
   // them ("reply: expected string") and adds latency — disable it there.
   const schemaHigh: AnyObj = { model: 'glm-5.2', response_format: { type: 'json_schema' } };
-  applyGlmThinking(schemaHigh, 'high');
+  applyDeclaredThinkingSwitch(schemaHigh, 'high');
   assert.deepEqual(schemaHigh.thinking, { type: 'disabled' }, 'json_schema + high effort → disabled');
   const jsonObj: AnyObj = { model: 'glm-5.2', response_format: { type: 'json_object' } };
-  applyGlmThinking(jsonObj, 'medium');
+  applyDeclaredThinkingSwitch(jsonObj, 'medium');
   assert.deepEqual(jsonObj.thinking, { type: 'disabled' }, 'json_object + medium effort → disabled');
   // free-form (no structured contract) keeps effort-driven thinking
   const freeform: AnyObj = { model: 'glm-5.2' };
-  applyGlmThinking(freeform, 'high');
+  applyDeclaredThinkingSwitch(freeform, 'high');
   assert.deepEqual(freeform.thinking, { type: 'disabled' }, 'free-form + high → still off: no harness tier switches extended thinking on');
 });
 
@@ -425,11 +425,11 @@ test('relax: a GLM structured (json_schema) request ends up with thinking disabl
   assert.equal((out.response_format as AnyObj).type, 'json_object', 'still downgraded for the wire');
 });
 
-test('applyGlmThinking: no effort, or pre-set thinking, is left alone', () => {
-  const noEffort: AnyObj = { model: 'glm-5.2' }; applyGlmThinking(noEffort, undefined);
+test('applyDeclaredThinkingSwitch: no effort, or pre-set thinking, is left alone', () => {
+  const noEffort: AnyObj = { model: 'glm-5.2' }; applyDeclaredThinkingSwitch(noEffort, undefined);
   assert.equal('thinking' in noEffort, false, 'no effort -> leave GLM default');
   const preset: AnyObj = { model: 'glm-5.2', thinking: { type: 'enabled', clear_thinking: false } };
-  applyGlmThinking(preset, 'none');
+  applyDeclaredThinkingSwitch(preset, 'none');
   assert.deepEqual(preset.thinking, { type: 'enabled', clear_thinking: false }, 'caller-set thinking wins');
 });
 

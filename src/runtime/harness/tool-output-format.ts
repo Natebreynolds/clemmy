@@ -1,18 +1,17 @@
 import { createHash } from 'node:crypto';
 import { getToolOutputForInvocation, writeToolOutput } from './eventlog.js';
+import { retainedResultWayThrough } from './retained-result-routes.js';
 import { getToolOutputContext } from './tool-output-context.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
-import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { actionTopologyRoleForRuntimeCall, unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { effectiveContextWindow } from './model-window-observations.js';
+import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 
-// Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
-// (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
-// "aggressive" clipping. Raised 12000 → 20000 (2026-08-05): a 39KB calendar
-// day (6 Graph events) digested at 12K, forcing a follow-up tool_output_query
-// round-trip for data the model was about to need anyway; 20K (~5K tokens)
-// passes typical single-screen results whole while genuinely huge outputs
-// (100KB+ Composio dumps) still digest + stay recoverable. Context pressure is
-// owned by compaction, which is now budgeted from the routed model's REAL
-// window (compactionBudgetForModel) instead of a fixed 200K.
+// One whole inline result: 20K (~5K tokens) passes typical single-screen
+// results whole, so the model does not spend a follow-up read on data it was
+// about to need, while genuinely huge outputs still digest and stay
+// recoverable. Context pressure is owned by compaction, budgeted from the
+// routed model's real window (compactionBudgetForModel).
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
 /** When the full payload is parked for recall, the prompt keeps a smaller
  *  field/index view plus a source reference instead of re-reading the dump. */
@@ -28,6 +27,172 @@ export function explicitLocalReadPreviewBudget(toolName: string, args: unknown):
   const requested = (args as Record<string, unknown>).max_chars;
   return typeof requested === 'number' && Number.isSafeInteger(requested)
     && requested > DEFAULT_TOOL_RESULT_MAX_CHARS ? requested : undefined;
+}
+
+/** Inline characters one result may take per token of the routed model's
+ * context window: about a tenth of the window at ~3.5 characters per token.
+ * Every window of 57,143 tokens or more keeps the full
+ * DEFAULT_TOOL_RESULT_MAX_CHARS; a small window scales down, never below
+ * PROMPT_INLINE_RECALLABLE_RESULT_CHARS, and a large window never scales up
+ * (per-round prefill is paid in absolute bytes). */
+const INLINE_RESULT_CHARS_PER_WINDOW_TOKEN = 0.35;
+
+/** The routed model's context window in tokens, or null when there is no
+ * routed model or its window is unknowable. Without a routed model the model
+ * registry is not asked to resolve (and warn about) an absent id on every
+ * tool result. */
+function routedWindowTokens(routedModelId?: string | null): number | null {
+  if (!routedModelId?.trim()) return null;
+  try {
+    const window = effectiveContextWindow(routedModelId);
+    return Number.isFinite(window) && window > 0 ? window : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The whole-result inline budget for the routed model's window. Without a
+ * routed model the tuned default applies. */
+export function inlineResultBudgetForModel(routedModelId?: string | null): number {
+  const window = routedWindowTokens(routedModelId);
+  if (window === null) return DEFAULT_TOOL_RESULT_MAX_CHARS;
+  return Math.max(
+    PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+    Math.min(DEFAULT_TOOL_RESULT_MAX_CHARS, Math.floor(window * INLINE_RESULT_CHARS_PER_WINDOW_TOKEN)),
+  );
+}
+
+/** The largest slice a retained-output reader's schema admits (the static
+ * recall_tool_result max_chars bound, so the tool contract never churns per
+ * model). What a reader actually returns is retainedReaderMaxChars. */
+export const RETAINED_OUTPUT_READER_MAX_SLICE_CHARS = 120_000;
+/** Room for a reader's header and paging line around its slice. */
+const RETAINED_OUTPUT_READER_FRAME_CHARS = 2_000;
+
+/**
+ * The most characters one tool reply may carry across the Claude CLI's MCP
+ * wire. The CLI measures an MCP tool reply against its own output-token cap
+ * (MAX_MCP_OUTPUT_TOKENS, default 25,000 tokens); a reply over the cap is cut
+ * to 4 characters per token of that cap (100,000 characters) and marked
+ * truncated, so a longer reply loses its tail after the reply's own paging
+ * frame already named the next offset. A reply at or under this bound is
+ * never cut. Dense text (CJK, base64, id-heavy JSON) can still exceed the
+ * token cap at this length, and then the CLI appends its truncation notice
+ * to a reply that lost nothing; the reply's own paging line stays accurate.
+ */
+export const MCP_TRANSPORT_MAX_CHARS = 60_000;
+
+/** Reader characters per token of the routed window: at the 200,000-token
+ * baseline every earlier reader bound was tuned against, this is the query
+ * page bound; a smaller window shrinks it. */
+const RETAINED_READER_CHARS_PER_WINDOW_TOKEN = 0.25;
+const BASELINE_WINDOW_TOKENS = 200_000;
+
+/**
+ * The most one retained-output reader reply (a recall slice, a query page)
+ * holds for the routed window, frame excluded. It never exceeds what the
+ * window can take (a quarter character per window token, never below one
+ * inline result), the reader schema bound, or what the MCP wire carries whole.
+ * recall_tool_result and tool_output_query bound their own replies by this,
+ * and presentation budgets every retained-output reader by this plus the
+ * frame, so presentation never re-clips those replies. A file_query reply
+ * larger than this bound (many passages on a small window) is shown as a
+ * recallable view like any other oversized result.
+ */
+export function retainedReaderMaxChars(routedModelId?: string | null): number {
+  const window = routedWindowTokens(routedModelId) ?? BASELINE_WINDOW_TOKENS;
+  return Math.min(
+    RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
+    MCP_TRANSPORT_MAX_CHARS - RETAINED_OUTPUT_READER_FRAME_CHARS,
+    Math.max(inlineResultBudgetForModel(routedModelId), Math.floor(window * RETAINED_READER_CHARS_PER_WINDOW_TOKEN)),
+  );
+}
+
+export interface PresentationBudgetInput {
+  /** The name the model called: a tool, or a carrier naming its inner tool. */
+  toolName: string;
+  /** The arguments of that call (a carrier's envelope for a carrier). */
+  args?: unknown;
+  /** The model the result is presented to. */
+  routedModelId?: string | null;
+}
+
+/**
+ * The one inline presentation budget for a tool result.
+ *
+ * It keys on the EFFECTIVE inner tool, resolved by the canonical carrier
+ * unwrapping, never on the carrier the call travelled through. A carrier and
+ * the child it dispatches therefore resolve the same number, so the carrier
+ * passes the child's presentation through instead of digesting it again, and
+ * an inner tool is shown exactly as it would be when called directly.
+ *
+ * - A local reader's explicit larger preview request is honored.
+ * - A retained-output reader (recall_tool_result, tool_output_query,
+ *   file_query) bounds its own reply by retainedReaderMaxChars for the routed
+ *   window; presentation allows that plus the reader's frame, so it never
+ *   clips a reader's reply again. Per-turn reading stays governed by the
+ *   RecallBudget.
+ * - A registry control read (Clementine's own state and control tools) is
+ *   shown whole up to the routed window's inline budget.
+ * - Everything else (provider and business results, foreign tools) keeps the
+ *   recallable keyhole: a bounded view plus the parked full payload.
+ */
+export function presentationBudgetFor(input: PresentationBudgetInput): number {
+  let effectiveName: string | null = null;
+  let effectiveArgs: unknown = input.args;
+  let role: 'control' | 'business' = 'business';
+  try {
+    const effective = unwrapRuntimeEffectiveToolIdentity(input.toolName, input.args);
+    effectiveName = effective.toolName;
+    effectiveArgs = effective.args;
+    role = actionTopologyRoleForRuntimeCall(input.toolName, input.args);
+  } catch {
+    // An unreadable identity presents like an unknown tool: the keyhole.
+  }
+  if (effectiveName) {
+    const explicitRead = explicitLocalReadPreviewBudget(effectiveName, effectiveArgs);
+    if (explicitRead !== undefined) return explicitRead;
+  }
+  if (role !== 'control') return PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
+  if (effectiveName && toolReadsRetainedOutput(effectiveName)) {
+    return retainedReaderMaxChars(input.routedModelId) + RETAINED_OUTPUT_READER_FRAME_CHARS;
+  }
+  return inlineResultBudgetForModel(input.routedModelId);
+}
+
+/**
+ * The bound a reviewer's view of a settled result uses: the answerer's own
+ * presentation budget from the same resolver (tool, arguments, routed window),
+ * so a result the window clipped is never shown to a reviewer as whole. A
+ * result presented through the recallable keyhole had its exact bytes parked
+ * for the answerer's next read, so its reviewer view keeps one whole inline
+ * result for the same window rather than the keyhole alone.
+ */
+export function answererViewBudgetFor(input: PresentationBudgetInput): number {
+  return Math.max(presentationBudgetFor(input), inlineResultBudgetForModel(input.routedModelId));
+}
+
+/**
+ * The bound an outer transport applies to a result its invocation already
+ * presented: a carrier's MCP wire, or the host lane's model projection.
+ *
+ * The invocation's own presentation budget (the same resolver) bounded the
+ * result, so a transport is a backstop only. It never cuts below that budget,
+ * or it would clip a slice the reader shaped whole and whose paging frame
+ * names offsets the model would then silently skip.
+ */
+export function transportPresentationMaxChars(input: PresentationBudgetInput): number {
+  return Math.max(DEFAULT_TOOL_RESULT_MAX_CHARS, presentationBudgetFor(input));
+}
+
+/**
+ * The same transport bound for a carrier reply that crosses the Claude CLI's
+ * MCP wire, never above what that wire carries whole. A reply the invocation
+ * presented larger (an explicit local read preview) is cut here, with this
+ * formatter's own truthful marker, instead of silently by the CLI.
+ */
+export function mcpTransportPresentationMaxChars(input: PresentationBudgetInput): number {
+  return Math.min(MCP_TRANSPORT_MAX_CHARS, transportPresentationMaxChars(input));
 }
 
 
@@ -66,6 +231,12 @@ export interface RecallableToolTextOptions {
   callId?: string;
   /** Host commentary, separate from the provider payload and its raw receipt. */
   hostAnnotations?: readonly string[];
+  /** A projection the handler itself already formatted from this invocation's
+   * exact bytes is kept whole up to this many characters, and re-rendered from
+   * those bytes at this budget above it, even when `maxChars` is smaller. Only
+   * a direct call's bracket passes it: a nested or batch child keeps the view
+   * its carrier or runner presents. */
+  verifiedProjectionMaxChars?: number;
 }
 
 const EXACT_OUTPUT_RECEIPT_RE = /\[exact-output-receipt:v1 nonce=([0-9a-f-]{36}) sha256=([0-9a-f]{64})\]/ig;
@@ -266,11 +437,11 @@ export function extractResourceIdIndex(text: string): string {
  * `recall_tool_result`. Without call context it falls back to a plain
  * truncation marker, which is the best a detached MCP/dev path can do.
  */
-// ─── Scrape-head densifier (live 2026-07-23, 120-account visibility run) ───
-// Scraped-page markdown reaches the model as a clipped head — and the head was
+// ─── Scrape-head densifier ───
+// Scraped-page markdown reaches the model as a clipped head, and that head is
 // junk-dense: image markdown, data: URI blobs, asset links, and bare-URL nav
-// lines burned the budget while the useful content sat below the cut (the
-// model went back via recall_tool_result 44× in one run). The STORED payload
+// lines burn the budget while the useful content sits below the cut, sending
+// the model back to recall_tool_result again and again. The STORED payload
 // stays raw (recall fidelity); only the model-visible head is computed from a
 // densified view, and only when the text is provably scrape-shaped.
 const MD_IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
@@ -296,9 +467,18 @@ export function formatRecallableToolText(
   const sessionId = options.sessionId ?? active?.sessionId;
   const callId = options.callId ?? active?.callId;
   const toolName = options.toolName ?? active?.toolName ?? 'tool';
-  const maxChars = options.maxChars
-    ?? (sessionId && callId && actionTopologyRoleFor(toolName) !== 'control'
-      ? PROMPT_INLINE_RECALLABLE_RESULT_CHARS
+  // A formatter inside a harness invocation defaults to the budget that
+  // invocation resolved once (presentationBudgetFor). Without one, the same
+  // resolver answers from the tool name alone.
+  const activeInvocationBudget = active?.presentationBudget !== undefined
+    && (options.sessionId === undefined || options.sessionId === active.sessionId)
+    && (options.callId === undefined || options.callId === active.callId)
+    && (options.toolName == null || options.toolName === active.toolName)
+    ? active.presentationBudget
+    : undefined;
+  let maxChars = options.maxChars
+    ?? (sessionId && callId
+      ? activeInvocationBudget ?? presentationBudgetFor({ toolName })
       : DEFAULT_TOOL_RESULT_MAX_CHARS);
   let persistenceFailed = false;
   let hostAnnotations = [...(options.hostAnnotations ?? [])].filter((note) => note.length > 0);
@@ -312,6 +492,9 @@ export function formatRecallableToolText(
       compactResult: text, settlementNonce: active.settlementNonce });
     if (exact instanceof TruncatedToolOutputResult) return JSON.stringify(exact);
     if (typeof exact === 'string' && exact !== text) {
+      if (options.verifiedProjectionMaxChars !== undefined) {
+        maxChars = Math.max(maxChars, options.verifiedProjectionMaxChars);
+      }
       if ((options.maxChars === undefined || text.length <= maxChars) && hostAnnotations.length === 0) return text;
       // Only an explicit smaller display request should re-render a verified
       // projection; a second formatter's default must not reinterpret it.
@@ -403,11 +586,19 @@ export function formatRecallableToolText(
       .slice(0, Math.max(0, maxChars));
   }
   const receiptReserve = exactReceipt ? exactReceipt.length + 1 : 0;
-  const compactBudget = Math.max(200, maxChars - receiptReserve);
+  // The digest fits its head, tail and footer inside what the host
+  // annotations and the id index leave, so the frame around it never pushes
+  // the footer (the exact reader call) past the cap below.
+  const frameReserve = annotationText.length + (idIndex ? idIndex.length + 2 : 0);
+  const compactBudget = Math.max(200, maxChars - receiptReserve - frameReserve);
   let compact = annotationText + withIndex(digestToolOutput(densifyMarkdownForModelHead(text), {
     maxChars: compactBudget,
     toolName,
     callId,
+    // The stored row exists (written above), so the one reader router can
+    // name the reader that serves this output's actual shape. The router reads
+    // from the durable lifecycle whether this call has returned yet.
+    readerAdvice: () => retainedResultWayThrough({ sessionId, callId }),
   }));
   if (exactReceipt && compact.length > maxChars - receiptReserve) {
     // Defensive absolute cap for non-JSON and root-array fallbacks. Preserve

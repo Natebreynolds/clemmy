@@ -25,7 +25,7 @@ const { DEFAULT_TOOL_RESULT_MAX_CHARS } = await import('./tool-output-format.js'
 const plans = await import('./plan-artifacts.js');
 const { shouldRunObjectiveJudge, buildObjectiveJudgePrompt, JUDGE_SYSTEM_PROMPT,
   completionJudgeContextAdmission, runRoutedJudgeAttempt, parseCompletionVerdict } = await import('./objective-judge.js');
-const { recordCatalogWindow } = await import('./model-window-observations.js');
+const { recordCatalogWindow, recordWindowRejection } = await import('./model-window-observations.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const { armHostCallAuthority } = await import('./accepted-turn-call-authority.js');
@@ -371,6 +371,29 @@ test('incremental trajectory windows bound bulk content, keep discovery navigati
     || r.contentDisposition === 'discovery_navigation'),
   'every result is shown, is the same bytes as a shown one, or is discovery navigation');
   assert.match(completion.summary, /the same content is shown above under logicalCall=/);
+});
+
+test('the reviewer bounds a read with the answerer\'s own presentation budget, never "ALL content" for a clipped read', () => {
+  const smallWindowModel = 'fixture-review-small-window';
+  recordWindowRejection(smallWindowModel, 32_001);
+  const identity = accepted('Show me the fixture workspace.');
+  const text = Array.from({ length: 560 }, (_, i) => `Workspace line ${i}: detail`).join('\n') + '\nWORKSPACE_TAIL';
+  assert.ok(text.length > 11_200 && text.length < DEFAULT_TOOL_RESULT_MAX_CHARS, `between the small and default budgets (${text.length})`);
+  retainedRead(identity, 'space_get', text);
+  events.closeEventLog();
+  // The answerer on a 32k-token window saw at most 11,200 chars of this read.
+  const small = brackets.withHarnessRunContext({ sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+    counter: new brackets.ToolCallsCounter(5), routedModelId: smallWindowModel }, () => sourceSettledReadEvidence(identity));
+  const bounded = small.results.find((row) => row.toolName === 'space_get');
+  assert.equal(bounded?.viewBounded, true, 'a read the answerer saw clipped is shown bounded');
+  assert.equal(bounded?.contentComplete, false);
+  assert.ok((bounded?.shownByteCount ?? Infinity) <= 11_200 + 100, `bounded by the answerer's budget (${bounded?.shownByteCount})`);
+  assert.match(small.summary, /showing a BOUNDED view/);
+  assert.doesNotMatch(small.summary, /showing ALL content/);
+  // On a default window the same read reached the answerer whole.
+  const whole = sourceSettledReadEvidence(identity);
+  assert.equal(whole.results.find((row) => row.toolName === 'space_get')?.contentComplete, true);
+  assert.match(whole.summary, /WORKSPACE_TAIL/);
 });
 
 test('a recalled page is shown whole, as the answerer received it, while its oversized source stays bounded', () => {

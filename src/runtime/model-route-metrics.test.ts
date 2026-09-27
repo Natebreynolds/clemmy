@@ -1,19 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 
 import {
+  MODEL_ROUTE_METRICS_DB_PATH,
   MODEL_ROUTE_METRICS_SCHEMA_SQL,
   MODEL_ROUTE_METRICS_SCHEMA_VERSION,
+  MODEL_ROUTE_METRICS_STATE_DIR,
   MODEL_ROUTE_METRICS_TABLES,
+  openModelRouteMetricsDb,
+  readRouteStandIn,
   recordModelRouteDecision,
   recordModelRouteOutcome,
+  resetModelRouteMetricsForTest,
   successfulRouteOutcome,
   scoreModelRouteCandidate,
   selectBestRouteCandidate,
   summarizeRouteOutcomes,
+  widenModelRouteMetricsDb,
+  widenModelRouteRoleChecks,
   withModelRouteMetrics,
+  withModelRouteObserver,
+  type ObservedModelRoute,
 } from './model-route-metrics.js';
 import { withModelFallback } from './harness/fallback-model.js';
 
@@ -507,4 +517,181 @@ test('nested reviewer usage measures its own request on ordinary and streamed ca
       assert.equal(row.inputTokens, 1000, 'provider token totals remain unchanged');
     }
   } finally { db.close(); }
+});
+
+// The first build of this DB admitted only brain, worker and judge in both
+// role CHECKs, so every writer (and would-be memory) row was dropped by
+// INSERT OR IGNORE and its outcome failed the foreign key.
+const FIRST_BUILD_SCHEMA_SQL = `
+CREATE TABLE model_route_decisions (
+  id TEXT PRIMARY KEY, created_at TEXT NOT NULL, session_id TEXT, workflow_run_id TEXT,
+  workflow_node_id TEXT, workspace_id TEXT,
+  role TEXT NOT NULL CHECK (role IN ('brain','worker','judge')),
+  intent TEXT, requested_model TEXT, resolved_model TEXT NOT NULL, provider TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('default','binding','intent_binding','explicit','fallback','policy')),
+  reason_json TEXT NOT NULL DEFAULT '{}', policy_version INTEGER
+);
+CREATE INDEX idx_model_route_decisions_created ON model_route_decisions(created_at DESC);
+CREATE INDEX idx_model_route_decisions_role_intent ON model_route_decisions(role, intent, created_at DESC);
+CREATE INDEX idx_model_route_decisions_workspace ON model_route_decisions(workspace_id, created_at DESC) WHERE workspace_id IS NOT NULL;
+CREATE TABLE model_route_outcomes (
+  decision_id TEXT PRIMARY KEY REFERENCES model_route_decisions(id) ON DELETE CASCADE,
+  completed_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('success','failed','fallback','cancelled')),
+  latency_ms INTEGER, input_tokens INTEGER, output_tokens INTEGER, cached_tokens INTEGER,
+  total_tokens INTEGER, cost_usd REAL, error_class TEXT, fallover_to_model TEXT, tool_calls INTEGER,
+  tool_success INTEGER CHECK (tool_success IN (0,1)), objective_met INTEGER CHECK (objective_met IN (0,1)),
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX idx_model_route_outcomes_status_completed ON model_route_outcomes(status, completed_at DESC);
+CREATE TABLE model_route_policy (
+  id TEXT PRIMARY KEY,
+  role TEXT NOT NULL CHECK (role IN ('brain','worker','judge')),
+  intent TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, score REAL NOT NULL,
+  sample_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
+  objective_met_count INTEGER NOT NULL DEFAULT 0, avg_latency_ms REAL, avg_cost_usd REAL,
+  disabled_reason TEXT, policy_version INTEGER NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(role, intent, provider, model)
+);
+CREATE INDEX idx_model_route_policy_lookup ON model_route_policy(role, intent, disabled_reason, score DESC);
+`;
+
+function countRows(db: Database.Database, table: string): number {
+  return (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+}
+
+test('a first-build metrics DB is rebuilt in place so writer and memory rows persist, keeping every row', () => {
+  const db = new Database(':memory:');
+  try {
+    db.exec('PRAGMA foreign_keys = ON;');
+    db.exec(FIRST_BUILD_SCHEMA_SQL);
+    for (const [i, role] of (['brain', 'worker', 'judge'] as const).entries()) {
+      recordModelRouteDecision({ id: `old-${i}`, role, resolvedModel: `${role}-model`, provider: 'codex', source: 'default',
+        reason: { seam: 'kept' }, now: new Date(`2026-09-2${i}T00:00:00.000Z`) }, db);
+      recordModelRouteOutcome({ decisionId: `old-${i}`, status: 'success', latencyMs: 10 + i, totalTokens: 100 + i,
+        metadata: { actualModel: `${role}-served` } }, db);
+    }
+    db.prepare(`INSERT INTO model_route_policy (id, role, intent, provider, model, score, policy_version, updated_at)
+      VALUES ('pol-1', 'judge', NULL, 'codex', 'judge-model', 0.9, 3, '2026-09-25T00:00:00.000Z')`).run();
+    // Before the rebuild a memory row is silently dropped.
+    recordModelRouteDecision({ id: 'dropped', role: 'memory', resolvedModel: 'm', provider: 'codex', source: 'default' }, db);
+    assert.equal(countRows(db, 'model_route_decisions'), 3, 'fixture: the first-build CHECK drops a memory row');
+    const before = {
+      decisions: db.prepare('SELECT * FROM model_route_decisions ORDER BY id').all(),
+      outcomes: db.prepare('SELECT * FROM model_route_outcomes ORDER BY decision_id').all(),
+      policy: db.prepare('SELECT * FROM model_route_policy ORDER BY id').all(),
+    };
+
+    assert.deepEqual(widenModelRouteRoleChecks(db), ['model_route_decisions', 'model_route_policy']);
+    assert.deepEqual(db.prepare('SELECT * FROM model_route_decisions ORDER BY id').all(), before.decisions, 'every decision kept exactly');
+    assert.deepEqual(db.prepare('SELECT * FROM model_route_outcomes ORDER BY decision_id').all(), before.outcomes, 'no outcome cascaded away');
+    assert.deepEqual(db.prepare('SELECT * FROM model_route_policy ORDER BY id').all(), before.policy);
+    assert.equal(db.pragma('foreign_keys', { simple: true }), 1, 'foreign keys are back on');
+    const indexes = (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_model_route_%' ORDER BY name`)
+      .all() as Array<{ name: string }>).map((row) => row.name);
+    assert.deepEqual(indexes, [
+      'idx_model_route_decisions_created', 'idx_model_route_decisions_role_intent', 'idx_model_route_decisions_workspace',
+      'idx_model_route_outcomes_status_completed', 'idx_model_route_policy_lookup',
+    ]);
+
+    for (const role of ['writer', 'memory'] as const) {
+      recordModelRouteDecision({ id: `new-${role}`, role, resolvedModel: `${role}-model`, provider: 'claude', source: 'binding' }, db);
+      assert.equal(recordModelRouteOutcome({ decisionId: `new-${role}`, status: 'success' }, db), true, `${role} outcome joins its decision`);
+      db.prepare(`INSERT INTO model_route_policy (id, role, intent, provider, model, score, policy_version, updated_at)
+        VALUES (?, ?, NULL, 'claude', ?, 0.5, 4, '2026-09-26T00:00:00.000Z')`).run(`pol-${role}`, role, `${role}-model`);
+    }
+    assert.equal(countRows(db, 'model_route_decisions'), 5);
+    assert.equal(countRows(db, 'model_route_outcomes'), 5);
+    // The rebuilt decisions table still owns its outcomes.
+    db.prepare(`DELETE FROM model_route_decisions WHERE id = 'old-0'`).run();
+    assert.equal(countRows(db, 'model_route_outcomes'), 4, 'outcomes still cascade with their decision');
+    assert.throws(() => recordModelRouteOutcomeStrict(db, 'no-such-decision'), /FOREIGN KEY/);
+
+    assert.deepEqual(widenModelRouteRoleChecks(db), [], 'a current DB is left untouched');
+  } finally {
+    db.close();
+  }
+});
+
+/** A raw insert, so the foreign key failure is visible (the recorder swallows it). */
+function recordModelRouteOutcomeStrict(db: Database.Database, decisionId: string): void {
+  db.prepare(`INSERT INTO model_route_outcomes (decision_id, completed_at, status) VALUES (?, '2026-09-26T00:00:00.000Z', 'success')`)
+    .run(decisionId);
+}
+
+test('a fresh metrics DB admits every route role with nothing to rebuild', () => {
+  const db = metricsDb();
+  try {
+    assert.deepEqual(widenModelRouteRoleChecks(db), []);
+    for (const role of ['brain', 'worker', 'judge', 'writer', 'memory'] as const) {
+      recordModelRouteDecision({ id: `fresh-${role}`, role, resolvedModel: 'm', provider: 'codex', source: 'default' }, db);
+    }
+    assert.equal(countRows(db, 'model_route_decisions'), 5);
+  } finally {
+    db.close();
+  }
+});
+
+test('opening the shared metrics DB never rebuilds it; the daemon\'s boot upkeep does, once', () => {
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'this test writes only an isolated home\'s metrics DB');
+  resetModelRouteMetricsForTest();
+  mkdirSync(MODEL_ROUTE_METRICS_STATE_DIR, { recursive: true });
+  const seed = new Database(MODEL_ROUTE_METRICS_DB_PATH);
+  seed.exec(FIRST_BUILD_SCHEMA_SQL);
+  seed.close();
+  try {
+    // The first open happens inside a role resolution on the turn path.
+    const db = openModelRouteMetricsDb();
+    const decisionsSql = () => (db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'model_route_decisions'`)
+      .get() as { sql: string }).sql;
+    assert.ok(!decisionsSql().includes(`'memory'`), 'the open path leaves the old CHECK alone');
+    recordModelRouteDecision({ id: 'before-boot', role: 'memory', resolvedModel: 'm', provider: 'codex', source: 'default' }, db);
+    assert.equal(countRows(db, 'model_route_decisions'), 0, 'until the boot upkeep runs, a memory row is dropped as before');
+
+    assert.deepEqual(widenModelRouteMetricsDb(), ['model_route_decisions', 'model_route_policy']);
+    assert.ok(decisionsSql().includes(`'memory'`) && decisionsSql().includes(`'writer'`));
+    recordModelRouteDecision({ id: 'after-boot', role: 'memory', resolvedModel: 'm', provider: 'codex', source: 'default' }, db);
+    assert.equal(countRows(db, 'model_route_decisions'), 1);
+    assert.deepEqual(widenModelRouteMetricsDb(), [], 'the next boot finds nothing to do');
+  } finally {
+    resetModelRouteMetricsForTest();
+  }
+});
+
+test('a job reads the route that served it, and a fallback lane is a stand-in by the route\'s own evidence', async () => {
+  const db = metricsDb();
+  try {
+    const primary = {
+      getResponse: async () => { throw { statusCode: 529, message: 'overloaded' }; },
+      getStreamedResponse: async function* () { throw { statusCode: 529, message: 'overloaded' }; },
+    } as Model;
+    const rescue = responseModel(responseWith({ inputTokens: 5, outputTokens: 1, totalTokens: 6 }, { model: 'served-rescue' }));
+    const fallback = withModelRouteMetrics(withModelFallback([
+      // Labels of their own: an earlier test's overload cools down 'primary'.
+      { label: 'memory-primary', provider: 'codex', model: 'memory-model', getModel: () => primary },
+      { label: 'memory-rescue', provider: 'claude', model: 'rescue-model', getModel: () => rescue },
+    ]), { role: 'memory', requestedModel: 'memory-model', resolvedModel: 'memory-model', provider: 'codex',
+      source: 'default', reason: { seam: 'memory', job: 'learn' } }, db);
+    const direct = withModelRouteMetrics(responseModel(responseWith({ inputTokens: 1, outputTokens: 1, totalTokens: 2 })),
+      { role: 'memory', requestedModel: 'memory-model', resolvedModel: 'memory-model', provider: 'codex', source: 'default' }, db);
+
+    const directRoutes: ObservedModelRoute[] = [];
+    await withModelRouteObserver(directRoutes, () => direct.getResponse(requestWithSentinel()));
+    assert.equal(readRouteStandIn(directRoutes)?.standIn, false);
+    assert.equal(readRouteStandIn(directRoutes)?.route.resolvedModel, 'memory-model');
+
+    const fellOver: ObservedModelRoute[] = [];
+    await withModelRouteObserver(fellOver, () => fallback.getResponse(requestWithSentinel()));
+    assert.deepEqual(fellOver.map((route) => [route.resolvedModel, route.status, route.source]), [
+      ['memory-model', 'failed', 'default'],
+      ['rescue-model', 'success', 'fallback'],
+    ]);
+    const served = readRouteStandIn(fellOver);
+    assert.equal(served?.standIn, true, 'the rescue lane stood in for the requested model');
+    assert.equal(served?.route.resolvedModel, 'rescue-model');
+    assert.equal(served?.route.servedModel, 'served-rescue', 'the provider-reported model is carried');
+    assert.equal(readRouteStandIn([]), null, 'no call answered: no served route');
+  } finally {
+    db.close();
+  }
 });

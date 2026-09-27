@@ -4547,6 +4547,24 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
   return options.desc ? mapped.reverse() : mapped;
 }
 
+/** The `tool_called` rows recorded under one call id in a session, oldest
+ *  first. Served by the tool-lifecycle index, so a caller following one call
+ *  does not load every tool call the session ever made. That index is partial
+ *  over both lifecycle types, and SQLite uses it only when the query states
+ *  that predicate itself, so the lifecycle IN list stays beside the narrower
+ *  type test. */
+export function listToolCalledEventsForCallId(sessionId: string, callId: string): EventRow[] {
+  const rows = prepareCached(openEventLog(), `
+    SELECT * FROM events
+     WHERE session_id = ?
+       AND type IN ('tool_called', 'tool_returned')
+       AND type = 'tool_called'
+       AND json_extract(data_json, '$.callId') = ?
+     ORDER BY seq ASC
+  `).all(sessionId, callId) as RawEventRow[];
+  return rows.map(rowToEvent);
+}
+
 /**
  * Bounded global recovery query for workflow batches that crossed the durable
  * foreground close boundary but have no public dispatch winner yet. Oldest
@@ -7436,6 +7454,84 @@ function derivedToolOutputReaderFailureReason(
   return DERIVED_TOOL_OUTPUT_READERS.some((tool) =>
     isPlainOrClementineLocalTool(legacyTarget.name, tool)
   ) ? DERIVED_READER_AUTHORITY_REASON : null;
+}
+
+/** Why the query resolver will refuse a stored output whose own call has
+ *  been called but has no durable return yet, judged on what exists before
+ *  the return: the bytes and the producer identity, by the resolver's own
+ *  rule. Once a return exists the lifecycle checks apply, through
+ *  `resolveToolOutputForQuery`. Routing callers use it so a reader that would
+ *  refuse is never offered; it grants nothing. */
+export function unsettledToolOutputQueryRefusal(record: ToolOutputRecord): string | null {
+  return authorityOutputFailureReason(record, null);
+}
+
+export interface ToolOutputStoredIdentity {
+  /** Equal keys mean the same stored bytes, the same invocation rows and the
+   *  same lifecycle, so every reader resolves the id to the same verdict. */
+  key: string;
+  /** Digest of the canonical stored bytes; null for a row without one. */
+  canonicalSha256: string | null;
+  /** Digest of each invocation row's bytes, by invocation nonce. */
+  invocationSha256: ReadonlyMap<string, string | null>;
+  /** The call has been called and has no durable return yet. A carrier's
+   *  transport mirror is a second view of the carrier's own invocation, so
+   *  while a top-level occurrence exists only its call and return count; a
+   *  mirror that returns first does not settle the carrier. */
+  awaitingReturn: boolean;
+}
+
+/** A metadata-only identity of one call id's stored output: the canonical
+ *  manifest, its invocation rows and its lifecycle events. No payload is read
+ *  or hashed. Null when nothing is stored under the id. A caller that judged
+ *  the bytes may reuse that judgement while the identity is unchanged. */
+export function toolOutputStoredIdentity(sessionId: string, callId: string): ToolOutputStoredIdentity | null {
+  const db = openEventLog();
+  return db.transaction((): ToolOutputStoredIdentity | null => {
+    const canonical = prepareCached(db, `
+      SELECT content_bytes, truncated_at_write, output_sha256, tool, created_at
+        FROM tool_outputs
+       WHERE session_id = ? AND call_id = ?
+    `).get(sessionId, callId) as {
+      content_bytes: number; truncated_at_write: number; output_sha256: string | null;
+      tool: string | null; created_at: string;
+    } | undefined;
+    if (!canonical) return null;
+    const invocations = prepareCached(db, `
+      SELECT invocation_nonce, output_sha256, content_bytes, created_at
+        FROM tool_output_invocations
+       WHERE session_id = ? AND call_id = ?
+       ORDER BY invocation_nonce ASC
+    `).all(sessionId, callId) as Array<{
+      invocation_nonce: string; output_sha256: string | null; content_bytes: number; created_at: string;
+    }>;
+    const lifecycle = prepareCached(db, `
+      SELECT COUNT(*) AS events,
+             COALESCE(SUM(type = 'tool_returned'), 0) AS returned,
+             COALESCE(SUM(type = 'tool_called' AND mirror = 0), 0) AS top_called,
+             COALESCE(SUM(type = 'tool_returned' AND mirror = 0), 0) AS top_returned,
+             MAX(seq) AS last_seq
+        FROM (
+          SELECT type, seq,
+                 COALESCE(json_extract(data_json, '$.accounting'), '') = 'transport_mirror' AS mirror
+            FROM events
+           WHERE session_id = ?
+             AND type IN ('tool_called', 'tool_returned')
+             AND json_extract(data_json, '$.callId') = ?
+        )
+    `).get(sessionId, callId) as {
+      events: number; returned: number; top_called: number; top_returned: number; last_seq: number | null;
+    };
+    const awaitingReturn = lifecycle.top_called > 0
+      ? lifecycle.top_returned === 0
+      : lifecycle.events > lifecycle.returned && lifecycle.returned === 0;
+    return {
+      key: JSON.stringify([canonical, invocations, lifecycle]),
+      canonicalSha256: canonical.output_sha256,
+      invocationSha256: new Map(invocations.map((row) => [row.invocation_nonce, row.output_sha256])),
+      awaitingReturn,
+    };
+  })();
 }
 
 function authorityOutputFailureReason(

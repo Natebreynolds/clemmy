@@ -23,7 +23,7 @@ import {
   isTerminalPhysicalDispatchOwner,
 } from './terminal-physical-dispatch-owner.js';
 import { getToolOutputContext, withToolOutputContext } from './tool-output-context.js';
-import { formatRecallableToolText, explicitLocalReadPreviewBudget, PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from './tool-output-format.js';
+import { formatRecallableToolText, explicitLocalReadPreviewBudget, inlineResultBudgetForModel, presentationBudgetFor, PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from './tool-output-format.js';
 import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
@@ -524,39 +524,28 @@ export function withTimeout<T>(
 /**
  * Recommended per-tool timeouts. Caller can override per-tool.
  *
- * Calibrated 2026-05-24 from real workloads observed in production:
- *
  *   - `default` (60s): internal tools — memory_*, workspace_*, file
- *     reads, plan/note writes. All complete in <5s in practice; 60s
- *     gives 12x headroom for slow disk or large vault re-indexes.
+ *     reads, plan/note writes. These finish in seconds; 60s leaves wide
+ *     headroom for a slow disk or a large re-index.
  *
- *   - `shell` (10min): `run_shell_command` and shell_* — covers long
- *     Salesforce `sf` CLI queries, large `gh` API pages, slow npm
- *     installs in workspaces. 10 min matches the prior production
- *     value and has never false-killed a legitimate command.
+ *   - `shell` (10min): `run_shell_command` and shell_* — long CLI
+ *     queries, large API pages and package installs legitimately run
+ *     for minutes.
  *
- *   - `externalApi` (5min, NEW): `composio_execute_tool` and any
- *     other tool that fans out to a 3rd-party HTTP API. Without this
- *     bucket, Composio calls fell to `default` (60s) and would
- *     false-kill on a slow Salesforce SOQL or a large Google Sheets
- *     `values.get`. 5 minutes covers the p99 of real Composio
- *     calls observed in eventlog.
+ *   - `externalApi` (5min): any tool that fans out to a third-party HTTP
+ *     API. A slow upstream query or a large sheet read must not be
+ *     killed at the internal-tool default.
  *
- *   - `mcp` (10min, WAS 30s): MCP-namespaced tools like DataForSEO
- *     scrapes, Supabase queries, browser tool. DataForSEO scrapes
- *     ROUTINELY take 5-10 minutes — 30s would false-kill nearly
- *     every legitimate scrape. The original comment in this file
- *     called out "10-min DataForSEO scrape" as the justification for
- *     the kill check, yet the mcp timeout was 30s — a latent bug
- *     waiting for brackets to actually activate (which they did
- *     2026-05-24 via F1 env injection).
+ *   - `mcp` (10min): MCP-namespaced tools. Scrapes, database queries and
+ *     browser work routinely run for minutes, so a short budget would
+ *     kill nearly every legitimate long call.
  */
 export const DEFAULT_TIMEOUTS_MS = {
   default: 60_000,
   /**
    * tool_search is a READ. Its broker budget is 30s. The host used to use
-   * `default` (60s), so a missed/hung search sat until the wrapper killed it
-   * (live Platform 49: two `timed_out` rows at ~60s). Keep a small settlement
+   * `default` (60s), so a missed/hung search sat until the wrapper killed it.
+   * Keep a small settlement
    * margin above the broker clock; never a work-budget 60s.
    */
   discovery: 35_000,
@@ -630,26 +619,15 @@ export function timeoutForTool(toolName: string): number {
   if (/^(exec|spawn|launch|run_shell|shell_)/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.shell;
   }
-  // External-API tools that fan out to 3rd-party services. The
-  // canonical case is composio_execute_tool (single tool, hundreds
-  // of upstream toolkits). Pattern-matches future siblings.
+  // External-API tools that fan out to third-party services, including a
+  // single tool that fronts many upstream toolkits, and future siblings.
   if (toolName === 'composio_execute_tool' || /^(composio|external_api)_/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.externalApi;
   }
-  // v0.5.20 Bug I — run_worker spawns a sub-agent that itself does
-  // tool calls (scrapes, SERP queries, file reads). Default 60s
-  // was way too short — the stream-timeout regression hit 60s on
-  // a worker doing firecrawl_search for LinkedIn URL lookup. The
-  // worker IS the external-API surface from the parent agent's
-  // perspective. 5min externalApi bucket is the right shape.
-  //
-  // v0.5.21.1 — extended to ALL sub-agent-as-tool wrappings. Verified
-  // In the plan-timeout regression, draft_plan (planner.asTool) timed
-  // out at 60s during a chronic Codex-flake window — same root cause
-  // as run_worker. Bucket policy: any tool that internally spins
-  // up another agent (which itself makes a Codex call) belongs in
-  // externalApi. Pattern-matched on the known names so we don't have
-  // to hand-curate every future asTool() wrap.
+  // A tool that spins up another agent (a worker, the planner) makes its own
+  // tool and model calls, so from the parent's side it IS an external-API
+  // call and gets that bucket. Matched on the known agent-as-tool names so a
+  // future wrap of the same kind is covered.
   if (
     toolName === 'run_worker' || /^run_worker/.test(toolName) ||
     toolName === 'draft_plan'
@@ -658,9 +636,8 @@ export function timeoutForTool(toolName: string): number {
   }
   // run_batch executes N gated external calls in a deterministic loop — a
   // legitimate batch runs for MINUTES by design (writes serial, reads in
-  // waves, rate-limit backoff pauses). Default 60s false-killed a live 8-item
-  // batch 2026-07-08: the tool call "timed out" at 60s and paused the run on
-  // ask-user while the batch itself COMPLETED 8/8 twenty seconds later. Same
+  // waves, rate-limit backoff pauses). A 60s default reports a batch that is
+  // still completing as "timed out" and pauses the run on ask-user. Same
   // shell-tier budget as the other long-running executors; the batch runner's
   // own halting rules (consecutive failures, backoff caps) bound the true
   // worst case well below it.
@@ -668,7 +645,7 @@ export function timeoutForTool(toolName: string): number {
     return DEFAULT_TIMEOUTS_MS.shell;
   }
   // Workflow authoring waits for the creation test it starts (real read steps
-  // against the connected tools plus model steps: 66 s live, 2026-09-22),
+  // against the connected tools plus model steps, which can exceed a minute),
   // exactly the external-work shape this bucket exists for. The default 60 s
   // budget would kill the tool while its own test is still running.
   if (toolName === 'workflow_create' || toolName === 'workflow_update' || toolName === 'workflow_reshape') {
@@ -691,7 +668,7 @@ export function timeoutForTool(toolName: string): number {
  *  excluded: a timeout there is a genuine hang with no async recovery move, so the
  *  ask-user card is still correct. run_worker is handled by its own dedicated block
  *  (worker-specific message) — returned false here so it never reaches the general path.
- *  draft_plan stays excluded (a planner/Codex flake → ask-user is the right call). */
+ *  draft_plan stays excluded (a planner that times out needs the owner's choice). */
 export function isTimeoutSelfCorrectTool(toolName: string): boolean {
   if (toolName === 'run_worker' || /^run_worker/.test(toolName)) return false; // own block
   if (toolName === 'composio_execute_tool') return true;
@@ -712,11 +689,10 @@ const PROVIDER_JOB_START_VERB_RE =
 /**
  * Could this call have STARTED provider-side work that outlives our timeout?
  *
- * Live 2026-08-07 (50-firm scrape): two Apify runs timed out client-side, kept
- * running, produced full datasets — and the harness had aborted its own read,
- * throwing away the response that carried the run id. The work was paid for
- * twice and fetched zero times. Aborting never stopped the provider; it only
- * blinded us to what we had already bought.
+ * A provider job that times out client-side keeps running and produces its
+ * result. Aborting our own read throws away the response that carries the job
+ * id, so the work is paid for twice and fetched zero times. Aborting never
+ * stops the provider; it only blinds us to what was already bought.
  */
 export function toolCallMayStartProviderJob(toolName: string, parsedInput: unknown): boolean {
   if (!isTimeoutSelfCorrectTool(toolName)) return false;
@@ -747,7 +723,7 @@ function timeoutCorrectiveFor(toolName: string, parsedInput: unknown, timeoutMs:
     : asyncJobTimeoutCorrective(toolName, summary, where);
   // A call that may have STARTED provider-side work is no longer cancelled on
   // timeout — it keeps running so it can park its own job with the watcher.
-  // Say so, or the model pays for the same work twice (live 2026-08-07).
+  // Say so, or the model pays for the same work twice.
   if (!toolCallMayStartProviderJob(toolName, parsedInput)) return base;
   return [
     base,
@@ -936,7 +912,7 @@ function hasSuccessfulReadBackAfter(
         if (orphanReadIdentityKeys(args).has(normalizedTarget)) {
           successfulReadCallIds.add(callId);
         } else {
-          // SHAPE-AGNOSTIC unlock (live 2026-07-30 rail): a list/search read
+          // SHAPE-AGNOSTIC unlock: a list/search read
           // has no target in its ARGS ("list my drafts"), so the old
           // args-only rule could never be satisfied by the most natural
           // verification — the model verified the target absent and stayed
@@ -997,7 +973,7 @@ function findOrphanedWriteMatch(
   // An orphan explicitly SETTLED later (execution_reconcile_write appended a
   // succeeded/failed outcome for the same shape+target) is no longer ambiguous
   // — the settlement verb is the deliberate human-verified path out of this
-  // speed bump, so it must actually open the gate (live 2026-07-30 rail).
+  // speed bump, so it must actually open the gate.
   let settlements: Array<{ seq: number; shapeKey?: string | null; targets?: string[] }> = [];
   try {
     settlements = listEvents(sessionId, { types: ['external_write_failed', 'external_write_succeeded'] })
@@ -1033,8 +1009,7 @@ function findOrphanedWriteMatch(
  *  verifies via a read-back and then re-issues — it never hard-aborts the run.
  *  The message states the RECORDED settlement reason: claiming "TIMED OUT" for
  *  every orphan class taught the model (and the user) a false story about what
- *  happened (live 2026-08-06: most orphans were unrecognized SUCCESS bodies,
- *  not timeouts). */
+ *  happened (an orphan is often an unrecognized SUCCESS body, not a timeout). */
 export class OrphanedWriteRetryError extends Error {
   public readonly toolName: string;
   public readonly shapeKey: string | undefined;
@@ -1110,7 +1085,7 @@ export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
 // ───────────────────────────────────────────────────────────────
 //  T2.1 — tool-call boundary wrapper
 //
-// Why this exists: the audit on 2026-05-18 found three failure modes
+// Why this exists: three failure modes
 // at the tool boundary that the existing brackets DID NOT close:
 //
 //   #6 — Kill switch checked only at turn start. A long-running tool
@@ -1136,12 +1111,19 @@ export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
 // ───────────────────────────────────────────────────────────────
 
 /**
- * Per-turn budget for recall_tool_result. After Layer 1 of auto-compact
- * clips old tool outputs with stubs that name a call_id, the agent can
- * call `recall_tool_result` with that call_id to retrieve the verbatim original.
- * Without a budget the agent could pull 200KB × 3 calls back into the
- * input prompt that we just compacted. Resets per-turn (the loop builds
- * a new HarnessRunContext per `Runner.run`).
+ * Per-turn budget for reading retained outputs back into the prompt. After
+ * Layer 1 of auto-compact clips old tool outputs with stubs that name a
+ * call_id, the agent can read the verbatim original back with
+ * `recall_tool_result`, or query it with `tool_output_query`. Without a budget
+ * the agent could pull the payloads we just compacted straight back into the
+ * input prompt. Resets per-turn (the loop builds a new HarnessRunContext per
+ * `Runner.run`).
+ *
+ * Bytes are the real resource, and every reader reply that enters the prompt
+ * spends them: a recall slice and a query reply alike. The call count is a
+ * recall runaway backstop only: a structured query reply spends bytes, never
+ * a recall call, while a query over text answers with recall's own slice and
+ * so spends a recall call like any recall.
  */
 export class RecallBudget {
   private calls = 0;
@@ -1161,54 +1143,87 @@ export class RecallBudget {
    */
   consume(returnBytes: number, callId?: string): string | null {
     if (this.calls + 1 > this.maxCalls) {
-      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId)}`;
+      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId, this.refusedAfterRecall(), { bareQueryRefused: !this.canServeQuery() })}`;
     }
     if (this.bytes + returnBytes > this.maxBytes) {
-      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId)}`;
+      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId, this.refusedAfterRecall(), { bareQueryRefused: !this.canServeQuery() })}`;
     }
     this.calls += 1;
     this.bytes += returnBytes;
     return null;
   }
 
+  /** The smallest query reply worth a round: a header and one record. */
+  static readonly QUERY_MIN_REPLY_BYTES = 1_000;
+
+  /** Bytes a reader reply may still put into the prompt this turn. */
+  remainingBytes(): number {
+    return Math.max(0, this.maxBytes - this.bytes);
+  }
+
   /**
-   * A budget refusal must hand back a way THROUGH, not just a stop.
-   *
-   * Retrying recall cannot succeed — the budget resets per turn, so a model
-   * that only hears "proceed or split the work" re-recalls on the next turn,
-   * exhausts it again, and burns the no-progress governor instead of the
-   * task (live platform-49 run, 2026-09-02: 19 recalls, zero business calls,
-   * a governor stop, and the sheet never touched). `tool_output_query` reads
-   * the SAME retained output, is not clipped to this tool's per-call slice,
-   * and spends none of this budget — so it is the exact next call, not a
-   * suggestion to give up.
+   * Whether a query reply can still be served this turn. A query spends the
+   * same bytes as recall, so a refusal may name it only while at least one
+   * minimal reply still fits.
    */
-  private wayThrough(callId?: string): string {
-    const stop = 'Do NOT retry recall_tool_result — it will refuse again this turn.';
-    // The successor is COMPUTED, never named here. This message used to say
-    // "call tool_output_query" unconditionally, while tool_output_query's own
-    // plain-text refusal said "use recall_tool_result" — a closed loop the
-    // model could not leave (live 2026-09-07 source 146537).
-    // A budget refusal must ALWAYS hand back an exact next call, never prose.
-    // Without a session the routes cannot be computed, so name the reader that
-    // reads the same stored output — its own refusal now computes the correct
-    // successor and excludes itself, so no loop can close through it.
-    // A budget refusal must ALWAYS hand back a next call, never prose alone.
-    // Where the routes cannot be computed (no call id, or no session) name the
-    // reader over the same stored output: its own refusal now computes the
-    // correct successor and excludes itself, so no loop can close through it.
+  canServeQuery(): boolean {
+    return this.remainingBytes() >= RecallBudget.QUERY_MIN_REPLY_BYTES;
+  }
+
+  /** Readers a recall refusal must not name: recall itself. The query stays
+   * open: a named page spends no reading bytes, so a refusal names that form
+   * once a bare reply no longer fits. */
+  refusedAfterRecall(): string[] {
+    return ['recall_tool_result'];
+  }
+
+  /**
+   * The refusal a bare query reply of `returnBytes` would meet, without
+   * charging it; null when it fits. It is sent to a named page or a passage
+   * search, which spend no reading bytes, never back to recall or to a bare
+   * query.
+   */
+  queryRefusal(returnBytes: number, callId?: string): string | null {
+    if (this.bytes + returnBytes <= this.maxBytes) return null;
+    return `reading byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). `
+      + this.wayThrough(callId, ['recall_tool_result'], { bareQueryRefused: true });
+  }
+
+  /** Charge a query reply's bytes. Returns the refusal when it does not fit. */
+  consumeQueryBytes(returnBytes: number, callId?: string): string | null {
+    const refusal = this.queryRefusal(returnBytes, callId);
+    if (refusal) return refusal;
+    this.bytes += returnBytes;
+    return null;
+  }
+
+  /**
+   * A budget refusal must hand back a way THROUGH, not just a stop, and never
+   * prose alone. Retrying the refused reader cannot succeed (the budget resets
+   * per turn), so the next call is COMPUTED from the stored output's real
+   * shape by the one reader router, excluding every reader this budget
+   * refuses. No reader names its own successor, so no two readers can send
+   * the model back and forth between each other.
+   */
+  private wayThrough(callId: string | undefined, refused: readonly string[], opts: { bareQueryRefused?: boolean } = {}): string {
+    const named = opts.bareQueryRefused ? [...refused, 'a bare tool_output_query'] : [...refused];
+    const stop = `Do NOT retry ${named.join(' or ')} — ${named.length > 1 ? 'they' : 'it'} will refuse again this turn.`;
+    // Without a session the routes cannot be computed, so name a reader over
+    // the same stored output that this budget does not refuse; its own reply
+    // computes the correct successor.
     if (!callId || !this.sessionId) {
       const exact = callId
-        ? `tool_output_query {"call_id":"${callId}"}`
-        : 'tool_output_query with that same call_id';
-      return `${stop} Call ${exact} instead — it reads the SAME stored output `
-        + 'server-side and spends no recall budget.';
+        ? `tool_output_query {"call_id":"${callId}"${opts.bareQueryRefused ? ',"limit":20' : ''}}`
+        : `tool_output_query with that same call_id${opts.bareQueryRefused ? ' and a limit' : ''}`;
+      return `${stop} Call ${exact} instead — it reads the SAME stored output server-side`
+        + (opts.bareQueryRefused ? ', and a named page spends no reading bytes.' : ' and spends no recall calls.');
     }
     return `${stop} ${retainedResultWayThrough({
       sessionId: this.sessionId,
       callId,
-      exclude: ['recall_tool_result'],
+      exclude: refused,
       recallCallsRemaining: 0,
+      readingBytesSpent: opts.bareQueryRefused === true,
     })}`;
   }
 
@@ -1333,7 +1348,7 @@ export interface HarnessRunContext {
    *  earns an activity-refreshed grace; no switch means reject within seconds. */
   modelFalloverInFlightAt?: number;
   /** Warn-advisory dedupe: (action:rule:tool) tuples already logged as
-   *  guardrail_tripped events this run context (2026-07-24 feed-spam fix). */
+   *  guardrail_tripped events this run context, so one advisory logs once. */
   guardrailAdvisoryLogged?: Set<string>;
   /** Loop-guard tracker key. When set (only for run_worker sub-agent
    *  runs, behind CLEMMY_WORKER_THRASH_GUARD), each worker's loop
@@ -1366,7 +1381,7 @@ export interface HarnessRunContext {
    *  multi-item primitive with its own per-item ledger — N same-kind creates
    *  in one plan would deadlock the single-deliverable slot model, and claim
    *  admission's scope side effects tripped the execution gate on uncertified
-   *  plans (2026-07-22). */
+   *  plans. */
   batchItem?: boolean;
   /** This tool call is the child of a host-owned carrier (`call_tool`,
    *  `work_call`, `run_batch`, or pending-action execution). The direct-read
@@ -1389,9 +1404,8 @@ export interface HarnessRunContext {
   /** Run-scoped account stickiness: toolkit → connectionId → use. One answered
    * account choice (explicit pin/alias or a positively resolved identity) holds
    * for the rest of the run; two DISTINCT accounts used in one run means later
-   * ambiguous calls ask again instead of guessing between proven alternatives
-   * (live 2026-08-06: with two Outlook accounts connected, EVERY call of a
-   * 10-draft run re-asked "which account?" — 81 calls, 43% refusals, 0 drafts). */
+   * ambiguous calls ask again instead of guessing between proven alternatives,
+   * and one resolved account is not asked about again on every call. */
   resolvedToolkitAccounts?: Map<string, Map<string, { identity?: string; explicit: boolean }>>;
 }
 
@@ -1433,7 +1447,7 @@ export function hostOwnsObservedGuardrailResult(input: Readonly<{
  *  inflate the ORCHESTRATOR's direct-read fanout counts — otherwise a batch/
  *  carrier with 6+ reads poisoned the shared session tracker and the orchestrator's
  *  very NEXT direct read of that tool was refused with a nonsensical "batch this
- *  single read" message (2026-07-12 strand-hunt finding). Workers already isolate
+ *  single read" message. Workers already isolate
  *  via guardrailScopeId; this extends the same isolation to nested dispatch/batch.
  *  Direct orchestrator calls fall through to behaviorScopeId ?? sessionId — the
  *  accepted-source ENFORCED scope. */
@@ -1448,9 +1462,8 @@ export function guardrailScopeKey(
 }
 
 /** CLEMMY_WORKER_THRASH_GUARD: per-worker loop-guard isolation + bounded
- *  worker turns + structured per-item give-up. Default ON (validated live
- *  2026-06-02: 8-worker fan-out, 0 cap-hits at maxTurns=8, 0 thrash, honest
- *  per-item ERROR reporting). `=off` is the emergency kill-switch. */
+ *  worker turns + structured per-item give-up. Default ON. `=off` is the
+ *  emergency kill-switch. */
 export function workerThrashGuardEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_THRASH_GUARD', 'on') ?? 'on').toLowerCase() !== 'off';
 }
@@ -1705,9 +1718,8 @@ export function parallelPreWriteGatesEnabled(): boolean {
 // output-grounding). Safety: the batch plan already passed ONE certification
 // judge over these EXACT payloads, and approval byte-pins the items by
 // payloadHash — nothing the model does between certification and execution can
-// alter them, so a second per-item opinion adds ~10-15s×N latency, not safety
-// (live 2026-07-08: a 10-email send ran ~18s/item on repeated goal_fidelity
-// judging). Every DETERMINISTIC gate (taxonomy approval, destination, duplicate-
+// alter them, so a second per-item opinion adds per-item latency, not safety.
+// Every DETERMINISTIC gate (taxonomy approval, destination, duplicate-
 // target, confirm-first, external_write ledger, guardrail counters) still runs.
 // Kill-switch CLEMMY_BATCH_SKIP_ITEM_JUDGE=off restores per-item judging.
 export function batchSkipItemJudgeEnabled(): boolean {
@@ -1715,9 +1727,8 @@ export function batchSkipItemJudgeEnabled(): boolean {
 }
 
 // A JUDGE FAILURE on an irreversible action must MINT a pending-approval card,
-// never silently refuse (P0c). Live 2026-07-08: goal-fidelity judge timeouts
-// refused 8 of 10 approved emails with a "GOAL_FIDELITY_CHECK_FAILED" string
-// buried in the tool results — the user lost the sends without ever being asked.
+// never silently refuse (P0c): a judge timeout that refuses approved sends
+// with a string buried in the tool results loses them without ever asking.
 // Default on. Kill-switch CLEMMY_JUDGE_FAIL_APPROVAL=off restores plain refusal.
 export function judgeFailApprovalEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_JUDGE_FAIL_APPROVAL', 'on') ?? 'on').toLowerCase() !== 'off';
@@ -2014,8 +2025,7 @@ function resolvedUserNamedDestinationIds(resultText: string, userBlob: string): 
  */
 
 /**
- * Build the publish-PROVENANCE predicate for the destination gate (2026-06-15
- * clobber). A target is "provenanced" if it was CREATED in this session (a
+ * Build the publish-PROVENANCE predicate for the destination gate. A target is "provenanced" if it was CREATED in this session (a
  * `sites:create`/`projects:create` — the intended --name slug, plus the new
  * site's id/name/url from that call's SUCCESS result, correlated by callId) OR
  * the user NAMED it in a message this session. Deliberately does NOT mine
@@ -2028,7 +2038,7 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
   const created = new Set<string>();
   const resolved = new Set<string>();
   let userBlob = '';
-  // Part 2 (2026-06-21): destinations THIS project has successfully published to
+  // Destinations THIS project has successfully published to
   // before — durable, cross-session, project-keyed. A target the project has
   // deliberately deployed to is not an "unrelated live site". Keyed by project
   // so it can never confer provenance across unrelated projects (no clobber).
@@ -2039,7 +2049,7 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
     const discoveryCallIds = new Set<string>();
     const discoveryResults: string[] = [];
     const userParts: string[] = [];
-    // CONFIRM-MINT (live 2026-07-30 friction): when CLEMENTINE asked "publish
+    // CONFIRM-MINT: when CLEMENTINE asked "publish
     // to <host>?" and the USER affirmed, that destination is user-sanctioned —
     // but the user's "Perfect" contains no hostname, so the user-text
     // provenance check could never see it and deploys stayed hard-blocked
@@ -2072,9 +2082,8 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
         if (callId && command && isReadOnlyDestinationDiscovery(command)) discoveryCallIds.add(callId);
         // Recognize ANY site-creation path, not just one command:
         // `netlify sites:create`, the API `netlify api createSite`,
-        // `create-site`. (2026-06-15 Fernwood false-positive: she self-recovered
-        // into `api createSite` and the gate then blocked the deploy to her OWN
-        // freshly-created site because it only matched `sites:create`.) Name is
+        // `create-site`; matching only one path blocks a deploy to a site the
+        // agent itself just created another way. Name is
         // captured from `--name X` OR a `--data '{"name":"X"}'` JSON body.
         if (/sites?:create|projects?:create|create-?sites?\b/i.test(args)) {
           const names: string[] = [];
@@ -2104,12 +2113,11 @@ export function buildPublishProvenance(sessionId: string, projectKey?: string): 
         if (names) {
           const res = stripAnsi(joinedEventText(d?.result, d?.preview, d?.output));
           if (!publishCreateSucceeded(res)) continue;
-          // LISTING-SHAPED output must NEVER confer blanket provenance (live
-          // 2026-07-08 clobber: `sites:create --name X … || sites:list --json`
-          // — the create FAILED, the fallback LIST exited 0 under the same
-          // callId, and this sweep harvested EVERY existing site's id/name as
-          // "created", handing the deploy stolen provenance onto an unrelated
-          // live site another task had just published). If the result is a
+          // LISTING-SHAPED output must NEVER confer blanket provenance: with
+          // `sites:create --name X … || sites:list --json` a failed create and a
+          // listing that exits 0 under the same callId would otherwise mark
+          // EVERY existing site as "created", handing a deploy provenance onto
+          // an unrelated live site. If the result is a
           // multi-site listing (JSON array / >1 site_id), harvest ONLY the
           // object whose "name" equals a REQUESTED create name — nothing else.
           const body = res.replace(/^[\s\S]*?stdout:\s*/i, '');
@@ -2211,8 +2219,8 @@ function recordExternalWriteSettlement(
     );
   // Tool formatting is presentation, not settlement authority. Large results
   // are parked losslessly under this exact call id and replaced with a compact
-  // model-facing digest. Judging that digest made valid >12K mutations look
-  // orphaned (live Google Docs regression, 2026-08-02). Use only the exact,
+  // model-facing digest. Judging that digest makes a valid large mutation
+  // look orphaned. Use only the exact,
   // same-tool, non-truncated side-store row for a normally returned call;
   // thrown/time-out outcomes remain ambiguous and can never be upgraded here.
   const settlementResult = (() => {
@@ -2352,9 +2360,8 @@ export function pendingNestedToolApprovalRequiredError(
  *
  * Duplicate detection is a hard gate for irreversible SENDS only — a create is
  * mutating but reversible, so nothing ever told the model it was repeating
- * itself. Live 2026-08-07: mid-scrape she created the Airtable table, lost
- * track of it, and tried to create the same table again; only Airtable's own
- * rejection stopped it, and the user could not find the table that DID exist.
+ * itself: an agent that loses track of an object it created tries to create
+ * the same object again, and only the provider's own rejection stops it.
  *
  * Advisory by construction (guardrails inform, they don't override): 50
  * legitimate record-creates must still flow, so this never blocks — it hands
@@ -2363,13 +2370,11 @@ export function pendingNestedToolApprovalRequiredError(
 /**
  * SELF-DESTRUCTION GUARD — she may not delete what she just made.
  *
- * Live 2026-08-09: a follow-up asked for HTML formatting on two drafts she had
- * created moments earlier. `OUTLOOK_UPDATE_DRAFT` failed pre-dispatch, she hunted
- * for another tool, tried `OUTLOOK_UPDATE_EMAIL`, and then reached for
- * `OUTLOOK_DELETE_MESSAGE` on both drafts — escalating a FORMATTING EDIT into
- * destroying the user's objects, which opened an approval card and parked the
- * turn for ten minutes. The same shape appeared on 08-07, deleting a duplicate
- * it had created itself.
+ * When an edit to an object the agent just created fails, the agent may hunt
+ * for another tool and reach for a delete of that object, escalating an EDIT
+ * into destroying the user's objects, which raises an approval card and parks
+ * the turn. The same shape covers deleting a duplicate the agent created
+ * itself.
  *
  * The rule is about EFFECTS, not methods: when an edit path fails, the safe
  * recovery is additive — leave the object alone and create a corrected one, or
@@ -2532,8 +2537,8 @@ function assertNoDuplicateExternalWrite(input: {
 
 /**
  * After a `run_shell_command` returns, if it was a PUBLISH to an explicit target
- * that demonstrably SUCCEEDED, record (project → destination) durably (Part 2,
- * 2026-06-21). projectKey = the command's cwd, so a future redeploy of THIS
+ * that demonstrably SUCCEEDED, record (project → destination) durably.
+ * projectKey = the command's cwd, so a future redeploy of THIS
  * project to the SAME site is provenanced cross-session — turning a one-time
  * success into learned, reusable knowledge (the ever-learning fix for the
  * "deploy blocked because it's a new session" recurrence). Only fires on a clear
@@ -2564,7 +2569,7 @@ function recordPublishIfSucceeded(
 }
 
 /**
- * Per-recalled-intent outcome correlation (2026-06-21 keystone): if the agent
+ * Per-recalled-intent outcome correlation: if the agent
  * recalled a CLI/MCP proven path and THIS tool result is the matching use of it,
  * credit that specific intent's outcome — closing the measured 0% CLI/MCP
  * outcome-coverage gap, precisely (per-operation, not per-binary). Haystack is
@@ -2617,12 +2622,11 @@ function creditRecallFromToolResult(
   } catch { /* learning is best-effort — never break the tool result */ }
 }
 
-// Per-session serialization for the irreversible-send confirm-first gate
-// (2026-07-09 Hole 4). The gate READS the prior same-shape count, AWAITs
+// Per-session serialization for the irreversible-send confirm-first gate.
+// The gate READS the prior same-shape count, AWAITs
 // dynamic imports (yielding the loop), then APPENDs its own external_write.
 // run_worker fans out up to 6 concurrent sends; without serialization all 6
-// read prior<threshold in the await gap and none trip the batch floor — the
-// exact 10-email incident on the worker lane. This chains the gate's critical
+// read prior<threshold in the await gap and none trip the batch floor. This chains the gate's critical
 // section per session so each send sees the prior's append.
 let beforeSharedWriteAdmissionForTests:
   | ((kind: 'shell' | 'generic') => void | Promise<void>)
@@ -2709,6 +2713,22 @@ function wrapperMustSettleLogicalCall(ctx: HarnessRunContext | undefined): boole
   throw new ToolAttemptSettlementAuthorityError(state.status, state.reason);
 }
 
+/** One invocation's inline presentation budget, resolved once and shared by
+ * every formatter of that invocation. A batch item is aggregated by its batch
+ * runner rather than read whole by the model, so it keeps the recallable
+ * keyhole; every other call, direct or through a carrier, gets the budget of
+ * its effective inner tool. */
+function invocationPresentationBudget(
+  toolName: string,
+  args: unknown,
+  ctx: Pick<HarnessRunContext, 'batchItem' | 'routedModelId'> | undefined,
+): number {
+  if (ctx?.batchItem) {
+    return explicitLocalReadPreviewBudget(toolName, args) ?? PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
+  }
+  return presentationBudgetFor({ toolName, args, routedModelId: ctx?.routedModelId });
+}
+
 /** An admitted work_call already carries a stricter, exact owner than the
  * legacy session execution row: its host-only binding was frozen only after
  * the accepted task, logical call, normalized arguments, and runtime effect
@@ -2745,8 +2765,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
   // The Runner calls `tool.invoke(runContext, input, details)` — NOT
   // `tool.execute`. So wrapping ONLY `execute` does nothing for SDK
   // tools: the Runner goes through invoke, which calls the closured
-  // original execute. Discovered 2026-05-24 after weeks of brackets
-  // appearing inactive even with HARNESS_TOOL_BRACKETS=on.
+  // original execute, so brackets would appear inactive even with
+  // HARNESS_TOOL_BRACKETS=on.
   //
   // We support TWO tool shapes:
   //   - SDK-built tools (have `.invoke`): wrap invoke. This is the
@@ -2796,8 +2816,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
   // Returns an advisory fan-out nudge string when the guardrail detects
   // serial per-item batch work (same composio slug, N distinct args). The
   // caller APPENDS it to the tool's result so the model reads it mid-stride —
-  // a warn-mode telemetry event alone is invisible to the model (live
-  // 2026-06-11: 74 serial composio calls, 8 warn events, zero course-change).
+  // a warn-mode telemetry event alone is invisible to the model and changes
+  // nothing about its course.
   const runBrackets = async (
     sessionId: string,
     parsedInput: unknown,
@@ -2856,8 +2876,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       }
       return undefined;
     }
-    // (fold 2026-07-17: the fail-closed turn-preflight gate that ran here was
-    // demoted — alignment is a conversational directive; consent enforcement
+    // (No fail-closed turn-preflight gate runs here: alignment is a conversational directive; consent enforcement
     // stays with plan-scope/approvals. See turn-control.ts.)
     // Artifact idempotency is an admission decision, not a tool attempt. Claim
     // immediately after kill/preflight authority but BEFORE counters, loop
@@ -2981,9 +3000,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
         }
       }
       if (decision.action !== 'allow') {
-        // Advisory dedupe (live 2026-07-24): a nested-dispatch rebuild emitted 15
-        // identical "run_shell_command called 2×" WARN rows into the visible
-        // feed. A warn logs once per (rule, tool) per run context; blocks and
+        // Advisory dedupe: a nested-dispatch rebuild must not flood the visible
+        // feed with identical WARN rows. A warn logs once per (rule, tool) per run context; blocks and
         // escalations always log. The guardrail DECISION itself is unchanged.
         const advisoryKey = `${decision.action}:${decision.rule}:${decision.toolName}`;
         const advisoryLogged = (ctx.guardrailAdvisoryLogged ??= new Set<string>());
@@ -3101,8 +3119,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // payload hash pinned) carries its authority with it — Exhibit C. An
       // exact accepted-work binding carries the same no-second-owner property
       // after its source, logical call, normalized effect, and contract froze.
-      // (2026-07-09): a certified + human-approved 25-email batch was refused
-      // 0/25 by this gate because the session's execution row wasn't active.
+      // A certified, human-approved batch is never refused merely because the
+      // session's execution row is not active.
       const grantCarried = Boolean(ctx.certifiedBatch)
         || expectedWorkBindingCarriesExecutionAuthority(ctx, tool.name, parsedInput);
       if (!grantCarried && isExecutionGateEnabled() && isMutatingExternalWrite(tool.name, parsedInput)) {
@@ -3177,7 +3195,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       console.warn('[harness] orphaned-write retry check threw (fail-open)', err instanceof Error ? err.message : err);
     }
     // 2c2. Grounding + duplicate-target gates (integrity at the
-    // irreversible-write boundary — the 2026-06-11 client-data incident class).
+    // irreversible-write boundary).
     // Runs for IRREVERSIBLE shapes only (SEND/PUBLISH). Both fail open on
     // any evaluation error; both surface as SOFT tool errors the model
     // recovers from. Ordered BEFORE confirm-first so a corrupted or
@@ -3219,8 +3237,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         throw new RecipientSetIntegrityError({ toolName: tool.name, result: recipientResult });
       }
       // ADVISORY (never blocks): the send is grounded but OMITS people from a
-      // roster the user asked to include in full — the "dropped 5" half of the
-      // incident. Record it so it is no longer silent and so the approval surface
+      // roster the user asked to include in full. Record it so it is no longer silent and so the approval surface
       // can show "N of M — missing …" to the human (Phase 2).
       if ((recipientResult.omittedRecipients?.length ?? 0) > 0) {
         try {
@@ -3397,15 +3414,14 @@ export function wrapToolForHarness<T extends WrappableTool>(
             });
           } else if (verdict.mode === 'advisory') {
             // Skill-less goal-alignment MISS → INFORM, do not block (north-star:
-            // guardrails inform, rarely block; a hard block here false-positived a
-            // legit self-send live 2026-06-22). The send PROCEEDS; record the
+            // guardrails inform, rarely block; a hard block here would refuse
+            // legitimate sends). The send PROCEEDS; record the
             // verdict (fulfills:false, advisory) + a warn-level guardrail so it
             // surfaces for review without breaking the send.
             //
-            // THE MANAGER SPEAKS (owner ask, 2026-08-07): this verdict used to go
-            // to telemetry only — the judge noticed the drift and the MODEL never
-            // heard it, so a run that wandered off the pinned task just kept
-            // wandering (live: personalized drafts the user never asked for). The
+            // THE MANAGER SPEAKS: a verdict sent to telemetry only is never heard
+            // by the MODEL, so a run that wandered off the pinned task would just
+            // keep wandering. The
             // manager's nudge now rides the advisory rail into the tool result:
             // the work proceeds, and the model is told a colleague-shaped truth —
             // this may not be what the user asked; consider checking with them.
@@ -3500,8 +3516,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // eslint-disable-next-line no-console
       console.warn('[harness] output-grounding gate threw (fail-open)', err instanceof Error ? err.message : err);
     }
-    // 2c3. Destination gate — AMBIENT-TARGET writes (the 2026-06-13
-    // wrong-site incident class). `run_shell_command` bypasses every gate
+    // 2c3. Destination gate — AMBIENT-TARGET writes (the wrong-site class).
+    // `run_shell_command` bypasses every gate
     // above (isMutatingExternalWrite only classifies composio writes), so
     // an irreversible publish (deploy/publish/release) whose destination
     // lives in cwd state — not its args — can clobber an unrelated live
@@ -3516,10 +3532,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
           : '';
         if (command) {
           const publishShape = classifyShellCommand(command);
-          // PROVENANCE (2026-06-15 clobber): a publish to an EXPLICIT target that
-          // was NOT created or named THIS session may be an unrelated live site
-          // (a coffee-shop build deployed onto a law-firm site via a site id
-          // reused from `netlify status` after `sites:create` failed). Hard-block.
+          // PROVENANCE: a publish to an EXPLICIT target that was NOT created or
+          // named THIS session may be an unrelated live site (a site id reused
+          // from a status listing after a create failed). Hard-block.
           // Chat only, so recurring workflows reusing a stable site id are exempt.
           // Build provenance only for commands that can use it; that scan walks the
           // session transcript and must stay off ordinary shell-command hot paths.
@@ -3551,8 +3566,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
           }
           const verdict = evaluateShellDestination(command);
           // PRODUCTION ambient publish → HARD block on EVERY attempt (retrying
-          // the same ambient command must never clobber the linked site — the
-          // 2026-06-14 Test-5 finding). Non-prod ambient publish → one-shot nudge.
+          // the same ambient command must never clobber the linked site).
+          // Non-prod ambient publish → one-shot nudge.
           if (verdict.action === 'flag' && verdict.shapeKey
             && (verdict.hardBlock || !wasDestinationNudged(ctx.sessionId, verdict.shapeKey))) {
             if (!verdict.hardBlock) markDestinationNudged(ctx.sessionId, verdict.shapeKey);
@@ -3579,8 +3594,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // external-write vector (curl -X POST / gh api --method POST / sf data
     // update / sendmail), but isMutatingExternalWrite is composio-only, so
     // these sends never got the grounding (payload-integrity) + duplicate gates
-    // that composio/MCP sends get — the client-data/mailbox incident class, reachable
-    // through shell. Classify only the CLEAR network-mutation shapes
+    // that composio/MCP sends get, although the same payload-integrity risk is
+    // reachable through shell. Classify only the CLEAR network-mutation shapes
     // (conservative; misses = status quo) and route them through the SAME
     // fail-open gates, reading the target from the command string. The
     // external_write ledger is SHARED so a shell re-send to the same target
@@ -3928,11 +3943,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // (sessionId arg is unused — included for future per-session
     // behavior without forcing callers to refactor.)
     void sessionId;
-    // WORKER FINISH WINDOW (2026-07-22): a worker one call from its ceiling
+    // WORKER FINISH WINDOW: a worker one call from its ceiling
     // gets a wrap-up notice ON this result instead of a guillotine on the
     // next — productive partial work lands as an honest partial answer
-    // rather than evaporating into a bare cap error ("I would hate to waste
-    // anything if a worker was actually being productive"). Worker scopes
+    // rather than evaporating into a bare cap error. Worker scopes
     // only (`::wkr:` / `::sdkx:`); the interactive lane has its own economy.
     let workerFinishNudge: string | undefined;
     if (
@@ -4004,8 +4018,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     // Batch items (certified or not) never claim artifact slots: the batch
     // lane is the sanctioned multi-item primitive with its own per-item
     // ledger — N same-kind creates in one plan would fight over the single
-    // deliverable slot and deadlock item 2+ (2026-07-22, surfaced live by
-    // the generic classifier).
+    // deliverable slot and deadlock item 2+.
     if (ctx.certifiedBatch || ctx.batchItem) return {};
     const expectedBinding = currentExpectedWorkBinding();
     const generatedContract = expectedBinding?.generatedArtifactContentContract;
@@ -4313,11 +4326,12 @@ export function wrapToolForHarness<T extends WrappableTool>(
         invokeCallId,
         tool.name,
       );
+      const presentationBudget = invocationPresentationBudget(tool.name, parsedInput, ctx);
       const invokeBody = async (): Promise<unknown> => {
       // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
       // values from the lossless store BEFORE gates + execution, so a high-stakes
-      // field comes from a trusted source, never model-authored text (the class of
-      // the 2026-07-19 fabricated-recipients incident). No-op for every call
+      // field comes from a trusted source, never model-authored text (a
+      // fabricated recipient list is the class this closes). No-op for every call
       // without the syntax (all traffic today). Fail-closed: an unresolvable
       // reference returns a soft, recoverable error and the tool does NOT run.
       if (!inputLocallyInvalid && toolOutputReferenceResolutionEnabled() && hasToolOutputReference(parsedInput)) {
@@ -4507,6 +4521,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: invokeCallId,
           toolName: tool.name,
           settlementNonce,
+          presentationBudget,
         }, () => originalInvoke.call(tt, runContext, input, invokeDetails)));
         const work = runWithToolAbortSignal(
           hostOwnedSignal ?? ac!.signal,
@@ -4682,7 +4697,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         creditRecallFromToolResult(ctx?.sessionId, tool.name, parsedInput, outwardResult, shellOutcome);
         // Poll-vs-loop discrimination: record the result fingerprint so the
         // exact-args guardrail can tell a progressing status poll from a
-        // genuine loop (live 2026-07-23).
+        // genuine loop.
         let semanticLoopDecision: ReturnType<typeof noteGuardrailToolResult>;
         if (ctx) { try { semanticLoopDecision = noteGuardrailToolResult(guardrailScopeKey(ctx), tool.name, parsedInput, outwardResult); } catch { /* advisory */ } }
         if (
@@ -4828,8 +4843,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
       }
       // GENERAL long-job timeout self-correction. A withTimeout kill of an
       // external-API / long-running-job tool (Composio static + cx_*, external_api_*,
-      // MCP __) means "the upstream job exceeded even its generous budget" — the live
-      // 2026-06-24 Apify case. Return the async start+poll corrective (reads) or the
+      // MCP __) means "the upstream job exceeded even its generous budget".
+      // Return the async start+poll corrective (reads) or the
       // verify-before-retry corrective (writes) as the tool RESULT instead of letting
       // ToolTimeout propagate to handleRunError's ask-user "retry/switch/stop" pause —
       // so the model self-corrects within the SAME run, generalizing the run_worker
@@ -4852,12 +4867,20 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: invokeCallId,
           toolName: tool.name,
           settlementNonce,
+          presentationBudget,
         }, () => formatRecallableToolText(value, {
-          // Nested results cross a compact carrier next. Apply that same
-          // budget while the child's exact receipt is still in scope, so the
-          // carrier never has to digest already-projected JSON as new raw data.
-          maxChars: explicitLocalReadPreviewBudget(tool.name, parsedInput)
-            ?? (ctx?.nestedDispatch ? PROMPT_INLINE_RECALLABLE_RESULT_CHARS : undefined),
+          // A carrier resolves the same budget as the child it dispatches
+          // (both key on the effective inner tool), so a nested child projects
+          // once while its exact receipt is in scope and the carrier passes
+          // that projection through instead of digesting it as new raw data.
+          maxChars: presentationBudget,
+          // A direct call whose handler already projected its own reply from
+          // the exact bytes keeps that projection up to one whole inline result
+          // for the window, instead of a smaller view rebuilt from the same
+          // bytes; a nested or batch child keeps its carrier's or runner's view.
+          ...(ctx?.nestedDispatch || ctx?.batchItem
+            ? {}
+            : { verifiedProjectionMaxChars: inlineResultBudgetForModel(ctx?.routedModelId) }),
           hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
       if (isTimeoutSelfCorrectTool(tool.name)) {
         try {
@@ -5052,6 +5075,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         callId: executeCallId,
         toolName: tool.name,
         settlementNonce,
+        presentationBudget: invocationPresentationBudget(tool.name, input, ctx),
       }, () => originalExecute(input, runContext)));
       const work = runWithToolAbortSignal(
         hostOwnedSignal ?? ac!.signal,
@@ -5236,7 +5260,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
     if ((settledRead || steer || repeatedCreate) && typeof outwardResult === 'string') return `${outwardResult}${settledRead}${repeatedCreate}${steer}`;
     return outwardResult;
     // NOTE: A tool-return truncator used to live here as part of
-    // Primitive 6 (v0.5.18 plan). Removed 2026-05-24 because hooks.ts
+    // Primitive 6. Removed because hooks.ts
     // `clipToolResult` + `writeToolOutput` + `clipOldToolResults`
     // already cover (a) per-write inline trim with recall_tool_result
     // marker, (b) lossless 200K side store, (c) compaction-driven

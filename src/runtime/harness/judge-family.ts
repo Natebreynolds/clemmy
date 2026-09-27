@@ -21,6 +21,7 @@ import { getClaudeAuthSnapshot } from '../claude-oauth.js';
 import { classifyModelError } from './resilient-model.js';
 import type { ModelProviderClass } from './model-wire-registry.js';
 import { readJudgeFallbackSetting } from './judge-fallback-policy.js';
+import { withOwnModelRequestAttribution } from '../usage-log.js';
 
 /** Is the Claude (Anthropic) subscription brain logged in + usable right now? */
 export function claudeAvailable(): boolean {
@@ -160,11 +161,27 @@ export function goalJudgeTimeoutMs(): number {
   return Number.isFinite(raw) && raw >= 1000 ? raw : 90000;
 }
 
-export async function withJudgeTimeout<T>(work: Promise<T>, timeoutMs = boundaryJudgeTimeoutMs()): Promise<T | null> {
+/**
+ * A judge verdict is one model request of its own, made inside whatever frame
+ * asked for it (a brain turn, a worker, a workflow step). Every judge seam in
+ * this module starts its work inside this scope, so the usage row records the
+ * reviewer role and the lane's channel instead of inheriting the frame's role
+ * and the frame's prompt measurements. Source identity is still inherited, so
+ * the verdict's cost stays attributed to the turn that asked for it.
+ */
+export function asJudgeRequest<T>(lane: string, work: () => T): T {
+  return withOwnModelRequestAttribution({ role: 'reviewer', channel: `judge:${lane}` }, work);
+}
+
+export async function withJudgeTimeout<T>(
+  lane: string,
+  work: () => Promise<T>,
+  timeoutMs = boundaryJudgeTimeoutMs(),
+): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      work,
+      asJudgeRequest(lane, work),
       new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
     ]);
   } finally {
@@ -220,10 +237,12 @@ export interface HedgedJudgeResult<T> {
 export async function withJudgeHedge<T>(
   primary: () => Promise<T>,
   hedge: (() => Promise<T>) | null,
-  opts: { hedgeDelayMs?: number; timeoutMs?: number } = {},
+  opts: { lane: JudgeMetricLane; hedgeDelayMs?: number; timeoutMs?: number },
 ): Promise<HedgedJudgeResult<T>> {
   const timeoutMs = opts.timeoutMs ?? boundaryJudgeTimeoutMs();
-  const hedgeThunk = judgeHedgeEnabled() ? hedge : null;
+  const hedgeThunk = judgeHedgeEnabled() && hedge
+    ? () => asJudgeRequest(opts.lane, hedge)
+    : null;
   const hedgeDelayMs = Math.min(opts.hedgeDelayMs ?? judgeHedgeDelayMs(), timeoutMs);
   return await new Promise((resolve) => {
     let settled = false;
@@ -257,7 +276,7 @@ export async function withJudgeHedge<T>(
 
     deadlineTimer = setTimeout(() => finish(null, null), timeoutMs);
     if (hedgeThunk) hedgeTimer = setTimeout(startHedge, hedgeDelayMs);
-    primary().then(
+    asJudgeRequest(opts.lane, primary).then(
       (v) => finish(v, 'primary'),
       (err) => {
         errors.push(err);

@@ -12,7 +12,10 @@ import {
   modelUsageAttributionStorage,
   observeModelUsageRecording,
   recordModelUsage,
+  withOwnModelRequestAttribution,
+  type UsageRequestRole,
 } from '../usage-log.js';
+import { estimateTokens } from '../harness/budget.js';
 import {
   PlanGroundingJudgeV1Schema,
   SourceEffectJudgeV1Schema,
@@ -236,8 +239,16 @@ async function completeStructured(input: {
     ...(reasoning ? { modelSettings: { reasoning: { effort: reasoning } } } : {}),
   }) as unknown as Agent;
   const runner = new Runner({ workflowName: `clementine-${input.purpose}` });
+  // Its own request: the enclosing turn's role and prompt measurements do not
+  // describe this call, so it records the purpose's role and its own sizes.
   const { value: result, recorded: usageRecorded } = await observeModelUsageRecording(
-    () => runner.run(agent, input.user, { maxTurns: 1 }),
+    () => withOwnModelRequestAttribution({
+      ...semanticUsageAttribution(input.purpose),
+      promptComponents: {
+        instructions: estimateTokens(input.system),
+        history: estimateTokens(input.user),
+      },
+    }, () => runner.run(agent, input.user, { maxTurns: 1 })),
   );
   const tokens = tokensFromAgentRun(result);
   const latencyMs = Date.now() - started;
@@ -372,7 +383,18 @@ export function tokensFromAgentRun(result: unknown): { inputTokens: number; outp
   );
 }
 
+/** The usage role and channel a semantic call records: a judge purpose is a
+ *  review; interpretation is not a brain round and declares no role. */
+export function semanticUsageAttribution(
+  purpose: ConfiguredSemanticPurpose,
+): { role?: UsageRequestRole; channel: string } {
+  return semanticModelRoleForPurpose(purpose) === 'judge'
+    ? { role: 'reviewer', channel: `judge:${purpose}` }
+    : { channel: `semantic:${purpose}` };
+}
+
 function recordSemanticModelUsage(input: {
+  purpose: ConfiguredSemanticPurpose;
   sessionId?: string;
   sourceUserSeq?: number;
   modelIdentity: string;
@@ -385,17 +407,28 @@ function recordSemanticModelUsage(input: {
   if (input.usageRecorded) return;
   if (input.inputTokens + input.outputTokens <= 0) return;
   const attribution = modelUsageAttributionStorage.getStore();
-  recordModelUsage({
-    sessionId: input.sessionId || attribution?.sessionId || 'unknown',
-    sourceUserSeq: input.sourceUserSeq ?? attribution?.sourceUserSeq,
-    attemptId: attribution?.attemptId,
-    model: input.modelIdentity,
-    cacheDialect: 'inclusive',
-    inputTokens: input.inputTokens,
-    outputTokens: input.outputTokens,
-    cachedInputTokens: input.cachedInputTokens,
-    totalTokens: input.inputTokens + input.outputTokens,
-    durationMs: input.latencyMs,
+  const own = semanticUsageAttribution(input.purpose);
+  // The fallback row describes the same own request the completion ran as, so
+  // it is recorded in that request's scope: an undeclared role stays unset
+  // rather than taking the enclosing frame's role or prompt measurements. The
+  // role and lane are read from that scope, so inside a memory job the row
+  // keeps the job's lane, as the completion itself does.
+  withOwnModelRequestAttribution(own, () => {
+    const scope = modelUsageAttributionStorage.getStore();
+    recordModelUsage({
+      ...(scope?.role ? { role: scope.role } : {}),
+      channel: scope?.channel ?? own.channel,
+      sessionId: input.sessionId || attribution?.sessionId || 'unknown',
+      sourceUserSeq: input.sourceUserSeq ?? attribution?.sourceUserSeq,
+      attemptId: attribution?.attemptId,
+      model: input.modelIdentity,
+      cacheDialect: 'inclusive',
+      inputTokens: input.inputTokens,
+      outputTokens: input.outputTokens,
+      cachedInputTokens: input.cachedInputTokens,
+      totalTokens: input.inputTokens + input.outputTokens,
+      durationMs: input.latencyMs,
+    });
   });
 }
 
@@ -441,8 +474,13 @@ export function installConfiguredBrainSemanticPort(): void {
 }
 
 export function configuredBrainSemanticPort(
-  complete: ConfiguredBrainSemanticComplete,
+  completeRequest: ConfiguredBrainSemanticComplete,
 ): TurnSemanticModelPort {
+  // Each result names its purpose so its usage records the purpose's role.
+  const complete = async (input: Parameters<ConfiguredBrainSemanticComplete>[0]) => ({
+    ...(await completeRequest(input)),
+    purpose: input.purpose,
+  });
   return {
     async judgeAccountSelection(call) {
       const result = await complete({
@@ -558,6 +596,7 @@ export function configuredBrainSemanticPort(
       recordSemanticModelUsage({
         sessionId: call.host.source.sessionId,
         sourceUserSeq: call.host.source.sourceUserSeq,
+        purpose: result.purpose,
         usageRecorded: result.usageRecorded,
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
@@ -594,6 +633,7 @@ export function configuredBrainSemanticPort(
       recordSemanticModelUsage({
         sessionId: call.sessionId,
         sourceUserSeq: call.sourceUserSeq,
+        purpose: result.purpose,
         usageRecorded: result.usageRecorded,
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,
@@ -632,6 +672,7 @@ export function configuredBrainSemanticPort(
       recordSemanticModelUsage({
         sessionId: call.sessionId,
         sourceUserSeq: call.sourceUserSeq,
+        purpose: result.purpose,
         usageRecorded: result.usageRecorded,
         modelIdentity: result.modelIdentity,
         inputTokens: result.inputTokens,

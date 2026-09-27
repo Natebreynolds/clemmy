@@ -243,15 +243,16 @@ test('dispatchBatchItemTool establishes tool-output context for the inner tool (
 // Program-recall budget exemption (live 2026-07-24): the inherited model-lane
 // recall budget capped a 100-item resume at 3 recalls; calls 4+ returned the
 // budget error and 60 accounts of good banked data were declared "malformed".
-test('nested dispatch context never inherits the model-lane recall budget; per-run accounting is kept', async () => {
+test('a non-mirror nested or batch dispatch never inherits the model-lane recall budget; per-run accounting is kept', async () => {
   const { withHarnessRunContext, ToolCallsCounter, RecallBudget } = await import('../runtime/harness/brackets.js');
   const { createSession } = await import('../runtime/harness/eventlog.js');
   const sess = createSession({ kind: 'chat' }).id;
+  const modelLaneBudget = new RecallBudget(3, 60_000);
   await withHarnessRunContext(
     {
       sessionId: sess,
       counter: new ToolCallsCounter(50),
-      recallBudget: new RecallBudget(3, 60_000),
+      recallBudget: modelLaneBudget,
       behaviorScopeId: 'scope-x',
       sourceUserSeq: 42,
       hostOwnsToolAccounting: true,
@@ -259,6 +260,8 @@ test('nested dispatch context never inherits the model-lane recall budget; per-r
     async () => {
       const nested = inheritedNestedHarnessContext(sess);
       assert.equal('recallBudget' in nested, false, 'nested recalls read a lossless local store — no model-context cost, no budget');
+      assert.equal(inheritedNestedHarnessContext(sess, false, 'mirrored-call').recallBudget, modelLaneBudget,
+        'a transport mirror is the model\'s own call and spends the same turn budget');
       assert.equal(nested.behaviorScopeId, 'scope-x', 'per-run accounting still inherited');
       assert.equal(nested.sourceUserSeq, 42, 'attempt authority still inherited');
       assert.equal(nested.hostOwnsToolAccounting, undefined, 'ambient parent accounting cannot exempt new nested work');

@@ -10,13 +10,9 @@
  *   recall-tools.ts (output is plain text)
  *     "It is text, not structured data — use recall_tool_result to read it."
  *
- * Both are individually well-reasoned, and each carries a comment explaining
- * the live incident it was written for. Together they are a closed loop, and a
- * model that obeys either one lands back where it started. Live 2026-09-07
- * source 146537 — the owner's Platform 49 Sheet-cleanup Plan — burned its turn
- * inside that cycle and never published a plan. The same shape had already been
- * fixed once on 2026-09-02 ("19 recalls, zero business calls, a governor stop,
- * and the sheet never touched"); pointing one tool at another simply moved it.
+ * Each is individually reasonable. Together they are a closed loop: a model
+ * that obeys either one lands back where it started and spends its turn
+ * inside that cycle. Pointing one reader at another only moves the loop.
  *
  * The durable form is not a better sentence. It is a single function that
  * answers "what can actually read this output right now?" from the output's
@@ -27,8 +23,19 @@
  * This mints no authority: every route it names is still subject to the same
  * exact source/account/occurrence checks at its own edge.
  */
-import { getToolOutput, listToolOutputCallIds, resolveToolOutputForAuthority } from './eventlog.js';
+import {
+  getToolOutput,
+  listToolOutputCallIds,
+  resolveToolOutputForAuthority,
+  resolveToolOutputForQuery,
+  toolOutputStoredIdentity,
+  unsettledToolOutputQueryRefusal,
+  type AuthorityToolOutputResolution,
+  type ToolOutputRecord,
+  type ToolOutputStoredIdentity,
+} from './eventlog.js';
 import { parseStoredToolOutputJson } from './json-repair.js';
+import { resolveRetainedOutputRead } from './retained-output-read.js';
 
 export interface RetainedResultRoute {
   /** The tool to call. */
@@ -46,6 +53,143 @@ export interface RetainedResultRouteInput {
   readonly exclude?: readonly string[];
   /** Recall calls still available this turn, when the caller knows. */
   readonly recallCallsRemaining?: number;
+  /** The turn's reading bytes cannot hold a bare query reply: name the query
+   *  as a named page, which spends none. */
+  readonly readingBytesSpent?: boolean;
+}
+
+/** The page size a route names when a bare query could not be served. */
+const NAMED_QUERY_PAGE = 20;
+
+/** What the readers can do with one retained output, judged from its bytes
+ * and from file_query's own query check. */
+interface RetainedOutputJudgement {
+  readonly readId: string;
+  /** Non-empty and complete: something a reader can serve. */
+  readonly readable: boolean;
+  readonly structured: boolean;
+  /** Structured data embedded in prose (a host document with its dataset
+   * inside): the query reaches the data, and only recall reaches the prose. */
+  readonly proseAroundData: boolean;
+  readonly fileQuery: boolean;
+}
+
+/** Judgements of unchanged outputs, keyed by the output's metadata identity.
+ * A recall pages through the router on every page; the bytes are judged once
+ * and the same stored output is routed again without loading them. */
+const JUDGEMENT_MEMO_LIMIT = 256;
+const judgementMemo = new Map<string, { identity: string; judgement: RetainedOutputJudgement }>();
+
+function rememberJudgement(key: string, identity: string, judgement: RetainedOutputJudgement): void {
+  judgementMemo.delete(key);
+  judgementMemo.set(key, { identity, judgement });
+  while (judgementMemo.size > JUDGEMENT_MEMO_LIMIT) {
+    const oldest = judgementMemo.keys().next().value;
+    if (oldest === undefined) break;
+    judgementMemo.delete(oldest);
+  }
+}
+
+function judgeBytes(
+  record: ToolOutputRecord | null,
+  readId: string,
+  fileQuery: boolean,
+): RetainedOutputJudgement {
+  // Without the stored bytes there is nothing to route to, and a prefix is
+  // not authoritative data that any reader can make whole.
+  if (!record || typeof record.output !== 'string' || record.output.length === 0 || record.truncatedAtWrite) {
+    return { readId, readable: false, structured: false, proseAroundData: false, fileQuery: false };
+  }
+  const recovered = (() => {
+    try {
+      return parseStoredToolOutputJson(record.output, {});
+    } catch {
+      return null;
+    }
+  })();
+  return {
+    readId,
+    readable: true,
+    structured: Boolean(recovered),
+    proseAroundData: recovered?.via === 'embedded',
+    fileQuery,
+  };
+}
+
+/** The resolver's record carries the canonical bytes when it is the canonical
+ * row itself or an invocation row with the same digest. */
+function resolvedRecordIsCanonical(
+  resolution: AuthorityToolOutputResolution,
+  identity: ToolOutputStoredIdentity,
+): resolution is Extract<AuthorityToolOutputResolution, { status: 'ok' }> {
+  if (resolution.status !== 'ok') return false;
+  if (resolution.source === 'legacy') return true;
+  const nonce = resolution.record.invocationNonce;
+  if (!nonce || !identity.canonicalSha256) return false;
+  return identity.invocationSha256.get(nonce) === identity.canonicalSha256;
+}
+
+function judgeRetainedOutput(input: RetainedResultRouteInput): RetainedOutputJudgement | null {
+  // Route to what the readers will actually read: a recall's id resolves to
+  // its producer and a receipt to its own redeemed bytes, exactly as each
+  // reader resolves it. Naming the producer id means no route reads a copy of
+  // a copy.
+  let resolved: ReturnType<typeof resolveRetainedOutputRead>;
+  try {
+    resolved = resolveRetainedOutputRead(input.sessionId, input.callId);
+  } catch {
+    return null;
+  }
+  const readId = resolved.callId;
+  // A redeemed receipt is read under its own exact identity, as file_query reads it.
+  if (resolved.receipt) return judgeBytes(resolved.receipt, readId, true);
+
+  let identity: ToolOutputStoredIdentity | null = null;
+  try {
+    identity = toolOutputStoredIdentity(input.sessionId, readId);
+  } catch {
+    identity = null;
+  }
+  if (!identity) return null;
+  // Whether the call is still open is read from the durable lifecycle, never
+  // from the caller: a call with no return yet cannot pass the query check,
+  // so its output is judged as that check will judge it once the call
+  // settles. Once a return exists, the check itself decides. A carrier is
+  // open until its own top-level return, even after its inner mirror has
+  // returned. The identity carries the lifecycle, so a remembered judgement
+  // never outlives it.
+  const inFlight = identity.awaitingReturn;
+  const memoKey = `${input.sessionId}\u0000${readId}`;
+  const remembered = judgementMemo.get(memoKey);
+  if (remembered && remembered.identity === identity.key) {
+    rememberJudgement(memoKey, identity.key, remembered.judgement);
+    return remembered.judgement;
+  }
+
+  let record: ToolOutputRecord | null = null;
+  let fileQuery = false;
+  let readFailed = false;
+  try {
+    if (inFlight) {
+      record = getToolOutput(input.sessionId, readId);
+      fileQuery = record !== null && unsettledToolOutputQueryRefusal(record) === null;
+    } else {
+      // file_query applies this resolver; its verified record doubles as the
+      // bytes to judge when it is the canonical row the other readers read.
+      const resolution = resolveToolOutputForQuery(input.sessionId, readId);
+      fileQuery = resolution.status === 'ok';
+      record = resolvedRecordIsCanonical(resolution, identity)
+        ? resolution.record
+        : getToolOutput(input.sessionId, readId);
+    }
+  } catch {
+    // A failed read leaves whatever was read before it; judged as found, and
+    // not remembered, so the next route reads the unchanged output again.
+    readFailed = true;
+  }
+  const judgement = judgeBytes(record, readId, fileQuery);
+  if (identity.canonicalSha256 && !readFailed) rememberJudgement(memoKey, identity.key, judgement);
+  return judgement;
 }
 
 /**
@@ -58,53 +202,48 @@ export function retainedResultRoutes(
 ): RetainedResultRoute[] {
   const excluded = new Set((input.exclude ?? []).map((name) => name.trim()));
   const routes: RetainedResultRoute[] = [];
-  let record: { output: string; truncatedAtWrite?: boolean } | null = null;
-  try {
-    record = getToolOutput(input.sessionId, input.callId);
-  } catch {
-    record = null;
-  }
-  // Without the stored bytes there is nothing to route to. Say so; do not
-  // invent a reader that will refuse for a different reason.
-  if (!record || typeof record.output !== 'string' || record.output.length === 0) return routes;
-  // A prefix is not authoritative data, and no reader can make it so.
-  if (record.truncatedAtWrite) return routes;
-
-  const structured = (() => {
-    try {
-      return Boolean(parseStoredToolOutputJson(record.output, {}));
-    } catch {
-      return false;
-    }
-  })();
+  const judged = judgeRetainedOutput(input);
+  // Say so when nothing can read it; do not invent a reader that will refuse
+  // for a different reason.
+  if (!judged || !judged.readable) return routes;
+  const { readId, structured, proseAroundData } = judged;
 
   // Structured rows: the server-side query is the cheap, unclipped read.
   if (structured && !excluded.has('tool_output_query')) {
-    routes.push({
-      tool: 'tool_output_query',
-      call: `tool_output_query {"call_id":"${input.callId}"}`,
-      why: 'this output holds structured records, which it can filter, project and page server-side without spending recall budget',
-    });
+    routes.push(input.readingBytesSpent
+      ? {
+        tool: 'tool_output_query',
+        call: `tool_output_query {"call_id":"${readId}","limit":${NAMED_QUERY_PAGE}}`,
+        why: 'this output holds structured records, and a named page (limit or fields) spends no reading bytes',
+      }
+      : {
+        tool: 'tool_output_query',
+        call: `tool_output_query {"call_id":"${readId}"}`,
+        why: 'this output holds structured records, which it can filter, project and page server-side; a named page or projection spends no recall budget',
+      });
   }
 
-  // Plain text: recall reads it, but only while its per-turn budget allows.
+  // Text: recall reads it, but only while its per-turn budget allows.
   const recallAvailable = input.recallCallsRemaining === undefined
     || input.recallCallsRemaining > 0;
-  if (!structured && recallAvailable && !excluded.has('recall_tool_result')) {
+  if ((!structured || proseAroundData) && recallAvailable && !excluded.has('recall_tool_result')) {
     routes.push({
       tool: 'recall_tool_result',
-      call: `recall_tool_result {"call_id":"${input.callId}"}`,
-      why: 'this output is text rather than structured records, and recall reads it verbatim',
+      call: `recall_tool_result {"call_id":"${readId}"}`,
+      why: structured
+        ? 'the text around that data is prose, and recall reads it verbatim'
+        : 'this output is text rather than structured records, and recall reads it verbatim',
     });
   }
 
-  // THE ROUTE NEITHER MESSAGE EVER NAMED. file_query reads the same stored
-  // text and spends no recall budget, so it serves exactly the case that
-  // trapped the Platform 49 plan: plain text with recall already exhausted.
-  if (!excluded.has('file_query')) {
+  // file_query reads the same stored text and spends no recall budget, so it
+  // serves plain text with recall already exhausted. It is offered only when
+  // its own query check accepts this id; advertising a reader that will
+  // refuse is a dead end.
+  if (!excluded.has('file_query') && judged.fileQuery) {
     routes.push({
       tool: 'file_query',
-      call: `file_query {"call_id":"${input.callId}","query":"<what you need>"}`,
+      call: `file_query {"call_id":"${readId}","query":"<what you need>"}`,
       why: 'it searches the same stored output as text and spends no recall budget',
     });
   }

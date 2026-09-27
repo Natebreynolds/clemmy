@@ -4,6 +4,7 @@ import { needsYouKey, needsYouReferents, notificationActionItemId, notificationN
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
+import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
@@ -4632,6 +4633,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  registerMobileMemoryWorkRoutes(router, requireMobileSession);
+
   /**
    * The Activity tab's feed. Delegates to the same collector as the desktop
    * dashboard's /api/runs — the phone door only serves /m/*, so this is the
@@ -5805,6 +5808,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const { codexRescueSettingsSnapshot } = await import('../runtime/harness/codex-rescue-settings.js');
     const { judgeFallbackSettingsSnapshot } = await import('../runtime/harness/judge-fallback-settings.js');
     const { judgeReviewsOwnFamily } = await import('../runtime/harness/debate-model.js');
+    const { memoryRoleSettingsView } = await import('../memory/memory-model-route.js');
     const { getActiveAuthMode } = await import('../config.js');
     const catalog = modelRoleOptionCatalogSnapshot();
     return {
@@ -5821,6 +5825,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         writer: resolveRoleModel('writer'),
         judge: resolveRoleModel('judge'),
         worker: resolveRoleModel('worker'),
+        // Who keeps the memory: the memory route's own model, never the
+        // checker's row, plus whose model it borrows when automatic.
+        memory: memoryRoleSettingsView(),
       },
       roleOptions: catalog.roleOptions,
       judgeFallback: judgeFallbackSettingsSnapshot(catalog),
@@ -5859,10 +5866,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
-  // Writer, judge and workers from the phone: an exact connected model id, or
-  // clear to go back to automatic. Role-wide only; routing a kind of work to a
-  // model stays on the desktop. Desktop Settings and the chat tool persist
-  // through the same owner, so the three doors cannot disagree.
+  // Writer, judge, workers and memory from the phone: an exact connected model
+  // id, or clear to go back to automatic. Role-wide only; routing a kind of
+  // work to a model stays on the desktop. Desktop Settings and the chat tool
+  // persist through the same owner, so the three doors cannot disagree.
   router.post('/api/settings/models/role', requireMobileSession, async (req, res) => {
     try {
       const {
@@ -5873,7 +5880,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (!isBindableModelRole(role)) {
         res.status(400).json({
           error: 'UNKNOWN_ROLE',
-          message: 'Choose the writer, the judge or the workers. The brain has its own switch.',
+          message: 'Choose the writer, the judge, the workers or the memory model. The brain has its own switch.',
         });
         return;
       }

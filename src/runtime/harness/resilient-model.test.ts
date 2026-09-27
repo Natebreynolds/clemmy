@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
+import { APIConnectionError, APIConnectionTimeoutError, APIUserAbortError } from 'openai';
 import { withResilience, translateSettings, classifyModelError, type ResiliencePolicy } from './resilient-model.js';
+import * as resilient from './resilient-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
 import { BoundaryError } from '../boundary-error.js';
 
@@ -432,6 +434,249 @@ test('isEffortRejection: matches the Anthropic effort-400, not other 400s', asyn
   assert.equal(isEffortRejection({ statusCode: 400, message: 'This model does not support the effort parameter.' }), true);
   assert.equal(isEffortRejection({ statusCode: 400, message: 'messages.0: invalid' }), false);
   assert.equal(isEffortRejection({ statusCode: 429 }), false);
+});
+
+// --- a provider that gave no answer -----------------------------------------
+
+test('classifyModelError: the SDK connection class is transport even when its timeout carries no cause and no transport word', () => {
+  // The real SDK objects: the timeout subclass is thrown for any pre-response
+  // failure whose text says "timed out", and it keeps nothing of that failure.
+  const timedOut = new APIConnectionTimeoutError();
+  assert.equal(timedOut.message, 'Request timed out.');
+  assert.equal((timedOut as { cause?: unknown }).cause, undefined);
+  assert.deepEqual(pick(classifyModelError(timedOut)), { retryable: true, kind: 'model.transport_timeout', isAuth: false });
+  assert.deepEqual(pick(classifyModelError(new APIConnectionError({ message: 'Connection error.', cause: new Error('socket closed') }))),
+    { retryable: true, kind: 'model.transport_timeout', isAuth: false });
+  assert.deepEqual(pick(classifyModelError({ message: 'wrapped', cause: timedOut })), { retryable: true, kind: 'model.transport_timeout', isAuth: false },
+    'the class counts anywhere in the cause chain');
+  assert.equal(classifyModelError(new Error('Tool call timed out after 30s')).kind, 'runtime.unknown',
+    'prose that says "timed out" is not a dropped connection');
+});
+
+test('getStreamedResponse: the SDK connection timeout before content is retried transparently and the answer streams', async () => {
+  let calls = 0;
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      calls += 1;
+      if (calls === 1) throw new APIConnectionTimeoutError();
+      yield { type: 'output_text_delta', delta: 'answered' } as any;
+      yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+    },
+  });
+  const events = await collect(withResilience(inner, policy()).getStreamedResponse(req()));
+  assert.equal(calls, 2);
+  assert.ok(events.some((e: any) => e.type === 'output_text_delta' && e.delta === 'answered'));
+});
+
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  test(`${path}: a request the caller withdrew is never retried`, async () => {
+    const caller = new AbortController();
+    let calls = 0;
+    const sleeps: number[] = [];
+    const withdraw = (): never => { calls += 1; caller.abort(); throw new APIUserAbortError(); };
+    const inner = makeModel({
+      getResponse: async () => withdraw(),
+      // eslint-disable-next-line require-yield
+      getStreamedResponse: async function* () { withdraw(); },
+    });
+    const model = withResilience(inner, policy({ sleep: async (ms) => { sleeps.push(ms); } }));
+    const request = req({ signal: caller.signal });
+    await assert.rejects(path === 'getResponse' ? model.getResponse(request) : collect(model.getStreamedResponse(request)));
+    assert.equal(calls, 1, 'no second attempt after the caller stopped');
+    assert.deepEqual(sleeps, [], 'no backoff after the caller stopped');
+  });
+}
+
+function connectTimeoutAfter(clock: { now: number }, ms: number): never {
+  clock.now += ms;
+  throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } });
+}
+
+test('getStreamedResponse: a connection that takes its own timeout to fail is retried only inside the no-answer window', async () => {
+  const clock = { now: 0 };
+  let calls = 0;
+  const inner = makeModel({
+    // eslint-disable-next-line require-yield
+    getStreamedResponse: async function* () { calls += 1; connectTimeoutAfter(clock, 15_000); },
+  });
+  const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+  const err = await collect(model.getStreamedResponse(req())).then(() => assert.fail('must throw'), (e: unknown) => e);
+  // 0-15 s fails; ~0.75 s backoff starts a second attempt inside 20 s; it
+  // fails at ~31 s and no third attempt starts.
+  assert.equal(calls, 2);
+  assert.ok(clock.now < 35_000, `bounded: ${clock.now} ms`);
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), true, 'outer layers see the retries were spent');
+});
+
+const slowFailures = {
+  'a reset socket': () => Object.assign(new TypeError('terminated'), { cause: { code: 'ECONNRESET' } }),
+  'a gateway 5xx with no Retry-After': () => ({ statusCode: 504, message: 'Gateway Timeout' }),
+};
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  for (const [shape, failure] of Object.entries(slowFailures)) {
+    test(`${path}: ${shape} that arrives after the no-answer window still gets one retry, and the answer arrives`, async () => {
+      const clock = { now: 0 };
+      let calls = 0;
+      const attempt = (): void => {
+        calls += 1;
+        if (calls === 1) { clock.now += 25_000; throw failure(); }
+      };
+      const inner = makeModel({
+        getResponse: async () => { attempt(); return resp([{ type: 'message', content: 'answered' }]); },
+        getStreamedResponse: async function* () {
+          attempt();
+          yield { type: 'output_text_delta', delta: 'answered' } as any;
+          yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+        },
+      });
+      const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+      if (path === 'getResponse') await model.getResponse(req());
+      else assert.ok((await collect(model.getStreamedResponse(req()))).some((e: any) => e.delta === 'answered'));
+      assert.equal(calls, 2, 'one slow failure is a single blip, not a spent budget');
+    });
+  }
+}
+
+test('getStreamedResponse: a slow failure that repeats is retried once, then surfaces marked as spent', async () => {
+  const clock = { now: 0 };
+  let calls = 0;
+  const inner = makeModel({
+    // eslint-disable-next-line require-yield
+    getStreamedResponse: async function* () { calls += 1; connectTimeoutAfter(clock, 25_000); },
+  });
+  const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+  const err = await collect(model.getStreamedResponse(req())).then(() => assert.fail('must throw'), (e: unknown) => e);
+  assert.equal(calls, 2, 'the first retry always runs; the window stops the second');
+  assert.ok(clock.now <= 2 * 25_000 + 1_000, `bounded by about two attempts: ${clock.now} ms`);
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), true);
+});
+
+// Other retries share the attempt count; they must not use up the no-answer
+// retry a later slow failure is owed.
+const fastFirsts = {
+  'a rate-limit 429': () => { throw { statusCode: 429 }; },
+  'an expired token (401) that refreshes': () => { throw { statusCode: 401 }; },
+  'a rejected effort setting (400)': () => { throw { statusCode: 400, message: 'this model does not support the effort parameter' }; },
+  'an empty completion': () => 'empty' as const,
+};
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  for (const [shape, first] of Object.entries(fastFirsts)) {
+    test(`${path}: ${shape} first, then one slow reset, still gets its no-answer retry and the answer arrives`, async () => {
+      const clock = { now: 0 };
+      let calls = 0;
+      let refreshes = 0;
+      const attempt = (): 'empty' | 'answer' => {
+        calls += 1;
+        if (calls === 1) return first();
+        if (calls === 2) { clock.now += 25_000; throw slowFailures['a reset socket'](); }
+        return 'answer';
+      };
+      const inner = makeModel({
+        getResponse: async () => (attempt() === 'empty' ? resp([]) : resp([{ type: 'message', content: 'answered' }])),
+        getStreamedResponse: async function* () {
+          if (attempt() === 'empty') { yield { type: 'response_done', response: { output: [] } } as any; return; }
+          yield { type: 'output_text_delta', delta: 'answered' } as any;
+          yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+        },
+      });
+      const model = withResilience(inner, policy({
+        now: () => clock.now,
+        sleep: async (ms) => { clock.now += ms; },
+        refreshAuth: async () => { refreshes += 1; },
+      }));
+      if (path === 'getResponse') await model.getResponse(req());
+      else assert.ok((await collect(model.getStreamedResponse(req()))).some((e: any) => e.delta === 'answered'));
+      assert.equal(calls, 3, 'the fast retry and the no-answer retry both ran');
+    });
+  }
+}
+
+test('getStreamedResponse: after a rate-limit retry, a slow failure that repeats still stops at two no-answer attempts', async () => {
+  const clock = { now: 0 };
+  let calls = 0;
+  const inner = makeModel({
+    // eslint-disable-next-line require-yield
+    getStreamedResponse: async function* () {
+      calls += 1;
+      if (calls === 1) throw { statusCode: 429 };
+      connectTimeoutAfter(clock, 25_000);
+    },
+  });
+  const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+  const err = await collect(model.getStreamedResponse(req())).then(() => assert.fail('must throw'), (e: unknown) => e);
+  assert.equal(calls, 3, 'one rate-limit retry, then one no-answer retry, then the window stops');
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), true);
+});
+
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  test(`${path}: a no-answer failure on the last attempt after only rate-limit retries is not marked spent`, async () => {
+    let calls = 0;
+    const attempt = (): void => {
+      calls += 1;
+      if (calls <= 3) throw { statusCode: 429 };
+      throw slowFailures['a reset socket']();
+    };
+    const inner = makeModel({
+      getResponse: async () => { attempt(); return resp([]); },
+      // eslint-disable-next-line require-yield
+      getStreamedResponse: async function* () { attempt(); },
+    });
+    const model = withResilience(inner, policy());
+    const run = path === 'getResponse' ? model.getResponse(req()) : collect(model.getStreamedResponse(req()));
+    const err = await run.then(() => assert.fail('must throw'), (e: unknown) => e);
+    assert.equal(calls, 4, 'the count budget ran out on rate limits');
+    assert.equal(resilient.modelRetriesSpentBeforeContent(err), false,
+      'no retry of a request that gave no answer ran, so the turn keeps its own retry');
+  });
+}
+
+test('getStreamedResponse: a stream that ends silently on the last attempt after only empty completions is not marked spent', async () => {
+  let calls = 0;
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      calls += 1;
+      if (calls <= 3) yield { type: 'response_done', response: { output: [] } } as any;
+    },
+  });
+  const err = await collect(withResilience(inner, policy()).getStreamedResponse(req())).then(() => assert.fail('must throw'), (e: unknown) => e);
+  assert.equal(calls, 4);
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), false);
+});
+
+test('getResponse: a connection that fails fast keeps the full retry count, and the spent failure is marked', async () => {
+  const clock = { now: 0 };
+  let calls = 0;
+  const inner = makeModel({ getResponse: async () => { calls += 1; return connectTimeoutAfter(clock, 50); } });
+  const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+  const err = await model.getResponse(req()).then(() => assert.fail('must throw'), (e: unknown) => e);
+  assert.equal(calls, 4, 'one attempt plus three retries');
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), true);
+});
+
+test('getStreamedResponse: a failure after content is not marked as spent before content', async () => {
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      yield { type: 'output_text_delta', delta: 'partial' } as any;
+      throw new TypeError('terminated');
+    },
+  });
+  const err = await collect(withResilience(inner, policy()).getStreamedResponse(req())).then(() => assert.fail('must throw'), (e: unknown) => e);
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), false, 'an outer layer still owns recovery of a partial frame');
+});
+
+test('getResponse: a provider-directed rate-limit wait is not cut short by the no-answer window', async () => {
+  const clock = { now: 0 };
+  let calls = 0;
+  const inner = makeModel({
+    getResponse: async () => {
+      calls += 1;
+      if (calls === 1) throw { statusCode: 429, responseHeaders: { 'retry-after': '25' } };
+      return resp([{ type: 'message' }]);
+    },
+  });
+  const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+  await model.getResponse(req());
+  assert.equal(calls, 2);
 });
 
 // --- helpers ---------------------------------------------------------------

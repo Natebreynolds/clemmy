@@ -11,6 +11,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { resolveToolOutputForQuery } from '../runtime/harness/eventlog.js';
+import { resolveRetainedOutputRead } from '../runtime/harness/retained-output-read.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { convertToMarkdown, isConvertibleExtension } from '../runtime/markitdown.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
@@ -67,29 +68,41 @@ export function registerFileQueryTools(server: McpServer): void {
         } else {
           const sessionId = getToolOutputContext()?.sessionId;
           if (!sessionId) return invalidArgumentsTextResult('ERROR: call_id needs a live session context — pass `file` instead.');
-          const resolution = resolveToolOutputForQuery(sessionId, callIdSource!);
-          if (resolution.status === 'ambiguous') return invalidArgumentsTextResult(`ERROR: call id "${callIdSource}" was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
-          if (resolution.status === 'missing') return invalidArgumentsTextResult(`ERROR: no stored output for call id "${callIdSource}" in this session.`);
-          if (resolution.status === 'failed') {
-            // "Re-run the source read" is not actionable for a derived,
-            // presentation-only reader, and it throws away outputs the host is
-            // still holding. Live 2026-09-07 source 148101 looped here. Name
-            // the authentic retained evidence instead.
-            const wayThrough = retainedResultWayThrough({
-              sessionId, callId: callIdSource!, exclude: ['file_query'],
-            });
-            return invalidArgumentsTextResult(
-              `ERROR: stored output for call id "${callIdSource}" cannot be used because ${resolution.reason}. ${wayThrough}`,
-            );
+          // Every reader of the retained store resolves an id the same way: a
+          // recall's id (however it was dispatched) names its producer, and a
+          // receipt is redeemed under its own exact identity. The query
+          // authority check then applies to the bytes actually read.
+          const resolved = resolveRetainedOutputRead(sessionId, callIdSource!);
+          const readId = resolved.callId;
+          const named = readId === callIdSource ? `call id "${callIdSource}"` : `call id "${callIdSource}" (read from its source "${readId}")`;
+          let record: { output: string; contentBytes: number; truncatedAtWrite: boolean };
+          if (resolved.receipt) {
+            record = resolved.receipt;
+          } else {
+            const resolution = resolveToolOutputForQuery(sessionId, readId);
+            if (resolution.status === 'ambiguous') return invalidArgumentsTextResult(`ERROR: ${named} was reused by ${resolution.invocationCount} invocations; pass a fresh unique call id.`);
+            if (resolution.status === 'missing') return invalidArgumentsTextResult(`ERROR: no stored output for ${named} in this session.`);
+            if (resolution.status === 'failed') {
+              // "Re-run the source read" is not actionable for a derived,
+              // presentation-only reader, and it throws away outputs the host
+              // is still holding. Name the authentic retained evidence instead.
+              const wayThrough = retainedResultWayThrough({
+                sessionId, callId: readId, exclude: ['file_query'],
+              });
+              return invalidArgumentsTextResult(
+                `ERROR: stored output for ${named} cannot be used because ${resolution.reason}. ${wayThrough}`,
+              );
+            }
+            record = resolution.record;
           }
-          if (resolution.record.truncatedAtWrite) {
+          if (record.truncatedAtWrite) {
             return invalidArgumentsTextResult(
-              `ERROR: stored output for call id "${callIdSource}" is incomplete (${resolution.record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so file_query will not report matches or misses from a prefix. `
+              `ERROR: stored output for ${named} is incomplete (${record.contentBytes} original bytes; legacy truncation or missing/corrupt chunks), so file_query will not report matches or misses from a prefix. `
               + 'Re-read/page the provider source until every page is present, or stage the full result as a file and query that file.',
             );
           }
-          text = resolution.record.output;
-          label = `tool output ${callIdSource}`;
+          text = record.output;
+          label = `tool output ${readId}`;
         }
 
         const chunks = chunkText(text);

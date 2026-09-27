@@ -1234,6 +1234,15 @@ function validPayloadReference(value: unknown): value is AuthorityEncryptedPaylo
     && Number.isSafeInteger(row.sealedFileBytes) && Number(row.sealedFileBytes) > 0;
 }
 
+/** The ordinal the next provider request of this accepted source receives. */
+export function nextModelRequestOrdinal(sessionId: string, sourceUserSeq: number): number {
+  return Number((openEventLog().prepare(`
+    SELECT COALESCE(MAX(request_ordinal), 0) + 1 AS next_ordinal
+      FROM model_request_provenance
+     WHERE session_id = ? AND source_user_seq = ?
+  `).get(sessionId, sourceUserSeq) as { next_ordinal: number }).next_ordinal);
+}
+
 export function recordModelRequestProvenance(
   input: RecordModelRequestProvenanceInput,
 ): RecordedModelRequestProvenance {
@@ -1242,11 +1251,7 @@ export function recordModelRequestProvenance(
     || !Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0
   ) throw new ModelRequestProvenanceError('identity_invalid');
   const db = openEventLog();
-  const requestOrdinal = Number((db.prepare(`
-    SELECT COALESCE(MAX(request_ordinal), 0) + 1 AS next_ordinal
-      FROM model_request_provenance
-     WHERE session_id = ? AND source_user_seq = ?
-  `).get(input.sessionId, input.sourceUserSeq) as { next_ordinal: number }).next_ordinal);
+  const requestOrdinal = nextModelRequestOrdinal(input.sessionId, input.sourceUserSeq);
   if (!Number.isSafeInteger(requestOrdinal) || requestOrdinal <= 0) {
     throw new ModelRequestProvenanceError('request_ordinal_invalid');
   }

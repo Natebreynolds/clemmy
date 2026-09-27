@@ -114,7 +114,8 @@ export async function judgeStepSkillExecution(
     // toolSummary is built INSIDE the try so a summarizer hiccup also fails open.
     const toolSummary = (opts.toolSummaryFn ?? summarizeToolCallsForJudge)(opts.sessionId);
     const verdict = await withJudgeTimeout(
-      judge(objective, deliverable, { skills: [{ name: skillName, body }], toolCallSummary: toolSummary }),
+      'workflow_step_skill',
+      () => judge(objective, deliverable, { skills: [{ name: skillName, body }], toolCallSummary: toolSummary }),
     );
     if (!verdict) {
       return { executed: true, judged: false, reason: 'step skill judge timed out — accepting' };

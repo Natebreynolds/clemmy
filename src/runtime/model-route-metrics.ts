@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { estimateTokens } from './harness/budget.js';
 import { providerReportedModel } from './harness/traceless-step-model.js';
@@ -34,7 +35,12 @@ export const MODEL_ROUTE_METRICS_TABLES = [
 
 export type ModelRouteMetricsTableName = (typeof MODEL_ROUTE_METRICS_TABLES)[number];
 
-export type ModelRouteRole = 'brain' | 'worker' | 'judge' | 'writer';
+export type ModelRouteRole = 'brain' | 'worker' | 'judge' | 'writer' | 'memory';
+
+/** Every route role the decision and policy tables admit. A role missing here
+ *  is dropped silently by `INSERT OR IGNORE` (the writer never had a row). */
+export const MODEL_ROUTE_ROLES: readonly ModelRouteRole[] = ['brain', 'worker', 'judge', 'writer', 'memory'];
+const ROUTE_ROLE_CHECK = `CHECK (role IN (${MODEL_ROUTE_ROLES.map((role) => `'${role}'`).join(',')}))`;
 export type ModelRouteOutcomeStatus = 'success' | 'failed' | 'fallback' | 'cancelled';
 export type ModelRouteDecisionSource = 'default' | 'binding' | 'intent_binding' | 'explicit' | 'fallback' | 'policy';
 export type ModelRouteProvider = 'codex' | 'claude' | 'byo' | 'openai' | 'unknown';
@@ -96,6 +102,45 @@ export const DEFAULT_ROUTE_SCORE_WEIGHTS: RouteScoreWeights = {
   fallbackPenalty: 0.02,
 };
 
+function decisionsTableSql(name: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${name} (
+  id                 TEXT PRIMARY KEY,
+  created_at         TEXT NOT NULL,
+  session_id         TEXT,
+  workflow_run_id    TEXT,
+  workflow_node_id   TEXT,
+  workspace_id       TEXT,
+  role               TEXT NOT NULL ${ROUTE_ROLE_CHECK},
+  intent             TEXT,
+  requested_model    TEXT,
+  resolved_model     TEXT NOT NULL,
+  provider           TEXT NOT NULL,
+  source             TEXT NOT NULL CHECK (source IN ('default','binding','intent_binding','explicit','fallback','policy')),
+  reason_json        TEXT NOT NULL DEFAULT '{}',
+  policy_version     INTEGER
+);`;
+}
+
+function policyTableSql(name: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${name} (
+  id                  TEXT PRIMARY KEY,
+  role                TEXT NOT NULL ${ROUTE_ROLE_CHECK},
+  intent              TEXT,
+  provider            TEXT NOT NULL,
+  model               TEXT NOT NULL,
+  score               REAL NOT NULL,
+  sample_count        INTEGER NOT NULL DEFAULT 0,
+  success_count       INTEGER NOT NULL DEFAULT 0,
+  objective_met_count INTEGER NOT NULL DEFAULT 0,
+  avg_latency_ms      REAL,
+  avg_cost_usd        REAL,
+  disabled_reason     TEXT,
+  policy_version      INTEGER NOT NULL,
+  updated_at          TEXT NOT NULL,
+  UNIQUE(role, intent, provider, model)
+);`;
+}
+
 /**
  * Local-first metrics schema for future route policy updates.
  *
@@ -104,22 +149,7 @@ export const DEFAULT_ROUTE_SCORE_WEIGHTS: RouteScoreWeights = {
  * the hot path depend on online learning.
  */
 export const MODEL_ROUTE_METRICS_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS model_route_decisions (
-  id                 TEXT PRIMARY KEY,
-  created_at         TEXT NOT NULL,
-  session_id         TEXT,
-  workflow_run_id    TEXT,
-  workflow_node_id   TEXT,
-  workspace_id       TEXT,
-  role               TEXT NOT NULL CHECK (role IN ('brain','worker','judge')),
-  intent             TEXT,
-  requested_model    TEXT,
-  resolved_model     TEXT NOT NULL,
-  provider           TEXT NOT NULL,
-  source             TEXT NOT NULL CHECK (source IN ('default','binding','intent_binding','explicit','fallback','policy')),
-  reason_json        TEXT NOT NULL DEFAULT '{}',
-  policy_version     INTEGER
-);
+${decisionsTableSql('model_route_decisions')}
 
 CREATE INDEX IF NOT EXISTS idx_model_route_decisions_created
   ON model_route_decisions(created_at DESC);
@@ -149,23 +179,7 @@ CREATE TABLE IF NOT EXISTS model_route_outcomes (
 CREATE INDEX IF NOT EXISTS idx_model_route_outcomes_status_completed
   ON model_route_outcomes(status, completed_at DESC);
 
-CREATE TABLE IF NOT EXISTS model_route_policy (
-  id                  TEXT PRIMARY KEY,
-  role                TEXT NOT NULL CHECK (role IN ('brain','worker','judge')),
-  intent              TEXT,
-  provider            TEXT NOT NULL,
-  model               TEXT NOT NULL,
-  score               REAL NOT NULL,
-  sample_count        INTEGER NOT NULL DEFAULT 0,
-  success_count       INTEGER NOT NULL DEFAULT 0,
-  objective_met_count INTEGER NOT NULL DEFAULT 0,
-  avg_latency_ms      REAL,
-  avg_cost_usd        REAL,
-  disabled_reason     TEXT,
-  policy_version      INTEGER NOT NULL,
-  updated_at          TEXT NOT NULL,
-  UNIQUE(role, intent, provider, model)
-);
+${policyTableSql('model_route_policy')}
 
 CREATE INDEX IF NOT EXISTS idx_model_route_policy_lookup
   ON model_route_policy(role, intent, disabled_reason, score DESC);
@@ -238,8 +252,85 @@ export function openModelRouteMetricsDb(): Database.Database {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   db.exec(MODEL_ROUTE_METRICS_SCHEMA_SQL);
+  // No CHECK rebuild here: the first open happens inside a role resolution on
+  // the turn path, and the rebuild copies every row. The daemon runs it once at
+  // boot (widenModelRouteMetricsDb) before any turn is served.
   cachedDb = db;
   return db;
+}
+
+/**
+ * Boot upkeep for the shared metrics DB: widen its role CHECKs before any turn
+ * is served, so writer and memory rows persist. It copies every row once after
+ * an upgrade (seconds on a large ledger), which is why it never runs on a call
+ * or resolution path. Until it has run, rows for a role the old CHECK does not
+ * admit are dropped exactly as before. Never throws; returns the tables it
+ * rebuilt.
+ */
+export function widenModelRouteMetricsDb(): string[] {
+  try {
+    return widenModelRouteRoleChecks(openModelRouteMetricsDb());
+  } catch {
+    // A database the rebuild cannot touch keeps its old CHECK. Metrics never block.
+    return [];
+  }
+}
+
+/** The role CHECK a table was created with admits every current route role. */
+function tableAdmitsEveryRouteRole(db: Database.Database, table: string): boolean {
+  const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(table) as { sql?: string } | undefined;
+  if (!row?.sql) return true; // nothing to widen; CREATE IF NOT EXISTS made it current
+  return MODEL_ROUTE_ROLES.every((role) => row.sql!.includes(`'${role}'`));
+}
+
+/**
+ * Rebuild `model_route_decisions` and `model_route_policy` in place when their
+ * role CHECK predates a route role (the first build admitted only brain,
+ * worker and judge, so writer and memory rows were silently dropped). The
+ * metrics DB has no version ledger: the table's own `CREATE` text is the
+ * version, which also keeps an older build working on the rebuilt table.
+ *
+ * One immediate transaction per call: copy every row into a table with the
+ * current CHECK, verify the counts match, drop the old table, rename, and
+ * recreate the indexes. Foreign keys are off for the swap, or dropping the
+ * decisions table would cascade-delete every outcome. Idempotent: a current
+ * table is left untouched. Returns the tables it rebuilt.
+ */
+export function widenModelRouteRoleChecks(db: Database.Database): string[] {
+  const stale = ['model_route_decisions', 'model_route_policy']
+    .filter((table) => !tableAdmitsEveryRouteRole(db, table));
+  if (stale.length === 0) return [];
+  const foreignKeys = db.pragma('foreign_keys', { simple: true }) as number;
+  if (foreignKeys) db.pragma('foreign_keys = OFF');
+  try {
+    return db.transaction((): string[] => {
+      const rebuilt: string[] = [];
+      for (const table of ['model_route_decisions', 'model_route_policy']) {
+        // Re-read inside the write lock: another process may have just done it.
+        if (tableAdmitsEveryRouteRole(db, table)) continue;
+        const next = `${table}__widened`;
+        db.exec(`DROP TABLE IF EXISTS ${next}`);
+        db.exec(table === 'model_route_decisions' ? decisionsTableSql(next) : policyTableSql(next));
+        const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+          .map((column) => column.name).join(', ');
+        db.exec(`INSERT INTO ${next} (${columns}) SELECT ${columns} FROM ${table}`);
+        const count = (name: string): number =>
+          (db.prepare(`SELECT COUNT(*) AS n FROM ${name}`).get() as { n: number }).n;
+        const before = count(table);
+        const after = count(next);
+        if (before !== after) throw new Error(`route metrics rebuild of ${table} copied ${after} of ${before} rows`);
+        db.exec(`DROP TABLE ${table}`);
+        db.exec(`ALTER TABLE ${next} RENAME TO ${table}`);
+        rebuilt.push(table);
+      }
+      // The drops took the tables' indexes with them.
+      db.exec(MODEL_ROUTE_METRICS_SCHEMA_SQL);
+      return rebuilt;
+    }).immediate();
+  } finally {
+    if (foreignKeys) db.pragma('foreign_keys = ON');
+  }
 }
 
 export function closeModelRouteMetricsDb(): void {
@@ -376,6 +467,54 @@ export function reapStaleModelRouteMetrics(maxAgeDays = 30): number {
   }
 }
 
+/** One routed model call as its route recorded it, handed to the job that
+ *  made it. Identifiers and model ids only, never content. */
+export interface ObservedModelRoute {
+  decisionId: string;
+  role: ModelRouteRole;
+  /** What the route asked for (an owner's pick or the automatic default). */
+  requestedModel?: string;
+  /** What this route lane dispatched to. */
+  resolvedModel: string;
+  /** The model the provider reported serving, when it reported one. */
+  servedModel?: string;
+  provider: string;
+  /** `fallback` = this lane is a later fallback target, not the first choice. */
+  source: ModelRouteDecisionSource;
+  status: ModelRouteOutcomeStatus;
+  /** Set when the call fell over inside the lane (outcome `fallback`). */
+  falloverToModel?: string;
+  reason?: Record<string, unknown>;
+}
+
+const modelRouteObservers = new AsyncLocalStorage<ObservedModelRoute[]>();
+
+/** Collect every routed model call finished inside `work` into `sink`, which
+ *  the caller owns (the route twin of usage-log's withModelUsageObserver). The
+ *  innermost observer wins, so a nested job's routes are its own. */
+export function withModelRouteObserver<T>(sink: ObservedModelRoute[], work: () => T): T {
+  return modelRouteObservers.run(sink, work);
+}
+
+/**
+ * Which route served a job, and whether it was a stand-in, from the route's
+ * own evidence — never by comparing model spellings. A stand-in is a call
+ * that fell over inside its lane (outcome `fallback`) or a lane that is itself
+ * a fallback target (decision source `fallback`). The serving route is the
+ * last call that returned an answer; null when none did.
+ */
+export function readRouteStandIn(routes: readonly ObservedModelRoute[]): {
+  route: ObservedModelRoute;
+  standIn: boolean;
+} | null {
+  for (let i = routes.length - 1; i >= 0; i -= 1) {
+    const route = routes[i]!;
+    if (route.status !== 'success' && route.status !== 'fallback') continue;
+    return { route, standIn: route.status === 'fallback' || route.source === 'fallback' };
+  }
+  return null;
+}
+
 export function withModelRouteMetrics(
   model: Model,
   context: ModelRouteMetricsContext,
@@ -448,13 +587,27 @@ export function successfulRouteOutcome(
   };
 }
 
-/** The routing role IS the explicit request role: brain, worker, or judge
- *  (accounted as reviewer). A judge or worker route inside a brain turn
- *  overrides the turn's scope; a brain route never overrides an explicit outer
- *  worker/reviewer scope; an unscoped call (a post-turn reflection judge) gets
- *  a role-only scope so its rows are never "unset". */
+/** The routing role IS the explicit request role: brain, worker, judge
+ *  (accounted as reviewer), writer or memory. A judge or worker route inside a
+ *  brain turn overrides the turn's scope; a brain route never overrides an
+ *  explicit outer worker/reviewer scope; an unscoped call (a post-turn
+ *  reflection judge) gets a role-only scope so its rows are never "unset". */
 function usageRoleForRoute(role: ModelRouteRole): UsageRequestRole {
   return role === 'judge' ? 'reviewer' : role;
+}
+
+/** This request's own prompt shape, never the parent turn's measurements. */
+function requestPromptComponents(request: ModelRequest): Record<string, number> {
+  try {
+    return {
+      instructions: estimateTokens(request.systemInstructions ?? ''),
+      history: estimateTokens(typeof request.input === 'string' ? request.input : JSON.stringify(request.input ?? [])),
+      toolSchemas: estimateTokens(JSON.stringify(request.tools ?? [])),
+      ...(request.outputType ? { outputSchema: estimateTokens(JSON.stringify(request.outputType)) } : {}),
+    };
+  } catch {
+    return {}; // Missing telemetry must not inherit a different request's measurements.
+  }
 }
 
 function routeAttributionContext(role: ModelRouteRole, request: ModelRequest): ModelUsageAttributionContext | null {
@@ -464,18 +617,18 @@ function routeAttributionContext(role: ModelRouteRole, request: ModelRequest): M
   // Estimate this request once, including each evidence lookup/repair frame.
   // Never label the parent's tool catalog or history as reviewer input.
   if (routeRole === 'reviewer' || (routeRole === 'brain' && inherited?.role === 'reviewer')) {
-    let promptComponents: Record<string, number> = {};
-    try {
-      promptComponents = {
-        instructions: estimateTokens(request.systemInstructions ?? ''),
-        history: estimateTokens(typeof request.input === 'string' ? request.input : JSON.stringify(request.input ?? [])),
-        toolSchemas: estimateTokens(JSON.stringify(request.tools ?? [])),
-        ...(request.outputType ? { outputSchema: estimateTokens(JSON.stringify(request.outputType)) } : {}),
-      };
-    } catch { /* Missing telemetry must not inherit a different request's measurements. */ }
-    return { sessionId: 'unknown', sourceUserSeq: 0, ...inherited, role: 'reviewer', promptComponents };
+    return { sessionId: 'unknown', sourceUserSeq: 0, ...inherited, role: 'reviewer', promptComponents: requestPromptComponents(request) };
+  }
+  // Memory work is its own request too. The job's scope keeps its channel
+  // (`memory:<job>`) and source; only the role and the prompt shape are the
+  // route's own.
+  if (routeRole === 'memory') {
+    return { sessionId: 'unknown', sourceUserSeq: 0, ...inherited, role: 'memory', promptComponents: requestPromptComponents(request) };
   }
   if (!inherited) return { sessionId: 'unknown', sourceUserSeq: 0, role: routeRole };
+  // The router labels every call in a frame by the frame's role. A call site
+  // that declared its own request already chose its role (or none).
+  if (inherited.ownRequest && (routeRole === 'brain' || routeRole === 'worker')) return null;
   if (inherited.role === routeRole) return null;
   if (routeRole === 'brain' && inherited.role) return null;
   return { ...inherited, role: routeRole, promptComponents: undefined };
@@ -623,6 +776,20 @@ class ModelRouteMetricsModel implements Model {
     errorClassName?: string,
     falloverToModel?: string,
   ): void {
+    try {
+      modelRouteObservers.getStore()?.push({
+        decisionId,
+        role: this.context.role,
+        ...(this.context.requestedModel ? { requestedModel: this.context.requestedModel } : {}),
+        resolvedModel: this.context.resolvedModel,
+        ...(typeof metadata.actualModel === 'string' ? { servedModel: metadata.actualModel } : {}),
+        provider: String(this.context.provider),
+        source: this.context.source,
+        status,
+        ...(falloverToModel ? { falloverToModel } : {}),
+        ...(this.context.reason ? { reason: { ...this.context.reason } } : {}),
+      });
+    } catch { /* an observer must never break the model-call path */ }
     recordModelRouteOutcome({
       decisionId,
       status,

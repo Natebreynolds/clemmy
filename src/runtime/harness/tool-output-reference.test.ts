@@ -106,6 +106,22 @@ test('resolves through a run_shell_command --json wrapper (sf/gh/aws)', () => {
   assert.deepEqual((out.resolved as { to: string[] }).to, ['x@co', 'y@co']);
 });
 
+test('a clipped list recovered as a prefix is never bound as if it were the whole list', () => {
+  // Three rows, the third invalid: the shell reader recovers the first two as
+  // a prefix. Binding them as the recipient list would silently drop the rest.
+  writeTrustedOutput({
+    callId: 'call_shell_prefix',
+    invocationNonce: 'shell-prefix-read',
+    tool: 'run_shell_command',
+    output: 'exit_code: 0\n\nstdout:\n[{"email":"a@x.test"},{"email":"b@x.test"},{"email":"c@x.test","score":NaN}]\nstderr:\n',
+    effect: 'compute',
+  });
+  const out = resolveToolOutputReferences(S, { to: { $fromToolOutput: { callId: 'call_shell_prefix', path: '[*].email' } } });
+  assert.equal((out.resolved as { to?: unknown }).to, undefined, JSON.stringify(out.resolved));
+  assert.equal(out.errors.length, 1);
+  assert.match(out.errors[0]!, /only the first rows of a list that was cut off.*Re-run it so the whole output is kept/);
+});
+
 // ---------- fail-closed ----------
 
 test('fail-closed: an unresolvable reference is an error, not a silent empty send', () => {

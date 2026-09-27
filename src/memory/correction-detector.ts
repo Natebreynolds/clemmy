@@ -175,12 +175,23 @@ export async function judgeCorrectionCrossFamily(
   input: CorrectionJudgeInput,
 ): Promise<{ verdict: CorrectionVerdict; reason?: string }> {
   if (judgeOverride) return judgeOverride(input);
+  // The model check is the `verify` memory job, on "Checks the work". Loaded
+  // on demand like the judge modules below, so the per-turn hook stays light.
+  const { memoryVerifyOutcome, memoryWorkSourceFromTurn, runMemoryModelJob } = await import('./memory-job-context.js');
+  return runMemoryModelJob('verify', { source: memoryWorkSourceFromTurn(null) },
+    () => judgeCorrectionWithModel(input), memoryVerifyOutcome);
+}
+
+async function judgeCorrectionWithModel(
+  input: CorrectionJudgeInput,
+): Promise<{ verdict: CorrectionVerdict; reason?: string }> {
   try {
     const { Agent, run } = await import('@openai/agents');
     const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
     const { resolveProvider } = await import('../runtime/harness/model-wire-registry.js');
     const { withJudgeTimeout } = await import('../runtime/harness/judge-family.js');
-    const judge = resolveRoleModel('judge');
+    const { inMemoryJobTurn } = await import('./memory-job-context.js');
+    const judge = inMemoryJobTurn(() => resolveRoleModel('judge'));
     const detectorProvider = resolveProvider(MODELS.fast);
     if (!judge?.modelId || String(judge.provider) === String(detectorProvider)) {
       return { verdict: 'unavailable', reason: 'no different-family judge bound' };
@@ -209,9 +220,11 @@ export async function judgeCorrectionCrossFamily(
       ...input.targetFacts.map((f) => `#${f.id}: ${f.content.slice(0, 200)}`),
       `User's latest message: ${input.correction.slice(0, 600)}`,
     ].join('\n');
-    const result = await withJudgeTimeout(run(agent, prompt));
+    const result = await withJudgeTimeout('memory_correction', () => run(agent, prompt));
     return parseCorrectionVerdict(String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? ''));
   } catch (err) {
+    const { noteMemoryModelFailure } = await import('./memory-job-context.js');
+    noteMemoryModelFailure(err);
     return { verdict: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
   }
 }

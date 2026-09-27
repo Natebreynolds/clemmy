@@ -20,8 +20,13 @@ writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'comp-machine\n');
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { measureToolPromptSurface, summarizePromptComposition } = await import('./prompt-composition.js');
-const { CACHE_BREAK_SENTINEL, CACHE_MEMORY_CONTEXT_SENTINEL } = await import('./model-wire-registry.js');
+const {
+  measureAdvertisedToolSurface, measureToolPromptSurface, memoryContextSections,
+  promptComponentsFromComposition, summarizePromptComposition,
+} = await import('./prompt-composition.js');
+const { MEMORY_CONTEXT_SECTION_TITLES } = await import('../../agents/memory-context-sections.js');
+const { readFileSync } = await import('node:fs');
+const { CACHE_BREAK_SENTINEL, CACHE_MEMORY_CONTEXT_SENTINEL, CACHE_MEMORY_CONTEXT_DELIM } = await import('./model-wire-registry.js');
 
 after(() => { rmSync(TMP_HOME, { recursive: true, force: true }); });
 
@@ -171,20 +176,104 @@ test('instructions split at the cache sentinel: memory context is variable, not 
 });
 
 
-test('host composition counts advertised schemas and separates deferred descriptions without mutating tools', () => {
+test('host composition measures the advertised projection: a deferLoading tool off the wire costs nothing', () => {
   const tools = [
-    { type: 'function', name: 'create', description: 'Create a record', parameters: { type: 'object', properties: { title: { type: 'string' } } }, strict: true },
-    { type: 'function', name: 'read', description: 'Read a record', parameters: { type: 'object' } },
+    { type: 'function', name: 'tool_search', description: 'Search tools', parameters: { type: 'object' } },
+    { type: 'function', name: 'call_tool', description: 'Call a tool', parameters: { type: 'object' } },
+    { type: 'function', name: 'create', description: 'Create a record', parameters: { $schema: 'http://json-schema.org/draft-07/schema#', type: 'object', properties: { title: { type: 'string' } } }, strict: true },
     { type: 'function', name: 'deferred', description: 'Find this later', parameters: { large: 'x'.repeat(10000) }, deferLoading: true },
   ];
   const before = structuredClone(tools);
   const surface = measureToolPromptSurface(tools);
   const summary = summarizePromptComposition({ instructions: 'Host instructions', ...surface });
-  assert.equal(summary.toolCount, 2, 'nonzero schema cost must not be reported as zero advertised tools');
-  assert.deepEqual(surface.toolNames, ['create', 'read']);
-  assert.equal(surface.toolSchemaCosts.length, 3);
-  assert.ok(surface.toolSchemaCosts[2].bytes! < 200, 'deferred schemas are not counted as transmitted full parameters');
-  assert.equal(surface.measuredToolSchemaTokens, surface.toolSchemaCosts.slice(0, 2).reduce((sum, cost) => sum + cost.tokens, 0));
+  assert.equal(summary.toolCount, 3, 'nonzero schema cost must not be reported as zero advertised tools');
+  assert.deepEqual(surface.toolNames, ['tool_search', 'call_tool', 'create']);
+  assert.equal(surface.toolSchemaCosts.length, 4);
+  assert.deepEqual(surface.toolSchemaCosts[3], { name: 'deferred', deferred: true, tokens: 0, bytes: 0 },
+    'with both doors the deferred schema is not sent and bills nothing');
+  assert.equal(surface.deferredToolIndexTokens, 0, 'nothing about a deferred tool is sent, so no index is billed');
+  assert.equal(summary.buckets.some((bucket) => bucket.name === 'deferredToolIndex'), false);
+  assert.equal(surface.measuredToolSchemaTokens, surface.toolSchemaCosts.slice(0, 3).reduce((sum, cost) => sum + cost.tokens, 0));
+  const createRaw = Buffer.byteLength(JSON.stringify({ type: 'function', name: 'create', description: 'Create a record', parameters: tools[2]!.parameters, strict: true }));
+  assert.ok(surface.toolSchemaCosts[2]!.bytes! < createRaw, 'schemas are measured on the compacted projection the runner sends');
   assert.deepEqual(tools, before);
-  assert.equal('parameters' in surface.toolSchemaCosts[0], false, 'telemetry does not duplicate schema payloads');
+  assert.equal('parameters' in surface.toolSchemaCosts[0]!, false, 'telemetry does not duplicate schema payloads');
+
+  // Without the doors the runner advertises the deferred tool, so it is billed in full.
+  const bare = measureToolPromptSurface([tools[2], tools[3]]);
+  assert.deepEqual(bare.toolNames, ['create', 'deferred']);
+  assert.ok(bare.toolSchemaCosts[1]!.bytes! > 10_000);
+});
+
+test('a runner-supplied wire is measured entry by entry as sent', () => {
+  const wire = [
+    { type: 'function', name: 'workspace_roots', description: 'Roots', parameters: { type: 'object', properties: {} }, strict: false },
+    { type: 'function', name: 'retained', description: 'Retained after it was disabled', parameters: { type: 'object' }, strict: false, deferLoading: true },
+  ];
+  const surface = measureAdvertisedToolSurface(wire);
+  assert.deepEqual(surface.toolNames, ['workspace_roots', 'retained'], 'every wire entry was sent, whatever its flags');
+  assert.equal(surface.deferredToolIndexTokens, 0);
+  assert.equal(surface.measuredToolSchemaTokens, surface.toolSchemaCosts.reduce((sum, cost) => sum + cost.tokens, 0));
+});
+
+test('memoryContext carries per-section sizes that add up to the rendered context', () => {
+  const memory = [
+    '# Persistent Context',
+    'Loaded fresh each turn.',
+    '## Now\n2026-09-26 03:14',
+    '## Persistent Facts\n- prefers morning briefings\n- works with the fixture team',
+    // A memory body's own heading stays inside the section that renders it.
+    '## Long-Term Memory\nintro line',
+    '## Projects\n- a body heading, not a section',
+    '## Right Now\nlate evening',
+  ].join('\n\n');
+  const summary = summarizePromptComposition({
+    instructions: `Standing rules.${CACHE_BREAK_SENTINEL}Turn rules.${CACHE_MEMORY_CONTEXT_DELIM}${memory}`,
+  });
+  const bucket = summary.buckets.find((entry) => entry.name === 'memoryContext');
+  assert.ok(bucket?.sections, 'the memory bucket names its sections');
+  assert.deepEqual(Object.keys(bucket!.sections!), ['(header)', 'Now', 'Persistent Facts', 'Long-Term Memory', 'Right Now']);
+  const sectionBytes = Object.values(bucket!.sections!).reduce((sum, section) => sum + section.bytes, 0);
+  assert.equal(sectionBytes, bucket!.bytes, 'section bytes add up to the memory context exactly');
+  assert.ok(bucket!.sections!['Long-Term Memory']!.bytes > Buffer.byteLength('## Long-Term Memory\nintro line'),
+    'a body heading does not open a section of its own');
+  assert.equal(JSON.stringify(bucket!.sections).includes('prefers morning'), false, 'sizes only, never contents');
+  assert.deepEqual(memoryContextSections('', ''), {});
+});
+
+test('every memory section the renderer titles is a section the meter recognises', () => {
+  const source = readFileSync(new URL('../../agents/harness-context.ts', import.meta.url), 'utf8');
+  const rendered = [...source.matchAll(/section\('([^']+)'/g)].map((match) => match[1]!);
+  assert.ok(rendered.length >= 20, 'fixture: the renderer titles its sections');
+  const known = new Set(MEMORY_CONTEXT_SECTION_TITLES);
+  assert.deepEqual(rendered.filter((title) => !known.has(title)), []);
+});
+
+test('the appended per-round items are separate buckets and the ledger components come from the same summary', () => {
+  const summary = summarizePromptComposition({
+    instructions: `Standing rules.${CACHE_BREAK_SENTINEL}Turn rules.${CACHE_MEMORY_CONTEXT_SENTINEL}## Now\nclock`,
+    measuredHistoryTokens: 400,
+    contextPacket: 'packet text',
+    memoryPrimer: 'primer text',
+    provenOperation: 'proven text',
+    retryContext: 'retry text',
+    currentMessage: 'the question',
+    measuredItemTokens: { contextPacket: 30, memoryPrimer: 40, provenOperation: 50, retryContext: 60, currentMessage: 70 },
+    measuredToolSchemaTokens: 900,
+  });
+  const byName = new Map(summary.buckets.map((bucket) => [bucket.name, bucket]));
+  assert.equal(byName.get('history')?.tokens, 400);
+  assert.equal(byName.get('contextPacket')?.tokens, 30, 'measured item tokens win over the text estimate');
+  assert.equal(byName.get('memoryPrimer')?.tokens, 40);
+  assert.equal(byName.get('provenOperation')?.tokens, 50);
+  assert.equal(byName.get('retryContext')?.tokens, 60);
+  assert.equal(byName.get('currentMessage')?.tokens, 70);
+  assert.ok(byName.get('memoryPrimer')?.sha256, 'the text still supplies bytes and a digest');
+  const components = promptComponentsFromComposition(summary);
+  assert.equal(Object.values(components).reduce((sum, value) => sum + value, 0), summary.totalTokens,
+    'ledger components and the composition total are one reading');
+  for (const key of ['instructions', 'turnContext', 'memoryContext', 'toolSchemas', 'history', 'contextPacket',
+    'memoryPrimer', 'provenOperation', 'retryContext', 'currentMessage']) {
+    assert.ok(components[key]! > 0, `ledger keeps the ${key} key`);
+  }
 });

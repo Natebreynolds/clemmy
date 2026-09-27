@@ -403,6 +403,9 @@ export function pickRoutePolicyModel(
   validate: (modelId: string) => boolean,
 ): RoutePolicyPick | null {
   if (!routePolicyEnabled()) return null;
+  // Memory is the owner's visible choice or today's automatic route; the
+  // policy never moves it (its rows are recorded for the dashboard only).
+  if (role === 'memory') return null;
 
   // Exact-intent scope first, then the role-wide (NULL-intent) scope — mirrors
   // the binding tiers. A scope only counts if it has any usable evidence.

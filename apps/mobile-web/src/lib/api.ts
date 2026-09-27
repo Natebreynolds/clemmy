@@ -1,4 +1,4 @@
-import { readCompletionReviewResponse, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
+import { readCompletionReviewResponse, type MemoryModelProblem, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
@@ -1266,6 +1266,39 @@ export async function listFacts(kind?: MemoryFact['kind'], limit = 60): Promise<
   return api<{ facts: MemoryFact[] }>(`/m/api/memory/facts?${params.toString()}`);
 }
 
+// Memory at work. The contract is shared with the desktop, not restated here.
+import type { MemoryWorkSnapshot, MemoryWorkUndoResult } from '@clem/chat-engine';
+export type { MemoryWorkSnapshot, MemoryWorkUndoResult };
+
+/**
+ * What the background memory jobs are doing, which model does the thinking,
+ * and what they changed: the same daemon builder desktop Memory reads. Null
+ * when this Mac's Clem does not report memory work yet (an older daemon), so
+ * the screen leaves the card out instead of calling that a failure.
+ */
+export async function getMemoryWork(): Promise<MemoryWorkSnapshot | null> {
+  try {
+    return await api<MemoryWorkSnapshot>('/m/api/memory/work');
+  } catch (err) {
+    if ((err as ApiError).status === 404) return null;
+    throw err;
+  }
+}
+
+/** Undo one recorded run: forget what it learned, or bring back what it let
+ *  fade. A refusal (too old, nothing left) is an answer, not a failure. */
+export async function undoMemoryWork(eventId: string): Promise<MemoryWorkUndoResult> {
+  try {
+    return await api<MemoryWorkUndoResult>(`/m/api/memory/work/${encodeURIComponent(eventId)}/undo`, { method: 'POST' });
+  } catch (err) {
+    const body = (err as ApiError).body as { ok?: unknown; reason?: unknown } | null | undefined;
+    if (body && typeof body === 'object' && body.ok === false && typeof body.reason === 'string') {
+      return body as MemoryWorkUndoResult;
+    }
+    throw err;
+  }
+}
+
 // ─── workflows ─
 
 export interface MobileWorkflow {
@@ -1680,6 +1713,12 @@ export interface ResolvedBrain {
   /** Present when a SAVED choice is unavailable — the honest "X is saved but
    *  Y actually answers" line comes straight from the daemon. */
   inactiveBinding?: { modelId: string; provider: string; reason: string };
+  /** Keeps your memory, automatic only: whose model memory work borrows
+   *  today, as the daemon resolved it (never inferred on the phone). */
+  follows?: 'checker' | 'brain' | null;
+  /** Keeps your memory: why its model cannot serve right now, and until when
+   *  when the provider said. */
+  unavailable?: { problem: MemoryModelProblem; until?: string } | null;
 }
 
 /** One row of the LIVE brain catalog — the same brainOptions the console
@@ -1707,8 +1746,9 @@ export interface CodexRescueSettings {
   options: CodexRescueModelOption[];
 }
 
-/** The roles the phone can bind to a model. The brain has its own switch. */
-export type ModelRoleName = 'writer' | 'judge' | 'worker';
+/** The roles the phone can bind to a model. The brain has its own switch.
+ *  `memory` (Keeps your memory) runs in the background, not in a request. */
+export type ModelRoleName = 'writer' | 'judge' | 'worker' | 'memory';
 
 /** Connected models that can fill a role, grouped by provider, straight from
  *  the daemon catalog desktop Settings renders. */
@@ -1727,8 +1767,9 @@ export interface ModelSettings {
   activeBrain: string;
   /** Optional for cached PWAs talking briefly to an older daemon. */
   codexRescue?: CodexRescueSettings;
-  /** Who writes the final answer, checks the work and helps in parallel, as
-   *  the daemon resolves them. Optional for an older daemon. */
+  /** Who writes the final answer, checks the work, helps in parallel and
+   *  keeps your memory, as the daemon resolves them. Each is optional for an
+   *  older daemon, and a role it leaves out is not shown. */
   roles?: Partial<Record<ModelRoleName, ResolvedBrain>>;
   roleOptions?: Partial<Record<ModelRoleName, RoleModelGroup[]>>;
   /** The selected checker would review its own family's answers. */

@@ -33,9 +33,11 @@
  * harness hands over at turn start — the part we control and can cut.
  */
 import { estimateTokens } from './budget.js';
-import { CACHE_BREAK_SENTINEL, splitCacheDynamicContext } from './model-wire-registry.js';
+import { CACHE_BREAK_SENTINEL, splitCacheDynamicContext, splitCacheDynamicLayers } from './model-wire-registry.js';
+import { MEMORY_CONTEXT_SECTION_TITLES } from '../../agents/memory-context-sections.js';
 import { createHash } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
+import { serializeAdvertisedTools, toolsOnAdvertisedWire, type AdvertisableTool } from './advertised-tool-wire.js';
 
 export interface ToolSchemaCost {
   name: string;
@@ -44,30 +46,83 @@ export interface ToolSchemaCost {
   deferred: boolean;
 }
 
-/** Observe the same schema projection used by the host budget estimator.
- * Never include schema contents or mutate tools in telemetry. */
-export function measureToolPromptSurface(tools: readonly unknown[]) {
-  const costs: ToolSchemaCost[] = [];
-  for (const raw of tools) {
-    const tool = raw as Record<string, unknown>;
-    const deferred = tool.deferLoading === true;
-    const name = typeof tool.name === 'string' ? tool.name : String(tool.type ?? 'unnamed');
-    try {
-      const serialized = JSON.stringify({
-        type: tool.type, name: tool.name, description: tool.description,
-        ...(!deferred ? { parameters: tool.parameters, strict: tool.strict } : {}),
-      });
-      costs.push({ name, deferred, tokens: estimateTokens(serialized), bytes: Buffer.byteLength(serialized) });
-    } catch {
-      costs.push({ name, deferred: false, tokens: 50 });
-    }
+/** Measure one advertised schema entry as the provider adapters receive it:
+ *  name, description, compacted parameters and the strict flag. Never include
+ *  schema contents in telemetry. */
+function measureAdvertisedEntry(raw: unknown): ToolSchemaCost {
+  const tool = (raw ?? {}) as Record<string, unknown>;
+  const name = typeof tool.name === 'string' ? tool.name : String(tool.type ?? 'unnamed');
+  try {
+    const serialized = JSON.stringify({
+      type: tool.type, name: tool.name, description: tool.description,
+      parameters: tool.parameters, strict: tool.strict,
+    });
+    return { name, deferred: false, tokens: estimateTokens(serialized), bytes: Buffer.byteLength(serialized) };
+  } catch {
+    return { name, deferred: false, tokens: 50 };
   }
+}
+
+function summarizeToolCosts(costs: ToolSchemaCost[]) {
+  const sent = costs.filter((cost) => !cost.deferred);
   return {
-    toolNames: costs.filter(cost => !cost.deferred).map(cost => cost.name),
-    measuredToolSchemaTokens: costs.filter(cost => !cost.deferred).reduce((sum, cost) => sum + cost.tokens, 0),
-    deferredToolIndexTokens: costs.filter(cost => cost.deferred).reduce((sum, cost) => sum + cost.tokens, 0),
+    toolNames: sent.map((cost) => cost.name),
+    measuredToolSchemaTokens: sent.reduce((sum, cost) => sum + cost.tokens, 0),
+    // Nothing about a deferred tool is sent: its schema is off the wire and it
+    // is not listed in the names-only catalog either. An index bucket is only
+    // non-zero for a caller that measured index text it actually sends.
+    deferredToolIndexTokens: 0,
     toolSchemaCosts: costs,
   };
+}
+
+/** Measure the exact schemas one request advertises (the host runner's wire,
+ *  already compacted, already without the tools it left off). */
+export function measureAdvertisedToolSurface(wire: readonly unknown[]) {
+  return summarizeToolCosts(wire.map(measureAdvertisedEntry));
+}
+
+/** Measure an agent's tools as the host runner would advertise them: a
+ *  deferLoading tool left off the wire costs nothing, and every schema is
+ *  measured on the compacted projection the runner sends. For callers that
+ *  do not have the runner's per-request wire in hand. `compactionBudgetTokens`
+ *  is the in-flight compaction and archive budget's own estimate of the same
+ *  tools (see estimateAgentToolBudgetTokens), never the meter's reading. */
+export function measureToolPromptSurface(tools: readonly unknown[]) {
+  const named = tools.map((raw) => (raw ?? {}) as AdvertisableTool);
+  const onWire = new Set(toolsOnAdvertisedWire(named));
+  const costs = named.map((tool): ToolSchemaCost => {
+    if (!onWire.has(tool)) return { name: tool.name, deferred: true, tokens: 0, bytes: 0 };
+    try {
+      return measureAdvertisedEntry(serializeAdvertisedTools([tool])[0]);
+    } catch {
+      return { name: typeof tool.name === 'string' ? tool.name : 'unnamed', deferred: false, tokens: 50 };
+    }
+  });
+  return { ...summarizeToolCosts(costs), compactionBudgetTokens: estimateAgentToolBudgetTokens(tools) };
+}
+
+/** The in-flight compaction and archive budget's estimate of an agent's
+ *  tools: every schema on its raw JSON, and each deferLoading tool's name and
+ *  description as an index entry whether or not the runner sends it. This is
+ *  the budget's own reading, kept apart from the meter's advertised-wire
+ *  measurement so that correcting the meter never moves when history is
+ *  compacted or archived. */
+function estimateAgentToolBudgetTokens(tools: readonly unknown[]): number {
+  let total = 0;
+  for (const raw of tools) {
+    const tool = (raw ?? {}) as Record<string, unknown>;
+    const deferred = tool.deferLoading === true;
+    try {
+      total += estimateTokens(JSON.stringify({
+        type: tool.type, name: tool.name, description: tool.description,
+        ...(!deferred ? { parameters: tool.parameters, strict: tool.strict } : {}),
+      }));
+    } catch {
+      total += 50;
+    }
+  }
+  return total;
 }
 
 /** Does this bucket survive unchanged into the next turn's prompt? */
@@ -83,6 +138,10 @@ export interface PromptBucket {
    *  (a STABLE bucket whose sha moves between consecutive steps is a cache
    *  bust the estimate would hide). */
   sha256?: string;
+  /** memoryContext only: size of each rendered memory section, keyed by its
+   *  heading (never its contents). "(header)" is the preamble before the
+   *  first section; "(appended)" is memory text appended after the context. */
+  sections?: Record<string, { bytes: number; tokens: number }>;
 }
 
 export interface PromptCompositionSummary {
@@ -113,6 +172,12 @@ export interface PromptCompositionInput {
   contextPacket?: string;
   /** The user's actual message. */
   currentMessage?: string;
+  /** The per-turn memory primer the host appends as its own input item. */
+  memoryPrimer?: string;
+  /** Proven-operation guidance the host appends as its own input item. */
+  provenOperation?: string;
+  /** Retry context the host appends after an interrupted call. */
+  retryContext?: string;
   /** Any structured-output schema shipped with the call. */
   outputSchema?: string;
   /** Names of tools advertised with first-class schemas this turn. */
@@ -131,8 +196,51 @@ export interface PromptCompositionInput {
    *  schema-on-demand catalog advertisement. Stable: same catalog every turn. */
   deferredToolIndexTokens?: number;
   /** MEASURED history tokens for callers whose history is structured items
-   *  rather than one string. Wins over estimating the history string. */
+   *  rather than one string. Wins over estimating the history string. It
+   *  excludes every item measured as its own bucket (the current message and
+   *  the appended packet, primer, proven operation and retry context). */
   measuredHistoryTokens?: number;
+  /** MEASURED tokens for text that rides as its own input item, item framing
+   *  included. Wins over estimating the text, which still supplies the
+   *  bucket's bytes and digest. */
+  measuredItemTokens?: Partial<Record<
+    'contextPacket' | 'currentMessage' | 'memoryPrimer' | 'provenOperation' | 'retryContext',
+    number
+  >>;
+}
+
+/** Split a rendered memory context into its sections (heading -> size). */
+export function memoryContextSections(
+  memoryContext: string,
+  appendedMemory = '',
+): Record<string, { bytes: number; tokens: number }> {
+  const sections: Record<string, { bytes: number; tokens: number }> = {};
+  const add = (heading: string, text: string): void => {
+    if (!text) return;
+    const current = sections[heading] ?? { bytes: 0, tokens: 0 };
+    current.bytes += Buffer.byteLength(text, 'utf8');
+    current.tokens += estimateTokens(text);
+    sections[heading] = current;
+  };
+  const titles = new Set(MEMORY_CONTEXT_SECTION_TITLES);
+  const blocks = memoryContext ? memoryContext.split('\n\n') : [];
+  let heading = '(header)';
+  let buffer: string[] = [];
+  // Each block keeps the separator that follows it, so the sections' bytes
+  // add up to the rendered context exactly.
+  const flush = (): void => { add(heading, buffer.join('')); buffer = []; };
+  blocks.forEach((block, index) => {
+    const firstLine = block.split('\n', 1)[0] ?? '';
+    const title = firstLine.startsWith('## ') ? firstLine.slice(3) : '';
+    if (title && titles.has(title)) {
+      flush();
+      heading = title;
+    }
+    buffer.push(index < blocks.length - 1 ? `${block}\n\n` : block);
+  });
+  flush();
+  add('(appended)', memoryContext && appendedMemory ? `\n\n${appendedMemory}` : appendedMemory);
+  return sections;
 }
 
 const DEFAULT_TOKENS_PER_TOOL_SCHEMA = 120;
@@ -161,6 +269,7 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
     ? instructionsText.slice(sentinelAt + CACHE_BREAK_SENTINEL.length)
     : '';
   const dynamicLayers = splitCacheDynamicContext(dynamicInstructions);
+  const memoryLayers = splitCacheDynamicLayers(dynamicInstructions);
   const measuredTools = Number.isFinite(input.measuredToolSchemaTokens)
     ? Math.max(0, Math.trunc(input.measuredToolSchemaTokens as number))
     : null;
@@ -170,6 +279,10 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
   const deferredIndex = Number.isFinite(input.deferredToolIndexTokens)
     ? Math.max(0, Math.trunc(input.deferredToolIndexTokens as number))
     : 0;
+  const itemTokens = (name: keyof NonNullable<PromptCompositionInput['measuredItemTokens']>, text: string): number => {
+    const measured = input.measuredItemTokens?.[name];
+    return Number.isFinite(measured) ? Math.max(0, Math.trunc(measured as number)) : estimateTokens(text);
+  };
   const raw: Array<[string, number, PromptBucketStability, string | null]> = [
     // STABLE: same bytes every turn for a given session, so the provider keeps
     // them warm. Large is FINE here — that is the whole point of the split.
@@ -184,8 +297,11 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
     // upstream of it re-pays the lot, so it is scored with the variable side
     // where it will be noticed.
     ['history', measuredHistory ?? estimateTokens(input.history ?? ''), 'variable', measuredHistory !== null ? null : input.history ?? ''],
-    ['contextPacket', estimateTokens(input.contextPacket ?? ''), 'variable', input.contextPacket ?? ''],
-    ['currentMessage', estimateTokens(input.currentMessage ?? ''), 'variable', input.currentMessage ?? ''],
+    ['contextPacket', itemTokens('contextPacket', input.contextPacket ?? ''), 'variable', input.contextPacket ?? ''],
+    ['memoryPrimer', itemTokens('memoryPrimer', input.memoryPrimer ?? ''), 'variable', input.memoryPrimer ?? ''],
+    ['provenOperation', itemTokens('provenOperation', input.provenOperation ?? ''), 'variable', input.provenOperation ?? ''],
+    ['retryContext', itemTokens('retryContext', input.retryContext ?? ''), 'variable', input.retryContext ?? ''],
+    ['currentMessage', itemTokens('currentMessage', input.currentMessage ?? ''), 'variable', input.currentMessage ?? ''],
     ['outputSchema', estimateTokens(input.outputSchema ?? ''), 'variable', input.outputSchema ?? ''],
   ];
 
@@ -196,6 +312,9 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
       tokens,
       stability,
       ...(text !== null ? digest(text) : {}),
+      ...(name === 'memoryContext'
+        ? { sections: memoryContextSections(memoryLayers.memoryContext, memoryLayers.appendedMemory) }
+        : {}),
     }))
     .sort((a, b) => b.tokens - a.tokens);
 
@@ -214,6 +333,42 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
   };
 }
 
+/** The ledger's per-request prompt components, read from the same summary
+ *  the composition event records (bucket name -> estimated tokens).
+ *  `instructions` is the stable instruction prefix only; the per-turn
+ *  instruction text is `turnContext` and the memory block is `memoryContext`.
+ *  A series that compares against rows recorded before those buckets existed
+ *  must sum the three to get the older combined `instructions` value. */
+export function promptComponentsFromComposition(summary: PromptCompositionSummary): Record<string, number> {
+  return Object.fromEntries(summary.buckets.map((bucket) => [bucket.name, bucket.tokens]));
+}
+
+/** The request a step sends in place of the one the input filter composed
+ *  (a chosen writer's pass, a response-format repair): its own input items,
+ *  instructions and tool wire, and the model it goes to. */
+export interface ReplacedPromptRequest {
+  input: readonly unknown[];
+  instructions?: string;
+  advertisedTools: readonly unknown[];
+  model?: string;
+}
+
+/** Publishes one request's reading. Called with no argument, it publishes the
+ *  composed request as measured; called with the request a step sent instead,
+ *  it measures and publishes that one. A sender that decides after the filter
+ *  what it sends holds the publisher and calls it once, when it has decided. */
+export type PromptReadingPublisher = (replaced?: ReplacedPromptRequest) => void;
+
+/** Which model request a reading describes. */
+export interface PromptCompositionRequest {
+  /** 1-based position of this request within its accepted source; equals the
+   *  request's model_request_provenance ordinal where the host records one. */
+  requestOrdinal?: number;
+  /** The model the request was composed for (the routed id, not proof of
+   *  which model served it; the usage ledger holds that). */
+  model?: string;
+}
+
 /**
  * Persist one composition reading. Best-effort by construction: measurement
  * must never be able to cost a turn it is only observing.
@@ -223,6 +378,7 @@ export function recordPromptComposition(
   lane: string,
   summary: PromptCompositionSummary,
   sourceUserSeq?: number,
+  request: PromptCompositionRequest = {},
 ): void {
   if (!sessionId || summary.totalTokens <= 0) return;
   try {
@@ -241,6 +397,10 @@ export function recordPromptComposition(
         ...(summary.toolSchemaCosts ? { toolSchemaCosts: summary.toolSchemaCosts } : {}),
         buckets: summary.buckets,
         ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
+        ...(Number.isSafeInteger(request.requestOrdinal) && (request.requestOrdinal ?? 0) > 0
+          ? { requestOrdinal: request.requestOrdinal }
+          : {}),
+        ...(request.model ? { model: request.model } : {}),
       },
     });
   } catch { /* telemetry never breaks a turn */ }

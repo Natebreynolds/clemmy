@@ -655,7 +655,7 @@ export async function judgeHealCrossFamily(
       diagnosis.fix.newStepPrompt ? `Rewritten step prompt:\n"""\n${diagnosis.fix.newStepPrompt.slice(0, 3000)}\n"""` : '',
       diagnosis.fix.newOutputContractJson ? `Proposed new output contract: ${diagnosis.fix.newOutputContractJson.slice(0, 1500)}` : '',
     ].filter(Boolean).join('\n\n');
-    const result = await withJudgeTimeout(run(agent, prompt));
+    const result = await withJudgeTimeout('workflow_heal', () => run(agent, prompt));
     const raw = String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? '').trim();
     if (!raw) return { verdict: 'unavailable', reason: 'judge timeout' };
     const match = /^\s*(APPROVE|VETO)\s*:?\s*(.*)$/im.exec(raw);

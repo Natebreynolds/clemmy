@@ -1834,7 +1834,7 @@ export function recordCodexHarnessUsage(
       reasoningTokens: typeof reasoning === 'number' ? reasoning : undefined,
       totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : inputTokens + outputTokens,
       responseId,
-      promptComponents: harnessContext?.promptComponents,
+      framePromptComponents: harnessContext?.promptComponents,
       ...(typeof durationMs === 'number' && durationMs >= 0 ? { durationMs } : {}),
     });
   } catch { /* fail-silent */ }

@@ -60,6 +60,9 @@ import {
   type LegacyReflectionCandidateBackfillResult,
 } from './reflection-candidates.js';
 import { drainTerminalSemanticLearning } from './semantic-learning-worker.js';
+import { MEMORY_JOB_CLOCKS } from './memory-jobs.js';
+import { sweepMemoryWorkIfDue } from './memory-work-journal.js';
+import { memoryIndexOutcome, memoryTidyOutcome, runMemoryModelJob } from './memory-job-context.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -200,8 +203,8 @@ const MEMORY_BACKUP_RETAIN = 7;
 // Memory self-heal parity: runs after the nightly DB backup and before the
 // older paraphrase merge. It is bounded, audited, reversible, and kill-switched
 // independently from the report-only curator and approval UI.
-const MEMORY_SELF_HEAL_NIGHTLY_HOUR = 4;
-const MEMORY_SELF_HEAL_NIGHTLY_MINUTE = 35;
+const MEMORY_SELF_HEAL_NIGHTLY_HOUR = MEMORY_JOB_CLOCKS.verify.hour;
+const MEMORY_SELF_HEAL_NIGHTLY_MINUTE = MEMORY_JOB_CLOCKS.verify.minute;
 
 // Evidence-backed relationship/identity repair runs after the reversible DB
 // backup and before semantic merge. It only converges exact personal-email
@@ -676,25 +679,33 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   }
 
   if (tickCount % BACKFILL_EVERY_N_TICKS === 0 && isEmbeddingsEnabled() && !shouldDeferDiscretionaryWork('embedding-backfill')) {
-    try {
-      const stats = await embedMissingChunks({ maxChunks: BACKFILL_BATCH });
-      if (stats.embedded > 0 || stats.failed > 0) {
-        logger.info({ stats }, 'embedding backfill tick');
+    // Keeping memory searchable is the `index` memory job (the local
+    // embedder): recorded when it indexed something.
+    await runMemoryModelJob('index', { source: { kind: 'schedule' } }, async () => {
+      let embedded = 0;
+      try {
+        const stats = await embedMissingChunks({ maxChunks: BACKFILL_BATCH });
+        embedded += stats.embedded;
+        if (stats.embedded > 0 || stats.failed > 0) {
+          logger.info({ stats }, 'embedding backfill tick');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'embedding backfill tick failed');
       }
-    } catch (err) {
-      logger.warn({ err }, 'embedding backfill tick failed');
-    }
-    // Facts get the same incremental, circuit-broken backfill so the
-    // conflict resolver's semantic findSimilarFacts has vectors to rank
-    // against. Re-embeds facts whose content changed (Mem0 UPDATE).
-    try {
-      const factStats = await embedMissingFacts({ maxChunks: BACKFILL_BATCH });
-      if (factStats.embedded > 0 || factStats.failed > 0) {
-        logger.info({ stats: factStats }, 'fact embedding backfill tick');
+      // Facts get the same incremental, circuit-broken backfill so the
+      // conflict resolver's semantic findSimilarFacts has vectors to rank
+      // against. Re-embeds facts whose content changed (Mem0 UPDATE).
+      try {
+        const factStats = await embedMissingFacts({ maxChunks: BACKFILL_BATCH });
+        embedded += factStats.embedded;
+        if (factStats.embedded > 0 || factStats.failed > 0) {
+          logger.info({ stats: factStats }, 'fact embedding backfill tick');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'fact embedding backfill tick failed');
       }
-    } catch (err) {
-      logger.warn({ err }, 'fact embedding backfill tick failed');
-    }
+      return embedded;
+    }, (embedded) => memoryIndexOutcome(embedded));
   }
 
   if (tickCount % BACKFILL_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('evidence-backfill')) {
@@ -726,6 +737,18 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     tickAutoresearchObservatory();
   }
 
+  // Memory-work history is a cache (7-day detail, 90-day daily totals). It
+  // ages out on its own persisted hourly clock: tickCount restarts at every
+  // boot, so a tick-count cadence would starve it on a daemon that restarts.
+  try {
+    const memoryWork = sweepMemoryWorkIfDue();
+    if (memoryWork && (memoryWork.detailDeleted > 0 || memoryWork.dailyDeleted > 0)) {
+      logger.info({ memoryWork }, 'memory work retention tick');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'memory work retention tick failed');
+  }
+
   // Keep conversation, result and Stop history unless the operator explicitly
   // configured an age policy. Context compaction does not delete source data.
   if (tickCount % EVENTLOG_REAPER_EVERY_N_TICKS === 0) {
@@ -734,8 +757,12 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       // Copy recoverable fact evidence before an explicitly configured purge.
       try { backfillTemporalEvidence(2_000); } catch { /* periodic backfill retries */ }
     }
-    const reaped = reapConfiguredConversationHistory({ policy: retentionPolicy,
-      onError: (store, err) => logger.warn({ store, err }, 'configured conversation retention failed') });
+    // Finished work ageing out (work episodes decay on their own clock) is the
+    // `tidy` memory job: recorded when something aged out.
+    const reaped = await runMemoryModelJob('tidy', { source: { kind: 'schedule' } },
+      async () => reapConfiguredConversationHistory({ policy: retentionPolicy,
+        onError: (store, err) => logger.warn({ store, err }, 'configured conversation retention failed') }),
+      (result) => memoryTidyOutcome([], result.workEpisodes));
     if (Object.values(reaped).some(count => count > 0)) logger.info({ reaped }, 'configured conversation retention tick');
     // Disposable operational metrics keep their separate storage policy.
     try {

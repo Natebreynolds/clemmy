@@ -7,6 +7,7 @@ import { accrueSessionTokens, getSession, type SessionKind } from './harness/eve
 import { sealTraceEnvelope } from './trace-envelope.js';
 import type { TraceEnvelope } from './trace-envelope.js';
 import { resolveWorkflowUsageSource } from './workflow-usage-context.js';
+import { MEMORY_JOBS, memoryJobFromChannel } from '../memory/memory-jobs.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -52,9 +53,10 @@ export interface UsageEvent {
   kindReason?: string;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
-  /** Explicit request role (brain/worker/reviewer/router) and how it was
-   *  set (`explicit` call, attribution `scope`, `channel` convention, or
-   *  `unset`). Rollups group by this, never by model name or prompt size. */
+  /** Explicit request role (brain/worker/reviewer/router/writer/memory) and
+   *  how it was set (`explicit` call, attribution `scope`, `channel`
+   *  convention, or `unset`). Rollups group by this, never by model name or
+   *  prompt size. */
   role?: UsageRequestRole;
   roleReason?: 'explicit' | 'scope' | 'channel' | 'unset';
   /**
@@ -99,7 +101,7 @@ export interface UsageEvent {
   firstTokenMs?: number;
   /** The reasoning effort as SENT on the wire, after every adapter rewrite. A
    *  ledger that only knows the harness's decision cannot tell whether a slow
-   *  round thought at the provider's default (live 2026-09-26, grok-4.7). */
+   *  round thought at the provider's default. */
   reasoningEffort?: string;
   /** Provider-reported time spent in remote API calls, in ms. This is a subset
    *  of durationMs when the provider exposes both values (currently Claude SDK). */
@@ -234,6 +236,9 @@ export function resolveUsageKind(
   if (channel && CHANNEL_KINDS[channel]) {
     return { kind: CHANNEL_KINDS[channel], reason: `channel:${channel}` };
   }
+  // A memory job (`memory:<job>`) is background work wherever it started; it
+  // must never inflate the chat lane of the conversation it learned from.
+  if (channel?.startsWith('memory:')) return { kind: 'background', reason: `channel:${channel}` };
   if (opts.sessionRowKind && SESSION_ROW_KINDS[opts.sessionRowKind]) {
     return { kind: SESSION_ROW_KINDS[opts.sessionRowKind], reason: `session_row:${opts.sessionRowKind}` };
   }
@@ -430,8 +435,9 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
  *  what the request IS; never inferred from model names or token sizes.
  *  brain = the turn's foreground model; worker = a delegated child; reviewer =
  *  judges, watchers, completion/goal reviews; router = Jev routing calls;
- *  writer = the chosen model writing the final answer from gathered evidence. */
-export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer';
+ *  writer = the chosen model writing the final answer from gathered evidence;
+ *  memory = background memory work (the memory model role). */
+export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory';
 
 export interface ModelUsageAttributionContext {
   /** Request-local estimates override ambient parent prompt measurements. */
@@ -443,9 +449,14 @@ export interface ModelUsageAttributionContext {
    *  narrower scope or the recording call overrides it. */
   role?: UsageRequestRole;
   /** Call-site lane for rows the SDK emits without one (a judge lane such as
-   * `judge:completion`). Live 2026-09-22: 94 reviewer calls in a day landed as
-   * `unknown / other` with no lane, so nothing about them could be ranked. */
+   * `judge:completion`). A row without a lane cannot be ranked by the call
+   * site that made it. */
   channel?: string;
+  /** This scope is one model request of its own made inside an enclosing
+   *  frame (a brain or worker turn). The frame's role and its prompt
+   *  measurements describe the frame's requests, not this one, so neither is
+   *  inherited: the call records the role and channel it declares, or none. */
+  ownRequest?: boolean;
 }
 
 /**
@@ -476,14 +487,82 @@ export function withModelUsageAttribution<T>(
   return modelUsageAttributionStorage.run(context, work);
 }
 
+/** One model call as the ledger recorded it, handed to the job that made it. */
+export interface ObservedModelUsage {
+  at: string;
+  model: string;
+  inputTokens: number;
+  cachedInputTokens?: number;
+  outputTokens: number;
+  durationMs?: number;
+  ok: boolean;
+  failReason?: string;
+  channel?: string;
+  role?: UsageRequestRole;
+}
+
+const modelUsageObservers = new AsyncLocalStorage<ObservedModelUsage[]>();
+
+/** Collect every model call recorded inside `work` into `sink`, which the
+ *  caller owns, so a job can report what served it even when it throws. The
+ *  innermost observer wins: a nested job's calls are its own, never counted
+ *  twice by the job around it. */
+export function withModelUsageObserver<T>(sink: ObservedModelUsage[], work: () => T): T {
+  return modelUsageObservers.run(sink, work);
+}
+
+/**
+ * Run a model call that is its own request inside the current scope (a
+ * semantic interpretation, a judge, a review). It keeps the accepted-source
+ * identity for cost attribution, and records its declared role, channel and
+ * request-local measurements instead of the enclosing frame's.
+ */
+export function withOwnModelRequestAttribution<T>(
+  own: {
+    role?: UsageRequestRole;
+    channel?: string;
+    promptComponents?: Record<string, number>;
+    /** Identity used only when no enclosing scope supplies one. */
+    sessionId?: string;
+    sourceUserSeq?: number;
+  },
+  work: () => T,
+): T {
+  const inherited = modelUsageAttributionStorage.getStore();
+  // A memory job is the more specific owner: a judge or semantic call made
+  // while it runs is that job's work, so the call keeps the job's lane and the
+  // role the job's scope names. Only its request-local measurements are its own.
+  const memoryJob = memoryJobFromChannel(inherited?.channel) !== null;
+  const role = memoryJob ? inherited?.role ?? own.role : own.role;
+  const channel = memoryJob ? inherited?.channel : own.channel ?? inherited?.channel;
+  return modelUsageAttributionStorage.run({
+    sessionId: inherited?.sessionId ?? own.sessionId ?? 'unknown',
+    sourceUserSeq: inherited?.sourceUserSeq ?? own.sourceUserSeq ?? 0,
+    ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
+    ...(role ? { role } : {}),
+    ...(channel ? { channel } : {}),
+    ...(own.promptComponents ? { promptComponents: own.promptComponents } : {}),
+    ownRequest: true,
+  }, work);
+}
+
 /** Role from an explicit channel convention only (`judge:*`, `watcher*`,
- *  `jev*`); anything else is left unset rather than guessed. */
+ *  `jev*`, `writer*`, `memory:<job>`); anything else is left unset rather than
+ *  guessed. A memory job's channel names whose model the job registry says
+ *  does its thinking: the memory model's jobs are `memory`, the checker's
+ *  (standing, verify) are `reviewer`, and the local index and model-free
+ *  upkeep name no role. */
 export function usageRoleFromChannel(channel: string | undefined): UsageRequestRole | undefined {
   const value = (channel ?? '').trim().toLowerCase();
   if (!value) return undefined;
   if (value.startsWith('judge') || value.startsWith('watcher') || value.startsWith('review')) return 'reviewer';
   if (value.startsWith('jev')) return 'router';
   if (value.startsWith('writer')) return 'writer';
+  const job = memoryJobFromChannel(value);
+  if (job) {
+    const owner = MEMORY_JOBS[job].modelOwner;
+    return owner === 'memory' ? 'memory' : owner === 'checker' ? 'reviewer' : undefined;
+  }
   return undefined;
 }
 
@@ -514,7 +593,12 @@ export function recordModelUsage(args: {
   reasoningEffort?: string;
   providerApiDurationMs?: number;
   responseId?: string;
+  /** Measurements of THIS request's prompt, computed by the caller. */
   promptComponents?: Record<string, number>;
+  /** The enclosing frame's per-request measurements (the harness context an
+   *  adapter reads). They describe the frame's own model requests, so they
+   *  apply only outside an own-request scope. */
+  framePromptComponents?: Record<string, number>;
   /** Context-window health (Claude SDK lane): how close this call ran to the
    *  model's window. utilization = inputTokens / contextWindowTokens. */
   contextWindowTokens?: number;
@@ -619,7 +703,12 @@ export function recordModelUsage(args: {
     ...(args.account ? { account: args.account } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
-    promptComponents: reconcilePromptComponents(attribution?.promptComponents ?? args.promptComponents, args.inputTokens),
+    promptComponents: reconcilePromptComponents(
+      attribution?.promptComponents
+        ?? args.promptComponents
+        ?? (attribution?.ownRequest ? undefined : args.framePromptComponents),
+      args.inputTokens,
+    ),
     contextWindowTokens: args.contextWindowTokens,
     windowUtilization: args.windowUtilization,
     firstByteMs: args.firstByteMs,
@@ -630,6 +719,20 @@ export function recordModelUsage(args: {
   recordUsage(event);
   const observation = modelUsageRecordingObservation.getStore();
   if (observation && args.inputTokens + args.outputTokens > 0) observation.recorded = true;
+  try {
+    modelUsageObservers.getStore()?.push({
+      at: event.at,
+      model: event.model,
+      inputTokens: event.inputTokens,
+      ...(typeof event.cachedInputTokens === 'number' ? { cachedInputTokens: event.cachedInputTokens } : {}),
+      outputTokens: event.outputTokens,
+      ...(typeof event.durationMs === 'number' ? { durationMs: event.durationMs } : {}),
+      ok: args.ok !== false,
+      ...(args.ok === false && args.failReason ? { failReason: args.failReason } : {}),
+      ...(channel ? { channel } : {}),
+      ...(role ? { role } : {}),
+    });
+  } catch { /* an observer must never break the model-call path */ }
   // Stage 4 (aggregate run budget): durable, restart/midnight-proof per-session
   // accumulator (fills the previously-dead sessions.tokens_used column). The
   // unit is UNCACHED tokens — counting the full prompt every turn would let
@@ -649,7 +752,11 @@ export function recordModelUsage(args: {
     actor: 'usage-log',
     now: new Date(event.at),
     payload: {
-      channel: args.channel,
+      // The RESOLVED lane and role, as the NDJSON row has them: adapters pass
+      // no channel, so the call-site scope is the only place it lives.
+      channel,
+      ...(role ? { role } : {}),
+      roleReason,
       usageKind: event.kind,
       model: event.model,
       inputTokens: event.inputTokens,

@@ -1,25 +1,46 @@
-import { getSession, getToolOutput, listEvents, openEventLog, type ToolOutputRecord } from './eventlog.js';
+import {
+  getSession,
+  getToolOutput,
+  listToolCalledEventsForCallId,
+  openEventLog,
+  toolOutputStoredIdentity,
+  type EventRow,
+  type ToolOutputRecord,
+} from './eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
+import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { readSharedWorkerResult } from './worker-retained-results.js';
 
 /** Read-only reference resolution. A receipt is redeemed under its own exact
  * durable identity in this session; a recall call points to its original
- * result through the host's recorded arguments, never its prose preamble. */
+ * result through the host's recorded arguments, never its prose preamble.
+ *
+ * A delegated worker reads a parent result only through the parent's share of
+ * that exact id. The id may be the one the worker named or the producer its
+ * own recall resolves to; either way the share, not the lineage, grants the
+ * read, so an unshared parent id stays unreadable. */
 export function resolveRetainedOutputRead(sessionId: string, requestedId: string): {
   callId: string;
   receipt?: ToolOutputRecord;
 } {
   const local = resolveLocalRetainedOutputRead(sessionId, requestedId);
-  if (local.receipt || getToolOutput(sessionId, local.callId)) return local;
+  // Whether the id is stored here is a metadata question; the bytes are for
+  // the reader that reads them.
+  if (local.receipt || toolOutputStoredIdentity(sessionId, local.callId)) return local;
   const session = getSession(sessionId);
   if (session?.kind !== 'agent' || session.metadata.source !== 'delegated_worker') return local;
-  const receipt = readSharedWorkerResult(requestedId, session.metadata.parentSessionId,
-    session.metadata.retainedResultShares, (parentId, id) => {
-      // No recursive ancestry search: a share names an immediate parent's own result.
-      const parent = resolveLocalRetainedOutputRead(parentId, id);
-      return parent.receipt ?? getToolOutput(parentId, parent.callId);
-    });
-  return receipt ? { callId: requestedId, receipt } : local;
+  const readParent = (parentId: string, id: string): ToolOutputRecord | null => {
+    // No recursive ancestry search: a share names an immediate parent's own result.
+    const parent = resolveLocalRetainedOutputRead(parentId, id);
+    return parent.receipt ?? getToolOutput(parentId, parent.callId);
+  };
+  for (const id of new Set([local.callId, requestedId])) {
+    const receipt = readSharedWorkerResult(id, session.metadata.parentSessionId,
+      session.metadata.retainedResultShares, readParent);
+    if (receipt) return { callId: id, receipt };
+  }
+  return local;
 }
 
 export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: string): {
@@ -49,20 +70,42 @@ export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: s
     } };
   }
 
-  const calls = listEvents(sessionId, { types: ['tool_called'] });
   let callId = requestedId;
   const visited = new Set<string>();
   while (!visited.has(callId)) {
     visited.add(callId);
-    const matches = calls.filter(event => event.data.callId === callId && event.data.accounting !== 'transport_mirror');
-    if (matches.length !== 1 || matches[0]!.data.tool !== 'recall_tool_result') break;
-    let args: unknown = matches[0]!.data.arguments ?? matches[0]!.data.args;
-    if (typeof args === 'string') {
-      try { args = JSON.parse(args); } catch { break; }
-    }
-    const sourceId = args && typeof args === 'object' ? (args as Record<string, unknown>).call_id : null;
-    if (typeof sourceId !== 'string' || !sourceId.trim() || visited.has(sourceId)) break;
+    const occurrences = listToolCalledEventsForCallId(sessionId, callId);
+    // The top-level row is the invocation the model made. A transport mirror
+    // is a second view of the same invocation, used only when it is the sole
+    // observation.
+    const topLevel = occurrences.filter(event => event.data.accounting !== 'transport_mirror');
+    const matches = topLevel.length > 0 ? topLevel : occurrences;
+    if (matches.length !== 1) break;
+    const sourceId = recallSourceCallId(matches[0]!);
+    if (!sourceId || visited.has(sourceId)) break;
     callId = sourceId;
   }
   return callId.startsWith('rh_') ? resolveLocalRetainedOutputRead(sessionId, callId) : { callId };
+}
+
+/**
+ * The call id a recorded recall read from, whichever way the recall was
+ * invoked. A carrier (call_tool / work_call) records its own name as `tool`,
+ * the inner reader as `effectiveTool`, and the reader's arguments inside its
+ * envelope; the canonical carrier unwrapper peels that envelope, so a recall
+ * of a recall reaches the original producer instead of the recall's copy.
+ * When the durable effective identity is present it must agree with the
+ * unwrapped arguments; any disagreement or unreadable envelope ends the walk.
+ */
+function recallSourceCallId(event: EventRow): string | null {
+  const recorded = typeof event.data.tool === 'string' ? event.data.tool.trim() : '';
+  if (!recorded) return null;
+  const identity = unwrapRuntimeEffectiveToolIdentity(recorded, event.data.arguments ?? event.data.args);
+  if (!identity.toolName || !isPlainOrClementineLocalTool(identity.toolName, 'recall_tool_result')) return null;
+  const durable = typeof event.data.effectiveTool === 'string' ? event.data.effectiveTool.trim() : '';
+  if (durable && !isPlainOrClementineLocalTool(durable, 'recall_tool_result')) return null;
+  const args = identity.args;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  const sourceId = (args as Record<string, unknown>).call_id;
+  return typeof sourceId === 'string' && sourceId.trim() ? sourceId.trim() : null;
 }

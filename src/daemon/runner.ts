@@ -76,6 +76,7 @@ import { runAttentionWatchdog } from '../execution/attention-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { migrateLegacyComposioJobRecords } from '../integrations/composio/job-watcher.js';
 import { runRoutePolicyJob } from '../runtime/harness/route-policy.js';
+import { widenModelRouteMetricsDb } from '../runtime/model-route-metrics.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { recordOperationalEvent, recordOperationalEventOnce } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
@@ -144,7 +145,7 @@ import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decisio
 import { migrateToolChoicesToCanonicalProcedures, reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
 import { installProvenStandardBeatLine, reapDeadSkillChoices } from '../memory/skill-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
-import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
+import { runRecursiveReflection, consolidateActiveFacts, recursiveReflectionOutcome, reflectionTurnedOff } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { autoCleanSafeMemory } from '../autoresearch/memory-apply.js';
@@ -189,6 +190,9 @@ import {
   hasExpectedExactOriginDeliveryReceipt,
 } from '../runtime/exact-origin-delivery.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { MEMORY_JOB_CLOCKS } from '../memory/memory-jobs.js';
+import { memoryTidyOutcome, runMemoryModelJob } from '../memory/memory-job-context.js';
+import { memoryModelAvailability } from '../memory/memory-model-route.js';
 import type { AssistantResponse } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
@@ -890,11 +894,20 @@ async function runCronJob(
 // internal jobs should be system-level and undisturbed by user edits.
 // The job is cheap (<$0.01/night per the Phase 2 plan) so a missed-run
 // catch-up on next-boot is fine — no make-up scheduling needed.
-const RECURSIVE_REFLECTION_LOCAL_HOUR = 3;
+const RECURSIVE_REFLECTION_LOCAL_HOUR = MEMORY_JOB_CLOCKS.patterns.hour;
 
+/** The nightly patterns run obeys the one learning switch the extractor and
+ *  the Memory tab read (reflection.ts owns it). */
 export function daemonRecursiveReflectionEnabled(): boolean {
-  const raw = (getRuntimeEnv('CLEMMY_REFLECTION', '') ?? '').trim().toLowerCase();
-  return raw !== 'off' && raw !== 'false' && raw !== '0';
+  return !reflectionTurnedOff();
+}
+
+/** Whether the memory model can take the nightly patterns run now. When it
+ *  cannot (nothing signed in, out of quota), the run waits: the day stays
+ *  unspent and a later tick runs it once the model is back, instead of
+ *  recording a run that could not start. The Memory tab already says why. */
+export function recursiveReflectionModelReady(): boolean {
+  return memoryModelAvailability('patterns').ok;
 }
 
 function localDayKey(at: Date): string {
@@ -914,6 +927,7 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
   if (now.getHours() < RECURSIVE_REFLECTION_LOCAL_HOUR) return;
   const day = localDayKey(now);
   if (state.lastRecursiveReflectionDay === day) return;
+  if (!recursiveReflectionModelReady()) return;
   state.lastRecursiveReflectionDay = day;
   saveState(state);
   // Phase A observability: the episodic→semantic distillation tick is the
@@ -921,7 +935,10 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
   // when memory consolidates and what it produced. Fail-open.
   recordOperationalEvent({ source: 'memory', type: 'memory_consolidation_started', actor: 'recursive-reflection', payload: { day } });
   try {
-    const result = await runRecursiveReflection();
+    // The nightly pattern pass is the `patterns` memory job.
+    const { patternFactIds: _ids, ...result } = await runMemoryModelJob(
+      'patterns', { source: { kind: 'schedule' } }, () => runRecursiveReflection(), recursiveReflectionOutcome,
+    );
     logger.info({ result }, 'Brain recursive reflection completed');
     recordOperationalEvent({ source: 'memory', type: 'memory_consolidation_completed', actor: 'recursive-reflection', payload: { day, ...result } });
   } catch (err) {
@@ -939,7 +956,7 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
 // safely prove it, so dedup is explicitly opt-in. Same once-per-local-day,
 // survives-restart contract as recursive reflection (offset one hour so
 // the two brain jobs don't pile onto the same tick).
-const MEMORY_HYGIENE_LOCAL_HOUR = 4;
+const MEMORY_HYGIENE_LOCAL_HOUR = MEMORY_JOB_CLOCKS.tidy.hour;
 
 async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
   // Decay remains default-on. Semantic dedup is default-off after production
@@ -961,60 +978,69 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
   state.lastMemoryHygieneDay = day;
   saveState(state);
 
-  if (decayOn) {
+  // Letting unused memories fade is the `tidy` memory job: recorded, with the
+  // faded ids (so the Memory tab can bring them back), when something faded.
+  await runMemoryModelJob('tidy', { source: { kind: 'schedule' } }, async () => {
+    const faded: number[] = [];
+    if (decayOn) {
+      try {
+        const result = decayAndEvictFacts();
+        faded.push(...result.ids);
+        logger.info({ result }, 'Memory decay/eviction completed');
+        if (result.deactivated > 0) {
+          appendHygieneAudit({
+            at: now.toISOString(),
+            kind: 'decay',
+            ids: result.ids,
+            detail: { scanned: result.scanned, deactivated: result.deactivated, reasons: result.reasons },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Memory decay/eviction failed (will retry tomorrow)',
+        );
+      }
+    }
+    if (dedupOn) {
+      try {
+        const result = await consolidateActiveFacts();
+        faded.push(...result.ids);
+        logger.info({ result }, 'Memory dedup/consolidation completed');
+        if (result.ids.length > 0) {
+          appendHygieneAudit({
+            at: now.toISOString(),
+            kind: 'dedup',
+            ids: result.ids,
+            detail: { examined: result.examined, merged: result.merged },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Memory dedup/consolidation failed (will retry tomorrow)',
+        );
+      }
+    }
+    // Tier A4: auto-clean the provably-safe class (synthetic smoke-test pollution
+    // matched by EXACT signature). The first auto-APPLY of the memory-refinement
+    // loop. Soft, capped, pinned-exempt, audited (kind:'autoclean'), reversible —
+    // and it only ever touches non-user-knowledge. CLEMMY_MEMORY_AUTOCLEAN=off is
+    // the kill-switch; autoCleanSafeMemory() honours it internally.
     try {
-      const result = decayAndEvictFacts();
-      logger.info({ result }, 'Memory decay/eviction completed');
-      if (result.deactivated > 0) {
-        appendHygieneAudit({
-          at: now.toISOString(),
-          kind: 'decay',
-          ids: result.ids,
-          detail: { scanned: result.scanned, deactivated: result.deactivated, reasons: result.reasons },
-        });
+      const result = autoCleanSafeMemory({ nowIso: now.toISOString() });
+      if (!result.dryRun) faded.push(...result.ids);
+      if (result.pruned > 0) {
+        logger.info({ pruned: result.pruned, ids: result.ids }, 'Memory auto-clean (synthetic junk) completed');
       }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
-        'Memory decay/eviction failed (will retry tomorrow)',
+        'Memory auto-clean failed (will retry tomorrow)',
       );
     }
-  }
-  if (dedupOn) {
-    try {
-      const result = await consolidateActiveFacts();
-      logger.info({ result }, 'Memory dedup/consolidation completed');
-      if (result.ids.length > 0) {
-        appendHygieneAudit({
-          at: now.toISOString(),
-          kind: 'dedup',
-          ids: result.ids,
-          detail: { examined: result.examined, merged: result.merged },
-        });
-      }
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Memory dedup/consolidation failed (will retry tomorrow)',
-      );
-    }
-  }
-  // Tier A4: auto-clean the provably-safe class (synthetic smoke-test pollution
-  // matched by EXACT signature). The first auto-APPLY of the memory-refinement
-  // loop. Soft, capped, pinned-exempt, audited (kind:'autoclean'), reversible —
-  // and it only ever touches non-user-knowledge. CLEMMY_MEMORY_AUTOCLEAN=off is
-  // the kill-switch; autoCleanSafeMemory() honours it internally.
-  try {
-    const result = autoCleanSafeMemory({ nowIso: now.toISOString() });
-    if (result.pruned > 0) {
-      logger.info({ pruned: result.pruned, ids: result.ids }, 'Memory auto-clean (synthetic junk) completed');
-    }
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      'Memory auto-clean failed (will retry tomorrow)',
-    );
-  }
+    return faded;
+  }, (faded) => memoryTidyOutcome(faded));
 }
 
 export interface CronMatchedOccurrence {
@@ -2227,6 +2253,16 @@ export async function startDaemon(
       { err: err instanceof Error ? err.message : String(err) },
       'Canonical tool-procedure migration failed (legacy aliases remain readable)',
     );
+  }
+  // The route ledger's role CHECK rebuild is a boot phase too: after an
+  // upgrade it copies every row once, so it runs here before the door opens,
+  // never inside a model call or a role resolution. Never throws.
+  const wideningStartedAt = Date.now();
+  const widenedRouteTables = widenModelRouteMetricsDb();
+  if (widenedRouteTables.length > 0) {
+    // How long the one-time copy held boot (it grows with the ledger).
+    logger.info({ tables: widenedRouteTables, durationMs: Date.now() - wideningStartedAt },
+      'Route ledger now keeps writer and memory rows');
   }
   // Surface "we missed N scheduled runs while you were offline" BEFORE
   // any other startup work so the user has the bad news first. Safe to

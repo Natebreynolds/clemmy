@@ -35,6 +35,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { mcpTransportPresentationMaxChars } from '../runtime/harness/tool-output-format.js';
 import {
   harnessRunContextStorage,
   hostOwnsLogicalCallAccounting,
@@ -232,8 +233,7 @@ class ExactCatalogBindingRefusalResult extends ExternalWritePreDispatchResult {
  * Nested_owned catalog dispatch is a terminal owner. Composio already writes
  * the durable logical settlement the host later adopts; the catalog production
  * port used to return a value and leave the row open. The host then failed
- * closed on "nested-owned logical settlement is missing" and killed the turn
- * (live 2026-08-29: work_call → salesforce_sf_soql_query, source 98339).
+ * closed on "nested-owned logical settlement is missing" and killed the turn.
  *
  * Only the host-owned nested path needs this write. Direct/unit callers still
  * let wrapToolForHarness settle, so they skip here.
@@ -621,11 +621,9 @@ export function isResolvedDispatchPreparedWithoutExecution(
  * refusal, so the no-progress governor can tell a real repair attempt from a
  * byte-identical repeat without reading prose.
  *
- * Live 2026-09-05, from the owner's phone: "find and add <person> to that"
- * refused three carrier attempts as schema-invalid, none carried repair
- * material, so every attempt keyed a fresh stage on a digest of its own
- * arguments and the turn died at the governor's transition cap — the reply the
- * user read was `schema_invalid:call:fbbf339c…`. Nine sites mint an
+ * A carrier attempt refused as schema-invalid without repair material keys a
+ * fresh stage on a digest of its own arguments, so repeated attempts die at the
+ * governor's transition cap and the user reads an opaque refusal code. Nine sites mint an
  * invalid-arguments refusal and exactly one (plan_task) fed this channel.
  * Deriving the key here covers every refusal this dispatcher raises.
  */
@@ -758,9 +756,7 @@ export interface BuildCallToolOptions {
    * in the deferred set above. Admitted so a model that wraps a first-class tool
    * in call_tool (a common confusion) gets a transparent dispatch instead of a
    * `not_reachable` bounce it loops on. The inner-name gate is identical to a
-   * direct call, so this never widens authority. Live 2026-07-19: a Discord
-   * calendar-invite run looped 4× / ~3.5 min calling `memory_recall_all` via
-   * call_tool before self-correcting. */
+   * direct call, so this never widens authority. */
   firstClassNames?: ReadonlySet<string>;
   /** Exact turn-configured local instances (for example connected discovery).
    * A wrapper must not fall back to a global instance with different context.
@@ -1041,9 +1037,8 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // CONSUME THE TURN'S PROVEN RESOLUTION. The host proves capabilities
       // before the model speaks; when the model names that exact proven
       // Composio identifier, refusing it as "not reachable" charges the model
-      // failed calls to rediscover what the harness already knew (live
-      // 2026-08-18: three refusals of tuition on a proven, connected calendar
-      // read). Map the identifier onto the carrier — authority is unchanged,
+      // failed calls to rediscover what the harness already knew. Map the
+      // identifier onto the carrier — authority is unchanged,
       // because the carrier's full gate chain still owns the dispatch.
       if (
         !reachableBuiltinNames.has(target)
@@ -1130,11 +1125,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           error: 'not_reachable',
           // "WRITES through work_call" reads as writes-ONLY, so a model holding
           // a disclosed READ rules the carrier out and has nowhere left to go.
-          // Live 2026-09-03: a correct reviewed-CLI SOQL read was attempted
-          // through run_shell_command, refused with this text, and the turn
-          // ended asking the user how to proceed — while the exact operation
-          // tool_search had disclosed was reachable through work_call the whole
-          // time, which is how the same read succeeded on an earlier run.
+          // Such a model falls back to run_shell_command, is refused, and ends
+          // the turn asking the user how to proceed while the operation
+          // tool_search disclosed is reachable through work_call.
           detail: `"${requestedTarget}" is not a registry-declared control or read on this turn.`
             + ` If tool_search disclosed an exact operation for this step, invoke it through work_call — READS included, not writes only:`
             + ` work_call {"name":"<the exact operation tool_search returned>","args_json":"<its arguments as ONE JSON string>"}.`,
@@ -1146,9 +1139,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // DOWNSTREAM: dispatchBatchItemTool resolves them against the session's
       // connected MCP scope (unknown/unconnected servers error honestly) and
       // routes approval through decideToolApproval on the inner name — the
-      // same contract as run_batch. Refusing them here was a
-      // live Phase-1 gap (2026-07-08): the model fell back to hand-rolling the
-      // provider's REST API through shell calls, slower and less gated.
+      // same contract as run_batch. Refusing them here sends the model to
+      // hand-roll the provider's REST API through shell calls, slower and less
+      // gated.
       const activeMcpScope = options.mcpToolScope !== undefined
         ? options.mcpToolScope
         : harnessRunContextStorage.getStore()?.mcpToolScope;
@@ -1183,7 +1176,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         // already the host's how (reviewed CLI live-reads). Requiring it
         // also to be a TOOL_REGISTRY builtin bounced the exact name
         // tool_search/plan_task had just cited, so the model fell through
-        // to run_shell_command (live 2026-08-29: salesforce_sf_soql_query).
+        // to run_shell_command.
         const selection = currentCatalogOperationForCall(target, resolvedArgs);
         if (!selection.ok) return refuse({ error: 'not_reachable',
           reason: 'exact_catalog_binding_missing', bindingReason: selection.reason,
@@ -1202,20 +1195,17 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         ) {
           return refuse({
             error: 'not_reachable',
-            // SAY THE EXACT CORRECTION, not a menu. Live 2026-09-02 (grok-4.6,
-            // platform-49 cleanup): the old prose said "use tool_search", the
-            // model wrapped tool_search in THIS carrier, was refused again, and
-            // the no-progress governor ended the turn — so the correction names
-            // the exact move instead.
+            // SAY THE EXACT CORRECTION, not a menu. Prose that says "use
+            // tool_search" leads a model to wrap tool_search in THIS carrier,
+            // be refused again, and end at the no-progress governor, so the
+            // correction names the exact move instead.
             //
             // It must also be TRUE. This branch used to answer any
             // registry-declared name with "it is a FIRST-CLASS tool on this
             // turn: call it directly" — but the guard above has just
             // established the opposite, so that advice fired exactly when it
-            // was false. Live 2026-09-05: a cold background turn asked for a
-            // built-in this turn's policy does not reach, was told three times
-            // to call it directly, could not (it is not on the surface), and
-            // the turn died at the no-progress floor.
+            // was false: a turn told to call directly a built-in that is not on
+            // its surface cannot, and dies at the no-progress floor.
             detail: isRegistryDeclaredTool(target)
               ? `"${requestedTarget}" is a Clementine built-in, but it is NOT on this turn's surface:`
                 + ' this turn\'s tool policy does not reach it, so neither this carrier nor a direct call can invoke it here.'
@@ -1358,8 +1348,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         // Composio carrier that resolver is the gateway itself — it still
         // applies schema repairs (e.g. renaming `query` to a required `q`)
         // AFTER this wrapper, so freezing the pre-repair bytes here made the
-        // gateway's own refinement a poisoning conflict and killed the step
-        // (live 2026-08-18: FIRECRAWL_SEARCH first attempt of the turn).
+        // gateway's own refinement a poisoning conflict and killed the step.
         if (!isTrustedComposioGateway(target)) {
           authorizeResolvedLogicalCallContract({
             sessionId,
@@ -1582,10 +1571,20 @@ export function registerCallToolMcp(
       // through here, so this is where a harness refusal stops looking like an
       // answer. The consumer already reads `isError`; nothing ever set it, so a
       // pre-dispatch rejection and a real result were indistinguishable and an
-      // identical payload could be sent straight back (live 2026-08-09).
+      // identical payload could be sent straight back.
       if (isToolMediaContent(output)) return { content: output };
       const rendered = jsonResult(output);
-      return textResult(rendered, { isError: isHarnessRefusalText(rendered) });
+      // The child already presented its result at the effective inner tool's
+      // budget; the wire must not clip it again, and never sends more than the
+      // CLI's MCP wire carries whole.
+      return textResult(rendered, {
+        isError: isHarnessRefusalText(rendered),
+        maxChars: mcpTransportPresentationMaxChars({
+          toolName: 'call_tool',
+          args: { name, args_json },
+          routedModelId: harnessRunContextStorage.getStore()?.routedModelId,
+        }),
+      });
     },
   );
 }

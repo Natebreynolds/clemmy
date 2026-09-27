@@ -32,7 +32,7 @@ export function reapConfiguredConversationHistory(input: {
     sweep('workingMemory', () => reapStaleWorkingMemory(policy.sessionDays!));
   }
   // Work episodes are a cache, not history: they decay on their own clock,
-  // with no operator policy (owner, 2026-09-26: track everything, let it decay).
+  // with no operator policy.
   sweep('workEpisodes', () => { const d = decayWorkEpisodes(); return d.summarized + d.deleted; });
   return result;
 }

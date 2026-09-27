@@ -107,6 +107,23 @@ test('operational event type list has no duplicates', () => {
   assert.equal(new Set(OPERATIONAL_EVENT_TYPES).size, OPERATIONAL_EVENT_TYPES.length);
 });
 
+test('memory work is recorded under memory types, with its daily counters table beside the events', () => {
+  assert.ok(isOperationalEventType('memory_work_completed'));
+  assert.ok(isOperationalEventType('memory_work_failed'));
+  const db = new Database(':memory:');
+  try {
+    db.exec(OPERATIONAL_TELEMETRY_SCHEMA_SQL);
+    db.exec(OPERATIONAL_TELEMETRY_SCHEMA_SQL); // idempotent on every open
+    const tables = (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>).map((r) => r.name);
+    assert.ok(tables.includes('memory_work_daily'));
+    assert.ok(tables.includes('memory_work_meta'));
+    const since = db.prepare(`SELECT COUNT(*) AS n FROM memory_work_meta WHERE key = 'journal_since'`).get() as { n: number };
+    assert.equal(since.n, 1);
+  } finally {
+    db.close();
+  }
+});
+
 test('WS2 visibility taxonomy: harness / scheduler / verdict / retry types are registered', () => {
   for (const type of [
     // harness run lifecycle + swarm + background task

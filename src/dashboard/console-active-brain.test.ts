@@ -349,6 +349,71 @@ test('worker role PATCH survives a route restart and clear removes the live and 
   }
 });
 
+test('the memory row shows the memory route, and its PATCH sets and clears it through the same owner', async () => {
+  rmSync(path.join(TMP_HOME, '.env'), { force: true });
+  const previous = {
+    AUTH_MODE: process.env.AUTH_MODE,
+    MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE,
+    CLEMMY_MODEL_ROLES: process.env.CLEMMY_MODEL_ROLES,
+    CLEMMY_DEBATE_JUDGE: process.env.CLEMMY_DEBATE_JUDGE,
+  };
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  process.env.CLEMMY_MODEL_ROLES = '[]';
+  delete process.env.CLEMMY_DEBATE_JUDGE;
+  const { describeMemoryModel } = await import('../memory/memory-model-route.js');
+  type MemoryRow = { modelId?: string; source?: string; follows?: string | null; provider?: string };
+  type Body = { modelRoles?: { bindings?: unknown[]; roles?: { memory?: MemoryRow }; roleOptions?: { memory?: unknown[] } }; error?: string };
+  const patch = async (body: unknown) => {
+    const response = await fetch(`${harness.url}/api/console/settings/models/roles`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, body: await response.json() as Body };
+  };
+  const harness = await boot();
+  try {
+    const settings = await (await fetch(`${harness.url}/api/console/settings`)).json() as Body;
+    const automatic = settings.modelRoles?.roles?.memory;
+    assert.equal(automatic?.source, 'default');
+    assert.equal(automatic?.modelId, describeMemoryModel().modelId ?? '', 'the row names the memory route, not the checker row');
+    assert.ok(automatic && 'follows' in automatic);
+    assert.ok(Array.isArray(settings.modelRoles?.roleOptions?.memory), 'the memory picker has its own options');
+
+    const chosen = await patch({ role: 'memory', modelId: 'glm-5.2' });
+    assert.equal(chosen.status, 200, chosen.body.error);
+    assert.deepEqual(chosen.body.modelRoles?.bindings, [{ role: 'memory', modelId: 'glm-5.2', scope: 'durable', source: 'settings' }]);
+    assert.deepEqual(
+      { modelId: chosen.body.modelRoles?.roles?.memory?.modelId, source: chosen.body.modelRoles?.roles?.memory?.source,
+        follows: chosen.body.modelRoles?.roles?.memory?.follows },
+      { modelId: 'glm-5.2', source: 'settings', follows: null },
+    );
+    assert.equal(persistedEnvValue('CLEMMY_DEBATE_JUDGE'), undefined, 'the memory model has no side key');
+
+    const refused = await patch({ role: 'memory', modelId: 'not-a-connected-model' });
+    assert.equal(refused.status, 400);
+
+    // Memory work reads only the role-wide pick: a per-kind rule is refused
+    // rather than saved as a rule nothing reads.
+    const scoped = await patch({ role: 'memory', modelId: 'glm-5.2', whenIntent: 'design' });
+    assert.equal(scoped.status, 400, 'a memory rule for one kind of work is refused');
+    assert.deepEqual(readDurableBindings(), [{ role: 'memory', modelId: 'glm-5.2', scope: 'durable', source: 'settings' }],
+      'the role-wide pick is untouched');
+
+    const cleared = await patch({ role: 'memory', clear: true });
+    assert.equal(cleared.status, 200, cleared.body.error);
+    assert.deepEqual(cleared.body.modelRoles?.bindings, []);
+    assert.equal(cleared.body.modelRoles?.roles?.memory?.source, 'default');
+  } finally {
+    await harness.close();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 // D2 pins (adversarial review 2026-08-26): once session brain pins serve (D1),
 // the global flip alone no longer re-routes an already-pinned conversation —
 // which would silently break the switcher's promise "applies to your next

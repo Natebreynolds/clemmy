@@ -46,6 +46,16 @@ const DEFAULT_MAX_RETRIES = 3;
 const BASE_BACKOFF_MS = 750;
 const RATE_LIMIT_BASE_BACKOFF_MS = 2000;
 const MAX_BACKOFF_MS = 30_000;
+/** A provider that gave no answer (a transport failure or a 5xx) always gets
+ * one new attempt, however long it took to fail and whatever other retries
+ * (a rate-limit wait, a token refresh, an empty completion, a dropped effort
+ * setting) came before it. Later no-answer attempts start only while this much
+ * time has passed since the call's first one. A
+ * connection that fails fast still gets every retry in the count budget; one
+ * that takes its own timeout to fail gets one retry, so a provider that is
+ * really down ends the call in about two of its timeouts, not minutes. */
+const NO_ANSWER_RETRY_WALL_MS = 20_000;
+const NO_ANSWER_KINDS: ReadonlySet<BoundaryErrorKind> = new Set(['model.transport_timeout', 'model.http_5xx']);
 
 export interface ResiliencePolicy {
   /** Short label for logs (e.g. 'claude', 'byo'). */
@@ -58,6 +68,31 @@ export interface ResiliencePolicy {
   refreshAuth?: () => Promise<void>;
   /** Test injection — replace the backoff sleep. */
   sleep?: (ms: number) => Promise<void>;
+  /** Test injection — replace the clock the retry wall reads. */
+  now?: () => number;
+}
+
+/** Errors this layer stopped retrying because its own budget ran out before
+ * any content: every retry this model boundary allows was already spent on
+ * them, so an outer layer should not start the same round again. */
+const retriesSpentBeforeContent = new WeakSet<object>();
+
+function markRetriesSpent(err: unknown): void {
+  if (err && typeof err === 'object') retriesSpentBeforeContent.add(err);
+}
+
+/** True when the resilience layer already spent its transparent retries on
+ * this failure before the model produced anything. */
+export function modelRetriesSpentBeforeContent(err: unknown): boolean {
+  return !!err && typeof err === 'object' && retriesSpentBeforeContent.has(err);
+}
+
+/** One model call across its attempts. `noAnswerRetries` counts only the
+ * retries granted after the provider gave no answer. */
+interface NoAnswerCall {
+  startedAt: number;
+  signal?: AbortSignal;
+  noAnswerRetries: number;
 }
 
 interface ErrorClass {
@@ -73,11 +108,27 @@ interface ErrorClass {
 
 const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefused|fetch failed|socket hang up|network|und_err|aborted|timeout|connection error|apiconnection/i;
 
+/** Generated HTTP SDKs raise one class for a request that got no response —
+ *  refused, reset, or timed out before headers — named APIConnectionError.
+ *  Its timeout subclass carries no cause, no status, no name of its own and
+ *  the message "Request timed out.", so only the class says it is transport.
+ *  The same SDKs' caller-cancel class is a sibling, not a subclass, so an
+ *  aborted request never reads as a dropped connection here. */
+function isSdkConnectionFailure(err: object): boolean {
+  let proto: unknown = Object.getPrototypeOf(err);
+  for (let depth = 0; proto && depth < 8; depth++) {
+    if ((proto as { constructor?: { name?: unknown } }).constructor?.name === 'APIConnectionError') return true;
+    proto = Object.getPrototypeOf(proto);
+  }
+  return false;
+}
+
 /** A transport failure often arrives wrapped: an SDK's connection error whose
  *  cause is the socket error, which in turn may carry only a code. Any link
  *  of that chain naming a transport condition makes the whole error one. */
 function transportErrorInChain(err: unknown, depth = 0): boolean {
   if (!err || typeof err !== 'object' || depth > 3) return false;
+  if (isSdkConnectionFailure(err)) return true;
   const e = err as { message?: unknown; name?: unknown; code?: unknown; cause?: unknown };
   for (const field of [e.message, e.name, e.code]) {
     if (typeof field === 'string' && TRANSPORT_RE.test(field)) return true;
@@ -300,6 +351,10 @@ export class ResilientModel implements Model {
     return this.policy.maxRetries ?? DEFAULT_MAX_RETRIES;
   }
 
+  private now(): number {
+    return this.policy.now ? this.policy.now() : Date.now();
+  }
+
   private sleep(ms: number): Promise<void> {
     if (this.policy.sleep) return this.policy.sleep(ms);
     if (ms <= 0) return Promise.resolve();
@@ -313,7 +368,11 @@ export class ResilientModel implements Model {
     attempt: number,
     authRefreshed: { value: boolean },
     path: 'getResponse' | 'getStreamedResponse',
+    call: NoAnswerCall,
   ): Promise<boolean> {
+    // The caller withdrew the request (the owner stopped, or an outer
+    // deadline retired it). Another attempt could only fail the same way.
+    if (call.signal?.aborted) return false;
     const cls = classifyModelError(err);
     // Auth path FIRST: the one-shot token refresh is INDEPENDENT of the
     // transient-retry budget — an access-token-expiry 401 can land on the final
@@ -332,12 +391,34 @@ export class ResilientModel implements Model {
     }
     // A durable plan/model allowance cannot heal during exponential backoff.
     // Surface it immediately to the outer cross-provider chain.
-    if (!cls.retryable || cls.sameProviderRetryable === false || attempt >= this.maxRetries) return false;
+    if (!cls.retryable || cls.sameProviderRetryable === false) return false;
+    const noAnswer = NO_ANSWER_KINDS.has(cls.kind);
+    if (attempt >= this.maxRetries) {
+      // Other retries share the attempt count, so a no-answer failure that
+      // arrives on the last attempt is spent only if one of them was its own.
+      if (!noAnswer || call.noAnswerRetries >= 1) markRetriesSpent(err);
+      return false;
+    }
     const wait = backoffMs(attempt, cls);
+    const elapsed = this.now() - call.startedAt;
+    // A wait the provider named (Retry-After) is honored as before; the window
+    // bounds only this layer's own backoff over silent failures. The first
+    // no-answer retry is never withheld: one slow failure is still a single
+    // blip, and an error marked spent must mean a no-answer retry really ran.
+    // Other retries share the attempt count, so the call counts its own.
+    if (noAnswer && call.noAnswerRetries >= 1 && cls.retryAfterMs == null && elapsed + wait > NO_ANSWER_RETRY_WALL_MS) {
+      markRetriesSpent(err);
+      logger.warn(
+        { label: this.policy.label, path, attempt: attempt + 1, kind: cls.kind, status: cls.status, elapsedMs: elapsed },
+        'model gave no answer before content and the retry window is spent — surfacing',
+      );
+      return false;
+    }
     logger.warn(
       { label: this.policy.label, path, attempt: attempt + 1, maxRetries: this.maxRetries, kind: cls.kind, status: cls.status, backoffMs: wait },
       'model call failed before content — retrying transparently',
     );
+    if (noAnswer) call.noAnswerRetries += 1;
     await this.sleep(wait);
     return true;
   }
@@ -345,6 +426,7 @@ export class ResilientModel implements Model {
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
+    const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
     let effortStripped = false;
     for (let attempt = 0; ; attempt++) {
       try {
@@ -375,7 +457,7 @@ export class ResilientModel implements Model {
           logger.warn({ label: this.policy.label, path: 'getResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
           continue;
         }
-        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getResponse')) continue;
+        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getResponse', call)) continue;
         throw err;
       }
     }
@@ -384,6 +466,7 @@ export class ResilientModel implements Model {
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
+    const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
     let effortStripped = false;
 
     for (let attempt = 0; ; attempt++) {
@@ -441,7 +524,7 @@ export class ResilientModel implements Model {
           logger.warn({ label: this.policy.label, path: 'getStreamedResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
           continue;
         }
-        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getStreamedResponse')) continue;
+        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getStreamedResponse', call)) continue;
         throw err;
       }
 
@@ -467,16 +550,19 @@ export class ResilientModel implements Model {
       if (!sawDone && !committed) {
         if (attempt < this.maxRetries) {
           logger.warn({ label: this.policy.label, attempt: attempt + 1 }, 'stream ended with no response_done before content — retrying');
+          call.noAnswerRetries += 1;
           await this.sleep(backoffMs(attempt, { retryable: true, kind: 'model.transport_timeout', isAuth: false }));
           continue;
         }
-        throw new BoundaryError({
+        const ended = new BoundaryError({
           kind: 'model.transport_timeout',
           retryable: true,
           userMessage: "Clementine's model backend dropped the connection before finishing this turn. Please retry.",
           operatorMessage: `${this.policy.label}: stream ended without response_done before content (attempts=${attempt + 1}).`,
           context: { label: this.policy.label, attempts: attempt + 1 },
         });
+        if (call.noAnswerRetries >= 1) markRetriesSpent(ended);
+        throw ended;
       }
       return; // committed + drained, or done emitted
     }

@@ -6,15 +6,16 @@ import {
   type ModelRoleName,
   type ModelSettings,
 } from '../lib/api';
-import { ROLE_COPY, inactiveNote, isChosen, modelName, sameFamilyWarning } from '../lib/model-roles';
+import { ROLE_COPY, inactiveNote, isChosen, modelName, roleAutomaticText, sameFamilyWarning } from '../lib/model-roles';
 import { haptic } from '../lib/native-bridge';
 
 /**
  * Picks the model for one part of a request: who writes the final answer, who
- * checks the work, who helps in parallel. A routing choice among models already
- * connected on the Mac, never a credential ceremony. Every row comes from the
- * daemon catalog, and a pick is saved through the same owner desktop Settings
- * uses, so the two can never disagree.
+ * checks the work, who helps in parallel; and for the background work that
+ * keeps your memory. A routing choice among models already connected on the
+ * Mac, never a credential ceremony. Every row comes from the daemon catalog,
+ * and a pick is saved through the same owner desktop Settings uses, so the
+ * two can never disagree.
  */
 export function RoleSheet({ role, settings, review, reviewBusy, reviewError, onToggleReview, onClose, onChanged }: {
   /** The role being picked; null when closed. */
@@ -73,8 +74,10 @@ export function RoleSheet({ role, settings, review, reviewBusy, reviewError, onT
   const resolved = settings.roles?.[role];
   const chosen = isChosen(resolved);
   const groups = settings.roleOptions?.[role] ?? [];
-  const inactive = inactiveNote(resolved, settings);
-  const warning = role === 'worker' ? null : sameFamilyWarning(settings);
+  const inactive = inactiveNote(resolved, settings, role);
+  // The same-provider caution is about a checker reviewing its own writer; it
+  // says nothing about helpers or the memory model.
+  const warning = role === 'judge' || role === 'writer' ? sameFamilyWarning(settings) : null;
 
   const pick = async (key: string, modelId: string | null) => {
     setBusyKey(key);
@@ -141,7 +144,7 @@ export function RoleSheet({ role, settings, review, reviewBusy, reviewError, onT
             <span class="brain-dot ok" aria-hidden="true" />
             <span class="role-row-main">
               <span class="brain-row-label">Automatic</span>
-              <span class="role-row-note">{copy.automatic}</span>
+              <span class="role-row-note">{roleAutomaticText(role, resolved)}</span>
             </span>
             <span class="brain-row-note">{busyKey === 'automatic' ? 'Saving…' : chosen ? '' : 'Current'}</span>
           </button>
@@ -174,7 +177,7 @@ export function RoleSheet({ role, settings, review, reviewBusy, reviewError, onT
         {groups.length === 0 ? (
           <p class="brain-note muted">No connected model can do this yet. Connect one on your Mac.</p>
         ) : null}
-        {saved ? <p class="brain-note switched">Saved. Applies to your next message.</p> : null}
+        {saved ? <p class="brain-note switched">{copy.saved ?? 'Saved. Applies to your next message.'}</p> : null}
         {error ? <p class="error brain-note">{error}</p> : null}
       </section>
     </div>

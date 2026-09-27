@@ -1,10 +1,12 @@
 import { CompletionReviewControl } from './CompletionReviewControl';
 import { ClaudeLoginForm } from './ClaudeLoginForm';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
-import { modelDisplayName } from '@clem/chat-engine';
+import { memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
+import { memoryTimeFormat } from '@/lib/memory-work';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -81,6 +83,19 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const mr = r.mr;
   const [newIntent, setNewIntent] = useState('');
   const [newIntentModel, setNewIntentModel] = useState('');
+  // The Memory tab's "Change" lands on the memory row. The row exists only once
+  // the settings read lands, after the page's own hash scroll has run.
+  const { hash } = useLocation();
+  const memoryRowReady = Boolean(mr?.roles.memory);
+  const [memoryLanded, setMemoryLanded] = useState(false);
+  useEffect(() => {
+    if (hash !== '#memory-model' || !memoryRowReady) return;
+    document.getElementById('memory-model')?.scrollIntoView({ block: 'center' });
+    // A short wash says "this is the row you came for", then lets go.
+    setMemoryLanded(true);
+    const timer = window.setTimeout(() => setMemoryLanded(false), 2_400);
+    return () => window.clearTimeout(timer);
+  }, [hash, memoryRowReady]);
   if (r.loading || !mr) return <Skeleton className="h-44 w-full" />;
   const settings = r.settings;
   const busy = r.busy;
@@ -119,6 +134,16 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const writer = mr.roles.writer;
   const judgeSharesWriterFamily = Boolean(writer && writer.source !== 'default' && writer.provider !== 'byo'
     && mr.roles.judge.provider === writer.provider);
+  // "Keeps your memory": Settings-only, shown when the daemon knows the role.
+  // Automatic names the memory route's OWN model (never the checker's); a
+  // chosen model that is gone leaves learning waiting, and the row says so.
+  const memory = mr.roles.memory;
+  const memoryFlat = r.memories;
+  const memoryPick = memory?.source === 'default' ? null : (memory?.modelId || memory?.inactiveBinding?.modelId || null);
+  const memoryMissingPick = memoryPick && !memoryFlat.some((m) => m.id === memoryPick) ? memoryPick : null;
+  // The memory route never substitutes a pick: an unavailable pick means
+  // learning waits (the daemon then names no model).
+  const memoryWaits = Boolean(memory?.inactiveBinding && !memory.modelId);
   const onCodexRescue = (value: string) => r.run('codex-rescue', () => patchCodexRescueModel(value === '__primary__' ? { clear: true } : { modelId: value }));
   const workerIntents = mr.bindings.filter((b) => b.role === 'worker' && b.whenIntent);
   const modelLabel = (id: string) => workerFlat.find((m) => m.id === id)?.label ?? id;
@@ -217,6 +242,42 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
               ? `Your saved choice is unavailable. ${fallback.reason || 'Connect it again or choose another fallback.'}`
               : fallback.mode === 'off' ? 'The checker reviews without a backup.' : 'Applies to new requests.'}
           </div>)}
+        {memory && (
+          <div
+            id="memory-model"
+            className={cn('grid scroll-mt-24 grid-cols-1 items-center gap-2 border-t border-border px-4 py-3 transition-colors duration-slow sm:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)] sm:gap-4', memoryLanded && 'bg-primary-tint')}
+          >
+            <div className="min-w-0">
+              <div className="text-body font-semibold text-fg">{ROLE_WORDS.memory.title}</div>
+              <div className="text-small text-muted">{ROLE_WORDS.memory.hint}</div>
+              {memory.source === 'default' && (
+                <div className="mt-1 text-caption text-muted">{memoryRoleAutomaticText(memory.follows ?? null, memory.modelId || null)}</div>
+              )}
+              {memoryWaits && memory.inactiveBinding && (
+                <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={memory.inactiveBinding.reason}>
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                  <span className="min-w-0">Your pick, {modelDisplayName(memory.inactiveBinding.modelId)}, isn’t available, so learning waits until it is back. Nothing is lost.</span>
+                </div>
+              )}
+              {!memoryWaits && memory.unavailable && (
+                // Automatic with nothing that can serve, or a pick that is out
+                // of quota or backing off: the same reason the Memory tab gives.
+                <div className="mt-1 flex items-center gap-1.5 text-caption text-warning">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                  <span className="min-w-0">{memoryModelUnavailableText(memory.unavailable, memory.modelId ? modelDisplayName(memory.modelId) : null, memoryTimeFormat(Date.now()))}</span>
+                </div>
+              )}
+              <Link to="/memory" className="mt-1 inline-block text-caption font-semibold text-primary hover:underline">See it at work in Memory</Link>
+            </div>
+            <div className="flex min-w-0 items-center gap-2 sm:justify-end [&>select]:w-full">
+              <Select disabled={busy === 'memory'} value={memoryPick ?? '__default__'} onChange={(e) => void r.onRole('memory', e.target.value)} aria-label="Model that keeps your memory">
+                <option value="__default__">Automatic{memory.source === 'default' && memory.modelId ? ` · ${modelDisplayName(memory.modelId)}` : ''}</option>
+                {memoryFlat.map((m) => <option key={`m-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
+                {memoryMissingPick && <option value={memoryMissingPick}>{modelDisplayName(memoryMissingPick)}{memoryWaits ? ' (unavailable)' : ''}</option>}
+              </Select>
+            </div>
+          </div>
+        )}
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
@@ -286,7 +347,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
         </details>
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-3 text-small">
-        {r.saved && <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies on the next message</span>}
+        {r.saved && <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> {r.saved === 'memory' ? 'Saved — the next memory job uses it' : 'Saved — applies on the next message'}</span>}
         {r.error && <span className="text-danger">{r.error}</span>}
         {mr.available.length === 0 && <span className="text-muted">No models connected yet — sign in or add a key under Connected.</span>}
       </div>
