@@ -392,8 +392,11 @@ export class ResilientModel implements Model {
     // A durable plan/model allowance cannot heal during exponential backoff.
     // Surface it immediately to the outer cross-provider chain.
     if (!cls.retryable || cls.sameProviderRetryable === false) return false;
+    const noAnswer = NO_ANSWER_KINDS.has(cls.kind);
     if (attempt >= this.maxRetries) {
-      markRetriesSpent(err);
+      // Other retries share the attempt count, so a no-answer failure that
+      // arrives on the last attempt is spent only if one of them was its own.
+      if (!noAnswer || call.noAnswerRetries >= 1) markRetriesSpent(err);
       return false;
     }
     const wait = backoffMs(attempt, cls);
@@ -403,7 +406,6 @@ export class ResilientModel implements Model {
     // no-answer retry is never withheld: one slow failure is still a single
     // blip, and an error marked spent must mean a no-answer retry really ran.
     // Other retries share the attempt count, so the call counts its own.
-    const noAnswer = NO_ANSWER_KINDS.has(cls.kind);
     if (noAnswer && call.noAnswerRetries >= 1 && cls.retryAfterMs == null && elapsed + wait > NO_ANSWER_RETRY_WALL_MS) {
       markRetriesSpent(err);
       logger.warn(
@@ -559,7 +561,7 @@ export class ResilientModel implements Model {
           operatorMessage: `${this.policy.label}: stream ended without response_done before content (attempts=${attempt + 1}).`,
           context: { label: this.policy.label, attempts: attempt + 1 },
         });
-        markRetriesSpent(ended);
+        if (call.noAnswerRetries >= 1) markRetriesSpent(ended);
         throw ended;
       }
       return; // committed + drained, or done emitted

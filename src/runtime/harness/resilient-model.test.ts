@@ -608,6 +608,41 @@ test('getStreamedResponse: after a rate-limit retry, a slow failure that repeats
   assert.equal(resilient.modelRetriesSpentBeforeContent(err), true);
 });
 
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  test(`${path}: a no-answer failure on the last attempt after only rate-limit retries is not marked spent`, async () => {
+    let calls = 0;
+    const attempt = (): void => {
+      calls += 1;
+      if (calls <= 3) throw { statusCode: 429 };
+      throw slowFailures['a reset socket']();
+    };
+    const inner = makeModel({
+      getResponse: async () => { attempt(); return resp([]); },
+      // eslint-disable-next-line require-yield
+      getStreamedResponse: async function* () { attempt(); },
+    });
+    const model = withResilience(inner, policy());
+    const run = path === 'getResponse' ? model.getResponse(req()) : collect(model.getStreamedResponse(req()));
+    const err = await run.then(() => assert.fail('must throw'), (e: unknown) => e);
+    assert.equal(calls, 4, 'the count budget ran out on rate limits');
+    assert.equal(resilient.modelRetriesSpentBeforeContent(err), false,
+      'no retry of a request that gave no answer ran, so the turn keeps its own retry');
+  });
+}
+
+test('getStreamedResponse: a stream that ends silently on the last attempt after only empty completions is not marked spent', async () => {
+  let calls = 0;
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      calls += 1;
+      if (calls <= 3) yield { type: 'response_done', response: { output: [] } } as any;
+    },
+  });
+  const err = await collect(withResilience(inner, policy()).getStreamedResponse(req())).then(() => assert.fail('must throw'), (e: unknown) => e);
+  assert.equal(calls, 4);
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), false);
+});
+
 test('getResponse: a connection that fails fast keeps the full retry count, and the spent failure is marked', async () => {
   const clock = { now: 0 };
   let calls = 0;

@@ -207,6 +207,21 @@ function rateLimited(): Response {
     { status: 429, headers: { 'content-type': 'application/json' } });
 }
 
+test('a dropped connection after only rate-limit retries keeps the turn\'s own retry, and the turn answers', async () => {
+  const session = HarnessSession.create({ kind: 'chat', title: 'rate limits then a drop recovers' });
+  fakeWire((attempt) => {
+    if (attempt <= 3) return rateLimited();
+    if (attempt === 4) return connectTimeout();
+    return answer('Here is the one-line summary.');
+  });
+  const result = await runChatTurn(session.id, productionBrain(session.id));
+  assert.equal(result.status, 'completed', 'one dropped connection is not a provider that keeps dropping');
+  assert.match(String(result.finalOutput), /one-line summary/);
+  assert.equal(wire.length, 5, 'the model boundary spent its count on rate limits; the turn retried the drop once');
+  assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0, 'no continuation question');
+  assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0);
+});
+
 test('a connection lost after reply text streamed is never replayed at the model boundary', async () => {
   fakeWire(() => answerThenDrop('Partial reply'));
   const brain = productionBrain('sess-transport-after-output');
