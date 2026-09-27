@@ -11,6 +11,7 @@ import { workflowParentActivation } from './workflow-parent-activation.js';
  */
 import { acceptedTaskMode } from './accepted-task-mode.js';
 import { appendEvent, finishRunAttempt, getKillRequest, getRunAttemptBySourceUserSeq } from './eventlog.js';
+import { recordAnswerWorkEpisode } from './work-episode-recording.js';
 import { createHash } from 'node:crypto';
 import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
@@ -1802,6 +1803,12 @@ export function commitTurnOutcome(
         sourceUserSeq: persisted.identity.sourceUserSeq,
       });
     } catch { /* strategy recall stays additive */ }
+    // The reviewed answer and where its results live, for a later chat to reuse with its age.
+    recordAnswerWorkEpisode({
+      sessionId: persisted.identity.sessionId,
+      sourceUserSeq: persisted.identity.sourceUserSeq,
+      text: persisted.text,
+    });
   }
   // NOTE: the run attempt is closed by the terminal publication itself, in the
   // same transaction (eventlog `terminalOwner` branch). A best-effort finish

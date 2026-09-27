@@ -2,6 +2,7 @@
  * an explicit operator policy, not a default memory/token optimization. */
 import { reapStaleChatCancellations, reapStaleSessions, reapStaleToolOutputs } from '../runtime/harness/eventlog.js';
 import { reapStaleWorkingMemory } from './working-memory.js';
+import { decayWorkEpisodes } from './work-episodes.js';
 
 export function automaticConversationRetentionPolicy(env: NodeJS.ProcessEnv = process.env): {
   sessionDays: number | null; toolOutputDays: number | null;
@@ -18,9 +19,9 @@ export function automaticConversationRetentionPolicy(env: NodeJS.ProcessEnv = pr
 export function reapConfiguredConversationHistory(input: {
   policy?: ReturnType<typeof automaticConversationRetentionPolicy>;
   onError?: (store: string, error: unknown) => void;
-} = {}): Record<'toolOutputs' | 'sessions' | 'cancellations' | 'workingMemory', number> {
+} = {}): Record<'toolOutputs' | 'sessions' | 'cancellations' | 'workingMemory' | 'workEpisodes', number> {
   const policy = input.policy ?? automaticConversationRetentionPolicy();
-  const result = { toolOutputs: 0, sessions: 0, cancellations: 0, workingMemory: 0 };
+  const result = { toolOutputs: 0, sessions: 0, cancellations: 0, workingMemory: 0, workEpisodes: 0 };
   const sweep = (key: keyof typeof result, action: () => number) => {
     try { result[key] = action(); } catch (error) { input.onError?.(key, error); }
   };
@@ -30,5 +31,8 @@ export function reapConfiguredConversationHistory(input: {
     sweep('cancellations', () => reapStaleChatCancellations(policy.sessionDays!));
     sweep('workingMemory', () => reapStaleWorkingMemory(policy.sessionDays!));
   }
+  // Work episodes are a cache, not history: they decay on their own clock,
+  // with no operator policy (owner, 2026-09-26: track everything, let it decay).
+  sweep('workEpisodes', () => { const d = decayWorkEpisodes(); return d.summarized + d.deleted; });
   return result;
 }

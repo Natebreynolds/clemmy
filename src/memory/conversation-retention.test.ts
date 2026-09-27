@@ -33,7 +33,7 @@ test('automatic maintenance keeps aged conversation, exact results, Stop and wor
   writeFileSync(file, 'Complete old working memory.');
   utimesSync(file, new Date(old), new Date(old));
   assert.deepEqual(retention.reapConfiguredConversationHistory({ policy: retention.automaticConversationRetentionPolicy({}) }),
-    { toolOutputs: 0, sessions: 0, cancellations: 0, workingMemory: 0 });
+    { toolOutputs: 0, sessions: 0, cancellations: 0, workingMemory: 0, workEpisodes: 0 });
   eventlog.closeEventLog();
   assert.ok(eventlog.getSession(session.id));
   assert.equal(eventlog.listEvents(session.id)[0]?.data.text, 'Remember the full old conversation.');
@@ -51,7 +51,7 @@ test('automatic maintenance keeps aged conversation, exact results, Stop and wor
     onError: (store, error) => failures.push({ store, error }),
   });
   assert.deepEqual(failures, []);
-  assert.deepEqual(reaped, { toolOutputs: 2, sessions: 1, cancellations: 1, workingMemory: 1 });
+  assert.deepEqual(reaped, { toolOutputs: 2, sessions: 1, cancellations: 1, workingMemory: 1, workEpisodes: 0 });
   assert.equal(eventlog.getSession(session.id), null);
   assert.equal(eventlog.getHarnessChatCancellation('old-stop'), null);
   assert.equal(existsSync(file), false);

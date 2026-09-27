@@ -19,6 +19,7 @@ import { digestSchema } from './tool-contract-store.js';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../shared/closed-canonical-json.js';
 import { validateProofProviderArguments } from '../runtime/harness/proof-provider-args.js';
 import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { recordPlanWorkEpisode } from '../runtime/harness/work-episode-recording.js';
 import { validatePlanArgumentPreparation } from './plan-argument-preparation.js';
 import type { HostCapabilityDescriptorV1 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import { PlanCollectionSchema, reviewedCollectionMembers, bindReviewedCollectionItem, planCollectionUniverseId, reviewedCollectionRoot, type PlanCollection } from '../runtime/harness/reviewed-plan-collection.js';
@@ -654,6 +655,8 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
         ...candidate,
         ...(typeof routed?.data.model === 'string' ? { authorModelId: routed.data.model } : {}),
         ...(baseRefJson ? { base: parsePlanRevisionRef(JSON.parse(baseRefJson)) } : {}) });
+      // A published plan is finished work a later chat can pick up (memory, never a grant).
+      recordPlanWorkEpisode(artifact);
       return publicationReceipt(artifact);
     },
   });
