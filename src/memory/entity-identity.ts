@@ -162,12 +162,26 @@ function chooseCanonicalPerson(db: Database.Database, ids: number[]): number {
   return rows[0]?.id ?? ids[0];
 }
 
+// One prepared redirect lookup per connection: the link sync, the grounding
+// index and recall's edge readers call this once per linked id, so preparing
+// it on every call cost more than the lookup itself.
+const redirectLookups = new WeakMap<Database.Database, Database.Statement>();
+
+function redirectLookup(db: Database.Database): Database.Statement {
+  let lookup = redirectLookups.get(db);
+  if (!lookup) {
+    lookup = db.prepare('SELECT canonical_entity_id FROM entity_redirects WHERE source_entity_id = ?');
+    redirectLookups.set(db, lookup);
+  }
+  return lookup;
+}
+
 /** Follow redirect chains on an explicitly supplied database handle. Release
  * rehearsal uses this variant so identity repair can run entirely on a clone. */
 export function resolveCanonicalEntityIdInDatabase(db: Database.Database, entityId: number): number {
   let current = entityId;
   const seen = new Set<number>();
-  const lookup = db.prepare('SELECT canonical_entity_id FROM entity_redirects WHERE source_entity_id = ?');
+  const lookup = redirectLookup(db);
   while (!seen.has(current)) {
     seen.add(current);
     const row = lookup.get(current) as { canonical_entity_id: number } | undefined;

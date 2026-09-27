@@ -511,10 +511,13 @@ export function finalizeGroundedEntityLinksOnBoot(): BootGroundedGraphFinalizati
     return { candidatesBefore: 0, ran: false, backupPath: null, reason: 'already_finalized', reconciliation: null };
   }
   const candidatesBefore = Number((db.prepare(`
-    SELECT COUNT(DISTINCT cf.id) AS count
+    SELECT COUNT(*) AS count
     FROM consolidated_facts cf
-    JOIN fact_entities fe ON fe.fact_id = cf.id AND fe.link_type = 'inferred_text'
     WHERE EXISTS (
+      SELECT 1 FROM fact_entities fe
+      WHERE fe.fact_id = cf.id AND +fe.link_type = 'inferred_text'
+    )
+    AND EXISTS (
       SELECT 1 FROM fact_evidence fve
       JOIN memory_episodes me ON me.id = fve.episode_id
       WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0
@@ -574,10 +577,13 @@ export function finalizeGroundedResourceLinksOnBoot(): BootGroundedResourceFinal
     return { candidatesBefore: 0, ran: false, backupPath: null, reason: 'already_finalized', reconciliation: null };
   }
   const candidatesBefore = Number((db.prepare(`
-    SELECT COUNT(DISTINCT cf.id) AS count
+    SELECT COUNT(*) AS count
     FROM consolidated_facts cf
-    JOIN fact_resources fr ON fr.fact_id = cf.id AND fr.link_type = 'inferred_text'
     WHERE EXISTS (
+      SELECT 1 FROM fact_resources fr
+      WHERE fr.fact_id = cf.id AND +fr.link_type = 'inferred_text'
+    )
+    AND EXISTS (
       SELECT 1 FROM fact_evidence fve
       JOIN memory_episodes me ON me.id = fve.episode_id
       WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0
