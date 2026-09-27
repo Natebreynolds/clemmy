@@ -462,14 +462,18 @@ function largestEmbeddedStoredJson(raw: string): string | null {
 }
 
 /**
- * The leading run of complete objects of an array of objects, in order: in
+ * The leading run of complete objects of an array of objects, in order, and
+ * whether it reached the array's closing bracket: in
  * the first `[` whose first element is an object, each element that is a
  * whole, parseable object, stopping at the first element that is not (an
  * invalid row, a non-object value, or the clip). Every returned row sits at
  * its own index, so the rows really are the array's prefix; an invalid row in
  * the middle ends the prefix rather than leaving a gap.
  */
-function leadingArrayObjects(raw: string, maxObjects: number): Array<Record<string, unknown>> {
+function leadingArrayObjects(
+  raw: string,
+  maxObjects: number,
+): { objects: Array<Record<string, unknown>>; complete: boolean } {
   const isSpace = (char: string | undefined) => char === ' ' || char === '\n' || char === '\r' || char === '\t';
   for (let open = raw.indexOf('['); open >= 0; open = raw.indexOf('[', open + 1)) {
     let index = open + 1;
@@ -494,12 +498,22 @@ function leadingArrayObjects(raw: string, maxObjects: number): Array<Record<stri
       objects.push(value as Record<string, unknown>);
       index = end + 1;
       while (isSpace(raw[index])) index += 1;
+      if (raw[index] === ']') return { objects, complete: true };
       if (raw[index] !== ',') break;
       index += 1;
     }
-    return objects;
+    return { objects, complete: false };
   }
-  return [];
+  return { objects: [], complete: false };
+}
+
+function stdoutIsExactJson(stdout: string): boolean {
+  try {
+    JSON.parse(stdout.trim());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Index of the `}` closing the object that opens at `start`, string-aware;
@@ -539,9 +553,11 @@ function balancedObjectEnd(raw: string, start: number): number {
  * holds, and a reader that calls prose data answers from a fragment; both are
  * worse than an honest "this is text".
  *
- * Order: the exact parse; for a shell envelope, its stdout parsed exactly, then
- * its first stdout candidate, then the complete objects of a clipped stdout
- * array (marked as a prefix), and only then the embedded scan of stdout; for
+ * Order: the exact parse; for a shell envelope, its stdout parsed exactly (or
+ * the shell parser's candidate when record-shaped), then its first
+ * record-shaped stdout candidate, then the leading complete objects of a
+ * stdout array (marked as a prefix unless the array closed), and only then the
+ * embedded scan of stdout; for
  * any other output, the embedded scan of the whole text.
  */
 export function parseStoredToolOutputJson(
@@ -557,7 +573,10 @@ export function parseStoredToolOutputJson(
   if (shell) {
     // A run_shell_command wrapper (`exit_code:/stdout:/stderr:`) around a
     // `--json` payload (sf, gh, aws…): the data is structured, the envelope is not.
-    if (shell.stdout_json !== undefined) {
+    // Stdout that is exactly JSON is taken whole; a candidate the shell parser
+    // found beside prose must be record-shaped like any embedded payload.
+    if (shell.stdout_json !== undefined
+      && (stdoutIsExactJson(shell.stdout) || isRecordShapedPayload(shell.stdout_json))) {
       return { value: shell.stdout_json, via: 'shell_stdout' };
     }
     const embeddedStdout = acceptedStoredPayload(
@@ -567,10 +586,12 @@ export function parseStoredToolOutputJson(
       return { value: JSON.parse(embeddedStdout) as unknown, via: 'shell_embedded' };
     }
     // A clipped or partly invalid array: recover the complete objects written
-    // so far, and say they are a prefix.
-    const objects = leadingArrayObjects(shell.stdout, 200);
-    if (objects.length > 0) {
-      return { value: objects, via: 'shell_objects', partialArrayPrefix: true };
+    // so far, and say they are a prefix. An array read to its closing bracket
+    // is the whole array, not a prefix.
+    const leading = leadingArrayObjects(shell.stdout, 200);
+    if (leading.complete) return { value: leading.objects, via: 'shell_embedded' };
+    if (leading.objects.length > 0) {
+      return { value: leading.objects, via: 'shell_objects', partialArrayPrefix: true };
     }
     const scanned = largestEmbeddedStoredJson(shell.stdout);
     return scanned === null ? null : { value: JSON.parse(scanned) as unknown, via: 'shell_embedded' };

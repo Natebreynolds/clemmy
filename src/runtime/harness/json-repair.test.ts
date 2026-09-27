@@ -459,3 +459,22 @@ test('host CLI envelope: a failed or non-JSON run is reported as what it was, ne
   assert.equal(readHostCliEnvelope('{"status":0}'), null);
   assert.equal(readHostCliEnvelope(null), null);
 });
+
+test('stored output: a bracketed number in shell prose is not the shell payload', () => {
+  // The shell parser's first stdout candidate can be a count or a citation in
+  // the prose before the data. Only stdout that is exactly JSON is taken
+  // whole; a candidate beside prose must be record-shaped like any other.
+  const shell = (stdout: string) => ['exit_code: 0', 'stdout:', stdout].join('\n');
+  const counted = parseStoredToolOutputJson(shell('Fetched [2] rows.\n[{"id":1},{"id":2}]'), { shell: parseShellToolOutput });
+  assert.ok(counted);
+  assert.deepEqual(counted.value, [{ id: 1 }, { id: 2 }]);
+  assert.notEqual(counted.partialArrayPrefix, true, 'a whole array is not labelled a prefix');
+
+  const cited = parseStoredToolOutputJson(shell('See [[1]] note.\nNo data today.'), { shell: parseShellToolOutput });
+  assert.equal(cited, null);
+
+  const scalar = parseStoredToolOutputJson(shell('42'), { shell: parseShellToolOutput });
+  assert.ok(scalar);
+  assert.equal(scalar.via, 'shell_stdout', 'stdout that is exactly JSON is taken whole, whatever its shape');
+  assert.equal(scalar.value, 42);
+});
