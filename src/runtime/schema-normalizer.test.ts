@@ -64,10 +64,10 @@ test('compactAdvertisedJsonSchema drops converter artifacts without changing wha
   assert.deepEqual(compactAdvertisedJsonSchema(compact), compact);
 });
 
-test('a standard string format is advertised by its name; the regex zod writes beside it is dropped and the parser still refuses', () => {
+test('a standard string format is advertised by its name when the regex beside it is zod\'s own spelling of that format; the parser still refuses', () => {
   const schema = z.object({
     after: z.string().datetime({ offset: true }).nullish(),
-    email: z.string().email(),
+    day: z.string().date(),
     id: z.string().regex(/^[A-Z]{3}$/),
     custom: z.string().regex(/^x/).describe('a pattern with no standard format is contract'),
   });
@@ -76,16 +76,45 @@ test('a standard string format is advertised by its name; the regex zod writes b
   assert.ok(containsKey(raw.after, 'pattern'), 'zod writes its date-time regex beside the format');
   const compact = compactAdvertisedJsonSchema(advertised) as { properties: Record<string, Record<string, unknown>> };
   assert.deepEqual(compact.properties.after, { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] });
-  assert.deepEqual(compact.properties.email, { type: 'string', format: 'email' });
+  assert.deepEqual(compact.properties.day, { type: 'string', format: 'date' });
   assert.equal(compact.properties.id!.pattern, '^[A-Z]{3}$', 'a pattern that is the only statement of the grammar stays');
   assert.equal(compact.properties.custom!.pattern, '^x');
   assert.ok(
     Buffer.byteLength(JSON.stringify(compact)) < Buffer.byteLength(JSON.stringify(advertised)) - 300,
-    'the date-time and email grammars are the bulk of the raw bytes',
+    'the date-time and date grammars are the bulk of the raw bytes',
   );
   assert.deepEqual(compactAdvertisedJsonSchema(compact), compact);
-  assert.equal(schema.safeParse({ after: 'yesterday', email: 'a@b.co', id: 'ABC', custom: 'x' }).success, false,
+  assert.equal(schema.safeParse({ after: 'yesterday', day: '2026-09-27', id: 'ABC', custom: 'x' }).success, false,
     'the registered parser still refuses what the dropped regex described');
+});
+
+test('a pattern that narrows or differs from its format stays in the advert', () => {
+  // Regression: every pattern beside a standard format was dropped, so a
+  // Z-only date-time was advertised as accepting any offset.
+  const schema = z.object({
+    zulu: z.string().datetime(),
+    local: z.string().datetime({ local: true }),
+    email: z.string().email(),
+    uuid: z.string().uuid(),
+  });
+  const advertised = z.toJSONSchema(schema) as { properties: Record<string, Record<string, unknown>> };
+  const compact = compactAdvertisedJsonSchema(advertised) as { properties: Record<string, Record<string, unknown>> };
+  for (const key of ['zulu', 'local', 'email', 'uuid']) {
+    assert.equal(typeof advertised.properties[key]!.pattern, 'string', `zod writes a pattern for ${key}`);
+    assert.equal(compact.properties[key]!.pattern, advertised.properties[key]!.pattern, `${key} keeps the grammar its format name does not state`);
+  }
+  assert.equal(schema.shape.zulu.safeParse('2026-09-27T10:00:00+02:00').success, false, 'the Z-only parser refuses an offset');
+
+  // A provider's raw JSON schema: a narrowing pattern beside a standard
+  // format is the provider's contract, not a converter artifact.
+  const provider = {
+    type: 'object',
+    properties: {
+      start: { type: 'string', format: 'date', pattern: '^20\\d{2}-\\d{2}-01$' },
+      at: { type: 'string', format: 'date-time', pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$' },
+    },
+  };
+  assert.deepEqual(compactAdvertisedJsonSchema(provider), provider);
 });
 
 test('normalizeZodForCodexStrict rewrites records without JSON Schema propertyNames', () => {

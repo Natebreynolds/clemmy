@@ -439,11 +439,19 @@ function flattenAnyOfAlternatives(alternatives: readonly unknown[]): unknown[] {
   });
 }
 
-// JSON Schema string formats whose name alone states the whole grammar. zod
-// advertises each twice: as `format` and again as its own regex for it.
-const ADVERTISED_SELF_DESCRIBING_STRING_FORMATS = new Set([
-  'date-time', 'date', 'time', 'duration', 'email', 'uuid', 'ipv4', 'ipv6',
-]);
+// A `pattern` beside a string `format` is dropped only when it is exactly the
+// regex zod writes for its own spelling of that format, so the format name
+// already states the grammar the parser accepts. Any other pattern beside a
+// format narrows it (zod's Z-only or zone-free date-time, its practical email
+// and versioned uuid, a provider's own pattern) and stays in the advert.
+const ADVERTISED_FORMAT_EQUIVALENT_PATTERNS: ReadonlyMap<string, string> = new Map(
+  [z.string().datetime({ offset: true }), z.string().date()].flatMap((schema) => {
+    const advertised = z.toJSONSchema(schema) as { format?: unknown; pattern?: unknown };
+    return typeof advertised.format === 'string' && typeof advertised.pattern === 'string'
+      ? [[advertised.format, advertised.pattern] as const]
+      : [];
+  }),
+);
 
 function compactAdvertisedSchemaNode(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(compactAdvertisedSchemaNode);
@@ -451,7 +459,8 @@ function compactAdvertisedSchemaNode(value: unknown): unknown {
   const node = value as Record<string, unknown>;
   const formatNamesGrammar = node.type === 'string'
     && typeof node.format === 'string'
-    && ADVERTISED_SELF_DESCRIBING_STRING_FORMATS.has(node.format);
+    && typeof node.pattern === 'string'
+    && ADVERTISED_FORMAT_EQUIVALENT_PATTERNS.get(node.format) === node.pattern;
   const out: Record<string, unknown> = {};
   for (const [key, nested] of Object.entries(node)) {
     if (ADVERTISED_SCHEMA_INSTANCE_VALUE_KEYS.has(key)) {
@@ -496,8 +505,9 @@ function compactAdvertisedSchemaNode(value: unknown): unknown {
  *   - `anyOf[anyOf[T,null],null]`, zod's spelling of `.nullable().optional()`,
  *     which is exactly `anyOf[T,null]`;
  *   - the safe-integer `minimum`/`maximum` sentinels zod adds to a bare `.int()`;
- *   - the regex zod writes beside a standard string `format` (date-time, email,
- *     uuid, …) whose name already states that grammar.
+ *   - the regex zod writes for its own spelling of a standard string `format`
+ *     (an offset date-time, a date), whose name already states that grammar.
+ *     A pattern that narrows or differs from its format stays.
  * Nothing the schema accepts or rejects changes; only its byte count does.
  */
 export function compactAdvertisedJsonSchema(schemaValue: unknown): unknown {
