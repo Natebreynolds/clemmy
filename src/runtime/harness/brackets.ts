@@ -1143,10 +1143,10 @@ export class RecallBudget {
    */
   consume(returnBytes: number, callId?: string): string | null {
     if (this.calls + 1 > this.maxCalls) {
-      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId, this.refusedAfterRecall())}`;
+      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId, this.refusedAfterRecall(), { bareQueryRefused: !this.canServeQuery() })}`;
     }
     if (this.bytes + returnBytes > this.maxBytes) {
-      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId, this.refusedAfterRecall())}`;
+      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId, this.refusedAfterRecall(), { bareQueryRefused: !this.canServeQuery() })}`;
     }
     this.calls += 1;
     this.bytes += returnBytes;
@@ -1170,21 +1170,23 @@ export class RecallBudget {
     return this.remainingBytes() >= RecallBudget.QUERY_MIN_REPLY_BYTES;
   }
 
-  /** Readers a recall refusal must not name: recall itself, and the query
-   * once the bytes left cannot hold a minimal query reply. */
+  /** Readers a recall refusal must not name: recall itself. The query stays
+   * open: a named page spends no reading bytes, so a refusal names that form
+   * once a bare reply no longer fits. */
   refusedAfterRecall(): string[] {
-    return this.canServeQuery() ? ['recall_tool_result'] : ['recall_tool_result', 'tool_output_query'];
+    return ['recall_tool_result'];
   }
 
   /**
-   * The refusal a query reply of `returnBytes` would meet, without charging
-   * it; null when it fits. A query that cannot fit is sent to a reader that
-   * spends no reading bytes, never back to recall or to itself.
+   * The refusal a bare query reply of `returnBytes` would meet, without
+   * charging it; null when it fits. It is sent to a named page or a passage
+   * search, which spend no reading bytes, never back to recall or to a bare
+   * query.
    */
   queryRefusal(returnBytes: number, callId?: string): string | null {
     if (this.bytes + returnBytes <= this.maxBytes) return null;
     return `reading byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). `
-      + this.wayThrough(callId, ['recall_tool_result', 'tool_output_query']);
+      + this.wayThrough(callId, ['recall_tool_result'], { bareQueryRefused: true });
   }
 
   /** Charge a query reply's bytes. Returns the refusal when it does not fit. */
@@ -1203,30 +1205,25 @@ export class RecallBudget {
    * refuses. No reader names its own successor, so no two readers can send
    * the model back and forth between each other.
    */
-  private wayThrough(callId: string | undefined, refused: readonly string[]): string {
-    const stop = `Do NOT retry ${refused.join(' or ')} — ${refused.length > 1 ? 'they' : 'it'} will refuse again this turn.`;
+  private wayThrough(callId: string | undefined, refused: readonly string[], opts: { bareQueryRefused?: boolean } = {}): string {
+    const named = opts.bareQueryRefused ? [...refused, 'a bare tool_output_query'] : [...refused];
+    const stop = `Do NOT retry ${named.join(' or ')} — ${named.length > 1 ? 'they' : 'it'} will refuse again this turn.`;
     // Without a session the routes cannot be computed, so name a reader over
-    // the same stored output that this budget does not refuse; its own
-    // refusal computes the correct successor and excludes itself.
+    // the same stored output that this budget does not refuse; its own reply
+    // computes the correct successor.
     if (!callId || !this.sessionId) {
-      if (refused.includes('tool_output_query')) {
-        const exact = callId
-          ? `file_query {"call_id":"${callId}","query":"<what you need>"}`
-          : 'file_query with that same call_id';
-        return `${stop} Call ${exact} instead — it searches the SAME stored output server-side `
-          + 'and spends no reading bytes.';
-      }
       const exact = callId
-        ? `tool_output_query {"call_id":"${callId}"}`
-        : 'tool_output_query with that same call_id';
-      return `${stop} Call ${exact} instead — it reads the SAME stored output `
-        + 'server-side and spends no recall calls.';
+        ? `tool_output_query {"call_id":"${callId}"${opts.bareQueryRefused ? ',"limit":20' : ''}}`
+        : `tool_output_query with that same call_id${opts.bareQueryRefused ? ' and a limit' : ''}`;
+      return `${stop} Call ${exact} instead — it reads the SAME stored output server-side`
+        + (opts.bareQueryRefused ? ', and a named page spends no reading bytes.' : ' and spends no recall calls.');
     }
     return `${stop} ${retainedResultWayThrough({
       sessionId: this.sessionId,
       callId,
       exclude: refused,
       recallCallsRemaining: 0,
+      readingBytesSpent: opts.bareQueryRefused === true,
     })}`;
   }
 

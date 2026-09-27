@@ -469,6 +469,7 @@ function readRetainedTextSlice(
       sessionId: ctx.sessionId,
       callId,
       exclude: ctx.recallBudget?.refusedAfterRecall() ?? ['recall_tool_result'],
+      readingBytesSpent: !(ctx.recallBudget?.canServeQuery() ?? true),
     })[0]
     : undefined;
   const header = [

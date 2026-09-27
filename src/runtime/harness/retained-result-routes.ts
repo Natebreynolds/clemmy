@@ -53,7 +53,13 @@ export interface RetainedResultRouteInput {
   readonly exclude?: readonly string[];
   /** Recall calls still available this turn, when the caller knows. */
   readonly recallCallsRemaining?: number;
+  /** The turn's reading bytes cannot hold a bare query reply: name the query
+   *  as a named page, which spends none. */
+  readonly readingBytesSpent?: boolean;
 }
+
+/** The page size a route names when a bare query could not be served. */
+const NAMED_QUERY_PAGE = 20;
 
 /** What the readers can do with one retained output, judged from its bytes
  * and from file_query's own query check. */
@@ -204,11 +210,17 @@ export function retainedResultRoutes(
 
   // Structured rows: the server-side query is the cheap, unclipped read.
   if (structured && !excluded.has('tool_output_query')) {
-    routes.push({
-      tool: 'tool_output_query',
-      call: `tool_output_query {"call_id":"${readId}"}`,
-      why: 'this output holds structured records, which it can filter, project and page server-side; a named page or projection spends no recall budget',
-    });
+    routes.push(input.readingBytesSpent
+      ? {
+        tool: 'tool_output_query',
+        call: `tool_output_query {"call_id":"${readId}","limit":${NAMED_QUERY_PAGE}}`,
+        why: 'this output holds structured records, and a named page (limit or fields) spends no reading bytes',
+      }
+      : {
+        tool: 'tool_output_query',
+        call: `tool_output_query {"call_id":"${readId}"}`,
+        why: 'this output holds structured records, which it can filter, project and page server-side; a named page or projection spends no recall budget',
+      });
   }
 
   // Text: recall reads it, but only while its per-turn budget allows.

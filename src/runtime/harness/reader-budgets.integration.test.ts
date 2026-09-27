@@ -342,7 +342,7 @@ test('a record larger than the whole reply is clipped inside the bound and still
   assert.ok(shown.includes('Next: tool_output_query {"call_id":"parked-big","offset":1}'), 'the exact next query survives the clip');
 });
 
-test('a recall refused for bytes never routes to a query the same byte budget would refuse', async () => {
+test('a recall refused for bytes names the named query page, which spends no reading bytes', async () => {
   const { results } = await runHostTurn({
     agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', seed: parkRows,
     recallBudget: (sessionId) => new brackets.RecallBudget(10, 900, sessionId),
@@ -350,11 +350,11 @@ test('a recall refused for bytes never routes to a query the same byte budget wo
   });
   const shown = results.get('recall-spent') ?? '';
   assert.match(shown, /^ERROR: recall byte budget exhausted/, shown.slice(0, 300));
-  assert.match(shown, /file_query \{"call_id":"parked-rows"/, shown);
-  assert.doesNotMatch(shown, /tool_output_query \{/, 'the query would refuse: fewer than one minimal reply of bytes remain');
+  assert.match(shown, /tool_output_query \{"call_id":"parked-rows","limit":20\}/, shown);
+  assert.match(shown, /a bare tool_output_query/, 'the bare form is the one that would refuse');
 });
 
-test('a recall refused for calls with its bytes spent too never routes to the query either', async () => {
+test('a recall refused for calls with its bytes spent too still names the named query page', async () => {
   const { results } = await runHostTurn({
     agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', seed: parkRows,
     recallBudget: (sessionId) => new brackets.RecallBudget(1, 1_050, sessionId),
@@ -366,8 +366,23 @@ test('a recall refused for calls with its bytes spent too never routes to the qu
   assert.match(results.get('recall-small') ?? '', /^Recalled chars 0–100/);
   const shown = results.get('recall-over') ?? '';
   assert.match(shown, /^ERROR: recall budget exhausted this turn \(max 1 calls\)/, shown.slice(0, 300));
-  assert.match(shown, /file_query \{"call_id":"parked-rows"/, shown);
-  assert.doesNotMatch(shown, /tool_output_query \{/, shown);
+  assert.match(shown, /tool_output_query \{"call_id":"parked-rows","limit":20\}/, shown);
+});
+
+test('a bare query refused for bytes names a named page, and that named page is served in the same turn', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkRows,
+    recallBudget: (sessionId) => new brackets.RecallBudget(10, 900, sessionId),
+    calls: [
+      { callId: 'bare-refused', args: { call_id: 'parked-rows' } },
+      { callId: 'named-served', args: { call_id: 'parked-rows', limit: 5 } },
+    ],
+  });
+  const refused = results.get('bare-refused') ?? '';
+  assert.match(refused, /^ERROR: reading byte budget exhausted/, refused.slice(0, 300));
+  assert.match(refused, /tool_output_query \{"call_id":"parked-rows","limit":20\}/, refused);
+  assert.match(refused, /Do NOT retry recall_tool_result or a bare tool_output_query —/, 'only the bare form is closed, never the query');
+  assert.match(results.get('named-served') ?? '', /^Showing 5 record\(s\) \[0–5\] of 60/);
 });
 
 test('while a minimal query reply still fits, a recall refused for bytes names the query, and that query is served', async () => {
