@@ -270,7 +270,7 @@ export async function judgeWorkflowTarget(
       : []),
   ].join('\n');
   try {
-    const verdict = await withJudgeTimeout(judge(objectivePrompt, deliverable, (evidence || opts.reviewPolicy) ? {
+    const verdict = await withJudgeTimeout('workflow_objective', () => judge(objectivePrompt, deliverable, (evidence || opts.reviewPolicy) ? {
       skills: [], fullSourceEvidence: Boolean(evidence), toolCallSummary: evidence?.summary ?? '',
       ...(evidence?.results ? { verifiedReadResults: evidence.results } : {}),
       ...(evidence?.evidence ? { evidence: evidence.evidence } : {}),

@@ -1,6 +1,5 @@
 import type { ResolvedRoleModel } from './model-roles.js';
 import { classifyModelError } from './resilient-model.js';
-import { withOwnModelRequestAttribution } from '../usage-log.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
 import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
@@ -1077,13 +1076,11 @@ export async function runHedgedJudge<T>(
       routing = debate.resolveBoundaryJudge(selection, opts.reviewedAuthor);
       hedgeRouting = debate.resolveBoundaryJudgeHedge(routing, selection);
     }
-    // Every attempt is attributed to its lane so the usage log can rank judge
-    // spend per lane; the turn's own session/source attribution is preserved.
-    const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (): Promise<T> => withOwnModelRequestAttribution<Promise<T>>(
-      { channel: `judge:${lane}`, role: 'reviewer' },
-      () => runRoutedJudgeAttempt<T>(
-        r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence, signal, opts.effort,
-      ),
+    // The hedge seam runs every attempt as the lane's own reviewer request, so
+    // the usage log can rank judge spend per lane while the turn's own
+    // session/source attribution is preserved.
+    const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (): Promise<T> => runRoutedJudgeAttempt<T>(
+      r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence, signal, opts.effort,
     );
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -1125,7 +1122,7 @@ export async function runHedgedJudge<T>(
         const controller = new AbortController();
         const signal = callerCancelSignal ? AbortSignal.any([controller.signal, callerCancelSignal]) : controller.signal;
         const result = await withJudgeHedge(attempt(route, signal), null,
-          { timeoutMs: opts.timeoutMs ?? route.timeoutMs });
+          { lane, timeoutMs: opts.timeoutMs ?? route.timeoutMs });
         const settled = { ...result, errors: [...result.errors] };
         if (result.value === null) controller.abort();
         callerCancelSignal?.throwIfAborted();
@@ -1153,7 +1150,7 @@ export async function runHedgedJudge<T>(
       raced = await withJudgeHedge(
         primaryAttempt,
         hedgeRouting ? attempt(hedgeRouting) : null,
-        effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {},
+        { lane, ...(effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {}) },
       );
     }
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : answering;

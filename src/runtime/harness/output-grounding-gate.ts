@@ -414,7 +414,7 @@ async function runOutputGroundingJudge(claims: NumericClaim[], sources: Groundin
   const raced = await withJudgeHedge(
     attempt(routing),
     hedgeRouting ? attempt(hedgeRouting) : null,
-    routing.timeoutMs ? { timeoutMs: routing.timeoutMs } : {},
+    { lane: 'output_grounding', ...(routing.timeoutMs ? { timeoutMs: routing.timeoutMs } : {}) },
   );
   if (raced.value) {
     const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : routing;

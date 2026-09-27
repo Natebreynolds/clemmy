@@ -15,7 +15,7 @@ for (const [name, src] of [['goal-fidelity-gate', GOAL], ['output-grounding-gate
   test(`${name} passes the routing deadline to withJudgeHedge`, () => {
     assert.match(
       src,
-      /withJudgeHedge\(\s*attempt\(routing\),\s*hedgeRouting \? attempt\(hedgeRouting\) : null,\s*routing\.timeoutMs \? \{ timeoutMs: routing\.timeoutMs \} : \{\},\s*\)/,
+      /withJudgeHedge\(\s*attempt\(routing\),\s*hedgeRouting \? attempt\(hedgeRouting\) : null,\s*\{ lane: '[a-z_]+', \.\.\.\(routing\.timeoutMs \? \{ timeoutMs: routing\.timeoutMs \} : \{\}\) \},\s*\)/,
       'the honoured exact-pin deadline must reach the hedge',
     );
   });

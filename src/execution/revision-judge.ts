@@ -65,7 +65,7 @@ export async function judgeRevisionWithModel(input: {
       ...(input.previous ? [`Previous draft:\n${clip(input.previous)}`] : []),
       `Revised draft:\n${clip(renderRevisionText(input.revised))}`,
     ].join('\n\n');
-    const result = await withJudgeTimeout(run(agent, prompt));
+    const result = await withJudgeTimeout('revision', () => run(agent, prompt));
     const parsed = parseRevisionModelVerdict(String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? ''));
     return { ...parsed, modelId: judge.modelId };
   } catch (error) {

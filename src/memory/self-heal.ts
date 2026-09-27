@@ -682,7 +682,7 @@ async function judgeMemoryFixWithModel(fix: ProposedMemoryFix): Promise<{ verdic
       'Target facts:',
       ...rows.map((r) => `#${r.id} kind=${r.kind} trust=${r.trust_level ?? 'null'} pinned=${r.pinned} active=${r.active}: ${r.content.slice(0, MAX_JUDGED_TEXT)}`),
     ].join('\n');
-    const result = await withJudgeTimeout(run(agent, prompt));
+    const result = await withJudgeTimeout('memory_fix', () => run(agent, prompt));
     return parseMemoryVetoVerdict(String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? ''));
   } catch (err) {
     noteMemoryModelFailure(err);

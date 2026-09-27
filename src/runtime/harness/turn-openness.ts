@@ -301,7 +301,8 @@ export async function resolveTurnOpenness(input: TurnOpennessInput): Promise<Tur
     // test/alternate ports are part of user-visible latency too, not exempt
     // setup before an inner provider-only timer begins.
     judged = (await withJudgeTimeout(
-      Promise.resolve().then(() => (judgeOverride ?? runOpennessJudge)(input)),
+      'turn_openness',
+      () => Promise.resolve().then(() => (judgeOverride ?? runOpennessJudge)(input)),
       turnOpennessTimeoutMs(),
     )) ?? null;
   } catch {

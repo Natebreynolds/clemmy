@@ -220,7 +220,7 @@ async function judgeCorrectionWithModel(
       ...input.targetFacts.map((f) => `#${f.id}: ${f.content.slice(0, 200)}`),
       `User's latest message: ${input.correction.slice(0, 600)}`,
     ].join('\n');
-    const result = await withJudgeTimeout(run(agent, prompt));
+    const result = await withJudgeTimeout('memory_correction', () => run(agent, prompt));
     return parseCorrectionVerdict(String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? ''));
   } catch (err) {
     const { noteMemoryModelFailure } = await import('./memory-job-context.js');

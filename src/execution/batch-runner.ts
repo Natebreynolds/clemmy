@@ -440,7 +440,7 @@ export async function certifyBatchPlan(plan: BatchPlan): Promise<BatchCertificat
       hedgeRouting ? () => runJudgeOnce(hedgeRouting) : null,
       // Batch certification must pay the selected route's deadline too, or a
       // pinned flagship certifier fails open on the short default.
-      primary?.timeoutMs ? { timeoutMs: primary.timeoutMs } : {},
+      { lane: 'certify', ...(primary?.timeoutMs ? { timeoutMs: primary.timeoutMs } : {}) },
     );
     if (raced.value) {
       if (raced.winner === 'hedge' && hedgeRouting) routing = hedgeRouting;
