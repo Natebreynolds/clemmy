@@ -560,6 +560,34 @@ test('a remembered run that only shares words is checked, and a rejected one lea
   }
 });
 
+// Regression: with no judgement available, a run that only shared words with
+// the request was offered as guidance with its tools' schemas, the same wrong
+// recommendation the coverage rule exists to prevent.
+test('with no turn-start judgement, a run that only shares words recommends nothing', async () => {
+  const { _setToolSchemaLoaderForTests } = await import('../../tools/composio-schema-cache.js');
+  _setToolSchemaLoaderForTests(async () => null);
+  recordZephyrStrategy("Build me a wombat digest workspace: today's calendar and emails waiting on my reply", 'outlook_get_calendar_view', 'wombat-build');
+  const { listMatchingRunStrategies } = await import('../../memory/run-strategy-store.js');
+  const request = 'Show me the wombat digest space';
+  try {
+    assert.ok(listMatchingRunStrategies(request, 4).some((row) => row.strategy.toolsUsed.includes('outlook_get_calendar_view')),
+      'the request clears the keyword floor for the build run');
+    const guessed = await prepareProvenOperationForRequest(
+      { query: request },
+      { decideTurnStart: decideWith([], () => ({ failedOpen: true })) },
+    );
+    assert.equal(guessed.text, undefined, 'no guidance at all: neither tool names nor schemas');
+    assert.equal(guessed.strategyId, undefined);
+    assert.equal(guessed.pickedBy, undefined);
+    assert.deepEqual(guessed.tools, []);
+    assert.equal(guessed.skipDiscoverySearch, false);
+    assert.equal(guessed.narrowSurface, false);
+    assert.equal(typeof guessed.decisionWaitMs, 'number', 'the wait on the failed decision is still measured');
+  } finally {
+    _setToolSchemaLoaderForTests(null);
+  }
+});
+
 // A familiar request is worded differently from the run that proved it: another
 // target, another phrasing, few shared words. Recall must not be gated on
 // shared words; words only order the window Jev reads.

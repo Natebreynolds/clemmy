@@ -44,8 +44,10 @@ const FAMILIAR_RUN_CANDIDATES = 8;
  *  - keywords: the request restates the run (keyword coverage);
  *  - jev: Jev judged, inside the budget, that the run did the same kind of work;
  *  - jev_route: Jev routed the request to one operation the host can hand over;
- *  - keywords_unconfirmed: Jev was unavailable, so the nearest keyword match is
- *    offered as guidance only and nothing is bound on it. */
+ *  - keywords_unconfirmed: no turn-start judgement was available and the
+ *    remembered runs the request matched disagree; the top match is taken only
+ *    because the request restates it. A match that does not cover the request
+ *    is not taken at all. */
 export type ProvenPickSource = 'keywords' | 'jev' | 'jev_route' | 'keywords_unconfirmed';
 
 export interface ProvenLiveRead {
@@ -627,6 +629,20 @@ export function familiarRunStrategiesForRequest(
   return picked;
 }
 
+/** The remembered run taken when no turn-start judgement is available: the
+ *  top keyword match, and only when the request restates it. A run that merely
+ *  shares words with the request is the wrong-recommendation shape the
+ *  coverage rule in prepareProvenOperationForRequest exists to prevent; with no
+ *  judgement to confirm it, it is not offered at all, neither its tools nor
+ *  their schemas. */
+function unconfirmedKeywordPick(
+  query: string,
+  matches: readonly MatchedRunStrategy[],
+): RunStrategyRecord | null {
+  const top = matches[0]?.strategy;
+  return top && provenStrategyCoversRequest(query, top) ? top : null;
+}
+
 type TurnStartDecisionFor = TurnStartDecision<ProvenStrategyCandidate, RoutableOperation>;
 
 /** The first frame waits on the turn-start decision for at most the budget,
@@ -716,9 +732,9 @@ export async function prepareProvenOperationForRequest(input: {
       if (judged) {
         strategy = judged;
         pickedBy = 'jev';
-      } else if (decision.failedOpen && matches.length > 0) {
-        strategy = matches[0]!.strategy;
-        pickedBy = 'keywords_unconfirmed';
+      } else if (decision.failedOpen) {
+        strategy = unconfirmedKeywordPick(input.query, matches);
+        if (strategy) pickedBy = 'keywords_unconfirmed';
       }
       if (!strategy && decision.route.pick) {
         routed = true;
