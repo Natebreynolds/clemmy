@@ -112,8 +112,14 @@ const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefus
  *  refused, reset, or timed out before headers — named APIConnectionError.
  *  Its timeout subclass carries no cause, no status, no name of its own and
  *  the message "Request timed out.", so only the class says it is transport.
- *  The same SDKs' caller-cancel class is a sibling, not a subclass, so an
- *  aborted request never reads as a dropped connection here. */
+ *
+ *  An aborted request is not decided here. The SDKs' abort class is a sibling
+ *  of this one, but its "aborted" message still reads as transport below, and
+ *  no error class can tell a person's stop from a harness deadline: both abort
+ *  the request's signal and surface as the same error, and a deadline abort
+ *  must stay eligible for a retry or fallover. So every layer that could retry
+ *  (this wrapper, the fallback chain, the host runner) reads the request's own
+ *  signal and never retries once the caller has cancelled. */
 function isSdkConnectionFailure(err: object): boolean {
   let proto: unknown = Object.getPrototypeOf(err);
   for (let depth = 0; proto && depth < 8; depth++) {
