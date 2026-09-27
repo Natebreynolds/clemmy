@@ -126,13 +126,20 @@ function realLocalTool(name: string) {
   return brackets.wrapToolForHarness(found as never);
 }
 
+/** Park an output the way a real call leaves it: its call, its bytes, its return. */
+function parkOutput(sessionId: string, callId: string, output: string, tool = 'run_shell_command') {
+  const called = events.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_called', data: { callId, tool, arguments: '{}' } });
+  events.writeToolOutput({ sessionId, callId, tool, output });
+  events.appendEvent({ sessionId, turn: 1, role: 'agent', type: 'tool_returned', parentEventId: called.id, data: { callId, tool, ok: true } });
+}
+
 /** 50 numbered ~1k text blocks: any dropped span is visible by block number. */
 const PARKED_TEXT = Array.from({ length: 50 }, (_, i) => `[block ${String(i).padStart(2, '0')}] ${'r'.repeat(988)}`).join('\n');
 
 test('a bare tool_output_query on text returns one inline result, exactly as a bare recall does', async () => {
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query',
-    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-text', tool: 'run_shell_command', output: PARKED_TEXT }),
+    seed: (sessionId) => parkOutput(sessionId, 'parked-text', PARKED_TEXT),
     calls: [{ callId: 'text-query', args: { call_id: 'parked-text' } }],
   });
   const shown = results.get('text-query') ?? '';
@@ -151,7 +158,7 @@ test('on a small window a bare text query shrinks to that window\'s inline resul
   assert.equal(inline, 11_200);
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', routedModelId: smallWindowModel,
-    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-text', tool: 'run_shell_command', output: PARKED_TEXT }),
+    seed: (sessionId) => parkOutput(sessionId, 'parked-text', PARKED_TEXT),
     calls: [{ callId: 'small-text-query', args: { call_id: 'parked-text' } }],
   });
   const shown = results.get('small-text-query') ?? '';
@@ -165,9 +172,7 @@ const PARKED_ROWS = JSON.stringify(Array.from({ length: 60 }, (_, i) => ({
   name: `Fixture record ${i}`,
   notes: `note ${i} `.repeat(150),
 })));
-const parkRows = (sessionId: string) => events.writeToolOutput({
-  sessionId, callId: 'parked-rows', tool: 'run_shell_command', output: PARKED_ROWS,
-});
+const parkRows = (sessionId: string) => parkOutput(sessionId, 'parked-rows', PARKED_ROWS);
 
 test('a bare tool_output_query on records is one inline result, cut on a record boundary with the exact next query', async () => {
   const { results } = await runHostTurn({
@@ -230,7 +235,7 @@ test('on a small window an explicit recall and a named query page stay within wh
   assert.equal(readerMax, 11_200, 'a 32k-token window takes one inline result per reader reply');
   const recall = await runHostTurn({
     agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', routedModelId: smallWindowModel,
-    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-text', tool: 'run_shell_command', output: PARKED_TEXT }),
+    seed: (sessionId) => parkOutput(sessionId, 'parked-text', PARKED_TEXT),
     calls: [{ callId: 'small-explicit-recall', args: { call_id: 'parked-text', max_chars: 30_000 } }],
   });
   const recalled = recall.results.get('small-explicit-recall') ?? '';
@@ -257,7 +262,7 @@ test('on a large window an explicit recall is bounded by what the MCP wire carri
   const large = Array.from({ length: 150 }, (_, i) => `[block ${String(i).padStart(3, '0')}] ${'r'.repeat(987)}`).join('\n');
   const { results } = await runHostTurn({
     agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', routedModelId: largeWindowModel,
-    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-large', tool: 'run_shell_command', output: large }),
+    seed: (sessionId) => parkOutput(sessionId, 'parked-large', large),
     calls: [{ callId: 'large-explicit-recall', args: { call_id: 'parked-large', max_chars: 120_000 } }],
   });
   const shown = results.get('large-explicit-recall') ?? '';
@@ -289,9 +294,7 @@ test('an object query is sized to the reading bytes the turn has left and served
   const budget = new brackets.RecallBudget(10, 10_000, undefined);
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', recallBudget: budget,
-    seed: (sessionId) => events.writeToolOutput({
-      sessionId, callId: 'parked-object', tool: 'run_shell_command', output: JSON.stringify({ body: 'x'.repeat(30_000), meta: 1 }),
-    }),
+    seed: (sessionId) => parkOutput(sessionId, 'parked-object', JSON.stringify({ body: 'x'.repeat(30_000), meta: 1 })),
     calls: [{ callId: 'object-remainder', args: { call_id: 'parked-object' } }],
   });
   const shown = results.get('object-remainder') ?? '';
@@ -306,7 +309,7 @@ test('a non-ASCII record page is cut on a record boundary to the bytes left, wit
   const rows = JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ id: `row-${i}`, notes: '中文记录'.repeat(300) })));
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', recallBudget: budget,
-    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-wide', tool: 'run_shell_command', output: rows }),
+    seed: (sessionId) => parkOutput(sessionId, 'parked-wide', rows),
     calls: [{ callId: 'wide-page', args: { call_id: 'parked-wide', limit: 30 } }],
   });
   const shown = results.get('wide-page') ?? '';
@@ -323,7 +326,7 @@ test('a record larger than the whole reply is clipped inside the bound and still
   const rows = JSON.stringify(Array.from({ length: 3 }, (_, i) => ({ id: `big-${i}`, notes: 'y'.repeat(30_000) })));
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query',
-    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-big', tool: 'run_shell_command', output: rows }),
+    seed: (sessionId) => parkOutput(sessionId, 'parked-big', rows),
     calls: [{ callId: 'big-record', args: { call_id: 'parked-big' } }],
   });
   const shown = results.get('big-record') ?? '';
@@ -400,9 +403,7 @@ test('a projection whose own arguments outgrow the bytes left is still served, w
 
 /** 20 records of ~3k chars each: no single record fits a small byte budget. */
 const WIDE_ROWS = JSON.stringify(Array.from({ length: 20 }, (_, i) => ({ id: i, body: `[row ${String(i).padStart(2, '0')}] ${'w'.repeat(3_000)}` })));
-const parkWideRows = (sessionId: string) => events.writeToolOutput({
-  sessionId, callId: 'parked-wide-rows', tool: 'run_shell_command', output: WIDE_ROWS,
-});
+const parkWideRows = (sessionId: string) => parkOutput(sessionId, 'parked-wide-rows', WIDE_ROWS);
 
 test('a clipped record page always shows the record it continues from, or no record and the same offset', async () => {
   for (const bytesLeft of [900, 1_400, 2_400]) {
