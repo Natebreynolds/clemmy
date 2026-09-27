@@ -156,7 +156,7 @@ test('a result still inside its own open lifecycle is offered to file_query', ()
   } });
   eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_open_text', invocationNonce: 'nonce-open-text',
     tool: 'space_get_view', output: 'A saved view of plain prose notes.' });
-  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_open_text', inFlight: true });
+  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_open_text' });
   assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(routes));
 });
 
@@ -208,8 +208,9 @@ test('file_query is offered exactly when its own query-authority check accepts t
   const lifecycleRoutes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_lifecycle_failed' });
   assert.ok(!lifecycleRoutes.some((r) => r.tool === 'file_query'), JSON.stringify(lifecycleRoutes));
 
-  // A call still in flight is judged on its bytes: a failure-shaped result is
-  // withheld from file_query even before its return is recorded.
+  // A call with no durable return yet is judged on its bytes: a
+  // failure-shaped result is withheld from file_query even before its return
+  // is recorded.
   const open = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'open-failure' });
   eventlog.appendEvent({ sessionId: open.id, turn: 1, role: 'agent', type: 'tool_called', data: {
     callId: 'toolu_open_failure', tool: 'call_tool', effectiveTool: 'space_get_view', accounting: 'top_level',
@@ -217,7 +218,7 @@ test('file_query is offered exactly when its own query-authority check accepts t
   } });
   eventlog.writeToolOutput({ sessionId: open.id, callId: 'toolu_open_failure', invocationNonce: 'nonce-open-failure',
     tool: 'space_get_view', output: 'ERROR: no saved view named notes.' });
-  const openRoutes = retainedResultRoutes({ sessionId: open.id, callId: 'toolu_open_failure', inFlight: true });
+  const openRoutes = retainedResultRoutes({ sessionId: open.id, callId: 'toolu_open_failure' });
   assert.ok(!openRoutes.some((r) => r.tool === 'file_query'), JSON.stringify(openRoutes));
 });
 
@@ -256,4 +257,34 @@ test('routing a long output loads its bytes at most once, and not again while no
   } });
   const afterFailure = retainedResultRoutes({ sessionId, callId: 'toolu_long_routed', exclude: ['recall_tool_result'] });
   assert.ok(!afterFailure.some((r) => r.tool === 'file_query'), JSON.stringify(afterFailure));
+});
+
+test('a preview formatted after its call returned never offers file_query for an output file_query refuses', async () => {
+  // The host previews a long result for the model after the call has
+  // returned. Whether the call is open is the durable lifecycle's answer, not
+  // the formatter's: a returned derived-reader output is judged by the query
+  // check itself, which refuses it.
+  const { hostModelOutputPreview } = await import('./host-model-output-preview.js');
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'preview-after-return' });
+  const called = eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_called', data: {
+    callId: 'toolu_query_preview', tool: 'call_tool', effectiveTool: 'tool_output_query', accounting: 'top_level',
+    arguments: JSON.stringify({ name: 'tool_output_query', args_json: '{"call_id":"toolu_elsewhere"}' }),
+  } });
+  const text = 'Matched line about the orchard walk.\n'.repeat(20_000);
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_query_preview', tool: 'call_tool', output: text });
+  eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_returned', parentEventId: called.id, data: {
+    callId: 'toolu_query_preview', tool: 'call_tool', effectiveTool: 'tool_output_query', accounting: 'top_level',
+  } });
+  assert.equal(eventlog.resolveToolOutputForQuery(s.id, 'toolu_query_preview').status, 'failed',
+    'precondition: file_query refuses a derived reader output');
+  const preview = await hostModelOutputPreview(text, {
+    identity: () => ({ sessionId: s.id, sourceUserSeq: 1 }),
+    callId: 'toolu_query_preview', toolName: 'call_tool',
+    arguments: { name: 'tool_output_query', args_json: '{"call_id":"toolu_elsewhere"}' },
+  });
+  assert.ok(preview.length < text.length, 'precondition: the preview is a digest, not the whole text');
+  assert.match(preview, /recall_tool_result \{"call_id":"toolu_query_preview"/, 'the footer names the reader that serves it');
+  assert.doesNotMatch(preview, /file_query \{/, preview.slice(-800));
+  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_query_preview' });
+  assert.ok(!routes.some((r) => r.tool === 'file_query'), JSON.stringify(routes));
 });

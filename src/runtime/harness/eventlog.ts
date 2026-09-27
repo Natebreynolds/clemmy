@@ -7456,11 +7456,12 @@ function derivedToolOutputReaderFailureReason(
   ) ? DERIVED_READER_AUTHORITY_REASON : null;
 }
 
-/** Why the query resolver will refuse a stored output whose own call has not
- *  returned yet, judged on what exists before the return: the bytes and the
- *  producer identity, by the resolver's own rule. The lifecycle checks apply
- *  when the call settles, through `resolveToolOutputForQuery`. Routing callers
- *  use it so a reader that would refuse is never offered; it grants nothing. */
+/** Why the query resolver will refuse a stored output whose own call has
+ *  been called but has no durable return yet, judged on what exists before
+ *  the return: the bytes and the producer identity, by the resolver's own
+ *  rule. Once a return exists the lifecycle checks apply, through
+ *  `resolveToolOutputForQuery`. Routing callers use it so a reader that would
+ *  refuse is never offered; it grants nothing. */
 export function unsettledToolOutputQueryRefusal(record: ToolOutputRecord): string | null {
   return authorityOutputFailureReason(record, null);
 }
@@ -7473,6 +7474,9 @@ export interface ToolOutputStoredIdentity {
   canonicalSha256: string | null;
   /** Digest of each invocation row's bytes, by invocation nonce. */
   invocationSha256: ReadonlyMap<string, string | null>;
+  /** Durable lifecycle events recorded for the call id, by type. */
+  calledEvents: number;
+  returnedEvents: number;
 }
 
 /** A metadata-only identity of one call id's stored output: the canonical
@@ -7500,16 +7504,20 @@ export function toolOutputStoredIdentity(sessionId: string, callId: string): Too
       invocation_nonce: string; output_sha256: string | null; content_bytes: number; created_at: string;
     }>;
     const lifecycle = prepareCached(db, `
-      SELECT COUNT(*) AS events, MAX(seq) AS last_seq
+      SELECT COUNT(*) AS events,
+             COALESCE(SUM(type = 'tool_returned'), 0) AS returned,
+             MAX(seq) AS last_seq
         FROM events
        WHERE session_id = ?
          AND type IN ('tool_called', 'tool_returned')
          AND json_extract(data_json, '$.callId') = ?
-    `).get(sessionId, callId) as { events: number; last_seq: number | null };
+    `).get(sessionId, callId) as { events: number; returned: number; last_seq: number | null };
     return {
       key: JSON.stringify([canonical, invocations, lifecycle]),
       canonicalSha256: canonical.output_sha256,
       invocationSha256: new Map(invocations.map((row) => [row.invocation_nonce, row.output_sha256])),
+      calledEvents: lifecycle.events - lifecycle.returned,
+      returnedEvents: lifecycle.returned,
     };
   })();
 }

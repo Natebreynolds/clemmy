@@ -53,11 +53,6 @@ export interface RetainedResultRouteInput {
   readonly exclude?: readonly string[];
   /** Recall calls still available this turn, when the caller knows. */
   readonly recallCallsRemaining?: number;
-  /** The output's own call has not returned yet: a formatter routing the
-   * result it is about to return. The query check cannot pass before the
-   * return exists, so the output is judged as that check will judge it once
-   * the call settles. */
-  readonly inFlight?: boolean;
 }
 
 /** What the readers can do with one retained output, judged from its bytes
@@ -150,11 +145,13 @@ function judgeRetainedOutput(input: RetainedResultRouteInput): RetainedOutputJud
     identity = null;
   }
   if (!identity) return null;
-  // The formatter of a result whose call has not returned yet: the query
-  // check cannot pass before the return exists, so the output is judged as
-  // that check will judge it once the call settles.
-  const inFlight = Boolean(input.inFlight && readId === input.callId);
-  const memoKey = `${input.sessionId}\u0000${readId}\u0000${inFlight ? 'in-flight' : 'settled'}`;
+  // Whether the call is still open is read from the durable lifecycle, never
+  // from the caller: a call with no return yet cannot pass the query check,
+  // so its output is judged as that check will judge it once the call
+  // settles. Once a return exists, the check itself decides. The identity
+  // carries the lifecycle, so a remembered judgement never outlives it.
+  const inFlight = identity.calledEvents > 0 && identity.returnedEvents === 0;
+  const memoKey = `${input.sessionId}\u0000${readId}`;
   const remembered = judgementMemo.get(memoKey);
   if (remembered && remembered.identity === identity.key) {
     rememberJudgement(memoKey, identity.key, remembered.judgement);
