@@ -107,11 +107,14 @@ async function runHostTurn(input: {
   toolName: string;
   calls: Array<{ callId: string; args: Record<string, unknown> }>;
   routedModelId?: string;
+  seed?: (sessionId: string) => void;
+  recallBudget?: { calls: number; bytes: number };
 }): Promise<{ results: Map<string, string>; sessionId: string }> {
   serial += 1;
   const session = events.createSession({ id: `sess-carrier-presentation-${serial}`, kind: 'chat' });
   const text = 'Read the fixture comparison and report the top terms.';
   const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+  input.seed?.(session.id);
   const requests: unknown[] = [];
   const model = {
     async *getStreamedResponse(request: unknown) {
@@ -145,7 +148,7 @@ async function runHostTurn(input: {
   const outcome = await brackets.withHarnessRunContext({
     sessionId: session.id, sourceUserSeq: source.seq,
     counter: new brackets.ToolCallsCounter(6), behaviorScopeId: `${session.id}::turn:1`,
-    recallBudget: new brackets.RecallBudget(10, 500_000, session.id),
+    recallBudget: new brackets.RecallBudget(input.recallBudget?.calls ?? 10, input.recallBudget?.bytes ?? 500_000, session.id),
     ...(input.routedModelId ? { routedModelId: input.routedModelId } : {}),
   }, () => hostRunRunner(runner as never, agent as never, [{ role: 'user', content: text }] as never, {
     maxTurns: 6, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq },
@@ -242,6 +245,27 @@ test('recall_tool_result through call_tool is never re-clipped by the carrier', 
   assert.ok(recalled.endsWith(wholeSpaceRead), 'the whole requested slice reaches the model');
   assert.doesNotMatch(recalled, /middle omitted|recall_tool_result \{"call_id":"recall-through-carrier"/,
     'no digest, and no footer asking the model to recall its own recall');
+});
+
+/** A 50k retained output with distinct marks, parked under one call id. */
+const PARKED = Array.from({ length: 50 }, (_, i) => `[block ${String(i).padStart(2, '0')}] ${'r'.repeat(988)}`).join('\n');
+const parkOutput = (sessionId: string) => events.writeToolOutput({
+  sessionId, callId: 'parked-read', tool: 'space_get', output: PARKED,
+});
+const recallThroughCarrier = (callId: string, args: Record<string, unknown>) => ({
+  callId, args: { name: 'recall_tool_result', args_json: JSON.stringify({ call_id: 'parked-read', ...args }) },
+});
+
+test('the per-turn RecallBudget governs recalls made through a carrier', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realCallTool(['recall_tool_result']), toolName: 'call_tool', seed: parkOutput,
+    recallBudget: { calls: 1, bytes: 500_000 },
+    calls: [recallThroughCarrier('budget-first', {}), recallThroughCarrier('budget-second', { offset: 20_000 })],
+  });
+  const first = results.get('budget-first') ?? '';
+  const second = results.get('budget-second') ?? '';
+  assert.ok(first.startsWith('Recalled chars 0–'), first.slice(0, 300));
+  assert.ok(/^ERROR: /.test(second), `the second carrier recall is refused by the turn budget: ${second.slice(0, 300)}`);
 });
 
 test('a provider result through the real work_call carrier keeps the 4,000-char keyhole and its digest', async () => {
