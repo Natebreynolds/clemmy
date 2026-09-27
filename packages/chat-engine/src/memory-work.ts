@@ -26,7 +26,9 @@ export type MemoryJobId =
   | 'standing'
   | 'verify'
   | 'index'
-  | 'tidy';
+  | 'tidy'
+  | 'backup'
+  | 'connect';
 
 /** Which model does a job's thinking:
  *  memory  = the "Keeps your memory" role (Settings → Models);
@@ -300,6 +302,8 @@ export const MEMORY_JOB_WORDS: Record<MemoryJobId, MemoryJobWords> = {
     doing: 'Indexing new memories',
     blurb: 'Indexes new memories so Clem can find them, using a model that runs on this Mac.',
   },
+  backup: { title: 'Protecting your memories', doing: 'Saving a recovery copy', blurb: 'Keeps a local recovery copy while Clem continues answering you.' },
+  connect: { title: 'Connecting your memories', doing: 'Organizing memory connections', blurb: 'Checks links between facts, people and resources, in small background steps.' },
   tidy: {
     title: 'Letting old memories fade',
     doing: 'Tidying memory',
@@ -309,7 +313,7 @@ export const MEMORY_JOB_WORDS: Record<MemoryJobId, MemoryJobWords> = {
 
 /** The display order: learning first, upkeep last. */
 export const MEMORY_JOB_ORDER: readonly MemoryJobId[] = [
-  'learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing', 'verify', 'index', 'tidy',
+  'learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing', 'verify', 'index', 'tidy', 'backup', 'connect',
 ];
 
 /** Settings → Models wording for the memory role. Both apps use these strings. */

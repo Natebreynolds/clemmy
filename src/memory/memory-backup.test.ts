@@ -34,6 +34,7 @@ const {
   memoryBackupInFlight,
   _setMemoryBackupWorkerEntryForTest,
   _pagedBackupStatsForTest,
+  _expireMemoryBackupWorkerForTest,
 } = await import('./memory-backup.js');
 
 before(() => {
@@ -352,8 +353,24 @@ test('C6: a second connection writing on every step makes the paged backup give 
 
 test('the nightly caller awaits the worker-backed backup', () => {
   const source = readFileSync(new URL('./maintenance.ts', import.meta.url), 'utf8');
-  assert.match(source, /await backupMemoryDbAsync\(\{\s*retain: MEMORY_BACKUP_RETAIN,\s*localDayKey: today,/,
+  assert.match(source, /await runMemoryJob\('backup',[\s\S]*?\(\) => backupMemoryDbAsync\(\{\s*retain: MEMORY_BACKUP_RETAIN,\s*localDayKey: today\s*\}\)/,
     'the nightly copy must not run VACUUM INTO on the main connection');
   const selfHeal = readFileSync(new URL('./self-heal.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(selfHeal, /\bbackupMemoryDb\(/, 'self-heal never takes a main-thread copy');
+});
+
+// A timed-out worker can still own a native SQLite operation until exit.
+test('a timed-out backup keeps synchronous backup excluded until its thread exits', async () => {
+  _setMemoryBackupWorkerEntryForTest(new URL('data:text/javascript,import { parentPort } from "node:worker_threads"; parentPort.postMessage({kind:"started"}); setInterval(() => {}, 1000);'));
+  const pending = backupMemoryDbAsync({ retain: 7 });
+  for (let i = 0; i < 100 && !_expireMemoryBackupWorkerForTest(); i++) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(await pending, null);
+  assert.equal(memoryBackupInFlight(), true, 'the timeout result does not mean the native lease is gone');
+  assert.equal(backupMemoryDb({ retain: 7 }), null);
+  for (let i = 0; i < 1000 && memoryBackupInFlight(); i++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(memoryBackupInFlight(), false, 'exit releases the exclusion');
 });

@@ -1,3 +1,4 @@
+import { backupMemoryDbAsync } from './memory-backup.js';
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
@@ -572,7 +573,7 @@ export async function reconcileTemporalEvidenceAsync(options: {
   const clock = options.clock ?? new SliceClock(NIGHTLY_SLICE);
   const before = countUnreconciledFactEvidence();
   await clock.next(true);
-  const backup = await (options.backup ?? (() => backupMemoryDb({ retain: 7 })))();
+  const backup = await (options.backup ?? (() => backupMemoryDbAsync({ retain: 7 })))();
   if ((options.requireBackup ?? true) && !backup) {
     throw new Error('Evidence reconciliation stopped because a preflight memory backup could not be created.');
   }

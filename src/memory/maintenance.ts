@@ -1,12 +1,15 @@
-import { statSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { statSync, existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import pino from 'pino';
 import { shouldDeferDiscretionaryWork } from '../runtime/system-load.js';
 import { getRuntimeEnv } from '../config.js';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
-import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFacts } from './db.js';
+import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFactsAsync } from './db.js';
 import { backupMemoryDbAsync } from './memory-backup.js';
+import { nightlyAdmission } from './nightly-admission.js';
+import { filePassCursorIO } from './pass-cursor.js';
+import { setSliceResumeHook } from './sliced-pass.js';
 import { resumeDaemonRuntimePhase } from '../daemon/phase.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
@@ -18,11 +21,12 @@ import { tickAutoresearchObservatory } from '../autoresearch/observatory.js';
 import { mergeParaphrases } from './memory-merge.js';
 import {
   backfillGroundedFactEntityLinks,
+  backfillGroundedFactEntityLinksAsync,
   backfillGroundedFactResourceLinks,
-  backfillGroundedEntityRelationships,
+  backfillGroundedEntityRelationshipsAsync,
   reconcileExtractedFactEntityEvidence,
-  syncFactEntityLinks,
-  syncFactResourceLinks,
+  syncFactEntityLinksAsync,
+  syncFactResourceLinksAsync,
   type ExtractedFactEntityEvidenceReconciliationStats,
   type GroundedFactEntityBackfillStats,
   type GroundedFactResourceBackfillStats,
@@ -63,7 +67,7 @@ import {
 } from './reflection-candidates.js';
 import { drainTerminalSemanticLearning } from './semantic-learning-worker.js';
 import { MEMORY_JOB_CLOCKS } from './memory-jobs.js';
-import { sweepMemoryWorkIfDue } from './memory-work-journal.js';
+import { runMemoryJob, sweepMemoryWorkIfDue } from './memory-work-journal.js';
 import { memoryIndexOutcome, memoryTidyOutcome, runMemoryModelJob } from './memory-job-context.js';
 
 /**
@@ -156,6 +160,9 @@ interface MemoryMaintenanceState {
   lastMemorySelfHealDay?: string;
   lastRelationshipBackfillDay?: string;
   lastMergeDay?: string;
+  lastLinkSyncDay?: string;
+  lastGroundedBackfillDay?: string;
+  lastFactPurgeDay?: string;
   lastGoalReapDay?: string;
   lastTaskLedgerHygieneDay?: string;
   lastNotificationReapDay?: string;
@@ -175,7 +182,9 @@ function readMaintenanceState(): MemoryMaintenanceState {
 function writeMaintenanceState(state: MemoryMaintenanceState): void {
   try {
     if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-    writeFileSync(MAINTENANCE_STATE_FILE, JSON.stringify(state), 'utf-8');
+    const temporary = `${MAINTENANCE_STATE_FILE}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify(state), { encoding: 'utf-8', mode: 0o600, flush: true });
+    renameSync(temporary, MAINTENANCE_STATE_FILE);
   } catch (err) {
     logger.warn({ err }, 'failed to persist memory-maintenance state');
   }
@@ -183,6 +192,12 @@ function writeMaintenanceState(state: MemoryMaintenanceState): void {
 
 // Loaded once at module init, mutated + persisted on each nightly fire.
 const maintenanceState: MemoryMaintenanceState = readMaintenanceState();
+// Legacy releases ran these in the merge slot. Preserve completed work on upgrade.
+maintenanceState.lastLinkSyncDay ??= maintenanceState.lastMergeDay;
+maintenanceState.lastGroundedBackfillDay ??= maintenanceState.lastMergeDay;
+maintenanceState.lastFactPurgeDay ??= maintenanceState.lastMergeDay;
+const nightlyCursor = filePassCursorIO(path.join(STATE_DIR, 'memory-nightly-passes.json'));
+setSliceResumeHook(resumeDaemonRuntimePhase);
 
 // Skill update poll. Installed skills (SKILL.md repos) drift behind
 // their GitHub source; this surfaces "update available" without forcing
@@ -937,6 +952,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // cadence above — users want a guaranteed "fresh report when I wake
   // up." We check hour+minute, dedupe by calendar day so we fire ONCE
   // even though four 15s ticks land inside the matching minute.
+  nightlyAdmission.begin(tickCount);
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   if (isAtOrAfterDailyTime(now, AUTORESEARCH_NIGHTLY_HOUR, AUTORESEARCH_NIGHTLY_MINUTE)) {
@@ -962,17 +978,16 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // Fire-once-per-day, persisted dedupe like the jobs above.
   if (isAtOrAfterDailyTime(now, MEMORY_BACKUP_NIGHTLY_HOUR, MEMORY_BACKUP_NIGHTLY_MINUTE)) {
     const backupEnabled = (getRuntimeEnv('CLEMMY_MEMORY_BACKUP', 'on') || 'on').toLowerCase() !== 'off';
-    if (backupEnabled && maintenanceState.lastBackupDay !== today) {
+    if (backupEnabled && maintenanceState.lastBackupDay !== today && nightlyAdmission.claim('backup')) {
       try {
         // `today` is the durable cross-process idempotency key. Every daemon
         // process may reach this branch with a stale in-memory state snapshot,
         // but exactly one publishes and every loser reports the same file.
         // Written by a worker thread on its own connection; the loop keeps
         // answering while the copy is made.
-        const result = await backupMemoryDbAsync({
-          retain: MEMORY_BACKUP_RETAIN,
-          localDayKey: today,
-        });
+        const result = await runMemoryJob('backup', { source: { kind: 'schedule' } },
+          () => backupMemoryDbAsync({ retain: MEMORY_BACKUP_RETAIN, localDayKey: today }),
+          (value) => ({ outcome: value ? value.reused ? 'nothing_new' : 'ok' : 'failed' }));
         // The synchronous nightly work below starts in this macrotask: name
         // it for the beacon, not whatever last entered a phase meanwhile.
         resumeDaemonRuntimePhase();
@@ -999,7 +1014,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // This applies only bounded, reversible memory fixes; any thrown error is
   // logged and never blocks the rest of maintenance.
   if (isAtOrAfterDailyTime(now, MEMORY_SELF_HEAL_NIGHTLY_HOUR, MEMORY_SELF_HEAL_NIGHTLY_MINUTE)) {
-    if (maintenanceState.lastMemorySelfHealDay !== today) {
+    if (maintenanceState.lastMemorySelfHealDay !== today && nightlyAdmission.claim('self_heal')) {
       maintenanceState.lastMemorySelfHealDay = today;
       writeMaintenanceState(maintenanceState);
       try {
@@ -1041,7 +1056,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   }
 
   if (isAtOrAfterDailyTime(now, RELATIONSHIP_BACKFILL_NIGHTLY_HOUR, RELATIONSHIP_BACKFILL_NIGHTLY_MINUTE)) {
-    if (maintenanceState.lastRelationshipBackfillDay !== today) {
+    if (maintenanceState.lastRelationshipBackfillDay !== today && nightlyAdmission.claim('identity')) {
       maintenanceState.lastRelationshipBackfillDay = today;
       writeMaintenanceState(maintenanceState);
       const enabled = (getRuntimeEnv('CLEMMY_ENTITY_RELATIONSHIP_BACKFILL', 'on') || 'on').trim().toLowerCase() !== 'off';
@@ -1065,7 +1080,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // The detector may propose semantic duplicates, but this mutating legacy job
   // runs only when CLEMMY_MERGE_ENABLED=true is explicitly configured.
   if (isAtOrAfterDailyTime(now, MEMORY_MERGE_NIGHTLY_HOUR, MEMORY_MERGE_NIGHTLY_MINUTE)) {
-    if (maintenanceState.lastMergeDay !== today) {
+    if (maintenanceState.lastMergeDay !== today && nightlyAdmission.claim('merge')) {
       maintenanceState.lastMergeDay = today;
       writeMaintenanceState(maintenanceState);
       try {
@@ -1076,39 +1091,39 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       } catch (err) {
         logger.warn({ err }, 'paraphrase merge nightly job failed');
       }
-      // WS2 — refresh stored fact↔entity / fact↔resource links AFTER the merge
-      // (merge rewrites/retires facts, so links re-derive against the settled
-      // set). Deterministic + idempotent; the graph reads these stored edges.
+    }
+  }
+
+  if (isAtOrAfterDailyTime(now, MEMORY_MERGE_NIGHTLY_HOUR, MEMORY_MERGE_NIGHTLY_MINUTE)) {
+    if (maintenanceState.lastLinkSyncDay !== today && nightlyAdmission.claim('link_sync')) {
       try {
-        const ent = syncFactEntityLinks();
-        const rsc = syncFactResourceLinks();
-        if (ent.linksWritten > 0 || rsc.linksWritten > 0) {
+        await runMemoryJob('connect', { source: { kind: 'schedule' } }, async () => {
+          const ent = await syncFactEntityLinksAsync({ cursor: nightlyCursor, day: today });
+          const rsc = await syncFactResourceLinksAsync({ cursor: nightlyCursor, day: today });
           logger.info({ entityLinks: ent.linksWritten, resourceLinks: rsc.linksWritten }, 'relationship link sync completed');
-        }
-      } catch (err) {
-        logger.warn({ err }, 'relationship link sync failed');
-      }
+        }, () => ({ outcome: 'ok' }));
+        maintenanceState.lastLinkSyncDay = today;
+        writeMaintenanceState(maintenanceState);
+      } catch (err) { logger.warn({ err }, 'relationship link sync failed; committed slices remain resumable'); }
+    }
+    if (maintenanceState.lastLinkSyncDay === today && maintenanceState.lastGroundedBackfillDay !== today
+      && nightlyAdmission.claim('grounded_backfill')) {
       try {
         const enabled = (getRuntimeEnv('CLEMMY_ENTITY_RELATIONSHIP_BACKFILL', 'on') || 'on').trim().toLowerCase() !== 'off';
-        if (enabled) {
-          const groundedFactLinks = backfillGroundedFactEntityLinks({ factLimit: 5_000 });
-          const relationships = backfillGroundedEntityRelationships({ factLimit: 5_000 });
-          if (groundedFactLinks.promoted > 0 || relationships.added > 0 || relationships.reinforced > 0) {
-            logger.info({ groundedFactLinks, relationships }, 'grounded entity relationship backfill completed');
-          }
-        }
-      } catch (err) {
-        logger.warn({ err }, 'grounded entity relationship backfill failed');
-      }
-      // WS6 — hard-purge facts soft-deleted well beyond the recovery window so
-      // consolidated_facts + fact_embeddings stop growing forever (FK CASCADE
-      // drops their embeddings + links). Default 180d; floored at 30d.
+        if (enabled) await runMemoryJob('connect', { source: { kind: 'schedule' } }, async () => {
+          await backfillGroundedFactEntityLinksAsync({ factLimit: 5_000, cursor: nightlyCursor, day: today });
+          await backfillGroundedEntityRelationshipsAsync({ factLimit: 5_000, cursor: nightlyCursor, day: today });
+        }, () => ({ outcome: 'ok' }));
+        maintenanceState.lastGroundedBackfillDay = today;
+        writeMaintenanceState(maintenanceState);
+      } catch (err) { logger.warn({ err }, 'grounded relationship backfill failed; committed slices remain resumable'); }
+    }
+    if (maintenanceState.lastFactPurgeDay !== today && nightlyAdmission.claim('fact_purge')) {
       try {
-        const purged = purgeSoftDeletedFacts();
-        if (purged > 0) logger.info({ purged }, 'soft-deleted fact hard-purge completed');
-      } catch (err) {
-        logger.warn({ err }, 'soft-deleted fact hard-purge failed');
-      }
+        await purgeSoftDeletedFactsAsync();
+        maintenanceState.lastFactPurgeDay = today;
+        writeMaintenanceState(maintenanceState);
+      } catch (err) { logger.warn({ err }, 'soft-deleted fact hard-purge failed'); }
     }
   }
 

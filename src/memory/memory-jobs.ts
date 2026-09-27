@@ -24,7 +24,9 @@ export type MemoryJobId =
   | 'standing'
   | 'verify'
   | 'index'
-  | 'tidy';
+  | 'tidy'
+  | 'backup'
+  | 'connect';
 
 export type MemoryJobModelOwner = 'memory' | 'checker' | 'local' | 'none';
 
@@ -57,6 +59,8 @@ export const MEMORY_JOBS: Readonly<Record<MemoryJobId, MemoryJobSpec>> = Object.
   standing: { id: 'standing', modelOwner: 'checker', trigger: 'after_message' },
   verify: { id: 'verify', modelOwner: 'checker', trigger: 'nightly' },
   index: { id: 'index', modelOwner: 'local', trigger: 'every_few_minutes' },
+  backup: { id: 'backup', modelOwner: 'none', trigger: 'nightly' },
+  connect: { id: 'connect', modelOwner: 'none', trigger: 'nightly' },
   tidy: { id: 'tidy', modelOwner: 'none', trigger: 'nightly' },
 });
 
@@ -76,6 +80,8 @@ export interface MemoryJobClock {
 export const MEMORY_JOB_CLOCKS = Object.freeze({
   patterns: Object.freeze({ hour: 3, minute: 0 }),
   tidy: Object.freeze({ hour: 4, minute: 0 }),
+  backup: Object.freeze({ hour: 4, minute: 30 }),
+  connect: Object.freeze({ hour: 4, minute: 45 }),
   verify: Object.freeze({ hour: 4, minute: 35 }),
 }) satisfies Readonly<Partial<Record<MemoryJobId, MemoryJobClock>>>;
 

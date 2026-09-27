@@ -318,3 +318,19 @@ test('host CLI envelope: a failed or non-JSON run is reported as what it was, ne
   assert.equal(readHostCliEnvelope('{"status":0}'), null);
   assert.equal(readHostCliEnvelope(null), null);
 });
+
+
+test('stored prose containing JSON examples remains text, including shell stdout', () => {
+  for (const raw of [
+    'Example response:\n```json\n{"records":[{"id":"example"}]}\n```\nDo not treat this as returned records.',
+    'No rows were returned. The schema is {"records":[]}.',
+    'Documentation: [{"id":"sample"}]',
+    'Recalled chars 20–40 of 100 • tool=read_file\n\n{"records":[]}',
+  ]) {
+    assert.equal(parseStoredToolOutputJson(raw), null);
+    assert.equal(parseStoredToolOutputJson('shell wrapper', { shell: () => ({ stdout: raw }) }), null);
+  }
+  assert.deepEqual(parseStoredToolOutputJson('```json\n{"records":[]}\n```')?.value, { records: [] });
+  assert.equal(extractJsonCandidate('Here is the requested answer: {"ok":true}'), '{"ok":true}',
+    'model answer recovery remains independent');
+});

@@ -167,15 +167,18 @@ function clipContextLine(text: string): string {
     ? t
     : `${t.slice(0, CONTEXT_LINE_MAX_CHARS)} …[truncated — search memory for the full fact]`;
 }
-/** Standing goals are advisory and live in their own store; none is bound to
- *  a session (the session's own goal contract renders with Current Focus).
- *  The per-turn context therefore names how many there are and where to read
- *  them, not their text. */
 function renderActiveGoals(): string {
-  const goals = listActiveGoalSummaries({ limit: 1_000 });
+  const goals = listActiveGoalSummaries({ limit: 8, sortByPriority: true });
   if (goals.length === 0) return '';
-  const blocked = goals.filter((goal) => goal.status === 'blocked').length;
-  return `${goals.length} standing goal${goals.length === 1 ? '' : 's'} on file${blocked > 0 ? ` (${blocked} blocked)` : ''}: advisory only, never the current request; goal_list reads them.`;
+  return [
+    'Advisory standing goals only — they never replace or redirect the current accepted request.',
+    ...goals.map((g) => {
+      const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
+      const due = g.targetDate ? ` (due ${g.targetDate})` : '';
+      const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
+      return `- [${g.id}] ${g.title}${status}${due}${next}`;
+    }),
+  ].join('\n');
 }
 
 /**
@@ -318,32 +321,14 @@ function renderRequestRankedBlocks(input: {
 /** Held-for-later tasks for THIS session, so the model can resurface one when
  *  the user references it ("pick up the Salesforce scrape"). Session-scoped so a
  *  held task from another chat never leaks in. '' when none. */
-const HELD_TASKS_SHOWN = 3;
-/** Session working memory is a checkpoint of the conversation so far; its
- *  full text stays in the session's record. */
-const WORKING_MEMORY_PROMPT_MAX_CHARS = 600;
-
-function clipLine(text: string, max: number): string {
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1).trimEnd()}…`;
-}
-
-function clipWorkingMemory(text: string | undefined): string | undefined {
-  const trimmed = text?.trim();
-  if (!trimmed || trimmed.length <= WORKING_MEMORY_PROMPT_MAX_CHARS) return trimmed || undefined;
-  return `${trimmed.slice(0, WORKING_MEMORY_PROMPT_MAX_CHARS).trimEnd()}\n… working memory clipped here; the full checkpoint stays in this conversation's record.`;
-}
-
 function renderHeldTasks(sessionId?: string): string {
   if (!sessionId) return '';
   try {
     const held = listHeldTasks(sessionId);
     if (held.length === 0) return '';
-    const shown = held.slice(0, HELD_TASKS_SHOWN);
     return [
       'Tasks you agreed to HOLD for later (the user can resume one by reference — then call resume_held_task with its id):',
-      ...shown.map((h) => `  - ${h.id} — ${clipLine(h.plan.objective, 160)}`),
-      ...(held.length > shown.length ? [`  - …and ${held.length - shown.length} more held in this conversation.`] : []),
+      ...held.slice(0, 8).map((h) => `  - ${h.id} — ${h.plan.objective}`),
     ].join('\n');
   } catch {
     return '';
@@ -469,9 +454,9 @@ function composeHarnessMemoryContext(
   const sessionWorkingMemory = opts?.sessionId
     ? loadWorkingMemoryForSession(opts.sessionId)
     : undefined;
-  const workingMemory = clipWorkingMemory(opts?.sessionId
+  const workingMemory = opts?.sessionId
     ? sessionWorkingMemory ?? (inputDisposition === 'resume' ? memContext.workingMemory : undefined)
-    : memContext.workingMemory);
+    : memContext.workingMemory;
   let sessionActions = '';
   if (opts?.sessionId && opts.includeSessionActions !== false) {
     try {
@@ -868,7 +853,7 @@ export function renderTurnMemoryTail(
     // A proven run names tools; a surface that declines remembered tool
     // choices (a locked workflow step) is not told about tools it cannot call.
     const strategy = signal.kind === 'ranked' && options.request && scope.includeRememberedToolChoices !== false
-      ? renderRunStrategiesForContext(options.request, 1, options.request)
+      ? renderRunStrategiesForContext(options.request, 2, options.request)
       : '';
     if (strategy) parts.push({ section: 'Proven Run Strategies', tier: 'relevant', text: section('Proven Run Strategies', strategy) });
     const visibleFacts = signal.kind === 'ranked'
@@ -924,12 +909,12 @@ export function memoryRankingQuery(
   return parts.join('\n');
 }
 
-/** The ranked tail's hit budget once the one proven-run line is set aside
+/** The ranked tail's hit budget once the advisory proven-run examples are set aside
  *  (only when the surface takes remembered tool choices). */
 export function rankedTailHitBudget(request: string, includeRememberedToolChoices?: boolean): number {
   let strategy = '';
   if (includeRememberedToolChoices !== false) {
-    try { strategy = section('Proven Run Strategies', renderRunStrategiesForContext(request, 1, request)); } catch { strategy = ''; }
+    try { strategy = section('Proven Run Strategies', renderRunStrategiesForContext(request, 2, request)); } catch { strategy = ''; }
   }
   return Math.max(300, RANKED_TAIL_MAX_CHARS - (strategy ? strategy.length + 2 : 0));
 }

@@ -12,8 +12,11 @@
  *   - Never throw. Every failure is `null`, which callers already read as
  *     "no snapshot, withhold the mutation".
  *   - Never hang forever. A worker still running after 30 minutes is
- *     terminated (its connections close, which releases the lease) and the
- *     call returns null.
+ *     terminated and the call returns null. Terminating stops the worker's
+ *     JavaScript, not SQLite work already running in native code, so the
+ *     backup still counts as in flight (and the synchronous path keeps
+ *     withholding) until the worker's thread has really exited and its
+ *     connections, and the lease, are gone.
  *   - One backup at a time in this process. Callers asking for the same
  *     nightly day share one publication; any other caller waits for the one in
  *     flight and then runs. While any is queued or running, the synchronous
@@ -62,6 +65,8 @@ let queue: Promise<unknown> = Promise.resolve();
 const sharedByDay = new Map<string, Promise<BackupResult | null>>();
 let workerUnavailableLogged = false;
 let workerEntryForTest: URL | null = null;
+/** Fires the running worker's timeout now (test seam). */
+let expireRunningWorker: (() => void) | null = null;
 let pagedBackupRuns = 0;
 let lastPagedBackupRestarts = 0;
 
@@ -111,14 +116,24 @@ function runInWorker(data: MemoryBackupWorkerData): Promise<WorkerOutcome> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (expireRunningWorker === expire) expireRunningWorker = null;
       resolve(outcome);
     };
-    const timer = setTimeout(() => {
+    const expire = () => {
+      if (settled) return;
       logger.warn({ timeoutMs: WORKER_TIMEOUT_MS }, 'memory backup worker timed out; terminating it');
+      // The caller gets its null now, but a VACUUM running in native code
+      // does not stop for terminate(): until the thread exits it can still
+      // hold the lease. Keep this process's backup counted as in flight until
+      // then, so a synchronous backup withholds instead of sleeping on it.
+      noteAsyncMemoryBackup(true);
+      worker.once('exit', () => { noteAsyncMemoryBackup(false); });
       void worker.terminate().catch(() => { /* already gone */ });
       finish({ kind: 'done', result: null });
-    }, WORKER_TIMEOUT_MS);
+    };
+    const timer = setTimeout(expire, WORKER_TIMEOUT_MS);
     timer.unref?.();
+    expireRunningWorker = expire;
     worker.on('message', (message: MemoryBackupWorkerMessage) => {
       if (message.kind === 'started') {
         started = true;
@@ -283,6 +298,13 @@ export function backupMemoryDbAsync(opts: BackupMemoryDbOptions = {}): Promise<B
 export function _setMemoryBackupWorkerEntryForTest(url: URL | null): void {
   workerEntryForTest = url;
   workerUnavailableLogged = false;
+}
+
+/** Test seam: fire the running worker's timeout now. False when none is running. */
+export function _expireMemoryBackupWorkerForTest(): boolean {
+  if (!expireRunningWorker) return false;
+  expireRunningWorker();
+  return true;
 }
 
 /** Test seam: how many paged fallbacks ran, and the restarts the last one saw. */

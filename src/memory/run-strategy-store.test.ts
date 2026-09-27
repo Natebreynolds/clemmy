@@ -96,7 +96,7 @@ test('a hint carries the tools and argument roles of a proven run, never that ru
   assert.ok(rec);
   assert.equal(rec.deliverable, '/Users/example/Desktop/ML-30-AI-Search-Drafts.md', 'the record keeps what the run produced, for audit');
   const hit = renderRunStrategiesForContext('write personalized AI-search emails for the market leader accounts');
-  assert.match(hit, /A proven run of this kind of request used: composio_execute_tool; write_file \(path, content\)/);
+  assert.match(hit, /Prior verified run \(candidate only; confirm it fits this request\) used: composio_execute_tool; write_file \(path, content\)/);
   assert.match(hit, /Use this request's own targets and values/);
   assert.doesNotMatch(hit, /first-target|ML-30|Desktop|30 personalized|produced|similar past run/, 'nothing from that instance reaches the hint');
 });
@@ -269,56 +269,19 @@ test('proven request shapes elide values, keep operation selectors literal, dedu
   assert.equal(new Set(again?.provenShapes?.map((r) => r.shape)).size, again?.provenShapes?.length);
 });
 
-test('a remembered run that only shares words with the request is not named in context; one that covers it is', () => {
-  // Regression: the memory section named a run's tools on the 0.34 keyword
-  // floor alone, the shape the proven-operation channel refuses without a
-  // judgement.
-  recordRunStrategy({
-    objective: 'Build me a platypus digest workspace from today calendar and emails waiting on a reply',
-    toolsUsed: ['outlook_get_calendar_view'],
-    workerCount: 0,
-    durationMs: 20_000,
-    learningReceipt: receipt('platypus-build'),
-  });
-  const touching = 'Show me the platypus digest space';
-  assert.ok(listMatchingRunStrategies(touching).some((row) => row.strategy.toolsUsed.includes('outlook_get_calendar_view')),
-    'the run clears the recall floor for the request');
-  assert.equal(renderRunStrategiesForContext(touching), '', 'shared words alone name no tool');
-  assert.match(
-    renderRunStrategiesForContext('Build the platypus digest workspace from today calendar and emails waiting on a reply'),
-    /outlook_get_calendar_view/,
-    'a request the run covers still names it',
-  );
-  assert.equal(
-    renderRunStrategiesForContext('platypus digest workspace calendar emails reply focus-notes', 2, touching),
-    '',
-    'coverage is measured against the literal request when the ranking objective carries more',
-  );
+test('recall candidates remain advisory when similar vocabulary does not establish the same work', () => {
+  recordRunStrategy({ objective: 'Build a platypus digest workspace from calendar and emails', toolsUsed: ['outlook_get_calendar_view'], workerCount: 0, durationMs: 20_000, learningReceipt: receipt('platypus-build') });
+  const rendered = renderRunStrategiesForContext('Show me the platypus digest space');
+  assert.match(rendered, /candidate only; confirm it fits this request/);
+  assert.match(rendered, /outlook_get_calendar_view/);
+  assert.doesNotMatch(rendered, /this kind of request|skip tool_search/);
 });
 
-test('a covering run ranked below one that only shares words is still named within the limit', () => {
-  // Regression: the limit was taken before coverage, so the lone slot went to
-  // a two-word run that shares words and was then filtered out.
-  recordRunStrategy({
-    objective: 'walrus ledger',
-    toolsUsed: ['walrus_touching_tool'],
-    workerCount: 0,
-    durationMs: 5_000,
-    learningReceipt: receipt('walrus-touching'),
-  });
-  recordRunStrategy({
-    objective: 'reconcile walrus invoices monthly figures',
-    toolsUsed: ['walrus_covering_tool'],
-    workerCount: 0,
-    durationMs: 5_000,
-    learningReceipt: receipt('walrus-covering'),
-  });
-  const request = 'reconcile walrus ledger invoices monthly totals';
-  const ranked = listMatchingRunStrategies(request, 2).map((row) => row.strategy.toolsUsed[0]);
-  assert.deepEqual(ranked, ['walrus_touching_tool', 'walrus_covering_tool'], 'the touching run ranks first');
-  const rendered = renderRunStrategiesForContext(request, 1, request);
-  assert.match(rendered, /walrus_covering_tool/, 'the covering run takes the one slot');
-  assert.doesNotMatch(rendered, /walrus_touching_tool/);
+test('a long phrasing retains the learned tool example without a Jaccard cutoff', () => {
+  recordRunStrategy({ objective: 'reconcile walrus invoices monthly figures', toolsUsed: ['walrus_reconcile_tool'], workerCount: 0, durationMs: 5_000, learningReceipt: receipt('walrus-long') });
+  const rendered = renderRunStrategiesForContext('Please reconcile the walrus invoices monthly figures and give a careful report with sources, dates, discrepancies, explanations and recommended next steps');
+  assert.match(rendered, /walrus_reconcile_tool/);
+  assert.match(rendered, /candidate only/);
 });
 
 test('a turn whose surface is locked is not told about a proven run', async () => {

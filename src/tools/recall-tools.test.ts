@@ -72,7 +72,7 @@ test('a recall that travelled through a carrier maps back to its producer, for r
   // carrier as `tool`; the lineage walk stopped there, so the model paged the
   // recall's own clipped copy instead of the original result.
   const session = createSession({ kind: 'chat' });
-  const producer = `${'H'.repeat(4_000)}${JSON.stringify([{ Name: 'Carrier Lineage Row' }])}`;
+  const producer = JSON.stringify([{ padding: 'H'.repeat(4_000), Name: 'Carrier Lineage Row' }]);
   writeToolOutput({ sessionId: session.id, callId: 'carrier-producer', tool: 'space_get', output: producer });
   for (const carrier of ['call_tool', 'work_call'] as const) {
     const recallId = `carrier-recall-${carrier}`;
@@ -265,7 +265,7 @@ test('tool_output_query queries JSON embedded in a run_shell_command wrapper (sf
   assert.ok(text.includes('seller0@scorpion.co'), 'embedded records are queryable');
 });
 
-test('tool_output_query recovers complete JSON after a CLI help preamble', async () => {
+test('mixed CLI help and JSON cannot be silently treated as an authoritative dataset', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const wrapped = [
@@ -303,8 +303,16 @@ test('tool_output_query recovers complete JSON after a CLI help preamble', async
   );
   const text = res.content[0].text;
   assert.doesNotMatch(text, /is not JSON — use recall_tool_result/);
-  assert.match(text, /site-target/);
-  assert.doesNotMatch(text, /site-other/);
+  assert.match(text, /text, not structured data/);
+  assert.match(text, /recall_tool_result/);
+  const raw = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_help_then_json' }),
+  );
+  assert.match(raw.content[0].text, /site-target/);
+  assert.match(raw.content[0].text, /USAGE/);
+  assert.match(raw.content[0].text, /site-other/);
+  assert.match(raw.content[0].text, /text, not structured records/);
 });
 
 test('tool_output_query recovers complete records from a clipped shell JSON-array prefix', async () => {

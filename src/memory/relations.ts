@@ -1,3 +1,4 @@
+import { backupMemoryDbAsync } from './memory-backup.js';
 import { exactGroundedIdentifierMatch } from './grounded-identifier-match.js';
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
@@ -2675,7 +2676,7 @@ export async function reconcileMemoryRelationshipsAsync(opts: {
   const clock = opts.clock ?? new SliceClock(NIGHTLY_SLICE);
   const before = readEntityRelationshipHealth();
   await clock.next(true);
-  const takeBackup = opts.backup ?? (() => backupMemoryDb({ retain: 14 }));
+  const takeBackup = opts.backup ?? (() => backupMemoryDbAsync({ retain: 14 }));
   const backup = opts.requireBackup === false ? null : await takeBackup();
   if (opts.requireBackup !== false && !backup) {
     throw new Error('relationship reconciliation requires a successful memory backup');

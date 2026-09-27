@@ -8,7 +8,7 @@ import {
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
 } from '../harness/host-capability-catalog-factory.js';
-import { STRATEGY_COVERAGE_MIN_OVERLAP, listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyCoversRequest, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
+import { strategyRestatesRequest, STRATEGY_COVERAGE_MIN_OVERLAP, listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyCoversRequest, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
 import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
 import { peekConnectedToolkits, peekCurrentConnectedToolkits } from '../../integrations/composio/client.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
@@ -42,13 +42,13 @@ const OPERATION_ROUTE_CANDIDATES = 10;
 const FAMILIAR_RUN_CANDIDATES = 8;
 
 /** How the turn's remembered run was chosen:
- *  - keywords: the request restates the run (keyword coverage);
+ *  - request_identity: the accepted request exactly restates the proven run;
  *  - jev: Jev judged, inside the budget, that the run did the same kind of work;
  *  - jev_route: Jev routed the request to one operation the host can hand over.
  *  Without a turn-start judgement, remembered runs that disagree are never
  *  settled by how many words the request shares with one of them: nothing is
  *  picked, and discovery runs as usual. */
-export type ProvenPickSource = 'keywords' | 'jev' | 'jev_route';
+export type ProvenPickSource = 'request_identity' | 'jev' | 'jev_route';
 
 export interface ProvenLiveRead {
   operation: string;
@@ -670,14 +670,11 @@ export async function prepareProvenOperationForRequest(input: {
   // anything it or a chat proved.
   const strategyScope = runStrategyScopeForSession(input.sessionId) === 'workflow_step' ? 'any' as const : 'chat' as const;
   const matches = listMatchingRunStrategies(input.query, 4, { scope: strategyScope });
-  // A remembered run is taken on keywords alone only when it covers the
-  // request. One that merely shares words with it goes through Jev's check
-  // below like any other ambiguous match: a request to show a workspace can
-  // share words with the run that built it, and that run's tools are not the
-  // ones the request needs.
-  const lexical = pickProvenRunStrategy(matches);
-  let strategy = lexical && provenStrategyCoversRequest(input.query, lexical) ? lexical : null;
-  let pickedBy: ProvenPickSource | undefined = strategy ? 'keywords' : undefined;
+  // An identical accepted request can reuse a proven procedure. Similar text
+  // supplies candidates to Jev, never an operation binding by itself.
+  const unambiguousMatch = pickProvenRunStrategy(matches);
+  let strategy = unambiguousMatch && strategyRestatesRequest(input.query, unambiguousMatch) ? unambiguousMatch : null;
+  let pickedBy: ProvenPickSource | undefined = strategy ? 'request_identity' : undefined;
   let decisionWaitMs: number | undefined;
   // Whether a remembered kind of work fits and which operation would do the
   // core of the request go to Jev together, in one bounded wait before the

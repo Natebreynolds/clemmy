@@ -135,7 +135,9 @@ test('paraphrases and same-tool strategies bind without exact wording', async ()
       controllerValidation: true,
     }).receipt!,
   });
-  const paraphrased = await prepareProvenOperationForRequest({ query: 'what on my calendar today' });
+  const paraphrased = await prepareProvenOperationForRequest({ query: 'what on my calendar today' }, {
+    decideTurnStart: decideWith([], strategies => ({ strategy: strategies.find(row => row.objective === 'whats on my calendar today')?.id })),
+  });
   assert.ok(paraphrased.text);
   assert.deepEqual(paraphrased.tools, ['outlook_get_calendar_view']);
 
@@ -628,7 +630,7 @@ test('when Jev cannot be asked, no candidates are offered, nothing waits, and ru
       // The one kind of work the request matched, restated, is still the
       // host's own pick: the same with or without Jev.
       const sole = await prepareProvenOperationForRequest({ query: 'otter burrow census tally' });
-      assert.equal(sole.pickedBy, 'keywords', mode);
+      assert.equal(sole.pickedBy, 'request_identity', mode);
       assert.deepEqual(sole.tools, ['otter_census_read'], mode);
     }
     assert.equal(requests, 0, 'no Jev request was attempted');
@@ -769,4 +771,15 @@ test('a bind before the first frame trusts a current connection observation, nev
     composio.__test__.setComposioApiKeyOverride(null);
     composio.resetComposioClient();
   }
+});
+
+test('shared words never bind a remembered destructive operation to a read request', async () => {
+  recordZephyrStrategy('delete the old ibis calendar events from last week', 'ibis_calendar_delete', 'ibis-delete');
+  const prepared = await prepareProvenOperationForRequest(
+    { query: 'list the old ibis calendar events from last week' },
+    { decideTurnStart: decideWith([], () => ({ failedOpen: true })) },
+  );
+  assert.equal(prepared.strategyId, undefined);
+  assert.deepEqual(prepared.tools, []);
+  assert.equal(prepared.skipDiscoverySearch, false);
 });

@@ -370,7 +370,7 @@ function renderOne(s: RunStrategyRecord): string {
     const roles = describeProvenShapeRoles(s.provenShapes, tool);
     return roles ? `${tool} (${roles})` : tool;
   });
-  return `- A proven run of this kind of request used: ${tools.join('; ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}. Use this request's own targets and values.`;
+  return `- Prior verified run (candidate only; confirm it fits this request) used: ${tools.join('; ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}. Use this request's own targets and values.`;
 }
 
 export interface MatchedRunStrategy {
@@ -426,22 +426,17 @@ export function strategyCoversRequest(request: string, strategy: Pick<RunStrateg
   return shared / union >= STRATEGY_COVERAGE_MIN_OVERLAP;
 }
 
-/** Render the top-matching strategies for an objective, or '' when nothing
- *  clears the relevance floor (additive injection contract). A context note
- *  that names a run's tools is a recommendation made with no judgement, so
- *  only a run that covers the request is named; one that merely shares words
- *  with it is left to tool discovery. `request`, when given, is the literal
- *  accepted request the coverage is measured against (the ranking objective
- *  may also carry focus text). */
-export function renderRunStrategiesForContext(objective: string | undefined, limit = 2, request?: string): string {
-  const coverageText = request?.trim() || objective || '';
-  // Coverage filters the whole recall before the limit applies, so a covering
-  // run ranked just below one that merely shares words is still named.
-  const scored = listMatchingRunStrategies(objective, Number.POSITIVE_INFINITY)
-    .filter((match) => strategyCoversRequest(coverageText, match.strategy))
-    .slice(0, limit);
-  if (scored.length === 0) return '';
-  return scored.map((x) => renderOne(x.strategy)).join('\n');
+/** Exact request identity permits reuse; shared vocabulary only finds candidates. */
+export function strategyRestatesRequest(request: string, strategy: Pick<RunStrategyRecord, 'objective'>): boolean {
+  return request.trim().length > 0 && request.trim() === strategy.objective.trim();
+}
+
+/** Recall advisory examples without turning lexical similarity into an operation
+ * decision. Binding is separate: exact accepted request identity or Jev, then
+ * current schema/account/effect attestation. No earlier argument values travel. */
+export function renderRunStrategiesForContext(objective: string | undefined, limit = 2, _request?: string): string {
+  return listMatchingRunStrategies(objective, limit)
+    .map((match) => renderOne(match.strategy)).join('\n');
 }
 
 export interface RunStrategyLearningStats {

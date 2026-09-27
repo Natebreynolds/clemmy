@@ -1,3 +1,4 @@
+import { nightlyAdmission } from '../memory/nightly-admission.js';
 import { workflowOwnedUnfinishedAttemptIds } from '../runtime/harness/accepted-source-outcome.js';
 import {
   closeSync,
@@ -928,6 +929,7 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
   const day = localDayKey(now);
   if (state.lastRecursiveReflectionDay === day) return;
   if (!recursiveReflectionModelReady()) return;
+  if (!nightlyAdmission.claim('patterns')) return;
   state.lastRecursiveReflectionDay = day;
   saveState(state);
   // Phase A observability: the episodic→semantic distillation tick is the
@@ -975,6 +977,7 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
   if (now.getHours() < MEMORY_HYGIENE_LOCAL_HOUR) return;
   const day = localDayKey(now);
   if (state.lastMemoryHygieneDay === day) return;
+  if (!nightlyAdmission.claim('tidy')) return;
   state.lastMemoryHygieneDay = day;
   saveState(state);
 

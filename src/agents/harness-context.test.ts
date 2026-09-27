@@ -17,7 +17,7 @@ const { createFocus, patchFocusWorkstate } = await import('../memory/focus.js');
 const { harnessInstructions, renderHarnessMemoryContext, renderCurrentTimeForInstructions, renderRightNowStamp, renderMemoryCore } = await import('./harness-context.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const { rememberFact } = await import('../memory/facts.js');
-const { checkpointWorkingMemory } = await import('../memory/working-memory.js');
+const { checkpointWorkingMemory, workingMemoryPathForSession } = await import('../memory/working-memory.js');
 const { createSession, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { createGoalContract } = await import('./plan-proposals.js');
 const { renderCanonicalMemoryContext } = await import('../runtime/harness/canonical-context.js');
@@ -698,25 +698,31 @@ test('the clock is stated once, last, next to the message, with the date-math ru
   assert.doesNotMatch(turn, /Today is \d{4}/);
 });
 
-test('the right-now tier stays small: three held tasks, clipped working memory, standing goals as a count', async () => {
+test('the right-now tier preserves standing goals, held objectives and the working checkpoint', async () => {
   resetMemoryDb();
-  const sessionId = 'right-now-bounds';
-  checkpointWorkingMemory(sessionId, { turn: 1, toolCallsTotal: 1, lastText: `Checkpoint start. ${'detail '.repeat(300)}` });
+  const sessionId = 'right-now-continuity';
+  const checkpoint = `Checkpoint start. ${'detail '.repeat(220)}KEEP-THE-REVIEW-DECISION`;
+  const workingPath = workingMemoryPathForSession(sessionId);
+  mkdirSync(path.dirname(workingPath), { recursive: true });
+  writeFileSync(workingPath, checkpoint);
+  checkpointWorkingMemory(sessionId, { turn: 1, toolCallsTotal: 1, lastText: 'Current step' });
   const dir = path.join(TMP_HOME, 'goals');
   mkdirSync(dir, { recursive: true });
-  for (let i = 0; i < 4; i += 1) {
-    writeFileSync(path.join(dir, `goal-${i}.json`), JSON.stringify({ id: `goal-${i}`, title: `Grow the zebra program ${i}`, status: i === 0 ? 'blocked' : 'active', priority: 'medium' }));
+  for (let i = 0; i < 5; i += 1) {
+    writeFileSync(path.join(dir, `goal-${i}.json`), JSON.stringify({ id: `goal-${i}`, title: `Grow the zebra program ${i}`, status: i === 0 ? 'blocked' : 'active', priority: 'medium', targetDate: '2026-10-01', nextActions: [`Next zebra action ${i}`] }));
   }
   const { holdTaskForLater } = await import('./plan-proposals.js');
-  for (let i = 0; i < 5; i += 1) holdTaskForLater({ sessionId, objective: `Held errand number ${i} for the zebra program` });
+  for (let i = 0; i < 6; i += 1) holdTaskForLater({ sessionId, objective: `Held errand number ${i} ${'specific context '.repeat(12)} ending-${i}` });
   const context = renderHarnessMemoryContext({ sessionId, partition: 'volatile' });
-  const held = context.slice(context.indexOf('## Held For Later'));
-  assert.equal((held.match(/^  - held-/gm) ?? []).length, 3, 'three held ids');
-  assert.match(held, /…and 2 more held in this conversation\./);
-  assert.match(context, /working memory clipped here/);
-  assert.equal(context.includes('detail '.repeat(120)), false, `working memory is clipped: ${context.length}`);
-  assert.match(context, /## Active Goals\n4 standing goals on file \(1 blocked\): advisory only, never the current request; goal_list reads them\./);
-  assert.doesNotMatch(context, /Grow the zebra program/, 'goal text stays in the goal store');
+  for (let i = 0; i < 6; i += 1) assert.ok(context.includes(`ending-${i}`), `held task ${i} retains its full objective`);
+  assert.match(context, /KEEP-THE-REVIEW-DECISION/);
+  for (let i = 0; i < 5; i += 1) {
+    assert.ok(context.includes(`Grow the zebra program ${i}`));
+    assert.ok(context.includes(`Next zebra action ${i}`));
+  }
+  assert.match(context, /\[BLOCKED\]/);
+  assert.match(context, /due 2026-10-01/);
+  assert.match(context, /Advisory standing goals only/);
 });
 test('the memory core is content-addressed: requests, sessions and later facts leave its bytes alone', () => {
   resetMemoryDb();

@@ -311,6 +311,24 @@ function storedJsonValue(value: unknown, via: StoredToolOutputJsonVia): StoredTo
   return { value, via };
 }
 
+/** Stored evidence is not a model's requested structured answer. Recover only
+ * an entire value with recognized host framing; never promote a JSON example
+ * inside documentation, an error, or other prose into the result's dataset. */
+function storedJsonCandidate(raw: string): string | null {
+  let text = raw.trim();
+  const recalled = /^Recalled chars (\d+)[–-](\d+) of (\d+)[^\n]*\n\n/.exec(text);
+  if (recalled) {
+    if (Number(recalled[1]) !== 0 || Number(recalled[2]) !== Number(recalled[3])) return null;
+    text = text.slice(recalled[0].length).trim();
+  }
+  // Legacy host annotations occupy separate trailing lines. Current outputs
+  // retain the payload separately, but historical records must stay readable.
+  text = text.replace(/(?:\n\s*\[(?:account-route|sender-verify)\][^\n]*)+\s*$/, '').trim();
+  const wholeFence = /^```(?:json)?\s*\n([\s\S]*?)\n```$/.exec(text);
+  if (wholeFence) text = wholeFence[1]!.trim();
+  return isParseableJson(text) ? text : null;
+}
+
 /**
  * Recover the JSON value from a STORED tool output.
  *
@@ -328,8 +346,8 @@ function storedJsonValue(value: unknown, via: StoredToolOutputJsonVia): StoredTo
  * it needed already in hand. A reader that lies about the data is worse than
  * one that errors.
  *
- * Precedence preserves each caller's previous behavior exactly and only ADDS
- * the raw-embedded step, so no shape that resolved before resolves differently.
+ * Exact payloads and recognized host envelopes are structured. Arbitrary prose
+ * remains text even if it includes a parseable JSON example.
  */
 export function parseStoredToolOutputJson(
   raw: string,
@@ -347,7 +365,7 @@ export function parseStoredToolOutputJson(
     return { value: shell.stdout_json, via: 'shell_stdout' };
   }
   if (shell) {
-    const embeddedStdout = extractJsonCandidate(shell.stdout);
+    const embeddedStdout = storedJsonCandidate(shell.stdout);
     if (embeddedStdout !== null) {
       try {
         return { value: JSON.parse(embeddedStdout) as unknown, via: 'shell_embedded' };
@@ -355,10 +373,9 @@ export function parseStoredToolOutputJson(
     }
   }
 
-  // THE ADDED STEP: a complete JSON value carrying harness prose before or
-  // after it. `extractJsonCandidate` does a string-aware balanced scan, so a
-  // leading preamble and a trailing note both fall away.
-  const embedded = extractJsonCandidate(raw);
+  // A complete value carrying only recognized host framing. Model-output
+  // JSON repair is deliberately broader and must not classify retained data.
+  const embedded = storedJsonCandidate(raw);
   if (embedded !== null) {
     try {
       return storedJsonValue(JSON.parse(embedded) as unknown, 'embedded');
@@ -366,7 +383,7 @@ export function parseStoredToolOutputJson(
   }
 
   // Last resort: a clipped array — recover the complete objects written so far.
-  if (shell?.stdout.includes('[')) {
+  if (shell?.stdout.trimStart().startsWith('[')) {
     const objects = extractCompleteJsonObjects(shell.stdout, 200);
     if (objects.length > 0) {
       return { value: objects, via: 'shell_objects', partialArrayPrefix: true };

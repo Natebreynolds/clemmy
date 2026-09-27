@@ -338,7 +338,7 @@ test('a request that restates the proven run is bound on its own words and narro
   const turnStartsBefore = turnStartRequests.length;
   const run = await hostTurn('restated', 'Is there a file called Q3 Plan in my Google Drive?', 'Q3 Plan');
   assert.equal(turnStartRequests.length, turnStartsBefore, 'a restated run needs no turn-start judgement');
-  assert.equal(run.selected?.pickedBy, 'keywords', debug(run));
+  assert.equal(run.selected?.pickedBy, 'request_identity', debug(run));
   assert.equal(run.selected?.skipDiscoverySearch, true, debug(run));
   assert.equal(run.selected?.narrowSurface, true, debug(run));
   assert.ok(!run.frames[0]?.tools.includes('read_file'), `the restated run's surface narrows: ${debug(run)}`);

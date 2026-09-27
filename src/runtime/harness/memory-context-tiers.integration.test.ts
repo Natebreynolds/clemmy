@@ -119,8 +119,9 @@ function recordingBrain(label: string) {
   };
 }
 
-async function hostTurn(label: string, request: string) {
+async function hostTurn(label: string, request: string, prepare?: (sessionId: string) => Promise<void>) {
   const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: label });
+  await prepare?.(session.id);
   const attempt = eventlog.beginRunAttempt(session.id, { runId: `memory-tiers-${label}:${session.id}` });
   const accepted = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
     text: request, taskMode: { version: 1, kind: 'normal' },
@@ -482,4 +483,31 @@ test('a fallback primer that cites a recall run leads the stand-in and is verifi
     assert.equal(verified.length, 1, 'the gate verified the stand-in with its primer');
     assert.equal(verified[0]!.recallId, record.recallId);
   }
+});
+
+
+test('the actual brain request retains goals, all held tasks and the long working checkpoint', async () => {
+  const goalsDir = path.join(HOME, 'goals');
+  mkdirSync(goalsDir, { recursive: true });
+  for (let i = 0; i < 5; i++) writeFileSync(path.join(goalsDir, `continuity-${i}.json`), JSON.stringify({
+    id: `continuity-${i}`, title: `Continuity goal ${i}`, status: 'active', priority: 'high', nextActions: [`Next continuity action ${i}`],
+  }));
+  try {
+    const run = await hostTurn('continuity-goals', 'What should I work on next?', async sessionId => {
+      const { holdTaskForLater } = await import('../../agents/plan-proposals.js');
+      const { workingMemoryPathForSession, checkpointWorkingMemory } = await import('../../memory/working-memory.js');
+      for (let i = 0; i < 6; i++) holdTaskForLater({ sessionId, objective: `Held continuity ${i}: ${'Details '.repeat(30)}retain-ending-${i}` });
+      const file = workingMemoryPathForSession(sessionId);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, `# Working Memory\n${'Retained detail '.repeat(100)}STILL-NEEDS-REVIEW`);
+      checkpointWorkingMemory(sessionId, { turn: 1, lastText: 'Resume from the checkpoint' });
+    });
+    const wire = run.frames[0]!.system + JSON.stringify(run.frames[0]!.input);
+    for (let i = 0; i < 5; i++) {
+      assert.ok(wire.includes(`Continuity goal ${i}`));
+      assert.ok(wire.includes(`Next continuity action ${i}`));
+    }
+    for (let i = 0; i < 6; i++) assert.ok(wire.includes(`retain-ending-${i}`));
+    assert.match(wire, /STILL-NEEDS-REVIEW/);
+  } finally { rmSync(goalsDir, { recursive: true, force: true }); }
 });

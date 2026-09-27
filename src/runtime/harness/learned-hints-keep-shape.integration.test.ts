@@ -6,8 +6,7 @@
  *
  * A first request about one target discovers a provider operation, calls it
  * and succeeds; the host learns that run at its done terminal. A later request
- * of the same kind about another target restates the run closely enough to
- * bind on its own words. Everything the host then puts in front of the brain
+ * of the same kind about another target is confirmed by Jev before binding. Everything the host then puts in front of the brain
  * before its first frame (the proven-operation guidance and the memory
  * context's proven-run hint) names the tool and the roles of its arguments,
  * and none of it carries the first request's target.
@@ -58,6 +57,7 @@ const manifests = await import('./capability-manifest-store.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
 const semanticPorts = await import('../semantic-boundary/turn-semantic-port-registry.js');
 const strategies = await import('../../memory/run-strategy-store.js');
+const jev = await import('../jev/client.js');
 
 const OPERATION = 'SAMPLESEO_GET_BACKLINKS_SUMMARY';
 const REF_PATTERN = /cap:resolved:sampleseo_get_backlinks_summary(?::definition:[a-z0-9]+)?/;
@@ -127,7 +127,35 @@ semanticPorts.installTurnSemanticModelPort({
   },
 } as never);
 
+jev._setTypesafeKeyForTests('ts_fixture');
+jev._setSystemOneFetchForTests(async (_url, init) => {
+  const body = JSON.parse(String(init.body)) as { questions: Record<string, { type: string; instructions?: string; criteria?: Record<string, unknown> }> };
+  const ids = Object.keys(body.questions);
+  if (!ids.some((id) => id.startsWith('run_') || id === 'select')) {
+    return { status: 503, ok: false, text: async () => '' };
+  }
+  const answers: Record<string, unknown> = {};
+  for (const [id, question] of Object.entries(body.questions)) {
+    if (question.type === 'choice') {
+      const hit = Object.entries(question.criteria ?? {})
+        .find(([key, text]) => key !== 'none' && /sampleseo_get_backlinks_summary/i.test(String(text)));
+      const choice = hit ? hit[0] : 'none';
+      const confidence = hit ? 0.45 : 0.9;
+      answers[id] = { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } };
+    } else {
+      answers[id] = { type: 'noul', noul: /sampleseo_get_backlinks_summary/i.test(question.instructions ?? '') ? 0.93 : 0.04 };
+    }
+  }
+  return {
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0', answers, usage: { input_tokens: 60, output_tokens: 6 } }),
+  };
+});
+
 after(() => {
+  jev._setSystemOneFetchForTests(undefined);
+  jev._setTypesafeKeyForTests(undefined);
   semanticPorts.installTurnSemanticModelPort(null);
   schemas._setToolSchemaLoaderForTests(null);
   schemas.resetToolSchemaCache();
@@ -272,14 +300,14 @@ test('a later request of the same kind about another target receives a hint that
   const request = `how many backlinks does https://${SECOND_TARGET} have?`;
   // The memory-context hint for this request, as the host renders it.
   const memoryHint = strategies.renderRunStrategiesForContext(request);
-  assert.match(memoryHint, /A proven run of this kind of request used: /, memoryHint);
+  assert.match(memoryHint, /Prior verified run \(candidate only; confirm it fits this request\) used: /, memoryHint);
   assert.match(memoryHint, /sampleseo_get_backlinks_summary \(tool_slug=SAMPLESEO_GET_BACKLINKS_SUMMARY, arguments\.target, arguments\.include_subdomains\)/i, memoryHint);
   assert.match(memoryHint, /Use this request's own targets and values/);
   assert.doesNotMatch(memoryHint, new RegExp(`${FIRST_TARGET.replace('.', '\\.')}|first-firm|similar past run`), memoryHint);
 
   const second = await hostTurn('second', request, SECOND_TARGET);
   assert.equal(second.result.status, 'completed', debug(second));
-  assert.equal(second.selected?.pickedBy, 'keywords', `the restated run binds on its own words: ${debug(second)}`);
+  assert.equal(second.selected?.pickedBy, 'jev', `Jev confirms the new target before the remembered operation binds: ${debug(second)}`);
   assert.equal(second.selected?.skipDiscoverySearch, true, debug(second));
   assert.deepEqual(second.toolCalls.filter((name) => name === 'tool_search'), [], `zero tool_search: ${debug(second)}`);
   assert.deepEqual(targetsSeen, [FIRST_TARGET, SECOND_TARGET], 'the bound operation ran once, on this request\'s own target');
