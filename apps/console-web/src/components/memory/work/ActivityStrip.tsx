@@ -130,7 +130,7 @@ export function ActivityStrip({ view }: { view: MemoryWorkView }) {
               bars={view.daily}
               slots={view.dailySlots}
               label="Memory work in the last 30 days, by day"
-              summary={view.dailyMissing > 0 ? `Daily totals start ${view.daily[0]?.label}; there is no record before that.` : `Bars show ${view.dailyUnit} per day.`}
+              summary={view.dailySummary}
               heightClass="h-9"
               ticks="ends"
             />

@@ -397,6 +397,8 @@ export interface MemoryWorkView {
   dailySlots: number;
   dailyUnit: 'model calls' | 'runs';
   dailyMissing: number;
+  /** The 30 days in one line: where the record starts, or what a bar counts. */
+  dailySummary: string;
   /** "Counts since midnight", or since the journal began when that was today. */
   todayCaption: string;
   totals: TotalView[];
@@ -484,6 +486,9 @@ function hourlyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: Activity
   const unit = useCalls ? 'model calls' : 'runs';
   const values = placed.map(({ h }) => count(useCalls ? h.modelCalls : h.runs) ?? 0);
   const max = Math.max(0, ...values);
+  // "now" labels the current hour; a tick in the slot beside it would run
+  // into it on a narrow strip.
+  const nowSlot = placed.find(({ start }) => now >= start && now < start + HOUR_MS)?.slot;
   const bars = placed.map(({ h, start, slot }, i) => {
     const value = values[i] ?? 0;
     const learned = count(h.learned) ?? 0;
@@ -491,7 +496,8 @@ function hourlyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: Activity
     const calls = count(h.modelCalls) ?? 0;
     const current = now >= start && now < start + HOUR_MS;
     const label = hourOfDay(start);
-    const tick = new Date(start).getHours() % 6 === 0 && !current ? label : null;
+    const besideNow = nowSlot !== undefined && Math.abs(slot - nowSlot) <= 1;
+    const tick = new Date(start).getHours() % 6 === 0 && !current && !besideNow ? label : null;
     const parts = runs + calls === 0
       ? ['no memory work']
       : [plural(calls, 'model call', 'model calls'), ...(runs ? [plural(runs, 'run', 'runs')] : []), ...(learned ? [`${learned.toLocaleString()} learned`] : [])];
@@ -529,7 +535,7 @@ function dayNoon(day: string): number {
   return /^\d{4}-\d{2}-\d{2}$/.test(day) ? new Date(`${day}T12:00:00`).getTime() : NaN;
 }
 
-function dailyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: ActivityBarView[]; unit: 'model calls' | 'runs'; missing: number } {
+function dailyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: ActivityBarView[]; unit: 'model calls' | 'runs'; missing: number; summary: string } {
   const days = (Array.isArray(snapshot.daily) ? snapshot.daily : []).filter((d) => Number.isFinite(dayNoon(d.day)));
   // Each bar in its own day's slot, counted back from the newest day.
   const newest = days.reduce((max, d) => Math.max(max, dayNoon(d.day)), Number.NEGATIVE_INFINITY);
@@ -563,7 +569,14 @@ function dailyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: ActivityB
       readout: `${label} · ${parts.join(' · ')}`,
     };
   });
-  return { bars, unit: useCalls ? 'model calls' : 'runs', missing: Math.max(0, DAILY_SLOTS - bars.length) };
+  const unit = useCalls ? 'model calls' : 'runs';
+  const missing = Math.max(0, DAILY_SLOTS - bars.length);
+  const first = bars[0];
+  // Mid-sentence, today is "today".
+  const summary = missing > 0 && first
+    ? `Daily totals start ${first.current ? 'today' : first.label}; there is no record before that.`
+    : `Bars show ${unit} per day.`;
+  return { bars, unit, missing, summary };
 }
 
 /** Today's counts start at midnight, or when the journal began if that was
@@ -834,6 +847,7 @@ export function memoryWorkViewModel(snapshot: MemoryWorkSnapshot, now: number, o
     dailySlots: DAILY_SLOTS,
     dailyUnit: daily.unit,
     dailyMissing: daily.missing,
+    dailySummary: daily.summary,
     todayCaption: todayCaption(snapshot, now),
     totals: totals(snapshot.today, unknown),
     jobs: jobs(snapshot, fmt, fresh, unknown),

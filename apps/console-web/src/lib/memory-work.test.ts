@@ -448,10 +448,39 @@ test('with no model calls the bars count runs, and a quiet day says so', () => {
   assert.equal(quiet.hourlySummary, 'No memory work in the last 24 hours.');
 });
 
+test('no hour tick sits beside "now", where it would run into it on a narrow strip', () => {
+  // 7:30 AM: the 6 AM tick is in the slot next to "now"; noon and midnight keep theirs.
+  const at = new Date(NOW); at.setHours(7, 30, 0, 0);
+  const now = at.getTime();
+  const start = new Date(now); start.setMinutes(0, 0, 0);
+  const hourly = Array.from({ length: 24 }, (_, i) => ({ hourStart: iso(start.getTime() - (23 - i) * HOUR), runs: 0, modelCalls: 0, learned: 0 }));
+  const view = memoryWorkViewModel(snapshot({ hourly }), now);
+  const ticks = view.hourly.filter((b) => b.tick).map((b) => [b.slot, new Date(Date.parse(b.key)).getHours()]);
+  assert.equal(view.hourly[23]?.current, true);
+  assert.ok(!ticks.some(([slot]) => slot === 22), 'the 6 AM tick beside "now" is dropped');
+  assert.deepEqual(ticks.map(([, hour]) => hour).sort((a, b) => a - b), [0, 12, 18]);
+  // At 9:30 AM the 6 AM tick is three slots away and stays.
+  at.setHours(9, 30, 0, 0);
+  const later = at.getTime();
+  const laterStart = new Date(later); laterStart.setMinutes(0, 0, 0);
+  const laterView = memoryWorkViewModel(snapshot({
+    hourly: Array.from({ length: 24 }, (_, i) => ({ hourStart: iso(laterStart.getTime() - (23 - i) * HOUR), runs: 0, modelCalls: 0, learned: 0 })),
+  }), later);
+  assert.ok(laterView.hourly.some((b) => b.tick && new Date(Date.parse(b.key)).getHours() === 6));
+});
+
 test('the 30-day strip leaves days before the record began blank, not zero', () => {
   const view = memoryWorkViewModel(snapshot(), NOW);
   assert.equal(view.daily.length, 24);
   assert.equal(view.dailyMissing, 6);
+  assert.equal(view.dailySummary, `Daily totals start ${view.daily[0]?.label}; there is no record before that.`);
+  const full = memoryWorkViewModel(snapshot({
+    daily: Array.from({ length: 30 }, (_, i) => {
+      const d = new Date(NOW); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - (29 - i));
+      return { day: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`, runs: 1, modelCalls: 2, learned: 0, inputTokens: 0, outputTokens: 0 };
+    }),
+  }), NOW);
+  assert.equal(full.dailySummary, 'Bars show model calls per day.');
   assert.equal(view.daily[view.daily.length - 1]?.label, 'Today');
   assert.equal(view.daily[view.daily.length - 1]?.current, true);
   assert.deepEqual(view.daily.map((b) => b.slot), Array.from({ length: 24 }, (_, i) => i + 6), 'each day in its own slot');
@@ -471,6 +500,7 @@ test('a new journal\'s one hour and one day sit at the right of their strips, an
   assert.equal(view.hourlySlots, 24);
   assert.deepEqual(view.daily.map((b) => b.slot), [29]);
   assert.equal(view.dailySlots, 30);
+  assert.equal(view.dailySummary, 'Daily totals start today; there is no record before that.', 'mid-sentence, today is "today"');
   const time = new Date(began).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   assert.equal(view.hourlySummary, `No memory work since ${time}.`, 'the span measured, not "the last 24 hours"');
   assert.equal(view.todayCaption, `Counts since ${time}`, 'today\'s zeros count from when the journal began');
