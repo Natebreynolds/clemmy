@@ -15,6 +15,8 @@
  *     the per-block rendering stands in, and when it finds nothing only the
  *     counts pointer is sent;
  *   - the owner's clock is stated once, last in the per-turn context;
+ *   - the accepted request's memory record (version 2) names every section
+ *     sent, by tier, and the console reads it back without memory text.
  * Each later tier adds its own pins below.
  */
 import assert from 'node:assert/strict';
@@ -274,4 +276,54 @@ test('the clock is stated once in the request, last in the per-turn memory', asy
   assert.doesNotMatch(system, /Today is \d{4}|## Now\n/, 'no second clock');
   assert.match(system.trimEnd(), /## Right Now\nRight now it is \w+day, \d{4}-\d{2}-\d{2}, \d{2}:\d{2} \(.+\)\. Use this for any date\/time math, never invent or guess\.$/,
     'the clock closes the per-turn memory, next to the message');
+});
+
+test('the accepted request records what memory it sent, by tier, and the console reads it back', async () => {
+  const run = await hostTurn('manifest', 'When does the quokka ledger close each month?');
+  const row = run.trace.filter((event) => event.type === 'guardrail_tripped'
+    && (event.data as { kind?: string }).kind === 'model_memory_context').at(-1)?.data as Record<string, unknown> | undefined;
+  assert.ok(row, 'the accepted request recorded its memory');
+  assert.equal(row!.version, 2);
+  const manifest = row!.manifest as Array<{ section: string; tier: string; tokens: number; bytes: number; refs: Array<{ type: string; id: string }> }>;
+  const tiers = new Set(manifest.map((entry) => entry.tier));
+  assert.deepEqual([...tiers].sort(), ['core', 'now', 'relevant'], JSON.stringify(manifest));
+  assert.ok(manifest.some((entry) => entry.tier === 'core' && entry.section === 'Standing Policies' && entry.refs.some((ref) => ref.type === 'policy')));
+  assert.ok(manifest.some((entry) => entry.tier === 'relevant' && entry.section === 'Relevant To This Request' && entry.refs.length > 0),
+    JSON.stringify(manifest));
+  assert.equal(manifest.filter((entry) => entry.section === 'Memory Pointer').length, 1, 'each section is listed once');
+  assert.ok(manifest.some((entry) => entry.tier === 'now' && entry.section === 'Right Now'));
+  const { renderMemoryCore } = await import('../../agents/harness-context.js');
+  assert.equal(row!.coreSha, renderMemoryCore().sha256, 'the record names the content-addressed core');
+  const totals = row!.totals as Record<string, number>;
+  assert.equal(totals.tokens, totals.coreTokens + totals.relevantTokens + totals.nowTokens);
+  const { acceptedModelMemoryEvidence } = await import('./model-memory-evidence.js');
+  assert.match(acceptedModelMemoryEvidence({ sessionId: run.sessionId, sourceUserSeq: run.sourceUserSeq })!,
+    /## Relevant To This Request/, 'a reviewer sees the ranked tail the model saw');
+
+  const express = (await import('express')).default;
+  const { createServer } = await import('node:http');
+  const { registerConsoleRoutes } = await import('../../dashboard/console-routes.js');
+  const app = express();
+  app.use(express.json());
+  registerConsoleRoutes(app, () => true, { getRuntime: () => ({ listPendingApprovals: () => [] }) } as never, { serveLegacyAtRoot: false });
+  const server = await new Promise<import('node:http').Server>((resolve) => { const s = createServer(app); s.listen(0, '127.0.0.1', () => resolve(s)); });
+  try {
+    const port = (server.address() as import('node:net').AddressInfo).port;
+    const res = await originalFetch(`http://127.0.0.1:${port}/api/console/sessions/${encodeURIComponent(run.sessionId)}/memory-sent`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { sourceUserSeq: number; version: number; coreSha: string; manifest: unknown[]; totals: Record<string, number> };
+    assert.equal(body.sourceUserSeq, run.sourceUserSeq);
+    assert.equal(body.version, 2);
+    assert.equal(body.coreSha, row!.coreSha);
+    assert.deepEqual(body.manifest, manifest);
+    assert.equal(JSON.stringify(body).includes('quokka'), false, 'sizes and refs, never memory text');
+    const named = await originalFetch(`http://127.0.0.1:${port}/api/console/sessions/${encodeURIComponent(run.sessionId)}/memory-sent?sourceUserSeq=${run.sourceUserSeq}`);
+    assert.equal(named.status, 200);
+    const missing = await originalFetch(`http://127.0.0.1:${port}/api/console/sessions/no-such-session/memory-sent`);
+    assert.equal(missing.status, 404);
+    const bad = await originalFetch(`http://127.0.0.1:${port}/api/console/sessions/${encodeURIComponent(run.sessionId)}/memory-sent?sourceUserSeq=abc`);
+    assert.equal(bad.status, 400);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

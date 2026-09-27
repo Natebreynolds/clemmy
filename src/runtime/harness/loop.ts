@@ -5492,7 +5492,7 @@ function assemblyTimeoutPrimer(input: string, scope: MemoryTailScope | undefined
   };
   if (!scope) return primer;
   const tail = renderTurnMemoryTail(scope, { kind: 'no_signal' }, { request: query });
-  registerMemoryTail(tail.text);
+  registerMemoryTail(tail.text, tail.manifest);
   return { ...primer, text: tail.text || undefined, injectedBytes: Buffer.byteLength(tail.text, 'utf8'), manifest: tail.manifest };
 }
 
@@ -5504,7 +5504,7 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
   const query = input.replace(/\s+/g, ' ').trim();
   const withTail = (primer: TurnMemoryPrimer, signal: TurnMemorySignal, sessionPointers = ''): TurnMemoryPrimer => {
     const tail = renderTurnMemoryTail(scope, signal, { request: query, sessionPointers });
-    registerMemoryTail(tail.text);
+    registerMemoryTail(tail.text, tail.manifest);
     return {
       ...primer,
       text: tail.text || undefined,

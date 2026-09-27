@@ -734,7 +734,7 @@ import {
   loadExpectedWorkCallBindingState,
 } from './expected-work-admission.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
-import { visibleInstructionMemory, recordAcceptedModelMemory, acceptedModelMemoryEvidence } from './model-memory-evidence.js';
+import { visibleModelMemory, recordAcceptedModelMemory, acceptedModelMemoryEvidence } from './model-memory-evidence.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 import {
   classifyHostModelFrame,
@@ -9588,7 +9588,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // and only after the model returns an admitted frame. Reviewers share that
     // exact view across activation/restart rather than guessing from searches.
     if (hostProduction && !consumingRecoveredFrame && !hostWriterForStep) {
-      const memory = visibleInstructionMemory((agent as { instructions?: unknown }).instructions, instructions, modelInput);
+      const memory = visibleModelMemory((agent as { instructions?: unknown }).instructions, instructions, modelInput);
       recordAcceptedModelMemory(exactHostIdentity(), memory, step.responseId);
     }
     // Persisting `step.output` or executing `step.toolCalls` would re-open the

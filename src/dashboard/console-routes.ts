@@ -53,6 +53,7 @@ import { countActiveFacts, FACT_KINDS, forgetFact, getFact, getFactWithEvidence,
 import { listResourcePointers, countResourcePointers, isSourceMapEnabled } from '../memory/source-map.js';
 import { readHygieneAudit } from '../memory/hygiene-audit.js';
 import { listRecallUses, listSessionRecallRunIds, readRecallRun } from '../memory/recall-usage.js';
+import { latestModelMemoryManifest } from '../runtime/harness/model-memory-evidence.js';
 import { MEMORY_DB_PATH, openMemoryDb, type FocusRow } from '../memory/db.js';
 import { auditMemoryReadiness } from '../memory/readiness.js';
 import { buildMemoryGraph, buildMemoryNeighborhood } from './memory-graph.js';
@@ -4578,6 +4579,31 @@ export function registerConsoleRoutes(
       const seen = new Set<string>();
       const used = usedRefs.filter((ref) => { const k = `${ref.type}:${ref.id}`; if (seen.has(k)) return false; seen.add(k); return true; });
       res.json({ sessionId, since, runs, used });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /**
+   * What memory an accepted model request carried for a conversation: the
+   * latest record, or the one for `?sourceUserSeq=`. Sections with tier
+   * (core | relevant | now), estimated tokens, bytes and refs, plus totals and
+   * the memory core's content address. Read-only, and never the memory text.
+   */
+  app.get('/api/console/sessions/:id/memory-sent', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const sessionId = String(req.params.id ?? '').trim();
+    if (!sessionId) { res.status(400).json({ error: 'session id required' }); return; }
+    const seqRaw = typeof req.query.sourceUserSeq === 'string' ? req.query.sourceUserSeq.trim() : '';
+    const sourceUserSeq = seqRaw ? Number(seqRaw) : undefined;
+    if (sourceUserSeq !== undefined && (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0)) {
+      res.status(400).json({ error: 'sourceUserSeq must be a positive integer' });
+      return;
+    }
+    try {
+      const record = latestModelMemoryManifest(sessionId, sourceUserSeq);
+      if (!record) { res.status(404).json({ error: 'no memory record for this conversation', sessionId }); return; }
+      res.json(record);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

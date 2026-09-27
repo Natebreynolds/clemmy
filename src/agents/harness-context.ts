@@ -27,7 +27,7 @@ import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
  * snapshot.
  */
 import { loadMemoryContext } from '../memory/vault.js';
-import { withInstructionMemory } from '../runtime/harness/model-memory-evidence.js';
+import { withInstructionMemory, type ModelMemoryManifestEntry } from '../runtime/harness/model-memory-evidence.js';
 import { countActiveFacts, renderCorePoliciesForInstructions, renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText, type CorePolicyRender } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
 import { getFocusSnapshot } from '../memory/focus.js';
@@ -371,7 +371,7 @@ const VOLATILE_CONTEXT_TITLES = new Set<string>([
   'Offer Being Discussed',
 ]);
 
-export function renderHarnessMemoryContext(opts?: {
+type HarnessMemoryContextOptions = {
   sessionId?: string;
   sourceUserSeq?: number;
   query?: string;
@@ -386,7 +386,24 @@ export function renderHarnessMemoryContext(opts?: {
    *  carry, under the per-turn header. The harness prompt sends the core in
    *  its cached prefix and this after the cache boundary. */
   layout?: 'legacy' | 'variable';
-}): string {
+};
+
+export function renderHarnessMemoryContext(opts?: HarnessMemoryContextOptions): string {
+  return composeHarnessMemoryContext(opts).text;
+}
+
+/** Sections that carry request-ranked memory; the rest of the per-turn
+ *  context is the conversation's right-now state. */
+const RELEVANT_CONTEXT_TITLES = new Set<string>([
+  'Relevant To Your Request',
+  'Relevant Skills',
+  'Persistent Facts',
+  'Recently Learned',
+  'Data Landscape',
+  'Remembered Tool Choices',
+]);
+
+function composeHarnessMemoryContext(opts?: HarnessMemoryContextOptions): { text: string; manifest: MemoryManifestEntry[] } {
   const variableLayout = opts?.layout === 'variable';
   let memContext;
   try {
@@ -518,30 +535,30 @@ export function renderHarnessMemoryContext(opts?: {
     { title: 'Right Now', text: section('Right Now', renderRightNowStamp()) },
   ];
 
-  const blocks = tagged
+  const kept = tagged
     .filter((b) => Boolean(b.text))
     .filter((b) => !variableLayout || !MEMORY_CORE_TITLES.has(b.title))
     .filter((b) =>
       partition === 'all' ? true
       : partition === 'volatile' ? VOLATILE_CONTEXT_TITLES.has(b.title)
-      : !VOLATILE_CONTEXT_TITLES.has(b.title))
-    .map((b) => b.text);
+      : !VOLATILE_CONTEXT_TITLES.has(b.title));
+  const blocks = kept.map((b) => b.text);
 
-  if (blocks.length === 0) return '';
+  if (blocks.length === 0) return { text: '', manifest: [] };
+  const tierOf = (title: string): MemoryTier => (MEMORY_CORE_TITLES.has(title) ? 'core'
+    : RELEVANT_CONTEXT_TITLES.has(title) ? 'relevant' : 'now');
   // The volatile tail rides in the user turn (uncached by design), so it gets a
   // lighter header that frames it as the time-sensitive refresh; stable/all keep
   // the canonical persistent-context header (byte-identical for 'all'). The
   // variable layout follows a memory core that already carries that header.
-  if (partition === 'volatile' || variableLayout) {
-    return [
-      CURRENT_STATE_HEADER,
-      ...blocks,
-    ].join('\n\n');
-  }
-  return [
-    PERSISTENT_CONTEXT_HEADER,
-    ...blocks,
-  ].join('\n\n');
+  const header = partition === 'volatile' || variableLayout ? CURRENT_STATE_HEADER : PERSISTENT_CONTEXT_HEADER;
+  return {
+    text: [header, ...blocks].join('\n\n'),
+    manifest: [
+      manifestEntry('(header)', header === CURRENT_STATE_HEADER ? 'now' : 'core', header),
+      ...kept.map((b) => manifestEntry(b.title, tierOf(b.title), b.text)),
+    ],
+  };
 }
 
 const CURRENT_STATE_HEADER = '# Current State (refreshed this turn)';
@@ -561,16 +578,10 @@ const MEMORY_CORE_TITLES = new Set<string>([
   'Skill Discovery',
 ]);
 
-export type MemoryTier = 'core' | 'relevant' | 'now';
-
-/** One section of memory as a model request carried it. */
-export interface MemoryManifestEntry {
-  section: string;
-  tier: MemoryTier;
-  tokens: number;
-  bytes: number;
-  refs: Array<{ type: string; id: string }>;
-}
+/** One section of memory as a model request carried it (the accepted-
+ *  request record's own shape). */
+export type MemoryManifestEntry = ModelMemoryManifestEntry;
+export type MemoryTier = ModelMemoryManifestEntry['tier'];
 
 export interface MemoryCore {
   /** The rendered core, '' when there is nothing to carry. */
@@ -674,7 +685,7 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   // The core is content-addressed and joins the cached prefix after the
   // rubric; everything request- or time-dependent follows the boundary.
   const core = renderMemoryCore();
-  const ctx = renderHarnessMemoryContext({
+  const variable = composeHarnessMemoryContext({
     sessionId: opts?.sessionId,
     sourceUserSeq: opts?.sourceUserSeq,
     focusInput: opts?.focusInput,
@@ -682,6 +693,7 @@ export function harnessInstructions(roleInstructions: string, opts?: {
     includeSessionActions: opts?.includeSessionActions,
     layout: 'variable',
   });
+  const ctx = variable.text;
   const agentInstructions = opts?.agentInstructions?.trim() ?? '';
   const stableRole = [roleInstructions, agentInstructions].filter(Boolean).join('\n\n');
   const stablePrefix = core.text ? `${stableRole}${CACHE_MEMORY_CORE_DELIM}${core.text}` : stableRole;
@@ -709,7 +721,13 @@ export function harnessInstructions(roleInstructions: string, opts?: {
         legacyMemory ? `${legacyMemory}\n\n---\n\n${historicalRole}` : historicalRole,
         volatileMemoryInstructions,
       ].filter(Boolean).join('\n\n');
-  const instructions = withInstructionMemory(() => rendered, [core.text, ctx, volatileMemoryInstructions]);
+  // Each fragment carries its sections, so the accepted-request record can
+  // say what memory was sent, by tier, without re-reading any store.
+  const instructions = withInstructionMemory(() => rendered, [
+    { text: core.text, manifest: core.manifest, coreSha: core.sha256 },
+    { text: ctx, manifest: variable.manifest },
+    { text: volatileMemoryInstructions, manifest: [manifestEntry('(appended)', 'relevant', volatileMemoryInstructions)] },
+  ]);
   const coreRefKeys = new Set<string>();
   for (const ref of core.policies.refs) {
     coreRefKeys.add(`policy:${ref.id}`);
