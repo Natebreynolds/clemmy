@@ -554,12 +554,13 @@ function composeHarnessMemoryContext(opts?: HarnessMemoryContextOptions): { text
   // The volatile tail rides in the user turn (uncached by design), so it gets a
   // lighter header that frames it as the time-sensitive refresh; stable/all keep
   // the canonical persistent-context header (byte-identical for 'all'). The
-  // variable layout follows a memory core that already carries that header.
-  const header = partition === 'volatile' || variableLayout ? CURRENT_STATE_HEADER : PERSISTENT_CONTEXT_HEADER;
+  // variable layout follows a memory core whose header already says the
+  // context is refreshed each turn, so its titled sections need none.
+  const header = variableLayout ? '' : partition === 'volatile' ? CURRENT_STATE_HEADER : PERSISTENT_CONTEXT_HEADER;
   return {
-    text: [header, ...blocks].join('\n\n'),
+    text: [header, ...blocks].filter(Boolean).join('\n\n'),
     manifest: [
-      manifestEntry('(header)', header === CURRENT_STATE_HEADER ? 'now' : 'core', header),
+      ...(header ? [manifestEntry('(header)', header === CURRENT_STATE_HEADER ? 'now' : 'core', header)] : []),
       ...kept.map((b) => manifestEntry(b.title, tierOf(b.title), b.text)),
     ],
   };
