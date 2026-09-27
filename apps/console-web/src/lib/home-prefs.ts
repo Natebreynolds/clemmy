@@ -101,8 +101,8 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   panes: { order: DEFAULT_HOME_PANE_ORDER, hidden: ['workstate'] },
   nav: {
     pinned: ['/chat', '/inbox', '/workspaces'],
-    shown: ['/automate', '/connect'],
-    more: ['/memory', '/meetings', '/goals', '/agents'],
+    shown: ['/automate', '/connect', '/memory', '/agents'],
+    more: ['/meetings', '/goals'],
   },
   quickActions: [],
   phoneSwitcher: ['home', 'inbox', 'chats', 'spaces', 'more'],
@@ -113,13 +113,20 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
  *  retain their relative order and grouping. This does not write the record. */
 const TODAY_PATH = '/chat';
 const MERGED_INTO_TODAY = new Set(['/home', TODAY_PATH]);
+/** Memory and Agents are what make Clementine hers, not power tools: a saved
+ *  sidebar from before they were everyday (the shipped default folded them)
+ *  shows them below the pinned group instead of behind More. Pinning either
+ *  is still the owner's choice and is kept. */
+export const ALWAYS_VISIBLE_PATHS: readonly string[] = ['/memory', '/agents'];
 export function primaryHomeNavigation(nav: HomePreferences['nav']): HomePreferences['nav'] {
   const rest = (paths: readonly string[]) => paths.filter((path) => !MERGED_INTO_TODAY.has(path));
-  return {
-    pinned: [TODAY_PATH, ...rest(nav.pinned)],
-    shown: rest(nav.shown),
-    more: rest(nav.more),
-  };
+  const pinned = [TODAY_PATH, ...rest(nav.pinned)];
+  const shown = rest(nav.shown);
+  const more = rest(nav.more).filter((path) => !ALWAYS_VISIBLE_PATHS.includes(path));
+  for (const path of ALWAYS_VISIBLE_PATHS) {
+    if (!pinned.includes(path) && !shown.includes(path)) shown.push(path);
+  }
+  return { pinned, shown, more };
 }
 
 /** Only the server's explicit untouched-default marker changes the landing.

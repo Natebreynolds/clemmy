@@ -13,8 +13,8 @@ test('Today is first and visible even when an older saved sidebar folded Home in
   assert.equal(PRIMARY_NAV[0]?.label, 'Today');
   assert.equal(PRIMARY_NAV.some(dest => dest.path === '/home' || dest.path === '/tasks'), false, 'Home merged into Today; Running folded into it');
   assert.deepEqual(nav.pinned.map(dest => dest.path), ['/chat']);
-  assert.deepEqual(nav.shown.map(dest => dest.path), ['/connect']);
-  assert.equal(nav.more.some(dest => dest.path === '/home' || dest.path === '/chat'), false);
+  assert.deepEqual(nav.shown.map(dest => dest.path), ['/connect', '/memory', '/agents'], 'Memory and Agents leave More and stay visible');
+  assert.equal(nav.more.some(dest => dest.path === '/home' || dest.path === '/chat' || dest.path === '/memory' || dest.path === '/agents'), false);
   assert.deepEqual(prefs.nav.more, ['/home', '/workspaces', '/memory'], 'rendering must not mutate the shared saved preferences');
 });
 
@@ -38,6 +38,13 @@ test('a shipped chips-first home record is re-expressed before the desktop reads
 test('making Today primary folds a saved Home into it, preserves other groups, and is stable when normalized twice', () => {
   const nav = { pinned: ['/memory', '/home', '/chat'], shown: ['/tasks', '/home'], more: ['/connect', '/home'] };
   const result = primaryHomeNavigation(nav);
-  assert.deepEqual(result, { pinned: ['/chat', '/memory'], shown: ['/tasks'], more: ['/connect'] });
+  assert.deepEqual(result, { pinned: ['/chat', '/memory'], shown: ['/tasks', '/agents'], more: ['/connect'] }, 'a pinned Memory stays pinned; Agents is shown, never folded');
   assert.deepEqual(primaryHomeNavigation(result), result);
+});
+
+test('Memory and Agents are visible by default and cannot be folded into More', () => {
+  assert.deepEqual(DEFAULT_HOME_PREFERENCES.nav.more.filter((p) => p === '/memory' || p === '/agents'), []);
+  const folded = resolveSidebarNav({ ...DEFAULT_HOME_PREFERENCES, nav: { pinned: ['/chat'], shown: [], more: ['/memory', '/agents', '/goals'] } }, { developerMode: false });
+  assert.deepEqual(folded.shown.map((d) => d.path), ['/memory', '/agents']);
+  assert.deepEqual(folded.more.map((d) => d.path).filter((p) => p === '/memory' || p === '/agents'), []);
 });
