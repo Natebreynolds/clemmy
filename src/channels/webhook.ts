@@ -1930,8 +1930,18 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     res.json({ ok: true });
   });
 
-  app.get('/api/notifications/destinations', requireAuth, (_req, res) => {
-    res.json({ destinations: listNotificationDestinations() });
+  app.get('/api/notifications/destinations', requireAuth, async (_req, res) => {
+    // A phone destination carries the label pairing recorded, often a raw
+    // user-agent string; the console shows the same recognisable name the
+    // phone's own Settings shows ("iPhone · Clem app").
+    const { describeDevice } = await import('../runtime/device-name.js');
+    res.json({
+      destinations: listNotificationDestinations().map((d) => (
+        d.type === 'apns' || d.type === 'web_push'
+          ? { ...d, deviceName: describeDevice(d.name).name, deviceApp: describeDevice(d.name).app }
+          : d
+      )),
+    });
   });
 
   app.get('/api/notifications/doctor', requireAuth, (_req, res) => {

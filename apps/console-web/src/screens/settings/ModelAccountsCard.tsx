@@ -177,7 +177,7 @@ function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, on
   const tone = meter ? meterTone(meter) : 'ok';
   const summary = meter ? accountHeadline(meter, now) : null;
   return (
-    <li id={`account-${id}`} className={cn('scroll-mt-16 rounded-lg border bg-surface px-4 py-3', out ? 'border-danger/50' : 'border-border')}>
+    <li id={`account-${id}`} className="scroll-mt-16 rounded-lg border border-border bg-surface px-4 py-3">
       <div className="flex items-center gap-3">
         <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: dotColor(id), opacity: connected ? 1 : 0.35 }} aria-hidden />
         <div className="min-w-0 flex-1">
@@ -226,12 +226,20 @@ export function ModelAccountsCard() {
 
   return (
     <div>
+      {/* One alarm for one problem: it names the account and jumps to its
+          row; the row itself says "Refusing requests" and offers Add credit. */}
       {outCount > 0 && (
-        <p className="mb-3 flex items-center gap-2 rounded-md border border-danger/40 bg-danger-tint px-3 py-2 text-small text-danger" role="status">
+        <p className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-danger/40 bg-danger-tint px-3 py-2 text-small text-danger" role="status">
           <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
-          {outCount === 1
-            ? 'A provider is turning down Clem’s requests for lack of credit. Its “Add credit” button opens that provider’s billing page.'
-            : `${outCount} providers are turning down Clem’s requests for lack of credit. Each “Add credit” button opens that provider’s billing page.`}
+          <span>
+            {meters.filter((m) => m.outOfCredit).map((m, i, all) => (
+              <span key={m.id}>
+                <a href={`#account-${m.id}`} className="font-semibold underline-offset-2 hover:underline">{m.label}</a>
+                {i < all.length - 1 ? (i === all.length - 2 ? ' and ' : ', ') : ''}
+              </span>
+            ))}
+            {outCount === 1 ? ' is refusing requests for lack of credit.' : ' are refusing requests for lack of credit.'}
+          </span>
         </p>
       )}
       <ul className="space-y-2" aria-label="Model accounts">

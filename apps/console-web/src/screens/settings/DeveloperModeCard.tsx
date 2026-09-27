@@ -1,8 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { FlaskConical } from 'lucide-react';
-import { Link } from 'react-router-dom';
-import { advancedNavFor } from '@/lib/nav';
 import { Card } from '@/components/ui/Card';
 import { Switch } from '@/components/ui/Switch';
 import { usePoll } from '@/lib/poll';
@@ -36,29 +34,11 @@ export function DeveloperModeCard() {
         <div className="flex-1">
           <h3 className="text-h3 text-fg">Developer mode</h3>
           <p className="text-small text-muted">
-            Reveals the instruments — diagnostics, telemetry, run replay, nightly self-research — and a <strong>Developer</strong> page for CLEMMY_* flags. Off by default; the panels keep working if you have a link to one.
+            Reveals the instruments under Advanced in the sidebar — diagnostics, telemetry, run replay, nightly self-research — and a <strong>Developer</strong> page for CLEMMY_* flags. Off by default; the panels keep working if you have a link to one.
           </p>
         </div>
         <Switch checked={on} disabled={busy || settings.isLoading} label="Developer mode" onChange={toggle} />
       </div>
-      <nav aria-label="Advanced panels" className="flex flex-wrap gap-2">
-        {/* One decision, one place: the instruments are advertised here on
-            exactly the terms the Advanced rail uses. */}
-        {advancedNavFor(on).map((d) => {
-          const Icon = d.icon;
-          return (
-            <Link
-              key={d.path}
-              to={d.path}
-              title={d.hint}
-              className="inline-flex h-8 items-center gap-1.5 rounded-sm border border-border bg-surface px-2.5 text-small text-muted transition-colors hover:border-border-strong hover:text-fg"
-            >
-              <Icon className="h-4 w-4" aria-hidden />
-              <span>{d.label}</span>
-            </Link>
-          );
-        })}
-      </nav>
     </Card>
   );
 }

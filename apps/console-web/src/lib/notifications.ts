@@ -7,12 +7,19 @@ export type DestinationType =
   | 'discord_user'
   | 'slack_webhook'
   | 'slack_channel'
-  | 'slack_user';
+  | 'slack_user'
+  | 'web_push'
+  | 'apns'
+  | 'desktop';
 
 export interface NotificationDestination {
   id: string;
   name: string;
   type: DestinationType;
+  /** Phone destinations: the device as a person names it ("iPhone · Clem app"). */
+  deviceName?: string;
+  deviceApp?: 'clem' | 'safari' | 'chrome' | 'firefox' | 'browser' | 'unknown';
+  deviceId?: string;
   url?: string;
   enabled?: boolean;
   channelId?: string;

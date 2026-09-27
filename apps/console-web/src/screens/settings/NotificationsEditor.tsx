@@ -22,13 +22,22 @@ const TYPE_LABEL: Record<DestinationType, string> = {
   slack_webhook: 'Slack webhook',
   slack_channel: 'Slack channel',
   slack_user: 'Slack DM',
+  web_push: 'Browser push',
+  apns: 'Clem app',
+  desktop: 'This Mac',
 };
+
+const PHONE_TYPES = new Set<DestinationType>(['web_push', 'apns']);
+const isPhone = (d: NotificationDestination) => PHONE_TYPES.has(d.type);
+const phoneCaption = (d: NotificationDestination) => (d.type === 'apns' ? 'Clem app · notifications from your Mac' : 'Browser push · notifications from your Mac');
 
 export function NotificationsEditor() {
   const qc = useQueryClient();
   const dests = usePoll(['notif-destinations'], listDestinations, 0);
   const doctor = usePoll(['notif-doctor'], getNotificationDoctor, 8000);
   const rows = dests.data?.destinations ?? [];
+  const phones = rows.filter(isPhone);
+  const others = rows.filter((d) => !isPhone(d));
 
   const [name, setName] = useState('');
   const [type, setType] = useState<DestinationType>('discord_channel');
@@ -82,23 +91,46 @@ export function NotificationsEditor() {
   return (
     <Card className="p-5">
       <h2 className="mb-1 text-h2 text-fg">Notifications</h2>
-      <p className="mb-4 text-small text-muted">Only when she needs an answer to continue, or finished something. Where those land:</p>
+      <p className="mb-4 text-small text-muted">Only when she needs an answer to continue, or finished something. Where those reach you:</p>
 
       {/* The desktop is always a loud surface: the durable store lives on this
           machine and the app shell toasts loud unread items. There is no
           setting to turn it off, so the row says so instead of faking a switch. */}
+      {/* First-party places first: this Mac, then your phone. Slack, Discord
+          and webhooks are other places, and adding one is folded away; a
+          form open by default read as the point of the page (owner 09-26). */}
       <ul className="mb-4 space-y-2">
         <li className="flex items-center gap-3 rounded-md border border-border px-3 py-2.5">
           <div className="min-w-0 flex-1">
-            <div className="truncate text-body font-medium text-fg">Desktop app</div>
-            <div className="truncate text-caption text-faint">This Mac · a toast when she needs you, or finished something while you were away</div>
+            <div className="truncate text-body font-medium text-fg">This Mac</div>
+            <div className="truncate text-caption text-faint">A toast when she needs you, or finished something while you were away</div>
           </div>
           <StatusPill tone="success">Always on</StatusPill>
         </li>
+        {dests.isLoading ? <li><Skeleton className="h-12 w-full" /></li> : phones.length === 0 ? (
+          <li className="flex items-center gap-3 rounded-md border border-dashed border-border px-3 py-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-body font-medium text-fg">Your phone</div>
+              <div className="truncate text-caption text-faint">Not set up yet · open Clem on your phone and allow notifications</div>
+            </div>
+            <StatusPill tone="neutral">Not yet</StatusPill>
+          </li>
+        ) : phones.map((d) => (
+          <li key={d.id} className="flex items-center gap-3 rounded-md border border-border px-3 py-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-body font-medium text-fg">{d.deviceName ?? d.name}</div>
+              <div className="truncate text-caption text-faint">{phoneCaption(d)}</div>
+            </div>
+            <Switch checked={!!d.enabled} onChange={async (v) => { setBusy(d.id); try { await toggleDestination(d.id, v); } finally { setBusy(null); refresh(); } }} label={`Toggle ${d.deviceName ?? d.name}`} />
+            <Button variant="ghost" size="icon" aria-label="Test" title="Send a test" disabled={busy === d.id} onClick={async () => { setBusy(d.id); try { await testDestination(d.id); refresh(); } finally { setBusy(null); } }}>
+              {busy === d.id ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Send className="h-4 w-4" aria-hidden />}
+            </Button>
+          </li>
+        ))}
       </ul>
-      {dests.isLoading ? <Skeleton className="h-20 w-full" /> : rows.length > 0 && (
-        <div className="mb-5 space-y-4">
-          {destinationGroups(rows).map((group) => (
+      {!dests.isLoading && others.length > 0 && (
+        <div className="mb-4 space-y-4">
+          {destinationGroups(others).map((group) => (
             <div key={group.label}>
               <div className="mb-2 text-small font-semibold text-fg">{group.label}</div>
               <ul className="space-y-2">
@@ -123,7 +155,12 @@ export function NotificationsEditor() {
           ))}
         </div>
       )}
-
+      <details className="group mb-1 border-t border-border pt-3">
+        <summary className="flex cursor-pointer list-none items-center gap-2 text-small text-muted hover:text-fg">
+          <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
+          Add another place — Slack, Discord or a webhook
+        </summary>
+        <div className="mt-3">
       <div className="grid gap-2 sm:grid-cols-2">
         <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (e.g. My Discord)" aria-label="Destination name" />
         <Select value={type} onChange={(e) => setType(e.target.value as DestinationType)} aria-label="Destination type">
@@ -145,6 +182,8 @@ export function NotificationsEditor() {
         </Button>
         {error && <span className="text-small text-danger">{error}</span>}
       </div>
+        </div>
+      </details>
       <details className="group mt-4 border-t border-border pt-3">
         <summary className="flex cursor-pointer list-none items-center gap-2 text-small text-muted hover:text-fg">
           <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
