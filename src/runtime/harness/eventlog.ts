@@ -6446,14 +6446,18 @@ function canonicalOutputChunks(
   ).all(sessionId, callId) as StoredOutputChunkRow[];
 }
 
-/** Does this session hold any retained tool output a reader could open?
- * The retained-output readers read exactly these rows by call_id. */
-export function sessionHasRetainedToolOutputs(sessionId: string): boolean {
+/** Does this session hold a retained tool output longer than `minChars`?
+ * The retained-output readers read exactly these rows by call_id; a caller
+ * passes the smallest inline presentation budget to ask whether any retained
+ * result was shown to the model only in part. */
+export function sessionHasRetainedToolOutputLongerThan(sessionId: string, minChars: number): boolean {
   const id = sessionId.trim();
   if (!id) return false;
   const row = openEventLog().prepare(
-    'SELECT 1 AS present FROM tool_outputs WHERE session_id = ? LIMIT 1',
-  ).get(id) as { present?: number } | undefined;
+    `SELECT 1 AS present FROM tool_outputs
+      WHERE session_id = ? AND COALESCE(output_chars, content_bytes) > ?
+      LIMIT 1`,
+  ).get(id, Math.max(0, Math.floor(minChars))) as { present?: number } | undefined;
   return row?.present === 1;
 }
 

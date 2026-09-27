@@ -424,3 +424,29 @@ test('delegation evidence starts the turn on the full rung: a planning card with
   assert.deepEqual(deferredOn(agent), [], 'no desk tool loses its schema');
   assert.equal(namesLine(agentInstructions(agent)), '', 'no names line');
 });
+
+/** Longer than every inline presentation budget, so it is shown in part. */
+const LONG_NOTES_PATH = path.join(TEST_HOME, 'long-notes.md');
+writeFileSync(LONG_NOTES_PATH, Array.from({ length: 400 }, (_, index) => `Line ${index + 1}: the quarry ledger row for item ${index + 1} holds tonnage ${1000 + index}.`).join('\n'), 'utf-8');
+
+test('a result shown whole keeps the next turn on the lean rung with the same tools block', async () => {
+  const sessionId = 'turn-desk-small-result';
+  const opening = await hostTurn(sessionId, TARGETED, [() => ({ name: 'workspace_roots', args: {} })]);
+  assert.equal(deskRecord(sessionId, opening.source.seq)?.rung, 'lean');
+  assert.ok(eventlog.getToolOutput(sessionId, opening.callId(0)), 'the small result was retained');
+  const next = await hostTurn(sessionId, TARGETED, []);
+  assert.equal(deskRecord(sessionId, next.source.seq)?.rung, 'lean', 'a whole result is no reason to preload the readers');
+  assert.equal(next.requests[0]!.toolsJson, opening.requests[0]!.toolsJson, 'the tools block is byte-identical');
+});
+
+test('a result shown only in part puts the readers on the next turn\'s first request', async () => {
+  const sessionId = 'turn-desk-long-result';
+  const opening = await hostTurn(sessionId, TARGETED, [() => ({ name: 'read_file', args: { path: LONG_NOTES_PATH } })]);
+  assert.equal(deskRecord(sessionId, opening.source.seq)?.rung, 'lean');
+  assert.ok((eventlog.getToolOutput(sessionId, opening.callId(0))?.output.length ?? 0) > 4_000, 'a long result was retained');
+  const next = await hostTurn(sessionId, TARGETED, []);
+  const desk = deskRecord(sessionId, next.source.seq);
+  assert.equal(desk?.rung, 'readers', JSON.stringify(desk));
+  assert.ok(desk?.climbedBy.includes('retained_output'), JSON.stringify(desk));
+  assert.deepEqual(READERS.filter((name) => !next.requests[0]!.tools.includes(name)), [], `readers ride round 1: ${next.requests[0]!.tools.join(',')}`);
+});

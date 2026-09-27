@@ -44,9 +44,10 @@ import {
   earlierInScopeDeskRungs,
   latestInScopeDeskEvent,
   sessionDispatchedToolsSince,
-  sessionHasRetainedToolOutputs,
+  sessionHasRetainedToolOutputLongerThan,
   type EventRow,
 } from '../runtime/harness/eventlog.js';
+import { PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from '../runtime/harness/tool-output-format.js';
 import { acceptedSourceHasAttachments } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { rankSkills } from '../runtime/harness/context-packet.js';
 import { summarizeWorkManifests } from '../runtime/harness/work-manifest.js';
@@ -193,7 +194,10 @@ export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
   return {
     identifiedTarget: input.identifiedTarget,
     evidence: {
-      retained_output: sessionHasRetainedToolOutputs(input.sessionId)
+      // A reader matters only for a result shown in part: one longer than the
+      // smallest inline presentation budget, whose footer named a reader. A
+      // result shown whole needs none; reaching for a reader later is a miss.
+      retained_output: sessionHasRetainedToolOutputLongerThan(input.sessionId, PROMPT_INLINE_RECALLABLE_RESULT_CHARS)
         || acceptedSourceHasAttachments({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq }),
       delegation: input.planningCapabilityCount > 0 || input.disclosedOperationCount > 0,
       // The surface is built before the context packet exists; the desk ranks
