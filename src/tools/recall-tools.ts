@@ -85,17 +85,85 @@ export function recallSliceChars(requested: unknown, routedModelId?: string): nu
   return Math.min(ceiling, inlineResultBudgetForModel(routedModelId));
 }
 
-// Cap a single tool_output_query response. The store now holds up to 2MB, and
-// tool_output_query intentionally bypasses the digest clip (it returns exactly
-// the page/projection asked for) — so without this bound an UNFILTERED query on
-// a large parked object (or a big array page) could dump the whole payload into
-// context. A page/projection is an explicit ask, so this sits a bit above
-// recall's per-call 30KB; the marker tells the model how to narrow further.
+/** The most one tool_output_query reply returns when the caller names a page
+ * size or a projection: that page was asked for explicitly, so it may run
+ * past one inline result. The marker tells the model how to narrow further. */
 const QUERY_MAX_CHARS = 50_000;
-const clipQueryBody = (text: string): string =>
-  text.length <= QUERY_MAX_CHARS
+/** A reply too small to hold a header and one record is not worth a round. */
+const QUERY_MIN_REPLY_CHARS = 1_000;
+
+const clipQueryBody = (text: string, maxChars: number = QUERY_MAX_CHARS): string =>
+  text.length <= maxChars
     ? text
-    : `${text.slice(0, QUERY_MAX_CHARS)}\n…[clipped to ${QUERY_MAX_CHARS} chars — narrow with fields:[...], a filter, or a smaller limit]`;
+    : `${text.slice(0, maxChars)}\n…[clipped to ${maxChars} chars — narrow with fields:[...], a filter, or a smaller limit]`;
+
+/** Whether the caller named a page size or a projection. */
+function queryNamesItsPage(input: Record<string, unknown>): boolean {
+  if (normalizeFieldsInput(input.fields) !== undefined) return true;
+  return typeof input.limit === 'number' && Number.isFinite(input.limit);
+}
+
+/**
+ * The most one tool_output_query reply may hold. A bare query (no limit, no
+ * fields) is one inline result for the routed window, the same default a bare
+ * recall gets; a named page or projection may use QUERY_MAX_CHARS. Either way
+ * the reply fits what the turn's reading byte budget still allows.
+ */
+function queryReplyChars(input: Record<string, unknown>, ctx: HarnessRunContext): number {
+  const shaped = queryNamesItsPage(input)
+    ? QUERY_MAX_CHARS
+    : Math.min(QUERY_MAX_CHARS, inlineResultBudgetForModel(ctx.routedModelId));
+  return Math.min(shaped, ctx.recallBudget?.remainingBytes() ?? Number.POSITIVE_INFINITY);
+}
+
+const QUERY_CONTINUATION_KEYS = [
+  'fields', 'filter_field', 'filter_contains', 'filter_equals', 'where', 'sort_by', 'order', 'limit',
+] as const;
+
+/** The exact next query for the records a reply had no room for. */
+function nextQueryCall(callId: string, input: Record<string, unknown>, offset: number): string {
+  const args: Record<string, unknown> = { call_id: callId };
+  for (const key of QUERY_CONTINUATION_KEYS) {
+    const value = input[key];
+    if (value !== undefined && value !== null) args[key] = value;
+  }
+  args.offset = offset;
+  return `tool_output_query ${JSON.stringify(args)}`;
+}
+
+/**
+ * The largest leading run of a page that fits `maxChars`, cut on a record
+ * boundary, never inside a record. When not even one record fits, the one
+ * record is clipped with the narrowing marker.
+ */
+function fitRecordPage(
+  pageLength: number,
+  render: (count: number) => string,
+  maxChars: number,
+): { count: number; text: string } {
+  const whole = render(pageLength);
+  if (whole.length <= maxChars) return { count: pageLength, text: whole };
+  let fits = 0;
+  let low = 1;
+  let high = pageLength - 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (render(middle).length <= maxChars) {
+      fits = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (fits === 0) return { count: Math.min(1, pageLength), text: clipQueryBody(render(Math.min(1, pageLength)), maxChars) };
+  return { count: fits, text: render(fits) };
+}
+
+/** Charge a query reply to the turn's reading byte budget. */
+function chargeQueryReply(ctx: HarnessRunContext, callId: string, bodyText: string) {
+  const refusal = ctx.recallBudget?.consumeQueryBytes(Buffer.byteLength(bodyText, 'utf8'), callId);
+  return refusal ? textResult(`ERROR: ${refusal}`) : textResult(bodyText, { maxChars: bodyText.length });
+}
 
 /** Zod shapes exported so the tool-call-hint pin can validate every emitted
  * hint example against the REAL registered contract (single source of truth —
@@ -568,8 +636,7 @@ export function registerRecallTools(server: McpServer): void {
             for (const group of shown) lines.push(aggregateLine(`${group.group}: `, aggregate, valueField, group.figure));
             if (result.groups.length > shown.length) lines.push(`…and ${result.groups.length - shown.length} more group(s)`);
           }
-          const bodyText = clipQueryBody(lines.join('\n'));
-          return textResult(bodyText, { maxChars: bodyText.length });
+          return chargeQueryReply(ctx, callId, clipQueryBody(lines.join('\n')));
         }
         if (sortBy) rows = sortRows(rows, sortBy, input.order === 'desc' ? 'desc' : 'asc');
         const matched = rows.length;
@@ -597,10 +664,12 @@ export function registerRecallTools(server: McpServer): void {
           const bodyText = `None of ${JSON.stringify(fields)} exist on these records. The result is an ${describeJsonShape(rows)}. Re-query with fields that exist.`;
           return textResult(bodyText, { maxChars: bodyText.length });
         }
+        const replyChars = queryReplyChars(input, ctx);
+        if (replyChars < QUERY_MIN_REPLY_CHARS) {
+          const refusal = ctx.recallBudget?.queryRefusal(QUERY_MIN_REPLY_CHARS, callId);
+          if (refusal) return textResult(`ERROR: ${refusal}`);
+        }
         const from = unwrappedPath ? ` from ${unwrappedPath}[*]` : '';
-        const header = recoveredClippedArrayPrefix
-          ? `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
-          : `Showing ${page.length} record(s) [${offset}–${offset + page.length}] of ${matched} matching (${(parsed as unknown[]).length} total${from})${sortBy ? `, ordered by ${sortBy} ${input.order === 'desc' ? 'descending' : 'ascending'}` : ''}${skippedNote ? `.${skippedNote}` : ''}`;
         // Hand the model the EXACT, copy-paste reference for these values, so a
         // downstream send binds them by reference instead of retyping (which is
         // how a value gets invented or dropped). Root array + single projected
@@ -608,8 +677,20 @@ export function registerRecallTools(server: McpServer): void {
         const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
         const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
-        const bodyText = clipQueryBody(`${header}\n\n${JSON.stringify(page, null, 1)}`) + refHint;
-        return textResult(bodyText, { maxChars: bodyText.length });
+        // A page that does not fit the reply is cut on a record boundary, and
+        // the header counts only the records shown and names the exact query
+        // for the rest, so paging never skips a record the model did not see.
+        const render = (count: number): string => {
+          const header = recoveredClippedArrayPrefix
+            ? `Showing ${count} record(s) [${offset}–${offset + count}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
+            : `Showing ${count} record(s) [${offset}–${offset + count}] of ${matched} matching (${(parsed as unknown[]).length} total${from})${sortBy ? `, ordered by ${sortBy} ${input.order === 'desc' ? 'descending' : 'ascending'}` : ''}${skippedNote ? `.${skippedNote}` : ''}`;
+          const continuation = count < page.length
+            ? `\n\n[${page.length - count} more record(s) of this page did not fit this reply. Next: ${nextQueryCall(callId, input, offset + count)}; fields:[...] fits more records per reply.]`
+            : '';
+          return `${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}${continuation}`;
+        };
+        const fitted = fitRecordPage(page.length, render, Math.max(0, replyChars - refHint.length));
+        return chargeQueryReply(ctx, callId, fitted.text + refHint);
       }
 
       if (parsed && typeof parsed === 'object') {
@@ -625,9 +706,15 @@ export function registerRecallTools(server: McpServer): void {
             + `Re-query with the fields/filter of the records themselves — this tool queries the record list directly.`;
           return textResult(bodyText, { maxChars: bodyText.length });
         }
+        const replyChars = queryReplyChars(input, ctx);
+        if (replyChars < QUERY_MIN_REPLY_CHARS) {
+          const refusal = ctx.recallBudget?.queryRefusal(QUERY_MIN_REPLY_CHARS, callId);
+          if (refusal) return textResult(`ERROR: ${refusal}`);
+        }
         const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To reuse values from this result in a later send/write WITHOUT retyping, reference them: {"$fromToolOutput":{"callId":"${callId}","path":"<path to the values, e.g. result.records[*].Email>"}} — the harness binds the real values before the call.`;
-        const bodyText = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`) + refHint;
-        return textResult(bodyText, { maxChars: bodyText.length });
+        const body = clipQueryBody(`Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`,
+          Math.max(0, replyChars - refHint.length));
+        return chargeQueryReply(ctx, callId, body + refHint);
       }
 
       return textResult(`Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`);

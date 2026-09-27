@@ -1136,12 +1136,17 @@ export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
 // ───────────────────────────────────────────────────────────────
 
 /**
- * Per-turn budget for recall_tool_result. After Layer 1 of auto-compact
- * clips old tool outputs with stubs that name a call_id, the agent can
- * call `recall_tool_result` with that call_id to retrieve the verbatim original.
- * Without a budget the agent could pull 200KB × 3 calls back into the
- * input prompt that we just compacted. Resets per-turn (the loop builds
- * a new HarnessRunContext per `Runner.run`).
+ * Per-turn budget for reading retained outputs back into the prompt. After
+ * Layer 1 of auto-compact clips old tool outputs with stubs that name a
+ * call_id, the agent can read the verbatim original back with
+ * `recall_tool_result`, or query it with `tool_output_query`. Without a budget
+ * the agent could pull the payloads we just compacted straight back into the
+ * input prompt. Resets per-turn (the loop builds a new HarnessRunContext per
+ * `Runner.run`).
+ *
+ * Bytes are the real resource, and every reader reply that enters the prompt
+ * spends them: a recall slice and a query reply alike. The call count is a
+ * recall runaway backstop only; a query spends bytes, never a recall call.
  */
 export class RecallBudget {
   private calls = 0;
@@ -1161,53 +1166,71 @@ export class RecallBudget {
    */
   consume(returnBytes: number, callId?: string): string | null {
     if (this.calls + 1 > this.maxCalls) {
-      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId)}`;
+      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId, ['recall_tool_result'])}`;
     }
     if (this.bytes + returnBytes > this.maxBytes) {
-      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId)}`;
+      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId, ['recall_tool_result'])}`;
     }
     this.calls += 1;
     this.bytes += returnBytes;
     return null;
   }
 
+  /** Bytes a reader reply may still put into the prompt this turn. */
+  remainingBytes(): number {
+    return Math.max(0, this.maxBytes - this.bytes);
+  }
+
   /**
-   * A budget refusal must hand back a way THROUGH, not just a stop.
-   *
-   * Retrying recall cannot succeed — the budget resets per turn, so a model
-   * that only hears "proceed or split the work" re-recalls on the next turn,
-   * exhausts it again, and burns the no-progress governor instead of the
-   * task (live platform-49 run, 2026-09-02: 19 recalls, zero business calls,
-   * a governor stop, and the sheet never touched). `tool_output_query` reads
-   * the SAME retained output, is not clipped to this tool's per-call slice,
-   * and spends none of this budget — so it is the exact next call, not a
-   * suggestion to give up.
+   * The refusal a query reply of `returnBytes` would meet, without charging
+   * it; null when it fits. A query that cannot fit is sent to a reader that
+   * spends no reading bytes, never back to recall or to itself.
    */
-  private wayThrough(callId?: string): string {
-    const stop = 'Do NOT retry recall_tool_result — it will refuse again this turn.';
-    // The successor is COMPUTED, never named here. This message used to say
-    // "call tool_output_query" unconditionally, while tool_output_query's own
-    // plain-text refusal said "use recall_tool_result" — a closed loop the
-    // model could not leave (live 2026-09-07 source 146537).
-    // A budget refusal must ALWAYS hand back an exact next call, never prose.
-    // Without a session the routes cannot be computed, so name the reader that
-    // reads the same stored output — its own refusal now computes the correct
-    // successor and excludes itself, so no loop can close through it.
-    // A budget refusal must ALWAYS hand back a next call, never prose alone.
-    // Where the routes cannot be computed (no call id, or no session) name the
-    // reader over the same stored output: its own refusal now computes the
-    // correct successor and excludes itself, so no loop can close through it.
+  queryRefusal(returnBytes: number, callId?: string): string | null {
+    if (this.bytes + returnBytes <= this.maxBytes) return null;
+    return `reading byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). `
+      + this.wayThrough(callId, ['recall_tool_result', 'tool_output_query']);
+  }
+
+  /** Charge a query reply's bytes. Returns the refusal when it does not fit. */
+  consumeQueryBytes(returnBytes: number, callId?: string): string | null {
+    const refusal = this.queryRefusal(returnBytes, callId);
+    if (refusal) return refusal;
+    this.bytes += returnBytes;
+    return null;
+  }
+
+  /**
+   * A budget refusal must hand back a way THROUGH, not just a stop, and never
+   * prose alone. Retrying the refused reader cannot succeed (the budget resets
+   * per turn), so the next call is COMPUTED from the stored output's real
+   * shape by the one reader router, excluding every reader this budget
+   * refuses. No reader names its own successor, so no two readers can send
+   * the model back and forth between each other.
+   */
+  private wayThrough(callId: string | undefined, refused: readonly string[]): string {
+    const stop = `Do NOT retry ${refused.join(' or ')} — ${refused.length > 1 ? 'they' : 'it'} will refuse again this turn.`;
+    // Without a session the routes cannot be computed, so name a reader over
+    // the same stored output that this budget does not refuse; its own
+    // refusal computes the correct successor and excludes itself.
     if (!callId || !this.sessionId) {
+      if (refused.includes('tool_output_query')) {
+        const exact = callId
+          ? `file_query {"call_id":"${callId}","query":"<what you need>"}`
+          : 'file_query with that same call_id';
+        return `${stop} Call ${exact} instead — it searches the SAME stored output server-side `
+          + 'and spends no reading bytes.';
+      }
       const exact = callId
         ? `tool_output_query {"call_id":"${callId}"}`
         : 'tool_output_query with that same call_id';
       return `${stop} Call ${exact} instead — it reads the SAME stored output `
-        + 'server-side and spends no recall budget.';
+        + 'server-side and spends no recall calls.';
     }
     return `${stop} ${retainedResultWayThrough({
       sessionId: this.sessionId,
       callId,
-      exclude: ['recall_tool_result'],
+      exclude: refused,
       recallCallsRemaining: 0,
     })}`;
   }

@@ -149,3 +149,62 @@ test('on a small window a bare text query shrinks to that window\'s inline resul
   assert.ok(shown.includes(`Recalled chars 0–${inline} of ${PARKED_TEXT.length}`), `${shown.slice(0, 240)} (${shown.length} chars)`);
   assert.ok(shown.length < inline + 1_000, `bounded by the window (got ${shown.length})`);
 });
+
+/** 60 records of ~1.5k chars each, parked under one call id. */
+const PARKED_ROWS = JSON.stringify(Array.from({ length: 60 }, (_, i) => ({
+  id: `row-${String(i).padStart(2, '0')}`,
+  name: `Fixture record ${i}`,
+  notes: `note ${i} `.repeat(150),
+})));
+const parkRows = (sessionId: string) => events.writeToolOutput({
+  sessionId, callId: 'parked-rows', tool: 'run_shell_command', output: PARKED_ROWS,
+});
+
+test('a bare tool_output_query on records is one inline result, cut on a record boundary with the exact next query', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkRows,
+    calls: [{ callId: 'bare-rows', args: { call_id: 'parked-rows' } }],
+  });
+  const shown = results.get('bare-rows') ?? '';
+  const inline = inlineResultBudgetForModel(undefined);
+  assert.ok(shown.length <= inline, `a bare query is one inline result (got ${shown.length} chars, budget ${inline})`);
+  const header = /^Showing (\d+) record\(s\) \[0–(\d+)\] of 60 matching/.exec(shown);
+  assert.ok(header, shown.slice(0, 200));
+  const count = Number(header[1]);
+  assert.ok(count > 0 && count < 50, `a partial page (${count} records)`);
+  assert.ok(shown.includes(`"id": "row-${String(count - 1).padStart(2, '0')}"`), 'the last counted record is shown whole');
+  assert.ok(!shown.includes(`"id": "row-${String(count).padStart(2, '0')}"`), 'no record past the count');
+  assert.ok(shown.includes(`Next: tool_output_query {"call_id":"parked-rows","offset":${count}}`), 'the exact next query');
+});
+
+test('a named page or projection may run past one inline result, up to the query bound', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkRows,
+    calls: [{ callId: 'named-page', args: { call_id: 'parked-rows', limit: 20 } }],
+  });
+  const shown = results.get('named-page') ?? '';
+  assert.match(shown, /^Showing 20 record\(s\) \[0–20\] of 60 matching/);
+  assert.ok(shown.length > inlineResultBudgetForModel(undefined), `the named page is returned whole (${shown.length} chars)`);
+});
+
+test('query replies spend the turn\'s reading byte budget, and a spent budget routes away from both readers', async () => {
+  const budget = new brackets.RecallBudget(10, 26_000, undefined);
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkRows, recallBudget: budget,
+    calls: [
+      { callId: 'spend-first', args: { call_id: 'parked-rows' } },
+      { callId: 'spend-second', args: { call_id: 'parked-rows', limit: 50, offset: 10 } },
+      { callId: 'spend-third', args: { call_id: 'parked-rows', offset: 40 } },
+    ],
+  });
+  const first = results.get('spend-first') ?? '';
+  const second = results.get('spend-second') ?? '';
+  const third = results.get('spend-third') ?? '';
+  assert.match(first, /^Showing \d+ record/);
+  assert.match(second, /^Showing \d+ record/);
+  assert.ok(Buffer.byteLength(first) + Buffer.byteLength(second) <= 26_000,
+    `the two replies fit the turn's byte budget (${first.length} + ${second.length} chars)`);
+  assert.equal(budget.snapshot().calls, 0, 'a query spends bytes, never a recall call');
+  assert.match(third, /^ERROR: reading byte budget exhausted/, third.slice(0, 300));
+  assert.doesNotMatch(third, /tool_output_query \{|recall_tool_result \{/, 'never routed back to a reader the budget refuses');
+});

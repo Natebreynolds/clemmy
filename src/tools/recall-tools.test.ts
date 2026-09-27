@@ -430,8 +430,17 @@ test('tool_output_query bounds an unfiltered large-object response (no full-payl
     () => query({ call_id: 'call_obj' }),
   );
   const text = res.content[0].text;
-  assert.ok(text.length <= 51_000, `response must be bounded, got ${text.length}`);
-  assert.match(text, /clipped to 50000 chars/);
+  // A bare query is one inline result, the same default a bare recall gets.
+  assert.ok(text.length <= 21_000, `response must be bounded, got ${text.length}`);
+  assert.match(text, /clipped to \d+ chars/);
+  // A named page is an explicit ask, bounded by the query's own maximum.
+  const named = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_obj', limit: 50 }),
+  );
+  assert.ok(named.content[0].text.length > 21_000 && named.content[0].text.length <= 51_000,
+    `named page bounded by the query maximum, got ${named.content[0].text.length}`);
+  assert.match(named.content[0].text, /clipped to \d+ chars/);
 });
 
 test('tool_output_query hands the model the exact copy-paste $fromToolOutput reference for record values', async () => {
