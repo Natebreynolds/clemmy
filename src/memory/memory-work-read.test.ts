@@ -339,8 +339,41 @@ test('a memory a nested reconcile added is undone once, from the run the owner r
   snap = readMemoryWork();
   const nested = snap.recent.find((e) => e.job === 'reconcile' && e.facts?.[0]?.id === String(pattern));
   assert.deepEqual(nested?.undo, { kind: 'forget', count: 1 }, 'a nested run with its own undo keeps its row');
+  const patternsCalls = snap.recent.find((e) => e.job === 'patterns')?.usage?.calls;
   assert.deepEqual(undoMemoryWork(nested!.id), { ok: true, changed: 1 });
   assert.equal(getFact(pattern)?.active, false);
+  // The row the owner just used stays, now with nothing left to undo, and
+  // the pattern run does not take over its calls.
+  snap = readMemoryWork();
+  const after = snap.recent.find((e) => e.id === nested!.id);
+  assert.ok(after, 'the undone row is still shown');
+  assert.equal(after.undo, null);
+  assert.deepEqual(after.facts?.map((f) => [f.id, f.active]), [[String(pattern), false]]);
+  assert.equal(snap.recent.find((e) => e.job === 'patterns')?.usage?.calls, patternsCalls);
+
+  // The same when the memory is forgotten from another door.
+  const other = fact('Status reports sent on Friday get read');
+  await runMemoryJob('patterns', { source: { kind: 'schedule' } }, async () => {
+    await runMemoryJob('reconcile', {}, async () => { call('memory-model'); },
+      () => ({ outcome: 'ok', produced: { learned: 1 }, facts: { learned: [String(other)] } }));
+  }, () => ({ outcome: 'ok', produced: { patterns: 1 } }));
+  forgetFact(other);
+  const elsewhere = readMemoryWork().recent.find((e) => e.job === 'reconcile' && e.facts?.[0]?.id === String(other));
+  assert.ok(elsewhere, 'a row whose memory was forgotten elsewhere is still shown');
+  assert.equal(elsewhere.undo, null);
+});
+
+test('a nested run that failed keeps its own row and its problem', async () => {
+  const kept = fact('The owner signs contracts on Tuesdays');
+  await runMemoryJob('learn', { source: { kind: 'conversation', sessionId: 'sess-f' } }, async () => {
+    call('memory-model', 100, 10);
+    await runMemoryJob('reconcile', {}, async () => { call('memory-model', 40, 4); },
+      () => ({ outcome: 'failed', failure: { problem: 'quota' } }));
+  }, () => ({ outcome: 'ok', produced: { claims: 1, learned: 1 }, facts: { learned: [String(kept)] } }));
+  const rows = readMemoryWork().recent;
+  assert.deepEqual(rows.map((e) => [e.job, e.outcome]).sort(), [['learn', 'ok'], ['reconcile', 'failed']]);
+  assert.deepEqual(rows.find((e) => e.job === 'reconcile')?.failure, { problem: 'quota' });
+  assert.equal(rows.find((e) => e.job === 'learn')?.usage?.calls, 1, 'its calls stay on its own row');
 });
 
 test('undo refuses what it cannot or should not change', async () => {

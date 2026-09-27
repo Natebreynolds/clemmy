@@ -631,9 +631,12 @@ function recentEvents(rows: EventRow[], titles: Map<string, string>): MemoryWork
  * One row per run the owner recognises. A run nested in a run this list also
  * shows (a reconcile inside the conversation read that saved the memory) is
  * folded into it: its calls and tokens join that row, and what it changed is
- * already that row's. A nested run the owner can still undo on its own (its
- * enclosing run offers no undo of that kind) keeps its row, and so does one
- * whose enclosing run is not listed (still running, or older than the list).
+ * already that row's. Decided from what the two runs recorded, never from
+ * fact state, so a row the owner just acted on (an undo, a forget elsewhere)
+ * stays where it was. A nested run keeps its row when it failed (its problem
+ * is its own), when it lists memories its enclosing run does not (a reconcile
+ * inside the nightly pattern run, whose undo is not a forget), or when its
+ * enclosing run is not listed (still running, or older than the list).
  */
 function foldNestedRuns(rows: Array<{ payload: Partial<MemoryWorkEventPayload>; event: MemoryWorkEvent }>): MemoryWorkEvent[] {
   const byRun = new Map<string, (typeof rows)[number]>();
@@ -642,8 +645,14 @@ function foldNestedRuns(rows: Array<{ payload: Partial<MemoryWorkEventPayload>; 
     const runId = row.payload.nestedIn?.runId;
     return typeof runId === 'string' ? byRun.get(runId) : undefined;
   };
+  const standsAlone = (row: (typeof rows)[number]): boolean => {
+    if (row.event.outcome === 'failed') return true;
+    const kind = undoKindOf(row.event.job);
+    if (!kind) return false;
+    return withoutEnclosingIds(kind, undoIdsOf(kind, row.payload.facts), row.payload.nestedIn, (runId) => byRun.get(runId)?.payload).length > 0;
+  };
   const folded = new Set<(typeof rows)[number]>();
-  for (const row of rows) if (parentOf(row) && !row.event.undo) folded.add(row);
+  for (const row of rows) if (parentOf(row) && !standsAlone(row)) folded.add(row);
   for (const row of rows) {
     if (!folded.has(row)) continue;
     // The nearest enclosing run that keeps its own row takes the usage.
