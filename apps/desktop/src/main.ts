@@ -15,6 +15,7 @@ import {
   type IpcMainInvokeEvent,
   type NativeImage,
 } from 'electron';
+import { createQuitCoordinator } from './quit-coordinator.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -2118,10 +2119,17 @@ async function repairUpdateOwnershipFromUi(): Promise<ReturnType<typeof getUpdat
   return { ...getUpdaterStatus(), repairResult: result };
 }
 
+// Every quit request (tray, Cmd-Q, a system or installer quit, a repeat press
+// mid-preparation) joins one clean quit; see quit-coordinator.ts for why a
+// second one must never start.
+const quitCoordinator = createQuitCoordinator({
+  prepare: prepareForQuit,
+  quit: () => app.quit(),
+  markQuitting: () => { (app as { isQuitting?: boolean }).isQuitting = true; },
+});
+
 async function quitCleanly(): Promise<void> {
-  (app as { isQuitting?: boolean }).isQuitting = true;
-  await prepareForQuit();
-  app.quit();
+  await quitCoordinator.quitCleanly();
 }
 
 function showSupervisorEventNotification(event: SupervisorEvent): void {
@@ -3777,8 +3785,6 @@ app.on('before-quit', (event) => {
     (app as { isQuitting?: boolean }).isQuitting = true;
     return;
   }
-  if (quitPrepared) return;
-  event.preventDefault();
-  void quitCleanly();
+  if (quitCoordinator.onBeforeQuit()) event.preventDefault();
 });
 app.on('will-quit', () => disposeClementineLiveShell());
