@@ -37,7 +37,8 @@ import {
 } from './memory-jobs.js';
 import { describeMemoryModel, memoryJobModelId, type MemoryModelDescription } from './memory-model-route.js';
 import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
-import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { modelProviderLive, resolveRoleModel } from '../runtime/harness/model-roles.js';
+import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { reflectionTurnedOff } from './reflection.js';
 import {
   MEMORY_WORK_EVENT_TYPES,
@@ -332,12 +333,24 @@ function jobModelId(id: MemoryJobId, described: MemoryModelDescription | null): 
 
 /** The checker's model for a checker job: the boundary checker for the
  *  standing-instruction check, the checker role for memory repairs. Null
- *  when the checker cannot be named (its pick is unavailable). */
+ *  when the checker cannot be named: its pick is unavailable, or nothing
+ *  signed in can serve it (the row then says "None available", as the
+ *  memory rows beside it do). */
 function checkerJobModelId(id: MemoryJobId): string | null {
   return safe(() => {
-    if (id === 'standing') return resolveBoundaryJudge().modelId || null;
-    const checker = resolveRoleModel('judge');
-    return checker.inactiveBinding ? null : checker.modelId || null;
+    let modelId: string;
+    let provider: ModelProviderClass;
+    if (id === 'standing') {
+      const routing = resolveBoundaryJudge();
+      modelId = routing.modelId;
+      provider = routing.judgeFamily;
+    } else {
+      const checker = resolveRoleModel('judge');
+      if (checker.inactiveBinding) return null;
+      modelId = checker.modelId;
+      provider = checker.provider;
+    }
+    return modelId && modelProviderLive(modelId, provider) ? modelId : null;
   }, null);
 }
 

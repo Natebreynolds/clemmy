@@ -134,9 +134,28 @@ test('an empty home gives a resting snapshot with every contract key, zeros only
   }
   assert.equal(byId.get('tidy')?.modelId, null, 'tidy has no model');
   assert.equal(byId.get('index')?.modelId, null, 'the index names the embedder, off here');
-  assert.equal(byId.get('standing')?.modelId, resolveBoundaryJudge().modelId, 'a checker job names the checker it would ask, before any run');
-  assert.equal(byId.get('verify')?.modelId, resolveRoleModel('judge').modelId);
+  // Nothing is signed in to this home: a checker job names no model it
+  // cannot ask ("None available"), as the memory jobs beside it do.
+  assert.equal(byId.get('standing')?.modelId, null, 'no checker can serve in a signed-out home');
+  assert.equal(byId.get('verify')?.modelId, null);
   assert.equal(byId.get('skills')?.modelId, resolveMemoryModelRoute('skills')?.modelId ?? null, 'a governed job that has not run names the model it would ask for');
+});
+
+test('a checker job names the checker it would ask once one is signed in, before any run', () => {
+  const state = path.join(BASE_DIR, 'state');
+  mkdirSync(state, { recursive: true });
+  writeFileSync(path.join(state, 'auth.json'), JSON.stringify({ codexOauth: { accessToken: 'fixture-codex-access', refreshToken: 'fixture-codex-refresh' } }));
+  writeFileSync(path.join(state, 'claude-auth.json'), JSON.stringify({ accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 }));
+  try {
+    const byId = new Map(readMemoryWork().jobs.map((j) => [j.id, j]));
+    assert.ok(resolveBoundaryJudge().modelId, 'fixture: a checker is selected');
+    assert.equal(byId.get('standing')?.modelId, resolveBoundaryJudge().modelId);
+    assert.equal(byId.get('verify')?.modelId, resolveRoleModel('judge').modelId);
+  } finally {
+    rmSync(path.join(state, 'auth.json'), { force: true });
+    rmSync(path.join(state, 'claude-auth.json'), { force: true });
+  }
+  assert.equal(new Map(readMemoryWork().jobs.map((j) => [j.id, j])).get('standing')?.modelId, null, 'signed out again, none is named');
 });
 
 test('working only while a job runs, with the conversation title', async () => {
@@ -432,7 +451,7 @@ test('today, the jobs and the memory model come from the recorded runs', async (
   assert.equal(byId.get('learn')?.today.modelCalls, 2);
   assert.equal(byId.get('learn')?.lastRun?.outcome, 'ok');
   assert.equal(typeof byId.get('learn')?.lastRun?.durationMs, 'number');
-  assert.equal(byId.get('standing')?.modelId, resolveBoundaryJudge().modelId);
+  assert.equal(byId.get('standing')?.modelId, null, 'nothing signed in can serve the checker');
   assert.equal(snap.recent.find((e) => e.job === 'standing')?.model?.modelId, 'checker-model');
   // The memory model's "last served" is a governed job's model, never the checker's.
   assert.equal(snap.model.lastServed?.modelId, 'memory-model');
