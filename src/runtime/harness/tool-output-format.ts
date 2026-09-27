@@ -5,6 +5,7 @@ import { getToolOutputContext } from './tool-output-context.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import { actionTopologyRoleForRuntimeCall, unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { effectiveContextWindow } from './model-window-observations.js';
+import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 
 // Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
 // (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
@@ -55,6 +56,12 @@ export function inlineResultBudgetForModel(routedModelId?: string | null): numbe
   );
 }
 
+/** The largest slice a retained-output reader returns by its own contract
+ * (the recall_tool_result schema bound). */
+export const RETAINED_OUTPUT_READER_MAX_SLICE_CHARS = 120_000;
+/** Room for a reader's header and paging line around its slice. */
+const RETAINED_OUTPUT_READER_FRAME_CHARS = 2_000;
+
 export interface PresentationBudgetInput {
   /** The name the model called: a tool, or a carrier naming its inner tool. */
   toolName: string;
@@ -74,6 +81,10 @@ export interface PresentationBudgetInput {
  * an inner tool is shown exactly as it would be when called directly.
  *
  * - A local reader's explicit larger preview request is honored.
+ * - A retained-output reader (recall_tool_result, tool_output_query,
+ *   file_query) already bounded its own slice from the caller's arguments and
+ *   the window; its handler owns that budget, so presentation never clips it
+ *   again. Per-turn reading stays governed by the RecallBudget.
  * - A registry control read (Clementine's own state and control tools) is
  *   shown whole up to the routed window's inline budget.
  * - Everything else (provider and business results, foreign tools) keeps the
@@ -95,9 +106,11 @@ export function presentationBudgetFor(input: PresentationBudgetInput): number {
     const explicitRead = explicitLocalReadPreviewBudget(effectiveName, effectiveArgs);
     if (explicitRead !== undefined) return explicitRead;
   }
-  return role === 'control'
-    ? inlineResultBudgetForModel(input.routedModelId)
-    : PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
+  if (role !== 'control') return PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
+  if (effectiveName && toolReadsRetainedOutput(effectiveName)) {
+    return RETAINED_OUTPUT_READER_MAX_SLICE_CHARS + RETAINED_OUTPUT_READER_FRAME_CHARS;
+  }
+  return inlineResultBudgetForModel(input.routedModelId);
 }
 
 

@@ -196,13 +196,22 @@ test('recall_tool_result pages with offset and signals when more remains', async
     () => handler({ call_id: 'call_page' }),
   );
   const t1 = page1.content[0].text;
-  assert.match(t1, /Recalled chars 0.30000 of 50000/);
+  // A bare recall shows one whole inline result for the window, not the much
+  // larger slice ceiling.
+  assert.match(t1, /Recalled chars 0.20000 of 50000/);
   // The paging signal must name the EXACT next call, not just "more remains".
   // A model that has to reconstruct the call guesses offsets, and blind paging
   // spends a turn per slice while crediting no business progress until the
   // no-progress governor ends the run (live platform-49 run, 2026-09-02).
   assert.match(t1, /more remains/);
-  assert.match(t1, /recall_tool_result \{"call_id":"call_page","offset":30000\}/);
+  assert.match(t1, /recall_tool_result \{"call_id":"call_page","offset":20000\}/);
+
+  const explicit = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => handler({ call_id: 'call_page', max_chars: 30_000 }),
+  );
+  assert.match(explicit.content[0].text, /Recalled chars 0.30000 of 50000/,
+    'an explicit larger slice is honored up to the ceiling');
 
   const page2 = await withHarnessRunContext(
     { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },

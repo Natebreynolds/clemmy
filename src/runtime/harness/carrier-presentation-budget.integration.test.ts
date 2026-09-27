@@ -256,6 +256,29 @@ const recallThroughCarrier = (callId: string, args: Record<string, unknown>) => 
   callId, args: { name: 'recall_tool_result', args_json: JSON.stringify({ call_id: 'parked-read', ...args }) },
 });
 
+test('an explicit larger recall through call_tool is returned whole, up to the slice ceiling', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realCallTool(['recall_tool_result']), toolName: 'call_tool', seed: parkOutput,
+    calls: [recallThroughCarrier('explicit-recall', { max_chars: 30_000 })],
+  });
+  const shown = results.get('explicit-recall')!;
+  assert.ok(shown.startsWith(`Recalled chars 0–30000 of ${PARKED.length} `), `${shown.slice(0, 300)} … (${shown.length} chars)`);
+  assert.ok(shown.endsWith(PARKED.slice(0, 30_000)), 'the whole 30,000-char slice reaches the model');
+  assert.doesNotMatch(shown, /middle omitted/);
+});
+
+test('a bare recall through call_tool shows one inline result and names the exact next page', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realCallTool(['recall_tool_result']), toolName: 'call_tool', seed: parkOutput,
+    calls: [recallThroughCarrier('bare-recall', {})],
+  });
+  const shown = results.get('bare-recall')!;
+  assert.ok(shown.startsWith(`Recalled chars 0–20000 of ${PARKED.length} `), `${shown.slice(0, 300)} … (${shown.length} chars)`);
+  assert.ok(shown.includes('continue with recall_tool_result {"call_id":"parked-read","offset":20000}'), 'exact next page');
+  assert.ok(shown.endsWith(PARKED.slice(0, 20_000)));
+  assert.doesNotMatch(shown, /middle omitted/);
+});
+
 test('the per-turn RecallBudget governs recalls made through a carrier', async () => {
   const { results } = await runHostTurn({
     agentTool: realCallTool(['recall_tool_result']), toolName: 'call_tool', seed: parkOutput,

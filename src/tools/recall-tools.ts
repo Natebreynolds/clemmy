@@ -4,6 +4,10 @@ import { z } from 'zod';
 import { getToolOutput, getToolOutputSlice, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
 import { harnessRunContextStorage, type HarnessRunContext } from '../runtime/harness/brackets.js';
 import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
+import {
+  RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
+  inlineResultBudgetForModel,
+} from '../runtime/harness/tool-output-format.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
 import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
@@ -57,13 +61,28 @@ import {
 const BASE_RECALL_MAX_CHARS = 30_000;
 /** Schema bound: BASE × the maximum window scale (4). Static so the tool
  *  contract — and therefore the prompt cache — never churns per model. */
-const RECALL_MAX_CHARS_CEILING = 120_000;
+const RECALL_MAX_CHARS_CEILING = RETAINED_OUTPUT_READER_MAX_SLICE_CHARS;
 
 function recallSliceCeiling(routedModelId?: string): number {
   return Math.min(
     RECALL_MAX_CHARS_CEILING,
     Math.max(BASE_RECALL_MAX_CHARS, Math.round(BASE_RECALL_MAX_CHARS * windowScaleForModel(routedModelId))),
   );
+}
+
+/**
+ * The slice one recall returns. An explicit max_chars is honored up to the
+ * window's slice ceiling. Without one, a recall shows one whole inline result
+ * for this window (the same budget a Clementine state read gets), never the
+ * much larger ceiling, so a bare recall costs what the original read would
+ * have cost and pages on with an exact next offset.
+ */
+export function recallSliceChars(requested: unknown, routedModelId?: string): number {
+  const ceiling = recallSliceCeiling(routedModelId);
+  if (typeof requested === 'number' && Number.isFinite(requested)) {
+    return Math.min(ceiling, Math.max(100, Math.trunc(requested)));
+  }
+  return Math.min(ceiling, inlineResultBudgetForModel(routedModelId));
 }
 
 // Cap a single tool_output_query response. The store now holds up to 2MB, and
@@ -98,7 +117,7 @@ export const RECALL_TOOL_RESULT_SHAPE = {
     .min(100)
     .max(RECALL_MAX_CHARS_CEILING)
     .optional()
-    .describe('Optional cap on the returned slice (default: the largest this context window allows).'),
+    .describe('Optional slice size; a larger value up to this context window\'s ceiling is returned whole (default: one inline result).'),
 };
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
@@ -324,10 +343,7 @@ export function registerRecallTools(server: McpServer): void {
     async (input: Record<string, unknown>) => {
       let callId = String(input.call_id ?? '');
       const ctx = harnessRunContextStorage.getStore();
-      const sliceCeiling = recallSliceCeiling(ctx?.routedModelId);
-      const maxChars = Number.isFinite(input.max_chars as number)
-        ? Math.min(sliceCeiling, Math.max(100, Math.trunc(input.max_chars as number)))
-        : sliceCeiling;
+      const maxChars = recallSliceChars(input.max_chars, ctx?.routedModelId);
       const offset = Number.isFinite(input.offset as number)
         ? Math.max(0, Math.trunc(input.offset as number))
         : 0;

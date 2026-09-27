@@ -19,12 +19,14 @@ mkdirSync(path.join(home, 'state'), { recursive: true });
 const {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
   PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+  RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
   inlineResultBudgetForModel,
   presentationBudgetFor,
 } = await import('./tool-output-format.js');
 const { recordCatalogWindow, recordWindowRejection, effectiveContextWindow } = await import('./model-window-observations.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
 const { inheritedNestedHarnessContext } = await import('../../tools/inner-dispatch.js');
+const { recallSliceChars } = await import('../../tools/recall-tools.js');
 
 after(() => rmSync(home, { recursive: true, force: true }));
 
@@ -100,4 +102,31 @@ test('a transport mirror child presents into the same routed model; a batch item
     assert.equal(inheritedNestedHarnessContext('sess-presentation-inherit', false, undefined).routedModelId, undefined);
     assert.equal(inheritedNestedHarnessContext('another-session', false, 'mirror-call').routedModelId, undefined);
   });
+});
+
+test('retained-output readers own their slice: presentation never clips them, direct or through a carrier', () => {
+  for (const routedModelId of [undefined, SMALL_WINDOW_MODEL]) {
+    for (const [name, args] of [
+      ['recall_tool_result', { call_id: 'c', max_chars: 60_000 }],
+      ['recall_tool_result', { call_id: 'c' }],
+      ['tool_output_query', { call_id: 'c' }],
+      ['file_query', { query: 'q', call_id: 'c' }],
+    ] as const) {
+      const direct = presentationBudgetFor({ toolName: name, args, routedModelId });
+      assert.ok(direct > RETAINED_OUTPUT_READER_MAX_SLICE_CHARS, `${name} is never re-clipped`);
+      assert.equal(presentationBudgetFor({ ...carried('call_tool', name, args), routedModelId }), direct);
+    }
+  }
+  // A foreign tool that merely shares a reader's name is not a reader.
+  assert.equal(presentationBudgetFor({ toolName: 'fixtureserver__recall_tool_result', args: { call_id: 'c' } }),
+    PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+});
+
+test('a bare recall slice is one inline result for the window; an explicit one is honored up to the ceiling', () => {
+  assert.equal(recallSliceChars(undefined, undefined), DEFAULT_TOOL_RESULT_MAX_CHARS);
+  assert.equal(recallSliceChars(undefined, SMALL_WINDOW_MODEL), 11_200);
+  assert.equal(recallSliceChars(30_000, SMALL_WINDOW_MODEL), 30_000);
+  assert.equal(recallSliceChars(500_000, undefined), 30_000, 'clamped to the default window ceiling');
+  assert.equal(recallSliceChars(500_000, LARGE_WINDOW_MODEL), RETAINED_OUTPUT_READER_MAX_SLICE_CHARS);
+  assert.equal(recallSliceChars(10, undefined), 100);
 });
