@@ -418,11 +418,9 @@ export function accountScopeExcludesFromRecall(activeAnchors: EntityAnchors, fac
     const f = extractAnchors({ content: factText });
     // Any shared account-level anchor makes it the SAME client: a comparison
     // memory that names the request's domain plus the competitors is about
-    // this client, however the competitors are spelled. Live 2026-09-26: the
-    // finished "tobinlawoffice.com vs Grand Canyon Law Group" work was hidden
-    // from a request that wrote "Grand Canyon Law" — one name mismatch
-    // outvoted the shared domain. Exclude only when every named dimension
-    // differs.
+    // this client, however the competitors are spelled; one differently
+    // spelled name must not outvote a shared domain. Exclude only when every
+    // named dimension differs.
     const shares = [
       [activeAnchors.accountIds, f.accountIds],
       [activeAnchors.domains, f.domains],

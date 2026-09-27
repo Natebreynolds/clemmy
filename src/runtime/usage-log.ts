@@ -101,7 +101,7 @@ export interface UsageEvent {
   firstTokenMs?: number;
   /** The reasoning effort as SENT on the wire, after every adapter rewrite. A
    *  ledger that only knows the harness's decision cannot tell whether a slow
-   *  round thought at the provider's default (live 2026-09-26, grok-4.7). */
+   *  round thought at the provider's default. */
   reasoningEffort?: string;
   /** Provider-reported time spent in remote API calls, in ms. This is a subset
    *  of durationMs when the provider exposes both values (currently Claude SDK). */

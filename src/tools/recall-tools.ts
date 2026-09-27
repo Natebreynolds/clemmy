@@ -477,11 +477,9 @@ export function registerRecallTools(server: McpServer): void {
         && (view.owner === 'mcp_structured_content' || view.owner === 'mcp_text_json');
       if (decodedMcpPayload) parsed = view.payload;
       // A dotted field reaches into nested objects, as `where` and `sort_by`
-      // already do; the projected key is the path as written. Live 2026-09-26:
-      // `fields: "keyword_data.keyword"` projected every record to {} and the
-      // tool answered "None of [...] exist on these records" while the same
-      // path sorted fine — six wasted rounds in one turn, the model re-guessing
-      // field names the tool had just used.
+      // already do; the projected key is the path as written. A projection
+      // that ignored the path would empty every record and tell the model a
+      // field it can sort by does not exist.
       const project = (rec: unknown): unknown => {
         if (!fields || !rec || typeof rec !== 'object' || Array.isArray(rec)) return rec;
         const out: Record<string, unknown> = {};
