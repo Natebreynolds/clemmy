@@ -6457,6 +6457,31 @@ export function sessionHasRetainedToolOutputs(sessionId: string): boolean {
   return row?.present === 1;
 }
 
+/** The newest tool_search_scope event of this session that recorded an
+ * in-scope round-one desk (agents/turn-desk.ts: a desk whose fallbackReason is
+ * JSON null) for an accepted source equal to, or earlier than,
+ * `sourceUserSeq`. The query filters on the desk itself, so no number of
+ * out-of-scope builds or same-source rebuilds can hide that record. */
+export function latestInScopeDeskEvent(
+  sessionId: string,
+  sourceUserSeq: number,
+  relation: 'same_source' | 'earlier_source',
+): EventRow | null {
+  const id = sessionId.trim();
+  if (!id || !Number.isSafeInteger(sourceUserSeq)) return null;
+  const comparison = relation === 'same_source' ? '=' : '<';
+  const row = prepareCached(openEventLog(),
+    `SELECT * FROM events
+      WHERE session_id = ?
+        AND type = 'tool_search_scope'
+        AND json_type(data_json, '$.desk.fallbackReason') = 'null'
+        AND json_extract(data_json, '$.desk.sourceUserSeq') ${comparison} ?
+      ORDER BY seq DESC
+      LIMIT 1`,
+  ).get(id, sourceUserSeq) as RawEventRow | undefined;
+  return row ? rowToEvent(row) : null;
+}
+
 /** Which of these exact tools this session dispatched after `afterSeq`,
  * directly or carried by a dispatcher (the call's recorded effective tool). */
 export function sessionDispatchedToolsSince(

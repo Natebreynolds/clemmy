@@ -310,6 +310,56 @@ test('Jev off and Jev on without a key decide the same desk and send the same to
   }
 });
 
+const ATTACHED = { attachmentIds: ['turn-desk-fixture-attachment'] };
+
+test('an evidence climb holds: the next turn without that evidence stays on the climbed rung and reuses its tools block', async () => {
+  const sessionId = 'turn-desk-evidence-floor';
+  const turn1 = await hostTurn(sessionId, TARGETED, []);
+  assert.equal(deskRecord(sessionId, turn1.source.seq)?.rung, 'lean');
+  const turn2 = await hostTurn(sessionId, TARGETED, [], ATTACHED);
+  const desk2 = deskRecord(sessionId, turn2.source.seq);
+  assert.equal(desk2?.rung, 'readers', `attachments climb to the readers rung: ${JSON.stringify(desk2)}`);
+  assert.ok(desk2?.climbedBy.includes('retained_output'), JSON.stringify(desk2));
+  const turn3 = await hostTurn(sessionId, TARGETED, []);
+  const desk3 = deskRecord(sessionId, turn3.source.seq);
+  assert.equal(desk3?.rung, 'readers', `a session never descends: ${JSON.stringify(desk3)}`);
+  assert.ok(desk3?.climbedBy.includes('session_floor'), JSON.stringify(desk3));
+  assert.equal(turn3.requests[0]!.toolsJson, turn2.requests[0]!.toolsJson, 'the next turn reuses the exact tools block');
+});
+
+test('a desk tool dispatched before a same-source rebuild still climbs the next turn', async () => {
+  const sessionId = 'turn-desk-miss-before-rebuild';
+  const turn1 = await hostTurn(sessionId, TARGETED, [() => ({ name: 'check_in', args: { note: 'Starting now.' } })]);
+  assert.equal(deskRecord(sessionId, turn1.source.seq)?.rung, 'lean');
+  assert.match(turn1.outputs.get(turn1.callId(0)) ?? '', /Check-in posted/, 'the bare-name call reached the handler');
+  // A re-entry on the same source (an approval resume, a retry) records the
+  // same desk again after the dispatch.
+  const rebuilt = await buildFor(sessionId, turn1.source.seq, TARGETED, idleModel);
+  assert.equal(toolsBytes(rebuilt), toolsBytes(turn1.agent), 'the re-entry keeps its desk');
+  const turn2 = await hostTurn(sessionId, TARGETED, []);
+  const desk2 = deskRecord(sessionId, turn2.source.seq);
+  assert.equal(desk2?.rung, 'full', `the miss climbs the next turn: ${JSON.stringify(desk2)}`);
+  assert.ok(desk2?.missed.includes('check_in'), JSON.stringify(desk2));
+});
+
+test('the session floor survives any number of out-of-scope builds between two ordinary turns', async () => {
+  const sessionId = 'turn-desk-floor-past-out-of-scope';
+  const turn1 = await hostTurn(sessionId, TARGETED, [], ATTACHED);
+  assert.equal(deskRecord(sessionId, turn1.source.seq)?.rung, 'readers');
+  const act = acceptSource(sessionId, TARGETED);
+  await buildFor(sessionId, act.seq, TARGETED, idleModel, { acceptedRoute: 'act' });
+  const actScope = eventlog.listEvents(sessionId, { sinceSeq: act.seq, types: ['tool_search_scope'] }).at(-1);
+  assert.equal((actScope?.data as { desk?: DeskRecord }).desk?.fallbackReason, 'out_of_scope');
+  // A long act source rebuilds many times; each build records its own scope.
+  for (let index = 0; index < 80; index += 1) {
+    eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'tool_search_scope', data: actScope!.data as Record<string, unknown> });
+  }
+  const turn2 = await hostTurn(sessionId, TARGETED, []);
+  const desk2 = deskRecord(sessionId, turn2.source.seq);
+  assert.equal(desk2?.rung, 'readers', `the floor is the previous in-scope source's rung: ${JSON.stringify(desk2)}`);
+  assert.equal(turn2.requests[0]!.toolsJson, turn1.requests[0]!.toolsJson, 'the ordinary turn reuses its tools block');
+});
+
 const multiItem = await import('./multi-item-intent.js');
 const contextPacket = await import('./context-packet.js');
 const FANOUT = 'For each of these 8 accounts: Acme, Globex, Initech, Umbrella, Hooli, Stark, Wayne, Wonka, look up their latest invoice and draft a follow-up email.';

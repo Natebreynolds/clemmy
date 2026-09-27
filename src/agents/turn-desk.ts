@@ -27,7 +27,10 @@
  *      the evidence each desk declaration names climbs the session to that
  *      tool's rung; a desk tool this session dispatched (a miss, or any use)
  *      climbs to its rung; and the session never descends below the rung its
- *      previous in-scope source recorded.
+ *      newest earlier in-scope source recorded, however many out-of-scope
+ *      sources or same-source rebuilds came after it. An out-of-scope or
+ *      facts_unavailable source records no in-scope desk, so it neither
+ *      raises nor lowers that floor.
  * Any fact that cannot be read gives today's surface (`facts_unavailable`).
  * All facts are durable records, so a restart decides the same rung.
  */
@@ -38,9 +41,10 @@ import {
   type DeskRung,
 } from '../tools/tool-registry.js';
 import {
-  listEvents,
+  latestInScopeDeskEvent,
   sessionDispatchedToolsSince,
   sessionHasRetainedToolOutputs,
+  type EventRow,
 } from '../runtime/harness/eventlog.js';
 import { acceptedSourceHasAttachments } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { rankSkills } from '../runtime/harness/context-packet.js';
@@ -142,8 +146,6 @@ export function decideTurnDesk(
   };
 }
 
-interface RecordedDesk { seq: number; desk: TurnDeskDecision }
-
 function isInScopeRecord(value: unknown): value is TurnDeskDecision {
   const desk = value as Partial<TurnDeskDecision> | undefined;
   return Boolean(desk)
@@ -155,18 +157,20 @@ function isInScopeRecord(value: unknown): value is TurnDeskDecision {
     && Array.isArray(desk!.deferred);
 }
 
-/** In-scope desks this session recorded, newest first. */
-function recordedDesks(sessionId: string): RecordedDesk[] {
-  return listEvents(sessionId, { types: ['tool_search_scope'], desc: true, limit: 64 })
-    .flatMap((event) => {
-      const desk = (event.data as { desk?: unknown }).desk;
-      return isInScopeRecord(desk) ? [{ seq: event.seq, desk }] : [];
-    });
+function inScopeDesk(event: EventRow | null): TurnDeskDecision | null {
+  const desk = (event?.data as { desk?: unknown } | undefined)?.desk;
+  return isInScopeRecord(desk) ? desk : null;
 }
 
 /** The in-scope desk this accepted source already decided, if a build recorded one. */
 export function recordedTurnDesk(sessionId: string, sourceUserSeq: number): TurnDeskDecision | null {
-  return recordedDesks(sessionId).find((entry) => entry.desk.sourceUserSeq === sourceUserSeq)?.desk ?? null;
+  return inScopeDesk(latestInScopeDeskEvent(sessionId, sourceUserSeq, 'same_source'));
+}
+
+/** The desk of the session's newest in-scope source before this one: the
+ *  floor, and the start of the miss window. */
+export function previousTurnDesk(sessionId: string, sourceUserSeq: number): TurnDeskDecision | null {
+  return inScopeDesk(latestInScopeDeskEvent(sessionId, sourceUserSeq, 'earlier_source'));
 }
 
 export interface TurnDeskFactInput {
@@ -179,8 +183,7 @@ export interface TurnDeskFactInput {
 
 /** Read the host facts the desk decides on. Throws when a read fails. */
 export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
-  const previous = recordedDesks(input.sessionId)
-    .find((entry) => entry.desk.sourceUserSeq < input.sourceUserSeq) ?? null;
+  const previous = previousTurnDesk(input.sessionId, input.sourceUserSeq);
   const openWork = summarizeWorkManifests(input.sessionId).some((manifest) => manifest.remaining > 0);
   return {
     identifiedTarget: input.identifiedTarget,
@@ -192,8 +195,10 @@ export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
       listed_skill: rankSkills(input.requestText).length > 0,
       long_work: openWork,
     },
-    missed: sessionDispatchedToolsSince(input.sessionId, previous?.seq ?? 0, deskDeclaredToolNames()),
-    sessionFloor: previous?.desk.rung ?? null,
+    // From the previous in-scope source's own user message, so a dispatch
+    // made before any rebuild of that source still counts.
+    missed: sessionDispatchedToolsSince(input.sessionId, previous?.sourceUserSeq ?? 0, deskDeclaredToolNames()),
+    sessionFloor: previous?.rung ?? null,
   };
 }
 
