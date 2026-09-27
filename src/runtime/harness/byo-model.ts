@@ -1218,7 +1218,7 @@ function recordByoUsage(
         ? { durationMs: Math.max(0, Date.now() - startedAt) }
         : {}),
       ...byoWireObservations(u, wire, startedAt),
-      promptComponents: harnessContext?.promptComponents,
+      framePromptComponents: harnessContext?.promptComponents,
     });
     // Proven-acceptance learning: an accepted request above our believed
     // window raises the budgeting floor (writes only when it beats the

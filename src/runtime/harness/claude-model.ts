@@ -983,7 +983,7 @@ class RawClaudeUsageRecordingModel implements Model {
         cacheDialect: 'inclusive',
         ...fields,
         durationMs: Math.max(0, Date.now() - startedAt),
-        promptComponents: context?.promptComponents,
+        framePromptComponents: context?.promptComponents,
       });
     } catch {
       // Usage observability must never affect the model response.

@@ -485,7 +485,7 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
       outputTokens,
       totalTokens: inputTokens + outputTokens,
       responseId: state.requestId || state.responseId,
-      promptComponents: harnessContext?.promptComponents,
+      framePromptComponents: harnessContext?.promptComponents,
     });
   } catch { /* observability must never break the response path */ }
 }

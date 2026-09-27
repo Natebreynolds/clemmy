@@ -104,3 +104,81 @@ test('the account-routing verdict reaches its model with no extended thinking; e
   assert.equal(modelIds[1], modelIds[0]);
   assert.equal(requests[1]?.modelSettings?.reasoning, undefined);
 });
+
+// Nested calls used to inherit the brain scope's role and the brain round's
+// prompt components, so a small judge read as another brain round carrying
+// the brain's whole prompt breakdown.
+test('a semantic call inside a brain turn records its own role and request, not the brain round', async () => {
+  const { withModelRouteMetrics } = await import('../model-route-metrics.js');
+  const { harnessRunContextStorage } = await import('../harness/brackets.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Use my work account.' } });
+  const brainRound = { instructions: 5_000, toolSchemas: 40_000, history: 9_000 };
+  let responses = 0;
+  // The router labels every call in a turn with the frame's role; the claude
+  // adapter's recorder reads the harness context's prompt components.
+  setDefaultModelProvider({ getModel: async (modelId?: string) => withModelRouteMetrics(
+    withRawClaudeUsageRecording({
+      async getResponse() {
+        responses += 1;
+        return { responseId: `nested-${responses}`,
+          usage: new Usage({ inputTokens: 900, outputTokens: 8, totalTokens: 908, requests: 1 }),
+          output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
+            text: JSON.stringify({ verdict: 'entailed', proposalDigest: 'c'.repeat(64) }), providerData: {} }] }] } as never;
+      },
+      async *getStreamedResponse() { throw new Error('semantic completion is not streaming'); },
+    } as never, String(modelId)),
+    { sessionId: session.id, role: 'brain', resolvedModel: String(modelId), provider: 'claude', source: 'explicit', reason: {} },
+  ) as never });
+  const port = configuredBrainSemanticPort(completeViaConfiguredBrain);
+  await withModelUsageAttribution({ sessionId: session.id, sourceUserSeq: source.seq, role: 'brain' },
+    () => harnessRunContextStorage.run({ sessionId: session.id, sourceUserSeq: source.seq, promptComponents: brainRound } as never,
+      () => port.judgeAccountSelection!({ purpose: 'turn_semantics_account_selection', sessionId: session.id,
+        sourceUserSeq: source.seq, mode: 'explicit_selection', acceptedText: 'Use my work account.',
+        sourceQuote: 'my work account', toolkit: 'fixture', accountIdentity: 'work', accountLabel: 'Work',
+        proposalDigest: 'c'.repeat(64) })));
+  const rows = readUsageEventsForDate().filter(row => row.source === session.id);
+  assert.equal(rows.length, 1);
+  assert.notEqual(rows[0]!.role, 'brain', 'a nested judge is not a brain round');
+  assert.equal(rows[0]!.role, 'reviewer');
+  assert.equal(rows[0]!.channel, 'judge:turn_semantics_account_selection');
+  assert.ok((rows[0]!.promptComponents?.toolSchemas ?? 0) < 100, 'the brain round\'s tool schemas are not billed to it');
+  assert.ok((rows[0]!.promptComponents?.instructions ?? 0) < brainRound.instructions,
+    'its components describe its own request');
+  assert.equal(rows[0]!.inputTokens, 900, 'provider token totals are unchanged');
+  assert.equal(rows[0]!.trace?.acceptedSource, `${session.id}:${source.seq}`, 'it still bills the accepted source');
+});
+
+test('interpretation inside a brain turn declares no role, and the brain round itself is still the brain', async () => {
+  const { harnessRunContextStorage } = await import('../harness/brackets.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'hello' } });
+  const brainRound = { instructions: 5_000, toolSchemas: 40_000, history: 9_000 };
+  const model = withRawClaudeUsageRecording({
+    async getResponse() {
+      return { responseId: 'frame-or-nested',
+        usage: new Usage({ inputTokens: 60_000, outputTokens: 8, totalTokens: 60_008, requests: 1 }),
+        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
+          text: '{}', providerData: {} }] }] } as never;
+    },
+    async *getStreamedResponse() { throw new Error('not streaming'); },
+  } as never, 'fixture-brain');
+  setDefaultModelProvider({ getModel: async () => model });
+  await withModelUsageAttribution({ sessionId: session.id, sourceUserSeq: source.seq, role: 'brain' },
+    () => harnessRunContextStorage.run({ sessionId: session.id, sourceUserSeq: source.seq, promptComponents: brainRound } as never,
+      async () => {
+        await model.getResponse({} as never);
+        await completeViaConfiguredBrain({ purpose: 'turn_semantics', system: 'fixture', user: '{}',
+          schemaName: 'TurnSemanticProposalV1' }).catch(() => undefined);
+      }));
+  const rows = readUsageEventsForDate().filter(row => row.source === session.id);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.role, 'brain', 'the brain round keeps its role');
+  assert.equal(rows[0]!.promptComponents?.toolSchemas, 40_000, 'and its measured composition');
+  assert.equal(rows[1]!.role, undefined, 'interpretation is not a brain round');
+  assert.equal(rows[1]!.roleReason, 'unset');
+  assert.equal(rows[1]!.channel, 'semantic:turn_semantics');
+  assert.equal(rows[1]!.promptComponents?.toolSchemas, undefined);
+});

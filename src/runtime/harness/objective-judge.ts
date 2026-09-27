@@ -1,6 +1,6 @@
 import type { ResolvedRoleModel } from './model-roles.js';
 import { classifyModelError } from './resilient-model.js';
-import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
+import { withOwnModelRequestAttribution } from '../usage-log.js';
 import { READ_SCOPE_EVIDENCE_RUBRIC } from '../../agents/clem-rubric.js';
 import { redactSensitiveText } from '../security.js';
 import { Agent, Runner } from '@openai/agents';
@@ -1079,10 +1079,8 @@ export async function runHedgedJudge<T>(
     }
     // Every attempt is attributed to its lane so the usage log can rank judge
     // spend per lane; the turn's own session/source attribution is preserved.
-    const inherited = modelUsageAttributionStorage.getStore();
-    const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (): Promise<T> => withModelUsageAttribution<Promise<T>>(
-      { sessionId: inherited?.sessionId ?? 'unknown', sourceUserSeq: inherited?.sourceUserSeq ?? 0,
-        ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}), channel: `judge:${lane}`, role: 'reviewer' },
+    const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (): Promise<T> => withOwnModelRequestAttribution<Promise<T>>(
+      { channel: `judge:${lane}`, role: 'reviewer' },
       () => runRoutedJudgeAttempt<T>(
         r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence, signal, opts.effort,
       ),

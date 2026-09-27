@@ -452,6 +452,11 @@ export interface ModelUsageAttributionContext {
    * `judge:completion`). Live 2026-09-22: 94 reviewer calls in a day landed as
    * `unknown / other` with no lane, so nothing about them could be ranked. */
   channel?: string;
+  /** This scope is one model request of its own made inside an enclosing
+   *  frame (a brain or worker turn). The frame's role and its prompt
+   *  measurements describe the frame's requests, not this one, so neither is
+   *  inherited: the call records the role and channel it declares, or none. */
+  ownRequest?: boolean;
 }
 
 /**
@@ -506,6 +511,35 @@ export function withModelUsageObserver<T>(sink: ObservedModelUsage[], work: () =
   return modelUsageObservers.run(sink, work);
 }
 
+/**
+ * Run a model call that is its own request inside the current scope (a
+ * semantic interpretation, a judge, a review). It keeps the accepted-source
+ * identity for cost attribution, and records its declared role, channel and
+ * request-local measurements instead of the enclosing frame's.
+ */
+export function withOwnModelRequestAttribution<T>(
+  own: {
+    role?: UsageRequestRole;
+    channel?: string;
+    promptComponents?: Record<string, number>;
+    /** Identity used only when no enclosing scope supplies one. */
+    sessionId?: string;
+    sourceUserSeq?: number;
+  },
+  work: () => T,
+): T {
+  const inherited = modelUsageAttributionStorage.getStore();
+  return modelUsageAttributionStorage.run({
+    sessionId: inherited?.sessionId ?? own.sessionId ?? 'unknown',
+    sourceUserSeq: inherited?.sourceUserSeq ?? own.sourceUserSeq ?? 0,
+    ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
+    ...(own.role ? { role: own.role } : {}),
+    ...(own.channel ?? inherited?.channel ? { channel: own.channel ?? inherited?.channel } : {}),
+    ...(own.promptComponents ? { promptComponents: own.promptComponents } : {}),
+    ownRequest: true,
+  }, work);
+}
+
 /** Role from an explicit channel convention only (`judge:*`, `watcher*`,
  *  `jev*`, `writer*`, `memory:<job>`); anything else is left unset rather than
  *  guessed. A memory job's channel names whose model the job registry says
@@ -553,7 +587,12 @@ export function recordModelUsage(args: {
   reasoningEffort?: string;
   providerApiDurationMs?: number;
   responseId?: string;
+  /** Measurements of THIS request's prompt, computed by the caller. */
   promptComponents?: Record<string, number>;
+  /** The enclosing frame's per-request measurements (the harness context an
+   *  adapter reads). They describe the frame's own model requests, so they
+   *  apply only outside an own-request scope. */
+  framePromptComponents?: Record<string, number>;
   /** Context-window health (Claude SDK lane): how close this call ran to the
    *  model's window. utilization = inputTokens / contextWindowTokens. */
   contextWindowTokens?: number;
@@ -658,7 +697,12 @@ export function recordModelUsage(args: {
     ...(args.account ? { account: args.account } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
-    promptComponents: reconcilePromptComponents(attribution?.promptComponents ?? args.promptComponents, args.inputTokens),
+    promptComponents: reconcilePromptComponents(
+      attribution?.promptComponents
+        ?? args.promptComponents
+        ?? (attribution?.ownRequest ? undefined : args.framePromptComponents),
+      args.inputTokens,
+    ),
     contextWindowTokens: args.contextWindowTokens,
     windowUtilization: args.windowUtilization,
     firstByteMs: args.firstByteMs,

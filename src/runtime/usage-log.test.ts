@@ -477,3 +477,31 @@ test('the model_call_completed event carries the resolved channel and role, in t
   assert.equal(read('usage-memory-explicit')?.roleReason, 'explicit');
   assert.equal(read('usage-memory-explicit')?.usageKind, 'background');
 });
+
+test('a call that declares its own request never inherits the frame role or the frame prompt components', async () => {
+  const { recordModelUsage, readUsageEventsForDate, withModelUsageAttribution, withOwnModelRequestAttribution } =
+    await import('./usage-log.js');
+  const source = `own-request-fixture-${Date.now()}`;
+  const frame = { instructions: 5_000, toolSchemas: 40_000 };
+  // What an adapter (BYO, Codex, Claude, headless CLI) passes: the ambient
+  // harness measurement of the brain round in flight.
+  const record = (responseId: string) => recordModelUsage({
+    sessionId: source, model: 'fixture', cacheDialect: 'inclusive', inputTokens: 1_000, outputTokens: 5,
+    responseId, framePromptComponents: frame,
+  });
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, role: 'brain' }, () => {
+    record('frame-round');
+    withOwnModelRequestAttribution({}, () => record('nested-unlabelled'));
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:fixture' }, () => record('nested-judge'));
+  });
+  const rows = new Map(readUsageEventsForDate().filter((row) => row.source === source).map((row) => [row.responseId, row]));
+  assert.equal(rows.get('frame-round')?.role, 'brain');
+  assert.equal(rows.get('frame-round')?.promptComponents?.toolSchemas, 40_000, 'the frame round keeps its measurement');
+  assert.equal(rows.get('nested-unlabelled')?.role, undefined);
+  assert.equal(rows.get('nested-unlabelled')?.roleReason, 'unset');
+  assert.equal(rows.get('nested-unlabelled')?.promptComponents, undefined, 'no inherited measurement');
+  assert.equal(rows.get('nested-judge')?.role, 'reviewer');
+  assert.equal(rows.get('nested-judge')?.channel, 'judge:fixture');
+  assert.equal(rows.get('nested-judge')?.promptComponents, undefined);
+  for (const row of rows.values()) assert.equal(row.inputTokens, 1_000, 'provider totals are untouched');
+});

@@ -626,6 +626,9 @@ function routeAttributionContext(role: ModelRouteRole, request: ModelRequest): M
     return { sessionId: 'unknown', sourceUserSeq: 0, ...inherited, role: 'memory', promptComponents: requestPromptComponents(request) };
   }
   if (!inherited) return { sessionId: 'unknown', sourceUserSeq: 0, role: routeRole };
+  // The router labels every call in a frame by the frame's role. A call site
+  // that declared its own request already chose its role (or none).
+  if (inherited.ownRequest && (routeRole === 'brain' || routeRole === 'worker')) return null;
   if (inherited.role === routeRole) return null;
   if (routeRole === 'brain' && inherited.role) return null;
   return { ...inherited, role: routeRole, promptComponents: undefined };
