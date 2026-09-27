@@ -196,8 +196,10 @@ test('what a nested reconcile changed counts once, through the learn run around 
   assert.equal(Number(learn.updated) + Number(reconcile.updated), 1, 'the memory updated is counted once');
   assert.equal(learn.conversations, 1);
   assert.equal(reconcile.conversations, 0);
-  // The nested runs' own work still counts: their calls, tokens and runs.
-  assert.equal(reconcile.runs, 2);
+  // The nested runs' own work still counts: their calls and tokens. They are
+  // part of the learn run, not runs of their own.
+  assert.equal(reconcile.runs, 0);
+  assert.equal(learn.runs, 1);
   assert.equal(reconcile.model_calls, 2);
   assert.equal(reconcile.input_tokens, 80);
   assert.equal(learn.model_calls, 1, 'the learn run never counts its reconciles\' calls');
@@ -208,7 +210,9 @@ test('what a nested reconcile changed counts once, through the learn run around 
   // A reconcile on its own (the owner saving a memory) counts as itself.
   await runMemoryJob('reconcile', { source: { kind: 'owner' } }, async () => { call('memory-model'); },
     () => ({ outcome: 'ok', produced: { learned: 1 }, facts: { learned: ['23'] } }));
-  assert.equal(new Map(dailyRows().map((row) => [row.job, row])).get('reconcile')?.learned, 1);
+  const own = new Map(dailyRows().map((row) => [row.job, row])).get('reconcile');
+  assert.equal(own?.learned, 1);
+  assert.equal(own?.runs, 1);
 });
 
 test('work that outlives the run it started in is its own, and counts', async () => {

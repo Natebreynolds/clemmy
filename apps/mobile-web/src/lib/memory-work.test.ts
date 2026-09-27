@@ -398,6 +398,14 @@ test('jobs list in the shared order, learning first, import only once it has run
   assert.match(learn.last, /^Last ran 4 min ago · done$/);
   assert.equal(learn.next, 'After each conversation, when Clem is idle');
   assert.equal(learn.today, '6 runs today · 14 model calls · 46k tokens');
+  // A job that ran only inside other runs today has no runs of its own; its
+  // model work still shows.
+  const nestedOnly = view('resting');
+  nestedOnly.jobs = nestedOnly.jobs.map((j) => (j.id === 'reconcile'
+    ? { ...j, today: { runs: 0, modelCalls: 5, inputTokens: 2_000, outputTokens: 200, learned: 0, updated: 0, faded: 0 } }
+    : j));
+  const reconcile = memoryJobGroups(nestedOnly, namer, NOW, false)[0]!.jobs.find((j) => j.id === 'reconcile');
+  assert.equal(reconcile?.today, '5 model calls today · 2.2k tokens');
   const byId = new Map(groups.flatMap((g) => g.jobs).map((j) => [j.id, j]));
   assert.equal(byId.get('standing')?.model, 'Named checker-model · Checks the work');
   assert.equal(byId.get('index')?.model, 'local-embedder · Runs on this Mac', 'the local model is a file, not a catalog name');

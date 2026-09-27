@@ -494,7 +494,7 @@ function hourlyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: Activity
     const tick = new Date(start).getHours() % 6 === 0 && !current ? label : null;
     const parts = runs + calls === 0
       ? ['no memory work']
-      : [plural(calls, 'model call', 'model calls'), plural(runs, 'run', 'runs'), ...(learned ? [`${learned.toLocaleString()} learned`] : [])];
+      : [plural(calls, 'model call', 'model calls'), ...(runs ? [plural(runs, 'run', 'runs')] : []), ...(learned ? [`${learned.toLocaleString()} learned`] : [])];
     return {
       key: h.hourStart,
       slot,
@@ -550,7 +550,7 @@ function dailyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: ActivityB
     const label = current ? 'Today' : shortDate(t);
     const parts = runs + calls === 0
       ? ['no memory work']
-      : [plural(calls, 'model call', 'model calls'), plural(runs, 'run', 'runs'), ...(learned ? [`${learned.toLocaleString()} learned`] : []), ...(tokens ? [`${formatTokenCount(tokens)} tokens`] : [])];
+      : [plural(calls, 'model call', 'model calls'), ...(runs ? [plural(runs, 'run', 'runs')] : []), ...(learned ? [`${learned.toLocaleString()} learned`] : []), ...(tokens ? [`${formatTokenCount(tokens)} tokens`] : [])];
     return {
       key: d.day,
       slot,
@@ -621,8 +621,11 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkSnapshot, fmt: Memory
   const runs = count(job.today?.runs) ?? 0;
   const tokens = (count(job.today?.inputTokens) ?? 0) + (count(job.today?.outputTokens) ?? 0);
   const calls = count(job.today?.modelCalls) ?? 0;
-  const todayParts = runs > 0 ? [plural(runs, 'run', 'runs')] : [];
+  // A job that ran only inside other runs today (a reconcile inside a
+  // conversation read) has no runs of its own, but its model work still shows.
+  const todayParts = runs > 0 ? [plural(runs, 'run', 'runs')] : calls > 0 ? [plural(calls, 'model call', 'model calls')] : [];
   if (runs > 0 && calls > 0) todayParts.push(tokens > 0 ? `${formatTokenCount(tokens)} tokens` : plural(calls, 'model call', 'model calls'));
+  else if (runs === 0 && tokens > 0) todayParts.push(`${formatTokenCount(tokens)} tokens`);
   // An unknown read sends zeros for a job's day (the contract types them as
   // numbers); they are not a quiet day.
   const todayText = unknown ? UNKNOWN : todayParts.length ? todayParts.join(' · ') : null;

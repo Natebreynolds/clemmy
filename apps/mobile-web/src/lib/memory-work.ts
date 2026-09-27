@@ -432,7 +432,8 @@ export function hourStrip(snapshot: MemoryWorkView | null, now: number): HourStr
 
 function workFigures(parts: { runs: number; modelCalls: number; learned: number }): string {
   if (parts.runs === 0 && parts.modelCalls === 0 && parts.learned === 0) return 'no memory work';
-  const out = [plural(parts.runs, 'run', 'runs')];
+  // Work that ran only inside other runs adds calls but no run of its own.
+  const out = parts.runs > 0 || parts.modelCalls === 0 ? [plural(parts.runs, 'run', 'runs')] : [];
   if (parts.modelCalls > 0) out.push(plural(parts.modelCalls, 'model call', 'model calls'));
   if (parts.learned > 0) out.push(`${parts.learned.toLocaleString()} learned`);
   return out.join(' · ');
@@ -756,9 +757,11 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkView, modelName: Mode
     : MEMORY_JOB_NO_RUN;
   const today = unread ? null : job.today;
   let todayLine: string | null = null;
-  if (today && count(today.runs) > 0) {
-    const parts = [`${plural(today.runs, 'run', 'runs')} today`];
-    if (count(today.modelCalls) > 0) parts.push(plural(today.modelCalls, 'model call', 'model calls'));
+  // A job that ran only inside other runs today (a reconcile inside a
+  // conversation read) has no runs of its own, but its model work still shows.
+  if (today && (count(today.runs) > 0 || count(today.modelCalls) > 0)) {
+    const parts = count(today.runs) > 0 ? [`${plural(today.runs, 'run', 'runs')} today`] : [];
+    if (count(today.modelCalls) > 0) parts.push(`${plural(today.modelCalls, 'model call', 'model calls')}${parts.length ? '' : ' today'}`);
     const tokens = count(today.inputTokens) + count(today.outputTokens);
     if (tokens > 0) parts.push(`${formatTokenCount(tokens)} tokens`);
     todayLine = parts.join(' · ');

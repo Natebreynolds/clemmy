@@ -104,6 +104,10 @@ export interface MemoryWorkModel {
 }
 
 export interface MemoryWorkTotals {
+  /** Runs started on their own. Work nested in another run (a reconcile
+   *  inside a conversation read) is part of that run: its model calls and
+   *  tokens count, but it adds no run. The hourly and daily strips count the
+   *  same way. */
   runs: number;
   modelCalls: number;
   inputTokens: number;

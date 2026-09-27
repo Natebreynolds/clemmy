@@ -433,14 +433,16 @@ function countsAsNewConversation(db: Database.Database, run: RunContext, outcome
 }
 
 /**
- * Add one recorded run to its day's counters. Runs, model calls and tokens
- * always count: a nested run's calls are its own (the enclosing run never
- * sees them). What a nested run changed does not count again: the enclosing
- * run reports the outcome of the whole run, including what its nested
- * reconciles added or updated.
+ * Add one recorded run to its day's counters. Model calls and tokens always
+ * count: a nested run's calls are its own (the enclosing run never sees
+ * them). A nested run is part of the run around it, so it is not a run of
+ * its own (the timeline shows it inside that run), and what it changed does
+ * not count again: the enclosing run reports the outcome of the whole run,
+ * including what its nested reconciles added or updated.
  */
 function upsertDaily(db: Database.Database, payload: MemoryWorkEventPayload, at: Date, conversations: number): void {
-  const p: MemoryWorkProduced = payload.nestedIn ? {} : payload.produced;
+  const nested = Boolean(payload.nestedIn);
+  const p: MemoryWorkProduced = nested ? {} : payload.produced;
   const atIso = at.toISOString();
   db.prepare(`
     INSERT INTO memory_work_daily (
@@ -448,12 +450,12 @@ function upsertDaily(db: Database.Database, payload: MemoryWorkEventPayload, at:
       faded, claims, left_out, set_aside, conversations, last_at, last_outcome,
       last_duration_ms, last_model_id, last_model_at, last_model_stand_in
     ) VALUES (
-      @day, @job, 1, @calls, @inputTokens, @outputTokens, @learned, @updated,
+      @day, @job, @runs, @calls, @inputTokens, @outputTokens, @learned, @updated,
       @faded, @claims, @leftOut, @setAside, @conversations, @at, @outcome,
       @durationMs, @modelId, @modelAt, @standIn
     )
     ON CONFLICT(day, job) DO UPDATE SET
-      runs = runs + 1,
+      runs = runs + excluded.runs,
       model_calls = model_calls + excluded.model_calls,
       input_tokens = input_tokens + excluded.input_tokens,
       output_tokens = output_tokens + excluded.output_tokens,
@@ -476,6 +478,7 @@ function upsertDaily(db: Database.Database, payload: MemoryWorkEventPayload, at:
   `).run({
     day: localDayKey(at),
     job: payload.job,
+    runs: nested ? 0 : 1,
     calls: payload.usage.calls,
     inputTokens: payload.inputTokens,
     outputTokens: payload.outputTokens,

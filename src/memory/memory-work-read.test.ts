@@ -327,8 +327,12 @@ test('a memory a nested reconcile added is undone once, from the run the owner r
   assert.equal(getFact(kept)?.active, true);
   assert.equal(snap.today.learned, 1, 'kept once in today\'s numbers');
   assert.equal(snap.hourly.at(-1)?.learned, 1, 'and once in the hour');
-  assert.equal(snap.today.runs, 2, 'both runs happened');
+  // One run, as the timeline shows it; the reconcile inside it adds its call.
+  assert.equal(snap.today.runs, 1, 'the reconcile is part of the learn run');
   assert.equal(snap.today.modelCalls, 2);
+  assert.equal(snap.hourly.at(-1)?.runs, 1, 'and so in the hour');
+  assert.equal(snap.hourly.at(-1)?.modelCalls, 2);
+  assert.equal(snap.jobs.find((j) => j.id === 'reconcile')?.today.modelCalls, 1, 'the reconcile\'s own model work is still its own');
 
   // Inside a run that offers no undo of its own, the reconcile keeps its own.
   const pattern = fact('Proposals that open with a result close faster');

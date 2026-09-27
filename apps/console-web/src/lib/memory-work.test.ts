@@ -273,6 +273,12 @@ test('a job row says its model, whose model that is, when it last ran, and when 
   assert.equal(skills.dot, 'unrecorded');
   assert.equal(skills.todayText, null);
   assert.equal(skills.unknown, false);
+  // A job that ran only inside other runs today has no runs of its own; its
+  // model work still shows.
+  const nestedOnly = memoryWorkViewModel(snapshot({ jobs: memoryWorkFixture('resting', NOW).jobs.map((j) => (j.id === 'reconcile'
+    ? { ...j, today: { runs: 0, modelCalls: 5, inputTokens: 2_000, outputTokens: 200, learned: 0, updated: 0, faded: 0 } }
+    : j)) }), NOW);
+  assert.equal(nestedOnly.jobs.learning.find((j) => j.id === 'reconcile')?.todayText, '5 model calls · 2.2k tokens');
   const failed = memoryWorkViewModel(snapshot({ jobs: [{ ...memoryWorkFixture('resting', NOW).jobs[0]!, lastRun: { at: iso(NOW - HOUR), outcome: 'failed' } }] }), NOW);
   assert.equal(failed.jobs.learning[0]?.dot, 'failed');
   assert.equal(failed.jobs.learning[0]?.lastFailed, true);

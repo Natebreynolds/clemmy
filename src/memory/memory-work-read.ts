@@ -409,11 +409,12 @@ function localHourStart(now: Date): number {
 }
 
 /** Runs, calls and learned per hour since `firstMs` (bucket 0 = the first
- *  hour). What a nested run changed is counted by the run around it. */
+ *  hour). A nested run is part of the run around it: its calls count here,
+ *  but it is not a run of its own, and what it changed is that run's. */
 function readHourRows(db: Database.Database, firstMs: number): HourRow[] {
   return db.prepare(`
     SELECT (CAST(strftime('%s', ts) AS INTEGER) - CAST(@first AS INTEGER)) / 3600 AS bucket,
-           COUNT(*) AS runs,
+           SUM(CASE WHEN json_extract(payload_json, '$.nestedIn') IS NULL THEN 1 ELSE 0 END) AS runs,
            SUM(COALESCE(json_extract(payload_json, '$.usage.calls'), 0)) AS calls,
            SUM(CASE WHEN json_extract(payload_json, '$.nestedIn') IS NULL
                     THEN COALESCE(json_extract(payload_json, '$.produced.learned'), 0) ELSE 0 END) AS learned
