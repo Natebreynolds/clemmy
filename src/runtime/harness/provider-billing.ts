@@ -19,7 +19,8 @@ import { getByoProviders, providerToBackendConfig, resolveByoProviderForModel } 
 import { boundWriterModel, resolveRoleModel } from './model-roles.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { activeEmbeddingProviderName } from '../../memory/embeddings.js';
-import { describeMemoryModel } from '../../memory/memory-model-route.js';
+import { describeMemoryModel, memoryJobModelId } from '../../memory/memory-model-route.js';
+import { MEMORY_JOB_IDS, memoryJobUsesMemoryModel } from '../../memory/memory-jobs.js';
 
 const logger = pino({ name: 'clementine.provider-billing' });
 
@@ -221,11 +222,20 @@ export function rolesByAccount(): Map<string, string[]> {
     try { add(accountForModel(resolveRoleModel(role).modelId), role); } catch { /* unresolved role names no account */ }
   }
   try { add(accountForModel(boundWriterModel()?.modelId ?? ''), 'writer'); } catch { /* no writer bound */ }
-  // Memory work always runs, on the memory route's own model (which can differ
-  // from the checker's). A pick that cannot be served runs on no account.
+  // Memory work always runs, on each governed job's own model: the memory
+  // route's (which can differ from the checker's) and, on Automatic, the
+  // fast-tier model skills, profile and import keep, which can belong to
+  // another account. Every account serving one is tagged; a pick that cannot
+  // be served runs on no account.
   try {
     const memory = describeMemoryModel();
-    if (memory.modelId && !memory.inactiveBinding) add(accountForModel(memory.modelId), 'memory');
+    if (!memory.inactiveBinding) {
+      for (const job of MEMORY_JOB_IDS) {
+        if (!memoryJobUsesMemoryModel(job)) continue;
+        const modelId = memoryJobModelId(job, memory);
+        if (modelId) add(accountForModel(modelId), 'memory');
+      }
+    }
   } catch { /* an unresolved memory route names no account */ }
   return out;
 }

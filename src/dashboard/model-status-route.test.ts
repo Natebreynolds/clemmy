@@ -304,7 +304,7 @@ test('each account carries its billing page, whether its provider refused for cr
   });
 });
 
-test('the OpenAI key does memory search only while it embeds, and only the automatic memory model\'s account keeps the memory', async () => {
+test('the OpenAI key does memory search only while it embeds, and every account doing memory work keeps the memory', async () => {
   const { _setEmbeddingProviderForTest } = await import('../memory/embeddings.js');
   const { describeMemoryModel } = await import('../memory/memory-model-route.js');
   const { __resetProviderBillingForTests } = await import('../runtime/harness/provider-billing.js');
@@ -332,7 +332,17 @@ test('the OpenAI key does memory search only while it embeds, and only the autom
         assert.ok(memory.modelId && memory.provider, 'fixture: the automatic memory route resolves');
         const keepers = (['codex', 'claude', 'openai', 'jev'] as const)
           .filter((account) => body[account].billing?.roles?.includes('memory'));
-        assert.deepEqual(keepers, [memory.provider], 'the account serving the automatic memory model keeps the memory');
+        // Learning runs on the memory route's model; skills, profile and
+        // import keep the fast-tier model, here another account's.
+        const { memoryJobModelId } = await import('../memory/memory-model-route.js');
+        const { resolveProvider } = await import('../runtime/harness/model-wire-registry.js');
+        const serving = new Set((['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const)
+          .map((job) => memoryJobModelId(job, memory))
+          .filter((id): id is string => Boolean(id))
+          .map((id) => resolveProvider(id)));
+        assert.ok(serving.has(memory.provider!), 'the automatic memory model\'s account is among them');
+        assert.ok(serving.size > 1, 'fixture: memory work runs on two accounts here');
+        assert.deepEqual([...keepers].sort(), [...serving].sort(), 'every account doing memory work keeps the memory');
         assert.ok(body.byoProviders.every((provider) => !provider.billing?.roles?.includes('memory')));
       } finally {
         await h.close();
