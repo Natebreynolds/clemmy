@@ -798,9 +798,11 @@ export interface TurnMemoryTail {
   manifest: MemoryManifestEntry[];
 }
 
-function countsPointer(scope: MemoryTailScope): string {
+/** What memory is on file beyond the tail; `visibleFacts` are the facts the
+ *  tail already shows, so they are not counted as beyond it. */
+function countsPointer(scope: MemoryTailScope, visibleFacts = 0): string {
   let facts = 0;
-  try { facts = countActiveFacts(); } catch { facts = 0; }
+  try { facts = Math.max(0, countActiveFacts() - visibleFacts); } catch { facts = 0; }
   const parts = [
     facts > 0 ? `${facts} fact${facts === 1 ? '' : 's'}` : '',
     scope.policyCounts.promptInstruction > 0
@@ -873,7 +875,10 @@ export function renderTurnMemoryTail(
       ? renderRunStrategiesForContext(options.request, 1, options.request)
       : '';
     if (strategy) parts.push({ section: 'Proven Run Strategies', tier: 'relevant', text: section('Proven Run Strategies', strategy) });
-    const pointer = countsPointer(scope);
+    const visibleFacts = signal.kind === 'ranked'
+      ? new Set(signal.refs.filter((ref) => ref.type === 'fact').map((ref) => ref.id)).size
+      : 0;
+    const pointer = countsPointer(scope, visibleFacts);
     if (pointer) parts.push({ section: 'Memory Pointer', tier: 'relevant', text: pointer });
   }
   if (options.sessionPointers?.trim()) {

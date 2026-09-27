@@ -190,6 +190,10 @@ test('request-ranked memory arrives once, as one bounded tail from the shared ra
   assert.match(tail!, /quokka ledger lives in the finance workspace/, 'the relevant fact is in it');
   assert.match(tail!, /\[ref fact:\d+\]/, 'each line names the ref to reopen');
   assert.match(tail!, /memory_recall_all searches all of it/, 'a counts pointer widens it');
+  const { countActiveFacts } = await import('../../memory/facts.js');
+  const shownFacts = new Set([...tail!.matchAll(/\[ref fact:(\d+)\]/g)].map((match) => match[1])).size;
+  const beyond = Number(/_Memory on file beyond this view: (\d+) facts?/.exec(tail!)?.[1]);
+  assert.equal(beyond, countActiveFacts() - shownFacts, 'the pointer counts only the facts the tail does not show');
   const ranked = tail!.slice(0, tail!.indexOf('_Memory on file beyond this view'));
   assert.ok(ranked.trim().length <= 1_200, `the ranked part stays within its budget (${ranked.trim().length})`);
   assert.doesNotMatch(tail!, /owner@example\.com/, 'a rule the core already carries is not repeated');
