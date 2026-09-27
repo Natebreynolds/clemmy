@@ -68,6 +68,15 @@ for (const rule of ONE_OFF_RULES) {
   await new Promise((resolve) => setTimeout(resolve, 2));
 }
 
+// Remembered facts for an agent whose prompt names no focus (a resumed
+// request's agent is built from the accepted source, not its text). Before
+// the tail existed, such a prompt ranked its facts with no request objective;
+// the ten important facts were the ones it showed.
+const STANDING_FACTS = Array.from({ length: 10 }, (_, index) =>
+  `Storage locker ${index + 1} at the east depot holds the spare tripods for crew ${index + 1}.`);
+for (const content of STANDING_FACTS) rememberFact({ kind: 'reference', content, importance: 9 });
+rememberFact({ kind: 'reference', content: 'The osprey subscription renews each March on the finance card.', importance: 1 });
+
 after(() => {
   semanticPorts.installTurnSemanticModelPort(null);
   eventlog.closeEventLog();
@@ -98,7 +107,7 @@ function recordingBrain(label: string) {
   };
 }
 
-async function hostTurn(label: string, request: string) {
+async function hostTurn(label: string, request: string, focus: 'request' | 'none' = 'request') {
   const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: label });
   const attempt = eventlog.beginRunAttempt(session.id, { runId: `memory-standin-policies-${label}:${session.id}` });
   const accepted = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
@@ -109,7 +118,8 @@ async function hostTurn(label: string, request: string) {
     reuseRecordedUserInput: true, runAttemptId: attempt.attemptId, turnEngine: 'host_v1', maxSteps: 1, maxTurns: 4,
     toolCallsPerTurn: 8, judgeCompletion: false,
     buildAgent: async (context) => buildOrchestratorAgent({ sessionId: context.sessionId,
-      sourceUserSeq: context.sourceUserSeq, hostFreshPlanning: context.hostFreshPlanning, userInput: request,
+      sourceUserSeq: context.sourceUserSeq, hostFreshPlanning: context.hostFreshPlanning,
+      ...(focus === 'request' ? { userInput: request } : {}),
       allowToolJit: true, model: brain as never }),
     makeRunner: () => Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not execute'); } }) as never,
   });
@@ -138,5 +148,14 @@ test('a standing rule that fits the request reaches a turn whose ranker is skipp
   assert.equal(all.split(RELEVANT_RULE).length - 1, 1, `the relevant rule reaches the model once: ${all.slice(-2500)}`);
   for (const rule of ONE_OFF_RULES) {
     assert.ok(all.split(rule).length - 1 <= 1, `a rule the core shows is not repeated: ${rule}`);
+  }
+});
+
+test('the stand-in ranks facts by the objective the prompt ranked them by, not by the request text', async () => {
+  const { frame, primer } = await hostTurn('no-focus', 'Summarize the osprey subscription renewal.', 'none');
+  assert.equal(primer?.skippedReason, 'disabled', 'the memory ranker did not run');
+  const all = requestText(frame);
+  for (const fact of STANDING_FACTS) {
+    assert.equal(all.split(fact).length - 1, 1, `a fact the prompt showed before reaches the model: ${fact}`);
   }
 });

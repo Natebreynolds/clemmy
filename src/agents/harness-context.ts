@@ -842,7 +842,10 @@ export function renderTurnMemoryTail(
     // begins with the recall marker) goes first, so the tail's bytes from
     // the marker onward are the ones its recall run is proven against.
     if (signal.primerText) parts.push({ section: 'Memory Primer', tier: 'relevant', text: signal.primerText });
-    const acceptedInput = scope.focusInput ?? options.request ?? '';
+    // The prompt ranked these blocks by its own focus input alone; a prompt
+    // built without one (a resumed request's agent) ranked them with no
+    // request objective, and the request text would displace facts it showed.
+    const acceptedInput = scope.focusInput ?? '';
     const { scopedFocus, requestObjective } = resolveRequestObjective(scope.sessionId, acceptedInput);
     for (const block of renderRequestRankedBlocks({
       requestObjective,
