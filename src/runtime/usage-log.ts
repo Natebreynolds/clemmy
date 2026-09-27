@@ -476,6 +476,30 @@ export function withModelUsageAttribution<T>(
   return modelUsageAttributionStorage.run(context, work);
 }
 
+/** One model call as the ledger recorded it, handed to the job that made it. */
+export interface ObservedModelUsage {
+  at: string;
+  model: string;
+  inputTokens: number;
+  cachedInputTokens?: number;
+  outputTokens: number;
+  durationMs?: number;
+  ok: boolean;
+  failReason?: string;
+  channel?: string;
+  role?: UsageRequestRole;
+}
+
+const modelUsageObservers = new AsyncLocalStorage<ObservedModelUsage[]>();
+
+/** Collect every model call recorded inside `work` into `sink`, which the
+ *  caller owns, so a job can report what served it even when it throws. The
+ *  innermost observer wins: a nested job's calls are its own, never counted
+ *  twice by the job around it. */
+export function withModelUsageObserver<T>(sink: ObservedModelUsage[], work: () => T): T {
+  return modelUsageObservers.run(sink, work);
+}
+
 /** Role from an explicit channel convention only (`judge:*`, `watcher*`,
  *  `jev*`); anything else is left unset rather than guessed. */
 export function usageRoleFromChannel(channel: string | undefined): UsageRequestRole | undefined {
@@ -630,6 +654,20 @@ export function recordModelUsage(args: {
   recordUsage(event);
   const observation = modelUsageRecordingObservation.getStore();
   if (observation && args.inputTokens + args.outputTokens > 0) observation.recorded = true;
+  try {
+    modelUsageObservers.getStore()?.push({
+      at: event.at,
+      model: event.model,
+      inputTokens: event.inputTokens,
+      ...(typeof event.cachedInputTokens === 'number' ? { cachedInputTokens: event.cachedInputTokens } : {}),
+      outputTokens: event.outputTokens,
+      ...(typeof event.durationMs === 'number' ? { durationMs: event.durationMs } : {}),
+      ok: args.ok !== false,
+      ...(args.ok === false && args.failReason ? { failReason: args.failReason } : {}),
+      ...(channel ? { channel } : {}),
+      ...(role ? { role } : {}),
+    });
+  } catch { /* an observer must never break the model-call path */ }
   // Stage 4 (aggregate run budget): durable, restart/midnight-proof per-session
   // accumulator (fills the previously-dead sessions.tokens_used column). The
   // unit is UNCACHED tokens — counting the full prompt every turn would let
