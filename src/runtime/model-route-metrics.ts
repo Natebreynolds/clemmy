@@ -252,14 +252,28 @@ export function openModelRouteMetricsDb(): Database.Database {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   db.exec(MODEL_ROUTE_METRICS_SCHEMA_SQL);
-  try {
-    widenModelRouteRoleChecks(db);
-  } catch {
-    // A database the rebuild cannot touch keeps its old CHECK: rows for a role
-    // it does not admit are dropped, exactly as before. Metrics never block.
-  }
+  // No CHECK rebuild here: the first open happens inside a role resolution on
+  // the turn path, and the rebuild copies every row. The daemon runs it once at
+  // boot (widenModelRouteMetricsDb) before any turn is served.
   cachedDb = db;
   return db;
+}
+
+/**
+ * Boot upkeep for the shared metrics DB: widen its role CHECKs before any turn
+ * is served, so writer and memory rows persist. It copies every row once after
+ * an upgrade (seconds on a large ledger), which is why it never runs on a call
+ * or resolution path. Until it has run, rows for a role the old CHECK does not
+ * admit are dropped exactly as before. Never throws; returns the tables it
+ * rebuilt.
+ */
+export function widenModelRouteMetricsDb(): string[] {
+  try {
+    return widenModelRouteRoleChecks(openModelRouteMetricsDb());
+  } catch {
+    // A database the rebuild cannot touch keeps its old CHECK. Metrics never block.
+    return [];
+  }
 }
 
 /** The role CHECK a table was created with admits every current route role. */
@@ -277,7 +291,7 @@ function tableAdmitsEveryRouteRole(db: Database.Database, table: string): boolea
  * metrics DB has no version ledger: the table's own `CREATE` text is the
  * version, which also keeps an older build working on the rebuilt table.
  *
- * One immediate transaction per open: copy every row into a table with the
+ * One immediate transaction per call: copy every row into a table with the
  * current CHECK, verify the counts match, drop the old table, rename, and
  * recreate the indexes. Foreign keys are off for the swap, or dropping the
  * decisions table would cascade-delete every outcome. Idempotent: a current

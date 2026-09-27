@@ -1,19 +1,25 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 
 import {
+  MODEL_ROUTE_METRICS_DB_PATH,
   MODEL_ROUTE_METRICS_SCHEMA_SQL,
   MODEL_ROUTE_METRICS_SCHEMA_VERSION,
+  MODEL_ROUTE_METRICS_STATE_DIR,
   MODEL_ROUTE_METRICS_TABLES,
+  openModelRouteMetricsDb,
   readRouteStandIn,
   recordModelRouteDecision,
   recordModelRouteOutcome,
+  resetModelRouteMetricsForTest,
   successfulRouteOutcome,
   scoreModelRouteCandidate,
   selectBestRouteCandidate,
   summarizeRouteOutcomes,
+  widenModelRouteMetricsDb,
   widenModelRouteRoleChecks,
   withModelRouteMetrics,
   withModelRouteObserver,
@@ -623,6 +629,32 @@ test('a fresh metrics DB admits every route role with nothing to rebuild', () =>
     assert.equal(countRows(db, 'model_route_decisions'), 5);
   } finally {
     db.close();
+  }
+});
+
+test('opening the shared metrics DB never rebuilds it; the daemon\'s boot upkeep does, once', () => {
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'this test writes only an isolated home\'s metrics DB');
+  resetModelRouteMetricsForTest();
+  mkdirSync(MODEL_ROUTE_METRICS_STATE_DIR, { recursive: true });
+  const seed = new Database(MODEL_ROUTE_METRICS_DB_PATH);
+  seed.exec(FIRST_BUILD_SCHEMA_SQL);
+  seed.close();
+  try {
+    // The first open happens inside a role resolution on the turn path.
+    const db = openModelRouteMetricsDb();
+    const decisionsSql = () => (db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'model_route_decisions'`)
+      .get() as { sql: string }).sql;
+    assert.ok(!decisionsSql().includes(`'memory'`), 'the open path leaves the old CHECK alone');
+    recordModelRouteDecision({ id: 'before-boot', role: 'memory', resolvedModel: 'm', provider: 'codex', source: 'default' }, db);
+    assert.equal(countRows(db, 'model_route_decisions'), 0, 'until the boot upkeep runs, a memory row is dropped as before');
+
+    assert.deepEqual(widenModelRouteMetricsDb(), ['model_route_decisions', 'model_route_policy']);
+    assert.ok(decisionsSql().includes(`'memory'`) && decisionsSql().includes(`'writer'`));
+    recordModelRouteDecision({ id: 'after-boot', role: 'memory', resolvedModel: 'm', provider: 'codex', source: 'default' }, db);
+    assert.equal(countRows(db, 'model_route_decisions'), 1);
+    assert.deepEqual(widenModelRouteMetricsDb(), [], 'the next boot finds nothing to do');
+  } finally {
+    resetModelRouteMetricsForTest();
   }
 });
 

@@ -76,6 +76,7 @@ import { runAttentionWatchdog } from '../execution/attention-watchdog.js';
 import { runBackgroundTaskWatchdog } from '../execution/background-task-watchdog.js';
 import { migrateLegacyComposioJobRecords } from '../integrations/composio/job-watcher.js';
 import { runRoutePolicyJob } from '../runtime/harness/route-policy.js';
+import { widenModelRouteMetricsDb } from '../runtime/model-route-metrics.js';
 import { getBuildInfo, describeBuild } from '../runtime/build-info.js';
 import { recordOperationalEvent, recordOperationalEventOnce } from '../runtime/operational-telemetry.js';
 import { ensureBuiltInWorkflows } from '../runtime/builtin-workflows.js';
@@ -2228,6 +2229,13 @@ export async function startDaemon(
       { err: err instanceof Error ? err.message : String(err) },
       'Canonical tool-procedure migration failed (legacy aliases remain readable)',
     );
+  }
+  // The route ledger's role CHECK rebuild is a boot phase too: after an
+  // upgrade it copies every row once, so it runs here before the door opens,
+  // never inside a model call or a role resolution. Never throws.
+  const widenedRouteTables = widenModelRouteMetricsDb();
+  if (widenedRouteTables.length > 0) {
+    logger.info({ tables: widenedRouteTables }, 'Route ledger now keeps writer and memory rows');
   }
   // Surface "we missed N scheduled runs while you were offline" BEFORE
   // any other startup work so the user has the bad news first. Safe to
