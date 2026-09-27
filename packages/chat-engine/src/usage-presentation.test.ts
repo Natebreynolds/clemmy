@@ -190,3 +190,15 @@ test('every account speaks one grammar: what is left, when it resets, what it do
   const old = { ...codex, capturedAt: now - 50 * 3_600_000 };
   assert.equal(accountHeadline(old, now), '13% left this week · resets in 3d · reading 2d old');
 });
+
+test('the account that keeps the memory says so, in the memory role\'s own words', async () => {
+  const { accountCaption } = await import('./usage-presentation.js');
+  const { MEMORY_ROLE_WORDS } = await import('./memory-work.js');
+  const [claude] = presentUsageMeters({
+    codex: { connected: false },
+    claude: { connected: true, billing: { url: 'https://claude.example/usage', kind: 'plan', roles: ['judge', 'memory'] } },
+  });
+  assert.deepEqual(claude.uses, ['checks the work', 'keeps your memory']);
+  assert.equal(claude.uses?.[1], MEMORY_ROLE_WORDS.title.toLowerCase(), 'one owner for the words: the memory role title');
+  assert.equal(accountCaption(claude, now), 'Checks the work · keeps your memory · nothing today');
+});

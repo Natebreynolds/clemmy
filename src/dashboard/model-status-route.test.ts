@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import express from 'express';
@@ -198,11 +198,20 @@ interface BillingView {
   roles?: string[];
 }
 
+/** A stand-in embedder, so which account does memory search never depends on
+ *  the machine's keys or on loading a local model. */
+function fixtureEmbedder(name: 'local' | 'openai') {
+  return { name, model: `${name}-embedding-model`, dim: 8, embed: async (texts: string[]) => texts.map(() => new Float32Array(8)) };
+}
+
 test('each account carries its billing page, whether its provider refused for credit, and the money figures the key can read', async () => {
   const { noteCreditRefused, __resetProviderCreditForTests } = await import('../runtime/provider-credit.js');
   const { __setBalanceFetchForTests, __resetProviderBillingForTests, recentCreditRefusalNotice } = await import('../runtime/harness/provider-billing.js');
+  const { _setEmbeddingProviderForTest } = await import('../memory/embeddings.js');
   __resetProviderCreditForTests();
   __resetProviderBillingForTests();
+  // Memory search runs on the local embedder (the default).
+  _setEmbeddingProviderForTest(fixtureEmbedder('local'));
   const balanceReads: string[] = [];
   __setBalanceFetchForTests(async (url) => {
     balanceReads.push(url);
@@ -290,8 +299,54 @@ test('each account carries its billing page, whether its provider refused for cr
       await h.close();
       __resetProviderBillingForTests();
       __resetProviderCreditForTests();
+      _setEmbeddingProviderForTest(undefined);
     }
   });
+});
+
+test('the OpenAI key does memory search only while it embeds, and only the automatic memory model\'s account keeps the memory', async () => {
+  const { _setEmbeddingProviderForTest } = await import('../memory/embeddings.js');
+  const { describeMemoryModel } = await import('../memory/memory-model-route.js');
+  const { __resetProviderBillingForTests } = await import('../runtime/harness/provider-billing.js');
+  const saved = { AUTH_MODE: process.env.AUTH_MODE, MODEL_ROUTING_MODE: process.env.MODEL_ROUTING_MODE };
+  const authFiles = [path.join(TMP_HOME, 'state', 'auth.json'), path.join(TMP_HOME, 'state', 'claude-auth.json')];
+  writeFileSync(authFiles[0], JSON.stringify({ codexOauth: { accessToken: 'fixture-codex-access', refreshToken: 'fixture-codex-refresh' } }));
+  writeFileSync(authFiles[1], JSON.stringify({ accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 }));
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.MODEL_ROUTING_MODE = 'off';
+  __resetProviderBillingForTests();
+  _setEmbeddingProviderForTest(fixtureEmbedder('openai'));
+  try {
+    await withEnv({ CLEMMY_MODEL_ROLES: '[]' }, async () => {
+      const h = await boot();
+      try {
+        type Account = { billing?: BillingView };
+        const body = await (await fetch(`${h.url}/api/console/model-status`)).json() as {
+          byoProviders: Array<{ id: string } & Account>;
+          codex: Account; claude: Account; openai: Account; jev: Account;
+        };
+        assert.deepEqual(body.openai.billing?.roles, ['memory_search'], 'the embedding key embeds, and that is all it does');
+
+        const memory = describeMemoryModel();
+        assert.equal(memory.source, 'automatic');
+        assert.ok(memory.modelId && memory.provider, 'fixture: the automatic memory route resolves');
+        const keepers = (['codex', 'claude', 'openai', 'jev'] as const)
+          .filter((account) => body[account].billing?.roles?.includes('memory'));
+        assert.deepEqual(keepers, [memory.provider], 'the account serving the automatic memory model keeps the memory');
+        assert.ok(body.byoProviders.every((provider) => !provider.billing?.roles?.includes('memory')));
+      } finally {
+        await h.close();
+      }
+    });
+  } finally {
+    _setEmbeddingProviderForTest(undefined);
+    __resetProviderBillingForTests();
+    for (const file of authFiles) rmSync(file, { force: true });
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('a Coding Plan endpoint and a pay-as-you-go endpoint on one host get their own pages', async () => {
