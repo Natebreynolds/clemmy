@@ -18,6 +18,7 @@
  * faded, through the same soft forget / restore every Memory door uses.
  */
 import type Database from 'better-sqlite3';
+import { withRuntimeConfigSnapshot } from '../config.js';
 import { openOperationalTelemetryDb } from '../runtime/operational-telemetry.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
@@ -126,13 +127,20 @@ export function memoryLearningTurnedOn(): boolean {
   return !reflectionTurnedOff();
 }
 
-/** The snapshot both apps poll. Never throws: an unreadable journal is `unknown`. */
+/**
+ * The snapshot both apps poll. Never throws: an unreadable journal is
+ * `unknown`. One read of the env file and the vault serves the whole
+ * snapshot: naming the memory model resolves roles many times, and each
+ * unscoped read would parse the env file again, every few seconds.
+ */
 export function readMemoryWork(now: Date = new Date()): MemoryWorkSnapshot {
-  try {
-    return buildSnapshot(now, openOperationalTelemetryDb());
-  } catch {
-    return unknownMemoryWorkSnapshot(now);
-  }
+  return withRuntimeConfigSnapshot(() => {
+    try {
+      return buildSnapshot(now, openOperationalTelemetryDb());
+    } catch {
+      return unknownMemoryWorkSnapshot(now);
+    }
+  });
 }
 
 function buildSnapshot(now: Date, db: Database.Database): MemoryWorkSnapshot {

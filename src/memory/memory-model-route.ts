@@ -28,10 +28,12 @@
  * this route's own resolution — never `resolveRoleModel('judge')`, which can
  * differ (a same-family checker, a downshifted default).
  *
- * Nothing here throws, and nothing here waits on the network.
+ * Nothing here throws, and nothing here waits on the network. Each public
+ * read runs under one runtime-config snapshot: resolving the route reads the
+ * role registry many times, and an unscoped read parses the env file anew.
  */
 import type { Model } from '@openai/agents-core';
-import { DEFAULT_CODEX_FAST_MODEL, MODELS, getByoBackendConfig } from '../config.js';
+import { DEFAULT_CODEX_FAST_MODEL, MODELS, getByoBackendConfig, withRuntimeConfigSnapshot } from '../config.js';
 import { memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
 import {
   modelProviderLive,
@@ -228,6 +230,10 @@ function automaticRoute(job: MemoryJobId): MemoryModelRoute | null {
  * not govern (standing, verify, index, tidy). Never throws.
  */
 export function resolveMemoryModelRoute(job: MemoryJobId): MemoryModelRoute | null {
+  return withRuntimeConfigSnapshot(() => resolveMemoryModelRouteNow(job));
+}
+
+function resolveMemoryModelRouteNow(job: MemoryJobId): MemoryModelRoute | null {
   try {
     if (!memoryJobUsesMemoryModel(job)) return null;
     const chosen = chosenMemoryRole();
@@ -319,6 +325,10 @@ function pausedFor(job: MemoryJobId): MemoryModelUnavailable | null {
  * reads as automatic with no model named.
  */
 export function describeMemoryModel(): MemoryModelDescription {
+  return withRuntimeConfigSnapshot(describeMemoryModelNow);
+}
+
+function describeMemoryModelNow(): MemoryModelDescription {
   try {
     const chosen = chosenMemoryRole();
     if (chosen?.inactiveBinding) {
@@ -387,6 +397,10 @@ export function memoryJobModelId(job: MemoryJobId, described: MemoryModelDescrip
  * is always ok here (its own route decides). Never throws.
  */
 export function memoryModelAvailability(job: MemoryJobId): MemoryModelAvailability {
+  return withRuntimeConfigSnapshot(() => memoryModelAvailabilityNow(job));
+}
+
+function memoryModelAvailabilityNow(job: MemoryJobId): MemoryModelAvailability {
   try {
     if (!memoryJobUsesMemoryModel(job)) return { ok: true };
     const paused = pausedFor(job);

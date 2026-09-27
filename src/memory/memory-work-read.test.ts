@@ -9,7 +9,7 @@
 import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,7 +25,7 @@ const read = await import('./memory-work-read.js');
 const { openMemoryDb, resetMemoryDb } = await import('./db.js');
 const { rememberFact, forgetFact, getFact, reactivateFact, setFactPinned, supersedeFact } = await import('./facts.js');
 const { reflectOnToolReturn, REFLECTION_MIN_CONTENT_CHARS } = await import('./reflection.js');
-const { BASE_DIR } = await import('../config.js');
+const { BASE_DIR, _setRuntimeConfigCaptureObserverForTest } = await import('../config.js');
 const { createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { recordModelUsage } = await import('../runtime/usage-log.js');
 const { resolveMemoryModelRoute } = await import('./memory-model-route.js');
@@ -540,6 +540,30 @@ test('a busy week of history reads well under 50 ms', () => {
   assert.equal(snap.daily.length, 30);
   assert.ok(median < 50, `median read ${median.toFixed(1)} ms of CPU`);
   console.log(`# readMemoryWork median ${median.toFixed(1)} ms of CPU over 20k events`);
+});
+
+test('a poll reads the env file and the vault once, however many roles it resolves', () => {
+  // Live-sized settings: about 4 KB of env file and a small vault. Unscoped,
+  // every role resolution parsed the env file again (hundreds per poll).
+  const envFile = path.join(BASE_DIR, '.env');
+  const vaultFile = path.join(BASE_DIR, 'state', 'secrets-vault.json');
+  const hadVault = existsSync(vaultFile);
+  writeFileSync(envFile, `${Array.from({ length: 80 }, (_, i) => `CLEMMY_FIXTURE_PADDING_${i}=${'x'.repeat(36)}`).join('\n')}\n`);
+  if (!hadVault) {
+    mkdirSync(path.dirname(vaultFile), { recursive: true });
+    writeFileSync(vaultFile, JSON.stringify({ version: 'v1', entries: { fixture_secret: 'fixture-value' } }));
+  }
+  const captures = { environment: 0, secret_vault: 0 };
+  _setRuntimeConfigCaptureObserverForTest((kind) => { captures[kind] += 1; });
+  try {
+    const snap = readMemoryWork();
+    assert.equal(snap.state, 'resting');
+    assert.deepEqual(captures, { environment: 1, secret_vault: 1 });
+  } finally {
+    _setRuntimeConfigCaptureObserverForTest(null);
+    rmSync(envFile, { force: true });
+    if (!hadVault) rmSync(vaultFile, { force: true });
+  }
 });
 
 test('imports of thousands of memories still read well under 50 ms', () => {
