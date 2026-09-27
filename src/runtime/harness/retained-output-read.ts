@@ -13,7 +13,12 @@ import { readSharedWorkerResult } from './worker-retained-results.js';
 
 /** Read-only reference resolution. A receipt is redeemed under its own exact
  * durable identity in this session; a recall call points to its original
- * result through the host's recorded arguments, never its prose preamble. */
+ * result through the host's recorded arguments, never its prose preamble.
+ *
+ * A delegated worker reads a parent result only through the parent's share of
+ * that exact id. The id may be the one the worker named or the producer its
+ * own recall resolves to; either way the share, not the lineage, grants the
+ * read, so an unshared parent id stays unreadable. */
 export function resolveRetainedOutputRead(sessionId: string, requestedId: string): {
   callId: string;
   receipt?: ToolOutputRecord;
@@ -22,13 +27,17 @@ export function resolveRetainedOutputRead(sessionId: string, requestedId: string
   if (local.receipt || getToolOutput(sessionId, local.callId)) return local;
   const session = getSession(sessionId);
   if (session?.kind !== 'agent' || session.metadata.source !== 'delegated_worker') return local;
-  const receipt = readSharedWorkerResult(requestedId, session.metadata.parentSessionId,
-    session.metadata.retainedResultShares, (parentId, id) => {
-      // No recursive ancestry search: a share names an immediate parent's own result.
-      const parent = resolveLocalRetainedOutputRead(parentId, id);
-      return parent.receipt ?? getToolOutput(parentId, parent.callId);
-    });
-  return receipt ? { callId: requestedId, receipt } : local;
+  const readParent = (parentId: string, id: string): ToolOutputRecord | null => {
+    // No recursive ancestry search: a share names an immediate parent's own result.
+    const parent = resolveLocalRetainedOutputRead(parentId, id);
+    return parent.receipt ?? getToolOutput(parentId, parent.callId);
+  };
+  for (const id of new Set([local.callId, requestedId])) {
+    const receipt = readSharedWorkerResult(id, session.metadata.parentSessionId,
+      session.metadata.retainedResultShares, readParent);
+    if (receipt) return { callId: id, receipt };
+  }
+  return local;
 }
 
 export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: string): {
