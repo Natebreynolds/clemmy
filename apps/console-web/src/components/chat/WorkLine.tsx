@@ -81,6 +81,11 @@ export function WorkLine({
   onBackground?: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  // While live, a turn's tool steps sit under ONE row (owner 09-26: "group a
+  // turn's tool steps under one row"); the row opens to the same list, and
+  // the choice is remembered so the reader who wants the steps keeps them.
+  const [liveOpen, setLiveOpen] = useState<boolean>(() => readLiveStepsOpen());
+  const toggleLiveOpen = () => setLiveOpen((value) => { writeLiveStepsOpen(!value); return !value; });
   const now = useNowTick(live);
   const outcome = live ? 'completed' : (terminalOutcome ?? 'interrupted');
   const view = items.length > 0 ? settleTerminalActivity(narrateActivity(items, { live }), live ? undefined : outcome) : [];
@@ -119,7 +124,20 @@ export function WorkLine({
     // The beat line carries what no step row does: the wait before the first
     // step, or the engine's own line between steps. While a step is running
     // it IS the beat, bold in the list, so saying it twice is noise.
-    const beat = view.length === 0 ? (current || 'Thinking…') : (!anyRunning && progress ? progress : '');
+    // With the rows folded, the running step is no longer on screen, so the
+    // beat says it again (50's rule: the beat is blank only while a visible
+    // step row carries it).
+    const beat = view.length === 0
+      ? (current || 'Thinking…')
+      : !liveOpen
+        ? current
+        : (!anyRunning && progress ? progress : '');
+    const liveStepCount = top.filter((row) => row.kind !== 'check').length;
+    const runningCount = view.filter((row) => row.status === 'running').length;
+    const liveSummary = [
+      `${liveStepCount} ${liveStepCount === 1 ? 'step' : 'steps'}`,
+      runningCount > 0 ? `${runningCount} running` : '',
+    ].filter(Boolean).join(' · ');
     const actions = Boolean(onBackground || traceHref);
     return (
       <section aria-label="What Clem is doing" className="min-w-0">
@@ -156,7 +174,20 @@ export function WorkLine({
             )}
           </div>
         )}
-        {view.length > 0 && steps}
+        {view.length > 0 && (
+          <div className="ml-[18.5px] mt-1.5">
+            <button
+              type="button"
+              onClick={toggleLiveOpen}
+              aria-expanded={liveOpen}
+              className="-ml-1.5 inline-flex max-w-full items-center gap-1.5 rounded-sm px-1.5 py-0.5 text-caption text-faint transition-colors duration-fast hover:bg-subtle hover:text-fg"
+            >
+              <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform duration-base', liveOpen && 'rotate-90')} aria-hidden />
+              <span className="min-w-0 truncate">{liveSummary}</span>
+            </button>
+            {liveOpen && steps}
+          </div>
+        )}
       </section>
     );
   }
@@ -186,4 +217,19 @@ export function WorkLine({
       )}
     </section>
   );
+}
+
+const LIVE_STEPS_OPEN_KEY = 'clem.workline.liveStepsOpen';
+/** Open the first time (the steps are the show while a turn runs); after
+ *  that, whatever the reader chose. Storage may be unavailable: default open. */
+function readLiveStepsOpen(): boolean {
+  try {
+    const raw = window.localStorage.getItem(LIVE_STEPS_OPEN_KEY);
+    return raw === null ? true : raw === '1';
+  } catch {
+    return true;
+  }
+}
+function writeLiveStepsOpen(open: boolean): void {
+  try { window.localStorage.setItem(LIVE_STEPS_OPEN_KEY, open ? '1' : '0'); } catch { /* per-viewer convenience only */ }
 }
