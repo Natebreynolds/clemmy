@@ -26,6 +26,7 @@ const { buildOrchestratorAgent } = await import('./orchestrator.js');
 const { serializeAdvertisedTools } = await import('../runtime/harness/advertised-tool-wire.js');
 const { closeEventLog } = await import('../runtime/harness/eventlog.js');
 const { buildWorkCall } = await import('../tools/work-call.js');
+const { digestToolOutput } = await import('../runtime/harness/tool-output-digest.js');
 
 after(() => {
   try { closeEventLog(); } catch { /* not opened */ }
@@ -80,4 +81,17 @@ test('the proposal-free work_call states its call contract; planning policy stay
     'a disclosed capabilityRef is not re-obtained through tool_search');
   assert.match(fields.source_call_ids!.description ?? '', /null when a read only informed order, a condition or a decision/);
   assert.match(fields.universe_item_id!.description ?? '', /JSON null, not "null"/);
+});
+
+test('tool_output_query advertises its query contract; the lossless-storage lesson lives in the reader footer', async () => {
+  // 3,301 -> 2,520 B.
+  const tool = withinCeiling((await builtWire()).get('tool_output_query'), 'tool_output_query', 2_600);
+  assert.match(tool.description, /counts, totals, averages and top-N rankings/);
+  const where = (tool.parameters.properties as Record<string, { anyOf?: Array<{ items?: { properties?: Record<string, { enum?: unknown }> } }> }>).where!;
+  assert.deepEqual(where.anyOf![0]!.items!.properties!.op!.enum, ['eq', 'ne', 'contains', 'lt', 'lte', 'gt', 'gte'],
+    'the operator list is the enum, not description prose');
+  const rows = Array.from({ length: 40 }, (_, index) => ({ id: `row-${index}`, title: `Row ${index} ${'x'.repeat(60)}` }));
+  const digest = digestToolOutput(JSON.stringify(rows), { maxChars: 1_500, toolName: 'fixture_list', callId: 'call_footer' });
+  assert.match(digest, /tool_output_query \{"call_id":"call_footer"/);
+  assert.match(digest, /do NOT say the data is unavailable/);
 });

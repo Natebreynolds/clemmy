@@ -295,7 +295,7 @@ export const RECALL_TOOL_RESULT_SHAPE = {
 };
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
-  call_id: z.string().min(1).describe('The original call_id from a digest/clip, or an rh_ receipt handle shown in a saved checkpoint.'),
+  call_id: z.string().min(1).describe('The call_id a clip or digest names, or an rh_ handle from a saved checkpoint.'),
   // Accepts BOTH an array and a comma-separated string. The array is the
   // documented form; the string form is deliberate boundary tolerance — a
   // near-miss models actually produce (`"fields": "subject,start"`), and a
@@ -308,28 +308,28 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
       z.string(),
     ])
     .optional()
-    .describe('Keys to keep per record, e.g. ["subject","start"] or "subject,start"; omit for all.'),
-  filter_field: z.string().optional().describe('Field to match with filter_contains/filter_equals.'),
-  filter_contains: z.string().optional().describe('Case-insensitive substring for filter_field.'),
-  filter_equals: z.string().optional().describe('Exact match for filter_field.'),
-  offset: z.number().int().min(0).optional().describe('Matching records to skip (default 0).'),
-  limit: z.number().int().min(1).max(200).optional().describe('Max records to return (default 50).'),
+    .describe('Keys to keep per record; omit for all.'),
+  filter_field: z.string().optional(),
+  filter_contains: z.string().optional().describe('Case-insensitive substring of filter_field.'),
+  filter_equals: z.string().optional(),
+  offset: z.number().int().min(0).optional().describe('Matching records to skip.'),
+  limit: z.number().int().min(1).max(200).optional().describe('Default 50.'),
   where: z
     .array(z.object({
-      field: z.string().min(1).describe('Record field; a dotted path reaches nested values.'),
+      field: z.string().min(1).describe('A dotted path reaches nested values.'),
       op: z.enum(['eq', 'ne', 'contains', 'lt', 'lte', 'gt', 'gte']),
       value: z.union([z.string(), z.number()]),
     }))
     .optional()
-    .describe('Conditions every record must meet. Numbers compare as numbers and ISO dates as dates; text compares case-insensitively.'),
-  sort_by: z.string().optional().describe('Order matching records by this field, for a ranking or a top N.'),
-  order: z.enum(['asc', 'desc']).optional().describe('Sort direction (default asc).'),
+    .describe('All must hold. Numbers and ISO dates compare by value; text case-insensitively.'),
+  sort_by: z.string().optional(),
+  order: z.enum(['asc', 'desc']).optional().describe('Default asc.'),
   aggregate: z
     .enum(['count', 'sum', 'avg', 'min', 'max'])
     .optional()
-    .describe('Return this exact figure over EVERY matching record instead of listing them: count, or sum/avg/min/max of value_field.'),
-  value_field: z.string().optional().describe('The numeric field sum/avg/min/max read.'),
-  group_by: z.string().optional().describe('Compute the aggregate per distinct value of this field.'),
+    .describe('One exact figure over every matching record instead of rows; sum/avg/min/max read value_field.'),
+  value_field: z.string().optional(),
+  group_by: z.string().optional().describe('Aggregate per distinct value of this field.'),
 };
 
 /** A computed figure as the model should read it: binary floating-point
@@ -564,9 +564,8 @@ export function registerRecallTools(server: McpServer): void {
   server.tool(
     'tool_output_query',
     [
-      'Query a slice of a large prior tool output by the call_id a `[digest: …]` footer or `[clipped: …]` stub names, without loading it all: filter rows, project fields and paginate a JSON array, or project the top-level keys of an object.',
-      'Compute exact figures here instead of reading rows: `where` conditions (eq/ne/contains/lt/lte/gt/gte), `sort_by` + `order` + `limit` for a ranking or top N, and `aggregate` (count, or sum/avg/min/max of `value_field`, optionally per `group_by`) over every matching record. Any count, total, average or ranking you state should come from here.',
-      'The result is parked losslessly — never say the data is unavailable.',
+      'Query the records of a large prior tool output by the call_id a `[digest: …]` footer or `[clipped: …]` stub names, without loading it all: filter, project and page a JSON array, or project an object\'s top-level keys.',
+      'Compute counts, totals, averages and top-N rankings here, over every matching record, instead of reading rows.',
       `E.g. ${toolCallHint('tool_output_query', { call_id: 'call_abc123', fields: ['name', 'id'], limit: 50 })}.`,
     ].join(' '),
     TOOL_OUTPUT_QUERY_SHAPE,
