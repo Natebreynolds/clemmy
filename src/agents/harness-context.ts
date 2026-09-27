@@ -392,6 +392,14 @@ type HarnessMemoryContextOptions = {
   layout?: 'legacy' | 'variable';
 };
 
+type LoadedMemoryContext = ReturnType<typeof loadMemoryContext>;
+
+/** The vault's memory files, read once per agent build; a failed read is an
+ *  empty context, never a failed build. */
+function readMemoryContext(): LoadedMemoryContext {
+  try { return loadMemoryContext(); } catch { return {} as LoadedMemoryContext; }
+}
+
 export function renderHarnessMemoryContext(opts?: HarnessMemoryContextOptions): string {
   return composeHarnessMemoryContext(opts).text;
 }
@@ -407,14 +415,12 @@ const RELEVANT_CONTEXT_TITLES = new Set<string>([
   'Remembered Tool Choices',
 ]);
 
-function composeHarnessMemoryContext(opts?: HarnessMemoryContextOptions): { text: string; manifest: MemoryManifestEntry[] } {
+function composeHarnessMemoryContext(
+  opts?: HarnessMemoryContextOptions,
+  loaded?: LoadedMemoryContext,
+): { text: string; manifest: MemoryManifestEntry[] } {
   const variableLayout = opts?.layout === 'variable';
-  let memContext;
-  try {
-    memContext = loadMemoryContext();
-  } catch {
-    memContext = {};
-  }
+  const memContext: Partial<LoadedMemoryContext> = loaded ?? readMemoryContext();
 
   const partition = opts?.partition ?? 'all';
   const acceptedInput = opts?.focusInput ?? opts?.query ?? '';
@@ -620,9 +626,8 @@ function manifestEntry(section: string, tier: MemoryTier, text: string, refs: Me
  * and turn. That is what lets it sit before the cache boundary: it is
  * re-billed only when the owner's memory changes.
  */
-export function renderMemoryCore(): MemoryCore {
-  let memContext: ReturnType<typeof loadMemoryContext>;
-  try { memContext = loadMemoryContext(); } catch { memContext = {} as ReturnType<typeof loadMemoryContext>; }
+export function renderMemoryCore(loaded?: LoadedMemoryContext): MemoryCore {
+  const memContext = loaded ?? readMemoryContext();
   let profile = '';
   try { profile = renderProfileForInstructions(); } catch { profile = ''; }
   let policies: CorePolicyRender;
@@ -689,7 +694,8 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   // the Agent and therefore receives a fresh snapshot.
   // The core is content-addressed and joins the cached prefix after the
   // rubric; everything request- or time-dependent follows the boundary.
-  const core = renderMemoryCore();
+  const loaded = readMemoryContext();
+  const core = renderMemoryCore(loaded);
   const variable = composeHarnessMemoryContext({
     sessionId: opts?.sessionId,
     sourceUserSeq: opts?.sourceUserSeq,
@@ -697,7 +703,7 @@ export function harnessInstructions(roleInstructions: string, opts?: {
     includeRememberedToolChoices: opts?.includeRememberedToolChoices,
     includeSessionActions: opts?.includeSessionActions,
     layout: 'variable',
-  });
+  }, loaded);
   const ctx = variable.text;
   const agentInstructions = opts?.agentInstructions?.trim() ?? '';
   const stableRole = [roleInstructions, agentInstructions].filter(Boolean).join('\n\n');
