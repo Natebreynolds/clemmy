@@ -295,3 +295,28 @@ test('a remembered run that only shares words with the request is not named in c
     'coverage is measured against the literal request when the ranking objective carries more',
   );
 });
+
+test('a covering run ranked below one that only shares words is still named within the limit', () => {
+  // Regression: the limit was taken before coverage, so the lone slot went to
+  // a two-word run that shares words and was then filtered out.
+  recordRunStrategy({
+    objective: 'walrus ledger',
+    toolsUsed: ['walrus_touching_tool'],
+    workerCount: 0,
+    durationMs: 5_000,
+    learningReceipt: receipt('walrus-touching'),
+  });
+  recordRunStrategy({
+    objective: 'reconcile walrus invoices monthly figures',
+    toolsUsed: ['walrus_covering_tool'],
+    workerCount: 0,
+    durationMs: 5_000,
+    learningReceipt: receipt('walrus-covering'),
+  });
+  const request = 'reconcile walrus ledger invoices monthly totals';
+  const ranked = listMatchingRunStrategies(request, 2).map((row) => row.strategy.toolsUsed[0]);
+  assert.deepEqual(ranked, ['walrus_touching_tool', 'walrus_covering_tool'], 'the touching run ranks first');
+  const rendered = renderRunStrategiesForContext(request, 1, request);
+  assert.match(rendered, /walrus_covering_tool/, 'the covering run takes the one slot');
+  assert.doesNotMatch(rendered, /walrus_touching_tool/);
+});

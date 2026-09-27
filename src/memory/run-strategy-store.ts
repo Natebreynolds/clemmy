@@ -435,8 +435,11 @@ export function strategyCoversRequest(request: string, strategy: Pick<RunStrateg
  *  may also carry focus text). */
 export function renderRunStrategiesForContext(objective: string | undefined, limit = 2, request?: string): string {
   const coverageText = request?.trim() || objective || '';
-  const scored = listMatchingRunStrategies(objective, limit)
-    .filter((match) => strategyCoversRequest(coverageText, match.strategy));
+  // Coverage filters the whole recall before the limit applies, so a covering
+  // run ranked just below one that merely shares words is still named.
+  const scored = listMatchingRunStrategies(objective, Number.POSITIVE_INFINITY)
+    .filter((match) => strategyCoversRequest(coverageText, match.strategy))
+    .slice(0, limit);
   if (scored.length === 0) return '';
   return scored.map((x) => renderOne(x.strategy)).join('\n');
 }
