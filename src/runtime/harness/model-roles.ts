@@ -141,13 +141,14 @@ function sessionBrainPinningEnabled(): boolean {
  *  scope that carries an accepted user input is a turn: background scopes
  *  (memory jobs, measurement probes, an unscoped review's route) use a fixed
  *  label with seq 0, and pinning under that label would keep every later job
- *  on whichever brain was active the first time one of them ran. */
+ *  on whichever brain was active the first time one of them ran. A usage scope
+ *  opened with the ledger's no-source placeholder names no turn either. */
 function activeTurnSessionId(): string | null {
   const attribution = modelUsageAttributionStorage.getStore();
   const seq = attribution?.sourceUserSeq;
   if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq <= 0) return null;
   const sessionId = attribution?.sessionId?.trim();
-  return sessionId ? sessionId : null;
+  return sessionId && sessionId !== 'unknown' ? sessionId : null;
 }
 
 /** Live-check seam for a pinned brain. Production refuses a pinned brain whose

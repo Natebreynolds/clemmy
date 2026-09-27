@@ -25,7 +25,7 @@ const {
   pinnedBrainForSession,
   __sessionBrainPinTest__,
 } = await import('./model-roles.js');
-const { modelUsageAttributionStorage } = await import('../usage-log.js');
+const { modelUsageAttributionStorage, withOwnModelRequestAttribution } = await import('../usage-log.js');
 
 function inSessionTurn<T>(sessionId: string, fn: () => T): T {
   return modelUsageAttributionStorage.run({ sessionId, sourceUserSeq: 1 }, fn);
@@ -109,6 +109,13 @@ test('a background scope (a fixed label, no accepted input) is not a turn: it ne
     const next = inBackground(() => resolveRoleModel('brain'));
     assert.notEqual(next.modelId, 'claude-test-model', 'the next background job sees the brain the owner chose');
     assert.equal(next.modelId, resolveRoleModel('brain').modelId);
+  });
+});
+
+test('a model request scope opened outside any turn does not pin a brain to a placeholder session', () => {
+  withEnv({ CLEMMY_MODEL_ROLES: undefined, MODEL_ROUTING_MODE: undefined }, () => {
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:fixture' }, () => resolveRoleModel('brain'));
+    assert.equal(pinnedBrainForSession('unknown'), null, 'no accepted session means no turn to pin');
   });
 });
 
