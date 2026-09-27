@@ -788,7 +788,7 @@ export function registerRecallTools(server: McpServer): void {
         // field → a precise path.
         const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
-        const refHint = resolved.receipt || decodedMcpPayload ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
+        const refHint = resolved.receipt || decodedMcpPayload || recoveredClippedArrayPrefix ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
         // A page that does not fit the reply is cut on a record boundary, and
         // the header counts only the records shown and names the exact query
         // for the rest, so paging never skips a record the model did not see.
