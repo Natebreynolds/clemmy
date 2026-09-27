@@ -1466,10 +1466,13 @@ export async function judgeObjectiveComplete(
     results: skillContext?.verifiedReadResults,
   });
   const directionQuestion = isDirectionSeekingQuestion(assistantResponse);
-  const askJev = async (): Promise<Awaited<ReturnType<typeof import('../jev/control-plane.js').tryJevCompletionVerdict>>> => {
+  // screening: the ask ahead of the reviewer, which Jev's record may skip.
+  // The late ask, when the reviewer could not run, is never skipped.
+  const askJev = async (screening = false): Promise<Awaited<ReturnType<typeof import('../jev/control-plane.js').tryJevCompletionVerdict>>> => {
     try {
       const { tryJevCompletionVerdict } = await import('../jev/control-plane.js');
       return await tryJevCompletionVerdict(objective, assistantResponse, {
+        ...(screening ? { screening: true } : {}),
         sessionId: skillContext?.sessionId,
         toolCallSummary: skillContext?.toolCallSummary,
         verifiedReads: skillContext?.verifiedReads,
@@ -1523,7 +1526,7 @@ export async function judgeObjectiveComplete(
   // reviewer: that review is the check that what was written is right.
   const reviewsWrite = skillContext?.reviewStakes === 'write';
   if (!reviewsPlan && !reviewsWrite && (coverage.complete || directionQuestion)) {
-    const jevPromise = askJev();
+    const jevPromise = askJev(true);
     const hedge = setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
     hedge.unref?.();
     const fast = await jevPromise;

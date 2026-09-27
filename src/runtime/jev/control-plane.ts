@@ -5,8 +5,14 @@
  */
 
 import { evaluateSystemOne } from './client.js';
-import { noteJevDecisionOutcome } from './decision-log.js';
-import type { ChoiceAnswer, NoulAnswer, SystemOneQuestions } from './system-one.js';
+import { noteJevDecisionOutcome, readRecentJevDecisions, recordJevSkip } from './decision-log.js';
+import { buildSystemOneRequest, type ChoiceAnswer, type NoulAnswer, type SystemOneQuestions } from './system-one.js';
+import {
+  decideCompletionCall,
+  estimateRequestTokens,
+  learnCompletionSizeGate,
+  type CompletionSizeGate,
+} from './completion-size-gate.js';
 
 export const RANK_TIMEOUT_MS = 1_200;
 const PRIMER_TIMEOUT_MS = 1_200;
@@ -775,10 +781,36 @@ function clipMiddle(text: string, max: number): { text: string; clipped: boolean
  * finds resting on a computed figure never settles here; that is the
  * reviewer's work.
  */
+/** How long a learned size bar is reused before Jev's record is read again. */
+const COMPLETION_GATE_TTL_MS = 10 * 60_000;
+let completionGateCache: { at: number; gate: CompletionSizeGate } | null = null;
+
+function completionSizeGate(nowMs = Date.now()): CompletionSizeGate {
+  if (completionGateCache && nowMs - completionGateCache.at < COMPLETION_GATE_TTL_MS) return completionGateCache.gate;
+  let gate: CompletionSizeGate;
+  try {
+    gate = learnCompletionSizeGate(readRecentJevDecisions('jev-completion', 14, nowMs));
+  } catch {
+    gate = { skipAboveTokens: null, largestSettledTokens: null, observedAbove: 0, calibration: 1 };
+  }
+  completionGateCache = { at: nowMs, gate };
+  return gate;
+}
+
+/** Test seam: forget the learned bar so the next screen reads the record. */
+export function _resetCompletionSizeGateForTests(): void {
+  completionGateCache = null;
+}
+
 export async function tryJevCompletionVerdict(
   objective: string,
   assistantResponse: string,
   opts?: {
+    /** A screen ahead of the configured reviewer: a call Jev's own record
+     *  says cannot settle is not made, and the reviewer decides alone. When
+     *  Jev is the only reader left (the reviewer could not run), it is
+     *  always asked. */
+    screening?: boolean;
     sessionId?: string;
     toolCallSummary?: string;
     verifiedReads?: string;
@@ -847,20 +879,50 @@ export async function tryJevCompletionVerdict(
   ].filter(Boolean).join('\n\n');
   const fixed = request.length + response.length + JSON.stringify(receipts).length + 400;
   const evidence = clipMiddle(evidenceText, Math.max(0, COMPLETION_STATE_BUDGET_CHARS - fixed));
+  const state = {
+    request,
+    response,
+    receipts,
+    receiptsComplete: opts?.coverage?.complete === true,
+    ...(evidence.text ? { evidence: evidence.text } : {}),
+    ...(evidence.clipped ? { evidenceNote: 'The middle of evidence was elided for length; receipts lists every result.' } : {}),
+  };
+  const estimatedTokens = estimateRequestTokens(JSON.stringify(buildSystemOneRequest(state, questions)));
+  let sizeGateContext: Record<string, unknown> = { estimatedTokens };
+  if (opts?.screening) {
+    const gate = completionSizeGate();
+    const decision = decideCompletionCall({ estimatedTokens, gate, probeKey: `${opts.sessionId ?? ''}\n${response}` });
+    sizeGateContext = {
+      estimatedTokens,
+      expectedTokens: decision.expectedTokens,
+      ...(gate.skipAboveTokens !== null ? { sizeBarTokens: gate.skipAboveTokens, observedAboveBar: gate.observedAbove } : {}),
+      ...(decision.call && decision.reprobe ? { sizeBarReprobe: true } : {}),
+    };
+    if (!decision.call) {
+      // Jev's record: a call this size has never settled across enough
+      // tries. The configured reviewer reads it alone, and starts now.
+      recordJevSkip({
+        lane: 'jev-completion',
+        ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+        reason: 'never_settles_at_size',
+        context: {
+          ...sizeGateContext,
+          largestSettledTokens: gate.largestSettledTokens,
+          calibration: Number(gate.calibration.toFixed(3)),
+          ...(evidence.clipped ? { evidenceClipped: true } : {}),
+        },
+      });
+      return null;
+    }
+  }
   const started = Date.now();
   const result = await evaluateSystemOne({
-    state: {
-      request,
-      response,
-      receipts,
-      receiptsComplete: opts?.coverage?.complete === true,
-      ...(evidence.text ? { evidence: evidence.text } : {}),
-      ...(evidence.clipped ? { evidenceNote: 'The middle of evidence was elided for length; receipts lists every result.' } : {}),
-    },
+    state,
     questions,
     timeoutMs: COMPLETION_TIMEOUT_MS,
     sessionId: opts?.sessionId,
     channel: 'jev-completion',
+    decisionContext: sizeGateContext,
   });
   if (!result.ok) return null;
   const read = (id: string): number | null => {

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
@@ -73,4 +73,74 @@ export function noteJevDecisionOutcome(
   try {
     append({ id, at: new Date().toISOString(), outcome, ...(detail ? { detail } : {}) });
   } catch { /* observability only */ }
+}
+
+/** A call the host decided not to make, and why, so the log shows every
+ *  question Jev was not asked beside the ones it was. Never read back as a
+ *  call: it has no answers and no tokens. */
+export function recordJevSkip(row: {
+  lane: string;
+  sessionId?: string;
+  reason: string;
+  context?: Record<string, unknown>;
+}): void {
+  try {
+    const attribution = modelUsageAttributionStorage.getStore();
+    const sessionId = row.sessionId?.trim() || attribution?.sessionId;
+    append({
+      id: randomUUID(),
+      at: new Date().toISOString(),
+      skipped: true,
+      ...row,
+      ...(sessionId ? { sessionId } : {}),
+      ...(attribution?.sourceUserSeq ? { sourceUserSeq: attribution.sourceUserSeq } : {}),
+    });
+  } catch { /* observability only */ }
+}
+
+/** One recorded call with the host's outcome joined on. */
+export interface JevDecisionRecord {
+  id: string;
+  at: string;
+  lane: string;
+  ok: boolean;
+  inputTokens?: number;
+  context?: Record<string, unknown>;
+  /** What the host did with it; absent when nothing was noted. */
+  outcome?: string;
+}
+
+/**
+ * The calls one lane made over the last `days` daily files, each with its
+ * outcome. Skipped calls and unreadable lines are left out. Bounded by the
+ * files it reads; a missing day is simply absent.
+ */
+export function readRecentJevDecisions(lane: string, days = 14, nowMs = Date.now()): JevDecisionRecord[] {
+  const calls = new Map<string, JevDecisionRecord>();
+  const outcomes = new Map<string, string>();
+  for (let back = days - 1; back >= 0; back--) {
+    const day = new Date(nowMs - back * 86_400_000).toISOString().slice(0, 10);
+    const file = path.join(DECISION_DIR, `${day}.ndjson`);
+    if (!existsSync(file)) continue;
+    let text: string;
+    try { text = readFileSync(file, 'utf-8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      let row: Record<string, unknown>;
+      try { row = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+      const id = typeof row.id === 'string' ? row.id : '';
+      if (!id) continue;
+      if (typeof row.outcome === 'string') { outcomes.set(id, row.outcome); continue; }
+      if (row.lane !== lane || row.skipped === true) continue;
+      calls.set(id, {
+        id,
+        at: typeof row.at === 'string' ? row.at : '',
+        lane,
+        ok: row.ok === true,
+        ...(typeof row.inputTokens === 'number' ? { inputTokens: row.inputTokens } : {}),
+        ...(row.context && typeof row.context === 'object' ? { context: row.context as Record<string, unknown> } : {}),
+      });
+    }
+  }
+  return [...calls.values()].map((call) => (outcomes.has(call.id) ? { ...call, outcome: outcomes.get(call.id) } : call));
 }
