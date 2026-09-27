@@ -21,9 +21,13 @@ import {
   memoryNextText,
   memoryPipeline,
   memoryRoleAutomaticText,
+  memoryUndoResultText,
   memoryUndoText,
   memoryWorkHeadline,
+  memoryWorkReadIsLive,
   modelDisplayName,
+  MEMORY_JOB_NO_RUN,
+  MEMORY_WORK_LIVE_MS,
   MEMORY_JOB_ORDER,
   MEMORY_JOB_WORDS,
   type MemoryJobId,
@@ -39,6 +43,8 @@ import {
   type MemoryWorkToday,
   type MemoryWorkUndoResult,
 } from '@clem/chat-engine';
+
+export { memoryUndoResultText } from '@clem/chat-engine';
 import { apiGet, apiPost } from './api';
 import { usePoll } from './poll';
 
@@ -67,22 +73,6 @@ export function useMemoryWork() {
   return usePoll(MEMORY_WORK_QUERY_KEY, getMemoryWork, MEMORY_WORK_POLL_MS);
 }
 
-/** What an undo did, said calmly. The next snapshot recomputes what is left. */
-export function memoryUndoResultText(result: MemoryWorkUndoResult, kind: 'forget' | 'restore'): string {
-  if (result.ok) {
-    const n = result.changed;
-    if (n <= 0) return 'Nothing left to change — it was already done.';
-    const what = n === 1 ? 'memory' : 'memories';
-    return kind === 'forget' ? `Forgot ${n} ${what}.` : `Brought back ${n} ${what}.`;
-  }
-  switch (result.reason) {
-    case 'not_found': return 'That run is no longer in the history.';
-    case 'expired': return 'That run is too old to undo now.';
-    case 'nothing_to_undo': return 'Nothing left to undo — it was already changed.';
-    default: return 'Couldn’t undo just now. Nothing was changed.';
-  }
-}
-
 export interface MemoryUndoNotice {
   /** It changed something (drawn with a check). */
   ok: boolean;
@@ -95,7 +85,8 @@ export interface MemoryUndoNotice {
 /** The line a row shows after its undo. `result` null = the request never got
  *  an answer (network, daemon restarting). */
 export function memoryUndoNotice(result: MemoryWorkUndoResult | null, kind: 'forget' | 'restore'): MemoryUndoNotice {
-  if (!result) return { ok: false, text: 'Couldn’t undo just now. Nothing was changed.', retry: true };
+  // The words are the phone's too (@clem/chat-engine).
+  if (!result) return { ok: false, text: memoryUndoResultText(null, kind), retry: true };
   return {
     ok: result.ok && result.changed > 0,
     text: memoryUndoResultText(result, kind),
@@ -428,25 +419,18 @@ function modelChip(snapshot: MemoryWorkSnapshot, fmt: MemoryTimeFormat, unknown:
     modelId,
     source,
     sourceLabel: source === 'chosen' ? 'Chosen' : 'Automatic',
-    automaticText: source === 'automatic' ? memoryRoleAutomaticText(m.follows ?? null) : null,
+    automaticText: source === 'automatic' ? memoryRoleAutomaticText(m.follows ?? null, modelId) : null,
     served,
     problem: m.unavailable?.problem ? memoryModelProblemText(m.unavailable.problem) : null,
     unknown: unknown && !modelId,
   };
 }
 
-/** The shared pipeline, with one correction for honesty: a combined stage
- *  whose every part is unknown is unknown, not zero. */
+/** The shared pipeline (a combined stage whose every part is unknown is
+ *  unknown there, not zero), with which stage is lit. */
 function pipeline(today: MemoryWorkToday | null | undefined, unknown: boolean, running: ReadonlySet<MemoryJobId>): PipelineStageView[] {
-  const stages = memoryPipeline(unknown ? null : today);
-  return stages.map((stage) => {
-    let value = stage.value;
-    if (!unknown && today) {
-      if (stage.id === 'kept' && count(today.learned) === null && count(today.updated) === null) value = null;
-      if (stage.id === 'aside' && count(today.leftOut) === null && count(today.setAside) === null) value = null;
-    }
-    return { ...stage, value, text: countText(value), active: running.has(stage.job) };
-  });
+  return memoryPipeline(unknown ? null : today)
+    .map((stage) => ({ ...stage, text: countText(stage.value), active: running.has(stage.job) }));
 }
 
 function flows(stages: readonly PipelineStageView[]): PipelineFlows {
@@ -562,7 +546,7 @@ function jobModel(owner: MemoryJobModelOwner, modelId: string | null, unknown: b
   return { name: null, text: UNKNOWN, hint: 'not reported' };
 }
 
-function jobView(job: MemoryJobStatus, snapshot: MemoryWorkSnapshot, fmt: MemoryTimeFormat, stale: boolean, unknown: boolean): JobView {
+function jobView(job: MemoryJobStatus, snapshot: MemoryWorkSnapshot, fmt: MemoryTimeFormat, fresh: boolean, unknown: boolean): JobView {
   const words = MEMORY_JOB_WORDS[job.id];
   const owner = job.modelOwner;
   const modelId = typeof job.modelId === 'string' && job.modelId ? job.modelId : null;
@@ -570,9 +554,8 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkSnapshot, fmt: Memory
   const last = job.lastRun ?? null;
   const lastWhen = last ? fmt.age(last.at) : '';
   const lastDetail = last ? `${OUTCOME_WORDS[last.outcome] ?? last.outcome}${last.durationMs ? ` · ${durationWords(last.durationMs)}` : ''}` : null;
-  // The journal keeps 90 days and began at install, and an in-process "last
-  // checked" resets on restart: no record is not "never ran".
-  const lastText = last ? `Last ran ${lastWhen || 'at an unknown time'} · ${lastDetail}` : unknown ? UNKNOWN : 'No run recorded yet';
+  // No record is not "never ran" (the shared word says why).
+  const lastText = last ? `Last ran ${lastWhen || 'at an unknown time'} · ${lastDetail}` : unknown ? UNKNOWN : MEMORY_JOB_NO_RUN;
   const runs = count(job.today?.runs) ?? 0;
   const tokens = (count(job.today?.inputTokens) ?? 0) + (count(job.today?.outputTokens) ?? 0);
   const calls = count(job.today?.modelCalls) ?? 0;
@@ -581,8 +564,8 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkSnapshot, fmt: Memory
   // An unknown read sends zeros for a job's day (the contract types them as
   // numbers); they are not a quiet day.
   const todayText = unknown ? UNKNOWN : todayParts.length ? todayParts.join(' · ') : null;
-  // "Working now" is a claim about now; a read that failed cannot make it.
-  const state: MemoryJobStatus['state'] = stale && job.state === 'running' ? 'idle' : job.state;
+  // "Working now" is a claim about now; only a fresh read that worked makes it.
+  const state: MemoryJobStatus['state'] = !fresh && job.state === 'running' ? 'idle' : job.state;
   let stateLabel: string | null = null;
   if (state === 'running') stateLabel = 'Working now';
   else if (state === 'waiting') stateLabel = snapshot.waiting?.reason === 'busy' ? 'Waiting its turn' : 'Waiting for the model';
@@ -613,7 +596,7 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkSnapshot, fmt: Memory
 
 /** The daemon's running list is read in process even when the rest of the
  *  snapshot is not, so a job said to be running stays running when unknown. */
-function jobs(snapshot: MemoryWorkSnapshot, fmt: MemoryTimeFormat, stale: boolean, unknown: boolean): MemoryWorkView['jobs'] {
+function jobs(snapshot: MemoryWorkSnapshot, fmt: MemoryTimeFormat, fresh: boolean, unknown: boolean): MemoryWorkView['jobs'] {
   const byId = new Map((Array.isArray(snapshot.jobs) ? snapshot.jobs : []).map((j) => [j.id, j] as const));
   const learning: JobView[] = [];
   const upkeep: JobView[] = [];
@@ -623,7 +606,7 @@ function jobs(snapshot: MemoryWorkSnapshot, fmt: MemoryTimeFormat, stale: boolea
     // Importing is something the owner starts; until it has, it is not work
     // Clem does, and a card for it would read as an idle chore.
     if (id === 'import' && !job.lastRun && job.state !== 'running' && !(count(job.today?.runs) ?? 0)) continue;
-    const view = jobView(job, snapshot, fmt, stale, unknown);
+    const view = jobView(job, snapshot, fmt, fresh, unknown);
     (view.group === 'learning' ? learning : upkeep).push(view);
   }
   return { learning, upkeep };
@@ -717,7 +700,8 @@ function queueLine(snapshot: MemoryWorkSnapshot): string | null {
 export interface MemoryWorkViewOptions {
   /** The last read failed and this snapshot is the previous good one. */
   stale?: boolean;
-  /** When the shown snapshot was read (for "as of" wording while stale). */
+  /** When the shown snapshot was read: for "as of" wording while stale, and
+   *  for how long it can vouch that a job is running. Defaults to `now`. */
   readAt?: number;
 }
 
@@ -729,9 +713,14 @@ export function memoryWorkViewModel(snapshot: MemoryWorkSnapshot, now: number, o
   const unknown = state === 'unknown';
   const runningList = Array.isArray(snapshot.running) ? snapshot.running : [];
   const working = state === 'working' && runningList.length > 0;
-  // A job read as running in a snapshot that could not be refreshed may have
-  // finished since. Nothing moves on stale data.
-  const live = working && !stale;
+  // A job read as running in a snapshot that could not be refreshed, or one
+  // read too long ago (a poll that hangs), may have finished since. Nothing
+  // moves unless the read vouches for now: the phone's rule, shared.
+  const readAt = opts.readAt ?? now;
+  const live = !stale && memoryWorkReadIsLive(snapshot, readAt, now);
+  // A job the daemon lists as running (its in-process list, read even when
+  // the journal is not) is said to be working only while this read is fresh.
+  const fresh = !stale && now - readAt <= MEMORY_WORK_LIVE_MS;
   const running = new Set<MemoryJobId>(live ? runningList.map((r) => r.job) : []);
   const headline = memoryWorkHeadline(
     {
@@ -754,10 +743,6 @@ export function memoryWorkViewModel(snapshot: MemoryWorkSnapshot, now: number, o
   const toLearn = count(snapshot.queue?.toLearn);
   const readAge = opts.readAt ? fmt.age(new Date(opts.readAt).toISOString()) : '';
   const band: MemoryWorkState = stale ? 'unknown' : state === 'working' && !live ? 'resting' : state;
-  // Resting with a queue that could not be read: nothing is running, but
-  // "up to date" would be a claim about a count nobody read. (The shared
-  // headline says "up to date" here; the Mac says what it knows instead.)
-  const queueUnread = !stale && band === 'resting' && toLearn === null;
   return {
     state,
     band,
@@ -765,12 +750,10 @@ export function memoryWorkViewModel(snapshot: MemoryWorkSnapshot, now: number, o
     live,
     // The status line speaks about now. After a failed read it says so, and
     // everything below it is the last good read, labelled as such.
-    headline: stale ? 'Couldn’t read memory work just now' : queueUnread ? 'No memory work running right now' : headline.text,
+    headline: stale ? 'Couldn’t read memory work just now' : headline.text,
     detail: stale
       ? `Showing what Clem reported${readAge ? ` ${readAge}` : ' earlier'}. Nothing has been lost; this checks again in a few seconds.`
-      : queueUnread
-        ? `Couldn’t read what is left to learn${headline.detail ? ` · ${headline.detail}` : ''}`
-        : headline.detail ?? null,
+      : headline.detail ?? null,
     runningSince: live && Number.isFinite(firstStart) ? firstStart : null,
     runningJobs: [...running],
     stale,
@@ -785,7 +768,7 @@ export function memoryWorkViewModel(snapshot: MemoryWorkSnapshot, now: number, o
     dailyUnit: daily.unit,
     dailyMissing: daily.missing,
     totals: totals(snapshot.today, unknown),
-    jobs: jobs(snapshot, fmt, stale, unknown),
+    jobs: jobs(snapshot, fmt, fresh, unknown),
     timeline: tl,
     eventCount: tl.reduce((n, d) => n + d.rows.length, 0),
     queueLine: queueLine(snapshot),

@@ -3,10 +3,15 @@ import assert from 'node:assert/strict';
 import {
   MEMORY_JOB_ORDER,
   MEMORY_JOB_WORDS,
+  MEMORY_ROLE_WORDS,
+  MEMORY_WORK_LIVE_MS,
   memoryEventSentence,
   memoryPipeline,
+  memoryRoleAutomaticText,
+  memoryUndoResultText,
   memoryUndoText,
   memoryWorkHeadline,
+  memoryWorkReadIsLive,
   type MemoryWorkEvent,
   type MemoryWorkSnapshot,
 } from './memory-work.js';
@@ -97,4 +102,34 @@ test('tidy says memories faded apart from finished work it cleared', () => {
   assert.equal(memoryEventSentence({ ...at, produced: { faded: 2 } }), 'Let 2 memories fade');
   assert.equal(memoryEventSentence({ ...at, produced: { agedOut: 3 } }), 'Cleared 3 records of finished work');
   assert.equal(memoryEventSentence({ ...at, produced: { faded: 1, agedOut: 1 } }), 'Let 1 memory fade, cleared 1 record of finished work');
+});
+
+test('automatic names whose model it borrows, Clem\'s own pick, or none', () => {
+  assert.equal(memoryRoleAutomaticText('checker', 'm-1'), MEMORY_ROLE_WORDS.automaticChecker);
+  assert.equal(memoryRoleAutomaticText('brain', 'm-1'), MEMORY_ROLE_WORDS.automaticBrain);
+  assert.equal(memoryRoleAutomaticText(null, 'm-1'), MEMORY_ROLE_WORDS.automaticOwn, 'a named model never reads as "none available"');
+  assert.equal(memoryRoleAutomaticText(null, null), MEMORY_ROLE_WORDS.automaticNone);
+  assert.equal(memoryRoleAutomaticText('checker', null), MEMORY_ROLE_WORDS.automaticNone);
+});
+
+test('an unread queue says so, instead of "up to date"', () => {
+  const h = memoryWorkHeadline({ ...base, queue: { toLearn: null, setAside: null, failed: null } }, fmt, name);
+  assert.equal(h.detail, 'Couldn’t read what is left to learn · Last worked 4 min ago');
+});
+
+test('motion needs a read that says a job runs now, and is recent', () => {
+  const working = { state: 'working' as const, running: [{ job: 'learn' as const, startedAt: 'x' }] };
+  assert.equal(memoryWorkReadIsLive(working, 1_000, 1_000 + MEMORY_WORK_LIVE_MS), true);
+  assert.equal(memoryWorkReadIsLive(working, 1_000, 1_001 + MEMORY_WORK_LIVE_MS), false, 'an old read stops the motion');
+  assert.equal(memoryWorkReadIsLive({ ...working, running: [] }, 1_000, 1_000), false);
+  assert.equal(memoryWorkReadIsLive({ ...working, state: 'resting' }, 1_000, 1_000), false);
+  assert.equal(memoryWorkReadIsLive(working, null, 1_000), false);
+});
+
+test('undo results read the same on both apps', () => {
+  assert.equal(memoryUndoResultText({ ok: true, changed: 2 }, 'forget'), 'Forgot 2 memories.');
+  assert.equal(memoryUndoResultText({ ok: true, changed: 1 }, 'restore'), 'Brought back 1 memory.');
+  assert.equal(memoryUndoResultText({ ok: false, reason: 'not_found' }, 'forget'), 'That run is no longer in the history.');
+  assert.equal(memoryUndoResultText({ ok: false, reason: 'failed' }, 'forget'), 'Couldn’t undo just now. Nothing was changed.');
+  assert.equal(memoryUndoResultText(null, 'restore'), 'Couldn’t undo just now. Nothing was changed.');
 });

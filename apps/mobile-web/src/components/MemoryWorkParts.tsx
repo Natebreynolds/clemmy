@@ -230,7 +230,7 @@ export function EventRow({ view, compact, onUndo }: {
       setOutcome(said);
     } catch (err) {
       haptic('error');
-      setOutcome({ ok: false, text: isOfflineError(err) ? 'Can’t reach your Mac right now.' : 'Couldn’t undo that. Try again.' });
+      setOutcome(isOfflineError(err) ? { ok: false, text: 'Can’t reach your Mac right now.' } : undoOutcomeText(null, undo.kind));
     } finally {
       setBusy(false);
     }

@@ -122,8 +122,8 @@ export function modelLabel(modelId: string, settings: ModelSettings | null | und
 
 /** The note under "Automatic" in a role's picker. Keeps your memory borrows
  *  another role's model, and the daemon says whose. */
-export function roleAutomaticText(role: ModelRoleName, resolved?: Pick<ResolvedBrain, 'follows'>): string {
-  return role === 'memory' ? memoryRoleAutomaticText(resolved?.follows ?? null) : ROLE_COPY[role].automatic;
+export function roleAutomaticText(role: ModelRoleName, resolved?: Partial<Pick<ResolvedBrain, 'follows' | 'modelId'>>): string {
+  return role === 'memory' ? memoryRoleAutomaticText(resolved?.follows ?? null, resolved?.modelId || null) : ROLE_COPY[role].automatic;
 }
 
 /** The brain as its picker names it. */
@@ -156,7 +156,7 @@ export function roleSummary(role: ModelRoleName, settings: ModelSettings): strin
 export function roleNote(role: ModelRoleName, settings: ModelSettings): string | null {
   const resolved = settings.roles?.[role];
   if (role !== 'memory' || !resolved?.modelId || isChosen(resolved) || !resolved.follows) return null;
-  return memoryRoleAutomaticText(resolved.follows);
+  return memoryRoleAutomaticText(resolved.follows, resolved.modelId);
 }
 
 /** A saved choice that is unavailable, and what runs instead. When nothing

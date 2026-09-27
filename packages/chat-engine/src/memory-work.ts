@@ -309,13 +309,21 @@ export const MEMORY_ROLE_WORDS = {
   explain: 'Learns from finished conversations, settles conflicting facts and finds patterns, in the background.',
   automaticChecker: 'Uses the same model as Checks the work.',
   automaticBrain: 'Uses the model that does the work.',
+  /** Automatic, a model named, neither the checker's nor the brain's (a
+   *  cheaper model of the same family, say). */
+  automaticOwn: 'Clem’s pick for memory work.',
+  /** Automatic, and no model can be named right now. */
   automaticNone: 'Clem picks a model when one is available.',
 } as const;
 
-export function memoryRoleAutomaticText(follows: MemoryWorkModel['follows']): string {
+/** The note beside "Automatic": whose model memory work borrows, Clem's own
+ *  pick when it borrows nobody's, or that none is available. `modelId` is
+ *  the automatic model named beside it (null when there is none). */
+export function memoryRoleAutomaticText(follows: MemoryWorkModel['follows'], modelId: string | null | undefined): string {
+  if (!modelId) return MEMORY_ROLE_WORDS.automaticNone;
   if (follows === 'checker') return MEMORY_ROLE_WORDS.automaticChecker;
   if (follows === 'brain') return MEMORY_ROLE_WORDS.automaticBrain;
-  return MEMORY_ROLE_WORDS.automaticNone;
+  return MEMORY_ROLE_WORDS.automaticOwn;
 }
 
 export function memoryJobModelOwnerText(owner: MemoryJobModelOwner): string {
@@ -431,9 +439,37 @@ export function memoryWorkHeadline(
     };
   }
   // "Up to date" is a claim about the queue; an unread queue cannot back it.
-  if (queued !== 0) return { tone: 'resting', text: 'No memory work running right now', detail: lastWorked };
+  if (queued !== 0) {
+    return {
+      tone: 'resting',
+      text: 'No memory work running right now',
+      detail: ['Couldn’t read what is left to learn', lastWorked].filter(Boolean).join(' · '),
+    };
+  }
   return { tone: 'resting', text: 'Memory is up to date', detail: lastWorked };
 }
+
+/** A read vouches that a job is running for this long (about three missed
+ *  polls on either app). After it, the words stay and the motion stops. */
+export const MEMORY_WORK_LIVE_MS = 30_000;
+
+/** Whether a surface may move: the read says a job is running in the daemon
+ *  right now, and it arrived within MEMORY_WORK_LIVE_MS. `readAt` is when
+ *  the surface received the snapshot (its own clock, like `now`). */
+export function memoryWorkReadIsLive(
+  snapshot: Pick<MemoryWorkSnapshot, 'state' | 'running'> | null | undefined,
+  readAt: number | null | undefined,
+  now: number,
+): boolean {
+  if (!snapshot || snapshot.state !== 'working' || !Array.isArray(snapshot.running) || snapshot.running.length === 0) return false;
+  if (typeof readAt !== 'number' || !Number.isFinite(readAt)) return false;
+  return now - readAt <= MEMORY_WORK_LIVE_MS;
+}
+
+/** A job with no run on record. The journal keeps 90 days and began at
+ *  install, and a run that changed nothing leaves no trace after a restart,
+ *  so this is never "never ran" or "not in N days". */
+export const MEMORY_JOB_NO_RUN = 'No run recorded yet';
 
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
@@ -487,6 +523,23 @@ export function memoryEventSentence(event: MemoryWorkEvent): string {
   if (parts.length === 0) return `${MEMORY_JOB_WORDS[event.job]?.title ?? 'Memory work'}: nothing new`;
   const sentence = parts.join(', ');
   return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}${suffix}`;
+}
+
+/** What an undo did, in the same words on both apps. `null` = the request
+ *  never got an answer (the network, a restarting daemon): nothing changed. */
+export function memoryUndoResultText(result: MemoryWorkUndoResult | null, kind: 'forget' | 'restore'): string {
+  if (!result) return 'Couldn’t undo just now. Nothing was changed.';
+  if (result.ok) {
+    if (result.changed <= 0) return 'Nothing left to undo.';
+    const what = plural(result.changed, 'memory', 'memories');
+    return kind === 'forget' ? `Forgot ${what}.` : `Brought back ${what}.`;
+  }
+  switch (result.reason) {
+    case 'not_found': return 'That run is no longer in the history.';
+    case 'expired': return 'That run is too old to undo now.';
+    case 'nothing_to_undo': return 'Nothing left to undo.';
+    default: return 'Couldn’t undo just now. Nothing was changed.';
+  }
 }
 
 /** Undo button words, or null when there is nothing to undo. */

@@ -26,8 +26,11 @@ import {
   memoryNextText,
   memoryPipeline,
   memoryRoleAutomaticText,
+  memoryUndoResultText,
   memoryUndoText,
   memoryWorkHeadline,
+  memoryWorkReadIsLive,
+  MEMORY_JOB_NO_RUN,
   type MemoryJobId,
   type MemoryJobStatus,
   type MemoryPipelineStage,
@@ -46,8 +49,8 @@ import {
 export const MEMORY_WORK_POLL_MS = 8_000;
 
 /** A read older than this cannot certify that a job is running now (about
- *  three missed polls): the words stay, the motion stops. */
-export const MEMORY_WORK_LIVE_MS = 30_000;
+ *  three missed polls): the words stay, the motion stops. The Mac's rule too. */
+export { MEMORY_WORK_LIVE_MS } from '@clem/chat-engine';
 
 /** How many runs the card shows before "See all". */
 export const MEMORY_WORK_CARD_EVENTS = 3;
@@ -220,11 +223,8 @@ export interface MemoryWorkRead {
 /** True only when the latest read succeeded, is recent, and says a job is
  *  running in the daemon right now. This is the only thing that may animate. */
 export function memoryWorkLive(read: MemoryWorkRead): boolean {
-  const snapshot = read.snapshot;
-  if (!snapshot || read.error || read.offline) return false;
-  if (snapshot.state !== 'working' || snapshot.running.length === 0) return false;
-  if (read.receivedAt === null || read.now - read.receivedAt > MEMORY_WORK_LIVE_MS) return false;
-  return true;
+  if (read.error || read.offline) return false;
+  return memoryWorkReadIsLive(read.snapshot, read.receivedAt, read.now);
 }
 
 export interface MemoryWorkStatus {
@@ -292,7 +292,7 @@ export function memoryModelView(snapshot: MemoryWorkView | null, modelName: Mode
     name: model.modelId ? modelName(model.modelId) : none,
     hasModel: Boolean(model.modelId),
     chosen,
-    source: chosen ? 'Chosen' : `Automatic · ${memoryRoleAutomaticText(model.follows ?? null)}`,
+    source: chosen ? 'Chosen' : `Automatic · ${memoryRoleAutomaticText(model.follows ?? null, model.modelId)}`,
     served,
     problem,
   };
@@ -320,24 +320,19 @@ export interface PipelineStageView {
   lit: boolean;
 }
 
-/** Today's learning, left to right. An unread day reads "—" at every stage. */
+/** Today's learning, left to right. An unread day reads "—" at every stage,
+ *  and the shared pipeline reads a sum of two unread counts as unread. */
 export function pipelineView(snapshot: MemoryWorkView | null, live: boolean): PipelineStageView[] {
   const today = snapshot && snapshot.state !== 'unknown' ? snapshot.today : null;
   const running = new Set<MemoryJobId>(live && snapshot ? snapshot.running.map((r) => r.job) : []);
-  return memoryPipeline(today).map((stage) => {
-    // A sum of two unread counts is unread, not zero.
-    let value = stage.value;
-    if (today && stage.id === 'kept' && !known(today.learned) && !known(today.updated)) value = null;
-    if (today && stage.id === 'aside' && !known(today.leftOut) && !known(today.setAside)) value = null;
-    return {
-      id: stage.id,
-      label: stage.label,
-      short: STAGE_SHORT[stage.id],
-      value: countText(value),
-      known: known(value),
-      lit: running.has(stage.job),
-    };
-  });
+  return memoryPipeline(today).map((stage) => ({
+    id: stage.id,
+    label: stage.label,
+    short: STAGE_SHORT[stage.id],
+    value: countText(stage.value),
+    known: known(stage.value),
+    lit: running.has(stage.job),
+  }));
 }
 
 /** Today's spend as a row of small figures (at most four, one row at 358 px);
@@ -585,19 +580,11 @@ export function undoConfirmText(undo: NonNullable<MemoryEventView['undo']>): str
     : `Forget the ${undo.count} memories this run learned?`;
 }
 
-export function undoOutcomeText(result: MemoryWorkUndoResult, kind: 'forget' | 'restore'): { ok: boolean; text: string } {
-  if (result.ok) {
-    if (result.changed <= 0) return { ok: true, text: 'Nothing left to undo.' };
-    return kind === 'forget'
-      ? { ok: true, text: result.changed === 1 ? 'Forgot 1 memory.' : `Forgot ${result.changed} memories.` }
-      : { ok: true, text: result.changed === 1 ? 'Brought 1 memory back.' : `Brought ${result.changed} memories back.` };
-  }
-  switch (result.reason) {
-    case 'nothing_to_undo': return { ok: true, text: 'Nothing left to undo.' };
-    case 'expired': return { ok: false, text: 'This run is too old to undo.' };
-    case 'not_found': return { ok: false, text: 'This run is no longer kept.' };
-    default: return { ok: false, text: 'Couldn’t undo that. Try again.' };
-  }
+/** What an undo did, in the Mac's words too (@clem/chat-engine). `null` =
+ *  the request never got an answer. Already undone is not a failure. */
+export function undoOutcomeText(result: MemoryWorkUndoResult | null, kind: 'forget' | 'restore'): { ok: boolean; text: string } {
+  const ok = Boolean(result && (result.ok || result.reason === 'nothing_to_undo'));
+  return { ok, text: memoryUndoResultText(result, kind) };
 }
 
 /** Newest first, grouped under "Today", "Yesterday", a weekday, or a date. */
@@ -669,8 +656,8 @@ export interface MemoryJobView {
   stateText: string;
   /** "Provider — Model · Keeps your memory", "Runs on this Mac". */
   model: string;
-  /** "Last ran 4 min ago · done", "No run in the last 7 days", or
-   *  "Last run —" when the journal could not be read. */
+  /** "Last ran 4 min ago · done", "No run recorded yet", or "Last run —"
+   *  when the journal could not be read. */
   last: string;
   next: string;
   /** "2 runs today · 9 model calls · 12k tokens"; null on a day it did not
@@ -708,10 +695,9 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkView, modelName: Mode
     : job.state === 'off' ? 'Off'
     : '';
   const lastRun = job.lastRun;
-  const detailDays = snapshot.retention && known(snapshot.retention.detailDays) ? snapshot.retention.detailDays : null;
   const last = unread ? 'Last run —'
     : lastRun ? `Last ran ${fmt.age(lastRun.at)} · ${OUTCOME_WORDS[lastRun.outcome] ?? lastRun.outcome}`
-    : detailDays ? `No run in the last ${plural(detailDays, 'day', 'days')}` : 'No recent run';
+    : MEMORY_JOB_NO_RUN;
   const today = unread ? null : job.today;
   let todayLine: string | null = null;
   if (today && count(today.runs) > 0) {

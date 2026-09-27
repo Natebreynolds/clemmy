@@ -312,12 +312,15 @@ test('undo appears only while it would change something, and forgetting asks fir
   assert.equal(undoConfirmText({ kind: 'forget', count: 3, text: '' }), 'Forget the 3 memories this run learned?');
 
   assert.deepEqual(undoOutcomeText({ ok: true, changed: 2 }, 'forget'), { ok: true, text: 'Forgot 2 memories.' });
-  assert.deepEqual(undoOutcomeText({ ok: true, changed: 1 }, 'restore'), { ok: true, text: 'Brought 1 memory back.' });
+  assert.deepEqual(undoOutcomeText({ ok: true, changed: 1 }, 'restore'), { ok: true, text: 'Brought back 1 memory.' });
   assert.deepEqual(undoOutcomeText({ ok: true, changed: 0 }, 'forget'), { ok: true, text: 'Nothing left to undo.' });
   assert.deepEqual(undoOutcomeText({ ok: false, reason: 'nothing_to_undo' }, 'forget'), { ok: true, text: 'Nothing left to undo.' });
   assert.equal(undoOutcomeText({ ok: false, reason: 'expired' }, 'forget').ok, false);
   assert.equal(undoOutcomeText({ ok: false, reason: 'not_found' }, 'restore').ok, false);
-  assert.equal(undoOutcomeText({ ok: false, reason: 'failed' }, 'restore').text, 'Couldn’t undo that. Try again.');
+  // The same words as the Mac's (@clem/chat-engine).
+  assert.equal(undoOutcomeText({ ok: false, reason: 'failed' }, 'restore').text, 'Couldn’t undo just now. Nothing was changed.');
+  assert.equal(undoOutcomeText({ ok: false, reason: 'not_found' }, 'restore').text, 'That run is no longer in the history.');
+  assert.deepEqual(undoOutcomeText(null, 'forget'), { ok: false, text: 'Couldn’t undo just now. Nothing was changed.' });
 });
 
 test('a run lists at most what the daemon sent and says how many more it changed', () => {
@@ -374,7 +377,7 @@ test('jobs list in the shared order, learning first, import only once it has run
   assert.equal(byId.get('standing')?.model, 'Named checker-model · Checks the work');
   assert.equal(byId.get('index')?.model, 'local-embedder · Runs on this Mac', 'the local model is a file, not a catalog name');
   assert.equal(byId.get('tidy')?.model, 'No model');
-  assert.equal(byId.get('identity')?.last, 'No run in the last 7 days');
+  assert.equal(byId.get('identity')?.last, 'No run recorded yet', 'no record is not "not in 7 days": a restart forgets quiet runs');
   assert.equal(byId.get('identity')?.today, null);
 });
 
@@ -398,8 +401,10 @@ const settings = memoryModelSettingsFixture() as unknown as ModelSettings;
 test('the memory role uses the desktop\'s words and the daemon\'s "follows"', () => {
   assert.equal(ROLE_COPY.memory.title, MEMORY_ROLE_WORDS.title);
   assert.equal(ROLE_COPY.memory.explain, MEMORY_ROLE_WORDS.explain);
-  assert.equal(roleAutomaticText('memory', { follows: 'checker' }), MEMORY_ROLE_WORDS.automaticChecker);
-  assert.equal(roleAutomaticText('memory', { follows: 'brain' }), MEMORY_ROLE_WORDS.automaticBrain);
+  assert.equal(roleAutomaticText('memory', { follows: 'checker', modelId: 'm-1' }), MEMORY_ROLE_WORDS.automaticChecker);
+  assert.equal(roleAutomaticText('memory', { follows: 'brain', modelId: 'm-1' }), MEMORY_ROLE_WORDS.automaticBrain);
+  assert.equal(roleAutomaticText('memory', { follows: null, modelId: 'm-1' }), MEMORY_ROLE_WORDS.automaticOwn,
+    'a named model that is neither the checker\'s nor the brain\'s is Clem\'s own pick, not "none available"');
   assert.equal(roleAutomaticText('memory', {}), MEMORY_ROLE_WORDS.automaticNone);
   assert.equal(roleAutomaticText('judge', { follows: 'brain' }), ROLE_COPY.judge.automatic, 'other roles keep their own words');
   assert.equal(ROLE_COPY.memory.saved, 'Saved. The next memory job uses it.');

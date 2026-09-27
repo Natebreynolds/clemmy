@@ -249,7 +249,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
               <div className="text-body font-semibold text-fg">{ROLE_WORDS.memory.title}</div>
               <div className="text-small text-muted">{ROLE_WORDS.memory.hint}</div>
               {memory.source === 'default' && (
-                <div className="mt-1 text-caption text-muted">{memoryRoleAutomaticText(memory.follows ?? null)}</div>
+                <div className="mt-1 text-caption text-muted">{memoryRoleAutomaticText(memory.follows ?? null, memory.modelId || null)}</div>
               )}
               {memoryWaits && memory.inactiveBinding && (
                 <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={memory.inactiveBinding.reason}>

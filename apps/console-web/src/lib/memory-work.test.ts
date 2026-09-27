@@ -75,6 +75,20 @@ test('a stale read never moves and never claims now: the line says the read fail
   assert.ok(view.eventCount > 0);
 });
 
+test('a read too old to vouch for now stops the motion, by the phone\'s rule', () => {
+  // A poll that hangs (the daemon busy with a nightly job) is not an error,
+  // so "stale" never comes; the read's age still ends the motion.
+  const fresh = memoryWorkViewModel(memoryWorkFixture('working', NOW), NOW, { readAt: NOW - 5_000 });
+  assert.equal(fresh.live, true);
+  const old = memoryWorkViewModel(memoryWorkFixture('working', NOW), NOW, { readAt: NOW - 31_000 });
+  assert.equal(old.live, false);
+  assert.equal(old.runningSince, null);
+  assert.equal(old.pipeline.some((s) => s.active), false);
+  const learn = old.jobs.learning.find((j) => j.id === 'learn');
+  assert.equal(learn?.stateLabel, null, '"Working now" is a claim about now');
+  assert.notEqual(learn?.dot, 'running');
+});
+
 test('working with an empty running list is not drawn as working', () => {
   const view = memoryWorkViewModel(snapshot({ state: 'working', running: [] }), NOW);
   assert.equal(view.live, false);
@@ -351,7 +365,8 @@ test('memories beyond the listed ones are counted, and an inactive memory is mar
 test('the undo result is said calmly, and a refusal changes nothing', () => {
   assert.equal(memoryUndoResultText({ ok: true, changed: 3 }, 'forget'), 'Forgot 3 memories.');
   assert.equal(memoryUndoResultText({ ok: true, changed: 1 }, 'restore'), 'Brought back 1 memory.');
-  assert.equal(memoryUndoResultText({ ok: true, changed: 0 }, 'forget'), 'Nothing left to change — it was already done.');
+  assert.equal(memoryUndoResultText({ ok: true, changed: 0 }, 'forget'), 'Nothing left to undo.');
+  assert.equal(memoryUndoResultText({ ok: false, reason: 'not_found' }, 'forget'), 'That run is no longer in the history.');
   assert.equal(memoryUndoResultText({ ok: false, reason: 'expired' }, 'forget'), 'That run is too old to undo now.');
   assert.equal(memoryUndoResultText({ ok: false, reason: 'failed' }, 'forget'), 'Couldn’t undo just now. Nothing was changed.');
 });
