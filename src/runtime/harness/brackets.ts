@@ -2376,9 +2376,9 @@ export function pendingNestedToolApprovalRequiredError(
  *
  * When an edit to an object the agent just created fails, the agent may hunt
  * for another tool and reach for a delete of that object, escalating an EDIT
- * into destroying the user's objects, which opened an approval card and parked the
- * turn for ten minutes. The same shape appeared on 08-07, deleting a duplicate
- * it had created itself.
+ * into destroying the user's objects, which raises an approval card and parks
+ * the turn. The same shape covers deleting a duplicate the agent created
+ * itself.
  *
  * The rule is about EFFECTS, not methods: when an edit path fails, the safe
  * recovery is additive — leave the object alone and create a corrected one, or
