@@ -1,0 +1,501 @@
+{
+  "about": "Lean Rounds ratchet baseline, measured on ba5439ead (shipping tip) by src/journeys/lean-rounds.acceptance.test.ts. rounds may not grow; round1Bytes and totalRequestBytes may not exceed baseline*(1+fraction)+absoluteBytes. Tighten when a change improves a case; regenerate a candidate with LEAN_ROUNDS_WRITE_BASELINE=/abs/path.json.",
+  "tolerance": {
+    "fraction": 0.01,
+    "absoluteBytes": 64
+  },
+  "cases": {
+    "a_saved_work_lookup/jev_off": {
+      "rounds": 4,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 170684,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "a_saved_work_lookup/jev_hang": {
+      "rounds": 4,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 170697,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "a_saved_work_lookup/jev_http_500": {
+      "rounds": 4,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 170745,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "a_saved_work_lookup/jev_scripted": {
+      "rounds": 4,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 170745,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "b_heartbeat_edit/jev_off": {
+      "rounds": 3,
+      "round1Bytes": 39060,
+      "totalRequestBytes": 128195,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "b_heartbeat_edit/jev_hang": {
+      "rounds": 3,
+      "round1Bytes": 39060,
+      "totalRequestBytes": 128201,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "b_heartbeat_edit/jev_http_500": {
+      "rounds": 3,
+      "round1Bytes": 39060,
+      "totalRequestBytes": 128225,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "b_heartbeat_edit/jev_scripted": {
+      "rounds": 3,
+      "round1Bytes": 39060,
+      "totalRequestBytes": 128225,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "c_provider_carrier_read/jev_off": {
+      "rounds": 4,
+      "round1Bytes": 36812,
+      "totalRequestBytes": 204853,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "c_provider_carrier_read/jev_hang": {
+      "rounds": 4,
+      "round1Bytes": 36812,
+      "totalRequestBytes": 204870,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "c_provider_carrier_read/jev_http_500": {
+      "rounds": 4,
+      "round1Bytes": 36812,
+      "totalRequestBytes": 204770,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "c_provider_carrier_read/jev_scripted": {
+      "rounds": 4,
+      "round1Bytes": 36812,
+      "totalRequestBytes": 204770,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "d_calendar_read/jev_off": {
+      "rounds": 3,
+      "round1Bytes": 36769,
+      "totalRequestBytes": 131184,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "d_calendar_read/jev_hang": {
+      "rounds": 3,
+      "round1Bytes": 36769,
+      "totalRequestBytes": 131192,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "d_calendar_read/jev_http_500": {
+      "rounds": 3,
+      "round1Bytes": 36769,
+      "totalRequestBytes": 131224,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "d_calendar_read/jev_scripted": {
+      "rounds": 3,
+      "round1Bytes": 36769,
+      "totalRequestBytes": 131224,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "e_no_signal_control/jev_off": {
+      "rounds": 1,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 36860,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "e_no_signal_control/jev_hang": {
+      "rounds": 1,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 36860,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "e_no_signal_control/jev_http_500": {
+      "rounds": 1,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 36860,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "e_no_signal_control/jev_scripted": {
+      "rounds": 1,
+      "round1Bytes": 36860,
+      "totalRequestBytes": 36860,
+      "round1WireTools": [
+        "ask_user_question",
+        "run_worker",
+        "call_tool",
+        "check_in",
+        "list_files",
+        "memory_recall_all",
+        "read_file",
+        "recall_tool_result",
+        "session_search",
+        "skill_read",
+        "tool_output_query",
+        "tool_search",
+        "file_query",
+        "workspace_roots",
+        "work_call"
+      ]
+    },
+    "f_calendar_read_warm/jev_off": {
+      "rounds": 2,
+      "round1Bytes": 39587,
+      "totalRequestBytes": 81383,
+      "round1WireTools": [
+        "ask_user_question",
+        "recall_tool_result",
+        "tool_output_query",
+        "tool_search",
+        "plan_task",
+        "work_call"
+      ]
+    },
+    "f_calendar_read_warm/jev_hang": {
+      "rounds": 2,
+      "round1Bytes": 39587,
+      "totalRequestBytes": 81387,
+      "round1WireTools": [
+        "ask_user_question",
+        "recall_tool_result",
+        "tool_output_query",
+        "tool_search",
+        "plan_task",
+        "work_call"
+      ]
+    },
+    "f_calendar_read_warm/jev_http_500": {
+      "rounds": 2,
+      "round1Bytes": 39587,
+      "totalRequestBytes": 81403,
+      "round1WireTools": [
+        "ask_user_question",
+        "recall_tool_result",
+        "tool_output_query",
+        "tool_search",
+        "plan_task",
+        "work_call"
+      ]
+    },
+    "f_calendar_read_warm/jev_scripted": {
+      "rounds": 2,
+      "round1Bytes": 39587,
+      "totalRequestBytes": 81403,
+      "round1WireTools": [
+        "ask_user_question",
+        "recall_tool_result",
+        "tool_output_query",
+        "tool_search",
+        "plan_task",
+        "work_call"
+      ]
+    }
+  }
+}
