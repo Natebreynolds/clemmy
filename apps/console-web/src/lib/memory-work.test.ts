@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { MEMORY_ROLE_WORDS, type MemoryWorkEvent, type MemoryWorkSnapshot } from '@clem/chat-engine';
 import {
-  durationWords, elapsedClock, memoryTimeFormat, memoryUndoNotice, memoryUndoResultText, memoryWorkViewModel, UNKNOWN,
+  durationWords, elapsedClock, getMemoryWork, memoryTimeFormat, memoryUndoNotice, memoryUndoResultText, memoryWorkViewModel, UNKNOWN,
 } from './memory-work.js';
 import { memoryWorkFixture } from './memory-work.fixture.js';
 import { JOB_ICON, jobIcon } from '../components/memory/work/job-icon.js';
@@ -530,7 +530,7 @@ test('WIRED: the Memory screen renders the panel, and the panel reads the route 
 
 test('the panel branches on a failed read before it draws anything as empty', () => {
   const panel = read('../components/memory/work/MemoryWorkPanel.tsx');
-  const guard = panel.indexOf('work.isError && !work.data');
+  const guard = panel.indexOf('work.isError && work.data === undefined');
   const drawn = panel.indexOf('<LearningPipeline');
   assert.ok(guard > 0, 'the failed-first-read branch is gone');
   assert.ok(drawn > guard, 'the error branch must come before the panel draws counts');
@@ -566,4 +566,12 @@ test('motion stops for reduced motion and for the owner’s still style', () => 
 test('the panel’s Change goes to the memory row in Settings, the one owner of the choice', () => {
   assert.match(read('../components/memory/work/WorkStatus.tsx'), /to="\/settings#memory-model"/);
   assert.match(read('../screens/settings/ModelRolesCard.tsx'), /id="memory-model"/);
+});
+
+test('a daemon without the memory-work route hides the panel, as on the phone; other failures still say so', async () => {
+  const failing = (status: number) => async () => { throw Object.assign(new Error(`HTTP ${status}`), { status }); };
+  assert.equal(await getMemoryWork(failing(404)), null, 'an older daemon: not reported, not "couldn’t read"');
+  await assert.rejects(getMemoryWork(failing(500)), /HTTP 500/);
+  const snap = memoryWorkFixture('resting', NOW);
+  assert.equal(await getMemoryWork(async () => snap), snap);
 });

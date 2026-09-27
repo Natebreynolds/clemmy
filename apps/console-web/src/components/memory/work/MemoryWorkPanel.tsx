@@ -91,7 +91,8 @@ export function MemoryWorkPanel() {
     );
   }
 
-  if (work.isError && !work.data) {
+  // A failed first read says so; a daemon that answered "not reported" (null) stays hidden.
+  if (work.isError && work.data === undefined) {
     return (
       <Frame>
         <div className="p-4 sm:p-5">
@@ -117,6 +118,7 @@ export function MemoryWorkPanel() {
     );
   }
 
+  // A daemon that does not report memory work (null) shows no panel.
   if (!view) return null;
   const unknown = view.state === 'unknown';
   return (

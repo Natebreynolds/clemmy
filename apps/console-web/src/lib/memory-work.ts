@@ -64,13 +64,26 @@ export type {
 export const MEMORY_WORK_POLL_MS = 5_000;
 export const MEMORY_WORK_QUERY_KEY = ['memory-work'] as const;
 
-export const getMemoryWork = () => apiGet<MemoryWorkSnapshot>('/api/console/memory/work');
+/** The snapshot, or null when this daemon does not report memory work (an
+ *  older daemon has no such route: the console's files can be newer than the
+ *  daemon). Null keeps the panel out of the way, as on the phone; only a
+ *  real failure reads as "couldn't read". */
+export async function getMemoryWork(
+  get: (path: string) => Promise<MemoryWorkSnapshot> = apiGet,
+): Promise<MemoryWorkSnapshot | null> {
+  try {
+    return await get('/api/console/memory/work');
+  } catch (err) {
+    if ((err as { status?: unknown } | null)?.status === 404) return null;
+    throw err;
+  }
+}
 
 export const undoMemoryWork = (eventId: string) =>
   apiPost<MemoryWorkUndoResult>(`/api/console/memory/work/${encodeURIComponent(eventId)}/undo`);
 
 export function useMemoryWork() {
-  return usePoll(MEMORY_WORK_QUERY_KEY, getMemoryWork, MEMORY_WORK_POLL_MS);
+  return usePoll(MEMORY_WORK_QUERY_KEY, () => getMemoryWork(), MEMORY_WORK_POLL_MS);
 }
 
 export interface MemoryUndoNotice {
