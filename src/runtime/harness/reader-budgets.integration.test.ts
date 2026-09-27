@@ -198,18 +198,23 @@ test('query replies spend the turn\'s reading byte budget, and a spent budget ro
       { callId: 'spend-first', args: { call_id: 'parked-rows' } },
       { callId: 'spend-second', args: { call_id: 'parked-rows', limit: 50, offset: 10 } },
       { callId: 'spend-third', args: { call_id: 'parked-rows', offset: 40 } },
+      { callId: 'spend-fourth', args: { call_id: 'parked-rows', offset: 50 } },
     ],
   });
   const first = results.get('spend-first') ?? '';
   const second = results.get('spend-second') ?? '';
   const third = results.get('spend-third') ?? '';
+  const fourth = results.get('spend-fourth') ?? '';
   assert.match(first, /^Showing \d+ record/);
   assert.match(second, /^Showing \d+ record/);
-  assert.ok(Buffer.byteLength(first) + Buffer.byteLength(second) <= 26_000,
-    `the two replies fit the turn's byte budget (${first.length} + ${second.length} chars)`);
+  // The third reply is sized to what is left, so it is served, not refused.
+  assert.match(third, /^Showing 1 record/, third.slice(0, 300));
+  const spent = [first, second, third].reduce((sum, reply) => sum + Buffer.byteLength(reply), 0);
+  assert.ok(spent <= 26_000, `the replies fit the turn's byte budget (${spent} bytes)`);
+  assert.equal(budget.snapshot().bytes, spent, 'every served reply was charged, in bytes');
   assert.equal(budget.snapshot().calls, 0, 'a query spends bytes, never a recall call');
-  assert.match(third, /^ERROR: reading byte budget exhausted/, third.slice(0, 300));
-  assert.doesNotMatch(third, /tool_output_query \{|recall_tool_result \{/, 'never routed back to a reader the budget refuses');
+  assert.match(fourth, /^ERROR: reading byte budget exhausted/, fourth.slice(0, 300));
+  assert.doesNotMatch(fourth, /tool_output_query \{|recall_tool_result \{/, 'never routed back to a reader the budget refuses');
 });
 
 test('on a small window an explicit recall and a named query page stay within what the window can take', async () => {
@@ -272,4 +277,53 @@ test('a direct business-role local tool keeps the projection its own handler for
     `the handler's own projection reaches the model, not the 4,000-char view (got ${shown.length})`);
   assert.ok(shown.length <= DEFAULT_TOOL_RESULT_MAX_CHARS, `bounded by one inline result (got ${shown.length})`);
   assert.ok(shown.includes('"id":"r0"'), 'the projection carries the records');
+});
+
+test('an object query is sized to the reading bytes the turn has left and served, never refused for its own clip marker', async () => {
+  const budget = new brackets.RecallBudget(10, 10_000, undefined);
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', recallBudget: budget,
+    seed: (sessionId) => events.writeToolOutput({
+      sessionId, callId: 'parked-object', tool: 'run_shell_command', output: JSON.stringify({ body: 'x'.repeat(30_000), meta: 1 }),
+    }),
+    calls: [{ callId: 'object-remainder', args: { call_id: 'parked-object' } }],
+  });
+  const shown = results.get('object-remainder') ?? '';
+  assert.match(shown, /^Object \(2 top-level keys\)/, shown.slice(0, 300));
+  assert.match(shown, /…\[clipped to \d+ chars — narrow with fields/);
+  assert.ok(Buffer.byteLength(shown, 'utf8') <= 10_000, `within the remaining bytes (${Buffer.byteLength(shown, 'utf8')})`);
+  assert.equal(budget.snapshot().bytes, Buffer.byteLength(shown, 'utf8'), 'the served reply is what was charged');
+});
+
+test('a non-ASCII record page is cut on a record boundary to the bytes left, with the exact next query', async () => {
+  const budget = new brackets.RecallBudget(10, 40_000, undefined);
+  const rows = JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ id: `row-${i}`, notes: '中文记录'.repeat(300) })));
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', recallBudget: budget,
+    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-wide', tool: 'run_shell_command', output: rows }),
+    calls: [{ callId: 'wide-page', args: { call_id: 'parked-wide', limit: 30 } }],
+  });
+  const shown = results.get('wide-page') ?? '';
+  const header = /^Showing (\d+) record\(s\) \[0–(\d+)\] of 40 matching/.exec(shown);
+  assert.ok(header, shown.slice(0, 300));
+  const count = Number(header[1]);
+  assert.ok(count > 0 && count < 30, `a partial page (${count} records)`);
+  assert.ok(shown.includes(`"id": "row-${count - 1}"`) && !shown.includes(`"id": "row-${count}"`), 'cut on a record boundary');
+  assert.ok(shown.includes(`Next: tool_output_query {"call_id":"parked-wide","limit":30,"offset":${count}}`), 'the exact next query');
+  assert.ok(Buffer.byteLength(shown, 'utf8') <= 40_000, `within the remaining bytes (${Buffer.byteLength(shown, 'utf8')})`);
+});
+
+test('a record larger than the whole reply is clipped inside the bound and still names the exact next query', async () => {
+  const rows = JSON.stringify(Array.from({ length: 3 }, (_, i) => ({ id: `big-${i}`, notes: 'y'.repeat(30_000) })));
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query',
+    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-big', tool: 'run_shell_command', output: rows }),
+    calls: [{ callId: 'big-record', args: { call_id: 'parked-big' } }],
+  });
+  const shown = results.get('big-record') ?? '';
+  const inline = inlineResultBudgetForModel(undefined);
+  assert.match(shown, /^Showing 1 record\(s\) \[0–1\] of 3 matching/);
+  assert.match(shown, /…\[clipped to \d+ chars — narrow with fields/);
+  assert.ok(shown.length <= inline, `within one inline result (got ${shown.length}, budget ${inline})`);
+  assert.ok(shown.includes('Next: tool_output_query {"call_id":"parked-big","offset":1}'), 'the exact next query survives the clip');
 });
