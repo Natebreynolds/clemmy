@@ -2465,15 +2465,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   })();
   // The advertised description rides every model step of every turn, so it
   // carries only what the model must know AT THE CALL: the packet contract,
-  // the lease rule, compose-only mutations and the ERROR: failure envelope.
-  // Everything else it used to narrate is enforced or surfaced by the harness
-  // at the moment it matters — the compose-only refusal (WORKER_COMPOSE_ONLY),
-  // the per-item batch ledger and "FAILED items" header, the manifest gates,
-  // and the digest footer that names tool_output_query for parked shards.
+  // the per-item cost and the lease rule. Each other rule is said once where
+  // it is owned: batching in the item/items fields, parent-owned commits in
+  // the rubric, and the rest enforced or surfaced by the harness at the moment
+  // it matters — the compose-only refusal (WORKER_COMPOSE_ONLY), the per-item
+  // batch ledger and "FAILED items" header, the ERROR: item envelope, the
+  // manifest gates, and the digest footer that names tool_output_query for
+  // parked shards.
   const runWorkerToolDescription = [
-    'Delegate independent work with a structured parent-planned job packet. Each item costs a model session; prefer direct calls for quick reads. Batch all items in one `items` call; use `item` for one.',
+    'Delegate independent work with a structured parent-planned job packet. Each item costs a model session; prefer direct calls for quick reads.',
     'Workers receive only packet context and shared result handles. Use the typed exact `externalMcpToolNames` array; resolvedTools carries schemas/commands/instructions but does not widen that lease.',
-    'Workers COMPOSE external mutations for parent approval. An "ERROR:" item FAILED; never claim full completion.',
   ].join(' ');
   /**
    * THE one door for a run_worker refusal that starts no child.

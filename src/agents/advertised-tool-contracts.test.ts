@@ -113,3 +113,12 @@ test('tool_search keeps the account nomination contract and drops what its resul
   assert.doesNotMatch(fields.account_selection!.description ?? '', /account_selection_required/,
     'the blocked result names the recovery where it arises');
 });
+
+test('run_worker states each packet rule once', async () => {
+  // 4,736 -> 4,524 B.
+  const tool = withinCeiling((await builtWire()).get('run_worker'), 'run_worker', 4_600);
+  assert.match(tool.description, /prefer direct calls for quick reads/);
+  assert.doesNotMatch(tool.description, /Batch all items/, 'batching is stated once, on the item/items fields');
+  const fields = tool.parameters.properties as Record<string, { description?: string }>;
+  assert.match(fields.items!.description ?? '', /run as one pool/);
+});
