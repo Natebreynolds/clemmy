@@ -49,6 +49,7 @@ before(() => {
   relations.syncFactResourceLinks();
   relations.backfillGroundedFactEntityLinks();
   relations.backfillGroundedFactResourceLinks();
+  relations.backfillGroundedEntityRelationships();
   maintenance.finalizeGroundedEntityLinksOnBoot();
   maintenance.finalizeGroundedResourceLinksOnBoot();
   (db as { prepare: typeof db.prepare }).prepare = original;
@@ -103,5 +104,14 @@ test('the per-fact lookups seek the primary key by fact', () => {
     const scansLinks = /\b(SCAN|SEARCH) (fe|fr|fact_entities|fact_resources)\b/.test(plan);
     if (!scansLinks) continue;
     assert.match(plan, /sqlite_autoindex_fact_(entities|resources)_1 \(fact_id=\?/, `plan for ${sql.replace(/\s+/g, ' ').slice(0, 120)}: ${plan}`);
+  }
+});
+
+test('every paged selection reads one primary-key range of facts per page', () => {
+  const paged = [...prepared].filter((sql) => /\bcf\.id > \? AND cf\.id <= \?/.test(sql));
+  assert.ok(paged.length >= 3, `paged selections captured: ${paged.length}`);
+  for (const sql of paged) {
+    const plan = planOf(sql);
+    assert.equal(plan[0], 'SEARCH cf USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)', `${sql.replace(/\s+/g, ' ').slice(0, 120)}: ${plan.join(' | ')}`);
   }
 });

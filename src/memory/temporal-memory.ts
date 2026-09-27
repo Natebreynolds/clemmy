@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3';
 import {
   backupMemoryDb,
   openMemoryDb,
+  type BackupResult,
   type MemoryEpisodeKind,
   type MemoryEpisodeRow,
   type MemoryEpisodeStatus,
@@ -11,6 +12,7 @@ import {
 import { resolveToolOutputForAuthority, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
 import { compileComposioStandingPolicy } from '../integrations/composio/standing-policy-compiler.js';
 import { compilePromptStandingPolicyDescriptor } from './policy-enforcement.js';
+import { NIGHTLY_SLICE, SliceClock, runSliced, stepsOf } from './sliced-pass.js';
 
 const MAX_EVIDENCE_CHARS = 2_000;
 
@@ -462,9 +464,8 @@ export function readTemporalEvidenceHealth(): TemporalEvidenceHealth {
   };
 }
 
-export function backfillTemporalEvidence(limit = 200): TemporalEvidenceBackfillResult {
-  const db = openMemoryDb();
-  const rows = db.prepare(`
+function selectFactsWithoutEvidence(limit: number): Array<Record<string, unknown>> {
+  return openMemoryDb().prepare(`
     SELECT cf.*
     FROM consolidated_facts cf
     LEFT JOIN fact_evidence fe ON fe.fact_id = cf.id
@@ -472,22 +473,34 @@ export function backfillTemporalEvidence(limit = 200): TemporalEvidenceBackfillR
     ORDER BY cf.updated_at DESC
     LIMIT ?
   `).all(Math.max(1, limit)) as Array<Record<string, unknown>>;
+}
+
+/** Capture one fact's evidence: it ends source-backed ('linked'), explicitly unavailable ('missing'), or neither. */
+function backfillFactEvidence(row: Record<string, unknown>): 'linked' | 'missing' | 'unclassified' {
+  const episode = captureFactEvidence({
+    factId: Number(row.id),
+    factContent: String(row.content ?? ''),
+    sourceApp: row.source_app ? String(row.source_app) : null,
+    sourcePath: row.source_path ? String(row.source_path) : null,
+    sessionId: row.derived_from_session_id ? String(row.derived_from_session_id) : (row.source_session_id ? String(row.source_session_id) : null),
+    callId: row.derived_from_call_id ? String(row.derived_from_call_id) : null,
+    tool: row.derived_from_tool ? String(row.derived_from_tool) : null,
+    occurredAt: row.created_at ? String(row.created_at) : undefined,
+  });
+  const evidence = getFactEvidence(Number(row.id));
+  if (evidence.some((item) => item.status === 'available' && item.excerpt.trim().length > 0)) return 'linked';
+  if (episode.status === 'missing' || evidence.some((item) => item.status === 'missing')) return 'missing';
+  return 'unclassified';
+}
+
+export function backfillTemporalEvidence(limit = 200): TemporalEvidenceBackfillResult {
+  const rows = selectFactsWithoutEvidence(limit);
   let linked = 0;
   let missing = 0;
   for (const row of rows) {
-    const episode = captureFactEvidence({
-      factId: Number(row.id),
-      factContent: String(row.content ?? ''),
-      sourceApp: row.source_app ? String(row.source_app) : null,
-      sourcePath: row.source_path ? String(row.source_path) : null,
-      sessionId: row.derived_from_session_id ? String(row.derived_from_session_id) : (row.source_session_id ? String(row.source_session_id) : null),
-      callId: row.derived_from_call_id ? String(row.derived_from_call_id) : null,
-      tool: row.derived_from_tool ? String(row.derived_from_tool) : null,
-      occurredAt: row.created_at ? String(row.created_at) : undefined,
-    });
-    const evidence = getFactEvidence(Number(row.id));
-    if (evidence.some((item) => item.status === 'available' && item.excerpt.trim().length > 0)) linked += 1;
-    else if (episode.status === 'missing' || evidence.some((item) => item.status === 'missing')) missing += 1;
+    const outcome = backfillFactEvidence(row);
+    if (outcome === 'linked') linked += 1;
+    else if (outcome === 'missing') missing += 1;
   }
   return { scanned: rows.length, linked, missing, remaining: countUnreconciledFactEvidence() };
 }
@@ -525,6 +538,80 @@ export function reconcileTemporalEvidence(options: {
       throw new Error(`Evidence reconciliation classified ${classified}/${result.scanned} facts; stopped to avoid a non-advancing loop.`);
     }
   }
+  return {
+    backupPath: backup?.backupPath ?? null,
+    before,
+    processed,
+    available,
+    unavailable,
+    remaining,
+    complete: remaining === 0,
+    elapsedMs: Date.now() - started,
+  };
+}
+
+/**
+ * {@link reconcileTemporalEvidence} with a turn of the event loop between
+ * batches and every slice bounded (one fact per step), so the request that
+ * runs it never holds the loop for the whole reconciliation. Same batches,
+ * same report, same stop when a batch does not advance.
+ *
+ * `backup` takes the preflight rollback point; by default the synchronous
+ * backup. A caller that has an off-thread backup passes it here.
+ */
+export async function reconcileTemporalEvidenceAsync(options: {
+  maxFacts?: number;
+  batchSize?: number;
+  requireBackup?: boolean;
+  backup?: () => BackupResult | null | Promise<BackupResult | null>;
+  clock?: SliceClock;
+} = {}): Promise<TemporalEvidenceReconciliationReport> {
+  const started = Date.now();
+  const maxFacts = Math.max(1, Math.min(50_000, options.maxFacts ?? 5_000));
+  const batchSize = Math.max(1, Math.min(1_000, options.batchSize ?? 200));
+  const clock = options.clock ?? new SliceClock(NIGHTLY_SLICE);
+  const before = countUnreconciledFactEvidence();
+  await clock.next(true);
+  const backup = await (options.backup ?? (() => backupMemoryDb({ retain: 7 })))();
+  if ((options.requireBackup ?? true) && !backup) {
+    throw new Error('Evidence reconciliation stopped because a preflight memory backup could not be created.');
+  }
+  await clock.next(true);
+  let processed = 0;
+  let available = 0;
+  let unavailable = 0;
+  let remaining = before;
+  let stalled: Error | null = null;
+  function* steps(): Generator<void, void, undefined> {
+    while (processed < maxFacts && remaining > 0) {
+      const rows = selectFactsWithoutEvidence(Math.min(batchSize, maxFacts - processed));
+      clock.unit();
+      yield;
+      let linked = 0;
+      let missing = 0;
+      for (const row of rows) {
+        const outcome = backfillFactEvidence(row);
+        if (outcome === 'linked') linked += 1;
+        else if (outcome === 'missing') missing += 1;
+        clock.unit();
+        yield;
+      }
+      remaining = countUnreconciledFactEvidence();
+      if (rows.length === 0) break;
+      processed += rows.length;
+      available += linked;
+      unavailable += missing;
+      if (linked + missing !== rows.length) {
+        stalled = new Error(`Evidence reconciliation classified ${linked + missing}/${rows.length} facts; stopped to avoid a non-advancing loop.`);
+        return;
+      }
+      // A turn between batches.
+      clock.boundary();
+      yield;
+    }
+  }
+  await runSliced(openMemoryDb(), clock, stepsOf(steps()));
+  if (stalled) throw stalled;
   return {
     backupPath: backup?.backupPath ?? null,
     before,

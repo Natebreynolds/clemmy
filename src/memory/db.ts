@@ -21,6 +21,7 @@ import {
   compileComposioStandingPolicy,
 } from '../integrations/composio/standing-policy-compiler.js';
 import { compilePromptStandingPolicyDescriptor } from './policy-enforcement.js';
+import { NIGHTLY_SLICE, SliceClock, runSliced, stepsOf, type SliceHooks } from './sliced-pass.js';
 
 // The real default home (~/.clementine-next). A full memory-DB reset against THIS
 // permanently destroys the user's long-term memory (facts/entities/embeddings are
@@ -2815,6 +2816,61 @@ export function purgeSoftDeletedFacts(opts: { minAgeDays?: number } = {}): numbe
     })();
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Facts per purge chunk. Until `entity_observations(source_fact_id)` has an
+ * index, deleting a fact scans that table (its ON DELETE SET NULL), so a chunk
+ * stays small enough to fit a slice; with the index it can grow to about 50.
+ */
+const PURGE_CHUNK_FACTS = 10;
+
+/**
+ * {@link purgeSoftDeletedFacts} in chunks: the eligible ids are read once,
+ * then deleted a chunk per transaction with a turn of the event loop between
+ * chunks. Each chunk re-checks eligibility, so a fact restored or pinned
+ * while the purge runs is kept. Returns the facts purged by the chunks that
+ * committed.
+ */
+export async function purgeSoftDeletedFactsAsync(
+  opts: { minAgeDays?: number; chunkSize?: number; hooks?: SliceHooks } = {},
+): Promise<number> {
+  const minAgeDays = Math.max(30, opts.minAgeDays ?? 180);
+  const chunkSize = Math.max(1, Math.floor(opts.chunkSize ?? PURGE_CHUNK_FACTS));
+  let purged = 0;
+  try {
+    const db = openMemoryDb();
+    ensureMemoryForeignKeysEnabled(db);
+    const cutoff = new Date(Date.now() - minAgeDays * 24 * 60 * 60 * 1000).toISOString();
+    const clock = new SliceClock(NIGHTLY_SLICE, opts.hooks);
+    function* steps(): Generator<void, void, undefined> {
+      const ids = (db.prepare(
+        'SELECT id FROM consolidated_facts WHERE active = 0 AND pinned = 0 AND updated_at < ?',
+      ).all(cutoff) as Array<{ id: number }>).map((row) => row.id);
+      if (ids.length === 0) return;
+      clock.boundary();
+      yield;
+      for (let offset = 0; offset < ids.length; offset += chunkSize) {
+        const chunk = ids.slice(offset, offset + chunkSize);
+        const placeholders = chunk.map(() => '?').join(',');
+        const eligible = (db.prepare(`
+          SELECT id FROM consolidated_facts
+          WHERE id IN (${placeholders}) AND active = 0 AND pinned = 0 AND updated_at < ?
+        `).all(...chunk, cutoff) as Array<{ id: number }>).map((row) => row.id);
+        const deleted = hardDeleteConsolidatedFacts(db, eligible);
+        purged += deleted;
+        clock.unit(chunk.length);
+        clock.wrote(deleted);
+        if (offset + chunkSize >= ids.length) break;
+        clock.boundary();
+        yield;
+      }
+    }
+    await runSliced(db, clock, stepsOf(steps()));
+    return purged;
+  } catch {
+    return purged;
   }
 }
 

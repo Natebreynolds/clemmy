@@ -26,6 +26,8 @@ const { groundedEntityMentionIds } = await import('./grounded-entity-mentions.js
 const { exactGroundedIdentifierMatch } = await import('./grounded-identifier-match.js');
 const { compileWordMatcher } = await import('./word-match.js');
 const relations = await import('./relations.js');
+const { SliceClock } = await import('./sliced-pass.js');
+const { memoryPassCursorIO } = await import('./pass-cursor.js');
 
 // ── fixture ────────────────────────────────────────────────────────────────
 
@@ -362,6 +364,94 @@ function referenceBackfillGroundedFactEntityLinks(): Record<string, number> {
   return stats;
 }
 
+/** The resource backfill as one ORDER BY … LIMIT statement and a per-candidate loop. */
+function referenceBackfillGroundedFactResourceLinks(): Record<string, number> {
+  const db = openMemoryDb();
+  const internals = relations.entityGroundingInternalsForTest();
+  const facts = db.prepare(`
+    SELECT cf.id, cf.content, cf.confidence, cf.trust_level FROM consolidated_facts cf
+    WHERE EXISTS (SELECT 1 FROM fact_resources fr WHERE fr.fact_id = cf.id AND fr.link_type = 'inferred_text')
+      AND EXISTS (SELECT 1 FROM fact_evidence fve JOIN memory_episodes me ON me.id = fve.episode_id
+                  WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0 AND me.status IN ('available','partial'))
+    ORDER BY cf.active DESC, cf.updated_at DESC, cf.id DESC LIMIT ?
+  `).all(5_000) as Array<{ id: number; content: string; confidence: number | null; trust_level: number | null }>;
+  const readEvidence = db.prepare(`
+    SELECT fve.episode_id, fve.excerpt FROM fact_evidence fve JOIN memory_episodes me ON me.id = fve.episode_id
+    WHERE fve.fact_id = ? AND length(trim(fve.excerpt)) > 0 AND me.status IN ('available','partial')
+    ORDER BY me.occurred_at DESC, fve.ordinal ASC LIMIT 12
+  `);
+  const readCandidates = db.prepare(`
+    SELECT fr.resource_id, rp.app, rp.kind, rp.name FROM fact_resources fr JOIN resource_pointers rp ON rp.id = fr.resource_id
+    WHERE fr.fact_id = ? AND fr.link_type = 'inferred_text' ORDER BY rp.mention_count DESC, rp.id ASC
+  `);
+  const owners = internals.buildResourceNameOwners(db);
+  const stats = { factsScanned: facts.length, evidenceScanned: 0, candidates: 0, promoted: 0, ambiguous: 0, ignored: 0 };
+  for (const fact of facts) {
+    const evidence = readEvidence.all(fact.id) as Array<{ episode_id: string; excerpt: string }>;
+    stats.evidenceScanned += evidence.length;
+    for (const candidate of readCandidates.all(fact.id) as Array<{ resource_id: number; app: string; kind: string; name: string }>) {
+      stats.candidates += 1;
+      const factMatch = internals.exactResourceNameMatch(fact.content, candidate.name);
+      const supporting = factMatch ? evidence.find((item) => internals.exactResourceNameMatch(item.excerpt, candidate.name)) : undefined;
+      if (!factMatch || !supporting || !internals.resourceNameSpecificEnough(candidate.name, candidate.app, candidate.kind)) { stats.ignored += 1; continue; }
+      if ((owners.get(internals.normalizedResourceGroundingName(candidate.name))?.size ?? 0) !== 1) { stats.ambiguous += 1; continue; }
+      relations.addFactResourceLinksInDatabase(db, fact.id, [candidate.resource_id], {
+        linkType: 'extracted', confidence: fact.confidence ?? fact.trust_level ?? 0.7,
+        evidenceEpisodeId: supporting.episode_id, evidenceExcerpt: supporting.excerpt,
+      });
+      stats.promoted += 1;
+    }
+  }
+  return stats;
+}
+
+/** The relationship backfill as one ORDER BY … LIMIT statement (with the correlated count) and a per-row loop. */
+function referenceBackfillGroundedEntityRelationships(): Record<string, number> {
+  const db = openMemoryDb();
+  const internals = relations.entityGroundingInternalsForTest();
+  const rows = db.prepare(`
+    SELECT cf.id AS fact_id, cf.confidence, cf.trust_level, cf.valid_from, cf.valid_to, fe.episode_id, fe.excerpt, fe.source_uri
+    FROM consolidated_facts cf
+    JOIN fact_evidence fe ON fe.fact_id = cf.id AND length(trim(fe.excerpt)) > 0
+    JOIN memory_episodes me ON me.id = fe.episode_id AND me.status IN ('available','partial')
+    WHERE cf.active = 1 AND (SELECT COUNT(*) FROM fact_entities link WHERE link.fact_id = cf.id) >= 2
+    ORDER BY cf.updated_at DESC, fe.ordinal ASC LIMIT ?
+  `).all(5_000) as Array<{
+    fact_id: number; confidence: number | null; trust_level: number | null; valid_from: string | null; valid_to: string | null;
+    episode_id: string; excerpt: string; source_uri: string | null;
+  }>;
+  const stats = { factsScanned: new Set(rows.map((row) => row.fact_id)).size, evidenceScanned: rows.length, candidates: 0, added: 0, reinforced: 0, ignored: 0 };
+  const names = new Map<number, string[]>();
+  for (const row of rows) {
+    const excerptLower = row.excerpt.toLowerCase();
+    const phrases = internals.relationshipPredicates.filter((phrase) => excerptLower.includes(phrase));
+    if (phrases.length === 0) continue;
+    const ids = relations.getEntityIdsForFact(row.fact_id).slice(0, 12);
+    for (const id of ids) if (!names.has(id)) names.set(id, internals.entityNamesForBackfill(db, id));
+    const emitted = new Set<string>();
+    for (const subjectId of ids) {
+      for (const objectId of ids) {
+        if (subjectId === objectId) continue;
+        const predicate = internals.explicitlyStatedRelationship(row.excerpt, names.get(subjectId) ?? [], names.get(objectId) ?? [], phrases);
+        if (!predicate) continue;
+        const key = `${subjectId}:${predicate}:${objectId}`;
+        if (emitted.has(key)) continue;
+        emitted.add(key);
+        stats.candidates += 1;
+        const result = relations.recordGroundedEntityRelationship({
+          subjectId, predicate, objectId, evidenceEpisodeId: row.episode_id, evidenceExcerpt: row.excerpt, sourceText: row.excerpt,
+          sourceUri: row.source_uri ?? undefined, sourceFactId: row.fact_id, confidence: row.confidence ?? row.trust_level ?? 0.7,
+          validFrom: row.valid_from ?? undefined, validTo: row.valid_to ?? undefined, extractionMethod: 'fact_backfill',
+        });
+        if (result.outcome === 'add') stats.added += 1;
+        else if (result.outcome === 'reinforce' || result.outcome === 'supersede') stats.reinforced += 1;
+        else stats.ignored += 1;
+      }
+    }
+  }
+  return stats;
+}
+
 // ── pins ───────────────────────────────────────────────────────────────────
 
 let fixture: Fixture;
@@ -375,8 +465,8 @@ before(() => {
     factEntityLinks: referenceSyncFactEntityLinks(),
     factResourceLinks: referenceSyncFactResourceLinks(),
     groundedFactEntityLinks: referenceBackfillGroundedFactEntityLinks(),
-    groundedFactResourceLinks: relations.backfillGroundedFactResourceLinks(),
-    relationships: relations.backfillGroundedEntityRelationships(),
+    groundedFactResourceLinks: referenceBackfillGroundedFactResourceLinks(),
+    relationships: referenceBackfillGroundedEntityRelationships(),
   };
   reference = { dump: dumpTables(), stats };
 });
@@ -493,4 +583,201 @@ test('the heavy fact is refreshed by exactly its difference: stale rows out, mis
   const inserted = [...expected].filter((id) => !oldIds.has(id) || old.find((row) => row.entity_id === id)!.confidence !== 0.55).length;
   assert.equal(writes(), deleted + inserted);
   assert.ok(deleted + inserted >= 150, `the heavy diff is ${deleted + inserted} rows`);
+});
+
+// ── sliced passes: same memory, bounded slices, a turn between slices ──────
+
+const TEST_SLICE = { maxMs: Number.POSITIVE_INFINITY, maxUnits: 50, maxWrites: 100 };
+
+/** Counts macrotask turns that ran while the code under test was awaited. */
+function turnCounter(): { stop: () => number } {
+  let turns = 0;
+  let on = true;
+  (function tick() {
+    turns += 1;
+    if (on) setImmediate(tick);
+  })();
+  return { stop: () => { on = false; return turns; } };
+}
+
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function heavyTier(db: Database.Database = openMemoryDb()): Set<string> {
+  return new Set((db.prepare(`SELECT entity_id, confidence FROM fact_entities WHERE fact_id = ? AND link_type = 'inferred_text'`)
+    .all(fixture.heavyFactId) as Array<{ entity_id: number; confidence: number }>).map((row) => `${row.entity_id}:${row.confidence}`));
+}
+
+test('the sliced passes leave memory exactly as the reference passes do, with a turn at least every 50 units or 100 row writes', async () => {
+  // The heavy fact's tier before and after its refresh.
+  restoreSnapshot();
+  const heavyBefore = heavyTier();
+  relations.syncFactEntityLinks();
+  const heavyAfter = heavyTier();
+  restoreSnapshot();
+
+  const db = openMemoryDb();
+  const meter = rowWriteMeter(db);
+  let metered = 0;
+  const writesBetweenTurns: number[] = [];
+  const slices: Array<{ units: number; writes: number }> = [];
+  const problems: string[] = [];
+  let checkHeavy = false;
+  let heavySplit = false;
+  const clock = new SliceClock(TEST_SLICE, {
+    onSlice: (slice) => slices.push({ units: slice.units, writes: slice.writes }),
+    yieldTurn: async () => {
+      if (db.inTransaction) problems.push('a turn inside a transaction');
+      const now = meter();
+      writesBetweenTurns.push(now - metered);
+      metered = now;
+      if (checkHeavy) {
+        const tier = heavyTier(db);
+        for (const row of tier) if (!heavyBefore.has(row) && !heavyAfter.has(row)) problems.push(`heavy tier gained ${row} outside old ∪ new`);
+        for (const row of heavyBefore) if (heavyAfter.has(row) && !tier.has(row)) problems.push(`heavy tier lost ${row} from old ∩ new`);
+        const same = (a: Set<string>) => a.size === tier.size && [...a].every((row) => tier.has(row));
+        if (!same(heavyBefore) && !same(heavyAfter)) heavySplit = true;
+      }
+      await nextTurn();
+    },
+  });
+
+  const counter = turnCounter();
+  checkHeavy = true;
+  const factEntityLinks = await relations.syncFactEntityLinksAsync({ clock });
+  checkHeavy = false;
+  const stats = {
+    factEntityLinks,
+    factResourceLinks: await relations.syncFactResourceLinksAsync({ clock }),
+    groundedFactEntityLinks: await relations.backfillGroundedFactEntityLinksAsync({ clock }),
+    groundedFactResourceLinks: await relations.backfillGroundedFactResourceLinksAsync({ clock }),
+    relationships: await relations.backfillGroundedEntityRelationshipsAsync({ clock }),
+  };
+  const loopTurns = counter.stop();
+  writesBetweenTurns.push(meter() - metered);
+
+  assert.deepEqual(stats, reference.stats);
+  assertSameTables(dumpTables(), reference.dump);
+  assert.deepEqual(problems, []);
+  assert.ok(heavySplit, "the heavy fact's difference was written across more than one slice");
+  for (const slice of slices) {
+    assert.ok(slice.units <= TEST_SLICE.maxUnits, `a slice counted ${slice.units} units`);
+    assert.ok(slice.writes <= TEST_SLICE.maxWrites, `a slice counted ${slice.writes} writes`);
+  }
+  assert.ok(Math.max(...writesBetweenTurns) <= TEST_SLICE.maxWrites, `metered row writes between turns: max ${Math.max(...writesBetweenTurns)}`);
+  const { units } = clock.totals;
+  assert.ok(clock.turns >= Math.ceil(units / TEST_SLICE.maxUnits) - 1, `${clock.turns} turns for ${units} units`);
+  assert.ok(loopTurns >= clock.turns, `the loop ran ${loopTurns} turns during ${clock.turns} pass turns`);
+});
+
+function failingClock(failAtTurn: number): SliceClock {
+  let turns = 0;
+  return new SliceClock(TEST_SLICE, {
+    yieldTurn: async () => {
+      turns += 1;
+      if (turns === failAtTurn) throw new Error('the process stopped');
+      await nextTurn();
+    },
+  });
+}
+
+test('an interrupted pass resumes after its last committed slice and ends exactly as an uninterrupted run', async () => {
+  restoreSnapshot();
+  const cursor = memoryPassCursorIO();
+  const day = '2026-09-27';
+  const options = { cursor, day, cursorWriteIntervalMs: 0 };
+  const ids = relations.LINK_PASS_IDS;
+
+  await assert.rejects(relations.syncFactEntityLinksAsync({ ...options, clock: failingClock(6) }), /the process stopped/);
+  const syncCursor = cursor.read(ids.entitySync);
+  assert.equal(syncCursor?.attempts, 1);
+  assert.equal(typeof syncCursor?.after, 'number', 'the entity refresh recorded the last fact it finished');
+  const factEntityLinks = await relations.syncFactEntityLinksAsync({ ...options, clock: new SliceClock(TEST_SLICE) });
+  assert.equal(cursor.read(ids.entitySync), null, 'a finished pass clears its cursor');
+
+  const factResourceLinks = await relations.syncFactResourceLinksAsync({ ...options, clock: new SliceClock(TEST_SLICE) });
+
+  await assert.rejects(relations.backfillGroundedFactEntityLinksAsync({ ...options, clock: failingClock(12) }), /the process stopped/);
+  const backfillCursor = cursor.read(ids.entityBackfill);
+  assert.ok(backfillCursor?.partial, 'the grounding pass stopped inside a fact and recorded the candidates it had decided');
+  const groundedFactEntityLinks = await relations.backfillGroundedFactEntityLinksAsync({ ...options, clock: new SliceClock(TEST_SLICE) });
+
+  await assert.rejects(relations.backfillGroundedFactResourceLinksAsync({ ...options, clock: failingClock(4) }), /the process stopped/);
+  const groundedFactResourceLinks = await relations.backfillGroundedFactResourceLinksAsync({ ...options, clock: new SliceClock(TEST_SLICE) });
+
+  await assert.rejects(relations.backfillGroundedEntityRelationshipsAsync({
+    ...options,
+    clock: new SliceClock({ ...TEST_SLICE, maxUnits: 20 }, {
+      yieldTurn: (() => { let turns = 0; return async () => { turns += 1; if (turns === 6) throw new Error('the process stopped'); await nextTurn(); }; })(),
+    }),
+  }), /the process stopped/);
+  assert.ok(cursor.read(ids.relationships)?.after, 'the relationship pass recorded the last evidence row it finished');
+  const relationships = await relations.backfillGroundedEntityRelationshipsAsync({ ...options, clock: new SliceClock(TEST_SLICE) });
+
+  assert.deepEqual(
+    { factEntityLinks, factResourceLinks, groundedFactEntityLinks, groundedFactResourceLinks, relationships },
+    reference.stats,
+  );
+  assertSameTables(dumpTables(), reference.dump);
+  assert.equal(cursor.cursors.size, 0);
+});
+
+test('a pass resumes at most once a day: the third attempt starts over', async () => {
+  restoreSnapshot();
+  const cursor = memoryPassCursorIO();
+  const day = '2026-09-27';
+  const id = relations.LINK_PASS_IDS.entityBackfill;
+  await assert.rejects(relations.backfillGroundedFactEntityLinksAsync({ cursor, day, cursorWriteIntervalMs: 0, clock: failingClock(8) }));
+  assert.equal(cursor.read(id)?.attempts, 1);
+  await assert.rejects(relations.backfillGroundedFactEntityLinksAsync({ cursor, day, cursorWriteIntervalMs: 0, clock: failingClock(8) }));
+  const second = cursor.read(id);
+  assert.equal(second?.attempts, 2);
+  assert.ok(second?.after !== null || second?.partial !== null, 'the second attempt resumed and moved on');
+
+  const writes: Array<{ attempts: number; after: unknown; stats: unknown }> = [];
+  const watched = {
+    read: cursor.read,
+    clear: cursor.clear,
+    write: (passId: string, value: Parameters<typeof cursor.write>[1]) => {
+      writes.push({ attempts: value.attempts, after: value.after, stats: value.stats });
+      cursor.write(passId, value);
+    },
+  };
+  const third = await relations.backfillGroundedFactEntityLinksAsync({ cursor: watched, day, cursorWriteIntervalMs: 0, clock: new SliceClock(TEST_SLICE) });
+  assert.deepEqual(writes[0], { attempts: 3, after: null, stats: null }, 'the third attempt starts from the beginning');
+  const uninterrupted = reference.stats as { groundedFactEntityLinks: { factsScanned: number; promoted: number } };
+  // Counted afresh: facts whose every candidate the earlier attempts promoted
+  // are no longer selected, and those links are no longer candidates.
+  assert.ok(third.factsScanned < uninterrupted.groundedFactEntityLinks.factsScanned);
+  assert.ok(third.promoted < uninterrupted.groundedFactEntityLinks.promoted);
+  assert.equal(cursor.read(id), null);
+
+  // A cursor left from another day is not resumed: the attempt is the day's first.
+  await assert.rejects(relations.backfillGroundedFactEntityLinksAsync({ cursor, day, cursorWriteIntervalMs: 0, clock: failingClock(8) }));
+  const nextDay = writes.length;
+  await relations.backfillGroundedFactEntityLinksAsync({ cursor: watched, day: '2026-09-28', cursorWriteIntervalMs: 0, clock: new SliceClock(TEST_SLICE) });
+  assert.deepEqual(writes[nextDay], { attempts: 1, after: null, stats: null });
+  assert.equal(cursor.read(id), null);
+});
+
+test('the paged selections return the same rows in the same order as the one-statement selections', () => {
+  restoreSnapshot();
+  const db = openMemoryDb();
+  const legacyBackfill = (db.prepare(`
+    SELECT cf.id FROM consolidated_facts cf
+    WHERE EXISTS (SELECT 1 FROM fact_entities fe WHERE fe.fact_id = cf.id AND fe.link_type = 'inferred_text')
+      AND EXISTS (SELECT 1 FROM fact_evidence fve JOIN memory_episodes me ON me.id = fve.episode_id
+                  WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0 AND me.status IN ('available','partial'))
+    ORDER BY cf.active DESC, cf.updated_at DESC, cf.id DESC LIMIT 5000
+  `).all() as Array<{ id: number }>).map((row) => row.id);
+  const legacyRelationships = (db.prepare(`
+    SELECT cf.id AS fact_id, fe.episode_id FROM consolidated_facts cf
+    JOIN fact_evidence fe ON fe.fact_id = cf.id AND length(trim(fe.excerpt)) > 0
+    JOIN memory_episodes me ON me.id = fe.episode_id AND me.status IN ('available','partial')
+    WHERE cf.active = 1 AND (SELECT COUNT(*) FROM fact_entities link WHERE link.fact_id = cf.id) >= 2
+    ORDER BY cf.updated_at DESC, fe.ordinal ASC LIMIT 5000
+  `).all() as Array<{ fact_id: number; episode_id: string }>).map((row) => `${row.fact_id}:${row.episode_id}`);
+  const selection = relations.linkPassSelectionsForTest(db);
+  assert.deepEqual(selection.groundingFactIds('fact_entities', 5_000), legacyBackfill);
+  assert.deepEqual(selection.relationshipRows(5_000), legacyRelationships);
+  assert.ok(legacyBackfill.length > 100 && legacyRelationships.length > 100);
 });

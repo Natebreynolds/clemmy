@@ -15,8 +15,10 @@ const {
   getFactEvidence,
   readTemporalEvidenceHealth,
   reconcileTemporalEvidence,
+  reconcileTemporalEvidenceAsync,
   recordMemoryEpisode,
 } = await import('./temporal-memory.js');
+const { SliceClock } = await import('./sliced-pass.js');
 const { recallMemory } = await import('./recall-memory.js');
 const {
   createSession,
@@ -254,6 +256,44 @@ test('operator reconciliation creates a backup and returns a complete audit repo
   assert.equal(report.remaining, 0);
   assert.equal(report.complete, true);
   assert.ok(report.backupPath && existsSync(report.backupPath));
+});
+
+test('the sliced operator reconciliation gives the same report, one fact per step, with turns between', async () => {
+  const facts = Array.from({ length: 5 }, (_, i) => rememberFact({ kind: 'user', content: `Legacy direct fact number ${i} awaiting provenance.` }));
+  const db = openMemoryDb();
+  for (const fact of facts) db.prepare('DELETE FROM fact_evidence WHERE fact_id = ?').run(fact.id);
+  assert.equal(countUnreconciledFactEvidence(), 5);
+
+  let backups = 0;
+  let turns = 0;
+  const unitsPerSlice: number[] = [];
+  const clock = new SliceClock({ maxMs: Number.POSITIVE_INFINITY, maxUnits: 2, maxWrites: 1_000 }, {
+    onSlice: (slice) => unitsPerSlice.push(slice.units),
+    yieldTurn: async () => {
+      assert.equal(db.inTransaction, false);
+      turns += 1;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    },
+  });
+  const report = await reconcileTemporalEvidenceAsync({
+    maxFacts: 10,
+    batchSize: 2,
+    requireBackup: true,
+    clock,
+    backup: async () => { backups += 1; return { backupPath: '/fixture/backup.db', bytes: 1, reused: false }; },
+  });
+  assert.equal(backups, 1);
+  assert.deepEqual(
+    { before: report.before, processed: report.processed, available: report.available, unavailable: report.unavailable, remaining: report.remaining, complete: report.complete, backupPath: report.backupPath },
+    { before: 5, processed: 5, available: 5, unavailable: 0, remaining: 0, complete: true, backupPath: '/fixture/backup.db' },
+  );
+  assert.ok(turns >= 5, `turns ${turns}`);
+  assert.ok(unitsPerSlice.every((units) => units <= 2));
+
+  await assert.rejects(
+    reconcileTemporalEvidenceAsync({ requireBackup: true, backup: () => null }),
+    /preflight memory backup could not be created/,
+  );
 });
 
 test('supersession returns the current claim now and the old claim historically', async () => {
