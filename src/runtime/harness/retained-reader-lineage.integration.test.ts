@@ -203,3 +203,48 @@ test('recall, query and search addressed at a carrier-dispatched recall all read
   assert.match(search, /Quartzfeather irrigation valve replaced/);
   assert.doesNotMatch(search, /presentation-only|cannot be used/);
 });
+
+test('a text result digested on the real carrier path names recall and file_query, never the record query', async () => {
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const slug = 'lineage-orchard-notes';
+  // A saved view is text: long enough to be digested when read through a
+  // carrier, with no structured records in it.
+  const paragraphs = Array.from({ length: 80 }, (_, index) =>
+    `<p>Walk ${index + 1}: the east rows were checked for frost damage and the mulch was topped up.</p>`).join('\n');
+  spaceStore.save({ id: slug, title: 'Orchard walk notes', initialData: { rows: [] },
+    viewContent: `<!doctype html><html><head><style>body{margin:0}</style></head><body>\n${paragraphs}\n</body></html>` });
+  const session = eventlog.createSession({ id: 'reader-digest-session', kind: 'chat' });
+  const objective = 'Read the saved orchard walk notes view.';
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: objective } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) throw new Error(primed.reason);
+  const model = stubModel([
+    [toolCall('digest-view', 'call_tool', { name: 'space_get_view',
+      args_json: JSON.stringify({ slug, grep: null, around: null }) })],
+    [textMessage('The notes record eighty orchard walks.')],
+  ]);
+  const agent = await buildOrchestratorAgent({ userInput: objective, ...identity,
+    hostFreshPlanning: primed.planning, allowedToolNames: ['space_get_view', 'recall_tool_result', 'tool_output_query', 'file_query', 'tool_search'],
+    allowToolJit: true,
+    mcpToolScope: { authority: 'none', reason: 'Reader digest integration has no external authority',
+      allowedServerSlugs: [], toolPatterns: [], maxTools: 0 }, model: model as never });
+  const runner = throwingRunner();
+  const detach = attachEventLogHooks(runner as never, { getSessionId: () => session.id, getTurn: () => source.turn });
+  const outcome = await brackets.withHarnessRunContext({ ...identity,
+    counter: new brackets.ToolCallsCounter(6), behaviorScopeId: `${session.id}::source:${source.seq}` },
+    () => hostRunRunner(runner as never, agent as never,
+      [{ type: 'message', role: 'user', content: objective }] as never,
+      { maxTurns: 4, hostTurnEngine: 'host_v1', context: identity } as never));
+  detach();
+  const visible = historyResult(outcome.history as unknown[], 'digest-view');
+  const footer = visible.slice(visible.lastIndexOf('[digest:'));
+  assert.match(footer, /\[digest: space_get_view returned/, visible.slice(-1500));
+  assert.match(footer, /recall_tool_result \{"call_id":"digest-view"/);
+  assert.match(footer, /file_query \{"call_id":"digest-view"/);
+  assert.doesNotMatch(footer, /tool_output_query/);
+  assert.match(footer, /still pending\.\]/, 'the footer is whole, never cut mid call id');
+});

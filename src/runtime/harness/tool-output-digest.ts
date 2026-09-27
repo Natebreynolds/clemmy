@@ -24,6 +24,11 @@ export interface DigestOptions {
   maxChars?: number;
   toolName?: string | null;
   callId?: string | null;
+  /** The reader router's advice for THIS stored output, computed only when a
+   *  text digest needs it. The digest never names a reader for text on its own
+   *  authority: which reader can serve a stored output is decided by its shape,
+   *  in one place. */
+  readerAdvice?: () => string;
 }
 
 function tryParse(text: string): unknown {
@@ -616,6 +621,22 @@ function recoveryHint(callId: string | null | undefined, sampleFields?: string[]
   );
 }
 
+/**
+ * The footer for a TEXT digest. A text result holds no records, so the record
+ * query is never advertised here unless the reader router, which inspects the
+ * stored bytes, says the output does hold structured data. Without the router
+ * (no session), recall is the reader that serves any stored text.
+ */
+function textRecoveryHint(callId: string | null | undefined, readerAdvice?: () => string): string {
+  if (!callId) return recoveryHint(callId);
+  let advice = '';
+  try { advice = readerAdvice?.() ?? ''; } catch { advice = ''; }
+  const readers = advice.trim()
+    || `Read it with ${toolCallHint('recall_tool_result', { call_id: callId })} (add "offset" to page).`;
+  return `The full result is stored. ${readers} `
+    + 'These readers are available now; do NOT say the data is unavailable or that the call is still pending.';
+}
+
 function digestArray(arr: unknown[], totalChars: number, maxChars: number, toolName: string, callId: string | null | undefined): string {
   const total = arr.length;
   const fields = collectFields(arr);
@@ -872,18 +893,27 @@ function digestComposioCatalog(
   return body + footer;
 }
 
-function digestText(text: string, maxChars: number, toolName: string, callId: string | null | undefined): string {
+function digestText(
+  text: string,
+  maxChars: number,
+  toolName: string,
+  callId: string | null | undefined,
+  readerAdvice?: () => string,
+): string {
   const lines = text.split('\n');
-  const footerReserve = 300;
-  const budget = Math.max(200, maxChars - footerReserve);
+  const hint = textRecoveryHint(callId, readerAdvice);
+  // The footer is sized first so the head and tail fit around it: a footer
+  // cut by a later cap loses the one exact call that reaches the rest.
+  const footerFor = (withTail: boolean) =>
+    `\n[digest: ${toolName} returned ${text.length.toLocaleString()} chars / ${lines.length.toLocaleString()} lines. ` +
+    `Showing the head${withTail ? ' and tail' : ''}. ${hint}]`;
+  const omitted = '\n…[middle omitted]…\n';
+  const budget = Math.max(200, maxChars - footerFor(true).length - omitted.length);
   const headLen = Math.floor(budget * 0.7);
   const tailLen = budget - headLen;
   const head = text.slice(0, headLen);
   const tail = text.length > headLen + tailLen ? text.slice(text.length - tailLen) : '';
-  const footer =
-    `\n[digest: ${toolName} returned ${text.length.toLocaleString()} chars / ${lines.length.toLocaleString()} lines. ` +
-    `Showing the head${tail ? ' and tail' : ''}. ${recoveryHint(callId)}]`;
-  return tail ? `${head}\n…[middle omitted]…\n${tail}${footer}` : `${head}${footer}`;
+  return tail ? `${head}${omitted}${tail}${footerFor(true)}` : `${head}${footerFor(false)}`;
 }
 
 /**
@@ -901,5 +931,5 @@ export function digestToolOutput(text: string, options: DigestOptions = {}): str
     const obj = parsed as Record<string, unknown>;
     return digestComposioCatalog(obj, text.length, maxChars, toolName, callId) ?? digestObject(obj, text.length, maxChars, toolName, callId);
   }
-  return digestText(text, maxChars, toolName, callId);
+  return digestText(text, maxChars, toolName, callId, options.readerAdvice);
 }

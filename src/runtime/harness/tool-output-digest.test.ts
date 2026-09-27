@@ -161,6 +161,30 @@ test('plain text: head+tail + line/char count, points to recall', () => {
   assert.match(digest, /recall_tool_result \{"call_id":"call_t1"\}/);
 });
 
+test('plain text: the footer never advertises the record query, and fits whole in the budget', () => {
+  // Regression: the text footer named tool_output_query for output it knew
+  // held no records, and a later cap cut that footer mid call id.
+  const text = Array.from({ length: 500 }, (_, i) => `line ${i} ${'x'.repeat(40)}`).join('\n');
+  const digest = digestToolOutput(text, { maxChars: 1200, toolName: 'run_shell_command', callId: 'call_t2' });
+  assert.doesNotMatch(digest, /tool_output_query/);
+  assert.ok(digest.length <= 1200, `digest ${digest.length} chars exceeds its budget`);
+  assert.ok(digest.endsWith('still pending.]'), 'the footer survives whole');
+});
+
+test('plain text: the reader router, when given, decides the footer advice', () => {
+  const text = 'y'.repeat(5_000);
+  let asked = 0;
+  const digest = digestToolOutput(text, { maxChars: 1500, toolName: 't', callId: 'call_t3',
+    readerAdvice: () => { asked += 1; return 'Call file_query {"call_id":"call_t3","query":"<what you need>"} — routed.'; } });
+  assert.equal(asked, 1);
+  assert.match(digest, /Call file_query \{"call_id":"call_t3"/);
+  assert.doesNotMatch(digest, /tool_output_query/);
+  // Structured digests keep their own record-query footer and never ask.
+  digestToolOutput(JSON.stringify(accounts), { maxChars: 1500, toolName: 'sf', callId: 'call_x9',
+    readerAdvice: () => { asked += 1; return ''; } });
+  assert.equal(asked, 1, 'the router is consulted only for a text digest');
+});
+
 test('no callId: still a digest, but recovery hint is the re-run advice', () => {
   const digest = digestToolOutput(JSON.stringify(accounts), { maxChars: 1500, toolName: 'sf' });
   assert.match(digest, /array of 37 records/);

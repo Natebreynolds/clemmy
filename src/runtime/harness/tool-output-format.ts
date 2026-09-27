@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getToolOutputForInvocation, writeToolOutput } from './eventlog.js';
+import { retainedResultWayThrough } from './retained-result-routes.js';
 import { getToolOutputContext } from './tool-output-context.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
@@ -408,6 +409,9 @@ export function formatRecallableToolText(
     maxChars: compactBudget,
     toolName,
     callId,
+    // The stored row exists (written above), so the one reader router can
+    // name the reader that serves this output's actual shape.
+    readerAdvice: () => retainedResultWayThrough({ sessionId, callId }),
   }));
   if (exactReceipt && compact.length > maxChars - receiptReserve) {
     // Defensive absolute cap for non-JSON and root-array fallbacks. Preserve
