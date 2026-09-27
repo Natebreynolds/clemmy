@@ -407,7 +407,11 @@ export interface MemoryJobServing {
  * others where the router sends today's fast-tier string. Null for a job the
  * memory model does not govern, or when nothing can be named. Never throws.
  */
-export function memoryJobServing(job: MemoryJobId, described: MemoryModelDescription = describeMemoryModel()): MemoryJobServing | null {
+export function memoryJobServing(job: MemoryJobId, described?: MemoryModelDescription): MemoryJobServing | null {
+  return withRuntimeConfigSnapshot(() => memoryJobServingNow(job, described ?? describeMemoryModel()));
+}
+
+function memoryJobServingNow(job: MemoryJobId, described: MemoryModelDescription): MemoryJobServing | null {
   try {
     if (!memoryJobUsesMemoryModel(job)) return null;
     if (described.source === 'chosen' || BOUNDARY_JOBS.has(job)) {
@@ -426,7 +430,7 @@ export function memoryJobServing(job: MemoryJobId, described: MemoryModelDescrip
 }
 
 /** The model id a governed job would ask for (see memoryJobServing). */
-export function memoryJobModelId(job: MemoryJobId, described: MemoryModelDescription = describeMemoryModel()): string | null {
+export function memoryJobModelId(job: MemoryJobId, described?: MemoryModelDescription): string | null {
   return memoryJobServing(job, described)?.modelId ?? null;
 }
 
