@@ -138,7 +138,7 @@ function resolveOne(sessionId: string, ref: ToolOutputRef, trustedCallIds: Set<s
   const row = resolution.record;
   const parked = parseParkedOutput(row.output);
   if (parked.partialPrefix) {
-    errors.push(`$fromToolOutput: output for "${ref.callId}" holds only the first rows of a list that was cut off — a reference would silently drop the rest. Re-read the complete result, then reference it.`);
+    errors.push(`$fromToolOutput: output for "${ref.callId}" holds only the first rows of a list that was cut off — a reference would silently drop the rest. Re-run it so the whole output is kept (paged, or written to a file), then reference that.`);
     return undefined;
   }
   const projected = projectToolOutputValueForAutomaticAuthority(
