@@ -439,15 +439,35 @@ function flattenAnyOfAlternatives(alternatives: readonly unknown[]): unknown[] {
   });
 }
 
+// A `pattern` beside a string `format` is dropped only when it is exactly the
+// regex zod writes for its own spelling of that format, so the format name
+// already states the grammar the parser accepts. Any other pattern beside a
+// format narrows it (zod's Z-only or zone-free date-time, its practical email
+// and versioned uuid, a provider's own pattern) and stays in the advert.
+const ADVERTISED_FORMAT_EQUIVALENT_PATTERNS: ReadonlyMap<string, string> = new Map(
+  [z.string().datetime({ offset: true }), z.string().date()].flatMap((schema) => {
+    const advertised = z.toJSONSchema(schema) as { format?: unknown; pattern?: unknown };
+    return typeof advertised.format === 'string' && typeof advertised.pattern === 'string'
+      ? [[advertised.format, advertised.pattern] as const]
+      : [];
+  }),
+);
+
 function compactAdvertisedSchemaNode(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(compactAdvertisedSchemaNode);
   if (!value || typeof value !== 'object') return value;
+  const node = value as Record<string, unknown>;
+  const formatNamesGrammar = node.type === 'string'
+    && typeof node.format === 'string'
+    && typeof node.pattern === 'string'
+    && ADVERTISED_FORMAT_EQUIVALENT_PATTERNS.get(node.format) === node.pattern;
   const out: Record<string, unknown> = {};
-  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, nested] of Object.entries(node)) {
     if (ADVERTISED_SCHEMA_INSTANCE_VALUE_KEYS.has(key)) {
       out[key] = nested;
       continue;
     }
+    if (key === 'pattern' && formatNamesGrammar) continue;
     // zod spells a bare `.int()` as the full safe-integer range; "any integer"
     // is already what `type: integer` says.
     if (
@@ -479,12 +499,15 @@ function compactAdvertisedSchemaNode(value: unknown): unknown {
  * The ADVERTISED form of a tool's JSON schema — the bytes every model step
  * carries for every tool on the surface — is a projection of the parser, not
  * the parser itself: the registered zod schema still validates every call.
- * Two converter artifacts ride along without telling the model anything and
+ * Converter artifacts ride along without telling the model anything; they
  * are removed here, once, for every surface:
  *   - the root `$schema` draft URI (meaningless inside a tool definition);
  *   - `anyOf[anyOf[T,null],null]`, zod's spelling of `.nullable().optional()`,
  *     which is exactly `anyOf[T,null]`;
- *   - the safe-integer `minimum`/`maximum` sentinels zod adds to a bare `.int()`.
+ *   - the safe-integer `minimum`/`maximum` sentinels zod adds to a bare `.int()`;
+ *   - the regex zod writes for its own spelling of a standard string `format`
+ *     (an offset date-time, a date), whose name already states that grammar.
+ *     A pattern that narrows or differs from its format stays.
  * Nothing the schema accepts or rejects changes; only its byte count does.
  */
 export function compactAdvertisedJsonSchema(schemaValue: unknown): unknown {

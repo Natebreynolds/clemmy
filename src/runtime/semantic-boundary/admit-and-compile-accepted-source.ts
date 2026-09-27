@@ -434,6 +434,15 @@ function eventHasAttachments(data: Record<string, unknown> | undefined): boolean
   return false;
 }
 
+/** The exact accepted source carries attachments. A read failure throws, so a
+ * caller that treats absence as evidence cannot mistake it for "none". */
+export function acceptedSourceHasAttachments(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): boolean {
+  return eventHasAttachments(acceptedUserSource(input)?.data);
+}
+
 /** Prior chat text or this-turn attachments. Retrieve/act is a separate signal. */
 export function sessionHasConversationalReferent(input: {
   sessionId: string;

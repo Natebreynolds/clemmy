@@ -76,7 +76,7 @@ export const WorkerToolInputSchema = z.object({
     .min(1)
     .describe('Shared source facts.'),
   retainedResultIds: z.array(z.string().min(1)).max(32).nullable().optional()
-    .describe('Read-only parent call IDs/handles. Use tool_output_query; avoid copying payloads.'),
+    .describe('Read-only parent call ids/handles, passed instead of copied payloads.'),
   instructions: z
     .string()
     .min(1)
@@ -139,7 +139,7 @@ export const WorkerToolCallSchema = WorkerToolInputSchema.extend({
     item: z.string().min(1),
     context: z.string().min(1),
   })).max(256).nullable().optional()
-    .describe('Exactly one facts entry per item, if supplied. Workers receive shared context plus their own entry only.'),
+    .describe('Exactly one facts entry per item, or null; each worker also gets context.'),
   // New live calls must state external authority explicitly. The base packet
   // remains optional for durable pre-upgrade packets recovered from disk.
   externalMcpToolNames: ExternalMcpToolNamesSchema

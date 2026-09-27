@@ -1691,6 +1691,23 @@ export function isHarnessBoundFunctionTool(tool: unknown): boolean {
   return candidate.name === attestation.name && candidate.invoke === attestation.invoke;
 }
 
+/**
+ * A copy of a tool whose schema stays off the request while the search and
+ * call doors ride it (`deferLoading: true`, advertised-tool-wire.ts). The
+ * source object is never mutated, and the copy keeps every identity-keyed
+ * host registration the harness wrapper itself carries across a copy: the
+ * executable identity is unchanged, only the loading flag differs.
+ */
+export function withDeferredLoading<T extends object>(tool: T): T {
+  const copy = { ...tool, deferLoading: true } as T;
+  copyToolLocalInputInvalidityAttestation(tool, copy);
+  copyHostPlanningReadCapabilityResolver(tool, copy);
+  copyHostWorkCallPreparer(tool, copy);
+  copyTerminalPhysicalDispatchOwnership(tool, copy);
+  if (isHarnessBoundFunctionTool(tool)) attestHarnessBoundTool(copy);
+  return copy;
+}
+
 // Tool reliability brackets — per-tool wall-clock timeout + identical-args
 // loop-guard (soft block@5 through 11, terminal escalate@12) + counter cap.
 // Production is unconditionally enabled: a raw tool must never escape because

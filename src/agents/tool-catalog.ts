@@ -280,6 +280,24 @@ export function resolveHotSet(
   userInput: string | undefined | null,
   opts: { allowedNames?: ReadonlySet<string> } = {},
 ): Set<string> {
+  const parts = resolveHotSetParts(sessionId, userInput, opts);
+  return new Set([...parts.kernel, ...parts.request, ...parts.session]);
+}
+
+/**
+ * The hot set by what earned each name, in hot-set order:
+ *   kernel  — TOOL_SEARCH_ALWAYS_LOADED;
+ *   request — the request identifies these: exact tool names, a uniquely
+ *             named workflow, recall pins for this input;
+ *   session — the bounded session LRU (tools this session dispatched).
+ * A name appears in every part that earned it; `resolveHotSet` is their
+ * union in this order, so its membership and order are unchanged.
+ */
+export function resolveHotSetParts(
+  sessionId: string | undefined | null,
+  userInput: string | undefined | null,
+  opts: { allowedNames?: ReadonlySet<string> } = {},
+): { kernel: string[]; request: string[]; session: string[] } {
   const universe = allRegistryNames();
   const allowed = opts.allowedNames;
   const keep = (name: string) => universe.has(name) && passesPolicy(name, allowed);
@@ -292,10 +310,11 @@ export function resolveHotSet(
   const keepFirstClass = (name: string) =>
     keep(name) && (!DISCOVERY_SIBLING_DOORS.has(name) || named(name));
 
-  const out = new Set<string>();
-  for (const name of TOOL_SEARCH_ALWAYS_LOADED) if (keep(name)) out.add(name);
+  const kernel = new Set<string>();
+  for (const name of TOOL_SEARCH_ALWAYS_LOADED) if (keep(name)) kernel.add(name);
+  const request = new Set<string>();
   for (const name of universe) {
-    if (keep(name) && named(name)) out.add(name);
+    if (keep(name) && named(name)) request.add(name);
   }
   // A uniquely named existing workflow is a bounded, host-proven resource
   // match. Keep its reader first-class so an inspect/frontmatter turn does not
@@ -303,16 +322,17 @@ export function resolveHotSet(
   // identity alone is not execution authority: promote the immediate run
   // control only when the positive (non-prohibited) request asks to execute.
   if (uniqueEnabledWorkflowMatch(query)) {
-    if (keep('workflow_get')) out.add('workflow_get');
-    if (keep('workflow_run') && requestsWorkflowExecution(query)) out.add('workflow_run');
+    if (keep('workflow_get')) request.add('workflow_get');
+    if (keep('workflow_run') && requestsWorkflowExecution(query)) request.add('workflow_run');
   }
   for (const name of recallPinnedBuiltinTools(userInput).slice(0, MAX_RECALL_PROMOTIONS)) {
-    if (keepFirstClass(name)) out.add(name);
+    if (keepFirstClass(name)) request.add(name);
   }
+  const session = new Set<string>();
   for (const name of getHotSet(sessionId).slice(0, MAX_SESSION_PROMOTIONS)) {
-    if (keepFirstClass(name)) out.add(name);
+    if (keepFirstClass(name)) session.add(name);
   }
-  return out;
+  return { kernel: [...kernel], request: [...request], session: [...session] };
 }
 
 // ── Ranking (reuses the embedding infra tool-jit ranks with) ──────────────────

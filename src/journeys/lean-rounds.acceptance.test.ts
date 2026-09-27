@@ -17,7 +17,9 @@
  *   c  a provider read whose result crosses the business carrier, with the
  *      answer in the payload's tail;
  *   d  a calendar read with planted events;
- *   e  a no-signal control ("the thing from earlier");
+ *   e  a no-signal control ("the thing from earlier"): every tool its baseline
+ *      round 1 carried stays reachable that round, under the desk owner's
+ *      no-signal rule (NO_TARGET_STARTS_LEAN in agents/turn-desk.ts);
  *   f  the calendar read again, after the same request already ran once in
  *      another conversation, so remembered runs and proven operations exist.
  * Jev arms: off with no key; key present but the System One wire hangs until
@@ -53,6 +55,8 @@ import {
   type JevArm,
   type ScenarioId,
 } from './lean-rounds-support.fixture.js';
+import { NO_TARGET_STARTS_LEAN } from '../agents/turn-desk.js';
+import { deskDeclarationFor } from '../tools/tool-registry.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CASE_FIXTURE = path.join(repoRoot, 'src/journeys/lean-rounds.case.fixture.ts');
@@ -129,6 +133,7 @@ test('Lean Rounds acceptance: rounds and round-1 bytes per scenario and Jev arm,
   for (const row of rows) {
     console.log(`${row.scenario}/${row.arm} r1 buckets(est. tokens) ${JSON.stringify(row.round1BucketTokens)}`);
     console.log(`${row.scenario}/${row.arm} r1 wire tools ${row.round1WireTools.join(',')}`);
+    console.log(`${row.scenario}/${row.arm} r1 on-request tools ${row.round1OnRequestTools.join(',') || '-'}`);
   }
   if (process.env.LEAN_ROUNDS_WRITE_BASELINE) {
     writeFileSync(process.env.LEAN_ROUNDS_WRITE_BASELINE, `${JSON.stringify({
@@ -138,6 +143,7 @@ test('Lean Rounds acceptance: rounds and round-1 bytes per scenario and Jev arm,
         round1Bytes: row.round1Bytes,
         totalRequestBytes: row.totalRequestBytes,
         round1WireTools: row.round1WireTools,
+        round1OnRequestTools: row.round1OnRequestTools,
       }])),
     }, null, 2)}\n`);
   }
@@ -178,12 +184,31 @@ test('Lean Rounds acceptance: rounds and round-1 bytes per scenario and Jev arm,
     }
   });
 
-  await t.test('the no-signal control keeps every baseline round-1 tool under every arm', () => {
-    const expected = baseline.cases['e_no_signal_control/jev_off']?.round1WireTools ?? [];
-    assert.ok(expected.length > 0, 'the control baseline names its round-1 tools');
-    for (const row of rows.filter((entry) => entry.scenario === 'e_no_signal_control')) {
-      assert.deepEqual(expected.filter((name) => !row.round1WireTools.includes(name)), [],
-        `${row.arm}: the no-signal control lost a round-1 tool`);
-    }
-  });
+  // The no-signal rule is the desk owner's constant. With "no evidence ->
+  // full" every baseline round-1 tool rides the control's wire. With "nothing
+  // becomes unreachable" each one is on the wire or deferred by a desk
+  // declaration and named on the names-only line; its exact-name tool_search
+  // schema and its call_tool handler are pinned for every desk-declared tool
+  // in src/runtime/harness/turn-desk-reachability.integration.test.ts.
+  const controlBaseline = baseline.cases['e_no_signal_control/jev_off'];
+  const controlTools = [...(controlBaseline?.round1WireTools ?? []), ...(controlBaseline?.round1OnRequestTools ?? [])];
+  if (!NO_TARGET_STARTS_LEAN) {
+    await t.test('the no-signal control keeps every baseline round-1 tool under every arm', () => {
+      assert.ok(controlTools.length > 0, 'the control baseline names its round-1 tools');
+      for (const row of rows.filter((entry) => entry.scenario === 'e_no_signal_control')) {
+        assert.deepEqual(controlTools.filter((name) => !row.round1WireTools.includes(name)), [],
+          `${row.arm}: the no-signal control lost a round-1 tool`);
+      }
+    });
+  } else {
+    await t.test('the no-signal control keeps every baseline round-1 tool reachable under every arm', () => {
+      assert.ok(controlTools.length > 0, 'the control baseline names its round-1 tools');
+      for (const row of rows.filter((entry) => entry.scenario === 'e_no_signal_control')) {
+        const unreachable = controlTools.filter((name) => !row.round1WireTools.includes(name)
+          && !(row.round1OnRequestTools.includes(name) && deskDeclarationFor(name) !== null));
+        assert.deepEqual(unreachable, [],
+          `${row.arm}: a baseline round-1 tool is neither on the wire nor a desk tool named on the names-only line`);
+      }
+    });
+  }
 });

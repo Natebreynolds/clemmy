@@ -6446,6 +6446,90 @@ function canonicalOutputChunks(
   ).all(sessionId, callId) as StoredOutputChunkRow[];
 }
 
+/** Does this session hold a retained tool output longer than `minChars`?
+ * The retained-output readers read exactly these rows by call_id; a caller
+ * passes the smallest inline presentation budget to ask whether any retained
+ * result was shown to the model only in part. */
+export function sessionHasRetainedToolOutputLongerThan(sessionId: string, minChars: number): boolean {
+  const id = sessionId.trim();
+  if (!id) return false;
+  const row = openEventLog().prepare(
+    `SELECT 1 AS present FROM tool_outputs
+      WHERE session_id = ? AND COALESCE(output_chars, content_bytes) > ?
+      LIMIT 1`,
+  ).get(id, Math.max(0, Math.floor(minChars))) as { present?: number } | undefined;
+  return row?.present === 1;
+}
+
+/** The newest tool_search_scope event of this session that recorded an
+ * in-scope round-one desk (agents/turn-desk.ts: a desk whose fallbackReason is
+ * JSON null) for an accepted source equal to, or earlier than,
+ * `sourceUserSeq`. The query filters on the desk itself, so no number of
+ * out-of-scope builds or same-source rebuilds can hide that record. */
+export function latestInScopeDeskEvent(
+  sessionId: string,
+  sourceUserSeq: number,
+  relation: 'same_source' | 'earlier_source',
+): EventRow | null {
+  const id = sessionId.trim();
+  if (!id || !Number.isSafeInteger(sourceUserSeq)) return null;
+  const comparison = relation === 'same_source' ? '=' : '<';
+  // The newest SOURCE first, then its newest record: a later rebuild of an
+  // older source must not stand in for a newer source's desk.
+  const row = prepareCached(openEventLog(),
+    `SELECT * FROM events
+      WHERE session_id = ?
+        AND type = 'tool_search_scope'
+        AND json_type(data_json, '$.desk.fallbackReason') = 'null'
+        AND json_extract(data_json, '$.desk.sourceUserSeq') ${comparison} ?
+      ORDER BY json_extract(data_json, '$.desk.sourceUserSeq') DESC, seq DESC
+      LIMIT 1`,
+  ).get(id, sourceUserSeq) as RawEventRow | undefined;
+  return row ? rowToEvent(row) : null;
+}
+
+/** Every rung an in-scope round-one desk recorded for an accepted source
+ * earlier than `sourceUserSeq` in this session. The session floor is the
+ * highest of them, so it is monotonic however builds of different sources
+ * interleave. */
+export function earlierInScopeDeskRungs(sessionId: string, sourceUserSeq: number): string[] {
+  const id = sessionId.trim();
+  if (!id || !Number.isSafeInteger(sourceUserSeq)) return [];
+  const rows = prepareCached(openEventLog(),
+    `SELECT DISTINCT json_extract(data_json, '$.desk.rung') AS rung FROM events
+      WHERE session_id = ?
+        AND type = 'tool_search_scope'
+        AND json_type(data_json, '$.desk.fallbackReason') = 'null'
+        AND json_extract(data_json, '$.desk.sourceUserSeq') < ?`,
+  ).all(id, sourceUserSeq) as Array<{ rung: unknown }>;
+  return rows.map((row) => row.rung).filter((rung): rung is string => typeof rung === 'string');
+}
+
+/** Which of these exact tools this session dispatched after `afterSeq`,
+ * directly or carried by a dispatcher (the call's recorded effective tool). */
+export function sessionDispatchedToolsSince(
+  sessionId: string,
+  afterSeq: number,
+  toolNames: readonly string[],
+): string[] {
+  const id = sessionId.trim();
+  const names = [...new Set(toolNames.filter((name) => name.length > 0))];
+  if (!id || names.length === 0) return [];
+  const placeholders = names.map(() => '?').join(', ');
+  const rows = openEventLog().prepare(
+    `SELECT DISTINCT coalesce(
+        CASE WHEN json_extract(data_json, '$.effectiveTool') IN (${placeholders})
+          THEN json_extract(data_json, '$.effectiveTool') END,
+        CASE WHEN json_extract(data_json, '$.tool') IN (${placeholders})
+          THEN json_extract(data_json, '$.tool') END) AS name
+       FROM events
+      WHERE session_id = ?
+        AND type = 'tool_called'
+        AND seq > ?`,
+  ).all(...names, ...names, id, Math.max(0, Math.trunc(afterSeq))) as Array<{ name?: string | null }>;
+  return rows.flatMap((row) => (typeof row.name === 'string' ? [row.name] : []));
+}
+
 /** Resolve an already-parked complete payload by its exact content identity.
  * This is a read-only alias target for evidence-backed worker replays: the new
  * logical replay may point at the original bytes without writing a second full

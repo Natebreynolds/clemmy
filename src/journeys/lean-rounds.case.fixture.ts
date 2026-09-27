@@ -504,6 +504,7 @@ const metrics: CaseMetrics = {
   round1BucketTokens: { ...round1.composition!.buckets },
   round1BucketBytes: { ...round1.composition!.bucketBytes },
   round1WireTools: round1.provenance!.wireTools,
+  round1OnRequestTools: [...requestView(requests[0]).onRequest],
   totalRequestBytes: score.totals.requestBytes,
   toolRoute: route,
   jevRouterRows: score.jev.calls.length,

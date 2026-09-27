@@ -44,3 +44,16 @@ export function serializeAdvertisedTools(tools: readonly AdvertisableTool[]): un
     ...(tool.providerData ? { providerData: tool.providerData } : {}),
   }));
 }
+
+/** Agents whose tools block keeps session-wide wire positions: the ordinary
+ *  host chat turns the round-one desk governs (agents/turn-desk.ts). Every
+ *  other agent keeps per-source first-seen order only. */
+const sessionOrderedAgents = new WeakSet<object>();
+
+export function bindSessionWireOrder(agent: object): void {
+  sessionOrderedAgents.add(agent);
+}
+
+export function usesSessionWireOrder(agent: unknown): boolean {
+  return Boolean(agent) && typeof agent === 'object' && sessionOrderedAgents.has(agent as object);
+}

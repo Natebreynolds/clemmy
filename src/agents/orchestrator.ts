@@ -77,7 +77,9 @@ import {
   ORCHESTRATOR_BEHAVIOR_NATIVE,
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSet, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet } from './tool-catalog.js';
+import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet } from './tool-catalog.js';
+import { renderDeskNamesLine, resolveTurnDesk, type TurnDeskDecision } from './turn-desk.js';
+import { bindSessionWireOrder } from '../runtime/harness/advertised-tool-wire.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import {
   composeSessionFromStore,
@@ -176,7 +178,7 @@ import {
   harnessInputGuardrails,
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
-import { assertNotKilled, DEFAULT_MAX_TURNS, harnessRunContextStorage, KillRequested, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
+import { assertNotKilled, DEFAULT_MAX_TURNS, harnessRunContextStorage, KillRequested, withDeferredLoading, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
 import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
 import { CancelledPreDispatchResult, HostLocalExecutionFailureResult, InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
 import { WorkerBatchGenerationCancelledError } from './worker-batch-execution.js';
@@ -2465,15 +2467,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   })();
   // The advertised description rides every model step of every turn, so it
   // carries only what the model must know AT THE CALL: the packet contract,
-  // the lease rule, compose-only mutations and the ERROR: failure envelope.
-  // Everything else it used to narrate is enforced or surfaced by the harness
-  // at the moment it matters — the compose-only refusal (WORKER_COMPOSE_ONLY),
-  // the per-item batch ledger and "FAILED items" header, the manifest gates,
-  // and the digest footer that names tool_output_query for parked shards.
+  // the per-item cost and the lease rule. Each other rule is said once where
+  // it is owned: batching in the item/items fields, parent-owned commits in
+  // the rubric, and the rest enforced or surfaced by the harness at the moment
+  // it matters — the compose-only refusal (WORKER_COMPOSE_ONLY), the per-item
+  // batch ledger and "FAILED items" header, the ERROR: item envelope, the
+  // manifest gates, and the digest footer that names tool_output_query for
+  // parked shards.
   const runWorkerToolDescription = [
-    'Delegate independent work with a structured parent-planned job packet. Each item costs a model session; prefer direct calls for quick reads. Batch all items in one `items` call; use `item` for one.',
+    'Delegate independent work with a structured parent-planned job packet. Each item costs a model session; prefer direct calls for quick reads.',
     'Workers receive only packet context and shared result handles. Use the typed exact `externalMcpToolNames` array; resolvedTools carries schemas/commands/instructions but does not widen that lease.',
-    'Workers COMPOSE external mutations for parent approval. An "ERROR:" item FAILED; never claim full completion.',
   ].join(' ');
   /**
    * THE one door for a run_worker refusal that starts no child.
@@ -3597,6 +3600,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const structuralDiscoveryMetadata = new Map<string, { schema: unknown; description: string }>();
   const turnOwnedDispatchTools = new Map<string, Tool<RuntimeContextValue>>();
   let callTool: Tool<RuntimeContextValue> | null = null;
+  // Whether an existing host promotion identifies this request's target; the
+  // round-one desk (turn-desk.ts) reads it under its no-signal rule.
+  let deskIdentifiedTarget = false;
   let workCallOptions: BuildWorkCallOptions | null = null;
   // Assigned after the capability universe seals (the agent does not exist yet
   // when the dispatcher is built). Until then it fails closed: a production
@@ -3630,13 +3636,18 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       const searchQuery = [scopeUserInput, ...priorUserInputs.slice(0, 3)]
         .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
         .join('\n');
-      const hot = resolveHotSet(options.sessionId, searchQuery, { allowedNames: policyAllowed });
+      const hotParts = resolveHotSetParts(options.sessionId, searchQuery, { allowedNames: policyAllowed });
+      const hot = new Set([...hotParts.kernel, ...hotParts.request, ...hotParts.session]);
+      if (hotParts.request.length > 0) deskIdentifiedTarget = true;
       pinCompositionHotTools(hot, sessionMount, policyAllowed);
       // A proven strategy ranks currently configured native capabilities; it
       // does not grant scope or execution authority. Their complete runtime
       // schemas and current-source refs are disclosed below after policy.
       for (const name of provenDisclosure.nativeTools ?? []) {
-        if (policyAllowed.has(name) && isRegistryDeclaredLocalPlanningCapability(name)) hot.add(name);
+        if (policyAllowed.has(name) && isRegistryDeclaredLocalPlanningCapability(name)) {
+          hot.add(name);
+          deskIdentifiedTarget = true;
+        }
       }
       // Exact caller/candidate resolution is already the answer to discovery.
       // Promote those registry names directly instead of charging another
@@ -3644,10 +3655,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // contains no operation vocabulary or prompt-noun matching.
       if (carrierWork) {
         for (const name of options.turnCandidates?.pinnedTools ?? []) {
-          if (policyAllowed.has(name)) hot.add(name);
+          if (policyAllowed.has(name)) {
+            hot.add(name);
+            deskIdentifiedTarget = true;
+          }
         }
         for (const name of explicitAllowed ?? []) {
-          if (policyAllowed.has(name) && actionTopologyRoleFor(name) === 'control') hot.add(name);
+          if (policyAllowed.has(name) && actionTopologyRoleFor(name) === 'control') {
+            hot.add(name);
+            deskIdentifiedTarget = true;
+          }
         }
       }
       const surface = resolveToolSurface({
@@ -4008,49 +4025,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     callTool = null;
   }
 
-  // Every accepted-turn authority/catalog byte is volatile across turns. Keep
-  // it visible and frozen for this Agent activation, but place it AFTER the
-  // identity/rubric cache boundary. Calling this whole block "static" made a
-  // catalog or frozen-plan revision silently revise the stable prefix.
-  const volatileInstructions = [
-    // After a switch between agents, earlier replies were written under other
-    // standing instructions; say so per turn, never in the stable prefix.
-    agentHandoffNote(options.sessionId),
-    !planMode && batchShapeMandate,
-    acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq)?.kind === 'execute' ? reviewedReadOnlyExecution ? '[explicit-execute-mode] The user selected one exact saved read-only plan. Its reviewed text and prepared arguments are in the current input. Perform its reads using exposed read tools or call_tool with the exact prepared arguments; discover an operation only when its schema is missing. This plan has no execution draft: plan_task and plan_step_result are not on this surface. Do not use reviewed step IDs as work_call requirement_id. Follow the reviewed dependencies, synthesize compute findings directly from the returned evidence, and report the result. Do not re-plan, change scope, or introduce mutations. Reuse preparation evidence unless freshness or the reviewed verification requires a current read. Investigate missing or contradictory evidence with additional reads within the same objective; preserve unresolved facts as unknown. Completion still requires the reviewed success criteria and actual evidence.' : '[explicit-execute-mode] The user selected one exact saved revision. Its complete reviewed text and prepared arguments are in the current input. Do not plan again or change scope. When the reviewed structure contains an executionDraft, call plan_task with {} to activate that saved draft, then use each reviewed step ID as work_call requirement_id and follow the disclosed work_call schema. If executionDraft is null and all reviewed steps are read or compute, perform those prepared reads directly. Execute known static arguments exactly; dynamic bindings consume the declared prior settled result paths. For a compute step, synthesize its actual findings after dependencies finish. Before recording content that a write will consume, compare that content with the accepted objective, source evidence and reviewed success criteria; preserve unresolved facts as unknown, distinguish preparation from current reads, and correct unsupported claims now. Then record its actual JSON value with plan_step_result using step_id and data (text for a whole-text binding, or the object fields used by later bindings) before the consuming write. The host fills declared dynamicBindings and per-member bindings from their retained results; omit those bound fields from work_call args_json instead of retyping the content. Static arguments still match the approved plan. Reuse evidence already gathered in Plan; read it again when freshness affects the result or the reviewed verification requires it. If a finding is missing, contradictory or a read fails, investigate with additional read-only calls within the same objective and synthesize the result before the write. Such contextual reads use their discovered capabilityRef through work_call (or call_tool for local reads), not a reviewed step ID. They do not replace required reviewed steps or authorize new effects. Successful supplemental observations are retained with the synthesis automatically. If a current capability changed, stop and explain the need to revise. If a saved local file contains a mistake, record its corrected synthesis with plan_step_result and invoke the same reviewed write step at its original destination. The host binds a new revision, keeps prior receipts and refuses to overwrite an intervening edit. Do not retry external creates or sends. Existing per-call consent, exact result provenance, completion evidence, and durable checkpoints still apply. Reuse successful results when no correction is needed.' : null,
-    planMode ? '[explicit-plan-mode] The user selected Plan. Understand the current goal, adopted user changes and what successful execution must deliver. Think through the approach before publishing: connect the important questions or decisions to the evidence needed and explain how findings will support the result. For comparisons, use consistent criteria across subjects; separate observed facts, source claims and inference. Describe follow-up investigation for missing or conflicting evidence within the synthesis method. Required graph steps must succeed: do not turn a contingent lookup or its fallback into mandatory success dependencies. Execute can make additional contextual read-only calls while synthesizing, retaining their observations without freezing an unknown number of lookups. Keep indispensable input reads as graph steps; if those cannot be obtained, explain the unresolved prerequisite. A missing fact remains unknown rather than guessed. Investigate enough to choose a useful method without doing the proposed business work. Inspect supplied inputs and use relevant recalled preferences, previous successful procedures and skills; read a matching skill before relying on its method, and search memory when the request depends on prior work not already present. In the plan, briefly name material remembered preferences, procedures or facts that shape the approach and explain why they matter to this goal. Distinguish established preferences from changeable facts: confirm the latter through available current evidence, or label them as assumptions with a verification step. Retrieval and plan approval do not themselves verify a fact. Do not add a memory-search checklist or ask separately to approve each remembered item; ask only about unresolved choices that materially change the work. Treat recalled tools as candidates to validate, not permission or proof of current availability. Investigate the exact capabilities, schemas, accounts and arguments needed for this task. If a tool wraps another operation or accepts an open input object, inspect the selected operation’s own input contract before treating its arguments as prepared. Check that pagination, batch settings and per-item settings cover the intended collection. When repairing a step or changing from per-item work to a batch, reconsider coverage and downstream dependencies, not just whether the arguments now parse. More connected tools means more options, not a checklist. Gather enough evidence to choose and validate the method; use URL or metadata discovery when page bodies are not yet needed. Save exhaustive collection for Execute unless it is necessary to prepare the plan. Preparation reads and read-only shell commands remain available. Reuse retained evidence and known operations, and discover missing ones when needed. A pending internal review is not a missing user decision; continue independent preparation when a future execution requirement is unresolved. Once an exact operation is available, use its supplied schema or inspect the selected nested operation’s documentation; do not repeat broad catalog searches or a full documentation index to recover a contract you already have. A supplied exact input or destination path does not require repeated directory exploration after its scope is established. Reopen only the missing or changed definition. Publish full_text and one structured_plan with ordinary staticArguments objects; omit redundant execution_draft and unused optional fields. The host compiles the execution structure. Explain the findings, chosen method and relevant skill or memory constraints in the full plan so Execute inherits them. Carry their evidence and confirmation status into execution and the final deliverable. Before reporting completion, compare material claims against the sources; saving and reading back a file proves persistence, not the accuracy of its contents. Keep interpretation and uncertainty labeled rather than adding unsupported specificity. Describe choices in terms of the user’s outcome; keep harness repair details out of the user-facing plan unless they materially affect the approach. Keep known input values exact. Link future values to settled tool outputs or to a reviewed compute step. A compute step with capabilityRef:null declares the synthesis method and dependencies; Execute records its actual output with plan_step_result. Reference its output fields in dynamicBindings (for example /markdown into /markdown_text), never freeze placeholder report text. Use one tool step per distinct operation. For repeated work over a known collection or a reviewed read, use forEach with stable member IDs and item-to-argument bindings instead of copying the operation for every record. A repeated step can feed another repeated step: its result records contain memberId and result; preserve /memberId. result is the retained inner tool value, not a carrier envelope. If the tool returns text, bind /result directly; do not invent /result/output or /result/content fields. For an object, bind only known fields under /result. If outputs need interpretation or reshaping, prepare a compute step that consumes them and produces the exact input object or batch array for the next tool. Distinguish reading API documentation from calling that API. Separate independent work from actual dependencies, assign helpers only where useful, and describe verification and meaningful user check-ins. Surface only choices or missing facts that materially change the result. Prepare a ready plan when the necessary facts are available. If a missing user choice prevents useful planning, ask that specific question now; do not inventory tools or memories just to postpone it. Publish the partial findings and question as full_text with readiness needs_input; structured_plan can be omitted for that partial. An answer continues planning, not business execution. If a prerequisite cannot be resolved, publish needs_input naming the gap or ask the specific question. Do not claim an unread input was inspected. The user may discuss and revise the saved plan; use its exact base reference for a revision. Execute selects the reviewed revision. There is no mandatory separate shape-approval round before investigating and preparing the plan. You may delegate investigation to run_worker; workers inherit Plan mode. Business mutations, workflow dispatch, sends, unknown-effect commands, approvals and plan_task stay closed. Never guess account IDs or present model-authored identities as verified. This turn produces a reviewable plan, not execution of its business effects.' : null,
-    !planMode && carrierWork
-      ? frozenContract
-        ? [
-            '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly, and deferred controls plus local READS through the `call_tool` carrier (reads never need a proposal); `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business WRITE through `work_call`.',
-            formatFrozenWorkAuthority(frozenContract),
-            formatFrozenNodeBindings(resolveFrozenNodeBindings({
-              contract: frozenContract,
-              catalogIdentifiers: workCallOptions?.catalogIdentifiers,
-              destinationFamily: workCallOptions?.destinationFamily,
-              sourceStrategyBinding: workCallOptions?.sourceStrategyBinding,
-            })),
-            'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
-          ].filter(Boolean).join('\n')
-        : hostFreshPlanning
-          ? [renderProvenDiscoveryCompleteLine(provenDisclosure), '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. When the user already named an operating account, use tool_search.account_selection with its exact live identity and verbatim user source_quote; an account-selection blocker is not a reason to ask again before trying that checked nomination. Recipients and third-party accounts are not operating-account choices. Proven reads and ordinary writes share discovery; consent stays at the tool edge. Emit identified proposal-free `work_call` calls directly for independent exact reversible actions, one call at a time; each tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use `plan_task` for coordinated business dependencies or per-member work that needs a graph, unresolved business dependencies, an explicitly requested execution graph, ambiguity, admin, destructive, or unknown-effect work. Contextual reads followed by one authorized reversible write and ordinary readback do not require a graph merely because they happen in order. Conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) also need none.'].filter(Boolean).join('\n')
-          : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
-      : null,
-    catalogBlock,
-    renderCapabilityCandidateCard(options.turnCandidates),
-  ].filter(Boolean).join('\n\n');
-  const acceptedActionRubric = carrierWork && rubricChoice.variant === 'lean'
-    ? ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN
-    : rubricChoice.instructions;
-  const instructions = harnessInstructions(acceptedActionRubric, {
-    // The agent this session works in: stable for the session, so it sits
-    // with the rubric before the cache boundary.
-    agentInstructions: sessionMount.agent?.context,
-    sourceUserSeq: options.sourceUserSeq,
-    sessionId: options.sessionId ?? undefined,
-    focusInput: scopeUserInput || undefined,
-    volatileInstructions,
-  });
   const reviewedComputeResults = taskMode?.kind === 'execute' && !reviewedReadOnlyExecution ? [buildPlanStepResultTool(options.sessionId && options.sourceUserSeq ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq } : undefined)] : [];
   const structuralTools = factorySkip
     ? []
@@ -4157,6 +4131,39 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       return sum + JSON.stringify(anyT.parameters ?? {}).length + (anyT.name?.length ?? 0);
     }, 0) / 4,
   );
+  const toolPolicy = resolveEffectiveToolPolicy({
+    surface: 'orchestrator',
+    lane: options.allowToolJit === true ? 'chat' : 'execution',
+    tools: assembledTools.map((toolRef) => toolRef as Tool<RuntimeContextValue>),
+    allowedToolNames: effectiveAllowedToolNames,
+    excludeToolNames: options.excludeToolNames,
+    reason: 'orchestrator local harness tools',
+  });
+  // The round-one desk (turn-desk.ts): one decision per accepted source over
+  // the policy-resolved surface, applied only as deferLoading on tools that
+  // stay on this Agent. Without schema-on-demand there is no desk.
+  const turnDesk: TurnDeskDecision | null = searchDecision.active
+    ? resolveTurnDesk({
+        sessionId: options.sessionId,
+        sourceUserSeq: options.sourceUserSeq,
+        ordinaryHostChat: Boolean(hostFreshPlanning)
+          && !factorySkip
+          && !planMode
+          && taskMode?.kind !== 'execute'
+          && options.acceptedRoute !== 'act'
+          && !actionWork
+          && !frozenContract
+          && !localMemoryScope,
+        surfaceNames: toolPolicy.tools.map((toolRef) => toolRef.name),
+        requestText: scopeUserInput,
+        identifiedTarget: deskIdentifiedTarget
+          || (hostFreshPlanning?.capabilities.length ?? 0) > 0
+          || disclosedOperations.length > 0,
+        planningCapabilityCount: hostFreshPlanning?.capabilities.length ?? 0,
+        disclosedOperationCount: disclosedOperations.length,
+      })
+    : null;
+  const deskDeferred = new Set(turnDesk?.deferred ?? []);
   if (options.sessionId && searchDecision.active) {
     try {
       appendEvent({
@@ -4189,20 +4196,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             .map((source) => source.kind))].sort(),
           planningDisclosureWired: Boolean(planningDisclosure),
           carrierWork,
+          // The round-one desk for this accepted source; a re-entry on the
+          // same source reads it back instead of deciding again.
+          ...(turnDesk ? { desk: turnDesk } : {}),
         },
       });
     } catch {
       // Telemetry never blocks agent construction.
     }
   }
-  const toolPolicy = resolveEffectiveToolPolicy({
-    surface: 'orchestrator',
-    lane: options.allowToolJit === true ? 'chat' : 'execution',
-    tools: assembledTools.map((toolRef) => toolRef as Tool<RuntimeContextValue>),
-    allowedToolNames: effectiveAllowedToolNames,
-    excludeToolNames: options.excludeToolNames,
-    reason: 'orchestrator local harness tools',
-  });
   // A native reader already on the Plan surface should carry its exact
   // planning identity too. Publish through the same current-source registry
   // validation as discovery, after policy filtering; this adds no callable
@@ -4227,6 +4229,50 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     return ref && t.type === 'function'
       ? { ...t, contractDescription: t.description, description: `${t.description}\nFor a saved plan, capabilityRef=${ref}. This current native reference is already available; no discovery call is needed.` }
       : t;
+  }).map((t) => (deskDeferred.has(t.name) ? withDeferredLoading(t) : t));
+  // Every accepted-turn authority/catalog byte is volatile across turns. Keep
+  // it visible and frozen for this Agent activation, but place it AFTER the
+  // identity/rubric cache boundary. Calling this whole block "static" made a
+  // catalog or frozen-plan revision silently revise the stable prefix.
+  const volatileInstructions = [
+    // After a switch between agents, earlier replies were written under other
+    // standing instructions; say so per turn, never in the stable prefix.
+    agentHandoffNote(options.sessionId),
+    !planMode && batchShapeMandate,
+    acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq)?.kind === 'execute' ? reviewedReadOnlyExecution ? '[explicit-execute-mode] The user selected one exact saved read-only plan. Its reviewed text and prepared arguments are in the current input. Perform its reads using exposed read tools or call_tool with the exact prepared arguments; discover an operation only when its schema is missing. This plan has no execution draft: plan_task and plan_step_result are not on this surface. Do not use reviewed step IDs as work_call requirement_id. Follow the reviewed dependencies, synthesize compute findings directly from the returned evidence, and report the result. Do not re-plan, change scope, or introduce mutations. Reuse preparation evidence unless freshness or the reviewed verification requires a current read. Investigate missing or contradictory evidence with additional reads within the same objective; preserve unresolved facts as unknown. Completion still requires the reviewed success criteria and actual evidence.' : '[explicit-execute-mode] The user selected one exact saved revision. Its complete reviewed text and prepared arguments are in the current input. Do not plan again or change scope. When the reviewed structure contains an executionDraft, call plan_task with {} to activate that saved draft, then use each reviewed step ID as work_call requirement_id and follow the disclosed work_call schema. If executionDraft is null and all reviewed steps are read or compute, perform those prepared reads directly. Execute known static arguments exactly; dynamic bindings consume the declared prior settled result paths. For a compute step, synthesize its actual findings after dependencies finish. Before recording content that a write will consume, compare that content with the accepted objective, source evidence and reviewed success criteria; preserve unresolved facts as unknown, distinguish preparation from current reads, and correct unsupported claims now. Then record its actual JSON value with plan_step_result using step_id and data (text for a whole-text binding, or the object fields used by later bindings) before the consuming write. The host fills declared dynamicBindings and per-member bindings from their retained results; omit those bound fields from work_call args_json instead of retyping the content. Static arguments still match the approved plan. Reuse evidence already gathered in Plan; read it again when freshness affects the result or the reviewed verification requires it. If a finding is missing, contradictory or a read fails, investigate with additional read-only calls within the same objective and synthesize the result before the write. Such contextual reads use their discovered capabilityRef through work_call (or call_tool for local reads), not a reviewed step ID. They do not replace required reviewed steps or authorize new effects. Successful supplemental observations are retained with the synthesis automatically. If a current capability changed, stop and explain the need to revise. If a saved local file contains a mistake, record its corrected synthesis with plan_step_result and invoke the same reviewed write step at its original destination. The host binds a new revision, keeps prior receipts and refuses to overwrite an intervening edit. Do not retry external creates or sends. Existing per-call consent, exact result provenance, completion evidence, and durable checkpoints still apply. Reuse successful results when no correction is needed.' : null,
+    planMode ? '[explicit-plan-mode] The user selected Plan. Understand the current goal, adopted user changes and what successful execution must deliver. Think through the approach before publishing: connect the important questions or decisions to the evidence needed and explain how findings will support the result. For comparisons, use consistent criteria across subjects; separate observed facts, source claims and inference. Describe follow-up investigation for missing or conflicting evidence within the synthesis method. Required graph steps must succeed: do not turn a contingent lookup or its fallback into mandatory success dependencies. Execute can make additional contextual read-only calls while synthesizing, retaining their observations without freezing an unknown number of lookups. Keep indispensable input reads as graph steps; if those cannot be obtained, explain the unresolved prerequisite. A missing fact remains unknown rather than guessed. Investigate enough to choose a useful method without doing the proposed business work. Inspect supplied inputs and use relevant recalled preferences, previous successful procedures and skills; read a matching skill before relying on its method, and search memory when the request depends on prior work not already present. In the plan, briefly name material remembered preferences, procedures or facts that shape the approach and explain why they matter to this goal. Distinguish established preferences from changeable facts: confirm the latter through available current evidence, or label them as assumptions with a verification step. Retrieval and plan approval do not themselves verify a fact. Do not add a memory-search checklist or ask separately to approve each remembered item; ask only about unresolved choices that materially change the work. Treat recalled tools as candidates to validate, not permission or proof of current availability. Investigate the exact capabilities, schemas, accounts and arguments needed for this task. If a tool wraps another operation or accepts an open input object, inspect the selected operation’s own input contract before treating its arguments as prepared. Check that pagination, batch settings and per-item settings cover the intended collection. When repairing a step or changing from per-item work to a batch, reconsider coverage and downstream dependencies, not just whether the arguments now parse. More connected tools means more options, not a checklist. Gather enough evidence to choose and validate the method; use URL or metadata discovery when page bodies are not yet needed. Save exhaustive collection for Execute unless it is necessary to prepare the plan. Preparation reads and read-only shell commands remain available. Reuse retained evidence and known operations, and discover missing ones when needed. A pending internal review is not a missing user decision; continue independent preparation when a future execution requirement is unresolved. Once an exact operation is available, use its supplied schema or inspect the selected nested operation’s documentation; do not repeat broad catalog searches or a full documentation index to recover a contract you already have. A supplied exact input or destination path does not require repeated directory exploration after its scope is established. Reopen only the missing or changed definition. Publish full_text and one structured_plan with ordinary staticArguments objects; omit redundant execution_draft and unused optional fields. The host compiles the execution structure. Explain the findings, chosen method and relevant skill or memory constraints in the full plan so Execute inherits them. Carry their evidence and confirmation status into execution and the final deliverable. Before reporting completion, compare material claims against the sources; saving and reading back a file proves persistence, not the accuracy of its contents. Keep interpretation and uncertainty labeled rather than adding unsupported specificity. Describe choices in terms of the user’s outcome; keep harness repair details out of the user-facing plan unless they materially affect the approach. Keep known input values exact. Link future values to settled tool outputs or to a reviewed compute step. A compute step with capabilityRef:null declares the synthesis method and dependencies; Execute records its actual output with plan_step_result. Reference its output fields in dynamicBindings (for example /markdown into /markdown_text), never freeze placeholder report text. Use one tool step per distinct operation. For repeated work over a known collection or a reviewed read, use forEach with stable member IDs and item-to-argument bindings instead of copying the operation for every record. A repeated step can feed another repeated step: its result records contain memberId and result; preserve /memberId. result is the retained inner tool value, not a carrier envelope. If the tool returns text, bind /result directly; do not invent /result/output or /result/content fields. For an object, bind only known fields under /result. If outputs need interpretation or reshaping, prepare a compute step that consumes them and produces the exact input object or batch array for the next tool. Distinguish reading API documentation from calling that API. Separate independent work from actual dependencies, assign helpers only where useful, and describe verification and meaningful user check-ins. Surface only choices or missing facts that materially change the result. Prepare a ready plan when the necessary facts are available. If a missing user choice prevents useful planning, ask that specific question now; do not inventory tools or memories just to postpone it. Publish the partial findings and question as full_text with readiness needs_input; structured_plan can be omitted for that partial. An answer continues planning, not business execution. If a prerequisite cannot be resolved, publish needs_input naming the gap or ask the specific question. Do not claim an unread input was inspected. The user may discuss and revise the saved plan; use its exact base reference for a revision. Execute selects the reviewed revision. There is no mandatory separate shape-approval round before investigating and preparing the plan. You may delegate investigation to run_worker; workers inherit Plan mode. Business mutations, workflow dispatch, sends, unknown-effect commands, approvals and plan_task stay closed. Never guess account IDs or present model-authored identities as verified. This turn produces a reviewable plan, not execution of its business effects.' : null,
+    !planMode && carrierWork
+      ? frozenContract
+        ? [
+            '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly, and deferred controls plus local READS through the `call_tool` carrier (reads never need a proposal); `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business WRITE through `work_call`.',
+            formatFrozenWorkAuthority(frozenContract),
+            formatFrozenNodeBindings(resolveFrozenNodeBindings({
+              contract: frozenContract,
+              catalogIdentifiers: workCallOptions?.catalogIdentifiers,
+              destinationFamily: workCallOptions?.destinationFamily,
+              sourceStrategyBinding: workCallOptions?.sourceStrategyBinding,
+            })),
+            'If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.',
+          ].filter(Boolean).join('\n')
+        : hostFreshPlanning
+          ? [renderProvenDiscoveryCompleteLine(provenDisclosure), '[action-planning] You are the one foreground reasoning loop. Resolve missing operation refs with `tool_search` (metadata/schema discovery only; it returns exact citable capabilityRef values). Run safe reads progressively while reasoning. When the user already named an operating account, use tool_search.account_selection with its exact live identity and verbatim user source_quote; an account-selection blocker is not a reason to ask again before trying that checked nomination. Recipients and third-party accounts are not operating-account choices. Proven reads and ordinary writes share discovery; consent stays at the tool edge. Emit identified proposal-free `work_call` calls directly for independent exact reversible actions, one call at a time; each tool-edge allow/deny/ask decision owns consent and dispatch — chat compiles no hidden plan. Include source_call_ids only when arguments consume or copy settled result bytes. Use `plan_task` for coordinated business dependencies or per-member work that needs a graph, unresolved business dependencies, an explicitly requested execution graph, ambiguity, admin, destructive, or unknown-effect work. Contextual reads followed by one authorized reversible write and ordinary readback do not require a graph merely because they happen in order. Conversation, independent read-only answers, and a uniquely named existing workflow (`workflow_run` / `workflow_get`) also need none.'].filter(Boolean).join('\n')
+          : '[action-work] This exact accepted turn requires durable action authority. Use hot controls directly and deferred controls through their control-only `call_tool` carrier; `run_worker` stays direct for multi-item fan-out (each worker settles its own business calls). Route every business operation through `work_call`. The first `work_call` must fuse one complete provider-neutral topology proposal with its first real inner call—do not spend a separate planning/model round. Subsequent business calls bind a frozen requirement with proposal:null. If the intended work is ambiguous or cannot be reached safely, talk to the user naturally.'
+      : null,
+    catalogBlock,
+    turnDesk ? renderDeskNamesLine(turnDesk.deferred) : null,
+    renderCapabilityCandidateCard(options.turnCandidates),
+  ].filter(Boolean).join('\n\n');
+  const acceptedActionRubric = carrierWork && rubricChoice.variant === 'lean'
+    ? ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN
+    : rubricChoice.instructions;
+  const instructions = harnessInstructions(acceptedActionRubric, {
+    // The agent this session works in: stable for the session, so it sits
+    // with the rubric before the cache boundary.
+    agentInstructions: sessionMount.agent?.context,
+    sourceUserSeq: options.sourceUserSeq,
+    sessionId: options.sessionId ?? undefined,
+    focusInput: scopeUserInput || undefined,
+    volatileInstructions,
   });
   if (options.sessionId) {
     try {
@@ -4331,6 +4377,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   });
   bindAgentMcpToolScope(agent, mcpToolScope);
   bindAgentRebuildContext(agent, options);
+  // A desk-governed turn keeps the session's wire order, so the tools block
+  // only changes when the session climbs a rung.
+  if (turnDesk && turnDesk.fallbackReason === null) bindSessionWireOrder(agent);
   if (hostFreshPlanning && workCallOptions?.reachableBuiltinNames) {
     bindHostLocalCallPreparation(agent, {
       planning: hostFreshPlanning,
