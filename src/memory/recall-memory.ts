@@ -395,6 +395,15 @@ function disjointNonEmpty<T>(a: Set<T>, b: Set<T>): boolean {
   return true;
 }
 
+/** Client names share identity when one names the other: "grand canyon law"
+ *  and "grand canyon law group" are one client written two ways, not two
+ *  clients (a spelling is not an identity). */
+function disjointClientNames(a: Set<string>, b: Set<string>): boolean {
+  if (a.size === 0 || b.size === 0) return false;
+  for (const x of a) for (const y of b) if (x === y || x.includes(y) || y.includes(x)) return false;
+  return true;
+}
+
 /** A candidate fact that belongs to a DIFFERENT CLIENT than the active request
  *  must not surface for this one. Keyed on ACCOUNT-level identity only
  *  (account id / domain / client name) — deliberately NOT emails or table ids:
@@ -407,10 +416,23 @@ export function accountScopeExcludesFromRecall(activeAnchors: EntityAnchors, fac
     if (!accountScopedRecallEnabled()) return false;
     if (!activeContextHasAccountScope(activeAnchors)) return false; // general request → no scoping
     const f = extractAnchors({ content: factText });
+    // Any shared account-level anchor makes it the SAME client: a comparison
+    // memory that names the request's domain plus the competitors is about
+    // this client, however the competitors are spelled. Live 2026-09-26: the
+    // finished "tobinlawoffice.com vs Grand Canyon Law Group" work was hidden
+    // from a request that wrote "Grand Canyon Law" — one name mismatch
+    // outvoted the shared domain. Exclude only when every named dimension
+    // differs.
+    const shares = [
+      [activeAnchors.accountIds, f.accountIds],
+      [activeAnchors.domains, f.domains],
+    ].some(([a, b]) => a.size > 0 && b.size > 0 && [...a].some((x) => b.has(x)))
+      || (activeAnchors.clientNames.size > 0 && f.clientNames.size > 0 && !disjointClientNames(activeAnchors.clientNames, f.clientNames));
+    if (shares) return false;
     return (
       disjointNonEmpty(activeAnchors.accountIds, f.accountIds)
       || disjointNonEmpty(activeAnchors.domains, f.domains)
-      || disjointNonEmpty(activeAnchors.clientNames, f.clientNames)
+      || disjointClientNames(activeAnchors.clientNames, f.clientNames)
     );
   } catch {
     return false;

@@ -59,3 +59,19 @@ test('fail-open: junk input never throws and never excludes', () => {
   assert.equal(accountScopeExcludesFromRecall(active, ''), false);
   assert.equal(accountScopeExcludesFromRecall(active, '\u0000\u0001 garbage'), false);
 });
+
+test('a memory that shares the request\'s domain stays even when a competitor is spelled differently (live 2026-09-26)', () => {
+  // The finished comparison named the request's own domain plus the
+  // competitors; the request wrote "Grand Canyon Law", the memory "Grand
+  // Canyon Law Group". One name mismatch must not outvote the shared domain.
+  const active = anchors('keyword and backlink comparison of tobinlawoffice.com against Mesa competitors Grand Canyon Law and Arizona Criminal Defense Lawyer');
+  assert.equal(activeContextHasAccountScope(active), true);
+  const memory = 'Completed answer: comparison of tobinlawoffice.com against Grand Canyon Law Group (grandcanyon.law) and Arizona Criminal Defense Lawyer (arizonacriminaldefenselawyer.com).';
+  assert.equal(accountScopeExcludesFromRecall(active, memory), false, 'same client: the domain is shared');
+  // Client names that contain each other are one client, not two.
+  const byName = anchors('client: Grand Canyon Law — draft the renewal');
+  assert.equal(accountScopeExcludesFromRecall(byName, 'client: Grand Canyon Law Group signed the SOW'), false, 'a longer spelling of the same client stays');
+  // A genuinely different client with no shared anchor is still excluded.
+  assert.equal(accountScopeExcludesFromRecall(byName, 'client: Beta LLC prefers morning calls'), true, 'a different client is still excluded');
+  assert.equal(accountScopeExcludesFromRecall(active, 'client: Beta LLC (beta.com) prefers morning calls'), true, 'different domain and different name: excluded');
+});
