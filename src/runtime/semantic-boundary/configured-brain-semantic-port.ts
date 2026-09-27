@@ -408,7 +408,10 @@ function recordSemanticModelUsage(input: {
   if (input.inputTokens + input.outputTokens <= 0) return;
   const attribution = modelUsageAttributionStorage.getStore();
   const own = semanticUsageAttribution(input.purpose);
-  recordModelUsage({
+  // The fallback row describes the same own request the completion ran as, so
+  // it is recorded in that request's scope: an undeclared role stays unset
+  // rather than taking the enclosing frame's role or prompt measurements.
+  withOwnModelRequestAttribution(own, () => recordModelUsage({
     ...(own.role ? { role: own.role } : {}),
     channel: own.channel,
     sessionId: input.sessionId || attribution?.sessionId || 'unknown',
@@ -421,7 +424,7 @@ function recordSemanticModelUsage(input: {
     cachedInputTokens: input.cachedInputTokens,
     totalTokens: input.inputTokens + input.outputTokens,
     durationMs: input.latencyMs,
-  });
+  }));
 }
 
 /** Production complete: one tool-less call on the configured brain/judge role. */

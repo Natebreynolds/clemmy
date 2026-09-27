@@ -182,3 +182,28 @@ test('interpretation inside a brain turn declares no role, and the brain round i
   assert.equal(rows[1]!.channel, 'semantic:turn_semantics');
   assert.equal(rows[1]!.promptComponents?.toolSchemas, undefined);
 });
+
+// The port's own fallback row (the adapter did not record the response) used to
+// be written outside the purpose's scope, so interpretation took the frame's role.
+test('the fallback row for an unrecorded interpretation inside a brain turn declares no role', async () => {
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'hi' } });
+  const brainRound = { instructions: 5_000, toolSchemas: 40_000, history: 9_000 };
+  const port = configuredBrainSemanticPort(async () => ({ raw: {}, modelIdentity: 'fixture-model', inputTokens: 500,
+    outputTokens: 5, latencyMs: 3, usageRecorded: false }) as never);
+  await withModelUsageAttribution({ sessionId: session.id, sourceUserSeq: source.seq, role: 'brain', promptComponents: brainRound },
+    () => port.interpret({
+      acceptedText: 'hi', recentTurns: [],
+      host: { source: { sessionId: session.id, sourceUserSeq: source.seq }, policyRevision: 'fixture', resumableGoals: [],
+        openQuestions: [], catalog: { capabilities: [], capabilityIds: [], workflowIds: [] } },
+    } as never));
+  const rows = readUsageEventsForDate().filter(row => row.source === session.id);
+  assert.equal(rows.length, 1, 'the port records the unrecorded response once');
+  assert.equal(rows[0]!.role, undefined, 'interpretation is not a brain round');
+  assert.equal(rows[0]!.roleReason, 'unset');
+  assert.equal(rows[0]!.channel, 'semantic:turn_semantics');
+  assert.equal(rows[0]!.promptComponents?.toolSchemas, undefined, 'the brain round\'s composition is not inherited');
+  assert.equal(rows[0]!.inputTokens, 500);
+  assert.equal(rows[0]!.trace?.acceptedSource, `${session.id}:${source.seq}`, 'it still bills the accepted source');
+});
