@@ -207,7 +207,7 @@ export function retainedResultRoutes(
     routes.push({
       tool: 'tool_output_query',
       call: `tool_output_query {"call_id":"${readId}"}`,
-      why: 'this output holds structured records, which it can filter, project and page server-side without spending recall budget',
+      why: 'this output holds structured records, which it can filter, project and page server-side; a named page or projection spends no recall budget',
     });
   }
 
