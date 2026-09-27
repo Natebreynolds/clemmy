@@ -16,7 +16,11 @@ const {
   parseWorkflowSource,
   reconcilePromptComponents,
   uncachedTokensForAccrual,
+  recordModelUsage,
+  usageRoleFromChannel,
+  withModelUsageAttribution,
 } = await import('./usage-log.js');
+const { listOperationalEvents } = await import('./operational-telemetry.js');
 
 function ev(over: Partial<import('./usage-log.js').UsageEvent>): import('./usage-log.js').UsageEvent {
   return {
@@ -413,4 +417,41 @@ test('usageEfficiencyForEvents: the brain is the model that carried the prompt b
   assert.equal(efficiency.sideFrames, 8);
   assert.equal(efficiency.sideInputTokens, 6_400);
   assert.ok(efficiency.prefixReuse > 0.8, `brain frames reused the previous prompt: ${efficiency.prefixReuse}`);
+});
+
+test('a memory job channel names the memory role, only by its exact prefix', () => {
+  assert.equal(usageRoleFromChannel('memory:learn'), 'memory');
+  assert.equal(usageRoleFromChannel('Memory:Tidy'), 'memory');
+  assert.equal(usageRoleFromChannel('memory_search'), undefined, 'the embedder lane is not memory model work');
+  assert.equal(usageRoleFromChannel('memorable'), undefined);
+});
+
+test('memory work is background usage, never the chat lane of the conversation it read', () => {
+  const r = resolveUsageKind('0a1b2c3d-cli-session', { channel: 'memory:learn', sessionRowKind: 'chat' });
+  assert.deepEqual(r, { kind: 'background', reason: 'channel:memory:learn' });
+  assert.equal(resolveUsageKind('warmup-1', { channel: 'memory:learn' }).kind, 'warmup', 'warmup still outranks');
+  assert.equal(resolveUsageKind('x', { channel: 'workflow' }).kind, 'workflow', 'exact channels are unchanged');
+});
+
+test('the model_call_completed event carries the resolved channel and role, in the same order the row uses', () => {
+  const read = (sessionId: string) => listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId, limit: 5 })[0]?.payload;
+
+  // An adapter passes no channel: the job scope's channel and the channel role land on the event.
+  withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, channel: 'memory:reconcile' }, () =>
+    recordModelUsage({ sessionId: 'usage-memory-channel', model: 'memory-model', inputTokens: 10, outputTokens: 2 }));
+  assert.deepEqual(
+    { channel: read('usage-memory-channel')?.channel, role: read('usage-memory-channel')?.role, roleReason: read('usage-memory-channel')?.roleReason },
+    { channel: 'memory:reconcile', role: 'memory', roleReason: 'channel' },
+  );
+
+  // A scope role outranks the channel convention (explicit > scope > channel is untouched).
+  withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, channel: 'memory:learn', role: 'reviewer' }, () =>
+    recordModelUsage({ sessionId: 'usage-memory-scope', model: 'memory-model', inputTokens: 10, outputTokens: 2 }));
+  assert.equal(read('usage-memory-scope')?.role, 'reviewer');
+  assert.equal(read('usage-memory-scope')?.roleReason, 'scope');
+  assert.equal(read('usage-memory-scope')?.channel, 'memory:learn');
+
+  recordModelUsage({ sessionId: 'usage-memory-explicit', channel: 'memory:patterns', role: 'memory', model: 'm', inputTokens: 1, outputTokens: 1 });
+  assert.equal(read('usage-memory-explicit')?.roleReason, 'explicit');
+  assert.equal(read('usage-memory-explicit')?.usageKind, 'background');
 });

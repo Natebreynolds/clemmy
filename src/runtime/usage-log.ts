@@ -52,9 +52,10 @@ export interface UsageEvent {
   kindReason?: string;
   /** Model name (gpt-5.4, gpt-5.4-mini, text-embedding-3-small, etc.). */
   model: string;
-  /** Explicit request role (brain/worker/reviewer/router) and how it was
-   *  set (`explicit` call, attribution `scope`, `channel` convention, or
-   *  `unset`). Rollups group by this, never by model name or prompt size. */
+  /** Explicit request role (brain/worker/reviewer/router/writer/memory) and
+   *  how it was set (`explicit` call, attribution `scope`, `channel`
+   *  convention, or `unset`). Rollups group by this, never by model name or
+   *  prompt size. */
   role?: UsageRequestRole;
   roleReason?: 'explicit' | 'scope' | 'channel' | 'unset';
   /**
@@ -234,6 +235,9 @@ export function resolveUsageKind(
   if (channel && CHANNEL_KINDS[channel]) {
     return { kind: CHANNEL_KINDS[channel], reason: `channel:${channel}` };
   }
+  // A memory job (`memory:<job>`) is background work wherever it started; it
+  // must never inflate the chat lane of the conversation it learned from.
+  if (channel?.startsWith('memory:')) return { kind: 'background', reason: `channel:${channel}` };
   if (opts.sessionRowKind && SESSION_ROW_KINDS[opts.sessionRowKind]) {
     return { kind: SESSION_ROW_KINDS[opts.sessionRowKind], reason: `session_row:${opts.sessionRowKind}` };
   }
@@ -430,8 +434,9 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
  *  what the request IS; never inferred from model names or token sizes.
  *  brain = the turn's foreground model; worker = a delegated child; reviewer =
  *  judges, watchers, completion/goal reviews; router = Jev routing calls;
- *  writer = the chosen model writing the final answer from gathered evidence. */
-export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer';
+ *  writer = the chosen model writing the final answer from gathered evidence;
+ *  memory = background memory work (the memory model role). */
+export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory';
 
 export interface ModelUsageAttributionContext {
   /** Request-local estimates override ambient parent prompt measurements. */
@@ -501,13 +506,15 @@ export function withModelUsageObserver<T>(sink: ObservedModelUsage[], work: () =
 }
 
 /** Role from an explicit channel convention only (`judge:*`, `watcher*`,
- *  `jev*`); anything else is left unset rather than guessed. */
+ *  `jev*`, `writer*`, `memory:*`); anything else is left unset rather than
+ *  guessed. */
 export function usageRoleFromChannel(channel: string | undefined): UsageRequestRole | undefined {
   const value = (channel ?? '').trim().toLowerCase();
   if (!value) return undefined;
   if (value.startsWith('judge') || value.startsWith('watcher') || value.startsWith('review')) return 'reviewer';
   if (value.startsWith('jev')) return 'router';
   if (value.startsWith('writer')) return 'writer';
+  if (value.startsWith('memory:')) return 'memory';
   return undefined;
 }
 
@@ -687,7 +694,11 @@ export function recordModelUsage(args: {
     actor: 'usage-log',
     now: new Date(event.at),
     payload: {
-      channel: args.channel,
+      // The RESOLVED lane and role, as the NDJSON row has them: adapters pass
+      // no channel, so the call-site scope is the only place it lives.
+      channel,
+      ...(role ? { role } : {}),
+      roleReason,
       usageKind: event.kind,
       model: event.model,
       inputTokens: event.inputTokens,
