@@ -511,7 +511,11 @@ export function formatRecallableToolText(
       .slice(0, Math.max(0, maxChars));
   }
   const receiptReserve = exactReceipt ? exactReceipt.length + 1 : 0;
-  const compactBudget = Math.max(200, maxChars - receiptReserve);
+  // The digest fits its head, tail and footer inside what the host
+  // annotations and the id index leave, so the frame around it never pushes
+  // the footer (the exact reader call) past the cap below.
+  const frameReserve = annotationText.length + (idIndex ? idIndex.length + 2 : 0);
+  const compactBudget = Math.max(200, maxChars - receiptReserve - frameReserve);
   let compact = annotationText + withIndex(digestToolOutput(densifyMarkdownForModelHead(text), {
     maxChars: compactBudget,
     toolName,

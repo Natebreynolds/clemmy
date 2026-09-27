@@ -513,3 +513,31 @@ test('fitting deep subtrees survive projection depth limits with original null a
   assert.equal(exactToolOutputForInvocation({ sessionId: session.id, callId: 'deep-fitting-subtree',
     toolName: 'composio_execute_tool', compactResult: visible, settlementNonce: nonce }), full);
 });
+
+test('a text digest keeps its whole footer when host annotations share its budget', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const nonce = '55555555-5555-4555-8555-555555555555';
+  const full = Array.from({ length: 600 }, (_, index) =>
+    `Walk ${index + 1}: the east rows were checked for frost damage and the mulch was topped up.`).join('\n');
+  const maxChars = 4_000;
+  const compact = withToolOutputContext({
+    sessionId: sess.id,
+    callId: 'call-annotated-text',
+    toolName: 'space_get_view',
+    settlementNonce: nonce,
+  }, () => formatRecallableToolText(full, {
+    maxChars,
+    hostAnnotations: [
+      '[account-route] Read through the one connected workspace account.',
+      '[sender-verify] The view belongs to this workspace.',
+    ],
+  })) as string;
+  assert.ok(compact.length <= maxChars, `within its budget: ${compact.length}`);
+  assert.match(compact, /\[Host annotations — separate from provider result\]/);
+  assert.match(compact, /\[digest: space_get_view returned [\d,]+ chars/);
+  assert.match(compact, /These readers are available now; do NOT say the data is unavailable or that the call is still pending\.\]/,
+    'the digest footer, with the routed readers, arrives whole');
+  assert.match(compact, /file_query \{"call_id":"call-annotated-text"/);
+  assert.match(compact, /\[exact-output-receipt:v1 nonce=55555555-5555-4555-8555-555555555555 sha256=[0-9a-f]{64}\]$/);
+});
