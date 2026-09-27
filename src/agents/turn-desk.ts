@@ -26,9 +26,9 @@
  *   4. decide — structural host facts only, never the request's wording:
  *      the evidence each desk declaration names climbs the session to that
  *      tool's rung; a desk tool this session dispatched (a miss, or any use)
- *      climbs to its rung; and the session never descends below the rung its
- *      newest earlier in-scope source recorded, however many out-of-scope
- *      sources or same-source rebuilds came after it. An out-of-scope or
+ *      climbs to its rung; and the session never descends below the highest rung
+ *      any earlier in-scope source recorded, however many out-of-scope
+ *      sources or rebuilds of older sources came after it. An out-of-scope or
  *      facts_unavailable source records no in-scope desk, so it neither
  *      raises nor lowers that floor.
  * Any fact that cannot be read gives today's surface (`facts_unavailable`).
@@ -41,6 +41,7 @@ import {
   type DeskRung,
 } from '../tools/tool-registry.js';
 import {
+  earlierInScopeDeskRungs,
   latestInScopeDeskEvent,
   sessionDispatchedToolsSince,
   sessionHasRetainedToolOutputs,
@@ -168,7 +169,7 @@ export function recordedTurnDesk(sessionId: string, sourceUserSeq: number): Turn
 }
 
 /** The desk of the session's newest in-scope source before this one: the
- *  floor, and the start of the miss window. */
+ *  start of the miss window. */
 export function previousTurnDesk(sessionId: string, sourceUserSeq: number): TurnDeskDecision | null {
   return inScopeDesk(latestInScopeDeskEvent(sessionId, sourceUserSeq, 'earlier_source'));
 }
@@ -203,8 +204,18 @@ export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
     // From the previous in-scope source's own user message, so a dispatch
     // made before any rebuild of that source still counts.
     missed: sessionDispatchedToolsSince(input.sessionId, previous?.sourceUserSeq ?? 0, deskDeclaredToolNames()),
-    sessionFloor: previous?.rung ?? null,
+    sessionFloor: sessionFloorRung(input.sessionId, input.sourceUserSeq),
   };
+}
+
+/** The highest rung any earlier in-scope source of this session recorded. */
+function sessionFloorRung(sessionId: string, sourceUserSeq: number): DeskRung | null {
+  let floor: DeskRung | null = null;
+  for (const rung of earlierInScopeDeskRungs(sessionId, sourceUserSeq)) {
+    if (!(DESK_RUNGS as readonly string[]).includes(rung)) continue;
+    floor = floor === null ? rung as DeskRung : higher(floor, rung as DeskRung);
+  }
+  return floor;
 }
 
 /** Reuse a recorded in-scope decision on re-entry, restricted to this surface. */

@@ -327,6 +327,25 @@ test('an evidence climb holds: the next turn without that evidence stays on the 
   assert.equal(turn3.requests[0]!.toolsJson, turn2.requests[0]!.toolsJson, 'the next turn reuses the exact tools block');
 });
 
+test('a rebuild of an older source recorded after a newer source climbed never lowers the floor', async () => {
+  const sessionId = 'turn-desk-interleaved-floor';
+  const turn1 = await hostTurn(sessionId, TARGETED, []);
+  const desk1 = deskRecord(sessionId, turn1.source.seq);
+  assert.equal(desk1?.rung, 'lean');
+  const turn2 = await hostTurn(sessionId, TARGETED, [], ATTACHED);
+  assert.equal(deskRecord(sessionId, turn2.source.seq)?.rung, 'readers');
+  // A retry or approval resume of the older source appends its record after
+  // the newer source's; it is newer by event order but older by source.
+  eventlog.appendEvent({
+    sessionId, turn: 0, role: 'system', type: 'tool_search_scope',
+    data: { active: true, desk: { ...desk1, sourceUserSeq: turn1.source.seq } },
+  });
+  const turn3 = await hostTurn(sessionId, TARGETED, []);
+  const desk3 = deskRecord(sessionId, turn3.source.seq);
+  assert.equal(desk3?.rung, 'readers', `the floor is the highest earlier rung, not the newest row: ${JSON.stringify(desk3)}`);
+  assert.equal(turn3.requests[0]!.toolsJson, turn2.requests[0]!.toolsJson, 'the tools block does not change');
+});
+
 test('a desk tool dispatched before a same-source rebuild still climbs the next turn', async () => {
   const sessionId = 'turn-desk-miss-before-rebuild';
   const turn1 = await hostTurn(sessionId, TARGETED, [() => ({ name: 'check_in', args: { note: 'Starting now.' } })]);

@@ -6470,16 +6470,35 @@ export function latestInScopeDeskEvent(
   const id = sessionId.trim();
   if (!id || !Number.isSafeInteger(sourceUserSeq)) return null;
   const comparison = relation === 'same_source' ? '=' : '<';
+  // The newest SOURCE first, then its newest record: a later rebuild of an
+  // older source must not stand in for a newer source's desk.
   const row = prepareCached(openEventLog(),
     `SELECT * FROM events
       WHERE session_id = ?
         AND type = 'tool_search_scope'
         AND json_type(data_json, '$.desk.fallbackReason') = 'null'
         AND json_extract(data_json, '$.desk.sourceUserSeq') ${comparison} ?
-      ORDER BY seq DESC
+      ORDER BY json_extract(data_json, '$.desk.sourceUserSeq') DESC, seq DESC
       LIMIT 1`,
   ).get(id, sourceUserSeq) as RawEventRow | undefined;
   return row ? rowToEvent(row) : null;
+}
+
+/** Every rung an in-scope round-one desk recorded for an accepted source
+ * earlier than `sourceUserSeq` in this session. The session floor is the
+ * highest of them, so it is monotonic however builds of different sources
+ * interleave. */
+export function earlierInScopeDeskRungs(sessionId: string, sourceUserSeq: number): string[] {
+  const id = sessionId.trim();
+  if (!id || !Number.isSafeInteger(sourceUserSeq)) return [];
+  const rows = prepareCached(openEventLog(),
+    `SELECT DISTINCT json_extract(data_json, '$.desk.rung') AS rung FROM events
+      WHERE session_id = ?
+        AND type = 'tool_search_scope'
+        AND json_type(data_json, '$.desk.fallbackReason') = 'null'
+        AND json_extract(data_json, '$.desk.sourceUserSeq') < ?`,
+  ).all(id, sourceUserSeq) as Array<{ rung: unknown }>;
+  return rows.map((row) => row.rung).filter((rung): rung is string => typeof rung === 'string');
 }
 
 /** Which of these exact tools this session dispatched after `afterSeq`,
