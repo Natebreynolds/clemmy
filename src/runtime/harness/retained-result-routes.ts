@@ -27,8 +27,14 @@
  * This mints no authority: every route it names is still subject to the same
  * exact source/account/occurrence checks at its own edge.
  */
-import { getToolOutput, listToolOutputCallIds, resolveToolOutputForAuthority } from './eventlog.js';
+import {
+  getToolOutput,
+  listToolOutputCallIds,
+  resolveToolOutputForAuthority,
+  resolveToolOutputForQuery,
+} from './eventlog.js';
 import { parseStoredToolOutputJson } from './json-repair.js';
+import { resolveRetainedOutputRead } from './retained-output-read.js';
 
 export interface RetainedResultRoute {
   /** The tool to call. */
@@ -58,9 +64,18 @@ export function retainedResultRoutes(
 ): RetainedResultRoute[] {
   const excluded = new Set((input.exclude ?? []).map((name) => name.trim()));
   const routes: RetainedResultRoute[] = [];
+  // Route to what the readers will actually read: a recall's id resolves to
+  // its producer and a receipt to its own redeemed bytes, exactly as each
+  // reader resolves it. Naming the producer id means no route reads a copy of
+  // a copy.
+  let readId = input.callId;
+  let receipt = false;
   let record: { output: string; truncatedAtWrite?: boolean } | null = null;
   try {
-    record = getToolOutput(input.sessionId, input.callId);
+    const resolved = resolveRetainedOutputRead(input.sessionId, input.callId);
+    readId = resolved.callId;
+    receipt = Boolean(resolved.receipt);
+    record = resolved.receipt ?? getToolOutput(input.sessionId, readId);
   } catch {
     record = null;
   }
@@ -82,7 +97,7 @@ export function retainedResultRoutes(
   if (structured && !excluded.has('tool_output_query')) {
     routes.push({
       tool: 'tool_output_query',
-      call: `tool_output_query {"call_id":"${input.callId}"}`,
+      call: `tool_output_query {"call_id":"${readId}"}`,
       why: 'this output holds structured records, which it can filter, project and page server-side without spending recall budget',
     });
   }
@@ -93,23 +108,34 @@ export function retainedResultRoutes(
   if (!structured && recallAvailable && !excluded.has('recall_tool_result')) {
     routes.push({
       tool: 'recall_tool_result',
-      call: `recall_tool_result {"call_id":"${input.callId}"}`,
+      call: `recall_tool_result {"call_id":"${readId}"}`,
       why: 'this output is text rather than structured records, and recall reads it verbatim',
     });
   }
 
-  // THE ROUTE NEITHER MESSAGE EVER NAMED. file_query reads the same stored
-  // text and spends no recall budget, so it serves exactly the case that
-  // trapped the Platform 49 plan: plain text with recall already exhausted.
-  if (!excluded.has('file_query')) {
+  // file_query reads the same stored text and spends no recall budget, so it
+  // serves plain text with recall already exhausted. It applies the query
+  // authority check to the resolved id, so it is offered only for an id that
+  // check accepts; advertising a reader that will refuse is a dead end.
+  if (!excluded.has('file_query') && fileQueryCanRead(input.sessionId, readId, receipt)) {
     routes.push({
       tool: 'file_query',
-      call: `file_query {"call_id":"${input.callId}","query":"<what you need>"}`,
+      call: `file_query {"call_id":"${readId}","query":"<what you need>"}`,
       why: 'it searches the same stored output as text and spends no recall budget',
     });
   }
 
   return routes;
+}
+
+function fileQueryCanRead(sessionId: string, readId: string, receipt: boolean): boolean {
+  // A redeemed receipt is read under its own exact identity, as file_query does.
+  if (receipt) return true;
+  try {
+    return resolveToolOutputForQuery(sessionId, readId).status === 'ok';
+  } catch {
+    return false;
+  }
 }
 
 /**

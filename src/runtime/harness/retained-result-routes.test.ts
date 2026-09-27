@@ -116,3 +116,31 @@ test('with nothing retained it still says so plainly', () => {
     /No retained reader can serve this/,
   );
 });
+
+test('file_query is never advertised for a derived output it would refuse', () => {
+  // Regression: routes offered file_query for every retained id, derived
+  // presentation-only readers included, and file_query then refused it.
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'derived-no-file-query' });
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_derived_query', tool: 'tool_output_query',
+    output: 'Showing 1 record(s) [0–1] of 1 matching (1 total)\n\n[{"row":1}]' });
+  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_derived_query' });
+  assert.ok(!routes.some((r) => r.tool === 'file_query'), JSON.stringify(routes));
+});
+
+test('routes for a carrier-dispatched recall name the producer, never the recall copy', () => {
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'recall-lineage-routes' });
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_producer_text', invocationNonce: 'nonce-producer-text', tool: 'read_file',
+    output: 'A long plain narrative the owner wrote, not structured data.' });
+  eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_called', data: {
+    callId: 'toolu_recall_carried', tool: 'call_tool', effectiveTool: 'recall_tool_result', accounting: 'top_level',
+    arguments: JSON.stringify({ name: 'recall_tool_result', args_json: JSON.stringify({ call_id: 'toolu_producer_text' }) }),
+  } });
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_recall_carried', tool: 'call_tool',
+    output: 'Recalled chars 0–10 of 60 (more remains — continue with recall_tool_result {"call_id":"toolu_producer_text","offset":10})\n\nA long pla' });
+  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_recall_carried' });
+  assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(routes));
+  for (const route of routes) {
+    assert.match(route.call, /"call_id":"toolu_producer_text"/);
+    assert.doesNotMatch(route.call, /toolu_recall_carried/);
+  }
+});
