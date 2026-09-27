@@ -15,6 +15,7 @@ export const MEMORY_CONTEXT_SECTION_TITLES: readonly string[] = [
   'Relevant To Your Request',
   'Completed Actions This Conversation',
   'User Preferences',
+  'Standing Policies',
   'Persistent Facts',
   'Recently Learned (last 24h)',
   'Data Landscape',

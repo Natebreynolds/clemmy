@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 const { resetMemoryDb } = await import('../memory/db.js');
 const { createFocus, patchFocusWorkstate } = await import('../memory/focus.js');
-const { harnessInstructions, renderHarnessMemoryContext, renderCurrentTimeForInstructions, renderRightNowStamp } = await import('./harness-context.js');
+const { harnessInstructions, renderHarnessMemoryContext, renderCurrentTimeForInstructions, renderRightNowStamp, renderMemoryCore } = await import('./harness-context.js');
 const { saveProactivityPolicy } = await import('./proactivity-policy.js');
 const { rememberFact } = await import('../memory/facts.js');
 const { checkpointWorkingMemory } = await import('../memory/working-memory.js');
@@ -94,6 +94,7 @@ test('stable rubric, turn authority, and externally-rendered Tool Memory occupy 
     CACHE_MEMORY_APPEND_SENTINEL,
     CACHE_MEMORY_CONTEXT_SENTINEL,
     splitCacheDynamicContext,
+    splitStableMemoryCore,
   } = await import('../runtime/harness/model-wire-registry.js');
   const rendered = harnessInstructions('STABLE RUBRIC', {
     volatileInstructions: 'CURRENT TURN AUTHORITY',
@@ -101,7 +102,11 @@ test('stable rubric, turn authority, and externally-rendered Tool Memory occupy 
   })();
   const at = rendered.indexOf(CACHE_BREAK_SENTINEL);
   assert.ok(at > 0);
-  assert.equal(rendered.slice(0, at).trim(), 'STABLE RUBRIC');
+  // The stable side is the rubric, then the memory core behind its own marker.
+  const stable = splitStableMemoryCore(rendered.slice(0, at).trim());
+  assert.equal(stable.role, 'STABLE RUBRIC');
+  assert.match(stable.memoryCore, /^# Persistent Context/);
+  assert.equal(stable.memoryCore, renderMemoryCore().text, 'the stable side carries exactly the content-addressed core');
   const dynamic = rendered.slice(at + CACHE_BREAK_SENTINEL.length).trim();
   const split = splitCacheDynamicContext(dynamic);
   assert.equal(split.turnContext, 'CURRENT TURN AUTHORITY');
@@ -684,4 +689,32 @@ test('the clock is stated twice: first in the Now section, and last, next to the
   // The stable half carries neither, so it stays cacheable across days.
   const stable = renderHarnessMemoryContext({ partition: 'stable' });
   assert.doesNotMatch(stable, /Right now it is|Today is \d{4}/);
+});
+
+test('the memory core is content-addressed: requests, sessions and later facts leave its bytes alone', () => {
+  resetMemoryDb();
+  const rule = 'Email sending constraint: ALWAYS send email via the Outlook mailbox desk@example.com. NEVER send from any other connected mailbox unless explicitly directed in the current conversation.';
+  rememberFact({ kind: 'constraint', content: rule });
+  const first = renderMemoryCore();
+  assert.match(first.text, /## Standing Policies\n\*\*Dispatch-enforced constraints\*\*\n- Email sending constraint/);
+  assert.equal(first.sha256.length, 64);
+  assert.deepEqual(first.manifest.map((entry) => entry.tier), first.manifest.map(() => 'core'));
+  assert.ok(first.manifest.find((entry) => entry.section === 'Standing Policies')?.refs.length === 1);
+  const a = harnessInstructions('ROLE', { sessionId: 'core-a', focusInput: 'first request about invoices' })();
+  rememberFact({ kind: 'project', content: 'An ordinary project fact learned between the two turns.' });
+  const b = harnessInstructions('ROLE', { sessionId: 'core-b', focusInput: 'a different request about travel' })();
+  const stableOf = (text: string) => text.slice(0, text.indexOf('<<<CLEM_CACHE_BREAK>>>'));
+  assert.equal(stableOf(a), stableOf(b), 'different sessions and requests share the stable prefix');
+  assert.equal(renderMemoryCore().sha256, first.sha256, 'a new non-policy fact does not move the core');
+});
+
+test('rendering the memory core records no impressions', async () => {
+  resetMemoryDb();
+  const { getFact } = await import('../memory/facts.js');
+  const fact = rememberFact({ kind: 'constraint', content: 'Email sending constraint: ALWAYS send email via the Outlook mailbox quiet@example.com. NEVER send from any other connected mailbox unless explicitly directed in the current conversation.' });
+  const id = fact.id;
+  const before = getFact(id)?.impressionCount ?? 0;
+  renderMemoryCore();
+  renderMemoryCore();
+  assert.equal(getFact(id)?.impressionCount ?? 0, before, 'the same bytes on every request are not an exposure per request');
 });

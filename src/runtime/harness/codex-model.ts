@@ -57,7 +57,7 @@ import { BoundaryError } from '../boundary-error.js';
 import { codexDispatcher, detectCodexTransportFailure, buildTransportTimeoutError } from '../codex-dispatcher.js';
 import { appendEvent } from './eventlog.js';
 import { estimateInputTokens } from './token-estimator.js';
-import { stripCacheBreakSentinel, INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
+import { stripCacheBreakSentinel, splitStableMemoryCore, INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { recordCodexRateLimit, recordCodexUsageExhausted } from './rate-limit-store.js';
 import { acceptedSourceIdentity, recordModelUsage } from '../usage-log.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
@@ -1088,7 +1088,10 @@ interface CodexRequestBody {
  * Prompt-cache routing key. The Responses API caches the longest identical
  * prefix (instructions, then tools, then input), and `prompt_cache_key` routes
  * calls to the node that holds it. The key therefore follows the part of the
- * prefix that stays fixed for a prompt ROLE: its instruction block.
+ * prefix that stays fixed for a prompt ROLE: its rubric. The memory core that
+ * follows the rubric in `instructions` is left out of the key, so a memory
+ * edit or another owner's memory keeps the role on the node that already
+ * holds its rubric.
  *
  * - Every call is keyed; an unkeyed call is never routed to a warm node.
  * - Different roles (a main agent, a sub-agent, a judge) carry different
@@ -1117,17 +1120,28 @@ function codexPromptShapeKey(instructions: string, tools: readonly unknown[]): s
     .slice(0, 12);
 }
 
-/** Split the assembler's `${role}${DELIM}${ctx}` into the STABLE role prefix (kept
+/** Split the assembler's `${role}${DELIM}${ctx}` into the STABLE prefix (kept
  *  in `instructions`) and the DYNAMIC ctx (re-homed after tools, in input). No
  *  sentinel (e.g. a sub-agent prompt that didn't pass through the assembler) → the
- *  whole string is stable instructions, ctx empty. Exported for the contract test. */
-export function splitCodexInstructions(raw: string | undefined | null): { instructions: string; trailingContext: string } {
+ *  whole string is stable instructions, ctx empty. The stable prefix may end in
+ *  the memory core; it stays in `instructions` (it changes only when the
+ *  owner's memory does), while `cacheKeySource` is the rubric alone, so the
+ *  routing key names the prompt role, not a memory version. Exported for the
+ *  contract test. */
+export function splitCodexInstructions(raw: string | undefined | null): {
+  instructions: string;
+  trailingContext: string;
+  cacheKeySource: string;
+} {
   const s = raw ?? '';
   const idx = s.indexOf(INSTRUCTION_CACHE_DELIM);
-  if (idx < 0) return { instructions: stripCacheBreakSentinel(s), trailingContext: '' };
+  const stable = idx < 0 ? s : s.slice(0, idx);
+  const cacheKeySource = stripCacheBreakSentinel(splitStableMemoryCore(stable).role);
+  if (idx < 0) return { instructions: stripCacheBreakSentinel(s), trailingContext: '', cacheKeySource };
   return {
-    instructions: s.slice(0, idx),
+    instructions: stripCacheBreakSentinel(stable),
     trailingContext: stripCacheBreakSentinel(s.slice(idx + INSTRUCTION_CACHE_DELIM.length)),
+    cacheKeySource,
   };
 }
 
@@ -1159,7 +1173,7 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
   // Route every call of this prompt role to the node holding its prefix, so
   // the (large, stable) tool-schema block actually hits. See codexPromptCacheKey().
   const shapeKey = codexPromptShapeKey(body.instructions ?? '', tools ?? []);
-  const cacheKey = codexPromptCacheKey(body.instructions ?? '');
+  const cacheKey = codexPromptCacheKey(split.cacheKeySource || body.instructions || '');
   body.prompt_cache_key = cacheKey;
   // THE CACHE PREFIX HAS NEVER BEEN OBSERVABLE FROM OUTSIDE.
   //

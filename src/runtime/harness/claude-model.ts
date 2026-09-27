@@ -41,6 +41,8 @@ import {
   CACHE_BREAK_SENTINEL,
   CACHE_MEMORY_CONTEXT_SENTINEL,
   CACHE_MEMORY_APPEND_SENTINEL,
+  CACHE_MEMORY_CORE_SENTINEL,
+  splitStableMemoryCore,
   type ModelCapability,
 } from './model-wire-registry.js';
 import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
@@ -365,7 +367,7 @@ export function buildClaudeSystemBlocks(
   cachingOn: boolean,
   toolsTokens = 0,
   stableTtl: '1h' | undefined = undefined,
-): { blocks: Array<Record<string, unknown>>; systemCached: boolean } {
+): { blocks: Array<Record<string, unknown>>; systemCached: boolean; systemBreakpoints: number } {
   let raw = normalizeSystemText(system);
   if (raw.startsWith(CLAUDE_CODE_IDENTITY)) {
     raw = raw.slice(CLAUDE_CODE_IDENTITY.length).replace(/^\s+/, '');
@@ -374,32 +376,47 @@ export function buildClaudeSystemBlocks(
   const stripAll = (s: string): string => stripPromptCacheLayerSentinels(
     s.split(CACHE_BREAK_SENTINEL).join(''),
   ).trim();
-  const stable = stripAll(sentIdx >= 0 ? raw.slice(0, sentIdx) : raw);
+  const stableRaw = sentIdx >= 0 ? raw.slice(0, sentIdx) : raw;
+  // The stable side may carry the memory core after the rubric. The core
+  // gets its own block and breakpoint AFTER the rubric's, so an edit to the
+  // owner's memory re-writes only the core's cache entry and never the
+  // rubric's hour-long one. Without a core marker the stable side is one
+  // block, exactly as before.
+  const split = sentIdx >= 0 ? splitStableMemoryCore(stableRaw) : { role: stableRaw, memoryCore: '' };
+  const role = stripAll(split.role);
+  const core = stripAll(split.memoryCore);
   const dynamic = stripAll(sentIdx >= 0 ? raw.slice(sentIdx + CACHE_BREAK_SENTINEL.length) : '');
 
   const blocks: Array<Record<string, unknown>> = [{ type: 'text', text: CLAUDE_CODE_IDENTITY }];
-  let systemCached = false;
-  // Anthropic 400s on an EMPTY text content block, so only emit the stable block
+  // A breakpoint on a system block caches the WHOLE prefix up to it (tools +
+  // identity + system so far, per Anthropic's tools->system->messages
+  // hierarchy), so each min-size gate counts the tools tokens that share it.
+  const canCache = cachingOn && cap.supportsPromptCache && sentIdx >= 0;
+  const marker = (): Record<string, unknown> => (stableTtl ? { type: 'ephemeral', ttl: stableTtl } : { type: 'ephemeral' });
+  const roleQualifies = canCache && Boolean(role)
+    && estimateTokens(CLAUDE_CODE_IDENTITY + role) + toolsTokens >= cap.cacheMinTokens;
+  const coreQualifies = canCache && Boolean(core)
+    && estimateTokens(CLAUDE_CODE_IDENTITY + role + core) + toolsTokens >= cap.cacheMinTokens;
+  let systemBreakpoints = 0;
+  // Anthropic 400s on an EMPTY text content block, so only emit a block
   // when it has content (identity-only is a valid system, matching legacy
   // withIdentityPrefix('')). Reachable with an empty/whitespace system or a
   // sentinel-led prompt whose stable prefix is empty.
-  if (stable) {
-    const stableBlock: Record<string, unknown> = { type: 'text', text: stable };
-    // A breakpoint on the stable system block caches the WHOLE prefix up to it
-    // (tools + identity + stable, per Anthropic's tools->system->messages
-    // hierarchy), so the min-size gate counts the tools tokens that share the
-    // cached prefix — not just identity+stable.
-    if (
-      cachingOn && cap.supportsPromptCache && sentIdx >= 0
-      && estimateTokens(CLAUDE_CODE_IDENTITY + stable) + toolsTokens >= cap.cacheMinTokens
-    ) {
-      stableBlock.cache_control = stableTtl ? { type: 'ephemeral', ttl: stableTtl } : { type: 'ephemeral' };
-      systemCached = true;
-    }
-    blocks.push(stableBlock);
+  if (role) {
+    const roleBlock: Record<string, unknown> = { type: 'text', text: role };
+    if (roleQualifies) { roleBlock.cache_control = marker(); systemBreakpoints += 1; }
+    blocks.push(roleBlock);
+  }
+  if (core) {
+    // Same lifetime as the rubric: the core is reused across turns, which are
+    // usually further apart than the default five minutes, and a later entry
+    // may not outlive an earlier one.
+    const coreBlock: Record<string, unknown> = { type: 'text', text: core };
+    if (coreQualifies) { coreBlock.cache_control = marker(); systemBreakpoints += 1; }
+    blocks.push(coreBlock);
   }
   if (dynamic) blocks.push({ type: 'text', text: dynamic });
-  return { blocks, systemCached };
+  return { blocks, systemCached: systemBreakpoints > 0, systemBreakpoints };
 }
 
 /** Cache the shared conversation transcript (`messages`) too, not just system+tools.
@@ -432,10 +449,11 @@ function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapabilit
   const tools = Array.isArray(parsed.tools) ? (parsed.tools as Array<Record<string, unknown>>) : [];
   const toolsTokens = tools.length > 0 ? estimateTokens(JSON.stringify(tools)) : 0;
   const stableTtl = claudeStablePrefixCacheTtl(typeof parsed.model === 'string' ? parsed.model : '');
-  const { blocks, systemCached } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens, stableTtl);
+  const { blocks, systemCached, systemBreakpoints } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens, stableTtl);
   parsed.system = blocks;
-  // breakpoint tally — Anthropic allows at most 4 cache_control markers per request.
-  let breakpoints = systemCached ? 1 : 0;
+  // breakpoint tally — Anthropic allows at most 4 cache_control markers per
+  // request: rubric, memory core and transcript use at most three.
+  let breakpoints = systemBreakpoints;
   if (!systemCached && cap.supportsPromptCache && tools.length > 0 && toolsTokens >= cap.cacheMinTokens) {
     const last = tools[tools.length - 1];
     if (last && typeof last === 'object') { last.cache_control = { type: 'ephemeral' }; breakpoints += 1; }
@@ -485,7 +503,8 @@ export function logClaudeRequestShape(body: BodyInit | null | undefined): void {
         effort: outputConfig?.effort ?? null,
         sentinelLeaked: body.includes(CACHE_BREAK_SENTINEL)
           || body.includes(CACHE_MEMORY_CONTEXT_SENTINEL)
-          || body.includes(CACHE_MEMORY_APPEND_SENTINEL),
+          || body.includes(CACHE_MEMORY_APPEND_SENTINEL)
+          || body.includes(CACHE_MEMORY_CORE_SENTINEL),
         messageCount: msgs.length,
         roles: roles.join(','),
         systemRoleInMessages: systemRoleIdxs,

@@ -295,3 +295,25 @@ test('an endpoint that refuses the hour-long marker gets the same request withou
     _resetClaudeCacheTtlForTests();
   }
 });
+
+test('envelope (parity on): the memory core gets its own hour-long entry after the rubric, so a memory edit never re-writes the rubric', async () => {
+  const { CACHE_MEMORY_CORE_DELIM, CACHE_MEMORY_CORE_SENTINEL } = await import('./model-wire-registry.js');
+  withParity('on', () => {
+    const rubric = 'R'.repeat(20000);
+    const bigHistory = [{ role: 'user', content: 'U'.repeat(20000) }];
+    const send = (core: string) => JSON.parse(applyClaudeEnvelope(
+      { body: JSON.stringify({ model: 'claude-opus-4-8', system: `${rubric}${CACHE_MEMORY_CORE_DELIM}${core}${CACHE_BREAK_SENTINEL}live context`, tools: [], messages: bigHistory }) },
+      TOKEN,
+    ).body as string);
+    const a = send('CORE v1: prefers mornings');
+    const b = send('CORE v2: prefers evenings');
+    assert.deepEqual(a.system.map((block: any) => block.text), [IDENTITY, rubric, 'CORE v1: prefers mornings', 'live context']);
+    assert.deepEqual(a.system[1].cache_control, { type: 'ephemeral', ttl: '1h' }, 'the rubric keeps its own entry');
+    assert.deepEqual(a.system[2].cache_control, { type: 'ephemeral', ttl: '1h' }, 'the core has its own entry after it');
+    assert.equal(a.system[3].cache_control, undefined, 'per-turn context stays uncached');
+    assert.equal(JSON.stringify(a.system[1]), JSON.stringify(b.system[1]), 'a core edit leaves the rubric block byte-identical');
+    assert.equal(JSON.stringify(a).includes(CACHE_MEMORY_CORE_SENTINEL), false, 'the marker never reaches the wire');
+    const markers = JSON.stringify(a).split('"cache_control"').length - 1;
+    assert.equal(markers, 3, 'rubric, core and transcript: within the four-marker limit');
+  });
+});

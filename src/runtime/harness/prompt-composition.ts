@@ -33,7 +33,7 @@
  * harness hands over at turn start — the part we control and can cut.
  */
 import { estimateTokens } from './budget.js';
-import { CACHE_BREAK_SENTINEL, splitCacheDynamicContext, splitCacheDynamicLayers } from './model-wire-registry.js';
+import { CACHE_BREAK_SENTINEL, splitCacheDynamicContext, splitCacheDynamicLayers, splitStableMemoryCore } from './model-wire-registry.js';
 import { MEMORY_CONTEXT_SECTION_TITLES } from '../../agents/memory-context-sections.js';
 import { createHash } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
@@ -138,7 +138,7 @@ export interface PromptBucket {
    *  (a STABLE bucket whose sha moves between consecutive steps is a cache
    *  bust the estimate would hide). */
   sha256?: string;
-  /** memoryContext only: size of each rendered memory section, keyed by its
+  /** memoryContext and memoryCore: size of each rendered memory section, keyed by its
    *  heading (never its contents). "(header)" is the preamble before the
    *  first section; "(appended)" is memory text appended after the context. */
   sections?: Record<string, { bytes: number; tokens: number }>;
@@ -264,7 +264,12 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
   // "stable" tokens change every turn.
   const instructionsText = input.instructions ?? '';
   const sentinelAt = instructionsText.indexOf(CACHE_BREAK_SENTINEL);
-  const staticInstructions = sentinelAt >= 0 ? instructionsText.slice(0, sentinelAt) : instructionsText;
+  // The stable half may end in the memory core (identity, profile, autonomy,
+  // enforced rules). It is memory, but cacheable, so it is its own STABLE
+  // bucket rather than hiding inside the rubric's.
+  const stableHalf = splitStableMemoryCore(sentinelAt >= 0 ? instructionsText.slice(0, sentinelAt) : instructionsText);
+  const staticInstructions = stableHalf.role;
+  const memoryCore = stableHalf.memoryCore;
   const dynamicInstructions = sentinelAt >= 0
     ? instructionsText.slice(sentinelAt + CACHE_BREAK_SENTINEL.length)
     : '';
@@ -287,6 +292,7 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
     // STABLE: same bytes every turn for a given session, so the provider keeps
     // them warm. Large is FINE here — that is the whole point of the split.
     ['instructions', estimateTokens(staticInstructions), 'stable', staticInstructions],
+    ['memoryCore', estimateTokens(memoryCore), 'stable', memoryCore],
     ['turnContext', estimateTokens(dynamicLayers.turnContext), 'variable', dynamicLayers.turnContext],
     ['memoryContext', estimateTokens(dynamicLayers.memoryContext), 'variable', dynamicLayers.memoryContext],
     // The measured serialized schemas win; the names x 120 guess is only for
@@ -315,6 +321,7 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
       ...(name === 'memoryContext'
         ? { sections: memoryContextSections(memoryLayers.memoryContext, memoryLayers.appendedMemory) }
         : {}),
+      ...(name === 'memoryCore' ? { sections: memoryContextSections(memoryCore) } : {}),
     }))
     .sort((a, b) => b.tokens - a.tokens);
 
@@ -335,10 +342,11 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
 
 /** The ledger's per-request prompt components, read from the same summary
  *  the composition event records (bucket name -> estimated tokens).
- *  `instructions` is the stable instruction prefix only; the per-turn
- *  instruction text is `turnContext` and the memory block is `memoryContext`.
- *  A series that compares against rows recorded before those buckets existed
- *  must sum the three to get the older combined `instructions` value. */
+ *  `instructions` is the stable rubric only; the cached memory core is
+ *  `memoryCore`, the per-turn instruction text is `turnContext` and the
+ *  per-turn memory block is `memoryContext`. A series that compares against
+ *  rows recorded before those buckets existed must sum them to get the older
+ *  combined `instructions` value. */
 export function promptComponentsFromComposition(summary: PromptCompositionSummary): Record<string, number> {
   return Object.fromEntries(summary.buckets.map((bucket) => [bucket.name, bucket.tokens]));
 }

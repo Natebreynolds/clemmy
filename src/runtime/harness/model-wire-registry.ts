@@ -71,6 +71,25 @@ export const CACHE_MEMORY_CONTEXT_DELIM = `\n\n${CACHE_MEMORY_CONTEXT_SENTINEL}\
 export const CACHE_MEMORY_APPEND_SENTINEL = '<<<CLEM_MEMORY_APPEND>>>';
 export const CACHE_MEMORY_APPEND_DELIM = `\n\n${CACHE_MEMORY_APPEND_SENTINEL}\n\n`;
 
+/**
+ * Marker on the STABLE side of the prompt-cache boundary, between the role
+ * rubric and the memory core (identity, profile, autonomy and enforced rules).
+ * The core changes only when the owner's memory changes, so it belongs in the
+ * cached prefix; the marker lets a wire give it its own cache entry so a
+ * memory edit never re-writes the rubric's entry, and lets a routing key
+ * follow the rubric alone. Transport metadata like the others: every adapter
+ * strips it before provider I/O.
+ */
+export const CACHE_MEMORY_CORE_SENTINEL = '<<<CLEM_MEMORY_CORE>>>';
+export const CACHE_MEMORY_CORE_DELIM = `\n\n${CACHE_MEMORY_CORE_SENTINEL}\n\n`;
+
+/** Split the stable prefix into the role rubric and the memory core. No
+ *  marker → the whole prefix is the role and the core is empty. */
+export function splitStableMemoryCore(stable: string | undefined | null): { role: string; memoryCore: string } {
+  const split = splitLayerMarker(stable ?? '', CACHE_MEMORY_CORE_DELIM, CACHE_MEMORY_CORE_SENTINEL);
+  return split.found ? { role: split.before, memoryCore: split.after } : { role: split.before, memoryCore: '' };
+}
+
 function splitLayerMarker(
   text: string,
   exactDelimiter: string,
@@ -134,7 +153,9 @@ export function stripPromptCacheLayerSentinels(text: string | undefined | null):
     .split(CACHE_MEMORY_CONTEXT_DELIM).join('\n\n')
     .split(CACHE_MEMORY_CONTEXT_SENTINEL).join('')
     .split(CACHE_MEMORY_APPEND_DELIM).join('\n\n')
-    .split(CACHE_MEMORY_APPEND_SENTINEL).join('');
+    .split(CACHE_MEMORY_APPEND_SENTINEL).join('')
+    .split(CACHE_MEMORY_CORE_DELIM).join('\n\n')
+    .split(CACHE_MEMORY_CORE_SENTINEL).join('');
 }
 
 /** Bare strip: drop the sentinel, leaving a `---` separator. Defensive fallback
@@ -157,12 +178,15 @@ export function restoreLegacyInstructionOrder(text: string | undefined | null): 
   const s = text ?? '';
   const idx = s.indexOf(INSTRUCTION_CACHE_DELIM);
   if (idx >= 0) {
-    const role = s.slice(0, idx);
+    const stable = splitStableMemoryCore(s.slice(0, idx));
+    const role = stable.role;
     const dynamic = s.slice(idx + INSTRUCTION_CACHE_DELIM.length);
     const split = splitCacheDynamicLayers(dynamic);
     const stableAndTurn = [role, split.turnContext].filter(Boolean).join('\n\n');
-    const historicalBase = split.memoryContext
-      ? `${split.memoryContext}\n\n---\n\n${stableAndTurn}`
+    // Legacy order puts every memory byte first, the core ahead of the rest.
+    const memory = [stable.memoryCore, split.memoryContext].filter(Boolean).join('\n\n');
+    const historicalBase = memory
+      ? `${memory}\n\n---\n\n${stableAndTurn}`
       : stableAndTurn;
     return [historicalBase, split.appendedMemory].filter(Boolean).join('\n\n');
   }

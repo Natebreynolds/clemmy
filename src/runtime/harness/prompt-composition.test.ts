@@ -277,3 +277,17 @@ test('the appended per-round items are separate buckets and the ledger component
     assert.ok(components[key]! > 0, `ledger keeps the ${key} key`);
   }
 });
+
+test('the memory core is its own STABLE bucket, split from the rubric and sized by section', async () => {
+  const { CACHE_MEMORY_CORE_DELIM } = await import('./model-wire-registry.js');
+  const core = '# Persistent Context\n\nheader\n\n## Autonomy\nposture\n\n## Standing Policies\n- rule';
+  const summary = summarizePromptComposition({
+    instructions: `Rubric.${CACHE_MEMORY_CORE_DELIM}${core}${CACHE_BREAK_SENTINEL}Turn.${CACHE_MEMORY_CONTEXT_DELIM}## Right Now\nclock`,
+  });
+  const byName = new Map(summary.buckets.map((bucket) => [bucket.name, bucket]));
+  assert.equal(byName.get('instructions')?.bytes, Buffer.byteLength('Rubric.'), 'the rubric bucket is the rubric alone');
+  assert.equal(byName.get('memoryCore')?.stability, 'stable');
+  assert.equal(byName.get('memoryCore')?.bytes, Buffer.byteLength(core));
+  assert.deepEqual(Object.keys(byName.get('memoryCore')!.sections!), ['(header)', 'Autonomy', 'Standing Policies']);
+  assert.equal(byName.get('memoryContext')?.stability, 'variable');
+});

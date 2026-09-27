@@ -28,7 +28,7 @@ import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
  */
 import { loadMemoryContext } from '../memory/vault.js';
 import { withInstructionMemory } from '../runtime/harness/model-memory-evidence.js';
-import { renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText } from '../memory/facts.js';
+import { renderCorePoliciesForInstructions, renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText, type CorePolicyRender } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
 import { getFocusSnapshot } from '../memory/focus.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
@@ -46,7 +46,9 @@ import {
   CACHE_BREAK_SENTINEL,
   CACHE_MEMORY_CONTEXT_SENTINEL,
   CACHE_MEMORY_APPEND_SENTINEL,
+  CACHE_MEMORY_CORE_DELIM,
 } from '../runtime/harness/model-wire-registry.js';
+import { createHash } from 'node:crypto';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { renderRecentActionsForHarnessHistory } from '../runtime/harness/session-transcript.js';
 import { appendFactRecallTrace } from '../memory/recall-trace.js';
@@ -201,6 +203,7 @@ function renderActiveGoals(): string {
 export function renderLearnedBlocks(
   objective?: string,
   focusScope?: { resourceRef?: string | null },
+  options: { request?: string } = {},
 ): { recentlyLearned: string; toolChoices: string; establishedDestinations: string } {
   let recentlyLearned = '';
   try {
@@ -221,14 +224,17 @@ export function renderLearnedBlocks(
   // tool picks — a strategy is the level above a tool choice. Additive: no
   // matching strategy → '' → identical context to before this existed.
   try {
-    const strategies = section('Proven Run Strategies', renderRunStrategiesForContext(objective));
+    const strategies = section('Proven Run Strategies', renderRunStrategiesForContext(objective, 2, options.request));
     if (strategies) toolChoices = [toolChoices, strategies].filter(Boolean).join('\n\n');
   } catch { /* strategy recall is best-effort */ }
   // Established deploy targets for the project under active focus — the AGENT
   // side of the destination gate↔recall unification (2026-06-21): surface WHERE
   // this project deploys so the agent updates the same site explicitly instead
   // of re-discovering / minting a new one / tripping the provenance gate.
-  let establishedDestinations = '';
+  return { recentlyLearned, toolChoices, establishedDestinations: renderEstablishedDestinationsSection(focusScope) };
+}
+
+function renderEstablishedDestinationsSection(focusScope?: { resourceRef?: string | null }): string {
   try {
     // User-turn callers pass an explicit scoped value (including null). The
     // legacy no-options form retains the old global behavior for non-turn
@@ -236,11 +242,73 @@ export function renderLearnedBlocks(
     const focusRef = focusScope === undefined
       ? getFocusSnapshot().active?.resource_ref
       : focusScope.resourceRef ?? undefined;
-    establishedDestinations = section('Established Deploy Targets', renderEstablishedDestinationsForContext(focusRef));
+    return section('Established Deploy Targets', renderEstablishedDestinationsForContext(focusRef));
   } catch {
-    establishedDestinations = '';
+    return '';
   }
-  return { recentlyLearned, toolChoices, establishedDestinations };
+}
+
+/** The accepted request and the focus proven current for this session: the
+ *  objective every request-ranked memory block ranks by. */
+function resolveRequestObjective(sessionId: string | undefined, acceptedInput: string) {
+  const activeTaskContext = resolveActiveTaskContext({ sessionId, input: acceptedInput });
+  const scopedFocus = activeTaskContext.focus?.disposition === 'active'
+    ? activeTaskContext.focus
+    : null;
+  const focusObjective = scopedFocus
+    ? [scopedFocus.title, scopedFocus.summary ?? ''].filter(Boolean).join(' ').trim()
+    : '';
+  const requestObjective = [acceptedInput.trim(), focusObjective]
+    .filter(Boolean)
+    .join('\n') || undefined;
+  return { activeTaskContext, scopedFocus, requestObjective };
+}
+
+/**
+ * The request-ranked blocks each ranked by its own matcher: Persistent Facts,
+ * Recently Learned, Data Landscape and Remembered Tool Choices (with Proven
+ * Run Strategies).
+ */
+function renderRequestRankedBlocks(input: {
+  requestObjective: string | undefined;
+  acceptedInput: string;
+  scopedFocus: { resourceRef?: string | null } | null;
+  includeRememberedToolChoices?: boolean;
+  omitCoreGroups: boolean;
+}): Array<{ title: string; text: string }> {
+  let facts = '';
+  try {
+    // The literal accepted request ranks first; only a focus proven current
+    // for this session may refine it. Process-global focus never scopes a
+    // different task branch.
+    facts = renderFactsForInstructions(10, 2600, input.requestObjective, 'all', { omitCoreGroups: input.omitCoreGroups });
+  } catch {
+    facts = '';
+  }
+  // Learned context (Recently Learned + Remembered Tool Choices) — shared with
+  // the chat assembler via renderLearnedBlocks so both surfaces see the same
+  // learned tools/facts. RANKING OBJECTIVE = current message BLENDED with the
+  // active focus, so a request with an unrelated focus still promotes the
+  // tool memo that fits the request. The chat assembler blends the same way.
+  const { recentlyLearned, toolChoices } = renderLearnedBlocks(
+    input.requestObjective,
+    { resourceRef: input.scopedFocus?.resourceRef ?? null },
+    { request: input.acceptedInput },
+  );
+  // Source-map / landscape memory — a pointer-first index of WHERE the user's
+  // data lives, scoped to the active objective. Off (flag) → ''.
+  let dataLandscape = '';
+  try {
+    dataLandscape = renderSourceMapForContext(24, undefined, input.requestObjective);
+  } catch {
+    dataLandscape = '';
+  }
+  return [
+    { title: 'Persistent Facts', text: section('Persistent Facts', facts) },
+    { title: 'Recently Learned', text: recentlyLearned },
+    { title: 'Data Landscape', text: section('Data Landscape', dataLandscape) },
+    { title: 'Remembered Tool Choices', text: input.includeRememberedToolChoices === false ? '' : toolChoices },
+  ];
 }
 
 /** Held-for-later tasks for THIS session, so the model can resurface one when
@@ -299,7 +367,12 @@ export function renderHarnessMemoryContext(opts?: {
   partition?: 'all' | 'stable' | 'volatile';
   includeRememberedToolChoices?: boolean;
   includeSessionActions?: boolean;
+  /** 'variable': everything the memory core (renderMemoryCore) does not
+   *  carry, under the per-turn header. The harness prompt sends the core in
+   *  its cached prefix and this after the cache boundary. */
+  layout?: 'legacy' | 'variable';
 }): string {
+  const variableLayout = opts?.layout === 'variable';
   let memContext;
   try {
     memContext = loadMemoryContext();
@@ -310,60 +383,25 @@ export function renderHarnessMemoryContext(opts?: {
   const partition = opts?.partition ?? 'all';
   const acceptedInput = opts?.focusInput ?? opts?.query ?? '';
   const inputDisposition = classifyCurrentTaskInput(acceptedInput);
-  const activeTaskContext = resolveActiveTaskContext({
-    sessionId: opts?.sessionId,
-    input: acceptedInput,
-  });
-  const scopedFocus = activeTaskContext.focus?.disposition === 'active'
-    ? activeTaskContext.focus
-    : null;
-  const focusObjective = scopedFocus
-    ? [scopedFocus.title, scopedFocus.summary ?? ''].filter(Boolean).join(' ').trim()
-    : '';
-  const requestObjective = [acceptedInput.trim(), focusObjective]
-    .filter(Boolean)
-    .join('\n') || undefined;
+  const { activeTaskContext, scopedFocus, requestObjective } = resolveRequestObjective(opts?.sessionId, acceptedInput);
 
-  let facts = '';
   // PHANTOM IMPRESSIONS killed (COMPOUNDING wave): Persistent Facts is a
   // STABLE-partition block; rendering it on a volatile-only pass recorded an
   // impression per fact per turn for text the model never received — the
   // measured live inflation behind the 1,735:1 impression:use ratio. Render
   // (and count) only when the partition actually delivers the block.
-  if (partition !== 'volatile') {
-    try {
-      // The literal accepted request ranks first; only a focus proven current
-      // for this session may refine it. Process-global focus never scopes a
-      // different task branch.
-      facts = renderFactsForInstructions(10, 2600, requestObjective);
-    } catch {
-      facts = '';
-    }
-  }
-
-  // Learned context (Recently Learned + Remembered Tool Choices) — shared with
-  // the chat assembler via renderLearnedBlocks so both surfaces see the same
-  // learned tools/facts. RANKING OBJECTIVE = current message BLENDED with the
-  // active focus (live 2026-07-31: this lane ranked by focus alone, so a
-  // Salesforce request with an unrelated focus never promoted the proven
-  // 19-success sf-CLI memo above the recency fold of 358 memos — the model
-  // went Composio-first against the owner's standing rule). The chat assembler
-  // already blends message+focus; the two lanes now rank identically.
-  const learnedObjective = requestObjective;
-  const { recentlyLearned, toolChoices, establishedDestinations } = renderLearnedBlocks(
-    learnedObjective,
-    { resourceRef: scopedFocus?.resourceRef ?? null },
-  );
-  const rememberedToolChoices = opts?.includeRememberedToolChoices === false ? '' : toolChoices;
-
-  // Source-map / landscape memory — a pointer-first index of WHERE the user's
-  // data lives, scoped to the active objective. Off (flag) → ''.
-  let dataLandscape = '';
-  try {
-    dataLandscape = renderSourceMapForContext(24, undefined, requestObjective);
-  } catch {
-    dataLandscape = '';
-  }
+  const rankedBlocks = partition !== 'volatile'
+    ? renderRequestRankedBlocks({
+        requestObjective,
+        acceptedInput,
+        scopedFocus,
+        includeRememberedToolChoices: opts?.includeRememberedToolChoices,
+        // The memory core carries the enforced and core-profile policies.
+        omitCoreGroups: variableLayout,
+      })
+    : [];
+  const rankedText = (title: string): string => rankedBlocks.find((block) => block.title === title)?.text ?? '';
+  const establishedDestinations = renderEstablishedDestinationsSection({ resourceRef: scopedFocus?.resourceRef ?? null });
 
   let profile = '';
   try {
@@ -451,10 +489,10 @@ export function renderHarnessMemoryContext(opts?: {
     { title: 'Relevant To Your Request', text: section('Relevant To Your Request', requestRecall) },
     { title: 'Completed Actions This Conversation', text: section('Completed Actions This Conversation', sessionActions) },
     { title: 'User Preferences', text: section('User Preferences', profile) },
-    { title: 'Persistent Facts', text: section('Persistent Facts', facts) },
-    { title: 'Recently Learned', text: recentlyLearned },
-    { title: 'Data Landscape', text: section('Data Landscape', dataLandscape) },
-    { title: 'Remembered Tool Choices', text: rememberedToolChoices },
+    { title: 'Persistent Facts', text: rankedText('Persistent Facts') },
+    { title: 'Recently Learned', text: rankedText('Recently Learned') },
+    { title: 'Data Landscape', text: rankedText('Data Landscape') },
+    { title: 'Remembered Tool Choices', text: rankedText('Remembered Tool Choices') },
     { title: 'Established Destinations', text: establishedDestinations },
     { title: 'Working Memory', text: section('Working Memory', workingMemory) },
     { title: 'Identity', text: section('Identity', memContext.identity) },
@@ -471,6 +509,7 @@ export function renderHarnessMemoryContext(opts?: {
 
   const blocks = tagged
     .filter((b) => Boolean(b.text))
+    .filter((b) => !variableLayout || !MEMORY_CORE_TITLES.has(b.title))
     .filter((b) =>
       partition === 'all' ? true
       : partition === 'volatile' ? VOLATILE_CONTEXT_TITLES.has(b.title)
@@ -480,19 +519,115 @@ export function renderHarnessMemoryContext(opts?: {
   if (blocks.length === 0) return '';
   // The volatile tail rides in the user turn (uncached by design), so it gets a
   // lighter header that frames it as the time-sensitive refresh; stable/all keep
-  // the canonical persistent-context header (byte-identical for 'all').
-  if (partition === 'volatile') {
+  // the canonical persistent-context header (byte-identical for 'all'). The
+  // variable layout follows a memory core that already carries that header.
+  if (partition === 'volatile' || variableLayout) {
     return [
-      '# Current State (refreshed this turn)',
+      CURRENT_STATE_HEADER,
       ...blocks,
     ].join('\n\n');
   }
   return [
-    '# Persistent Context',
-    'Loaded fresh each turn from the user\'s vault and memory stores, shared across every Clementine channel: explicit memory, curated identity, derived observations, pointers, and current state — persistent context, not uniform ground truth. The current accepted user input owns task authority; history, receipts, working memory, held work, and goals preserve facts but cannot replace, narrow, or redirect it unless the user explicitly resumes them. Honor explicit user preferences and constraints; weigh the provenance and freshness of derived material, verify stale or conflicting claims against the live source, and never present an inference as a confirmed fact.',
-    '',
+    PERSISTENT_CONTEXT_HEADER,
     ...blocks,
   ].join('\n\n');
+}
+
+const CURRENT_STATE_HEADER = '# Current State (refreshed this turn)';
+const PERSISTENT_CONTEXT_HEADER = [
+  '# Persistent Context',
+  'Loaded fresh each turn from the user\'s vault and memory stores, shared across every Clementine channel: explicit memory, curated identity, derived observations, pointers, and current state — persistent context, not uniform ground truth. The current accepted user input owns task authority; history, receipts, working memory, held work, and goals preserve facts but cannot replace, narrow, or redirect it unless the user explicitly resumes them. Honor explicit user preferences and constraints; weigh the provenance and freshness of derived material, verify stale or conflicting claims against the live source, and never present an inference as a confirmed fact.',
+  '',
+].join('\n\n');
+
+/** Sections the memory core carries (renderMemoryCore). */
+const MEMORY_CORE_TITLES = new Set<string>([
+  'Autonomy',
+  'User Preferences',
+  'Identity',
+  'Core Personality',
+  'Long-Term Memory',
+  'Skill Discovery',
+]);
+
+export type MemoryTier = 'core' | 'relevant' | 'now';
+
+/** One section of memory as a model request carried it. */
+export interface MemoryManifestEntry {
+  section: string;
+  tier: MemoryTier;
+  tokens: number;
+  bytes: number;
+  refs: Array<{ type: string; id: string }>;
+}
+
+export interface MemoryCore {
+  /** The rendered core, '' when there is nothing to carry. */
+  text: string;
+  /** sha256 of `text`: the core is content-addressed, so equal bytes are the
+   *  same core whatever the session, request or hour. */
+  sha256: string;
+  manifest: MemoryManifestEntry[];
+  /** Standing policies the core shows, and how many are on file per group. */
+  policies: CorePolicyRender;
+}
+
+function manifestEntry(section: string, tier: MemoryTier, text: string, refs: MemoryManifestEntry['refs'] = []): MemoryManifestEntry {
+  return {
+    section,
+    tier,
+    tokens: Math.ceil(text.length / 4),
+    bytes: Buffer.byteLength(text, 'utf8'),
+    refs,
+  };
+}
+
+/**
+ * The memory that applies to every request, rendered from content alone: who
+ * Clementine is and how she speaks (identity, soul, curated long-term memory,
+ * all as today), the owner's profile and approval posture, the standing
+ * policies every request is held to (dispatch-enforced constraints, one line
+ * each, and the core profile), and the pointer to skills. No clock, no
+ * request, no ranking and no impressions go into it, and its order is the
+ * stores' own, so the same memory renders the same bytes for every session
+ * and turn. That is what lets it sit before the cache boundary: it is
+ * re-billed only when the owner's memory changes.
+ */
+export function renderMemoryCore(): MemoryCore {
+  let memContext: ReturnType<typeof loadMemoryContext>;
+  try { memContext = loadMemoryContext(); } catch { memContext = {} as ReturnType<typeof loadMemoryContext>; }
+  let profile = '';
+  try { profile = renderProfileForInstructions(); } catch { profile = ''; }
+  let policies: CorePolicyRender;
+  try {
+    policies = renderCorePoliciesForInstructions();
+  } catch {
+    policies = { text: '', refs: [], counts: { dispatchConstraint: 0, coreProfile: 0, promptInstruction: 0, standingPreference: 0 } };
+  }
+  let skillDiscovery = '';
+  try { skillDiscovery = renderSkillDiscoveryPrompt(); } catch { skillDiscovery = ''; }
+  const sections: Array<{ title: string; text: string; refs?: MemoryManifestEntry['refs'] }> = [
+    { title: 'Autonomy', text: section('Autonomy', renderAutonomy()) },
+    { title: 'User Preferences', text: section('User Preferences', profile) },
+    { title: 'Standing Policies', text: section('Standing Policies', policies.text), refs: policies.refs },
+    { title: 'Identity', text: section('Identity', memContext.identity) },
+    { title: 'Core Personality', text: section('Core Personality', memContext.soul) },
+    { title: 'Long-Term Memory', text: section('Long-Term Memory', memContext.memory) },
+    { title: 'Skill Discovery', text: section('Skill Discovery', skillDiscovery) },
+  ].filter((entry) => Boolean(entry.text));
+  if (sections.length === 0) {
+    return { text: '', sha256: createHash('sha256').update('').digest('hex'), manifest: [], policies };
+  }
+  const text = [PERSISTENT_CONTEXT_HEADER, ...sections.map((entry) => entry.text)].join('\n\n');
+  return {
+    text,
+    sha256: createHash('sha256').update(text, 'utf8').digest('hex'),
+    manifest: [
+      manifestEntry('(header)', 'core', PERSISTENT_CONTEXT_HEADER),
+      ...sections.map((entry) => manifestEntry(entry.title, 'core', entry.text, entry.refs ?? [])),
+    ],
+    policies,
+  };
 }
 
 /**
@@ -525,15 +660,20 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   // accepted-turn context, move the prompt-cache boundary, or make later model
   // cycles observe a different memory primer. The next genuine turn rebuilds
   // the Agent and therefore receives a fresh snapshot.
+  // The core is content-addressed and joins the cached prefix after the
+  // rubric; everything request- or time-dependent follows the boundary.
+  const core = renderMemoryCore();
   const ctx = renderHarnessMemoryContext({
     sessionId: opts?.sessionId,
     sourceUserSeq: opts?.sourceUserSeq,
     focusInput: opts?.focusInput,
     includeRememberedToolChoices: opts?.includeRememberedToolChoices,
     includeSessionActions: opts?.includeSessionActions,
+    layout: 'variable',
   });
   const agentInstructions = opts?.agentInstructions?.trim() ?? '';
   const stableRole = [roleInstructions, agentInstructions].filter(Boolean).join('\n\n');
+  const stablePrefix = core.text ? `${stableRole}${CACHE_MEMORY_CORE_DELIM}${core.text}` : stableRole;
   const volatileInstructions = opts?.volatileInstructions?.trim() ?? '';
   const volatileMemoryInstructions = opts?.volatileMemoryInstructions?.trim() ?? '';
   const historicalRole = [stableRole, volatileInstructions].filter(Boolean).join('\n\n');
@@ -544,16 +684,20 @@ export function harnessInstructions(roleInstructions: string, opts?: {
       ? [CACHE_MEMORY_APPEND_SENTINEL, volatileMemoryInstructions]
       : []),
   ].filter(Boolean).join('\n\n');
+  const legacyMemory = [core.text, ctx].filter(Boolean).join('\n\n');
   const rendered = modelParityEnabled() && dynamic
-    // Only the identity/rubric policy precedes the boundary. Every current-turn
-    // authority/catalog byte and every memory byte follows it, so changing
-    // either can invalidate only its own suffix rather than re-billing policy.
-    ? `${stableRole}\n\n${CACHE_BREAK_SENTINEL}\n\n${dynamic}`
-    // Kill-switch/legacy path retains the exact historical order: memory first,
+    // The rubric and the memory core precede the boundary. Every current-turn
+    // authority/catalog byte and every per-turn memory byte follows it, so
+    // changing either can invalidate only its own suffix rather than
+    // re-billing policy; the core has its own marker so a wire can cache it
+    // apart from the rubric.
+    ? `${stablePrefix}\n\n${CACHE_BREAK_SENTINEL}\n\n${dynamic}`
+    // Kill-switch/legacy path retains the historical order: memory first,
     // separator, then role + the per-turn instruction trailer.
     : [
-        ctx ? `${ctx}\n\n---\n\n${historicalRole}` : historicalRole,
+        legacyMemory ? `${legacyMemory}\n\n---\n\n${historicalRole}` : historicalRole,
         volatileMemoryInstructions,
       ].filter(Boolean).join('\n\n');
-  return withInstructionMemory(() => rendered, [ctx, volatileMemoryInstructions]);
+  const instructions = withInstructionMemory(() => rendered, [core.text, ctx, volatileMemoryInstructions]);
+  return instructions;
 }

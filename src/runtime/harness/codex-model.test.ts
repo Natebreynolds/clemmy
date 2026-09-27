@@ -94,8 +94,22 @@ function requestWithInstructions(systemInstructions: string, input: ModelRequest
 
 test('splitCodexInstructions splits role (stable) from dynamic ctx on the sentinel; no sentinel → all instructions', () => {
   const raw = `ROLE_RUBRIC${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`;
-  assert.deepEqual(splitCodexInstructions(raw), { instructions: 'ROLE_RUBRIC', trailingContext: 'DYNAMIC_CTX' });
-  assert.deepEqual(splitCodexInstructions('just role, no sentinel'), { instructions: 'just role, no sentinel', trailingContext: '' });
+  assert.deepEqual(splitCodexInstructions(raw), { instructions: 'ROLE_RUBRIC', trailingContext: 'DYNAMIC_CTX', cacheKeySource: 'ROLE_RUBRIC' });
+  assert.deepEqual(splitCodexInstructions('just role, no sentinel'), { instructions: 'just role, no sentinel', trailingContext: '', cacheKeySource: 'just role, no sentinel' });
+});
+
+test('Codex wire: the memory core stays in instructions while the routing key follows the rubric alone', async () => {
+  const { CACHE_MEMORY_CORE_DELIM, CACHE_MEMORY_CORE_SENTINEL } = await import('./model-wire-registry.js');
+  const withCore = (core: string) => buildCodexRequestBody('gpt-5.5',
+    requestWithInstructions(`ROLE_RUBRIC${CACHE_MEMORY_CORE_DELIM}${core}${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`));
+  const a = withCore('CORE v1: prefers mornings');
+  const b = withCore('CORE v2: prefers evenings');
+  const bare = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE_RUBRIC${INSTRUCTION_CACHE_DELIM}DYNAMIC_CTX`));
+  assert.equal(a.instructions, 'ROLE_RUBRIC\n\nCORE v1: prefers mornings', 'the core is cacheable prefix, marker stripped');
+  assert.ok(!String(a.instructions).includes(CACHE_MEMORY_CORE_SENTINEL));
+  assert.equal(a.prompt_cache_key, b.prompt_cache_key, 'a memory edit keeps the role on its node');
+  assert.equal(a.prompt_cache_key, bare.prompt_cache_key, 'the key names the prompt role, not a memory version');
+  assert.deepEqual((a.input as Array<Record<string, unknown>>).at(-1), { role: 'system', content: 'DYNAMIC_CTX' });
 });
 
 test('splitCodexInstructions preserves turn then memory bytes but strips the internal memory marker', async () => {
