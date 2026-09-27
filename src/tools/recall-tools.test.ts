@@ -486,11 +486,19 @@ test('a recall budget refusal hands back the exact next call, never prose only',
   assert.match(callErr, /tool_output_query \{"call_id":"call_abc123"\}/);
   assert.match(callErr, /Do NOT retry recall_tool_result/);
 
-  const byteBudget = new RecallBudget(9, 150);
-  const byteErr = byteBudget.consume(200, 'call_xyz789');
+  const byteBudget = new RecallBudget(9, 2_000);
+  const byteErr = byteBudget.consume(3_000, 'call_xyz789');
   assert.ok(byteErr, 'an oversized slice exhausts the byte budget');
   assert.match(byteErr, /^recall byte budget exhausted/);
   assert.match(byteErr, /tool_output_query \{"call_id":"call_xyz789"\}/);
+
+  // A query spends the same bytes, so once too few remain for a minimal query
+  // reply the exact next call is the reader that spends none.
+  const spentBudget = new RecallBudget(9, 150);
+  const spentErr = spentBudget.consume(200, 'call_xyz789');
+  assert.ok(spentErr);
+  assert.match(spentErr, /file_query \{"call_id":"call_xyz789","query":"<what you need>"\}/);
+  assert.doesNotMatch(spentErr, /tool_output_query \{/);
 
   // Without a call_id the refusal still points at the tool rather than dead-ending.
   const bare = new RecallBudget(0, 60_000).consume(10);
