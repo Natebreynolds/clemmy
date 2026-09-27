@@ -224,8 +224,9 @@ test('the ranked tail keeps hits above half the best score, puts request-relevan
   });
   assert.equal(tail.status, 'ok');
   const text = tail.text ?? '';
-  assert.ok(text.startsWith('## Relevant To This Request\n'), text);
-  assert.doesNotMatch(text, /\[MEMORY PRIMER\]|\[RELEVANT MEMORY/, 'no primer preamble or block header');
+  assert.ok(text.startsWith('[MEMORY PRIMER]\n\n## Relevant To This Request\n'), text);
+  assert.equal(text.split('[MEMORY PRIMER]').length - 1, 1, 'the recall marker once, first, for the provenance gate');
+  assert.doesNotMatch(text, /\[RELEVANT MEMORY|A .* memory search ran/, 'no primer preamble or block header');
   assert.deepEqual(tail.visibleRefs, [
     { type: 'policy', id: String(policy.id) },
     { type: 'fact', id: String(strong.id) },

@@ -55,6 +55,7 @@ const { runConversation } = await import('./loop.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
 const { rememberFact } = await import('../../memory/facts.js');
 const turnPrimer = await import('../../memory/turn-primer.js');
+const provenance = await import('./model-request-provenance.js');
 const semanticPorts = await import('../semantic-boundary/turn-semantic-port-registry.js');
 const {
   CACHE_BREAK_SENTINEL,
@@ -208,9 +209,11 @@ test('request-ranked memory arrives once, as one bounded tail from the shared ra
   assert.doesNotMatch(tail!, /owner@example\.com/, 'a rule the core already carries is not repeated');
   assert.equal(tail!.includes(PROMPT_ONLY_RULE), false, 'a prompt-only rule the core carries is not repeated');
   const all = requestText(frame);
-  for (const retired of ['## Persistent Facts', '## Recently Learned', '## Data Landscape', '## Remembered Tool Choices', '[MEMORY PRIMER]']) {
+  for (const retired of ['## Persistent Facts', '## Recently Learned', '## Data Landscape', '## Remembered Tool Choices']) {
     assert.equal(all.includes(retired), false, `no separately ranked block: ${retired}`);
   }
+  assert.ok(tail!.startsWith('[MEMORY PRIMER]\n'), 'the tail opens with the recall marker the provenance gate reads');
+  assert.equal(all.split('[MEMORY PRIMER]').length - 1, 1, 'one recall marker in the whole request');
   const recorded = run.trace.filter((event) => event.type === 'turn_memory_primer').at(-1)?.data as Record<string, unknown>;
   assert.equal(recorded?.source, 'unified', 'the shared ranker produced it');
   assert.equal(recorded?.injected, true);
@@ -409,5 +412,67 @@ test('an owner rule reaches a ranked request that shares no words with it', asyn
   for (const rule of [PROMPT_ONLY_RULE, SIGN_OFF_RULE]) {
     assert.equal(all.split(rule).length - 1, 1, `the rule reaches the model once: ${rule}`);
     assert.ok(stableHalf(frame.system).includes(rule), `the rule rides in the cached core: ${rule}`);
+  }
+});
+
+/** The memory the dispatch provenance gate verified on each recorded request. */
+function verifiedMemory(sessionId: string): Array<Array<{ recallId: string; visibleTextBytes: number }>> {
+  const rows = eventlog.openEventLog()
+    .prepare('SELECT record_id FROM model_request_provenance WHERE session_id = ? ORDER BY rowid')
+    .all(sessionId) as Array<{ record_id: string }>;
+  assert.ok(rows.length > 0, 'every provider-bound request is recorded');
+  return rows.map((row) => {
+    const projected = provenance.projectModelRequestProvenance(row.record_id) as { status: string; manifest?: { verifiedMemory?: Array<{ recallId: string; visibleTextBytes: number }> } };
+    assert.equal(projected.status, 'ok', JSON.stringify(projected));
+    return projected.manifest?.verifiedMemory ?? [];
+  });
+}
+
+// Regression: the ranked tail once reached the provider without the dispatch
+// proof that its bytes come from a recall run recorded for this session.
+test('the ranked tail is the memory the dispatch provenance gate verifies', async () => {
+  const run = await hostTurn('provenance-ranked', 'When does the quokka ledger close each month?');
+  const record = primerRecord(run);
+  assert.equal(record.source, 'unified');
+  assert.ok(typeof record.recallId === 'string' && record.recallId, 'the tail cites a recall run');
+  const tail = tailItem(run.frames[0]!)!;
+  assert.equal(record.injectedBytes, Buffer.byteLength(tail, 'utf8'), 'the record sizes exactly the bytes sent');
+  for (const verified of verifiedMemory(run.sessionId)) {
+    assert.equal(verified.length, 1, 'the gate verified the tail');
+    assert.equal(verified[0]!.recallId, record.recallId, 'against the recall run the turn recorded');
+    assert.equal(verified[0]!.visibleTextBytes, record.injectedBytes);
+  }
+});
+
+test('a stand-in with no recall run carries no marker and is not stripped as unproven', async () => {
+  const run = await hostTurn('provenance-stand-in', 'thanks, that is perfect');
+  const record = primerRecord(run);
+  assert.equal(record.skippedReason, 'intent_budget');
+  assert.equal(record.recallId, null);
+  const frame = run.frames[0]!;
+  assert.equal(requestText(frame).includes('[MEMORY PRIMER]'), false, 'no recall marker without a recall run');
+  assert.ok(memoryItem(frame, '## Persistent Facts'), 'the stand-in reached the provider');
+  for (const verified of verifiedMemory(run.sessionId)) assert.equal(verified.length, 0);
+});
+
+test('a fallback primer that cites a recall run leads the stand-in and is verified', async () => {
+  const previous = process.env.CLEMMY_UNIFIED_TURN_PRIMER;
+  process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
+  let run: Awaited<ReturnType<typeof hostTurn>>;
+  try {
+    run = await hostTurn('provenance-fallback', 'When does the quokka ledger close each month?');
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_UNIFIED_TURN_PRIMER; else process.env.CLEMMY_UNIFIED_TURN_PRIMER = previous;
+  }
+  const record = primerRecord(run);
+  const frame = run.frames[0]!;
+  const standIn = memoryItem(frame, '## Persistent Facts')!;
+  assert.ok(standIn, 'the per-block memory stands in');
+  assert.ok(typeof record.recallId === 'string' && record.recallId, `the fallback's remembered facts cite a run: ${JSON.stringify(record)}`);
+  assert.ok(standIn.startsWith('[MEMORY PRIMER]\n'), 'the cited primer opens the stand-in');
+  assert.equal(record.injectedBytes, Buffer.byteLength(standIn, 'utf8'));
+  for (const verified of verifiedMemory(run.sessionId)) {
+    assert.equal(verified.length, 1, 'the gate verified the stand-in with its primer');
+    assert.equal(verified[0]!.recallId, record.recallId);
   }
 });

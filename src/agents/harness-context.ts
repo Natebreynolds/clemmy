@@ -827,7 +827,10 @@ export function renderTurnMemoryTail(
   if (signal.kind === 'no_signal') {
     // A blind ranker must cost nothing: the per-block rendering stands in,
     // ranked by the same objective the prompt used before, minus the
-    // policies the memory core already carries.
+    // policies the memory core already carries. A fallback primer (which
+    // begins with the recall marker) goes first, so the tail's bytes from
+    // the marker onward are the ones its recall run is proven against.
+    if (signal.primerText) parts.push({ section: 'Memory Primer', tier: 'relevant', text: signal.primerText });
     const acceptedInput = scope.focusInput ?? options.request ?? '';
     const { scopedFocus, requestObjective } = resolveRequestObjective(scope.sessionId, acceptedInput);
     for (const block of renderRequestRankedBlocks({
@@ -841,7 +844,6 @@ export function renderTurnMemoryTail(
     })) {
       if (block.text) parts.push({ section: block.title, tier: 'relevant', text: block.text });
     }
-    if (signal.primerText) parts.push({ section: 'Memory Primer', tier: 'relevant', text: signal.primerText });
   } else {
     if (signal.kind === 'ranked' && signal.text) {
       parts.push({ section: 'Relevant To This Request', tier: 'relevant', text: signal.text, refs: signal.refs });

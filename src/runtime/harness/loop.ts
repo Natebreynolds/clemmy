@@ -252,7 +252,7 @@ import {
 import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
-import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import { buildUnifiedTurnPrimer, MEMORY_PRIMER_MARKER } from '../../memory/turn-primer.js';
 import {
   RANKED_TAIL_POLICY_SLOTS,
   RANKED_TAIL_RELATIVE_FLOOR,
@@ -5410,7 +5410,7 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     ? 'local FTS5 plus semantic rerank'
     : 'local FTS5';
   const text = [
-    '[MEMORY PRIMER]',
+    MEMORY_PRIMER_MARKER,
     `A ${sourceLabel} memory search ran for the latest user message before this model call.`,
     'Use these hits to steer the first response and tool choice. Treat snippets as candidate memory, not proof; before mutating external resources or creating source-backed artifacts, load the source with memory_read/read_file/recall_tool_result or call memory_recall_all for evidence-backed context.',
     ...(factsBlock ? ['', factsBlock] : []),
@@ -5612,7 +5612,13 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
       return primer.text ? primer : { ...primer, skippedReason: 'no_hits' };
     }
     const fallback = await plainFallbackPrimer(query, sessionId, unified.status, hybridEnabled);
-    return withTail(fallback, { kind: 'no_signal', primerText: fallback.text, primerFactIds: fallback.factIds });
+    // The fallback primer is recall-run memory: it rides only when it cites a
+    // run the dispatch provenance gate can prove. One that cites none would be
+    // removed at dispatch as unproven, so it is not sent and the per-block
+    // memory stands in alone.
+    return fallback.recallId
+      ? withTail(fallback, { kind: 'no_signal', primerText: fallback.text, primerFactIds: fallback.factIds })
+      : withTail({ ...fallback, text: undefined, factIds: undefined, hitCount: 0 }, { kind: 'no_signal' });
   } catch (err) {
     return withTail({
       enabled: true,

@@ -37,7 +37,7 @@ import { isTemporalMeetingQuery } from '../../memory/recall.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { recordRecallRun } from '../../memory/recall-usage.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
-import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer, MEMORY_PRIMER_MARKER } from '../../memory/turn-primer.js';
 import { rememberTurnMemoryForJudges } from '../../memory/judge-memory.js';
 import {
   EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
@@ -674,7 +674,7 @@ function stripRecallFromTurnContext(turnContext: string | undefined): string | u
   if (!turnContext) return turnContext;
   return turnContext
     .split('\n\n')
-    .filter((block) => !block.startsWith('[MEMORY PRIMER]') && !block.startsWith('## Relevant To Your Request'))
+    .filter((block) => !block.startsWith(MEMORY_PRIMER_MARKER) && !block.startsWith('## Relevant To Your Request'))
     .join('\n\n');
 }
 
@@ -1576,14 +1576,14 @@ function emitClaudeAgentSdkBrainContextTelemetry(
       : null;
   const query = retrievalTaskInput(request).replace(/\s+/g, ' ').trim();
   const recallBlocks = turnContext.split('\n\n').filter((block) =>
-    block.startsWith('[MEMORY PRIMER]')
+    block.startsWith(MEMORY_PRIMER_MARKER)
     || block.startsWith('## Relevant To Your Request')
     || block.startsWith('[ALSO IN MEMORY'),
   );
   const recallText = recallBlocks.join('\n\n');
   const injectedBytes = Buffer.byteLength(recallText, 'utf-8');
   const injected = injectedBytes > 0;
-  const unified = recallBlocks.some((block) => block.startsWith('[MEMORY PRIMER]'));
+  const unified = recallBlocks.some((block) => block.startsWith(MEMORY_PRIMER_MARKER));
   const refs = unified ? [...recallText.matchAll(/\[ref\s+(?:fact|note|entity|resource|episode|policy|procedure):[^\]]+\]/g)].length : null;
   const recallId = recallText.match(/recall:\s*([^;\]\s]+)/i)?.[1] ?? null;
   const answerability = recallText.match(/answerability:\s*(supported|partial|insufficient)/i)?.[1] ?? null;

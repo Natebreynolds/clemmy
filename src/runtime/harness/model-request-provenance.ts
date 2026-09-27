@@ -11,6 +11,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { AgentInputItem, ModelRequest } from '@openai/agents';
 import { openMemoryDb } from '../../memory/db.js';
+import { MEMORY_PRIMER_MARKER } from '../../memory/turn-primer.js';
 import {
   persistAuthorityEncryptedPayload,
   readAuthorityEncryptedPayload,
@@ -57,7 +58,6 @@ import {
 
 export const MODEL_REQUEST_PROVENANCE_VERSION = 1 as const;
 const SHA256 = /^[a-f0-9]{64}$/;
-const MEMORY_PRIMER_MARKER = '[MEMORY PRIMER]';
 
 interface RawEventRow {
   seq: number;

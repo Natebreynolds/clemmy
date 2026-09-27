@@ -41,6 +41,14 @@ export interface RankedTailSelection {
   excludeRefKeys?: ReadonlySet<string>;
 }
 
+/**
+ * The first line of every model-visible memory block that carries a recall
+ * run's bytes. The dispatch provenance gate finds automatic memory by it and
+ * proves the bytes from it onward against the recorded run, so a block begins
+ * with it exactly when it cites a run, and no other block does.
+ */
+export const MEMORY_PRIMER_MARKER = '[MEMORY PRIMER]';
+
 /** The ranked tail's heading and reading rule. */
 export const RANKED_TAIL_TITLE = '## Relevant To This Request';
 export const RANKED_TAIL_USE_RULE = 'Ranked by a memory search for this request: candidates, not proof. Use complete, applicable facts with their dates; a dated record does not establish another date. Reopen a ref when a value is missing or its scope is uncertain.';
@@ -214,7 +222,7 @@ export async function buildUnifiedTurnPrimer(input: {
 
   const recallId = createRecallRunId();
   result.recallId = recallId;
-  const preamble = '[MEMORY PRIMER]';
+  const preamble = MEMORY_PRIMER_MARKER;
   // ANSWERABILITY IS CONSUMED (COMPOUNDING wave): the use-rule tells the
   // model how much to trust this block. Before, one confident sentence
   // shipped whether recall held a complete roster or a single truncated
@@ -233,7 +241,7 @@ export async function buildUnifiedTurnPrimer(input: {
     ? Math.max(200, Math.min(12_000, input.maxChars ?? 1_200))
     : Math.max(700, Math.min(12_000, input.maxChars ?? 2_600));
   const recallBudget = tailFormat
-    ? Math.max(0, maxChars - RANKED_TAIL_TITLE.length - RANKED_TAIL_USE_RULE.length - 2)
+    ? Math.max(0, maxChars - MEMORY_PRIMER_MARKER.length - RANKED_TAIL_TITLE.length - RANKED_TAIL_USE_RULE.length - 4)
     : Math.max(0, maxChars - preamble.length - RULE_RESERVE - 2);
   const retrievedHitCount = retrievedBeforeFilter;
   result.hits = visibleUnifiedPrimerHits(result, recallBudget, { header: !tailFormat });
@@ -272,7 +280,9 @@ export async function buildUnifiedTurnPrimer(input: {
     input.sessionId,
   );
   const text = tailFormat
-    ? [RANKED_TAIL_TITLE, RANKED_TAIL_USE_RULE, ...unifiedPrimerLines(result.hits)].join('\n')
+    // The marker stands alone above the heading so the ranked lines stay
+    // one block of their own for any reader that splits on blank lines.
+    ? [MEMORY_PRIMER_MARKER, '', RANKED_TAIL_TITLE, RANKED_TAIL_USE_RULE, ...unifiedPrimerLines(result.hits)].join('\n')
     : [preamble, useRule, formatUnifiedPrimer(result, recallBudget)].join('\n');
   return {
     status: 'ok',
