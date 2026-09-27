@@ -3837,6 +3837,35 @@ test('setPin enforces 8-64 char floor + allowed-char policy', async () => {
 
 // ---- native (APNs) push registration ---------------------------------------
 
+test('the phone renames, pins and archives a conversation on the same record the desktop list edits', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Clem iPhone');
+    const { createSession } = await import('../runtime/harness/eventlog.js');
+    const session = createSession({ id: 'sess-mob-manage-1', kind: 'chat', channel: 'mobile', title: 'Quick SEO audit', status: 'active' } as never);
+    const patch = (body: Record<string, unknown>) => fetch(`${h.url}/m/api/chat/sessions/${session.id}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify(body),
+    });
+    const list = async (archived = false) => (await (await fetch(`${h.url}/m/api/chat/sessions${archived ? '?archived=1' : ''}`, { headers: { cookie } })).json()) as { sessions: Array<{ id: string; title: string; pinned: boolean; archived: boolean }> };
+
+    assert.equal((await patch({})).status, 400, 'nothing to change is refused');
+    const renamed = await patch({ title: '  Tobin audit  ' });
+    assert.equal(renamed.status, 200);
+    assert.equal(((await renamed.json()) as { session: { title: string } }).session.title, 'Tobin audit');
+    assert.equal((await patch({ pinned: true })).status, 200);
+    let rows = (await list()).sessions;
+    assert.deepEqual(rows.find((r) => r.id === session.id), { ...rows.find((r) => r.id === session.id)!, title: 'Tobin audit', pinned: true, archived: false });
+    assert.equal((await patch({ archived: true })).status, 200);
+    rows = (await list()).sessions;
+    assert.equal(rows.some((r) => r.id === session.id), false, 'archived leaves the live list');
+    const archivedRows = (await list(true)).sessions;
+    assert.equal(archivedRows.find((r) => r.id === session.id)?.archived, true, 'and appears under ?archived=1');
+    assert.equal((await fetch(`${h.url}/m/api/chat/sessions/does-not-exist`, { method: 'PATCH', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ pinned: true }) })).status, 404);
+  } finally {
+    await h.close();
+  }
+});
+
 test('APNs registration carries the build environment per phone; a re-registration without one keeps it', async () => {
   const h = await startHarness();
   try {

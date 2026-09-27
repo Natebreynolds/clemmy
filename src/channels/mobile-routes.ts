@@ -1,4 +1,5 @@
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
+import { patchUnifiedSession } from '../dashboard/sessions-api.js';
 import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
@@ -336,6 +337,8 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
   updatedAt: number;
   agentId: string | null;
   agentName: string | null;
+  pinned: boolean;
+  archived: boolean;
 } {
   const title = session.title?.trim()
     || (session.objective ? session.objective.slice(0, 80) : '')
@@ -346,6 +349,8 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
     title,
     agentId,
     agentName: agentId && typeof session.metadata?.agentName === 'string' ? session.metadata.agentName : null,
+    pinned: session.metadata?.pinned === true,
+    archived: session.metadata?.archived === true,
     kind: session.kind,
     channel: session.channel,
     status: session.status,
@@ -3647,14 +3652,40 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // Mobile-friendly shapes — we drop fields the phone doesn't render
   // (token budget, plan IDs, raw metadata) to keep payloads small.
 
-  router.get('/api/chat/sessions', requireMobileSession, (_req, res) => {
+  router.get('/api/chat/sessions', requireMobileSession, (req, res) => {
     // Only chat sessions land on the phone — workflow / execution sessions
     // belong on the dashboard. The list reads titles and times, never the
     // conversation state (megabytes per long chat; it held the phone's chat
-    // list on skeletons for 7+ s on 2026-09-22).
-    const sessions = harnessListSessions({ limit: 80, archived: false, kind: 'chat', withoutConversationState: true })
+    // list on skeletons for 7+ s on 2026-09-22). ?archived=1 lists what was
+    // put away instead.
+    const archived = req.query.archived === '1' || req.query.archived === 'true';
+    const sessions = harnessListSessions({ limit: 80, archived, kind: 'chat', withoutConversationState: true })
       .map(serializeSessionForMobile);
     res.json({ sessions });
+  });
+
+  /**
+   * Rename, pin or archive a conversation: the same record and the same
+   * rule as the desktop list (dashboard/sessions-api patchUnifiedSession),
+   * so a pin made on the phone is a pin on the Mac.
+   */
+  router.patch('/api/chat/sessions/:sessionId', requireMobileSession, (req, res) => {
+    const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    const patch: { title?: string; pinned?: boolean; archived?: boolean } = {};
+    if (typeof body.title === 'string' && body.title.trim()) patch.title = body.title.trim().slice(0, 120);
+    if (typeof body.pinned === 'boolean') patch.pinned = body.pinned;
+    if (typeof body.archived === 'boolean') patch.archived = body.archived;
+    if (Object.keys(patch).length === 0) { res.status(400).json({ error: 'NOTHING_TO_CHANGE' }); return; }
+    try {
+      const updated = patchUnifiedSession(`harness:${sessionId}`, patch);
+      if (!updated) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+      const row = harnessGetSession(sessionId);
+      if (!row) { res.status(404).json({ error: 'NOT_FOUND' }); return; }
+      res.json({ session: serializeSessionForMobile(row) });
+    } catch (err) {
+      res.status(500).json({ error: 'SESSION_PATCH_FAILED', message: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // Switch who answers a conversation from its next turn — the same decision

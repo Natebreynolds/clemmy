@@ -4442,3 +4442,20 @@ textarea.cz-input { resize: vertical; }
 .today-recent-when { flex: 0 0 auto; color: var(--fg-3); font-size: var(--t-xs); font-variant-numeric: tabular-nums; }
 .today-foot { display: flex; justify-content: center; }
 .today-foot button { border: 0; background: transparent; color: var(--fg-3); font: inherit; font-size: var(--t-xs); font-weight: 650; min-height: 44px; padding: 0 12px; }
+
+/* ── Conversations: search, pin, rename, archive ─────────────────────────── */
+.chats-search { display: flex; align-items: center; gap: 8px; min-height: 44px; margin: var(--sp-2) 0 var(--sp-3); padding: 0 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg-1); color: var(--fg-3); }
+.chats-search svg { width: 18px; height: 18px; flex: 0 0 auto; }
+.chats-search input { flex: 1 1 auto; min-width: 0; border: 0; background: transparent; color: var(--fg); font-size: 16px; outline: none; -webkit-appearance: none; appearance: none; }
+.chats-search input:focus-visible { outline: none; box-shadow: none; }
+.chats-search:focus-within { border-color: var(--line-hot); }
+.chat-card { display: flex; align-items: stretch; padding: 0; }
+.chat-card-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 10px; padding: var(--sp-4); border: 0; background: transparent; color: inherit; text-align: left; font: inherit; }
+.chat-card-menu { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 48px; border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--fg-3); }
+.chat-card-menu svg { width: 20px; height: 20px; }
+.chat-card-menu:active { background: var(--bg-2); }
+.chats-menu-title { margin: 0 var(--sp-3) var(--sp-2); color: var(--fg-3); font-size: var(--t-xs); font-weight: 700; }
+.chats-rename { display: flex; flex-direction: column; gap: var(--sp-3); padding: 0 var(--sp-3) var(--sp-3); }
+.chats-rename-input { min-height: 44px; padding: 0 12px; border: 1px solid var(--line-hot); border-radius: 12px; background: var(--bg-1); color: var(--fg); font-size: 16px; }
+.chats-rename-input:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.chats-none { margin: var(--sp-3) 2px; color: var(--fg-3); font-size: var(--t-sm); }

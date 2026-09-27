@@ -947,6 +947,10 @@ export interface ChatSession {
   /** Saved agent answering this conversation's next message; null = Clem. */
   agentId: string | null;
   agentName: string | null;
+  /** Kept at the top of the list by the owner. */
+  pinned?: boolean;
+  /** Out of the list until restored; the conversation itself is kept. */
+  archived?: boolean;
 }
 
 export interface ChatEvent {
@@ -959,8 +963,13 @@ export interface ChatEvent {
   data: Record<string, unknown>;
 }
 
-export async function listChatSessions(): Promise<{ sessions: ChatSession[] }> {
-  return api<{ sessions: ChatSession[] }>('/m/api/chat/sessions');
+export async function listChatSessions(opts: { archived?: boolean } = {}): Promise<{ sessions: ChatSession[] }> {
+  return api<{ sessions: ChatSession[] }>(`/m/api/chat/sessions${opts.archived ? '?archived=1' : ''}`);
+}
+
+/** Rename, pin or archive a conversation; the same record the desktop list edits. */
+export async function patchChatSession(sessionId: string, patch: { title?: string; pinned?: boolean; archived?: boolean }): Promise<{ session: ChatSession }> {
+  return api<{ session: ChatSession }>(`/m/api/chat/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH', body: JSON.stringify(patch) });
 }
 
 /** Switch who answers a conversation from its next message: a saved agent's
