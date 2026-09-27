@@ -189,9 +189,10 @@ export function memoryTidyOutcome(fadedFactIds: Iterable<number>, agedOut = 0): 
  *  not finish. A check that made no call (no independent model is bound)
  *  only refreshes "last checked". */
 export function memoryVerifyOutcome(result: { verdict: string }, note: MemoryJobNote): MemoryJobOutcome {
-  if (result.verdict === 'approve') return { outcome: 'ok' };
+  if (result.verdict === 'approve') return { outcome: 'ok', produced: { approved: 1 } };
   if (result.verdict === 'unavailable' && note.error !== undefined) return memoryJobFailed(note);
-  return { outcome: 'nothing_new' };
+  if (result.verdict === 'unavailable') return { outcome: 'nothing_new' };
+  return { outcome: 'ok', produced: { declined: 1 } };
 }
 
 /** An index run's record: recorded only when it indexed something. */

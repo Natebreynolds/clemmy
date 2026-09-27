@@ -65,6 +65,7 @@ import type {
   MemoryWorkUndoResult,
   MemoryWorkWaiting,
 } from './memory-work-types.js';
+import { MEMORY_WORK_PRODUCED_KEYS } from './memory-work-types.js';
 
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
@@ -802,14 +803,9 @@ function parsePayload(json: string | null): Partial<MemoryWorkEventPayload> {
   }
 }
 
-const PRODUCED_KEYS: readonly (keyof MemoryWorkProduced)[] = [
-  'claims', 'learned', 'updated', 'reinforced', 'leftOut', 'setAside', 'faded',
-  'restored', 'patterns', 'skills', 'proposals', 'embedded', 'entities',
-];
-
 function produced(value: MemoryWorkProduced | undefined): MemoryWorkProduced {
   const out: MemoryWorkProduced = {};
-  for (const key of PRODUCED_KEYS) {
+  for (const key of MEMORY_WORK_PRODUCED_KEYS) {
     const n = value?.[key];
     if (typeof n === 'number' && Number.isFinite(n) && n > 0) out[key] = n;
   }

@@ -51,7 +51,8 @@ test('busy names what learning waits behind', () => {
 
 test('resting with a queue says what is next; an unread queue is not zero', () => {
   assert.match(memoryWorkHeadline({ ...base, queue: { toLearn: 3, setAside: 0, failed: 0 } }, fmt, name).text, /^3 parts/);
-  assert.equal(memoryWorkHeadline({ ...base, queue: { toLearn: null, setAside: null, failed: null } }, fmt, name).text, 'Memory is up to date');
+  assert.equal(memoryWorkHeadline({ ...base, queue: { toLearn: null, setAside: null, failed: null } }, fmt, name).text, 'No memory work running right now');
+  assert.equal(memoryWorkHeadline(base, fmt, name).text, 'Memory is up to date');
 });
 
 test('event sentences say what changed and where it came from', () => {
@@ -78,4 +79,15 @@ test('the pipeline keeps unknown as null', () => {
     conversationsRead: 3, claimsFound: 9, leftOut: 5, setAside: 1,
   });
   assert.deepEqual(stages.map((s) => s.value), [3, 9, 3, 6, 4]);
+  assert.ok(memoryPipeline(stagesInput(), { unknown: true }).every((s) => s.value === null));
+});
+
+function stagesInput() {
+  return { runs: 0, modelCalls: 0, inputTokens: 0, outputTokens: 0, learned: 0, updated: 0, faded: 0, conversationsRead: 0, claimsFound: 0, leftOut: 0, setAside: 0 };
+}
+
+test('checks say what they approved or stopped, not "nothing new"', () => {
+  const at = { id: 'e', at: 'x', outcome: 'ok' as const, expiresAt: 'y' };
+  assert.equal(memoryEventSentence({ ...at, job: 'standing', produced: { approved: 1 } }), 'Approved a standing instruction');
+  assert.equal(memoryEventSentence({ ...at, job: 'verify', produced: { declined: 2 } }), 'Stopped 2 memory repairs');
 });

@@ -130,7 +130,17 @@ export interface MemoryWorkProduced {
   proposals?: number;
   embedded?: number;
   entities?: number;
+  /** A check passed (a standing instruction, a memory repair). */
+  approved?: number;
+  /** A check stopped a change. */
+  declined?: number;
 }
+
+/** Every count a memory-work record may carry, in one list. */
+export const MEMORY_WORK_PRODUCED_KEYS: readonly (keyof MemoryWorkProduced)[] = Object.freeze([
+  'claims', 'learned', 'updated', 'reinforced', 'leftOut', 'setAside', 'faded',
+  'restored', 'patterns', 'skills', 'proposals', 'embedded', 'entities', 'approved', 'declined',
+]);
 
 export interface MemoryWorkFact {
   id: string;

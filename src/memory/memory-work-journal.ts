@@ -35,6 +35,7 @@ import type {
   MemoryWorkSource,
   MemoryWorkWaiting,
 } from './memory-work-types.js';
+import { MEMORY_WORK_PRODUCED_KEYS } from './memory-work-types.js';
 import {
   openOperationalTelemetryDb,
   recordOperationalEvent,
@@ -552,14 +553,9 @@ function publicSource(source: MemoryWorkSource | null | undefined): MemoryWorkSo
   return { kind: source.kind, ...(sessionId ? { sessionId } : {}) };
 }
 
-const PRODUCED_KEYS: readonly (keyof MemoryWorkProduced)[] = [
-  'claims', 'learned', 'updated', 'reinforced', 'leftOut', 'setAside', 'faded',
-  'restored', 'patterns', 'skills', 'proposals', 'embedded', 'entities',
-];
-
 function cleanProduced(produced: MemoryWorkProduced | undefined): MemoryWorkProduced {
   const out: MemoryWorkProduced = {};
-  for (const key of PRODUCED_KEYS) {
+  for (const key of MEMORY_WORK_PRODUCED_KEYS) {
     const value = produced?.[key];
     if (typeof value === 'number' && Number.isFinite(value) && value > 0) out[key] = Math.floor(value);
   }

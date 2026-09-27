@@ -93,7 +93,7 @@ export async function reviewStandingMemory(
   // the model that served; the rule it approves is kept by the save after it.
   return runMemoryModelJob('standing', { source: memoryWorkSourceFromTurn({ kind: 'owner' }) },
     () => reviewStandingMemoryNow(source, candidate, mode),
-    (review) => ({ outcome: review.scope === 'standing' ? 'ok' : 'nothing_new' }));
+    (review) => (review.scope === 'standing' ? { outcome: 'ok', produced: { approved: 1 } } : { outcome: 'nothing_new' }));
 }
 
 async function reviewStandingMemoryNow(

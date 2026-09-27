@@ -166,6 +166,10 @@ export interface MemoryWorkProduced {
   proposals?: number;
   embedded?: number;
   entities?: number;
+  /** A check passed (a standing instruction, a memory repair). */
+  approved?: number;
+  /** A check stopped a change. */
+  declined?: number;
 }
 
 export interface MemoryWorkFact {
@@ -415,18 +419,17 @@ export function memoryWorkHeadline(
     return { tone: 'unknown', text: 'Couldn’t read memory work just now' };
   }
   const queued = snapshot.queue.toLearn;
+  const lastWorked = snapshot.lastWorkAt ? `Last worked ${fmt.age(snapshot.lastWorkAt)}` : undefined;
   if (typeof queued === 'number' && queued > 0) {
     return {
       tone: 'resting',
       text: `${queued} ${queued === 1 ? 'part' : 'parts'} of finished conversations to read next`,
-      detail: snapshot.lastWorkAt ? `Last worked ${fmt.age(snapshot.lastWorkAt)}` : undefined,
+      detail: lastWorked,
     };
   }
-  return {
-    tone: 'resting',
-    text: 'Memory is up to date',
-    detail: snapshot.lastWorkAt ? `Last worked ${fmt.age(snapshot.lastWorkAt)}` : undefined,
-  };
+  // "Up to date" is a claim about the queue; an unread queue cannot back it.
+  if (queued !== 0) return { tone: 'resting', text: 'No memory work running right now', detail: lastWorked };
+  return { tone: 'resting', text: 'Memory is up to date', detail: lastWorked };
 }
 
 function plural(n: number, one: string, many: string): string {
@@ -470,8 +473,11 @@ export function memoryEventSentence(event: MemoryWorkEvent): string {
       break;
     }
     case 'standing':
+      if (p.approved) parts.push(p.approved === 1 ? 'approved a standing instruction' : `approved ${p.approved} standing instructions`);
+      break;
     case 'verify':
-      if (p.learned) parts.push(`approved ${p.learned}`);
+      if (p.approved) parts.push(p.approved === 1 ? 'approved a memory repair' : `approved ${p.approved} memory repairs`);
+      if (p.declined) parts.push(p.declined === 1 ? 'stopped a memory repair' : `stopped ${p.declined} memory repairs`);
       break;
   }
   if (parts.length === 0) return `${MEMORY_JOB_WORDS[event.job]?.title ?? 'Memory work'}: nothing new`;
@@ -497,10 +503,19 @@ export interface MemoryPipelineStage {
   job: MemoryJobId;
 }
 
-export function memoryPipeline(today: MemoryWorkToday | null | undefined): MemoryPipelineStage[] {
+export function memoryPipeline(
+  today: MemoryWorkToday | null | undefined,
+  opts: { unknown?: boolean } = {},
+): MemoryPipelineStage[] {
   const n = (v: number | undefined) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
-  const kept = today ? (n(today.learned) ?? 0) + (n(today.updated) ?? 0) : null;
-  const aside = today ? (n(today.leftOut) ?? 0) + (n(today.setAside) ?? 0) : null;
+  // A combined stage is unknown only when every part is; an unread snapshot counts nothing.
+  const sum = (a: number | undefined, b: number | undefined) => {
+    const x = n(a); const y = n(b);
+    return x === null && y === null ? null : (x ?? 0) + (y ?? 0);
+  };
+  if (opts.unknown) today = null;
+  const kept = today ? sum(today.learned, today.updated) : null;
+  const aside = today ? sum(today.leftOut, today.setAside) : null;
   return [
     { id: 'read', label: 'Conversations read', value: today ? n(today.conversationsRead) : null, job: 'learn' },
     { id: 'found', label: 'Things noticed', value: today ? n(today.claimsFound) : null, job: 'learn' },

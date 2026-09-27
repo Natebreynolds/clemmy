@@ -422,6 +422,7 @@ test('a standing-instruction check is recorded on the checker with its own lane'
   assert.equal(review.scope, 'standing');
   const [event] = memoryEvents('standing');
   assert.equal(event.payload.outcome, 'ok');
+  assert.deepEqual(event.payload.produced, { approved: 1 }, 'an approval is named, not "nothing new"');
   assert.deepEqual(event.payload.source, { kind: 'owner' });
   assert.equal(event.payload.model?.modelId, checker.modelId);
   const [call] = callEvents(checker.modelId);
@@ -468,8 +469,9 @@ test('a repair check asks the independent checker and is recorded on its own lan
 });
 
 test('verify, tidy and index outcomes say only what happened', () => {
-  assert.deepEqual(jobs.memoryVerifyOutcome({ verdict: 'approve' }, {}), { outcome: 'ok' });
-  assert.deepEqual(jobs.memoryVerifyOutcome({ verdict: 'veto' }, {}), { outcome: 'nothing_new' });
+  assert.deepEqual(jobs.memoryVerifyOutcome({ verdict: 'approve' }, {}), { outcome: 'ok', produced: { approved: 1 } });
+  assert.deepEqual(jobs.memoryVerifyOutcome({ verdict: 'veto' }, {}), { outcome: 'ok', produced: { declined: 1 } });
+  assert.deepEqual(jobs.memoryVerifyOutcome({ verdict: 'unavailable' }, {}), { outcome: 'nothing_new' });
   assert.deepEqual(jobs.memoryVerifyOutcome({ verdict: 'unavailable' }, { error: Object.assign(new Error('x'), { status: 401 }) }),
     { outcome: 'failed', failure: { problem: 'not_connected' } });
   assert.deepEqual(jobs.memoryTidyOutcome([4, 4, 9]), { outcome: 'ok', produced: { faded: 2 }, facts: { faded: ['4', '9'] }, record: true });
