@@ -143,17 +143,16 @@ export function renderCurrentTimeForInstructions(): string {
 }
 
 /**
- * The same clock, one line, placed LAST in the per-turn context so it sits
- * next to the user's message. The Now section above is read first by a model
- * that reads everything; a small model weights the tokens nearest the message,
- * and a greeting that named the wrong weekday (live 2026-09-26, "the usual
- * Friday stuff" on a Saturday, with the Now line 2,700 tokens back) is what
- * this line prevents. Ten tokens, uncached by design like the rest of the tail.
+ * The owner's clock, stated once, LAST in the per-turn context so it sits next
+ * to the user's message: a model weights the tokens nearest the message, and
+ * a clock read thousands of tokens earlier is the one a greeting gets wrong.
+ * It carries the date-math rule the separate Now line used to carry. Ten-odd
+ * tokens, uncached by design like the rest of the per-turn context.
  */
 export function renderRightNowStamp(now = new Date()): string {
   const t = currentLocalTime(now);
   if (!t) return '';
-  return `Right now it is ${t.weekday}, ${t.date}, ${t.time} (${t.tz}).`;
+  return `Right now it is ${t.weekday}, ${t.date}, ${t.time} (${t.tz}). Use this for any date/time math, never invent or guess.`;
 }
 
 // Per-line bound for injected memory content (recall bullets, constraint
@@ -168,18 +167,15 @@ function clipContextLine(text: string): string {
     ? t
     : `${t.slice(0, CONTEXT_LINE_MAX_CHARS)} …[truncated — search memory for the full fact]`;
 }
+/** Standing goals are advisory and live in their own store; none is bound to
+ *  a session (the session's own goal contract renders with Current Focus).
+ *  The per-turn context therefore names how many there are and where to read
+ *  them, not their text. */
 function renderActiveGoals(): string {
-  const goals = listActiveGoalSummaries({ limit: 8, sortByPriority: true });
+  const goals = listActiveGoalSummaries({ limit: 1_000 });
   if (goals.length === 0) return '';
-  return [
-    'Advisory standing goals only — they never replace or redirect the current accepted request.',
-    ...goals.map((g) => {
-      const next = g.nextActions?.[0] ? ` → ${g.nextActions[0]}` : '';
-      const due = g.targetDate ? ` (due ${g.targetDate})` : '';
-      const status = g.status === 'blocked' ? ' [BLOCKED]' : '';
-      return `- [${g.id}] ${g.title}${status}${due}${next}`;
-    }),
-  ].join('\n');
+  const blocked = goals.filter((goal) => goal.status === 'blocked').length;
+  return `${goals.length} standing goal${goals.length === 1 ? '' : 's'} on file${blocked > 0 ? ` (${blocked} blocked)` : ''}: advisory only, never the current request; goal_list reads them.`;
 }
 
 /**
@@ -315,14 +311,32 @@ function renderRequestRankedBlocks(input: {
 /** Held-for-later tasks for THIS session, so the model can resurface one when
  *  the user references it ("pick up the Salesforce scrape"). Session-scoped so a
  *  held task from another chat never leaks in. '' when none. */
+const HELD_TASKS_SHOWN = 3;
+/** Session working memory is a checkpoint of the conversation so far; its
+ *  full text stays in the session's record. */
+const WORKING_MEMORY_PROMPT_MAX_CHARS = 600;
+
+function clipLine(text: string, max: number): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1).trimEnd()}…`;
+}
+
+function clipWorkingMemory(text: string | undefined): string | undefined {
+  const trimmed = text?.trim();
+  if (!trimmed || trimmed.length <= WORKING_MEMORY_PROMPT_MAX_CHARS) return trimmed || undefined;
+  return `${trimmed.slice(0, WORKING_MEMORY_PROMPT_MAX_CHARS).trimEnd()}\n… working memory clipped here; the full checkpoint stays in this conversation's record.`;
+}
+
 function renderHeldTasks(sessionId?: string): string {
   if (!sessionId) return '';
   try {
     const held = listHeldTasks(sessionId);
     if (held.length === 0) return '';
+    const shown = held.slice(0, HELD_TASKS_SHOWN);
     return [
       'Tasks you agreed to HOLD for later (the user can resume one by reference — then call resume_held_task with its id):',
-      ...held.slice(0, 8).map((h) => `  - ${h.id} — ${h.plan.objective}`),
+      ...shown.map((h) => `  - ${h.id} — ${clipLine(h.plan.objective, 160)}`),
+      ...(held.length > shown.length ? [`  - …and ${held.length - shown.length} more held in this conversation.`] : []),
     ].join('\n');
   } catch {
     return '';
@@ -422,13 +436,12 @@ export function renderHarnessMemoryContext(opts?: {
     try { offerContext = proactiveOfferContextForTurn(opts.sessionId, opts.sourceUserSeq); }
     catch { /* Optional offer context cannot prevent ordinary chat. */ }
   }
-  const nowLine = renderCurrentTimeForInstructions();
   const sessionWorkingMemory = opts?.sessionId
     ? loadWorkingMemoryForSession(opts.sessionId)
     : undefined;
-  const workingMemory = opts?.sessionId
+  const workingMemory = clipWorkingMemory(opts?.sessionId
     ? sessionWorkingMemory ?? (inputDisposition === 'resume' ? memContext.workingMemory : undefined)
-    : memContext.workingMemory;
+    : memContext.workingMemory);
   let sessionActions = '';
   if (opts?.sessionId && opts.includeSessionActions !== false) {
     try {
@@ -481,10 +494,6 @@ export function renderHarnessMemoryContext(opts?: {
   // system prefix) or only the VOLATILE tail (sent in the user turn). Order is
   // preserved exactly, so partition:'all' is byte-identical to the prior output.
   const tagged: Array<{ title: string; text: string }> = [
-    // Current date/time goes FIRST so the model reads it before any
-    // other context. Without this the model defaults to its training
-    // cutoff for date math, which is months stale.
-    { title: 'Now', text: section('Now', nowLine) },
     { title: 'Offer Being Discussed', text: section('Offer Being Discussed', offerContext) },
     { title: 'Autonomy', text: section('Autonomy', renderAutonomy()) },
     { title: 'Relevant To Your Request', text: section('Relevant To Your Request', requestRecall) },
@@ -504,7 +513,8 @@ export function renderHarnessMemoryContext(opts?: {
     { title: 'Current Focus', text: section('Current Focus', activeTask) },
     { title: 'Skill Discovery', text: section('Skill Discovery', skillDiscovery) },
     { title: 'Relevant Skills', text: section('Relevant Skills', relevantSkills) },
-    // Last on purpose: adjacent to the user's message (see renderRightNowStamp).
+    // The one clock, last on purpose: adjacent to the user's message (see
+    // renderRightNowStamp).
     { title: 'Right Now', text: section('Right Now', renderRightNowStamp()) },
   ];
 

@@ -14,6 +14,7 @@
  *   - when the ranker gives no signal (switched off, failing, out of time)
  *     the per-block rendering stands in, and when it finds nothing only the
  *     counts pointer is sent;
+ *   - the owner's clock is stated once, last in the per-turn context;
  * Each later tier adds its own pins below.
  */
 import assert from 'node:assert/strict';
@@ -264,4 +265,13 @@ test('an empty ranked result sends only the counts pointer', async () => {
   for (const absent of ['## Relevant To This Request', '## Persistent Facts', '[MEMORY PRIMER]', 'quokka ledger lives']) {
     assert.equal(all.includes(absent), false, `nothing ranked rides the empty turn: ${absent}`);
   }
+});
+
+test('the clock is stated once in the request, last in the per-turn memory', async () => {
+  const run = await hostTurn('clock', 'Draft a short note about the weekly planning meeting.');
+  const system = run.frames[0]!.system;
+  assert.equal(system.split('Right now it is').length - 1, 1, 'one clock in the whole request');
+  assert.doesNotMatch(system, /Today is \d{4}|## Now\n/, 'no second clock');
+  assert.match(system.trimEnd(), /## Right Now\nRight now it is \w+day, \d{4}-\d{2}-\d{2}, \d{2}:\d{2} \(.+\)\. Use this for any date\/time math, never invent or guess\.$/,
+    'the clock closes the per-turn memory, next to the message');
 });

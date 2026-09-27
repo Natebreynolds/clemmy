@@ -523,7 +523,7 @@ test('partition: stable EXCLUDES the volatile tail (Now / query recall / Current
   const volatile = renderHarnessMemoryContext({ sessionId: 's', query: q, partition: 'volatile' });
   // The volatile tail carries the time-sensitive bits and its own light header…
   assert.match(volatile, /# Current State \(refreshed this turn\)/);
-  assert.match(volatile, /## Now/);
+  assert.match(volatile, /## Right Now/);
   assert.match(volatile, /## Relevant To Your Request/);
   // …and NOT the stable memory (so it doesn't duplicate the cached prefix).
   assert.doesNotMatch(volatile, /## Persistent Facts/);
@@ -676,24 +676,48 @@ test('agent instructions join the stable prefix before the cache boundary, never
   assert.equal(rendered.split(CACHE_BREAK_SENTINEL).length, 2, 'never a second sentinel');
 });
 
-test('the clock is stated twice: first in the Now section, and last, next to the message, as one line', () => {
+// The clock used to be stated twice (a Now section first, a Right Now line
+// last). Stated once, last, next to the message, the model reads the line it
+// weights most, the per-turn context loses a duplicate, and nothing clock-
+// shaped is left anywhere a cache prefix could reach.
+test('the clock is stated once, last, next to the message, with the date-math rule', () => {
   resetMemoryDb();
   const volatile = renderHarnessMemoryContext({ partition: 'volatile' });
   const stamp = renderRightNowStamp();
-  assert.match(stamp, /^Right now it is (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{4}-\d{2}-\d{2}, \d{2}:\d{2} \(.+\)\.$/);
+  assert.match(stamp, /^Right now it is (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{4}-\d{2}-\d{2}, \d{2}:\d{2} \(.+\)\. Use this for any date\/time math, never invent or guess\.$/);
   assert.ok(volatile.trimEnd().endsWith(stamp), 'the stamp is the last thing before the user message');
-  assert.ok(volatile.indexOf('## Now') < volatile.indexOf('Right now it is'), 'the Now section still comes first');
-  // Both lines read the same clock: same weekday and date.
-  const nowLine = renderCurrentTimeForInstructions();
-  const day = nowLine.match(/\((\w+day)\)/)?.[1];
-  const date = nowLine.match(/Today is (\d{4}-\d{2}-\d{2})/)?.[1];
-  assert.ok(day && date);
-  assert.ok(stamp.includes(day) && stamp.includes(date));
-  // The stable half carries neither, so it stays cacheable across days.
+  assert.equal(volatile.split('Right now it is').length - 1, 1, 'stated once');
+  assert.doesNotMatch(volatile, /## Now\n|Today is \d{4}/, 'no second clock');
+  // The stable half and the memory core carry no clock, so they stay cacheable across days.
   const stable = renderHarnessMemoryContext({ partition: 'stable' });
   assert.doesNotMatch(stable, /Right now it is|Today is \d{4}/);
+  assert.doesNotMatch(renderMemoryCore().text, /Right now it is|Today is \d{4}/);
+  const turn = harnessInstructions('ROLE', { sessionId: 'clock-once' })();
+  assert.equal(turn.split('Right now it is').length - 1, 1, 'the assembled prompt states the clock once');
+  assert.ok(turn.trimEnd().endsWith(stamp), 'and last');
+  assert.doesNotMatch(turn, /Today is \d{4}/);
 });
 
+test('the right-now tier stays small: three held tasks, clipped working memory, standing goals as a count', async () => {
+  resetMemoryDb();
+  const sessionId = 'right-now-bounds';
+  checkpointWorkingMemory(sessionId, { turn: 1, toolCallsTotal: 1, lastText: `Checkpoint start. ${'detail '.repeat(300)}` });
+  const dir = path.join(TMP_HOME, 'goals');
+  mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < 4; i += 1) {
+    writeFileSync(path.join(dir, `goal-${i}.json`), JSON.stringify({ id: `goal-${i}`, title: `Grow the zebra program ${i}`, status: i === 0 ? 'blocked' : 'active', priority: 'medium' }));
+  }
+  const { holdTaskForLater } = await import('./plan-proposals.js');
+  for (let i = 0; i < 5; i += 1) holdTaskForLater({ sessionId, objective: `Held errand number ${i} for the zebra program` });
+  const context = renderHarnessMemoryContext({ sessionId, partition: 'volatile' });
+  const held = context.slice(context.indexOf('## Held For Later'));
+  assert.equal((held.match(/^  - held-/gm) ?? []).length, 3, 'three held ids');
+  assert.match(held, /…and 2 more held in this conversation\./);
+  assert.match(context, /working memory clipped here/);
+  assert.equal(context.includes('detail '.repeat(120)), false, `working memory is clipped: ${context.length}`);
+  assert.match(context, /## Active Goals\n4 standing goals on file \(1 blocked\): advisory only, never the current request; goal_list reads them\./);
+  assert.doesNotMatch(context, /Grow the zebra program/, 'goal text stays in the goal store');
+});
 test('the memory core is content-addressed: requests, sessions and later facts leave its bytes alone', () => {
   resetMemoryDb();
   const rule = 'Email sending constraint: ALWAYS send email via the Outlook mailbox desk@example.com. NEVER send from any other connected mailbox unless explicitly directed in the current conversation.';
