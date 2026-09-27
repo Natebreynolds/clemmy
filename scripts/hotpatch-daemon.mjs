@@ -171,7 +171,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       ));
       let running = false;
       try {
-        execFileSync('pgrep', ['-f', 'Clementine\\.app/Contents/'], { stdio: 'ignore' });
+        // Anchored to a command line that STARTS inside a bundle: an unanchored
+        // match also catches any shell whose arguments merely mention the
+        // bundle path (an operator's verification command), refuses to patch,
+        // and leaves the app quit with no relaunch.
+        execFileSync('pgrep', ['-f', '^/[^ ]*/Clementine\\.app/Contents/'], { stdio: 'ignore' });
         running = true;
       } catch (error) { if (error.status !== 1) throw error; }
       if (running) throw new Error('Quit Clementine before patching so the active run can finish cleanly.');
