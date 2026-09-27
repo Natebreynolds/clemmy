@@ -8,7 +8,7 @@ import {
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
 } from '../harness/host-capability-catalog-factory.js';
-import { listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyKeywords, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
+import { STRATEGY_COVERAGE_MIN_OVERLAP, listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyCoversRequest, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
 import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
 import { peekConnectedToolkits, peekCurrentConnectedToolkits } from '../../integrations/composio/client.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
@@ -491,23 +491,13 @@ function toolSignature(tools: readonly string[]): string {
  * Several matches that used the same tools are the same job (today vs
  * tomorrow calendar). Jev is only needed when proven tools disagree.
  */
-export const PROVEN_SKIP_MIN_OVERLAP = 0.5;
+export const PROVEN_SKIP_MIN_OVERLAP = STRATEGY_COVERAGE_MIN_OVERLAP;
 
-/** Does the strategy cover the request, not merely touch it? The store's
- *  recall score is containment of the SHORTER keyword list, so a two-word
- *  strategy matches any longer request that mentions one of its words, and
- *  a three-word strategy matches a four-word request about something else
- *  that shares two of them. The skip (a thinned surface with no search) needs
- *  the two keyword sets to mostly coincide: shared words over all words of
- *  either side, at least half. */
+/** Does the strategy cover the request, not merely touch it? The rule is the
+ *  strategy store's own (strategyCoversRequest), so every surface that offers
+ *  a remembered run without a judgement applies the same bar. */
 export function provenStrategyCoversRequest(query: string, strategy: Pick<RunStrategyRecord, 'keywords'>): boolean {
-  const words = new Set(strategyKeywords(query));
-  const known = new Set(strategy.keywords);
-  if (words.size === 0 || known.size === 0) return words.size === known.size;
-  let shared = 0;
-  for (const word of words) if (known.has(word)) shared += 1;
-  const union = words.size + known.size - shared;
-  return shared / union >= PROVEN_SKIP_MIN_OVERLAP;
+  return strategyCoversRequest(query, strategy);
 }
 
 export function pickProvenRunStrategy(matches: readonly MatchedRunStrategy[]): RunStrategyRecord | null {

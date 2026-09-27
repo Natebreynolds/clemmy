@@ -405,10 +405,38 @@ export function listMatchingRunStrategies(
     .slice(0, limit);
 }
 
+/** Shared words over all words of either side a remembered run needs before
+ *  it is offered without a judgement. */
+export const STRATEGY_COVERAGE_MIN_OVERLAP = 0.5;
+
+/** Does the strategy cover the request, not merely touch it? The recall score
+ *  above is containment of the SHORTER keyword list, so a two-word strategy
+ *  matches any longer request that mentions one of its words, and a
+ *  three-word strategy matches a four-word request about something else that
+ *  shares two of them. Offering the run's tools without a judgement needs the
+ *  two keyword sets to mostly coincide: shared words over all words of either
+ *  side, at least half. */
+export function strategyCoversRequest(request: string, strategy: Pick<RunStrategyRecord, 'keywords'>): boolean {
+  const words = new Set(strategyKeywords(request));
+  const known = new Set(strategy.keywords);
+  if (words.size === 0 || known.size === 0) return words.size === known.size;
+  let shared = 0;
+  for (const word of words) if (known.has(word)) shared += 1;
+  const union = words.size + known.size - shared;
+  return shared / union >= STRATEGY_COVERAGE_MIN_OVERLAP;
+}
+
 /** Render the top-matching strategies for an objective, or '' when nothing
- *  clears the relevance floor (additive injection contract). */
-export function renderRunStrategiesForContext(objective: string | undefined, limit = 2): string {
-  const scored = listMatchingRunStrategies(objective, limit);
+ *  clears the relevance floor (additive injection contract). A context note
+ *  that names a run's tools is a recommendation made with no judgement, so
+ *  only a run that covers the request is named; one that merely shares words
+ *  with it is left to tool discovery. `request`, when given, is the literal
+ *  accepted request the coverage is measured against (the ranking objective
+ *  may also carry focus text). */
+export function renderRunStrategiesForContext(objective: string | undefined, limit = 2, request?: string): string {
+  const coverageText = request?.trim() || objective || '';
+  const scored = listMatchingRunStrategies(objective, limit)
+    .filter((match) => strategyCoversRequest(coverageText, match.strategy));
   if (scored.length === 0) return '';
   return scored.map((x) => renderOne(x.strategy)).join('\n');
 }

@@ -203,6 +203,8 @@ function assertNoUnconfirmedGuidance(label: string, run: Awaited<ReturnType<type
     assert.doesNotMatch(frame.text, /already proved these tools/, `${label}: the unconfirmed run is not recommended`);
     assert.ok(!frame.text.includes(`${REMEMBERED_TOOL} schema`) && !frame.text.includes(SCHEMA_MARKER),
       `${label}: the unconfirmed run's tool schema is not carried`);
+    assert.ok(!frame.text.includes(`proven run of this kind of request used: ${REMEMBERED_TOOL}`),
+      `${label}: the memory context does not recommend the run's tool on shared words`);
   }
 }
 

@@ -268,3 +268,30 @@ test('proven request shapes elide values, keep operation selectors literal, dedu
   assert.equal(again?.provenShapes?.[0]?.shape, '{"method":"POST","path":"/v3/new"}');
   assert.equal(new Set(again?.provenShapes?.map((r) => r.shape)).size, again?.provenShapes?.length);
 });
+
+test('a remembered run that only shares words with the request is not named in context; one that covers it is', () => {
+  // Regression: the memory section named a run's tools on the 0.34 keyword
+  // floor alone, the shape the proven-operation channel refuses without a
+  // judgement.
+  recordRunStrategy({
+    objective: 'Build me a platypus digest workspace from today calendar and emails waiting on a reply',
+    toolsUsed: ['outlook_get_calendar_view'],
+    workerCount: 0,
+    durationMs: 20_000,
+    learningReceipt: receipt('platypus-build'),
+  });
+  const touching = 'Show me the platypus digest space';
+  assert.ok(listMatchingRunStrategies(touching).some((row) => row.strategy.toolsUsed.includes('outlook_get_calendar_view')),
+    'the run clears the recall floor for the request');
+  assert.equal(renderRunStrategiesForContext(touching), '', 'shared words alone name no tool');
+  assert.match(
+    renderRunStrategiesForContext('Build the platypus digest workspace from today calendar and emails waiting on a reply'),
+    /outlook_get_calendar_view/,
+    'a request the run covers still names it',
+  );
+  assert.equal(
+    renderRunStrategiesForContext('platypus digest workspace calendar emails reply focus-notes', 2, touching),
+    '',
+    'coverage is measured against the literal request when the ranking objective carries more',
+  );
+});
