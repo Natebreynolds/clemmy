@@ -6,6 +6,7 @@ import { shouldDeferDiscretionaryWork } from '../runtime/system-load.js';
 import { getRuntimeEnv } from '../config.js';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFacts } from './db.js';
+import { backupMemoryDbAsync } from './memory-backup.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
@@ -959,7 +960,9 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
         // `today` is the durable cross-process idempotency key. Every daemon
         // process may reach this branch with a stale in-memory state snapshot,
         // but exactly one publishes and every loser reports the same file.
-        const result = backupMemoryDb({
+        // Written by a worker thread on its own connection; the loop keeps
+        // answering while the copy is made.
+        const result = await backupMemoryDbAsync({
           retain: MEMORY_BACKUP_RETAIN,
           localDayKey: today,
         });

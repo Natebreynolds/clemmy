@@ -5,11 +5,11 @@ import pino from 'pino';
 import { Agent, run } from '@openai/agents';
 import { BASE_DIR, MODELS, getRuntimeEnv } from '../config.js';
 import {
-  backupMemoryDb,
   openMemoryDb,
   type ConsolidatedFactKind,
   type ConsolidatedFactRow,
 } from './db.js';
+import { backupMemoryDbAsync } from './memory-backup.js';
 import { loadFactEmbeddings, cosine } from './embeddings.js';
 import { canMergeEntitySafe, extractAnchors } from './memory-merge.js';
 import { appendHygieneAudit, readHygieneAudit, type HygieneAuditEntry } from './hygiene-audit.js';
@@ -121,6 +121,13 @@ interface ApplyOptions {
    * the probabilistic model veto so an offline/local-first install can honor a
    * deliberate review decision. Never set this from unattended maintenance. */
   humanApproved?: boolean;
+  /**
+   * The caller owns the rollback point for a batch of fixes: applyMemoryFix
+   * awaits this where it would otherwise take its own snapshot (after the
+   * probe and the judge, before the first write). runMemorySelfHeal passes one
+   * shared snapshot for its whole run, taken before the first fix it applies.
+   */
+  backup?: () => Promise<unknown>;
 }
 
 interface RunOptions extends CandidateOptions {
@@ -1181,7 +1188,9 @@ export async function applyMemoryFix(input: string | ProposedMemoryFix, opts: Ap
       return { ok: false, fixId: fix.id, kind: fix.kind, applied: 0, ids: [], message: `Skipped memory fix ${fix.id}: ${reason}`, reason };
     }
   }
-  if (!opts.dryRun) backupMemoryDb({ retain: 14 });
+  // The snapshot is written off the main thread. Its result is not a gate,
+  // as before: a fix is small, reversible and audited on its own.
+  if (!opts.dryRun) await (opts.backup ?? (() => backupMemoryDbAsync({ retain: 14 })))();
   let result: MemoryHealResult;
   if (fix.kind === 'merge_duplicate') result = applyMergeDuplicate(fix, nowIso, opts.dryRun === true);
   else if (fix.kind === 'retire_internal_noise') result = applyRetireInternalNoise(fix, nowIso, opts.dryRun === true);
@@ -1206,6 +1215,10 @@ export async function runMemorySelfHeal(opts: RunOptions = {}): Promise<MemoryHe
   });
   const results: MemoryHealResult[] = [];
   const skipped: Array<{ id: string; kind: MemoryFixKind; reason: string }> = [];
+  // One snapshot for the whole run, taken before the first fix that is really
+  // applied, instead of one full copy per fix.
+  let runSnapshot: Promise<unknown> | null = null;
+  const backupOnce = () => (runSnapshot ??= backupMemoryDbAsync({ retain: 14 }));
   for (const fix of candidates.slice(0, maxApply)) {
     // Embedding similarity is evidence for a review queue, never authority to
     // delete a durable claim. Keep the proposal pending so the desktop/API can
@@ -1221,7 +1234,7 @@ export async function runMemorySelfHeal(opts: RunOptions = {}): Promise<MemoryHe
       skipped.push({ id: fix.id, kind: fix.kind, reason: `stored status is ${fix.status}` });
       continue;
     }
-    const res = await applyMemoryFix(fix, { dryRun, nowIso: opts.nowIso, judge: opts.judge });
+    const res = await applyMemoryFix(fix, { dryRun, nowIso: opts.nowIso, judge: opts.judge, backup: backupOnce });
     results.push(res);
     if (!res.ok) skipped.push({ id: fix.id, kind: fix.kind, reason: res.reason ?? res.message });
   }
