@@ -333,9 +333,9 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
 // The extractor, the conflict resolver and the nightly pattern finder run on
 // the "Keeps your memory" route (memory-model-route.ts): the owner's pick when
 // one is chosen, else exactly the concrete checker-route model they used
-// before the role existed. A bare gpt-* string is resolved by the
-// process-global Agents provider and silently sent Claude/BYO turns through
-// Codex credentials, so these jobs always get a provider-bound model. A null
+// before the role existed. A bare model string is resolved by the
+// process-global provider, which can send a call through another account's
+// credentials, so these jobs always get a model bound to its provider. A null
 // route means the model cannot be served right now: the job waits.
 
 export function _testOnly_reflectorRoute(): { modelId: string; provider: string; transport: string } | null {
