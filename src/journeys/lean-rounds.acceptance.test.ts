@@ -6,7 +6,7 @@
  * production host (lean-rounds.case.fixture.ts, one fresh isolated home and
  * process per case). The model wire is an evidence-seeking scripted model
  * that may call only names visible on its request, in the catalog index, or
- * disclosed by tool_search (lean-rounds.fixture-support.ts). Surface
+ * disclosed by tool_search (lean-rounds-support.fixture.ts). Surface
  * building, catalog index, carriers, result budgets, readers, provenance,
  * composition and the usage ledger are production.
  *
@@ -52,7 +52,7 @@ import {
   type CaseMetrics,
   type JevArm,
   type ScenarioId,
-} from './lean-rounds.fixture-support.js';
+} from './lean-rounds-support.fixture.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const CASE_FIXTURE = path.join(repoRoot, 'src/journeys/lean-rounds.case.fixture.ts');

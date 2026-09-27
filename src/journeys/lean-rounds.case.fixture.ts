@@ -58,7 +58,7 @@ import {
   type CaseMetrics,
   type JevArm,
   type ScenarioId,
-} from './lean-rounds.fixture-support.js';
+} from './lean-rounds-support.fixture.js';
 
 const [scenarioArg, armArg] = process.argv.slice(2);
 const SCRIPTS = scenarioScripts();
