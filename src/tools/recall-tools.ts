@@ -16,6 +16,7 @@ import { describeMissingRetainedOutputForSession } from '../runtime/harness/reta
 import {
   aggregateRows,
   applyWhere,
+  fieldValue,
   sortRows,
   type AggregateFigure,
   type RecordAggregateOp,
@@ -402,10 +403,19 @@ export function registerRecallTools(server: McpServer): void {
       const decodedMcpPayload = view?.kind === 'provider_payload'
         && (view.owner === 'mcp_structured_content' || view.owner === 'mcp_text_json');
       if (decodedMcpPayload) parsed = view.payload;
+      // A dotted field reaches into nested objects, as `where` and `sort_by`
+      // already do; the projected key is the path as written. Live 2026-09-26:
+      // `fields: "keyword_data.keyword"` projected every record to {} and the
+      // tool answered "None of [...] exist on these records" while the same
+      // path sorted fine — six wasted rounds in one turn, the model re-guessing
+      // field names the tool had just used.
       const project = (rec: unknown): unknown => {
         if (!fields || !rec || typeof rec !== 'object' || Array.isArray(rec)) return rec;
         const out: Record<string, unknown> = {};
-        for (const f of fields) if (f in (rec as Record<string, unknown>)) out[f] = (rec as Record<string, unknown>)[f];
+        for (const f of fields) {
+          const value = fieldValue(rec, f);
+          if (value !== undefined) out[f] = value;
+        }
         return out;
       };
 

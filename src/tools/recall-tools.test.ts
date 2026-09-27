@@ -444,6 +444,27 @@ test('a projection that matches nothing returns the MAP, never "{}"', async () =
   assert.match(t2, /None of \["zzz_not_real"\] exist on these records/);
   assert.match(t2, /subject/, 'record fields are named so the next query lands');
 
+  // A dotted field reaches a nested value, as where/sort_by already do
+  // (live 2026-09-26: "keyword_data.keyword" projected to {} and the tool
+  // claimed the field did not exist while sorting by it worked).
+  writeToolOutput({
+    sessionId: sess.id, callId: 'call_nested', tool: 'composio_execute_tool',
+    output: JSON.stringify({ items: [
+      { keyword_data: { keyword: 'dui attorney', keyword_info: { search_volume: 1900, cpc: 41.2 } }, ranked_serp_element: { serp_item: { rank_absolute: 3 } } },
+      { keyword_data: { keyword: 'burglary', keyword_info: { search_volume: 300, cpc: 2.1 } }, ranked_serp_element: { serp_item: { rank_absolute: 9 } } },
+    ] }),
+  });
+  const nested = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_nested', fields: 'keyword_data.keyword,keyword_data.keyword_info.cpc,ranked_serp_element.serp_item.rank_absolute', sort_by: 'keyword_data.keyword_info.cpc', order: 'desc' }),
+  );
+  const tNested = nested.content[0].text;
+  assert.match(tNested, /Showing 2 record\(s\)/);
+  assert.match(tNested, /"keyword_data\.keyword": "dui attorney"/, 'the nested value is projected under the path as written');
+  assert.match(tNested, /"ranked_serp_element\.serp_item\.rank_absolute": 3/);
+  assert.doesNotMatch(tNested, /search_volume/, 'fields not asked for stay out');
+  assert.ok(tNested.indexOf('dui attorney') < tNested.indexOf('burglary'), 'sorted by the nested cpc, descending');
+
   const missFilter = await withHarnessRunContext(
     { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
     () => query({ call_id: 'call_wrap', filter_field: 'subject', filter_equals: 'Z' }),
