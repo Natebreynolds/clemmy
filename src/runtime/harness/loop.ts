@@ -5516,6 +5516,35 @@ function primerWithoutRanker(
   return { ...primer, text: tail.text || undefined, injectedBytes: Buffer.byteLength(tail.text, 'utf8'), manifest: tail.manifest };
 }
 
+/** The ranker was held back for a later activation of a request that did
+ *  not itself decline memory (a host-owned continuation of the same source). */
+const SAME_REQUEST_CONTINUATION_REASON = 'same_request_continuation';
+
+/**
+ * Whether the request itself declined automatic memory, as opposed to the
+ * runtime holding the ranker back while it re-enters the same accepted source
+ * (the tool-ceiling resume, the no-progress check-in). Both set the same
+ * suppression flag. A caller that is not re-entering a source sets it only as
+ * the request's policy; on a host-owned re-entry the accepted request's own
+ * text decides, and an unreadable source keeps the request declined.
+ */
+function requestDeclinedAutomaticMemory(
+  options: RunTurnOptions,
+  policyInput: string,
+  sourceUserSeq: number | undefined,
+): boolean {
+  if (explicitlyOptsOutOfAutomaticMemoryRecall(policyInput)) return true;
+  if (options.suppressAutomaticMemoryForRequest !== true) return false;
+  if (options.hostOwnedContinuation !== true) return true;
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return true;
+  try {
+    const text = acceptedUserEvent(options.sessionId, sourceUserSeq as number).data.text;
+    return typeof text !== 'string' || explicitlyOptsOutOfAutomaticMemoryRecall(text);
+  } catch {
+    return true;
+  }
+}
+
 /** The primer when assembly outran its hard outer timeout: no ranker signal. */
 function assemblyTimeoutPrimer(input: string, scope: MemoryTailScope | undefined): TurnMemoryPrimer {
   return primerWithoutRanker(input, 'assembly_timeout', scope, { queryChars: 160 });
@@ -10793,6 +10822,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     ?? options.input;
   const automaticMemoryOptedOut = options.suppressAutomaticMemoryForRequest === true
     || explicitlyOptsOutOfAutomaticMemoryRecall(memoryRecallPolicyInput);
+  const requestDeclinedMemory = automaticMemoryOptedOut
+    && requestDeclinedAutomaticMemory(options, memoryRecallPolicyInput, sourceUserSeq);
   // The recall-vector embed is FIRE-AND-FORGET, not awaited: it stashes into a
   // TTL'd slot that per-turn fact recall reads OPPORTUNISTICALLY (late arrival
   // still helps mid-turn recalls; absence just drops the relevance term). The
@@ -10823,7 +10854,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     : declinedContinuation
     ? Promise.resolve(primerWithoutRanker(memoryPrimerInput, 'declined_continuation', memoryTailScope))
     : automaticMemoryOptedOut
-    ? Promise.resolve(primerWithoutRanker(memoryPrimerInput, EXPLICIT_MEMORY_RECALL_OPTOUT_REASON, memoryTailScope))
+    ? Promise.resolve(primerWithoutRanker(
+        memoryPrimerInput,
+        requestDeclinedMemory ? EXPLICIT_MEMORY_RECALL_OPTOUT_REASON : SAME_REQUEST_CONTINUATION_REASON,
+        memoryTailScope,
+      ))
     : Promise.race([
         buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId, memoryTailScope),
         new Promise<null>((resolve) => {
