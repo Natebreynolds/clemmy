@@ -41,8 +41,11 @@ export function explicitLocalReadPreviewBudget(toolName: string, args: unknown):
  * (per-round prefill is paid in absolute bytes). */
 const INLINE_RESULT_CHARS_PER_WINDOW_TOKEN = 0.35;
 
-/** The whole-result inline budget for the routed model's window. */
+/** The whole-result inline budget for the routed model's window. Without a
+ * routed model the tuned default applies; the model registry is not asked to
+ * resolve (and warn about) an absent id on every tool result. */
 export function inlineResultBudgetForModel(routedModelId?: string | null): number {
+  if (!routedModelId?.trim()) return DEFAULT_TOOL_RESULT_MAX_CHARS;
   let window: number;
   try {
     window = effectiveContextWindow(routedModelId);
