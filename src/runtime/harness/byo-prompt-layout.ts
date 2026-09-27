@@ -162,12 +162,19 @@ function textDigest(text: string): string {
  * when the caller computes this before appending it.
  */
 export function turnAnchorDigest(input: readonly unknown[]): string | undefined {
+  const item = turnAnchorItem(input);
+  if (!item) return undefined;
+  const text = userMessageText(item.content);
+  return text.trim() ? textDigest(text) : undefined;
+}
+
+/** The user message that opened the turn: the last user message item. */
+export function turnAnchorItem<T>(input: readonly T[]): (T & { content?: unknown }) | undefined {
   for (let i = input.length - 1; i >= 0; i -= 1) {
-    const item = input[i] as { role?: unknown; type?: unknown; content?: unknown } | undefined;
+    const item = input[i] as (T & { role?: unknown; type?: unknown; content?: unknown }) | undefined;
     if (!item || item.role !== 'user') continue;
     if (item.type !== undefined && item.type !== 'message') continue;
-    const text = userMessageText(item.content);
-    return text.trim() ? textDigest(text) : undefined;
+    return item;
   }
   return undefined;
 }

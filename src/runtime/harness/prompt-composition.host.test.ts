@@ -52,8 +52,11 @@ async function* testModelStream(
   request: unknown,
 ) {
   const response = await this.getResponse(request);
+  const finishReason = (response.output ?? []).some((item) => (item as { type?: string }).type === 'function_call')
+    ? 'tool_calls'
+    : 'stop';
   yield { type: 'response_started' } as never;
-  yield { type: 'model', event: { type: 'finish', finishReason: 'stop' } } as never;
+  yield { type: 'model', event: { type: 'finish', finishReason } } as never;
   yield {
     type: 'response_done',
     response: {
@@ -197,4 +200,105 @@ test('without the search and call doors the deferLoading tool is advertised and 
   assert.deepEqual(sent.names, ['workspace_roots', 'memory_search']);
   const data = compositions[0]!.data as { buckets: Array<{ name: string; tokens: number }> };
   assert.equal(data.buckets.find((bucket) => bucket.name === 'toolSchemas')?.tokens, sent.tokens);
+});
+
+test('a composed host turn measures history before the per-round appends and its buckets add up to what was sent', async () => {
+  const brackets = await import('./brackets.js');
+  const { estimateInputTokens } = await import('./token-estimator.js');
+  let reads = 0;
+  const roots = brackets.wrapToolForHarness({
+    ...fixtureTool('workspace_roots'),
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    invoke: async () => { reads += 1; return 'ROOTS: /fixture'; },
+  } as never);
+  const tools = [roots];
+  const previous = process.env.CLEMMY_TURN_ENGINE;
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  _resetAdvertisedSurfaceMemoryForTests();
+  const requests: Array<{ input?: unknown; systemInstructions?: string }> = [];
+  const model = {
+    async getResponse(request: { input?: unknown; systemInstructions?: string }) {
+      requests.push(structuredClone(request));
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output: requests.length === 1
+          ? [{ type: 'function_call', callId: 'roots-1', name: 'workspace_roots', arguments: '{}' }]
+          : [textMsg('roots listed')],
+        responseId: `bookkeeping-${requests.length}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const steer = 'CONTINUATION STEER FIXTURE: keep going with the roots.';
+  let sessionId = '';
+  try {
+    const session = eventlog.createSession({ id: 'prompt-composition-bookkeeping', kind: 'chat' });
+    sessionId = session.id;
+    await runConversation({
+      sessionId: session.id,
+      input: 'Please list the workspace roots you can see for me.',
+      turnEngine: 'host_v1',
+      maxSteps: 3,
+      judgeCompletion: false,
+      continuationSteer: steer,
+      buildAgent: async () => {
+        const agent = { model, instructions: 'base system', tools, getAllTools: async () => tools };
+        bindSurface(session.id, agent, tools as Array<{ name?: unknown }>);
+        return agent as never;
+      },
+      makeRunner: () => {
+        const runner = new EventEmitter();
+        (runner as unknown as { run: () => never }).run = () => { throw new Error('legacy Runner.run must be unreachable'); };
+        return runner as never;
+      },
+      maxTurns: 3,
+    } as never);
+  } finally {
+    if (previous === undefined) delete process.env.CLEMMY_TURN_ENGINE;
+    else process.env.CLEMMY_TURN_ENGINE = previous;
+  }
+  assert.equal(reads, 1, 'fixture: the tool round ran');
+  assert.equal(requests.length, 2, 'fixture: two model requests');
+  const compositions = eventlog.listEvents(sessionId, { types: ['prompt_composition'] });
+  assert.equal(compositions.length, 2);
+  const source = eventlog.listEvents(sessionId, { types: ['user_input_received'] })
+    .find((event) => event.data.synthetic !== true)!;
+  const provenance = eventlog.openEventLog().prepare(`
+    SELECT request_ordinal FROM model_request_provenance WHERE session_id = ? AND source_user_seq = ? ORDER BY request_ordinal
+  `).all(sessionId, source.seq) as Array<{ request_ordinal: number }>;
+  assert.deepEqual(provenance.map((row) => row.request_ordinal), [1, 2]);
+
+  const inputBuckets = ['history', 'currentMessage', 'contextPacket', 'memoryPrimer', 'provenOperation', 'retryContext'];
+  compositions.forEach((event, index) => {
+    const data = event.data as {
+      requestOrdinal?: number;
+      sourceUserSeq?: number;
+      totalTokens: number;
+      buckets: Array<{ name: string; tokens: number }>;
+    };
+    assert.equal(data.requestOrdinal, provenance[index]!.request_ordinal, 'each reading joins its provenance row by ordinal');
+    assert.equal(data.sourceUserSeq, source.seq);
+    const names = data.buckets.map((bucket) => bucket.name);
+    assert.equal(new Set(names).size, names.length, 'no bucket is recorded twice');
+    const tokens = new Map(data.buckets.map((bucket) => [bucket.name, bucket.tokens]));
+    assert.ok((tokens.get('contextPacket') ?? 0) > 0, 'the context packet is its own bucket');
+    assert.ok((tokens.get('currentMessage') ?? 0) > 0, 'the opening message is its own bucket');
+    // The input the model received, less any host guidance appended after the
+    // filter, equals the input-side buckets exactly: nothing counted twice.
+    const sent = (requests[index]!.input ?? []) as Array<{ role?: string; content?: unknown }>;
+    const filterEnd = sent.findIndex((item) => item.role === 'system'
+      && typeof item.content === 'string' && item.content.includes(steer));
+    assert.ok(filterEnd >= 0, 'fixture: the context packet item reached the model');
+    const composedInput = sent.slice(0, filterEnd + 1);
+    const inputSum = inputBuckets.reduce((sum, name) => sum + (tokens.get(name) ?? 0), 0);
+    assert.equal(inputSum, estimateInputTokens(composedInput as never),
+      'history + message + appended items = the composed input, with nothing counted twice');
+    assert.equal(data.totalTokens, data.buckets.reduce((sum, bucket) => sum + bucket.tokens, 0));
+  });
+  const first = new Map((compositions[0]!.data as { buckets: Array<{ name: string; tokens: number }> }).buckets
+    .map((bucket) => [bucket.name, bucket.tokens]));
+  const second = new Map((compositions[1]!.data as { buckets: Array<{ name: string; tokens: number }> }).buckets
+    .map((bucket) => [bucket.name, bucket.tokens]));
+  assert.ok((second.get('history') ?? 0) > (first.get('history') ?? 0), 'the tool round grows history, not the appended buckets');
+  assert.equal(second.get('contextPacket'), first.get('contextPacket'));
 });
