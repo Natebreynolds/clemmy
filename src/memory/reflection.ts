@@ -27,7 +27,7 @@ import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
-import { resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
+import { boundaryTransport, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
 import { resolveMemoryModelRoute, type MemoryModelProblem } from './memory-model-route.js';
@@ -338,17 +338,11 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
 // Codex credentials, so these jobs always get a provider-bound model. A null
 // route means the model cannot be served right now: the job waits.
 
-const MEMORY_ROUTE_TRANSPORT = {
-  codex: 'codex_responses',
-  claude: 'claude_subscription',
-  byo: 'byo_openai_compatible',
-} as const;
-
 export function _testOnly_reflectorRoute(): { modelId: string; provider: string; transport: string } | null {
   const route = resolveMemoryModelRoute('learn');
   const provider = route?.provider ?? route?.boundary?.judgeFamily;
   if (!route || !provider) return null;
-  return { modelId: route.modelId, provider, transport: route.boundary?.transport ?? MEMORY_ROUTE_TRANSPORT[provider] };
+  return { modelId: route.modelId, provider, transport: route.boundary?.transport ?? boundaryTransport(provider) };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

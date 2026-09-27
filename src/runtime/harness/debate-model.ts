@@ -1190,7 +1190,7 @@ export interface BoundaryJudgeRouting {
   deferredFallback?: true;
 }
 
-function boundaryTransport(provider: ModelProviderClass): BoundaryJudgeRouting['transport'] {
+export function boundaryTransport(provider: ModelProviderClass): BoundaryJudgeRouting['transport'] {
   if (provider === 'codex') return 'codex_responses';
   if (provider === 'claude') return 'claude_subscription';
   return 'byo_openai_compatible';
