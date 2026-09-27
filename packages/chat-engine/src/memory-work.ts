@@ -352,6 +352,18 @@ export function memoryModelProblemText(problem: MemoryModelProblem): string {
   return PROBLEM_WORDS[problem] ?? PROBLEM_WORDS.error;
 }
 
+/** The Settings line when the memory model cannot serve right now: what is
+ *  wrong, until when if the provider said, and that learning waits.
+ *  `modelName` is the named model's display name, null when none is named. */
+export function memoryModelUnavailableText(
+  unavailable: NonNullable<MemoryWorkModel['unavailable']>,
+  modelName: string | null,
+  fmt: Pick<MemoryTimeFormat, 'clock'>,
+): string {
+  const until = unavailable.until ? ` until about ${fmt.clock(unavailable.until)}` : '';
+  return `${modelName ?? 'The memory model'} ${memoryModelProblemText(unavailable.problem)}${until}. Learning waits; nothing is lost.`;
+}
+
 const TRIGGER_WORDS: Record<MemoryJobTrigger, string> = {
   after_conversation: 'After each conversation, when Clem is idle',
   after_message: 'After you send a message',

@@ -1,4 +1,5 @@
-import { MEMORY_ROLE_WORDS, memoryRoleAutomaticText } from '@clem/chat-engine';
+import { MEMORY_ROLE_WORDS, memoryModelUnavailableText, memoryRoleAutomaticText } from '@clem/chat-engine';
+import { clockText } from './memory-work';
 import type { JudgeFallbackSelection, JudgeFallbackSetting, ModelRoleName, ModelSettings, ResolvedBrain, RoleModelGroup } from './api';
 
 export function judgeFallbackValue(setting: JudgeFallbackSetting): string {
@@ -161,9 +162,17 @@ export function roleNote(role: ModelRoleName, settings: ModelSettings): string |
 
 /** A saved choice that is unavailable, and what runs instead. When nothing
  *  runs in its place (Keeps your memory never substitutes a pick), the work
- *  waits for it, and the note says that instead of naming a stand-in. */
+ *  waits for it, and the note says that instead of naming a stand-in. For
+ *  Keeps your memory it also says why its model cannot serve at all. */
 export function inactiveNote(resolved: ResolvedBrain | undefined, settings: ModelSettings, role?: ModelRoleName): string | null {
   const saved = resolved?.inactiveBinding;
+  // Keeps your memory with no saved pick in the way (Automatic with nothing
+  // that can serve, or a pick out of quota or backing off): the daemon's
+  // reason, in the Mac's words.
+  if (role === 'memory' && resolved?.unavailable && !saved) {
+    const name = resolved.modelId ? describe(resolved.modelId, resolved.provider, settings) : null;
+    return memoryModelUnavailableText(resolved.unavailable, name, { clock: (iso) => clockText(iso, Date.now()) });
+  }
   if (!resolved || !saved) return null;
   const pick = describe(saved.modelId, saved.provider, settings);
   const nothingRuns = !resolved.modelId || (role === 'memory' && saved.modelId === resolved.modelId);

@@ -1,4 +1,4 @@
-import { readCompletionReviewResponse, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
+import { readCompletionReviewResponse, type MemoryModelProblem, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
@@ -1716,6 +1716,9 @@ export interface ResolvedBrain {
   /** Keeps your memory, automatic only: whose model memory work borrows
    *  today, as the daemon resolved it (never inferred on the phone). */
   follows?: 'checker' | 'brain' | null;
+  /** Keeps your memory: why its model cannot serve right now, and until when
+   *  when the provider said. */
+  unavailable?: { problem: MemoryModelProblem; until?: string } | null;
 }
 
 /** One row of the LIVE brain catalog — the same brainOptions the console

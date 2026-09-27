@@ -1,3 +1,4 @@
+import type { MemoryModelProblem } from '@clem/chat-engine';
 import { apiGet, apiPost, apiDelete, api } from './api';
 
 // ─── Scoped send-trust ───────────────────────────────────────────────────────
@@ -184,7 +185,12 @@ export interface ResolvedRole {
  *  when no model can serve (a chosen model that is disconnected: learning
  *  waits, and `inactiveBinding` names the pick). The model shown is the memory
  *  route's own resolution, never the checker's. */
-export type MemoryResolvedRole = ResolvedRole & { follows?: 'checker' | 'brain' | null };
+export type MemoryResolvedRole = ResolvedRole & {
+  follows?: 'checker' | 'brain' | null;
+  /** Why the memory model cannot serve right now (a disconnected account, a
+   *  used-up plan, a provider backoff), with its end when known. */
+  unavailable?: { problem: MemoryModelProblem; until?: string } | null;
+};
 export interface ModelRolesSnapshot {
   judgeFallback?: JudgeFallbackSetting;
   // writer and memory are absent on daemons that predate those roles.

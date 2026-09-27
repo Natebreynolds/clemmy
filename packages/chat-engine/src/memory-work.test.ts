@@ -6,6 +6,7 @@ import {
   MEMORY_ROLE_WORDS,
   MEMORY_WORK_LIVE_MS,
   memoryEventSentence,
+  memoryModelUnavailableText,
   memoryPipeline,
   memoryRoleAutomaticText,
   memoryUndoResultText,
@@ -132,4 +133,11 @@ test('undo results read the same on both apps', () => {
   assert.equal(memoryUndoResultText({ ok: false, reason: 'not_found' }, 'forget'), 'That run is no longer in the history.');
   assert.equal(memoryUndoResultText({ ok: false, reason: 'failed' }, 'forget'), 'Couldn’t undo just now. Nothing was changed.');
   assert.equal(memoryUndoResultText(null, 'restore'), 'Couldn’t undo just now. Nothing was changed.');
+});
+
+test('Settings says why the memory model cannot serve, and that learning waits', () => {
+  assert.equal(memoryModelUnavailableText({ problem: 'not_connected' }, null, fmt),
+    'The memory model is not connected. Learning waits; nothing is lost.');
+  assert.equal(memoryModelUnavailableText({ problem: 'quota', until: '2026-09-26T11:00:00.000Z' }, 'Model(m-1)', fmt),
+    'Model(m-1) is out of quota until about 3:00 AM. Learning waits; nothing is lost.');
 });

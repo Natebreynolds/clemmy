@@ -5,7 +5,8 @@ import { Link, useLocation } from 'react-router-dom';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
-import { memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
+import { memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
+import { memoryTimeFormat } from '@/lib/memory-work';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -140,8 +141,9 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const memoryFlat = r.memories;
   const memoryPick = memory?.source === 'default' ? null : (memory?.modelId || memory?.inactiveBinding?.modelId || null);
   const memoryMissingPick = memoryPick && !memoryFlat.some((m) => m.id === memoryPick) ? memoryPick : null;
+  // The memory route never substitutes a pick: an unavailable pick means
+  // learning waits (the daemon then names no model).
   const memoryWaits = Boolean(memory?.inactiveBinding && !memory.modelId);
-  const memorySwapped = Boolean(memory?.inactiveBinding && memory.modelId && memory.inactiveBinding.modelId !== memory.modelId);
   const onCodexRescue = (value: string) => r.run('codex-rescue', () => patchCodexRescueModel(value === '__primary__' ? { clear: true } : { modelId: value }));
   const workerIntents = mr.bindings.filter((b) => b.role === 'worker' && b.whenIntent);
   const modelLabel = (id: string) => workerFlat.find((m) => m.id === id)?.label ?? id;
@@ -257,10 +259,12 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
                   <span className="min-w-0">Your pick, {modelDisplayName(memory.inactiveBinding.modelId)}, isn’t available, so learning waits until it is back. Nothing is lost.</span>
                 </div>
               )}
-              {memorySwapped && memory.inactiveBinding && (
-                <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={memory.inactiveBinding.reason}>
+              {!memoryWaits && memory.unavailable && (
+                // Automatic with nothing that can serve, or a pick that is out
+                // of quota or backing off: the same reason the Memory tab gives.
+                <div className="mt-1 flex items-center gap-1.5 text-caption text-warning">
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
-                  <span className="min-w-0">Your pick, {modelDisplayName(memory.inactiveBinding.modelId)}, isn’t available, so {modelDisplayName(memory.modelId)} is used instead.</span>
+                  <span className="min-w-0">{memoryModelUnavailableText(memory.unavailable, memory.modelId ? modelDisplayName(memory.modelId) : null, memoryTimeFormat(Date.now()))}</span>
                 </div>
               )}
               <Link to="/memory" className="mt-1 inline-block text-caption font-semibold text-primary hover:underline">See it at work in Memory</Link>

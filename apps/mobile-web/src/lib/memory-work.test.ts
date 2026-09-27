@@ -489,6 +489,13 @@ test('with no model at all the memory row says so, and a missing pick waits inst
   assert.match(inactiveNote(sameId, settings, 'memory') ?? '', /learning waits until it is back/,
     'a pick reported under its own id is still a wait, never "used instead"');
   assert.equal(inactiveNote(sameId, settings, 'judge'), null, 'request roles keep their existing reading');
+  // No pick in the way: Automatic with nothing that can serve, or a pick out
+  // of quota. The row says why, in the Mac's words.
+  const automaticNone = { modelId: '', provider: '', source: 'default', follows: null, unavailable: { problem: 'not_connected' as const } };
+  assert.equal(inactiveNote(automaticNone, settings, 'memory'), 'The memory model is not connected. Learning waits; nothing is lost.');
+  const pickOutOfQuota = { modelId: FIXTURE_MEMORY_MODEL, provider: 'byo', source: 'settings', unavailable: { problem: 'quota' as const } };
+  assert.equal(inactiveNote(pickOutOfQuota, settings, 'memory'), 'Provider A — Quick model is out of quota. Learning waits; nothing is lost.');
+  assert.equal(inactiveNote(automaticNone, settings, 'judge'), null, 'only the memory row carries this reason');
   const judge = { modelId: FIXTURE_MEMORY_MODEL, provider: 'byo', source: 'default', inactiveBinding: { modelId: FIXTURE_STAND_IN_MODEL, provider: 'byo', reason: 'x' } };
   assert.equal(inactiveNote(judge, settings, 'judge'),
     'Your pick, Provider B — Backup model, isn\'t available, so Provider A — Quick model is used instead.',
