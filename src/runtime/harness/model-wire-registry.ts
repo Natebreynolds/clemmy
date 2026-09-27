@@ -498,16 +498,24 @@ const REGISTRY: RegistryRow[] = [
   },
 ];
 
+/** Unknown ids already warned about in this process. */
+const warnedUnknownModelIds = new Set<string>();
+
 /**
  * Resolve the wire capability for a model id. First family match wins; an
  * unknown id warns LOUD and returns a conservative default (never a silent
- * wrong assumption). Pure + cheap — safe to call per request.
+ * wrong assumption). Pure + cheap — safe to call per request, so the warning
+ * fires once per unknown id per process rather than on every call.
  */
 export function resolveModelCapability(modelId: string | undefined | null): ModelCapability {
   const id = (modelId ?? '').trim();
   const matched = matchCapability(id);
   if (matched) return matched;
-  logger.warn({ modelId: id || '(empty)' }, 'model-wire-registry: unknown model id — using conservative defaults');
+  const warnKey = id || '(empty)';
+  if (!warnedUnknownModelIds.has(warnKey)) {
+    warnedUnknownModelIds.add(warnKey);
+    logger.warn({ modelId: warnKey }, 'model-wire-registry: unknown model id — using conservative defaults');
+  }
   return DEFAULT_CAPABILITY;
 }
 
