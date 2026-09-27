@@ -1685,6 +1685,21 @@ test('ambiguous unified discovery uses Jev before selecting schemas, with exact-
   }
 });
 
+test('a request about one of Clementine\'s own objects finds the tool named for it on the first page of the real native catalog', async () => {
+  // Live 2026-09-26: the queries a heartbeat edit actually issued.
+  const t = captureToolSearch(undefined, false);
+  for (const query of [
+    'list or edit my heartbeats recurring check-in prompts',
+    'update heartbeat rules add suppression rule to a recurring review',
+    'heartbeat',
+  ]) {
+    const raw = await t.handler({ query, limit: 8 });
+    const body = JSON.parse(raw.content[0]!.text) as { results: Array<{ name: string }> };
+    const firstPage = body.results.map((row) => row.name);
+    assert.ok(firstPage.includes('heartbeat_refine'), `${query}: ${firstPage.join(', ')}`);
+  }
+});
+
 test('a request for two operations keeps both on the first page beside the real native catalog', async () => {
   // Live shape 2026-09-24: "search for restaurants ... and create a new Google
   // Sheet" returned the search operation plus seven native search helpers on the

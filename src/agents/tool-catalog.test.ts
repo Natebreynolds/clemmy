@@ -396,6 +396,44 @@ test('a request for two operations keeps both ahead of tools that share only its
   }
 });
 
+test('an operation named after the request\'s object reaches the first page even when its purpose opens with another verb', () => {
+  // Live shape 2026-09-26: "list or edit my heartbeats ..." and "update
+  // heartbeat rules ..." returned list_* and *_update tools for four pages;
+  // heartbeat_refine ("Change one of the owner's heartbeats ...") never
+  // appeared, and the turn spent 18 tool_search calls and 45 rounds crawling
+  // the home directory instead.
+  const entries = [
+    { name: 'heartbeat_refine', oneLiner: 'Change one of the owner\'s heartbeats (the checks Clementine runs on her own: work review, calendar watch, workflow suggestions) the way the owner just asked. Use when the owner says how a heartbeat should behave. add_rule stores the owner\'s wish; remove_rule takes one back; cadence_minutes, notify and enabled change the contract directly.' },
+    { name: 'list_pending_check_ins', oneLiner: 'List check-ins waiting for an answer.' },
+    { name: 'check_in', oneLiner: 'Ask the owner a check-in question and wait for the reply.' },
+    { name: 'workflow_update', oneLiner: 'Modify an existing workflow by exact saved name or slug: update description, trigger schedule, steps, inputs, or synthesis.' },
+    { name: 'home_update', oneLiner: 'Update the home page layout and its sections.' },
+    { name: 'task_update', oneLiner: 'Update a task: title, due date, status, or notes.' },
+    { name: 'goal_upsert', oneLiner: 'Update or create a goal with its review cadence.' },
+    { name: 'skill_list', oneLiner: 'List installed skills with name and one-line description.' },
+    { name: 'list_files', oneLiner: 'List files in a workspace directory.' },
+  ];
+  for (const [query, within] of [
+    ['list or edit my heartbeats recurring check-in prompts', 3],
+    ['update heartbeat rules add suppression rule to a recurring review', 1],
+    ['About my Work review heartbeat: stop telling me about unsent drafts, I file those myself', 1],
+  ] as const) {
+    for (const ordered of [entries, [...entries].reverse()]) {
+      const ranked = rankCatalogEntriesLexically(query, ordered);
+      const at = ranked.findIndex((row) => row.name === 'heartbeat_refine');
+      assert.ok(at >= 0 && at < within, `${query}: heartbeat_refine at ${at}: ${ranked.map((row) => row.name).join(', ')}`);
+      assert.equal(ranked.find((row) => row.name === 'heartbeat_refine')!.purposeLeadMatch, false, 'the object names the tool; the verb tier stays honest');
+    }
+  }
+  // A tool that performs the verb on the same object still leads.
+  const ranked = rankCatalogEntriesLexically('update the workflow schedule', [
+    { name: 'workflow_update', oneLiner: 'Modify an existing workflow: trigger schedule, steps, inputs.' },
+    { name: 'workflow_list', oneLiner: 'List saved workflows with their schedules.' },
+    { name: 'workflow_run', oneLiner: 'Run a saved workflow now.' },
+  ]);
+  assert.equal(ranked[0]!.name, 'workflow_update');
+});
+
 test('a conjunction inside the object does not invent a second requested operation', () => {
   const entries = [
     { name: 'LISTING_SEARCH', oneLiner: 'Search venue listings by location and category.' },

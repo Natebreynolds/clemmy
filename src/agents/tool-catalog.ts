@@ -387,11 +387,13 @@ function requestedActionsOf(requestBody: string, leadingActions: ReadonlySet<str
 function lexicalRelevance(queryTokens: string[], requestedActions: readonly RequestedAction[], e: CatalogEntry, weights: ReadonlyMap<string, number>): {
   score: number;
   actionFit: number[];
+  performsAction: boolean[];
   fullLexicalCoverage: boolean;
   completeCompoundNameMatch: boolean;
 } {
   const noFit = requestedActions.map(() => -1);
-  if (queryTokens.length === 0) return { score: 0, actionFit: noFit, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  const performsNone = requestedActions.map(() => false);
+  if (queryTokens.length === 0) return { score: 0, actionFit: noFit, performsAction: performsNone, fullLexicalCoverage: false, completeCompoundNameMatch: false };
   const descriptionTokens = new Set(lexicalTokens(e.oneLiner));
   const nameTokens = new Set(lexicalTokens(e.name));
   // Long descriptions also name prerequisites and alternative operations.
@@ -407,7 +409,14 @@ function lexicalRelevance(queryTokens: string[], requestedActions: readonly Requ
     if (nameTokens.has(q)) nameHits += weight;
     if (nameTokens.has(q) || descriptionTokens.has(q)) covered += weight;
   }
-  if (queryWeight === 0) return { score: 0, actionFit: noFit, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  if (queryWeight === 0) return { score: 0, actionFit: noFit, performsAction: performsNone, fullLexicalCoverage: false, completeCompoundNameMatch: false };
+  // The operation performs the action when its own purpose or name opens with
+  // the request's verb. An operation NAMED AFTER the action's object is about
+  // that object even when its purpose opens with another verb, so a request to
+  // list or update an object reaches the tool named for it ahead of every
+  // generic list or update tool that merely shares the verb.
+  const performsAction = requestedActions.map(({ lead }) => purposeTokens.has(lead) || nameTokens.has(lead));
+  const namedAfterObject = requestedActions.map(({ objects }) => objects.some((token) => nameTokens.has(token)));
   // Coverage rewards the requested concepts; Dice similarity also accounts
   // for unrequested operation qualifiers. Merely adding more name tokens must
   // not make every reply/forward variant beat the matching base operation.
@@ -420,10 +429,11 @@ function lexicalRelevance(queryTokens: string[], requestedActions: readonly Requ
     // turn those operations into this tool's purpose. For each requested
     // action this operation performs, how much of that action's object it
     // covers; -1 when it does not perform the action.
-    actionFit: requestedActions.map(({ lead, objects }) => (purposeTokens.has(lead) || nameTokens.has(lead)
+    actionFit: requestedActions.map(({ objects }, index) => (performsAction[index] || namedAfterObject[index]
       ? objects.reduce((total, token) => total
         + (nameTokens.has(token) || descriptionTokens.has(token) ? weights.get(token) ?? 0 : 0), 0)
       : -1)),
+    performsAction,
     // A compound operation identifier explicitly present in ordinary word
     // order is stronger lexical evidence than incidental description words.
     // A single generic token (including a repeated-token name) is insufficient.
@@ -513,14 +523,15 @@ export function rankCatalogEntriesLexically<T extends CatalogEntry>(
   const rows = entries.map((entry) => ({ entry, relevance: lexicalRelevance(queryTokens, informativeActions, entry, weights) }));
   const bestFit = requestedActions.map((_, index) => Math.max(0, ...rows.map(({ relevance }) => relevance.actionFit[index] ?? -1)));
   return rows
-    .map(({ entry, relevance: { actionFit, ...relevance } }) => ({
+    .map(({ entry, relevance: { actionFit, performsAction, ...relevance } }) => ({
       ...entry,
       ...relevance,
       purposeObjectMatch: actionFit.some((fit, index) => fit >= 0 && bestFit[index]! > 0
         && fit >= bestFit[index]! * PURPOSE_OBJECT_SHARE),
       // The request's first verb alone, as before: an operation whose purpose
-      // is that verb outranks one that merely mentions it.
-      purposeLeadMatch: (actionFit[0] ?? -1) >= 0,
+      // is that verb outranks one that merely mentions it, and one that is
+      // only named after the object.
+      purposeLeadMatch: performsAction[0] ?? false,
       namespaceMatch: namesNamespace(querySequence, entry.namespace),
     }))
     .sort((left, right) => Number(right.completeCompoundNameMatch) - Number(left.completeCompoundNameMatch)
