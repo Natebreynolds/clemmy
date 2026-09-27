@@ -334,12 +334,10 @@ test('the OpenAI key does memory search only while it embeds, and every account 
           .filter((account) => body[account].billing?.roles?.includes('memory'));
         // Learning runs on the memory route's model; skills, profile and
         // import keep the fast-tier model, here another account's.
-        const { memoryJobModelId } = await import('../memory/memory-model-route.js');
-        const { resolveProvider } = await import('../runtime/harness/model-wire-registry.js');
+        const { memoryJobServing } = await import('../memory/memory-model-route.js');
         const serving = new Set((['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const)
-          .map((job) => memoryJobModelId(job, memory))
-          .filter((id): id is string => Boolean(id))
-          .map((id) => resolveProvider(id)));
+          .map((job) => memoryJobServing(job, memory)?.provider)
+          .filter((provider): provider is NonNullable<typeof provider> => Boolean(provider)));
         assert.ok(serving.has(memory.provider!), 'the automatic memory model\'s account is among them');
         assert.ok(serving.size > 1, 'fixture: memory work runs on two accounts here');
         assert.deepEqual([...keepers].sort(), [...serving].sort(), 'every account doing memory work keeps the memory');

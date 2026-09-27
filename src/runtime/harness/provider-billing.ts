@@ -19,7 +19,7 @@ import { getByoProviders, providerToBackendConfig, resolveByoProviderForModel } 
 import { boundWriterModel, resolveRoleModel } from './model-roles.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { activeEmbeddingProviderName } from '../../memory/embeddings.js';
-import { describeMemoryModel, memoryJobModelId } from '../../memory/memory-model-route.js';
+import { describeMemoryModel, memoryJobServing, type MemoryJobServing } from '../../memory/memory-model-route.js';
 import { MEMORY_JOB_IDS, memoryJobUsesMemoryModel } from '../../memory/memory-jobs.js';
 
 const logger = pino({ name: 'clementine.provider-billing' });
@@ -209,6 +209,22 @@ function accountForModel(modelId: string): string | undefined {
   }
 }
 
+/** Which account serves a memory job's model: the provider the job is
+ *  served on (the router's pick for a bare fast-tier string, the route's
+ *  family otherwise), never a guess from the id's shape. */
+function accountForServing(serving: MemoryJobServing): string | undefined {
+  if (serving.provider === 'codex' || serving.provider === 'claude') return serving.provider;
+  if (serving.provider === 'byo') {
+    if (serving.byoProviderId) return serving.byoProviderId;
+    try {
+      return resolveByoProviderForModel(serving.modelId)?.providerId || undefined;
+    } catch {
+      return undefined; // an ambiguous id belongs to no single account
+    }
+  }
+  return accountForModel(serving.modelId);
+}
+
 /** account id → the jobs it is doing now. */
 export function rolesByAccount(): Map<string, string[]> {
   const out = new Map<string, string[]>();
@@ -224,16 +240,16 @@ export function rolesByAccount(): Map<string, string[]> {
   try { add(accountForModel(boundWriterModel()?.modelId ?? ''), 'writer'); } catch { /* no writer bound */ }
   // Memory work always runs, on each governed job's own model: the memory
   // route's (which can differ from the checker's) and, on Automatic, the
-  // fast-tier model skills, profile and import keep, which can belong to
-  // another account. Every account serving one is tagged; a pick that cannot
-  // be served runs on no account.
+  // fast-tier model skills, profile and import keep, on whichever account the
+  // router sends it to. Every account serving one is tagged; a pick that
+  // cannot be served runs on no account.
   try {
     const memory = describeMemoryModel();
     if (!memory.inactiveBinding) {
       for (const job of MEMORY_JOB_IDS) {
         if (!memoryJobUsesMemoryModel(job)) continue;
-        const modelId = memoryJobModelId(job, memory);
-        if (modelId) add(accountForModel(modelId), 'memory');
+        const serving = memoryJobServing(job, memory);
+        if (serving) add(accountForServing(serving), 'memory');
       }
     }
   } catch { /* an unresolved memory route names no account */ }

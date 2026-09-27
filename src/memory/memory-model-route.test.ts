@@ -427,6 +427,35 @@ test('with no model signed in, the automatic route resolves nothing: every gover
   }
 });
 
+test('the fast-tier jobs name the model the router actually serves them, and the meter tags that account', async () => {
+  const { rolesByAccount } = await import('../runtime/harness/provider-billing.js');
+  const { getClaudeBrainModel } = await import('../config.js');
+  const fast = ['skills', 'identity', 'import'] as const;
+  const memoryAccounts = () => [...rolesByAccount()].filter(([, roles]) => roles.includes('memory')).map(([account]) => account).sort();
+
+  // BYO all-in with Codex also signed in: the router sends the fast-tier
+  // string to the BYO primary, so Codex does no memory work.
+  Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_JUDGE_ID: 'byo-judge-model' });
+  useByo();
+  writeAuth({ claude: false });
+  let described = describeMemoryModel();
+  for (const job of fast) {
+    assert.equal(memoryJobModelId(job, described), 'byo-memory-model', `${job} names the BYO primary`);
+    assert.equal(resolveMemoryModelRoute(job)?.modelId, 'byo-memory-model', `${job} asks for it`);
+    assert.equal(resolveMemoryModelRoute(job)?.model, job === 'import' ? (MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL) : MODELS.fast,
+      `${job} still hands the agent today's string`);
+  }
+  assert.ok(!memoryAccounts().includes('codex'), 'the connected Codex account keeps no memory here');
+
+  // Claude signed in without Codex: the router sends a Codex-shaped string
+  // to the Claude brain.
+  Object.assign(process.env, { AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'off', BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '', BYO_MODEL_ID: '', BYO_MODEL_JUDGE_ID: '' });
+  writeAuth({ codex: false });
+  described = describeMemoryModel();
+  for (const job of fast) assert.equal(memoryJobModelId(job, described), getClaudeBrainModel(), `${job} names the Claude brain`);
+  assert.deepEqual(memoryAccounts(), ['claude'], 'only the account that serves memory work keeps the memory');
+});
+
 test('a same-family automatic route on a signed-out brain family waits, while the model strings still reach a connected provider', () => {
   Object.assign(process.env, { AUTH_MODE: 'claude_oauth', CLEMMY_JUDGE_CROSS_FAMILY: 'off' });
   writeAuth({ claude: false });

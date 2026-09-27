@@ -54,7 +54,8 @@ import {
   debateBrainsAvailable,
   judgeCrossFamilyEnabled,
 } from '../runtime/harness/judge-family.js';
-import { resolveByoProviderForModel, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
+import { resolveByoProviderForModel } from '../runtime/harness/byo-providers.js';
+import { routedPrimaryModel, type RoutedPrimaryModel } from '../runtime/harness/router-model.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { creditRefusal } from '../runtime/provider-credit.js';
 import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
@@ -144,13 +145,29 @@ function automaticFastModelId(job: MemoryJobId): string {
   return job === 'import' ? (MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL) : MODELS.fast;
 }
 
-/** Whether a bare model string can be served: the process-global router
- *  serves it on its own provider, or falls over to another connected one.
- *  Generous on purpose: this only holds work back when nothing can run it. */
-function modelStringServes(modelId: string): boolean {
+/** Where the process-global router sends a bare model string first: the
+ *  router's own rule (routedPrimaryModel), so a job row and the token meter
+ *  name the model and account that actually serve it (the BYO primary under
+ *  all-in, the Claude brain for a Codex-shaped id when only Claude is signed
+ *  in). Null when the router would refuse the string outright. */
+function routedModelString(modelId: string): RoutedPrimaryModel | null {
   try {
-    if (modelProviderLive(modelId, resolveEffectiveProviderForModel(modelId))) return true;
-  } catch { /* an ambiguous id still reaches whichever provider is connected */ }
+    return routedPrimaryModel(modelId);
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a bare model string can be served: the router serves it on the
+ *  provider it routes to, or falls over to another connected one. Generous
+ *  on purpose: this only holds work back when nothing can run it. A string
+ *  the router refuses outright (a BYO id with no backend) never serves. */
+function modelStringServes(modelId: string): boolean {
+  const routed = routedModelString(modelId);
+  if (!routed) return false;
+  try {
+    if (modelProviderLive(routed.modelId, routed.provider)) return true;
+  } catch { /* an unreadable provider state still reaches whichever one is connected */ }
   try {
     const brains = debateBrainsAvailable();
     return brains.claude || brains.codex || getByoBackendConfig().configured;
@@ -161,8 +178,10 @@ function modelStringServes(modelId: string): boolean {
 
 /** Why a bare model string cannot be served. */
 function modelStringProblem(modelId: string): MemoryModelUnavailable {
+  const routed = routedModelString(modelId);
+  if (!routed) return { problem: 'not_connected' };
   try {
-    return problemForModel(resolveEffectiveProviderForModel(modelId), modelId);
+    return problemForModel(routed.provider, routed.modelId);
   } catch {
     return { problem: 'not_connected' };
   }
@@ -185,10 +204,13 @@ type AutomaticResolution =
 
 function resolveAutomatic(job: MemoryJobId): AutomaticResolution {
   if (!BOUNDARY_JOBS.has(job)) {
-    const modelId = automaticFastModelId(job);
-    if (!modelId) return { route: null, why: { problem: 'not_connected' } };
-    if (!modelStringServes(modelId)) return { route: null, why: modelStringProblem(modelId) };
-    return { route: { job, model: modelId, modelId, source: 'automatic', follows: null } };
+    const requested = automaticFastModelId(job);
+    if (!requested) return { route: null, why: { problem: 'not_connected' } };
+    if (!modelStringServes(requested)) return { route: null, why: modelStringProblem(requested) };
+    // The agent still gets today's string; the router serves it. What will
+    // be asked for is what the router sends it to.
+    const modelId = routedModelString(requested)?.modelId ?? requested;
+    return { route: { job, model: requested, modelId, source: 'automatic', follows: null } };
   }
   let routing: BoundaryJudgeRouting;
   try {
@@ -368,24 +390,44 @@ function describeMemoryModelNow(): MemoryModelDescription {
   }
 }
 
+/** A governed job's model as it is served: the model id, and the provider
+ *  (with its BYO backend, when the router picked one) serving it. */
+export interface MemoryJobServing {
+  modelId: string;
+  provider: ModelProviderClass | null;
+  /** The BYO backend's registry id, when the router routed to a named one. */
+  byoProviderId?: string;
+}
+
 /**
- * The model id a governed job would ask for, read from one description
- * without building a model (the Memory tab polls it every few seconds): the
- * owner's pick for every job when chosen; for automatic, the described
- * checker selection for learn / reconcile / patterns (they share it) and
- * today's fast-tier string for the others. Null for a job the memory model
- * does not govern, or when nothing can be named. Never throws.
+ * How a governed job's model is served, read from one description without
+ * building a model (the Memory tab and the token meter poll it): the owner's
+ * pick for every job when chosen; for automatic, the described checker
+ * selection for learn / reconcile / patterns (they share it), and for the
+ * others where the router sends today's fast-tier string. Null for a job the
+ * memory model does not govern, or when nothing can be named. Never throws.
  */
-export function memoryJobModelId(job: MemoryJobId, described: MemoryModelDescription = describeMemoryModel()): string | null {
+export function memoryJobServing(job: MemoryJobId, described: MemoryModelDescription = describeMemoryModel()): MemoryJobServing | null {
   try {
     if (!memoryJobUsesMemoryModel(job)) return null;
-    if (described.source === 'chosen' || BOUNDARY_JOBS.has(job)) return described.modelId || null;
+    if (described.source === 'chosen' || BOUNDARY_JOBS.has(job)) {
+      return described.modelId ? { modelId: described.modelId, provider: described.provider ?? null } : null;
+    }
     // A model string nothing connected can serve is not the job's model.
-    const modelId = automaticFastModelId(job);
-    return modelId && modelStringServes(modelId) ? modelId : null;
+    const requested = automaticFastModelId(job);
+    if (!requested || !modelStringServes(requested)) return null;
+    const routed = routedModelString(requested);
+    if (!routed) return null;
+    const byoProviderId = routed.provider === 'byo' ? routed.backend?.providerId : undefined;
+    return { modelId: routed.modelId, provider: routed.provider, ...(byoProviderId ? { byoProviderId } : {}) };
   } catch {
     return null;
   }
+}
+
+/** The model id a governed job would ask for (see memoryJobServing). */
+export function memoryJobModelId(job: MemoryJobId, described: MemoryModelDescription = describeMemoryModel()): string | null {
+  return memoryJobServing(job, described)?.modelId ?? null;
 }
 
 /**
