@@ -6,7 +6,9 @@ import {
   projectedRecallAnswerability,
   recallEverything,
   unifiedHitRecallRef,
+  unifiedPrimerLines,
   visibleUnifiedPrimerHits,
+  type UnifiedHit,
   type UnifiedRecallResult,
 } from './unified-recall.js';
 import { createRecallRunId, recordRecallRun } from './recall-usage.js';
@@ -25,6 +27,40 @@ export interface UnifiedTurnPrimerResult {
   answerability?: 'supported' | 'partial' | 'insufficient';
   diagnostics?: { candidates: number; stores: string[]; elapsedMs: number };
   error?: string;
+  /** The refs the text shows, in order (tail format). */
+  visibleRefs?: Array<{ type: string; id: string }>;
+}
+
+/** How the ranked tail picks from the ranker's hits. */
+export interface RankedTailSelection {
+  /** Keep a hit only when it scores at least this fraction of the best hit. */
+  relativeFloor: number;
+  /** Standing-policy hits placed first and exempt from the floor. */
+  reservedPolicySlots: number;
+  /** `type:id` refs the prompt already carries elsewhere. */
+  excludeRefKeys?: ReadonlySet<string>;
+}
+
+/** The ranked tail's heading and reading rule. */
+export const RANKED_TAIL_TITLE = '## Relevant To This Request';
+export const RANKED_TAIL_USE_RULE = 'Ranked by a memory search for this request: candidates, not proof. Use complete, applicable facts with their dates; a dated record does not establish another date. Reopen a ref when a value is missing or its scope is uncertain.';
+
+/** Apply the tail's selection to the ranker's hits, in the ranker's order. */
+export function selectRankedTailHits(hits: readonly UnifiedHit[], selection: RankedTailSelection): UnifiedHit[] {
+  const excluded = selection.excludeRefKeys ?? new Set<string>();
+  const shownElsewhere = (hit: UnifiedHit): boolean => {
+    const ref = unifiedHitRecallRef(hit);
+    // A policy is stored as a fact; either ref names the same rule.
+    return excluded.has(`${ref.type}:${ref.id}`)
+      || ((hit.type === 'policy' || hit.type === 'fact') && (excluded.has(`policy:${hit.ref}`) || excluded.has(`fact:${hit.ref}`)));
+  };
+  const candidates = hits.filter((hit) => !shownElsewhere(hit));
+  if (candidates.length === 0) return [];
+  const policies = candidates.filter((hit) => hit.type === 'policy').slice(0, Math.max(0, selection.reservedPolicySlots));
+  const reserved = new Set(policies);
+  const best = Math.max(...candidates.map((hit) => hit.score));
+  const floor = best * Math.max(0, Math.min(1, selection.relativeFloor));
+  return [...policies, ...candidates.filter((hit) => !reserved.has(hit) && hit.score >= floor)];
 }
 
 type RecallEverythingFn = typeof recallEverything;
@@ -113,6 +149,11 @@ export async function buildUnifiedTurnPrimer(input: {
   /** Optional store subset — the degraded fast pass runs the same primer
    *  over the synchronous stores only (one retrieval system, less coverage). */
   stores?: import('./unified-recall.js').UnifiedHitType[];
+  /** Tail selection (floor, reserved policy slots, refs shown elsewhere). */
+  selection?: RankedTailSelection;
+  /** 'tail' renders the ranked tail's heading, rule and lines instead of
+   *  the primer preamble and header. */
+  format?: 'primer' | 'tail';
 }): Promise<UnifiedTurnPrimerResult> {
   const started = Date.now();
   const query = input.query.replace(/\s+/g, ' ').trim();
@@ -168,6 +209,8 @@ export async function buildUnifiedTurnPrimer(input: {
   });
 
   const retrievedBeforeFilter = result.hits.length;
+  if (input.selection) result.hits = selectRankedTailHits(result.hits, input.selection);
+  const tailFormat = input.format === 'tail';
 
   const recallId = createRecallRunId();
   result.recallId = recallId;
@@ -186,10 +229,14 @@ export async function buildUnifiedTurnPrimer(input: {
   // The [USAGE] mark-used trailer was subtracted 2026-07-16 — usage credit is
   // now attributed in code post-turn (recall-auto-credit.ts). Its budget share
   // goes to the hits themselves.
-  const maxChars = Math.max(700, Math.min(12_000, input.maxChars ?? 2_600));
-  const recallBudget = Math.max(0, maxChars - preamble.length - RULE_RESERVE - 2);
+  const maxChars = tailFormat
+    ? Math.max(200, Math.min(12_000, input.maxChars ?? 1_200))
+    : Math.max(700, Math.min(12_000, input.maxChars ?? 2_600));
+  const recallBudget = tailFormat
+    ? Math.max(0, maxChars - RANKED_TAIL_TITLE.length - RANKED_TAIL_USE_RULE.length - 2)
+    : Math.max(0, maxChars - preamble.length - RULE_RESERVE - 2);
   const retrievedHitCount = retrievedBeforeFilter;
-  result.hits = visibleUnifiedPrimerHits(result, recallBudget);
+  result.hits = visibleUnifiedPrimerHits(result, recallBudget, { header: !tailFormat });
   result.answerability = projectedRecallAnswerability(result, result.hits);
   const useRule = result.purpose === 'ambient'
     ? AMBIENT_USE_RULE
@@ -224,12 +271,17 @@ export async function buildUnifiedTurnPrimer(input: {
     { retrieved: retrievedHitCount, included: result.hits.length },
     input.sessionId,
   );
-  const block = formatUnifiedPrimer(result, recallBudget);
-  const text = [preamble, useRule, block].join('\n');
+  const text = tailFormat
+    ? [RANKED_TAIL_TITLE, RANKED_TAIL_USE_RULE, ...unifiedPrimerLines(result.hits)].join('\n')
+    : [preamble, useRule, formatUnifiedPrimer(result, recallBudget)].join('\n');
   return {
     status: 'ok',
     query,
     text,
+    ...(tailFormat ? { visibleRefs: result.hits.map((hit) => {
+      const ref = unifiedHitRecallRef(hit);
+      return { type: ref.type, id: String(ref.id) };
+    }) } : {}),
     hitCount: result.hits.length,
     retrievedHitCount,
     omittedHitCount: retrievedHitCount - result.hits.length,

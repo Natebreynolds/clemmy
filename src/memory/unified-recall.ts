@@ -213,6 +213,11 @@ function compactText(value: string | undefined, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
+/** The compact primer lines for exactly these hits, without the block header. */
+export function unifiedPrimerLines(hits: readonly UnifiedHit[]): string[] {
+  return hits.map(unifiedPrimerLine);
+}
+
 function unifiedPrimerLine(hit: UnifiedHit): string {
   const label: Record<UnifiedHitType, string> = {
     fact: 'FACT', vault: 'NOTE', entity: 'WHO/WHAT', resource: 'WHERE', episode: 'EPISODE', policy: 'POLICY', 'tool-recall': 'HOW', deliverable: 'YOUR WORK LIVES AT',
@@ -258,9 +263,9 @@ export function visibleUnifiedRecallHits(result: UnifiedRecallResult, maxChars =
 
 /** Exact visible candidate set for the compact automatic primer. Attribution
  * must use this formatter's real boundary, not the larger tool-output format. */
-export function visibleUnifiedPrimerHits(result: UnifiedRecallResult, maxChars = 1800): UnifiedHit[] {
+export function visibleUnifiedPrimerHits(result: UnifiedRecallResult, maxChars = 1800, options: { header?: boolean } = {}): UnifiedHit[] {
   const visible: UnifiedHit[] = [];
-  let used = unifiedRecallHeader(result).length;
+  let used = options.header === false ? 0 : unifiedRecallHeader(result).length;
   for (const hit of result.hits) {
     const line = unifiedPrimerLine(hit);
     // Skip-and-continue, not break — one large hit must not discard the rest.

@@ -12,11 +12,32 @@ export function withInstructionMemory<T extends Function>(instructions: T, fragm
   return instructions;
 }
 
-/** Match producer-owned fragments against the final request, after filters.
- * Never infer context from a model's claim or reload a subsequently edited file. */
+// Memory rendered after the instructions (the turn's ranked tail rides as its
+// own input item). Keyed by exact text: a request that carries the text
+// carried that memory. Bounded, newest kept.
+const MAX_REGISTERED_TAILS = 128;
+const tails = new Set<string>();
+
+/** Register memory text a host sends outside the instructions, so the
+ *  accepted-request record names it when a request carries it. */
+export function registerMemoryTail(text: string): void {
+  if (!text.trim()) return;
+  tails.delete(text);
+  tails.add(text);
+  while (tails.size > MAX_REGISTERED_TAILS) {
+    const oldest = tails.values().next().value;
+    if (oldest === undefined) break;
+    tails.delete(oldest);
+  }
+}
+
+/** Match producer-owned fragments (instruction memory and registered tails)
+ * against the final request, after filters. Never infer context from a
+ * model's claim or reload a subsequently edited file. */
 export function visibleInstructionMemory(instructions: unknown, finalInstructions: string | undefined, input: readonly unknown[]): string[] {
-  const fragments = typeof instructions === 'function' ? views.get(instructions) : undefined;
-  if (!fragments) return [];
+  const own = typeof instructions === 'function' ? views.get(instructions) : undefined;
+  if (!own) return [];
+  const fragments = [...own, ...tails];
   const text = [finalInstructions ?? '', ...input.flatMap(item => {
     if (!item || typeof item !== 'object' || !('content' in item)) return [];
     const content = (item as { content: unknown }).content;

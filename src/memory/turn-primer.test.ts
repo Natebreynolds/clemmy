@@ -195,3 +195,44 @@ for (const surface of ['automatic_primer', 'claude_primer', 'legacy_assistant_pr
     assert.doesNotMatch(result.text ?? '', /call memory_recall_all \(one call\)/, 'ambient candidates do not impose another mandatory discovery hoop');
   });
 }
+
+test('the ranked tail keeps hits above half the best score, puts request-relevant policies first and skips refs the core carries', async () => {
+  const strong = rememberFact({ kind: 'project', content: 'The kestrel report ships every Friday.' });
+  const weak = rememberFact({ kind: 'project', content: 'A loosely related kestrel note.' });
+  const policy = rememberFact({ kind: 'feedback', content: 'Always attach the kestrel appendix when sending the report.' });
+  const inCore = rememberFact({ kind: 'constraint', content: 'A rule the memory core already shows.' });
+  _setUnifiedTurnPrimerRecallForTest(async () => ({
+    objective: 'send the kestrel report',
+    answerability: 'partial',
+    purpose: 'ambient',
+    diagnostics: { candidates: 4, stores: ['fact', 'policy'], elapsedMs: 3 },
+    perStore: { fact: 2, policy: 2 },
+    hits: [
+      { type: 'fact', ref: String(strong.id), title: 'project fact', snippet: strong.content, score: 0.9, evidence: [], whyRecalled: [] },
+      { type: 'policy', ref: String(inCore.id), title: 'hard constraint', snippet: inCore.content, score: 0.88, evidence: [], whyRecalled: [] },
+      { type: 'fact', ref: String(weak.id), title: 'project fact', snippet: weak.content, score: 0.3, evidence: [], whyRecalled: [] },
+      { type: 'policy', ref: String(policy.id), title: 'standing preference', snippet: policy.content, score: 0.2, evidence: [], whyRecalled: [] },
+    ],
+  }));
+  const tail = await buildUnifiedTurnPrimer({
+    query: 'send the kestrel report',
+    surface: 'automatic_primer',
+    maxChars: 1_200,
+    timeoutMs: 100,
+    format: 'tail',
+    selection: { relativeFloor: 0.5, reservedPolicySlots: 2, excludeRefKeys: new Set([`policy:${inCore.id}`]) },
+  });
+  assert.equal(tail.status, 'ok');
+  const text = tail.text ?? '';
+  assert.ok(text.startsWith('## Relevant To This Request\n'), text);
+  assert.doesNotMatch(text, /\[MEMORY PRIMER\]|\[RELEVANT MEMORY/, 'no primer preamble or block header');
+  assert.deepEqual(tail.visibleRefs, [
+    { type: 'policy', id: String(policy.id) },
+    { type: 'fact', id: String(strong.id) },
+  ], 'the reserved policy leads; the weak hit is below the floor; the core rule is not repeated');
+  assert.ok(text.length <= 1_200);
+  const row = openMemoryDb().prepare('SELECT candidate_refs_json FROM memory_recall_runs WHERE id = ?')
+    .get(tail.recallId) as { candidate_refs_json: string };
+  assert.deepEqual((JSON.parse(row.candidate_refs_json) as Array<{ id: string }>).map((ref) => ref.id),
+    [String(policy.id), String(strong.id)], 'attribution covers exactly what the tail shows');
+});

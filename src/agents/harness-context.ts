@@ -28,7 +28,7 @@ import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
  */
 import { loadMemoryContext } from '../memory/vault.js';
 import { withInstructionMemory } from '../runtime/harness/model-memory-evidence.js';
-import { renderCorePoliciesForInstructions, renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText, type CorePolicyRender } from '../memory/facts.js';
+import { countActiveFacts, renderCorePoliciesForInstructions, renderFactsForInstructions, renderRecentlyLearnedForInstructions, searchFactsByText, type CorePolicyRender } from '../memory/facts.js';
 import { getRuntimeEnv } from '../config.js';
 import { getFocusSnapshot } from '../memory/focus.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
@@ -267,7 +267,8 @@ function resolveRequestObjective(sessionId: string | undefined, acceptedInput: s
 /**
  * The request-ranked blocks each ranked by its own matcher: Persistent Facts,
  * Recently Learned, Data Landscape and Remembered Tool Choices (with Proven
- * Run Strategies).
+ * Run Strategies). The harness prompt sends these only when the shared ranker
+ * gave no signal (renderTurnMemoryTail); the legacy composition always does.
  */
 function renderRequestRankedBlocks(input: {
   requestObjective: string | undefined;
@@ -389,15 +390,15 @@ export function renderHarnessMemoryContext(opts?: {
   // STABLE-partition block; rendering it on a volatile-only pass recorded an
   // impression per fact per turn for text the model never received — the
   // measured live inflation behind the 1,735:1 impression:use ratio. Render
-  // (and count) only when the partition actually delivers the block.
-  const rankedBlocks = partition !== 'volatile'
+  // (and count) only when the partition actually delivers the block. The
+  // variable layout never delivers them: the turn's one ranked tail does.
+  const rankedBlocks = partition !== 'volatile' && !variableLayout
     ? renderRequestRankedBlocks({
         requestObjective,
         acceptedInput,
         scopedFocus,
         includeRememberedToolChoices: opts?.includeRememberedToolChoices,
-        // The memory core carries the enforced and core-profile policies.
-        omitCoreGroups: variableLayout,
+        omitCoreGroups: false,
       })
     : [];
   const rankedText = (title: string): string => rankedBlocks.find((block) => block.title === title)?.text ?? '';
@@ -699,5 +700,122 @@ export function harnessInstructions(roleInstructions: string, opts?: {
         volatileMemoryInstructions,
       ].filter(Boolean).join('\n\n');
   const instructions = withInstructionMemory(() => rendered, [core.text, ctx, volatileMemoryInstructions]);
+  const coreRefKeys = new Set<string>();
+  for (const ref of core.policies.refs) {
+    coreRefKeys.add(`policy:${ref.id}`);
+    coreRefKeys.add(`fact:${ref.id}`);
+  }
+  memoryTailScopes.set(instructions, {
+    sessionId: opts?.sessionId,
+    focusInput: opts?.focusInput,
+    includeRememberedToolChoices: opts?.includeRememberedToolChoices,
+    coreRefKeys,
+    policyCounts: core.policies.counts,
+  });
   return instructions;
+}
+
+/** What the turn's ranked tail needs to know about the prompt it joins. */
+export interface MemoryTailScope {
+  sessionId?: string;
+  focusInput?: string;
+  includeRememberedToolChoices?: boolean;
+  /** `type:id` of every policy the memory core already shows. */
+  coreRefKeys: ReadonlySet<string>;
+  policyCounts: CorePolicyRender['counts'];
+}
+
+const memoryTailScopes = new WeakMap<Function, MemoryTailScope>();
+
+/** The tail scope of an agent's instructions when harnessInstructions built
+ *  them; undefined for any other instructions, whose turns keep the plain
+ *  memory primer. */
+export function memoryTailScopeFor(instructions: unknown): MemoryTailScope | undefined {
+  return typeof instructions === 'function' ? memoryTailScopes.get(instructions) : undefined;
+}
+
+/** Budget of the ranked tail: heading, rule, ranked lines and the one
+ *  proven-run line together. The counts pointer is outside it. */
+export const RANKED_TAIL_MAX_CHARS = 1_200;
+/** How the tail picks from the shared ranker's hits: a hit must score at
+ *  least half of the best one; up to two request-relevant standing policies
+ *  are placed first whatever their rank; the core's policies are not
+ *  repeated. */
+export const RANKED_TAIL_RELATIVE_FLOOR = 0.5;
+export const RANKED_TAIL_POLICY_SLOTS = 2;
+
+/** What the shared ranker gave the turn. */
+export type TurnMemorySignal =
+  /** Ranked hits, already rendered as the tail's heading, rule and lines. */
+  | { kind: 'ranked'; text: string; refs: Array<{ type: string; id: string }> }
+  /** The ranker ran and nothing cleared it. */
+  | { kind: 'empty' }
+  /** The ranker is off, failed or ran out of time. */
+  | { kind: 'no_signal'; primerText?: string };
+
+export interface TurnMemoryTail {
+  text: string;
+  manifest: MemoryManifestEntry[];
+}
+
+function countsPointer(scope: MemoryTailScope): string {
+  let facts = 0;
+  try { facts = countActiveFacts(); } catch { facts = 0; }
+  const parts = [
+    facts > 0 ? `${facts} fact${facts === 1 ? '' : 's'}` : '',
+    scope.policyCounts.promptInstruction > 0
+      ? `${scope.policyCounts.promptInstruction} prompt-only rule${scope.policyCounts.promptInstruction === 1 ? '' : 's'}` : '',
+    scope.policyCounts.standingPreference > 0
+      ? `${scope.policyCounts.standingPreference} standing preference${scope.policyCounts.standingPreference === 1 ? '' : 's'}` : '',
+  ].filter(Boolean);
+  if (parts.length === 0) return '';
+  return `_Memory on file beyond this view: ${parts.join(', ')}. memory_recall_all searches all of it for this request._`;
+}
+
+/**
+ * The turn's one request-ranked memory tail, rendered after the ranker has
+ * answered. It replaces the blocks that each ranked memory by their own
+ * matcher (Persistent Facts' scored tail and request-ranked policies,
+ * Recently Learned, Data Landscape, Remembered Tool Choices, Proven Run
+ * Strategies) and the separate memory primer:
+ *   - ranked: the ranker's hits (at most RANKED_TAIL_MAX_CHARS with one
+ *     proven run that covers the request), then a counts pointer;
+ *   - empty: the counts pointer alone;
+ *   - no signal: whatever fallback primer the host built.
+ * Session breadcrumbs (`sessionPointers`) ride along in every case.
+ */
+export function renderTurnMemoryTail(
+  scope: MemoryTailScope,
+  signal: TurnMemorySignal,
+  options: { request?: string; sessionPointers?: string } = {},
+): TurnMemoryTail {
+  const parts: Array<{ section: string; tier: MemoryTier; text: string; refs?: MemoryManifestEntry['refs'] }> = [];
+  if (signal.kind === 'no_signal') {
+    if (signal.primerText) parts.push({ section: 'Memory Primer', tier: 'relevant', text: signal.primerText });
+  } else {
+    if (signal.kind === 'ranked' && signal.text) {
+      parts.push({ section: 'Relevant To This Request', tier: 'relevant', text: signal.text, refs: signal.refs });
+    }
+    const strategy = signal.kind === 'ranked' && options.request
+      ? renderRunStrategiesForContext(options.request, 1, options.request)
+      : '';
+    if (strategy) parts.push({ section: 'Proven Run Strategies', tier: 'relevant', text: section('Proven Run Strategies', strategy) });
+    const pointer = countsPointer(scope);
+    if (pointer) parts.push({ section: 'Memory Pointer', tier: 'relevant', text: pointer });
+  }
+  if (options.sessionPointers?.trim()) {
+    parts.push({ section: 'Session Pointers', tier: 'now', text: options.sessionPointers.trim() });
+  }
+  const text = parts.map((part) => part.text).join('\n\n');
+  return {
+    text,
+    manifest: parts.map((part) => manifestEntry(part.section, part.tier, part.text, part.refs ?? [])),
+  };
+}
+
+/** The ranked tail's hit budget once the one proven-run line is set aside. */
+export function rankedTailHitBudget(request: string): number {
+  let strategy = '';
+  try { strategy = section('Proven Run Strategies', renderRunStrategiesForContext(request, 1, request)); } catch { strategy = ''; }
+  return Math.max(300, RANKED_TAIL_MAX_CHARS - (strategy ? strategy.length + 2 : 0));
 }

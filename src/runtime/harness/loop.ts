@@ -253,6 +253,17 @@ import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import {
+  RANKED_TAIL_POLICY_SLOTS,
+  RANKED_TAIL_RELATIVE_FLOOR,
+  memoryTailScopeFor,
+  rankedTailHitBudget,
+  renderTurnMemoryTail,
+  type MemoryManifestEntry,
+  type MemoryTailScope,
+  type TurnMemorySignal,
+} from '../../agents/harness-context.js';
+import { registerMemoryTail } from './model-memory-evidence.js';
 import { rememberTurnMemoryForJudges } from '../../memory/judge-memory.js';
 import {
   EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
@@ -5378,6 +5389,8 @@ interface TurnMemoryPrimer {
   omittedCount?: number;
   stores?: string[];
   recallElapsedMs?: number;
+  /** Tail turns: what each section of the text is (tier, size, refs). */
+  manifest?: MemoryManifestEntry[];
 }
 
 function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = '', breadcrumbs = ''): TurnMemoryPrimer {
@@ -5426,7 +5439,145 @@ async function searchVaultAsyncWithTimeout(query: string): Promise<ReturnType<ty
   ]);
 }
 
-async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<TurnMemoryPrimer> {
+/** The primer the host builds when the shared ranker gave no signal (off,
+ *  failed or out of time): cross-store breadcrumbs plus the vault search. */
+async function plainFallbackPrimer(
+  query: string,
+  sessionId: string,
+  unifiedStatus: 'timeout' | 'error' | 'disabled',
+  hybridEnabled: boolean,
+): Promise<TurnMemoryPrimer> {
+  const unified = { status: unifiedStatus };
+  // Wave 2 Move A: APPEND sync cross-store breadcrumbs (people/places/tools) to
+  // the existing facts+vault+episodic primer — never replacing it. Self-gating +
+  // computed once (sync stores → no latency), passed into every format path below.
+  const breadcrumbs = await crossStoreBreadcrumbs(query);
+  const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
+  if (!hybridEnabled) {
+    const legacy = formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
+    return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
+  }
+
+  try {
+    const hybridHits = await searchVaultAsyncWithTimeout(query);
+    if (hybridHits && hybridHits.length > 0) {
+      const legacy = formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId, breadcrumbs);
+      return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
+    }
+    if (hybridHits === null) {
+      return {
+        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId, breadcrumbs),
+        skippedReason: ftsHits.length > 0 ? `unified_${unified.status}_hybrid_timeout` : `unified_${unified.status}_hybrid_timeout_no_fts_hits`,
+      };
+    }
+  } catch {
+    return {
+      ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId, breadcrumbs),
+      skippedReason: ftsHits.length > 0 ? `unified_${unified.status}_hybrid_error` : `unified_${unified.status}_hybrid_error_no_fts_hits`,
+    };
+  }
+
+  return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
+}
+
+/** The primer when assembly outran its hard outer timeout: no ranker signal. */
+function assemblyTimeoutPrimer(input: string, scope: MemoryTailScope | undefined): TurnMemoryPrimer {
+  const query = input.replace(/\s+/g, ' ').trim();
+  const primer: TurnMemoryPrimer = {
+    enabled: true,
+    query: query.slice(0, 160),
+    hitCount: 0,
+    injectedBytes: 0,
+    skippedReason: 'assembly_timeout',
+  };
+  if (!scope) return primer;
+  const tail = renderTurnMemoryTail(scope, { kind: 'no_signal' }, { request: query });
+  registerMemoryTail(tail.text);
+  return { ...primer, text: tail.text || undefined, injectedBytes: Buffer.byteLength(tail.text, 'utf8'), manifest: tail.manifest };
+}
+
+/** The primer for a turn whose agent was built by harnessInstructions: the
+ *  prompt's one request-ranked memory tail (renderTurnMemoryTail). Any other
+ *  agent keeps the plain primer. */
+async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: MemoryTailScope): Promise<TurnMemoryPrimer> {
+  if (!scope) return buildPlainTurnMemoryPrimer(input, sessionId);
+  const query = input.replace(/\s+/g, ' ').trim();
+  const withTail = (primer: TurnMemoryPrimer, signal: TurnMemorySignal, sessionPointers = ''): TurnMemoryPrimer => {
+    const tail = renderTurnMemoryTail(scope, signal, { request: query, sessionPointers });
+    registerMemoryTail(tail.text);
+    return {
+      ...primer,
+      text: tail.text || undefined,
+      injectedBytes: Buffer.byteLength(tail.text, 'utf8'),
+      manifest: tail.manifest,
+    };
+  };
+  const enabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER', 'on') ?? 'on').toLowerCase() !== 'off';
+  if (!enabled) {
+    // The ranker is switched off: the per-block rendering stands in for it.
+    return withTail({ enabled: false, query, hitCount: 0, injectedBytes: 0, skippedReason: 'disabled' }, { kind: 'no_signal' });
+  }
+  if (!query) return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'empty_input' };
+  if (isSyntheticStallRetryInput(query)) {
+    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'synthetic_retry' };
+  }
+  if (explicitlyOptsOutOfAutomaticMemoryRecall(query)) {
+    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: EXPLICIT_MEMORY_RECALL_OPTOUT_REASON };
+  }
+  if (memoryBudgetFor(classifyMessageIntent(query).intent).vaultSearchTopK <= 0) {
+    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'intent_budget' };
+  }
+  const hybridEnabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID', 'on') ?? 'on').toLowerCase() !== 'off';
+  scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
+  try {
+    const sessionPointers = episodicBlockForPrimer(sessionId);
+    const unified = await buildUnifiedTurnPrimer({
+      query,
+      surface: 'automatic_primer',
+      // Retrieve more than the tail shows so reserved policy slots can fill.
+      limit: Math.max(10, TURN_MEMORY_PRIMER_TOP_K),
+      maxChars: rankedTailHitBudget(query),
+      timeoutMs: TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS,
+      sessionId,
+      format: 'tail',
+      selection: {
+        relativeFloor: RANKED_TAIL_RELATIVE_FLOOR,
+        reservedPolicySlots: RANKED_TAIL_POLICY_SLOTS,
+        excludeRefKeys: scope.coreRefKeys,
+      },
+    });
+    if (unified.status === 'ok' || unified.status === 'empty') {
+      const primer = withTail({
+        enabled: true,
+        query,
+        hitCount: unified.hitCount,
+        injectedBytes: 0,
+        source: 'unified',
+        recallId: unified.recallId,
+        answerability: unified.answerability,
+        candidateCount: unified.diagnostics?.candidates,
+        omittedCount: unified.omittedHitCount,
+        stores: unified.diagnostics?.stores,
+        recallElapsedMs: unified.diagnostics?.elapsedMs,
+      }, unified.status === 'ok' && unified.text
+        ? { kind: 'ranked', text: unified.text, refs: unified.visibleRefs ?? [] }
+        : { kind: 'empty' }, sessionPointers);
+      return primer.text ? primer : { ...primer, skippedReason: 'no_hits' };
+    }
+    const fallback = await plainFallbackPrimer(query, sessionId, unified.status, hybridEnabled);
+    return withTail(fallback, { kind: 'no_signal', primerText: fallback.text });
+  } catch (err) {
+    return withTail({
+      enabled: true,
+      query,
+      hitCount: 0,
+      injectedBytes: 0,
+      skippedReason: err instanceof Error ? `error:${err.message}` : 'error',
+    }, { kind: 'no_signal' });
+  }
+}
+
+async function buildPlainTurnMemoryPrimer(input: string, sessionId = ''): Promise<TurnMemoryPrimer> {
   const enabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER', 'on') ?? 'on').toLowerCase() !== 'off';
   const hybridEnabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID', 'on') ?? 'on').toLowerCase() !== 'off';
   const query = input.replace(/\s+/g, ' ').trim();
@@ -5485,36 +5636,7 @@ async function buildTurnMemoryPrimer(input: string, sessionId = ''): Promise<Tur
       };
     }
 
-    // Wave 2 Move A: APPEND sync cross-store breadcrumbs (people/places/tools) to
-    // the existing facts+vault+episodic primer — never replacing it. Self-gating +
-    // computed once (sync stores → no latency), passed into every format path below.
-    const breadcrumbs = await crossStoreBreadcrumbs(query);
-    const ftsHits = searchVault(query, TURN_MEMORY_PRIMER_TOP_K);
-    if (!hybridEnabled) {
-      const legacy = formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
-      return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
-    }
-
-    try {
-      const hybridHits = await searchVaultAsyncWithTimeout(query);
-      if (hybridHits && hybridHits.length > 0) {
-        const legacy = formatTurnMemoryPrimer(query, hybridHits, 'hybrid', sessionId, breadcrumbs);
-        return unified.status === 'disabled' ? legacy : { ...legacy, skippedReason: `unified_${unified.status}_fallback` };
-      }
-      if (hybridHits === null) {
-        return {
-          ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_timeout', sessionId, breadcrumbs),
-          skippedReason: ftsHits.length > 0 ? `unified_${unified.status}_hybrid_timeout` : `unified_${unified.status}_hybrid_timeout_no_fts_hits`,
-        };
-      }
-    } catch {
-      return {
-        ...formatTurnMemoryPrimer(query, ftsHits, 'fts5_hybrid_error', sessionId, breadcrumbs),
-        skippedReason: ftsHits.length > 0 ? `unified_${unified.status}_hybrid_error` : `unified_${unified.status}_hybrid_error_no_fts_hits`,
-      };
-    }
-
-    return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
+    return await plainFallbackPrimer(query, sessionId, unified.status, hybridEnabled);
   } catch (err) {
     return {
       enabled: true,
@@ -10673,6 +10795,9 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     void primeTurnRecallVector(memoryPrimerInput).catch(() => {});
   }
   markTurnClock(options.sessionId, 'assembly_launched');
+  // A harness-instructed agent's prompt carries no request-ranked memory of
+  // its own; the primer below is its one ranked tail.
+  const memoryTailScope = memoryTailScopeFor((options.agent as { instructions?: unknown } | undefined)?.instructions);
   const assemblyPromise: Promise<TurnMemoryPrimer | null> = options.skipAutomaticMemoryPrimer
     ? Promise.resolve({
         enabled: true,
@@ -10698,7 +10823,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         skippedReason: EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
       })
     : Promise.race([
-        buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId),
+        buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId, memoryTailScope),
         new Promise<null>((resolve) => {
           const t = setTimeout(() => resolve(null), 15_000);
           (t as unknown as { unref?: () => void }).unref?.();
@@ -11032,13 +11157,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   markTurnClock(options.sessionId, 'assembly_settled');
   const turnMemoryPrimer: TurnMemoryPrimer = assemblySettled
     ? assemblySettled
-      : {
-        enabled: true,
-        query: memoryPrimerInput.replace(/\s+/g, ' ').trim().slice(0, 160),
-        hitCount: 0,
-        injectedBytes: 0,
-        skippedReason: 'assembly_timeout',
-      };
+      : assemblyTimeoutPrimer(memoryPrimerInput, memoryTailScope);
   // Goal contract: re-fetch the session's parked goal EVERY turn from the
   // store (never trusted to transcript memory) so the model always works
   // against the authoritative objective + criteria + progress ledger.

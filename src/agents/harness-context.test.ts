@@ -67,15 +67,18 @@ test('persistent context distinguishes explicit authority from derived memory in
 
 test('one accepted-turn instruction function freezes its memory snapshot across model cycles', () => {
   resetMemoryDb();
-  rememberFact({ kind: 'project', content: 'Snapshot fact present before this accepted turn begins.' });
+  // Standing rules ride in the instruction snapshot (the memory core); a
+  // request-ranked fact rides in the turn's ranked tail instead.
+  const rule = (mailbox: string) => `Email sending constraint: ALWAYS send email via the Outlook mailbox ${mailbox}. NEVER send from any other connected mailbox unless explicitly directed in the current conversation.`;
+  rememberFact({ kind: 'constraint', content: rule('before@example.com') });
   const acceptedTurnInstructions = harnessInstructions('SNAPSHOT ROLE', {
     sessionId: 'accepted-turn-snapshot-session',
     focusInput: 'snapshot memory for this request',
   });
   const firstCycle = acceptedTurnInstructions();
-  assert.match(firstCycle, /Snapshot fact present before this accepted turn begins/);
+  assert.match(firstCycle, /before@example\.com/);
 
-  rememberFact({ kind: 'project', content: 'Fact learned during a later model cycle in the same turn.' });
+  rememberFact({ kind: 'constraint', content: rule('later@example.com') });
   assert.equal(acceptedTurnInstructions(), firstCycle,
     'a later model cycle must receive byte-identical accepted-turn context');
 
@@ -83,7 +86,7 @@ test('one accepted-turn instruction function freezes its memory snapshot across 
     sessionId: 'accepted-turn-snapshot-session',
     focusInput: 'snapshot memory for this request',
   })();
-  assert.match(nextTurn, /Fact learned during a later model cycle in the same turn/,
+  assert.match(nextTurn, /later@example\.com/,
     'a newly constructed turn receives the latest consolidated memory');
 });
 

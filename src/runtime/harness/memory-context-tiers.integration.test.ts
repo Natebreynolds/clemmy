@@ -9,6 +9,8 @@
  *   - the memory core (identity, profile, autonomy, enforced rules) sits
  *     before the prompt-cache boundary and is byte-identical across sessions
  *     and requests;
+ *   - request-ranked memory reaches the model once, as one tail built by the
+ *     shared ranker, instead of per-block rankers plus a separate primer;
  * Each later tier adds its own pins below.
  */
 import assert from 'node:assert/strict';
@@ -148,4 +150,41 @@ test('the memory core rides in the cached prefix, byte-identical across sessions
     'nothing from the core is repeated after the boundary');
   assert.doesNotMatch(dynamic, /ALWAYS send email via the Outlook mailbox owner@example\.com/,
     'the enforced rule is not repeated after the boundary');
+});
+
+/** Every text the request carries, instructions and input items alike. */
+function requestText(frame: Frame): string {
+  return [frame.system, ...frame.input.map((item) => JSON.stringify(item))].join('\n');
+}
+
+/** The system input item that carries the ranked tail, if any. */
+function tailItem(frame: Frame): string | undefined {
+  for (const item of frame.input) {
+    const row = item as { role?: string; content?: unknown };
+    const text = typeof row.content === 'string'
+      ? row.content
+      : Array.isArray(row.content) ? row.content.map((part) => (part as { text?: string }).text ?? '').join('') : '';
+    if (row.role === 'system' && text.includes('## Relevant To This Request')) return text;
+  }
+  return undefined;
+}
+
+test('request-ranked memory arrives once, as one bounded tail from the shared ranker', async () => {
+  const run = await hostTurn('tail', 'When does the quokka ledger close each month?');
+  const frame = run.frames[0]!;
+  const tail = tailItem(frame);
+  assert.ok(tail, `the ranked tail rides the request: ${requestText(frame).slice(-3000)}`);
+  assert.match(tail!, /quokka ledger lives in the finance workspace/, 'the relevant fact is in it');
+  assert.match(tail!, /\[ref fact:\d+\]/, 'each line names the ref to reopen');
+  assert.match(tail!, /memory_recall_all searches all of it/, 'a counts pointer widens it');
+  const ranked = tail!.slice(0, tail!.indexOf('_Memory on file beyond this view'));
+  assert.ok(ranked.trim().length <= 1_200, `the ranked part stays within its budget (${ranked.trim().length})`);
+  assert.doesNotMatch(tail!, /owner@example\.com/, 'a rule the core already carries is not repeated');
+  const all = requestText(frame);
+  for (const retired of ['## Persistent Facts', '## Recently Learned', '## Data Landscape', '## Remembered Tool Choices', '[MEMORY PRIMER]']) {
+    assert.equal(all.includes(retired), false, `no separately ranked block: ${retired}`);
+  }
+  const recorded = run.trace.filter((event) => event.type === 'turn_memory_primer').at(-1)?.data as Record<string, unknown>;
+  assert.equal(recorded?.source, 'unified', 'the shared ranker produced it');
+  assert.equal(recorded?.injected, true);
 });
