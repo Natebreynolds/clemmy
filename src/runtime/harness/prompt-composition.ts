@@ -334,7 +334,11 @@ export function summarizePromptComposition(input: PromptCompositionInput): Promp
 }
 
 /** The ledger's per-request prompt components, read from the same summary
- *  the composition event records (bucket name -> estimated tokens). */
+ *  the composition event records (bucket name -> estimated tokens).
+ *  `instructions` is the stable instruction prefix only; the per-turn
+ *  instruction text is `turnContext` and the memory block is `memoryContext`.
+ *  A series that compares against rows recorded before those buckets existed
+ *  must sum the three to get the older combined `instructions` value. */
 export function promptComponentsFromComposition(summary: PromptCompositionSummary): Record<string, number> {
   return Object.fromEntries(summary.buckets.map((bucket) => [bucket.name, bucket.tokens]));
 }
