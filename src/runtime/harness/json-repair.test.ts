@@ -355,6 +355,28 @@ test('stored output: a shell array cut short by an invalid row keeps its honest 
   assert.deepEqual(got.value, [{ id: 1, score: 0.9 }, { id: 2, score: 0.5 }, { id: 3, score: 0.4 }]);
 });
 
+test('stored output: a shell array with an invalid row in the middle keeps only the rows before it', () => {
+  // The rows after an invalid one are not the array's prefix: offering them
+  // as one would drop a row silently and misstate every later position.
+  const shell = (stdout: string) => ['exit_code: 0', 'stdout:', stdout].join('\n');
+  const middle = parseStoredToolOutputJson(shell('[{"a":1},{"a":NaN},{"a":3}]'), { shell: parseShellToolOutput });
+  assert.ok(middle);
+  assert.equal(middle.via, 'shell_objects');
+  assert.equal(middle.partialArrayPrefix, true);
+  assert.deepEqual(middle.value, [{ a: 1 }]);
+
+  const nonObject = parseStoredToolOutputJson(shell('Fetched rows.\n[{"a":1}, 7, {"a":3}, {"a":NaN}]'), { shell: parseShellToolOutput });
+  assert.ok(nonObject);
+  assert.deepEqual(nonObject.value, [{ a: 1 }], 'a non-object element ends the prefix too');
+
+  // An invalid first row leaves no prefix, and a nested array inside that row
+  // is never taken for the array itself.
+  const firstInvalid = parseStoredToolOutputJson(
+    shell('[{"a":NaN,"tags":[{"t":"x"}]},{"a":2}]'), { shell: parseShellToolOutput },
+  );
+  assert.equal(firstInvalid, null, JSON.stringify(firstInvalid));
+});
+
 test('stored output: a host document read with prose, tags and a view pointer before its dataset is queryable', () => {
   const dataset = {
     meta: { title: 'Orchard yields', revision: 3 },

@@ -462,6 +462,72 @@ function largestEmbeddedStoredJson(raw: string): string | null {
 }
 
 /**
+ * The leading run of complete objects of an array of objects, in order: in
+ * the first `[` whose first element is an object, each element that is a
+ * whole, parseable object, stopping at the first element that is not (an
+ * invalid row, a non-object value, or the clip). Every returned row sits at
+ * its own index, so the rows really are the array's prefix; an invalid row in
+ * the middle ends the prefix rather than leaving a gap.
+ */
+function leadingArrayObjects(raw: string, maxObjects: number): Array<Record<string, unknown>> {
+  const isSpace = (char: string | undefined) => char === ' ' || char === '\n' || char === '\r' || char === '\t';
+  for (let open = raw.indexOf('['); open >= 0; open = raw.indexOf('[', open + 1)) {
+    let index = open + 1;
+    while (isSpace(raw[index])) index += 1;
+    // A bracket that does not open an array of objects is prose; the first
+    // one that does is the array, and a nested array inside its first row is
+    // never taken for it.
+    if (raw[index] !== '{') continue;
+    const objects: Array<Record<string, unknown>> = [];
+    while (objects.length < maxObjects) {
+      while (isSpace(raw[index])) index += 1;
+      if (raw[index] !== '{') break;
+      const end = balancedObjectEnd(raw, index);
+      if (end < 0) break;
+      let value: unknown;
+      try {
+        value = JSON.parse(raw.slice(index, end + 1));
+      } catch {
+        break;
+      }
+      if (!value || typeof value !== 'object' || Array.isArray(value)) break;
+      objects.push(value as Record<string, unknown>);
+      index = end + 1;
+      while (isSpace(raw[index])) index += 1;
+      if (raw[index] !== ',') break;
+      index += 1;
+    }
+    return objects;
+  }
+  return [];
+}
+
+/** Index of the `}` closing the object that opens at `start`, string-aware;
+ * -1 when the text ends first. */
+function balancedObjectEnd(raw: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < raw.length; index += 1) {
+    const char = raw[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === '{' || char === '[') depth += 1;
+    else if (char === '}' || char === ']') {
+      depth -= 1;
+      if (depth === 0) return char === '}' ? index : -1;
+      if (depth < 0) return -1;
+    }
+  }
+  return -1;
+}
+
+/**
  * Recover the JSON value from a STORED tool output.
  *
  * The parked record is not always the provider's bare payload: the harness
@@ -502,11 +568,9 @@ export function parseStoredToolOutputJson(
     }
     // A clipped or partly invalid array: recover the complete objects written
     // so far, and say they are a prefix.
-    if (shell.stdout.includes('[')) {
-      const objects = extractCompleteJsonObjects(shell.stdout, 200);
-      if (objects.length > 0) {
-        return { value: objects, via: 'shell_objects', partialArrayPrefix: true };
-      }
+    const objects = leadingArrayObjects(shell.stdout, 200);
+    if (objects.length > 0) {
+      return { value: objects, via: 'shell_objects', partialArrayPrefix: true };
     }
     const scanned = largestEmbeddedStoredJson(shell.stdout);
     return scanned === null ? null : { value: JSON.parse(scanned) as unknown, via: 'shell_embedded' };
