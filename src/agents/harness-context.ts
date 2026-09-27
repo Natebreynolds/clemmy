@@ -612,9 +612,9 @@ function manifestEntry(section: string, tier: MemoryTier, text: string, refs: Me
 /**
  * The memory that applies to every request, rendered from content alone: who
  * Clementine is and how she speaks (identity, soul, curated long-term memory,
- * all as today), the owner's profile and approval posture, the standing
- * policies every request is held to (dispatch-enforced constraints, one line
- * each, and the core profile), and the pointer to skills. No clock, no
+ * all as today), the owner's profile and approval posture, every standing
+ * policy the owner stated (renderCorePoliciesForInstructions), and the pointer
+ * to skills. No clock, no
  * request, no ranking and no impressions go into it, and its order is the
  * stores' own, so the same memory renders the same bytes for every session
  * and turn. That is what lets it sit before the cache boundary: it is
@@ -776,10 +776,6 @@ export const RANKED_TAIL_MAX_CHARS = 1_200;
  *  repeated. */
 export const RANKED_TAIL_RELATIVE_FLOOR = 0.5;
 export const RANKED_TAIL_POLICY_SLOTS = 2;
-/** Policy budget of a memory-declined request: the same share the policy
- *  groups had inside Persistent Facts. */
-const OPT_OUT_POLICY_BUDGET = 1_600;
-
 /** What the shared ranker gave the turn. */
 export type TurnMemorySignal =
   /** Ranked hits, already rendered as the tail's heading, rule and lines. */
@@ -788,30 +784,24 @@ export type TurnMemorySignal =
   | { kind: 'empty' }
   /** The ranker is off, failed, ran out of time, or was not run for this
    *  request (a budget skip, a retry, a conversation-only surface). */
-  | { kind: 'no_signal'; primerText?: string; primerFactIds?: readonly number[] }
-  /** The request declined automatic memory: no remembered facts, but the
-   *  standing policies it is held to still apply. */
-  | { kind: 'policies_only' };
+  | { kind: 'no_signal'; primerText?: string; primerFactIds?: readonly number[] };
 
 export interface TurnMemoryTail {
   text: string;
   manifest: MemoryManifestEntry[];
 }
 
-/** What memory is on file beyond the tail; `visibleFacts` are the facts the
- *  tail already shows, so they are not counted as beyond it. */
+/** How many remembered facts are on file beyond the tail. Standing policies
+ *  are stored as facts but the memory core shows them (and names any
+ *  overflow), so they are not counted; `visibleFacts` are the facts the tail
+ *  already shows. */
 function countsPointer(scope: MemoryTailScope, visibleFacts = 0): string {
+  const counts = scope.policyCounts;
+  const policies = counts.dispatchConstraint + counts.coreProfile + counts.promptInstruction + counts.standingPreference;
   let facts = 0;
-  try { facts = Math.max(0, countActiveFacts() - visibleFacts); } catch { facts = 0; }
-  const parts = [
-    facts > 0 ? `${facts} fact${facts === 1 ? '' : 's'}` : '',
-    scope.policyCounts.promptInstruction > 0
-      ? `${scope.policyCounts.promptInstruction} prompt-only rule${scope.policyCounts.promptInstruction === 1 ? '' : 's'}` : '',
-    scope.policyCounts.standingPreference > 0
-      ? `${scope.policyCounts.standingPreference} standing preference${scope.policyCounts.standingPreference === 1 ? '' : 's'}` : '',
-  ].filter(Boolean);
-  if (parts.length === 0) return '';
-  return `_Memory on file beyond this view: ${parts.join(', ')}. memory_recall_all searches all of it for this request._`;
+  try { facts = Math.max(0, countActiveFacts() - policies - visibleFacts); } catch { facts = 0; }
+  if (facts === 0) return '';
+  return `_Memory on file beyond this view: ${facts} fact${facts === 1 ? '' : 's'}. memory_recall_all searches all of it for this request._`;
 }
 
 /**
@@ -824,9 +814,8 @@ function countsPointer(scope: MemoryTailScope, visibleFacts = 0): string {
  *     proven run that covers the request), then a counts pointer;
  *   - empty: the counts pointer alone;
  *   - no signal: the per-block rendering exactly as before, then whatever
- *     fallback primer the host built, so a blind ranker costs nothing;
- *   - policies only: the request-ranked standing policies, for a request
- *     that declined automatic memory.
+ *     fallback primer the host built, so a blind ranker costs nothing.
+ * The standing policies are never part of it: the memory core carries them.
  * Session breadcrumbs (`sessionPointers`) ride along in every case.
  */
 export function renderTurnMemoryTail(
@@ -835,21 +824,7 @@ export function renderTurnMemoryTail(
   options: { request?: string; sessionPointers?: string } = {},
 ): TurnMemoryTail {
   const parts: Array<{ section: string; tier: MemoryTier; text: string; refs?: MemoryManifestEntry['refs'] }> = [];
-  if (signal.kind === 'policies_only') {
-    // Declining memory for one request does not suspend the owner's standing
-    // rules: the prompt-only instructions and standing preferences render as
-    // they did in the instructions, ordered by the request, with no facts and
-    // no invitation to recall.
-    const acceptedInput = scope.focusInput ?? options.request ?? '';
-    const { requestObjective } = resolveRequestObjective(scope.sessionId, acceptedInput);
-    let policies = '';
-    try {
-      policies = renderFactsForInstructions(10, OPT_OUT_POLICY_BUDGET, requestObjective, 'pinned', { omitCoreGroups: true });
-    } catch {
-      policies = '';
-    }
-    if (policies) parts.push({ section: 'Persistent Facts', tier: 'relevant', text: section('Persistent Facts', policies) });
-  } else if (signal.kind === 'no_signal') {
+  if (signal.kind === 'no_signal') {
     // A blind ranker must cost nothing: the per-block rendering stands in,
     // ranked by the same objective the prompt used before, minus the
     // policies the memory core already carries.

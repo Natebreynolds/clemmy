@@ -1885,7 +1885,7 @@ function policyGroupOf(fact: ConsolidatedFact, policies: PromptPolicies): Policy
 }
 
 export interface CorePolicyRender {
-  /** The rendered block, '' when the owner has no core policy. */
+  /** The rendered block, '' when the owner has no standing policy. */
   text: string;
   /** Every policy the block shows, in order. */
   refs: Array<{ type: 'policy'; id: string }>;
@@ -1893,13 +1893,70 @@ export interface CorePolicyRender {
   counts: { dispatchConstraint: number; coreProfile: number; promptInstruction: number; standingPreference: number };
 }
 
+/** Budget weights of the policy groups inside the shared policy budget. */
+const POLICY_GROUP_WEIGHTS: Record<PolicyGroup, number> = {
+  dispatch_constraint: 28,
+  prompt_instruction: 25,
+  core_profile: 25,
+  standing_preference: 22,
+};
+/** The policy budget the prompt-only and preference groups share with the rest. */
+const POLICY_TOTAL_BUDGET = 1600;
+
 /**
- * The part of standing policy that applies to every request: dispatch-enforced
- * constraints (all of them, one line each, identical lines once) and the core
- * profile (bounded). It takes no objective and reads no clock, so the bytes
- * change only when the policies do, which lets them sit in a cached prefix.
- * Rendering it is not an impression: the same bytes ride every request, and
- * counting them would inflate every rule's exposure by the number of turns.
+ * Each budgeted group's share of the policy budget, allocated only among the
+ * groups the owner has: reserving a share for an empty group can hide the one
+ * real preference even when it fits. Dispatch-enforced constraints are not
+ * budgeted; they all render.
+ */
+function policyGroupBudgets(
+  present: Record<PolicyGroup, boolean>,
+  total: number,
+): { promptInstruction: number; coreProfile: number; standingPreference: number } {
+  const activeWeight = (Object.keys(POLICY_GROUP_WEIGHTS) as PolicyGroup[])
+    .reduce((sum, group) => sum + (present[group] ? POLICY_GROUP_WEIGHTS[group] : 0), 0);
+  const share = (group: PolicyGroup, cap: number): number => present[group] && activeWeight > 0
+    ? Math.min(cap, Math.floor(total * POLICY_GROUP_WEIGHTS[group] / activeWeight))
+    : 0;
+  return {
+    promptInstruction: share('prompt_instruction', total),
+    coreProfile: share('core_profile', CORE_PROFILE_BUDGET),
+    standingPreference: share('standing_preference', STANDING_PREFERENCE_BUDGET),
+  };
+}
+
+/** The rows of one budgeted group that fit, in the order given; a row that
+ *  cannot fit is omitted on its own and never hides the smaller rows after it. */
+function fitPolicyRows(
+  group: readonly ConsolidatedFact[],
+  budget: number,
+  present: (fact: ConsolidatedFact) => string = (fact) => fact.content,
+): { lines: string[]; shown: ConsolidatedFact[] } {
+  const lines: string[] = [];
+  const shown: ConsolidatedFact[] = [];
+  let used = 0;
+  for (const fact of group) {
+    const line = `- ${present(fact)}`;
+    if (used + line.length + 1 > budget) continue;
+    lines.push(line);
+    shown.push(fact);
+    used += line.length + 1;
+  }
+  return { lines, shown };
+}
+
+/**
+ * Every standing policy the owner stated, as one block that applies to every
+ * request: dispatch-enforced constraints (all of them, one line each, identical
+ * lines once), prompt-only instructions, the core profile and standing
+ * preferences, each budgeted group within its share of the policy budget and
+ * any overflow named with the recall that reaches it. A rule the prompt alone
+ * enforces must reach the model whether or not a request shares its words, so
+ * none of these waits on a ranker. It takes no objective and reads no clock,
+ * and each group keeps the store's own order, so the bytes change only when
+ * the policies do, which lets them sit in a cached prefix. Rendering it is not
+ * an impression: the same bytes ride every request, and counting them would
+ * inflate every rule's exposure by the number of turns.
  */
 export function renderCorePoliciesForInstructions(): CorePolicyRender {
   const empty: CorePolicyRender = {
@@ -1913,6 +1970,12 @@ export function renderCorePoliciesForInstructions(): CorePolicyRender {
     dispatch_constraint: [], prompt_instruction: [], core_profile: [], standing_preference: [],
   };
   for (const fact of policies.pinned) byGroup[policyGroupOf(fact, policies)].push(fact);
+  const budgets = policyGroupBudgets({
+    dispatch_constraint: byGroup.dispatch_constraint.length > 0,
+    prompt_instruction: byGroup.prompt_instruction.length > 0,
+    core_profile: byGroup.core_profile.length > 0,
+    standing_preference: byGroup.standing_preference.length > 0,
+  }, POLICY_TOTAL_BUDGET);
   const refs: CorePolicyRender['refs'] = [];
   const dispatchLines: string[] = [];
   const seenDispatch = new Set<string>();
@@ -1923,23 +1986,37 @@ export function renderCorePoliciesForInstructions(): CorePolicyRender {
     seenDispatch.add(line);
     dispatchLines.push(line);
   }
-  const coreLines: string[] = [];
-  let used = 0;
-  for (const fact of byGroup.core_profile) {
-    const line = `- ${fact.content}`;
-    if (used + line.length + 1 > CORE_PROFILE_BUDGET) continue;
-    coreLines.push(line);
-    refs.push({ type: 'policy', id: String(fact.id) });
-    used += line.length + 1;
-  }
-  const coreOmitted = byGroup.core_profile.length - coreLines.length;
+  const group = (
+    title: string,
+    facts: readonly ConsolidatedFact[],
+    budget: number,
+    overflow: (omitted: number) => string,
+  ): string => {
+    if (facts.length === 0) return '';
+    const { lines, shown } = fitPolicyRows(facts, budget);
+    for (const fact of shown) refs.push({ type: 'policy', id: String(fact.id) });
+    const omitted = facts.length - shown.length;
+    return [`**${title}**`, ...lines, omitted > 0 ? overflow(omitted) : ''].filter(Boolean).join('\n');
+  };
+  const promptOnly = group(
+    'Prompt-only instructions (context, not deterministic enforcement)', byGroup.prompt_instruction, budgets.promptInstruction,
+    (n) => `_… ${n} more prompt-only instruction${n === 1 ? '' : 's'} available through memory_recall_all._`,
+  );
+  // The core profile keeps its own budget: it held that budget alone before
+  // the other groups joined the core, and it does not shrink for them.
+  const coreProfile = group(
+    'Core profile', byGroup.core_profile, CORE_PROFILE_BUDGET,
+    (n) => `_… ${n} more core-profile item${n === 1 ? '' : 's'} omitted; call memory_recall_all to widen._`,
+  );
+  const preferences = group(
+    'Standing preferences', byGroup.standing_preference, budgets.standingPreference,
+    (n) => `_… ${n} more standing preference${n === 1 ? '' : 's'} available through memory_recall_all._`,
+  );
   const text = [
     dispatchLines.length > 0 ? ['**Dispatch-enforced constraints**', ...dispatchLines].join('\n') : '',
-    coreLines.length > 0 || coreOmitted > 0
-      ? ['**Core profile**', ...coreLines,
-          coreOmitted > 0 ? `_… ${coreOmitted} more core-profile item${coreOmitted === 1 ? '' : 's'} omitted; call memory_recall_all to widen._` : '',
-        ].filter(Boolean).join('\n')
-      : '',
+    promptOnly,
+    coreProfile,
+    preferences,
   ].filter(Boolean).join('\n\n');
   return {
     text,
@@ -1961,10 +2038,9 @@ export function renderFactsForInstructions(
   // (Tier-1); 'scored' → only the ranked by-kind facts (Tier-2); 'all'
   // (default) → both, byte-identical to before.
   mode: 'all' | 'pinned' | 'scored' = 'all',
-  // `omitCoreGroups`: the dispatch-enforced constraints and the core profile
-  // are rendered elsewhere (renderCorePoliciesForInstructions), so this block
-  // leaves them out while every other group keeps the budget it has with
-  // them present.
+  // `omitCoreGroups`: every standing policy is rendered in the memory core
+  // (renderCorePoliciesForInstructions), so this block leaves the policy
+  // groups out and carries only the ranked facts.
   options: { omitCoreGroups?: boolean; excludeFactIds?: readonly number[] } = {},
 ): string {
   let facts: ConsolidatedFact[] = [];
@@ -2005,7 +2081,7 @@ export function renderFactsForInstructions(
   const { policyTypeByFactId, enforcementByFactId, dispatchBackedFactIds } = loaded;
   const pinned = loaded.pinned;
   const pinnedIds = new Set(pinned.map((f) => f.id));
-  const renderPinned = mode !== 'scored';
+  const renderPinned = mode !== 'scored' && options.omitCoreGroups !== true;
   // `excludeFactIds`: facts the same request already shows elsewhere.
   const excluded = new Set(options.excludeFactIds ?? []);
   const scored = mode === 'pinned' ? [] : facts.filter((f) => !pinnedIds.has(f.id) && !excluded.has(f.id));
@@ -2044,15 +2120,12 @@ export function renderFactsForInstructions(
         objective,
       ),
     };
-    // Allocate only among groups that exist. Reserving 75% of a small budget
-    // for empty tiers can hide the one real preference even when it fits.
-    const activeWeight = (groups.dispatch_constraint.length > 0 ? 28 : 0)
-      + (groups.prompt_instruction.length > 0 ? 25 : 0)
-      + (groups.core_profile.length > 0 ? 25 : 0)
-      + (groups.standing_preference.length > 0 ? 22 : 0);
-    const share = (present: boolean, weight: number, cap: number): number => present && activeWeight > 0
-      ? Math.min(cap, Math.floor(totalPolicyBudget * weight / activeWeight))
-      : 0;
+    const budgets = policyGroupBudgets({
+      dispatch_constraint: groups.dispatch_constraint.length > 0,
+      prompt_instruction: groups.prompt_instruction.length > 0,
+      core_profile: groups.core_profile.length > 0,
+      standing_preference: groups.standing_preference.length > 0,
+    }, totalPolicyBudget);
     // Dispatch-enforced constraints ALL render, always — none is omitted, and
     // each line is held to the per-rule display bound. They are few
     // (compiled policies, POLICY_RUNAWAY_CAP-bounded), and each carries the
@@ -2063,9 +2136,9 @@ export function renderFactsForInstructions(
     // 55 calls, and produced zero drafts while the negative gate dutifully
     // guarded a dispatch that never happened.
     const dispatchBudget = Number.MAX_SAFE_INTEGER;
-    const promptOnlyBudget = share(groups.prompt_instruction.length > 0, 25, totalPolicyBudget);
-    const coreBudget = share(groups.core_profile.length > 0, 25, CORE_PROFILE_BUDGET);
-    const preferenceBudget = share(groups.standing_preference.length > 0, 22, STANDING_PREFERENCE_BUDGET);
+    const promptOnlyBudget = budgets.promptInstruction;
+    const coreBudget = budgets.coreProfile;
+    const preferenceBudget = budgets.standingPreference;
     const renderGroup = (
       title: string,
       group: ConsolidatedFact[],
@@ -2074,25 +2147,15 @@ export function renderFactsForInstructions(
       present: (fact: ConsolidatedFact) => string = (fact) => fact.content,
     ): string => {
       if (group.length === 0) return '';
-      const lines: string[] = [];
-      let used = 0;
-      for (const fact of group) {
-        const line = `- ${present(fact)}`;
-        // A row that cannot fit is omitted on its own; it never hides the
-        // smaller rows ranked after it.
-        if (used + line.length + 1 > budget) continue;
-        lines.push(line);
-        renderedPolicyFacts.push(fact);
-        used += line.length + 1;
-      }
+      const { lines, shown } = fitPolicyRows(group, budget, present);
+      renderedPolicyFacts.push(...shown);
       const omitted = group.length - lines.length;
       return [`**${title}**`, ...lines, omitted > 0 ? suffix(omitted) : ''].filter(Boolean).join('\n');
     };
-    const omitCore = options.omitCoreGroups === true;
     pinnedSection = [
       // The only unbudgeted group, so the per-rule display bound is what keeps
       // it finite; the budgeted groups below omit a row that does not fit.
-      omitCore ? '' : renderGroup(
+      renderGroup(
         'Dispatch-enforced constraints', groups.dispatch_constraint, dispatchBudget,
         (n) => `_… ${n} more constraint${n === 1 ? '' : 's'} omitted from this summary but still enforced._`,
         presentPolicyText,
@@ -2101,7 +2164,7 @@ export function renderFactsForInstructions(
         'Prompt-only instructions (context, not deterministic enforcement)', groups.prompt_instruction, promptOnlyBudget,
         (n) => `_… ${n} more prompt-only instruction${n === 1 ? '' : 's'} available through memory_recall_all._`,
       ),
-      omitCore ? '' : renderGroup(
+      renderGroup(
         'Core profile', groups.core_profile, coreBudget,
         (n) => `_… ${n} more core-profile item${n === 1 ? '' : 's'} omitted; call memory_recall_all to widen._`,
       ),
@@ -2111,12 +2174,7 @@ export function renderFactsForInstructions(
         (n) => `_… ${n} more standing preference${n === 1 ? '' : 's'} available through memory_recall_all._`,
       ),
     ].filter(Boolean).join('\n\n');
-    if (!omitCore) {
-      pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${pinned.length} shown; ${groups.dispatch_constraint.length} dispatch-enforced, ${groups.prompt_instruction.length} prompt-only._`;
-    } else if (pinnedSection) {
-      const listed = groups.prompt_instruction.length + groups.standing_preference.length;
-      pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${listed} request-ranked policies shown._`;
-    }
+    pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${pinned.length} shown; ${groups.dispatch_constraint.length} dispatch-enforced, ${groups.prompt_instruction.length} prompt-only._`;
   }
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {

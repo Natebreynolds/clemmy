@@ -5487,11 +5487,12 @@ async function plainFallbackPrimer(
 /**
  * The primer of a turn whose shared ranker did not run: switched off, out of
  * its outer time, or skipped for this request (empty, a stall retry, a budget
- * skip, a conversation-only surface, a declined continuation, a request that
- * declined automatic memory). An agent built by harnessInstructions carries no
- * request-ranked memory in its prompt, so its tail stands in for the ranker:
- * the per-block rendering, or, when the request declined memory, only the
- * standing policies it is still held to. Any other agent gets the bare record.
+ * skip, a conversation-only surface, a declined continuation, a held-back
+ * re-entry, a request that declined automatic memory). An agent built by
+ * harnessInstructions carries no request-ranked memory in its prompt, so its
+ * tail stands in for the ranker with the per-block rendering. A request that
+ * declined memory gets no tail: the standing policies it is still held to ride
+ * in the memory core. Any other agent gets the bare record.
  */
 function primerWithoutRanker(
   input: string,
@@ -5507,11 +5508,8 @@ function primerWithoutRanker(
     injectedBytes: 0,
     skippedReason,
   };
-  if (!scope) return primer;
-  const signal: TurnMemorySignal = skippedReason === EXPLICIT_MEMORY_RECALL_OPTOUT_REASON
-    ? { kind: 'policies_only' }
-    : { kind: 'no_signal' };
-  const tail = renderTurnMemoryTail(scope, signal, { request: query });
+  if (!scope || skippedReason === EXPLICIT_MEMORY_RECALL_OPTOUT_REASON) return primer;
+  const tail = renderTurnMemoryTail(scope, { kind: 'no_signal' }, { request: query });
   registerMemoryTail(tail.text, tail.manifest);
   return { ...primer, text: tail.text || undefined, injectedBytes: Buffer.byteLength(tail.text, 'utf8'), manifest: tail.manifest };
 }

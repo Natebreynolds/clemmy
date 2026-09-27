@@ -71,10 +71,13 @@ const DISPATCH_RULE = 'Email sending constraint: ALWAYS send email via the Outlo
 rememberFact({ kind: 'constraint', content: DISPATCH_RULE });
 rememberFact({ kind: 'project', content: 'The quokka ledger lives in the finance workspace and closes on the fifth business day.' });
 rememberFact({ kind: 'project', content: 'Invoices are reviewed on Tuesdays by the operations desk.' });
-// A rule only the prompt enforces (no deterministic contract) and a personal
-// fact: neither belongs to the memory core.
+// Rules only the prompt enforces (no deterministic contract): the owner stated
+// them, so they ride in the memory core with the enforced one. A personal fact
+// does not belong to the core.
 const PROMPT_ONLY_RULE = 'Never quote competitor pricing figures in anything written for a client.';
 rememberFact({ kind: 'constraint', content: PROMPT_ONLY_RULE });
+const SIGN_OFF_RULE = 'Always sign off emails as Nate, never as Nathan.';
+rememberFact({ kind: 'constraint', content: SIGN_OFF_RULE });
 rememberFact({ kind: 'user', content: 'The owner has a daughter named Wren who turns nine in October.' });
 
 after(() => {
@@ -156,6 +159,10 @@ test('the memory core rides in the cached prefix, byte-identical across sessions
   assert.match(core, /## Standing Policies\n\*\*Dispatch-enforced constraints\*\*/);
   assert.equal(core.split('ALWAYS send email via the Outlook mailbox owner@example.com').length - 1, 1,
     'the enforced rule is stated once, in the core');
+  assert.match(core, /\*\*Prompt-only instructions \(context, not deterministic enforcement\)\*\*/);
+  for (const rule of [PROMPT_ONLY_RULE, SIGN_OFF_RULE]) {
+    assert.equal(core.split(rule).length - 1, 1, `the prompt-only rule is stated once, in the core: ${rule}`);
+  }
   assert.doesNotMatch(core, /Today is \d{4}|Right now it is/, 'no clock in the core');
   assert.doesNotMatch(core, /quokka ledger/, 'no request-ranked fact in the core');
   const dynamic = first.frames[0]!.system.slice(first.frames[0]!.system.indexOf(CACHE_BREAK_SENTINEL));
@@ -189,14 +196,17 @@ test('request-ranked memory arrives once, as one bounded tail from the shared ra
   assert.ok(tail, `the ranked tail rides the request: ${requestText(frame).slice(-3000)}`);
   assert.match(tail!, /quokka ledger lives in the finance workspace/, 'the relevant fact is in it');
   assert.match(tail!, /\[ref fact:\d+\]/, 'each line names the ref to reopen');
-  assert.match(tail!, /memory_recall_all searches all of it/, 'a counts pointer widens it');
-  const { countActiveFacts } = await import('../../memory/facts.js');
+  const { countActiveFacts, renderCorePoliciesForInstructions } = await import('../../memory/facts.js');
   const shownFacts = new Set([...tail!.matchAll(/\[ref fact:(\d+)\]/g)].map((match) => match[1])).size;
-  const beyond = Number(/_Memory on file beyond this view: (\d+) facts?/.exec(tail!)?.[1]);
-  assert.equal(beyond, countActiveFacts() - shownFacts, 'the pointer counts only the facts the tail does not show');
+  const beyond = Number(/_Memory on file beyond this view: (\d+) facts?\./.exec(tail!)?.[1] ?? 0);
+  const policies = Object.values(renderCorePoliciesForInstructions().counts).reduce((sum, count) => sum + count, 0);
+  const expected = countActiveFacts() - policies - shownFacts;
+  assert.equal(beyond, Math.max(0, expected),
+    'the counts pointer counts only the remembered facts the tail does not show, never the core\'s policies');
   const ranked = tail!.slice(0, tail!.indexOf('_Memory on file beyond this view'));
   assert.ok(ranked.trim().length <= 1_200, `the ranked part stays within its budget (${ranked.trim().length})`);
   assert.doesNotMatch(tail!, /owner@example\.com/, 'a rule the core already carries is not repeated');
+  assert.equal(tail!.includes(PROMPT_ONLY_RULE), false, 'a prompt-only rule the core carries is not repeated');
   const all = requestText(frame);
   for (const retired of ['## Persistent Facts', '## Recently Learned', '## Data Landscape', '## Remembered Tool Choices', '[MEMORY PRIMER]']) {
     assert.equal(all.includes(retired), false, `no separately ranked block: ${retired}`);
@@ -273,7 +283,7 @@ test('an empty ranked result sends only the counts pointer', async () => {
   const frame = run.frames[0]!;
   const pointer = memoryItem(frame, '_Memory on file beyond this view');
   assert.ok(pointer, `the pointer is sent: ${requestText(frame).slice(-2000)}`);
-  assert.match(pointer!, /^_Memory on file beyond this view: \d+ facts?[^\n]*memory_recall_all searches all of it for this request\._$/,
+  assert.match(pointer!, /^_Memory on file beyond this view: \d+ facts?\. memory_recall_all searches all of it for this request\._$/,
     'the pointer alone: nothing ranked, no per-block rendering');
   const all = requestText(frame);
   for (const absent of ['## Relevant To This Request', '## Persistent Facts', '[MEMORY PRIMER]', 'quokka ledger lives']) {
@@ -359,10 +369,9 @@ for (const [label, request] of [
     const all = requestText(frame);
     const fallback = memoryItem(frame, '## Persistent Facts');
     assert.ok(fallback, `the per-block rendering stands in for the ranker: ${all.slice(-2500)}`);
-    assert.match(fallback!, /\*\*Prompt-only instructions/, 'the prompt-only group is listed');
-    assert.ok(fallback!.includes(PROMPT_ONLY_RULE), 'the prompt-only rule reaches the model');
+    assert.ok(stableHalf(frame.system).includes(PROMPT_ONLY_RULE), 'the prompt-only rule reaches the model, in the core');
     assert.match(fallback!, /daughter named Wren/, 'a remembered fact reaches the model');
-    assert.doesNotMatch(fallback!, /owner@example\.com/, 'the core\'s rule is not repeated');
+    assert.doesNotMatch(fallback!, /owner@example\.com|Prompt-only instructions/, 'the core\'s policies are not repeated');
     assert.equal(all.split(PROMPT_ONLY_RULE).length - 1, 1, 'the rule is stated once');
     const memorySent = run.trace.filter((event) => event.type === 'guardrail_tripped'
       && (event.data as { kind?: string }).kind === 'model_memory_context').at(-1)?.data as { manifest?: Array<{ section: string; tier: string }> } | undefined;
@@ -375,15 +384,30 @@ test('a request that declines memory still carries the standing policies it is h
   const run = await hostTurn('skip-opt-out',
     'Do not use memory for this request. Draft a client note comparing our pricing with a competitor.');
   assert.equal(primerRecord(run).skippedReason, 'explicit_request_opt_out');
+  assert.equal(primerRecord(run).injected, false, 'no per-turn memory');
   const frame = run.frames[0]!;
   const all = requestText(frame);
-  const policies = memoryItem(frame, '## Persistent Facts');
-  assert.ok(policies, `the request's standing policies are sent: ${all.slice(-2500)}`);
-  assert.ok(policies!.includes(PROMPT_ONLY_RULE), 'the prompt-only rule still applies');
+  const core = stableHalf(frame.system);
+  assert.ok(core.includes(PROMPT_ONLY_RULE), 'the prompt-only rule still applies, from the core');
   for (const absent of ['daughter named Wren', 'quokka ledger', 'Invoices are reviewed', '## Recently Learned',
-    '## Relevant To This Request', 'memory_recall_all searches all of it']) {
+    '## Persistent Facts', '## Relevant To This Request', 'memory_recall_all searches all of it']) {
     assert.equal(all.includes(absent), false, `no remembered fact or recall invitation: ${absent}`);
   }
-  assert.ok(stableHalf(frame.system).includes('ALWAYS send email via the Outlook mailbox owner@example.com'),
+  assert.ok(core.includes('ALWAYS send email via the Outlook mailbox owner@example.com'),
     'the enforced rule stays in the core');
+});
+
+// Regression: an owner's prompt-only rule once reached a ranked turn only when
+// the request shared its words, so a client note about retainer rates went out
+// without the rule against quoting competitor pricing.
+test('an owner rule reaches a ranked request that shares no words with it', async () => {
+  const run = await hostTurn('rule-no-overlap', 'Draft a short note to Acme Legal about our monthly retainer rates.');
+  const frame = run.frames[0]!;
+  const all = requestText(frame);
+  assert.ok(primerRecord(run).source === 'unified' || primerRecord(run).skippedReason === 'no_hits',
+    `the shared ranker ran: ${JSON.stringify(primerRecord(run))}`);
+  for (const rule of [PROMPT_ONLY_RULE, SIGN_OFF_RULE]) {
+    assert.equal(all.split(rule).length - 1, 1, `the rule reaches the model once: ${rule}`);
+    assert.ok(stableHalf(frame.system).includes(rule), `the rule rides in the cached core: ${rule}`);
+  }
 });
