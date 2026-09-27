@@ -1,4 +1,11 @@
-import { getSession, getToolOutput, listEvents, openEventLog, type EventRow, type ToolOutputRecord } from './eventlog.js';
+import {
+  getSession,
+  getToolOutput,
+  listToolCalledEventsForCallId,
+  openEventLog,
+  type EventRow,
+  type ToolOutputRecord,
+} from './eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
@@ -51,12 +58,11 @@ export function resolveLocalRetainedOutputRead(sessionId: string, requestedId: s
     } };
   }
 
-  const calls = listEvents(sessionId, { types: ['tool_called'] });
   let callId = requestedId;
   const visited = new Set<string>();
   while (!visited.has(callId)) {
     visited.add(callId);
-    const occurrences = calls.filter(event => event.data.callId === callId);
+    const occurrences = listToolCalledEventsForCallId(sessionId, callId);
     // The top-level row is the invocation the model made. A transport mirror
     // is a second view of the same invocation, used only when it is the sole
     // observation.

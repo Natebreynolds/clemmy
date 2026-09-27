@@ -4547,6 +4547,20 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
   return options.desc ? mapped.reverse() : mapped;
 }
 
+/** The `tool_called` rows recorded under one call id in a session, oldest
+ *  first. Served by the tool-lifecycle index, so a caller following one call
+ *  does not load every tool call the session ever made. */
+export function listToolCalledEventsForCallId(sessionId: string, callId: string): EventRow[] {
+  const rows = prepareCached(openEventLog(), `
+    SELECT * FROM events
+     WHERE session_id = ?
+       AND type = 'tool_called'
+       AND json_extract(data_json, '$.callId') = ?
+     ORDER BY seq ASC
+  `).all(sessionId, callId) as RawEventRow[];
+  return rows.map(rowToEvent);
+}
+
 /**
  * Bounded global recovery query for workflow batches that crossed the durable
  * foreground close boundary but have no public dispatch winner yet. Oldest
