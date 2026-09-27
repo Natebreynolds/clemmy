@@ -3,20 +3,26 @@
  *
  * Run: node scripts/run-tests-isolated.mjs src/runtime/harness/jev-unavailable-turn.integration.test.ts
  *
- * Users without Jev are first-class. The owner has a remembered run that only
- * shares words with the new request ("build the wombat digest workspace" from
- * calendar and mail against "show me the wombat digest space"). Only a
- * turn-start judgement could say whether that run fits; without one, the host
- * must not recommend its tools or carry their schemas. Three ways to be
- * without Jev are driven through the real host path: turned off, no key, and a
- * request that never answers. Each turn completes; off and no-key attempt no
- * Jev request and write no Jev rows; none carries the unconfirmed guidance.
- * (The memory context's own strategy section is a separate owner, rendered
- * the same with or without Jev, and is not what this file pins.)
+ * Users without Jev are first-class. Two shapes of remembered work are driven:
+ *  - a run that only shares words with the request ("build the wombat digest
+ *    workspace" from calendar and mail against "show me the wombat digest
+ *    space");
+ *  - two runs that did different work, one of which the request restates
+ *    word for word ("numbat ledger reconciliation report" against a
+ *    reconciliation run and an export run).
+ * Only a turn-start judgement could say which remembered run fits; without
+ * one, the host picks none of them on the words they share with the request:
+ * it neither recommends their tools, nor carries their schemas, nor binds
+ * their operations. Three ways to be without Jev are driven through the real
+ * host path: turned off, no key, and a request that never answers. Each turn
+ * completes; off and no-key attempt no Jev request and write no Jev rows; none
+ * carries keyword-derived guidance. (The memory context's own strategy section
+ * is a separate owner, rendered the same with or without Jev, and is not what
+ * this file pins.)
  *
- * Regression: before, every one of these turns injected a [PROVEN OPERATION]
- * note naming the calendar operation, the wrong-recommendation shape the
- * coverage rule exists to prevent.
+ * Regression: before, the restated request was taken on its word overlap as an
+ * unconfirmed pick, and its [PROVEN OPERATION] note named the reconciliation
+ * operation.
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -62,6 +68,10 @@ const semanticPorts = await import('../semantic-boundary/turn-semantic-port-regi
 
 const REMEMBERED_TOOL = 'outlook_get_calendar_view';
 const REQUEST = 'Show me the wombat digest space';
+/** Restates one of two remembered runs that did different work. */
+const RESTATED_REQUEST = 'numbat ledger reconciliation report';
+const RESTATED_TOOL = 'numbat_ledger_read';
+const OTHER_TOOL = 'numbat_export_write';
 const JEV_DECISIONS = path.join(HOME, 'state', 'jev-decisions');
 const TOKEN_USAGE = path.join(HOME, 'state', 'token-usage');
 
@@ -77,20 +87,25 @@ semanticPorts.installTurnSemanticModelPort({
   async interpret() { throw new Error('no hidden work plan in this fixture'); },
 } as never);
 
-recordRunStrategy({
-  objective: "Build me a wombat digest workspace: today's calendar and emails waiting on my reply",
-  toolsUsed: [REMEMBERED_TOOL],
-  workerCount: 0,
-  durationMs: 20_000,
-  learningReceipt: evaluateLearningCandidate({
-    target: 'strategy',
-    authority: 'background_delivery_verifier',
-    sessionId: 'background:wombat-build',
-    sourceId: 'wombat-build',
-    terminalSuccess: true,
-    controllerValidation: true,
-  }).receipt!,
-});
+function rememberRun(objective: string, tool: string, sourceId: string): void {
+  recordRunStrategy({
+    objective,
+    toolsUsed: [tool],
+    workerCount: 0,
+    durationMs: 20_000,
+    learningReceipt: evaluateLearningCandidate({
+      target: 'strategy',
+      authority: 'background_delivery_verifier',
+      sessionId: `background:${sourceId}`,
+      sourceId,
+      terminalSuccess: true,
+      controllerValidation: true,
+    }).receipt!,
+  });
+}
+rememberRun("Build me a wombat digest workspace: today's calendar and emails waiting on my reply", REMEMBERED_TOOL, 'wombat-build');
+rememberRun('numbat ledger reconciliation report', RESTATED_TOOL, 'numbat-reconcile');
+rememberRun('numbat ledger export report', OTHER_TOOL, 'numbat-export');
 
 let jevRequests = 0;
 
@@ -151,18 +166,18 @@ function jevRowCounts(): { decisions: number; usage: number } {
   };
 }
 
-async function hostTurn(label: string) {
+async function hostTurn(label: string, request = REQUEST) {
   const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: label });
   const attempt = eventlog.beginRunAttempt(session.id, { runId: `jev-unavailable-${label}:${session.id}` });
   const accepted = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
-    text: REQUEST, taskMode: { version: 1, kind: 'normal' },
+    text: request, taskMode: { version: 1, kind: 'normal' },
   } }, { armRunInFlight: true });
   const brain = recordingBrain(label);
-  const result = await runConversation({ sessionId: session.id, sourceUserSeq: accepted.seq, input: REQUEST,
+  const result = await runConversation({ sessionId: session.id, sourceUserSeq: accepted.seq, input: request,
     reuseRecordedUserInput: true, runAttemptId: attempt.attemptId, turnEngine: 'host_v1', maxSteps: 1, maxTurns: 4,
     toolCallsPerTurn: 8, judgeCompletion: false,
     buildAgent: async (context) => buildOrchestratorAgent({ sessionId: context.sessionId,
-      sourceUserSeq: context.sourceUserSeq, hostFreshPlanning: context.hostFreshPlanning, userInput: REQUEST,
+      sourceUserSeq: context.sourceUserSeq, hostFreshPlanning: context.hostFreshPlanning, userInput: request,
       allowToolJit: true, model: brain as never }),
     makeRunner: () => Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not execute'); } }) as never,
   });
@@ -191,11 +206,40 @@ function assertNoUnconfirmedGuidance(label: string, run: Awaited<ReturnType<type
   }
 }
 
+/** The restated request, where the remembered runs disagree: nothing is
+ *  picked on word overlap, so nothing is recommended and nothing is bound. */
+function assertNoKeywordPick(label: string, run: Awaited<ReturnType<typeof hostTurn>>): void {
+  const debug = JSON.stringify({
+    status: run.result.status,
+    frames: run.frames.map((frame) => frame.tools),
+    selected: run.trace.filter((event) => event.type === 'proven_operation_selected').map((event) => event.data),
+  }).slice(0, 4_000);
+  assert.equal(run.result.status, 'completed', `${label}: the turn completes: ${debug}`);
+  assert.ok(run.frames.length > 0 && run.frames[0]!.tools.includes('tool_search'),
+    `${label}: an ordinary tool surface with discovery: ${debug}`);
+  assert.equal(run.trace.filter((event) => event.type === 'proven_operation_selected').length, 0,
+    `${label}: no remembered run is picked on the words the request shares with it: ${debug}`);
+  for (const frame of run.frames) {
+    assert.doesNotMatch(frame.text, /\[(PROVEN|ROUTED) OPERATION/, `${label}: no operation guidance reaches the brain`);
+    assert.ok(!frame.tools.includes(RESTATED_TOOL) && !frame.tools.includes(OTHER_TOOL),
+      `${label}: no remembered operation is bound onto the surface: ${debug}`);
+  }
+}
+
 test('fixture: the remembered run clears the keyword floor for the request but does not cover it', async () => {
   const { provenStrategyCoversRequest } = await import('../jev/proven-operation.js');
   const matches = listMatchingRunStrategies(REQUEST, 4);
   assert.equal(matches[0]?.strategy.toolsUsed[0], REMEMBERED_TOOL);
   assert.equal(provenStrategyCoversRequest(REQUEST, matches[0]!.strategy), false);
+});
+
+test('fixture: the restated request covers the top of two remembered runs that did different work', async () => {
+  const { pickProvenRunStrategy, provenStrategyCoversRequest } = await import('../jev/proven-operation.js');
+  const matches = listMatchingRunStrategies(RESTATED_REQUEST, 4);
+  assert.deepEqual(matches.slice(0, 2).map((row) => row.strategy.toolsUsed[0]), [RESTATED_TOOL, OTHER_TOOL]);
+  assert.equal(pickProvenRunStrategy(matches), null, 'the runs disagree, so the host has no pick of its own');
+  assert.equal(provenStrategyCoversRequest(RESTATED_REQUEST, matches[0]!.strategy), true,
+    'only word overlap could have chosen the top run');
 });
 
 test('with Jev turned off, the turn completes with no Jev request, no Jev rows and no unconfirmed guidance', async () => {
@@ -206,6 +250,7 @@ test('with Jev turned off, the turn completes with no Jev request, no Jev rows a
   const requestsBefore = jevRequests;
   const run = await hostTurn('off');
   assertNoUnconfirmedGuidance('off', run);
+  assertNoKeywordPick('off restated', await hostTurn('off-restated', RESTATED_REQUEST));
   assert.equal(jevRequests, requestsBefore, 'no Jev request was attempted');
   assert.deepEqual(jevRowCounts(), before, 'no Jev decision or usage rows were written');
 });
@@ -217,6 +262,7 @@ test('with no Jev key, the turn completes with no Jev request, no Jev rows and n
   const requestsBefore = jevRequests;
   const run = await hostTurn('no-key');
   assertNoUnconfirmedGuidance('no-key', run);
+  assertNoKeywordPick('no-key restated', await hostTurn('no-key-restated', RESTATED_REQUEST));
   assert.equal(jevRequests, requestsBefore, 'no Jev request was attempted');
   assert.deepEqual(jevRowCounts(), before, 'no Jev decision or usage rows were written');
 });
@@ -237,6 +283,7 @@ test('when Jev never answers, the turn completes within the budget and carries n
   const started = Date.now();
   const run = await hostTurn('timeout');
   assertNoUnconfirmedGuidance('timeout', run);
+  assertNoKeywordPick('timeout restated', await hostTurn('timeout-restated', RESTATED_REQUEST));
   assert.ok(asked.some((ids) => ids.split(',').some((id) => id === 'which' || id === 'select')),
     `the turn-start decision was asked and timed out: ${JSON.stringify(asked)}`);
   const turnStart = readdirSync(JEV_DECISIONS)

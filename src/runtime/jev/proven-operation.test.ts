@@ -522,8 +522,13 @@ test('one Jev request decides both turn-start questions, and a routed operation 
       { query: 'create a workflow for the zephyr ledger report' },
       { decideTurnStart: decideWith(calls, () => ({ failedOpen: true })) },
     );
-    assert.ok(unreachable.strategyId && !unreachable.strategyId.startsWith('route:'), 'unreachable Jev keeps the top memory match, as before');
-    assert.equal(unreachable.pickedBy, 'keywords_unconfirmed', 'and says it was not confirmed, so nothing is bound on it');
+    // The request restates the top match, but the remembered runs disagree:
+    // without a judgement, shared words do not decide between them.
+    assert.equal(unreachable.strategyId, undefined, 'unreachable Jev picks no remembered run on its words');
+    assert.equal(unreachable.pickedBy, undefined);
+    assert.equal(unreachable.text, undefined, 'and offers no guidance');
+    assert.deepEqual(unreachable.tools, []);
+    assert.equal(typeof unreachable.decisionWaitMs, 'number', 'the wait on the failed decision is still measured');
 
     calls.length = 0;
     const none = await prepareProvenOperationForRequest(
@@ -588,12 +593,13 @@ test('with no turn-start judgement, a run that only shares words recommends noth
   }
 });
 
-test('when Jev cannot be asked, no candidates are offered and nothing waits; a restated run is still taken', async () => {
+test('when Jev cannot be asked, no candidates are offered, nothing waits, and runs that disagree are not settled by shared words', async () => {
   const jev = await import('./client.js');
   const { _setToolSchemaLoaderForTests } = await import('../../tools/composio-schema-cache.js');
   _setToolSchemaLoaderForTests(async () => null);
   recordZephyrStrategy('yak ledger reconciliation report', 'yak_ledger_read', 'yak-a');
   recordZephyrStrategy('yak ledger export report', 'yak_export_write', 'yak-b');
+  recordZephyrStrategy('otter burrow census tally', 'otter_census_read', 'otter-a');
   let requests = 0;
   jev._setSystemOneFetchForTests(async () => { requests += 1; throw new Error('Jev must not be asked'); });
   const unavailable: Array<[string, () => void]> = [
@@ -609,12 +615,21 @@ test('when Jev cannot be asked, no candidates are offered and nothing waits; a r
       const none = await prepareProvenOperationForRequest({ query: 'create a workflow named narwhal tally' });
       assert.equal(none.text, undefined, mode);
       assert.equal(none.decisionWaitMs, undefined, `${mode}: no decision was waited on`);
-      // Runs that disagree, one of which the request restates: the fallback a
-      // failed decision takes still applies, without the wait.
+      // Runs that disagree, one of which the request restates: with no
+      // judgement, the words the request shares with one of them pick nothing.
       const restated = await prepareProvenOperationForRequest({ query: 'yak ledger reconciliation report' });
-      assert.equal(restated.pickedBy, 'keywords_unconfirmed', mode);
-      assert.deepEqual(restated.tools, ['yak_ledger_read'], mode);
+      assert.equal(restated.pickedBy, undefined, mode);
+      assert.equal(restated.strategyId, undefined, mode);
+      assert.equal(restated.text, undefined, `${mode}: no guidance`);
+      assert.deepEqual(restated.tools, [], mode);
+      assert.deepEqual(restated.nativeTools, [], mode);
+      assert.equal(restated.skipDiscoverySearch, false, mode);
       assert.equal(restated.decisionWaitMs, undefined, mode);
+      // The one kind of work the request matched, restated, is still the
+      // host's own pick: the same with or without Jev.
+      const sole = await prepareProvenOperationForRequest({ query: 'otter burrow census tally' });
+      assert.equal(sole.pickedBy, 'keywords', mode);
+      assert.deepEqual(sole.tools, ['otter_census_read'], mode);
     }
     assert.equal(requests, 0, 'no Jev request was attempted');
   } finally {
@@ -676,8 +691,7 @@ test('a remembered run Jev judges to be the same kind of work is bound before th
   assert.match(prepared.text ?? '', /Use this request's own targets and values/);
   assert.doesNotMatch(prepared.text ?? '', /first-firm|second-firm/, 'another instance\'s values never reach the brain as guidance');
 
-  // Unconfirmed: Jev unavailable. The nearest keyword match, if any, is
-  // guidance only; nothing is re-attested or bound on it.
+  // Unconfirmed: Jev unavailable. Nothing is picked, re-attested or bound.
   const other = createSession({ kind: 'chat', channel: 'desktop', title: 'familiar links unconfirmed' });
   const otherAccepted = appendEvent({ sessionId: other.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: request } });
   const unconfirmed: string[] = [];
@@ -692,7 +706,8 @@ test('a remembered run Jev judges to be the same kind of work is bound before th
     },
   );
   assert.deepEqual(unconfirmed, [], 'an unconfirmed guess binds nothing');
-  assert.notEqual(guessed.pickedBy, 'jev');
+  assert.equal(guessed.pickedBy, undefined);
+  assert.equal(guessed.text, undefined);
   assert.equal(guessed.skipDiscoverySearch, false);
 });
 

@@ -44,12 +44,11 @@ const FAMILIAR_RUN_CANDIDATES = 8;
 /** How the turn's remembered run was chosen:
  *  - keywords: the request restates the run (keyword coverage);
  *  - jev: Jev judged, inside the budget, that the run did the same kind of work;
- *  - jev_route: Jev routed the request to one operation the host can hand over;
- *  - keywords_unconfirmed: no turn-start judgement was available and the
- *    remembered runs the request matched disagree; the top match is taken only
- *    because the request restates it. A match that does not cover the request
- *    is not taken at all. */
-export type ProvenPickSource = 'keywords' | 'jev' | 'jev_route' | 'keywords_unconfirmed';
+ *  - jev_route: Jev routed the request to one operation the host can hand over.
+ *  Without a turn-start judgement, remembered runs that disagree are never
+ *  settled by how many words the request shares with one of them: nothing is
+ *  picked, and discovery runs as usual. */
+export type ProvenPickSource = 'keywords' | 'jev' | 'jev_route';
 
 export interface ProvenLiveRead {
   operation: string;
@@ -631,20 +630,6 @@ export function familiarRunStrategiesForRequest(
   return picked;
 }
 
-/** The remembered run taken when no turn-start judgement is available: the
- *  top keyword match, and only when the request restates it. A run that merely
- *  shares words with the request is the wrong-recommendation shape the
- *  coverage rule in prepareProvenOperationForRequest exists to prevent; with no
- *  judgement to confirm it, it is not offered at all, neither its tools nor
- *  their schemas. */
-function unconfirmedKeywordPick(
-  query: string,
-  matches: readonly MatchedRunStrategy[],
-): RunStrategyRecord | null {
-  const top = matches[0]?.strategy;
-  return top && provenStrategyCoversRequest(query, top) ? top : null;
-}
-
 type TurnStartDecisionFor = TurnStartDecision<ProvenStrategyCandidate, RoutableOperation>;
 
 /** The first frame waits on the turn-start decision for at most the budget,
@@ -714,20 +699,15 @@ export async function prepareProvenOperationForRequest(input: {
   let routed = false;
   if (!strategy) {
     // The candidates exist only for Jev's question. When Jev cannot be asked
-    // (turned off, or no key), none are built and nothing waits: the host
-    // goes straight to what a failed decision falls back to, for a run that
-    // decision would have been offered (one with an operation to hand over).
+    // (turned off, or no key), none are built and nothing waits. With no
+    // judgement, whether it was never asked, failed or ran out of time, no
+    // remembered run is picked or offered on the words it shares with the
+    // request: discovery finds the operation instead.
     const decideTurnStart = dependencies.decideTurnStart
       ?? (await jevAvailable() ? decideTurnStartWithJev : null);
     const familiar = decideTurnStart ? familiarRunStrategiesForRequest(input.query, strategyScope) : [];
     const operations = decideTurnStart ? routableOperationsForRequest(input.query, strategyScope) : [];
-    if (!decideTurnStart) {
-      const top = matches[0]?.strategy;
-      if (top && bindableStrategyTools(top.toolsUsed).length > 0) {
-        strategy = unconfirmedKeywordPick(input.query, matches);
-        if (strategy) pickedBy = 'keywords_unconfirmed';
-      }
-    } else if (familiar.length > 0 || operations.length > 0) {
+    if (decideTurnStart && (familiar.length > 0 || operations.length > 0)) {
       const startedAt = Date.now();
       const decision = await decideWithinBudget(() => decideTurnStart(
         input.query,
@@ -746,9 +726,6 @@ export async function prepareProvenOperationForRequest(input: {
       if (judged) {
         strategy = judged;
         pickedBy = 'jev';
-      } else if (decision.failedOpen) {
-        strategy = unconfirmedKeywordPick(input.query, matches);
-        if (strategy) pickedBy = 'keywords_unconfirmed';
       }
       if (!strategy && decision.route.pick) {
         routed = true;
@@ -780,8 +757,7 @@ export async function prepareProvenOperationForRequest(input: {
   let boundAccounts: ProvenBoundAccount[] = [];
   const composioSlugs = composioSlugsFromStrategy(strategy.toolsUsed);
   // A strategy that does not cover the request must not spend the request's
-  // time provisioning its operations: a run that merely shares words with the
-  // request is guidance only. Coverage is either the request restating the run
+  // time provisioning its operations. Coverage is either the request restating the run
   // (its own keywords), or a turn-start judgement inside the budget that the
   // run did this same kind of work or that the routed operation does its core.
   const coversRequest = routed || pickedBy === 'jev' || provenStrategyCoversRequest(input.query, strategy);
