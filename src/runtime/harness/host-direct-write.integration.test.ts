@@ -1074,3 +1074,81 @@ test('a send to a merged recipient list records each person once', async () => {
   assert.equal(engine.outsideWorkCards(rows.map((write) => ({ write })))[0]?.subtitle,
     'To pat@example.test, sam@example.test');
 });
+
+// Memory after the owner answers a card. The request's remembered fact is
+// stored here, after every case above has run, so it reaches only these. The
+// resumed activation is the same accepted request: it carries the memory a
+// fresh activation of that request carries (the shared ranker's tail, or the
+// per-block stand-in when the ranker gives no signal), on the approve path and
+// on the change-request path alike.
+const RESUME_FACT = 'Validated content for the connected owner account is filed under the heron archive label.';
+for (const [decision, ranker] of [['approve', 'on'], ['approve', 'off'], ['change', 'on'], ['change', 'off']] as const) {
+  test(`a resumed request (${decision}, ranker ${ranker}) carries the request's memory to the model`, async () => {
+    const { rememberFact } = await import('../../memory/facts.js');
+    const { listActiveFacts } = await import('../../memory/facts.js');
+    if (!listActiveFacts({ limit: 50 }).some((fact) => fact.content === RESUME_FACT)) rememberFact({ kind: 'reference', content: RESUME_FACT });
+    const previous = { primer: process.env.CLEMMY_UNIFIED_TURN_PRIMER, recall: process.env.CLEMMY_UNIFIED_RECALL, embeddings: process.env.EMBEDDINGS_DISABLED };
+    process.env.CLEMMY_UNIFIED_TURN_PRIMER = ranker;
+    process.env.CLEMMY_UNIFIED_RECALL = ranker;
+    process.env.EMBEDDINGS_DISABLED = 'true';
+    try {
+      const fixture = await directWriteFixture('work_call', 'opaque', `resume-memory-${decision}-${ranker}`, false, 'args_json', 1, {
+        operationId: `MEMORY_RESUME_WRITE_${decision === 'approve' ? 1 : 2}${ranker === 'on' ? 1 : 2}`, schema: INPUT_SCHEMA, payloads: [ARGS],
+      });
+      assert.ok(fixture);
+      // Every request the brain receives, instructions and input alike.
+      const sent: string[] = [];
+      const answer = fixture.model.getResponse.bind(fixture.model);
+      fixture.model.getResponse = async (request: any) => {
+        sent.push([request.systemInstructions ?? '', JSON.stringify(request.input ?? [])].join('\n'));
+        return answer(request);
+      };
+      const { runConversation, runConversationFromResume } = await import('./loop.js');
+      const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+      const agent = await fixture.useProductionAgent();
+      const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+        sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+        suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+      assert.equal(paused.status, 'awaiting_approval', JSON.stringify(paused));
+      assert.match(sent.join('\n'), /heron archive label/, `the first activation carries the fact: ${JSON.stringify(eventlog.listEvents(fixture.session.id, { types: ['turn_memory_primer'] }).map((event) => event.data))}`);
+      const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+      assert.ok(approval);
+      if (decision === 'approve') assert.equal(approvals.resolve(approval.approvalId, 'approved', 'resume-memory').ok, true);
+      const before = sent.length;
+      eventlog.closeEventLog();
+      await runConversationFromResume({ sessionId: fixture.session.id,
+        approvalId: approval.approvalId,
+        ...(decision === 'approve'
+          ? { decision: 'approve' as const }
+          : { decision: 'reject' as const, changeRequest: 'make it shorter and mention the heron label' }),
+        resolver: 'resume-memory', turnEngine: 'host_v1',
+        makeRunner: () => fixture.runner as never, maxTurns: 3,
+        judgeFn: async () => ({ done: true, reason: 'fixture reply' }),
+        buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+          sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+          ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+          model: fixture.model as never, allowToolJit: true,
+        }),
+      });
+      assert.equal(fixture.counts().providerCalls, decision === 'approve' ? 1 : 0);
+      const resumed = sent.slice(before);
+      assert.ok(resumed.length > 0, 'the resumed activation called the brain');
+      assert.ok(resumed[0]!.includes(RESUME_FACT), `the resumed request carries the request's fact: ${resumed[0]!.slice(-3000)}`);
+      assert.equal(resumed[0]!.split('[MEMORY PRIMER]').length - 1, 1, 'one memory tail rides the resumed request');
+      const primer = eventlog.listEvents(fixture.session.id, { types: ['turn_memory_primer'] })
+        .filter((event) => event.data.sourceUserSeq === fixture.source.seq).at(-1)?.data as Record<string, unknown> | undefined;
+      assert.equal(primer?.injected, true, 'the resumed activation records the memory it sent');
+      if (ranker === 'on') {
+        assert.match(resumed[0]!, /## Relevant To This Request/, 'the shared ranker\'s tail rides the resumed request');
+        assert.equal(primer?.source, 'unified');
+      } else {
+        assert.doesNotMatch(resumed[0]!, /## Relevant To This Request/, 'no ranked tail without a ranker');
+        assert.match(resumed[0]!, /\[REMEMBERED FACTS/, 'the fallback memory stands in for a ranker with no signal');
+      }
+    } finally {
+      for (const [key, value] of [['CLEMMY_UNIFIED_TURN_PRIMER', previous.primer], ['CLEMMY_UNIFIED_RECALL', previous.recall], ['EMBEDDINGS_DISABLED', previous.embeddings]] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+}

@@ -5534,13 +5534,115 @@ function requestDeclinedAutomaticMemory(
   if (explicitlyOptsOutOfAutomaticMemoryRecall(policyInput)) return true;
   if (options.suppressAutomaticMemoryForRequest !== true) return false;
   if (options.hostOwnedContinuation !== true) return true;
-  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return true;
+  return acceptedSourceMemoryPolicy(options.sessionId, sourceUserSeq).declined ?? true;
+}
+
+/**
+ * The accepted request's own text and whether it declined automatic memory.
+ * `declined` is undefined when the source cannot be read, so each caller
+ * decides what an unreadable source means for it.
+ */
+function acceptedSourceMemoryPolicy(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+): { text?: string; declined?: boolean } {
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return {};
   try {
-    const text = acceptedUserEvent(options.sessionId, sourceUserSeq as number).data.text;
-    return typeof text !== 'string' || explicitlyOptsOutOfAutomaticMemoryRecall(text);
+    const text = acceptedUserEvent(sessionId, sourceUserSeq as number).data.text;
+    return typeof text === 'string' ? { text, declined: explicitlyOptsOutOfAutomaticMemoryRecall(text) } : {};
   } catch {
-    return true;
+    return {};
   }
+}
+
+/** The hard outer bound on assembling a turn's memory primer. */
+const TURN_MEMORY_ASSEMBLY_TIMEOUT_MS = 15_000;
+
+/**
+ * The memory of an activation that resumes a parked request after the owner
+ * answered its card (approved, edited, rejected or asked for a change). It is
+ * the same accepted request, and an agent built by harnessInstructions carries
+ * no request-ranked memory in its prompt, so the activation gets the tail a
+ * fresh activation of that request gets: the shared ranker's, or the per-block
+ * stand-in when the ranker gives no signal. A request that declined automatic
+ * memory gets none. A source that cannot be read gets the stand-in, which is
+ * what the prompt itself carried before the tail existed. Any other agent keeps
+ * its own prompt and gets nothing here.
+ */
+async function resumedActivationMemoryPrimer(input: {
+  sessionId: string;
+  sourceUserSeq: number | undefined;
+  agent: unknown;
+  /** The caller's dedicated memory query for this request, as runTurn takes it. */
+  memoryPrimerQuery?: string;
+}): Promise<TurnMemoryPrimer | undefined> {
+  const scope = memoryTailScopeFor((input.agent as { instructions?: unknown } | undefined)?.instructions);
+  if (!scope) return undefined;
+  const source = acceptedSourceMemoryPolicy(input.sessionId, input.sourceUserSeq);
+  const query = input.memoryPrimerQuery ?? source.text ?? '';
+  if (source.declined === true) return primerWithoutRanker(query, EXPLICIT_MEMORY_RECALL_OPTOUT_REASON, scope);
+  if (source.declined === undefined) return primerWithoutRanker(query, 'source_unreadable', scope);
+  const settled = await Promise.race([
+    buildTurnMemoryPrimer(query, input.sessionId, scope).catch(() => null),
+    new Promise<null>((resolve) => {
+      const t = setTimeout(() => resolve(null), TURN_MEMORY_ASSEMBLY_TIMEOUT_MS);
+      (t as unknown as { unref?: () => void }).unref?.();
+    }),
+  ]);
+  return settled ?? assemblyTimeoutPrimer(query, scope);
+}
+
+/** Durable record of the memory an activation sends; the dispatch provenance
+ *  gate proves a request's recall-run memory against the newest one. */
+function recordTurnMemoryPrimer(
+  sessionId: string,
+  turn: number,
+  sourceUserSeq: number | undefined,
+  primer: TurnMemoryPrimer,
+): void {
+  safeAppend({
+    sessionId,
+    turn,
+    role: 'system',
+    type: 'turn_memory_primer',
+    data: {
+      // The SOURCE identity, not just the turn number. `turn` is not a stable
+      // key — one exchange writes events at turn 0, 1 and 2 — so anything that
+      // joined this primer to its request by turn found nothing. Live
+      // 2026-08-28: model-request-provenance looked up by turn, missed a primer
+      // that was correct in every other respect, and killed the request before
+      // the model ran. Every other store in the harness joins on
+      // session_id + source_user_seq; this now carries it too.
+      sourceUserSeq: Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+        ? sourceUserSeq
+        : null,
+      enabled: primer.enabled,
+      queryPreview: clip(primer.query, 160),
+      hitCount: primer.hitCount,
+      includedCount: primer.hitCount,
+      injected: Boolean(primer.text),
+      injectedBytes: primer.injectedBytes,
+      visibleTextSha256: modelVisibleTextSha256(primer.text),
+      source: primer.source ?? null,
+      skippedReason: primer.skippedReason ?? null,
+      recallId: primer.recallId ?? null,
+      answerability: primer.answerability ?? null,
+      candidateCount: primer.candidateCount ?? null,
+      omittedCount: primer.omittedCount ?? null,
+      stores: primer.stores ?? [],
+      recallElapsedMs: primer.recallElapsedMs ?? null,
+    },
+  });
+}
+
+/** The model-input filter of an activation whose only per-request context is
+ *  its memory primer: the primer rides as a trailing system item, where
+ *  runTurn's filter places it. */
+function memoryPrimerInputFilter(text: string) {
+  return (args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => ({
+    input: [...args.modelData.input, { role: 'system', content: text } as AgentInputItem],
+    instructions: args.modelData.instructions,
+  });
 }
 
 /** The primer when assembly outran its hard outer timeout: no ranker signal. */
@@ -10866,7 +10968,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
     : Promise.race([
         buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId, memoryTailScope),
         new Promise<null>((resolve) => {
-          const t = setTimeout(() => resolve(null), 15_000);
+          const t = setTimeout(() => resolve(null), TURN_MEMORY_ASSEMBLY_TIMEOUT_MS);
           (t as unknown as { unref?: () => void }).unref?.();
         }),
       ]);
@@ -11365,39 +11467,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // it continues the same conversation instead of repeating it or asking for
   // generic permission a second time.
   let sameTurnPreamble = '';
-  safeAppend({
-    sessionId: options.sessionId,
-    turn,
-    role: 'system',
-    type: 'turn_memory_primer',
-    data: {
-      // The SOURCE identity, not just the turn number. `turn` is not a stable
-      // key — one exchange writes events at turn 0, 1 and 2 — so anything that
-      // joined this primer to its request by turn found nothing. Live
-      // 2026-08-28: model-request-provenance looked up by turn, missed a primer
-      // that was correct in every other respect, and killed the request before
-      // the model ran. Every other store in the harness joins on
-      // session_id + source_user_seq; this now carries it too.
-      sourceUserSeq: Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
-        ? sourceUserSeq
-        : null,
-      enabled: turnMemoryPrimer.enabled,
-      queryPreview: clip(turnMemoryPrimer.query, 160),
-      hitCount: turnMemoryPrimer.hitCount,
-      includedCount: turnMemoryPrimer.hitCount,
-      injected: Boolean(turnMemoryPrimer.text),
-      injectedBytes: turnMemoryPrimer.injectedBytes,
-      visibleTextSha256: modelVisibleTextSha256(turnMemoryPrimer.text),
-      source: turnMemoryPrimer.source ?? null,
-      skippedReason: turnMemoryPrimer.skippedReason ?? null,
-      recallId: turnMemoryPrimer.recallId ?? null,
-      answerability: turnMemoryPrimer.answerability ?? null,
-      candidateCount: turnMemoryPrimer.candidateCount ?? null,
-      omittedCount: turnMemoryPrimer.omittedCount ?? null,
-      stores: turnMemoryPrimer.stores ?? [],
-      recallElapsedMs: turnMemoryPrimer.recallElapsedMs ?? null,
-    },
-  });
+  recordTurnMemoryPrimer(options.sessionId, turn, sourceUserSeq, turnMemoryPrimer);
   markTurnClock(options.sessionId, 'primer_recorded');
   safeAppend({
     sessionId: options.sessionId,
@@ -12349,6 +12419,9 @@ export interface ResumePendingApprovalOptions {
    * again. The words never authorize any bytes.
    */
   changeRequest?: string;
+  /** The caller's dedicated memory query for the parked request (a workflow
+   *  step's), the same one its fresh activation ranked memory by. */
+  memoryPrimerQuery?: string;
   /**
    * Audit source recorded when the durable approval row is resolved.
    * Callers pass the surface that accepted the approval; the harness
@@ -12784,6 +12857,19 @@ export async function resumePendingApproval(
       },
     });
   }
+  // The resumed activation is the parked request continuing: it carries that
+  // request's memory as its fresh activation did (runTurn's filter never runs
+  // here), recorded before the run so the dispatch gate can prove it.
+  const resumeMemoryPrimer = await resumedActivationMemoryPrimer({
+    sessionId: options.sessionId,
+    sourceUserSeq: resumeSourceUserSeq,
+    agent: options.agent,
+    ...(options.memoryPrimerQuery ? { memoryPrimerQuery: options.memoryPrimerQuery } : {}),
+  });
+  if (resumeMemoryPrimer) {
+    rememberTurnMemoryForJudges(options.sessionId, resumeMemoryPrimer.text);
+    recordTurnMemoryPrimer(options.sessionId, turn, resumeSourceUserSeq, resumeMemoryPrimer);
+  }
   safeAppend({
     sessionId: options.sessionId,
     turn,
@@ -12870,6 +12956,7 @@ export async function resumePendingApproval(
     // the stall as an error (the user re-sends) instead of silently duplicating.
     disablePreContentRetry: true,
     ...(hostApprovalIds.length > 0 ? { hostApprovalIds } : {}),
+    ...(resumeMemoryPrimer?.text ? { callModelInputFilter: memoryPrimerInputFilter(resumeMemoryPrimer.text) } : {}),
   };
 
   try {
@@ -13209,6 +13296,8 @@ export async function runConversationFromResume(opts: {
   modifiedArgs?: string;
   /** With decision 'reject': the owner's requested change (see ResumePendingApprovalOptions). */
   changeRequest?: string;
+  /** The caller's dedicated memory query for the parked request (see ResumePendingApprovalOptions). */
+  memoryPrimerQuery?: string;
   resolver?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
@@ -13536,6 +13625,7 @@ async function runConversationFromResumeCore(opts: {
   decision: 'approve' | 'reject' | 'approve_with_edits';
   modifiedArgs?: string;
   changeRequest?: string;
+  memoryPrimerQuery?: string;
   resolver?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
@@ -13636,6 +13726,7 @@ async function runConversationFromResumeCore(opts: {
     decision: opts.decision,
     modifiedArgs: opts.modifiedArgs,
     ...(opts.decision === 'reject' && opts.changeRequest ? { changeRequest: opts.changeRequest } : {}),
+    ...(opts.memoryPrimerQuery ? { memoryPrimerQuery: opts.memoryPrimerQuery } : {}),
     resolver: opts.resolver,
     maxTurns,
     toolCallsPerTurn,

@@ -6067,6 +6067,7 @@ async function runStepViaHarness(
         agent,
         sessionId: realSessionId,
         approvalId: approvalResume.approvalId,
+        ...(workflowMemoryPrimerQuery ? { memoryPrimerQuery: workflowMemoryPrimerQuery } : {}),
         runAttemptId: stepAttempt.attemptId,
         deferToolCallsLimitTerminal: true,
         decision: approvalResume.decision,

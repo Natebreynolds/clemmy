@@ -3415,12 +3415,14 @@ test('standard workflow approval resume retains the exact step attempt identity'
     sessionId: string;
     sourceUserSeq?: number;
     runAttemptId?: string;
+    memoryPrimerQuery?: string;
   } | undefined;
   let resumeOptions: {
     sessionId: string;
     runAttemptId?: string;
     approvalId?: string;
     decision?: 'approve' | 'reject';
+    memoryPrimerQuery?: string;
   } | undefined;
   try {
     const stateDir = path.join(tmp, 'state');
@@ -3545,6 +3547,9 @@ test('standard workflow approval resume retains the exact step attempt identity'
       activeAttempt?.attemptId,
       'approval resume remains owned by the same durable workflow step attempt',
     );
+    assert.ok(initialOptions?.memoryPrimerQuery, 'the step ranks its memory by its own query');
+    assert.equal(resumeOptions?.memoryPrimerQuery, initialOptions?.memoryPrimerQuery,
+      'the resumed step ranks its memory by the query its first activation used');
     assert.equal(getLatestRunAttempt(sessionId)?.status, 'completed');
   } finally {
     if (approvalId) approvalRegistry.resolve(approvalId, 'cancelled_by_user', 'test-cleanup');
