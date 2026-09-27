@@ -7,6 +7,7 @@ import { refreshRetainedPlanPreparation, attachReviewedPlanPreparation } from '.
 import { FreshActionPlanDraftSchema } from './plan-tools.js';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
+import { jsonArgumentText, jsonObjectArgument } from './json-argument.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { acceptedTaskModeIdentity } from '../runtime/harness/accepted-task-mode.js';
 import { parsePlanRevisionRef } from '../runtime/harness/task-mode.js';
@@ -110,7 +111,7 @@ export const PlanPublicationInputSchema = z.object({
   structured_plan: PlanPublicationOutlineSchema.optional(),
   readiness: z.enum(['ready', 'needs_input']).default('ready'),
   missing_prerequisites: z.array(z.string().min(1)).default([]),
-  base_ref_json: z.string().nullable().default(null).describe('Exact prior {planId,revision,digest} for a revision. With full_text and structured_plan omitted, reuse that ready plan unchanged and run fresh preparation/review; no need to retransmit it.'),
+  base_ref_json: jsonObjectArgument().nullable().default(null).describe('Exact prior {planId,revision,digest} for a revision. With full_text and structured_plan omitted, reuse that ready plan unchanged and run fresh preparation/review; no need to retransmit it.'),
   draft_digest: z.string().length(64).optional().describe('Repair only: copy the exact digest returned by a failed preparation. Omit this field entirely for a new full plan; never invent a digest. Requires step_patches.'),
   step_patches: z.array(stepPatchSchema).min(1).optional().describe('Repair only: [{step_id, changes}] for existing steps, paired with the returned draft_digest. Put every changed step field inside changes. Omitted steps and full_text are retained. To add, remove or reorder steps, submit the complete structured_plan and full_text without draft_digest or step_patches.'),
 }).strict();
@@ -543,20 +544,22 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
       // the bytes it wants published; refusing that as a malformed repair only
       // cost a round trip (live 2026-09-15 22:52).
       const fullSubmission = Boolean(args.full_text && args.structured_plan);
+      // A revision reference given as an object is serialized once here.
+      const baseRefText = jsonArgumentText(args.base_ref_json) ?? null;
       if (!fullSubmission && (args.draft_digest || args.step_patches)) {
         if (!args.draft_digest) throw new Error('Draft repair requires the exact draft_digest returned with the retained draft.');
         draft = applyPlanDraftPatches(loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest }),
           { ...args, structured_plan: undefined, step_patches: args.step_patches ?? [] });
-      } else if (args.base_ref_json && !args.full_text && !args.structured_plan) {
+      } else if (baseRefText && !args.full_text && !args.structured_plan) {
         const prior = getPlanRevision({ sessionId: context.sessionId, principalId: source.principalId,
-          ref: parsePlanRevisionRef(JSON.parse(args.base_ref_json)) });
+          ref: parsePlanRevisionRef(JSON.parse(baseRefText)) });
         if (prior.readiness !== 'ready' || prior.missingPrerequisites.length || !prior.structuredPlan) {
           throw new Error('Only a ready plan without unresolved prerequisites can be reused unchanged.');
         }
         const refreshed = await refreshRetainedPlanPreparation(prior);
         assertActive();
         if (planning) await attachReviewedPlanPreparation(planning, refreshed.checked);
-        draft = { fullText: prior.fullText, baseRefJson: args.base_ref_json, raw: {
+        draft = { fullText: prior.fullText, baseRefJson: baseRefText, raw: {
           steps: refreshed.artifact.structuredPlan!.steps, successCriteria: prior.structuredPlan.successCriteria,
           subagents: prior.structuredPlan.subagents,
         } };
@@ -570,7 +573,7 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
             } });
           } catch { /* advisory */ }
         }
-        draft = { fullText: args.full_text, baseRefJson: args.base_ref_json,
+        draft = { fullText: args.full_text, baseRefJson: baseRefText,
           raw: args.structured_plan ? decodePublishedPlanOutline(args.structured_plan) : null };
       }
       // An honest question does not need a guessed executable graph. This

@@ -12,6 +12,7 @@
  * on-demand capability, so an ordinary turn pays nothing for it.
  */
 import { z } from 'zod';
+import { jsonArgumentText, jsonValueArgument } from './json-argument.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { textResult } from './shared.js';
 import { reshapeWorkflowGraph, loadLiveWorkflowGraph } from '../execution/workflow-graph-reshape.js';
@@ -146,7 +147,7 @@ export function registerWorkflowReshapeTools(server: McpServer): void {
       run_id: z.string().min(1).describe('The in-flight run to reshape.'),
       action: z.enum(['inspect', 'apply']).describe('"inspect" reads the live graph; "apply" performs the reshape.'),
       reason: z.string().max(500).nullish().describe('For "apply": one plain sentence on why the shape must change. Required and surfaced to the user.'),
-      operations_json: z.string().nullish().describe('For "apply": a JSON ARRAY string of operations. Each entry: {"op":"add_node","node_id":"analyze-b","label":"second branch","prompt":"...","side_effect":"read"} | {"op":"add_edge","source":"pull","target":"analyze-b"}. New nodes must include a prompt and may only be read-only.'),
+      operations_json: jsonValueArgument().nullish().describe('For "apply": a JSON ARRAY string of operations. Each entry: {"op":"add_node","node_id":"analyze-b","label":"second branch","prompt":"...","side_effect":"read"} | {"op":"add_edge","source":"pull","target":"analyze-b"}. New nodes must include a prompt and may only be read-only.'),
     },
     async ({ workflow, run_id, action, reason, operations_json }) => {
       try {
@@ -165,7 +166,7 @@ export function registerWorkflowReshapeTools(server: McpServer): void {
           return textResult('Refused: "apply" requires one plain-sentence reason explaining why this active run needs a new branch.');
         }
 
-        const parsedOps = parseOperationsJson(operations_json ?? '');
+        const parsedOps = parseOperationsJson(jsonArgumentText(operations_json) ?? '');
         if (parsedOps.errors.length > 0) return textResult(`Refused: ${parsedOps.errors.join(' ')} Call action "inspect" first to see real node and edge ids.`);
         if (parsedOps.inputs.length === 0) return textResult('Refused: "apply" needs at least one operation. Call action "inspect" first to see real node and edge ids.');
 
