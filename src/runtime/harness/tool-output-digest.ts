@@ -1,7 +1,6 @@
 /**
  * Structure-aware digest for large tool outputs — the single, always-on path
- * for parked tool output (the legacy clip-and-recall fallback + its
- * LARGE_TOOL_OUTPUT_DIGEST toggle were removed 2026-06-24).
+ * for parked tool output; there is no clip-and-recall fallback and no toggle.
  *
  * The problem: tool outputs are unbounded (query results, API lists, web
  * scrapes), the context window is finite. The old clip was `text.slice(0,
@@ -151,13 +150,9 @@ function jsonChars(value: unknown): number {
  * allocateJsonBudgets then water-fills them EQUALLY. That systematically buys
  * the cheapest fields and omits the informative ones.
  *
- * Live 2026-09-21, source 276961, "whats on my calendar today": each of 5
- * events got ~28 chars per key, so `isAllDay: false` (5 chars) fit exactly
- * while `subject` (44) did not. The brain received 21 key names per record with
- * `categories: []`, `importance: "normal"`, `onlineMeeting: null` — 127 keys and
- * 56 values omitted, none of them the answer — and had to spend a second round
- * on tool_output_query asking for subject/start/end/location, which returned
- * 5,428 bytes against the 2,948 it already had.
+ * Equal shares let a short constant flag fit while a longer, distinguishing
+ * value is omitted, so the reader receives key names and boilerplate and must
+ * spend a second round querying for the fields it came for.
  *
  * A key whose value is IDENTICAL across every sibling record cannot distinguish
  * them, however cheap it is to include; one that differs everywhere is what the
@@ -188,18 +183,15 @@ function discriminatingKeyOrder(records: readonly unknown[]): readonly string[] 
       cost.set(key, Math.max(cost.get(key) ?? 0, serialized.length));
     }
   }
-  // Spread dominates, then CHEAPEST first. Information alone is not enough: on
-  // the live calendar payload ten keys tied at maximum spread and an
-  // alphabetical tiebreak put `attendees` (3,213 bytes) second, where it
-  // consumed the whole record budget and pushed `subject` (44 bytes) into the
-  // shared tail — the same failure in a new order. Cost is the max across
-  // siblings, so a key that is huge in any one record is treated as expensive.
+  // Spread dominates, then CHEAPEST first. Information alone is not enough:
+  // when many keys tie at maximum spread, an arbitrary tiebreak can put a huge
+  // key early, where it consumes the whole record budget and pushes a short
+  // informative key into the shared tail. Cost is the max across siblings, so
+  // a key that is huge in any one record is treated as expensive.
   //
-  // Spread is necessary but not sufficient. Live 2026-09-22, source 278624,
-  // "whats on my calendar tomorrow": `@odata.etag` differs on every record and
-  // is cheap, so it ranked first and every record arrived as an etag plus at
-  // most a subject — `start` and `end` were among 174 omitted keys, and the
-  // brain re-called the provider three times to learn the start times. A value
+  // Spread is necessary but not sufficient. A cheap version tag differs on
+  // every record, so ranking by spread alone puts it first and pushes the
+  // fields the reader needs out of every record. A value
   // that is an opaque token (a version tag, a hash, a base64 blob, a GUID)
   // varies on every record BECAUSE it is opaque; that variation is not
   // information a reader can use. Such keys keep their place only after every
@@ -557,9 +549,9 @@ export function compactStructuredJsonToolOutput(
 
 /**
  * One-line-per-key shape outline of a JSON value — the MAP a model needs to
- * write a query that lands on the first try (2026-07-31 calendar-run audit: a
- * no-match projection answered "{}" with no shape, so the model gave up on
- * querying and recalled the full 26KB payload). Pure, bounded, no content.
+ * write a query that lands on the first try; a no-match projection answered
+ * with no shape sends the model to recall the whole payload instead. Pure,
+ * bounded, no content.
  */
 export function describeJsonShape(value: unknown, maxLines = 12): string {
   if (Array.isArray(value)) {
@@ -606,10 +598,9 @@ function recoveryHint(callId: string | null | undefined, sampleFields?: string[]
   // The full result is parked losslessly under this call_id — these two
   // readers are available to you RIGHT NOW. Spell that out so the model
   // pulls the data instead of declaring it unavailable / still pending /
-  // "the reader isn't exposed" (observed live, 2026-06-01). The examples are
-  // literal valid-JSON inputs (toolCallHint) — the model copies hint syntax
-  // verbatim, so a pseudo-signature here becomes an unparseable tool call
-  // (observed live, 2026-08-05).
+  // "the reader isn't exposed". The examples are literal valid-JSON inputs
+  // (toolCallHint) — the model copies hint syntax verbatim, so a
+  // pseudo-signature here becomes an unparseable tool call.
   const queryArgs: Record<string, unknown> = { call_id: callId };
   if (sampleFields && sampleFields.length > 0) queryArgs.fields = sampleFields.slice(0, 3);
   queryArgs.limit = 50;
@@ -656,7 +647,7 @@ function digestArray(arr: unknown[], totalChars: number, maxChars: number, toolN
   const body = JSON.stringify(shown, null, 1);
   // Field list rendered as a JSON array — the model lifts this list verbatim
   // into `fields:`, so it must already be the exact syntax the tool accepts
-  // (a bare comma list here became `"fields": subject,start,…` live 2026-08-05).
+  // (a bare comma list is copied as an invalid `"fields": a,b` argument).
   const fieldList = fields.length ? ` Fields: ${JSON.stringify(fields.slice(0, 24))}${fields.length > 24 ? ' (+more)' : ''}.` : '';
   const footer =
     `\n[digest: ${toolName} returned a JSON array of ${total} record${total === 1 ? '' : 's'} (~${totalChars.toLocaleString()} chars). ` +
@@ -703,7 +694,7 @@ function renderValue(v: unknown, budget: number, depth: number): string {
     // depth 4) reaches context instead of forcing a shell-dig of the on-disk
     // result. Compaction-safe: the clip is length-capped AND rides the caller's
     // `budget`, and the parent digest still caps the TOTAL — so a huge read never
-    // balloons, it just shows useful text within the same size (2026-07-09).
+    // balloons, it just shows useful text within the same size.
     for (const ck of ['content', 'text', 'body', 'message', 'snippet', 'value', 'plainText', 'bodyPreview']) {
       const leaf = obj[ck];
       if (typeof leaf === 'string' && leaf.trim()) {
@@ -756,11 +747,10 @@ function digestObject(obj: Record<string, unknown>, totalChars: number, maxChars
   const domFields = resolved ? collectFields(resolved.rows) : [];
   // Name WHERE the records live and their fields, and say the query engine
   // operates on them directly — so the first tool_output_query is written
-  // against known shape instead of a guessed top-level projection (the
-  // 2026-07-31 calendar run paid 3 extra calls + a 26KB replay for that guess).
+  // against known shape instead of a guessed top-level projection, which costs
+  // extra calls and a replay of the payload.
   // Field list as a JSON array — the model lifts it verbatim into `fields:`,
-  // so it must already be the exact accepted syntax (same fix as digestArray;
-  // a bare comma list here became `"fields": subject,start,…` live 2026-08-05).
+  // so it must already be the exact accepted syntax (as in digestArray).
   const domNote = resolved
     ? ` Contains ${resolved.rows.length} record(s) at ${resolved.path ? `${resolved.path}[*]` : '[*]'}` +
       `${domFields.length ? ` with fields: ${JSON.stringify(domFields.slice(0, 16))}${domFields.length > 16 ? ' (+more)' : ''}` : ''}` +

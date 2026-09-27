@@ -10,13 +10,9 @@
  *   recall-tools.ts (output is plain text)
  *     "It is text, not structured data — use recall_tool_result to read it."
  *
- * Both are individually well-reasoned, and each carries a comment explaining
- * the live incident it was written for. Together they are a closed loop, and a
- * model that obeys either one lands back where it started. Live 2026-09-07
- * source 146537 — the owner's Platform 49 Sheet-cleanup Plan — burned its turn
- * inside that cycle and never published a plan. The same shape had already been
- * fixed once on 2026-09-02 ("19 recalls, zero business calls, a governor stop,
- * and the sheet never touched"); pointing one tool at another simply moved it.
+ * Each is individually reasonable. Together they are a closed loop: a model
+ * that obeys either one lands back where it started and spends its turn
+ * inside that cycle. Pointing one reader at another only moves the loop.
  *
  * The durable form is not a better sentence. It is a single function that
  * answers "what can actually read this output right now?" from the output's

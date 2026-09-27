@@ -1,6 +1,6 @@
 /**
  * Tolerant JSON extraction for structured output from OpenAI-compatible
- * backends (MiniMax/DeepSeek/…). Those models often wrap a JSON answer in
+ * backends. Those models often wrap a JSON answer in
  * ```fences``` or surround it with prose even when asked for json_object,
  * which makes the SDK's downstream `JSON.parse` fail the whole run.
  *
@@ -30,7 +30,7 @@ export function extractJsonCandidate(raw: string): string | null {
   let s = raw.trim();
   if (!s) return null;
 
-  // Reasoning models (e.g. MiniMax M3) emit inline <think>…</think> blocks
+  // Reasoning models can emit inline <think>…</think> blocks
   // before the JSON — and the reasoning frequently RESTATES the schema, braces
   // and all, which would derail the balanced-brace scan into the thinking
   // instead of the real answer. Strip think blocks first.
@@ -167,8 +167,8 @@ export function repairToParseableJson(raw: string): { text: string; repaired: bo
  * Conservative top-level shape check for a structured response whose JSON Schema
  * was downgraded (json_schema → json_object, or dropped entirely when tools are
  * in scope) for an OpenAI-compatible backend — where the schema is no longer
- * WIRE-enforced. A compat backend (Together / DeepSeek / MiniMax / OpenRouter /
- * GLM / …) can then return clean, *parseable* JSON of the WRONG shape, which
+ * WIRE-enforced. A compatible backend can then return clean, *parseable* JSON
+ * of the WRONG shape, which
  * passes the parse-only repair but fails the SDK's downstream Zod validation —
  * forcing an expensive full re-turn. This catches the common cases at the model-
  * call layer so a single cheap re-ask can fix them.
