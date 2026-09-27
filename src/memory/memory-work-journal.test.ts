@@ -124,6 +124,19 @@ test('model calls inside a job carry its channel and the memory role, even insid
   assert.equal((standing?.payload as { role?: string }).role, 'reviewer', 'the checker jobs keep their own role');
 });
 
+test('a job\'s scope names whose thinking it is, so a route recorded as the brain\'s still books the job\'s role', async () => {
+  // A check can reach the checker through a route recorded as the brain's.
+  // That route opens no reviewer scope of its own and keeps an inherited
+  // role, so the job's scope has to name it.
+  const scopeRole = (job: 'verify' | 'standing' | 'reconcile' | 'index' | 'tidy') => runMemoryJob(job, {},
+    async () => modelUsageAttributionStorage.getStore()?.role, () => ({ outcome: 'nothing_new' }));
+  assert.equal(await scopeRole('verify'), 'reviewer');
+  assert.equal(await scopeRole('standing'), 'reviewer');
+  assert.equal(await scopeRole('reconcile'), 'memory');
+  assert.equal(await scopeRole('index'), undefined, 'the local index names no model role');
+  assert.equal(await scopeRole('tidy'), undefined);
+});
+
 /** A routed call the way an adapter makes one: the route wrapper records the
  *  decision, the adapter records its usage. */
 function routedCall(source: 'explicit' | 'fallback', model: string) {

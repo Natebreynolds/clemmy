@@ -44,6 +44,7 @@ const distiller = await import('./skill-distiller.js');
 const { evaluateLearningCandidate } = await import('./learning-receipt.js');
 const { reviewStandingMemory } = await import('./standing-memory-review.js');
 const { judgeMemoryFixCrossFamily } = await import('./self-heal.js');
+const { judgeCorrectionCrossFamily } = await import('./correction-detector.js');
 const conflictRetry = await import('./conflict-retry.js');
 const { _setEmbeddingProviderForTest } = await import('./embeddings.js');
 const { IDENTITY_FILE } = await import('./vault.js');
@@ -438,9 +439,24 @@ test('a repair check asks the independent checker and is recorded on its own lan
   assert.equal(event.payload.outcome, 'ok');
   assert.equal(event.payload.model?.modelId, judge.modelId);
   // The check's route is untouched (it asks for the checker by id through the
-  // shared router); the job scope still puts its call on the verify lane.
+  // shared router); the job scope still puts its call on the verify lane and
+  // books it as the checker's work, not the brain's.
   const [call] = callEvents(judge.modelId);
   assert.equal(call.channel, 'memory:verify');
+  assert.equal(call.role, 'reviewer', 'the checker keeps its own role');
+
+  // A correction check is the same job on the same checker.
+  telemetry.resetOperationalTelemetryForTest();
+  const correction = await judgeCorrectionCrossFamily({
+    priorAnswer: 'The launch is in August.',
+    correction: 'No, it moved to September.',
+    targetFacts: [{ id: '7', content: 'The launch is in August' }],
+  });
+  assert.equal(correction.verdict, 'approve');
+  const [correctionCall] = callEvents(judge.modelId);
+  assert.equal(correctionCall.channel, 'memory:verify');
+  assert.equal(correctionCall.role, 'reviewer');
+  assert.equal(memoryEvents('verify').length, 1);
 
   // With no model independent of the fast tier bound, the check makes no call.
   telemetry.resetOperationalTelemetryForTest();

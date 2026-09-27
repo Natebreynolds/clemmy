@@ -26,7 +26,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import { memoryJobChannel, memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
+import { memoryJobChannel, type MemoryJobId } from './memory-jobs.js';
 import type {
   MemoryModelProblem,
   MemoryWorkOutcome,
@@ -41,6 +41,7 @@ import {
   type OperationalEventType,
 } from '../runtime/operational-telemetry.js';
 import {
+  usageRoleFromChannel,
   withModelUsageAttribution,
   withModelUsageObserver,
   type ModelUsageAttributionContext,
@@ -143,7 +144,8 @@ let nextRetentionSweepMs: number | null = null;
 /**
  * Run one memory job: listed as running while `work` runs, its model calls
  * attributed to `memory:<job>` (role `memory` for jobs the memory model
- * governs) and observed, then one event recorded from `summarize`.
+ * governs, `reviewer` for the checker's) and observed, then one event
+ * recorded from `summarize`.
  *
  * Tokens are never charged to the conversation the job learns from: the
  * scope names no session and no user turn, so no run budget accrues and no
@@ -281,13 +283,19 @@ function runningEntry(job: MemoryJobId, startedAt: string, opts: MemoryJobRunOpt
 
 /** No session and no user turn: background work that belongs to no
  *  conversation. The ledger books it by channel; nothing keyed by session
- *  (a run budget, a brain pin) can attach to it. */
+ *  (a run budget, a brain pin) can attach to it. The scope names the role of
+ *  whoever does the job's thinking (the memory model's jobs `memory`, the
+ *  checker's `reviewer`), so a call that reaches its model through a route
+ *  recorded as the brain's (a check that asks for the checker by id) is
+ *  still booked as the job's. */
 function memoryJobAttribution(job: MemoryJobId): ModelUsageAttributionContext {
+  const channel = memoryJobChannel(job);
+  const role = usageRoleFromChannel(channel);
   return {
     sessionId: '',
     sourceUserSeq: 0,
-    channel: memoryJobChannel(job),
-    ...(memoryJobUsesMemoryModel(job) ? { role: 'memory' as const } : {}),
+    channel,
+    ...(role ? { role } : {}),
   };
 }
 
