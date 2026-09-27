@@ -210,6 +210,42 @@ test('an exit hands the label to the caller that continues, when that caller is 
   assert.equal(getDaemonRuntimePhase().name, 'daemon.loop.tick');
 });
 
+test('a timer phase started outside any phase hands back a label dated from its exit, not from the start of the pass', async () => {
+  const tick = setDaemonRuntimePhase('daemon.loop.tick', { tickCount: 12 });
+  // An independent timer lane, started outside any phase (like the runner's
+  // setInterval lanes). It enters and leaves its phase while a later
+  // sub-phase of the pass awaits.
+  const laneGate = deferred();
+  const timerLane = (async () => {
+    await laneGate.promise;
+    await withDaemonRuntimePhase('daemon.timer.background_tasks', {}, async () => { await delay(1); });
+  })();
+  // An earlier sub-phase of the same pass awaits a while, so the pass is
+  // older than the sub-phase that follows it.
+  await withDaemonRuntimePhase('daemon.loop.cron_schedules', {}, () => delay(20));
+  let label: ReturnType<typeof getDaemonRuntimePhase> | undefined;
+  let subPhase: ReturnType<typeof getDaemonRuntimePhase> | undefined;
+  let afterResume = '';
+  await withDaemonRuntimePhase('daemon.loop.memory_maintenance', {}, async () => {
+    laneGate.release();
+    await timerLane; // stands in for the awaited backup: another lane ran meanwhile
+    const now = Date.now();
+    label = getDaemonRuntimePhase(now);
+    subPhase = listInFlightDaemonPhases(now).find((phase) => phase.name === 'daemon.loop.memory_maintenance');
+    resumeDaemonRuntimePhase();
+    afterResume = getDaemonRuntimePhase().name;
+  });
+  assert.ok(label && subPhase);
+  assert.equal(label!.name, tick.name, 'without a resume the label is the loop\'s own');
+  assert.equal(label!.sequence, tick.sequence);
+  assert.ok(
+    Date.parse(label!.startedAt) >= Date.parse(subPhase!.startedAt),
+    `the label is dated from the timer phase's exit (${label!.startedAt}), not from the start of the pass (${tick.startedAt})`,
+  );
+  assert.ok(label!.activeMs <= subPhase!.activeMs, 'so its age is at most the running sub-phase\'s');
+  assert.equal(afterResume, 'daemon.loop.memory_maintenance', 'a resume names the sub-phase');
+});
+
 test('listInFlightDaemonPhases is exactly the set of entered, unfinished phases', async () => {
   setDaemonRuntimePhase('daemon.loop.tick', { tickCount: 10 });
   const release = [deferred(), deferred(), deferred()];

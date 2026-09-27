@@ -20,12 +20,25 @@ const MAX_POSTED_IN_FLIGHT = 32;
 
 /**
  * Shared stamps, written by the main thread with plain stores:
- *   [0] ms timestamp of the main thread's last stamp
+ *   [0] ms timestamp (wall clock) of the main thread's last stamp
  *   [1] ms timestamp the running phase began
  *   [2] the running phase's sequence
  *   [3] 1 while any metered phase is in flight, else 0
+ *   [4] the same last stamp on the process's monotonic clock (ms)
+ *
+ * Stretches are measured on [4]. The monotonic clock is the one timers run
+ * on, and it does not advance while the machine sleeps, so the time a
+ * laptop spent asleep never reads as the main thread holding the loop.
+ * [0] stays for display (`mainStampAt`).
  */
-export const LIVENESS_STAMP_SLOTS = 4;
+export const LIVENESS_STAMP_SLOTS = 5;
+
+/** Milliseconds on the process's monotonic clock: the same clock in every
+ *  thread of the process (liveness.worker.ts reads it the same way). */
+export function livenessMonotonicMs(): number {
+  const [seconds, nanoseconds] = process.hrtime();
+  return seconds * 1_000 + nanoseconds / 1_000_000;
+}
 
 /** What phase.ts hands the beacon. Only these fields are ever posted. */
 export interface LivenessPhase {
@@ -74,11 +87,16 @@ function pick(phase: LivenessPhase): LivenessPhase {
  * fresh while the same phase awaits the network, so the stamp's age is the
  * main thread's real stretch and never just "nobody stamped lately".
  */
+function stampMainThread(view: Float64Array): void {
+  view[0] = Date.now();
+  view[4] = livenessMonotonicMs();
+}
+
 function syncMeteredTicker(metered: boolean): void {
   if (!stamps) return;
   stamps[3] = metered ? 1 : 0;
   if (metered && !meteredTicker) {
-    meteredTicker = setInterval(() => { if (stamps) stamps[0] = Date.now(); }, METERED_SAMPLE_MS);
+    meteredTicker = setInterval(() => { if (stamps) stampMainThread(stamps); }, METERED_SAMPLE_MS);
     meteredTicker.unref?.();
   } else if (!metered && meteredTicker) {
     clearInterval(meteredTicker);
@@ -100,7 +118,7 @@ export function stampLiveness(
   listInFlight?: () => readonly LivenessPhase[],
 ): void {
   if (!stamps) return;
-  stamps[0] = Date.now();
+  stampMainThread(stamps);
   if (!running) return;
   stamps[1] = running.startedAtMs;
   stamps[2] = running.sequence;
@@ -129,7 +147,7 @@ export function startLivenessBeacon(): void {
   try {
     const buffer = new SharedArrayBuffer(LIVENESS_STAMP_SLOTS * Float64Array.BYTES_PER_ELEMENT);
     const view = new Float64Array(buffer);
-    view[0] = Date.now();
+    stampMainThread(view);
     view[1] = Date.now();
     const { url, execArgv } = workerEntry();
     const spawned = new Worker(url, {

@@ -47,6 +47,8 @@ let phaseSequence = 0;
  * Every entered, unfinished phase is in `inFlight`, and the code a phase runs
  * carries that phase in `context`, so an exit hands the label to the caller
  * that actually continues, never back to a phase that has already ended.
+ * When that caller is the loop's own code (no phase in flight), the ambient
+ * label is dated from that known point (see ownerAtKnownPoint).
  */
 let ambientPhase: StoredDaemonRuntimePhase = {
   name: 'daemon.boot',
@@ -106,13 +108,29 @@ function listStoredInFlight(): StoredDaemonRuntimePhase[] {
   return [...inFlight.values()];
 }
 
-/** The nearest phase that is still in flight, starting from `phase` and
- *  walking to the phases that entered it; the ambient label when none is. */
-function nearestInFlight(phase: StoredDaemonRuntimePhase | undefined): StoredDaemonRuntimePhase {
+/**
+ * The phase that owns code continuing at a known point (a phase exit or a
+ * resume): the nearest phase still in flight, starting from `phase` and
+ * walking to the phases that entered it.
+ *
+ * With none in flight, the code is the loop's own, and it began HERE, not
+ * when the loop pass began. The ambient label is handed out dated from
+ * `nowMs`, so `activeMs` measures the code that is really running and never
+ * the age of the whole pass (which can include a long awaited sub-phase).
+ * Same name and sequence as the ambient label: the beacon learns the new
+ * start from its stamp and posts nothing extra.
+ */
+function ownerAtKnownPoint(phase: StoredDaemonRuntimePhase | undefined, nowMs: number): StoredDaemonRuntimePhase {
   for (let cursor = phase; cursor; cursor = cursor.parent) {
     if (inFlight.has(cursor.sequence)) return cursor;
   }
-  return ambientPhase;
+  return {
+    name: ambientPhase.name,
+    detail: ambientPhase.detail,
+    startedAt: new Date(nowMs).toISOString(),
+    startedAtMs: nowMs,
+    sequence: ambientPhase.sequence,
+  };
 }
 
 /** Tell the beacon where the main thread is: a few float stores, plus one post
@@ -179,7 +197,7 @@ export async function withDaemonRuntimePhase<T>(
     // fn, so the store here is the caller's phase (if any). Never hand the
     // label back to a phase that has already ended.
     const before = runningPhase;
-    runningPhase = nearestInFlight(context.getStore());
+    runningPhase = ownerAtKnownPoint(context.getStore(), Date.now());
     if (ipc && runningPhase.sequence !== before.sequence) sendSupervisorIpcHeartbeat('phase_restore');
     else stampBeacon();
   }
@@ -192,7 +210,7 @@ export async function withDaemonRuntimePhase<T>(
  * exact for it. Sends no IPC, so it is cheap enough to call on every slice.
  */
 export function resumeDaemonRuntimePhase(): void {
-  runningPhase = nearestInFlight(context.getStore());
+  runningPhase = ownerAtKnownPoint(context.getStore(), Date.now());
   stampBeacon();
 }
 

@@ -45,16 +45,40 @@ const STALL_JOURNAL_TRIM_SLACK = 50;
 
 /** Stamps written by the main thread with plain stores (see
  *  LIVENESS_STAMP_SLOTS in liveness-beacon.ts):
- *    [0] ms timestamp of the main thread's last stamp
+ *    [0] ms timestamp (wall clock) of the main thread's last stamp
  *    [1] ms timestamp the running phase began
  *    [2] the running phase's sequence
  *    [3] 1 while a metered phase is in flight
+ *    [4] the same last stamp on the process's monotonic clock (ms)
  *  No lock: a torn read is impossible for aligned float64, and a stale read is
  *  harmless (it only ever under-reports freshness, which fails safe toward
  *  keeping the daemon alive... and the supervisor's own ceiling still bounds a
  *  true freeze). */
 const { file, stamps, intervalMs, sampleMs = 20, pid } = workerData as BeaconWorkerData;
 const view = new Float64Array(stamps);
+
+/**
+ * The process's monotonic clock, read exactly as livenessMonotonicMs in
+ * liveness-beacon.ts does (a worker cannot import that module from source).
+ * Every thread of the process reads the same clock, and it does not advance
+ * while the machine sleeps. Stretches are measured on it, so after a wake,
+ * whichever thread runs first, the hours asleep are never a stall.
+ */
+function monotonicMs(): number {
+  const [seconds, nanoseconds] = process.hrtime();
+  return seconds * 1_000 + nanoseconds / 1_000_000;
+}
+
+/** The main thread's last stamp and how long ago it was, in awake time.
+ *  Falls back to the wall clock only if the monotonic slot was never set. */
+function readMainStamp(now: number): { wallAt: number; at: number; ageMs: number } | null {
+  const wallAt = view[0] || 0;
+  if (!wallAt) return null;
+  const monoAt = view.length > 4 ? view[4] || 0 : 0;
+  if (monoAt) return { wallAt, at: monoAt, ageMs: Math.max(0, monotonicMs() - monoAt) };
+  return { wallAt, at: wallAt, ageMs: Math.max(0, now - wallAt) };
+}
+
 const stallFile = path.join(path.dirname(file), 'daemon-stalls.jsonl');
 
 let running: LivenessPhase = { name: 'daemon.boot', startedAtMs: 0, sequence: 0 };
@@ -67,8 +91,10 @@ let windowMaxAgeMs = 0;
 let sampler: NodeJS.Timeout | null = null;
 
 interface OpenStall {
-  /** The main thread's last stamp before the stretch. */
+  /** The main thread's last stamp before the stretch (monotonic ms). */
   stampAt: number;
+  /** The same stamp on the wall clock, for the record. */
+  wallStampAt: number;
   thresholdMs: number;
   metered: boolean;
   maxAgeMs: number;
@@ -145,11 +171,13 @@ function appendStallLine(record: Record<string, unknown>): void {
  * Read the main thread's stamp once. Tracks the longest age for the current
  * beat window and opens/closes a stall record. A stall closes as soon as the
  * main thread stamps again; its duration is the gap between the two stamps.
+ * Ages and durations are awake time (the monotonic stamp), so a machine that
+ * slept since the last stamp opens no stall, whichever thread wakes first.
  */
 function sample(now = Date.now()): void {
-  const stampAt = view[0] || 0;
-  if (!stampAt) return;
-  const ageMs = Math.max(0, now - stampAt);
+  const stamp = readMainStamp(now);
+  if (!stamp) return;
+  const { at: stampAt, ageMs } = stamp;
   if (ageMs > windowMaxAgeMs) windowMaxAgeMs = ageMs;
 
   if (openStall) {
@@ -160,7 +188,7 @@ function sample(now = Date.now()): void {
         event: 'end',
         at: new Date(now).toISOString(),
         pid,
-        since: iso(openStall.stampAt),
+        since: iso(openStall.wallStampAt),
         durationMs,
         maxAgeMs: Math.max(openStall.maxAgeMs, durationMs),
         thresholdMs: openStall.thresholdMs,
@@ -180,6 +208,7 @@ function sample(now = Date.now()): void {
   if (ageMs < thresholdMs) return;
   openStall = {
     stampAt,
+    wallStampAt: stamp.wallAt,
     thresholdMs,
     metered,
     maxAgeMs: ageMs,
@@ -190,7 +219,7 @@ function sample(now = Date.now()): void {
     event: 'start',
     at: new Date(now).toISOString(),
     pid,
-    since: iso(stampAt),
+    since: iso(stamp.wallAt),
     ageMs,
     thresholdMs,
     metered,
@@ -215,15 +244,16 @@ function beat(): void {
   const now = Date.now();
   sample(now);
   syncSampler();
-  const mainStampAt = view[0] || 0;
+  const mainStamp = readMainStamp(now);
   const payload = JSON.stringify({
     at: new Date(now).toISOString(),
     pid,
     // Proof the PROCESS is alive even when its main loop is not.
     beaconUptimeMs: now - startedAt,
-    // Proof of whether the main loop is making progress.
-    mainStampAt: mainStampAt ? new Date(mainStampAt).toISOString() : null,
-    mainStampAgeMs: mainStampAt ? Math.max(0, now - mainStampAt) : null,
+    // Proof of whether the main loop is making progress. The age is awake
+    // time: a machine asleep since the last stamp does not age it.
+    mainStampAt: mainStamp ? new Date(mainStamp.wallAt).toISOString() : null,
+    mainStampAgeMs: mainStamp ? mainStamp.ageMs : null,
     // The longest stretch seen in this beat window. While metered it is sampled
     // every few milliseconds; otherwise it is this beat's own reading.
     maxMainStampAgeMs: windowMaxAgeMs,

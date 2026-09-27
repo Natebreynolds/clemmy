@@ -7,6 +7,7 @@ import {
   readLivenessBeacon,
   shouldDeferHungRestartForLivenessBeacon,
 } from '../../apps/desktop/src/daemon-supervisor.js';
+import { LIVENESS_STAMP_SLOTS, livenessMonotonicMs } from './liveness-beacon.js';
 
 // 2026-09-10, during a Zoom call: the daemon blocked in
 // daemon.loop.memory_maintenance on a CPU-starved machine. HTTP stopped
@@ -162,12 +163,25 @@ function readLines(file: string): Array<Record<string, unknown>> {
   }
 }
 
+/** Stamp as the main thread does, on both clocks, `agoMs` in the past. */
+function stampMain(view: Float64Array, agoMs = 0): void {
+  view[0] = Date.now() - agoMs;
+  view[4] = livenessMonotonicMs() - agoMs;
+}
+
+/** A live main thread: re-stamps every 10 ms until the returned stop is called. */
+function keepStamping(view: Float64Array): () => void {
+  stampMain(view);
+  const timer = setInterval(() => stampMain(view), 10);
+  return () => clearInterval(timer);
+}
+
 async function startBeaconWorker(dir: string, intervalMs = 50) {
   const { Worker } = await import('node:worker_threads');
   const file = path.join(dir, 'daemon-liveness.json');
-  const buffer = new SharedArrayBuffer(4 * Float64Array.BYTES_PER_ELEMENT);
+  const buffer = new SharedArrayBuffer(LIVENESS_STAMP_SLOTS * Float64Array.BYTES_PER_ELEMENT);
   const view = new Float64Array(buffer);
-  view[0] = Date.now();
+  stampMain(view);
   view[1] = Date.now();
   const worker = new Worker(new URL('./liveness.worker.ts', import.meta.url), {
     workerData: { file, stamps: buffer, intervalMs, sampleMs: 20, pid: 4242 },
@@ -179,6 +193,7 @@ async function startBeaconWorker(dir: string, intervalMs = 50) {
 test('while a metered phase runs, a stale stamp is measured and journalled with the in-flight set', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'clem-beacon-metered-'));
   const { worker, view, file, stalls } = await startBeaconWorker(dir);
+  const stopStamping = keepStamping(view);
   try {
     const now = Date.now();
     worker.postMessage({
@@ -196,7 +211,8 @@ test('while a metered phase runs, a stale stamp is measured and journalled with 
     await waitFor(() => (readJson(file)?.phase as { name?: string } | undefined)?.name === 'daemon.nightly.link_sync', 'the worker to take the phase message');
     // Drive the stamp directly: the main thread last stamped 1.2 s ago and has
     // not stamped since. The stamp stays stale until the assertions have seen it.
-    view[0] = Date.now() - 1_200;
+    stopStamping();
+    stampMain(view, 1_200);
 
     const beacon = await waitFor(() => {
       const b = readJson(file);
@@ -215,15 +231,16 @@ test('while a metered phase runs, a stale stamp is measured and journalled with 
     assert.ok(Number(start.ageMs) >= 1_000);
 
     // The main thread comes back.
-    const staleStamp = view[0]!;
-    view[0] = Date.now();
+    const staleStamp = view[4]!;
+    stampMain(view);
     const end = await waitFor(() => readLines(stalls).find((line) => line.event === 'end'), 'a stall end line');
-    assert.equal(Number(end.durationMs), view[0]! - staleStamp);
+    assert.equal(Number(end.durationMs), view[4]! - staleStamp, 'the duration is the gap between the two stamps, in awake time');
     assert.ok(Number(end.durationMs) >= 1_200);
     assert.equal((end.phase as { name?: string }).name, 'daemon.nightly.link_sync', 'the end line names the phase that held the thread');
     assert.deepEqual((end.inFlight as Array<{ name: string }>).map((p) => p.name), ['daemon.loop.memory_maintenance', 'daemon.nightly.link_sync']);
     assert.equal(readLines(stalls).filter((line) => line.event === 'start').length, 1, 'one stretch, one record');
   } finally {
+    stopStamping();
     await worker.terminate();
   }
 });
@@ -231,6 +248,7 @@ test('while a metered phase runs, a stale stamp is measured and journalled with 
 test('outside a metered phase only a stretch past the long threshold is journalled', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'clem-beacon-unmetered-'));
   const { worker, view, file, stalls } = await startBeaconWorker(dir);
+  const stopStamping = keepStamping(view);
   try {
     worker.postMessage({
       running: { name: 'daemon.loop.cron_schedules', startedAtMs: Date.now(), sequence: 7 },
@@ -239,18 +257,52 @@ test('outside a metered phase only a stretch past the long threshold is journall
     });
     view[3] = 0;
     await waitFor(() => (readJson(file)?.phase as { name?: string } | undefined)?.name === 'daemon.loop.cron_schedules', 'the worker to take the phase message');
-    view[0] = Date.now() - 1_200;
+    stopStamping();
+    stampMain(view, 1_200);
     await waitFor(() => {
       const b = readJson(file);
       return b && typeof b.maxMainStampAgeMs === 'number' && b.maxMainStampAgeMs >= 1_200 ? b : null;
     }, 'a beat reporting the stale stamp');
     assert.deepEqual(readLines(stalls), [], 'a 1.2 s stretch outside metered work is not a stall');
 
-    view[0] = Date.now() - 10_500;
+    stampMain(view, 10_500);
     const start = await waitFor(() => readLines(stalls).find((line) => line.event === 'start'), 'a long-stall start line');
     assert.equal(start.metered, false);
     assert.equal(start.thresholdMs, 10_000);
   } finally {
+    stopStamping();
+    await worker.terminate();
+  }
+});
+
+test('a machine that slept is not a stall: stretches are measured in awake time', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'clem-beacon-sleep-'));
+  const { worker, view, file, stalls } = await startBeaconWorker(dir);
+  const stopStamping = keepStamping(view);
+  try {
+    worker.postMessage({
+      running: { name: 'daemon.loop.sleep', startedAtMs: Date.now(), sequence: 9 },
+      inFlight: [],
+      metered: false,
+    });
+    view[3] = 0;
+    await waitFor(() => (readJson(file)?.phase as { name?: string } | undefined)?.name === 'daemon.loop.sleep', 'the worker to take the phase message');
+    // Just after a wake, before the main thread has run: its last stamp is
+    // three hours old on the wall clock, but only moments old in awake time,
+    // because the monotonic clock stood still while the machine slept.
+    stopStamping();
+    const wallBeforeSleep = Date.now() - 3 * 60 * 60_000;
+    view[0] = wallBeforeSleep;
+    view[4] = livenessMonotonicMs();
+    const beacon = await waitFor(() => {
+      const b = readJson(file);
+      return b && b.mainStampAt === new Date(wallBeforeSleep).toISOString() ? b : null;
+    }, 'a beat that read the post-wake stamp');
+    assert.ok(Number(beacon.mainStampAgeMs) < 10_000, `the hours asleep are not main-thread time (age ${String(beacon.mainStampAgeMs)})`);
+    assert.ok(Number(beacon.maxMainStampAgeMs) < 10_000);
+    assert.deepEqual(readLines(stalls), [], 'no stall is journalled for the sleep');
+  } finally {
+    stopStamping();
     await worker.terminate();
   }
 });
@@ -280,6 +332,17 @@ test('the host posts a phase message only when the running phase or the in-fligh
     const beforeHttp = beacon._livenessBeaconPostCountForTest();
     await phase.withDaemonRuntimePhase('daemon.http', {}, async () => { await phase.yieldToEventLoop(); }, { ipc: false });
     assert.ok(beacon._livenessBeaconPostCountForTest() >= beforeHttp + 2, 'entry and exit of a request both change the in-flight set');
+
+    // The loop's own label, handed back when a request started outside any
+    // phase ends, is dated from that exit in the stamp the worker reads.
+    const tick = phase.setDaemonRuntimePhase('daemon.loop.tick', { tickCount: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const beforeRequest = Date.now();
+    await phase.withDaemonRuntimePhase('daemon.http', {}, async () => { await phase.yieldToEventLoop(); }, { ipc: false });
+    const stamps = beacon._livenessStampsForTest()!;
+    assert.equal(stamps[2], tick.sequence, 'the running label is the loop\'s own again');
+    assert.ok(stamps[1]! >= beforeRequest, 'dated from the request\'s exit, not from the start of the pass');
+    assert.ok(stamps[4]! > 0, 'the stamp is also written on the monotonic clock');
   } finally {
     beacon._stopLivenessBeaconForTest();
     if (previous === undefined) delete process.env.CLEMMY_LIVENESS_BEACON_FILE;

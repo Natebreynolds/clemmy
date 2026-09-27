@@ -7,6 +7,7 @@ import { getRuntimeEnv } from '../config.js';
 import { embedMissingChunks, embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { MEMORY_SCHEMA_VERSION, STATE_DIR, backupMemoryDb, openMemoryDb, reapStaleEpisodicPointers, purgeSoftDeletedFacts } from './db.js';
 import { backupMemoryDbAsync } from './memory-backup.js';
+import { resumeDaemonRuntimePhase } from '../daemon/phase.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
@@ -966,6 +967,9 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
           retain: MEMORY_BACKUP_RETAIN,
           localDayKey: today,
         });
+        // The synchronous nightly work below starts in this macrotask: name
+        // it for the beacon, not whatever last entered a phase meanwhile.
+        resumeDaemonRuntimePhase();
         if (result) {
           // Do not stamp the day before publication: a crash/failure must be
           // retried. A crash after atomic publication but before this write is
