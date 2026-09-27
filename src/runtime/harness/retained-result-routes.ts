@@ -31,7 +31,7 @@ import {
   getToolOutput,
   listToolOutputCallIds,
   resolveToolOutputForAuthority,
-  resolveToolOutputForQuery,
+  toolOutputIsDerivedReaderOutput,
 } from './eventlog.js';
 import { parseStoredToolOutputJson } from './json-repair.js';
 import { resolveRetainedOutputRead } from './retained-output-read.js';
@@ -114,10 +114,10 @@ export function retainedResultRoutes(
   }
 
   // file_query reads the same stored text and spends no recall budget, so it
-  // serves plain text with recall already exhausted. It applies the query
-  // authority check to the resolved id, so it is offered only for an id that
-  // check accepts; advertising a reader that will refuse is a dead end.
-  if (!excluded.has('file_query') && fileQueryCanRead(input.sessionId, readId, receipt)) {
+  // serves plain text with recall already exhausted. It refuses a derived
+  // reader's own output that no lineage maps back to a producer, so such an id
+  // is never offered to it; advertising a reader that will refuse is a dead end.
+  if (!excluded.has('file_query') && !derivedWithoutLineage(input.sessionId, readId, receipt)) {
     routes.push({
       tool: 'file_query',
       call: `file_query {"call_id":"${readId}","query":"<what you need>"}`,
@@ -128,13 +128,13 @@ export function retainedResultRoutes(
   return routes;
 }
 
-function fileQueryCanRead(sessionId: string, readId: string, receipt: boolean): boolean {
+function derivedWithoutLineage(sessionId: string, readId: string, receipt: boolean): boolean {
   // A redeemed receipt is read under its own exact identity, as file_query does.
-  if (receipt) return true;
+  if (receipt) return false;
   try {
-    return resolveToolOutputForQuery(sessionId, readId).status === 'ok';
+    return toolOutputIsDerivedReaderOutput(sessionId, readId);
   } catch {
-    return false;
+    return true;
   }
 }
 

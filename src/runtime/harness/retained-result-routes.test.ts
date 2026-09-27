@@ -144,3 +144,18 @@ test('routes for a carrier-dispatched recall name the producer, never the recall
     assert.doesNotMatch(route.call, /toolu_recall_carried/);
   }
 });
+
+test('a result still inside its own open lifecycle is offered to file_query', () => {
+  // A digest footer is written while its call is still open (no return yet).
+  // file_query will read it once the call settles, so the router must not
+  // withhold it for that; only a derived reader's unmapped output is withheld.
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'open-lifecycle' });
+  eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_called', data: {
+    callId: 'toolu_open_text', tool: 'call_tool', effectiveTool: 'space_get_view', accounting: 'top_level',
+    arguments: JSON.stringify({ name: 'space_get_view', args_json: '{"slug":"notes"}' }),
+  } });
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_open_text', invocationNonce: 'nonce-open-text',
+    tool: 'space_get_view', output: 'A saved view of plain prose notes.' });
+  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_open_text' });
+  assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(routes));
+});
