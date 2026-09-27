@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { retainedResultRoutes, retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { z } from 'zod';
 import { getToolOutput, getToolOutputSlice, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
-import { harnessRunContextStorage, type HarnessRunContext } from '../runtime/harness/brackets.js';
+import { harnessRunContextStorage, RecallBudget, type HarnessRunContext } from '../runtime/harness/brackets.js';
 import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
 import {
   RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
@@ -90,8 +90,6 @@ export function recallSliceChars(requested: unknown, routedModelId?: string): nu
  * size or a projection: that page was asked for explicitly, so it may run
  * past one inline result. The marker tells the model how to narrow further. */
 const QUERY_MAX_CHARS = 50_000;
-/** A reply too small to hold a header and one record is not worth a round. */
-const QUERY_MIN_REPLY_CHARS = 1_000;
 
 /**
  * What one query reply may hold, in both units that bound it: characters for
@@ -167,8 +165,8 @@ function queryReplyBound(input: Record<string, unknown>, ctx: HarnessRunContext)
 
 /** The refusal when the turn's reading budget cannot hold even a minimal reply. */
 function queryBoundRefusal(bound: QueryReplyBound, ctx: HarnessRunContext, callId: string) {
-  if (Math.min(bound.chars, bound.bytes) >= QUERY_MIN_REPLY_CHARS) return null;
-  const refusal = ctx.recallBudget?.queryRefusal(QUERY_MIN_REPLY_CHARS, callId);
+  if (bound.chars >= RecallBudget.QUERY_MIN_REPLY_BYTES && (ctx.recallBudget?.canServeQuery() ?? true)) return null;
+  const refusal = ctx.recallBudget?.queryRefusal(RecallBudget.QUERY_MIN_REPLY_BYTES, callId);
   return refusal ? textResult(`ERROR: ${refusal}`) : null;
 }
 
@@ -426,7 +424,11 @@ function readRetainedTextSlice(
   // Which reader that is depends on the output's shape, so the one reader
   // router names it (a query for records, a passage search for text).
   const answerRoute = end < total && (total - end) > maxChars * 2
-    ? retainedResultRoutes({ sessionId: ctx.sessionId, callId, exclude: ['recall_tool_result'] })[0]
+    ? retainedResultRoutes({
+      sessionId: ctx.sessionId,
+      callId,
+      exclude: ctx.recallBudget?.refusedAfterRecall() ?? ['recall_tool_result'],
+    })[0]
     : undefined;
   const header = [
     `Recalled chars ${sliceStart}–${end} of ${total} (${row.contentBytes} total bytes)`,

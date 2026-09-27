@@ -51,10 +51,13 @@ let serial = 0;
 async function runHostTurn(input: {
   agentTool: unknown;
   toolName: string;
-  calls: Array<{ callId: string; args: Record<string, unknown> }>;
+  calls: Array<{ callId: string; args: Record<string, unknown>; tool?: string }>;
+  /** Further registered local tools the model may call by name. */
+  extraTools?: string[];
   routedModelId?: string;
   seed?: (sessionId: string) => void;
-  recallBudget?: InstanceType<typeof brackets.RecallBudget>;
+  recallBudget?: InstanceType<typeof brackets.RecallBudget>
+    | ((sessionId: string) => InstanceType<typeof brackets.RecallBudget>);
 }): Promise<{ results: Map<string, string>; sessionId: string }> {
   serial += 1;
   const session = events.createSession({ id: `sess-reader-budgets-${serial}`, kind: 'chat' });
@@ -75,14 +78,15 @@ async function runHostTurn(input: {
         responseId: `response-${requests.length}`,
         usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
         output: next
-          ? [{ type: 'function_call', callId: next.callId, name: input.toolName, arguments: JSON.stringify(next.args) }]
+          ? [{ type: 'function_call', callId: next.callId, name: next.tool ?? input.toolName, arguments: JSON.stringify(next.args) }]
           : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Read.' }] }],
       };
     },
   };
-  const agent = { model, tools: [input.agentTool] };
+  const tools = [input.agentTool, ...(input.extraTools ?? []).map(realLocalTool)];
+  const agent = { model, tools };
   const sealed = envelopes.sealAgentCapabilityUniverse({
-    sessionId: session.id, universeTools: [input.agentTool as never], activeToolNames: [input.toolName],
+    sessionId: session.id, universeTools: tools as never[], activeToolNames: [input.toolName, ...(input.extraTools ?? [])],
     policyHash: `reader-budgets-${serial}`,
     budget: { maxUncachedTokens: 100000, maxModelCalls: 6, maxToolCalls: 6, maxElapsedMs: 60000 },
   });
@@ -94,7 +98,9 @@ async function runHostTurn(input: {
   const outcome = await brackets.withHarnessRunContext({
     sessionId: session.id, sourceUserSeq: source.seq,
     counter: new brackets.ToolCallsCounter(6), behaviorScopeId: `${session.id}::turn:1`,
-    recallBudget: input.recallBudget ?? new brackets.RecallBudget(10, 500_000, session.id),
+    recallBudget: typeof input.recallBudget === 'function'
+      ? input.recallBudget(session.id)
+      : input.recallBudget ?? new brackets.RecallBudget(10, 500_000, session.id),
     ...(input.routedModelId ? { routedModelId: input.routedModelId } : {}),
   }, () => hostRunRunner(runner as never, agent as never, [{ role: 'user', content: text }] as never, {
     maxTurns: 6, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq },
@@ -326,4 +332,50 @@ test('a record larger than the whole reply is clipped inside the bound and still
   assert.match(shown, /…\[clipped to \d+ chars — narrow with fields/);
   assert.ok(shown.length <= inline, `within one inline result (got ${shown.length}, budget ${inline})`);
   assert.ok(shown.includes('Next: tool_output_query {"call_id":"parked-big","offset":1}'), 'the exact next query survives the clip');
+});
+
+test('a recall refused for bytes never routes to a query the same byte budget would refuse', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', seed: parkRows,
+    recallBudget: (sessionId) => new brackets.RecallBudget(10, 900, sessionId),
+    calls: [{ callId: 'recall-spent', args: { call_id: 'parked-rows' } }],
+  });
+  const shown = results.get('recall-spent') ?? '';
+  assert.match(shown, /^ERROR: recall byte budget exhausted/, shown.slice(0, 300));
+  assert.match(shown, /file_query \{"call_id":"parked-rows"/, shown);
+  assert.doesNotMatch(shown, /tool_output_query \{/, 'the query would refuse: fewer than one minimal reply of bytes remain');
+});
+
+test('a recall refused for calls with its bytes spent too never routes to the query either', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', seed: parkRows,
+    recallBudget: (sessionId) => new brackets.RecallBudget(1, 1_050, sessionId),
+    calls: [
+      { callId: 'recall-small', args: { call_id: 'parked-rows', max_chars: 100 } },
+      { callId: 'recall-over', args: { call_id: 'parked-rows', max_chars: 100 } },
+    ],
+  });
+  assert.match(results.get('recall-small') ?? '', /^Recalled chars 0–100/);
+  const shown = results.get('recall-over') ?? '';
+  assert.match(shown, /^ERROR: recall budget exhausted this turn \(max 1 calls\)/, shown.slice(0, 300));
+  assert.match(shown, /file_query \{"call_id":"parked-rows"/, shown);
+  assert.doesNotMatch(shown, /tool_output_query \{/, shown);
+});
+
+test('while a minimal query reply still fits, a recall refused for bytes names the query, and that query is served', async () => {
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', seed: parkRows,
+    extraTools: ['tool_output_query'],
+    recallBudget: (sessionId) => new brackets.RecallBudget(10, 2_000, sessionId),
+    calls: [
+      { callId: 'recall-too-big', args: { call_id: 'parked-rows' } },
+      { callId: 'named-query', tool: 'tool_output_query', args: { call_id: 'parked-rows' } },
+    ],
+  });
+  const refused = results.get('recall-too-big') ?? '';
+  assert.match(refused, /^ERROR: recall byte budget exhausted/, refused.slice(0, 300));
+  assert.ok(refused.includes('tool_output_query {"call_id":"parked-rows"}'), refused);
+  const served = results.get('named-query') ?? '';
+  assert.match(served, /^Showing 1 record\(s\) \[0–1\] of 60 matching/, served.slice(0, 300));
+  assert.ok(Buffer.byteLength(served, 'utf8') <= 2_000, `within the bytes left (${Buffer.byteLength(served, 'utf8')})`);
 });

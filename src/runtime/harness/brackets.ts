@@ -1164,19 +1164,37 @@ export class RecallBudget {
    */
   consume(returnBytes: number, callId?: string): string | null {
     if (this.calls + 1 > this.maxCalls) {
-      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId, ['recall_tool_result'])}`;
+      return `recall budget exhausted this turn (max ${this.maxCalls} calls). ${this.wayThrough(callId, this.refusedAfterRecall())}`;
     }
     if (this.bytes + returnBytes > this.maxBytes) {
-      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId, ['recall_tool_result'])}`;
+      return `recall byte budget exhausted this turn (max ${this.maxBytes} bytes; would push to ${this.bytes + returnBytes}). ${this.wayThrough(callId, this.refusedAfterRecall())}`;
     }
     this.calls += 1;
     this.bytes += returnBytes;
     return null;
   }
 
+  /** The smallest query reply worth a round: a header and one record. */
+  static readonly QUERY_MIN_REPLY_BYTES = 1_000;
+
   /** Bytes a reader reply may still put into the prompt this turn. */
   remainingBytes(): number {
     return Math.max(0, this.maxBytes - this.bytes);
+  }
+
+  /**
+   * Whether a query reply can still be served this turn. A query spends the
+   * same bytes as recall, so a refusal may name it only while at least one
+   * minimal reply still fits.
+   */
+  canServeQuery(): boolean {
+    return this.remainingBytes() >= RecallBudget.QUERY_MIN_REPLY_BYTES;
+  }
+
+  /** Readers a recall refusal must not name: recall itself, and the query
+   * once the bytes left cannot hold a minimal query reply. */
+  refusedAfterRecall(): string[] {
+    return this.canServeQuery() ? ['recall_tool_result'] : ['recall_tool_result', 'tool_output_query'];
   }
 
   /**
