@@ -27,12 +27,13 @@ import os from 'node:os';
 import { Agent, Runner } from '@openai/agents';
 import { z } from 'zod';
 import pino from 'pino';
-import { BASE_DIR, DEFAULT_CODEX_FAST_MODEL, MODELS } from '../config.js';
+import { BASE_DIR } from '../config.js';
 import { embedMissingFacts, isEmbeddingsEnabled } from './embeddings.js';
 import { deleteFact } from './facts.js';
 import type { ConsolidatedFactKind } from './db.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { consolidateFact } from './reflection.js';
+import { resolveMemoryModelRoute } from './memory-model-route.js';
 import { recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 
 const logger = pino({ name: 'clementine-next.memory.import' });
@@ -298,10 +299,18 @@ export function _testOnly_sanitizeDistillerOutput(value: unknown): DistilledImpo
 }
 
 async function distillFile(text: string, filePath: string): Promise<DistilledImportFact[] | null> {
+  // The "Keeps your memory" route: the owner's pick, or today's fast-tier
+  // model string when automatic. A pick that cannot be served falls back to
+  // the model-free harvest, like any distiller failure; nothing stands in.
+  const route = resolveMemoryModelRoute('import');
+  if (!route) {
+    logger.warn({ file: filePath }, 'memory-import distiller skipped — the memory model is unavailable; using the deterministic harvest');
+    return null;
+  }
   try {
     const agent = new Agent({
       name: 'Memory Import Distiller',
-      model: MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL,
+      model: route.model,
       instructions: DISTILL_INSTRUCTIONS,
     });
     const runner = new Runner({ workflowName: 'clementine-memory-import' });

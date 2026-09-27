@@ -28,7 +28,9 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 import { Agent, Runner } from '@openai/agents';
-import { BASE_DIR, getRuntimeEnv, MODELS } from '../config.js';
+import type { Model } from '@openai/agents-core';
+import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { resolveMemoryModelRoute } from './memory-model-route.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { addNotification, markNotificationRead } from '../runtime/notifications.js';
 import { IDENTITY_FILE, SOUL_FILE, composeCuratedMemory, sanitizeCuratedMemory, splitCuratedMemory } from './vault.js';
@@ -134,13 +136,15 @@ export function setIdentityDistillerForTest(fn: IdentityDistillerFn | null): voi
   distillerOverrideForTest = fn;
 }
 
-function buildDistillerAgent(target: IdentityProposalTarget): Agent<unknown> {
+/** The distiller runs on the "Keeps your memory" route (the owner's pick, or
+ *  today's fast-tier model string when automatic). */
+function buildDistillerAgent(target: IdentityProposalTarget, model: Model | string): Agent<unknown> {
   const scope = target === 'identity'
     ? 'the Identity section: who Clementine is to this user and what their working relationship has become'
     : 'the Soul section: how Clementine communicates — tone, reply shape, initiative';
   return new Agent({
     name: 'IdentityEvolutionDistiller',
-    model: MODELS.fast,
+    model,
     modelSettings: { reasoning: { effort: 'low' } },
     instructions: [
       `You revise ${scope}. You receive the CURRENT curated text and a list of durable facts the user has confirmed over time.`,
@@ -169,8 +173,9 @@ function parseDistillerOutput(value: unknown): IdentityDistillerOutput | null {
   return { proposedText: proposedText.trim(), rationale: rationale.replace(/\s+/g, ' ').trim() };
 }
 
-async function runDistiller(input: IdentityDistillerInput): Promise<IdentityDistillerOutput | null> {
+async function runDistiller(input: IdentityDistillerInput, model: Model | string | null): Promise<IdentityDistillerOutput | null> {
   if (distillerOverrideForTest) return distillerOverrideForTest(input);
+  if (!model) return null;
   const runner = new Runner({ workflowName: 'clementine-identity-evolution' });
   const prompt = [
     `CURRENT ${input.target.toUpperCase()} SECTION:`,
@@ -179,7 +184,7 @@ async function runDistiller(input: IdentityDistillerInput): Promise<IdentityDist
     'DURABLE CONFIRMED FACTS:',
     ...input.facts.map((f) => `- [${f.kind}] ${f.content}`),
   ].join('\n');
-  const result = await runner.run(buildDistillerAgent(input.target), prompt, { maxTurns: 1 });
+  const result = await runner.run(buildDistillerAgent(input.target, model), prompt, { maxTurns: 1 });
   return parseDistillerOutput((result as { finalOutput?: unknown }).finalOutput);
 }
 
@@ -200,7 +205,7 @@ function selectEvidenceFacts(nowMs: number): ConsolidatedFact[] {
 
 export interface ProposeResult {
   proposed: boolean;
-  reason: 'disabled' | 'pending-exists' | 'too-soon' | 'not-enough-evidence' | 'no-change' | 'invalid-output' | 'drafted' | 'failed';
+  reason: 'disabled' | 'pending-exists' | 'too-soon' | 'not-enough-evidence' | 'model-unavailable' | 'no-change' | 'invalid-output' | 'drafted' | 'failed';
   proposalId?: string;
 }
 
@@ -235,12 +240,17 @@ export async function maybeProposeIdentityUpdate(now = new Date()): Promise<Prop
   const target: IdentityProposalTarget = toneLike.length > newSince.length / 2 ? 'soul' : 'identity';
   const currentText = readCuratedTarget(target);
 
+  // A chosen memory model that cannot be served makes this cycle wait for the
+  // next tick; nothing stands in for it.
+  const route = distillerOverrideForTest ? null : resolveMemoryModelRoute('identity');
+  if (!distillerOverrideForTest && !route) return { proposed: false, reason: 'model-unavailable' };
+
   try {
     const output = await runDistiller({
       target,
       currentText,
       facts: facts.map((f) => ({ id: f.id, kind: f.kind, content: f.content })),
-    });
+    }, route?.model ?? null);
     if (!output) return { proposed: false, reason: 'invalid-output' };
     if (!output.proposedText || !output.rationale) return { proposed: false, reason: 'no-change' };
 

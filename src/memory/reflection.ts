@@ -1,4 +1,5 @@
 import { Agent, Runner } from '@openai/agents';
+import type { Model } from '@openai/agents-core';
 import { z } from 'zod';
 import pino from 'pino';
 import { createHash } from 'node:crypto';
@@ -26,10 +27,10 @@ import { isSourceMapEnabled, upsertResourcePointer } from './source-map.js';
 import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
-import { resolveBoundaryJudge, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
+import { resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
-import type { MemoryModelProblem } from './memory-model-route.js';
+import { resolveMemoryModelRoute, type MemoryModelProblem } from './memory-model-route.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { looksLikeIncidentNarrative } from './incident-narrative.js';
@@ -302,29 +303,25 @@ function buildExtractorPreamble(includeResources: boolean, includeRelationships 
   return lines.join('\n');
 }
 
-function getReflectorRoute(): ReturnType<typeof resolveBoundaryJudge> | null {
-  try {
-    // Bind the extractor to a concrete model on the active brain's provider.
-    // A bare gpt-* string is resolved by the process-global Agents provider and
-    // silently sent Claude/BYO turns through Codex credentials.
-    return resolveBoundaryJudge();
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'reflection model route unavailable');
-    return null;
-  }
-}
+// The extractor, the conflict resolver and the nightly pattern finder run on
+// the "Keeps your memory" route (memory-model-route.ts): the owner's pick when
+// one is chosen, else exactly the concrete checker-route model they used
+// before the role existed. A bare gpt-* string is resolved by the
+// process-global Agents provider and silently sent Claude/BYO turns through
+// Codex credentials, so these jobs always get a provider-bound model. A null
+// route means the model cannot be served right now: the job waits.
 
-function getReflectorModel() {
-  return getReflectorRoute()?.model ?? null;
-}
+const MEMORY_ROUTE_TRANSPORT = {
+  codex: 'codex_responses',
+  claude: 'claude_subscription',
+  byo: 'byo_openai_compatible',
+} as const;
 
 export function _testOnly_reflectorRoute(): { modelId: string; provider: string; transport: string } | null {
-  try {
-    const route = resolveBoundaryJudge();
-    return { modelId: route.modelId, provider: route.judgeFamily, transport: route.transport };
-  } catch {
-    return null;
-  }
+  const route = resolveMemoryModelRoute('learn');
+  const provider = route?.provider ?? route?.boundary?.judgeFamily;
+  if (!route || !provider) return null;
+  return { modelId: route.modelId, provider, transport: route.boundary?.transport ?? MEMORY_ROUTE_TRANSPORT[provider] };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1068,7 +1065,7 @@ function quotaResetHintMs(err: unknown): number | undefined {
  * deliberation.
  */
 export function reflectionExtractorAgent(
-  model: NonNullable<ReturnType<typeof getReflectorModel>>,
+  model: Model | string,
   instructions: string,
 ): Agent {
   return new Agent({
@@ -1085,7 +1082,7 @@ async function runExtractor(
 ): Promise<Extraction | null> {
   if (extractorOverrideForTest) return extractorOverrideForTest(serialized);
   if (!reflectionExtractorAvailable()) return null;
-  const route = getReflectorRoute();
+  const route = resolveMemoryModelRoute('learn');
   if (!route) return null;
   // Source-map: when on, ask the extractor for `resources` too (named
   // locations). Flag-off keeps the schema + prompt byte-identical to today.
@@ -1103,14 +1100,13 @@ async function runExtractor(
   // resource field or an enum synonym should cost one entry, not the entire
   // extraction pass. Clementine-owned sanitization below preserves the signal
   // and drops only fields/entries that cannot be made meaningful.
-  const attempt = async (model: NonNullable<ReturnType<typeof getReflectorModel>>): Promise<Extraction | null> => {
+  const attempt = async (model: Model | string): Promise<Extraction | null> => {
     const agent = reflectionExtractorAgent(model, instructions);
     const runner = new Runner({ workflowName: 'clementine-reflection' });
     const result = await runner.run(agent, serialized);
     const final = (result as { finalOutput?: unknown }).finalOutput;
     return sanitizeExtractionOutput(final, { withResources, withRelationships });
   };
-  if (!route.model) return null;
   try {
     return await attempt(route.model);
   } catch (err) {
@@ -1132,13 +1128,14 @@ async function runExtractor(
     }
     // Quota/auth/transient on the primary judge family — memory must not stop
     // learning because ONE provider is out of quota. Try the other family once
-    // (same cross-family judge routing every boundary judge uses).
+    // (same cross-family judge routing every boundary judge uses). Only the
+    // automatic route may: a model the owner chose is used exactly.
     try {
-      const hedge = resolveBoundaryJudgeHedge(route);
+      const hedge = route.boundary ? resolveBoundaryJudgeHedge(route.boundary) : null;
       if (hedge?.model) {
         const out = await attempt(hedge.model);
         logger.info(
-          { from: route.judgeFamily, to: hedge.judgeFamily },
+          { from: route.provider, to: hedge.judgeFamily },
           'reflection extractor fell over to the alternate judge family',
         );
         return out;
@@ -1241,7 +1238,7 @@ export async function resolveConflict(
   similar: ConsolidatedFact[],
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
-  const model = getReflectorModel();
+  const model = resolveMemoryModelRoute('reconcile')?.model ?? null;
   if (!model) return { decision: 'ADD', unresolved: true, unresolvedReason: 'No memory conflict resolver is available.' };
   try {
     const agent = new Agent({
@@ -2989,7 +2986,7 @@ export async function runRecursivePatternExtractor(
   kind: ConsolidatedFactKind,
   facts: ConsolidatedFactRow[],
 ): Promise<{ patterns: RecursivePattern[] } | null> {
-  const model = getReflectorModel();
+  const model = resolveMemoryModelRoute('patterns')?.model ?? null;
   if (!model) return null;
   try {
     const agent = new Agent({

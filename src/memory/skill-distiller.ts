@@ -17,8 +17,9 @@
 import pino from 'pino';
 import { z } from 'zod';
 import { Agent, Runner } from '@openai/agents';
+import type { Model } from '@openai/agents-core';
 import path from 'node:path';
-import { getRuntimeEnv, MODELS } from '../config.js';
+import { getRuntimeEnv } from '../config.js';
 import { withFileLock } from '../runtime/atomic-json.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { isPackageRunnerMaterializationFailure } from '../runtime/shell-execution-outcome.js';
@@ -39,6 +40,7 @@ import { isTransientFailure } from './procedural-recall-link.js';
 import { addNotification } from '../runtime/notifications.js';
 import { publishLearnedSkillOffer } from './skill-proactive-offer.js';
 import { consolidateFact } from './reflection.js';
+import { resolveMemoryModelRoute } from './memory-model-route.js';
 import { recordMemoryEpisode } from './temporal-memory.js';
 
 const logger = pino({ name: 'clementine-next.skill-distiller' });
@@ -419,10 +421,12 @@ const DistilledSchema = z.object({
 });
 export type DistilledSkill = z.infer<typeof DistilledSchema>;
 
-function buildDistillerAgent(): Agent<unknown> {
+/** The distiller runs on the "Keeps your memory" route: the owner's pick when
+ *  one is chosen, else today's fast-tier model string. */
+function buildDistillerAgent(model: Model | string): Agent<unknown> {
   return new Agent({
     name: 'SkillDistiller',
-    model: MODELS.fast,
+    model,
     modelSettings: { reasoning: { effort: 'low' } },
     instructions: [
       'You distill a REUSABLE skill from a successful run. Output a SKILL.md draft that lets the agent repeat this capability next time without re-discovering it.',
@@ -742,9 +746,13 @@ async function distillFromCalls(
   try {
     if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
 
+    // A chosen memory model that cannot be served skips this run; nothing
+    // stands in for it.
+    const route = resolveMemoryModelRoute('skills');
+    if (!route) return { status: 'failed', detail: 'the memory model is unavailable right now' };
     const runner = new Runner({ workflowName: 'clementine-skill-distiller' });
     const result = await runner.run(
-      buildDistillerAgent(),
+      buildDistillerAgent(route.model),
       renderDistillerPrompt({ objective: context.objective, evidence: context.evidence ?? '', calls }),
       { maxTurns: 1 },
     );
