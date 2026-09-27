@@ -17,6 +17,8 @@ const journal = await import('./memory-work-journal.js');
 const telemetry = await import('../runtime/operational-telemetry.js');
 const { recordModelUsage, withModelUsageAttribution, modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
 const { withModelRouteMetrics } = await import('../runtime/model-route-metrics.js');
+const { BoundaryError } = await import('../runtime/boundary-error.js');
+const { pinnedBrainForSession, resolveRoleModel, __sessionBrainPinTest__ } = await import('../runtime/harness/model-roles.js');
 type Model = import('@openai/agents-core').Model;
 type ModelRequest = import('@openai/agents-core').ModelRequest;
 
@@ -157,8 +159,92 @@ test('a nested job owns its own calls; the job around it never counts them twice
   assert.equal(byJob.get('patterns')?.model.modelId, 'outer-model');
   assert.equal(byJob.get('reconcile')?.usage.calls, 1);
   assert.equal(byJob.get('reconcile')?.model.modelId, 'inner-model');
+  assert.deepEqual(byJob.get('reconcile')?.nestedIn, { job: 'patterns', runId: byJob.get('patterns')?.runId });
+  assert.equal(byJob.get('patterns')?.nestedIn, undefined);
   const calls = telemetry.listOperationalEvents({ source: 'model', type: 'model_call_completed' });
   assert.equal((calls.find((e) => (e.payload as { model?: string }).model === 'inner-model')?.payload as { channel?: string }).channel, 'memory:reconcile');
+});
+
+test('what a nested reconcile changed counts once, through the learn run around it', async () => {
+  // Learning a conversation settles each new memory through a reconcile run;
+  // the learn run reports every memory it kept, those included.
+  await runMemoryJob('learn', { source: { kind: 'conversation', sessionId: 'sess-n' } }, async () => {
+    call('memory-model', 100, 10);
+    await runMemoryJob('reconcile', {}, async () => { call('memory-model', 40, 4); },
+      () => ({ outcome: 'ok', produced: { learned: 1 }, facts: { learned: ['21'] } }));
+    await runMemoryJob('reconcile', {}, async () => { call('memory-model', 40, 4); },
+      () => ({ outcome: 'ok', produced: { updated: 1 }, facts: { updated: ['22'] } }));
+  }, () => ({ outcome: 'ok', produced: { claims: 3, learned: 1, updated: 1, leftOut: 1 }, facts: { learned: ['21'], updated: ['22'] } }));
+  const rows = new Map(dailyRows().map((row) => [row.job, row]));
+  const learn = rows.get('learn')!;
+  const reconcile = rows.get('reconcile')!;
+  assert.equal(Number(learn.learned) + Number(reconcile.learned), 1, 'the memory kept is counted once');
+  assert.equal(Number(learn.updated) + Number(reconcile.updated), 1, 'the memory updated is counted once');
+  assert.equal(learn.conversations, 1);
+  assert.equal(reconcile.conversations, 0);
+  // The nested runs' own work still counts: their calls, tokens and runs.
+  assert.equal(reconcile.runs, 2);
+  assert.equal(reconcile.model_calls, 2);
+  assert.equal(reconcile.input_tokens, 80);
+  assert.equal(learn.model_calls, 1, 'the learn run never counts its reconciles\' calls');
+  assert.equal(reconcile.last_model_id, 'memory-model');
+  // A later, separate learn of the same conversation still does not count it again.
+  await runMemoryJob('learn', { source: { kind: 'conversation', sessionId: 'sess-n' } }, async () => { call('memory-model'); }, () => ({ outcome: 'nothing_new' }));
+  assert.equal(new Map(dailyRows().map((row) => [row.job, row])).get('learn')?.conversations, 1);
+  // A reconcile on its own (the owner saving a memory) counts as itself.
+  await runMemoryJob('reconcile', { source: { kind: 'owner' } }, async () => { call('memory-model'); },
+    () => ({ outcome: 'ok', produced: { learned: 1 }, facts: { learned: ['23'] } }));
+  assert.equal(new Map(dailyRows().map((row) => [row.job, row])).get('reconcile')?.learned, 1);
+});
+
+test('work that outlives the run it started in is its own, and counts', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let detached!: Promise<void>;
+  await runMemoryJob('learn', { source: { kind: 'conversation', sessionId: 'sess-d' } }, async () => {
+    call('memory-model');
+    // Started inside the learn run, not awaited by it.
+    detached = runMemoryJob('reconcile', {}, async () => { await gate; call('memory-model'); },
+      () => ({ outcome: 'ok', produced: { learned: 1 }, facts: { learned: ['31'] } }));
+  }, () => ({ outcome: 'nothing_new' }));
+  release();
+  await detached;
+  const reconcile = memoryEvents().find((e) => e.actor === 'reconcile')?.payload as Record<string, any>;
+  assert.equal(reconcile.nestedIn, undefined, 'the learn run had already reported');
+  assert.equal(new Map(dailyRows().map((row) => [row.job, row])).get('reconcile')?.learned, 1);
+});
+
+test('a memory job reads the brain the owner chose and pins nothing', async () => {
+  // The job scope carries no session and no user turn: a turn-only brain pin
+  // must never be stamped under it, or every later job would stay on the
+  // brain that was active the first time one ran.
+  const saved = { AUTH_MODE: process.env.AUTH_MODE, OPENAI_MODEL_PRIMARY: process.env.OPENAI_MODEL_PRIMARY };
+  __sessionBrainPinTest__.reset();
+  __sessionBrainPinTest__.setValidatorForTests(() => true);
+  try {
+    process.env.AUTH_MODE = 'codex_oauth';
+    const first = await runMemoryJob('learn', {}, async () => resolveRoleModel('brain'), () => ({ outcome: 'nothing_new' }));
+    assert.equal(first.provider, 'codex');
+    assert.notEqual(first.source, 'session');
+    process.env.AUTH_MODE = 'claude_oauth'; // the owner switches the brain
+    const outside = resolveRoleModel('brain');
+    const second = await runMemoryJob('learn', {}, async () => resolveRoleModel('brain'), () => ({ outcome: 'nothing_new' }));
+    assert.equal(second.provider, 'claude');
+    assert.equal(second.modelId, outside.modelId, 'inside a job, the brain is the one outside it');
+    assert.equal(pinnedBrainForSession('memory'), null);
+    assert.equal(pinnedBrainForSession(''), null);
+    // Inside a chat turn, the job still names no session of its own.
+    await withModelUsageAttribution({ sessionId: 'sess-chat', sourceUserSeq: 3 }, () =>
+      runMemoryJob('standing', {}, async () => {
+        assert.equal(modelUsageAttributionStorage.getStore()?.sessionId, '');
+        assert.equal(modelUsageAttributionStorage.getStore()?.sourceUserSeq, 0);
+      }, () => ({ outcome: 'nothing_new' })));
+  } finally {
+    __sessionBrainPinTest__.reset();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });
 
 test('a job is listed as running only while it runs', async () => {
@@ -177,7 +263,7 @@ test('a job is listed as running only while it runs', async () => {
 });
 
 test('a failed run rethrows the original error and records what served before it', async () => {
-  const boom = new Error('parse failed');
+  const boom = Object.assign(new Error('upstream failed'), { status: 503 });
   await assert.rejects(runMemoryJob('learn', { requestedModelId: 'memory-model' }, async () => {
     call('memory-model', 90, 0);
     throw boom;
@@ -194,13 +280,33 @@ test('a failed run rethrows the original error and records what served before it
   assert.equal(dailyRows()[0].conversations, 0, 'a failed read is not a conversation read');
 });
 
+test('a run that breaks in its own code records no model problem', async () => {
+  // A type or database error is the job's, not the model's: the timeline
+  // says the run did not finish, never that the model returned an error.
+  const broken = new TypeError("Cannot read properties of undefined (reading 'id')");
+  await assert.rejects(runMemoryJob('learn', {}, async () => { call('memory-model'); throw broken; }, () => ({ outcome: 'ok' })),
+    (err) => err === broken);
+  await runMemoryJob('tidy', {}, async () => null, () => ({ outcome: 'failed' }));
+  const failures = memoryEvents('memory_work_failed').map((e) => (e.payload as Record<string, any>).failure);
+  assert.deepEqual(failures, [null, null]);
+});
+
 test('a thrown model error names its problem class, never a provider', () => {
   assert.equal(memoryModelProblemFromError(Object.assign(new Error('payment required'), { status: 402 })), 'credit');
   assert.equal(memoryModelProblemFromError(Object.assign(new Error('slow down'), { status: 429 })), 'quota');
   assert.equal(memoryModelProblemFromError(Object.assign(new Error('unauthorized'), { status: 401 })), 'not_connected');
   assert.equal(memoryModelProblemFromError(new Error('socket hang up')), 'timeout');
-  assert.equal(memoryModelProblemFromError(new Error('something else')), 'error');
-  assert.equal(memoryModelProblemFromError(null), 'error');
+  assert.equal(memoryModelProblemFromError(Object.assign(new Error('overloaded'), { status: 529 })), 'error');
+  assert.equal(memoryModelProblemFromError(Object.assign(new Error('bad request'), { status: 400 })), 'error');
+  // The resilient wrapper's own errors already name the model's class.
+  const boundary = (kind: string) => new BoundaryError({ kind: kind as never, retryable: true, userMessage: 'x', operatorMessage: 'x' });
+  assert.equal(memoryModelProblemFromError(boundary('model.empty_completion')), 'error');
+  assert.equal(memoryModelProblemFromError(boundary('model.transport_timeout')), 'timeout');
+  assert.equal(memoryModelProblemFromError(boundary('model.auth_expired')), 'not_connected');
+  // Not the model's: no problem is named.
+  assert.equal(memoryModelProblemFromError(new Error('something else')), null);
+  assert.equal(memoryModelProblemFromError(new TypeError('x is not a function')), null);
+  assert.equal(memoryModelProblemFromError(null), null);
 });
 
 test('a summarize that says failed records the failure without a throw', async () => {
@@ -285,6 +391,21 @@ test('the retention sweep runs at most hourly on a clock that survives a restart
   assert.deepEqual(sweepMemoryWorkIfDue(new Date(now.getTime() + 61 * 60_000)), { detailDeleted: 1, dailyDeleted: 0 });
   const stamp = telemetry.openOperationalTelemetryDb().prepare(`SELECT value FROM memory_work_meta WHERE key = 'retention_swept_at'`).get() as { value: string };
   assert.equal(stamp.value, new Date(now.getTime() + 61 * 60_000).toISOString());
+});
+
+test('a retention stamp from the future is no sweep: it sweeps now and stamps the real time', () => {
+  const now = new Date('2026-09-26T12:00:00.000Z');
+  const db = telemetry.openOperationalTelemetryDb();
+  db.prepare(`INSERT INTO memory_work_meta (key, value) VALUES ('retention_swept_at', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(new Date(now.getTime() + 3 * 86_400_000).toISOString());
+  seedEvent(new Date(now.getTime() - 8 * 86_400_000));
+  assert.deepEqual(sweepMemoryWorkIfDue(now), { detailDeleted: 1, dailyDeleted: 0 });
+  const stamp = db.prepare(`SELECT value FROM memory_work_meta WHERE key = 'retention_swept_at'`).get() as { value: string };
+  assert.equal(stamp.value, now.toISOString());
+  assert.equal(sweepMemoryWorkIfDue(new Date(now.getTime() + 30 * 60_000)), null, 'then hourly as usual');
+  // The in-process due time follows the clock back too.
+  seedEvent(new Date(now.getTime() - 2 * 86_400_000 - 8 * 86_400_000));
+  assert.deepEqual(sweepMemoryWorkIfDue(new Date(now.getTime() - 2 * 86_400_000)), { detailDeleted: 1, dailyDeleted: 0 });
 });
 
 test('the journal remembers when it began, so earlier days are absent rather than zero', () => {

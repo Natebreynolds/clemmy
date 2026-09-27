@@ -14,9 +14,16 @@
  * Retention is a cache: detailed events live 7 days, daily counters 90 days,
  * then both are deleted on a persisted hourly clock (`sweepMemoryWorkIfDue`).
  *
+ * A job can run inside another (learning a conversation settles each new
+ * memory through a reconcile run). The nested run's calls, tokens and time
+ * are its own; what it changed is not counted again, because the enclosing
+ * run reports the outcome of the whole run. Its event says `nestedIn`. A run
+ * that finishes after the run it started in (detached work) is its own.
+ *
  * Observability never breaks or slows a job: every write is guarded and
  * synchronous, nothing here awaits the network.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { memoryJobChannel, memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
@@ -41,6 +48,7 @@ import {
 } from '../runtime/usage-log.js';
 import { readRouteStandIn, withModelRouteObserver, type ObservedModelRoute } from '../runtime/model-route-metrics.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
+import { BoundaryError } from '../runtime/boundary-error.js';
 import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
 
 /** Detail events age out after `detailDays`; daily counters after `summaryDays`. */
@@ -88,6 +96,12 @@ export interface MemoryJobOutcome {
  *  `*Tokens` keys only there (a nested `inputTokens` reads as a secret name). */
 export interface MemoryWorkEventPayload {
   job: MemoryJobId;
+  /** This run's own id; a run nested in it names it in `nestedIn`. */
+  runId?: string;
+  /** Set when the run happened inside another memory job's run. Its produced
+   *  counts are not added to the day's counters (the enclosing run reports
+   *  them), and undo leaves the ids the enclosing run lists to that run. */
+  nestedIn?: { job: MemoryJobId; runId: string };
   outcome: MemoryWorkOutcome;
   startedAt: string;
   durationMs: number;
@@ -111,7 +125,13 @@ interface RunContext {
   /** The routes those calls took: the only evidence of a stand-in. */
   routes: ObservedModelRoute[];
   startedAtMs: number;
+  runId?: string;
+  nestedIn?: { job: MemoryJobId; runId: string } | null;
 }
+
+/** The memory job whose `work` is running in this async context, so a job
+ *  started inside it knows it is nested. */
+const enclosingRun = new AsyncLocalStorage<{ job: MemoryJobId; runId: string }>();
 
 const runningJobs = new Map<string, MemoryWorkRunning>();
 const lastChecked = new Map<MemoryJobId, string>();
@@ -126,9 +146,11 @@ let nextRetentionSweepMs: number | null = null;
  * governs) and observed, then one event recorded from `summarize`.
  *
  * Tokens are never charged to the conversation the job learns from: the
- * scope names the `memory` pseudo-session with no user turn, so no run budget
- * accrues; the originating conversation lives in the event's source. A scope
- * opened here replaces any outer one, so the memory channel always wins.
+ * scope names no session and no user turn, so no run budget accrues and no
+ * turn-only state (a session's brain pin) is read or stamped; the originating
+ * conversation lives in the event's source. A scope opened here replaces any
+ * outer one, so the memory channel always wins. A job started inside another
+ * job's work is recorded as nested in it (see the module note).
  * The value (or the error) of `work` passes through untouched.
  */
 export async function runMemoryJob<T>(
@@ -138,14 +160,17 @@ export async function runMemoryJob<T>(
   summarize: (value: T) => MemoryJobOutcome,
 ): Promise<T> {
   const token = randomUUID();
-  const run: RunContext = { job, opts, calls: [], routes: [], startedAtMs: Date.now() };
+  const run: RunContext = {
+    job, opts, calls: [], routes: [], startedAtMs: Date.now(), runId: token, nestedIn: enclosingRunOf(),
+  };
   try {
     runningJobs.set(token, runningEntry(job, new Date(run.startedAtMs).toISOString(), opts));
   } catch { /* the job runs even if it cannot be listed */ }
   try {
-    const value = await withModelUsageObserver(run.calls, () =>
-      withModelRouteObserver(run.routes, () =>
-        withModelUsageAttribution(memoryJobAttribution(job), work)));
+    const value = await enclosingRun.run({ job, runId: token }, () =>
+      withModelUsageObserver(run.calls, () =>
+        withModelRouteObserver(run.routes, () =>
+          withModelUsageAttribution(memoryJobAttribution(job), work))));
     settle(run, () => summarize(value));
     return value;
   } catch (error) {
@@ -164,16 +189,25 @@ export function recordMemoryJobFailure(
   job: MemoryJobId,
   opts: MemoryJobRunOptions,
   error: unknown,
-  observed: { calls?: ObservedModelUsage[]; routes?: ObservedModelRoute[]; startedAtMs?: number } = {},
+  observed: {
+    calls?: ObservedModelUsage[];
+    routes?: ObservedModelRoute[];
+    startedAtMs?: number;
+    runId?: string;
+    nestedIn?: { job: MemoryJobId; runId: string } | null;
+  } = {},
 ): never {
   try {
+    const problem = memoryModelProblemFromError(error);
     record({
       job,
       opts,
       calls: observed.calls ?? [],
       routes: observed.routes ?? [],
       startedAtMs: observed.startedAtMs ?? Date.now(),
-    }, { outcome: 'failed', failure: { problem: memoryModelProblemFromError(error) } }, new Date());
+      runId: observed.runId ?? randomUUID(),
+      nestedIn: observed.nestedIn !== undefined ? observed.nestedIn : enclosingRunOf(),
+    }, { outcome: 'failed', failure: problem ? { problem } : null }, new Date());
   } catch { /* observability never replaces the job's own error */ }
   throw error;
 }
@@ -204,16 +238,31 @@ export function lastCheckedByJob(): Partial<Record<MemoryJobId, string>> {
   return Object.fromEntries(lastChecked) as Partial<Record<MemoryJobId, string>>;
 }
 
-/** The problem class of a thrown model error, in the Memory tab's words and
- *  by the same rule the extractor's pause uses. Never a provider name. */
-export function memoryModelProblemFromError(error: unknown): MemoryModelProblem {
+/**
+ * The problem class of a thrown model error, in the Memory tab's words and by
+ * the same rule the extractor's pause uses. Never a provider name. Null when
+ * the error is not the model's: a failure in the job's own code (a type or
+ * database error) must not read as "the model returned an error".
+ */
+export function memoryModelProblemFromError(error: unknown): MemoryModelProblem | null {
   try {
+    // The resilient model wrapper already names the model's failure class.
+    if (error instanceof BoundaryError) return problemOfKind(error.kind, error);
     const cls = classifyModelError(error);
-    if (cls.kind === 'model.rate_limited') return isProviderCreditRefusal(cls.status, error) ? 'credit' : 'quota';
-    if (cls.kind === 'model.auth_expired') return 'not_connected';
-    if (cls.kind === 'model.transport_timeout') return 'timeout';
-  } catch { /* unknown shape */ }
-  return 'error';
+    // An error with no HTTP status that is not a transport failure did not
+    // come from a model; one with a status is the provider answering.
+    if (cls.kind === 'runtime.unknown') return typeof cls.status === 'number' ? 'error' : null;
+    return problemOfKind(cls.kind, error, cls.status);
+  } catch {
+    return null; // unknown shape: not known to be the model's
+  }
+}
+
+function problemOfKind(kind: string, error: unknown, status?: number): MemoryModelProblem | null {
+  if (kind === 'model.rate_limited') return isProviderCreditRefusal(status, error) ? 'credit' : 'quota';
+  if (kind === 'model.auth_expired') return 'not_connected';
+  if (kind === 'model.transport_timeout') return 'timeout';
+  return kind.startsWith('model.') ? 'error' : null;
 }
 
 function runningEntry(job: MemoryJobId, startedAt: string, opts: MemoryJobRunOptions): MemoryWorkRunning {
@@ -227,13 +276,21 @@ function runningEntry(job: MemoryJobId, startedAt: string, opts: MemoryJobRunOpt
   };
 }
 
+/** No session and no user turn: background work that belongs to no
+ *  conversation. The ledger books it by channel; nothing keyed by session
+ *  (a run budget, a brain pin) can attach to it. */
 function memoryJobAttribution(job: MemoryJobId): ModelUsageAttributionContext {
   return {
-    sessionId: 'memory',
+    sessionId: '',
     sourceUserSeq: 0,
     channel: memoryJobChannel(job),
     ...(memoryJobUsesMemoryModel(job) ? { role: 'memory' as const } : {}),
   };
+}
+
+function enclosingRunOf(): { job: MemoryJobId; runId: string } | null {
+  const outer = enclosingRun.getStore();
+  return outer ? { job: outer.job, runId: outer.runId } : null;
 }
 
 function settle(run: RunContext, summarize: () => MemoryJobOutcome): void {
@@ -252,6 +309,9 @@ function settle(run: RunContext, summarize: () => MemoryJobOutcome): void {
 // ───────────────────────────── recording ─────────────────────────────
 
 function record(run: RunContext, result: MemoryJobOutcome, completedAt: Date): void {
+  // Nested only if the enclosing run is still running: it can report what
+  // finished inside it, never work that outlived it (a detached job).
+  if (run.nestedIn && !runningJobs.has(run.nestedIn.runId)) run.nestedIn = null;
   const produced = cleanProduced(result.produced);
   const facts = cleanFacts(result.facts);
   const failed = result.outcome === 'failed';
@@ -295,6 +355,8 @@ function eventPayload(
   const source = publicSource(run.opts.source);
   return {
     job: run.job,
+    ...(run.runId ? { runId: run.runId } : {}),
+    ...(run.nestedIn ? { nestedIn: { job: run.nestedIn.job, runId: run.nestedIn.runId } } : {}),
     outcome: result.outcome,
     startedAt: new Date(run.startedAtMs).toISOString(),
     durationMs: Math.max(0, completedAt.getTime() - run.startedAtMs),
@@ -313,7 +375,9 @@ function eventPayload(
     source: source ? { kind: source.kind, ...(source.sessionId ? { sessionId: source.sessionId } : {}) } : null,
     ...(positiveInt(run.opts.part) ? { part: run.opts.part } : {}),
     ...(positiveInt(run.opts.parts) ? { parts: run.opts.parts } : {}),
-    failure: result.outcome === 'failed' ? (result.failure ?? { problem: 'error' }) : null,
+    // A failure names a problem only when it is the model's; otherwise the
+    // run simply did not finish.
+    failure: result.outcome === 'failed' && result.failure?.problem ? { problem: result.failure.problem } : null,
   };
 }
 
@@ -321,10 +385,11 @@ function eventPayload(
  * "Conversations read" counts a conversation once per local day: a learn run
  * that finished (ok or nothing new) for a session no earlier finished learn
  * run named today. Parts of one conversation, and later turns of it the same
- * day, do not count again. Runs without a session are not conversations.
+ * day, do not count again. Runs without a session are not conversations, and
+ * a nested run counts nothing (see upsertDaily).
  */
 function countsAsNewConversation(db: Database.Database, run: RunContext, outcome: MemoryWorkOutcome, at: Date): boolean {
-  if (run.job !== 'learn' || (outcome !== 'ok' && outcome !== 'nothing_new')) return false;
+  if (run.job !== 'learn' || run.nestedIn || (outcome !== 'ok' && outcome !== 'nothing_new')) return false;
   const sessionId = run.opts.source?.sessionId?.trim();
   if (!sessionId) return false;
   const seen = db.prepare(`
@@ -332,13 +397,21 @@ function countsAsNewConversation(db: Database.Database, run: RunContext, outcome
      WHERE session_id = ? AND ts >= ? AND source = 'memory'
        AND type = 'memory_work_completed' AND actor = 'learn'
        AND json_extract(payload_json, '$.outcome') IN ('ok', 'nothing_new')
+       AND json_extract(payload_json, '$.nestedIn') IS NULL
      LIMIT 1
   `).get(sessionId, localDayStart(at).toISOString());
   return !seen;
 }
 
+/**
+ * Add one recorded run to its day's counters. Runs, model calls and tokens
+ * always count: a nested run's calls are its own (the enclosing run never
+ * sees them). What a nested run changed does not count again: the enclosing
+ * run reports the outcome of the whole run, including what its nested
+ * reconciles added or updated.
+ */
 function upsertDaily(db: Database.Database, payload: MemoryWorkEventPayload, at: Date, conversations: number): void {
-  const p = payload.produced;
+  const p: MemoryWorkProduced = payload.nestedIn ? {} : payload.produced;
   const atIso = at.toISOString();
   db.prepare(`
     INSERT INTO memory_work_daily (
@@ -422,13 +495,18 @@ export function decayMemoryWork(
  */
 export function sweepMemoryWorkIfDue(now: Date = new Date()): { detailDeleted: number; dailyDeleted: number } | null {
   const nowMs = now.getTime();
-  if (nextRetentionSweepMs !== null && nowMs < nextRetentionSweepMs) return null;
+  // The in-process due time is never more than an hour ahead of now; one that
+  // is (the clock moved back) is re-read from the stamp below.
+  if (nextRetentionSweepMs !== null && nowMs < nextRetentionSweepMs
+    && nextRetentionSweepMs - nowMs <= RETENTION_SWEEP_EVERY_MS) return null;
   const db = openOperationalTelemetryDb();
   const row = db.prepare('SELECT value FROM memory_work_meta WHERE key = ?').get(RETENTION_STAMP_KEY) as { value: string } | undefined;
   const lastMs = row ? Date.parse(row.value) : Number.NaN;
-  // A stamp from the future (the clock moved back) counts as "just swept".
-  if (Number.isFinite(lastMs) && nowMs - Math.min(lastMs, nowMs) < RETENTION_SWEEP_EVERY_MS) {
-    nextRetentionSweepMs = Math.min(lastMs, nowMs) + RETENTION_SWEEP_EVERY_MS;
+  // A stamp from the future (the clock moved back, or was briefly wrong) is
+  // no evidence of a sweep: sweep now and stamp the real time, rather than
+  // waiting for the wall clock to catch up with it.
+  if (Number.isFinite(lastMs) && lastMs <= nowMs && nowMs - lastMs < RETENTION_SWEEP_EVERY_MS) {
+    nextRetentionSweepMs = lastMs + RETENTION_SWEEP_EVERY_MS;
     return null;
   }
   const result = decayMemoryWork(now, db);
