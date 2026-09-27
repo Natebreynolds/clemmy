@@ -70,6 +70,7 @@ semanticPorts.installTurnSemanticModelPort({
 const DISPATCH_RULE = 'Email sending constraint: ALWAYS send email via the Outlook mailbox owner@example.com. NEVER send from any other connected mailbox unless explicitly directed in the current conversation.';
 rememberFact({ kind: 'constraint', content: DISPATCH_RULE });
 rememberFact({ kind: 'project', content: 'The quokka ledger lives in the finance workspace and closes on the fifth business day.' });
+rememberFact({ kind: 'project', content: 'Invoices are reviewed on Tuesdays by the operations desk.' });
 
 after(() => {
   semanticPorts.installTurnSemanticModelPort(null);
@@ -220,7 +221,9 @@ async function assertNoSignalFallback(label: string, arrange: () => void, restor
   const all = requestText(frame);
   const fallback = memoryItem(frame, '## Persistent Facts');
   assert.ok(fallback, `${label}: the per-block rendering stands in: ${all.slice(-2500)}`);
-  assert.match(fallback!, /quokka ledger lives in the finance workspace/, `${label}: ranked by the request as before`);
+  assert.match(fallback!, /Invoices are reviewed on Tuesdays/, `${label}: Persistent Facts ranked as before`);
+  assert.equal(fallback!.split('quokka ledger lives in the finance workspace').length - 1, 1,
+    `${label}: the request's fact is in the fallback once, whichever block lists it`);
   assert.doesNotMatch(fallback!, /owner@example\.com/, `${label}: the core's rule is not repeated`);
   assert.equal(all.includes('## Relevant To This Request'), false, `${label}: no ranked tail without a ranker`);
   const cacheBoundary = frame.system.indexOf(CACHE_BREAK_SENTINEL);

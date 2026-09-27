@@ -1965,7 +1965,7 @@ export function renderFactsForInstructions(
   // are rendered elsewhere (renderCorePoliciesForInstructions), so this block
   // leaves them out while every other group keeps the budget it has with
   // them present.
-  options: { omitCoreGroups?: boolean } = {},
+  options: { omitCoreGroups?: boolean; excludeFactIds?: readonly number[] } = {},
 ): string {
   let facts: ConsolidatedFact[] = [];
   if (mode === 'pinned') {
@@ -2006,7 +2006,9 @@ export function renderFactsForInstructions(
   const pinned = loaded.pinned;
   const pinnedIds = new Set(pinned.map((f) => f.id));
   const renderPinned = mode !== 'scored';
-  const scored = mode === 'pinned' ? [] : facts.filter((f) => !pinnedIds.has(f.id));
+  // `excludeFactIds`: facts the same request already shows elsewhere.
+  const excluded = new Set(options.excludeFactIds ?? []);
+  const scored = mode === 'pinned' ? [] : facts.filter((f) => !pinnedIds.has(f.id) && !excluded.has(f.id));
 
   if ((!renderPinned || pinned.length === 0) && scored.length === 0) return '';
 

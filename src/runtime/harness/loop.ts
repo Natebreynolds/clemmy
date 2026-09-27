@@ -5119,7 +5119,7 @@ function episodicBlockForPrimer(sessionId: string): string {
  *  a fact remembered seconds ago, before its embedding indexes). The primer's
  *  vault search never touched consolidated_facts, so a freshly-stated "remember
  *  X" was invisible to auto-context and the model would confabulate. */
-export function factsBlockForPrimer(query: string, sessionId = ''): { text: string; recallId?: string } {
+export function factsBlockForPrimer(query: string, sessionId = ''): { text: string; recallId?: string; factIds?: number[] } {
   try {
     const facts = searchFactsByText(query, TURN_MEMORY_PRIMER_FACT_TOP_K);
     if (facts.length === 0) return { text: '' };
@@ -5149,6 +5149,7 @@ export function factsBlockForPrimer(query: string, sessionId = ''): { text: stri
     return {
       text: ['[REMEMBERED FACTS — durable, user-stated or curated; treat as known]', ...lines].join('\n'),
       recallId,
+      factIds: facts.map((f) => f.id),
     };
   } catch {
     return { text: '' };
@@ -5391,13 +5392,15 @@ interface TurnMemoryPrimer {
   recallElapsedMs?: number;
   /** Tail turns: what each section of the text is (tier, size, refs). */
   manifest?: MemoryManifestEntry[];
+  /** Facts the fallback primer's remembered-facts block shows. */
+  factIds?: number[];
 }
 
 function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVault>, source: TurnMemoryPrimer['source'], sessionId = '', breadcrumbs = ''): TurnMemoryPrimer {
   const formatted = formatSearchHits(hits, TURN_MEMORY_PRIMER_MAX_CHARS);
   // Durable facts relevant to THIS message — the primer's vault search alone
   // never surfaced consolidated_facts, so a just-remembered fact was invisible.
-  const { text: factsBlock, recallId } = factsBlockForPrimer(query, sessionId);
+  const { text: factsBlock, recallId, factIds } = factsBlockForPrimer(query, sessionId);
   // Recently-observed breadcrumbs for this session (was a write-only table).
   const episodicBlock = episodicBlockForPrimer(sessionId);
   if (!formatted && !factsBlock && !episodicBlock && !breadcrumbs) {
@@ -5426,6 +5429,7 @@ function formatTurnMemoryPrimer(query: string, hits: ReturnType<typeof searchVau
     source,
     text,
     recallId,
+    ...(factsBlock && factIds?.length ? { factIds } : {}),
   };
 }
 
@@ -5565,7 +5569,7 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
       return primer.text ? primer : { ...primer, skippedReason: 'no_hits' };
     }
     const fallback = await plainFallbackPrimer(query, sessionId, unified.status, hybridEnabled);
-    return withTail(fallback, { kind: 'no_signal', primerText: fallback.text });
+    return withTail(fallback, { kind: 'no_signal', primerText: fallback.text, primerFactIds: fallback.factIds });
   } catch (err) {
     return withTail({
       enabled: true,

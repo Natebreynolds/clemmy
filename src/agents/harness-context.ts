@@ -272,13 +272,17 @@ function renderRequestRankedBlocks(input: {
   scopedFocus: { resourceRef?: string | null } | null;
   includeRememberedToolChoices?: boolean;
   omitCoreGroups: boolean;
+  excludeFactIds?: readonly number[];
 }): Array<{ title: string; text: string }> {
   let facts = '';
   try {
     // The literal accepted request ranks first; only a focus proven current
     // for this session may refine it. Process-global focus never scopes a
     // different task branch.
-    facts = renderFactsForInstructions(10, 2600, input.requestObjective, 'all', { omitCoreGroups: input.omitCoreGroups });
+    facts = renderFactsForInstructions(10, 2600, input.requestObjective, 'all', {
+      omitCoreGroups: input.omitCoreGroups,
+      excludeFactIds: input.excludeFactIds,
+    });
   } catch {
     facts = '';
   }
@@ -779,7 +783,7 @@ export type TurnMemorySignal =
   /** The ranker ran and nothing cleared it. */
   | { kind: 'empty' }
   /** The ranker is off, failed or ran out of time. */
-  | { kind: 'no_signal'; primerText?: string };
+  | { kind: 'no_signal'; primerText?: string; primerFactIds?: readonly number[] };
 
 export interface TurnMemoryTail {
   text: string;
@@ -831,6 +835,8 @@ export function renderTurnMemoryTail(
       scopedFocus,
       includeRememberedToolChoices: scope.includeRememberedToolChoices,
       omitCoreGroups: true,
+      // A fact the fallback primer already lists is not listed twice.
+      excludeFactIds: signal.primerFactIds,
     })) {
       if (block.text) parts.push({ section: block.title, tier: 'relevant', text: block.text });
     }
