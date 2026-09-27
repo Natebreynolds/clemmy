@@ -516,6 +516,11 @@ test('a job started in a turn picks its model as that turn would, while its call
         charged: modelUsageAttributionStorage.getStore()?.sessionId,
       }), () => ({ outcome: 'nothing_new' }));
       assert.deepEqual(seen, { selected: 'codex', global: 'claude', charged: '' });
+      // A job nested in that job (a save inside an import) selects the same way.
+      const nested = await jobs.runMemoryModelJob('import', {}, () => jobs.runMemoryModelJob('reconcile', {}, async () =>
+        jobs.inMemoryJobTurn(() => resolveRoleModel('brain').provider), () => ({ outcome: 'nothing_new' })),
+      () => ({ outcome: 'nothing_new' }));
+      assert.equal(nested, 'codex');
     });
   } finally {
     __sessionBrainPinTest__.reset();

@@ -57,7 +57,8 @@ export async function runMemoryModelJob<T>(
   work: () => Promise<T>,
   summarize: (value: T, note: MemoryJobNote) => MemoryJobOutcome,
 ): Promise<T> {
-  const turn = acceptedTurnScope();
+  // A job nested in another job selects as the job around it does.
+  const turn = acceptedTurnScope() ?? jobNotes.getStore()?.turnScope ?? null;
   const note: MemoryJobNote = turn ? { turnScope: turn } : {};
   const runOpts: MemoryJobRunOptions = { ...opts };
   return runMemoryJob(job, runOpts, async () => {
