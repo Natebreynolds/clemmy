@@ -85,13 +85,17 @@ export function retainedResultRoutes(
   // A prefix is not authoritative data, and no reader can make it so.
   if (record.truncatedAtWrite) return routes;
 
-  const structured = (() => {
+  const recovered = (() => {
     try {
-      return Boolean(parseStoredToolOutputJson(record.output, {}));
+      return parseStoredToolOutputJson(record.output, {});
     } catch {
-      return false;
+      return null;
     }
   })();
+  const structured = Boolean(recovered);
+  // Structured data embedded in prose (a host document with its dataset
+  // inside): the query reaches the data, and only recall reaches the prose.
+  const proseAroundData = recovered?.via === 'embedded';
 
   // Structured rows: the server-side query is the cheap, unclipped read.
   if (structured && !excluded.has('tool_output_query')) {
@@ -102,14 +106,16 @@ export function retainedResultRoutes(
     });
   }
 
-  // Plain text: recall reads it, but only while its per-turn budget allows.
+  // Text: recall reads it, but only while its per-turn budget allows.
   const recallAvailable = input.recallCallsRemaining === undefined
     || input.recallCallsRemaining > 0;
-  if (!structured && recallAvailable && !excluded.has('recall_tool_result')) {
+  if ((!structured || proseAroundData) && recallAvailable && !excluded.has('recall_tool_result')) {
     routes.push({
       tool: 'recall_tool_result',
       call: `recall_tool_result {"call_id":"${readId}"}`,
-      why: 'this output is text rather than structured records, and recall reads it verbatim',
+      why: structured
+        ? 'the text around that data is prose, and recall reads it verbatim'
+        : 'this output is text rather than structured records, and recall reads it verbatim',
     });
   }
 
