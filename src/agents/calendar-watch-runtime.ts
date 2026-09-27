@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
+import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import {
   compileLiveCatalogWorkflowCallPlan,
   ensureLiveReadCapabilityForOperation,
@@ -583,17 +584,20 @@ export function isCalendarWatchDue(nowMs = Date.now()): { due: boolean; reason: 
 
 /** Daemon heartbeat: checks every minute, ticks on the policy cadence. */
 export function startCalendarWatchHeartbeat(): { stop: () => void } {
+  // Its own phase, so time this timer holds the main thread is named.
   const beat = (): void => {
-    let due: ReturnType<typeof isCalendarWatchDue>;
-    try {
-      due = isCalendarWatchDue();
-    } catch (error) {
-      logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'calendar watch: due check failed');
-      return;
-    }
-    if (!due.due) return;
-    runCalendarWatchTick({ source: 'heartbeat' }).catch((error) => {
-      logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'calendar watch: tick failed');
+    void withDaemonRuntimePhase('daemon.timer.calendar_watch', {}, async () => {
+      let due: ReturnType<typeof isCalendarWatchDue>;
+      try {
+        due = isCalendarWatchDue();
+      } catch (error) {
+        logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'calendar watch: due check failed');
+        return;
+      }
+      if (!due.due) return;
+      await runCalendarWatchTick({ source: 'heartbeat' }).catch((error) => {
+        logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'calendar watch: tick failed');
+      });
     });
   };
   const first = setTimeout(beat, FIRST_HEARTBEAT_DELAY_MS);

@@ -1,5 +1,6 @@
 import express from 'express';
 import pino from 'pino';
+import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -1353,6 +1354,17 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   // decided by which listener a request arrived on (see mobile-ingress.ts),
   // never by a client-supplied forwarding header.
   app.set('trust proxy', false);
+  // Every request runs in a phase for its whole life, so a handler that holds
+  // the main thread is named for what it is, never charged to whichever job
+  // last took the label. No IPC per request: the beacon alone learns of it.
+  // The path only, never the query string (it can carry the dashboard token).
+  app.use((req, res, next) => {
+    void withDaemonRuntimePhase('daemon.http', `${req.method} ${req.path}`, () => new Promise<void>((resolve) => {
+      res.once('finish', () => resolve());
+      res.once('close', () => resolve());
+      next();
+    }), { ipc: false }).catch(() => { /* the request's own handlers own its errors */ });
+  });
   const dashboardSessionCookieName = 'clementine_dashboard_session';
   const dashboardSessionToken = deriveDashboardSessionToken(WEBHOOK_SECRET);
 

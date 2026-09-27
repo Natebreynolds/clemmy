@@ -1,18 +1,11 @@
 import Database from 'better-sqlite3';
 import {
-  closeSync,
   copyFileSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
-  readdirSync,
-  renameSync,
   statSync,
-  statfsSync,
   unlinkSync,
 } from 'node:fs';
-import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import { BASE_DIR } from '../config.js';
@@ -21,6 +14,15 @@ import {
   compileComposioStandingPolicy,
 } from '../integrations/composio/standing-policy-compiler.js';
 import { compilePromptStandingPolicyDescriptor } from './policy-enforcement.js';
+import {
+  memoryBackupInFlight,
+  publishMemorySnapshot,
+  requiredMemoryBackupFreeBytesFor,
+  validatedLocalDayKey,
+  type BackupMemoryDbOptions,
+  type BackupResult,
+  type MemoryBackupPaths,
+} from './memory-backup-protocol.js';
 
 // The real default home (~/.clementine-next). A full memory-DB reset against THIS
 // permanently destroys the user's long-term memory (facts/entities/embeddings are
@@ -2302,6 +2304,10 @@ export function openMemoryDb(): Database.Database {
   // a transient process that holds the connection a while. PASSIVE under the
   // hood — never blocks writers, no-op when it can't proceed.
   db.pragma('wal_autocheckpoint = 256');
+  // Cap the WAL FILE once a checkpoint resets it. The nightly backup no longer
+  // runs a TRUNCATE checkpoint on the main connection (its worker uses
+  // PASSIVE), and without a limit the file only ever shrank on TRUNCATE.
+  db.pragma('journal_size_limit = 4194304');
 
   try {
     const schemaBeforeOpen = readMemorySchemaVersion(db);
@@ -2379,306 +2385,52 @@ export function resetMemoryDb(opts: { force?: boolean } = {}): void {
   }
 }
 
-export interface BackupResult {
-  backupPath: string;
-  bytes: number;
-  /** True when another process already published the requested keyed snapshot. */
-  reused: boolean;
-}
+export type { BackupMemoryDbOptions, BackupResult } from './memory-backup-protocol.js';
 
-export interface BackupMemoryDbOptions {
-  retain?: number;
-  /**
-   * Local calendar day for the nominal nightly snapshot. Supplying this opts
-   * into cross-process, once-per-day reuse. Backup-first repair callers must
-   * omit it so every mutation still receives a fresh rollback point.
-   */
-  localDayKey?: string;
-  /** Test-only free-space observation. Honored only outside the real default
-   * home so production callers cannot bypass the filesystem measurement. */
-  _availableBytesForTest?: number;
-}
-
-const MEMORY_BACKUP_MIN_SAFETY_MARGIN_BYTES = 64 * 1024 * 1024;
-
-function fileBytesOrZero(filePath: string): number {
-  try {
-    const stat = statSync(filePath);
-    return stat.isFile() ? Math.max(0, stat.size) : 0;
-  } catch {
-    return 0;
-  }
+/** Where the backup protocol reads and writes, for the synchronous path here
+ *  and for the worker-backed async path (memory-backup.ts). */
+export function memoryBackupPaths(): MemoryBackupPaths {
+  return {
+    dbPath: MEMORY_DB_PATH,
+    backupDir: MEMORY_BACKUP_DIR,
+    coordinatorPath: MEMORY_BACKUP_COORDINATOR_PATH,
+    stateDir: STATE_DIR,
+  };
 }
 
 /** VACUUM INTO needs room for a complete logical image while the live DB and
  * WAL remain in place. Size the guard from the actual source, not a constant;
  * the larger of 64 MiB or 10% absorbs SQLite/filesystem publication overhead. */
 export function requiredMemoryBackupFreeBytes(): number {
-  const sourceBytes = fileBytesOrZero(MEMORY_DB_PATH)
-    + fileBytesOrZero(`${MEMORY_DB_PATH}-wal`);
-  const safetyMargin = Math.max(
-    MEMORY_BACKUP_MIN_SAFETY_MARGIN_BYTES,
-    Math.ceil(sourceBytes * 0.1),
-  );
-  return sourceBytes + safetyMargin;
-}
-
-interface BackupPublicationRow {
-  backup_path: string;
-  bytes: number;
-  mtime_ms: number;
-}
-
-function validatedLocalDayKey(value: string | undefined): string | null {
-  if (value === undefined) return null;
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (!match) throw new Error(`Invalid memory backup localDayKey: ${value}`);
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const date = new Date(Date.UTC(year, month - 1, day));
-  if (
-    date.getUTCFullYear() !== year
-    || date.getUTCMonth() !== month - 1
-    || date.getUTCDate() !== day
-  ) {
-    throw new Error(`Invalid memory backup localDayKey: ${value}`);
-  }
-  return value;
-}
-
-function openMemoryBackupCoordinator(): Database.Database {
-  if (!existsSync(MEMORY_BACKUP_DIR)) mkdirSync(MEMORY_BACKUP_DIR, { recursive: true });
-  const coordinator = new Database(MEMORY_BACKUP_COORDINATOR_PATH);
-  // A multi-gigabyte VACUUM can legitimately take minutes. SQLite owns the
-  // wait and drops the lock automatically if the winner exits or is SIGKILLed.
-  coordinator.pragma('busy_timeout = 300000');
-  coordinator.pragma('synchronous = FULL');
-  coordinator.exec(`
-    CREATE TABLE IF NOT EXISTS backup_publications (
-      backup_key  TEXT PRIMARY KEY,
-      backup_path TEXT NOT NULL,
-      bytes       INTEGER NOT NULL,
-      mtime_ms    REAL NOT NULL,
-      published_at TEXT NOT NULL
-    )
-  `);
-  return coordinator;
-}
-
-function snapshotBytesIfReadable(snapshotPath: string): number | null {
-  try {
-    const stat = statSync(snapshotPath);
-    if (!stat.isFile() || stat.size <= 0) return null;
-    const probe = new Database(snapshotPath, { readonly: true, fileMustExist: true });
-    try {
-      const hasFacts = probe.prepare(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'consolidated_facts'",
-      ).get();
-      if (!hasFacts) return null;
-      // VACUUM INTO returning successfully is SQLite's consistency boundary.
-      // Touch one canonical page before publication/re-adoption so an empty or
-      // foreign SQLite file cannot masquerade as a memory snapshot. Full
-      // integrity_check remains restore-time policy; doing it for every loser
-      // would re-read a multi-gigabyte file N times.
-      probe.prepare('SELECT id FROM consolidated_facts LIMIT 1').get();
-      return stat.size;
-    } finally {
-      probe.close();
-    }
-  } catch {
-    return null;
-  }
-}
-
-function recordedSnapshotBytes(
-  coordinator: Database.Database,
-  backupKey: string,
-  backupPath: string,
-): number | null {
-  const row = coordinator.prepare(`
-    SELECT backup_path, bytes, mtime_ms
-      FROM backup_publications
-     WHERE backup_key = ?
-  `).get(backupKey) as BackupPublicationRow | undefined;
-  if (!row || row.backup_path !== backupPath) return null;
-  try {
-    const stat = statSync(backupPath);
-    return stat.isFile() && stat.size === row.bytes && stat.mtimeMs === row.mtime_ms
-      ? row.bytes
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function recordBackupPublication(
-  coordinator: Database.Database,
-  backupKey: string,
-  backupPath: string,
-  bytes: number,
-): void {
-  const stat = statSync(backupPath);
-  coordinator.prepare(`
-    INSERT INTO backup_publications
-      (backup_key, backup_path, bytes, mtime_ms, published_at)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(backup_key) DO UPDATE SET
-      backup_path = excluded.backup_path,
-      bytes = excluded.bytes,
-      mtime_ms = excluded.mtime_ms,
-      published_at = excluded.published_at
-  `).run(backupKey, backupPath, bytes, stat.mtimeMs, new Date().toISOString());
-}
-
-function cleanupOrphanedBackupPartials(): void {
-  for (const filename of readdirSync(MEMORY_BACKUP_DIR)) {
-    if (!filename.startsWith('memory-') || !filename.includes('.db.partial-')) continue;
-    try { unlinkSync(path.join(MEMORY_BACKUP_DIR, filename)); } catch { /* best effort */ }
-  }
-}
-
-function pruneMemoryBackups(retain: number, protectedPath: string): void {
-  const protectedName = path.basename(protectedPath);
-  const backups = readdirSync(MEMORY_BACKUP_DIR)
-    .filter((filename) => filename.startsWith('memory-') && filename.endsWith('.db'))
-    .sort();
-  let excess = Math.max(0, backups.length - retain);
-  for (const filename of backups) {
-    if (excess <= 0) break;
-    // The snapshot returned to this caller must still exist when the lease is
-    // released, even if an unusual retain/key combination makes it sort old.
-    if (filename === protectedName) continue;
-    try {
-      unlinkSync(path.join(MEMORY_BACKUP_DIR, filename));
-      excess -= 1;
-    } catch { /* best effort */ }
-  }
-}
-
-function fsyncBackupPublication(backupPath: string): void {
-  try {
-    const file = openSync(backupPath, 'r');
-    try { fsyncSync(file); } finally { closeSync(file); }
-  } catch { /* SQLite already closed the snapshot; durability sync is best effort */ }
-  try {
-    const dir = openSync(MEMORY_BACKUP_DIR, 'r');
-    try { fsyncSync(dir); } finally { closeSync(dir); }
-  } catch { /* directory fsync is unavailable on some platforms */ }
+  return requiredMemoryBackupFreeBytesFor(MEMORY_DB_PATH);
 }
 
 /**
- * Tier C2 — disaster-recovery backup of the memory DB. Unlike the vault
- * (rebuildable from markdown), `consolidated_facts`/`entities`/`embeddings`
- * are NOT derivable from anything on disk — a corrupt memory.db loses the
- * agent's whole long-term memory. This writes a consistent, defragmented
- * snapshot and prunes to the newest `retain` copies.
+ * Tier C2 — disaster-recovery backup of the memory DB, on THIS thread. The
+ * protocol itself lives in memory-backup-protocol.ts; see
+ * publishMemorySnapshot there. The nightly copy and the self-heal snapshot use
+ * the worker-backed backupMemoryDbAsync (memory-backup.ts) instead, so the main
+ * loop keeps answering while the copy is written.
  *
- * `VACUUM INTO` (vs a raw file copy) is atomic and consistent under WAL —
- * it serializes a clean page image, so the backup is never a torn mid-write
- * file. We checkpoint the WAL first so the live file is also compacted.
+ * Synchronous callers (boot finalizers, restore, a few repair paths) keep
+ * this. While an async backup is queued or running in this process, it
+ * returns null at once: that backup holds (or is about to hold) the
+ * cross-process lease, and waiting for it here would sleep in SQLite's busy
+ * handler on the main thread for up to five minutes. Every synchronous caller
+ * already treats null as "withhold the mutation".
  */
 export function backupMemoryDb(opts: BackupMemoryDbOptions = {}): BackupResult | null {
   const retain = Math.max(1, opts.retain ?? 7);
   const localDayKey = validatedLocalDayKey(opts.localDayKey);
-  try {
-    if (!existsSync(MEMORY_BACKUP_DIR)) mkdirSync(MEMORY_BACKUP_DIR, { recursive: true });
-    const coordinator = openMemoryBackupCoordinator();
-    let partialPath: string | null = null;
-    try {
-      // BEGIN IMMEDIATE is the one cross-process ownership point for BOTH
-      // snapshot publication and retention. OS process death releases it;
-      // no stale PID/mtime lock-stealing protocol is required.
-      coordinator.exec('BEGIN IMMEDIATE');
-      cleanupOrphanedBackupPartials();
-
-      const backupKey = localDayKey ? `nightly:${localDayKey}` : null;
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = localDayKey
-        ? `memory-${localDayKey}-nightly.db`
-        : `memory-${stamp}-${randomUUID().slice(0, 8)}.db`;
-      const backupPath = path.join(MEMORY_BACKUP_DIR, filename);
-
-      if (backupKey) {
-        let bytes = recordedSnapshotBytes(coordinator, backupKey, backupPath);
-        if (bytes === null && existsSync(backupPath)) {
-          // Covers SIGKILL after atomic rename but before the coordinator row
-          // committed: re-adopt the complete deterministic publication.
-          bytes = snapshotBytesIfReadable(backupPath);
-          if (bytes === null) {
-            const quarantine = `${backupPath}.corrupt-${stamp}-${randomUUID().slice(0, 8)}`;
-            renameSync(backupPath, quarantine);
-          }
-        }
-        if (bytes !== null) {
-          recordBackupPublication(coordinator, backupKey, backupPath, bytes);
-          // Reuse/re-adoption is still a maintenance pass. Repair snapshots may
-          // have accumulated since the nightly was first published, so restore
-          // the requested bound before releasing the same lease that protects
-          // publication. Never prune the snapshot this caller is returning.
-          pruneMemoryBackups(retain, backupPath);
-          coordinator.exec('COMMIT');
-          return { backupPath, bytes, reused: true };
-        }
-      }
-
-      // Disk-full guard (v0.5.64): a VACUUM INTO snapshot needs room for a
-      // full copy. It intentionally runs AFTER keyed reuse, because returning
-      // an already-published nightly snapshot needs no free-space headroom.
-      // Best-effort only when statfs itself is unavailable; a measured volume
-      // must cover the current DB+WAL image plus a proportional safety margin.
-      try {
-        const freeBytes = opts._availableBytesForTest !== undefined
-          && BASE_DIR !== REAL_DEFAULT_HOME
-          && (process.env.NODE_TEST_CONTEXT !== undefined
-            || process.env.CLEMMY_TEST_ISOLATED_HOME === '1')
-          ? opts._availableBytesForTest
-          : (() => {
-              const fsStat = statfsSync(STATE_DIR);
-              return fsStat.bavail * fsStat.bsize;
-            })();
-        if (!Number.isFinite(freeBytes) || freeBytes < requiredMemoryBackupFreeBytes()) {
-          coordinator.exec('ROLLBACK');
-          return null;
-        }
-      } catch { /* statfs unsupported — fall through and let the write try */ }
-
-      const db = openMemoryDb();
-      // Fold the WAL back into the main file (TRUNCATE resets it) so both the
-      // live DB and the snapshot stay compact. Best-effort — a busy checkpoint
-      // is not fatal to the backup itself.
-      try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* best effort */ }
-
-      partialPath = `${backupPath}.partial-${process.pid}-${randomUUID()}`;
-      // VACUUM refuses an existing target and writes a consistent source
-      // snapshot. The unpublished unique partial is renamed only after the
-      // operation closes successfully and its canonical schema is readable.
-      db.exec(`VACUUM INTO '${partialPath.replace(/'/g, "''")}'`);
-      const bytes = snapshotBytesIfReadable(partialPath);
-      if (bytes === null) throw new Error('memory backup snapshot is empty or unreadable');
-      fsyncBackupPublication(partialPath);
-      renameSync(partialPath, backupPath);
-      partialPath = null;
-      fsyncBackupPublication(backupPath);
-
-      if (backupKey) recordBackupPublication(coordinator, backupKey, backupPath, bytes);
-      pruneMemoryBackups(retain, backupPath);
-      coordinator.exec('COMMIT');
-      return { backupPath, bytes, reused: false };
-    } catch (error) {
-      if (coordinator.inTransaction) {
-        try { coordinator.exec('ROLLBACK'); } catch { /* process-local cleanup */ }
-      }
-      if (partialPath) {
-        try { if (existsSync(partialPath)) unlinkSync(partialPath); } catch { /* next lease cleans it */ }
-      }
-      throw error;
-    } finally {
-      coordinator.close();
-    }
-  } catch {
-    return null;
-  }
+  if (memoryBackupInFlight()) return null;
+  // The main-thread caller folds the WAL back (TRUNCATE) so both the live DB
+  // and the snapshot stay compact, as it always has.
+  return publishMemorySnapshot(() => openMemoryDb(), memoryBackupPaths(), {
+    retain,
+    localDayKey,
+    checkpoint: 'truncate',
+    availableBytesForTest: opts._availableBytesForTest,
+  });
 }
 
 export interface RestoreResult {

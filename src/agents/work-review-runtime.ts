@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
+import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { listRuns } from '../runtime/run-events.js';
 import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
@@ -220,15 +221,18 @@ export function isWorkReviewDue(nowMs = Date.now()): { due: boolean; reason: str
 
 /** Daemon heartbeat: checks every minute, ticks on the policy cadence. */
 export function startWorkReviewHeartbeat(): { stop: () => void } {
+  // Its own phase, so time this timer holds the main thread is named.
   const beat = (): void => {
-    let due: ReturnType<typeof isWorkReviewDue>;
-    try { due = isWorkReviewDue(); } catch (error) {
-      logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'work review: due check failed');
-      return;
-    }
-    if (!due.due) return;
-    runWorkReviewTickNow({ source: 'heartbeat' }).catch((error) => {
-      logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'work review: tick failed');
+    void withDaemonRuntimePhase('daemon.timer.work_review', {}, async () => {
+      let due: ReturnType<typeof isWorkReviewDue>;
+      try { due = isWorkReviewDue(); } catch (error) {
+        logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'work review: due check failed');
+        return;
+      }
+      if (!due.due) return;
+      await runWorkReviewTickNow({ source: 'heartbeat' }).catch((error) => {
+        logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'work review: tick failed');
+      });
     });
   };
   const first = setTimeout(beat, FIRST_HEARTBEAT_DELAY_MS);

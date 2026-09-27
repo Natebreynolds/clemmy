@@ -12,6 +12,7 @@ import {
   normalizeDaemonIpcHeartbeatMessage,
   settleTerminalReadinessFailure,
   shouldDeferHungRestartForIpcHeartbeat,
+  shouldDeferHungRestartForLivenessBeacon,
 } from './daemon-supervisor.js';
 
 test('isDaemonIpcHeartbeatMessage accepts only the daemon heartbeat envelope', () => {
@@ -129,4 +130,69 @@ test('terminal readiness failure does not disturb an already-reaped daemon', asy
   }, expected), (err: unknown) => err === expected);
 
   assert.equal(stopCalls, 0);
+});
+
+test('a young running phase defers the kill even next to an old in-flight entry', () => {
+  // A background task's phase stays open for its whole run. It is in flight,
+  // but it is not what holds the thread; the running phase is.
+  const read = {
+    beacon: {
+      at: new Date().toISOString(),
+      mainStampAgeMs: 70_000,
+      maxMainStampAgeMs: 70_000,
+      phase: { name: 'daemon.nightly.grounded_backfill', activeMs: 75_000 },
+      inFlight: [
+        { name: 'daemon.timer.background_tasks', activeMs: 25 * 60_000 },
+        { name: 'daemon.nightly.grounded_backfill', activeMs: 75_000 },
+      ],
+    },
+    ageMs: 2_000,
+  };
+  assert.equal(shouldDeferHungRestartForLivenessBeacon(read, 0), true);
+});
+
+test('the HUNG line names the beacon running phase, its stamp ages and the in-flight set', () => {
+  const diagnostic = formatHungRestartDiagnostic({
+    misses: 4,
+    unresponsiveMs: 80_000,
+    ipcHeartbeatAgeMs: 85_000,
+    // The IPC heartbeat is the last one sent before the loop stopped.
+    heartbeat: { phase: { name: 'daemon.kick.notification_delivery', activeMs: 90_000 } },
+    recentLogs: [],
+    beacon: {
+      ageMs: 3_000,
+      beacon: {
+        at: new Date().toISOString(),
+        mainStampAgeMs: 81_234,
+        maxMainStampAgeMs: 81_000,
+        metered: true,
+        phase: { name: 'daemon.nightly.link_sync', activeMs: 82_000 },
+        inFlight: [
+          { name: 'daemon.loop.memory_maintenance', activeMs: 90_000 },
+          { name: 'daemon.nightly.link_sync', activeMs: 82_000 },
+        ],
+      },
+    },
+  });
+  const headline = diagnostic.split('\n')[0]!;
+  assert.match(headline, /phase=daemon\.kick\.notification_delivery/);
+  assert.match(headline, /beacon_phase=daemon\.nightly\.link_sync active=82s/);
+  assert.match(headline, /main_stamp_age=81234ms/);
+  assert.match(headline, /max_main_stamp_age=81000ms/);
+  assert.match(headline, /in_flight=\[daemon\.loop\.memory_maintenance\(90s\),daemon\.nightly\.link_sync\(82s\)\]/);
+  assert.match(diagnostic, /\[beacon\] \{/);
+});
+
+test('a HUNG line without a beacon says so instead of guessing', () => {
+  const diagnostic = formatHungRestartDiagnostic({
+    misses: 4, unresponsiveMs: 80_000, ipcHeartbeatAgeMs: null, heartbeat: null, recentLogs: [], beacon: null,
+  });
+  assert.match(diagnostic.split('\n')[0]!, /beacon=none/);
+});
+
+test('the hang snapshot and the HUNG line carry the beacon read used for the decision', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./daemon-supervisor.ts', import.meta.url), 'utf8');
+  assert.match(source, /formatHungRestartDiagnostic\(\{[^}]*beacon: beaconRead \}\)/);
+  assert.match(source, /writeHungRestartSnapshot\(\{[^}]*beacon: beaconRead\?\.beacon/);
 });

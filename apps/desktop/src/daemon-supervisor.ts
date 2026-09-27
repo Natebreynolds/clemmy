@@ -183,22 +183,54 @@ export function appendSupervisorLogTail(
   return next.slice(-maxEntries);
 }
 
+function formatPhaseText(phase: { name?: string; detail?: string; activeMs?: number | null } | undefined): string {
+  return phase?.name
+    ? `${phase.name}${phase.detail ? ` ${phase.detail}` : ''}${typeof phase.activeMs === 'number' ? ` active=${Math.round(phase.activeMs / 1000)}s` : ''}`
+    : 'unknown';
+}
+
+function formatStampAge(ms: number | null | undefined): string {
+  return typeof ms === 'number' && Number.isFinite(ms) ? `${Math.round(ms)}ms` : 'none';
+}
+
+/** The beacon's own view: the phase really running when the main thread last
+ *  checked in, how stale that check-in is, the longest stretch in the last
+ *  beat window, and every phase still in flight. The IPC phase above it is the
+ *  last one sent before the loop stopped, which can be older. */
+export function formatLivenessBeaconDiagnostic(read: { beacon: DaemonLivenessBeacon; ageMs: number } | null | undefined): string {
+  if (!read) return 'beacon=none';
+  const { beacon } = read;
+  const inFlight = Array.isArray(beacon.inFlight)
+    ? beacon.inFlight
+      .map((phase) => `${phase?.name ?? '?'}${typeof phase?.activeMs === 'number' ? `(${Math.round(phase.activeMs / 1000)}s)` : ''}`)
+      .join(',')
+    : '';
+  return [
+    `beacon_age=${formatStampAge(read.ageMs)}`,
+    `beacon_phase=${formatPhaseText(beacon.phase ?? undefined)}`,
+    `main_stamp_age=${formatStampAge(beacon.mainStampAgeMs)}`,
+    `max_main_stamp_age=${formatStampAge(beacon.maxMainStampAgeMs)}`,
+    `in_flight=[${inFlight}]`,
+  ].join(' ');
+}
+
 export function formatHungRestartDiagnostic(input: {
   misses: number;
   unresponsiveMs: number;
   ipcHeartbeatAgeMs: number | null;
   heartbeat: DaemonIpcHeartbeatSnapshot | null;
   recentLogs: SupervisorLogTailEntry[];
+  beacon?: { beacon: DaemonLivenessBeacon; ageMs: number } | null;
 }): string {
-  const phase = input.heartbeat?.phase;
-  const phaseText = phase?.name
-    ? `${phase.name}${phase.detail ? ` ${phase.detail}` : ''}${typeof phase.activeMs === 'number' ? ` active=${Math.round(phase.activeMs / 1000)}s` : ''}`
-    : 'unknown';
+  const phaseText = formatPhaseText(input.heartbeat?.phase);
   const lines = [
-    `=== Daemon HUNG diagnostic: misses=${input.misses} http_unresponsive=${Math.round(input.unresponsiveMs / 1000)}s ipc_heartbeat=${formatIpcHeartbeatAge(input.ipcHeartbeatAgeMs)} phase=${phaseText} ===`,
+    `=== Daemon HUNG diagnostic: misses=${input.misses} http_unresponsive=${Math.round(input.unresponsiveMs / 1000)}s ipc_heartbeat=${formatIpcHeartbeatAge(input.ipcHeartbeatAgeMs)} phase=${phaseText} ${formatLivenessBeaconDiagnostic(input.beacon)} ===`,
   ];
   if (input.heartbeat) {
     lines.push(`[heartbeat] ${JSON.stringify(input.heartbeat)}`);
+  }
+  if (input.beacon) {
+    lines.push(`[beacon] ${JSON.stringify(input.beacon.beacon)}`);
   }
   if (input.recentLogs.length > 0) {
     lines.push('[recent daemon logs]');
@@ -218,7 +250,15 @@ export interface DaemonLivenessBeacon {
   pid?: number;
   beaconUptimeMs?: number;
   mainStampAgeMs?: number | null;
+  /** Longest main-thread stretch the worker saw in its last beat window. */
+  maxMainStampAgeMs?: number | null;
+  /** True while a metered (long memory) phase is in flight. */
+  metered?: boolean;
+  /** The RUNNING phase: the code that last took the main thread. */
   phase?: { name?: string; detail?: string; activeMs?: number | null };
+  /** Every phase entered and not yet finished. Diagnostic only: the decision
+   *  below reads the running phase, never an old entry that is merely open. */
+  inFlight?: Array<{ name?: string; detail?: string; startedAt?: string | null; activeMs?: number | null }>;
 }
 
 export function readLivenessBeacon(file: string, now = Date.now()): { beacon: DaemonLivenessBeacon; ageMs: number } | null {
@@ -723,8 +763,8 @@ export class DaemonSupervisor {
           const recentLogs = [...this.recentDaemonLogs];
           this.emit({ type: 'hung-restart', misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs });
           this.logStream?.write(`=== Daemon HUNG (HTTP unresponsive ~${Math.round(unresponsiveMs / 1000)}s, IPC heartbeat ${formatIpcHeartbeatAge(ipcHeartbeatAgeMs)} old) — force-restarting at ${new Date().toISOString()} ===\n`);
-          this.logStream?.write(formatHungRestartDiagnostic({ misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs }));
-          this.writeHungRestartSnapshot({ misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs });
+          this.logStream?.write(formatHungRestartDiagnostic({ misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs, beacon: beaconRead }));
+          this.writeHungRestartSnapshot({ misses, unresponsiveMs, ipcHeartbeatAgeMs, heartbeat, recentLogs, beacon: beaconRead?.beacon ?? null, beaconAgeMs: beaconRead?.ageMs ?? null });
           this.stopLivenessWatchdog();
           // A frozen event loop cannot run its SIGTERM handler — go straight
           // to SIGKILL; the child 'exit' handler schedules the restart with
@@ -749,6 +789,9 @@ export class DaemonSupervisor {
     ipcHeartbeatAgeMs: number | null;
     heartbeat: DaemonIpcHeartbeatSnapshot | null;
     recentLogs: SupervisorLogTailEntry[];
+    /** The beacon as read for the decision: running phase, stamp ages, in-flight set. */
+    beacon: DaemonLivenessBeacon | null;
+    beaconAgeMs: number | null;
   }): void {
     try {
       const file = path.join(path.dirname(this.opts.logFile), 'supervisor-hang-snapshots.jsonl');
