@@ -39,8 +39,12 @@ const brackets = await import('./brackets.js');
 const envelopes = await import('../../agents/capability-envelope.js');
 const { harnessInstructions } = await import('../../agents/harness-context.js');
 const { rememberFact } = await import('../../memory/facts.js');
-const { runConversationContinuingPastToolCallsLimit: runConversation } = await import('./loop.js');
+const { runConversationContinuingPastToolCallsLimit: runConversation, runConversationFromResume } = await import('./loop.js');
+const { HarnessSession } = await import('./session.js');
+const approvals = await import('./approval-registry.js');
+const { Agent, RunContext, RunState } = await import('@openai/agents');
 const memoryDatabase = await import('../../memory/db.js');
+const { BoundaryError } = await import('../boundary-error.js');
 
 rememberFact({ kind: 'reference', content: 'Priority accounts are the records where Account.Priority_Account__c is true in the quokka ledger.' });
 rememberFact({ kind: 'project', content: 'Invoices are reviewed on Tuesdays by the operations desk.' });
@@ -96,29 +100,34 @@ function taskList() {
   });
 }
 
-async function ceilingRun(label: string, request: string) {
-  const session = eventlog.createSession({ kind: 'chat' });
+/** The production harness composition, so the turn carries the memory core
+ *  in its prefix and memory after the boundary, under a sealed envelope. */
+function sealedAgent(label: string, sessionId: string, request: string, model: ReturnType<typeof recordingModel>) {
   const tool = taskList();
-  const model = recordingModel([
-    [1, 2, 3, 4, 5].map((n) => functionCall(`${label}-${n}`, 'task_list')),
-    [4, 5].map((n) => functionCall(`${label}-${n}-again`, 'task_list')),
-    [done('Done.')],
-  ]);
-  // The instructions are the production harness composition, so the turn
-  // carries the memory core in its prefix and memory after the boundary.
   const agent = {
     model,
-    instructions: harnessInstructions('Use the exact configured tool.', { sessionId: session.id, focusInput: request }),
+    instructions: harnessInstructions('Use the exact configured tool.', { sessionId, focusInput: request }),
     tools: [tool],
   };
   const sealed = envelopes.sealAgentCapabilityUniverse({
-    sessionId: session.id, universeTools: [tool], activeToolNames: ['task_list'],
+    sessionId, universeTools: [tool], activeToolNames: ['task_list'],
     policyHash: `memory-continuation-${label}`,
     budget: { maxUncachedTokens: 1_000, maxModelCalls: 16, maxToolCalls: 64, maxElapsedMs: 20_000 },
   });
   if (!sealed.ok) throw new Error(sealed.errors.join('; '));
   envelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
   envelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  return agent;
+}
+
+async function ceilingRun(label: string, request: string) {
+  const session = eventlog.createSession({ kind: 'chat' });
+  const model = recordingModel([
+    [1, 2, 3, 4, 5].map((n) => functionCall(`${label}-${n}`, 'task_list')),
+    [4, 5].map((n) => functionCall(`${label}-${n}-again`, 'task_list')),
+    [done('Done.')],
+  ]);
+  const agent = sealedAgent(label, session.id, request, model);
   const result = await runConversation({
     sessionId: session.id, input: request, turnEngine: 'host_v1', judgeCompletion: false,
     agent: agent as never, makeRunner: () => throwingRunner() as never,
@@ -152,4 +161,137 @@ test('a request that declined memory stays declined when it resumes', async () =
     assert.equal(request.includes('Priority_Account__c'), false, 'no remembered fact on a declined request');
     assert.equal(request.includes('Invoices are reviewed on Tuesdays'), false, 'no remembered fact on a declined request');
   }
+});
+
+/** What the model receives for one runner call: the agent's instructions and
+ *  the input after the turn's own model-input filter. */
+function modelRequest(agent: { instructions?: unknown }, items: unknown[], opts: Record<string, unknown>): string {
+  const instructions = typeof agent.instructions === 'function' ? String((agent.instructions as () => unknown)()) : String(agent.instructions ?? '');
+  const filter = opts.callModelInputFilter as ((args: { modelData: { input: unknown[]; instructions?: string } }) => { input: unknown[]; instructions?: string }) | undefined;
+  const filtered = filter ? filter({ modelData: { input: items, instructions } }) : { input: items, instructions };
+  return [filtered.instructions ?? '', JSON.stringify(filtered.input)].join('\n');
+}
+
+/** Remembered notes that share the host directives' words and not the
+ *  request's, so memory ranked by a directive shows them instead of the
+ *  request's fact. Stored once. */
+let directiveLookalikesStored = false;
+function rememberDirectiveLookalikes(): void {
+  if (directiveLookalikesStored) return;
+  directiveLookalikesStored = true;
+  for (let n = 1; n <= 12; n += 1) {
+    rememberFact({ kind: 'project', importance: 5,
+      content: `Backend step ${n}: a failed call after a transient error is retried exactly as before by depot sync ${n}, which surfaces the choice when it fails again.` });
+    rememberFact({ kind: 'project', importance: 5,
+      content: `Visible answer ${n}: a completed turn that produced no reply for the user is answered again as plain text, stating the actual result and evidence (desk ${n}).` });
+  }
+}
+
+// Regression: a retry of the same request (the host's quiet re-attempt after
+// a transient model failure) once ranked the request's memory by the host's
+// own retry directive, so the retry lost the fact its request carries and was
+// shown unrelated memory instead. The runner is the only stand-in: the
+// conversation loop, the turn, its memory and its model-input filter are the
+// production ones, and the filter's output is what the model would receive.
+test('a retry of the same request ranks its memory by the request, not the host directive', async () => {
+  rememberDirectiveLookalikes();
+  const session = eventlog.createSession({ kind: 'chat' });
+  const request = 'List my priority accounts in the quokka ledger and draft a client note to each.';
+  const sent: string[] = [];
+  let calls = 0;
+  const agent = { instructions: harnessInstructions('Answer the request.', { sessionId: session.id, focusInput: request }) };
+  const result = await runConversation({
+    sessionId: session.id, input: request, judgeCompletion: false,
+    agent: agent as never,
+    makeRunner: () => new EventEmitter() as never,
+    maxTurns: 4, toolCallsPerTurn: 3, suppressMemoryCapture: true,
+    runRunner: async (_runner, _agent, items, opts) => {
+      calls += 1;
+      if (calls === 1) {
+        throw BoundaryError.from(new Error('backend 529 overloaded'), {
+          kind: 'model.overloaded', retryable: true, userMessage: 'The model runtime is temporarily unavailable.',
+        });
+      }
+      sent.push(modelRequest(agent, items, opts));
+      return { history: items, lastResponseId: undefined,
+        finalOutput: { summary: 'Listed them.', reply: 'Here are the priority accounts.', done: true, nextAction: 'completed', reason: null } };
+    },
+  });
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(eventlog.listEvents(session.id, { types: ['infra_auto_recover'] }).length, 1,
+    'the second activation is the host\'s retry of the same request');
+  const primers = eventlog.listEvents(session.id, { types: ['turn_memory_primer'] }).map((event) => event.data as Record<string, unknown>);
+  assert.equal(primers.length, 2, 'one primer per activation');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0]!, /Account\.Priority_Account__c is true/, 'the retry carries the request\'s fact');
+  assert.match(String(primers[1]!.queryPreview), /quokka ledger/, 'the retry ranks memory by the accepted request');
+});
+
+/** A request parked on an approval card, resumed through the production
+ *  resume wrapper and its continuation loop. The runner is the only stand-in:
+ *  the resume, the continuation's turn, its memory and its model-input filter
+ *  are the production ones. The resumed step completes with no reply, so the
+ *  host re-asks with its own directive as a later step of the same request. */
+async function resumedReask(label: string, options: { answerBySource: boolean; memoryPrimerQuery?: string }) {
+  rememberDirectiveLookalikes();
+  const request = `Which accounts count as priority in the quokka ledger for the ${label} renewal review?`;
+  const session = eventlog.createSession({ kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: request } });
+  // A resume agent is built without the request as its focus.
+  const agent = new Agent({ name: `ResumedRequestMemory-${label}`, instructions: harnessInstructions('Answer the request.', { sessionId: session.id }) });
+  const state = new RunState(new RunContext({}), request, agent, null).toJSON() as Record<string, unknown>;
+  state.currentStep = { type: 'next_step_interruption', data: { interruptions: [{
+    rawItem: { type: 'function_call', name: 'composio_execute_tool', callId: 'c1', arguments: JSON.stringify({ tool_slug: 'X', arguments: '{}' }) },
+    toolName: 'composio_execute_tool',
+  }] } };
+  HarnessSession.load(session.id)!.saveInterruptState(JSON.stringify(state));
+  const card = approvals.register({ sessionId: session.id, subject: 'one draft', tool: 'composio_execute_tool', args: { tool_slug: 'X', arguments: '{}' } });
+  const sent: string[] = [];
+  let calls = 0;
+  const result = await runConversationFromResume({
+    agent, sessionId: session.id, decision: 'approve', resolver: 'memory-continuation',
+    // Answered in chat, the request's own source accepts the answer; answered
+    // by the card's button, the runtime records a control edge for it.
+    ...(options.answerBySource ? { sourceUserSeq: source.seq } : { approvalId: card.approvalId }),
+    ...(options.memoryPrimerQuery ? { memoryPrimerQuery: options.memoryPrimerQuery } : {}),
+    makeRunner: () => new EventEmitter() as never,
+    runRunner: async (_runner, _agent, items, opts) => {
+      calls += 1;
+      // The first call resumes the parked run state; the re-ask is a turn.
+      sent.push(Array.isArray(items) ? modelRequest(agent, items, opts) : '');
+      return { history: Array.isArray(items) ? items : [], lastResponseId: undefined, finalOutput: calls === 1
+        ? { done: true, nextAction: 'completed', reply: null, summary: 'Resumed the approval.', reason: null }
+        : { done: true, nextAction: 'completed', reply: 'Here are the priority accounts.', summary: 'Listed them.', reason: null } };
+    },
+  });
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(calls, 2, 'the resumed step and the host\'s re-ask');
+  assert.ok(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
+    .some((event) => (event.data as { kind?: string; path?: string }).kind === 'completed_without_reply'
+      && (event.data as { path?: string }).path === 'resume'), 'the second step is the host\'s re-ask on the resume path');
+  const primers = eventlog.listEvents(session.id, { types: ['turn_memory_primer'] }).map((event) => event.data as Record<string, unknown>);
+  assert.equal(primers.length, 2, 'the resumed step and the re-ask each record their memory');
+  return { reask: sent[1]!, primer: primers[1]!, resumedPrimer: primers[0]! };
+}
+
+// Regression: after the owner answers a card, a later step of the resumed
+// request (the host re-asking for the reply the resumed step did not give)
+// once ranked the request's memory by the host's directive and lost the
+// request's fact.
+test('a later step of a resumed request ranks its memory by the request, not the host directive', async () => {
+  const { reask, primer } = await resumedReask('request', { answerBySource: true });
+  assert.match(reask, /Account\.Priority_Account__c is true/, 'the re-ask carries the request\'s fact');
+  assert.match(String(primer.queryPreview), /quokka ledger/, 'the re-ask ranks memory by the accepted request');
+});
+
+// A card answered by its button is accepted by a source the runtime records,
+// whose text is not a request. With no request text to rank by, the resumed
+// step and the re-ask carry the per-block rendering the prompt carried, not a
+// ranking of the control text or of the host's directive.
+test('a later step of a resumed request accepted by a control edge is not ranked by the host directive', async () => {
+  const { reask, primer, resumedPrimer } = await resumedReask('control-edge', { answerBySource: false });
+  assert.equal(resumedPrimer.skippedReason, 'empty_input', `the resumed step is not ranked by the control text: ${JSON.stringify(resumedPrimer)}`);
+  assert.equal(primer.skippedReason, 'empty_input', `the ranker is not run on a directive: ${JSON.stringify(primer)}`);
+  assert.doesNotMatch(reask, /## Relevant To This Request/, 'no ranked tail about the directive');
+  assert.match(reask, /## Persistent Facts/, 'the per-block memory stands in');
 });

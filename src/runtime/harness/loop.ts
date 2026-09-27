@@ -5540,19 +5540,31 @@ function requestDeclinedAutomaticMemory(
 /**
  * The accepted request's own text and whether it declined automatic memory.
  * `declined` is undefined when the source cannot be read, so each caller
- * decides what an unreadable source means for it.
+ * decides what an unreadable source means for it. `synthetic` marks a source
+ * the runtime recorded for a control edge (an approval answered by button),
+ * whose text is not a request.
  */
 function acceptedSourceMemoryPolicy(
   sessionId: string,
   sourceUserSeq: number | undefined,
-): { text?: string; declined?: boolean } {
+): { text?: string; declined?: boolean; synthetic?: boolean } {
   if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return {};
   try {
-    const text = acceptedUserEvent(sessionId, sourceUserSeq as number).data.text;
-    return typeof text === 'string' ? { text, declined: explicitlyOptsOutOfAutomaticMemoryRecall(text) } : {};
+    const data = acceptedUserEvent(sessionId, sourceUserSeq as number).data;
+    const text = data.text;
+    return typeof text === 'string'
+      ? { text, declined: explicitlyOptsOutOfAutomaticMemoryRecall(text), ...(data.synthetic === true ? { synthetic: true } : {}) }
+      : {};
   } catch {
     return {};
   }
+}
+
+/** The text of the request an accepted source carries; none for a source the
+ *  runtime recorded for a control edge, or one that cannot be read. */
+function acceptedRequestText(sessionId: string, sourceUserSeq: number | undefined): string | undefined {
+  const source = acceptedSourceMemoryPolicy(sessionId, sourceUserSeq);
+  return source.synthetic ? undefined : source.text;
 }
 
 /** The hard outer bound on assembling a turn's memory primer. */
@@ -5579,7 +5591,7 @@ async function resumedActivationMemoryPrimer(input: {
   const scope = memoryTailScopeFor((input.agent as { instructions?: unknown } | undefined)?.instructions);
   if (!scope) return undefined;
   const source = acceptedSourceMemoryPolicy(input.sessionId, input.sourceUserSeq);
-  const query = input.memoryPrimerQuery ?? source.text ?? '';
+  const query = input.memoryPrimerQuery ?? (source.synthetic ? undefined : source.text) ?? '';
   if (source.declined === true) return primerWithoutRanker(query, EXPLICIT_MEMORY_RECALL_OPTOUT_REASON, scope);
   if (source.declined === undefined) return primerWithoutRanker(query, 'source_unreadable', scope);
   const settled = await Promise.race([
@@ -10922,7 +10934,19 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // memory lookup. Keep it out of `semanticInput`: that value intentionally
   // continues to drive task classification, confirmation, convergence, and
   // post-turn attribution for verified conversational continuations.
-  const memoryPrimerInput = options.memoryPrimerQuery ?? semanticInput;
+  // A later activation of the same accepted request whose input is still the
+  // runtime's own directive (a retry, a re-ask, a step after a resumed card)
+  // ranks memory by the request it continues, as its first activation did: the
+  // request-ranked memory is the tail, and the directive's wording would rank
+  // it instead of the request. With no request text to rank by, the query is
+  // empty, so the per-block memory stands in as the prompt carried it.
+  const directiveContinuesAcceptedRequest = options.memoryPrimerQuery === undefined
+    && options.internalContinuation === true
+    && semanticInput === options.input;
+  const memoryPrimerInput = options.memoryPrimerQuery
+    ?? (directiveContinuesAcceptedRequest
+      ? acceptedRequestText(options.sessionId, sourceUserSeq) ?? ''
+      : semanticInput);
   const memoryRecallPolicyInput = options.semanticTaskInput
     ?? options.authoritativeUserInput
     ?? options.input;
