@@ -67,6 +67,49 @@ test('queries of a recall call recover the original data, not the JSON example i
   assert.doesNotMatch(result.content[0].text, /None of|No tool output/);
 });
 
+test('a recall that travelled through a carrier maps back to its producer, for recall and query alike', async () => {
+  // Regression: a recall dispatched through call_tool / work_call records the
+  // carrier as `tool`; the lineage walk stopped there, so the model paged the
+  // recall's own clipped copy instead of the original result.
+  const session = createSession({ kind: 'chat' });
+  const producer = `${'H'.repeat(4_000)}${JSON.stringify([{ Name: 'Carrier Lineage Row' }])}`;
+  writeToolOutput({ sessionId: session.id, callId: 'carrier-producer', tool: 'space_get', output: producer });
+  for (const carrier of ['call_tool', 'work_call'] as const) {
+    const recallId = `carrier-recall-${carrier}`;
+    appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+      callId: recallId, tool: carrier, effectiveTool: 'recall_tool_result', accounting: 'top_level',
+      arguments: JSON.stringify({ name: 'recall_tool_result', args_json: JSON.stringify({ call_id: 'carrier-producer', max_chars: 500 }) }),
+    } });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+      callId: recallId, tool: 'recall_tool_result', accounting: 'transport_mirror', canonicalCallId: recallId,
+      args: JSON.stringify({ call_id: 'carrier-producer', max_chars: 500, offset: null }),
+    } });
+    writeToolOutput({ sessionId: session.id, callId: recallId, tool: carrier,
+      output: `Recalled chars 0–500 of ${producer.length} (more remains — continue with recall_tool_result {"call_id":"carrier-producer","offset":500})\n\n${'H'.repeat(500)}` });
+    const recalled = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+      () => captureRecallHandler()({ call_id: recallId, offset: 4_000 }));
+    assert.match(recalled.content[0].text, new RegExp(`Recalled chars 4000–${producer.length} of ${producer.length}\\b`));
+    assert.match(recalled.content[0].text, /Carrier Lineage Row/);
+    const queried = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+      () => captureToolOutputQueryHandler()({ call_id: recallId, fields: ['Name'] }));
+    assert.match(queried.content[0].text, /Carrier Lineage Row/);
+  }
+});
+
+test('lineage never follows a foreign tool that only shares the recall name', async () => {
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'foreign-target', tool: 'work_call', output: 'the target text' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_called', data: {
+    callId: 'foreign-recall', tool: 'recall_tool_result', effectiveTool: 'othersrv__recall_tool_result',
+    accounting: 'top_level', arguments: JSON.stringify({ call_id: 'foreign-target' }),
+  } });
+  writeToolOutput({ sessionId: session.id, callId: 'foreign-recall', tool: 'recall_tool_result', output: 'the foreign tool own output' });
+  const recalled = await withHarnessRunContext({ sessionId: session.id, turn: 2, toolCalls: new ToolCallsCounter(10) },
+    () => captureRecallHandler()({ call_id: 'foreign-recall' }));
+  assert.match(recalled.content[0].text, /the foreign tool own output/);
+  assert.doesNotMatch(recalled.content[0].text, /the target text/);
+});
+
 test('old or failed projections do not permanently exhaust a retained result for later turns', async () => {
   const session = createSession({ kind: 'chat' });
   writeToolOutput({ sessionId: session.id, callId: 'long-lived-result', tool: 'work_call',
