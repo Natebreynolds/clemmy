@@ -29,7 +29,7 @@
  * Nothing here throws, and nothing here waits on the network.
  */
 import type { Model } from '@openai/agents-core';
-import { DEFAULT_CODEX_FAST_MODEL, getByoBackendConfig, MODELS } from '../config.js';
+import { DEFAULT_CODEX_FAST_MODEL, MODELS } from '../config.js';
 import { memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
 import {
   readDurableBindings,
@@ -197,7 +197,8 @@ function problemForModel(provider: ModelProviderClass, modelId: string): MemoryM
     accountId = resolveByoProviderForModel(modelId)?.providerId || undefined;
   } catch { /* an ambiguous id belongs to no single account */ }
   if (accountId && creditRefusal(accountId)) return { problem: 'credit' };
-  if (!accountId && !getByoBackendConfig().configured) return { problem: 'not_connected' };
+  // A provider that owns the model but still could not be built is an error;
+  // no owning provider means the model is not connected.
   return { problem: accountId ? 'error' : 'not_connected' };
 }
 
