@@ -1405,3 +1405,26 @@ test('manifest-only Workspace reads expose the manifest without inventing a save
   const preview = text(await tools.space_preview({ slug }));
   assert.match(preview, /no view to preview/i);
 });
+
+test('a Space document may be passed as the object itself, not only as JSON text', async () => {
+  const slug = 'object-document-space';
+  const document = { _mobile: { title: 'Object doc', sections: [{ heading: 'One', body: 'Alpha "quoted" text' }] }, items: [{ id: 1, note: 'brace } inside' }] };
+  const created = text(await tools.space_save({
+    slug,
+    title: 'Object Document',
+    objective: 'Prove a native object is accepted where JSON text was required.',
+    success_criteria: ['The saved data equals the object'],
+    invariants: [],
+    view_html: '<!doctype html><html><body><h1>Object doc</h1></body></html>',
+    initial_data_json: document,
+  } as never));
+  assert.match(created, /Created workspace "Object Document"/);
+  assert.deepEqual(JSON.parse(readFileSync(store.resolveInSpace(slug, 'data.json'), 'utf8')), document);
+  // The text form is unchanged, and malformed text is still refused with the same message.
+  const bad = text(await tools.space_save({
+    slug: 'object-document-space-2', title: 'Bad text', objective: 'x', success_criteria: ['y'], invariants: [],
+    view_html: '<!doctype html><html><body>x</body></html>',
+    initial_data_json: '{"a": "unterminated}',
+  } as never));
+  assert.match(bad, /initial_data_json is not valid JSON/);
+});

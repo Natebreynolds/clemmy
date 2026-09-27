@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { jsonArgumentText, jsonObjectArgument, jsonValueArgument } from './json-argument.js';
 import { BASE_DIR } from '../config.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
@@ -207,8 +208,8 @@ const dataSourceShape = z.object({
   runner_path: z.string().max(1000).nullish().describe('Legacy compatibility only: may update the file of an existing runner-backed source, which invalidates its prior entrypoint grant and requires a fresh pinned-entrypoint approval. New data-source runner installation is refused.'),
   composio_slug: z.string().max(120).nullish().describe('A PROVABLY READ-ONLY Composio tool slug (GET/LIST/SEARCH/FETCH/READ) to call server-side for data. Writes, unknown actions, and runners are refused; credentials resolve server-side, never in the view.'),
   composio_account_id: z.string().trim().min(1).max(200).nullish().describe('Exact connected account ID from tool discovery for this read source. Save it when multiple accounts are connected; never guess an account.'),
-  transforms_json: z.string().max(65536).nullish().describe('Optional pure pipeline JSON: [{id,transform:{version:1,expression:<workflow transform>}}]. Read result is steps.read.output; reference earlier steps by ID. input.observed_at is the host read timestamp. Final output becomes this source dataset on desktop and phone. No calls or code; 1-16 steps.'),
-  composio_args_json: z.string().max(4000).nullish().describe('JSON string of frozen args for composio_slug.'),
+  transforms_json: jsonValueArgument().nullish().describe('Optional pure pipeline JSON: [{id,transform:{version:1,expression:<workflow transform>}}]. Read result is steps.read.output; reference earlier steps by ID. input.observed_at is the host read timestamp. Final output becomes this source dataset on desktop and phone. No calls or code; 1-16 steps.'),
+  composio_args_json: jsonObjectArgument().nullish().describe('JSON string of frozen args for composio_slug.'),
   cli_argv: z.array(z.string().min(1).max(1000)).max(64).nullish().describe('OR a frozen READ-ONLY CLI invocation as an argv array (no shell), e.g. ["sf","data","query","-q","SELECT ...","-r","json"]. argv[0] must be a bare installed-command name on PATH. The user approves the exact command once; after that, scheduled and manual refreshes run it unattended. Any argv or schedule change re-asks. Stdout becomes the dataset (JSON parsed when possible, else {stdout}). Declare only commands that read — never ones that create/update/delete.'),
   allow_empty: z.boolean().nullish().describe('Set true only when zero rows is an intentional valid product state (for example a brand-new content calendar). The creation smoke will still run, but will not mislabel that expected empty state as broken.'),
   schedule: z.string().max(60).nullish().describe('Optional 5-field cron for an automatic daily/periodic refresh — LIVE: the in-process scheduler runs it server-side (and harvests _reengage from the output). Omit for on-demand only.'),
@@ -221,7 +222,7 @@ const actionShape = z.object({
   composio_slug: z.string().max(120).nullish().describe('Composio tool to call server-side, e.g. OUTLOOK_SEND_EMAIL. Mutually exclusive with runner.'),
   runner: z.string().max(120).nullish().describe('OR the installed filename of a script under data/ that performs the side effect. Use runner_path to install a newly-authored script in this call.'),
   runner_path: z.string().max(1000).nullish().describe(`Optional source path to the action runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
-  args_template_json: z.string().max(4000).nullish().describe('JSON string of base args. The view supplies the variable parts (e.g. {to, subject, body}) at click time, merged over this template.'),
+  args_template_json: jsonObjectArgument().nullish().describe('JSON string of base args. The view supplies the variable parts (e.g. {to, subject, body}) at click time, merged over this template.'),
   confirm: z.boolean().nullish().describe('Hint that the view should confirm before firing (advisory).'),
 });
 
@@ -257,8 +258,8 @@ function declaredRunner(
   return runner;
 }
 
-function parseJsonObjectField(raw: string | null | undefined, label: string, errors: string[]): Record<string, unknown> | undefined {
-  const text = raw?.trim();
+function parseJsonObjectField(raw: string | Record<string, unknown> | unknown[] | null | undefined, label: string, errors: string[]): Record<string, unknown> | undefined {
+  const text = jsonArgumentText(raw)?.trim();
   if (!text) return undefined;
   try {
     const parsed = JSON.parse(text);
@@ -487,8 +488,8 @@ export function registerSpaceTools(server: McpServer): void {
       invariants: z.array(z.string().min(1).max(500)).max(12).nullish().describe('Optional user/product rules that later edits must never violate, e.g. "Salesforce remains read-only" or "Never publish without approval". An explicit [] clears; omit to preserve.'),
       view_html: z.string().min(1).max(SPACE_INLINE_VIEW_MAX_BYTES).nullish().describe(`Preferred for ordinary views: complete self-contained HTML, at most ${SPACE_INLINE_VIEW_MAX_BYTES} UTF-8 bytes. Mutually exclusive with view_path; omit both to update only metadata on an existing Workspace.`),
       view_path: z.string().max(1000).nullish().describe(`Legacy / oversized compatibility: path to an already-authored HTML file inside ${BASE_DIR}. Mutually exclusive with view_html; omit both to update only metadata on an existing Workspace.`),
-      initial_data_json: z.string().min(1).max(SPACE_INITIAL_DATA_MAX_BYTES).nullish().describe(`Create-only complete JSON document for a one-off static Workspace, maximum ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes. Include top-level _mobile so the substantive content is visible on the phone. Cannot be combined with data_sources; exact retry of the same committed create is idempotent.`),
-      replacement_data_json: z.string().min(1).max(SPACE_INITIAL_DATA_MAX_BYTES).nullish().describe('Complete replacement root JSON document for an EXISTING static Workspace; preserve unrelated content and its authored _mobile projection. Pair with expected_revision from space_get. Optional view_html commits in the same revision. Cannot combine with initial_data_json or data sources.'),
+      initial_data_json: jsonObjectArgument().nullish().describe(`Create-only complete JSON document for a one-off static Workspace, maximum ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes. Include top-level _mobile so the substantive content is visible on the phone. Cannot be combined with data_sources; exact retry of the same committed create is idempotent.`),
+      replacement_data_json: jsonObjectArgument().nullish().describe('Complete replacement root JSON document for an EXISTING static Workspace; preserve unrelated content and its authored _mobile projection. Pair with expected_revision from space_get. Optional view_html commits in the same revision. Cannot combine with initial_data_json or data sources.'),
       expected_revision: z.string().regex(/^[a-f0-9]{64}$/).nullish().describe('Exact snapshot revision returned by space_get or space_get_view. Required only with replacement_data_json; rejects an edit of a stale board without changing it.'),
       data_sources: z.array(dataSourceShape).nullish().describe('Optional declared data sources for server-side (token-free) refresh. On an EXISTING Workspace a non-empty list is merged by id: a source with a known id is updated, a new id is added, and every other source is kept. To drop one source, name it in remove_data_sources; an explicit empty list [] clears them all.'),
       remove_data_sources: z.array(z.string().min(1)).nullish().describe('Ids of existing data sources to remove from this Workspace. The only way a source is removed — an omitted source is kept.'),
@@ -498,9 +499,12 @@ export function registerSpaceTools(server: McpServer): void {
       origin_session_id: z.string().max(200).nullish().describe('Usually omit — defaults to the current chat session so the workspace stays tied to this conversation.'),
     },
     async ({
-      slug, title, objective, success_criteria, invariants, view_html, view_path, initial_data_json, replacement_data_json, expected_revision, data_sources, remove_data_sources, actions,
+      slug, title, objective, success_criteria, invariants, view_html, view_path, initial_data_json: initialDataInput, replacement_data_json: replacementDataInput, expected_revision, data_sources, remove_data_sources, actions,
       reengage_triggers, reengage_guidance, origin_session_id,
     }) => {
+      // A document given as an object is serialized once here; every check below reads the text.
+      const initial_data_json = jsonArgumentText(initialDataInput);
+      const replacement_data_json = jsonArgumentText(replacementDataInput);
       if (!isValidSpaceSlug(slug)) {
         return invalidArgumentsTextResult(`Error: "${slug}" is not a valid workspace slug. Use lowercase kebab-case, 2-63 chars (e.g. "sf-daily-report").`);
       }
@@ -1029,7 +1033,7 @@ export function registerSpaceTools(server: McpServer): void {
     {
       slug: z.string().min(2).max(63).describe('Exact existing Workspace slug.'),
       action_id: z.string().min(1).max(120).describe('Exact id of an action already declared in that Workspace.'),
-      args_json: z.string().max(20_000).nullish().describe('Optional JSON object of caller-supplied arguments for this one action. Omit for {}. The declared action template remains authoritative.'),
+      args_json: jsonObjectArgument().nullish().describe('Optional JSON object of caller-supplied arguments for this one action. Omit for {}. The declared action template remains authoritative.'),
     },
     async ({ slug, action_id, args_json }) => {
       if (!isValidSpaceSlug(slug)) {
@@ -1064,9 +1068,10 @@ export function registerSpaceTools(server: McpServer): void {
       }
 
       let callerArgs: Record<string, unknown> = {};
-      if (args_json != null && args_json.trim()) {
+      const argsText = jsonArgumentText(args_json);
+      if (argsText != null && argsText.trim()) {
         try {
-          const parsed = JSON.parse(args_json) as unknown;
+          const parsed = JSON.parse(argsText) as unknown;
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             return textResult('Error: args_json must be one JSON object. Nothing was prepared or run.');
           }
@@ -1794,7 +1799,7 @@ export function registerSpaceTools(server: McpServer): void {
     {
       slug: z.string().min(2).max(63).describe('The workspace slug.'),
       runner_path: z.string().min(1).max(120).describe('Runner filename under the workspace data/ dir, e.g. "refresh.mjs".'),
-      payload_json: z.string().max(4000).nullable().describe('Legacy compatibility field. It is validated but never executed because this inspection does not spawn the runner.'),
+      payload_json: jsonObjectArgument().nullable().describe('Legacy compatibility field. It is validated but never executed because this inspection does not spawn the runner.'),
     },
     async ({ slug, runner_path, payload_json }) => {
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
@@ -1803,9 +1808,10 @@ export function registerSpaceTools(server: McpServer): void {
       const runner = runner_path.trim();
       const filenameError = runnerFilenameError(runner);
       if (filenameError) return textResult(`Error: ${filenameError}`);
-      if (payload_json && payload_json.trim()) {
+      const payloadText = jsonArgumentText(payload_json);
+      if (payloadText && payloadText.trim()) {
         let parsed: unknown;
-        try { parsed = JSON.parse(payload_json); }
+        try { parsed = JSON.parse(payloadText); }
         catch (err) { return textResult(`Error: payload_json is not valid JSON: ${(err as Error).message}`); }
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
           return textResult('Error: payload_json must be a JSON object.');
