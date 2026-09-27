@@ -1,8 +1,12 @@
 /**
  * Memory on the phone — no longer a read-only list.
  *
- * Three surfaces, same canonical data the desktop uses:
+ * Four surfaces, same canonical data the desktop uses:
  *  - SEARCH (top, unchanged): unified recall with "why recalled" chips.
+ *  - MEMORY AT WORK: what the background memory jobs are doing now, which
+ *    model does their thinking (changeable in place), today's numbers and
+ *    the latest runs with undo; "See all" opens the full record.
+ *    (components/MemoryWorkCard.tsx, lib/memory-work.ts)
  *  - MEMORIES: browsable facts; every card opens a full detail view with
  *    evidence and validity history, and the actions that matter — pin,
  *    correct, forget/restore. Corrections SUPERSEDE (the daemon preserves
@@ -17,17 +21,27 @@ import {
   forgetFact,
   getEntityDetail,
   getFactDetail,
+  getMemoryWork,
+  getModelSettings,
   listEntities,
   listFacts,
   pinFact,
   restoreFact,
   searchMemory,
+  undoMemoryWork,
   type MemoryEntity,
   type MemoryFact,
   type MemoryHit,
+  type ModelSettings,
 } from '../lib/api';
 import { humanizeReasons } from '../lib/memory-reasons';
+import { MEMORY_WORK_POLL_MS, normalizeMemoryWork, type MemoryWorkRead } from '../lib/memory-work';
+import { modelLabel } from '../lib/model-roles';
+import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import { ChatBackButton } from '../components/ChatBackButton';
+import { MemoryWorkCard } from '../components/MemoryWorkCard';
+import { MemoryWorkTimeline } from '../components/MemoryWorkTimeline';
+import { RoleSheet } from '../components/RoleSheet';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { haptic } from '../lib/native-bridge';
@@ -110,6 +124,66 @@ export function Memory() {
 
   const pinnedCount = useMemo(() => facts.filter((f) => f.pinned).length, [facts]);
 
+  // Memory at work. The card and its full view share one poll, which runs
+  // only while this screen itself is showing (not a fact, a person, or search
+  // results).
+  const [workOpen, setWorkOpen] = useState(false);
+  const loadWork = useCallback(async () => normalizeMemoryWork(await getMemoryWork()), []);
+  const work = useScreenData(loadWork, {
+    intervalMs: MEMORY_WORK_POLL_MS,
+    disabled: openFactId !== null || openEntityId !== null || (Boolean(searchQuery) && !workOpen),
+  });
+  const workRead: MemoryWorkRead = {
+    snapshot: work.data,
+    error: work.error,
+    offline: work.offline,
+    receivedAt: work.updatedAt,
+    now: Date.now(),
+  };
+  const refreshWork = work.refresh;
+  const retryWork = useCallback(() => { void refreshWork(); }, [refreshWork]);
+  const undoWork = useCallback(async (eventId: string) => {
+    const result = await undoMemoryWork(eventId);
+    // The run's undo count and the Memories list both come from fact state,
+    // so the next reads are what show the change.
+    await Promise.allSettled([refreshWork(), refreshFacts()]);
+    return result;
+  }, [refreshWork, refreshFacts]);
+
+  // Models are named the way Settings › Models names them, from the connected
+  // catalog, and the memory model is changed with the same picker, in place.
+  const models = useScreenData(getModelSettings);
+  const [savedModels, setSavedModels] = useState<ModelSettings | null>(null);
+  useEffect(() => { setSavedModels(null); }, [models.data]);
+  const modelSettings = savedModels ?? models.data;
+  const nameModel = useCallback((modelId: string) => modelLabel(modelId, modelSettings), [modelSettings]);
+  const [modelSheet, setModelSheet] = useState(false);
+  const openModelSheet = modelSettings?.roles?.memory ? () => setModelSheet(true) : undefined;
+  const closeModelSheet = useCallback(() => setModelSheet(false), []);
+  const refreshModels = models.refresh;
+  const modelChanged = useCallback((next: ModelSettings) => {
+    setSavedModels(next);
+    void refreshModels();
+    void refreshWork();
+  }, [refreshModels, refreshWork]);
+  const modelPicker = (
+    <RoleSheet
+      role={modelSheet ? 'memory' : null}
+      settings={modelSettings}
+      onClose={closeModelSheet}
+      onChanged={modelChanged}
+    />
+  );
+
+  // The full view is depth, like a run on Activity: the swipe-back closes it.
+  useBackGesture(workOpen, () => setWorkOpen(false));
+  const openWork = () => {
+    haptic('light');
+    withDepthTransition(() => setWorkOpen(true));
+    document.querySelector('.app-main')?.scrollTo({ top: 0 });
+  };
+  const closeWork = () => withDepthTransition(() => setWorkOpen(false));
+
   if (openFactId !== null) {
     return (
       <FactDetailView
@@ -126,6 +200,22 @@ export function Memory() {
         onBack={() => { setOpenEntityId(null); void refreshEntities(); }}
         onOpenFact={(id) => { setOpenEntityId(null); setOpenFactId(id); }}
       />
+    );
+  }
+  if (workOpen) {
+    return (
+      <>
+        <MemoryWorkTimeline
+          read={workRead}
+          loading={work.loading}
+          modelName={nameModel}
+          onChangeModel={openModelSheet}
+          onBack={closeWork}
+          onUndo={undoWork}
+          onRetry={retryWork}
+        />
+        {modelPicker}
+      </>
     );
   }
 
@@ -154,6 +244,15 @@ export function Memory() {
         />
       ) : (
         <>
+          <MemoryWorkCard
+            read={workRead}
+            loading={work.loading}
+            modelName={nameModel}
+            onChangeModel={openModelSheet}
+            onOpen={openWork}
+            onUndo={undoWork}
+            onRetry={retryWork}
+          />
           <div class="memory-tabs" role="tablist">
             <button role="tab" aria-selected={tab === 'facts'} class={`memory-tab ${tab === 'facts' ? 'active' : ''}`} onClick={() => setTab('facts')}>Memories</button>
             <button role="tab" aria-selected={tab === 'people'} class={`memory-tab ${tab === 'people' ? 'active' : ''}`} onClick={() => setTab('people')}>People</button>
@@ -179,6 +278,7 @@ export function Memory() {
           )}
         </>
       )}
+      {modelPicker}
     </div>
   );
 }

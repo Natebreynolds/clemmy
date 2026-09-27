@@ -4562,3 +4562,270 @@ textarea.cz-input { resize: vertical; }
   letter-spacing: 0.02em;
 }
 .settings-signout-page { border-top: 0; padding-top: 0; margin-top: var(--sp-2); }
+
+/* ── memory at work ──────────────────────────────────────────────────
+   The card at the top of Memory and its full view (components/MemoryWork*).
+   Still by default. One pulse, a lit stage and a slow flow between stages
+   appear only while the daemon says a job is running right now, and the flow
+   runs slower than the chat's own rail: background work should feel quieter
+   than the work you are watching. */
+.mw-skeleton { margin-bottom: var(--sp-3); }
+.mw-skeleton i { height: 196px; }
+.mw-card { display: flex; flex-direction: column; gap: var(--sp-3); margin-bottom: var(--sp-3); }
+.mw-card.is-working { border-color: var(--line-hot); }
+.mw-card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin: calc(var(--sp-2) * -1) 0 calc(var(--sp-2) * -1); }
+.mw-card .section-head { margin: 0; }
+.mw-see-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 44px;
+  padding: 0 0 0 var(--sp-3);
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: var(--t-sm);
+  font-weight: 650;
+}
+.mw-see-all svg { width: 16px; height: 16px; }
+
+.mw-status { display: flex; align-items: flex-start; gap: var(--sp-3); min-width: 0; }
+.mw-dot { flex: 0 0 auto; width: 9px; height: 9px; margin-top: 6px; border-radius: 50%; background: var(--fg-3); }
+.pulse-dot.mw-dot { background: var(--accent); }
+.mw-dot-resting { background: var(--accent-2); }
+.mw-dot-waiting { background: var(--accent-warn); }
+.mw-dot-off, .mw-job-dot-off { background: transparent; box-shadow: inset 0 0 0 1.5px var(--fg-3); }
+.mw-dot-unknown, .mw-job-dot-idle { background: var(--bg-4); }
+/* Working at the last read, which can no longer vouch for now: no motion. */
+.mw-dot-working, .mw-job-dot-running { background: var(--accent); opacity: 0.45; }
+.mw-job-dot-waiting { background: var(--accent-warn); }
+.mw-status-main { min-width: 0; flex: 1 1 auto; }
+.mw-headline {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--t-body);
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.mw-status.tone-unknown .mw-headline { color: var(--fg-2); }
+.mw-detail { margin: 2px 0 0; font-size: var(--t-xs); color: var(--fg-3); }
+.mw-stale { color: var(--accent-warn); }
+.mw-link { min-height: 44px; padding: 0; border: 0; background: none; color: var(--accent); font-size: var(--t-sm); font-weight: 650; }
+
+.mw-model {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 52px;
+  padding: var(--sp-3) 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+}
+.mw-model-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.mw-model-role { font-size: var(--t-xs); font-weight: 650; color: var(--fg-3); }
+.mw-model-name { font-size: var(--t-sm); font-weight: 700; overflow-wrap: anywhere; }
+.mw-model-name.is-none { font-weight: 600; color: var(--fg-2); }
+.mw-model-note { font-size: var(--t-xs); color: var(--fg-3); }
+.mw-model-note.warning { color: var(--accent-warn); }
+
+.mw-block { border-top: 1px solid var(--line); padding-top: var(--sp-3); }
+.mw-label { margin: 0 0 var(--sp-2); font-size: var(--t-xs); font-weight: 650; letter-spacing: 0.02em; color: var(--fg-3); }
+
+/* Today: five stages joined by hairlines. A stage whose job is running is
+   washed in the accent and the hairline into it carries a slow sweep. */
+.mw-pipe {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 14px minmax(0, 1fr) 14px minmax(0, 1fr) 14px minmax(0, 1fr) 14px minmax(0, 1fr);
+  align-items: start;
+}
+.mw-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  min-width: 0;
+  padding: 4px 0 5px;
+  border-radius: var(--r-sm);
+  text-align: center;
+  transition: background-color var(--clem-dur-base) var(--ease-out);
+}
+.mw-stage-n {
+  font-family: var(--font-display);
+  font-size: var(--t-title);
+  font-weight: 750;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  transition: color var(--clem-dur-base) var(--ease-out);
+}
+.mw-stage-label { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--t-xs); line-height: 1.2; color: var(--fg-3); }
+.mw-stage.is-unknown .mw-stage-n { color: var(--fg-3); }
+.mw-stage.is-lit { background: var(--accent-soft); }
+.mw-stage.is-lit .mw-stage-n { color: var(--accent); }
+.mw-stage.is-lit .mw-stage-label { color: var(--fg-2); font-weight: 600; }
+.mw-flow { padding-top: calc(4px + var(--t-title) * 0.55 - 1px); }
+.mw-flow i { display: block; height: 2px; border-radius: 999px; background: var(--line-strong); }
+.mw-flow.is-flowing i {
+  background: linear-gradient(90deg, var(--clem-primary) 0%, var(--clem-primary) 35%, var(--accent-soft) 50%, var(--clem-primary) 65%, var(--clem-primary) 100%);
+  background-size: 200% 100%;
+  animation: rail-sweep 2.4s linear infinite;
+}
+
+/* The activity strips: bars drawn from what the daemon counted. An empty
+   hour is a hairline, the current hour is the citrus fill, and a green dot
+   marks an hour in which something was learned. */
+.mw-hours, .mw-days { display: flex; flex-direction: column; gap: 4px; }
+.mw-hours-bars, .mw-days-bars {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  height: 44px;
+  padding-top: 7px;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.mw-hours-bars { cursor: pointer; }
+.mw-hours-bars:focus-visible { outline: var(--clem-focus-width) solid var(--clem-focus); outline-offset: 3px; border-radius: 4px; }
+.mw-days-bars { height: 30px; gap: 1px; }
+.mw-bar { position: relative; flex: 1 1 0; min-width: 0; }
+.mw-bar i {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: max(2px, calc(var(--h, 0) * 100%));
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--fg-3) 42%, transparent);
+  transition: height var(--clem-dur-slow) var(--ease-out), background-color var(--clem-dur-fast) var(--ease-out);
+}
+.mw-bar.is-empty i { height: 1px; background: var(--line-strong); }
+.mw-bar.is-now i { background: var(--clem-primary); }
+.mw-bar.is-picked i { background: var(--accent); }
+.mw-bar-learned {
+  position: absolute;
+  left: 50%;
+  bottom: calc(max(2px, calc(var(--h, 0) * 100%)) + 2px);
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--accent-2);
+}
+.mw-axis { display: flex; justify-content: space-between; font-size: var(--t-xs); line-height: 1.2; color: var(--fg-3); }
+.mw-caption { margin: 0; min-height: 1.5em; font-size: var(--t-xs); color: var(--fg-2); font-variant-numeric: tabular-nums; }
+
+/* Runs. */
+.mw-events { list-style: none; margin: 0; padding: 0; }
+.mw-events-compact, .mw-day .mw-events, .mw-jobs { border-top: 1px solid var(--line); }
+.mw-event + .mw-event, .mw-job + .mw-job { border-top: 1px solid var(--line); }
+.mw-event-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 44px;
+  padding: var(--sp-2) 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+}
+.mw-event-dot { flex: 0 0 auto; width: 7px; height: 7px; margin-top: 7px; border-radius: 50%; background: var(--fg-3); }
+.mw-event-dot.tone-ok { background: var(--accent-2); }
+.mw-event-dot.tone-quiet { background: var(--bg-4); }
+.mw-event-dot.tone-waiting { background: var(--accent-warn); }
+.mw-event-dot.tone-failed { background: var(--accent-fail); }
+.mw-event-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.mw-event-text { font-size: var(--t-sm); line-height: 1.4; overflow-wrap: anywhere; }
+.mw-event-time { margin-right: 6px; font-variant-numeric: tabular-nums; color: var(--fg-3); }
+.mw-event-meta { font-size: var(--t-xs); color: var(--fg-3); overflow-wrap: anywhere; }
+.mw-standin { margin-left: 6px; padding: 0 6px; border-radius: 5px; background: var(--warn-soft); color: var(--accent-warn); font-weight: 650; }
+.mw-chevron { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 3px; color: var(--fg-3); transition: transform var(--clem-dur-base) var(--ease-out); }
+.mw-chevron.open { transform: rotate(90deg); }
+.mw-event-body { padding: 0 0 var(--sp-2) 15px; }
+.mw-facts { list-style: none; margin: 0 0 var(--sp-2); padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.mw-fact { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 7px 10px; border-radius: var(--r-sm); background: var(--bg-2); }
+.mw-fact-change { font-size: var(--t-xs); font-weight: 700; color: var(--accent-2); }
+.mw-fact.change-faded .mw-fact-change { color: var(--fg-3); }
+.mw-fact-state { font-size: var(--t-xs); color: var(--fg-3); }
+.mw-fact-text { order: 3; flex: 1 1 100%; font-size: var(--t-sm); color: var(--fg-2); overflow-wrap: anywhere; }
+.mw-fact.is-inactive .mw-fact-text { color: var(--fg-3); }
+.mw-fact-more { padding-left: 10px; font-size: var(--t-xs); color: var(--fg-3); }
+.mw-kept { margin: 0; font-size: var(--t-xs); color: var(--fg-3); }
+.mw-event-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--sp-4); margin-top: -6px; padding-left: 15px; }
+.mw-undo { min-height: 44px; padding: 0; border: 0; background: none; color: var(--accent); font-size: var(--t-sm); font-weight: 650; }
+.mw-undo.danger { color: var(--accent-fail); }
+.mw-undo:disabled { color: var(--fg-3); }
+.mw-confirm { flex: 1 1 100%; padding-top: 6px; font-size: var(--t-sm); color: var(--fg-2); }
+.mw-outcome { display: inline-flex; align-items: center; min-height: 44px; font-size: var(--t-sm); font-weight: 600; color: var(--accent-2); }
+.mw-outcome.error { color: var(--accent-fail); }
+.mw-empty { margin: 0; font-size: var(--t-sm); color: var(--fg-2); }
+
+/* The full view. */
+.mw-detail .workflow-detail-body { display: flex; flex-direction: column; gap: var(--sp-5); }
+.mw-detail .mw-card { margin-bottom: 0; }
+.mw-section { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
+.mw-section > h3 { margin: 0 2px; }
+.mw-figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(72px, 1fr)); gap: var(--sp-2); margin: 0; }
+.mw-figure {
+  display: flex;
+  flex-direction: column-reverse;
+  justify-content: flex-end;
+  gap: 1px;
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-1);
+}
+.mw-figure dt { font-size: var(--t-xs); color: var(--fg-3); }
+.mw-figure dd { margin: 0; font-family: var(--font-display); font-size: var(--t-body); font-weight: 700; font-variant-numeric: tabular-nums; }
+.mw-queue { margin: 0; font-size: var(--t-xs); color: var(--fg-3); }
+.mw-day + .mw-day, .mw-job-group + .mw-job-group { margin-top: var(--sp-3); }
+.mw-day .mw-label, .mw-job-group .mw-label { margin-left: 2px; }
+.mw-jobs { list-style: none; margin: 0; padding: 0; }
+.mw-job-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 52px;
+  padding: var(--sp-3) 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+}
+.mw-job-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.mw-job-title { font-size: var(--t-sm); font-weight: 700; }
+.mw-job-state { font-size: var(--t-xs); font-weight: 650; color: var(--accent); }
+.mw-job-state.warning { color: var(--accent-warn); }
+.mw-job-line { font-size: var(--t-xs); color: var(--fg-3); overflow-wrap: anywhere; }
+.mw-job-body { padding: 0 0 var(--sp-3) 21px; font-size: var(--t-sm); color: var(--fg-2); }
+.mw-job-body p { margin: 0 0 4px; }
+.mw-foot { margin: 0; font-size: var(--t-xs); color: var(--fg-3); }
+
+/* The smallest phones: tighter joins so every stage keeps its whole word. */
+@media (max-width: 360px) {
+  .mw-pipe { grid-template-columns: minmax(0, 1fr) 6px minmax(0, 1fr) 6px minmax(0, 1fr) 6px minmax(0, 1fr) 6px minmax(0, 1fr); }
+  .mw-stage-label { letter-spacing: -0.01em; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mw-flow.is-flowing i { animation: none; background: var(--clem-primary); }
+  .mw-bar i, .mw-stage, .mw-stage-n, .mw-chevron { transition: none; }
+}

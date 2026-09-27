@@ -1266,6 +1266,39 @@ export async function listFacts(kind?: MemoryFact['kind'], limit = 60): Promise<
   return api<{ facts: MemoryFact[] }>(`/m/api/memory/facts?${params.toString()}`);
 }
 
+// Memory at work. The contract is shared with the desktop, not restated here.
+import type { MemoryWorkSnapshot, MemoryWorkUndoResult } from '@clem/chat-engine';
+export type { MemoryWorkSnapshot, MemoryWorkUndoResult };
+
+/**
+ * What the background memory jobs are doing, which model does the thinking,
+ * and what they changed: the same daemon builder desktop Memory reads. Null
+ * when this Mac's Clem does not report memory work yet (an older daemon), so
+ * the screen leaves the card out instead of calling that a failure.
+ */
+export async function getMemoryWork(): Promise<MemoryWorkSnapshot | null> {
+  try {
+    return await api<MemoryWorkSnapshot>('/m/api/memory/work');
+  } catch (err) {
+    if ((err as ApiError).status === 404) return null;
+    throw err;
+  }
+}
+
+/** Undo one recorded run: forget what it learned, or bring back what it let
+ *  fade. A refusal (too old, nothing left) is an answer, not a failure. */
+export async function undoMemoryWork(eventId: string): Promise<MemoryWorkUndoResult> {
+  try {
+    return await api<MemoryWorkUndoResult>(`/m/api/memory/work/${encodeURIComponent(eventId)}/undo`, { method: 'POST' });
+  } catch (err) {
+    const body = (err as ApiError).body as { ok?: unknown; reason?: unknown } | null | undefined;
+    if (body && typeof body === 'object' && body.ok === false && typeof body.reason === 'string') {
+      return body as MemoryWorkUndoResult;
+    }
+    throw err;
+  }
+}
+
 // ─── workflows ─
 
 export interface MobileWorkflow {
