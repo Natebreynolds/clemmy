@@ -113,6 +113,7 @@ import {
   promptComponentsFromComposition,
   recordPromptComposition,
   summarizePromptComposition,
+  type PromptReadingPublisher,
 } from './prompt-composition.js';
 import {
   renderTurnOpennessForContext,
@@ -11355,6 +11356,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   const modelInputFilter = ((args: {
     modelData: { input: AgentInputItem[]; instructions?: string };
     advertisedTools?: readonly unknown[];
+    /** A sender that decides after this filter what it actually sends takes
+     *  the reading's publisher and publishes once it has decided. Without it,
+     *  the reading is published here. */
+    holdReading?: (publish: PromptReadingPublisher) => void;
   }) => {
     let modelData = args.modelData;
     // Estimated tokens per component, measured BEFORE any per-round append so
@@ -11499,13 +11504,44 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         }
       } catch { /* Preserve the uncompacted frame if best-effort compaction fails. */ }
 
-      // Composition as CACHEABILITY (parity with the Claude lane): per-step
-      // prompt cost is paid once per step and ~100x per task, and the lever is
-      // keeping the large part invariant rather than making everything small.
-      // Observation only — this reads what is already being sent. One summary
-      // feeds both the composition event and the ledger's prompt components.
+      const harnessContext = harnessRunContextStorage.getStore();
+      if (harnessContext) {
+        // This filter appends only system items, and single-request host
+        // guidance is appended after it, so the last user message here is the
+        // one that opened the turn.
+        harnessContext.modelTurnAnchor = turnAnchorDigest(value.input);
+      }
+      const composed = value;
+      let published = false;
+      const publish: PromptReadingPublisher = (replaced) => {
+        if (published) return;
+        published = true;
+        publishReading(composed, replaced);
+      };
+      if (args.holdReading) args.holdReading(publish);
+      else publish();
+      return value;
+    };
+    // Composition as CACHEABILITY (parity with the Claude lane): per-step
+    // prompt cost is paid once per step and ~100x per task, and the lever is
+    // keeping the large part invariant rather than making everything small.
+    // Observation only — this reads what is being sent. One summary feeds both
+    // the composition event and the ledger's prompt components. A step that
+    // sends another request in place of the composed one (its own input and
+    // instructions, its own tool wire) is measured as that request.
+    const publishReading = (
+      value: { input: AgentInputItem[]; instructions?: string },
+      replaced?: Parameters<PromptReadingPublisher>[0],
+    ): void => {
+      const replacedSurface = replaced ? measureAdvertisedToolSurface(replaced.advertisedTools) : undefined;
       const measured = Object.keys(promptComponents).length > 0;
-      const composition = summarizePromptComposition({
+      const composition = replaced && replacedSurface ? summarizePromptComposition({
+        toolNames: replacedSurface.toolNames,
+        toolSchemaCosts: replacedSurface.toolSchemaCosts,
+        instructions: replaced.instructions ?? '',
+        measuredToolSchemaTokens: replacedSurface.measuredToolSchemaTokens,
+        measuredHistoryTokens: estimateInputTokens(replaced.input as AgentInputItem[]),
+      }) : summarizePromptComposition({
         toolNames: requestToolSurface.toolNames,
         toolSchemaCosts: requestToolSurface.toolSchemaCosts,
         instructions: value.instructions ?? '',
@@ -11532,18 +11568,12 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         } : {}),
       });
       const harnessContext = harnessRunContextStorage.getStore();
-      if (harnessContext) {
-        harnessContext.promptComponents = promptComponentsFromComposition(composition);
-        // This filter appends only system items, and single-request host
-        // guidance is appended after it, so the last user message here is the
-        // one that opened the turn.
-        harnessContext.modelTurnAnchor = turnAnchorDigest(value.input);
-      }
+      if (harnessContext) harnessContext.promptComponents = promptComponentsFromComposition(composition);
+      const model = replaced ? replaced.model : routedModelIdForBudget;
       recordPromptComposition(options.sessionId, 'host', composition, sourceUserSeq, {
         requestOrdinal: nextCompositionOrdinal(),
-        ...(routedModelIdForBudget ? { model: routedModelIdForBudget } : {}),
+        ...(model ? { model } : {}),
       });
-      return value;
     };
     try {
 

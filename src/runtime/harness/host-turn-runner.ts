@@ -76,6 +76,7 @@ import { workflowParentActivation } from './workflow-parent-activation.js';
 import { classifyModelError } from './resilient-model.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { serializeAdvertisedTools, toolsOnAdvertisedWire } from './advertised-tool-wire.js';
+import type { PromptReadingPublisher } from './prompt-composition.js';
 import { getBuildInfo } from '../build-info.js';
 import type { Agent, AgentInputItem, Model, ModelRequest } from '@openai/agents';
 import {
@@ -3418,6 +3419,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       /** The exact tool schemas this request advertises, for observation
        *  only: a filter reads them and never changes them. */
       advertisedTools?: readonly unknown[];
+      /** Takes the filter's reading publisher. The host decides after the
+       *  filter whether a step sends the composed request or another one, and
+       *  publishes the reading of what it sends. */
+      holdReading?: (publish: PromptReadingPublisher) => void;
     }) => Promise<{ input: AgentInputItem[]; instructions?: string }>
       | { input: AgentInputItem[]; instructions?: string };
   }).callModelInputFilter;
@@ -9237,6 +9242,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let hostWriterForStep: PendingHostWriter | undefined;
     let modelInput: AgentInputItem[] = [];
     let instructions: string | undefined;
+    let publishReading: PromptReadingPublisher | undefined;
     if (!consumingRecoveredFrame) {
       modelInput = structuredClone(history);
       // Match Agent.getSystemPrompt semantics: dynamic instructions are
@@ -9257,6 +9263,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           agent,
           context: contextValue,
           advertisedTools: modelStepSchemas,
+          holdReading: (publish) => { publishReading = publish; },
         });
         if (!filtered || !Array.isArray(filtered.input)) {
           throw new Error('callModelInputFilter must return a model input object with an input array.');
@@ -9338,6 +9345,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         journalHostGuide('response_format_repair', { modelId: formatWorkerModelId,
           promptChars: formatRepair.text.length, tools: 0 });
       }
+      // The reading describes the request this step sends: the composed one,
+      // or the writer's or format repair's own, which carries no tools.
+      const replacedBy = hostWriterForStep?.author.modelId ?? formatWorkerModelId;
+      (publishReading as PromptReadingPublisher | undefined)?.(hostWriterForStep || formatWorkerModelId
+        ? { input: modelInput, ...(instructions !== undefined ? { instructions } : {}), advertisedTools: [],
+          ...(replacedBy ? { model: replacedBy } : {}) }
+        : undefined);
     }
     let step: Awaited<ReturnType<typeof codexOneStep>>;
     let ranModelStep = false;

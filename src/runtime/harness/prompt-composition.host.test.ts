@@ -302,3 +302,113 @@ test('a composed host turn measures history before the per-round appends and its
   assert.ok((second.get('history') ?? 0) > (first.get('history') ?? 0), 'the tool round grows history, not the appended buckets');
   assert.equal(second.get('contextPacket'), first.get('contextPacket'));
 });
+
+// Regression: the reading was published inside the input filter, before the
+// host decided that the step is a chosen writer's pass. The writer's request
+// (one user message, the writer's instructions, no tools) was then recorded,
+// and billed on the ledger, as the brain request it replaced.
+test('a chosen writer\'s request is measured as what it sends, not as the brain request it replaced', async () => {
+  const brackets = await import('./brackets.js');
+  const host = await import('./host-turn-runner.js');
+  const { estimateInputTokens } = await import('./token-estimator.js');
+  const readTool = (name: string, body: string) => brackets.wrapToolForHarness({
+    ...fixtureTool(name),
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    invoke: async () => body,
+  } as never);
+  const tools = [
+    readTool('workspace_roots', `ROOTS: /fixture/reports ${'r'.repeat(600)}`),
+    readTool('list_files', `FILES: q3-visits.json q3-rank.json ${'f'.repeat(600)}`),
+  ];
+  const brainRequests: Array<{ tools?: unknown[] }> = [];
+  const brain = {
+    async getResponse(request: { tools?: unknown[] }) {
+      brainRequests.push(request);
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output: brainRequests.length === 1
+          ? [
+            { type: 'function_call', callId: 'writer-roots', name: 'workspace_roots', arguments: '{}' },
+            { type: 'function_call', callId: 'writer-files', name: 'list_files', arguments: '{}' },
+          ]
+          : [textMsg('Brain draft: the reports folder holds the Q3 visits and rank files.')],
+        responseId: `writer-brain-${brainRequests.length}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const writerRequests: Array<{ input?: unknown; systemInstructions?: string; tools?: unknown[] }> = [];
+  const writerModel = {
+    async getResponse(request: { input?: unknown; systemInstructions?: string; tools?: unknown[] }) {
+      writerRequests.push(structuredClone(request));
+      return {
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output: [textMsg('Written: the reports folder holds q3-visits.json and q3-rank.json.')],
+        responseId: `writer-${writerRequests.length}`,
+      };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  host._setHostWriterForTests(() => ({
+    resolved: { modelId: 'fixture-writer-model', provider: 'claude', source: 'settings' },
+    model: writerModel as never,
+  }) as never);
+  host._setHostObjectiveJudgeForTests(async () => ({ done: true, reason: 'The reply matches the reads.' }) as never);
+  const previous = process.env.CLEMMY_TURN_ENGINE;
+  process.env.CLEMMY_TURN_ENGINE = 'host_v1';
+  _resetAdvertisedSurfaceMemoryForTests();
+  let sessionId = '';
+  try {
+    const session = eventlog.createSession({ id: 'prompt-composition-writer', kind: 'chat' });
+    sessionId = session.id;
+    await runConversation({
+      sessionId: session.id,
+      input: 'List the workspace roots and the report files there, then write me a short summary of what is in them.',
+      turnEngine: 'host_v1',
+      maxSteps: 6,
+      judgeCompletion: true,
+      buildAgent: async () => {
+        const agent = { model: brain, instructions: 'base system', tools, getAllTools: async () => tools };
+        bindSurface(session.id, agent, tools as Array<{ name?: unknown }>);
+        return agent as never;
+      },
+      makeRunner: () => {
+        const runner = new EventEmitter();
+        (runner as unknown as { run: () => never }).run = () => { throw new Error('legacy Runner.run must be unreachable'); };
+        return runner as never;
+      },
+      maxTurns: 6,
+    } as never);
+  } finally {
+    host._setHostWriterForTests(null);
+    host._setHostObjectiveJudgeForTests(null);
+    if (previous === undefined) delete process.env.CLEMMY_TURN_ENGINE;
+    else process.env.CLEMMY_TURN_ENGINE = previous;
+  }
+  const journal = eventlog.listEvents(sessionId, { types: ['guardrail_tripped'] })
+    .map((event) => event.data as { kind?: string; phase?: string })
+    .filter((data) => data.kind === 'host_final_writer')
+    .map((data) => data.phase);
+  assert.equal(writerRequests.length, 1, `fixture: the chosen writer wrote once (${JSON.stringify(journal)})`);
+  assert.deepEqual(writerRequests[0]!.tools ?? [], [], 'fixture: the writer request carries no tools');
+  const compositions = eventlog.listEvents(sessionId, { types: ['prompt_composition'] })
+    .map((event) => event.data as {
+      requestOrdinal?: number; model?: string; toolCount: number;
+      buckets: Array<{ name: string; tokens: number }>;
+    });
+  assert.equal(compositions.length, brainRequests.length + writerRequests.length, 'one reading per request sent');
+  const ordinals = compositions.map((row) => row.requestOrdinal);
+  assert.deepEqual(ordinals, [...ordinals].sort((a, b) => (a ?? 0) - (b ?? 0)));
+  const written = compositions.at(-1)!;
+  const buckets = new Map(written.buckets.map((bucket) => [bucket.name, bucket.tokens]));
+  assert.equal(written.toolCount, 0, 'the writer request advertises no tools');
+  assert.equal(buckets.get('toolSchemas') ?? 0, 0, 'and is billed no tool schemas');
+  for (const name of ['contextPacket', 'memoryPrimer', 'provenOperation', 'currentMessage']) {
+    assert.equal(buckets.get(name) ?? 0, 0, `the brain's ${name} was not sent to the writer`);
+  }
+  assert.equal(buckets.get('history'), estimateInputTokens(writerRequests[0]!.input as never),
+    'the input side is the writer\'s own input');
+  assert.ok((compositions[0]!.buckets.find((bucket) => bucket.name === 'toolSchemas')?.tokens ?? 0) > 0,
+    'fixture: the brain requests did advertise tools');
+  assert.equal(written.model, 'fixture-writer-model', 'the reading names the model the writer request went to');
+});

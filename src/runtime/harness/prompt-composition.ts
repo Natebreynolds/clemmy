@@ -343,6 +343,22 @@ export function promptComponentsFromComposition(summary: PromptCompositionSummar
   return Object.fromEntries(summary.buckets.map((bucket) => [bucket.name, bucket.tokens]));
 }
 
+/** The request a step sends in place of the one the input filter composed
+ *  (a chosen writer's pass, a response-format repair): its own input items,
+ *  instructions and tool wire, and the model it goes to. */
+export interface ReplacedPromptRequest {
+  input: readonly unknown[];
+  instructions?: string;
+  advertisedTools: readonly unknown[];
+  model?: string;
+}
+
+/** Publishes one request's reading. Called with no argument, it publishes the
+ *  composed request as measured; called with the request a step sent instead,
+ *  it measures and publishes that one. A sender that decides after the filter
+ *  what it sends holds the publisher and calls it once, when it has decided. */
+export type PromptReadingPublisher = (replaced?: ReplacedPromptRequest) => void;
+
 /** Which model request a reading describes. */
 export interface PromptCompositionRequest {
   /** 1-based position of this request within its accepted source; equals the
