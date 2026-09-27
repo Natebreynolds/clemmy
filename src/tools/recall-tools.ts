@@ -278,20 +278,20 @@ export const RECALL_TOOL_RESULT_SHAPE = {
   call_id: z
     .string()
     .min(1)
-    .describe('The original call_id from a clip/digest, or an rh_ receipt handle shown in a saved checkpoint.'),
+    .describe('The call_id a clip or digest names, or an rh_ handle from a saved checkpoint.'),
   offset: z
     .number()
     .int()
     .min(0)
     .optional()
-    .describe('Start character (default 0); page with the "offset: N" hint from a prior slice.'),
+    .describe('Start character (default 0).'),
   max_chars: z
     .number()
     .int()
     .min(100)
     .max(RECALL_MAX_CHARS_CEILING)
     .optional()
-    .describe('Optional slice size; a larger value up to this context window\'s ceiling is returned whole (default: one inline result).'),
+    .describe('Slice size; up to this context window\'s ceiling returns whole (default: one inline result).'),
 };
 
 export const TOOL_OUTPUT_QUERY_SHAPE = {
@@ -512,8 +512,7 @@ export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
     [
-      'Read the full verbatim output of a prior tool call by the call_id a `[clipped: …]` stub or `[digest: …]` footer names, when you need a detail the shortened view dropped.',
-      'The payload is stored losslessly — never say the data is unavailable. Returns one slice from `offset`; the header names the next offset when more remains.',
+      'Read the full verbatim output of a prior tool call by the call_id a `[clipped: …]` stub or `[digest: …]` footer names, when you need a detail the shortened view dropped. Returns one slice from `offset`.',
       `E.g. ${toolCallHint('recall_tool_result', { call_id: 'call_abc123' })}.`,
     ].join(' '),
     RECALL_TOOL_RESULT_SHAPE,

@@ -95,3 +95,10 @@ test('tool_output_query advertises its query contract; the lossless-storage less
   assert.match(digest, /tool_output_query \{"call_id":"call_footer"/);
   assert.match(digest, /do NOT say the data is unavailable/);
 });
+
+test('recall_tool_result advertises its read contract; the next offset lives in each slice header', async () => {
+  // 1,127 -> 905 B.
+  const tool = withinCeiling((await builtWire()).get('recall_tool_result'), 'recall_tool_result', 960);
+  assert.match(tool.description, /one slice from `offset`/);
+  assert.match(tool.description, /recall_tool_result \{"call_id":"call_abc123"\}/);
+});
