@@ -39,9 +39,15 @@ export interface CompletionSizeGate {
   calibration: number;
 }
 
+/** Characters per token Jev reports for a completion request. Measured on
+ *  the live record: screens whose state reached the size cap (~75k characters
+ *  of request) reported a median of about 22.9k input tokens. The calibration
+ *  below replaces it as soon as enough calls recorded both numbers. */
+export const REQUEST_CHARS_PER_TOKEN = 3.3;
+
 /** A dependency-free size estimate; the calibration absorbs its bias. */
 export function estimateRequestTokens(requestText: string): number {
-  return Math.ceil(requestText.length / 4);
+  return Math.ceil(requestText.length / REQUEST_CHARS_PER_TOKEN);
 }
 
 function median(values: number[]): number {
@@ -52,7 +58,9 @@ function median(values: number[]): number {
 
 export function learnCompletionSizeGate(records: readonly JevDecisionRecord[]): CompletionSizeGate {
   const calls = records.filter((row) => row.ok && typeof row.inputTokens === 'number' && row.inputTokens > 0);
+  // Only estimates made the same way calibrate this one.
   const ratios = calls
+    .filter((row) => row.context?.estimateCharsPerToken === REQUEST_CHARS_PER_TOKEN)
     .map((row) => {
       const estimated = Number(row.context?.estimatedTokens);
       return Number.isFinite(estimated) && estimated > 0 ? row.inputTokens! / estimated : null;

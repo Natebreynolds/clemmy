@@ -11,6 +11,7 @@ import {
   decideCompletionCall,
   estimateRequestTokens,
   learnCompletionSizeGate,
+  REQUEST_CHARS_PER_TOKEN,
   type CompletionSizeGate,
 } from './completion-size-gate.js';
 
@@ -888,12 +889,13 @@ export async function tryJevCompletionVerdict(
     ...(evidence.clipped ? { evidenceNote: 'The middle of evidence was elided for length; receipts lists every result.' } : {}),
   };
   const estimatedTokens = estimateRequestTokens(JSON.stringify(buildSystemOneRequest(state, questions)));
-  let sizeGateContext: Record<string, unknown> = { estimatedTokens };
+  let sizeGateContext: Record<string, unknown> = { estimatedTokens, estimateCharsPerToken: REQUEST_CHARS_PER_TOKEN };
   if (opts?.screening) {
     const gate = completionSizeGate();
     const decision = decideCompletionCall({ estimatedTokens, gate, probeKey: `${opts.sessionId ?? ''}\n${response}` });
     sizeGateContext = {
       estimatedTokens,
+      estimateCharsPerToken: REQUEST_CHARS_PER_TOKEN,
       expectedTokens: decision.expectedTokens,
       ...(gate.skipAboveTokens !== null ? { sizeBarTokens: gate.skipAboveTokens, observedAboveBar: gate.observedAbove } : {}),
       ...(decision.call && decision.reprobe ? { sizeBarReprobe: true } : {}),

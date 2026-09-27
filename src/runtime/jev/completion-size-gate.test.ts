@@ -67,8 +67,13 @@ test('a failed call or a call without tokens teaches nothing', () => {
   assert.equal(learnCompletionSizeGate(rows).largestSettledTokens, 12_000);
 });
 
-test('the estimate is scaled by the ratio Jev reported for earlier calls', () => {
-  const rows = history(COMPLETION_GATE_MIN_OBSERVATIONS).map((row) => ({ ...row, context: { estimatedTokens: row.inputTokens! / 2 } }));
+test('the estimate is scaled by the ratio Jev reported for earlier calls', async () => {
+  const { REQUEST_CHARS_PER_TOKEN } = await import('./completion-size-gate.js');
+  const stale = history(COMPLETION_GATE_MIN_OBSERVATIONS).map((row) => ({ ...row, context: { estimatedTokens: row.inputTokens! / 3 } }));
+  assert.equal(learnCompletionSizeGate(stale).calibration, 1, 'estimates made another way never calibrate this one');
+  const rows = history(COMPLETION_GATE_MIN_OBSERVATIONS).map((row) => ({
+    ...row, context: { estimatedTokens: row.inputTokens! / 2, estimateCharsPerToken: REQUEST_CHARS_PER_TOKEN },
+  }));
   const gate = learnCompletionSizeGate(rows);
   assert.equal(gate.calibration, 2);
   const under = decideCompletionCall({ estimatedTokens: 6_000, gate, probeKey: 'a' });
@@ -174,4 +179,11 @@ test('a small screen is made as before, and records its size estimate for calibr
   const made = readRecentJevDecisions('jev-completion').find((row) => row.context?.estimatedTokens !== undefined);
   assert.ok(made, 'the call records estimatedTokens');
   assert.equal(made!.context!.sizeBarTokens, 13_800);
+});
+
+test('a screen at the size cap estimates above a bar set just under what such screens have reported', async () => {
+  const { estimateRequestTokens } = await import('./completion-size-gate.js');
+  // A request at the state cap (~75k characters) reported ~22.9k tokens live;
+  // a chars/4 estimate (18.8k) could never reach a 19.5k bar.
+  assert.ok(estimateRequestTokens('x'.repeat(75_000)) > 19_496);
 });
