@@ -73,10 +73,12 @@ const RETAINED_OUTPUT_READER_FRAME_CHARS = 2_000;
  * The most characters one tool reply may carry across the Claude CLI's MCP
  * wire. The CLI measures an MCP tool reply against its own output-token cap
  * (MAX_MCP_OUTPUT_TOKENS, default 25,000 tokens); a reply over the cap is cut
- * to 4 characters per token of that cap and marked truncated, so its tail is
- * lost after the reply's own paging frame already named the next offset.
- * This bound is 25,000 tokens at 2.4 characters per token, denser than any
- * text a reader returns, so a reply at or under it is never cut by the CLI.
+ * to 4 characters per token of that cap (100,000 characters) and marked
+ * truncated, so a longer reply loses its tail after the reply's own paging
+ * frame already named the next offset. A reply at or under this bound is
+ * never cut. Dense text (CJK, base64, id-heavy JSON) can still exceed the
+ * token cap at this length, and then the CLI appends its truncation notice
+ * to a reply that lost nothing; the reply's own paging line stays accurate.
  */
 export const MCP_TRANSPORT_MAX_CHARS = 60_000;
 
@@ -91,8 +93,11 @@ const BASELINE_WINDOW_TOKENS = 200_000;
  * holds for the routed window, frame excluded. It never exceeds what the
  * window can take (a quarter character per window token, never below one
  * inline result), the reader schema bound, or what the MCP wire carries whole.
- * Every reader bounds its own reply by this, and presentation budgets readers
- * by this plus the frame, so presentation never re-clips a reader's reply.
+ * recall_tool_result and tool_output_query bound their own replies by this,
+ * and presentation budgets every retained-output reader by this plus the
+ * frame, so presentation never re-clips those replies. A file_query reply
+ * larger than this bound (many passages on a small window) is shown as a
+ * recallable view like any other oversized result.
  */
 export function retainedReaderMaxChars(routedModelId?: string | null): number {
   const window = routedWindowTokens(routedModelId) ?? BASELINE_WINDOW_TOKENS;
