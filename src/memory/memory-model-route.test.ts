@@ -456,6 +456,24 @@ test('the fast-tier jobs name the model the router actually serves them, and the
   assert.deepEqual(memoryAccounts(), ['claude'], 'only the account that serves memory work keeps the memory');
 });
 
+test('the token meter reads the env file and the vault once to say which account does what', async () => {
+  // The model-status poll asks this every few seconds; unscoped, each role
+  // and each memory job's model re-parsed the env file and re-read the vault.
+  const { rolesByAccount } = await import('../runtime/harness/provider-billing.js');
+  const { _setRuntimeConfigCaptureObserverForTest } = await import('../config.js');
+  const envFile = path.join(TEST_HOME, '.env');
+  writeFileSync(envFile, `${Array.from({ length: 80 }, (_, i) => `CLEMMY_FIXTURE_PADDING_${i}=${'x'.repeat(36)}`).join('\n')}\n`);
+  const captures = { environment: 0, secret_vault: 0 };
+  _setRuntimeConfigCaptureObserverForTest((kind: 'environment' | 'secret_vault') => { captures[kind] += 1; });
+  try {
+    assert.ok([...rolesByAccount().values()].some((roles) => roles.includes('memory')), 'fixture: memory work is tagged');
+    assert.ok(captures.environment <= 1 && captures.secret_vault <= 1, JSON.stringify(captures));
+  } finally {
+    _setRuntimeConfigCaptureObserverForTest(null);
+    rmSync(envFile, { force: true });
+  }
+});
+
 test('a same-family automatic route on a signed-out brain family waits, while the model strings still reach a connected provider', () => {
   Object.assign(process.env, { AUTH_MODE: 'claude_oauth', CLEMMY_JUDGE_CROSS_FAMILY: 'off' });
   writeAuth({ claude: false });

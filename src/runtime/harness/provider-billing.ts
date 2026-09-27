@@ -14,6 +14,7 @@
  * the background so building a status never waits on a network.
  */
 import pino from 'pino';
+import { withRuntimeConfigSnapshot } from '../../config.js';
 import { creditRefusal, creditRefusals, JEV_ACCOUNT_ID, OPENAI_KEY_ACCOUNT_ID, type CreditRefusal } from '../provider-credit.js';
 import { getByoProviders, providerToBackendConfig, resolveByoProviderForModel } from './byo-providers.js';
 import { boundWriterModel, resolveRoleModel } from './model-roles.js';
@@ -225,8 +226,16 @@ function accountForServing(serving: MemoryJobServing): string | undefined {
   return accountForModel(serving.modelId);
 }
 
-/** account id → the jobs it is doing now. */
+/** account id → the jobs it is doing now. Read under one runtime-config
+ *  snapshot: resolving every role (and each memory job's model) reads the
+ *  role registry dozens of times, and an unscoped read parses the env file
+ *  and the vault anew each time; the model-status poll runs this every few
+ *  seconds. */
 export function rolesByAccount(): Map<string, string[]> {
+  return withRuntimeConfigSnapshot(rolesByAccountNow);
+}
+
+function rolesByAccountNow(): Map<string, string[]> {
   const out = new Map<string, string[]>();
   const add = (account: string | undefined, role: string): void => {
     if (!account) return;
