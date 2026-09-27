@@ -192,6 +192,13 @@ test('recall, query and search addressed at a carrier-dispatched recall all read
     'recall on the recall id pages the producer, not the recall text');
   assert.ok(recallOfRecall.includes(producer.output.slice(3000, 3100)), 'the slice is the producer bytes at that offset');
 
+  // The producer is prose with a pseudo-call before its dataset; the query
+  // reaches the dataset records, not the recall header's JSON hint.
+  const query = historyResult(history, 'lineage-query-of-recall');
+  assert.match(query, /Plot 41/);
+  assert.match(query, /Quartzfeather irrigation valve replaced/);
+  assert.doesNotMatch(query, /No JSON value could be recovered|None of/);
+
   const search = historyResult(history, 'lineage-search-of-recall');
   assert.match(search, /Quartzfeather irrigation valve replaced/);
   assert.doesNotMatch(search, /presentation-only|cannot be used/);

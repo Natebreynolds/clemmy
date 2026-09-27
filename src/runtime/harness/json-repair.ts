@@ -311,6 +311,82 @@ function storedJsonValue(value: unknown, via: StoredToolOutputJsonVia): StoredTo
   return { value, via };
 }
 
+/** Full balanced scans a stored-output read may spend looking for embedded
+ * JSON. Each is linear in the output, so the total stays bounded. */
+const STORED_JSON_OPENER_ATTEMPTS = 8;
+
+/** Whether the bytes at `index` can begin a JSON object or array. A prose
+ * bracket (`[note]`, `{name:…}`) cannot, and is skipped without a scan. */
+function canOpenJsonValue(text: string, index: number): boolean {
+  let next = index + 1;
+  while (next < text.length && /\s/.test(text[next]!)) next += 1;
+  const following = text[next];
+  if (following === undefined) return false;
+  if (text[index] === '{') return following === '"' || following === '}';
+  return following === ']' || following === '"' || following === '{' || following === '['
+    || following === '-' || (following >= '0' && following <= '9')
+    || text.startsWith('true', next) || text.startsWith('false', next) || text.startsWith('null', next);
+}
+
+/** String-aware index of the bracket that closes the one at `start`, or -1. */
+function balancedJsonEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ']') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The largest complete JSON value embedded in a stored output. A host document
+ * can carry prose with its own brackets before its data (a pseudo-call such as
+ * `reader({slug:"x"})`, a `[note]`, a reader's `{"call_id":…}` hint), so the
+ * first opener is not necessarily the data. Candidates are tried from
+ * successive openers, a bounded number of scans, and the largest one that
+ * parses wins: the payload, not an incidental example beside it. Only the
+ * stored-output reader uses this; parsing a model's own answer keeps the
+ * first-candidate rule of `extractJsonCandidate`.
+ */
+function largestEmbeddedStoredJson(raw: string): string | null {
+  let best = extractJsonCandidate(raw);
+  let attempts = 0;
+  for (let start = 0; start < raw.length && attempts < STORED_JSON_OPENER_ATTEMPTS; start += 1) {
+    const ch = raw[start];
+    if ((ch !== '{' && ch !== '[') || !canOpenJsonValue(raw, start)) continue;
+    attempts += 1;
+    const end = balancedJsonEnd(raw, start);
+    // Never closed: every later bracket lies inside this clipped value, so a
+    // complete element found there is a fragment, not the payload.
+    if (end === -1) break;
+    const length = end + 1 - start;
+    if (best !== null && length <= best.length) {
+      // Nothing inside it can be larger than what is already held.
+      start = end;
+      continue;
+    }
+    const candidate = raw.slice(start, end + 1);
+    if (isParseableJson(candidate)) {
+      best = candidate;
+      start = end;
+    }
+  }
+  return best;
+}
+
 /**
  * Recover the JSON value from a STORED tool output.
  *
@@ -355,10 +431,9 @@ export function parseStoredToolOutputJson(
     }
   }
 
-  // THE ADDED STEP: a complete JSON value carrying harness prose before or
-  // after it. `extractJsonCandidate` does a string-aware balanced scan, so a
-  // leading preamble and a trailing note both fall away.
-  const embedded = extractJsonCandidate(raw);
+  // A complete JSON value carrying prose before or after it. The string-aware
+  // balanced scan lets a leading preamble and a trailing note fall away.
+  const embedded = largestEmbeddedStoredJson(raw);
   if (embedded !== null) {
     try {
       return storedJsonValue(JSON.parse(embedded) as unknown, 'embedded');

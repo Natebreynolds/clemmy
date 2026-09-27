@@ -264,6 +264,56 @@ test('stored output: the shell-wrapper precedence is unchanged', () => {
   assert.deepEqual(got.value, { records: [{ id: 'a' }] });
 });
 
+test('stored output: a host document with a pseudo-call before its data is queryable', () => {
+  // Regression: a Space read leads with a view pointer written as a
+  // pseudo-call (`{slug:"…"}` is not JSON); recovery stopped at that first
+  // opener and the whole document was declared text.
+  const dataset = { rows: [{ plot: 'Plot 7', note: 'valve replaced' }, { plot: 'Plot 8', note: 'pruned' }] };
+  const raw = [
+    'Workspace "Orchard board" (orchard-board) — active, v1.',
+    '[status] static snapshot',
+    'View source: space_get_view({slug:"orchard-board",grep:null,around:null}) returns the saved HTML.',
+    `Dataset (complete JSON): ${JSON.stringify(dataset)}`,
+    'No notes yet.',
+  ].join('\n');
+  assert.equal(extractJsonCandidate(raw), null,
+    'precondition: the shared model-output parser keeps its first-candidate rule unchanged');
+  const got = parseStoredToolOutputJson(raw);
+  assert.ok(got, 'the dataset after the pseudo-call must be recovered');
+  assert.equal(got.via, 'embedded');
+  assert.deepEqual(got.value, dataset);
+});
+
+test('stored output: the largest complete value wins over a small JSON hint beside it', () => {
+  // A reader's own header can carry a copyable `{"call_id":…}` hint before the
+  // payload; the hint must never be mistaken for the data.
+  const payload = { records: [{ id: 'a', name: 'First' }, { id: 'b', name: 'Second' }] };
+  const raw = 'Recalled chars 0–120 of 120 • (continue with recall_tool_result {"call_id":"call_1","offset":120})\n\n'
+    + JSON.stringify(payload);
+  const got = parseStoredToolOutputJson(raw);
+  assert.ok(got);
+  assert.deepEqual(got.value, payload);
+});
+
+test('stored output: successive-opener recovery is bounded', () => {
+  // Many small parseable values before the payload: the scan stops after a
+  // bounded number of attempts instead of walking every bracket in the text.
+  const payload = { records: Array.from({ length: 5 }, (_, i) => ({ id: i })) };
+  const noise = Array.from({ length: 20 }, (_, i) => `item ${i}: [${i}]`).join('\n');
+  const got = parseStoredToolOutputJson(`${noise}\n${JSON.stringify(payload)}`);
+  assert.ok(got, 'a small early value is still recovered');
+  assert.notDeepEqual(got.value, payload, 'the payload lies beyond the attempt bound');
+  const near = parseStoredToolOutputJson(`item: [1]\nitem: [2]\n${JSON.stringify(payload)}`);
+  assert.deepEqual(near?.value, payload, 'within the bound the largest value wins');
+});
+
+test('stored output: a record inside a clipped array is never taken for the payload', () => {
+  // The successive-opener scan must not present one complete element of a
+  // clipped array as the whole result.
+  const raw = 'Rows follow:\n[\n{"id":"a","amount":5},\n{"id":"b","amount":7},\n{"id":"partial"';
+  assert.equal(parseStoredToolOutputJson(raw), null);
+});
+
 test('stored output: genuinely non-JSON text recovers nothing (and must say so honestly)', () => {
   assert.equal(parseStoredToolOutputJson('just some prose, no payload here'), null);
   assert.equal(parseStoredToolOutputJson(''), null);
