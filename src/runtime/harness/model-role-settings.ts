@@ -57,6 +57,11 @@ export function persistModelRoleSetting(change: ModelRoleSettingChange): RoleBin
   if (whenIntent && !slug) {
     throw new ModelRoleSettingError('INVALID_INTENT', 'whenIntent is empty after normalization');
   }
+  // Memory work reads only the role-wide pick, so a per-kind memory rule would
+  // be saved, listed and never used.
+  if (role === 'memory' && slug) {
+    throw new ModelRoleSettingError('INVALID_INTENT', 'The memory model is chosen for all memory work, not per kind of work.');
+  }
   const clear = change.clear === true || !modelId;
   if (!clear) {
     const validation = validateRoleModelBinding(role, modelId);

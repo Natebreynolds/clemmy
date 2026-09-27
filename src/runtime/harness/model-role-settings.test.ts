@@ -80,6 +80,8 @@ test('a refused change writes nothing', () => {
     [{ role: 'writer', modelId: 'glm 5.2; rm', source: 'settings' }, 'INVALID_MODEL_ID'],
     [{ role: 'writer', modelId: 'not-a-connected-model', source: 'settings' }, 'MODEL_UNAVAILABLE'],
     [{ role: 'worker', modelId: 'glm-5.2', whenIntent: '!!!', source: 'chat-rule' }, 'INVALID_INTENT'],
+    // Memory work reads only the role-wide pick; a per-kind rule would never be used.
+    [{ role: 'memory', modelId: 'glm-5.2', whenIntent: 'design', source: 'settings' }, 'INVALID_INTENT'],
   ];
   for (const [change, code] of refusals) {
     assert.throws(

@@ -394,6 +394,13 @@ test('the memory row shows the memory route, and its PATCH sets and clears it th
     const refused = await patch({ role: 'memory', modelId: 'not-a-connected-model' });
     assert.equal(refused.status, 400);
 
+    // Memory work reads only the role-wide pick: a per-kind rule is refused
+    // rather than saved as a rule nothing reads.
+    const scoped = await patch({ role: 'memory', modelId: 'glm-5.2', whenIntent: 'design' });
+    assert.equal(scoped.status, 400, 'a memory rule for one kind of work is refused');
+    assert.deepEqual(readDurableBindings(), [{ role: 'memory', modelId: 'glm-5.2', scope: 'durable', source: 'settings' }],
+      'the role-wide pick is untouched');
+
     const cleared = await patch({ role: 'memory', clear: true });
     assert.equal(cleared.status, 200, cleared.body.error);
     assert.deepEqual(cleared.body.modelRoles?.bindings, []);
