@@ -76,10 +76,6 @@ function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-export function interactiveForegroundBusy(): boolean {
-  return interactiveForegroundBlocker() !== null;
-}
-
 /**
  * The oldest unfinished run learning yields to — its kind (a conversation, a
  * workflow, background work) and when it started — or null when the
@@ -436,9 +432,9 @@ export async function drainTerminalSemanticLearning(options: {
     shardsDeadLettered: 0,
     extractorInvocations: 0,
   };
-  // Learning waits for the memory model BEFORE it claims anything. A paused
-  // or unreachable model used to fail every claimed part at once, and four
-  // such claims dead-lettered it: learning was silently thrown away.
+  // Learning waits for the memory model BEFORE it claims anything: a part
+  // claimed for a model that cannot answer would spend its tries toward dead
+  // letter, and learning would be thrown away.
   const unavailable = modelWaiting();
   if (unavailable) {
     summary.modelWaiting = unavailable.reason as TerminalSemanticLearningSummary['modelWaiting'];

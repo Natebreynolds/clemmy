@@ -399,5 +399,5 @@ test('a chat run blocks learning as a conversation', async () => {
   const session = eventlog.createSession({ id: 'sess-chat', kind: 'chat' });
   eventlog.beginRunAttempt(session.id, {});
   assert.equal(worker.interactiveForegroundBlocker()?.kind, 'chat');
-  assert.equal(worker.interactiveForegroundBusy(), true);
+  assert.notEqual(worker.interactiveForegroundBlocker(), null);
 });

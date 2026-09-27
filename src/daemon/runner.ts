@@ -145,7 +145,7 @@ import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decisio
 import { migrateToolChoicesToCanonicalProcedures, reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
 import { installProvenStandardBeatLine, reapDeadSkillChoices } from '../memory/skill-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
-import { runRecursiveReflection, consolidateActiveFacts, recursiveReflectionOutcome } from '../memory/reflection.js';
+import { runRecursiveReflection, consolidateActiveFacts, recursiveReflectionOutcome, reflectionTurnedOff } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { autoCleanSafeMemory } from '../autoresearch/memory-apply.js';
@@ -895,9 +895,10 @@ async function runCronJob(
 // catch-up on next-boot is fine — no make-up scheduling needed.
 const RECURSIVE_REFLECTION_LOCAL_HOUR = MEMORY_JOB_CLOCKS.patterns.hour;
 
+/** The nightly patterns run obeys the one learning switch the extractor and
+ *  the Memory tab read (reflection.ts owns it). */
 export function daemonRecursiveReflectionEnabled(): boolean {
-  const raw = (getRuntimeEnv('CLEMMY_REFLECTION', '') ?? '').trim().toLowerCase();
-  return raw !== 'off' && raw !== 'false' && raw !== '0';
+  return !reflectionTurnedOff();
 }
 
 function localDayKey(at: Date): string {
@@ -2246,9 +2247,12 @@ export async function startDaemon(
   // The route ledger's role CHECK rebuild is a boot phase too: after an
   // upgrade it copies every row once, so it runs here before the door opens,
   // never inside a model call or a role resolution. Never throws.
+  const wideningStartedAt = Date.now();
   const widenedRouteTables = widenModelRouteMetricsDb();
   if (widenedRouteTables.length > 0) {
-    logger.info({ tables: widenedRouteTables }, 'Route ledger now keeps writer and memory rows');
+    // How long the one-time copy held boot (it grows with the ledger).
+    logger.info({ tables: widenedRouteTables, durationMs: Date.now() - wideningStartedAt },
+      'Route ledger now keeps writer and memory rows');
   }
   // Surface "we missed N scheduled runs while you were offline" BEFORE
   // any other startup work so the user has the bad news first. Safe to

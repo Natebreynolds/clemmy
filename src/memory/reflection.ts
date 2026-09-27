@@ -555,8 +555,7 @@ function sanitizeRecursivePatternOutput(value: unknown): { patterns: RecursivePa
 /** The operator kill-switch (CLEMMY_REFLECTION=off|false|0), read like every
  *  other runtime setting here — the process env, then the env file — so the
  *  extractor, the nightly patterns tick and the Memory tab obey one switch.
- *  (Reading the process env alone missed a switch set in the env file, which
- *  never reaches it: the nightly tick stopped while learning carried on.) */
+ *  This is its only reader. */
 export function reflectionTurnedOff(): boolean {
   const raw = (getRuntimeEnv('CLEMMY_REFLECTION', '') ?? '').trim().toLowerCase();
   return raw === 'off' || raw === 'false' || raw === '0';

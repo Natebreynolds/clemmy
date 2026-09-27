@@ -120,7 +120,7 @@ test('automatic learning takes exactly the model the boundary checker selects, r
       assert.equal(route.source, 'automatic');
       assert.equal(route.modelId, checker.modelId, `${job} keeps today's model (cross-family ${crossFamily})`);
       assert.equal(route.provider, checker.judgeFamily);
-      assert.equal(route.timeoutMs, checker.timeoutMs, 'the checker deadline passes through');
+      assert.equal(route.boundary?.timeoutMs, checker.timeoutMs, 'the checker deadline passes through');
       assert.equal(route.boundary?.transport, checker.transport);
       assert.equal(routeContext(route.model).role, 'memory', 'recorded under the memory route role');
       assert.deepEqual({ seam: routeContext(route.model).reason?.seam, job: routeContext(route.model).reason?.job },
@@ -164,7 +164,7 @@ test('skills, profile and import keep today\'s fast-tier model string when autom
     assert.equal(route.modelId, MODELS.fast);
     assert.equal(route.source, 'automatic');
     assert.equal(route.follows, null);
-    assert.equal(route.timeoutMs, undefined);
+    assert.equal(route.boundary, undefined, 'no checker deadline or hedge');
   }
   const imported = resolveMemoryModelRoute('import');
   assert.equal(imported?.model, MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL);
@@ -180,8 +180,7 @@ test('a chosen memory model is used exactly by every governed job, with no deadl
     assert.equal(route.modelId, 'byo-memory-model');
     assert.equal(route.provider, 'byo');
     assert.equal(typeof route.model, 'object', 'a concrete provider-bound model, never a bare string');
-    assert.equal(route.timeoutMs, undefined);
-    assert.equal(route.boundary, undefined);
+    assert.equal(route.boundary, undefined, 'no checker deadline or hedge');
     assert.equal(route.follows, null);
     assert.equal(routeContext(route.model).role, 'memory');
     assert.equal(routeContext(route.model).reason?.job, job);

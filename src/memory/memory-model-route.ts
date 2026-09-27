@@ -73,8 +73,6 @@ export interface MemoryModelRoute {
   source: 'chosen' | 'automatic';
   /** Automatic boundary-route jobs only: whose model the route borrows today. */
   follows: 'checker' | 'brain' | null;
-  /** Only automatic boundary-route jobs may carry today's hedge/pause semantics. */
-  timeoutMs?: number;
   /** The provider family the model is bound to; absent for a bare model string. */
   provider?: ModelProviderClass;
   /** Automatic boundary-route jobs: the checker routing this route reuses, so
@@ -212,7 +210,6 @@ function resolveAutomatic(job: MemoryJobId): AutomaticResolution {
       modelId: routing.modelId,
       source: 'automatic',
       follows: followsFor(routing.modelId),
-      ...(typeof routing.timeoutMs === 'number' ? { timeoutMs: routing.timeoutMs } : {}),
       provider: routing.judgeFamily,
       boundary: routing,
     },
@@ -247,9 +244,10 @@ function resolveMemoryModelRouteNow(job: MemoryJobId): MemoryModelRoute | null {
   }
 }
 
-/** When a used-up Codex plan serves again, from the same reading that proved it
- *  used up: the refusal latch's end, else the latest reset among the windows
- *  at their limit. Undefined when the reading names no time (never guessed). */
+/** When a used-up subscription plan whose windows the app reads serves
+ *  again, from the same reading that proved it used up: the refusal latch's
+ *  end, else the latest reset among the windows at their limit. Undefined
+ *  when the reading names no time (never guessed). */
 function codexQuotaResetAt(now: number): number | undefined {
   try {
     const codex = getRateLimitSnapshot().codex;
