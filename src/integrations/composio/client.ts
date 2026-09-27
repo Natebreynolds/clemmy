@@ -597,8 +597,27 @@ export function maskApiKey(value: string): string {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
+/** The toolkit's name as its maker writes it: the curated list first, then
+ *  the cached catalog Composio served ("OpenAI", "DataForSEO"), and only then
+ *  a capitalised slug. No vendor is spelled in code; the catalog is the
+ *  source. */
 export function displayNameFor(slug: string): string {
-  return DISPLAY_NAME_BY_SLUG.get(slug) ?? humanize(slug);
+  return DISPLAY_NAME_BY_SLUG.get(slug) ?? catalogNameFor(slug) ?? humanize(slug);
+}
+
+let catalogNames: Map<string, string> | null = null;
+function catalogNameFor(slug: string): string | undefined {
+  const live = catalogCache?.data;
+  if (live && live.length > 0) {
+    const hit = live.find((t) => t.slug === slug);
+    if (hit?.name && hit.name !== humanize(slug)) return hit.name;
+  }
+  if (!catalogNames) {
+    catalogNames = new Map();
+    for (const t of readCatalogCache()) if (t.name) catalogNames.set(t.slug, t.name);
+  }
+  const name = catalogNames.get(slug);
+  return name && name !== humanize(slug) ? name : undefined;
 }
 
 function humanize(slug: string): string {
@@ -1476,6 +1495,7 @@ export function listCachedToolkits(): CatalogToolkit[] {
 }
 
 function writeCatalogCache(data: CatalogToolkit[]): void {
+  catalogNames = null;
   mkdirSync(CACHE_DIR, { recursive: true });
   writeFileSync(CATALOG_CACHE_FILE, JSON.stringify({ at: Date.now(), data }, null, 2), { encoding: 'utf-8', mode: 0o600 });
 }

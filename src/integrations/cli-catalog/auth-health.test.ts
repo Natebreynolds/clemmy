@@ -275,7 +275,7 @@ test('previous ok + non-zero exit without the signed-out pattern keeps ok and ma
   });
   assert.equal(readPersistedHealth().railway?.authStatus, 'ok', 'the persisted cache keeps the verdict too');
   assert.equal(readPersistedHealth().railway?.staleSince, good.checkedAt);
-  assert.match(cliHealthStaleNote(kept, Date.parse(kept.checkedAt) + 3 * 3_600_000) ?? '', /^checked 3h ago, last probe failed \(exit 1\)$/);
+  assert.match(cliHealthStaleNote(kept, Date.parse(kept.checkedAt) + 3 * 3_600_000) ?? '', /^last check 3h ago did not finish$/);
 
   // A second transient keeps the ORIGINAL staleSince (age keeps growing), and
   // the memo serves the settled record, not the raw probe.
@@ -342,7 +342,7 @@ test('a timeout with no previous verdict is unknown, never error', async () => {
   assert.notEqual(first.authStatus, 'error');
   assert.equal(first.staleSince, undefined, 'nothing was kept, so nothing is stale');
   assert.deepEqual(first.lastProbeError, { exitCode: null, timedOut: true, stderrHead: '' });
-  assert.match(cliHealthStaleNote(first, Date.parse(first.checkedAt)) ?? '', /^checked just now, last probe failed \(timed out\)$/);
+  assert.match(cliHealthStaleNote(first, Date.parse(first.checkedAt)) ?? '', /^last check just now timed out$/);
   assert.equal(readPersistedHealth().gcloud?.authStatus, 'unknown');
 });
 

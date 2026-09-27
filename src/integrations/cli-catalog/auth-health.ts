@@ -381,10 +381,11 @@ export function cliHealthStaleNote(health: CliHealth, now: number = Date.now()):
     : ageMs < 3_600_000 ? `${Math.round(ageMs / 60_000)}m ago`
     : ageMs < 86_400_000 ? `${Math.round(ageMs / 3_600_000)}h ago`
     : `${Math.round(ageMs / 86_400_000)}d ago`;
-  const why = health.lastProbeError.timedOut ? 'timed out'
-    : health.lastProbeError.exitCode === null ? 'failed'
-    : `exit ${health.lastProbeError.exitCode}`;
-  return `checked ${age}, last probe failed (${why})`;
+  // The owner's words, not the probe's: "exit 1" and "probe" mean nothing to
+  // the person reading Connections. Neutral about the verdict, because the
+  // caller says what the kept verdict is; this says only that the latest
+  // check did not finish, and how long ago that was.
+  return health.lastProbeError.timedOut ? `last check ${age} timed out` : `last check ${age} did not finish`;
 }
 
 /** Persist + fire the recovered event on a signed_out→ok transition.
