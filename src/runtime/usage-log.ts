@@ -449,8 +449,8 @@ export interface ModelUsageAttributionContext {
    *  narrower scope or the recording call overrides it. */
   role?: UsageRequestRole;
   /** Call-site lane for rows the SDK emits without one (a judge lane such as
-   * `judge:completion`). Live 2026-09-22: 94 reviewer calls in a day landed as
-   * `unknown / other` with no lane, so nothing about them could be ranked. */
+   * `judge:completion`). A row without a lane cannot be ranked by the call
+   * site that made it. */
   channel?: string;
   /** This scope is one model request of its own made inside an enclosing
    *  frame (a brain or worker turn). The frame's role and its prompt

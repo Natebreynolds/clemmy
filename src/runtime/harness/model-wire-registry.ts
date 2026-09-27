@@ -305,35 +305,21 @@ const REGISTRY: RegistryRow[] = [
       completionsEffortValues: ['low', 'medium', 'high', 'xhigh'],
     },
   },
-  // ONE LOOP, MANY BRAINS (2026-08-20): grok ids previously fell to
-  // DEFAULT_CAPABILITY (128K/8K, generic retry) — mis-budgeted for fleet
-  // work. grok-4 family: 256K window per xAI docs.
+  // The family row: a 256K window per the provider's documentation, so an id
+  // in this family is budgeted for fleet work rather than falling to the
+  // conservative default.
   //
-  // PROMPT CACHE: corrected 2026-09-12 from MEASUREMENT, not doctrine. The
-  // 2026-08-20 seed said "no server-side prompt cache contract we can rely
-  // on", which was a judgement rather than an observation, and it was wrong.
-  // Two days of this machine's own usage log
-  // (~/.clementine-next/state/token-usage):
+  // PROMPT CACHE: the provider caches prompt prefixes server-side, and the
+  // adapter records the cached subset and its dialect on every call. The
+  // cacheable floor is about 1,024 tokens; a larger prompt without a hit is a
+  // cold prefix, not one below a size threshold. The cache seed is set from
+  // the usage log's own record of cached tokens, never from an assumption.
   //
-  //     grok usage events        690
-  //     calls reporting cache    673  (97.5%)
-  //     input tokens          11,449,913
-  //     cached tokens          3,457,024  (30.2% hit rate)
-  //     cacheDialect          'inclusive' on all 690
-  //
-  // The adapter has been stamping the dialect and recording the cached subset
-  // on every call the whole time. Smallest prompt observed WITH a cache hit
-  // was 1,093 tokens, so the floor is ~1024; the 17 calls without a hit
-  // include a 40,888-token prompt, i.e. they are cold prefixes, not a size
-  // threshold.
-  //
-  // This flag is load-bearing twice over. inFlightCompactionThresholds gates
-  // mid-turn collapse on it: reading false pinned grok to the absolute 32k
-  // trigger, so a 256k-window brain compacted at 13% of its context — and
-  // every collapse rewrote a prefix the provider was caching, the exact
-  // arithmetic that cost ~126k of one 2026-09-03 run's ~139k uncached tokens.
-  // Non-caching wires (GLM, gpt, kimi) keep the absolute trigger untouched,
-  // so the 2026-09-01 first-byte timeout that motivated it is unaffected.
+  // inFlightCompactionThresholds gates mid-turn collapse on this flag. A
+  // caching wire compacts on a window-scaled trigger, because every collapse
+  // rewrites a prefix the provider is caching and turns a cache hit into a
+  // full cold prefill. A non-caching wire keeps the absolute trigger, which
+  // bounds how large a prompt it composes before its first byte.
   {
     idMatch: /grok-4|grok-3|grok-beta|grok-/i,
     cap: GROK_CAPABILITY,

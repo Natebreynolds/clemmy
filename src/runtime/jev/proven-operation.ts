@@ -682,9 +682,9 @@ export async function prepareProvenOperationForRequest(input: {
   const matches = listMatchingRunStrategies(input.query, 4, { scope: strategyScope });
   // A remembered run is taken on keywords alone only when it covers the
   // request. One that merely shares words with it goes through Jev's check
-  // below like any other ambiguous match: live 300948, "Show me the Daily
-  // Brief space" matched a run that BUILT that space, whose calendar and mail
-  // tools were then recommended while routing to the space tools never ran.
+  // below like any other ambiguous match: a request to show a workspace can
+  // share words with the run that built it, and that run's tools are not the
+  // ones the request needs.
   const lexical = pickProvenRunStrategy(matches);
   let strategy = lexical && provenStrategyCoversRequest(input.query, lexical) ? lexical : null;
   let pickedBy: ProvenPickSource | undefined = strategy ? 'keywords' : undefined;
@@ -794,9 +794,9 @@ export async function prepareProvenOperationForRequest(input: {
       }
       const bound = bindPublishedSkip(published);
       // A strategy that covers only a sliver of the request may still be
-      // called directly, but it never thins the surface: live 282184 a
-      // two-word calendar strategy matched "create a workflow… calendar…"
-      // and the thinned surface had no door to authoring.
+      // called directly, but it never thins the surface: a short strategy can
+      // match a longer request that needs other doors, and a thinned surface
+      // would not have them.
       skipDiscoverySearch = bound.skipDiscoverySearch && coversRequest;
       capabilityRefs = bound.capabilityRefs;
       descriptors = bound.descriptors;

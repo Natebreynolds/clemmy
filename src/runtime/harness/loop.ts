@@ -11545,10 +11545,8 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
         toolNames: requestToolSurface.toolNames,
         toolSchemaCosts: requestToolSurface.toolSchemaCosts,
         instructions: value.instructions ?? '',
-        // The MEASURED costs. This call previously passed neither tools nor
-        // history, so a wire carrying 9,198 tokens was recorded as 6,850 — the
-        // meter was off by 34% of its own figure on the very turn used to
-        // justify a prompt trim.
+        // The measured tool schema and history costs, never an estimate from
+        // names: a reading that leaves either out under-reports the request.
         measuredToolSchemaTokens: requestToolSurface.measuredToolSchemaTokens,
         ...(typeof requestToolComponents.deferredToolIndex === 'number'
           ? { deferredToolIndexTokens: requestToolComponents.deferredToolIndex }

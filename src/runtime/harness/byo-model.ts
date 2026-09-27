@@ -1,7 +1,7 @@
 /**
  * BYO (bring-your-own) model adapter — run worker/all-in roles on a
- * user-supplied OpenAI-compatible Chat-Completions backend (MiniMax,
- * DeepSeek, OpenRouter, or any compatible endpoint).
+ * user-supplied OpenAI-compatible Chat-Completions backend (any compatible
+ * endpoint).
  *
  * The harness's Agents SDK ships `OpenAIChatCompletionsModel`, which
  * already implements the SDK `Model` interface end to end. We don't
