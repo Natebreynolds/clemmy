@@ -148,9 +148,11 @@ function judgeRetainedOutput(input: RetainedResultRouteInput): RetainedOutputJud
   // Whether the call is still open is read from the durable lifecycle, never
   // from the caller: a call with no return yet cannot pass the query check,
   // so its output is judged as that check will judge it once the call
-  // settles. Once a return exists, the check itself decides. The identity
-  // carries the lifecycle, so a remembered judgement never outlives it.
-  const inFlight = identity.calledEvents > 0 && identity.returnedEvents === 0;
+  // settles. Once a return exists, the check itself decides. A carrier is
+  // open until its own top-level return, even after its inner mirror has
+  // returned. The identity carries the lifecycle, so a remembered judgement
+  // never outlives it.
+  const inFlight = identity.awaitingReturn;
   const memoKey = `${input.sessionId}\u0000${readId}`;
   const remembered = judgementMemo.get(memoKey);
   if (remembered && remembered.identity === identity.key) {

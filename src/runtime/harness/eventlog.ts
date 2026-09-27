@@ -7474,9 +7474,11 @@ export interface ToolOutputStoredIdentity {
   canonicalSha256: string | null;
   /** Digest of each invocation row's bytes, by invocation nonce. */
   invocationSha256: ReadonlyMap<string, string | null>;
-  /** Durable lifecycle events recorded for the call id, by type. */
-  calledEvents: number;
-  returnedEvents: number;
+  /** The call has been called and has no durable return yet. A carrier's
+   *  transport mirror is a second view of the carrier's own invocation, so
+   *  while a top-level occurrence exists only its call and return count; a
+   *  mirror that returns first does not settle the carrier. */
+  awaitingReturn: boolean;
 }
 
 /** A metadata-only identity of one call id's stored output: the canonical
@@ -7506,18 +7508,28 @@ export function toolOutputStoredIdentity(sessionId: string, callId: string): Too
     const lifecycle = prepareCached(db, `
       SELECT COUNT(*) AS events,
              COALESCE(SUM(type = 'tool_returned'), 0) AS returned,
+             COALESCE(SUM(type = 'tool_called' AND mirror = 0), 0) AS top_called,
+             COALESCE(SUM(type = 'tool_returned' AND mirror = 0), 0) AS top_returned,
              MAX(seq) AS last_seq
-        FROM events
-       WHERE session_id = ?
-         AND type IN ('tool_called', 'tool_returned')
-         AND json_extract(data_json, '$.callId') = ?
-    `).get(sessionId, callId) as { events: number; returned: number; last_seq: number | null };
+        FROM (
+          SELECT type, seq,
+                 COALESCE(json_extract(data_json, '$.accounting'), '') = 'transport_mirror' AS mirror
+            FROM events
+           WHERE session_id = ?
+             AND type IN ('tool_called', 'tool_returned')
+             AND json_extract(data_json, '$.callId') = ?
+        )
+    `).get(sessionId, callId) as {
+      events: number; returned: number; top_called: number; top_returned: number; last_seq: number | null;
+    };
+    const awaitingReturn = lifecycle.top_called > 0
+      ? lifecycle.top_returned === 0
+      : lifecycle.events > lifecycle.returned && lifecycle.returned === 0;
     return {
       key: JSON.stringify([canonical, invocations, lifecycle]),
       canonicalSha256: canonical.output_sha256,
       invocationSha256: new Map(invocations.map((row) => [row.invocation_nonce, row.output_sha256])),
-      calledEvents: lifecycle.events - lifecycle.returned,
-      returnedEvents: lifecycle.returned,
+      awaitingReturn,
     };
   })();
 }

@@ -311,3 +311,41 @@ test('a route judged while the stored output could not be read is not remembered
     (db as { prepare: typeof db.prepare }).prepare = prepare;
   }
 });
+
+test('a carrier formatting its own result after the inner tool returned still offers file_query', async () => {
+  // A carrier writes its own top-level lifecycle and the inner tool's
+  // transport mirror under the same call id. The mirror returns first; the
+  // carrier formats its result (host annotations force a digest) before its
+  // own return. The call is open until the top-level return, so the footer
+  // judges it as the query check will once the carrier settles, and that
+  // check accepts it.
+  const { formatRecallableToolText } = await import('./tool-output-format.js');
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'carrier-mirror' });
+  const callId = 'toolu_carrier_mirror_text';
+  const called = eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_called', data: {
+    callId, tool: 'call_tool', effectiveTool: 'space_get_view', accounting: 'top_level', dispatchLeaseId: 'lease-carrier',
+    arguments: JSON.stringify({ name: 'space_get_view', args_json: '{"slug":"notes"}' }),
+  } });
+  const mirror = eventlog.appendEvent({ sessionId: s.id, turn: 0, role: 'Clem', type: 'tool_called', data: {
+    callId, tool: 'space_get_view', accounting: 'transport_mirror', canonicalCallId: callId,
+  } });
+  const text = 'A long saved view of plain prose notes about the orchard.\n'.repeat(4000);
+  eventlog.writeToolOutput({ sessionId: s.id, callId, invocationNonce: 'nonce-carrier-inner', tool: 'space_get_view', output: text });
+  eventlog.appendEvent({ sessionId: s.id, turn: 0, role: 'tool', type: 'tool_returned', parentEventId: mirror.id, data: {
+    callId, tool: 'space_get_view', accounting: 'transport_mirror', ok: true, canonicalCallId: callId,
+  } });
+  eventlog.writeToolOutput({ sessionId: s.id, callId, invocationNonce: 'nonce-carrier-outer', tool: 'call_tool', output: text });
+
+  const footer = formatRecallableToolText(text, {
+    sessionId: s.id, callId, toolName: 'call_tool', maxChars: 6000, hostAnnotations: ['A host note about this read.'],
+  });
+  assert.ok(footer.length < text.length, 'precondition: the result is presented as a digest');
+  assert.match(footer, /file_query \{/, footer.slice(-800));
+
+  eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_returned', parentEventId: called.id, data: {
+    callId, tool: 'call_tool', effectiveTool: 'space_get_view', accounting: 'top_level', dispatchLeaseId: 'lease-carrier', ok: true,
+  } });
+  assert.equal(eventlog.resolveToolOutputForQuery(s.id, callId).status, 'ok', 'the offered reader accepts the settled output');
+  const settled = retainedResultRoutes({ sessionId: s.id, callId });
+  assert.deepEqual(settled.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(settled));
+});
