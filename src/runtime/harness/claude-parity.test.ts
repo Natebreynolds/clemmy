@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyClaudeEnvelope, buildClaudeSystemBlocks, claudeWireDebugEnabled, logClaudeRequestShape, logClaudeResponseUsage, hoistSystemMessagesIntoSystem } from './claude-model.js';
+import { applyClaudeEnvelope, buildClaudeSystemBlocks, claudeWireDebugEnabled, logClaudeRequestShape, logClaudeResponseUsage, hoistSystemMessagesIntoSystem, claudeCacheTtlRejected, stripClaudeCacheTtl, markClaudeCacheTtlRejected, _resetClaudeCacheTtlForTests } from './claude-model.js';
 import {
   resolveModelCapability,
   CACHE_BREAK_SENTINEL,
@@ -120,7 +120,7 @@ test('envelope (parity on): cached stable system blocks; effort is NOT written i
     );
     const parsed = JSON.parse(body as string);
     assert.equal(parsed.system[0].text, IDENTITY);
-    assert.deepEqual(parsed.system[1].cache_control, { type: 'ephemeral' });
+    assert.deepEqual(parsed.system[1].cache_control, { type: 'ephemeral', ttl: '1h' });
     assert.equal(parsed.system[2].text, 'live context');
     // Effort travels via providerData/output_config at the SDK layer, NOT the
     // raw body rewrite — the envelope must not invent it.
@@ -241,4 +241,57 @@ test('envelope (parity off): legacy identity-prefix path, NO cache_control anywh
     assert.equal(parsed.system[1].text, 'Be helpful.');
     assert.equal(JSON.stringify(parsed).includes('cache_control'), false, 'kill-switch removes all caching');
   });
+});
+
+// --- stable-prefix cache lifetime --------------------------------------------
+
+test('the stable prefix is cached for an hour; the tools-only and transcript markers keep the default lifetime', () => {
+  _resetClaudeCacheTtlForTests();
+  withParity('on', () => {
+    const stable = 'R'.repeat(20000);
+    const { body } = applyClaudeEnvelope(
+      { body: JSON.stringify({ model: 'claude-sonnet-5', system: `${stable}${CACHE_BREAK_SENTINEL}live`, tools: [],
+        messages: [{ role: 'user', content: 'Q'.repeat(20000) }] }) },
+      TOKEN,
+    );
+    const parsed = JSON.parse(body as string);
+    assert.deepEqual(parsed.system[1].cache_control, { type: 'ephemeral', ttl: '1h' }, 'the stable block lives an hour');
+    const lastMsg = parsed.messages[parsed.messages.length - 1];
+    const lastBlock = Array.isArray(lastMsg.content) ? lastMsg.content[lastMsg.content.length - 1] : lastMsg;
+    assert.deepEqual(lastBlock.cache_control, { type: 'ephemeral' }, 'the transcript marker after it keeps the default lifetime');
+    // No stable prefix: the tools marker stands alone at the default lifetime.
+    const tools = Array.from({ length: 40 }, (_, i) => ({ name: `tool_${i}`, description: 'D'.repeat(400), input_schema: { type: 'object', properties: {} } }));
+    const { body: toolsOnly } = applyClaudeEnvelope(
+      { body: JSON.stringify({ model: 'claude-sonnet-5', tools, messages: [] }) }, TOKEN,
+    );
+    const tp = JSON.parse(toolsOnly as string);
+    assert.deepEqual(tp.tools[tp.tools.length - 1].cache_control, { type: 'ephemeral' });
+  });
+});
+
+test('an endpoint that refuses the hour-long marker gets the same request without it, and that model omits it from then on', () => {
+  _resetClaudeCacheTtlForTests();
+  try {
+    const withTtl = JSON.stringify({ model: 'claude-sonnet-5', system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }] });
+    assert.equal(claudeCacheTtlRejected(400, '{"type":"error","error":{"type":"invalid_request_error","message":"cache_control.ttl: unsupported value"}}', withTtl), true);
+    assert.equal(claudeCacheTtlRejected(400, 'max_tokens: must be a positive integer', withTtl), false, 'another 400 is not about the marker');
+    assert.equal(claudeCacheTtlRejected(400, 'ttl unsupported', withTtl.replace('"ttl":"1h"', '')), false, 'a request without the marker cannot be refused for it');
+    assert.equal(claudeCacheTtlRejected(529, 'ttl', withTtl), false);
+    const stripped = JSON.parse(stripClaudeCacheTtl(withTtl));
+    assert.deepEqual(stripped.system[0].cache_control, { type: 'ephemeral' });
+    assert.deepEqual(stripped.messages[0].content[0].cache_control, { type: 'ephemeral' });
+    assert.equal(stripClaudeCacheTtl('not json'), 'not json');
+    markClaudeCacheTtlRejected('claude-sonnet-5');
+    withParity('on', () => {
+      const stable = 'R'.repeat(20000);
+      const request = (model: string) => JSON.parse(applyClaudeEnvelope(
+        { body: JSON.stringify({ model, system: `${stable}${CACHE_BREAK_SENTINEL}live`, tools: [], messages: [] }) }, TOKEN,
+      ).body as string);
+      assert.deepEqual(request('claude-sonnet-5').system[1].cache_control, { type: 'ephemeral' }, 'the refused model omits the lifetime');
+      assert.deepEqual(request('claude-opus-4-8').system[1].cache_control, { type: 'ephemeral', ttl: '1h' }, 'other models keep it');
+    });
+  } finally {
+    _resetClaudeCacheTtlForTests();
+  }
 });

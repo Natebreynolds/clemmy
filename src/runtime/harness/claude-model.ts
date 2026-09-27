@@ -303,11 +303,69 @@ function normalizeSystemText(system: unknown): string {
  * stays uncached. No sentinel → the whole prompt is treated as dynamic (no system
  * cache) and the caller caches tools instead.
  */
+/**
+ * How long the STABLE prefix (identity + instructions + tools) stays cached.
+ * Anthropic's default entry lives five minutes: a reviewer whose fixed prefix
+ * is re-sent once per turn wrote it on every turn and read it back almost
+ * never (live 2026-09-26: 77 first reviewer calls, cached tokens 0 on every
+ * one; only a second call inside the same review ever hit). An hour covers
+ * the gap between turns. Only the stable block gets it: Anthropic orders a
+ * longer-lived entry before shorter ones, and the tools-only and transcript
+ * markers that follow keep the default lifetime. A write at an hour costs
+ * more than a write at five minutes, so this is for a prefix reused across
+ * calls, which the stable block is by construction.
+ */
+export const CLAUDE_STABLE_PREFIX_CACHE_TTL = '1h' as const;
+
+/** Models whose endpoint refused the hour-long marker in this process. The
+ *  next request omits it, so a refusal costs one retried call, once. */
+const cacheTtlRejectedModels = new Set<string>();
+
+export function claudeStablePrefixCacheTtl(modelId: string): '1h' | undefined {
+  return cacheTtlRejectedModels.has(modelId.trim()) ? undefined : CLAUDE_STABLE_PREFIX_CACHE_TTL;
+}
+
+/** A 400 that names the cache lifetime, on a request that carried it. */
+export function claudeCacheTtlRejected(status: number, responseText: string, requestBody: unknown): boolean {
+  if (status !== 400 || typeof requestBody !== 'string' || !requestBody.includes('"ttl":"1h"')) return false;
+  return /\bttl\b/i.test(responseText) || /cache_control/i.test(responseText);
+}
+
+/** The same request without the lifetime on any cache marker. */
+export function stripClaudeCacheTtl(requestBody: string): string {
+  try {
+    const parsed = JSON.parse(requestBody) as Record<string, unknown>;
+    const strip = (value: unknown): void => {
+      if (Array.isArray(value)) { for (const item of value) strip(item); return; }
+      if (!value || typeof value !== 'object') return;
+      const row = value as Record<string, unknown>;
+      const marker = row.cache_control;
+      if (marker && typeof marker === 'object' && 'ttl' in (marker as Record<string, unknown>)) {
+        delete (marker as Record<string, unknown>).ttl;
+      }
+      for (const child of Object.values(row)) strip(child);
+    };
+    strip(parsed);
+    return JSON.stringify(parsed);
+  } catch {
+    return requestBody;
+  }
+}
+
+export function markClaudeCacheTtlRejected(modelId: string): void {
+  if (modelId.trim()) cacheTtlRejectedModels.add(modelId.trim());
+}
+
+export function _resetClaudeCacheTtlForTests(): void {
+  cacheTtlRejectedModels.clear();
+}
+
 export function buildClaudeSystemBlocks(
   system: unknown,
   cap: ModelCapability,
   cachingOn: boolean,
   toolsTokens = 0,
+  stableTtl: '1h' | undefined = undefined,
 ): { blocks: Array<Record<string, unknown>>; systemCached: boolean } {
   let raw = normalizeSystemText(system);
   if (raw.startsWith(CLAUDE_CODE_IDENTITY)) {
@@ -336,7 +394,7 @@ export function buildClaudeSystemBlocks(
       cachingOn && cap.supportsPromptCache && sentIdx >= 0
       && estimateTokens(CLAUDE_CODE_IDENTITY + stable) + toolsTokens >= cap.cacheMinTokens
     ) {
-      stableBlock.cache_control = { type: 'ephemeral' };
+      stableBlock.cache_control = stableTtl ? { type: 'ephemeral', ttl: stableTtl } : { type: 'ephemeral' };
       systemCached = true;
     }
     blocks.push(stableBlock);
@@ -374,7 +432,8 @@ function breakpointLastMessage(msg: Record<string, unknown>): void {
 function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapability): void {
   const tools = Array.isArray(parsed.tools) ? (parsed.tools as Array<Record<string, unknown>>) : [];
   const toolsTokens = tools.length > 0 ? estimateTokens(JSON.stringify(tools)) : 0;
-  const { blocks, systemCached } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens);
+  const stableTtl = claudeStablePrefixCacheTtl(typeof parsed.model === 'string' ? parsed.model : '');
+  const { blocks, systemCached } = buildClaudeSystemBlocks(parsed.system, cap, true, toolsTokens, stableTtl);
   parsed.system = blocks;
   // breakpoint tally — Anthropic allows at most 4 cache_control markers per request.
   let breakpoints = systemCached ? 1 : 0;
@@ -593,12 +652,33 @@ export function makeClaudeFetch(): typeof fetch {
     const dispatcher = modelParityEnabled() ? getClaudeDispatcher(claudeHeadersTimeoutMs(body)) : undefined;
     const debug = claudeWireDebugEnabled();
     if (debug) logClaudeRequestShape(body);
-    const res = await fetch(input, {
+    let res = await fetch(input, {
       ...init,
       headers,
       body,
       ...(dispatcher ? { dispatcher } : {}),
     } as RequestInit & { dispatcher?: unknown });
+    // An endpoint that refuses the hour-long cache marker gets the same
+    // request once more without it, and this model omits the marker from
+    // then on. The refusal itself is still traced below.
+    if (res.status === 400 && typeof body === 'string' && body.includes('"ttl":"1h"')) {
+      let detail = '';
+      try { detail = await res.clone().text(); } catch { /* the trace below still runs */ }
+      if (claudeCacheTtlRejected(res.status, detail, body)) {
+        let modelId = '';
+        try { modelId = String((JSON.parse(body) as { model?: unknown }).model ?? ''); } catch { /* unreadable body */ }
+        markClaudeCacheTtlRejected(modelId);
+        logger.warn({ modelId, detail: detail.slice(0, 300) }, 'Claude endpoint refused the hour-long cache marker; retrying without it');
+        void persistClaudeErrorTrace(res.clone(), body, res.status);
+        const retried = stripClaudeCacheTtl(body);
+        res = await fetch(input, {
+          ...init,
+          headers,
+          body: retried,
+          ...(dispatcher ? { dispatcher } : {}),
+        } as RequestInit & { dispatcher?: unknown });
+      }
+    }
     // ALWAYS persist an error trace (request body + response) to disk on ANY
     // non-2xx — 4xx (malformed: system placement / effort / cache_control), 429
     // (rate_limit_error; scope depends on provider detail), 529 (ANTHROPIC capacity:

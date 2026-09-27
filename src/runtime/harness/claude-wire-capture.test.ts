@@ -95,7 +95,7 @@ test('CLAUDE wire (parity on): identity-0, ONE breakpoint on the stable role blo
   assert.equal(parsed.system[0].cache_control, undefined);
   // stable role block carries the single breakpoint and is the real instructions
   assert.equal(parsed.system[1].text, ORCHESTRATOR_INSTRUCTIONS);
-  assert.deepEqual(parsed.system[1].cache_control, { type: 'ephemeral' });
+  assert.deepEqual(parsed.system[1].cache_control, { type: 'ephemeral', ttl: '1h' });
   // dynamic context is last and uncached
   assert.equal(parsed.system[2].text, DYNAMIC_CTX);
   assert.equal(parsed.system[2].cache_control, undefined);
@@ -124,7 +124,7 @@ test('CLAUDE wire (parity on, REAL array system): identity-0, one stable breakpo
   const parsed = claudeBody('on', { system: ARRAY_SYSTEM });
   assert.equal(parsed.system[0].text, IDENTITY);
   assert.equal(parsed.system[1].text, ORCHESTRATOR_INSTRUCTIONS);
-  assert.deepEqual(parsed.system[1].cache_control, { type: 'ephemeral' });
+  assert.deepEqual(parsed.system[1].cache_control, { type: 'ephemeral', ttl: '1h' });
   assert.equal(parsed.system[2].text, DYNAMIC_CTX);
   assert.equal(countCacheControl(parsed), 1);
   assert.equal(body(parsed).includes(CACHE_BREAK_SENTINEL), false);
