@@ -96,7 +96,9 @@ export function MemoryWorkPanel() {
       <Frame>
         <div className="p-4 sm:p-5">
           <Title />
-          <div role="alert" className="mt-3 flex flex-wrap items-start gap-3 rounded-md border border-border bg-subtle px-4 py-3">
+          {/* Static content in a labelled section, not an alert: opening Memory
+              on a daemon without this route must not interrupt a screen reader. */}
+          <div className="mt-3 flex flex-wrap items-start gap-3 rounded-md border border-border bg-subtle px-4 py-3">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
             <div className="min-w-0 flex-1">
               <p className="text-body font-semibold text-fg">Couldn’t read memory work just now</p>

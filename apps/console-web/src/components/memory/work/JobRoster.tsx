@@ -9,7 +9,7 @@
  */
 import { clsx } from 'clsx';
 import type { JobDot, JobView } from '@/lib/memory-work';
-import { JOB_ICON } from './job-icon';
+import { jobIcon } from './job-icon';
 
 const TILE: Record<JobDot, string> = {
   running: 'bg-primary-tint text-primary',
@@ -17,7 +17,8 @@ const TILE: Record<JobDot, string> = {
   off: 'bg-subtle text-faint',
   ok: 'bg-subtle text-muted',
   failed: 'bg-subtle text-muted',
-  never: 'bg-subtle text-faint',
+  unrecorded: 'bg-subtle text-faint',
+  unknown: 'bg-subtle text-faint',
 };
 
 const DOT: Record<JobDot, string> = {
@@ -26,7 +27,9 @@ const DOT: Record<JobDot, string> = {
   off: 'border-2 border-dashed border-border-strong bg-raised',
   ok: 'bg-success',
   failed: 'bg-warning',
-  never: 'border-2 border-border-strong bg-raised',
+  unrecorded: 'border-2 border-border-strong bg-raised',
+  // Neutral: a failed read says nothing about how the job went.
+  unknown: 'bg-border-strong',
 };
 
 const DOT_WORDS: Record<JobDot, string> = {
@@ -35,7 +38,8 @@ const DOT_WORDS: Record<JobDot, string> = {
   off: 'off',
   ok: 'last run went fine',
   failed: 'last run didn’t finish',
-  never: 'hasn’t run yet',
+  unrecorded: 'no run recorded yet',
+  unknown: 'couldn’t be read',
 };
 
 /** Visible when the row is stacked; a screen-reader label once it is a column. */
@@ -44,7 +48,7 @@ function InlineLabel({ children }: { children: string }) {
 }
 
 function JobRow({ job }: { job: JobView }) {
-  const Icon = JOB_ICON[job.id];
+  const Icon = jobIcon(job.id);
   return (
     <li className="memory-jobs-row px-3.5 py-3">
       <div className="flex min-w-0 items-start gap-3">
@@ -67,15 +71,16 @@ function JobRow({ job }: { job: JobView }) {
       </div>
       <div className="memory-jobs-meta min-w-0 text-caption leading-snug">
         <InlineLabel>Model:</InlineLabel>
-        {job.modelOwner === 'none'
-          ? <span className="text-muted">No model</span>
-          : <span className={job.modelName ? 'text-fg' : 'text-faint'}>{job.modelName ?? 'None available'}</span>}
+        <span className={job.modelName ? 'text-fg' : job.modelOwner === 'none' ? 'text-muted' : 'text-faint'}>{job.modelText}</span>
+        {job.modelHint && <span className="sr-only"> ({job.modelHint})</span>}
         <span className="memory-jobs-sub text-faint">{job.modelOwner === 'none' ? 'Rules only' : job.modelOwnerText}</span>
       </div>
       <div className="memory-jobs-meta min-w-0 text-caption leading-snug">
         {job.lastWhen
           ? <><InlineLabel>Last ran</InlineLabel><span className={job.lastFailed ? 'text-warning' : 'text-fg'}>{job.lastWhen}</span><span className={clsx('memory-jobs-sub', job.lastFailed ? 'text-warning' : 'text-faint')}>{job.lastDetail}</span></>
-          : <span className="text-faint">Hasn’t run yet</span>}
+          : job.unknown
+            ? <><InlineLabel>Last ran:</InlineLabel><span className="text-faint">{job.lastText}</span></>
+            : <span className="text-faint">{job.lastText}</span>}
       </div>
       <div className="memory-jobs-meta min-w-0 text-caption leading-snug text-muted">
         <span className="sr-only">Runs: </span>
@@ -83,7 +88,10 @@ function JobRow({ job }: { job: JobView }) {
       </div>
       <div className={clsx('memory-jobs-meta min-w-0 text-caption leading-snug tabular-nums', !job.todayText && 'memory-jobs-empty')}>
         <InlineLabel>Today:</InlineLabel>
-        {job.todayText ? <span className="text-muted">{job.todayText}</span> : <span className="text-faint">none yet</span>}
+        {job.todayText
+          ? <span className={job.unknown ? 'text-faint' : 'text-muted'}>{job.todayText}</span>
+          // Only recorded runs are counted; a check that found nothing new is not.
+          : <span className="text-faint">none recorded</span>}
       </div>
     </li>
   );

@@ -10,7 +10,6 @@ import type { PipelineFlows, PipelineStageView } from '@/lib/memory-work';
 function Stage({ stage }: { stage: PipelineStageView }) {
   return (
     <div
-      role="listitem"
       style={{ gridArea: stage.id }}
       className={clsx(
         'relative flex min-w-0 flex-col justify-center gap-0.5 rounded-md border px-3 py-2.5 transition-[background-color,border-color,box-shadow] duration-slow',
@@ -43,7 +42,9 @@ export function LearningPipeline({ stages, flows }: { stages: PipelineStageView[
   const read = by('read'); const found = by('found'); const kept = by('kept'); const aside = by('aside'); const faded = by('faded');
   if (!read || !found || !kept || !aside || !faded) return null;
   return (
-    <div role="list" aria-label="Today’s learning, stage by stage" className="memory-pipeline">
+    // A group, not a list: the note shares the grid with the stages (the
+    // wide layout sets it beside "left out"), and a list may own only items.
+    <div role="group" aria-label="Today’s learning, stage by stage" className="memory-pipeline">
       <Stage stage={read} />
       <StageLink area="l1" axis="main" flowing={flows.readToFound} />
       <Stage stage={found} />

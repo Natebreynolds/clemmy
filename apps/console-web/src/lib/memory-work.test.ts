@@ -13,9 +13,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { MEMORY_ROLE_WORDS, type MemoryWorkEvent, type MemoryWorkSnapshot } from '@clem/chat-engine';
 import {
-  durationWords, elapsedClock, memoryTimeFormat, memoryUndoResultText, memoryWorkViewModel, UNKNOWN,
+  durationWords, elapsedClock, memoryTimeFormat, memoryUndoNotice, memoryUndoResultText, memoryWorkViewModel, UNKNOWN,
 } from './memory-work.js';
 import { memoryWorkFixture } from './memory-work.fixture.js';
+import { JOB_ICON, jobIcon } from '../components/memory/work/job-icon.js';
 
 const HOUR = 3_600_000;
 const MIN = 60_000;
@@ -110,8 +111,11 @@ test('resting is up to date only when nothing is left to read', () => {
   assert.equal(queued.headline, '6 parts of finished conversations to read next');
   assert.equal(queued.upToDate, false);
   const unread = memoryWorkViewModel(snapshot({ queue: { toLearn: null, setAside: null, failed: null } }), NOW);
-  assert.equal(unread.upToDate, true, 'an unreadable queue is not invented into a backlog');
-  assert.equal(unread.queueLine, null);
+  assert.equal(unread.upToDate, false, 'an unreadable queue is not "up to date" (no green mark)');
+  assert.equal(unread.band, 'resting');
+  assert.equal(unread.headline, 'No memory work running right now', 'nothing is running is known; up to date is not');
+  assert.equal(unread.detail, 'Couldn’t read what is left to learn · Last worked 4 min ago');
+  assert.equal(unread.queueLine, null, 'nor is it invented into a backlog');
 });
 
 test('off says learning is off and the learning job says so too', () => {
@@ -124,17 +128,52 @@ test('off says learning is off and the learning job says so too', () => {
 
 // ─── unknown is not zero ─────────────────────────────────────────────────────
 
-test('unknown: every count is "—", the model is not claimed to be missing, and nothing is empty-by-assumption', () => {
+test('unknown: every count is "—" though the daemon sends zeros, and nothing is empty-by-assumption', () => {
   const view = memoryWorkViewModel(memoryWorkFixture('unknown', NOW), NOW);
   assert.equal(view.headline, 'Couldn’t read memory work just now');
   assert.ok(view.pipeline.every((s) => s.value === null && s.text === UNKNOWN), 'no stage reads 0');
   assert.ok(view.totals.every((t) => t.value === UNKNOWN), 'no total reads 0');
   assert.equal(view.totals.some((t) => t.label === 'Cost'), false);
-  assert.equal(view.model.unknown, true);
-  assert.equal(view.model.name, null);
-  assert.equal(view.jobs.learning.length + view.jobs.upkeep.length, 0);
+  assert.equal(view.model.unknown, false, 'the model is described by its own read, which succeeded');
+  assert.equal(view.model.name, 'Memory Model Large');
   assert.equal(view.eventCount, 0);
   assert.equal(view.hourly.length, 0);
+  const noModel = memoryWorkViewModel({ ...memoryWorkFixture('unknown', NOW), model: { source: 'automatic', modelId: null } }, NOW);
+  assert.equal(noModel.model.unknown, true, 'an unread model is "—", never "no model available"');
+  assert.equal(noModel.model.name, null);
+});
+
+test('unknown: the job roster says "—", never "hasn’t run", "none available" or "none yet"', () => {
+  const view = memoryWorkViewModel(memoryWorkFixture('unknown', NOW), NOW);
+  const rows = [...view.jobs.learning, ...view.jobs.upkeep];
+  assert.deepEqual(rows.map((j) => j.id), ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'standing', 'verify', 'index', 'tidy'],
+    'every job the daemon listed, in the shared order; importing still waits for a recorded run');
+  for (const job of rows) {
+    assert.equal(job.unknown, true);
+    assert.equal(job.dot, 'unknown', `${job.id}: a failed read says nothing about how the job went`);
+    assert.equal(job.lastWhen, null);
+    assert.equal(job.lastText, UNKNOWN, `${job.id}: not "No run recorded yet"`);
+    assert.equal(job.todayText, UNKNOWN, `${job.id}: a zero day sent by a failed read is not "none yet"`);
+    if (job.modelOwner === 'none') assert.equal(job.modelText, 'No model', 'no model is the registry’s fact, not a read');
+    else {
+      assert.equal(job.modelText, UNKNOWN, `${job.id}: not "None available"`);
+      assert.equal(job.modelHint, 'couldn’t be read');
+    }
+    assert.notEqual(job.stateLabel, 'Working now');
+  }
+  assert.match(rows.find((j) => j.id === 'patterns')!.nextText, /^Nightly/, 'when a job runs is the registry’s, still known');
+  // The running list is read in process even when the journal is not.
+  const base = memoryWorkFixture('unknown', NOW);
+  const running = memoryWorkViewModel({
+    ...base,
+    running: [{ job: 'learn', startedAt: iso(NOW - 20_000) }],
+    jobs: base.jobs.map((j) => (j.id === 'learn' ? { ...j, state: 'running' as const } : j)),
+  }, NOW);
+  const learn = running.jobs.learning.find((j) => j.id === 'learn')!;
+  assert.equal(learn.dot, 'running');
+  assert.equal(learn.stateLabel, 'Working now');
+  assert.equal(learn.lastText, UNKNOWN);
+  assert.equal(running.live, false, 'the panel line is still unknown and does not move');
 });
 
 test('a combined stage is unknown only when every part is unknown', () => {
@@ -216,12 +255,33 @@ test('a job row says its model, whose model that is, when it last ran, and when 
   assert.match(tidy.nextText, /^Nightly · next /);
   const skills = view.jobs.learning.find((j) => j.id === 'skills')!;
   assert.equal(skills.lastWhen, null);
-  assert.equal(skills.lastText, 'Hasn’t run yet');
-  assert.equal(skills.dot, 'never');
+  assert.equal(skills.lastText, 'No run recorded yet', 'the journal keeps 90 days and began at install: no record is not "never ran"');
+  assert.equal(skills.dot, 'unrecorded');
   assert.equal(skills.todayText, null);
+  assert.equal(skills.unknown, false);
   const failed = memoryWorkViewModel(snapshot({ jobs: [{ ...memoryWorkFixture('resting', NOW).jobs[0]!, lastRun: { at: iso(NOW - HOUR), outcome: 'failed' } }] }), NOW);
   assert.equal(failed.jobs.learning[0]?.dot, 'failed');
   assert.equal(failed.jobs.learning[0]?.lastFailed, true);
+});
+
+test('a null model means "none available" only for a memory job; a checker or local job with no recorded run says "—"', () => {
+  const jobs = memoryWorkFixture('resting', NOW).jobs.map((j) => ({ ...j, modelId: null, lastRun: null }));
+  const view = memoryWorkViewModel(snapshot({ jobs }), NOW);
+  const all = [...view.jobs.learning, ...view.jobs.upkeep];
+  const by = (id: string) => all.find((j) => j.id === id)!;
+  assert.equal(by('learn').modelText, 'None available', 'a memory job’s route resolved to nothing');
+  assert.equal(by('learn').modelHint, null);
+  for (const id of ['standing', 'verify']) {
+    assert.equal(by(id).modelText, UNKNOWN, `${id}: the checker’s model is reported from a recorded run`);
+    assert.equal(by(id).modelHint, 'named once a run is recorded');
+    assert.equal(by(id).modelOwnerText, 'Checks the work');
+    assert.equal(by(id).modelName, null);
+  }
+  assert.equal(by('index').modelText, UNKNOWN);
+  assert.equal(by('index').modelHint, 'not reported');
+  assert.equal(by('tidy').modelText, 'No model');
+  const named = memoryWorkViewModel(snapshot(), NOW);
+  assert.equal([...named.jobs.upkeep].find((j) => j.id === 'standing')?.modelText, 'Checker Model Fast');
 });
 
 // ─── the timeline ────────────────────────────────────────────────────────────
@@ -294,6 +354,37 @@ test('the undo result is said calmly, and a refusal changes nothing', () => {
   assert.equal(memoryUndoResultText({ ok: true, changed: 0 }, 'forget'), 'Nothing left to change — it was already done.');
   assert.equal(memoryUndoResultText({ ok: false, reason: 'expired' }, 'forget'), 'That run is too old to undo now.');
   assert.equal(memoryUndoResultText({ ok: false, reason: 'failed' }, 'forget'), 'Couldn’t undo just now. Nothing was changed.');
+});
+
+test('a failed undo can be tried again; a done or refused one cannot', () => {
+  assert.deepEqual(memoryUndoNotice(null, 'forget'), { ok: false, text: 'Couldn’t undo just now. Nothing was changed.', retry: true }, 'no answer at all');
+  assert.equal(memoryUndoNotice({ ok: false, reason: 'failed' }, 'restore').retry, true);
+  assert.equal(memoryUndoNotice({ ok: false, reason: 'expired' }, 'forget').retry, false);
+  assert.equal(memoryUndoNotice({ ok: false, reason: 'not_found' }, 'forget').retry, false);
+  assert.equal(memoryUndoNotice({ ok: false, reason: 'nothing_to_undo' }, 'forget').retry, false);
+  assert.deepEqual(memoryUndoNotice({ ok: true, changed: 3 }, 'forget'), { ok: true, text: 'Forgot 3 memories.', retry: false });
+  assert.equal(memoryUndoNotice({ ok: true, changed: 0 }, 'forget').ok, false, 'nothing changed is not drawn as done');
+  const timeline = read('../components/memory/work/WorkTimeline.tsx');
+  assert.match(timeline, /row\.undo && \(!result \|\| result\.retry\)/, 'the button comes back after a retryable failure');
+});
+
+test('a job this build does not know keeps its row and a plain glyph, and cannot take the screen down', () => {
+  const future = 'a-job-from-a-newer-daemon' as unknown as MemoryWorkEvent['job'];
+  const view = memoryWorkViewModel(snapshot({
+    recent: [event({ id: 'new', job: future, produced: { learned: 2 } })],
+    jobs: [...memoryWorkFixture('resting', NOW).jobs, { ...memoryWorkFixture('resting', NOW).jobs[0]!, id: future }],
+  }), NOW);
+  const row = view.timeline[0]?.rows[0];
+  assert.equal(row?.id, 'new');
+  assert.equal(row?.sentence, 'Memory work: nothing new', 'the shared words fall back for an unknown job');
+  assert.equal([...view.jobs.learning, ...view.jobs.upkeep].some((j) => j.id === future), false, 'the roster lists the jobs it knows');
+  assert.ok(jobIcon(future), 'an unknown id still gets a drawable glyph');
+  assert.equal(typeof jobIcon(future), typeof JOB_ICON.learn);
+  assert.equal(jobIcon('learn'), JOB_ICON.learn);
+  assert.equal(jobIcon('toString'), jobIcon(future), 'an inherited property name is not a glyph');
+  for (const file of ['WorkTimeline.tsx', 'JobRoster.tsx']) {
+    assert.doesNotMatch(read(`../components/memory/work/${file}`), /JOB_ICON\[/, `${file} looks glyphs up through jobIcon()`);
+  }
 });
 
 test('the quiet queue line appears only for counts above zero, and retention is said in days', () => {
@@ -402,6 +493,24 @@ test('the panel branches on a failed read before it draws anything as empty', ()
   assert.ok(guard > 0, 'the failed-first-read branch is gone');
   assert.ok(drawn > guard, 'the error branch must come before the panel draws counts');
   assert.match(panel, /Couldn’t read memory work just now/);
+});
+
+test('the headline is the one live region polling can speak through; nothing alerts', () => {
+  const files = ['MemoryWorkPanel.tsx', 'WorkStatus.tsx', 'LearningPipeline.tsx', 'ActivityStrip.tsx', 'JobRoster.tsx', 'WorkTimeline.tsx'];
+  const src = Object.fromEntries(files.map((f) => [f, read(`../components/memory/work/${f}`)]));
+  for (const f of files) assert.doesNotMatch(src[f]!, /role="alert"/, `${f}: no assertive interruptions`);
+  const live = files.filter((f) => /aria-live=/.test(src[f]!));
+  assert.deepEqual(live, ['WorkStatus.tsx']);
+  // The one other status line answers the owner's own undo click (the app's
+  // pattern for an action result); a poll never writes into it.
+  const status = files.flatMap((f) => (src[f]!.match(/role="status"/g) ?? []).map(() => f));
+  assert.deepEqual(status.sort(), ['WorkStatus.tsx', 'WorkTimeline.tsx']);
+});
+
+test('the pipeline is a labelled group: a list may own only its items, and the note shares the grid', () => {
+  const src = read('../components/memory/work/LearningPipeline.tsx');
+  assert.doesNotMatch(src, /role="list(item)?"/);
+  assert.match(src, /role="group" aria-label="Today’s learning, stage by stage"/);
 });
 
 test('motion stops for reduced motion and for the owner’s still style', () => {

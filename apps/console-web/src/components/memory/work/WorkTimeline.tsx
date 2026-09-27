@@ -10,10 +10,10 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Check, ChevronDown, RotateCcw, Undo2 } from 'lucide-react';
 import { clsx } from 'clsx';
 import {
-  MEMORY_WORK_QUERY_KEY, memoryUndoResultText, undoMemoryWork,
-  type TimelineDayView, type TimelineRowView,
+  MEMORY_WORK_QUERY_KEY, memoryUndoNotice, undoMemoryWork,
+  type MemoryUndoNotice, type TimelineDayView, type TimelineRowView,
 } from '@/lib/memory-work';
-import { JOB_ICON } from './job-icon';
+import { jobIcon } from './job-icon';
 
 const FIRST_ROWS = 6;
 
@@ -29,8 +29,8 @@ function Row({ row }: { row: TimelineRowView }) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
-  const Icon = JOB_ICON[row.job];
+  const [result, setResult] = useState<MemoryUndoNotice | null>(null);
+  const Icon = jobIcon(row.job);
   const detailsId = `memory-work-${row.id}`;
   const meta = [
     row.failed ? 'Didn’t finish' : null,
@@ -40,12 +40,12 @@ function Row({ row }: { row: TimelineRowView }) {
   ].filter(Boolean).join(' · ');
   const undo = async () => {
     if (!row.undo) return;
+    const kind = row.undo.kind;
     setBusy(true);
     try {
-      const r = await undoMemoryWork(row.id);
-      setResult({ ok: r.ok && r.changed > 0, text: memoryUndoResultText(r, row.undo.kind) });
+      setResult(memoryUndoNotice(await undoMemoryWork(row.id), kind));
     } catch {
-      setResult({ ok: false, text: 'Couldn’t undo just now. Nothing was changed.' });
+      setResult(memoryUndoNotice(null, kind));
     } finally {
       setBusy(false);
       void qc.invalidateQueries({ queryKey: MEMORY_WORK_QUERY_KEY });
@@ -75,7 +75,9 @@ function Row({ row }: { row: TimelineRowView }) {
           {(meta || row.undo || result) && (
             <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption">
               {meta && <span className={row.failed ? 'text-warning' : 'text-faint'}>{meta}</span>}
-              {row.undo && !result && (
+              {/* A failure the owner can retry keeps its button; a done or
+                  refused undo does not (the next read drops it anyway). */}
+              {row.undo && (!result || result.retry) && (
                 <button
                   type="button"
                   onClick={() => void undo()}

@@ -226,20 +226,29 @@ export function memoryWorkFixture(state: MemoryWorkFixtureState, now: number = D
   };
 
   if (state === 'unknown') {
+    // The daemon's own shape when the journal cannot be read: every job
+    // listed with no model, no last run and a zero day (the contract types
+    // those counts as numbers), the queue null, the lists empty. The model is
+    // still described (that read is separate); the running list is read in
+    // process, so it can still hold a job.
     return {
       ...base,
       running: [],
       waiting: null,
       lastWorkAt: null,
       queue: { toLearn: null, setAside: null, failed: null },
-      model: { source: 'automatic', modelId: null, follows: null, lastServed: null, unavailable: null },
-      jobs: [],
-      // The daemon sends nulls for what it could not read; the contract types
-      // them as numbers, so the fixture says so the same way the wire does.
-      today: {
-        runs: null, modelCalls: null, inputTokens: null, outputTokens: null, learned: null, updated: null, faded: null,
-        conversationsRead: null, claimsFound: null, leftOut: null, setAside: null, costUsd: null,
-      } as unknown as MemoryWorkSnapshot['today'],
+      model: { source: 'automatic', modelId: memoryModel, follows: 'checker', lastServed: null, unavailable: null },
+      embedder: null,
+      jobs: MEMORY_JOB_ORDER.map((id) => ({
+        id,
+        modelOwner: OWNER[id],
+        state: 'idle' as const,
+        modelId: null,
+        lastRun: null,
+        next: { trigger: TRIGGER[id] },
+        today: zeroTotals(),
+      })),
+      today: { ...zeroTotals(), conversationsRead: 0, claimsFound: 0, leftOut: 0, setAside: 0, costUsd: null },
       hourly: [],
       daily: [],
       recent: [],
