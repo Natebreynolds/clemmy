@@ -31,6 +31,17 @@ import { resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
 import { resolveMemoryModelRoute, type MemoryModelProblem } from './memory-model-route.js';
+import {
+  factIdStrings,
+  memoryIndexOutcome,
+  memoryJobFailed,
+  memoryJobRoute,
+  memoryWorkSourceForSession,
+  noteMemoryModelFailure,
+  runMemoryModelJob,
+  type MemoryJobNote,
+} from './memory-job-context.js';
+import type { MemoryJobOutcome } from './memory-work-journal.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { looksLikeIncidentNarrative } from './incident-narrative.js';
@@ -236,6 +247,22 @@ export interface ReflectionResult {
   pointersStored: number;
   sumImportance?: number;
   skipped?: 'too_short' | 'already_reflected' | 'extractor_failed' | 'disabled' | 'low_importance' | 'self_tool' | 'write_receipt' | 'scope_budget';
+  /** What this reflection did with each claim the extractor found, for the
+   *  memory-work journal (fact ids only). Absent when nothing was extracted.
+   *  Not stored on the reflection receipt. */
+  learning?: ReflectionLearning;
+}
+
+export interface ReflectionLearning {
+  /** Distinct claims the extractor returned. */
+  claims: number;
+  /** Claims left out: the source did not support them, or they were noise. */
+  leftOut: number;
+  /** Claims set aside for a second look (they overlap an existing memory). */
+  setAside: number;
+  learnedFactIds: number[];
+  updatedFactIds: number[];
+  reinforcedFactIds: number[];
 }
 
 const PROMPT_PREAMBLE = buildExtractorPreamble(false);
@@ -1082,7 +1109,7 @@ async function runExtractor(
 ): Promise<Extraction | null> {
   if (extractorOverrideForTest) return extractorOverrideForTest(serialized);
   if (!reflectionExtractorAvailable()) return null;
-  const route = resolveMemoryModelRoute('learn');
+  const route = memoryJobRoute('learn');
   if (!route) return null;
   // Source-map: when on, ask the extractor for `resources` too (named
   // locations). Flag-off keeps the schema + prompt byte-identical to today.
@@ -1116,6 +1143,7 @@ async function runExtractor(
       'reflection extractor failed',
     );
     if (!cls.retryable || !options.allowHedge) {
+      noteMemoryModelFailure(err);
       if (cls.retryable) {
         const pauseMs = Math.min(
           quotaResetHintMs(err) ?? cls.retryAfterMs ?? EXTRACTOR_PAUSE_DEFAULT_MS,
@@ -1146,6 +1174,7 @@ async function runExtractor(
         'reflection extractor hedge attempt failed too',
       );
     }
+    noteMemoryModelFailure(err);
     // No working family right now: honor the provider's reset hint and stop
     // grinding. The failed-receipt replay drain re-runs these once the pause
     // lifts, from the durable raw in tool_outputs.
@@ -1238,7 +1267,7 @@ export async function resolveConflict(
   similar: ConsolidatedFact[],
 ): Promise<ConflictDecision> {
   if (similar.length === 0) return { decision: 'ADD' };
-  const model = resolveMemoryModelRoute('reconcile')?.model ?? null;
+  const model = memoryJobRoute('reconcile')?.model ?? null;
   if (!model) return { decision: 'ADD', unresolved: true, unresolvedReason: 'No memory conflict resolver is available.' };
   try {
     const agent = new Agent({
@@ -1270,6 +1299,7 @@ export async function resolveConflict(
     // Conservative: on any failure, ADD. Better to have a duplicate
     // than to lose a real fact — but flag it so the retry queue
     // re-resolves the conflict instead of leaving it live forever.
+    noteMemoryModelFailure(error);
     const reason = redactSensitiveText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').slice(0, 400);
     logger.warn({ reason }, 'memory conflict resolver failed; saved fact still needs reconciliation');
     return { decision: 'ADD', unresolved: true, unresolvedReason: `Memory conflict review failed: ${reason}` };
@@ -1605,10 +1635,16 @@ export function triggerEmbedAtWrite(): Promise<void> {
   }
   embedAtWritePromise = (async () => {
     try {
-      do {
-        embedAtWriteRerun = false;
-        await embedMissingFacts({ maxChunks: EMBED_AT_WRITE_BATCH, newestFirst: true });
-      } while (embedAtWriteRerun);
+      // Indexing what was just saved is the `index` memory job: one run per
+      // coalesced pass, recorded when it indexed something.
+      await runMemoryModelJob('index', {}, async () => {
+        let embedded = 0;
+        do {
+          embedAtWriteRerun = false;
+          embedded += (await embedMissingFacts({ maxChunks: EMBED_AT_WRITE_BATCH, newestFirst: true })).embedded;
+        } while (embedAtWriteRerun);
+        return embedded;
+      }, (embedded) => memoryIndexOutcome(embedded));
     } catch {
       // Best-effort: the nightly backfill is the backstop.
     } finally {
@@ -1636,7 +1672,15 @@ export async function consolidateFact(
   ctx: ConsolidateContext = {},
   opts: ConsolidateOptions = {},
 ): Promise<ConsolidateOutcome> {
-  const out = await consolidateFactInner(candidate, ctx, opts);
+  // Settling a new memory is the `reconcile` memory job. It is recorded when
+  // its conflict review asked the memory model (or it failed); a deterministic
+  // save only refreshes the job's "last checked".
+  const out = await runMemoryModelJob(
+    'reconcile',
+    { source: consolidationSource(candidate, ctx) },
+    () => consolidateFactInner(candidate, ctx, opts),
+    reconcileOutcome,
+  );
   // Tally the resolver decision (a fact is exactly one of these per call).
   if (out.updated) resolverStats.update += 1;
   else if (out.deleted) resolverStats.delete += 1;
@@ -1646,6 +1690,38 @@ export async function consolidateFact(
   // turns can semantically recall it. Fire-and-forget — never blocks the caller.
   if (out.written || out.updated) void triggerEmbedAtWrite();
   return out;
+}
+
+/** Where a memory being settled came from: the conversation or workflow it
+ *  was said or found in, else the owner when they saved it themselves. */
+function consolidationSource(candidate: ConsolidateCandidate, ctx: ConsolidateContext) {
+  const owner = candidate.authority === 'user' || candidate.authority === 'manual' ? { kind: 'owner' as const } : null;
+  return memoryWorkSourceForSession(ctx.derivedFrom?.sessionId ?? ctx.sessionId, owner);
+}
+
+/** The reconcile job's record of one settled memory: the model's decision as
+ *  a change to the resulting fact (ADD → learned, UPDATE/DELETE → updated,
+ *  NOOP or an exact restatement → reinforced). */
+function reconcileOutcome(out: ConsolidateOutcome, note: MemoryJobNote): MemoryJobOutcome {
+  // No model was asked (a deterministic path, or the model could not be
+  // served and the memory was saved unreconciled for the nightly retry).
+  if (typeof note.requestedModelId !== 'string') return { outcome: 'nothing_new' };
+  const ids = factIdStrings([out.factId]);
+  const facts = out.action === 'add'
+    ? { learned: ids }
+    : out.action === 'supersede'
+      ? { updated: ids }
+      : out.action === 'reinforce' || out.noop ? { reinforced: ids } : {};
+  const produced = {
+    learned: facts.learned?.length ?? 0,
+    updated: facts.updated?.length ?? 0,
+    reinforced: facts.reinforced?.length ?? 0,
+  };
+  // The model failed and the memory was kept as a plain ADD, queued to be
+  // settled again: say what was kept and why it did not finish.
+  if (note.error !== undefined) return memoryJobFailed(note, { produced, facts });
+  const changed = produced.learned + produced.updated + produced.reinforced > 0;
+  return { outcome: changed ? 'ok' : 'nothing_new', produced, facts };
 }
 
 async function consolidateFactInner(
@@ -2410,6 +2486,11 @@ interface ReflectionCommitStats {
   factsNoop: number;
   entitiesUpserted: number;
   sumImportance: number;
+  /** Claims parked for a second look instead of committed. */
+  setAside: number;
+  learnedFactIds: number[];
+  updatedFactIds: number[];
+  reinforcedFactIds: number[];
 }
 
 function emptyCommitStats(): ReflectionCommitStats {
@@ -2420,6 +2501,10 @@ function emptyCommitStats(): ReflectionCommitStats {
     factsNoop: 0,
     entitiesUpserted: 0,
     sumImportance: 0,
+    setAside: 0,
+    learnedFactIds: [],
+    updatedFactIds: [],
+    reinforcedFactIds: [],
   };
 }
 
@@ -2430,6 +2515,10 @@ function mergeCommitStats(into: ReflectionCommitStats, next: ReflectionCommitSta
   into.factsNoop += next.factsNoop;
   into.entitiesUpserted += next.entitiesUpserted;
   into.sumImportance += next.sumImportance;
+  into.setAside += next.setAside;
+  into.learnedFactIds.push(...next.learnedFactIds);
+  into.updatedFactIds.push(...next.updatedFactIds);
+  into.reinforcedFactIds.push(...next.reinforcedFactIds);
 }
 
 function terminalConflictNeedsReview(candidate: string, existing: ConsolidatedFact): boolean {
@@ -2566,6 +2655,15 @@ async function commitExtractionMemory(input: ReflectionInput, extraction: Extrac
       stats.sumImportance += 'importanceAdded' in outcome
         ? outcome.importanceAdded
         : outcome.deferred ? 0 : fact.importance;
+      if ('deferred' in outcome && outcome.deferred) stats.setAside += 1;
+      if (outcome.factId) {
+        const change = 'action' in outcome
+          ? (outcome.action === 'add' ? 'learned' : outcome.action === 'supersede' ? 'updated' : outcome.noop ? 'reinforced' : null)
+          : (outcome.written ? 'learned' : outcome.noop ? 'reinforced' : null);
+        if (change === 'learned') stats.learnedFactIds.push(outcome.factId);
+        else if (change === 'updated') stats.updatedFactIds.push(outcome.factId);
+        else if (change === 'reinforced') stats.reinforcedFactIds.push(outcome.factId);
+      }
       if (outcome.factId) committedFacts.push({ fact, factId: outcome.factId });
       if (outcome.factId && evidenceEpisodeId && evidenceSourceText) {
         try {
@@ -2923,7 +3021,17 @@ export async function reflectOnToolReturn(input: ReflectionInput): Promise<Refle
     sumImportance: clearPendingAfterCommit ? pendingImportance : totals.sumImportance,
   };
   settleReflectionReceipt(input, receipt.inputHash, 'completed', result);
-  return emitObservability(result);
+  return emitObservability({
+    ...result,
+    learning: {
+      claims: candidateDecisions.length,
+      leftOut: candidateDecisions.filter((decision) => decision.status === 'rejected').length,
+      setAside: totals.setAside,
+      learnedFactIds: [...new Set(totals.learnedFactIds)],
+      updatedFactIds: [...new Set(totals.updatedFactIds)],
+      reinforcedFactIds: [...new Set(totals.reinforcedFactIds)],
+    },
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -2965,7 +3073,7 @@ const RECURSIVE_PROMPT = [
   '- Output ONLY the JSON object. No markdown fences.',
 ].join('\n');
 
-interface RecursiveReflectionResult {
+export interface RecursiveReflectionResult {
   patternsWritten: number;
   patternsUpdated: number;
   patternsNoop: number;
@@ -2980,13 +3088,16 @@ interface RecursiveReflectionResult {
    *  low-signal night (groups processed, 0 patterns). >0 means the synthesizer
    *  is broken (auth/quota/model), not that the week was quiet. */
   groupsFailed: number;
+  /** The pattern facts written and updated (ids), for the memory-work
+   *  journal. */
+  patternFactIds: { learned: number[]; updated: number[] };
 }
 
 export async function runRecursivePatternExtractor(
   kind: ConsolidatedFactKind,
   facts: ConsolidatedFactRow[],
 ): Promise<{ patterns: RecursivePattern[] } | null> {
-  const model = resolveMemoryModelRoute('patterns')?.model ?? null;
+  const model = memoryJobRoute('patterns')?.model ?? null;
   if (!model) return null;
   try {
     const agent = new Agent({
@@ -3001,9 +3112,29 @@ export async function runRecursivePatternExtractor(
     const final = (result as { finalOutput?: unknown }).finalOutput;
     return sanitizeRecursivePatternOutput(final);
   } catch (err) {
+    noteMemoryModelFailure(err);
     logger.warn({ kind, err: err instanceof Error ? err.message : String(err) }, 'recursive-reflection extractor failed');
     return null;
   }
+}
+
+/**
+ * The patterns job's record of one nightly run: the patterns it kept (their
+ * facts count as learned or updated today, by id), or — when groups failed and
+ * nothing was kept — that it did not finish, with the model's problem.
+ */
+export function recursiveReflectionOutcome(result: RecursiveReflectionResult, note: MemoryJobNote): MemoryJobOutcome {
+  const facts = {
+    learned: factIdStrings(result.patternFactIds.learned),
+    updated: factIdStrings(result.patternFactIds.updated),
+  };
+  const produced = {
+    patterns: result.patternsWritten + result.patternsUpdated,
+    learned: facts.learned.length,
+    updated: facts.updated.length,
+  };
+  if (result.groupsFailed > 0 && produced.patterns === 0) return memoryJobFailed(note, { produced, facts });
+  return { outcome: produced.patterns > 0 ? 'ok' : 'nothing_new', produced, facts };
 }
 
 /**
@@ -3030,6 +3161,7 @@ export async function runRecursiveReflection(
     groupsSkipped: 0,
     factsConsidered: 0,
     groupsFailed: 0,
+    patternFactIds: { learned: [], updated: [] },
   };
 
   const emit = (skipped?: 'disabled' | 'empty'): RecursiveReflectionResult => {
@@ -3170,9 +3302,11 @@ export async function runRecursiveReflection(
         });
         if (outcome.action === 'add') {
           result.patternsWritten += 1;
+          if (outcome.factId) result.patternFactIds.learned.push(outcome.factId);
           sourceIds.forEach(id => rolledUpSourceIds.add(id));
         } else if (outcome.action === 'supersede') {
           result.patternsUpdated += 1;
+          if (outcome.factId) result.patternFactIds.updated.push(outcome.factId);
           sourceIds.forEach(id => rolledUpSourceIds.add(id));
         } else {
           result.patternsNoop += 1;

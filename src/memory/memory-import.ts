@@ -33,7 +33,17 @@ import { deleteFact } from './facts.js';
 import type { ConsolidatedFactKind } from './db.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { consolidateFact } from './reflection.js';
-import { resolveMemoryModelRoute } from './memory-model-route.js';
+import {
+  factIdStrings,
+  memoryIndexOutcome,
+  memoryJobFailed,
+  memoryJobRoute,
+  memoryWorkSourceFromTurn,
+  noteMemoryModelFailure,
+  runMemoryModelJob,
+  type MemoryJobNote,
+} from './memory-job-context.js';
+import type { MemoryJobOutcome } from './memory-work-journal.js';
 import { recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 
 const logger = pino({ name: 'clementine-next.memory.import' });
@@ -302,7 +312,7 @@ async function distillFile(text: string, filePath: string): Promise<DistilledImp
   // The "Keeps your memory" route: the owner's pick, or today's fast-tier
   // model string when automatic. A pick that cannot be served falls back to
   // the model-free harvest, like any distiller failure; nothing stands in.
-  const route = resolveMemoryModelRoute('import');
+  const route = memoryJobRoute('import');
   if (!route) {
     logger.warn({ file: filePath }, 'memory-import distiller skipped — the memory model is unavailable; using the deterministic harvest');
     return null;
@@ -319,6 +329,7 @@ async function distillFile(text: string, filePath: string): Promise<DistilledImp
     const final = (result as { finalOutput?: unknown }).finalOutput;
     return sanitizeDistillerOutput(final);
   } catch (err) {
+    noteMemoryModelFailure(err);
     logger.warn({ err: err instanceof Error ? err.message : String(err), file: filePath }, 'memory-import distiller failed — falling back to deterministic harvest');
     return null;
   }
@@ -344,9 +355,37 @@ function harvestDeterministic(text: string): Array<{ kind: ConsolidatedFactKind;
 
 // ─── Ingest ──────────────────────────────────────────────────────────────────
 
+/**
+ * Import memories from a folder of foreign memory files. The import is the
+ * `import` memory job: its record lists the memories it added (so the Memory
+ * tab can forget them) and the ones it only confirmed.
+ */
 export async function ingestMemorySource(
   rootInput: string,
   options: { files?: string[]; sourceLabel?: string; distill?: boolean } = {},
+): Promise<MemoryImportBatch> {
+  return runMemoryModelJob(
+    'import',
+    { source: memoryWorkSourceFromTurn({ kind: 'owner' }) },
+    () => ingestMemorySourceNow(rootInput, options),
+    importOutcome,
+  );
+}
+
+function importOutcome(batch: MemoryImportBatch, note: MemoryJobNote): MemoryJobOutcome {
+  const learned = factIdStrings(batch.newFactIds);
+  const produced = { learned: learned.length, reinforced: batch.dedupedCount };
+  const facts = learned.length > 0 ? { learned } : undefined;
+  // Every file failed and nothing was kept: the import did not finish.
+  if (batch.fileCount > 0 && batch.errors.length >= batch.fileCount && learned.length === 0) {
+    return memoryJobFailed(note, { produced, ...(facts ? { facts } : {}) });
+  }
+  return { outcome: learned.length > 0 || batch.dedupedCount > 0 ? 'ok' : 'nothing_new', produced, ...(facts ? { facts } : {}) };
+}
+
+async function ingestMemorySourceNow(
+  rootInput: string,
+  options: { files?: string[]; sourceLabel?: string; distill?: boolean },
 ): Promise<MemoryImportBatch> {
   const scan = scanMemorySource(rootInput);
   const selected = options.files?.length
@@ -459,7 +498,8 @@ export async function ingestMemorySource(
   // semantically searchable immediately instead of waiting for the next
   // maintenance tick. The tick remains the safety net if this pass fails.
   if (newFactIds.length > 0 && isEmbeddingsEnabled()) {
-    void embedMissingFacts({ newestFirst: true }).then(
+    void runMemoryModelJob('index', {}, () => embedMissingFacts({ newestFirst: true }),
+      (stats) => memoryIndexOutcome(stats.embedded)).then(
       (stats) => logger.info({ batchId, embedded: stats.embedded, failed: stats.failed }, 'memory import: embedding pass done'),
       (err: unknown) => logger.warn({ batchId, err: err instanceof Error ? err.message : String(err) }, 'memory import: embedding pass failed (maintenance tick will retry)'),
     );

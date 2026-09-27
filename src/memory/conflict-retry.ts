@@ -26,6 +26,8 @@ import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { getFact, markFactSupersededBy } from './facts.js';
 import { resolveConflict } from './reflection.js';
+import { factIdStrings, memoryJobFailed, runMemoryModelJob, type MemoryJobNote } from './memory-job-context.js';
+import type { MemoryJobOutcome } from './memory-work-journal.js';
 
 const logger = pino({ name: 'clementine.conflict-retry' });
 
@@ -81,10 +83,37 @@ export interface ConflictRetryResult {
   dropped: number;
 }
 
+/** What a retry pass settled, by the fact that now stands (ids, for the
+ *  memory-work journal): a stale fact retired behind it (updated), or a
+ *  duplicate folded into it (reinforced). */
+interface ConflictRetrySettled {
+  updated: number[];
+  reinforced: number[];
+}
+
 /** Nightly pass: re-resolve every pending conflict a resolver can now judge.
- *  `resolver` is injectable for tests; defaults to the real resolveConflict. */
+ *  `resolver` is injectable for tests; defaults to the real resolveConflict.
+ *  The pass is one `reconcile` memory-job run. */
 export async function retryPendingMemoryConflicts(
   opts: { resolver?: typeof resolveConflict; nowMs?: number } = {},
+): Promise<ConflictRetryResult> {
+  const settled: ConflictRetrySettled = { updated: [], reinforced: [] };
+  return runMemoryModelJob('reconcile', { source: { kind: 'schedule' } },
+    () => retryPendingMemoryConflictsNow(opts, settled),
+    (result, note) => conflictRetryOutcome(result, settled, note));
+}
+
+function conflictRetryOutcome(result: ConflictRetryResult, settled: ConflictRetrySettled, note: MemoryJobNote): MemoryJobOutcome {
+  const facts = { updated: factIdStrings(settled.updated), reinforced: factIdStrings(settled.reinforced) };
+  const produced = { updated: facts.updated.length, reinforced: facts.reinforced.length };
+  // The model failed on every entry it was asked about: the pass did not finish.
+  if (note.error !== undefined && result.resolved === 0 && result.stillPending > 0) return memoryJobFailed(note, { produced, facts });
+  return { outcome: produced.updated + produced.reinforced > 0 ? 'ok' : 'nothing_new', produced, facts };
+}
+
+async function retryPendingMemoryConflictsNow(
+  opts: { resolver?: typeof resolveConflict; nowMs?: number },
+  settled: ConflictRetrySettled,
 ): Promise<ConflictRetryResult> {
   const now = opts.nowMs ?? Date.now();
   const resolver = opts.resolver ?? resolveConflict;
@@ -131,6 +160,7 @@ export async function retryPendingMemoryConflicts(
       // The candidate (already-added correction) wins; the old fact retires.
       const ok = markFactSupersededBy(decision.target_id, candidate.id);
       if (ok) {
+        settled.updated.push(candidate.id);
         logger.info({ loser: decision.target_id, winner: candidate.id, decision: decision.decision },
           'retried memory conflict resolved — stale fact superseded by the existing correction');
         result.resolved += 1;
@@ -153,6 +183,7 @@ export async function retryPendingMemoryConflicts(
       // The EXISTING fact is canonical; the fail-open ADD was the duplicate.
       const ok = markFactSupersededBy(candidate.id, decision.target_id);
       if (ok) {
+        settled.reinforced.push(decision.target_id);
         logger.info({ loser: candidate.id, winner: decision.target_id },
           'retried memory conflict resolved — duplicate fail-open ADD folded into the canonical fact');
         result.resolved += 1;

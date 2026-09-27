@@ -30,7 +30,14 @@ import pino from 'pino';
 import { Agent, Runner } from '@openai/agents';
 import type { Model } from '@openai/agents-core';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
-import { resolveMemoryModelRoute } from './memory-model-route.js';
+import {
+  memoryJobFailed,
+  memoryJobRoute,
+  noteMemoryModelFailure,
+  runMemoryModelJob,
+  type MemoryJobNote,
+} from './memory-job-context.js';
+import type { MemoryJobOutcome } from './memory-work-journal.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { addNotification, markNotificationRead } from '../runtime/notifications.js';
 import { IDENTITY_FILE, SOUL_FILE, composeCuratedMemory, sanitizeCuratedMemory, splitCuratedMemory } from './vault.js';
@@ -240,63 +247,79 @@ export async function maybeProposeIdentityUpdate(now = new Date()): Promise<Prop
   const target: IdentityProposalTarget = toneLike.length > newSince.length / 2 ? 'soul' : 'identity';
   const currentText = readCuratedTarget(target);
 
-  // A chosen memory model that cannot be served makes this cycle wait for the
-  // next tick; nothing stands in for it.
-  const route = distillerOverrideForTest ? null : resolveMemoryModelRoute('identity');
-  if (!distillerOverrideForTest && !route) return { proposed: false, reason: 'model-unavailable' };
-
-  try {
-    const output = await runDistiller({
-      target,
-      currentText,
-      facts: facts.map((f) => ({ id: f.id, kind: f.kind, content: f.content })),
-    }, route?.model ?? null);
-    if (!output) return { proposed: false, reason: 'invalid-output' };
-    if (!output.proposedText || !output.rationale) return { proposed: false, reason: 'no-change' };
-
-    const proposedText = sanitizeCuratedMemory(output.proposedText).trim();
-    const currentHeading = currentText.match(/^#[^\n]*/)?.[0];
-    if (
-      proposedText.length > MAX_PROPOSED_CHARS
-      || !proposedText.startsWith('#')
-      || (currentHeading && !proposedText.startsWith(currentHeading))
-    ) {
-      return { proposed: false, reason: 'invalid-output' };
-    }
-    if (normalizeText(proposedText) === normalizeText(currentText)) {
-      return { proposed: false, reason: 'no-change' };
-    }
-
-    const proposal: IdentityProposal = {
-      id: `idp-${randomUUID().slice(0, 12)}`,
-      target,
-      currentText,
-      proposedText,
-      rationale: output.rationale.slice(0, 600),
-      derivedFromFactIds: facts.map((f) => f.id),
-      status: 'pending',
-      createdAt: now.toISOString(),
-    };
-    store.proposals.push(proposal);
-    saveStore(store);
+  // Drafting a proposal is the `identity` memory job.
+  return runMemoryModelJob('identity', { source: { kind: 'schedule' } }, async (): Promise<ProposeResult> => {
+    // A chosen memory model that cannot be served makes this cycle wait for the
+    // next tick; nothing stands in for it.
+    const route = distillerOverrideForTest ? null : memoryJobRoute('identity');
+    if (!distillerOverrideForTest && !route) return { proposed: false, reason: 'model-unavailable' };
 
     try {
-      addNotification({
-        id: `identity-proposal-${proposal.id}`,
-        kind: 'system',
-        title: target === 'identity' ? 'Identity update suggested' : 'Personality update suggested',
-        body: `Based on what I've learned about you, I drafted an update to my ${target === 'identity' ? 'identity' : 'personality'} description. Review and approve it in Memory → Files. ${proposal.rationale}`,
-        createdAt: proposal.createdAt,
-        read: false,
-        metadata: { proposalId: proposal.id, target },
-      });
-    } catch { /* notification is best-effort */ }
+      const output = await runDistiller({
+        target,
+        currentText,
+        facts: facts.map((f) => ({ id: f.id, kind: f.kind, content: f.content })),
+      }, route?.model ?? null);
+      if (!output) return { proposed: false, reason: 'invalid-output' };
+      if (!output.proposedText || !output.rationale) return { proposed: false, reason: 'no-change' };
 
-    logger.info({ proposalId: proposal.id, target, evidence: facts.length }, 'identity update proposed');
-    return { proposed: true, reason: 'drafted', proposalId: proposal.id };
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err }, 'identity evolution distiller failed');
-    return { proposed: false, reason: 'failed' };
+      const proposedText = sanitizeCuratedMemory(output.proposedText).trim();
+      const currentHeading = currentText.match(/^#[^\n]*/)?.[0];
+      if (
+        proposedText.length > MAX_PROPOSED_CHARS
+        || !proposedText.startsWith('#')
+        || (currentHeading && !proposedText.startsWith(currentHeading))
+      ) {
+        return { proposed: false, reason: 'invalid-output' };
+      }
+      if (normalizeText(proposedText) === normalizeText(currentText)) {
+        return { proposed: false, reason: 'no-change' };
+      }
+
+      const proposal: IdentityProposal = {
+        id: `idp-${randomUUID().slice(0, 12)}`,
+        target,
+        currentText,
+        proposedText,
+        rationale: output.rationale.slice(0, 600),
+        derivedFromFactIds: facts.map((f) => f.id),
+        status: 'pending',
+        createdAt: now.toISOString(),
+      };
+      store.proposals.push(proposal);
+      saveStore(store);
+
+      try {
+        addNotification({
+          id: `identity-proposal-${proposal.id}`,
+          kind: 'system',
+          title: target === 'identity' ? 'Identity update suggested' : 'Personality update suggested',
+          body: `Based on what I've learned about you, I drafted an update to my ${target === 'identity' ? 'identity' : 'personality'} description. Review and approve it in Memory → Files. ${proposal.rationale}`,
+          createdAt: proposal.createdAt,
+          read: false,
+          metadata: { proposalId: proposal.id, target },
+        });
+      } catch { /* notification is best-effort */ }
+
+      logger.info({ proposalId: proposal.id, target, evidence: facts.length }, 'identity update proposed');
+      return { proposed: true, reason: 'drafted', proposalId: proposal.id };
+    } catch (err) {
+      noteMemoryModelFailure(err);
+      logger.warn({ err: err instanceof Error ? err.message : err }, 'identity evolution distiller failed');
+      return { proposed: false, reason: 'failed' };
+    }
+  }, identityOutcome);
+}
+
+/** The identity job's record of one drafting run: a proposal made, a cycle
+ *  that waits for the memory model, or a run that did not finish. */
+function identityOutcome(result: ProposeResult, note: MemoryJobNote): MemoryJobOutcome {
+  switch (result.reason) {
+    case 'drafted': return { outcome: 'ok', produced: { proposals: 1 } };
+    case 'model-unavailable': return { outcome: 'waiting', record: true };
+    case 'failed':
+    case 'invalid-output': return memoryJobFailed(note);
+    default: return { outcome: 'nothing_new' };
   }
 }
 

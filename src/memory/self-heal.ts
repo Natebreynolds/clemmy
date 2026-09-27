@@ -16,6 +16,7 @@ import { appendHygieneAudit, readHygieneAudit, type HygieneAuditEntry } from './
 import { readFactRecallTrace, type FactRecallSurface } from './recall-trace.js';
 import { isSelfReferentialTool } from './reflection.js';
 import { looksLikeTransientRequest } from './memory-quality.js';
+import { inMemoryJobTurn, memoryVerifyOutcome, memoryWorkSourceFromTurn, noteMemoryModelFailure, runMemoryModelJob } from './memory-job-context.js';
 
 const logger = pino({ name: 'clementine-next.memory.self-heal' });
 
@@ -644,11 +645,17 @@ export function detectMemoryHealCandidates(opts: CandidateOptions = {}): Propose
 export async function judgeMemoryFixCrossFamily(fix: ProposedMemoryFix): Promise<{ verdict: 'approve' | 'veto' | 'unavailable'; reason?: string }> {
   if (!memorySelfHealJudgeRequired()) return { verdict: 'unavailable', reason: 'memory fix judge disabled' };
   if (fix.kind !== 'merge_duplicate' && fix.kind !== 'supersede_stale_fact') return { verdict: 'approve', reason: 'deterministic fix kind' };
+  // The model check is the `verify` memory job, on "Checks the work".
+  return runMemoryModelJob('verify', { source: memoryWorkSourceFromTurn({ kind: 'schedule' }) },
+    () => judgeMemoryFixWithModel(fix), memoryVerifyOutcome);
+}
+
+async function judgeMemoryFixWithModel(fix: ProposedMemoryFix): Promise<{ verdict: 'approve' | 'veto' | 'unavailable'; reason?: string }> {
   try {
     const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
     const { resolveProvider } = await import('../runtime/harness/model-wire-registry.js');
     const { withJudgeTimeout } = await import('../runtime/harness/judge-family.js');
-    const judge = resolveRoleModel('judge');
+    const judge = inMemoryJobTurn(() => resolveRoleModel('judge'));
     const detectorProvider = resolveProvider(MODELS.fast);
     if (!judge?.modelId || String(judge.provider) === String(detectorProvider)) {
       return { verdict: 'unavailable', reason: 'no different-family judge bound' };
@@ -678,6 +685,7 @@ export async function judgeMemoryFixCrossFamily(fix: ProposedMemoryFix): Promise
     const result = await withJudgeTimeout(run(agent, prompt));
     return parseMemoryVetoVerdict(String((result as { finalOutput?: unknown } | undefined)?.finalOutput ?? ''));
   } catch (err) {
+    noteMemoryModelFailure(err);
     return { verdict: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
   }
 }

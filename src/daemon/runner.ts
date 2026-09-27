@@ -145,7 +145,7 @@ import { reapStaleWorkflowCatchups } from '../execution/workflow-catchup-decisio
 import { migrateToolChoicesToCanonicalProcedures, reapDeadToolChoiceMemos } from '../memory/tool-choice-store.js';
 import { installProvenStandardBeatLine, reapDeadSkillChoices } from '../memory/skill-choice-store.js';
 import { embedQuery, isEmbeddingsEnabled } from '../memory/embeddings.js';
-import { runRecursiveReflection, consolidateActiveFacts } from '../memory/reflection.js';
+import { runRecursiveReflection, consolidateActiveFacts, recursiveReflectionOutcome } from '../memory/reflection.js';
 import { decayAndEvictFacts } from '../memory/facts.js';
 import { appendHygieneAudit } from '../memory/hygiene-audit.js';
 import { autoCleanSafeMemory } from '../autoresearch/memory-apply.js';
@@ -191,6 +191,7 @@ import {
 } from '../runtime/exact-origin-delivery.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { MEMORY_JOB_CLOCKS } from '../memory/memory-jobs.js';
+import { memoryTidyOutcome, runMemoryModelJob } from '../memory/memory-job-context.js';
 import type { AssistantResponse } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
@@ -923,7 +924,10 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
   // when memory consolidates and what it produced. Fail-open.
   recordOperationalEvent({ source: 'memory', type: 'memory_consolidation_started', actor: 'recursive-reflection', payload: { day } });
   try {
-    const result = await runRecursiveReflection();
+    // The nightly pattern pass is the `patterns` memory job.
+    const { patternFactIds: _ids, ...result } = await runMemoryModelJob(
+      'patterns', { source: { kind: 'schedule' } }, () => runRecursiveReflection(), recursiveReflectionOutcome,
+    );
     logger.info({ result }, 'Brain recursive reflection completed');
     recordOperationalEvent({ source: 'memory', type: 'memory_consolidation_completed', actor: 'recursive-reflection', payload: { day, ...result } });
   } catch (err) {
@@ -963,60 +967,69 @@ async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
   state.lastMemoryHygieneDay = day;
   saveState(state);
 
-  if (decayOn) {
+  // Letting unused memories fade is the `tidy` memory job: recorded, with the
+  // faded ids (so the Memory tab can bring them back), when something faded.
+  await runMemoryModelJob('tidy', { source: { kind: 'schedule' } }, async () => {
+    const faded: number[] = [];
+    if (decayOn) {
+      try {
+        const result = decayAndEvictFacts();
+        faded.push(...result.ids);
+        logger.info({ result }, 'Memory decay/eviction completed');
+        if (result.deactivated > 0) {
+          appendHygieneAudit({
+            at: now.toISOString(),
+            kind: 'decay',
+            ids: result.ids,
+            detail: { scanned: result.scanned, deactivated: result.deactivated, reasons: result.reasons },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Memory decay/eviction failed (will retry tomorrow)',
+        );
+      }
+    }
+    if (dedupOn) {
+      try {
+        const result = await consolidateActiveFacts();
+        faded.push(...result.ids);
+        logger.info({ result }, 'Memory dedup/consolidation completed');
+        if (result.ids.length > 0) {
+          appendHygieneAudit({
+            at: now.toISOString(),
+            kind: 'dedup',
+            ids: result.ids,
+            detail: { examined: result.examined, merged: result.merged },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Memory dedup/consolidation failed (will retry tomorrow)',
+        );
+      }
+    }
+    // Tier A4: auto-clean the provably-safe class (synthetic smoke-test pollution
+    // matched by EXACT signature). The first auto-APPLY of the memory-refinement
+    // loop. Soft, capped, pinned-exempt, audited (kind:'autoclean'), reversible —
+    // and it only ever touches non-user-knowledge. CLEMMY_MEMORY_AUTOCLEAN=off is
+    // the kill-switch; autoCleanSafeMemory() honours it internally.
     try {
-      const result = decayAndEvictFacts();
-      logger.info({ result }, 'Memory decay/eviction completed');
-      if (result.deactivated > 0) {
-        appendHygieneAudit({
-          at: now.toISOString(),
-          kind: 'decay',
-          ids: result.ids,
-          detail: { scanned: result.scanned, deactivated: result.deactivated, reasons: result.reasons },
-        });
+      const result = autoCleanSafeMemory({ nowIso: now.toISOString() });
+      if (!result.dryRun) faded.push(...result.ids);
+      if (result.pruned > 0) {
+        logger.info({ pruned: result.pruned, ids: result.ids }, 'Memory auto-clean (synthetic junk) completed');
       }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
-        'Memory decay/eviction failed (will retry tomorrow)',
+        'Memory auto-clean failed (will retry tomorrow)',
       );
     }
-  }
-  if (dedupOn) {
-    try {
-      const result = await consolidateActiveFacts();
-      logger.info({ result }, 'Memory dedup/consolidation completed');
-      if (result.ids.length > 0) {
-        appendHygieneAudit({
-          at: now.toISOString(),
-          kind: 'dedup',
-          ids: result.ids,
-          detail: { examined: result.examined, merged: result.merged },
-        });
-      }
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Memory dedup/consolidation failed (will retry tomorrow)',
-      );
-    }
-  }
-  // Tier A4: auto-clean the provably-safe class (synthetic smoke-test pollution
-  // matched by EXACT signature). The first auto-APPLY of the memory-refinement
-  // loop. Soft, capped, pinned-exempt, audited (kind:'autoclean'), reversible —
-  // and it only ever touches non-user-knowledge. CLEMMY_MEMORY_AUTOCLEAN=off is
-  // the kill-switch; autoCleanSafeMemory() honours it internally.
-  try {
-    const result = autoCleanSafeMemory({ nowIso: now.toISOString() });
-    if (result.pruned > 0) {
-      logger.info({ pruned: result.pruned, ids: result.ids }, 'Memory auto-clean (synthetic junk) completed');
-    }
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      'Memory auto-clean failed (will retry tomorrow)',
-    );
-  }
+    return faded;
+  }, (faded) => memoryTidyOutcome(faded));
 }
 
 export interface CronMatchedOccurrence {

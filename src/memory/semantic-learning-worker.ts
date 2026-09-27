@@ -15,7 +15,16 @@ import {
   type MemoryLearningShardManifest,
   type TerminalLearningIntakeSummary,
 } from './learning-intake.js';
-import { reflectOnToolReturn, type ReflectionResult } from './reflection.js';
+import { reflectionExtractorPause, reflectOnToolReturn, type ReflectionResult } from './reflection.js';
+import {
+  factIdStrings,
+  memoryJobFailed,
+  memoryWorkSourceForSession,
+  notedMemoryModelProblem,
+  runMemoryModelJob,
+  type MemoryJobNote,
+} from './memory-job-context.js';
+import type { MemoryJobOutcome } from './memory-work-journal.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 
@@ -25,6 +34,10 @@ const MAX_SHARD_ATTEMPTS = 4;
 interface ClaimedShard {
   shardId: string;
   batchId: string;
+  /** 0-based position of this shard in its batch, and the batch's shard count:
+   *  a long conversation is read in parts. */
+  ordinal: number;
+  shardCount: number;
   reflectionCallId: string;
   manifestJson: string;
   manifestHash: string;
@@ -68,8 +81,8 @@ function claimNextShard(nowMs = Date.now()): ClaimedShard | null {
   const leaseExpiresAt = new Date(nowMs + SHARD_LEASE_MS).toISOString();
   return db.transaction(() => {
     const row = db.prepare(`
-      SELECT s.shard_id, s.batch_id, s.reflection_call_id, s.manifest_json,
-             s.manifest_hash, s.attempts, b.session_id
+      SELECT s.shard_id, s.batch_id, s.ordinal, b.shard_count, s.reflection_call_id,
+             s.manifest_json, s.manifest_hash, s.attempts, b.session_id
         FROM memory_learning_shards s
         JOIN memory_learning_batches b ON b.batch_id = s.batch_id
        WHERE s.attempts < ?
@@ -82,6 +95,8 @@ function claimNextShard(nowMs = Date.now()): ClaimedShard | null {
     `).get(MAX_SHARD_ATTEMPTS, now, now) as {
       shard_id: string;
       batch_id: string;
+      ordinal: number;
+      shard_count: number;
       reflection_call_id: string;
       manifest_json: string;
       manifest_hash: string;
@@ -103,6 +118,8 @@ function claimNextShard(nowMs = Date.now()): ClaimedShard | null {
     return {
       shardId: row.shard_id,
       batchId: row.batch_id,
+      ordinal: Number(row.ordinal),
+      shardCount: Number(row.shard_count),
       reflectionCallId: row.reflection_call_id,
       manifestJson: row.manifest_json,
       manifestHash: row.manifest_hash,
@@ -138,7 +155,11 @@ function parseManifest(shard: ClaimedShard): MemoryLearningShardManifest | null 
   return manifest as MemoryLearningShardManifest;
 }
 
+/** Test seam: a shard's source text without a harness settlement behind it. */
+let rebuildOverrideForTest: ((shardId: string) => string | null) | null = null;
+
 function rebuildShardInput(shard: ClaimedShard): string | null {
+  if (rebuildOverrideForTest) return rebuildOverrideForTest(shard.shardId);
   const manifest = parseManifest(shard);
   if (!manifest) return null;
   const members = new Map(listMemoryLearningMemberReceipts(shard.batchId).map((member) => (
@@ -233,6 +254,32 @@ function completedWithoutAnotherExtraction(result: ReflectionResult, shard: Clai
     || result.skipped === 'write_receipt';
 }
 
+/** The learn job's record of one part: what the extractor noticed, what was
+ *  kept (by fact id), left out or set aside. A failed extraction names the
+ *  model's problem when it is known (the error it hit, or the backoff it set). */
+function learnOutcome(result: ReflectionResult, note: MemoryJobNote): MemoryJobOutcome {
+  if (result.skipped === 'extractor_failed') {
+    return memoryJobFailed(note, {}, notedMemoryModelProblem(note) ?? reflectionExtractorPause()?.problem ?? null);
+  }
+  const learning = result.learning;
+  if (!learning) return { outcome: 'nothing_new' };
+  const facts = {
+    learned: factIdStrings(learning.learnedFactIds),
+    updated: factIdStrings(learning.updatedFactIds),
+    reinforced: factIdStrings(learning.reinforcedFactIds),
+  };
+  const produced = {
+    claims: learning.claims,
+    learned: facts.learned.length,
+    updated: facts.updated.length,
+    reinforced: facts.reinforced.length,
+    leftOut: learning.leftOut,
+    setAside: learning.setAside,
+  };
+  const kept = produced.learned + produced.updated + produced.reinforced + produced.setAside;
+  return { outcome: kept > 0 ? 'ok' : 'nothing_new', produced, facts };
+}
+
 export async function drainTerminalSemanticLearning(options: {
   discoverLimit?: number;
   shardLimit?: number;
@@ -281,14 +328,19 @@ export async function drainTerminalSemanticLearning(options: {
     summary.extractorInvocations += 1;
     let result: ReflectionResult;
     try {
-      result = await reflectOnToolReturn({
+      // Reading one part of a finished conversation is the `learn` memory job.
+      result = await runMemoryModelJob('learn', {
+        source: memoryWorkSourceForSession(shard.sessionId, { kind: 'conversation', sessionId: shard.sessionId }),
+        part: shard.ordinal + 1,
+        parts: Math.max(shard.shardCount, shard.ordinal + 1),
+      }, () => reflectOnToolReturn({
         sessionId: shard.sessionId,
         callId: shard.reflectionCallId,
         tool: 'terminal_learning_batch',
         output,
         sourceUri: `memory-batch://${shard.batchId}/${shard.shardId}`,
         learningMode: 'terminal_batch',
-      });
+      }), learnOutcome);
     } catch (error) {
       const state = retryShard(shard, error instanceof Error ? error.message : String(error));
       if (state === 'retried') summary.shardsRetried += 1;
@@ -310,4 +362,7 @@ export const _testOnlySemanticLearningWorker = {
   claimNextShard,
   parseManifest,
   rebuildShardInput,
+  setShardInputRebuilder(fn: ((shardId: string) => string | null) | null): void {
+    rebuildOverrideForTest = fn;
+  },
 };
