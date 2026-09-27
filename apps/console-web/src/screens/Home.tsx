@@ -59,14 +59,18 @@ export function Home() {
   const [params] = useSearchParams();
   const mockFlag = params.get('mock');
   const mockScreen = params.get('screen');
-  if (mockFlag !== null || isHomeMockScreen(mockScreen)) {
-    return (
-      <Suspense fallback={<div className="p-8"><Skeleton className="h-64 w-full" /></div>}>
-        <HomeMock initialScreen={mockFlag || mockScreen || undefined} embedded />
-      </Suspense>
-    );
-  }
-  return <LiveHome />;
+  const mock = mockFlag !== null || isHomeMockScreen(mockScreen);
+  // Today lives inside the fixed-height chat shell. Own its page scroll here;
+  // conversation routes keep their independent transcript/composer layout.
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto" role="region" aria-label="Today overview" tabIndex={0}>
+      {mock ? (
+        <Suspense fallback={<div className="p-8"><Skeleton className="h-64 w-full" /></div>}>
+          <HomeMock initialScreen={mockFlag || mockScreen || undefined} embedded />
+        </Suspense>
+      ) : <LiveHome />}
+    </div>
+  );
 }
 
 function LiveHome() {
