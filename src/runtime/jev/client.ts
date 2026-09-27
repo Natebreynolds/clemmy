@@ -60,6 +60,16 @@ export async function resolveTypesafeApiKey(): Promise<{ value: string; source: 
   return fromEnv ? { value: fromEnv, source: 'env' } : null;
 }
 
+/** Whether a Jev request would be attempted at all: Jev is enabled and a key
+ *  is configured. It says nothing about whether Jev would answer in time. A
+ *  caller that builds candidates only for Jev asks this first, so a user
+ *  without Jev pays for neither the candidates nor the request. The key is
+ *  read on each call, so connecting or disconnecting applies to the next one. */
+export async function jevAvailable(): Promise<boolean> {
+  if (!jevEnabled()) return false;
+  return Boolean(await resolveTypesafeApiKey());
+}
+
 export async function evaluateSystemOne(input: {
   state: unknown;
   questions: SystemOneQuestions;

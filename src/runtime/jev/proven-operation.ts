@@ -26,6 +26,7 @@ import {
   type RoutableOperation,
   type TurnStartDecision,
 } from './control-plane.js';
+import { jevAvailable } from './client.js';
 import { DISCOVERY_SIBLING_DOORS, TOOL_SEARCH_ALWAYS_LOADED, rankCatalogEntriesLexically } from '../../agents/tool-catalog.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 
@@ -97,7 +98,8 @@ export interface ProvenOperationPreparation {
 
 export interface ProvenOperationDependencies {
   acquireLiveRead?: typeof import('../../tools/tool-search-provider-sources.js').acquireProvenLiveReadForSource;
-  /** Test seam for the turn-start Jev decision. */
+  /** Test seam for the turn-start Jev decision. An injected decision stands in
+   *  for Jev entirely, so it is asked whether or not Jev is available. */
   decideTurnStart?: typeof decideTurnStartWithJev;
 }
 
@@ -711,11 +713,23 @@ export async function prepareProvenOperationForRequest(input: {
   // the operation over below.
   let routed = false;
   if (!strategy) {
-    const familiar = familiarRunStrategiesForRequest(input.query, strategyScope);
-    const operations = routableOperationsForRequest(input.query, strategyScope);
-    if (familiar.length > 0 || operations.length > 0) {
+    // The candidates exist only for Jev's question. When Jev cannot be asked
+    // (turned off, or no key), none are built and nothing waits: the host
+    // goes straight to what a failed decision falls back to, for a run that
+    // decision would have been offered (one with an operation to hand over).
+    const decideTurnStart = dependencies.decideTurnStart
+      ?? (await jevAvailable() ? decideTurnStartWithJev : null);
+    const familiar = decideTurnStart ? familiarRunStrategiesForRequest(input.query, strategyScope) : [];
+    const operations = decideTurnStart ? routableOperationsForRequest(input.query, strategyScope) : [];
+    if (!decideTurnStart) {
+      const top = matches[0]?.strategy;
+      if (top && bindableStrategyTools(top.toolsUsed).length > 0) {
+        strategy = unconfirmedKeywordPick(input.query, matches);
+        if (strategy) pickedBy = 'keywords_unconfirmed';
+      }
+    } else if (familiar.length > 0 || operations.length > 0) {
       const startedAt = Date.now();
-      const decision = await decideWithinBudget(() => (dependencies.decideTurnStart ?? decideTurnStartWithJev)(
+      const decision = await decideWithinBudget(() => decideTurnStart(
         input.query,
         familiar.map((row) => ({
           id: row.id,

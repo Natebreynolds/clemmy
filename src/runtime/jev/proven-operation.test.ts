@@ -588,6 +588,43 @@ test('with no turn-start judgement, a run that only shares words recommends noth
   }
 });
 
+test('when Jev cannot be asked, no candidates are offered and nothing waits; a restated run is still taken', async () => {
+  const jev = await import('./client.js');
+  const { _setToolSchemaLoaderForTests } = await import('../../tools/composio-schema-cache.js');
+  _setToolSchemaLoaderForTests(async () => null);
+  recordZephyrStrategy('yak ledger reconciliation report', 'yak_ledger_read', 'yak-a');
+  recordZephyrStrategy('yak ledger export report', 'yak_export_write', 'yak-b');
+  let requests = 0;
+  jev._setSystemOneFetchForTests(async () => { requests += 1; throw new Error('Jev must not be asked'); });
+  const unavailable: Array<[string, () => void]> = [
+    ['turned off', () => { process.env.CLEMMY_JEV = 'off'; jev._setTypesafeKeyForTests('ts_fixture'); }],
+    ['no key', () => { delete process.env.CLEMMY_JEV; jev._setTypesafeKeyForTests(null); }],
+  ];
+  try {
+    for (const [mode, arrange] of unavailable) {
+      arrange();
+      assert.equal(await jev.jevAvailable(), false, mode);
+      // The request names a workflow, so with Jev available it would be asked.
+      assert.ok(routableOperationsForRequest('create a workflow named narwhal tally', 'chat').length > 0);
+      const none = await prepareProvenOperationForRequest({ query: 'create a workflow named narwhal tally' });
+      assert.equal(none.text, undefined, mode);
+      assert.equal(none.decisionWaitMs, undefined, `${mode}: no decision was waited on`);
+      // Runs that disagree, one of which the request restates: the fallback a
+      // failed decision takes still applies, without the wait.
+      const restated = await prepareProvenOperationForRequest({ query: 'yak ledger reconciliation report' });
+      assert.equal(restated.pickedBy, 'keywords_unconfirmed', mode);
+      assert.deepEqual(restated.tools, ['yak_ledger_read'], mode);
+      assert.equal(restated.decisionWaitMs, undefined, mode);
+    }
+    assert.equal(requests, 0, 'no Jev request was attempted');
+  } finally {
+    delete process.env.CLEMMY_JEV;
+    jev._setTypesafeKeyForTests(undefined);
+    jev._setSystemOneFetchForTests(undefined);
+    _setToolSchemaLoaderForTests(null);
+  }
+});
+
 // A familiar request is worded differently from the run that proved it: another
 // target, another phrasing, few shared words. Recall must not be gated on
 // shared words; words only order the window Jev reads.
