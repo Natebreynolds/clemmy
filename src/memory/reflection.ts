@@ -531,8 +531,13 @@ function sanitizeRecursivePatternOutput(value: unknown): { patterns: RecursivePa
   return { patterns };
 }
 
-function readDisableFlag(): boolean {
-  const raw = (process.env.CLEMMY_REFLECTION ?? '').trim().toLowerCase();
+/** The operator kill-switch (CLEMMY_REFLECTION=off|false|0), read like every
+ *  other runtime setting here — the process env, then the env file — so the
+ *  extractor, the nightly patterns tick and the Memory tab obey one switch.
+ *  (Reading the process env alone missed a switch set in the env file, which
+ *  never reaches it: the nightly tick stopped while learning carried on.) */
+export function reflectionTurnedOff(): boolean {
+  const raw = (getRuntimeEnv('CLEMMY_REFLECTION', '') ?? '').trim().toLowerCase();
   return raw === 'off' || raw === 'false' || raw === '0';
 }
 
@@ -788,7 +793,7 @@ function reflectionInputHash(input: ReflectionInput): string {
 type PreclaimReflectionSkip = 'disabled' | 'self_tool' | 'write_receipt' | 'too_short';
 
 function preclaimReflectionSkipReason(input: ReflectionInput): PreclaimReflectionSkip | null {
-  if (readDisableFlag()) return 'disabled';
+  if (reflectionTurnedOff()) return 'disabled';
   if (
     selfToolReflectionFilterEnabled()
     && (isSelfReferentialTool(input.tool) || isInternalTaskLedgerReturn(input.tool, input.output))
@@ -3048,7 +3053,7 @@ export async function runRecursiveReflection(
     return result;
   };
 
-  if (readDisableFlag()) return emit('disabled');
+  if (reflectionTurnedOff()) return emit('disabled');
 
   const db = openMemoryDb();
   const sinceIso = new Date(Date.now() - RECURSIVE_REFLECTION_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
