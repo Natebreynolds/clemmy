@@ -24,6 +24,7 @@ const {
   presentationBudgetFor,
   retainedReaderMaxChars,
   mcpTransportPresentationMaxChars,
+  answererViewBudgetFor,
 } = await import('./tool-output-format.js');
 const { recordCatalogWindow, recordWindowRejection, effectiveContextWindow } = await import('./model-window-observations.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
@@ -143,4 +144,14 @@ test('the reader bound follows the window, keeps the baseline on a 200k window, 
   const read = carried('call_tool', 'read_file', { path: '/tmp/x', max_chars: 90_000 });
   assert.equal(presentationBudgetFor(read), 90_000);
   assert.equal(mcpTransportPresentationMaxChars(read), MCP_TRANSPORT_MAX_CHARS);
+});
+
+test('a reviewer\'s view of a result uses the answerer\'s budget, never more than its window shows whole', () => {
+  // A window-bounded read is bounded for the reviewer exactly as for the answerer.
+  assert.equal(answererViewBudgetFor({ toolName: 'space_get', args: {}, routedModelId: SMALL_WINDOW_MODEL }), 11_200);
+  // A keyhole result keeps one whole inline result for the same window.
+  assert.equal(answererViewBudgetFor({ toolName: 'fixtureserver__read', routedModelId: SMALL_WINDOW_MODEL }), 11_200);
+  assert.equal(answererViewBudgetFor({ toolName: 'fixtureserver__read' }), DEFAULT_TOOL_RESULT_MAX_CHARS);
+  // An explicit larger local read is what the answerer was shown.
+  assert.equal(answererViewBudgetFor({ toolName: 'read_file', args: { path: '/tmp/x', max_chars: 40_000 } }), 40_000);
 });

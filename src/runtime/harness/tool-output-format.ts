@@ -160,6 +160,18 @@ export function presentationBudgetFor(input: PresentationBudgetInput): number {
 }
 
 /**
+ * The bound a reviewer's view of a settled result uses: the answerer's own
+ * presentation budget from the same resolver (tool, arguments, routed window),
+ * so a result the window clipped is never shown to a reviewer as whole. A
+ * result presented through the recallable keyhole had its exact bytes parked
+ * for the answerer's next read, so its reviewer view keeps one whole inline
+ * result for the same window rather than the keyhole alone.
+ */
+export function answererViewBudgetFor(input: PresentationBudgetInput): number {
+  return Math.max(presentationBudgetFor(input), inlineResultBudgetForModel(input.routedModelId));
+}
+
+/**
  * The bound an outer transport applies to a result its invocation already
  * presented: a carrier's MCP wire, or the host lane's model projection.
  *
