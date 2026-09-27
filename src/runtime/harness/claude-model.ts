@@ -307,8 +307,7 @@ function normalizeSystemText(system: unknown): string {
  * How long the STABLE prefix (identity + instructions + tools) stays cached.
  * Anthropic's default entry lives five minutes: a reviewer whose fixed prefix
  * is re-sent once per turn wrote it on every turn and read it back almost
- * never (live 2026-09-26: 77 first reviewer calls, cached tokens 0 on every
- * one; only a second call inside the same review ever hit). An hour covers
+ * never; only a second call inside the same review ever hit. An hour covers
  * the gap between turns. Only the stable block gets it: Anthropic orders a
  * longer-lived entry before shorter ones, and the tools-only and transcript
  * markers that follow keep the default lifetime. A write at an hour costs

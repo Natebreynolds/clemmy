@@ -221,11 +221,9 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
   // server-side cache keys on a STABLE PREFIX, so putting per-turn memory at
   // byte 0 means no prefix is ever repeated and nothing can ever hit.
   //
-  // Measured on the installed build, live 2026-09-20 source for "how many
-  // meetings does tim have tomorrow...": six grok-4.6 calls, 25,007 -> 38,353
-  // input tokens each, 236,961 input total, CACHED 0 — for 2,087 output tokens.
-  // The judge, whose prompt does not carry this reordered block, was caching on
-  // the same provider in the same period.
+  // With per-turn memory first, every call of a tool loop re-bills its whole
+  // input uncached, while a prompt without the reordered block caches on the
+  // same provider.
   //
   // Byte-identity with the pre-parity wire was a migration guarantee, not a
   // correctness one. The content is unchanged; only the order of two blocks

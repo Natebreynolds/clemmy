@@ -5,10 +5,9 @@
  * A generic request tool (an MCP server's `api_request`, `fetch`, `call`)
  * declares one definition for every endpoint it can reach, so nothing about
  * the tool itself can say whether a given call reads or writes. The effect
- * lives in the request: its method and its path. Live 2026-09-26: four
- * DataForSEO `POST /v3/serp/.../live/...` calls in a read-only SEO audit
- * settled as writes, so the turn drew a full write review, Jev could not
- * close it, and the ledger reserved four "writes" that changed nothing.
+ * lives in the request: its method and its path. Without that, a read-only
+ * request sent as POST settles as a write: the turn draws a full write
+ * review and the ledger reserves writes that changed nothing.
  *
  * This store remembers, per provider operation and request shape, that the
  * shape was found to read only. As with learned operation delivery, nothing
