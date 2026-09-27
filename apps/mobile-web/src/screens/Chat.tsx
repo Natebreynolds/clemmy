@@ -271,23 +271,40 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     });
   }
 
+  // Following the tail is a courtesy while the owner is reading the newest
+  // words, never a grip. A streamed turn redraws many times a second; if each
+  // redraw snapped the transcript to the bottom, a finger could never get the
+  // 72 px away that counts as "reading something older" (the owner: "I can't
+  // scroll in the chat sometimes"). So the first touch or wheel releases the
+  // follow at once, the snap only happens when the content actually grew, and
+  // reaching the tail again by hand re-arms it.
+  const lastScrollHeight = useRef(0);
   useEffect(() => {
     const transcript = scrollRef.current;
     if (!transcript) return;
+    const grew = transcript.scrollHeight !== lastScrollHeight.current;
+    lastScrollHeight.current = transcript.scrollHeight;
     if (followingTail.current) {
-      transcript.scrollTop = transcript.scrollHeight;
+      if (grew) transcript.scrollTop = transcript.scrollHeight;
       setShowJumpToLatest(false);
     } else {
-      setShowJumpToLatest(true);
+      setShowJumpToLatest(transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight >= 72);
     }
   }, [messages]);
+
+  function releaseTail() {
+    const transcript = scrollRef.current;
+    if (!transcript) return;
+    if (transcript.scrollHeight <= transcript.clientHeight + 1) return;
+    followingTail.current = false;
+  }
 
   function updateTailState() {
     const transcript = scrollRef.current;
     if (!transcript) return;
     const nearTail = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 72;
     followingTail.current = nearTail;
-    if (nearTail) setShowJumpToLatest(false);
+    setShowJumpToLatest(!nearTail);
   }
 
   function jumpToLatest() {
@@ -426,6 +443,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         aria-live="off"
         aria-label="Conversation"
         onScroll={updateTailState}
+        onTouchStart={releaseTail}
+        onWheel={releaseTail}
       >
         {error ? <div class="global-error">{error}</div> : null}
         {messages.length === 0 ? (
