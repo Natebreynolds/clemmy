@@ -3176,8 +3176,11 @@ export async function startDaemon(
   // single-flight + lock, so it adds no reuse-revoke risk.
   // Run once shortly after boot so a daemon that started with a near-expired
   // token warms it before the first job, then every 5 min.
-  setTimeout(() => { void tickAuthKeepalive(); }, 30_000).unref?.();
-  const authKeepaliveTimer = setInterval(() => { void tickAuthKeepalive(); }, 5 * 60_000);
+  const tickAuthKeepaliveInPhase = () => {
+    void withDaemonRuntimePhase('daemon.timer.auth_keepalive', {}, () => tickAuthKeepalive());
+  };
+  setTimeout(tickAuthKeepaliveInPhase, 30_000).unref?.();
+  const authKeepaliveTimer = setInterval(tickAuthKeepaliveInPhase, 5 * 60_000);
   authKeepaliveTimer.unref?.();
 
   // Boot warmup: one model call + one embed ping shortly after boot so the

@@ -137,3 +137,152 @@ test('a worker that cannot spawn degrades immediately, not after the boot timeou
   assert.match(boot, /worker\.once\('exit'/, 'an immediate exit must settle the boot promise');
   assert.ok(boot.indexOf('WORKER_BOOT_TIMEOUT_MS') > 0, 'the timeout remains the backstop, not the only exit');
 });
+
+// ── In-flight phases, the metered stretch meter and the stall journal ─────────
+
+async function waitFor<T>(read: () => T | undefined | null | false, what: string, timeoutMs = 10_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function readJson(file: string): Record<string, unknown> | null {
+  try { return JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; } catch { return null; }
+}
+
+function readLines(file: string): Array<Record<string, unknown>> {
+  try {
+    return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line) as Record<string, unknown>);
+  } catch {
+    return [];
+  }
+}
+
+async function startBeaconWorker(dir: string, intervalMs = 50) {
+  const { Worker } = await import('node:worker_threads');
+  const file = path.join(dir, 'daemon-liveness.json');
+  const buffer = new SharedArrayBuffer(4 * Float64Array.BYTES_PER_ELEMENT);
+  const view = new Float64Array(buffer);
+  view[0] = Date.now();
+  view[1] = Date.now();
+  const worker = new Worker(new URL('./liveness.worker.ts', import.meta.url), {
+    workerData: { file, stamps: buffer, intervalMs, sampleMs: 20, pid: 4242 },
+    execArgv: ['--import', 'tsx'],
+  });
+  return { worker, view, file, stalls: path.join(dir, 'daemon-stalls.jsonl') };
+}
+
+test('while a metered phase runs, a stale stamp is measured and journalled with the in-flight set', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'clem-beacon-metered-'));
+  const { worker, view, file, stalls } = await startBeaconWorker(dir);
+  try {
+    const now = Date.now();
+    worker.postMessage({
+      running: { name: 'daemon.nightly.link_sync', detail: '{"tick":3}', startedAtMs: now - 5_000, sequence: 42 },
+      inFlight: [
+        { name: 'daemon.loop.memory_maintenance', startedAtMs: now - 6_000, sequence: 40 },
+        { name: 'daemon.nightly.link_sync', startedAtMs: now - 5_000, sequence: 42 },
+      ],
+      metered: true,
+    });
+    view[1] = now - 5_000;
+    view[2] = 42;
+    view[3] = 1;
+    // The worker has taken the message once a beat names the phase.
+    await waitFor(() => (readJson(file)?.phase as { name?: string } | undefined)?.name === 'daemon.nightly.link_sync', 'the worker to take the phase message');
+    // Drive the stamp directly: the main thread last stamped 1.2 s ago and has
+    // not stamped since. The stamp stays stale until the assertions have seen it.
+    view[0] = Date.now() - 1_200;
+
+    const beacon = await waitFor(() => {
+      const b = readJson(file);
+      return b && typeof b.maxMainStampAgeMs === 'number' && b.maxMainStampAgeMs >= 1_200 ? b : null;
+    }, 'a beat window reporting the stale stretch');
+    assert.equal(beacon.metered, true);
+    assert.equal((beacon.phase as { name?: string }).name, 'daemon.nightly.link_sync');
+    const inFlight = beacon.inFlight as Array<{ name: string; activeMs: number }>;
+    assert.deepEqual(inFlight.map((p) => p.name), ['daemon.loop.memory_maintenance', 'daemon.nightly.link_sync']);
+    assert.ok(inFlight[0]!.activeMs >= 6_000);
+
+    const start = await waitFor(() => readLines(stalls).find((line) => line.event === 'start'), 'a stall start line');
+    assert.equal(start.metered, true);
+    assert.equal(start.thresholdMs, 1_000);
+    assert.equal((start.phase as { name?: string }).name, 'daemon.nightly.link_sync');
+    assert.ok(Number(start.ageMs) >= 1_000);
+
+    // The main thread comes back.
+    const staleStamp = view[0]!;
+    view[0] = Date.now();
+    const end = await waitFor(() => readLines(stalls).find((line) => line.event === 'end'), 'a stall end line');
+    assert.equal(Number(end.durationMs), view[0]! - staleStamp);
+    assert.ok(Number(end.durationMs) >= 1_200);
+    assert.equal((end.phase as { name?: string }).name, 'daemon.nightly.link_sync', 'the end line names the phase that held the thread');
+    assert.deepEqual((end.inFlight as Array<{ name: string }>).map((p) => p.name), ['daemon.loop.memory_maintenance', 'daemon.nightly.link_sync']);
+    assert.equal(readLines(stalls).filter((line) => line.event === 'start').length, 1, 'one stretch, one record');
+  } finally {
+    await worker.terminate();
+  }
+});
+
+test('outside a metered phase only a stretch past the long threshold is journalled', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'clem-beacon-unmetered-'));
+  const { worker, view, file, stalls } = await startBeaconWorker(dir);
+  try {
+    worker.postMessage({
+      running: { name: 'daemon.loop.cron_schedules', startedAtMs: Date.now(), sequence: 7 },
+      inFlight: [{ name: 'daemon.loop.cron_schedules', startedAtMs: Date.now(), sequence: 7 }],
+      metered: false,
+    });
+    view[3] = 0;
+    await waitFor(() => (readJson(file)?.phase as { name?: string } | undefined)?.name === 'daemon.loop.cron_schedules', 'the worker to take the phase message');
+    view[0] = Date.now() - 1_200;
+    await waitFor(() => {
+      const b = readJson(file);
+      return b && typeof b.maxMainStampAgeMs === 'number' && b.maxMainStampAgeMs >= 1_200 ? b : null;
+    }, 'a beat reporting the stale stamp');
+    assert.deepEqual(readLines(stalls), [], 'a 1.2 s stretch outside metered work is not a stall');
+
+    view[0] = Date.now() - 10_500;
+    const start = await waitFor(() => readLines(stalls).find((line) => line.event === 'start'), 'a long-stall start line');
+    assert.equal(start.metered, false);
+    assert.equal(start.thresholdMs, 10_000);
+  } finally {
+    await worker.terminate();
+  }
+});
+
+test('the host posts a phase message only when the running phase or the in-flight set changes', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'clem-beacon-host-'));
+  const previous = process.env.CLEMMY_LIVENESS_BEACON_FILE;
+  process.env.CLEMMY_LIVENESS_BEACON_FILE = path.join(dir, 'daemon-liveness.json');
+  const beacon = await import('./liveness-beacon.js');
+  const phase = await import('./phase.js');
+  try {
+    beacon.startLivenessBeacon();
+    assert.ok(beacon._livenessStampsForTest(), 'the beacon started');
+    let postsInsideJob = -1;
+    let tickerDuringJob = false;
+    await phase.withDaemonRuntimePhase('daemon.nightly.grounded_backfill', {}, async () => {
+      const atEntry = beacon._livenessBeaconPostCountForTest();
+      for (let i = 0; i < 20; i += 1) await phase.yieldToEventLoop();
+      postsInsideJob = beacon._livenessBeaconPostCountForTest() - atEntry;
+      tickerDuringJob = beacon._livenessMeteredTickerRunningForTest();
+      assert.equal(beacon._livenessStampsForTest()![3], 1, 'the metered flag is set while the pass is in flight');
+    });
+    assert.equal(postsInsideJob, 0, 'twenty slices of one job post nothing');
+    assert.equal(tickerDuringJob, true, 'the main thread re-stamps while a metered phase is in flight');
+    assert.equal(beacon._livenessMeteredTickerRunningForTest(), false, 'and stops when it ends');
+    assert.equal(beacon._livenessStampsForTest()![3], 0);
+    const beforeHttp = beacon._livenessBeaconPostCountForTest();
+    await phase.withDaemonRuntimePhase('daemon.http', {}, async () => { await phase.yieldToEventLoop(); }, { ipc: false });
+    assert.ok(beacon._livenessBeaconPostCountForTest() >= beforeHttp + 2, 'entry and exit of a request both change the in-flight set');
+  } finally {
+    beacon._stopLivenessBeaconForTest();
+    if (previous === undefined) delete process.env.CLEMMY_LIVENESS_BEACON_FILE;
+    else process.env.CLEMMY_LIVENESS_BEACON_FILE = previous;
+  }
+});

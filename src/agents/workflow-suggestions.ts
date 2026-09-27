@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../config.js';
+import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { describeProvenShapeRoles, listVerifiedRunStrategies, overlapScore, strategyKeywords, type ProvenCallShape, type RunStrategyRecord } from '../memory/run-strategy-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
@@ -592,9 +593,14 @@ let heartbeat: { first: NodeJS.Timeout; interval: NodeJS.Timeout } | null = null
 
 export function startWorkflowSuggestionsHeartbeat(): () => void {
   if (heartbeat) return stopWorkflowSuggestionsHeartbeat;
+  // Its own phase, so time this timer holds the main thread is named.
   const beat = () => {
-    if (!isWorkflowSuggestionsDue().due) return;
-    void runWorkflowSuggestionsTick({ source: 'heartbeat' });
+    void withDaemonRuntimePhase('daemon.timer.workflow_suggestions', {}, async () => {
+      if (!isWorkflowSuggestionsDue().due) return;
+      await runWorkflowSuggestionsTick({ source: 'heartbeat' });
+    }).catch((error) => {
+      logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'workflow suggestions heartbeat failed');
+    });
   };
   const first = setTimeout(beat, FIRST_HEARTBEAT_DELAY_MS);
   const interval = setInterval(beat, HEARTBEAT_MS);

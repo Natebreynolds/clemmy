@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
+import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import {
   ActionRowBuilder,
   ActivityType,
@@ -4090,7 +4091,8 @@ async function pollDiscordDirectMessages(client: Client, assistant: ClementineAs
 async function runDiscordDmPollingLoop(client: Client, assistant: ClementineAssistant): Promise<void> {
   while (dmPollLoopActive && discordClient === client && client.isReady()) {
     try {
-      await pollDiscordDirectMessages(client, assistant);
+      // Its own phase, so time a poll holds the main thread is named.
+      await withDaemonRuntimePhase('daemon.timer.discord_dm_poll', {}, () => pollDiscordDirectMessages(client, assistant));
     } catch (error) {
       logger.error({ err: error }, 'Discord DM polling loop iteration failed');
     }

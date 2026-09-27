@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../../config.js';
+import { withDaemonRuntimePhase } from '../../daemon/phase.js';
 import { findSafeCliCommand } from '../../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../../runtime/spawn-env.js';
 import { getSavedClis } from '../../runtime/saved-clis.js';
@@ -487,9 +488,9 @@ export function startCliHealthSweep(): void {
   if (sweepTimer) return;
   if ((process.env.CLEMMY_CLI_HEALTH_SWEEP ?? 'on').trim().toLowerCase() === 'off') return;
   const tick = (): void => {
-    void getRosterHealth().catch((err) => {
+    void withDaemonRuntimePhase('daemon.timer.cli_auth_health', {}, () => getRosterHealth().catch((err) => {
       logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'cli health sweep failed');
-    });
+    }));
   };
   // First pass shortly after boot (after the CLI warm scan), then slow.
   const boot = setTimeout(tick, 60_000);
