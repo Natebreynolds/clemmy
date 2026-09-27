@@ -32,7 +32,7 @@ const {
   memoryRoleSettingsView,
   resolveMemoryModelRoute,
 } = await import('./memory-model-route.js');
-const { setReflectionExtractorPauseForTest } = await import('./reflection.js');
+const { _testOnly_runExtractor, reflectionExtractorPause, setReflectionExtractorPauseForTest } = await import('./reflection.js');
 const {
   openModelRouteMetricsDb,
   readRouteStandIn,
@@ -264,4 +264,35 @@ test('a memory call records role memory, keeps the job channel, and names the ro
   assert.equal(row?.role, 'memory', 'the decisions table admits the memory role');
   assert.equal(row?.status, 'success');
   assert.deepEqual({ seam: JSON.parse(row!.reason_json).seam, job: JSON.parse(row!.reason_json).job }, { seam: 'memory', job: 'learn' });
+});
+
+test('a failed extraction pauses learning with the kind of trouble the provider reported', async () => {
+  process.env.CLEMMY_JUDGE_CROSS_FAMILY = 'off'; // no other family to hedge onto
+  const failing = (error: Record<string, unknown>): Model => ({
+    async getResponse(): Promise<ModelResponse> { throw Object.assign(new Error(String(error.message ?? 'refused')), error); },
+    async *getStreamedResponse() { throw Object.assign(new Error(String(error.message ?? 'refused')), error); },
+  });
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ statusCode: 429, message: 'rate limited' }, 'quota'],
+    [{ statusCode: 402, message: 'payment required' }, 'credit'],
+    [{ statusCode: 401, message: 'unauthorized' }, 'not_connected'],
+    [{ statusCode: 503, message: 'unavailable' }, 'error'],
+  ];
+  for (const [error, problem] of cases) {
+    setReflectionExtractorPauseForTest(null);
+    mock.restoreAll();
+    mock.method(CodexModelProvider.prototype, 'getModel', () => failing(error));
+    mock.method(ClaudeModelProvider.prototype, 'getModel', () => failing(error));
+    assert.equal(await _testOnly_runExtractor('{"fixture":true}'), null);
+    const pause = reflectionExtractorPause();
+    assert.equal(pause?.problem, problem, `status ${error.statusCode} pauses as ${problem}`);
+    const availability = memoryModelAvailability('learn');
+    assert.equal(availability.ok, false);
+    if (!availability.ok) {
+      assert.equal(availability.reason, 'model_paused');
+      assert.equal(availability.problem, problem);
+      assert.equal(availability.until, new Date(pause!.until).toISOString());
+    }
+  }
+  setReflectionExtractorPauseForTest(null);
 });
