@@ -334,26 +334,74 @@ test('tool_output_query recovers complete records from a clipped shell JSON-arra
   assert.match(text, /site-target/);
 });
 
-test('tool_output_query still bounces genuinely non-JSON output to recall_tool_result', async () => {
+test('tool_output_query on genuinely non-JSON text answers with the text, never a refusal round', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   writeToolOutput({ sessionId: sess.id, callId: 'call_txt', tool: 'run_shell_command', output: 'exit_code: 0\n\nstdout:\njust some log lines, not json\n' });
   const query = captureToolOutputQueryHandler();
+  const budget = new RecallBudget(3, 200_000);
+  // Strict transports send every unused optional argument as null; a bare
+  // query (the old digest footer even suggested a limit) still means "show it".
   const res = await withHarnessRunContext(
-    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
-    () => query({ call_id: 'call_txt' }),
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: budget },
+    () => query({ call_id: 'call_txt', fields: null, filter_field: null, where: null, limit: 50 }),
   );
-  // Genuinely non-JSON text still routes to recall_tool_result — but the
-  // message states what is TRUE (recovery found no JSON value) rather than
-  // asserting the output "is not JSON", which was a falsehood whenever the
-  // payload was JSON carrying harness prose (live 2026-09-03, platform-49
-  // run 6: the model obeyed that falsehood twice and the run died).
-  assert.match(res.content[0].text, /No JSON value could be recovered/);
-  // The PROPERTY, not the sentence: genuinely non-JSON output routes to the
-  // reader that can read text. The exact call is now computed (and a fallback
-  // named) rather than hardcoded, so assert the routing, not the phrasing.
-  assert.match(res.content[0].text, /recall_tool_result \{"call_id":"call_txt"\}/);
-  assert.doesNotMatch(res.content[0].text, /is not JSON/);
+  const text = res.content[0].text;
+  assert.match(text, /is text, not structured records/);
+  assert.match(text, /Recalled chars 0–\d+ of \d+/);
+  assert.match(text, /just some log lines, not json/);
+  assert.doesNotMatch(text, /No JSON value could be recovered|is not JSON/);
+  assert.equal(budget.snapshot().calls, 1, 'the text answer spends recall budget like recall does');
+
+  // A projection or filter needs records; text still gets a computed route,
+  // never a claim that the output "is not JSON".
+  const filtered = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+    () => query({ call_id: 'call_txt', filter_field: 'level', filter_contains: 'warn' }),
+  );
+  assert.match(filtered.content[0].text, /No JSON value could be recovered/);
+  assert.match(filtered.content[0].text, /recall_tool_result \{"call_id":"call_txt"\}/);
+  assert.doesNotMatch(filtered.content[0].text, /is not JSON/);
+});
+
+test('tool_output_query on text with recall spent routes to a reader that still serves, never back to itself', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_txt_spent', tool: 'work_call', invocationNonce: 'nonce-txt-spent',
+    output: 'plain narrative text with no records at all' });
+  const budget = new RecallBudget(0, 200_000, sess.id);
+  const res = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: budget },
+    () => captureToolOutputQueryHandler()({ call_id: 'call_txt_spent' }),
+  );
+  const text = res.content[0].text;
+  assert.match(text, /^ERROR: /);
+  assert.match(text, /file_query \{"call_id":"call_txt_spent"/);
+  assert.doesNotMatch(text, /tool_output_query \{|recall_tool_result \{/);
+});
+
+test('a long text slice never points an ANSWER at the record query', async () => {
+  // The paging header's "answer instead of paging" route is computed from the
+  // output's shape: a record query for records, a passage search for text.
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: sess.id, callId: 'call_long_text', tool: 'work_call', invocationNonce: 'nonce-long-text',
+    output: 'narrative line without records\n'.repeat(2_000) });
+  for (const [reader, input] of [
+    [captureRecallHandler(), { call_id: 'call_long_text', max_chars: 1_000 }],
+    [captureToolOutputQueryHandler(), { call_id: 'call_long_text' }],
+  ] as const) {
+    const res = await withHarnessRunContext(
+      { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(5, 400_000) },
+      () => reader({ ...input }),
+    );
+    assert.doesNotMatch(res.content[0].text, /tool_output_query \{/);
+  }
+  const paged = await withHarnessRunContext(
+    { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(5, 400_000) },
+    () => captureRecallHandler()({ call_id: 'call_long_text', max_chars: 1_000 }),
+  );
+  assert.match(paged.content[0].text, /if you need an ANSWER rather than the raw text, file_query \{"call_id":"call_long_text"/);
 });
 
 test('tool_output_query bounds an unfiltered large-object response (no full-payload context dump)', async () => {

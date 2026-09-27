@@ -1,8 +1,8 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
+import { retainedResultRoutes, retainedResultWayThrough } from '../runtime/harness/retained-result-routes.js';
 import { z } from 'zod';
-import { getToolOutput, getToolOutputSlice } from '../runtime/harness/eventlog.js';
-import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { getToolOutput, getToolOutputSlice, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
+import { harnessRunContextStorage, type HarnessRunContext } from '../runtime/harness/brackets.js';
 import { windowScaleForModel } from '../runtime/harness/model-window-observations.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
@@ -227,6 +227,91 @@ export function nearestToolOutputCallId(
   return best ? best.id : null;
 }
 
+type RetainedTextSlice =
+  | { status: 'missing' }
+  | { status: 'incomplete'; contentBytes: number }
+  | { status: 'budget'; error: string }
+  | { status: 'ok'; body: string };
+
+/**
+ * One verbatim slice of a retained output, with the header that names the
+ * exact next call. The single owner of reading retained TEXT: recall_tool_result
+ * returns it, and tool_output_query returns it for an output that holds no
+ * structured records. Either way it spends the turn's recall budget.
+ */
+function readRetainedTextSlice(
+  ctx: HarnessRunContext,
+  resolved: { callId: string; receipt?: ToolOutputRecord },
+  offset: number,
+  maxChars: number,
+): RetainedTextSlice {
+  const callId = resolved.callId;
+  const start = resolved.receipt ? Math.min(offset, resolved.receipt.output.length) : 0;
+  const row = resolved.receipt
+    ? { ...resolved.receipt, start, end: Math.min(start + maxChars, resolved.receipt.output.length),
+        totalChars: resolved.receipt.output.length, output: resolved.receipt.output.slice(start, start + maxChars) }
+    : getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
+  if (!row) return { status: 'missing' };
+  if (row.truncatedAtWrite) return { status: 'incomplete', contentBytes: row.contentBytes };
+
+  // The range reader uses persisted UTF-16 offsets and fetches only BLOBs
+  // intersecting this page; it does not rebuild/hash an unrelated tail on
+  // every slice.
+  const total = row.totalChars;
+  const sliceStart = row.start;
+  const slice = row.output;
+  const sliceBytes = Buffer.byteLength(slice, 'utf8');
+
+  // Budget check — only when a HarnessRunContext provided one.
+  if (ctx.recallBudget) {
+    const err = ctx.recallBudget.consume(sliceBytes, callId);
+    if (err) return { status: 'budget', error: err };
+  }
+
+  const end = row.end;
+  // When a lot is left, paging is the wrong instrument entirely: a reader that
+  // answers over the SAME stored output beats walking it a slice at a time.
+  // Which reader that is depends on the output's shape, so the one reader
+  // router names it (a query for records, a passage search for text).
+  const answerRoute = end < total && (total - end) > maxChars * 2
+    ? retainedResultRoutes({ sessionId: ctx.sessionId, callId, exclude: ['recall_tool_result'] })[0]
+    : undefined;
+  const header = [
+    `Recalled chars ${sliceStart}–${end} of ${total} (${row.contentBytes} total bytes)`,
+    row.tool ? `tool=${row.tool}` : null,
+    `recorded at ${row.createdAt}`,
+    end < total
+      // Name the EXACT next call. A model that has to reconstruct it guesses
+      // offsets, and blind paging spends a turn per slice while crediting no
+      // business progress until the governor ends the run.
+      ? `(more remains — continue with recall_tool_result {"call_id":"${callId}","offset":${end}}`
+        + (answerRoute
+          ? `; that is ~${Math.ceil((total - end) / maxChars)} more slices, so if you need an ANSWER rather than `
+            + `the raw text, ${answerRoute.call} — ${answerRoute.why}`
+          : '')
+        + ')'
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' • ');
+  return { status: 'ok', body: `${header}\n\n${slice}` };
+}
+
+/** Whether a tool_output_query asks for record shaping (a projection, filter,
+ * ordering or figure) rather than just the stored output. Strict-schema
+ * transports send unused optional arguments as null. */
+function asksForRecordShaping(input: Record<string, unknown>): boolean {
+  if (normalizeFieldsInput(input.fields) !== undefined) return true;
+  return ['filter_field', 'filter_contains', 'filter_equals', 'where', 'sort_by', 'aggregate', 'value_field', 'group_by']
+    .some((key) => {
+      const value = input[key];
+      if (value === undefined || value === null) return false;
+      if (typeof value === 'string') return value.trim().length > 0;
+      if (Array.isArray(value)) return value.length > 0;
+      return true;
+    });
+}
+
 export function registerRecallTools(server: McpServer): void {
   server.tool(
     'recall_tool_result',
@@ -254,15 +339,11 @@ export function registerRecallTools(server: McpServer): void {
 
       const resolved = resolveRetainedOutputRead(ctx.sessionId, callId);
       callId = resolved.callId;
-      const start = resolved.receipt ? Math.min(offset, resolved.receipt.output.length) : 0;
-      const row = resolved.receipt
-        ? { ...resolved.receipt, start, end: Math.min(start + maxChars, resolved.receipt.output.length),
-            totalChars: resolved.receipt.output.length, output: resolved.receipt.output.slice(start, start + maxChars) }
-        : getToolOutputSlice(ctx.sessionId, callId, offset, maxChars);
-      if (!row) {
+      const read = readRetainedTextSlice(ctx, resolved, offset, maxChars);
+      if (read.status === 'missing') {
         // A capability reference is not a result handle, and "not found" is
         // not "empty": name what the id is, how to invoke it, and what this
-        // turn has actually retained (live 2026-09-21 source 277962).
+        // turn has actually retained.
         return textResult(describeMissingRetainedOutputForSession({
           sessionId: ctx.sessionId,
           sourceUserSeq: ctx.sourceUserSeq,
@@ -270,54 +351,15 @@ export function registerRecallTools(server: McpServer): void {
           readerTool: 'recall_tool_result',
         }));
       }
-      if (row.truncatedAtWrite) {
+      if (read.status === 'incomplete') {
         return textResult(
-          `ERROR: tool output "${callId}" is incomplete (${row.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be recalled as authoritative data.`,
+          `ERROR: tool output "${callId}" is incomplete (${read.contentBytes} original bytes; legacy truncation or missing/corrupt durable chunks). Re-read/page the provider source or stage a complete artifact; the stored prefix cannot be recalled as authoritative data.`,
         );
       }
-
-      // The range reader uses persisted UTF-16 offsets and fetches only BLOBs
-      // intersecting this page; it does not rebuild/hash an unrelated 100MB
-      // tail on every 30KB recall call.
-      const total = row.totalChars;
-      const sliceStart = row.start;
-      const slice = row.output;
-      const sliceBytes = Buffer.byteLength(slice, 'utf8');
-
-      // Budget check — only when a HarnessRunContext provided one.
-      if (ctx.recallBudget) {
-        const err = ctx.recallBudget.consume(sliceBytes, callId);
-        // Unmistakably an ERROR, never data (live 2026-07-24: a program
-        // JSON.parsed the bare budget message and called good data malformed).
-        if (err) return textResult(`ERROR: ${err}`);
-      }
-
-      const end = row.end;
-      const header = [
-        `Recalled chars ${sliceStart}–${end} of ${total} (${row.contentBytes} total bytes)`,
-        row.tool ? `tool=${row.tool}` : null,
-        `recorded at ${row.createdAt}`,
-        end < total
-          // Name the EXACT next call. A model that has to reconstruct it
-          // guesses offsets, and blind paging spends a turn per slice while
-          // crediting no business progress until the governor ends the run.
-          ? `(more remains — continue with recall_tool_result {"call_id":"${callId}","offset":${end}}`
-            // When a lot is left, paging is the wrong instrument entirely:
-            // tool_output_query answers over the SAME stored output instead of
-            // walking it a slice at a time.
-            + ((total - end) > maxChars * 2
-              ? `; that is ~${Math.ceil((total - end) / maxChars)} more slices, so if you need an ANSWER rather than `
-                + `the raw text, tool_output_query {"call_id":"${callId}"} reads the same stored output server-side `
-                + `and does not page`
-              : '')
-            + ')'
-          : null,
-      ]
-        .filter(Boolean)
-        .join(' • ');
-
-      const body = `${header}\n\n${slice}`;
-      return textResult(body, { maxChars: body.length });
+      // Unmistakably an ERROR, never data: a program must not JSON.parse a
+      // budget message and call good data malformed.
+      if (read.status === 'budget') return textResult(`ERROR: ${read.error}`);
+      return textResult(read.body, { maxChars: read.body.length });
     },
   );
 
@@ -375,12 +417,27 @@ export function registerRecallTools(server: McpServer): void {
       // notes, a recall preamble), so a bare JSON.parse is not the question.
       const recovered = parseStoredToolOutputJson(row.output, { shell: parseShellToolOutput });
       if (!recovered) {
+        // Text never dead-ends. Asked for the output itself (no projection,
+        // filter or figure), answer with the text exactly as recall would,
+        // spending the same recall budget, instead of a refusal round.
+        if (!asksForRecordShaping(input)) {
+          const read = readRetainedTextSlice(ctx, resolved, 0, recallSliceCeiling(ctx.routedModelId));
+          if (read.status === 'ok') {
+            const bodyText = `Tool output "${callId}" is text, not structured records, so here is its text as recall_tool_result returns it (fields, filters and figures need records).\n${read.body}`;
+            return textResult(bodyText, { maxChars: bodyText.length });
+          }
+          if (read.status === 'budget') {
+            return textResult(
+              `ERROR: tool output "${callId}" is text, and this turn's recall budget is spent, so its text cannot be returned here. `
+              + retainedResultWayThrough({ sessionId: ctx.sessionId, callId,
+                exclude: ['tool_output_query', 'recall_tool_result'], recallCallsRemaining: 0 }),
+            );
+          }
+        }
         // Say what is true: recovery failed. Never tell the model its own
         // valid JSON "is not JSON" — it obeys, comes back, and burns the turn.
-        // The successor is COMPUTED. This used to say "use recall_tool_result"
-        // unconditionally, while recall's own exhaustion message said "call
-        // tool_output_query instead" — a closed loop with no exit (live
-        // 2026-09-07 source 146537, the Platform 49 plan that never published).
+        // The successor is COMPUTED by the one reader router, never named
+        // here, so no two readers can point at each other.
         return textResult(
           `No JSON value could be recovered from tool output "${callId}" (${row.output.length.toLocaleString()} chars). `
           + 'It is text, not structured data. '
