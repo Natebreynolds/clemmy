@@ -53,8 +53,7 @@ import {
  *
  * A fixed 30KB slice is a long-horizon cliff: paging one large parked payload
  * costs a tool call per 30KB, those calls credit no business progress, and the
- * no-progress governor ends the run before the work starts (live platform-49
- * run 2026-09-02: 19 recalls, zero business calls, the sheet never touched).
+ * no-progress governor ends the run before the work starts.
  * A 1M-window brain can hold far more than 30KB per step, so the slice now
  * rides the same window scale the recall BUDGET already uses rather than
  * pinning every model to the smallest one's ceiling.
@@ -293,11 +292,9 @@ function editDistanceWithin(a: string, b: string, max: number): number | null {
  * The exact correction for a call_id that does not exist.
  *
  * The harness knows every real id, so a transposition should be answered with
- * the right one rather than a dead end. Live 2026-09-03, platform-49 run 10:
- * the model asked for `toulu_016PctF8QXsnvKo5ZKasu1ri` (a two-letter swap of
- * `toolu_…`), got a bare "no tool output found", and spent the rest of the turn
- * recovering. Run 5 proved the opposite works — an exact correction repaired the
- * very next frame.
+ * the right one rather than a dead end: a bare "no tool output found" for a
+ * two-letter swap costs the rest of the turn, while an exact correction repairs
+ * the very next frame.
  */
 export function nearestToolOutputCallId(
   wanted: string,
@@ -567,8 +564,7 @@ export function registerRecallTools(server: McpServer): void {
       // `{ data: { value: [...] } }` (Graph), `{ data: { records: [...] } }`
       // (composio/Airtable) — and the object path below can only project
       // TOP-LEVEL keys, so every filter/project/paginate query against a
-      // wrapped result missed (2026-07-31 calendar run: the miss cost 3 extra
-      // calls and a full 26KB recall). The records ARE the result; query them.
+      // wrapped result would miss. The records ARE the result; query them.
       let unwrappedPath = '';
       if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
         const wantsRecordQuery = Boolean(
@@ -699,9 +695,9 @@ export function registerRecallTools(server: McpServer): void {
 
       if (parsed && typeof parsed === 'object') {
         const projected = project(parsed);
-        // A projection that matched NOTHING must return the map, not "{}" —
-        // the 2026-07-31 calendar run got the empty object, learned nothing,
-        // and fell back to recalling the entire 26KB raw payload.
+        // A projection that matched NOTHING must return the map, not "{}": an
+        // empty object teaches nothing and sends the model to recall the whole
+        // raw payload.
         const projectionMissed = fields && fields.length > 0
           && Object.keys(projected as Record<string, unknown>).length === 0;
         if (projectionMissed) {
