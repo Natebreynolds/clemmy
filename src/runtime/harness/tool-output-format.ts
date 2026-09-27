@@ -3,7 +3,8 @@ import { getToolOutputForInvocation, writeToolOutput } from './eventlog.js';
 import { retainedResultWayThrough } from './retained-result-routes.js';
 import { getToolOutputContext } from './tool-output-context.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
-import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { actionTopologyRoleForRuntimeCall, unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { effectiveContextWindow } from './model-window-observations.js';
 
 // Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
 // (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
@@ -29,6 +30,74 @@ export function explicitLocalReadPreviewBudget(toolName: string, args: unknown):
   const requested = (args as Record<string, unknown>).max_chars;
   return typeof requested === 'number' && Number.isSafeInteger(requested)
     && requested > DEFAULT_TOOL_RESULT_MAX_CHARS ? requested : undefined;
+}
+
+/** Inline characters one result may take per token of the routed model's
+ * context window: about a tenth of the window at ~3.5 characters per token.
+ * Every window of 57,143 tokens or more keeps the full
+ * DEFAULT_TOOL_RESULT_MAX_CHARS; a small window scales down, never below
+ * PROMPT_INLINE_RECALLABLE_RESULT_CHARS, and a large window never scales up
+ * (per-round prefill is paid in absolute bytes). */
+const INLINE_RESULT_CHARS_PER_WINDOW_TOKEN = 0.35;
+
+/** The whole-result inline budget for the routed model's window. */
+export function inlineResultBudgetForModel(routedModelId?: string | null): number {
+  let window: number;
+  try {
+    window = effectiveContextWindow(routedModelId);
+  } catch {
+    return DEFAULT_TOOL_RESULT_MAX_CHARS;
+  }
+  if (!Number.isFinite(window) || window <= 0) return DEFAULT_TOOL_RESULT_MAX_CHARS;
+  return Math.max(
+    PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+    Math.min(DEFAULT_TOOL_RESULT_MAX_CHARS, Math.floor(window * INLINE_RESULT_CHARS_PER_WINDOW_TOKEN)),
+  );
+}
+
+export interface PresentationBudgetInput {
+  /** The name the model called: a tool, or a carrier naming its inner tool. */
+  toolName: string;
+  /** The arguments of that call (a carrier's envelope for a carrier). */
+  args?: unknown;
+  /** The model the result is presented to. */
+  routedModelId?: string | null;
+}
+
+/**
+ * The one inline presentation budget for a tool result.
+ *
+ * It keys on the EFFECTIVE inner tool, resolved by the canonical carrier
+ * unwrapping, never on the carrier the call travelled through. A carrier and
+ * the child it dispatches therefore resolve the same number, so the carrier
+ * passes the child's presentation through instead of digesting it again, and
+ * an inner tool is shown exactly as it would be when called directly.
+ *
+ * - A local reader's explicit larger preview request is honored.
+ * - A registry control read (Clementine's own state and control tools) is
+ *   shown whole up to the routed window's inline budget.
+ * - Everything else (provider and business results, foreign tools) keeps the
+ *   recallable keyhole: a bounded view plus the parked full payload.
+ */
+export function presentationBudgetFor(input: PresentationBudgetInput): number {
+  let effectiveName: string | null = null;
+  let effectiveArgs: unknown = input.args;
+  let role: 'control' | 'business' = 'business';
+  try {
+    const effective = unwrapRuntimeEffectiveToolIdentity(input.toolName, input.args);
+    effectiveName = effective.toolName;
+    effectiveArgs = effective.args;
+    role = actionTopologyRoleForRuntimeCall(input.toolName, input.args);
+  } catch {
+    // An unreadable identity presents like an unknown tool: the keyhole.
+  }
+  if (effectiveName) {
+    const explicitRead = explicitLocalReadPreviewBudget(effectiveName, effectiveArgs);
+    if (explicitRead !== undefined) return explicitRead;
+  }
+  return role === 'control'
+    ? inlineResultBudgetForModel(input.routedModelId)
+    : PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
 }
 
 
@@ -297,9 +366,18 @@ export function formatRecallableToolText(
   const sessionId = options.sessionId ?? active?.sessionId;
   const callId = options.callId ?? active?.callId;
   const toolName = options.toolName ?? active?.toolName ?? 'tool';
+  // A formatter inside a harness invocation defaults to the budget that
+  // invocation resolved once (presentationBudgetFor). Without one, the same
+  // resolver answers from the tool name alone.
+  const activeInvocationBudget = active?.presentationBudget !== undefined
+    && (options.sessionId === undefined || options.sessionId === active.sessionId)
+    && (options.callId === undefined || options.callId === active.callId)
+    && (options.toolName == null || options.toolName === active.toolName)
+    ? active.presentationBudget
+    : undefined;
   const maxChars = options.maxChars
-    ?? (sessionId && callId && actionTopologyRoleFor(toolName) !== 'control'
-      ? PROMPT_INLINE_RECALLABLE_RESULT_CHARS
+    ?? (sessionId && callId
+      ? activeInvocationBudget ?? presentationBudgetFor({ toolName })
       : DEFAULT_TOOL_RESULT_MAX_CHARS);
   let persistenceFailed = false;
   let hostAnnotations = [...(options.hostAnnotations ?? [])].filter((note) => note.length > 0);

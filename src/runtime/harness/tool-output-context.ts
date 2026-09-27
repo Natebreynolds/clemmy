@@ -21,6 +21,10 @@ export interface ToolOutputContext {
    * Large-result receipts bind their lossless side-store bytes to this value,
    * so a reused SDK call id can never reuse an older tool result as evidence. */
   settlementNonce?: string;
+  /** Inline presentation budget resolved once for this invocation. Every
+   * formatter inside the same invocation defaults to it, so a tool's own
+   * adapter and the harness bracket present one result the same way. */
+  presentationBudget?: number;
 }
 
 export const toolOutputContextStorage = new AsyncLocalStorage<ToolOutputContext>();
@@ -46,8 +50,17 @@ export function withToolOutputContext<T>(
   );
   const inheritedNonce = context.settlementNonce
     ?? (sameInvocation ? parent?.settlementNonce : undefined);
+  // The presentation budget belongs to the same exact invocation as the nonce.
+  const inheritedBudget = context.presentationBudget
+    ?? (sameInvocation ? parent?.presentationBudget : undefined);
   return toolOutputContextStorage.run(
-    inheritedNonce ? { ...context, settlementNonce: inheritedNonce } : context,
+    inheritedNonce || inheritedBudget !== undefined
+      ? {
+          ...context,
+          ...(inheritedNonce ? { settlementNonce: inheritedNonce } : {}),
+          ...(inheritedBudget !== undefined ? { presentationBudget: inheritedBudget } : {}),
+        }
+      : context,
     work,
   );
 }

@@ -6792,6 +6792,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       callId: call.callId,
       toolName: call.name,
       arguments: parsedArguments,
+      routedModelId: harnessRunContextStorage.getStore()?.routedModelId,
     });
     return {
       historyItem: functionResultItem(call.callId, call.name, modelOutput, hostSteer),

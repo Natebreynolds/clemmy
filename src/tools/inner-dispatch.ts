@@ -274,6 +274,7 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
   | 'dispatchLease'
   | 'runAttemptId'
   | 'hostOwnsToolAccounting'
+  | 'routedModelId'
 >> {
   const parent = harnessRunContextStorage.getStore();
   if (!parent || parent.sessionId !== sessionId) return {};
@@ -293,6 +294,10 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
     // ambient parent flag cannot exempt arbitrary child work.
     ...((exactHostAdmission || hostOwnsLogicalCallAccounting(sessionId, mirroredCallId)) && parent.hostOwnsToolAccounting === true
       ? { hostOwnsToolAccounting: true } : {}),
+    // A transport mirror is the model's own call seen through its carrier: its
+    // result is presented into the same model window, so child and carrier
+    // must resolve their presentation budget against the same model.
+    ...(mirroredCallId && parent.routedModelId ? { routedModelId: parent.routedModelId } : {}),
     // recallBudget is deliberately NOT inherited (live 2026-07-24): the budget
     // protects the MODEL's context window, but an inner recall never enters
     // model context — only the carrier's clipped output does. Inheriting

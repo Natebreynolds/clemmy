@@ -23,7 +23,7 @@ import {
   isTerminalPhysicalDispatchOwner,
 } from './terminal-physical-dispatch-owner.js';
 import { getToolOutputContext, withToolOutputContext } from './tool-output-context.js';
-import { formatRecallableToolText, explicitLocalReadPreviewBudget, PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from './tool-output-format.js';
+import { formatRecallableToolText, explicitLocalReadPreviewBudget, presentationBudgetFor, PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from './tool-output-format.js';
 import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
@@ -2709,6 +2709,22 @@ function wrapperMustSettleLogicalCall(ctx: HarnessRunContext | undefined): boole
   throw new ToolAttemptSettlementAuthorityError(state.status, state.reason);
 }
 
+/** One invocation's inline presentation budget, resolved once and shared by
+ * every formatter of that invocation. A batch item is aggregated by its batch
+ * runner rather than read whole by the model, so it keeps the recallable
+ * keyhole; every other call, direct or through a carrier, gets the budget of
+ * its effective inner tool. */
+function invocationPresentationBudget(
+  toolName: string,
+  args: unknown,
+  ctx: Pick<HarnessRunContext, 'batchItem' | 'routedModelId'> | undefined,
+): number {
+  if (ctx?.batchItem) {
+    return explicitLocalReadPreviewBudget(toolName, args) ?? PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
+  }
+  return presentationBudgetFor({ toolName, args, routedModelId: ctx?.routedModelId });
+}
+
 /** An admitted work_call already carries a stricter, exact owner than the
  * legacy session execution row: its host-only binding was frozen only after
  * the accepted task, logical call, normalized arguments, and runtime effect
@@ -4313,6 +4329,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         invokeCallId,
         tool.name,
       );
+      const presentationBudget = invocationPresentationBudget(tool.name, parsedInput, ctx);
       const invokeBody = async (): Promise<unknown> => {
       // Layer 1 — structural prevention. Bind $fromToolOutput references to REAL
       // values from the lossless store BEFORE gates + execution, so a high-stakes
@@ -4507,6 +4524,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: invokeCallId,
           toolName: tool.name,
           settlementNonce,
+          presentationBudget,
         }, () => originalInvoke.call(tt, runContext, input, invokeDetails)));
         const work = runWithToolAbortSignal(
           hostOwnedSignal ?? ac!.signal,
@@ -4852,12 +4870,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
           callId: invokeCallId,
           toolName: tool.name,
           settlementNonce,
+          presentationBudget,
         }, () => formatRecallableToolText(value, {
-          // Nested results cross a compact carrier next. Apply that same
-          // budget while the child's exact receipt is still in scope, so the
-          // carrier never has to digest already-projected JSON as new raw data.
-          maxChars: explicitLocalReadPreviewBudget(tool.name, parsedInput)
-            ?? (ctx?.nestedDispatch ? PROMPT_INLINE_RECALLABLE_RESULT_CHARS : undefined),
+          // A carrier resolves the same budget as the child it dispatches
+          // (both key on the effective inner tool), so a nested child projects
+          // once while its exact receipt is in scope and the carrier passes
+          // that projection through instead of digesting it as new raw data.
+          maxChars: presentationBudget,
           hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
       if (isTimeoutSelfCorrectTool(tool.name)) {
         try {
@@ -5052,6 +5071,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         callId: executeCallId,
         toolName: tool.name,
         settlementNonce,
+        presentationBudget: invocationPresentationBudget(tool.name, input, ctx),
       }, () => originalExecute(input, runContext)));
       const work = runWithToolAbortSignal(
         hostOwnedSignal ?? ac!.signal,
