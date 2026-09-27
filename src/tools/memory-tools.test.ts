@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
@@ -613,4 +613,27 @@ test('archivedFactFallback opens the cold tier only when live recall is thin, wi
 
   const rich = await archivedFactFallback('Coral proposal deck', ARCHIVE_FALLBACK_THRESHOLD);
   assert.deepEqual(rich, { lines: [], refs: [] }, 'enough live results keeps the archive closed');
+});
+
+
+test('memory_search exposes and honors result limits without accepting malformed arguments', async () => {
+  const { VAULT_DIR } = await import('../memory/vault.js');
+  const { reindexVault } = await import('../memory/indexer.js');
+  mkdirSync(VAULT_DIR, {recursive:true});
+  for (let i = 0; i < 10; i++) writeFileSync(path.join(VAULT_DIR, `bounded-${i}.md`), `# Bounded ${i}\nquartzprobe memory number ${i}.`);
+  reindexVault(VAULT_DIR);
+  let search: ((input: Record<string, unknown>) => Promise<{content: Array<{text:string}>}>) | undefined;
+  registerMemoryTools({ tool(name: string, _description: string, shape: z.ZodRawShape, handler: (input: unknown) => Promise<any>) {
+    if (name === 'memory_search') search = input => handler(z.object(shape).strict().parse(input));
+  }} as never);
+  assert.ok(search);
+  const count = async (args: Record<string, unknown>) => ((await search!({query:'quartzprobe', ...args})).content[0].text.match(/^- /gm) ?? []).length;
+  assert.equal(await count({limit:2}), 2);
+  assert.equal(await count({}), 8, 'existing default is unchanged');
+  const expanded = await count({limit:20});
+  assert.ok(expanded > 8 && expanded <= 10, 'larger retrieval is honored within the existing response budget');
+  assert.ok((await search!({query:'quartzprobe', limit:20})).content[0].text.length <= 3000);
+  for (const args of [{limit:0}, {limit:-1}, {limit:1.5}, {limit:'2'}, {unknown:true}]) {
+    await assert.rejects(async () => search!({query:'quartzprobe', ...args}));
+  }
 });

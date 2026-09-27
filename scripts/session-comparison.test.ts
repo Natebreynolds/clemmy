@@ -396,3 +396,19 @@ test('turn comparison CLI and formatter use separate session/source selectors', 
     rmSync(fixture.home, { recursive: true, force: true });
   }
 });
+
+
+test('causally owned background memory after delivery is included exactly once in task totals', () => {
+  const fixture = fixtureHome();
+  try {
+    const before = measureAcceptedTurn(fixture.home, 'multi', 201);
+    const row = {at:'2026-08-08T03:30:00.000Z', source:'memory:standing:job-fixture', kind:'background', channel:'memory:standing', role:'reviewer',
+      trace:{acceptedSource:'multi:201', logicalTurnId:'turn:201', attemptId:'attempt-multi-1'},
+      model:'fixture-memory', cacheDialect:'inclusive', inputTokens:123, outputTokens:7, totalTokens:130};
+    writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + JSON.stringify(row) + '\n');
+    const after = measureAcceptedTurn(fixture.home, 'multi', 201);
+    assert.equal(after.promptTokens - before.promptTokens, 123);
+    assert.equal(after.outputTokens - before.outputTokens, 7);
+    assert.equal(after.usageRecords - before.usageRecords, 1);
+  } finally { rmSync(fixture.home, {recursive:true, force:true}); }
+});

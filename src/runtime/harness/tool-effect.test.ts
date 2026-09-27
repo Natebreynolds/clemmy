@@ -1011,3 +1011,19 @@ test('automation review staging stays host-only through direct and deferred call
     tool_slug: 'MAIL_SEND', arguments: { to: 'fixture@example.test', body: 'x' },
   }).effect, 'host_only');
 });
+
+
+test('declared status branches are reads through local carriers, never foreign lookalikes or mutations', () => {
+  for (const name of ['heartbeat_refine', 'mcp__clementine__heartbeat_refine']) {
+    assert.equal(classifyRuntimeToolEffect(name, {action:'status'}).effect, 'read');
+    for (const action of ['set', 'add_rule', 'remove_rule', 'STATUS', undefined]) {
+      assert.equal(classifyRuntimeToolEffect(name, {action}).effect, 'local_write');
+    }
+    for (const carrier of ['call_tool', 'work_call']) {
+      assert.equal(classifyRuntimeToolEffect(carrier, {name, args_json:JSON.stringify({action:'status'})}).effect, 'read');
+      assert.equal(classifyRuntimeToolEffect(carrier, {name, args_json:JSON.stringify({action:'set', enabled:false})}).effect, 'local_write');
+    }
+  }
+  assert.notEqual(classifyRuntimeToolEffect('mcp__foreign__heartbeat_refine', {action:'status'}).effect, 'read');
+  assert.equal(runtimeToolAccountingMetadata('heartbeat_refine', JSON.stringify({action:'status'})).effect, 'read');
+});

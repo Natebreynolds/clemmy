@@ -9,8 +9,8 @@
  * notes into its own run, never its parent's.
  *
  * A job started inside an accepted turn (a save the turn made, a check after
- * the owner's message) runs in its own usage scope, so its calls are never
- * charged to the turn. Its model is still SELECTED as that turn would select
+ * the owner's message) runs in its own usage scope, so it cannot consume the parent's execution budget
+ * or authority. Its usage keeps a causal parent link for whole-task accounting. Its model is still SELECTED as that turn would select
  * it (`inMemoryJobTurn`): a session's pinned brain decides the automatic
  * checker family exactly as it did before memory work had its own scope.
  *

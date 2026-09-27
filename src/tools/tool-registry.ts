@@ -240,6 +240,9 @@ export interface ToolDecl {
   /** Effect class from the taxonomy (execute folded into write). Advisory in step 1. */
   sideEffect: ToolSideEffect;
   runtimeEffect?: ToolRuntimeEffectOverride;
+  /** Exact argument branches whose handler returns without a mutation.
+   * Default sideEffect still governs every other or missing argument value. */
+  readOnlyWhen?: { field: string; values: readonly string[] };
   /** Authenticated result acknowledges coordination; it promises no host file.
    * This does not change effect authority or discharge child effects. */
   resultContract?: 'acknowledgement';
@@ -444,7 +447,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   // A heartbeat's contract is the owner's own configuration: reversible, local,
   // and exactly what they just said. It is a write so the boundary records it,
   // never a send.
-  { name: 'heartbeat_refine', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], actionTopologyRole: 'control', localPlanning: { consequence: 'runtime_configuration', reversibility: 'reversible', destructive: false, purpose: 'configure_runtime', inputKind: 'configuration', outputKind: 'configuration', deliverableKind: 'runtime_configuration', destinationPosture: 'named_existing', advisoryRoles: ['admin'] }, description: 'Change one of the owner\'s heartbeats (work review, calendar watch, workflow suggestions) the way the owner asked: add or remove a rule in their words, change cadence, on/off, or whether items reach the phone.' },
+  { name: 'heartbeat_refine', sideEffect: 'write', readOnlyWhen: { field: 'action', values: ['status'] }, tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], actionTopologyRole: 'control', localPlanning: { consequence: 'runtime_configuration', reversibility: 'reversible', destructive: false, purpose: 'configure_runtime', inputKind: 'configuration', outputKind: 'configuration', deliverableKind: 'runtime_configuration', destinationPosture: 'named_existing', advisoryRoles: ['admin'] }, description: 'Change one of the owner\'s heartbeats (work review, calendar watch, workflow suggestions) the way the owner asked: add or remove a rule in their words, change cadence, on/off, or whether items reach the phone.' },
   { name: 'mcp_configure', sideEffect: 'admin', tier: 'discoverable', lanes: ['orchestrator', 'cli'], localPlanning: { consequence: 'runtime_configuration', reversibility: 'unknown', destructive: false, purpose: 'configure_runtime', inputKind: 'configuration', outputKind: 'configuration', deliverableKind: 'runtime_configuration', destinationPosture: 'named_existing', advisoryRoles: ['admin'] }, description: 'Edit an EXISTING external MCP server\'s NON-SECRET fields (description/command/args/url/he…' },
   { name: 'mcp_list_tools', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Search one configured external MCP server for exact callable names and the best match\'s real input schema.' },
   { name: 'mcp_reconnect', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Recover an external MCP server that is degraded/unavailable (stuck in the connection back…' },

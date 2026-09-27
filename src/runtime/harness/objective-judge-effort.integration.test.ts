@@ -81,3 +81,31 @@ test('actual Grok completion adapter preserves its existing provider-default rea
     assert.equal(Object.hasOwn(bodies[0]!, 'thinking'), false);
   } finally { mock.restoreAll(); resetByoModelCache(); }
 });
+
+for (const repair of [false, true]) {
+  test(`declared review effort reaches a compatible wire and verdict repair (${repair})`, async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+      const req = new Request(input, init);
+      assert.equal(req.url, 'https://judge-effort.invalid/v1/chat/completions');
+      bodies.push(await req.json() as Record<string, unknown>);
+      return new Response(JSON.stringify({ id: `effort-${bodies.length}`, object: 'chat.completion', created: 1,
+        model: 'grok-4.7', choices: [{ index: 0, message: { role: 'assistant',
+          content: repair && bodies.length === 1 ? 'The evidence supports the requested answer.' : 'DONE: checked against evidence' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    try {
+      const model = getByoModel('grok-4.7', { configured: true,
+        baseURL: 'https://judge-effort.invalid/v1', apiKey: 'fixture-key-never-real',
+        primaryId: 'grok-4.7', judgeId: 'grok-4.7', providerLabel: 'xAI' });
+      const v = await runRoutedJudgeAttempt({ model, modelId: 'grok-4.7', judgeFamily: 'byo',
+        judgeProviderId: 'xai', brainFamily: 'byo', selfJudge: true, ownerSelectedJudge: true },
+        'Audit the accepted objective.', 'Objective and evidence retained in full.', parseCompletionVerdict,
+        false, undefined, undefined, 'medium');
+      assert.equal(v.done, true);
+      assert.equal(bodies.length, repair ? 2 : 1);
+      for (const body of bodies) assert.equal(body.reasoning_effort, 'medium');
+    } finally { mock.restoreAll(); resetByoModelCache(); }
+  });
+}

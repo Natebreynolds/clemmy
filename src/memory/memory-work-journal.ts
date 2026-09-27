@@ -42,6 +42,7 @@ import {
   type OperationalEventType,
 } from '../runtime/operational-telemetry.js';
 import {
+  modelUsageAttributionStorage,
   usageRoleFromChannel,
   withModelUsageAttribution,
   withModelUsageObserver,
@@ -149,7 +150,7 @@ let nextRetentionSweepMs: number | null = null;
  * governs, `reviewer` for the checker's) and observed, then one event
  * recorded from `summarize`.
  *
- * Tokens are never charged to the conversation the job learns from: the
+ * Calls retain a causal parent for total task accounting, but the execution
  * scope names no session and no user turn, so no run budget accrues and no
  * turn-only state (a session's brain pin) is read or stamped; the originating
  * conversation lives in the event's source. A scope opened here replaces any
@@ -174,7 +175,7 @@ export async function runMemoryJob<T>(
     const value = await enclosingRun.run({ job, runId: token }, () =>
       withModelUsageObserver(run.calls, () =>
         withModelRouteObserver(run.routes, () =>
-          withModelUsageAttribution(memoryJobAttribution(job), work))));
+          withModelUsageAttribution(memoryJobAttribution(job, token), work))));
     settle(run, () => summarize(value));
     return value;
   } catch (error) {
@@ -300,18 +301,25 @@ function runningEntry(job: MemoryJobId, startedAt: string, opts: MemoryJobRunOpt
 }
 
 /** No session and no user turn: background work that belongs to no
- *  conversation. The ledger books it by channel; nothing keyed by session
+ *  conversation execution scope. Accounting retains the causal parent, if any,
+ *  and always names this job run. The ledger books it by channel; nothing keyed by session
  *  (a run budget, a brain pin) can attach to it. The scope names the role of
  *  whoever does the job's thinking (the memory model's jobs `memory`, the
  *  checker's `reviewer`), so a call that reaches its model through a route
  *  recorded as the brain's (a check that asks for the checker by id) is
  *  still booked as the job's. */
-function memoryJobAttribution(job: MemoryJobId): ModelUsageAttributionContext {
+function memoryJobAttribution(job: MemoryJobId, runId: string): ModelUsageAttributionContext {
+  const enclosing = modelUsageAttributionStorage.getStore();
+  const parent = enclosing && enclosing.sessionId && enclosing.sourceUserSeq > 0
+    ? { sessionId: enclosing.sessionId, sourceUserSeq: enclosing.sourceUserSeq, attemptId: enclosing.attemptId }
+    : enclosing?.usageParentTurn;
   const channel = memoryJobChannel(job);
   const role = usageRoleFromChannel(channel);
   return {
     sessionId: '',
     sourceUserSeq: 0,
+    usageJobId: `memory:${job}:${runId}`,
+    ...(parent ? { usageParentTurn: parent } : {}),
     channel,
     ...(role ? { role } : {}),
   };

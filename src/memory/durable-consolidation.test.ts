@@ -752,3 +752,33 @@ test('an explicitly taught reporting procedure retains its late conditions throu
   assert.deepEqual(extractAutoMemoryCandidates(`${message} Do not save any of this.`), [],
     'a late privacy instruction must not disappear behind an input preview limit');
 });
+
+
+for (const validSource of [true, false]) {
+  test(`replayed memory accounting validates its durable source and ignores an unrelated draining turn (${validSource})`, async () => {
+    const {createSession, appendEvent} = await import('../runtime/harness/eventlog.js');
+    const {withModelUsageAttribution, recordModelUsage, readUsageEventsForDate, modelUsageAttributionStorage} = await import('../runtime/usage-log.js');
+    const {runMemoryJob} = await import('./memory-work-journal.js');
+    const sessionId = `durable-accounting-${validSource}`;
+    const message = 'Use short paragraphs in every future report.';
+    createSession({id:sessionId, kind:'chat'});
+    const source = appendEvent({sessionId, turn:1, role:'user', type:'user_input_received', data:{text:message}});
+    const queued = enqueueAutoCaptureCandidates({sessionId, message,
+      sourceEventId:`user-source:${validSource ? source.seq : source.seq + 1000000}`,
+      candidates:[{kind:'user', content:message, reason:'standing instruction (marker + concrete target)'}]});
+    closeMemoryDb(); // Drain from persisted intake, with no original async scope.
+    const model = `durable-accounting-model-${validSource}`;
+    await withModelUsageAttribution({sessionId:'unrelated-active-chat', sourceUserSeq:999, attemptId:'unrelated-attempt'}, () =>
+      drainDurableConsolidationCandidates({ids:queued.candidateIds, standingReviewer:async () =>
+        runMemoryJob('standing', {}, async () => {
+          assert.equal(modelUsageAttributionStorage.getStore()?.sessionId, '');
+          recordModelUsage({sessionId:'unknown', model, cacheDialect:'inclusive', inputTokens:17, outputTokens:3});
+          return {scope:'task' as const, reason:'fixture only'};
+        }, () => ({outcome:'nothing_new'}))}));
+    const rows = readUsageEventsForDate().filter(row => row.model === model);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].trace?.acceptedSource, validSource ? `${sessionId}:${source.seq}` : undefined);
+    assert.equal(rows[0].trace?.attemptId, undefined, 'maintenance must not invent a parent attempt');
+    assert.match(rows[0].source, /^memory:standing:/);
+  });
+}

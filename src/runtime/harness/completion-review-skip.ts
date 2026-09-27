@@ -24,6 +24,13 @@ function reviewSkipReason(gate: ObjectiveJudgeGateInput): string | undefined {
     && isConversationalReviewSkip({ ...gate, claimedCompletedWork: false })) {
     return 'non_action_without_new_work';
   }
+  // History may contain business calls from a prior accepted source. They do
+  // not turn a tool-free follow-up into new work. Keep the exact current-source
+  // empty-work proof and the ordinary policy gate; this is disposition only.
+  if (gate.actionIntent === false && gate.meaningfulToolEvidence === true
+    && isConversationalReviewSkip({ ...gate, meaningfulToolEvidence: false, claimedCompletedWork: false })) {
+    return 'retained_context_non_action_without_new_work';
+  }
   // The existing judge policy also skips a single-result action answered from
   // retained history with no new work or completion claim. Describe that exact
   // branch; this record neither changes eligibility nor certifies the answer.

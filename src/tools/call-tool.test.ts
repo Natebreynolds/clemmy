@@ -2368,7 +2368,7 @@ test('host-accounted local reads and argument refusals do not spend the same cal
   try {
     for (const [id, args, expected] of [
       ['valid', { name: 'skill_list', args_json: '{}' }, '[]'],
-      ['refused', { name: 'memory_search', args_json: '{"query":"brief","limit":20}' }, 'arg_validation'],
+      ['refused', { name: 'memory_search', args_json: '{"query":"brief","limit":0}' }, 'arg_validation'],
     ] as const) {
       const counter = new ToolCallsCounter(1);
       counter.increment(); // The actual host stepper charges before entering the carrier.

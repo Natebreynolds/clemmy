@@ -584,9 +584,9 @@ export function registerMemoryTools(server: McpServer): void {
   server.tool(
     'memory_search',
     'Search the local Clementine vault for relevant notes and memories. Uses FTS5 and, when an embedding provider is available, an embedding rerank.',
-    { query: z.string().min(1) },
-    async ({ query }) => {
-      const hits = await searchVaultAsync(query, 8);
+    { query: z.string().min(1), limit: z.number().int().positive().safe().optional().describe('Maximum hits to retrieve; defaults to 8. The response remains bounded; use memory_read for full content.') },
+    async ({ query, limit }) => {
+      const hits = await searchVaultAsync(query, limit ?? 8);
       const text = hits.length > 0 ? formatSearchHits(hits, 3000) : 'No relevant memory hits found.';
       return textResult(text);
     },

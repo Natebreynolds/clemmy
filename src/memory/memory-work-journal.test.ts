@@ -15,7 +15,7 @@ process.env.EMBEDDINGS_DISABLED = 'true';
 
 const journal = await import('./memory-work-journal.js');
 const telemetry = await import('../runtime/operational-telemetry.js');
-const { recordModelUsage, withModelUsageAttribution, modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
+const { recordModelUsage, readUsageEventsForDate, withOwnModelRequestAttribution, withModelUsageAttribution, modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
 const { withModelRouteMetrics } = await import('../runtime/model-route-metrics.js');
 const { BoundaryError } = await import('../runtime/boundary-error.js');
 const { buildTransportTimeoutError } = await import('../runtime/codex-dispatcher.js');
@@ -437,4 +437,39 @@ test('a retention stamp from the future is no sweep: it sweeps now and stamps th
 test('the journal remembers when it began, so earlier days are absent rather than zero', () => {
   const row = telemetry.openOperationalTelemetryDb().prepare(`SELECT value FROM memory_work_meta WHERE key = 'journal_since'`).get() as { value: string } | undefined;
   assert.ok(row && Number.isFinite(Date.parse(row.value)));
+});
+
+
+test('memory child calls keep exact causal ownership without restoring turn execution scope', async () => {
+  const parent = { sessionId: 'sess-memory-causal', sourceUserSeq: 37, attemptId: 'attempt:memory-causal' };
+  await withModelUsageAttribution(parent, () => runMemoryJob('learn', {}, async () => {
+    await runMemoryJob('standing', {}, async () => {
+      const scope = modelUsageAttributionStorage.getStore()!;
+      assert.equal(scope.sessionId, '');
+      assert.equal(scope.sourceUserSeq, 0, 'accounting does not reactivate a turn pin or execution authority');
+      await withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:completion' }, async () => {
+        call('causal-memory-check');
+      });
+    }, () => ({ outcome: 'nothing_new' }));
+  }, () => ({ outcome: 'nothing_new' })));
+  const rows = readUsageEventsForDate().filter(e => e.model === 'causal-memory-check');
+  assert.equal(rows.length, 1, 'a nested call is persisted once');
+  const row = rows[0]!;
+  const event = memoryEvents().find(e => e.actor === 'standing')!;
+  assert.equal(row.source, `memory:standing:${(event.payload as {runId: string}).runId}`);
+  assert.equal(row.channel, 'memory:standing');
+  assert.equal(row.role, 'reviewer');
+  assert.equal(row.trace?.acceptedSource, 'sess-memory-causal:37');
+  assert.equal(row.trace?.logicalTurnId, 'turn:37');
+  assert.equal(row.trace?.attemptId, parent.attemptId);
+});
+
+test('scheduled memory gets a unique journal identity without inventing a parent task', async () => {
+  await runMemoryJob('standing', {source: {kind: 'schedule'}}, async () => call('scheduled-memory-check'), () => ({outcome: 'nothing_new'}));
+  const row = readUsageEventsForDate().find(e => e.model === 'scheduled-memory-check')!;
+  const event = memoryEvents().find(e => e.actor === 'standing')!;
+  assert.equal(row.source, `memory:standing:${(event.payload as {runId: string}).runId}`);
+  assert.equal(row.trace?.acceptedSource, undefined);
+  assert.equal(row.trace?.attemptId, undefined);
+  assert.equal(row.kind, 'background');
 });

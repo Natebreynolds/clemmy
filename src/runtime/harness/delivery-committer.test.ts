@@ -788,3 +788,24 @@ test(`publication keeps the ${label} reason and never calls a missing review an 
   assert.equal(verdict.disposition, 'enabled_unavailable');
 });
 }
+
+
+test('publication distinguishes an intentional history-only review skip from an unavailable review', async () => {
+  const { captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
+  const { conversationalReviewSkipRecord } = await import('./completion-review-skip.js');
+  for (const includeReceipt of [false, true]) {
+    const sessionId = `history-only-review-${includeReceipt}`;
+    createSession({id:sessionId, kind:'chat'});
+    const proposed = acceptedAnswer(sessionId, 'A Space stores context; a workflow runs repeatable steps.');
+    captureEffectiveCompletionPolicyOnce({...proposed.identity, enabled:true});
+    if (includeReceipt) {
+      const data = conversationalReviewSkipRecord({sourceUserSeq:proposed.identity.sourceUserSeq!, objective:'Accepted request.', reply:proposed.presentation.text,
+        gate:{optIn:true, actionIntent:false, meaningfulToolEvidence:true, sourceWorkAttempted:false, settledSourceEffects:0, settledEvidenceAvailable:true, multiResultObjective:false, acceptedExecutionEvidence:false, continuationsUsed:0, maxContinuations:2, nextAction:'completed', promiseShaped:false, claimedCompletedWork:false, openApprovalCard:false}});
+      assert.ok(data);
+      appendEvent({sessionId, turn:1, role:'system', type:'completion_review_skipped', data});
+    }
+    commitTurnOutcome(proposed);
+    const terminal = listEvents(sessionId, {types:['conversation_completed']})[0];
+    assert.equal((terminal.data.completionReview as {disposition:string}).disposition, includeReceipt ? 'not_required' : 'enabled_unavailable');
+  }
+});

@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { openEventLog } from '../runtime/harness/eventlog.js';
+import { modelUsageAttributionStorage, withModelUsageAttribution, type ModelUsageAttributionContext } from '../runtime/usage-log.js';
 import { openMemoryDb, type ConsolidatedFactKind } from './db.js';
 import { consolidateFact, type ConsolidateOptions } from './reflection.js';
 import {
@@ -187,6 +189,32 @@ function candidateRows(options: { ids?: number[]; limit: number; now: string }):
   `).all(options.now, staleLease, ...ids, options.limit) as PendingAutoCaptureRow[];
 }
 
+/** Restore accounting ownership from the persisted accepted source on replay.
+ * Never infer a source from timestamps, a turn number, or the draining chat. */
+function candidateUsageScope(row: PendingAutoCaptureRow): ModelUsageAttributionContext {
+  const match = /^auto-capture:user-source:([1-9][0-9]*)$/.exec(row.call_id);
+  const seq = match ? Number(match[1]) : 0;
+  let verified = false;
+  if (Number.isSafeInteger(seq) && seq > 0) {
+    try {
+      verified = Boolean(openEventLog().prepare(`SELECT 1 FROM events
+        WHERE session_id = ? AND seq = ? AND role = 'user' AND type = 'user_input_received'`)
+        .get(row.session_id, seq));
+    } catch { /* Unknown ownership stays unassigned, never guessed. */ }
+  }
+  const ambient = modelUsageAttributionStorage.getStore();
+  const sameTurn = verified && ambient?.sessionId === row.session_id && ambient.sourceUserSeq === seq;
+  // Preserve an immediate caller's existing selection scope only for its own
+  // source. A maintenance replay restores accounting, never execution pins.
+  return {
+    sessionId: sameTurn ? row.session_id : '',
+    sourceUserSeq: sameTurn ? seq : 0,
+    ...(sameTurn ? ambient : {}),
+    usageParentTurn: verified ? {sessionId:row.session_id, sourceUserSeq:seq,
+      ...(sameTurn && ambient?.attemptId ? {attemptId:ambient.attemptId} : {})} : undefined,
+  };
+}
+
 /** Process durable user-statement candidates. Claims are leased before any
  * model call, retried with bounded backoff, and resolved against the canonical
  * fact id. A failed immediate microtask therefore becomes visible queued work
@@ -227,6 +255,7 @@ export async function drainDurableConsolidationCandidates(options: {
     }
     result.claimed += 1;
     const attempt = row.attempt_count + 1;
+    const usageScope = candidateUsageScope(row);
     try {
       const sourceText = row.evidence_excerpt?.trim() ?? '';
       if (!sourceText) throw new Error('durable source episode has no evidence excerpt');
@@ -246,7 +275,8 @@ export async function drainDurableConsolidationCandidates(options: {
         const reviewMode = explicitScopeReview
           ? 'explicit'
           : row.intake_reason === UNJUDGED_OWNER_STATEMENT_REASON ? 'volunteered' : 'inferred';
-        const review = await (options.standingReviewer ?? reviewStandingMemory)(sourceText, row.text, reviewMode);
+        const review = await withModelUsageAttribution(usageScope, () =>
+          (options.standingReviewer ?? reviewStandingMemory)(sourceText, row.text, reviewMode));
         if (explicitScopeReview && (review.scope !== 'standing' || !review.text?.includes(row.text))) {
           throw new Error('Explicit memory scope review lost the authorized candidate');
         }
@@ -260,7 +290,7 @@ export async function drainDurableConsolidationCandidates(options: {
         candidateText = review.text;
       }
       const excerpt = selectSupportingExcerpt(sourceText, candidateText);
-      const outcome = await consolidateFact({
+      const outcome = await withModelUsageAttribution(usageScope, () => consolidateFact({
         kind: row.kind,
         text: candidateText,
         importance: row.importance,
@@ -275,7 +305,7 @@ export async function drainDurableConsolidationCandidates(options: {
           excerpt,
           sourceUri: row.source_uri ?? row.episode_source_uri,
         },
-      }, { sessionId: row.session_id }, options.resolver ? { resolver: options.resolver } : {});
+      }, { sessionId: row.session_id }, options.resolver ? { resolver: options.resolver } : {}));
       const people = attachGroundedUserPeople({
         factId: outcome.factId,
         episodeId: row.episode_id,

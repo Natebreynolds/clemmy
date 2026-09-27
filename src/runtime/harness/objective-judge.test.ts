@@ -583,8 +583,9 @@ test('review depth follows what the review protects', async () => {
     asked.push(depth);
     return { verdict: { done: false, reason: 'not done' }, failure: null, routing: other };
   });
-  assert.equal(asked.length, 1, 'a reviewer without thinking levels reviews once, as before');
-  assert.equal(once.reviewDepth, undefined);
+  assert.deepEqual(asked, [{ effort: 'medium' }, {}], 'negative fast reviews get full-depth confirmation regardless of provider');
+  assert.equal(once.reviewDepth, 'full');
+  assert.equal(once.reviewConfirmation, 'upheld');
 });
 
 test('work that wrote something is never closed by Jev alone', async () => {

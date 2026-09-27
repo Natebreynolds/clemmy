@@ -277,6 +277,9 @@ export function pairTransportMirrorToolCalls(
 const REGISTRY_EFFECTS = new Map<string, ToolSideEffect>(
   TOOL_REGISTRY.map((decl) => [decl.name, decl.sideEffect]),
 );
+const REGISTRY_READ_BRANCHES = new Map(
+  TOOL_REGISTRY.flatMap((decl) => decl.readOnlyWhen ? [[decl.name, decl.readOnlyWhen] as const] : []),
+);
 const REGISTRY_RUNTIME_EFFECTS = new Map<string, RuntimeToolEffect>(
   TOOL_REGISTRY.flatMap((decl) => decl.runtimeEffect ? [[decl.name, decl.runtimeEffect]] : []),
 );
@@ -696,7 +699,7 @@ function shellMutatesLocalState(command: string): boolean {
   return expandLiteralShellCommands(command).commands.some(oneShellCommandMutatesLocalState);
 }
 
-function classifyRegistered(toolName: string): RuntimeToolEffectDecision | null {
+function classifyRegistered(toolName: string, args?: unknown): RuntimeToolEffectDecision | null {
   const tail = localToolTail(toolName);
   // The Claude SDK may surface its deferred-discovery built-in in PascalCase
   // (`ToolSearch`) while Clementine's registry uses `tool_search`. Normalize
@@ -706,6 +709,12 @@ function classifyRegistered(toolName: string): RuntimeToolEffectDecision | null 
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .replace(/-/g, '_')
     .toLowerCase();
+  const readOnlyWhen = REGISTRY_READ_BRANCHES.get(tail) ?? REGISTRY_READ_BRANCHES.get(registryTail);
+  const input = decodedToolArgs(args);
+  if (readOnlyWhen && input && typeof input === 'object' && !Array.isArray(input)
+    && readOnlyWhen.values.includes((input as Record<string, unknown>)[readOnlyWhen.field] as string)) {
+    return readDecision('registry');
+  }
   const runtimeEffect = REGISTRY_RUNTIME_EFFECTS.get(tail) ?? REGISTRY_RUNTIME_EFFECTS.get(registryTail);
   if (runtimeEffect === 'host_only') {
     return { effect: 'host_only', mutating: true, dangerousWrite: false, source: 'registry' };
@@ -944,7 +953,7 @@ export function classifyRuntimeToolEffect(toolName: string, args: unknown): Runt
     return readDecision('registry');
   }
 
-  return classifyRegistered(normalized)
+  return classifyRegistered(normalized, args)
     ?? unknownDecision();
 }
 

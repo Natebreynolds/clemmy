@@ -962,8 +962,9 @@ export async function runRoutedJudgeAttempt<T>(
   // stable prefix, so every review reads them (with the tools) from the prompt
   // cache. The words and their order are unchanged; the marker never reaches
   // the model.
-  // A review effort is a Claude setting; other providers keep their default.
-  const reviewEffort = routing.judgeFamily === 'claude' ? effort : undefined;
+  // Review depth is provider-neutral. Each adapter maps supported effort
+  // values through its wire capabilities; unsupported controls stay omitted.
+  const reviewEffort = effort;
   const agent = evidence
     ? buildJudgeAgent(routing,
       routing.judgeFamily === 'claude' ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : reviewInstructions,
@@ -985,7 +986,7 @@ export async function runRoutedJudgeAttempt<T>(
     const head = prior.replace(/\s+/g, ' ').slice(0, 600);
     if (prior) {
       try {
-        const repairAgent = buildJudgeAgent(routing, instructions);
+        const repairAgent = buildJudgeAgent(routing, instructions, [], reviewEffort);
         const repairPrompt = [
             'You already reviewed a response and wrote the review below, but it did not contain the required verdict line.',
             'Do not review again. From your own review, state the verdict now.',
@@ -1256,8 +1257,8 @@ export const WRITE_REVIEW_TIMEOUT_MS = 180_000;
  * review that wants to send the work back is checked by a full review, whose
  * verdict decides, so a fast misreading never costs the owner a rewrite. When
  * the full review cannot finish, the fast review's completed finding stands.
- * The fast pass applies to reviewers that take a thinking level; others review
- * once, as before.
+ * Adapters map the requested effort through declared wire capabilities. A
+ * negative fast verdict receives the same confirmation on every provider.
  */
 export async function reviewAtStakes(
   stakes: ReviewStakes,
@@ -1267,7 +1268,6 @@ export async function reviewAtStakes(
     return { ...(await review({ timeoutMs: WRITE_REVIEW_TIMEOUT_MS })), reviewDepth: 'full' };
   }
   const fast = await review({ effort: 'medium' });
-  if (fast.routing?.judgeFamily !== 'claude') return fast;
   if (!fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
   const full = await review({});
   if (!full.verdict) return { ...fast, reviewDepth: 'fast', reviewConfirmation: 'unavailable' };

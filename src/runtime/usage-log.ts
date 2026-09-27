@@ -439,7 +439,17 @@ export function acceptedSourceIdentity(sessionId: string, sourceUserSeq?: number
  *  memory = background memory work (the memory model role). */
 export type UsageRequestRole = 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory';
 
+export interface UsageParentTurn {
+  sessionId: string;
+  sourceUserSeq: number;
+  attemptId?: string;
+}
+
 export interface ModelUsageAttributionContext {
+  /** Accounting-only parent: never reinstates the turn's model pin or tool authority. */
+  usageParentTurn?: UsageParentTurn;
+  /** Unique autonomous job identity, also present on its operational receipt. */
+  usageJobId?: string;
   /** Request-local estimates override ambient parent prompt measurements. */
   promptComponents?: Record<string, number>;
   sessionId: string;
@@ -539,6 +549,8 @@ export function withOwnModelRequestAttribution<T>(
     sessionId: inherited?.sessionId ?? own.sessionId ?? 'unknown',
     sourceUserSeq: inherited?.sourceUserSeq ?? own.sourceUserSeq ?? 0,
     ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
+    ...(inherited?.usageParentTurn ? { usageParentTurn: inherited.usageParentTurn } : {}),
+    ...(inherited?.usageJobId ? { usageJobId: inherited.usageJobId } : {}),
     ...(role ? { role } : {}),
     ...(channel ? { channel } : {}),
     ...(own.promptComponents ? { promptComponents: own.promptComponents } : {}),
@@ -639,9 +651,13 @@ export function recordModelUsage(args: {
         ),
       }
     : inheritedExact;
-  const source = exactAttribution?.sessionId ?? resolveWorkflowUsageSource(argsSource);
-  const sourceUserSeq = exactAttribution?.sourceUserSeq;
-  const attemptId = exactAttribution?.attemptId ?? (!exactAttribution ? args.attemptId : undefined);
+  const source = exactAttribution?.sessionId
+    ?? (argsSource === 'unknown' && attribution?.usageJobId ? attribution.usageJobId : resolveWorkflowUsageSource(argsSource));
+  const parent = attribution?.usageParentTurn;
+  const traceOwner = exactAttribution ?? (parent?.sessionId && parent.sessionId !== 'unknown'
+    && Number.isSafeInteger(parent.sourceUserSeq) && parent.sourceUserSeq > 0 ? parent : undefined);
+  const sourceUserSeq = traceOwner?.sourceUserSeq;
+  const attemptId = traceOwner?.attemptId ?? (!traceOwner ? args.attemptId : undefined);
   // Write-time authority: the durable session row knows what this session IS,
   // so classification does not depend on every surface's id-minting habits.
   // Guarded — observability must never break the model-call path.
@@ -660,7 +676,7 @@ export function recordModelUsage(args: {
   const rawTrace = args.trace || hasExactAcceptedSource || attemptId || args.responseId
     ? {
         ...(args.trace ?? {}),
-        ...(hasExactAcceptedSource ? { acceptedSource: acceptedSourceIdentity(source, sourceUserSeq) } : {}),
+        ...(hasExactAcceptedSource ? { acceptedSource: acceptedSourceIdentity(traceOwner?.sessionId ?? source, sourceUserSeq) } : {}),
         ...(hasExactAcceptedSource ? { logicalTurnId: `turn:${sourceUserSeq}` } : {}),
         ...(attemptId ? { attemptId } : {}),
         ...(args.responseId && !args.trace?.modelCallId ? { modelCallId: args.responseId } : {}),
