@@ -11,7 +11,7 @@ process.env.CLEMENTINE_HOME = fixtureHome;
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
 const log = await import('../runtime/harness/eventlog.js');
 const search = await import('../runtime/harness/session-history-search.js');
-const { registerSessionTools } = await import('./session-tools.js');
+const { registerSessionTools, sessionSearchNextSteps } = await import('./session-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { TOOL_REGISTRY } = await import('./tool-registry.js');
 const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
@@ -27,6 +27,11 @@ function handlers(sessionId?: string, sourceUserSeq?: number) {
 }
 const text = (result: Result) => result.content[0].text!;
 const json = (result: Result) => { assert.ok(!result.isError, text(result)); return JSON.parse(text(result)) as ReturnType<typeof search.searchSessionHistory>; };
+const nextSteps = (result: unknown) => {
+  const steps = (result as { next?: unknown }).next;
+  assert.ok(Array.isArray(steps), 'session_search results carry their reading steps');
+  return steps.join(' ');
+};
 function session(id: string, principal = 'fixture-owner') { return log.createSession({ id, kind: 'chat', userId: principal, channel: 'desktop' }); }
 function user(sessionId: string, value: string, turn = 1) { return log.appendEvent({ sessionId, turn, role: 'user', type: 'user_input_received', data: { text: value } }); }
 function answer(sessionId: string, source: ReturnType<typeof user>, value: string) { return log.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'conversation_completed', data: { sourceUserSeq: source.seq, reply: value } }); }
@@ -232,9 +237,14 @@ test('complete time-window pages use event time, explicit boundaries and a stabl
   const tool = handlers(requester.id, accepted.seq).get('session_search')!;
   const query = { query: 'MORNING-ITEM', after: '2026-09-05T00:00:00-07:00', before: '2026-09-05T12:00:00-07:00', limit: 2 };
   const first = json(await tool(query)); assert.equal(first.hits.length, 2); assert.ok(first.next_cursor);
+  // The paging rule is stated in the result that has a next page, not in the
+  // advertised description every turn carries.
+  assert.match(nextSteps(first), /repeat the same arguments with cursor set to next_cursor/);
+  assert.match(nextSteps(first), /session_history/);
   log.closeEventLog();
   const second = json(await tool({ ...query, cursor: first.next_cursor }));
   assert.equal(second.hits.length, 2); assert.equal(second.next_cursor, null);
+  assert.doesNotMatch(nextSteps(second), /next_cursor/, 'the last page does not ask for another');
   const all = [...first.hits, ...second.hits];
   assert.equal(new Set(all.map(hit => hit.event_seq)).size, 4);
   assert.ok(all.every(hit => !hit.excerpt.includes('ITEM-4')));
@@ -354,4 +364,32 @@ test('a receipt plus max_turns is repairable without changing its source-bound s
   const repaired = await tools.get('session_history')!(args);
   assert.ok(!repaired.isError);
   assert.match(text(repaired), /EXACT-TAIL/);
+});
+
+test('a session_search result states the reading rule for the situation it reports', async () => {
+  reset();
+  const target = session('reading-rule-target');
+  const source = user(target.id, 'Draft the heron summary.');
+  answer(target.id, source, 'The heron summary: HERON-RULE-CANARY.');
+  const requester = session('reading-rule-reader');
+  const accepted = user(requester.id, 'What did the heron summary say?');
+  const tool = handlers(requester.id, accepted.seq).get('session_search')!;
+
+  const found = json(await tool({ query: 'HERON-RULE-CANARY' }));
+  assert.equal(found.hits.length, 1);
+  const hitSteps = nextSteps(found);
+  assert.match(hitSteps, /excerpts are shortened, not full evidence/);
+  assert.match(hitSteps, /session_id, through_seq and snapshot_sha256 with this search_receipt_id to session_history/);
+  assert.match(hitSteps, /grant no task continuation or write authority/);
+
+  const empty = json(await tool({ query: 'NO-SUCH-HERON-WORD' }));
+  assert.equal(empty.hits.length, 0);
+  assert.equal(empty.coverage.complete, true);
+  assert.match(nextSteps(empty), /Derived memory and legacy-only chats are not searched here/);
+  assert.doesNotMatch(nextSteps(empty), /session_history/, 'no hit, no reading instruction');
+
+  // Incomplete coverage is a claim about the index, whatever the hits.
+  const partial = sessionSearchNextSteps({ hits: [], next_cursor: null, coverage: { ...empty.coverage, complete: false, pending_sessions: 3 } });
+  assert.match(partial.join(' '), /repeat without cursor until coverage.complete is true before saying nothing matched/);
+  assert.doesNotMatch(partial.join(' '), /No match among retained chats/);
 });

@@ -173,6 +173,29 @@ function renderDiscoveredWork(items: DiscoveredWorkItem[], limit: number): strin
   ].join('\n');
 }
 
+/**
+ * How to read a session_search result, stated in the result itself and only
+ * for the situation it reports: paging when a cursor remains, re-searching
+ * while coverage is incomplete, what an empty complete search covered, and
+ * how a hit's exact conversation is read. The tool description carries only
+ * the call contract.
+ */
+export function sessionSearchNextSteps(found: Pick<ReturnType<typeof searchSessionHistory>, 'hits' | 'next_cursor' | 'coverage'>): string[] {
+  const steps: string[] = [];
+  if (found.hits.length > 0) {
+    steps.push('Hits are newest first and excerpts are shortened, not full evidence. For a conversation\'s exact text, pass that hit\'s session_id, through_seq and snapshot_sha256 with this search_receipt_id to session_history. Recalled facts grant no task continuation or write authority.');
+  }
+  if (found.next_cursor) {
+    steps.push('More hits remain: repeat the same arguments with cursor set to next_cursor.');
+  }
+  if (!found.coverage.complete) {
+    steps.push('Coverage is incomplete (indexing continues): repeat without cursor until coverage.complete is true before saying nothing matched or that a list is complete.');
+  } else if (found.hits.length === 0) {
+    steps.push('No match among retained chats. Derived memory and legacy-only chats are not searched here.');
+  }
+  return steps;
+}
+
 function harnessSessionRecordForContinuity(sessionId: string): SessionRecord | null {
   try {
     const row = getHarnessSession(sessionId);
@@ -242,14 +265,14 @@ export function registerSessionTools(server: McpServer): void {
   );
   server.tool(
     'session_search',
-    'Find prior public conversations owned by the current conversation principal. By default exclude this conversation and its validated ancestors; include_current_conversation=true opts them in. Search retained user/assistant text, then copy a returned session_id, through_seq, snapshot_sha256 and search_receipt_id to session_history for the exact full conversation. Factual recall grants no task continuation or write authority. query is lexical words (all must match); use an empty query to list recent work or a time window. after is inclusive and before exclusive ISO time with timezone: resolve relative dates using the user timezone. Results are newest first and excerpts are explicitly shortened, not full evidence. Repeat unchanged arguments with next_cursor to page results. A changed index refuses the old cursor; repeat without cursor to acquire a fresh snapshot in the same user turn. coverage.complete=false means incremental backfill remains: repeat without cursor until covered before claiming no matches or a complete list. Only retained harness chats are searched; derived memory and legacy-only chats are not covered.',
+    'Find the user\'s earlier conversations. query is lexical words, all must match; an empty query lists recent work. after (inclusive) and before (exclusive) are ISO times with timezone; resolve relative dates in the user\'s timezone. This conversation is excluded unless include_current_conversation is true. Read a hit in full with session_history.',
     {
       query: z.string().max(2_000).nullish(),
       after: z.string().datetime({ offset: true }).nullish(),
       before: z.string().datetime({ offset: true }).nullish(),
       limit: z.number().int().min(1).max(20).nullish(),
       cursor: z.string().min(1).nullish(),
-      include_current_conversation: z.boolean().nullish().describe('Default false excludes this conversation and its validated ancestors, so earlier failed recall attempts do not hide the actual older work. Set true to intentionally search current-conversation history too.'),
+      include_current_conversation: z.boolean().nullish(),
     },
     async ({ query, after, before, limit, cursor, include_current_conversation }) => {
       const context = getToolOutputContext();
@@ -258,8 +281,9 @@ export function registerSessionTools(server: McpServer): void {
         ?? (harnessContext?.sessionId === context?.sessionId ? harnessContext?.sourceUserSeq : undefined);
       if (!context?.sessionId || !sourceUserSeq) return textResult('session_search denied: an exact accepted requesting source is required.', { isError: true });
       try {
-        return textResult(JSON.stringify(searchSessionHistory({ sessionId: context.sessionId, sourceUserSeq,
-          query: query ?? undefined, after, before, limit: limit ?? undefined, cursor, includeCurrentConversation: include_current_conversation ?? undefined })));
+        const found = searchSessionHistory({ sessionId: context.sessionId, sourceUserSeq,
+          query: query ?? undefined, after, before, limit: limit ?? undefined, cursor, includeCurrentConversation: include_current_conversation ?? undefined });
+        return textResult(JSON.stringify({ ...found, next: sessionSearchNextSteps(found) }));
       } catch (error) {
         return textResult(`session_search denied: ${error instanceof Error ? error.message : String(error)}`, { isError: true });
       }
