@@ -1680,6 +1680,9 @@ export interface ResolvedBrain {
   /** Present when a SAVED choice is unavailable — the honest "X is saved but
    *  Y actually answers" line comes straight from the daemon. */
   inactiveBinding?: { modelId: string; provider: string; reason: string };
+  /** Keeps your memory, automatic only: whose model memory work borrows
+   *  today, as the daemon resolved it (never inferred on the phone). */
+  follows?: 'checker' | 'brain' | null;
 }
 
 /** One row of the LIVE brain catalog — the same brainOptions the console
@@ -1707,8 +1710,9 @@ export interface CodexRescueSettings {
   options: CodexRescueModelOption[];
 }
 
-/** The roles the phone can bind to a model. The brain has its own switch. */
-export type ModelRoleName = 'writer' | 'judge' | 'worker';
+/** The roles the phone can bind to a model. The brain has its own switch.
+ *  `memory` (Keeps your memory) runs in the background, not in a request. */
+export type ModelRoleName = 'writer' | 'judge' | 'worker' | 'memory';
 
 /** Connected models that can fill a role, grouped by provider, straight from
  *  the daemon catalog desktop Settings renders. */
@@ -1727,8 +1731,9 @@ export interface ModelSettings {
   activeBrain: string;
   /** Optional for cached PWAs talking briefly to an older daemon. */
   codexRescue?: CodexRescueSettings;
-  /** Who writes the final answer, checks the work and helps in parallel, as
-   *  the daemon resolves them. Optional for an older daemon. */
+  /** Who writes the final answer, checks the work, helps in parallel and
+   *  keeps your memory, as the daemon resolves them. Each is optional for an
+   *  older daemon, and a role it leaves out is not shown. */
   roles?: Partial<Record<ModelRoleName, ResolvedBrain>>;
   roleOptions?: Partial<Record<ModelRoleName, RoleModelGroup[]>>;
   /** The selected checker would review its own family's answers. */

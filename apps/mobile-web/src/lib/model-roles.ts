@@ -1,3 +1,4 @@
+import { MEMORY_ROLE_WORDS, memoryRoleAutomaticText } from '@clem/chat-engine';
 import type { JudgeFallbackSelection, JudgeFallbackSetting, ModelRoleName, ModelSettings, ResolvedBrain, RoleModelGroup } from './api';
 
 export function judgeFallbackValue(setting: JudgeFallbackSetting): string {
@@ -24,13 +25,20 @@ export function judgeFallbackChoices(settings: ModelSettings): Array<{ id: strin
 }
 
 /**
- * Plain words for who handles each part of a request. The phone names a role
- * by what it does, never by a registry term, and every model name it shows
- * comes from the daemon catalog.
+ * Plain words for who handles each part of a request, and who keeps your
+ * memory in the background. The phone names a role by what it does, never by
+ * a registry term, and every model name it shows comes from the daemon
+ * catalog.
  */
 export type ModelsRow = 'brain' | ModelRoleName;
 
-export const ROLE_COPY: Record<ModelsRow, { title: string; explain: string; automatic: string }> = {
+export const ROLE_COPY: Record<ModelsRow, {
+  title: string;
+  explain: string;
+  automatic: string;
+  /** What a saved pick changes, when it is not the next message. */
+  saved?: string;
+}> = {
   brain: {
     title: 'Does the work',
     explain: 'Reads your request, plans it and uses your tools.',
@@ -50,6 +58,15 @@ export const ROLE_COPY: Record<ModelsRow, { title: string; explain: string; auto
     title: 'Helps in parallel',
     explain: 'Takes side tasks that run at the same time, like looking into several companies at once.',
     automatic: 'Clem picks, usually the model that does the work.',
+  },
+  // The words are the desktop's too (@clem/chat-engine), so the two can never
+  // name this role differently. Its automatic line depends on whose model it
+  // borrows today, which only the daemon knows: see roleAutomaticText.
+  memory: {
+    title: MEMORY_ROLE_WORDS.title,
+    explain: MEMORY_ROLE_WORDS.explain,
+    automatic: MEMORY_ROLE_WORDS.automaticNone,
+    saved: 'Saved. The next memory job uses it.',
   },
 };
 
@@ -89,11 +106,24 @@ export function describeModel(
 
 function catalogGroups(settings: ModelSettings): RoleModelGroup[] {
   const options = settings.roleOptions ?? {};
-  return [...(options.writer ?? []), ...(options.judge ?? []), ...(options.worker ?? [])];
+  return [...(options.writer ?? []), ...(options.judge ?? []), ...(options.worker ?? []), ...(options.memory ?? [])];
 }
 
 function describe(modelId: string, provider: string | undefined, settings: ModelSettings): string {
   return describeModel(modelId, catalogGroups(settings), provider, settings.options);
+}
+
+/** "Provider — Model" for any model id the daemon reports (a memory job's
+ *  served model, say), named from the same catalog as the Models card. Before
+ *  the catalog loads, or for an id it does not know, the id shows as itself. */
+export function modelLabel(modelId: string, settings: ModelSettings | null | undefined): string {
+  return settings ? describe(modelId, undefined, settings) : modelId;
+}
+
+/** The note under "Automatic" in a role's picker. Keeps your memory borrows
+ *  another role's model, and the daemon says whose. */
+export function roleAutomaticText(role: ModelRoleName, resolved?: Pick<ResolvedBrain, 'follows'>): string {
+  return role === 'memory' ? memoryRoleAutomaticText(resolved?.follows ?? null) : ROLE_COPY[role].automatic;
 }
 
 /** The brain as its picker names it. */
@@ -106,16 +136,33 @@ export function brainSummary(settings: ModelSettings): string {
 export function roleSummary(role: ModelRoleName, settings: ModelSettings): string {
   const resolved = settings.roles?.[role];
   if (!resolved) return '';
+  // No model at all (Keeps your memory, when nothing it may use is reachable):
+  // say so rather than print an empty name.
+  if (!resolved.modelId) {
+    const saved = resolved.inactiveBinding;
+    if (saved?.modelId) return `${describe(saved.modelId, saved.provider, settings)} · not available right now`;
+    return isChosen(resolved) ? 'No model available right now' : 'Automatic · no model available right now';
+  }
   if (isChosen(resolved)) return describe(resolved.modelId, resolved.provider, settings);
   if (resolved.modelId === settings.brain.modelId) return 'Same model that does the work';
   return `Automatic · ${describe(resolved.modelId, resolved.provider, settings)}`;
 }
 
-/** A saved choice that is unavailable, and what runs instead. */
-export function inactiveNote(resolved: ResolvedBrain | undefined, settings: ModelSettings): string | null {
+/** A saved choice that is unavailable, and what runs instead. When nothing
+ *  runs in its place (Keeps your memory never substitutes a pick), the work
+ *  waits for it, and the note says that instead of naming a stand-in. */
+export function inactiveNote(resolved: ResolvedBrain | undefined, settings: ModelSettings, role?: ModelRoleName): string | null {
   const saved = resolved?.inactiveBinding;
-  if (!resolved || !saved || saved.modelId === resolved.modelId) return null;
-  return `Your pick, ${describe(saved.modelId, saved.provider, settings)}, isn't available, so ${describe(resolved.modelId, resolved.provider, settings)} is used instead.`;
+  if (!resolved || !saved) return null;
+  const pick = describe(saved.modelId, saved.provider, settings);
+  const nothingRuns = !resolved.modelId || (role === 'memory' && saved.modelId === resolved.modelId);
+  if (!nothingRuns && saved.modelId === resolved.modelId) return null;
+  if (nothingRuns) {
+    return role === 'memory'
+      ? `Your pick, ${pick}, isn't available, so learning waits until it is back. Nothing is lost.`
+      : `Your pick, ${pick}, isn't available, and nothing runs in its place until it is back.`;
+  }
+  return `Your pick, ${pick}, isn't available, so ${describe(resolved.modelId, resolved.provider, settings)} is used instead.`;
 }
 
 /** Warn only when the owner made a choice the checker's independence depends
