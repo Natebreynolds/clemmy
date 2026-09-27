@@ -62,6 +62,28 @@ export const MEMORY_JOBS: Readonly<Record<MemoryJobId, MemoryJobSpec>> = Object.
 
 export const MEMORY_JOB_IDS: readonly MemoryJobId[] = Object.freeze(Object.keys(MEMORY_JOBS) as MemoryJobId[]);
 
+/** A local clock time: a nightly job fires once per local day at or after it. */
+export interface MemoryJobClock {
+  hour: number;
+  minute: number;
+}
+
+/**
+ * When the nightly memory jobs fire. The daemon's schedulers read these (the
+ * recursive reflection and hygiene ticks, the maintenance self-heal slot), so
+ * the Memory tab's "next" is the schedule itself, never a copy of it.
+ */
+export const MEMORY_JOB_CLOCKS = Object.freeze({
+  patterns: Object.freeze({ hour: 3, minute: 0 }),
+  tidy: Object.freeze({ hour: 4, minute: 0 }),
+  verify: Object.freeze({ hour: 4, minute: 35 }),
+}) satisfies Readonly<Partial<Record<MemoryJobId, MemoryJobClock>>>;
+
+/** The clock a job fires on, or null for jobs started by an event. */
+export function memoryJobClock(job: MemoryJobId): MemoryJobClock | null {
+  return (MEMORY_JOB_CLOCKS as Readonly<Partial<Record<MemoryJobId, MemoryJobClock>>>)[job] ?? null;
+}
+
 export function isMemoryJobId(value: unknown): value is MemoryJobId {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(MEMORY_JOBS, value);
 }

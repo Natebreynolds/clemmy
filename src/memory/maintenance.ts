@@ -60,6 +60,7 @@ import {
   type LegacyReflectionCandidateBackfillResult,
 } from './reflection-candidates.js';
 import { drainTerminalSemanticLearning } from './semantic-learning-worker.js';
+import { MEMORY_JOB_CLOCKS } from './memory-jobs.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -200,8 +201,8 @@ const MEMORY_BACKUP_RETAIN = 7;
 // Memory self-heal parity: runs after the nightly DB backup and before the
 // older paraphrase merge. It is bounded, audited, reversible, and kill-switched
 // independently from the report-only curator and approval UI.
-const MEMORY_SELF_HEAL_NIGHTLY_HOUR = 4;
-const MEMORY_SELF_HEAL_NIGHTLY_MINUTE = 35;
+const MEMORY_SELF_HEAL_NIGHTLY_HOUR = MEMORY_JOB_CLOCKS.verify.hour;
+const MEMORY_SELF_HEAL_NIGHTLY_MINUTE = MEMORY_JOB_CLOCKS.verify.minute;
 
 // Evidence-backed relationship/identity repair runs after the reversible DB
 // backup and before semantic merge. It only converges exact personal-email

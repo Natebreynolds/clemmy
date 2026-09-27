@@ -189,6 +189,7 @@ import {
   hasExpectedExactOriginDeliveryReceipt,
 } from '../runtime/exact-origin-delivery.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { MEMORY_JOB_CLOCKS } from '../memory/memory-jobs.js';
 import type { AssistantResponse } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
@@ -890,7 +891,7 @@ async function runCronJob(
 // internal jobs should be system-level and undisturbed by user edits.
 // The job is cheap (<$0.01/night per the Phase 2 plan) so a missed-run
 // catch-up on next-boot is fine — no make-up scheduling needed.
-const RECURSIVE_REFLECTION_LOCAL_HOUR = 3;
+const RECURSIVE_REFLECTION_LOCAL_HOUR = MEMORY_JOB_CLOCKS.patterns.hour;
 
 export function daemonRecursiveReflectionEnabled(): boolean {
   const raw = (getRuntimeEnv('CLEMMY_REFLECTION', '') ?? '').trim().toLowerCase();
@@ -939,7 +940,7 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
 // safely prove it, so dedup is explicitly opt-in. Same once-per-local-day,
 // survives-restart contract as recursive reflection (offset one hour so
 // the two brain jobs don't pile onto the same tick).
-const MEMORY_HYGIENE_LOCAL_HOUR = 4;
+const MEMORY_HYGIENE_LOCAL_HOUR = MEMORY_JOB_CLOCKS.tidy.hour;
 
 async function processMemoryHygieneTick(state: DaemonState): Promise<void> {
   // Decay remains default-on. Semantic dedup is default-off after production
