@@ -221,10 +221,15 @@ export interface MemoryWorkSnapshot {
   embedder?: { modelId: string | null; local: boolean } | null;
   jobs: MemoryJobStatus[];
   today: MemoryWorkToday;
-  /** Last 24 hours, oldest first. */
+  /** Last 24 hours, oldest first. An hour before the journal began is left
+   *  out (never measured), not zero. */
   hourly: MemoryWorkHour[];
-  /** Last 30 days, oldest first. */
+  /** Last 30 days, oldest first; a day before the journal began is left out. */
   daily: MemoryWorkDay[];
+  /** When the journal began counting, while that is inside the 30 days the
+   *  strips show. The hour and the day that hold it, and today's totals on
+   *  that day, count only from then: say "since", not a full day's zero. */
+  measuredSince?: string | null;
   /** Newest first. */
   recent: MemoryWorkEvent[];
   retention: { detailDays: number; summaryDays: number };

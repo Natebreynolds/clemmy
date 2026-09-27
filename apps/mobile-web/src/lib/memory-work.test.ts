@@ -17,12 +17,15 @@ import {
   MEMORY_WORK_POLL_MS,
   ageText,
   countText,
+  dayKey,
   dayStrip,
   durationText,
   groupByDay,
   hourCaption,
   hourStrip,
   hourStripSummary,
+  timeOfDayText,
+  todaySinceText,
   keptText,
   memoryEventView,
   memoryJobGroups,
@@ -268,7 +271,29 @@ test('the 30-day strip shows the days the daemon kept, never padding with invent
   assert.equal(strip.bars.length, 12);
   assert.match(strip.summary, /^Last 12 days · /);
   assert.equal(strip.bars.at(-1)?.today, true);
+  assert.deepEqual(strip.bars.map((b) => b.slot), Array.from({ length: 12 }, (_, i) => i + 18), 'the days sit at the right, the rest blank');
+  assert.equal(strip.slots, 30);
   assert.equal(dayStrip(view('resting', { daily: [] }), NOW), null);
+});
+
+test('a new journal\'s one hour and one day are one slot each, not the whole strip, and say since when', () => {
+  // Install day: the daemon sends only the hour and the day it measured.
+  const hourStart = new Date(NOW); hourStart.setMinutes(0, 0, 0);
+  const began = new Date(hourStart.getTime() + 7 * 60_000).toISOString();
+  const young = view('resting', {
+    measuredSince: began,
+    hourly: [{ hourStart: hourStart.toISOString(), runs: 0, modelCalls: 0, learned: 0 }],
+    daily: [{ day: dayKey(NOW), runs: 0, modelCalls: 0, learned: 0, inputTokens: 0, outputTokens: 0 }],
+  });
+  const hours = hourStrip(young, NOW)!;
+  assert.deepEqual(hours.bars.map((b) => b.slot), [23], 'one bar in the current hour\'s slot');
+  assert.equal(hours.slots, 24);
+  assert.equal(hours.since, began);
+  assert.equal(hourStripSummary(hours), `Since ${timeOfDayText(began)} · no memory work`, 'the span measured, not "the last 24 hours"');
+  const days = dayStrip(young, NOW)!;
+  assert.deepEqual(days.bars.map((b) => b.slot), [29]);
+  assert.equal(todaySinceText(young, NOW), `since ${timeOfDayText(began)}`);
+  assert.equal(todaySinceText(view('resting', { measuredSince: null }), NOW), null, 'a full day needs no "since"');
 });
 
 // ───────────────────────────── runs and undo ─────────────────────────────

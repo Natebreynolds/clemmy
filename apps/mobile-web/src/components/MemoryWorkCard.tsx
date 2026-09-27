@@ -17,6 +17,7 @@ import {
   pipelineView,
   recentEmptyText,
   serverNow,
+  todaySinceText,
   type MemoryWorkRead,
   type ModelNamer,
 } from '../lib/memory-work';
@@ -47,6 +48,7 @@ export function MemoryWorkCard({ read, loading, modelName, onChangeModel, onOpen
     ? snapshot.recent.slice(0, MEMORY_WORK_CARD_EVENTS).map((event) => memoryEventView(event, modelName, now))
     : [];
   const empty = recentEmptyText(snapshot);
+  const since = todaySinceText(snapshot, now);
 
   return (
     <section class={`card mw-card${status.pulse ? ' is-working' : ''}`} aria-labelledby="mw-card-title">
@@ -66,7 +68,7 @@ export function MemoryWorkCard({ read, loading, modelName, onChangeModel, onOpen
         <>
           {model ? <ModelRow view={model} onChange={onChangeModel} /> : null}
           <div class="mw-block">
-            <p class="mw-label">Today</p>
+            <p class="mw-label">{since ? `Today · ${since}` : 'Today'}</p>
             <Pipeline stages={pipelineView(snapshot, status.pulse)} />
           </div>
           <HourStripView strip={hourStrip(snapshot, now)} />

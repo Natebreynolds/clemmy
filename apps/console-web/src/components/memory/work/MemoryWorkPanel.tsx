@@ -133,7 +133,7 @@ export function MemoryWorkPanel() {
       </div>
 
       <div className="space-y-6 px-4 pb-5 pt-5 sm:px-5">
-        <Section id="memory-work-today" title="Today’s learning" aside={<span className="text-caption text-faint">Counts since midnight</span>}>
+        <Section id="memory-work-today" title="Today’s learning" aside={<span className="text-caption text-faint">{view.todayCaption}</span>}>
           <LearningPipeline stages={view.pipeline} flows={view.flows} />
         </Section>
 

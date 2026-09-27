@@ -221,6 +221,8 @@ export function memoryWorkFixture(state: MemoryWorkFixtureState, now: number = D
     },
     hourly,
     daily,
+    // The journal began 23 days ago: the first daily bar counts from then.
+    measuredSince: iso(now - 23 * DAY),
     recent,
     retention: { detailDays: 7, summaryDays: 90 },
   };
@@ -251,6 +253,7 @@ export function memoryWorkFixture(state: MemoryWorkFixtureState, now: number = D
       today: { ...zeroTotals(), conversationsRead: 0, claimsFound: 0, leftOut: 0, setAside: 0, costUsd: null },
       hourly: [],
       daily: [],
+      measuredSince: null,
       recent: [],
     };
   }

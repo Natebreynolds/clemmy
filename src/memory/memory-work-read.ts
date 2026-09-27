@@ -191,6 +191,7 @@ function buildSnapshot(now: Date, db: Database.Database): MemoryWorkSnapshot {
     today: todayTotals(todayRows),
     hourly: hourly(firstHourMs, hourRows, since?.ms ?? null),
     daily: daily(now, dayRows, since?.day ?? null),
+    measuredSince: since && since.ms > nowMs - DAILY_DAYS * DAY_MS ? new Date(since.ms).toISOString() : null,
     recent: recentEvents(eventRows, titles),
     retention: { ...MEMORY_WORK_RETENTION },
   };
@@ -232,6 +233,7 @@ export function unknownMemoryWorkSnapshot(now: Date = new Date()): MemoryWorkSna
     today: { ...zeroTotals(), conversationsRead: 0, claimsFound: 0, leftOut: 0, setAside: 0, costUsd: null },
     hourly: [],
     daily: [],
+    measuredSince: null,
     recent: [],
     retention: { ...MEMORY_WORK_RETENTION },
   };

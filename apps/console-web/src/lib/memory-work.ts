@@ -253,6 +253,9 @@ export interface PipelineFlows {
 
 export interface ActivityBarView {
   key: string;
+  /** Its place on the strip (0 = oldest hour or day): bars sit in their own
+   *  hour's or day's slot, and slots never measured stay empty. */
+  slot: number;
   label: string;
   value: number;
   /** 0–100, share of the busiest bar; a bar with any work is at least visible. */
@@ -368,14 +371,21 @@ export interface MemoryWorkView {
   pipeline: PipelineStageView[];
   flows: PipelineFlows;
   hourly: ActivityBarView[];
+  /** Slots on the 24-hour strip (one per hour). */
+  hourlySlots: number;
   /** What the 24-hour bars measure. */
   hourlyUnit: 'model calls' | 'runs';
   hourlyEmpty: boolean;
-  /** The 24 hours in one line, shown until a bar is pointed at. */
+  /** The 24 hours in one line, shown until a bar is pointed at; the span
+   *  measured ("since 9:12 AM") when the journal is younger than the strip. */
   hourlySummary: string;
   daily: ActivityBarView[];
+  /** Slots on the 30-day strip (one per day). */
+  dailySlots: number;
   dailyUnit: 'model calls' | 'runs';
   dailyMissing: number;
+  /** "Counts since midnight", or since the journal began when that was today. */
+  todayCaption: string;
   totals: TotalView[];
   jobs: { learning: JobView[]; upkeep: JobView[] };
   timeline: TimelineDayView[];
@@ -438,26 +448,43 @@ function flows(stages: readonly PipelineStageView[]): PipelineFlows {
   return { readToFound: on('found'), foundToKept: on('kept'), foundToAside: on('aside'), keptToFaded: on('faded') };
 }
 
+const HOURLY_SLOTS = 24;
+const DAILY_SLOTS = 30;
+
+/** When the journal began, if it is inside `[from, to)`. */
+function measuredSinceWithin(snapshot: MemoryWorkSnapshot, from: number, to: number): number | null {
+  const t = parse(snapshot.measuredSince ?? null);
+  return Number.isFinite(t) && t >= from && t < to ? t : null;
+}
+
 function hourlyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: ActivityBarView[]; unit: 'model calls' | 'runs'; empty: boolean; summary: string } {
-  const hours = Array.isArray(snapshot.hourly) ? snapshot.hourly : [];
-  const useCalls = hours.some((h) => (count(h.modelCalls) ?? 0) > 0) || !hours.some((h) => (count(h.runs) ?? 0) > 0);
+  const hours = (Array.isArray(snapshot.hourly) ? snapshot.hourly : []).filter((h) => Number.isFinite(parse(h.hourStart)));
+  // Each bar sits in its own hour's slot, counted back from the current hour
+  // (the newest bucket, carried forward to now): a new journal's one hour is
+  // one bar at the right, never a bar across the day.
+  const newest = hours.reduce((max, h) => Math.max(max, parse(h.hourStart)), Number.NEGATIVE_INFINITY);
+  const anchor = Number.isFinite(newest) ? newest + Math.max(0, Math.floor((now - newest) / HOUR_MS)) * HOUR_MS : NaN;
+  const placed = hours
+    .map((h) => ({ h, start: parse(h.hourStart), slot: HOURLY_SLOTS - 1 - Math.round((anchor - parse(h.hourStart)) / HOUR_MS) }))
+    .filter((p) => p.slot >= 0 && p.slot < HOURLY_SLOTS);
+  const useCalls = placed.some(({ h }) => (count(h.modelCalls) ?? 0) > 0) || !placed.some(({ h }) => (count(h.runs) ?? 0) > 0);
   const unit = useCalls ? 'model calls' : 'runs';
-  const values = hours.map((h) => count(useCalls ? h.modelCalls : h.runs) ?? 0);
+  const values = placed.map(({ h }) => count(useCalls ? h.modelCalls : h.runs) ?? 0);
   const max = Math.max(0, ...values);
-  const bars = hours.map((h, i) => {
-    const start = parse(h.hourStart);
+  const bars = placed.map(({ h, start, slot }, i) => {
     const value = values[i] ?? 0;
     const learned = count(h.learned) ?? 0;
     const runs = count(h.runs) ?? 0;
     const calls = count(h.modelCalls) ?? 0;
-    const current = Number.isFinite(start) && now >= start && now < start + HOUR_MS;
-    const label = Number.isFinite(start) ? hourOfDay(start) : '';
-    const tick = Number.isFinite(start) && new Date(start).getHours() % 6 === 0 && !current ? label : null;
+    const current = now >= start && now < start + HOUR_MS;
+    const label = hourOfDay(start);
+    const tick = new Date(start).getHours() % 6 === 0 && !current ? label : null;
     const parts = runs + calls === 0
       ? ['no memory work']
       : [plural(calls, 'model call', 'model calls'), plural(runs, 'run', 'runs'), ...(learned ? [`${learned.toLocaleString()} learned`] : [])];
     return {
-      key: h.hourStart || String(i),
+      key: h.hourStart,
+      slot,
       label,
       value,
       height: max > 0 && value > 0 ? Math.max(8, Math.round((value / max) * 100)) : 0,
@@ -471,34 +498,49 @@ function hourlyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: Activity
   const total = values.reduce((n, v) => n + v, 0);
   const learned = bars.reduce((n, b) => n + b.learned, 0);
   const lead = useCalls ? plural(total, 'model call', 'model calls') : plural(total, 'run', 'runs');
+  // Fewer hours than the strip: the journal began inside it. Say the span
+  // measured, not "the last 24 hours".
+  const first = placed[0]?.start;
+  const since = bars.length < HOURLY_SLOTS && first !== undefined
+    ? `since ${timeOfDay(measuredSinceWithin(snapshot, first, first + HOUR_MS) ?? first)}`
+    : 'in the last 24 hours';
   const summary = empty
-    ? 'No memory work in the last 24 hours.'
-    : `${lead}${learned ? ` · ${learned.toLocaleString()} learned` : ''} in the last 24 hours. Point at a bar for its hour.`;
+    ? `No memory work ${since}.`
+    : `${lead}${learned ? ` · ${learned.toLocaleString()} learned` : ''} ${since}. Point at a bar for its hour.`;
   return { bars, unit, empty, summary };
 }
 
+/** A local calendar day ("2026-09-26") as local noon, so no timezone can move
+ *  it to the neighbouring date. */
+function dayNoon(day: string): number {
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? new Date(`${day}T12:00:00`).getTime() : NaN;
+}
+
 function dailyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: ActivityBarView[]; unit: 'model calls' | 'runs'; missing: number } {
-  const days = Array.isArray(snapshot.daily) ? snapshot.daily.slice(-30) : [];
-  const useCalls = days.some((d) => (count(d.modelCalls) ?? 0) > 0) || !days.some((d) => (count(d.runs) ?? 0) > 0);
-  const values = days.map((d) => count(useCalls ? d.modelCalls : d.runs) ?? 0);
+  const days = (Array.isArray(snapshot.daily) ? snapshot.daily : []).filter((d) => Number.isFinite(dayNoon(d.day)));
+  // Each bar in its own day's slot, counted back from the newest day.
+  const newest = days.reduce((max, d) => Math.max(max, dayNoon(d.day)), Number.NEGATIVE_INFINITY);
+  const placed = days
+    .map((d) => ({ d, t: dayNoon(d.day), slot: DAILY_SLOTS - 1 - Math.round((newest - dayNoon(d.day)) / DAY_MS) }))
+    .filter((p) => p.slot >= 0 && p.slot < DAILY_SLOTS);
+  const useCalls = placed.some(({ d }) => (count(d.modelCalls) ?? 0) > 0) || !placed.some(({ d }) => (count(d.runs) ?? 0) > 0);
+  const values = placed.map(({ d }) => count(useCalls ? d.modelCalls : d.runs) ?? 0);
   const max = Math.max(0, ...values);
   const todayKey = localDayKey(now);
-  const bars = days.map((d, i) => {
-    // `day` is a local calendar day ("2026-09-26"); read it as local noon so
-    // no timezone can move it to the neighbouring date.
-    const t = /^\d{4}-\d{2}-\d{2}$/.test(d.day) ? new Date(`${d.day}T12:00:00`).getTime() : parse(d.day);
+  const bars = placed.map(({ d, t, slot }, i) => {
     const value = values[i] ?? 0;
     const learned = count(d.learned) ?? 0;
     const calls = count(d.modelCalls) ?? 0;
     const runs = count(d.runs) ?? 0;
     const tokens = (count(d.inputTokens) ?? 0) + (count(d.outputTokens) ?? 0);
-    const current = Number.isFinite(t) && localDayKey(t) === todayKey;
-    const label = Number.isFinite(t) ? (current ? 'Today' : shortDate(t)) : d.day;
+    const current = localDayKey(t) === todayKey;
+    const label = current ? 'Today' : shortDate(t);
     const parts = runs + calls === 0
       ? ['no memory work']
       : [plural(calls, 'model call', 'model calls'), plural(runs, 'run', 'runs'), ...(learned ? [`${learned.toLocaleString()} learned`] : []), ...(tokens ? [`${formatTokenCount(tokens)} tokens`] : [])];
     return {
-      key: d.day || String(i),
+      key: d.day,
+      slot,
       label,
       value,
       height: max > 0 && value > 0 ? Math.max(8, Math.round((value / max) * 100)) : 0,
@@ -508,7 +550,14 @@ function dailyBars(snapshot: MemoryWorkSnapshot, now: number): { bars: ActivityB
       readout: `${label} · ${parts.join(' · ')}`,
     };
   });
-  return { bars, unit: useCalls ? 'model calls' : 'runs', missing: Math.max(0, 30 - bars.length) };
+  return { bars, unit: useCalls ? 'model calls' : 'runs', missing: Math.max(0, DAILY_SLOTS - bars.length) };
+}
+
+/** Today's counts start at midnight, or when the journal began if that was
+ *  today. */
+function todayCaption(snapshot: MemoryWorkSnapshot, now: number): string {
+  const began = measuredSinceWithin(snapshot, startOfLocalDay(now), now + 1);
+  return began === null ? 'Counts since midnight' : `Counts since ${timeOfDay(began)}`;
 }
 
 function totals(today: MemoryWorkToday | null | undefined, unknown: boolean): TotalView[] {
@@ -761,12 +810,15 @@ export function memoryWorkViewModel(snapshot: MemoryWorkSnapshot, now: number, o
     pipeline: stages,
     flows: flows(stages),
     hourly: hourly.bars,
+    hourlySlots: HOURLY_SLOTS,
     hourlyUnit: hourly.unit,
     hourlyEmpty: hourly.empty,
     hourlySummary: hourly.summary,
     daily: daily.bars,
+    dailySlots: DAILY_SLOTS,
     dailyUnit: daily.unit,
     dailyMissing: daily.missing,
+    todayCaption: todayCaption(snapshot, now),
     totals: totals(snapshot.today, unknown),
     jobs: jobs(snapshot, fmt, fresh, unknown),
     timeline: tl,

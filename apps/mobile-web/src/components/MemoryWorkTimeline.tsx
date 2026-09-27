@@ -22,6 +22,7 @@ import {
   retentionText,
   serverNow,
   todayFigures,
+  todaySinceText,
   type MemoryWorkRead,
   type ModelNamer,
 } from '../lib/memory-work';
@@ -43,6 +44,7 @@ export function MemoryWorkTimeline({ read, loading, modelName, onChangeModel, on
   const live = status?.pulse ?? false;
   const model = memoryModelView(snapshot, modelName, now);
   const figures = todayFigures(snapshot);
+  const since = todaySinceText(snapshot, now);
   const days = groupByDay(snapshot?.recent ?? [], now);
   const jobs = memoryJobGroups(snapshot, modelName, now, live);
   const queue = queueLine(snapshot?.queue);
@@ -67,7 +69,7 @@ export function MemoryWorkTimeline({ read, loading, modelName, onChangeModel, on
         {snapshot ? (
           <>
             <section class="mw-section" aria-label="Today">
-              <h3>Today</h3>
+              <h3>{since ? `Today · ${since}` : 'Today'}</h3>
               <Pipeline stages={pipelineView(snapshot, live)} />
               {figures.length > 0 ? (
                 <dl class="mw-figures">

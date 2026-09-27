@@ -362,42 +362,72 @@ export interface HourBar {
   height: number;
   /** The hour the Mac's clock is in now. */
   current: boolean;
+  /** Its place on the strip, 0 = 23 hours ago: each bar sits in its own
+   *  hour, and an hour never measured stays blank. */
+  slot: number;
 }
+
+export const HOUR_SLOTS = 24;
+export const DAY_SLOTS = 30;
 
 export interface HourStrip {
   bars: HourBar[];
+  slots: number;
   /** What a bar's height measures: model calls, or runs on a day without any. */
   metric: 'modelCalls' | 'runs';
   totals: { runs: number; modelCalls: number; learned: number };
+  /** When fewer hours than the strip were measured (the journal began
+   *  inside it): the instant counting began. */
+  since: string | null;
 }
 
 function count(value: unknown): number {
   return known(value) && value > 0 ? value : 0;
 }
 
-/** The last 24 hours as bars, oldest first. Null when there is nothing the
- *  daemon could read, so the view shows "—" instead of a flat line of zeros. */
+/** When the journal began, if that falls in `[from, to)`. */
+function measuredSinceWithin(snapshot: MemoryWorkView, from: number, to: number): string | null {
+  const t = snapshot.measuredSince ? Date.parse(snapshot.measuredSince) : Number.NaN;
+  return Number.isFinite(t) && t >= from && t < to ? new Date(t).toISOString() : null;
+}
+
+/** The last 24 hours as bars, oldest first, each in its own hour's slot
+ *  (counted back from the Mac's current hour), so a young journal's one hour
+ *  is one bar at the right, never a bar across the day. Null when there is
+ *  nothing the daemon could read, so the view shows "—" instead of a flat
+ *  line of zeros. */
 export function hourStrip(snapshot: MemoryWorkView | null, now: number): HourStrip | null {
-  if (!snapshot || snapshot.state === 'unknown' || snapshot.hourly.length === 0) return null;
-  const metric: HourStrip['metric'] = snapshot.hourly.some((h) => count(h.modelCalls) > 0) ? 'modelCalls' : 'runs';
-  const max = Math.max(0, ...snapshot.hourly.map((h) => count(h[metric])));
+  if (!snapshot || snapshot.state === 'unknown') return null;
+  const hours = snapshot.hourly.filter((h) => Number.isFinite(Date.parse(h.hourStart)));
+  if (hours.length === 0) return null;
+  const newest = Math.max(...hours.map((h) => Date.parse(h.hourStart)));
+  const anchor = newest + Math.max(0, Math.floor((now - newest) / HOUR)) * HOUR;
+  const placed = hours
+    .map((hour) => ({ hour, start: Date.parse(hour.hourStart), slot: HOUR_SLOTS - 1 - Math.round((anchor - Date.parse(hour.hourStart)) / HOUR) }))
+    .filter((p) => p.slot >= 0 && p.slot < HOUR_SLOTS);
+  const metric: HourStrip['metric'] = placed.some(({ hour }) => count(hour.modelCalls) > 0) ? 'modelCalls' : 'runs';
+  const max = Math.max(0, ...placed.map(({ hour }) => count(hour[metric])));
   const totals = { runs: 0, modelCalls: 0, learned: 0 };
-  const bars = snapshot.hourly.map((hour) => {
-    const start = Date.parse(hour.hourStart);
+  const bars = placed.map(({ hour, start, slot }) => {
     const bar: HourBar = {
       hourStart: hour.hourStart,
       runs: count(hour.runs),
       modelCalls: count(hour.modelCalls),
       learned: count(hour.learned),
       height: max > 0 ? count(hour[metric]) / max : 0,
-      current: Number.isFinite(start) && now >= start && now < start + HOUR,
+      current: now >= start && now < start + HOUR,
+      slot,
     };
     totals.runs += bar.runs;
     totals.modelCalls += bar.modelCalls;
     totals.learned += bar.learned;
     return bar;
   });
-  return { bars, metric, totals };
+  const first = placed[0]?.start;
+  const since = bars.length < HOUR_SLOTS && first !== undefined
+    ? measuredSinceWithin(snapshot, first, first + HOUR) ?? new Date(first).toISOString()
+    : null;
+  return { bars, slots: HOUR_SLOTS, metric, totals, since };
 }
 
 function workFigures(parts: { runs: number; modelCalls: number; learned: number }): string {
@@ -408,8 +438,12 @@ function workFigures(parts: { runs: number; modelCalls: number; learned: number 
   return out.join(' · ');
 }
 
+/** "Last 24 hours · …", or the span measured ("Since 9:12 AM · …") while the
+ *  journal is younger than the strip. */
 export function hourStripSummary(strip: HourStrip | null): string {
-  return strip ? `Last 24 hours · ${workFigures(strip.totals)}` : 'Last 24 hours · —';
+  if (!strip) return 'Last 24 hours · —';
+  const span = strip.since ? `Since ${timeOfDayText(strip.since)}` : 'Last 24 hours';
+  return `${span} · ${workFigures(strip.totals)}`;
 }
 
 /** "3 PM · 2 runs · 9 model calls · 2 learned", or "This hour · …". */
@@ -429,18 +463,31 @@ export interface DayBar {
   tokens: number;
   height: number;
   today: boolean;
+  /** Its place on the strip, 0 = 29 days ago; a day with no record stays blank. */
+  slot: number;
 }
 
-/** The daily totals the daemon keeps, oldest first. A day it has no row for
- *  is absent, not a zero. */
-export function dayStrip(snapshot: MemoryWorkView | null, now: number): { bars: DayBar[]; summary: string } | null {
-  if (!snapshot || snapshot.state === 'unknown' || snapshot.daily.length === 0) return null;
-  const metric = snapshot.daily.some((d) => count(d.modelCalls) > 0) ? 'modelCalls' : 'runs';
-  const max = Math.max(0, ...snapshot.daily.map((d) => count(d[metric])));
+/** A calendar day ("2026-09-26") at noon, so no time zone moves it. */
+function dayNoon(day: string): number {
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? new Date(`${day}T12:00:00`).getTime() : Number.NaN;
+}
+
+/** The daily totals the daemon keeps, oldest first, each in its own day's
+ *  slot. A day it has no row for is blank, not a zero. */
+export function dayStrip(snapshot: MemoryWorkView | null, now: number): { bars: DayBar[]; slots: number; summary: string } | null {
+  if (!snapshot || snapshot.state === 'unknown') return null;
+  const days = snapshot.daily.filter((d) => Number.isFinite(dayNoon(d.day)));
+  if (days.length === 0) return null;
+  const newest = Math.max(...days.map((d) => dayNoon(d.day)));
+  const placed = days
+    .map((day) => ({ day, slot: DAY_SLOTS - 1 - Math.round((newest - dayNoon(day.day)) / DAY) }))
+    .filter((p) => p.slot >= 0 && p.slot < DAY_SLOTS);
+  const metric = placed.some(({ day }) => count(day.modelCalls) > 0) ? 'modelCalls' : 'runs';
+  const max = Math.max(0, ...placed.map(({ day }) => count(day[metric])));
   const todayKey = dayKey(now);
   let learned = 0;
   let calls = 0;
-  const bars = snapshot.daily.map((day) => {
+  const bars = placed.map(({ day, slot }) => {
     learned += count(day.learned);
     calls += count(day.modelCalls);
     return {
@@ -451,11 +498,20 @@ export function dayStrip(snapshot: MemoryWorkView | null, now: number): { bars: 
       tokens: count(day.inputTokens) + count(day.outputTokens),
       height: max > 0 ? count(day[metric]) / max : 0,
       today: day.day === todayKey,
+      slot,
     };
   });
   const span = bars.length === 1 ? 'Today' : `Last ${bars.length} days`;
   const figures = [plural(calls, 'model call', 'model calls'), `${learned.toLocaleString()} learned`];
-  return { bars, summary: `${span} · ${figures.join(' · ')}` };
+  return { bars, slots: DAY_SLOTS, summary: `${span} · ${figures.join(' · ')}` };
+}
+
+/** "since 9:12 AM" when the journal began today (on the Mac's clock): the
+ *  day's zeros count only from then. Null on a full day. */
+export function todaySinceText(snapshot: MemoryWorkView | null, now: number): string | null {
+  if (!snapshot || snapshot.state === 'unknown') return null;
+  const since = measuredSinceWithin(snapshot, localDayStart(now), now + 1);
+  return since ? `since ${timeOfDayText(since)}` : null;
 }
 
 /** "2026-09-26" on this phone's calendar. */

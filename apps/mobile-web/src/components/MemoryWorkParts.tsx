@@ -109,13 +109,16 @@ export function HourStripView({ strip }: { strip: HourStrip | null }) {
     holdOpen();
     releaseTimer.current = setTimeout(() => setPicked(null), 5_000);
   };
+  const slots = strip?.slots ?? bars.length;
   const pickAt = (clientX: number) => {
     const el = barsRef.current;
     if (!el || bars.length === 0) return;
     const rect = el.getBoundingClientRect();
     if (rect.width <= 0) return;
-    const at = Math.floor(((clientX - rect.left) / rect.width) * bars.length);
-    const next = Math.min(bars.length - 1, Math.max(0, at));
+    // The slot under the finger, then the measured hour nearest it.
+    const slot = Math.min(slots - 1, Math.max(0, Math.floor(((clientX - rect.left) / rect.width) * slots)));
+    let next = 0;
+    bars.forEach((bar, i) => { if (Math.abs(bar.slot - slot) < Math.abs(bars[next]!.slot - slot)) next = i; });
     if (next !== index) haptic('light');
     setPicked(next);
   };
@@ -155,16 +158,23 @@ export function HourStripView({ strip }: { strip: HourStrip | null }) {
           releaseSoon();
         }}
       >
-        {bars.map((bar, i) => (
-          <span
-            key={bar.hourStart}
-            class={`mw-bar${bar.current ? ' is-now' : ''}${i === index ? ' is-picked' : ''}${bar.height > 0 ? '' : ' is-empty'}`}
-            style={{ '--h': bar.height }}
-          >
-            <i />
-            {bar.learned > 0 ? <b class="mw-bar-learned" /> : null}
-          </span>
-        ))}
+        {/* Each hour in its own slot; an hour before the record began is
+            blank, not a bar. */}
+        {Array.from({ length: slots }, (_, slot) => {
+          const i = bars.findIndex((bar) => bar.slot === slot);
+          const bar = i >= 0 ? bars[i] : undefined;
+          if (!bar) return <span key={`blank-${slot}`} class="mw-bar" />;
+          return (
+            <span
+              key={bar.hourStart}
+              class={`mw-bar${bar.current ? ' is-now' : ''}${i === index ? ' is-picked' : ''}${bar.height > 0 ? '' : ' is-empty'}`}
+              style={{ '--h': bar.height }}
+            >
+              <i />
+              {bar.learned > 0 ? <b class="mw-bar-learned" /> : null}
+            </span>
+          );
+        })}
       </div>
       <div class="mw-axis" aria-hidden="true"><span>24 h ago</span><span>now</span></div>
       <p class="mw-caption" aria-hidden="true">{caption}</p>
@@ -172,17 +182,21 @@ export function HourStripView({ strip }: { strip: HourStrip | null }) {
   );
 }
 
-export function DayStripView({ strip }: { strip: { bars: DayBar[]; summary: string } | null }) {
+export function DayStripView({ strip }: { strip: { bars: DayBar[]; slots: number; summary: string } | null }) {
   if (!strip) return null;
   return (
     <div class="mw-days">
       <div class="mw-days-bars" role="img" aria-label={strip.summary}>
-        {strip.bars.map((bar) => (
-          <span key={bar.day} class={`mw-bar${bar.today ? ' is-now' : ''}${bar.height > 0 ? '' : ' is-empty'}`} style={{ '--h': bar.height }}>
-            <i />
-            {bar.learned > 0 ? <b class="mw-bar-learned" /> : null}
-          </span>
-        ))}
+        {Array.from({ length: strip.slots }, (_, slot) => {
+          const bar = strip.bars.find((b) => b.slot === slot);
+          if (!bar) return <span key={`blank-${slot}`} class="mw-bar" />;
+          return (
+            <span key={bar.day} class={`mw-bar${bar.today ? ' is-now' : ''}${bar.height > 0 ? '' : ' is-empty'}`} style={{ '--h': bar.height }}>
+              <i />
+              {bar.learned > 0 ? <b class="mw-bar-learned" /> : null}
+            </span>
+          );
+        })}
       </div>
       <p class="mw-caption" aria-hidden="true">{strip.summary}</p>
     </div>

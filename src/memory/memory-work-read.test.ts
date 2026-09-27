@@ -118,6 +118,10 @@ test('an empty home gives a resting snapshot with every contract key, zeros only
   assert.deepEqual(snap.hourly, [{ hourStart: thisHour, runs: 0, modelCalls: 0, learned: 0 }]);
   // The journal began today: today is a genuine zero, earlier days are absent.
   assert.deepEqual(snap.daily, [{ day: localDayKey(now), runs: 0, modelCalls: 0, learned: 0, inputTokens: 0, outputTokens: 0 }]);
+  // ... and counted only from when it began, which the apps say ("since").
+  // (It is stamped when the journal first opens, inside this very read.)
+  assert.ok(snap.measuredSince && Date.parse(snap.measuredSince) <= Date.now()
+    && Date.parse(snap.measuredSince) >= Date.parse(snap.hourly[0].hourStart), 'the journal began inside the first hour shown');
 
   const byId = new Map(snap.jobs.map((j) => [j.id, j]));
   assert.equal(byId.get('learn')?.next?.trigger, 'after_conversation');
@@ -440,7 +444,10 @@ test('the 30-day strip leaves out days before the journal began and zero-fills t
   const dayOf = (daysAgo: number) => localDayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo));
   db.prepare('INSERT INTO memory_work_daily (day, job, runs, model_calls, learned) VALUES (?, ?, ?, ?, ?)').run(dayOf(5), 'learn', 3, 3, 2);
   const snap = readMemoryWork(now);
+  assert.equal(snap.measuredSince, new Date(sinceMs).toISOString());
   assert.deepEqual(snap.daily.map((d) => d.day), [dayOf(5), dayOf(3), dayOf(2), dayOf(1), dayOf(0)]);
+  db.prepare(`UPDATE memory_work_meta SET value = ? WHERE key = 'journal_since'`).run(new Date(now.getTime() - 40 * DAY).toISOString());
+  assert.equal(readMemoryWork(now).measuredSince, null, 'a journal older than the strips measured all of them');
   assert.deepEqual(snap.daily[0], { day: dayOf(5), runs: 3, modelCalls: 3, learned: 2, inputTokens: 0, outputTokens: 0 });
   assert.equal(snap.daily[1].runs, 0);
 });

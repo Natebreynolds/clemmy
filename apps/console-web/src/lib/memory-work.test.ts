@@ -448,6 +448,33 @@ test('the 30-day strip leaves days before the record began blank, not zero', () 
   assert.equal(view.dailyMissing, 6);
   assert.equal(view.daily[view.daily.length - 1]?.label, 'Today');
   assert.equal(view.daily[view.daily.length - 1]?.current, true);
+  assert.deepEqual(view.daily.map((b) => b.slot), Array.from({ length: 24 }, (_, i) => i + 6), 'each day in its own slot');
+});
+
+test('a new journal\'s one hour and one day sit at the right of their strips, and say since when', () => {
+  // Install day: the journal began at 3:12 PM; the daemon sends only the hour
+  // and the day it has measured.
+  const began = new Date(2026, 8, 26, 15, 12, 0).getTime();
+  const start = new Date(NOW); start.setMinutes(0, 0, 0);
+  const view = memoryWorkViewModel(snapshot({
+    measuredSince: iso(began),
+    hourly: [{ hourStart: iso(start.getTime()), runs: 0, modelCalls: 0, learned: 0 }],
+    daily: [{ day: '2026-09-26', runs: 0, modelCalls: 0, learned: 0, inputTokens: 0, outputTokens: 0 }],
+  }), NOW);
+  assert.deepEqual(view.hourly.map((b) => b.slot), [23], 'one bar in the current hour\'s slot, not across the day');
+  assert.equal(view.hourlySlots, 24);
+  assert.deepEqual(view.daily.map((b) => b.slot), [29]);
+  assert.equal(view.dailySlots, 30);
+  const time = new Date(began).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  assert.equal(view.hourlySummary, `No memory work since ${time}.`, 'the span measured, not "the last 24 hours"');
+  assert.equal(view.todayCaption, `Counts since ${time}`, 'today\'s zeros count from when the journal began');
+  // An hour in the middle of the strip with no record stays blank too.
+  const gappy = memoryWorkViewModel(snapshot({
+    measuredSince: null,
+    hourly: [{ hourStart: iso(start.getTime() - 5 * HOUR), runs: 1, modelCalls: 2, learned: 0 }, { hourStart: iso(start.getTime()), runs: 0, modelCalls: 0, learned: 0 }],
+  }), NOW);
+  assert.deepEqual(gappy.hourly.map((b) => b.slot), [18, 23]);
+  assert.equal(memoryWorkViewModel(snapshot({ measuredSince: null }), NOW).todayCaption, 'Counts since midnight');
 });
 
 // ─── time words ──────────────────────────────────────────────────────────────

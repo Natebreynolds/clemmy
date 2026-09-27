@@ -9,13 +9,14 @@ import { useRef, useState, type KeyboardEvent } from 'react';
 import { clsx } from 'clsx';
 import type { ActivityBarView, MemoryWorkView } from '@/lib/memory-work';
 
-function BarStrip({ bars, label, summary, heightClass, missing = 0, ticks }: {
+function BarStrip({ bars, slots, label, summary, heightClass, ticks }: {
   bars: ActivityBarView[];
+  /** Slots on the strip; each bar sits in its own (`bar.slot`), and a slot
+   *  never measured (before history began) stays blank. */
+  slots: number;
   label: string;
   summary: string;
   heightClass: string;
-  /** Leading slots with no record at all (before history began): left blank. */
-  missing?: number;
   ticks: 'hours' | 'ends';
 }) {
   const [shown, setShown] = useState<number | null>(null);
@@ -33,62 +34,69 @@ function BarStrip({ bars, label, summary, heightClass, missing = 0, ticks }: {
     else if (e.key === 'Home') { e.preventDefault(); go(0); }
     else if (e.key === 'End') { e.preventDefault(); go(bars.length - 1); }
   };
-  const slots = missing + bars.length;
+  const bySlot = new Map(bars.map((bar, i) => [bar.slot, i] as const));
+  const slotList = Array.from({ length: slots }, (_, slot) => slot);
+  const first = bars[0];
+  const last = bars[bars.length - 1];
   return (
     <div className="min-w-0">
       <div role="group" aria-label={label} className={clsx('flex items-end', heightClass)} onMouseLeave={() => setShown(null)}>
-        {Array.from({ length: missing }, (_, i) => <span key={`missing-${i}`} className="h-full flex-1" aria-hidden />)}
-        {bars.map((bar, i) => (
-          <button
-            key={bar.key}
-            ref={(el) => { refs.current[i] = el; }}
-            type="button"
-            tabIndex={i === tabAt ? 0 : -1}
-            aria-label={bar.readout}
-            onMouseEnter={() => setShown(i)}
-            onFocus={() => { setShown(i); setStop(i); }}
-            onBlur={() => setShown(null)}
-            onKeyDown={(e) => onKey(e, i)}
-            className="group relative flex h-full min-w-0 flex-1 cursor-default items-end justify-center rounded-[3px] px-[1.5px]"
-          >
-            <span
-              aria-hidden
-              className={clsx(
-                'block w-full max-w-[1.25rem] rounded-t-[3px] transition-colors duration-fast',
-                bar.value === 0 ? 'bg-border' : clsx('memory-bar', (bar.current || shown === i) && 'is-strong'),
-              )}
-              style={{ height: bar.value > 0 ? `${bar.height}%` : '2px' }}
-            />
-            {bar.learned > 0 && (
+        {slotList.map((slot) => {
+          const i = bySlot.get(slot);
+          const bar = i === undefined ? undefined : bars[i];
+          if (i === undefined || !bar) return <span key={`blank-${slot}`} className="h-full flex-1" aria-hidden />;
+          return (
+            <button
+              key={bar.key}
+              ref={(el) => { refs.current[i] = el; }}
+              type="button"
+              tabIndex={i === tabAt ? 0 : -1}
+              aria-label={bar.readout}
+              onMouseEnter={() => setShown(i)}
+              onFocus={() => { setShown(i); setStop(i); }}
+              onBlur={() => setShown(null)}
+              onKeyDown={(e) => onKey(e, i)}
+              className="group relative flex h-full min-w-0 flex-1 cursor-default items-end justify-center rounded-[3px] px-[1.5px]"
+            >
               <span
                 aria-hidden
-                className="absolute left-1/2 h-1.5 w-1.5 -translate-x-1/2 rounded-full bg-primary"
-                style={{ bottom: bar.value > 0 ? `calc(${bar.height}% + 3px)` : '5px' }}
+                className={clsx(
+                  'block w-full max-w-[1.25rem] rounded-t-[3px] transition-colors duration-fast',
+                  bar.value === 0 ? 'bg-border' : clsx('memory-bar', (bar.current || shown === i) && 'is-strong'),
+                )}
+                style={{ height: bar.value > 0 ? `${bar.height}%` : '2px' }}
               />
-            )}
-          </button>
-        ))}
+              {bar.learned > 0 && (
+                <span
+                  aria-hidden
+                  className="absolute left-1/2 h-1.5 w-1.5 -translate-x-1/2 rounded-full bg-primary"
+                  style={{ bottom: bar.value > 0 ? `calc(${bar.height}% + 3px)` : '5px' }}
+                />
+              )}
+            </button>
+          );
+        })}
       </div>
       <div className="relative mt-1 flex h-4 text-caption leading-4 text-faint" aria-hidden>
         {ticks === 'hours'
-          ? (
+          ? slotList.map((slot) => {
+            const i = bySlot.get(slot);
+            const bar = i === undefined ? undefined : bars[i];
+            return (
+              <span key={`t-${slot}`} className="relative flex-1">
+                {bar && (bar.tick || bar.current) && (
+                  <span className={clsx('absolute left-1/2 -translate-x-1/2 whitespace-nowrap', bar.current && 'font-semibold text-muted')}>
+                    {bar.current ? 'now' : bar.tick}
+                  </span>
+                )}
+              </span>
+            );
+          })
+          : first && last && (
             <>
-              {Array.from({ length: missing }, (_, i) => <span key={`tm-${i}`} className="flex-1" />)}
-              {bars.map((bar) => (
-                <span key={bar.key} className="relative flex-1">
-                  {(bar.tick || bar.current) && (
-                    <span className={clsx('absolute left-1/2 -translate-x-1/2 whitespace-nowrap', bar.current && 'font-semibold text-muted')}>
-                      {bar.current ? 'now' : bar.tick}
-                    </span>
-                  )}
-                </span>
-              ))}
-            </>
-          )
-          : bars.length > 0 && (
-            <>
-              <span style={{ marginLeft: `${(missing / slots) * 100}%` }}>{bars[0]?.label}</span>
-              <span className="ml-auto">{bars[bars.length - 1]?.label}</span>
+              {/* One day of history has one label, not the same one twice. */}
+              {first !== last && <span style={{ marginLeft: `${(first.slot / slots) * 100}%` }}>{first.label}</span>}
+              <span className="ml-auto">{last.label}</span>
             </>
           )}
       </div>
@@ -113,17 +121,17 @@ export function ActivityStrip({ view }: { view: MemoryWorkView }) {
           </div>
           {view.hourly.length === 0
             ? <p className="text-small text-muted">— <span className="text-faint">couldn’t be read</span></p>
-            : <BarStrip bars={view.hourly} label="Memory work in the last 24 hours, by hour" summary={view.hourlySummary} heightClass="h-16" ticks="hours" />}
+            : <BarStrip bars={view.hourly} slots={view.hourlySlots} label="Memory work in the last 24 hours, by hour" summary={view.hourlySummary} heightClass="h-16" ticks="hours" />}
         </div>
         {view.daily.length > 0 && (
           <div>
             <h4 className="mb-2 text-small font-semibold text-fg">Last 30 days</h4>
             <BarStrip
               bars={view.daily}
+              slots={view.dailySlots}
               label="Memory work in the last 30 days, by day"
               summary={view.dailyMissing > 0 ? `Daily totals start ${view.daily[0]?.label}; there is no record before that.` : `Bars show ${view.dailyUnit} per day.`}
               heightClass="h-9"
-              missing={view.dailyMissing}
               ticks="ends"
             />
           </div>
