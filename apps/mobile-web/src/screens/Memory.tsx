@@ -35,7 +35,7 @@ import {
   type ModelSettings,
 } from '../lib/api';
 import { humanizeReasons } from '../lib/memory-reasons';
-import { MEMORY_WORK_POLL_MS, normalizeMemoryWork, type MemoryWorkRead } from '../lib/memory-work';
+import { MEMORY_WORK_LIVE_MS, MEMORY_WORK_POLL_MS, normalizeMemoryWork, type MemoryWorkRead } from '../lib/memory-work';
 import { modelLabel } from '../lib/model-roles';
 import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import { ChatBackButton } from '../components/ChatBackButton';
@@ -133,6 +133,7 @@ export function Memory() {
     intervalMs: MEMORY_WORK_POLL_MS,
     disabled: openFactId !== null || openEntityId !== null || (Boolean(searchQuery) && !workOpen),
   });
+  useLiveExpiry(Boolean(work.data && work.data.state === 'working' && work.data.running.length > 0), work.updatedAt);
   const workRead: MemoryWorkRead = {
     snapshot: work.data,
     error: work.error,
@@ -176,13 +177,17 @@ export function Memory() {
   );
 
   // The full view is depth, like a run on Activity: the swipe-back closes it.
-  useBackGesture(workOpen, () => setWorkOpen(false));
+  // The picker registers no back entry of its own (a second entry would make
+  // a tap-close unwind two levels), so a swipe while it is open over the full
+  // view closes both together instead of leaving it floating over the card.
+  const leaveWork = () => { setModelSheet(false); setWorkOpen(false); };
+  useBackGesture(workOpen, leaveWork);
   const openWork = () => {
     haptic('light');
     withDepthTransition(() => setWorkOpen(true));
     document.querySelector('.app-main')?.scrollTo({ top: 0 });
   };
-  const closeWork = () => withDepthTransition(() => setWorkOpen(false));
+  const closeWork = () => withDepthTransition(leaveWork);
 
   if (openFactId !== null) {
     return (
@@ -281,6 +286,23 @@ export function Memory() {
       {modelPicker}
     </div>
   );
+}
+
+/**
+ * A read vouches that a job is running for MEMORY_WORK_LIVE_MS, and only a
+ * render can notice that it has stopped vouching. A poll that hangs (a
+ * stalled relay, a Mac asleep mid-request) changes no state, so nothing would
+ * render again until the fetch gave up; this schedules the render that stops
+ * the motion on time. The small margin keeps it past the line, not on it.
+ */
+function useLiveExpiry(working: boolean, receivedAt: number | null): void {
+  const [, setChecked] = useState(0);
+  useEffect(() => {
+    if (!working || receivedAt === null) return;
+    const left = Math.max(0, receivedAt + MEMORY_WORK_LIVE_MS - Date.now());
+    const timer = setTimeout(() => setChecked((n) => n + 1), left + 250);
+    return () => clearTimeout(timer);
+  }, [working, receivedAt]);
 }
 
 /** "Remember this" — rides the daemon's dedup-aware consolidation, so adding

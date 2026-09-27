@@ -37,6 +37,7 @@ import {
   ROLE_COPY,
   brainSummary,
   inactiveNote,
+  roleNote,
   roleSummary,
   sameFamilyWarning,
   judgeFallbackChoices,
@@ -504,7 +505,7 @@ function ModelsCard({ loaded, onRefresh }: {
                 title={ROLE_COPY[role].title}
                 summary={roleSummary(role, settings)}
                 warning={inactiveNote(settings.roles[role], settings, role)}
-                note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : null}
+                note={role === 'judge' && reviewOff ? 'Review of finished work is off.' : roleNote(role, settings)}
                 onOpen={() => setSheet(role)}
               />
               {role === 'judge' && settings.judgeFallback ? (

@@ -52,6 +52,7 @@ import {
   inactiveNote,
   modelLabel,
   roleAutomaticText,
+  roleNote,
   roleSummary,
   sameFamilyWarning,
 } from './model-roles';
@@ -168,6 +169,21 @@ test('today\'s pipeline shows "—" for anything the daemon could not count', ()
   assert.equal(countText(Number.NaN), '—');
   assert.equal(countText(1234), (1234).toLocaleString());
   assert.deepEqual(todayFigures(view('unknown')), []);
+});
+
+test('a journal the daemon could not read never says a job did not run', () => {
+  // The daemon's unread snapshot: jobs with no last run, zero-filled totals
+  // and retention still set (see the fixture). None of it was counted.
+  const unread = view('unknown');
+  assert.ok(unread.retention && unread.jobs.length > 0);
+  assert.ok(unread.jobs.every((j) => !j.lastRun && j.today.runs === 0));
+  const jobs = memoryJobGroups(unread, namer, NOW, false).flatMap((g) => g.jobs);
+  assert.ok(jobs.length > 0);
+  for (const job of jobs) {
+    assert.doesNotMatch(job.last, /No run|No recent run/, `${job.id}: an unread journal is not "no run"`);
+    assert.equal(job.last, 'Last run —');
+    assert.equal(job.today, null, `${job.id}: zero-filled totals on an unread day are not today's figures`);
+  }
 });
 
 test('a stage lights only while its job runs, and only on a live read', () => {
@@ -403,6 +419,29 @@ test('the memory row names its model from the catalog, including a memory-only m
   assert.equal(modelLabel('unknown-id', settings), 'unknown-id');
 });
 
+test('the memory row says whose model Automatic borrows from the daemon\'s "follows", never from a matching id', () => {
+  assert.equal(roleNote('memory', settings), MEMORY_ROLE_WORDS.automaticChecker);
+  // The daemon resolved the checker's model, which happens to be the brain's
+  // id too: the row still says the checker, as the picker does.
+  const sharedId: ModelSettings = {
+    ...settings,
+    roles: { ...settings.roles, memory: { modelId: 'brain-model', provider: 'byo', source: 'default', follows: 'checker' } },
+  };
+  assert.equal(roleSummary('memory', sharedId), 'Automatic · Provider A — Main model');
+  assert.equal(roleNote('memory', sharedId), MEMORY_ROLE_WORDS.automaticChecker);
+  assert.equal(roleNote('memory', sharedId), roleAutomaticText('memory', sharedId.roles!.memory), 'row and picker agree');
+  const brain: ModelSettings = { ...settings, roles: { ...settings.roles, memory: { ...sharedId.roles!.memory!, follows: 'brain' } } };
+  assert.equal(roleNote('memory', brain), MEMORY_ROLE_WORDS.automaticBrain);
+  const chosen: ModelSettings = { ...settings, roles: { ...settings.roles, memory: { modelId: FIXTURE_MEMORY_MODEL, provider: 'byo', source: 'settings', follows: 'checker' } } };
+  assert.equal(roleNote('memory', chosen), null, 'a chosen model borrows nothing');
+  const none: ModelSettings = { ...settings, roles: { ...settings.roles, memory: { modelId: '', provider: '', source: 'default', follows: 'checker' } } };
+  assert.equal(roleNote('memory', none), null, 'no model: the summary already says so');
+  const unsaid: ModelSettings = { ...settings, roles: { ...settings.roles, memory: { modelId: FIXTURE_MEMORY_MODEL, provider: 'byo', source: 'default' } } };
+  assert.equal(roleNote('memory', unsaid), null, 'an older daemon that does not say whose model: the phone does not guess');
+  assert.equal(roleNote('writer', settings), null);
+  assert.equal(roleSummary('writer', settings), 'Same model that does the work', 'request roles keep their reading');
+});
+
 test('with no model at all the memory row says so, and a missing pick waits instead of naming a stand-in', () => {
   const none: ModelSettings = { ...settings, roles: { ...settings.roles, memory: { modelId: '', provider: '', source: 'default', follows: null } } };
   assert.equal(roleSummary('memory', none), 'Automatic · no model available right now');
@@ -441,7 +480,12 @@ test('Memory shows the card above the tabs, polls only while on screen, and need
     'search results replace the card, as they replace the tabs');
   assert.match(memory, /intervalMs: MEMORY_WORK_POLL_MS/);
   assert.match(memory, /disabled: openFactId !== null \|\| openEntityId !== null \|\| \(Boolean\(searchQuery\) && !workOpen\)/);
-  assert.match(memory, /useBackGesture\(workOpen,/, 'the full view closes with the swipe-back gesture');
+  assert.match(memory, /useBackGesture\(workOpen, leaveWork\)/, 'the full view closes with the swipe-back gesture');
+  assert.match(memory, /const leaveWork = \(\) => \{ setModelSheet\(false\); setWorkOpen\(false\); \};/,
+    'a swipe while the picker is open over the full view closes both, never leaving the sheet over the card');
+  assert.match(memory, /const closeWork = \(\) => withDepthTransition\(leaveWork\);/, 'the arrow and the swipe close the same way');
+  assert.doesNotMatch(read('../components/RoleSheet.tsx'), /useBackGesture/,
+    'the picker takes no back entry: a tap-close would unwind two levels (back-gesture.ts)');
   assert.match(memory, /<RoleSheet[\s\S]*?role=\{modelSheet \? 'memory' : null\}/, 'the picker opens in place');
   assert.match(memory, /modelSettings\?\.roles\?\.memory \?/, 'Change appears only when this Mac offers the role');
   assert.equal(MEMORY_WORK_POLL_MS, 8_000);
@@ -457,6 +501,12 @@ test('the pulse renders only from the certified flag, and only the headline is a
   assert.ok(pulses.length >= 2);
   assert.equal((parts.match(/aria-live=/g) ?? []).length, 1, 'one polite live region: the headline');
   assert.match(parts, /<p class="mw-headline" aria-live="polite">/);
+  // A hung poll changes no state, so the screen schedules the render that
+  // stops the motion when the last read stops vouching for it.
+  const memory = read('../screens/Memory.tsx');
+  assert.match(memory, /useLiveExpiry\(Boolean\(work\.data && work\.data\.state === 'working' && work\.data\.running\.length > 0\), work\.updatedAt\);/);
+  assert.match(memory, /function useLiveExpiry[\s\S]*?receivedAt \+ MEMORY_WORK_LIVE_MS - Date\.now\(\)[\s\S]*?setTimeout\(/);
+  assert.match(memory, /receivedAt: work\.updatedAt,\s*now: Date\.now\(\),/, 'the certificate is judged on the clock at render');
   const css = read('../styles.css');
   assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{\s*\.mw-flow\.is-flowing i \{ animation: none;/,
     'the flow between stages is still for anyone who asked for less motion');
@@ -475,6 +525,8 @@ test('Settings lists the memory row, and the picker warns about providers only f
   const settingsSource = read('../screens/Settings.tsx');
   assert.match(settingsSource, /\(\['writer', 'judge', 'worker', 'memory'\] as const\)\.map\(\(role\) => settings\.roles\?\.\[role\]/,
     'a daemon that does not offer the role hides the row');
+  assert.match(settingsSource, /note=\{role === 'judge' && reviewOff \? 'Review of finished work is off\.' : roleNote\(role, settings\)\}/,
+    'the memory row says whose model Automatic borrows, from the daemon');
   const sheet = read('../components/RoleSheet.tsx');
   assert.match(sheet, /role === 'judge' \|\| role === 'writer' \? sameFamilyWarning\(settings\) : null/);
   assert.match(sheet, /roleAutomaticText\(role, resolved\)/);

@@ -669,9 +669,12 @@ export interface MemoryJobView {
   stateText: string;
   /** "Provider — Model · Keeps your memory", "Runs on this Mac". */
   model: string;
+  /** "Last ran 4 min ago · done", "No run in the last 7 days", or
+   *  "Last run —" when the journal could not be read. */
   last: string;
   next: string;
-  /** "2 runs today · 9 model calls · 12k tokens"; null on a day it did not run. */
+  /** "2 runs today · 9 model calls · 12k tokens"; null on a day it did not
+   *  run, or on one the daemon could not read. */
   today: string | null;
 }
 
@@ -700,12 +703,15 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkView, modelName: Mode
     : job.state === 'waiting' ? 'Waiting'
     : job.state === 'off' ? 'Off'
     : '';
+  // A journal the daemon could not read says nothing about when a job ran:
+  // its last run and today's figures are unknown, never "no run" or none.
+  const unread = snapshot.state === 'unknown';
   const lastRun = job.lastRun;
   const detailDays = snapshot.retention && known(snapshot.retention.detailDays) ? snapshot.retention.detailDays : null;
-  const last = lastRun
-    ? `Last ran ${fmt.age(lastRun.at)} · ${OUTCOME_WORDS[lastRun.outcome] ?? lastRun.outcome}`
+  const last = unread ? 'Last run —'
+    : lastRun ? `Last ran ${fmt.age(lastRun.at)} · ${OUTCOME_WORDS[lastRun.outcome] ?? lastRun.outcome}`
     : detailDays ? `No run in the last ${plural(detailDays, 'day', 'days')}` : 'No recent run';
-  const today = job.today;
+  const today = unread ? null : job.today;
   let todayLine: string | null = null;
   if (today && count(today.runs) > 0) {
     const parts = [`${plural(today.runs, 'run', 'runs')} today`];

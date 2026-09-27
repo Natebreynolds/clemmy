@@ -35,6 +35,14 @@ function job(id: MemoryJobId, patch: Partial<MemoryJobStatus>): MemoryJobStatus 
   return { id, modelOwner: owner[id], state: 'idle', today: zeroTotals(), ...patch };
 }
 
+/** The jobs as the daemon sends them. When it cannot read the journal, every
+ *  job has no last run and zero-filled totals (the contract's totals are
+ *  plain numbers), so only `state: 'unknown'` says none of it was counted. */
+function jobsAsSent(unknown: boolean, jobs: MemoryJobStatus[]): MemoryJobStatus[] {
+  if (!unknown) return jobs;
+  return jobs.map((j) => ({ ...j, state: 'idle', modelId: null, lastRun: null, today: zeroTotals() }));
+}
+
 function events(now: number): MemoryWorkEvent[] {
   const at = (ago: number) => iso(now - ago);
   const expires = (ago: number) => iso(now - ago + 7 * DAY);
@@ -155,8 +163,8 @@ export function memoryWorkFixture(state: MemoryWorkState = 'resting', now = Date
       lastServed: unknown ? null : { modelId: FIXTURE_MEMORY_MODEL, at: iso(now - 4 * MINUTE), standIn: false },
       unavailable: waiting ? { problem: 'quota', until: iso(now + 25 * MINUTE) } : null,
     },
-    embedder: { modelId: FIXTURE_EMBEDDER, local: true },
-    jobs: [
+    embedder: unknown ? null : { modelId: FIXTURE_EMBEDDER, local: true },
+    jobs: jobsAsSent(unknown, [
       job('learn', {
         state: working ? 'running' : waiting ? 'waiting' : off ? 'off' : 'idle',
         modelId: FIXTURE_MEMORY_MODEL,
@@ -183,9 +191,9 @@ export function memoryWorkFixture(state: MemoryWorkState = 'resting', now = Date
         today: { runs: 9, modelCalls: 0, inputTokens: 0, outputTokens: 0, learned: 0, updated: 0, faded: 0 },
       }),
       job('tidy', { modelId: null, lastRun: { at: iso(now - DAY - 2 * HOUR), outcome: 'ok' }, next: { trigger: 'nightly', at: iso(now + 10 * HOUR) } }),
-    ],
+    ]),
     today: unknown
-      ? (null as unknown as MemoryWorkSnapshot['today'])
+      ? { ...zeroTotals(), conversationsRead: 0, claimsFound: 0, leftOut: 0, setAside: 0, costUsd: null }
       : {
           runs: 18, modelCalls: 17, inputTokens: 47_600, outputTokens: 5_470, learned: 8, updated: 3, faded: 3,
           conversationsRead: 5, claimsFound: 19, leftOut: 4, setAside: 3, costUsd: null,

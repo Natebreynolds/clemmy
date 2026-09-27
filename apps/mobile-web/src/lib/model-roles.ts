@@ -144,8 +144,19 @@ export function roleSummary(role: ModelRoleName, settings: ModelSettings): strin
     return isChosen(resolved) ? 'No model available right now' : 'Automatic · no model available right now';
   }
   if (isChosen(resolved)) return describe(resolved.modelId, resolved.provider, settings);
-  if (resolved.modelId === settings.brain.modelId) return 'Same model that does the work';
+  // Whose model Keeps your memory borrows is the daemon's to say (roleNote);
+  // an id that happens to match the brain's says nothing about it.
+  if (role !== 'memory' && resolved.modelId === settings.brain.modelId) return 'Same model that does the work';
   return `Automatic · ${describe(resolved.modelId, resolved.provider, settings)}`;
+}
+
+/** The line under a role's summary in Settings › Models: for Keeps your
+ *  memory on Automatic, whose model it borrows today, as the daemon resolved
+ *  it (the same words the picker and the desktop use). */
+export function roleNote(role: ModelRoleName, settings: ModelSettings): string | null {
+  const resolved = settings.roles?.[role];
+  if (role !== 'memory' || !resolved?.modelId || isChosen(resolved) || !resolved.follows) return null;
+  return memoryRoleAutomaticText(resolved.follows);
 }
 
 /** A saved choice that is unavailable, and what runs instead. When nothing
