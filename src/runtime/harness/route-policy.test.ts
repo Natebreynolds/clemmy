@@ -40,7 +40,7 @@ const acceptAll = () => true;
 
 /** Seed N outcomes for a (role, intent, model) with the given success rate. */
 function seed(opts: {
-  role: 'brain' | 'worker' | 'judge';
+  role: 'brain' | 'worker' | 'judge' | 'writer' | 'memory';
   intent?: string;
   model: string;
   n: number;
@@ -116,6 +116,34 @@ test('job: reruns bump the policy version and fully rebuild', () => {
   assert.equal(runRoutePolicyJob({ now: NOW })!.policyVersion, 2);
   const count = (openModelRouteMetricsDb().prepare(`SELECT COUNT(*) AS c FROM model_route_policy`).get() as { c: number }).c;
   assert.equal(count, 1, 'rebuild, not append');
+});
+
+// Writer and memory decisions persist now (the route role CHECK admits them).
+// Their groups must not break the one-transaction rebuild: the first build's
+// policy CHECK would have rolled back every brain/worker/judge row with them.
+test('job: writer and memory evidence never stops the brain, worker and judge policy rebuilding', () => {
+  seed({ role: 'judge', model: 'judge-model', n: 10, successRate: 1 });
+  seed({ role: 'worker', model: 'worker-model', n: 10, successRate: 1 });
+  seed({ role: 'writer', model: 'writer-model', n: 10, successRate: 1 });
+  seed({ role: 'memory', model: 'memory-model', n: 10, successRate: 1 });
+  const decisionRoles = (openModelRouteMetricsDb()
+    .prepare(`SELECT DISTINCT role FROM model_route_decisions ORDER BY role`).all() as Array<{ role: string }>)
+    .map((row) => row.role);
+  assert.deepEqual(decisionRoles, ['judge', 'memory', 'worker', 'writer'], 'every route role is recorded');
+
+  const result = runRoutePolicyJob({ now: NOW });
+  assert.ok(result, 'the rebuild committed');
+  const policyRoles = (openModelRouteMetricsDb()
+    .prepare(`SELECT role FROM model_route_policy ORDER BY role`).all() as Array<{ role: string }>)
+    .map((row) => row.role);
+  assert.ok(policyRoles.includes('judge') && policyRoles.includes('worker'), 'checker and worker policy rows are written');
+});
+
+test('pick: the memory role is never moved by the learned policy', () => {
+  seed({ role: 'memory', model: 'memory-default', n: 12, successRate: 0.6 });
+  seed({ role: 'memory', model: 'memory-better', n: 12, successRate: 1 });
+  runRoutePolicyJob({ now: NOW });
+  assert.equal(pickRoutePolicyModel('memory', undefined, 'memory-default', acceptAll), null);
 });
 
 test('pick: empty table ⇒ null (byte-identical static behavior)', () => {
