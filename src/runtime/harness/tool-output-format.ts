@@ -41,29 +41,71 @@ export function explicitLocalReadPreviewBudget(toolName: string, args: unknown):
  * (per-round prefill is paid in absolute bytes). */
 const INLINE_RESULT_CHARS_PER_WINDOW_TOKEN = 0.35;
 
-/** The whole-result inline budget for the routed model's window. Without a
- * routed model the tuned default applies; the model registry is not asked to
- * resolve (and warn about) an absent id on every tool result. */
-export function inlineResultBudgetForModel(routedModelId?: string | null): number {
-  if (!routedModelId?.trim()) return DEFAULT_TOOL_RESULT_MAX_CHARS;
-  let window: number;
+/** The routed model's context window in tokens, or null when there is no
+ * routed model or its window is unknowable. Without a routed model the model
+ * registry is not asked to resolve (and warn about) an absent id on every
+ * tool result. */
+function routedWindowTokens(routedModelId?: string | null): number | null {
+  if (!routedModelId?.trim()) return null;
   try {
-    window = effectiveContextWindow(routedModelId);
+    const window = effectiveContextWindow(routedModelId);
+    return Number.isFinite(window) && window > 0 ? window : null;
   } catch {
-    return DEFAULT_TOOL_RESULT_MAX_CHARS;
+    return null;
   }
-  if (!Number.isFinite(window) || window <= 0) return DEFAULT_TOOL_RESULT_MAX_CHARS;
+}
+
+/** The whole-result inline budget for the routed model's window. Without a
+ * routed model the tuned default applies. */
+export function inlineResultBudgetForModel(routedModelId?: string | null): number {
+  const window = routedWindowTokens(routedModelId);
+  if (window === null) return DEFAULT_TOOL_RESULT_MAX_CHARS;
   return Math.max(
     PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
     Math.min(DEFAULT_TOOL_RESULT_MAX_CHARS, Math.floor(window * INLINE_RESULT_CHARS_PER_WINDOW_TOKEN)),
   );
 }
 
-/** The largest slice a retained-output reader returns by its own contract
- * (the recall_tool_result schema bound). */
+/** The largest slice a retained-output reader's schema admits (the static
+ * recall_tool_result max_chars bound, so the tool contract never churns per
+ * model). What a reader actually returns is retainedReaderMaxChars. */
 export const RETAINED_OUTPUT_READER_MAX_SLICE_CHARS = 120_000;
 /** Room for a reader's header and paging line around its slice. */
 const RETAINED_OUTPUT_READER_FRAME_CHARS = 2_000;
+
+/**
+ * The most characters one tool reply may carry across the Claude CLI's MCP
+ * wire. The CLI measures an MCP tool reply against its own output-token cap
+ * (MAX_MCP_OUTPUT_TOKENS, default 25,000 tokens); a reply over the cap is cut
+ * to 4 characters per token of that cap and marked truncated, so its tail is
+ * lost after the reply's own paging frame already named the next offset.
+ * This bound is 25,000 tokens at 2.4 characters per token, denser than any
+ * text a reader returns, so a reply at or under it is never cut by the CLI.
+ */
+export const MCP_TRANSPORT_MAX_CHARS = 60_000;
+
+/** Reader characters per token of the routed window: at the 200,000-token
+ * baseline every earlier reader bound was tuned against, this is the query
+ * page bound; a smaller window shrinks it. */
+const RETAINED_READER_CHARS_PER_WINDOW_TOKEN = 0.25;
+const BASELINE_WINDOW_TOKENS = 200_000;
+
+/**
+ * The most one retained-output reader reply (a recall slice, a query page)
+ * holds for the routed window, frame excluded. It never exceeds what the
+ * window can take (a quarter character per window token, never below one
+ * inline result), the reader schema bound, or what the MCP wire carries whole.
+ * Every reader bounds its own reply by this, and presentation budgets readers
+ * by this plus the frame, so presentation never re-clips a reader's reply.
+ */
+export function retainedReaderMaxChars(routedModelId?: string | null): number {
+  const window = routedWindowTokens(routedModelId) ?? BASELINE_WINDOW_TOKENS;
+  return Math.min(
+    RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
+    MCP_TRANSPORT_MAX_CHARS - RETAINED_OUTPUT_READER_FRAME_CHARS,
+    Math.max(inlineResultBudgetForModel(routedModelId), Math.floor(window * RETAINED_READER_CHARS_PER_WINDOW_TOKEN)),
+  );
+}
 
 export interface PresentationBudgetInput {
   /** The name the model called: a tool, or a carrier naming its inner tool. */
@@ -85,9 +127,10 @@ export interface PresentationBudgetInput {
  *
  * - A local reader's explicit larger preview request is honored.
  * - A retained-output reader (recall_tool_result, tool_output_query,
- *   file_query) already bounded its own slice from the caller's arguments and
- *   the window; its handler owns that budget, so presentation never clips it
- *   again. Per-turn reading stays governed by the RecallBudget.
+ *   file_query) bounds its own reply by retainedReaderMaxChars for the routed
+ *   window; presentation allows that plus the reader's frame, so it never
+ *   clips a reader's reply again. Per-turn reading stays governed by the
+ *   RecallBudget.
  * - A registry control read (Clementine's own state and control tools) is
  *   shown whole up to the routed window's inline budget.
  * - Everything else (provider and business results, foreign tools) keeps the
@@ -111,7 +154,7 @@ export function presentationBudgetFor(input: PresentationBudgetInput): number {
   }
   if (role !== 'control') return PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
   if (effectiveName && toolReadsRetainedOutput(effectiveName)) {
-    return RETAINED_OUTPUT_READER_MAX_SLICE_CHARS + RETAINED_OUTPUT_READER_FRAME_CHARS;
+    return retainedReaderMaxChars(input.routedModelId) + RETAINED_OUTPUT_READER_FRAME_CHARS;
   }
   return inlineResultBudgetForModel(input.routedModelId);
 }
@@ -127,6 +170,16 @@ export function presentationBudgetFor(input: PresentationBudgetInput): number {
  */
 export function transportPresentationMaxChars(input: PresentationBudgetInput): number {
   return Math.max(DEFAULT_TOOL_RESULT_MAX_CHARS, presentationBudgetFor(input));
+}
+
+/**
+ * The same transport bound for a carrier reply that crosses the Claude CLI's
+ * MCP wire, never above what that wire carries whole. A reply the invocation
+ * presented larger (an explicit local read preview) is cut here, with this
+ * formatter's own truthful marker, instead of silently by the CLI.
+ */
+export function mcpTransportPresentationMaxChars(input: PresentationBudgetInput): number {
+  return Math.min(MCP_TRANSPORT_MAX_CHARS, transportPresentationMaxChars(input));
 }
 
 

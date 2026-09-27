@@ -7,6 +7,7 @@ import { windowScaleForModel } from '../runtime/harness/model-window-observation
 import {
   RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
   inlineResultBudgetForModel,
+  retainedReaderMaxChars,
 } from '../runtime/harness/tool-output-format.js';
 import { textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
@@ -66,6 +67,7 @@ const RECALL_MAX_CHARS_CEILING = RETAINED_OUTPUT_READER_MAX_SLICE_CHARS;
 function recallSliceCeiling(routedModelId?: string): number {
   return Math.min(
     RECALL_MAX_CHARS_CEILING,
+    retainedReaderMaxChars(routedModelId),
     Math.max(BASE_RECALL_MAX_CHARS, Math.round(BASE_RECALL_MAX_CHARS * windowScaleForModel(routedModelId))),
   );
 }
@@ -110,9 +112,10 @@ function queryNamesItsPage(input: Record<string, unknown>): boolean {
  * the reply fits what the turn's reading byte budget still allows.
  */
 function queryReplyChars(input: Record<string, unknown>, ctx: HarnessRunContext): number {
+  const pageMax = Math.min(QUERY_MAX_CHARS, retainedReaderMaxChars(ctx.routedModelId));
   const shaped = queryNamesItsPage(input)
-    ? QUERY_MAX_CHARS
-    : Math.min(QUERY_MAX_CHARS, inlineResultBudgetForModel(ctx.routedModelId));
+    ? pageMax
+    : Math.min(pageMax, inlineResultBudgetForModel(ctx.routedModelId));
   return Math.min(shaped, ctx.recallBudget?.remainingBytes() ?? Number.POSITIVE_INFINITY);
 }
 
@@ -636,7 +639,8 @@ export function registerRecallTools(server: McpServer): void {
             for (const group of shown) lines.push(aggregateLine(`${group.group}: `, aggregate, valueField, group.figure));
             if (result.groups.length > shown.length) lines.push(`…and ${result.groups.length - shown.length} more group(s)`);
           }
-          return chargeQueryReply(ctx, callId, clipQueryBody(lines.join('\n')));
+          return chargeQueryReply(ctx, callId,
+            clipQueryBody(lines.join('\n'), Math.min(QUERY_MAX_CHARS, retainedReaderMaxChars(ctx.routedModelId))));
         }
         if (sortBy) rows = sortRows(rows, sortBy, input.order === 'desc' ? 'desc' : 'asc');
         const matched = rows.length;

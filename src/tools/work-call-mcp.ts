@@ -11,7 +11,7 @@ import { isToolMediaContent } from '../runtime/harness/tool-media-content.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Tool } from '@openai/agents';
 import { harnessRunContextStorage, wrapToolForHarness } from '../runtime/harness/brackets.js';
-import { transportPresentationMaxChars } from '../runtime/harness/tool-output-format.js';
+import { mcpTransportPresentationMaxChars } from '../runtime/harness/tool-output-format.js';
 import { actionExpectedWorkState } from '../runtime/harness/expected-work-admission.js';
 import { ExternalWritePreDispatchResult } from '../runtime/harness/external-write-admission.js';
 import {
@@ -162,10 +162,11 @@ export function registerClaudeActionWorkCall(
           ? output
           : JSON.stringify(output ?? null);
       // The child already presented its result at the effective inner tool's
-      // budget; the wire must not clip it again.
+      // budget; the wire must not clip it again, and never sends more than the
+      // CLI's MCP wire carries whole.
       return textResult(rendered, {
         isError: isExpectedWorkMcpRefusal(rendered),
-        maxChars: transportPresentationMaxChars({
+        maxChars: mcpTransportPresentationMaxChars({
           toolName: 'work_call',
           args: input,
           routedModelId: harnessRunContextStorage.getStore()?.routedModelId,

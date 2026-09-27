@@ -32,8 +32,8 @@ const envelopes = await import('../../agents/capability-envelope.js');
 const inner = await import('../../tools/inner-dispatch.js');
 const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
-const { inlineResultBudgetForModel } = await import('./tool-output-format.js');
-const { recordWindowRejection } = await import('./model-window-observations.js');
+const { MCP_TRANSPORT_MAX_CHARS, inlineResultBudgetForModel, retainedReaderMaxChars } = await import('./tool-output-format.js');
+const { recordCatalogWindow, recordWindowRejection } = await import('./model-window-observations.js');
 
 after(() => {
   inner._setInnerDispatchToolsForTests(null);
@@ -207,4 +207,48 @@ test('query replies spend the turn\'s reading byte budget, and a spent budget ro
   assert.equal(budget.snapshot().calls, 0, 'a query spends bytes, never a recall call');
   assert.match(third, /^ERROR: reading byte budget exhausted/, third.slice(0, 300));
   assert.doesNotMatch(third, /tool_output_query \{|recall_tool_result \{/, 'never routed back to a reader the budget refuses');
+});
+
+test('on a small window an explicit recall and a named query page stay within what the window can take', async () => {
+  const smallWindowModel = 'fixture-reader-small-window';
+  recordWindowRejection(smallWindowModel, 32_001);
+  const readerMax = retainedReaderMaxChars(smallWindowModel);
+  assert.equal(readerMax, 11_200, 'a 32k-token window takes one inline result per reader reply');
+  const recall = await runHostTurn({
+    agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', routedModelId: smallWindowModel,
+    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-text', tool: 'run_shell_command', output: PARKED_TEXT }),
+    calls: [{ callId: 'small-explicit-recall', args: { call_id: 'parked-text', max_chars: 30_000 } }],
+  });
+  const recalled = recall.results.get('small-explicit-recall') ?? '';
+  assert.ok(recalled.startsWith(`Recalled chars 0–${readerMax} of ${PARKED_TEXT.length}`), `${recalled.slice(0, 200)} (${recalled.length} chars)`);
+  assert.ok(recalled.includes(`recall_tool_result {"call_id":"parked-text","offset":${readerMax}}`), 'the exact next page');
+  assert.ok(recalled.endsWith(PARKED_TEXT.slice(0, readerMax)), 'the whole slice reaches the model, never re-clipped');
+
+  const query = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', routedModelId: smallWindowModel, seed: parkRows,
+    calls: [{ callId: 'small-named-page', args: { call_id: 'parked-rows', limit: 50 } }],
+  });
+  const page = query.results.get('small-named-page') ?? '';
+  assert.ok(page.length <= readerMax, `a named page fits the window's reader bound (${page.length} chars)`);
+  const header = /^Showing (\d+) record\(s\) \[0–(\d+)\]/.exec(page);
+  assert.ok(header, page.slice(0, 200));
+  assert.ok(page.includes(`Next: tool_output_query {"call_id":"parked-rows","limit":50,"offset":${header[1]}}`), 'the exact next query');
+});
+
+test('on a large window an explicit recall is bounded by what the MCP wire carries whole, never re-clipped', async () => {
+  const largeWindowModel = 'fixture-reader-large-window';
+  recordCatalogWindow(largeWindowModel, 1_000_000, 'fixture');
+  const readerMax = retainedReaderMaxChars(largeWindowModel);
+  assert.ok(readerMax < MCP_TRANSPORT_MAX_CHARS, `room for the reader frame (${readerMax})`);
+  const large = Array.from({ length: 150 }, (_, i) => `[block ${String(i).padStart(3, '0')}] ${'r'.repeat(987)}`).join('\n');
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('recall_tool_result'), toolName: 'recall_tool_result', routedModelId: largeWindowModel,
+    seed: (sessionId) => events.writeToolOutput({ sessionId, callId: 'parked-large', tool: 'run_shell_command', output: large }),
+    calls: [{ callId: 'large-explicit-recall', args: { call_id: 'parked-large', max_chars: 120_000 } }],
+  });
+  const shown = results.get('large-explicit-recall') ?? '';
+  assert.ok(shown.length <= MCP_TRANSPORT_MAX_CHARS, `one reply fits the MCP wire (${shown.length} chars)`);
+  assert.ok(shown.startsWith(`Recalled chars 0–${readerMax} of ${large.length}`), shown.slice(0, 200));
+  assert.ok(shown.includes(`"offset":${readerMax}`), 'the exact next page');
+  assert.ok(shown.endsWith(large.slice(0, readerMax)), 'the whole slice reaches the model');
 });

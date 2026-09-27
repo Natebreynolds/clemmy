@@ -19,9 +19,11 @@ mkdirSync(path.join(home, 'state'), { recursive: true });
 const {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
   PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
-  RETAINED_OUTPUT_READER_MAX_SLICE_CHARS,
+  MCP_TRANSPORT_MAX_CHARS,
   inlineResultBudgetForModel,
   presentationBudgetFor,
+  retainedReaderMaxChars,
+  mcpTransportPresentationMaxChars,
 } = await import('./tool-output-format.js');
 const { recordCatalogWindow, recordWindowRejection, effectiveContextWindow } = await import('./model-window-observations.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
@@ -105,7 +107,7 @@ test('a transport mirror child presents into the same routed model; a batch item
 });
 
 test('retained-output readers own their slice: presentation never clips them, direct or through a carrier', () => {
-  for (const routedModelId of [undefined, SMALL_WINDOW_MODEL]) {
+  for (const routedModelId of [undefined, SMALL_WINDOW_MODEL, LARGE_WINDOW_MODEL]) {
     for (const [name, args] of [
       ['recall_tool_result', { call_id: 'c', max_chars: 60_000 }],
       ['recall_tool_result', { call_id: 'c' }],
@@ -113,7 +115,8 @@ test('retained-output readers own their slice: presentation never clips them, di
       ['file_query', { query: 'q', call_id: 'c' }],
     ] as const) {
       const direct = presentationBudgetFor({ toolName: name, args, routedModelId });
-      assert.ok(direct > RETAINED_OUTPUT_READER_MAX_SLICE_CHARS, `${name} is never re-clipped`);
+      assert.ok(direct > retainedReaderMaxChars(routedModelId), `${name} is never re-clipped`);
+      assert.ok(direct <= MCP_TRANSPORT_MAX_CHARS, `${name} fits the CLI's MCP wire`);
       assert.equal(presentationBudgetFor({ ...carried('call_tool', name, args), routedModelId }), direct);
     }
   }
@@ -125,8 +128,19 @@ test('retained-output readers own their slice: presentation never clips them, di
 test('a bare recall slice is one inline result for the window; an explicit one is honored up to the ceiling', () => {
   assert.equal(recallSliceChars(undefined, undefined), DEFAULT_TOOL_RESULT_MAX_CHARS);
   assert.equal(recallSliceChars(undefined, SMALL_WINDOW_MODEL), 11_200);
-  assert.equal(recallSliceChars(30_000, SMALL_WINDOW_MODEL), 30_000);
+  assert.equal(recallSliceChars(30_000, SMALL_WINDOW_MODEL), 11_200, 'never above what a small window takes');
   assert.equal(recallSliceChars(500_000, undefined), 30_000, 'clamped to the default window ceiling');
-  assert.equal(recallSliceChars(500_000, LARGE_WINDOW_MODEL), RETAINED_OUTPUT_READER_MAX_SLICE_CHARS);
+  assert.equal(recallSliceChars(500_000, LARGE_WINDOW_MODEL), MCP_TRANSPORT_MAX_CHARS - 2_000,
+    'a large window is bounded by what the MCP wire carries whole');
   assert.equal(recallSliceChars(10, undefined), 100);
+});
+
+test('the reader bound follows the window, keeps the baseline on a 200k window, and never exceeds the MCP wire', () => {
+  assert.equal(retainedReaderMaxChars(undefined), 50_000);
+  assert.equal(retainedReaderMaxChars(SMALL_WINDOW_MODEL), 11_200);
+  assert.equal(retainedReaderMaxChars(LARGE_WINDOW_MODEL), MCP_TRANSPORT_MAX_CHARS - 2_000);
+  // An explicit local read preview may exceed it on the host lane, never on the MCP wire.
+  const read = carried('call_tool', 'read_file', { path: '/tmp/x', max_chars: 90_000 });
+  assert.equal(presentationBudgetFor(read), 90_000);
+  assert.equal(mcpTransportPresentationMaxChars(read), MCP_TRANSPORT_MAX_CHARS);
 });
