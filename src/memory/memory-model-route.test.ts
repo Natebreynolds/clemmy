@@ -29,6 +29,7 @@ const { _setDiscoveredModelsForTest } = await import('../runtime/harness/model-d
 const { MODELS, DEFAULT_CODEX_FAST_MODEL } = await import('../config.js');
 const {
   describeMemoryModel,
+  memoryJobModelId,
   memoryModelAvailability,
   memoryRoleSettingsView,
   resolveMemoryModelRoute,
@@ -193,6 +194,28 @@ test('a chosen memory model is used exactly by every governed job, with no deadl
   const view = memoryRoleSettingsView();
   assert.deepEqual({ source: view.source, modelId: view.modelId, provider: view.provider },
     { source: 'settings', modelId: 'byo-memory-model', provider: 'byo' });
+});
+
+test('each governed job\'s model is named from one description, building no model', () => {
+  // The Memory tab polls every few seconds; naming six jobs must not build
+  // six provider models (each build reads the account state).
+  const governed = ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const;
+  const builds = () => [ClaudeModelProvider.prototype.getModel, CodexModelProvider.prototype.getModel]
+    .reduce((n, fn) => n + (fn as unknown as { mock: { callCount(): number } }).mock.callCount(), 0);
+  const counted = builds();
+  const expected = governed.map((job) => resolveMemoryModelRoute(job)?.modelId ?? null);
+  assert.ok(expected[0], 'fixture: the automatic route resolves');
+  assert.ok(builds() > counted, 'fixture: building a route is counted');
+  const described = describeMemoryModel();
+  const before = builds();
+  assert.deepEqual(governed.map((job) => memoryJobModelId(job, described)), expected, 'the same ids the routes ask for');
+  assert.equal(builds(), before, 'no model was built to name them');
+  for (const job of ['standing', 'verify', 'index', 'tidy'] as const) assert.equal(memoryJobModelId(job, described), null, job);
+
+  useByo();
+  chooseMemory('byo-memory-model');
+  const chosen = describeMemoryModel();
+  assert.deepEqual(governed.map((job) => memoryJobModelId(job, chosen)), governed.map(() => 'byo-memory-model'));
 });
 
 test('a chosen model that cannot be served makes learning wait; nothing stands in', () => {

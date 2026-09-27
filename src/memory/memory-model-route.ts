@@ -301,6 +301,24 @@ export function describeMemoryModel(): MemoryModelDescription {
 }
 
 /**
+ * The model id a governed job would ask for, read from one description
+ * without building a model (the Memory tab polls it every few seconds): the
+ * owner's pick for every job when chosen; for automatic, the described
+ * checker selection for learn / reconcile / patterns (they share it) and
+ * today's fast-tier string for the others. Null for a job the memory model
+ * does not govern, or when nothing can be named. Never throws.
+ */
+export function memoryJobModelId(job: MemoryJobId, described: MemoryModelDescription = describeMemoryModel()): string | null {
+  try {
+    if (!memoryJobUsesMemoryModel(job)) return null;
+    if (described.source === 'chosen' || BOUNDARY_JOBS.has(job)) return described.modelId || null;
+    return automaticFastModelId(job) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Whether `job` may start model work now. Learning checks this BEFORE it
  * claims anything, so a paused or unreachable model makes it wait instead of
  * burning retries into dead letters. A job the memory model does not govern
