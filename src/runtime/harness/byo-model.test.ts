@@ -442,6 +442,23 @@ test('relax: GLM request translates stripped reasoning_effort into `thinking`', 
   assert.deepEqual(out.thinking, { type: 'disabled' }, 'effort is translated to an explicit thinking switch, and no harness tier turns it on');
 });
 
+test('relax: Grok 4.5+ keeps the harness effort in xAI vocabulary instead of defaulting to "high"', () => {
+  const relax = (body: Record<string, unknown>) => relaxRequestForCompatBackend({ messages: [{ role: 'user', content: 'hi' }], ...body }) as Record<string, unknown>;
+  // The tier the harness chose reaches the wire; "none" is the cheapest depth xAI allows.
+  assert.equal(relax({ model: 'grok-4.7', reasoning_effort: 'none' }).reasoning_effort, 'low');
+  assert.equal(relax({ model: 'grok-4.7', reasoning_effort: 'medium' }).reasoning_effort, 'medium');
+  assert.equal(relax({ model: 'grok-4.6', reasoning_effort: 'high' }).reasoning_effort, 'high');
+  assert.equal(relax({ model: 'grok-4.5', reasoning_effort: 'minimal' }).reasoning_effort, 'low');
+  // A structured call never spends deep reasoning on a shape.
+  assert.equal(relax({ model: 'grok-4.7', reasoning_effort: 'high', response_format: { type: 'json_schema', json_schema: { name: 'x', schema: { type: 'object' } } } }).reasoning_effort, 'low');
+  // No harness decision → the wire's own default stays (nothing invented).
+  assert.equal('reasoning_effort' in relax({ model: 'grok-4.7' }), false);
+  // Releases without the documented parameter still get it stripped.
+  assert.equal('reasoning_effort' in relax({ model: 'grok-4', reasoning_effort: 'low' }), false);
+  assert.equal('reasoning_effort' in relax({ model: 'grok-4.20-multi-agent', reasoning_effort: 'low' }), false);
+  assert.equal('thinking' in relax({ model: 'grok-4.7', reasoning_effort: 'low' }), false);
+});
+
 test('relax: non-GLM request strips reasoning_effort and adds no `thinking`', () => {
   const out = relaxRequestForCompatBackend({
     model: 'deepseek-chat', reasoning_effort: 'high',

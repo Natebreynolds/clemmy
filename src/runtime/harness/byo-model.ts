@@ -117,6 +117,32 @@ export function applyGlmThinking(body: Record<string, unknown>, effort: string |
   body.thinking = { type: 'disabled' };
 }
 
+/** xAI (Grok 4.5+): reasoning cannot be switched off and DEFAULTS TO "high"
+ *  when `reasoning_effort` is absent — and the compat relax strips that field.
+ *  Live 2026-09-26: every brain round on grok-4.7 thought at "high" (84 visible
+ *  output tokens in 20.6 s; 290 in 56 s), 22 s per round against 6 s on the
+ *  previous brain, while the harness had decided effort "none" for the turn.
+ *  Send the harness tier in xAI's vocabulary; "none"/"minimal" become "low",
+ *  the cheapest depth the wire allows. A structured (json) call is always
+ *  "low": the shape is the contract, not the reasoning. Only the models whose
+ *  documentation lists the parameter (4.5, 4.6, 4.7); older Grok releases
+ *  reject it. A caller that set the field itself is honored. */
+const GROK_EFFORT_MODEL = /grok-4[.-](5|6|7)(?![0-9])/i;
+export function applyGrokReasoningEffort(body: Record<string, unknown>, effort: string | undefined): void {
+  const modelId = typeof body.model === 'string' ? body.model : '';
+  if (!GROK_EFFORT_MODEL.test(modelId)) return;
+  if (typeof body.reasoning_effort === 'string') return;
+  const rfType = (body.response_format as { type?: string } | undefined)?.type;
+  if (rfType === 'json_schema' || rfType === 'json_object') { body.reasoning_effort = 'low'; return; }
+  const tier = (effort ?? '').toLowerCase();
+  const mapped = tier === 'none' || tier === 'minimal' || tier === 'low' ? 'low'
+    : tier === 'medium' ? 'medium'
+    : tier === 'high' ? 'high'
+    : tier === 'xhigh' ? 'xhigh'
+    : undefined;
+  if (mapped) body.reasoning_effort = mapped;
+}
+
 // Marks request bodies whose strict json_schema we downgraded to json_object,
 // so the response interceptor only repairs OUR structured calls — never a
 // tool-call turn, free-text worker output, or a pre-existing json_object
@@ -174,6 +200,8 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
 
   // GLM (Z.ai): drive its `thinking` switch from the (now-stripped) effort tier.
   applyGlmThinking(next, requestedEffort);
+  // xAI (Grok 4.5+): put the tier back in xAI's vocabulary, or it thinks at "high".
+  applyGrokReasoningEffort(next, requestedEffort);
   // Every OTHER compat backend has just had the harness's effort decision
   // deleted with nothing put in its place, so the brain runs at whatever depth
   // the backend defaults to. That is a real, invisible latency cost: live
