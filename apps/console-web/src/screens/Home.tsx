@@ -38,6 +38,8 @@ import { presentWorkingNow } from '@/lib/activity-presentation';
 import { listSpaces } from '@/lib/spaces';
 import type { CommandCenter } from '@/lib/types';
 import { Composer } from '@/components/chat/Composer';
+import { AgentPicker } from '@/components/chat/AgentPicker';
+import { useConversationAgent } from '@/lib/conversation-agent';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { ModelStatusChips } from '@/components/ModelStatusChips';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -123,11 +125,18 @@ function LiveHome() {
     if (openTimerRef.current !== null) window.clearTimeout(openTimerRef.current);
   }, []);
 
+  // Who answers the first message: Clem, or one of the owner's agents. The
+  // same chip the thread composer has (owner 09-26: "I don't have the agent
+  // picker on the home page"); a brand-new conversation opens inside the pick.
+  const agentChoice = useConversationAgent(null);
   const sendAndOpen = useCallback((input: { text: string; attachmentIds: string[]; attachmentNames: string[] }) => {
     if (chat.busy || opening) return;
     setNotice(null);
     setOpening(true);
-    void chat.send(input);
+    void (async () => {
+      const addressed = await agentChoice.prepare(chat.sessionId.current, chat.busy).catch(() => ({}));
+      await chat.send({ ...input, ...addressed });
+    })();
     const started = Date.now();
     const tick = () => {
       const id = chat.sessionId.current;
@@ -142,7 +151,7 @@ function LiveHome() {
       openTimerRef.current = window.setTimeout(tick, 100);
     };
     tick();
-  }, [chat, navigate, opening]);
+  }, [agentChoice, chat, navigate, opening]);
 
   useEffect(() => {
     if (!opening || chat.busy || chat.sessionId.current) return;
@@ -351,6 +360,8 @@ function LiveHome() {
           onModeChange={chat.setComposerMode}
           onSend={sendAndOpen}
           onStop={chat.stop}
+          agentSlot={<AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} />}
+          placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined}
         />
         {shown('quick_actions') && (
           <QuickActions
