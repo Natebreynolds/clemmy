@@ -357,7 +357,9 @@ test('provider cooldown persists across daemon health reset and routes OpenAI to
   const prevLocal = process.env.CLEMMY_LOCAL_EMBEDDINGS;
   const realFetch = globalThis.fetch;
   process.env.OPENAI_API_KEY = 'sk-test-openai-fails';
-  delete process.env.CLEMMY_EMBED_PROVIDER;
+  // OpenAI is a deliberate choice now (local is the default); the choice still
+  // falls to local when OpenAI refuses.
+  process.env.CLEMMY_EMBED_PROVIDER = 'openai';
   process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';
   let fetchCalls = 0;
   globalThis.fetch = (async () => {

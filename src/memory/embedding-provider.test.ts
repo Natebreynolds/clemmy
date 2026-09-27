@@ -1,3 +1,4 @@
+import path from 'node:path';
 /**
  * Run: CLEMENTINE_HOME=/tmp/clemmy-test-embprov npx tsx --test src/memory/embedding-provider.test.ts
  *
@@ -150,6 +151,7 @@ test('embedMissingFacts switches to local provider mid-tick after OpenAI demotio
   _setEmbeddingProviderForTest(undefined);
   _setLocalProviderForTest(fakeProvider('local', 'test-local-embedding', 4));
   process.env.OPENAI_API_KEY = 'sk-test-openai-fails';
+  process.env.CLEMMY_EMBED_PROVIDER = 'openai';
 
   let fetchCalls = 0;
   globalThis.fetch = (async () => {
@@ -226,5 +228,34 @@ test('CLEMMY_EMBED_PROVIDER=off forces no provider even with one injectable', as
     assert.equal(await getEmbeddingProvider(), null);
   } finally {
     delete process.env.CLEMMY_EMBED_PROVIDER;
+  }
+});
+
+test('the local model is the default embedder even when an OpenAI key is present; OpenAI only by choice', async () => {
+  const { getEmbeddingProvider, activeEmbeddingModel, _setEmbeddingProviderForTest, _setLocalProviderForTest, _resetEmbedDemotionForTest, _resetEmbeddingProviderCooldownsForTest, _resetEmbeddingHealthForTest, _setEmbeddingProviderHealthFileForTest } = await import('./embeddings.js');
+  // Earlier cases in this file persisted an OpenAI auth cooldown; this case is
+  // about selection, so it starts from a clean, disposable health file.
+  _resetEmbeddingHealthForTest();
+  _setEmbeddingProviderHealthFileForTest(path.join(TEST_HOME, 'embedding-provider-health.selection.json'));
+  _resetEmbeddingProviderCooldownsForTest();
+  _resetEmbedDemotionForTest();
+  const prevKey = process.env.OPENAI_API_KEY; const prevProvider = process.env.CLEMMY_EMBED_PROVIDER; const prevLocal = process.env.CLEMMY_LOCAL_EMBEDDINGS;
+  process.env.OPENAI_API_KEY = 'sk-test-present';
+  delete process.env.CLEMMY_EMBED_PROVIDER;
+  process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';
+  _setEmbeddingProviderForTest(undefined);
+  _setLocalProviderForTest(fakeProvider('local', 'test-local-embedding', 4));
+  try {
+    const provider = await getEmbeddingProvider();
+    assert.equal(provider?.name, 'local', 'a key alone never makes OpenAI the embedder');
+    assert.equal(activeEmbeddingModel(), 'test-local-embedding');
+    process.env.CLEMMY_EMBED_PROVIDER = 'openai';
+    assert.equal((await getEmbeddingProvider())?.name, 'openai', 'the owner can still choose OpenAI');
+  } finally {
+    if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+    if (prevProvider === undefined) delete process.env.CLEMMY_EMBED_PROVIDER; else process.env.CLEMMY_EMBED_PROVIDER = prevProvider;
+    if (prevLocal === undefined) delete process.env.CLEMMY_LOCAL_EMBEDDINGS; else process.env.CLEMMY_LOCAL_EMBEDDINGS = prevLocal;
+    _setEmbeddingProviderForTest(undefined);
+    _setEmbeddingProviderHealthFileForTest(null);
   }
 });

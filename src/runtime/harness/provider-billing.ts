@@ -18,6 +18,7 @@ import { creditRefusal, creditRefusals, JEV_ACCOUNT_ID, OPENAI_KEY_ACCOUNT_ID, t
 import { getByoProviders, providerToBackendConfig, resolveByoProviderForModel } from './byo-providers.js';
 import { boundWriterModel, resolveRoleModel } from './model-roles.js';
 import { resolveProvider } from './model-wire-registry.js';
+import { activeEmbeddingProviderName } from '../../memory/embeddings.js';
 
 const logger = pino({ name: 'clementine.provider-billing' });
 
@@ -261,7 +262,10 @@ export function buildAccountBilling(now = Date.now()): Record<string, AccountBil
     };
     out[provider.id] = assemble(provider.id, entry, roles.get(provider.id), { balance: read('balance'), monthSpend: read('monthSpend') });
   }
-  out[OPENAI_KEY_ACCOUNT_ID] = assemble(OPENAI_KEY_ACCOUNT_ID, BY_ACCOUNT[OPENAI_KEY_ACCOUNT_ID], ['memory_search']);
+  // The OpenAI key does memory search only while it is the active embedder;
+  // memory runs on the local model by default (owner 09-26).
+  const openAiRoles = activeEmbeddingProviderName() === 'openai' ? ['memory_search'] : [];
+  out[OPENAI_KEY_ACCOUNT_ID] = assemble(OPENAI_KEY_ACCOUNT_ID, BY_ACCOUNT[OPENAI_KEY_ACCOUNT_ID], openAiRoles);
   out[JEV_ACCOUNT_ID] = assemble(JEV_ACCOUNT_ID, BY_ACCOUNT[JEV_ACCOUNT_ID], ['quick_checks']);
   return out;
 }

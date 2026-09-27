@@ -328,7 +328,6 @@ let transientBreakerOpens = 0;
 
 function maybeDemoteToLocal(cls: EmbedErrorClass): void {
   if (demotedToLocal) return;
-  if (providerOverride() === 'openai') return; // an explicit force is honored
   if (!localEmbeddingsAllowed()) return;
   const terminal = cls === 'quota' || cls === 'auth';
   if (!terminal) {
@@ -697,29 +696,49 @@ function providerOverride(): string {
 }
 
 /**
- * The active provider, async (may lazily load the local model). Selection:
+ * The active provider, async (may lazily load the local model). Selection
+ * (owner 09-26: memory runs on the local model Clementine ships with; a paid
+ * embedder is a deliberate choice, never the default because a key exists):
  *   override 'off' / EMBEDDINGS_DISABLED → none
- *   override 'openai' OR (no override AND key present) → OpenAI
- *   override 'local' OR (no key) → local (if loadable)
+ *   override 'openai' → OpenAI (key required); local while OpenAI is cooling
+ *     down or demoted, so a refusal never leaves recall lexical-only
+ *   otherwise → local; OpenAI only as the stand-in when the local model
+ *     cannot load on this machine and a key exists
  */
 export async function getEmbeddingProvider(): Promise<EmbeddingProvider | null> {
   if (injectedProvider !== undefined) return injectedProvider;
   if (embeddingsDisabledByEnv()) return null;
   const override = providerOverride();
   if (override === 'off') return null;
-  // A demoted OpenAI embedder routes to local for this process lifetime
-  // (breaker opened on quota/auth, or twice on transient — see recordFailure).
-  if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return loadLocalProvider();
-  if (override !== 'local' && getOpenAiApiKey()) {
-    if (override !== 'openai' && providerCooldown(OPENAI_PROVIDER)) {
-      if (!localEmbeddingsAllowed()) return null;
-      return loadLocalProvider();
-    }
+  if (override === 'openai') {
+    if (!getOpenAiApiKey()) return null; // chosen OpenAI but no key
+    // A demoted or cooling OpenAI embedder routes to local for now (breaker
+    // opened on quota/auth, or twice on transient — see recordFailure).
+    if ((demotedToLocal || providerCooldown(OPENAI_PROVIDER)) && localEmbeddingsAllowed()) return loadLocalProvider();
     return OPENAI_PROVIDER;
   }
-  if (override === 'openai') return null; // forced openai but no key
-  if (!localEmbeddingsAllowed()) return null;
-  return loadLocalProvider();
+  if (localEmbeddingsAllowed()) {
+    const local = await loadLocalProvider();
+    if (local) return local;
+  }
+  // The local model could not load here (weights unavailable, worker and
+  // main-thread runtime both refused). A key the owner already holds is the
+  // stand-in; said once so nobody is billed in silence.
+  if (override !== 'local' && getOpenAiApiKey() && !providerCooldown(OPENAI_PROVIDER)) {
+    noteLocalUnavailableStandIn();
+    return OPENAI_PROVIDER;
+  }
+  return null;
+}
+
+let standInNoted = false;
+function noteLocalUnavailableStandIn(): void {
+  if (standInNoted) return;
+  standInNoted = true;
+  logger.warn(
+    { model: LOCAL_EMBEDDING_MODEL },
+    'local embedding model unavailable on this machine — the OpenAI embedder stands in until it loads',
+  );
 }
 
 /** Sync best-effort view of the active provider (no model load). Used by the
@@ -730,27 +749,34 @@ function activeProviderSync(): EmbeddingProvider | null {
   if (embeddingsDisabledByEnv()) return null;
   const override = providerOverride();
   if (override === 'off') return null;
-  // Demoted → local only. Deliberately NOT falling back to OPENAI_PROVIDER
-  // while the local model is still loading: OpenAI is known-bad here, and a
-  // brief lexical-only window beats re-poisoning recall with timeouts.
-  if (demotedToLocal && override !== 'openai' && localEmbeddingsAllowed()) return localProviderSync();
-  if (override !== 'local' && getOpenAiApiKey()) {
-    if (override !== 'openai' && providerCooldown(OPENAI_PROVIDER)) {
-      if (!localEmbeddingsAllowed()) return null;
-      return localProviderSync();
-    }
+  if (override === 'openai') {
+    if (!getOpenAiApiKey()) return null;
+    // Demoted or cooling → local only. Deliberately NOT OPENAI_PROVIDER while
+    // the local model is still loading: OpenAI is known-bad here, and a brief
+    // lexical-only window beats re-poisoning recall with timeouts.
+    if ((demotedToLocal || providerCooldown(OPENAI_PROVIDER)) && localEmbeddingsAllowed()) return localProviderSync();
     return OPENAI_PROVIDER;
   }
-  if (override === 'openai') return null;
-  if (!localEmbeddingsAllowed()) return null;
-  // Answers from constants while the weights load instead of null. That null is
-  // what made every sync gate read "embeddings off" on a local install — and it
-  // disabled the maintenance backfill that was supposed to populate the store,
-  // so the condition could not clear itself.
-  return localProviderSync();
+  if (localEmbeddingsAllowed()) {
+    // Answers from constants while the weights load instead of null. That null
+    // is what made every sync gate read "embeddings off" on a local install —
+    // and it disabled the maintenance backfill that was supposed to populate
+    // the store, so the condition could not clear itself.
+    const local = localProviderSync();
+    if (local) return local;
+  }
+  if (override !== 'local' && getOpenAiApiKey() && !providerCooldown(OPENAI_PROVIDER)) return OPENAI_PROVIDER;
+  return null;
 }
 
 export function activeEmbeddingModel(): string | null { return activeProviderSync()?.model ?? null; }
+/** 'local' | 'openai' | null: which embedder memory runs on right now, for
+ *  surfaces that say who does what (the OpenAI account is "memory search"
+ *  only while it actually embeds). */
+export function activeEmbeddingProviderName(): 'local' | 'openai' | null {
+  const name = activeProviderSync()?.name;
+  return name === 'local' || name === 'openai' ? name : null;
+}
 export function activeEmbeddingDim(): number | null { return activeProviderSync()?.dim ?? null; }
 
 /**
@@ -1028,7 +1054,8 @@ async function callProviderEmbed(provider: EmbeddingProvider, texts: string[]): 
  */
 async function fallbackProviderAfterFailure(failedProvider: EmbeddingProvider): Promise<EmbeddingProvider | null> {
   if (failedProvider.name !== 'openai') return null; // local has no further fallback
-  if (providerOverride() === 'openai') return null; // an explicit force is honored, even for a rescue
+  // An explicit OpenAI choice is not a vow of lexical-only recall: when OpenAI
+  // refuses, the local model rescues the very same request.
   if (!localEmbeddingsAllowed()) return null;
   return loadLocalProvider();
 }

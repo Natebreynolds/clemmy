@@ -16,6 +16,9 @@ const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-test-emb-demotion-'
 const PROVIDER_HEALTH_FILE = path.join(TEST_HOME, 'state', 'embedding-provider-health.json');
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.OPENAI_API_KEY = 'sk-test-not-real';
+// These scenarios are about an OpenAI embedder failing over; OpenAI is now the
+// owner's explicit choice (the local model is the default).
+process.env.CLEMMY_EMBED_PROVIDER = 'openai';
 // Exercise local failover, but always inject a fake provider so the real
 // transformers model is never loaded or downloaded by this unit test.
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'on';

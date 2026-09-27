@@ -591,8 +591,9 @@ function MemoryAssurancePanel({ report, loading }: { report?: MemoryReadinessRep
 }
 
 // ─────────── Recall / embedding health ───────────
-// Surfaces the signal that was illegible before: when embeddings are off (no
-// key) or circuit-broken, semantic recall silently degrades to lexical match.
+// Surfaces the signal that was illegible before: when embeddings are off (the
+// local model did not load) or circuit-broken, semantic recall silently
+// degrades to lexical match.
 function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryHealth }) {
   const emb = health?.embeddings;
   const recall = health?.recall;
@@ -609,7 +610,7 @@ function RecallHealthStrip({ health }: { health?: import('@/lib/memory').MemoryH
   const tone: 'good' | 'warn' | 'neutral' = !emb.enabled ? 'warn' : emb.breakerOpen ? 'warn' : 'good';
   const dot = tone === 'good' ? 'bg-success' : tone === 'warn' ? 'bg-warning' : 'bg-faint';
   const label = !emb.enabled
-    ? 'Semantic recall OFF — no embedding key; using lexical match only'
+    ? 'Semantic recall OFF — the local embedding model is not loaded; using lexical match only'
     : emb.breakerOpen
       ? `Semantic recall paused (${emb.lastErrorClass ?? 'error'}) — temporarily lexical-only`
       : 'Semantic recall on';
