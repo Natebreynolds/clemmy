@@ -7,6 +7,7 @@ import { accrueSessionTokens, getSession, type SessionKind } from './harness/eve
 import { sealTraceEnvelope } from './trace-envelope.js';
 import type { TraceEnvelope } from './trace-envelope.js';
 import { resolveWorkflowUsageSource } from './workflow-usage-context.js';
+import { MEMORY_JOBS, memoryJobFromChannel } from '../memory/memory-jobs.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -506,15 +507,22 @@ export function withModelUsageObserver<T>(sink: ObservedModelUsage[], work: () =
 }
 
 /** Role from an explicit channel convention only (`judge:*`, `watcher*`,
- *  `jev*`, `writer*`, `memory:*`); anything else is left unset rather than
- *  guessed. */
+ *  `jev*`, `writer*`, `memory:<job>`); anything else is left unset rather than
+ *  guessed. A memory job's channel names whose model the job registry says
+ *  does its thinking: the memory model's jobs are `memory`, the checker's
+ *  (standing, verify) are `reviewer`, and the local index and model-free
+ *  upkeep name no role. */
 export function usageRoleFromChannel(channel: string | undefined): UsageRequestRole | undefined {
   const value = (channel ?? '').trim().toLowerCase();
   if (!value) return undefined;
   if (value.startsWith('judge') || value.startsWith('watcher') || value.startsWith('review')) return 'reviewer';
   if (value.startsWith('jev')) return 'router';
   if (value.startsWith('writer')) return 'writer';
-  if (value.startsWith('memory:')) return 'memory';
+  const job = memoryJobFromChannel(value);
+  if (job) {
+    const owner = MEMORY_JOBS[job].modelOwner;
+    return owner === 'memory' ? 'memory' : owner === 'checker' ? 'reviewer' : undefined;
+  }
   return undefined;
 }
 

@@ -419,11 +419,33 @@ test('usageEfficiencyForEvents: the brain is the model that carried the prompt b
   assert.ok(efficiency.prefixReuse > 0.8, `brain frames reused the previous prompt: ${efficiency.prefixReuse}`);
 });
 
-test('a memory job channel names the memory role, only by its exact prefix', () => {
-  assert.equal(usageRoleFromChannel('memory:learn'), 'memory');
-  assert.equal(usageRoleFromChannel('Memory:Tidy'), 'memory');
+test('a memory job channel names the role of the model the job registry gives it', () => {
+  for (const job of ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import']) {
+    assert.equal(usageRoleFromChannel(`memory:${job}`), 'memory', `${job} runs on the memory model`);
+  }
+  assert.equal(usageRoleFromChannel('Memory:Reconcile'), 'memory', 'case does not change the job');
+  // Checking stays with "Checks the work" on purpose; its calls are review.
+  assert.equal(usageRoleFromChannel('memory:standing'), 'reviewer');
+  assert.equal(usageRoleFromChannel('memory:verify'), 'reviewer');
+  // The local index and model-free upkeep are not memory model work.
+  assert.equal(usageRoleFromChannel('memory:index'), undefined);
+  assert.equal(usageRoleFromChannel('Memory:Tidy'), undefined);
+  assert.equal(usageRoleFromChannel('memory:not-a-job'), undefined, 'an unknown job is not guessed');
   assert.equal(usageRoleFromChannel('memory_search'), undefined, 'the embedder lane is not memory model work');
   assert.equal(usageRoleFromChannel('memorable'), undefined);
+});
+
+test('a checker memory job books an unrouted call as review, never as the memory model', () => {
+  const read = (sessionId: string) => listOperationalEvents({ source: 'model', type: 'model_call_completed', sessionId, limit: 5 })[0]?.payload;
+  // The journal's scope shape: a governed job adds role memory, a checker job only its channel.
+  for (const [job, role] of [['verify', 'reviewer'], ['standing', 'reviewer'], ['index', undefined], ['learn', 'memory']] as const) {
+    const sessionId = `usage-memory-owner-${job}`;
+    withModelUsageAttribution({ sessionId: 'memory', sourceUserSeq: 0, channel: `memory:${job}`,
+      ...(job === 'learn' ? { role: 'memory' as const } : {}) }, () =>
+      recordModelUsage({ sessionId, model: 'test-model', inputTokens: 5, outputTokens: 1 }));
+    assert.equal(read(sessionId)?.channel, `memory:${job}`);
+    assert.equal(read(sessionId)?.role, role, `${job} books as ${role ?? 'no role'}`);
+  }
 });
 
 test('memory work is background usage, never the chat lane of the conversation it read', () => {
