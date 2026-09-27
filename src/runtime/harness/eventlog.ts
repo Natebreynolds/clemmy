@@ -7456,15 +7456,13 @@ function derivedToolOutputReaderFailureReason(
   ) ? DERIVED_READER_AUTHORITY_REASON : null;
 }
 
-/** Whether a stored output was produced by a derived retained-output reader,
- *  judged by the same rule the authority and query resolvers apply. Routing
- *  callers use it so a reader that would refuse the output is never offered;
- *  it grants nothing. */
-export function toolOutputIsDerivedReaderOutput(sessionId: string, callId: string): boolean {
-  const record = getToolOutput(sessionId, callId);
-  if (!record) return false;
-  const lifecycle = durableToolOutputOccurrence(openEventLog(), sessionId, callId);
-  return derivedToolOutputReaderFailureReason(record, lifecycle.occurrence) !== null;
+/** Why the query resolver will refuse a stored output whose own call has not
+ *  returned yet, judged on what exists before the return: the bytes and the
+ *  producer identity, by the resolver's own rule. The lifecycle checks apply
+ *  when the call settles, through `resolveToolOutputForQuery`. Routing callers
+ *  use it so a reader that would refuse is never offered; it grants nothing. */
+export function unsettledToolOutputQueryRefusal(record: ToolOutputRecord): string | null {
+  return authorityOutputFailureReason(record, null);
 }
 
 function authorityOutputFailureReason(

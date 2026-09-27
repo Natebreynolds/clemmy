@@ -31,7 +31,9 @@ import {
   getToolOutput,
   listToolOutputCallIds,
   resolveToolOutputForAuthority,
-  toolOutputIsDerivedReaderOutput,
+  resolveToolOutputForQuery,
+  unsettledToolOutputQueryRefusal,
+  type ToolOutputRecord,
 } from './eventlog.js';
 import { parseStoredToolOutputJson } from './json-repair.js';
 import { resolveRetainedOutputRead } from './retained-output-read.js';
@@ -52,6 +54,11 @@ export interface RetainedResultRouteInput {
   readonly exclude?: readonly string[];
   /** Recall calls still available this turn, when the caller knows. */
   readonly recallCallsRemaining?: number;
+  /** The output's own call has not returned yet: a formatter routing the
+   * result it is about to return. The query check cannot pass before the
+   * return exists, so the output is judged as that check will judge it once
+   * the call settles. */
+  readonly inFlight?: boolean;
 }
 
 /**
@@ -70,7 +77,7 @@ export function retainedResultRoutes(
   // a copy.
   let readId = input.callId;
   let receipt = false;
-  let record: { output: string; truncatedAtWrite?: boolean } | null = null;
+  let record: ToolOutputRecord | null = null;
   try {
     const resolved = resolveRetainedOutputRead(input.sessionId, input.callId);
     readId = resolved.callId;
@@ -120,10 +127,10 @@ export function retainedResultRoutes(
   }
 
   // file_query reads the same stored text and spends no recall budget, so it
-  // serves plain text with recall already exhausted. It refuses a derived
-  // reader's own output that no lineage maps back to a producer, so such an id
-  // is never offered to it; advertising a reader that will refuse is a dead end.
-  if (!excluded.has('file_query') && !derivedWithoutLineage(input.sessionId, readId, receipt)) {
+  // serves plain text with recall already exhausted. It is offered only when
+  // its own query check accepts this id; advertising a reader that will
+  // refuse is a dead end.
+  if (!excluded.has('file_query') && fileQueryServes(input, readId, receipt, record)) {
     routes.push({
       tool: 'file_query',
       call: `file_query {"call_id":"${readId}","query":"<what you need>"}`,
@@ -134,13 +141,20 @@ export function retainedResultRoutes(
   return routes;
 }
 
-function derivedWithoutLineage(sessionId: string, readId: string, receipt: boolean): boolean {
-  // A redeemed receipt is read under its own exact identity, as file_query does.
-  if (receipt) return false;
+/** file_query's own acceptance, from the one resolver it applies. A redeemed
+ * receipt is read under its own exact identity, as file_query reads it. */
+function fileQueryServes(
+  input: RetainedResultRouteInput,
+  readId: string,
+  receipt: boolean,
+  record: ToolOutputRecord,
+): boolean {
+  if (receipt) return true;
   try {
-    return toolOutputIsDerivedReaderOutput(sessionId, readId);
+    if (input.inFlight && readId === input.callId) return unsettledToolOutputQueryRefusal(record) === null;
+    return resolveToolOutputForQuery(input.sessionId, readId).status === 'ok';
   } catch {
-    return true;
+    return false;
   }
 }
 

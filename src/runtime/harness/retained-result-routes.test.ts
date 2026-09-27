@@ -146,9 +146,9 @@ test('routes for a carrier-dispatched recall name the producer, never the recall
 });
 
 test('a result still inside its own open lifecycle is offered to file_query', () => {
-  // A digest footer is written while its call is still open (no return yet).
-  // file_query will read it once the call settles, so the router must not
-  // withhold it for that; only a derived reader's unmapped output is withheld.
+  // A digest footer is written while its call is still open (no return yet),
+  // and says so. file_query will read it once the call settles, so the router
+  // must not withhold it for that.
   const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'open-lifecycle' });
   eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_called', data: {
     callId: 'toolu_open_text', tool: 'call_tool', effectiveTool: 'space_get_view', accounting: 'top_level',
@@ -156,7 +156,7 @@ test('a result still inside its own open lifecycle is offered to file_query', ()
   } });
   eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_open_text', invocationNonce: 'nonce-open-text',
     tool: 'space_get_view', output: 'A saved view of plain prose notes.' });
-  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_open_text' });
+  const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_open_text', inFlight: true });
   assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(routes));
 });
 
@@ -183,4 +183,40 @@ test('prose whose brackets happen to parse is routed as text, never to the recor
     const routes = retainedResultRoutes({ sessionId, callId });
     assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], `${callId}: ${JSON.stringify(routes)}`);
   }
+});
+
+test('file_query is offered exactly when its own query-authority check accepts the output', () => {
+  // Settled outputs: the router asks the resolver file_query applies.
+  const failed = stored('toolu_failure_text', 'ERROR: the provider refused the request.\nNothing was read.');
+  assert.equal(eventlog.resolveToolOutputForQuery(failed, 'toolu_failure_text').status, 'failed',
+    'precondition: file_query refuses a failure-shaped output');
+  const failedRoutes = retainedResultRoutes({ sessionId: failed, callId: 'toolu_failure_text' });
+  assert.ok(!failedRoutes.some((r) => r.tool === 'file_query'), JSON.stringify(failedRoutes));
+  assert.ok(failedRoutes.some((r) => r.tool === 'recall_tool_result'), 'recall still reads the text verbatim');
+
+  const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'explicit-failed-lifecycle' });
+  const called = eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_called', data: {
+    callId: 'toolu_lifecycle_failed', tool: 'read_file', arguments: '{"path":"notes.txt"}',
+  } });
+  eventlog.writeToolOutput({ sessionId: s.id, callId: 'toolu_lifecycle_failed', invocationNonce: 'nonce-lifecycle-failed',
+    tool: 'read_file', output: 'Partial notes read before the provider dropped the connection.' });
+  eventlog.appendEvent({ sessionId: s.id, turn: 1, role: 'agent', type: 'tool_returned', parentEventId: called.id, data: {
+    callId: 'toolu_lifecycle_failed', tool: 'read_file', ok: false,
+  } });
+  assert.equal(eventlog.resolveToolOutputForQuery(s.id, 'toolu_lifecycle_failed').status, 'failed',
+    'precondition: file_query refuses an output whose lifecycle explicitly failed');
+  const lifecycleRoutes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_lifecycle_failed' });
+  assert.ok(!lifecycleRoutes.some((r) => r.tool === 'file_query'), JSON.stringify(lifecycleRoutes));
+
+  // A call still in flight is judged on its bytes: a failure-shaped result is
+  // withheld from file_query even before its return is recorded.
+  const open = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'open-failure' });
+  eventlog.appendEvent({ sessionId: open.id, turn: 1, role: 'agent', type: 'tool_called', data: {
+    callId: 'toolu_open_failure', tool: 'call_tool', effectiveTool: 'space_get_view', accounting: 'top_level',
+    arguments: JSON.stringify({ name: 'space_get_view', args_json: '{"slug":"notes"}' }),
+  } });
+  eventlog.writeToolOutput({ sessionId: open.id, callId: 'toolu_open_failure', invocationNonce: 'nonce-open-failure',
+    tool: 'space_get_view', output: 'ERROR: no saved view named notes.' });
+  const openRoutes = retainedResultRoutes({ sessionId: open.id, callId: 'toolu_open_failure', inFlight: true });
+  assert.ok(!openRoutes.some((r) => r.tool === 'file_query'), JSON.stringify(openRoutes));
 });

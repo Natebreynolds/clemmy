@@ -517,8 +517,9 @@ export function formatRecallableToolText(
     toolName,
     callId,
     // The stored row exists (written above), so the one reader router can
-    // name the reader that serves this output's actual shape.
-    readerAdvice: () => retainedResultWayThrough({ sessionId, callId }),
+    // name the reader that serves this output's actual shape. This call has
+    // not returned yet, so the router judges it as it will stand once settled.
+    readerAdvice: () => retainedResultWayThrough({ sessionId, callId, inFlight: true }),
   }));
   if (exactReceipt && compact.length > maxChars - receiptReserve) {
     // Defensive absolute cap for non-JSON and root-array fallbacks. Preserve
