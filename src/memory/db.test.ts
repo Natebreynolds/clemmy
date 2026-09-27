@@ -155,23 +155,28 @@ test('backupMemoryDb refuses before VACUUM when free space cannot hold the sourc
   assert.deepEqual(snapshots, [], 'the low-space refusal publishes no partial or final snapshot');
 });
 
-test('backupMemoryDb retains only the newest N snapshots', () => {
-  // Seed three OLD fake snapshots (lexicographically earlier ISO stamps).
+test('backupMemoryDb retains only the newest N snapshots of its own kind', () => {
+  // Seed three OLD fake repair snapshots (lexicographically earlier ISO
+  // stamps) and one old nightly.
   if (!existsSync(MEMORY_BACKUP_DIR)) mkdirSync(MEMORY_BACKUP_DIR, { recursive: true });
   for (const stamp of ['2020-01-01T00-00-00-000Z', '2020-02-01T00-00-00-000Z', '2020-03-01T00-00-00-000Z']) {
     writeFileSync(path.join(MEMORY_BACKUP_DIR, `memory-${stamp}.db`), 'stale');
   }
+  writeFileSync(path.join(MEMORY_BACKUP_DIR, 'memory-2020-01-15-nightly.db'), 'stale nightly');
   rememberFact({ kind: 'project', content: 'Backup retention check.' });
 
+  // An unkeyed backup is a repair snapshot: it prunes repair snapshots only.
   const result = backupMemoryDb({ retain: 2 });
   assert.ok(result, 'backup succeeded');
 
   const remaining = readdirSync(MEMORY_BACKUP_DIR).filter((f) => f.startsWith('memory-') && f.endsWith('.db')).sort();
-  assert.equal(remaining.length, 2, 'pruned to the newest 2 snapshots');
+  const repairs = remaining.filter((f) => !f.endsWith('-nightly.db'));
+  assert.equal(repairs.length, 2, 'pruned to the newest 2 repair snapshots');
   // The fresh (real) backup is the newest, so it must survive.
-  assert.ok(remaining.includes(path.basename(result!.backupPath)), 'the just-written backup survives pruning');
+  assert.ok(repairs.includes(path.basename(result!.backupPath)), 'the just-written backup survives pruning');
   // The oldest fakes are gone.
   assert.ok(!remaining.includes('memory-2020-01-01T00-00-00-000Z.db'), 'oldest snapshot pruned');
+  assert.ok(remaining.includes('memory-2020-01-15-nightly.db'), 'a repair snapshot never pushes a nightly copy out');
 });
 
 test('reapStaleEpisodicPointers drops pointers past the TTL but keeps fresh ones', () => {

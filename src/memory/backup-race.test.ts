@@ -176,14 +176,11 @@ test('rename-before-commit SIGKILL re-adopts the deterministic nightly snapshot'
   initialize(home);
   const backupDir = path.join(home, 'state', 'backups');
   mkdirSync(backupDir, { recursive: true });
-  for (const stamp of [
-    '2020-01-01T00-00-00-000Z',
-    '2020-02-01T00-00-00-000Z',
-    '2020-03-01T00-00-00-000Z',
-    '2020-04-01T00-00-00-000Z',
-  ]) {
-    writeFileSync(path.join(backupDir, `memory-${stamp}.db`), 'old');
+  for (const day of ['2020-01-01', '2020-02-01', '2020-03-01', '2020-04-01']) {
+    writeFileSync(path.join(backupDir, `memory-${day}-nightly.db`), 'old');
   }
+  // A repair snapshot is a different kind; nightly retention never touches it.
+  writeFileSync(path.join(backupDir, 'memory-2020-05-01T00-00-00-000Z.db'), 'old repair');
 
   const crashed = spawn(process.execPath, ['--import', 'tsx', fixture, 'publish-uncommitted', '2026-08-25'], {
     cwd: repoRoot,
@@ -203,14 +200,16 @@ test('rename-before-commit SIGKILL re-adopts the deterministic nightly snapshot'
     assert.equal(result.reused, true, 'restart adopts the complete final instead of vacuuming again');
     assert.equal(result.bytes > 0, true);
     const retained = publishedSnapshots(home);
-    assert.equal(retained.length, 2, 're-adoption also restores the requested retention bound');
-    assert.equal(retained.includes(path.basename(expected)), true, 'the re-adopted snapshot is protected from pruning');
+    const nightlies = retained.filter((name) => name.endsWith('-nightly.db'));
+    assert.equal(nightlies.length, 2, 're-adoption also restores the requested nightly retention bound');
+    assert.equal(nightlies.includes(path.basename(expected)), true, 'the re-adopted snapshot is protected from pruning');
+    assert.equal(retained.includes('memory-2020-05-01T00-00-00-000Z.db'), true, 'the repair snapshot is not a nightly to prune');
   } finally {
     if (crashed.exitCode === null && crashed.signalCode === null) crashed.kill('SIGKILL');
   }
 });
 
-test('same-day reuse prunes a later unkeyed repair burst while protecting the nightly snapshot', { timeout: 40_000 }, async () => {
+test('same-day reuse prunes older nightlies, never a later repair burst, and protects the nightly snapshot', { timeout: 40_000 }, async () => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'clemmy-memory-backup-reuse-prune-'));
   initialize(home);
 
@@ -218,12 +217,16 @@ test('same-day reuse prunes a later unkeyed repair burst while protecting the ni
   assert.equal(initial.code, 0, initial.stderr || initial.stdout);
   const nightly = (JSON.parse(initial.stdout.trim()) as BackupResult).result!;
   assert.equal(nightly.reused, false);
+  const backupDir = path.join(home, 'state', 'backups');
+  for (const day of ['2026-08-21', '2026-08-22', '2026-08-23']) {
+    writeFileSync(path.join(backupDir, `memory-${day}-nightly.db`), 'older nightly');
+  }
 
   const repairExits = await Promise.all(
     Array.from({ length: 4 }, () => completion(spawnUnkeyedBackup(home, 99))),
   );
   for (const result of repairExits) assert.equal(result.code, 0, result.stderr || result.stdout);
-  assert.equal(publishedSnapshots(home).length, 5, 'repair burst intentionally exceeds nightly retention');
+  assert.equal(publishedSnapshots(home).length, 8, 'four nightlies plus a repair burst');
 
   const reusedExit = await completion(spawnBackup(home, '2026-08-25', 3));
   assert.equal(reusedExit.code, 0, reusedExit.stderr || reusedExit.stdout);
@@ -231,8 +234,13 @@ test('same-day reuse prunes a later unkeyed repair burst while protecting the ni
   assert.equal(reused.reused, true);
   assert.equal(reused.backupPath, nightly.backupPath);
   const retained = publishedSnapshots(home);
-  assert.equal(retained.length, 3, 'keyed reuse prunes under the same coordinator lease');
-  assert.equal(retained.includes(path.basename(nightly.backupPath)), true, 'the returned snapshot survives pruning');
+  const nightlies = retained.filter((name) => name.endsWith('-nightly.db'));
+  assert.deepEqual(
+    nightlies,
+    ['memory-2026-08-22-nightly.db', 'memory-2026-08-23-nightly.db', path.basename(nightly.backupPath)],
+    'keyed reuse prunes nightlies to the bound under the same coordinator lease',
+  );
+  assert.equal(retained.length - nightlies.length, 4, 'the repair burst is a different kind and stays');
 });
 
 test('unkeyed repair backups remain fresh while nightly publication and retention serialize', { timeout: 40_000 }, async () => {
@@ -259,8 +267,13 @@ test('unkeyed repair backups remain fresh while nightly publication and retentio
   assert.equal(existsSync(nightlyResult.backupPath), true);
   assert.equal(existsSync(repairAResult.backupPath), true);
   assert.equal(existsSync(repairBResult.backupPath), true);
+  // Repairs keep the newest 3 repairs (one old one survives); the nightly is
+  // counted only against nightlies.
   assert.deepEqual(
     publishedSnapshots(home),
-    [nightlyResult, repairAResult, repairBResult].map((result) => path.basename(result.backupPath)).sort(),
+    [
+      'memory-2020-02-01T00-00-00-000Z.db',
+      ...[nightlyResult, repairAResult, repairBResult].map((result) => path.basename(result.backupPath)),
+    ].sort(),
   );
 });

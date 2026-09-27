@@ -220,6 +220,37 @@ test('a refused free-space check is a null from the worker too', async () => {
   assert.deepEqual(partials(), []);
 });
 
+// ── C4: retention by class ───────────────────────────────────────────────────
+
+test('C4: repair snapshots never push the week of nightly copies out, and a nightly never prunes a repair', async () => {
+  const { writeFileSync } = await import('node:fs');
+  mkdirSync(MEMORY_BACKUP_DIR, { recursive: true });
+  const nightlies = ['2026-09-19', '2026-09-20', '2026-09-21', '2026-09-22', '2026-09-23', '2026-09-24', '2026-09-25']
+    .map((day) => `memory-${day}-nightly.db`);
+  // Repair snapshots from the night before, which sort AFTER every older nightly.
+  const repairs = Array.from({ length: 8 }, (_, i) => `memory-2026-09-25T04-35-0${i}-000Z-0000000${i}.db`);
+  for (const name of [...nightlies, ...repairs]) writeFileSync(path.join(MEMORY_BACKUP_DIR, name), 'seeded');
+
+  const nightly = await backupMemoryDbAsync({ retain: 7, localDayKey: '2026-09-26' });
+  assert.ok(nightly);
+  const afterNightly = snapshots();
+  assert.deepEqual(
+    afterNightly.filter((name) => name.endsWith('-nightly.db')),
+    [...nightlies.slice(1), 'memory-2026-09-26-nightly.db'],
+    'the newest seven nightlies remain: the week is intact',
+  );
+  assert.deepEqual(afterNightly.filter((name) => !name.endsWith('-nightly.db')), repairs, 'a nightly prunes nightlies only');
+
+  // A repair snapshot prunes repairs only, however small its bound.
+  const repair = await backupMemoryDbAsync({ retain: 2 });
+  assert.ok(repair);
+  const afterRepair = snapshots();
+  assert.deepEqual(afterRepair.filter((name) => name.endsWith('-nightly.db')).length, 7, 'every nightly survives a repair burst');
+  const repairsLeft = afterRepair.filter((name) => !name.endsWith('-nightly.db'));
+  assert.equal(repairsLeft.length, 2);
+  assert.ok(repairsLeft.includes(path.basename(repair!.backupPath)));
+});
+
 // ── C5: self-heal takes one snapshot per run ─────────────────────────────────
 
 test('C5: a self-heal run that applies three fixes takes exactly one snapshot', async () => {

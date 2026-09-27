@@ -245,10 +245,36 @@ function cleanupOrphanedBackupPartials(backupDir: string): void {
   }
 }
 
-function pruneMemoryBackups(backupDir: string, retain: number, protectedPath: string): void {
+/**
+ * Two kinds of snapshot share the backup directory:
+ *   - nightly: `memory-YYYY-MM-DD-nightly.db`, one per day (keyed);
+ *   - repair:  every other `memory-*.db` — the fresh rollback point a repair
+ *     takes before it writes (`memory-<ISO>-<id>.db`, and older unkeyed names).
+ * Each kind is pruned only against its own kind, so a burst of repair
+ * snapshots can never push the week of nightly copies out, and a nightly
+ * never deletes the rollback point a repair just took.
+ */
+export type MemoryBackupRetainClass = 'nightly' | 'repair';
+const NIGHTLY_SNAPSHOT_NAME = /^memory-\d{4}-\d{2}-\d{2}-nightly\.db$/;
+
+export function memoryBackupRetainClass(filename: string): MemoryBackupRetainClass {
+  return NIGHTLY_SNAPSHOT_NAME.test(filename) ? 'nightly' : 'repair';
+}
+
+function retainClassFor(opts: PublishMemorySnapshotOptions): MemoryBackupRetainClass {
+  return opts.localDayKey ? 'nightly' : 'repair';
+}
+
+function pruneMemoryBackups(
+  backupDir: string,
+  retain: number,
+  protectedPath: string,
+  retainClass: MemoryBackupRetainClass,
+): void {
   const protectedName = path.basename(protectedPath);
   const backups = readdirSync(backupDir)
     .filter((filename) => filename.startsWith('memory-') && filename.endsWith('.db'))
+    .filter((filename) => memoryBackupRetainClass(filename) === retainClass)
     .sort();
   let excess = Math.max(0, backups.length - retain);
   for (const filename of backups) {
@@ -321,11 +347,10 @@ export function preparePublication(
     }
     if (bytes !== null) {
       recordBackupPublication(coordinator, backupKey, backupPath, bytes);
-      // Reuse/re-adoption is still a maintenance pass. Repair snapshots may
-      // have accumulated since the nightly was first published, so restore
-      // the requested bound before releasing the same lease that protects
+      // Reuse/re-adoption is still a maintenance pass: restore the requested
+      // nightly bound before releasing the same lease that protects
       // publication. Never prune the snapshot this caller is returning.
-      pruneMemoryBackups(paths.backupDir, retain, backupPath);
+      pruneMemoryBackups(paths.backupDir, retain, backupPath, retainClassFor(opts));
       coordinator.exec('COMMIT');
       return { done: true, result: { backupPath, bytes, reused: true } };
     }
@@ -378,7 +403,7 @@ export function finishPublication(
   fsyncBackupPublication(paths.backupDir, pending.backupPath);
 
   if (pending.backupKey) recordBackupPublication(coordinator, pending.backupKey, pending.backupPath, bytes);
-  pruneMemoryBackups(paths.backupDir, Math.max(1, opts.retain), pending.backupPath);
+  pruneMemoryBackups(paths.backupDir, Math.max(1, opts.retain), pending.backupPath, retainClassFor(opts));
   coordinator.exec('COMMIT');
   return { backupPath: pending.backupPath, bytes, reused: false };
 }
@@ -406,7 +431,8 @@ function checkpointSource(source: Database.Database, mode: PublishMemorySnapshot
  * (rebuildable from markdown), `consolidated_facts`/`entities`/`embeddings`
  * are NOT derivable from anything on disk — a corrupt memory.db loses the
  * agent's whole long-term memory. This writes a consistent, defragmented
- * snapshot and prunes to the newest `retain` copies.
+ * snapshot and prunes to the newest `retain` copies of its own kind (nightly
+ * or repair; see memoryBackupRetainClass).
  *
  * `VACUUM INTO` (vs a raw file copy) is atomic and consistent under WAL — it
  * serializes a clean page image as of the moment its read transaction starts,
