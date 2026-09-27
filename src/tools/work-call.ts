@@ -2049,9 +2049,10 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       requireHostPlan
         ? 'Compose content you write yourself in the consuming call\'s args; after a reviewed compute step is recorded with plan_step_result, call its consumer with the plan requirement id and omit the bound fields.'
         : 'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
-      // The discovery and ambiguity policy for the proposal-free carrier has
-      // one owner, the [action-planning] instruction line and the rubric; an
-      // invalid inner call returns its exact schema.
+      // The discovery and ambiguity policy for the proposal-free carrier is
+      // owned by the rubric (CAPABILITY USE; resolve missing capabilities
+      // once), whichever host action line the turn carries; an invalid inner
+      // call returns its exact schema.
       requireHostPlan
         ? null
         : 'Invoke a runtime-resolved inner name/schema directly. When a requirement is unresolved, use tool_search once for that requirement; when only an exact schema is missing, describe that exact tool once instead of broad-searching. Ask the user naturally if the intended work itself is ambiguous.',

@@ -50,7 +50,9 @@ function builtWire(): Promise<Map<string, WireTool>> {
 function withinCeiling(tool: WireTool | undefined, name: string, ceiling: number): WireTool {
   assert.ok(tool, `${name} is on the advertised surface`);
   const size = Buffer.byteLength(JSON.stringify(tool), 'utf8');
-  assert.ok(size <= ceiling, `${name} advertises ${size} B, above its ${ceiling} B ceiling`);
+  assert.ok(size <= ceiling, `${name} advertises ${size} B, above its ${ceiling} B ceiling. `
+    + 'If the added text is call contract no result, refusal or instruction owner can carry, raise the ceiling on purpose '
+    + 'and record the byte change in the Lean Rounds baseline commit.');
   return tool;
 }
 
