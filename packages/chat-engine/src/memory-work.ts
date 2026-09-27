@@ -162,6 +162,8 @@ export interface MemoryWorkProduced {
   setAside?: number;
   faded?: number;
   restored?: number;
+  /** Records of finished work cleared once they aged out. Not memories. */
+  agedOut?: number;
   patterns?: number;
   skills?: number;
   proposals?: number;
@@ -471,6 +473,7 @@ export function memoryEventSentence(event: MemoryWorkEvent): string {
     case 'tidy': {
       if (p.faded) parts.push(`let ${plural(p.faded, 'memory', 'memories')} fade`);
       if (p.restored) parts.push(`restored ${p.restored}`);
+      if (p.agedOut) parts.push(`cleared ${plural(p.agedOut, 'record', 'records')} of finished work`);
       break;
     }
     case 'standing':

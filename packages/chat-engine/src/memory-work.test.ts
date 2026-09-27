@@ -91,3 +91,10 @@ test('checks say what they approved or stopped, not "nothing new"', () => {
   assert.equal(memoryEventSentence({ ...at, job: 'standing', produced: { approved: 1 } }), 'Approved a standing instruction');
   assert.equal(memoryEventSentence({ ...at, job: 'verify', produced: { declined: 2 } }), 'Stopped 2 memory repairs');
 });
+
+test('tidy says memories faded apart from finished work it cleared', () => {
+  const at = { id: 'e', at: 'x', outcome: 'ok' as const, expiresAt: 'y', job: 'tidy' as const };
+  assert.equal(memoryEventSentence({ ...at, produced: { faded: 2 } }), 'Let 2 memories fade');
+  assert.equal(memoryEventSentence({ ...at, produced: { agedOut: 3 } }), 'Cleared 3 records of finished work');
+  assert.equal(memoryEventSentence({ ...at, produced: { faded: 1, agedOut: 1 } }), 'Let 1 memory fade, cleared 1 record of finished work');
+});

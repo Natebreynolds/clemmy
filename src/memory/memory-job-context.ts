@@ -174,14 +174,21 @@ export function memoryWorkSourceFromTurn(fallback: MemoryWorkSource | null): Mem
 
 /**
  * A tidy run's record: the memories it let fade (by id, so the Memory tab can
- * bring them back) plus finished work it aged out (a count). Recorded only
- * when something faded; otherwise the run just refreshes "last checked".
+ * bring them back) and, apart from them, the records of finished work it
+ * cleared once they aged out (a count; they are not memories, so they never
+ * count as faded). Recorded only when something changed; otherwise the run
+ * just refreshes "last checked".
  */
 export function memoryTidyOutcome(fadedFactIds: Iterable<number>, agedOut = 0): MemoryJobOutcome {
   const faded = [...new Set(factIdStrings(fadedFactIds))];
-  const count = faded.length + Math.max(0, Math.floor(agedOut));
-  if (count === 0) return { outcome: 'nothing_new' };
-  return { outcome: 'ok', produced: { faded: count }, ...(faded.length > 0 ? { facts: { faded } } : {}), record: true };
+  const aged = Number.isFinite(agedOut) ? Math.max(0, Math.floor(agedOut)) : 0;
+  if (faded.length === 0 && aged === 0) return { outcome: 'nothing_new' };
+  return {
+    outcome: 'ok',
+    produced: { ...(faded.length > 0 ? { faded: faded.length } : {}), ...(aged > 0 ? { agedOut: aged } : {}) },
+    ...(faded.length > 0 ? { facts: { faded } } : {}),
+    record: true,
+  };
 }
 
 /** A verify run's record (a second model checking a memory repair or a

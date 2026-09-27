@@ -475,7 +475,9 @@ test('verify, tidy and index outcomes say only what happened', () => {
   assert.deepEqual(jobs.memoryVerifyOutcome({ verdict: 'unavailable' }, { error: Object.assign(new Error('x'), { status: 401 }) }),
     { outcome: 'failed', failure: { problem: 'not_connected' } });
   assert.deepEqual(jobs.memoryTidyOutcome([4, 4, 9]), { outcome: 'ok', produced: { faded: 2 }, facts: { faded: ['4', '9'] }, record: true });
-  assert.deepEqual(jobs.memoryTidyOutcome([], 3), { outcome: 'ok', produced: { faded: 3 }, record: true });
+  assert.deepEqual(jobs.memoryTidyOutcome([], 3), { outcome: 'ok', produced: { agedOut: 3 }, record: true },
+    'finished work that aged out is not a faded memory');
+  assert.deepEqual(jobs.memoryTidyOutcome([7], 2), { outcome: 'ok', produced: { faded: 1, agedOut: 2 }, facts: { faded: ['7'] }, record: true });
   assert.deepEqual(jobs.memoryTidyOutcome([]), { outcome: 'nothing_new' });
   assert.deepEqual(jobs.memoryIndexOutcome(5), { outcome: 'ok', produced: { embedded: 5 } });
   assert.deepEqual(jobs.memoryIndexOutcome(0), { outcome: 'nothing_new' });
