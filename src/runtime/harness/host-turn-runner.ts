@@ -73,7 +73,7 @@ import { isToolMediaContent, toolMediaText } from './tool-media-content.js';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
 import { BoundaryError } from '../boundary-error.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
-import { classifyModelError } from './resilient-model.js';
+import { classifyModelError, modelRetriesSpentBeforeContent } from './resilient-model.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { serializeAdvertisedTools, toolsOnAdvertisedWire } from './advertised-tool-wire.js';
 import type { PromptReadingPublisher } from './prompt-composition.js';
@@ -9428,7 +9428,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const bufferedRequestInFlight = error instanceof ModelStreamStalledError
         ? error.bufferedProviderRequestInFlight
         : [...(harnessRunContextStorage.getStore()?.bufferedProviderRequests ?? [])].some(request => request.active);
-      if (!signal?.aborted && !bufferedRequestInFlight
+      // The model boundary owns retries of a request that produced nothing.
+      // When it already spent them, the same request again only lengthens
+      // the wait and may bill again; the owner gets the question instead.
+      const modelRetriesSpent = transportInterrupted && modelRetriesSpentBeforeContent(error);
+      if (!signal?.aborted && !bufferedRequestInFlight && !modelRetriesSpent
         && (error instanceof ModelStreamStalledError || transportInterrupted)
         && remainingModelStallRetries > 0) {
         remainingModelStallRetries -= 1;

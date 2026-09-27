@@ -131,6 +131,25 @@ test('a credential refresh that times out before the request is sent is retried 
   assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0);
 });
 
+test('a provider that never answers ends in a resumable question after one bounded round, never a failed run', async () => {
+  const session = HarnessSession.create({ kind: 'chat', title: 'provider unreachable' });
+  fakeWire(() => connectTimeout());
+  const startedAt = Date.now();
+  const result = await runChatTurn(session.id, productionBrain(session.id));
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.match(String(result.finalOutput), /connection to my model/i);
+  assert.match(String(result.finalOutput), /Would you like me to try continuing from here\?/);
+  assert.equal(wire.length, 4, 'the model boundary spends its retries once; the host does not start a second round');
+  assert.ok(elapsedMs < 15_000, `bounded wait (${elapsedMs} ms)`);
+  const waiting = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(waiting.length, 1);
+  assert.equal(waiting[0].data.reason, 'model_transport_unavailable');
+  assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0, 'no generic failure');
+  const completed = eventlog.listEvents(session.id, { types: ['conversation_completed'] });
+  assert.ok(completed.every(event => event.data.status !== 'failed'), 'the turn is not recorded as failed');
+});
+
 test('a connection lost after reply text streamed is never replayed at the model boundary', async () => {
   fakeWire(() => answerThenDrop('Partial reply'));
   const brain = productionBrain('sess-transport-after-output');
