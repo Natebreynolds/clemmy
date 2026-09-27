@@ -9,7 +9,7 @@
 import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -23,7 +23,9 @@ const telemetry = await import('../runtime/operational-telemetry.js');
 const journal = await import('./memory-work-journal.js');
 const read = await import('./memory-work-read.js');
 const { openMemoryDb, resetMemoryDb } = await import('./db.js');
-const { rememberFact, forgetFact, getFact } = await import('./facts.js');
+const { rememberFact, forgetFact, getFact, reactivateFact, setFactPinned, supersedeFact } = await import('./facts.js');
+const { reflectOnToolReturn, REFLECTION_MIN_CONTENT_CHARS } = await import('./reflection.js');
+const { BASE_DIR } = await import('../config.js');
 const { createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { recordModelUsage } = await import('../runtime/usage-log.js');
 const { resolveMemoryModelRoute } = await import('./memory-model-route.js');
@@ -108,11 +110,10 @@ test('an empty home gives a resting snapshot with every contract key, zeros only
   assert.deepEqual(snap.retention, { detailDays: 7, summaryDays: 90 });
   assert.deepEqual(snap.embedder, { modelId: null, local: false }, 'embeddings are off in this home');
 
-  // 24 hourly buckets, oldest first, the last one is this hour.
-  assert.equal(snap.hourly.length, 24);
-  const thisHour = new Date(Math.floor(now.getTime() / 3_600_000) * 3_600_000).toISOString();
-  assert.equal(snap.hourly.at(-1)?.hourStart, thisHour);
-  assert.ok(snap.hourly[0].hourStart < snap.hourly[23].hourStart);
+  // The journal began just now: only this local hour was measured; the
+  // hours before it are absent, not zero.
+  const thisHour = new Date(now.getTime() - (now.getMinutes() * 60_000 + now.getSeconds() * 1000 + now.getMilliseconds())).toISOString();
+  assert.deepEqual(snap.hourly, [{ hourStart: thisHour, runs: 0, modelCalls: 0, learned: 0 }]);
   // The journal began today: today is a genuine zero, earlier days are absent.
   assert.deepEqual(snap.daily, [{ day: localDayKey(now), runs: 0, modelCalls: 0, learned: 0, inputTokens: 0, outputTokens: 0 }]);
 
@@ -242,6 +243,89 @@ test('a tidy run can bring back what it faded, while it is still faded', async (
   assert.equal(readMemoryWork().recent[0].undo, null);
 });
 
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
+
+async function tidyFaded(id: number) {
+  forgetFact(id); // the nightly tidy lets it fade …
+  await runMemoryJob('tidy', { source: { kind: 'schedule' } }, async () => 1, () => ({
+    outcome: 'ok', produced: { faded: 1 }, facts: { faded: [String(id)] }, record: true,
+  }));
+  await tick(); // … and the owner acts later
+  return readMemoryWork().recent[0];
+}
+
+test('bring back leaves alone a memory the owner restored and then forgot on purpose', async () => {
+  const x = fact('An old vendor contact nobody used');
+  const event = await tidyFaded(x);
+  assert.deepEqual(event.undo, { kind: 'restore', count: 1 });
+  reactivateFact(x); // the owner brings it back from the Memory tab
+  assert.equal(readMemoryWork().recent[0].undo, null, 'nothing of this run is faded now');
+  forgetFact(x); // then forgets it deliberately
+  assert.equal(readMemoryWork().recent[0].undo, null, 'the owner\'s forget is not this run\'s fade');
+  assert.deepEqual(undoMemoryWork(event.id), { ok: false, reason: 'nothing_to_undo' });
+  assert.equal(getFact(x)?.active, false);
+});
+
+test('bring back never revives a memory a newer one replaced', async () => {
+  const x = fact('The weekly sync is on Tuesday');
+  const event = await tidyFaded(x);
+  reactivateFact(x);
+  const y = supersedeFact(x, { content: 'The weekly sync moved to Wednesday' });
+  assert.ok(y && y.id !== x);
+  assert.equal(readMemoryWork().recent[0].undo, null);
+  assert.deepEqual(undoMemoryWork(event.id), { ok: false, reason: 'nothing_to_undo' });
+  assert.equal(getFact(x)?.active, false, 'the replaced memory stays replaced');
+  assert.equal(getFact(y.id)?.active, true, 'its replacement stays the one in use');
+});
+
+test('forget leaves a memory the owner pinned after the run, and still forgets one the run itself pinned', async () => {
+  const plain = fact('Invoices go out on the first business day');
+  const rule = rememberFact({ kind: 'constraint', content: 'Never email a prospect before 8am their time' }).id;
+  assert.equal(getFact(rule)?.pinned, true, 'fixture: a constraint is pinned from birth');
+  await runMemoryJob('learn', { source: { kind: 'conversation', sessionId: 'sess-p' } }, async () => { call('memory-model'); }, () => ({
+    outcome: 'ok', produced: { learned: 2 }, facts: { learned: [String(plain), String(rule)] },
+  }));
+  await tick();
+  setFactPinned(plain, true); // the owner keeps this one on purpose
+  const [event] = readMemoryWork().recent;
+  assert.deepEqual(event.undo, { kind: 'forget', count: 1 });
+  assert.deepEqual(undoMemoryWork(event.id), { ok: true, changed: 1 });
+  assert.equal(getFact(plain)?.active, true);
+  assert.equal(getFact(rule)?.active, false);
+});
+
+test('a memory a nested reconcile added is undone once, from the run the owner recognises', async () => {
+  const kept = fact('The owner reviews proposals on Fridays');
+  const learnRun = () => runMemoryJob('learn', { source: { kind: 'conversation', sessionId: 'sess-r' } }, async () => {
+    call('memory-model', 100, 10);
+    await runMemoryJob('reconcile', {}, async () => { call('memory-model', 40, 4); },
+      () => ({ outcome: 'ok', produced: { learned: 1 }, facts: { learned: [String(kept)] } }));
+  }, () => ({ outcome: 'ok', produced: { claims: 1, learned: 1 }, facts: { learned: [String(kept)] } }));
+  await learnRun();
+  let snap = readMemoryWork();
+  const byJob = new Map(snap.recent.map((e) => [e.job, e]));
+  assert.deepEqual(byJob.get('learn')?.undo, { kind: 'forget', count: 1 });
+  assert.equal(byJob.get('reconcile')?.undo, null, 'the learn run offers it; the reconcile inside it does not');
+  assert.deepEqual(undoMemoryWork(byJob.get('reconcile')!.id), { ok: false, reason: 'nothing_to_undo' });
+  assert.equal(getFact(kept)?.active, true);
+  assert.equal(snap.today.learned, 1, 'kept once in today\'s numbers');
+  assert.equal(snap.hourly.at(-1)?.learned, 1, 'and once in the hour');
+  assert.equal(snap.today.runs, 2, 'both runs happened');
+  assert.equal(snap.today.modelCalls, 2);
+
+  // Inside a run that offers no undo of its own, the reconcile keeps its own.
+  const pattern = fact('Proposals that open with a result close faster');
+  await runMemoryJob('patterns', { source: { kind: 'schedule' } }, async () => {
+    await runMemoryJob('reconcile', {}, async () => { call('memory-model'); },
+      () => ({ outcome: 'ok', produced: { learned: 1 }, facts: { learned: [String(pattern)] } }));
+  }, () => ({ outcome: 'ok', produced: { patterns: 1 } }));
+  snap = readMemoryWork();
+  const nested = snap.recent.find((e) => e.job === 'reconcile' && e.facts?.[0]?.id === String(pattern));
+  assert.deepEqual(nested?.undo, { kind: 'forget', count: 1 });
+  assert.deepEqual(undoMemoryWork(nested!.id), { ok: true, changed: 1 });
+  assert.equal(getFact(pattern)?.active, false);
+});
+
 test('undo refuses what it cannot or should not change', async () => {
   assert.deepEqual(undoMemoryWork('no-such-event'), { ok: false, reason: 'not_found' });
   await runMemoryJob('patterns', {}, async () => { call('memory-model'); }, () => ({ outcome: 'ok', produced: { patterns: 1 } }));
@@ -320,6 +404,67 @@ function hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+test('a failure that was not the model\'s names no problem', async () => {
+  await assert.rejects(runMemoryJob('learn', {}, async () => { throw new TypeError('x is not a function'); }, () => ({ outcome: 'ok' })));
+  const [event] = readMemoryWork().recent;
+  assert.equal(event.outcome, 'failed');
+  assert.equal(event.failure, null, 'the timeline says it did not finish, without blaming the model');
+});
+
+test('learning switched off in the env file reads as off, and the extractor obeys the same switch', async () => {
+  const envFile = path.join(BASE_DIR, '.env');
+  writeFileSync(envFile, 'CLEMMY_REFLECTION=off\n');
+  try {
+    assert.equal(process.env.CLEMMY_REFLECTION, undefined, 'fixture: the switch is only in the env file');
+    assert.equal(read.memoryLearningTurnedOn(), false);
+    assert.equal(readMemoryWork().state, 'off');
+    const result = await reflectOnToolReturn({
+      sessionId: 'sess-envoff', callId: 'call-envoff', tool: 't', output: 'x'.repeat(REFLECTION_MIN_CONTENT_CHARS + 1),
+    });
+    assert.equal(result.skipped, 'disabled', 'the extractor stops too');
+  } finally {
+    rmSync(envFile, { force: true });
+  }
+  assert.equal(readMemoryWork().state, 'resting');
+});
+
+test('the hourly strip follows local hours, even in a half-hour time zone', () => {
+  const savedTz = process.env.TZ;
+  process.env.TZ = 'Asia/Kolkata'; // UTC+5:30: local hours start at :30 UTC
+  try {
+    const now = new Date('2026-09-26T12:10:00.000Z'); // 17:40 local
+    const db = telemetry.openOperationalTelemetryDb();
+    db.prepare(`UPDATE memory_work_meta SET value = ? WHERE key = 'journal_since'`).run(new Date(now.getTime() - 3 * DAY).toISOString());
+    const seed = (iso: string) => telemetry.recordOperationalEvent({
+      source: 'memory', type: 'memory_work_completed', actor: 'learn',
+      payload: { job: 'learn', outcome: 'ok', usage: { calls: 1 }, produced: { learned: 1 } }, now: new Date(iso),
+    }, db);
+    seed('2026-09-26T11:45:00.000Z'); // 17:15 local: this hour
+    seed('2026-09-26T11:29:59.000Z'); // 16:59:59 local: the hour before
+    seed('2026-09-26T11:30:00.000Z'); // 17:00 local sharp: this hour
+    const snap = readMemoryWork(now);
+    assert.equal(snap.hourly.length, 24);
+    assert.equal(snap.hourly.at(-1)?.hourStart, '2026-09-26T11:30:00.000Z');
+    assert.equal(snap.hourly.at(-1)?.runs, 2);
+    assert.equal(snap.hourly.at(-2)?.hourStart, '2026-09-26T10:30:00.000Z');
+    assert.equal(snap.hourly.at(-2)?.runs, 1);
+    assert.equal(snap.hourly[0].hourStart, '2026-09-25T12:30:00.000Z');
+  } finally {
+    if (savedTz === undefined) delete process.env.TZ; else process.env.TZ = savedTz;
+  }
+});
+
+test('the hourly strip leaves out hours before the journal began', () => {
+  const now = new Date();
+  const db = telemetry.openOperationalTelemetryDb();
+  db.prepare(`UPDATE memory_work_meta SET value = ? WHERE key = 'journal_since'`).run(new Date(now.getTime() - 150 * 60_000).toISOString());
+  const snap = readMemoryWork(now);
+  // Began 2.5 hours ago: the hour it began in, the two after it, and this one.
+  assert.ok(snap.hourly.length === 3 || snap.hourly.length === 4, `got ${snap.hourly.length}`);
+  assert.ok(Date.parse(snap.hourly[0].hourStart) + 3_600_000 > now.getTime() - 150 * 60_000, 'the first hour ends after the journal began');
+  assert.ok(snap.hourly.every((h) => h.runs === 0), 'a measured hour with no work is a real zero');
+});
+
 test('the queue counts parts to read, claims set aside and parts that failed every retry', () => {
   const db = openMemoryDb();
   const now = new Date().toISOString();
@@ -395,4 +540,48 @@ test('a busy week of history reads well under 50 ms', () => {
   assert.equal(snap.daily.length, 30);
   assert.ok(median < 50, `median read ${median.toFixed(1)} ms of CPU`);
   console.log(`# readMemoryWork median ${median.toFixed(1)} ms of CPU over 20k events`);
+});
+
+test('imports of thousands of memories still read well under 50 ms', () => {
+  // Undo is counted inside memory.db and text is read only for the facts
+  // each event shows, so what a run touched adds index lookups, not reads.
+  const db = openMemoryDb();
+  const base = fact('seed fact for the schema');
+  const columns = Object.keys(db.prepare('SELECT * FROM consolidated_facts WHERE id = ?').get(base) as object)
+    .filter((c) => c !== 'id');
+  const copy = db.prepare(`INSERT INTO consolidated_facts (${columns.join(',')})
+    SELECT ${columns.map((c) => (c === 'content' || c === 'content_hash' ? '?' : c)).join(',')} FROM consolidated_facts WHERE id = ?`);
+  const ids: string[] = [];
+  const contentFirst = columns.indexOf('content') < columns.indexOf('content_hash');
+  db.transaction(() => {
+    for (let i = 0; i < 5000; i += 1) {
+      const content = `Imported memory number ${i} `.repeat(12);
+      const params = contentFirst ? [content, hex(`import-${i}`)] : [hex(`import-${i}`), content];
+      ids.push(String(copy.run(...params, base).lastInsertRowid));
+    }
+  })();
+  const cpu = () => {
+    readMemoryWork();
+    const times: number[] = [];
+    for (let i = 0; i < 7; i += 1) {
+      const started = process.cpuUsage();
+      readMemoryWork();
+      const used = process.cpuUsage(started);
+      times.push((used.user + used.system) / 1000);
+    }
+    return times.sort((a, b) => a - b)[3];
+  };
+  const empty = cpu();
+  const tdb = telemetry.openOperationalTelemetryDb();
+  for (let e = 0; e < 3; e += 1) {
+    telemetry.recordOperationalEvent({ source: 'memory', type: 'memory_work_completed', actor: 'import',
+      payload: { job: 'import', outcome: 'ok', produced: { learned: 5000 }, facts: { learned: ids }, usage: { calls: 1 } } }, tdb);
+  }
+  const big = cpu();
+  const [event] = readMemoryWork().recent;
+  assert.deepEqual(event.undo, { kind: 'forget', count: 5000 });
+  assert.equal(event.facts?.length, 8);
+  console.log(`# readMemoryWork median ${empty.toFixed(1)} ms empty, ${big.toFixed(1)} ms with 3 imports of 5,000 memories`);
+  // CPU time (as above); the budget is the poll's, like the busy week's.
+  assert.ok(big < 50, `median read ${big.toFixed(1)} ms of CPU with 15,000 ids`);
 });

@@ -18,7 +18,6 @@
  * faded, through the same soft forget / restore every Memory door uses.
  */
 import type Database from 'better-sqlite3';
-import { getRuntimeEnv } from '../config.js';
 import { openOperationalTelemetryDb } from '../runtime/operational-telemetry.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
@@ -35,7 +34,8 @@ import {
   type MemoryJobClock,
   type MemoryJobId,
 } from './memory-jobs.js';
-import { describeMemoryModel, resolveMemoryModelRoute } from './memory-model-route.js';
+import { describeMemoryModel, memoryJobModelId, type MemoryModelDescription } from './memory-model-route.js';
+import { reflectionTurnedOff } from './reflection.js';
 import {
   MEMORY_WORK_EVENT_TYPES,
   MEMORY_WORK_RETENTION,
@@ -118,11 +118,11 @@ interface EventRow {
   payload_json: string | null;
 }
 
-/** Learning runs unless the operator kill-switch says off (the same key and
- *  reader the nightly recursive reflection uses). */
+/** Learning runs unless the operator kill-switch says off. The very reader
+ *  the extractor and the nightly patterns run obey, so the tab can never say
+ *  "off" while learning carries on (or the reverse). */
 export function memoryLearningTurnedOn(): boolean {
-  const raw = (getRuntimeEnv('CLEMMY_REFLECTION', '') ?? '').trim().toLowerCase();
-  return raw !== 'off' && raw !== 'false' && raw !== '0';
+  return !reflectionTurnedOff();
 }
 
 /** The snapshot both apps poll. Never throws: an unreadable journal is `unknown`. */
@@ -140,8 +140,11 @@ function buildSnapshot(now: Date, db: Database.Database): MemoryWorkSnapshot {
   const summarySince = localDayKey(new Date(nowMs - MEMORY_WORK_RETENTION.summaryDays * DAY_MS));
   const dayRows = db.prepare('SELECT * FROM memory_work_daily WHERE day >= ?').all(summarySince) as DailyRow[];
   const since = journalSince(db);
-  const hourRows = readHourRows(db, now);
+  const firstHourMs = localHourStart(now) - (HOURLY_HOURS - 1) * HOUR_MS;
+  const hourRows = readHourRows(db, firstHourMs);
   const eventRows = readRecentRows(db, detailSince);
+  // One description serves the model chip and every governed job's name.
+  const described = safe(() => describeMemoryModel(), null);
 
   const running = safe(() => listRunningMemoryJobs(), [] as MemoryWorkRunning[]);
   const learningOn = memoryLearningTurnedOn();
@@ -153,7 +156,7 @@ function buildSnapshot(now: Date, db: Database.Database): MemoryWorkSnapshot {
 
   const todayKey = localDayKey(now);
   const todayRows = dayRows.filter((row) => row.day === todayKey && isMemoryJobId(row.job));
-  const model = memoryModel(dayRows);
+  const model = memoryModel(dayRows, described);
   const titles = sessionTitles([
     ...running.map((r) => r.source?.sessionId),
     ...eventRows.map((r) => r.session_id ?? undefined),
@@ -172,11 +175,11 @@ function buildSnapshot(now: Date, db: Database.Database): MemoryWorkSnapshot {
     model,
     embedder: readEmbedder(),
     jobs: MEMORY_JOB_IDS.map((id) => jobStatus(id, {
-      now, learningOn, waiting, running, dayRows, todayRows,
+      now, learningOn, waiting, running, dayRows, todayRows, described,
     })),
     today: todayTotals(todayRows),
-    hourly: hourly(now, hourRows),
-    daily: daily(now, dayRows, since),
+    hourly: hourly(firstHourMs, hourRows, since?.ms ?? null),
+    daily: daily(now, dayRows, since?.day ?? null),
     recent: recentEvents(eventRows, titles),
     retention: { ...MEMORY_WORK_RETENTION },
   };
@@ -254,8 +257,7 @@ function readEmbedder(): MemoryWorkSnapshot['embedder'] {
 
 /** The memory model: what the next governed job asks for (the memory route's
  *  own resolution) and what last answered a governed job. */
-function memoryModel(dayRows: DailyRow[]): MemoryWorkModel {
-  const described = safe(() => describeMemoryModel(), null);
+function memoryModel(dayRows: DailyRow[], described: MemoryModelDescription | null): MemoryWorkModel {
   let lastServed: MemoryWorkModel['lastServed'] = null;
   for (const row of dayRows) {
     if (!isMemoryJobId(row.job) || !memoryJobUsesMemoryModel(row.job)) continue;
@@ -280,6 +282,7 @@ function jobStatus(id: MemoryJobId, ctx: {
   running: MemoryWorkRunning[];
   dayRows: DailyRow[];
   todayRows: DailyRow[];
+  described: MemoryModelDescription | null;
 }): MemoryJobStatus {
   const spec = MEMORY_JOBS[id];
   const rows = ctx.dayRows.filter((row) => row.job === id);
@@ -293,14 +296,14 @@ function jobStatus(id: MemoryJobId, ctx: {
     id,
     modelOwner: spec.modelOwner,
     state,
-    modelId: jobModelId(id, rows),
+    modelId: jobModelId(id, rows, ctx.described),
     lastRun: lastRun(id, rows),
     next: off ? null : { trigger: spec.trigger, ...(clock ? { at: nextClockAt(clock, ctx.now) } : {}) },
     today: totalsOf(ctx.todayRows.filter((row) => row.job === id)),
   };
 }
 
-function jobModelId(id: MemoryJobId, rows: DailyRow[]): string | null {
+function jobModelId(id: MemoryJobId, rows: DailyRow[], described: MemoryModelDescription | null): string | null {
   const owner = MEMORY_JOBS[id].modelOwner;
   if (owner === 'none') return null;
   if (owner === 'local') return safe(() => activeEmbeddingModel(), null);
@@ -309,8 +312,9 @@ function jobModelId(id: MemoryJobId, rows: DailyRow[]): string | null {
     if (row.last_model_id && row.last_model_at && (!newest || row.last_model_at > (newest.last_model_at ?? ''))) newest = row;
   }
   if (newest?.last_model_id) return newest.last_model_id;
-  // A governed job that has not run yet: the model it would ask for.
-  if (owner === 'memory') return safe(() => resolveMemoryModelRoute(id)?.modelId ?? null, null);
+  // A governed job that has not run yet: the model it would ask for, named
+  // from the one description (no model is built on a poll).
+  if (owner === 'memory' && described) return memoryJobModelId(id, described);
   return null;
 }
 
@@ -370,30 +374,46 @@ function zeroTotals(): MemoryWorkTotals {
   return { runs: 0, modelCalls: 0, inputTokens: 0, outputTokens: 0, learned: 0, updated: 0, faded: 0 };
 }
 
-interface HourRow { hour: string; runs: number; calls: number | null; learned: number | null }
+interface HourRow { bucket: number; runs: number; calls: number | null; learned: number | null }
 
-function readHourRows(db: Database.Database, now: Date): HourRow[] {
-  const first = new Date(hourFloor(now.getTime()) - (HOURLY_HOURS - 1) * HOUR_MS).toISOString();
-  return db.prepare(`
-    SELECT substr(ts, 1, 13) AS hour,
-           COUNT(*) AS runs,
-           SUM(COALESCE(json_extract(payload_json, '$.usage.calls'), 0)) AS calls,
-           SUM(COALESCE(json_extract(payload_json, '$.produced.learned'), 0)) AS learned
-      FROM operational_events
-     WHERE source = 'memory' AND type IN ('memory_work_completed', 'memory_work_failed') AND ts >= ?
-     GROUP BY hour
-  `).all(first) as HourRow[];
+/**
+ * Start of the local hour holding `now`, as an instant. Local, not UTC: in a
+ * zone with a half-hour offset the hour starts at :30 UTC. Measured back from
+ * `now`'s own minutes, so it is unambiguous across a daylight-saving change.
+ */
+function localHourStart(now: Date): number {
+  return now.getTime() - (now.getMinutes() * 60_000 + now.getSeconds() * 1000 + now.getMilliseconds());
 }
 
-/** 24 one-hour buckets ending with the current hour, oldest first. */
-function hourly(now: Date, rows: HourRow[]): MemoryWorkHour[] {
-  const byHour = new Map(rows.map((row) => [row.hour, row]));
-  const current = hourFloor(now.getTime());
+/** Runs, calls and learned per hour since `firstMs` (bucket 0 = the first
+ *  hour). What a nested run changed is counted by the run around it. */
+function readHourRows(db: Database.Database, firstMs: number): HourRow[] {
+  return db.prepare(`
+    SELECT (CAST(strftime('%s', ts) AS INTEGER) - CAST(@first AS INTEGER)) / 3600 AS bucket,
+           COUNT(*) AS runs,
+           SUM(COALESCE(json_extract(payload_json, '$.usage.calls'), 0)) AS calls,
+           SUM(CASE WHEN json_extract(payload_json, '$.nestedIn') IS NULL
+                    THEN COALESCE(json_extract(payload_json, '$.produced.learned'), 0) ELSE 0 END) AS learned
+      FROM operational_events
+     WHERE source = 'memory' AND type IN ('memory_work_completed', 'memory_work_failed') AND ts >= @since
+     GROUP BY bucket
+  `).all({ first: Math.floor(firstMs / 1000), since: new Date(firstMs).toISOString() }) as HourRow[];
+}
+
+/**
+ * The last 24 local hours ending with the current one, oldest first. An hour
+ * with runs shows them; an hour since the journal began with none is a
+ * genuine zero; an hour that ended before the journal began was never
+ * measured and is left out (as the 30-day strip leaves out earlier days).
+ */
+function hourly(firstMs: number, rows: HourRow[], sinceMs: number | null): MemoryWorkHour[] {
+  const byBucket = new Map(rows.map((row) => [Number(row.bucket), row]));
   const out: MemoryWorkHour[] = [];
-  for (let i = HOURLY_HOURS - 1; i >= 0; i -= 1) {
-    const start = new Date(current - i * HOUR_MS).toISOString();
-    const row = byHour.get(start.slice(0, 13));
-    out.push({ hourStart: start, runs: num(row?.runs), modelCalls: num(row?.calls), learned: num(row?.learned) });
+  for (let i = 0; i < HOURLY_HOURS; i += 1) {
+    const start = firstMs + i * HOUR_MS;
+    const row = byBucket.get(i);
+    if (!row && (sinceMs === null || start + HOUR_MS <= sinceMs)) continue;
+    out.push({ hourStart: new Date(start).toISOString(), runs: num(row?.runs), modelCalls: num(row?.calls), learned: num(row?.learned) });
   }
   return out;
 }
@@ -425,11 +445,12 @@ function daily(now: Date, rows: DailyRow[], sinceDay: string | null): MemoryWork
   return out;
 }
 
-function journalSince(db: Database.Database): string | null {
+/** When the journal began, as an instant and as its local day. */
+function journalSince(db: Database.Database): { ms: number; day: string } | null {
   try {
     const row = db.prepare(`SELECT value FROM memory_work_meta WHERE key = 'journal_since'`).get() as { value: string } | undefined;
     const ms = row ? Date.parse(row.value) : Number.NaN;
-    return Number.isFinite(ms) ? localDayKey(new Date(ms)) : null;
+    return Number.isFinite(ms) ? { ms, day: localDayKey(new Date(ms)) } : null;
   } catch {
     return null;
   }
@@ -456,23 +477,154 @@ function readRecentRows(db: Database.Database, since: string): EventRow[] {
 
 interface FactState { active: boolean; text: string }
 
-function recentEvents(rows: EventRow[], titles: Map<string, string>): MemoryWorkEvent[] {
-  const parsed = rows.map((row) => ({ row, payload: parsePayload(row.payload_json) }));
-  const ids = new Set<number>();
-  for (const { payload } of parsed) {
-    for (const change of FACT_CHANGES) for (const id of payload.facts?.[change] ?? []) {
+type UndoKind = 'forget' | 'restore';
+
+/**
+ * Which of a run's ids undo may still change: ONE rule for the offer and for
+ * the undo itself, so the button never promises what undo would not do.
+ * - forget: still active, and not pinned since the run (a pin after the run
+ *   is the owner keeping it on purpose).
+ * - restore: still faded exactly as this run left it. Fading stamps
+ *   `updated_at` before the run's event is written; an owner restore, a later
+ *   forget or a supersede each stamp it again after (a supersede also names
+ *   its replacement), so bringing those back would undo someone else's
+ *   decision, or leave a fact and its replacement both active.
+ * `@at` is the run's event time; `@ids` a JSON array of fact ids.
+ */
+const UNDO_TARGETS_WHERE: Record<UndoKind, string> = {
+  forget: `active = 1 AND NOT (pinned = 1 AND COALESCE(updated_at, '') > @at)`,
+  restore: `active = 0 AND superseded_by_fact_id IS NULL AND updated_at <= @at`,
+};
+
+function undoKindOf(job: unknown): UndoKind | null {
+  if (!isMemoryJobId(job)) return null;
+  if (FORGETTABLE_JOBS.has(job)) return 'forget';
+  if (RESTORABLE_JOBS.has(job)) return 'restore';
+  return null;
+}
+
+/** The ids a run's undo would act on: what it learned (forget) or faded (restore). */
+function undoIdsOf(kind: UndoKind, facts: MemoryJobFacts | null | undefined): number[] {
+  const list = kind === 'forget' ? facts?.learned : facts?.faded;
+  return [...new Set((Array.isArray(list) ? list : []).map(factNumber).filter((n): n is number => n !== null))];
+}
+
+/**
+ * A run nested in another run whose undo is of the same kind leaves the ids
+ * the enclosing run lists to that run: one "Forget" per memory, on the run
+ * the owner recognises (the conversation that was read), not twice. When the
+ * enclosing run lists nothing (it failed, or is still running), the nested
+ * run keeps its own undo.
+ */
+function withoutEnclosingIds(
+  kind: UndoKind,
+  ids: number[],
+  nestedIn: MemoryWorkEventPayload['nestedIn'] | undefined,
+  enclosing: (runId: string) => Partial<MemoryWorkEventPayload> | undefined,
+): number[] {
+  if (!nestedIn || typeof nestedIn.runId !== 'string' || undoKindOf(nestedIn.job) !== kind || ids.length === 0) return ids;
+  const parent = enclosing(nestedIn.runId);
+  if (!parent) return ids;
+  const theirs = new Set(undoIdsOf(kind, parent.facts));
+  return ids.filter((id) => !theirs.has(id));
+}
+
+/** Counts (or lists) a run's ids that undo would still change, in memory.db. */
+function undoTargetReader(memory: Database.Database) {
+  const statements = new Map<string, Database.Statement>();
+  const statement = (kind: UndoKind, select: 'count' | 'ids') => {
+    const key = `${kind}:${select}`;
+    let stmt = statements.get(key);
+    if (!stmt) {
+      stmt = memory.prepare(`
+        SELECT ${select === 'count' ? 'COUNT(*) AS n' : 'id'} FROM consolidated_facts
+         WHERE id IN (SELECT value FROM json_each(@ids)) AND ${UNDO_TARGETS_WHERE[kind]}
+      `);
+      statements.set(key, stmt);
+    }
+    return stmt;
+  };
+  return {
+    count(kind: UndoKind, ids: number[], at: string): number {
+      if (ids.length === 0) return 0;
+      const row = statement(kind, 'count').get({ ids: JSON.stringify(ids), at }) as { n: number } | undefined;
+      return typeof row?.n === 'number' ? row.n : 0;
+    },
+    ids(kind: UndoKind, ids: number[], at: string): number[] {
+      if (ids.length === 0) return [];
+      return (statement(kind, 'ids').all({ ids: JSON.stringify(ids), at }) as Array<{ id: number }>).map((row) => row.id);
+    },
+  };
+}
+
+/** The first ids an event shows, in change order (at most FACTS_PER_EVENT). */
+function shownFactIds(facts: MemoryJobFacts | null | undefined): Array<{ n: number; change: MemoryWorkFact['change'] }> {
+  const out: Array<{ n: number; change: MemoryWorkFact['change'] }> = [];
+  for (const change of FACT_CHANGES) {
+    const list = facts?.[change];
+    for (const id of Array.isArray(list) ? list : []) {
+      if (out.length >= FACTS_PER_EVENT) return out;
       const n = factNumber(id);
-      if (n !== null) ids.add(n);
+      if (n !== null) out.push({ n, change });
     }
   }
-  const facts = readFacts([...ids]);
-  return parsed.map(({ row, payload }) => toEvent(row, payload, facts, titles));
+  return out;
+}
+
+/**
+ * Bounded by what is shown, not by how much a run touched: text is read only
+ * for the few facts each event lists, and undo is counted inside memory.db
+ * (one counting query per event, primary-key lookups only), so an import of
+ * thousands of memories never loads thousands of texts on every poll.
+ */
+function recentEvents(rows: EventRow[], titles: Map<string, string>): MemoryWorkEvent[] {
+  const parsed = rows.map((row) => ({ row, payload: parsePayload(row.payload_json) }));
+  const byRun = new Map<string, Partial<MemoryWorkEventPayload>>();
+  for (const { payload } of parsed) if (typeof payload.runId === 'string') byRun.set(payload.runId, payload);
+  const shown = parsed.map(({ payload }) => shownFactIds(payload.facts));
+  let memory: Database.Database | null = null;
+  let facts: Map<number, FactState> | null = null;
+  try {
+    memory = openMemoryDb();
+    facts = readFactTexts(memory, [...new Set(shown.flat().map((s) => s.n))]);
+  } catch {
+    memory = null; // no facts and no undo, rather than wrong ones
+  }
+  const targets = memory ? undoTargetReader(memory) : null;
+  return parsed.map(({ row, payload }, i) => {
+    let undo: MemoryWorkEvent['undo'] = null;
+    if (targets) {
+      try {
+        undo = undoOffer(row, payload, targets, (runId) => byRun.get(runId));
+      } catch {
+        undo = null;
+      }
+    }
+    return toEvent(row, payload, shown[i], facts, undo, titles);
+  });
+}
+
+/** Forget what a run learned that is still active; bring back what it faded
+ *  that is still faded as it left it. Recomputed from fact state on every read. */
+function undoOffer(
+  row: EventRow,
+  payload: Partial<MemoryWorkEventPayload>,
+  targets: ReturnType<typeof undoTargetReader>,
+  enclosing: (runId: string) => Partial<MemoryWorkEventPayload> | undefined,
+): MemoryWorkEvent['undo'] {
+  const kind = undoKindOf(row.actor);
+  if (!kind) return null;
+  const ids = withoutEnclosingIds(kind, undoIdsOf(kind, payload.facts), payload.nestedIn, enclosing);
+  const count = targets.count(kind, ids, row.ts);
+  return count > 0 ? { kind, count } : null;
 }
 
 function toEvent(
   row: EventRow,
   payload: Partial<MemoryWorkEventPayload>,
+  shown: Array<{ n: number; change: MemoryWorkFact['change'] }>,
   facts: Map<number, FactState> | null,
+  undo: MemoryWorkEvent['undo'],
   titles: Map<string, string>,
 ): MemoryWorkEvent {
   const job = row.actor as MemoryJobId;
@@ -483,15 +635,15 @@ function toEvent(
   const model = payload.model && typeof payload.model.modelId === 'string' && payload.model.modelId
     ? { modelId: payload.model.modelId, standIn: payload.model.standIn === true }
     : null;
+  // A problem is named only when it was the model's; a run that failed for
+  // another reason simply did not finish.
   const failure = payload.failure && PROBLEMS.has(payload.failure.problem)
     ? { problem: payload.failure.problem }
-    : outcome === 'failed' ? { problem: 'error' as const } : null;
+    : null;
   const listed: MemoryWorkFact[] = [];
   if (facts) {
-    for (const change of FACT_CHANGES) for (const id of payload.facts?.[change] ?? []) {
-      if (listed.length >= FACTS_PER_EVENT) break;
-      const n = factNumber(id);
-      const fact = n === null ? undefined : facts.get(n);
+    for (const { n, change } of shown) {
+      const fact = facts.get(n);
       if (fact) listed.push({ id: String(n), text: fact.text, change, active: fact.active });
     }
   }
@@ -513,46 +665,25 @@ function toEvent(
     source,
     produced: produced(payload.produced),
     ...(listed.length > 0 ? { facts: listed } : {}),
-    undo: facts ? undoOffer(job, payload.facts ?? null, facts) : null,
+    undo,
     failure,
     expiresAt,
   };
 }
 
-/** Forget what a run learned that is still active; bring back what it faded
- *  that is still faded. Recomputed from fact state on every read. */
-function undoOffer(job: MemoryJobId, ids: MemoryJobFacts | null, facts: Map<number, FactState>): MemoryWorkEvent['undo'] {
-  if (FORGETTABLE_JOBS.has(job)) {
-    const count = (ids?.learned ?? []).filter((id) => facts.get(factNumber(id) ?? -1)?.active === true).length;
-    return count > 0 ? { kind: 'forget', count } : null;
-  }
-  if (RESTORABLE_JOBS.has(job)) {
-    const count = (ids?.faded ?? []).filter((id) => facts.get(factNumber(id) ?? -1)?.active === false).length;
-    return count > 0 ? { kind: 'restore', count } : null;
-  }
-  return null;
-}
-
-/** Current text and active flag for each id, or null when memory.db cannot
- *  be read (then no facts and no undo are offered, rather than wrong ones). */
-function readFacts(ids: number[]): Map<number, FactState> | null {
+/** Current text and active flag for the facts the timeline shows (a few per
+ *  event). Throws when memory.db cannot be read; the caller then offers no
+ *  facts and no undo rather than wrong ones. */
+function readFactTexts(memory: Database.Database, ids: number[]): Map<number, FactState> {
   const out = new Map<number, FactState>();
   if (ids.length === 0) return out;
-  try {
-    const db = openMemoryDb();
-    for (let i = 0; i < ids.length; i += 500) {
-      const chunk = ids.slice(i, i + 500);
-      const rows = db.prepare(`
-        SELECT id, active, substr(content, 1, ${FACT_TEXT_MAX * 2}) AS content
-          FROM consolidated_facts
-         WHERE id IN (${chunk.map(() => '?').join(',')})
-      `).all(...chunk) as Array<{ id: number; active: number; content: string }>;
-      for (const row of rows) out.set(row.id, { active: row.active === 1, text: clip(row.content, FACT_TEXT_MAX) });
-    }
-    return out;
-  } catch {
-    return null;
-  }
+  const rows = memory.prepare(`
+    SELECT id, active, substr(content, 1, ${FACT_TEXT_MAX * 2}) AS content
+      FROM consolidated_facts
+     WHERE id IN (SELECT value FROM json_each(?))
+  `).all(JSON.stringify(ids)) as Array<{ id: number; active: number; content: string }>;
+  for (const row of rows) out.set(row.id, { active: row.active === 1, text: clip(row.content ?? '', FACT_TEXT_MAX) });
+  return out;
 }
 
 /** Conversation and workflow titles from the harness session rows (read
@@ -606,37 +737,42 @@ function withTitle(source: MemoryWorkSource, titles: Map<string, string>): Memor
 
 /**
  * Undo one recorded run: forget (soft) each memory it learned that is still
- * active, or bring back each memory it faded that is still faded. The same
+ * active, or bring back each memory it faded that is still faded as the run
+ * left it — exactly the ids the timeline's offer counted (one rule,
+ * `UNDO_TARGETS_WHERE`, checked again inside the transaction). The same
  * forget / restore the Memory tab's buttons use, so every door keeps one
  * safety story. Undo is a direct action, not a job: the next snapshot
  * recomputes what is left to undo from fact state.
  */
 export function undoMemoryWork(eventId: string, now: Date = new Date()): MemoryWorkUndoResult {
   try {
-    const row = openOperationalTelemetryDb().prepare(`
+    const telemetry = openOperationalTelemetryDb();
+    const row = telemetry.prepare(`
       SELECT event_id, ts, type, actor, session_id, payload_json
         FROM operational_events
        WHERE event_id = ? AND source = 'memory' AND type IN ('memory_work_completed', 'memory_work_failed')
     `).get(eventId) as EventRow | undefined;
     if (!row || !isMemoryJobId(row.actor)) return { ok: false, reason: 'not_found' };
     if (Date.parse(row.ts) < now.getTime() - MEMORY_WORK_RETENTION.detailDays * DAY_MS) return { ok: false, reason: 'expired' };
-    const job = row.actor;
-    const ids = parsePayload(row.payload_json).facts ?? null;
-    const forget = FORGETTABLE_JOBS.has(job);
-    if (!forget && !RESTORABLE_JOBS.has(job)) return { ok: false, reason: 'nothing_to_undo' };
-    const targets = [...new Set((forget ? ids?.learned : ids?.faded) ?? [])]
-      .map(factNumber)
-      .filter((n): n is number => n !== null);
-    if (targets.length === 0) return { ok: false, reason: 'nothing_to_undo' };
+    const kind = undoKindOf(row.actor);
+    if (!kind) return { ok: false, reason: 'nothing_to_undo' };
+    const payload = parsePayload(row.payload_json);
+    const ids = withoutEnclosingIds(kind, undoIdsOf(kind, payload.facts), payload.nestedIn, (runId) => {
+      const parent = telemetry.prepare(`
+        SELECT payload_json FROM operational_events
+         WHERE source = 'memory' AND type IN ('memory_work_completed', 'memory_work_failed')
+           AND ts >= ? AND actor = ? AND json_extract(payload_json, '$.runId') = ?
+         LIMIT 1
+      `).get(row.ts, payload.nestedIn?.job ?? '', runId) as { payload_json: string | null } | undefined;
+      return parent ? parsePayload(parent.payload_json) : undefined;
+    });
+    if (ids.length === 0) return { ok: false, reason: 'nothing_to_undo' };
     const db = openMemoryDb();
+    const targets = undoTargetReader(db);
     const changed = db.transaction(() => {
       let count = 0;
-      const activeOf = db.prepare('SELECT active FROM consolidated_facts WHERE id = ?');
-      for (const id of targets) {
-        const fact = activeOf.get(id) as { active: number } | undefined;
-        if (!fact) continue;
-        if (forget && fact.active === 1 && forgetFact(id)) count += 1;
-        if (!forget && fact.active === 0 && reactivateFact(id)) count += 1;
+      for (const id of targets.ids(kind, ids, row.ts)) {
+        if (kind === 'forget' ? forgetFact(id) : reactivateFact(id)) count += 1;
       }
       return count;
     })();
@@ -683,10 +819,6 @@ function produced(value: MemoryWorkProduced | undefined): MemoryWorkProduced {
 function factNumber(id: unknown): number | null {
   const n = typeof id === 'number' ? id : Number.parseInt(String(id ?? ''), 10);
   return Number.isSafeInteger(n) && n > 0 ? n : null;
-}
-
-function hourFloor(ms: number): number {
-  return Math.floor(ms / HOUR_MS) * HOUR_MS;
 }
 
 function num(value: unknown): number {
