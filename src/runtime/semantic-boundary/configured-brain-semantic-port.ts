@@ -410,21 +410,26 @@ function recordSemanticModelUsage(input: {
   const own = semanticUsageAttribution(input.purpose);
   // The fallback row describes the same own request the completion ran as, so
   // it is recorded in that request's scope: an undeclared role stays unset
-  // rather than taking the enclosing frame's role or prompt measurements.
-  withOwnModelRequestAttribution(own, () => recordModelUsage({
-    ...(own.role ? { role: own.role } : {}),
-    channel: own.channel,
-    sessionId: input.sessionId || attribution?.sessionId || 'unknown',
-    sourceUserSeq: input.sourceUserSeq ?? attribution?.sourceUserSeq,
-    attemptId: attribution?.attemptId,
-    model: input.modelIdentity,
-    cacheDialect: 'inclusive',
-    inputTokens: input.inputTokens,
-    outputTokens: input.outputTokens,
-    cachedInputTokens: input.cachedInputTokens,
-    totalTokens: input.inputTokens + input.outputTokens,
-    durationMs: input.latencyMs,
-  }));
+  // rather than taking the enclosing frame's role or prompt measurements. The
+  // role and lane are read from that scope, so inside a memory job the row
+  // keeps the job's lane, as the completion itself does.
+  withOwnModelRequestAttribution(own, () => {
+    const scope = modelUsageAttributionStorage.getStore();
+    recordModelUsage({
+      ...(scope?.role ? { role: scope.role } : {}),
+      channel: scope?.channel ?? own.channel,
+      sessionId: input.sessionId || attribution?.sessionId || 'unknown',
+      sourceUserSeq: input.sourceUserSeq ?? attribution?.sourceUserSeq,
+      attemptId: attribution?.attemptId,
+      model: input.modelIdentity,
+      cacheDialect: 'inclusive',
+      inputTokens: input.inputTokens,
+      outputTokens: input.outputTokens,
+      cachedInputTokens: input.cachedInputTokens,
+      totalTokens: input.inputTokens + input.outputTokens,
+      durationMs: input.latencyMs,
+    });
+  });
 }
 
 /** Production complete: one tool-less call on the configured brain/judge role. */

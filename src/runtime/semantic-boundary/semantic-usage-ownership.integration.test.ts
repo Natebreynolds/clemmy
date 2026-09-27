@@ -207,3 +207,20 @@ test('the fallback row for an unrecorded interpretation inside a brain turn decl
   assert.equal(rows[0]!.inputTokens, 500);
   assert.equal(rows[0]!.trace?.acceptedSource, `${session.id}:${source.seq}`, 'it still bills the accepted source');
 });
+
+test('the fallback row for an unrecorded interpretation inside a memory job stays on the job lane', async () => {
+  const marker = `memory-fallback-${Date.now()}`;
+  const port = configuredBrainSemanticPort(async () => ({ raw: {}, modelIdentity: marker, inputTokens: 300,
+    outputTokens: 4, latencyMs: 2, usageRecorded: false }) as never);
+  await withModelUsageAttribution({ sessionId: '', sourceUserSeq: 0, channel: 'memory:reconcile', role: 'memory' },
+    () => port.interpret({
+      acceptedText: 'hi', recentTurns: [],
+      host: { source: { sessionId: '', sourceUserSeq: 0 }, policyRevision: 'fixture', resumableGoals: [],
+        openQuestions: [], catalog: { capabilities: [], capabilityIds: [], workflowIds: [] } },
+    } as never));
+  const rows = readUsageEventsForDate().filter(row => row.model === marker);
+  assert.equal(rows.length, 1, 'the port records the unrecorded response once');
+  assert.equal(rows[0]!.channel, 'memory:reconcile', 'memory work is booked on its job lane');
+  assert.equal(rows[0]!.role, 'memory');
+  assert.equal(rows[0]!.inputTokens, 300);
+});

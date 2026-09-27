@@ -529,12 +529,18 @@ export function withOwnModelRequestAttribution<T>(
   work: () => T,
 ): T {
   const inherited = modelUsageAttributionStorage.getStore();
+  // A memory job is the more specific owner: a judge or semantic call made
+  // while it runs is that job's work, so the call keeps the job's lane and the
+  // role the job's scope names. Only its request-local measurements are its own.
+  const memoryJob = memoryJobFromChannel(inherited?.channel) !== null;
+  const role = memoryJob ? inherited?.role ?? own.role : own.role;
+  const channel = memoryJob ? inherited?.channel : own.channel ?? inherited?.channel;
   return modelUsageAttributionStorage.run({
     sessionId: inherited?.sessionId ?? own.sessionId ?? 'unknown',
     sourceUserSeq: inherited?.sourceUserSeq ?? own.sourceUserSeq ?? 0,
     ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
-    ...(own.role ? { role: own.role } : {}),
-    ...(own.channel ?? inherited?.channel ? { channel: own.channel ?? inherited?.channel } : {}),
+    ...(role ? { role } : {}),
+    ...(channel ? { channel } : {}),
     ...(own.promptComponents ? { promptComponents: own.promptComponents } : {}),
     ownRequest: true,
   }, work);

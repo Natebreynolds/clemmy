@@ -505,3 +505,35 @@ test('a call that declares its own request never inherits the frame role or the 
   assert.equal(rows.get('nested-judge')?.promptComponents, undefined);
   for (const row of rows.values()) assert.equal(row.inputTokens, 1_000, 'provider totals are untouched');
 });
+
+test('a judge or interpretation made inside a memory job stays on the job lane with the job role', async () => {
+  const { recordModelUsage, readUsageEventsForDate, withModelUsageAttribution, withOwnModelRequestAttribution } =
+    await import('./usage-log.js');
+  const source = `memory-job-own-request-${Date.now()}`;
+  const record = (responseId: string) => recordModelUsage({
+    sessionId: source, model: 'fixture', cacheDialect: 'inclusive', inputTokens: 700, outputTokens: 5, responseId,
+  });
+  // The checker's job (role reviewer) and the memory model's job (role memory).
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, channel: 'memory:verify', role: 'reviewer' }, () => {
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:memory_fix' }, () => record('verify-judge'));
+  });
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, channel: 'memory:learn', role: 'memory' }, () => {
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:fixture' }, () => record('learn-judge'));
+    withOwnModelRequestAttribution({ channel: 'semantic:fixture', promptComponents: { history: 40 } },
+      () => record('learn-interpretation'));
+  });
+  // Outside any memory job, a declared lane still replaces an ordinary one.
+  withModelUsageAttribution({ sessionId: source, sourceUserSeq: 0, channel: 'chat', role: 'brain' }, () => {
+    withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:fixture' }, () => record('chat-judge'));
+  });
+  const rows = new Map(readUsageEventsForDate().filter((row) => row.source === source).map((row) => [row.responseId, row]));
+  assert.equal(rows.get('verify-judge')?.channel, 'memory:verify', 'the repair check is the verify job\'s work');
+  assert.equal(rows.get('verify-judge')?.role, 'reviewer');
+  assert.equal(rows.get('learn-judge')?.channel, 'memory:learn');
+  assert.equal(rows.get('learn-judge')?.role, 'memory', 'the job scope names whose model does its thinking');
+  assert.equal(rows.get('learn-interpretation')?.channel, 'memory:learn');
+  assert.equal(rows.get('learn-interpretation')?.role, 'memory');
+  assert.equal(rows.get('learn-interpretation')?.promptComponents?.history, 40, 'its own measurements still apply');
+  assert.equal(rows.get('chat-judge')?.channel, 'judge:fixture');
+  assert.equal(rows.get('chat-judge')?.role, 'reviewer');
+});
