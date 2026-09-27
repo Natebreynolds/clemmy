@@ -2047,7 +2047,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           })()
         : []),
       requireHostPlan
-        ? 'Compose content you write yourself in the consuming call\'s args; after a reviewed compute step is recorded with plan_step_result, call its consumer with the plan requirement id and omit the bound fields.'
+        ? 'Compose content you write yourself in the consuming call\'s args. After a reviewed compute step is recorded with plan_step_result, call its consumer with the plan requirement id and omit the bound argument fields: the host fills them from the recorded output.'
         : 'Content you compose yourself (drafts, summaries, messages) is NOT a compute operation — composition happens inside the consuming write\'s args. Propose compute ONLY for work a tool will perform; a compute requirement no tool call ever carries can never be proven and will block everything that depends on it.',
       // The discovery and ambiguity policy for the proposal-free carrier is
       // owned by the rubric (CAPABILITY USE; resolve missing capabilities
