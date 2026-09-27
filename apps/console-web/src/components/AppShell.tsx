@@ -17,6 +17,8 @@ import type { CommandCenter } from '@/lib/types';
 import { listWorkingNowSnapshot } from '@/lib/activity';
 import { presentWorkingNow } from '@/lib/activity-presentation';
 import { pollIntervalForStream, useConsoleActionStream } from '@/lib/action-stream';
+import { DEFAULT_HOME_PREFERENCES, useHomePreferences } from '@/lib/home-prefs';
+import { useHomeToday } from '@/lib/home-data';
 
 const NARROW_QUERY = '(max-width: 720px)';
 
@@ -76,6 +78,11 @@ export function AppShell() {
     workingNow.data?.observedAt ?? '',
     { omitSessionId: currentChatSession },
   );
+  // The header's live status: the owner's style for it and the next scheduled
+  // check come from the same records Today reads; nothing is fetched twice.
+  const prefs = useHomePreferences().data ?? DEFAULT_HOME_PREFERENCES;
+  const liveMode = prefs.liveStatus ?? 'animated';
+  const today = useHomeToday(liveMode !== 'off');
 
   // A 401 from the daemon dispatches a global `clem:needs-login` event
   // (see lib/api.ts). Nothing surfaced it before, so an expired session was a
@@ -120,6 +127,10 @@ export function AppShell() {
           runningCount={workingView.running}
           needsYouCount={needsYouCount}
           onOpenTasks={() => navigate('/tasks')}
+          liveEntries={workingView.entries}
+          liveMode={liveMode}
+          nextCheckAt={today.data?.nextCheckAt ?? null}
+          liveUnavailable={workingNow.isError && !workingNow.data}
         />
         <LocalRecordingBanner />
         {needsLogin && (

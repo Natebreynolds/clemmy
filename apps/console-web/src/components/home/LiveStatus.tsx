@@ -16,13 +16,18 @@ const CYCLE_MS = 4_200;
  * shared working-now presenter (the board's own counts) and the calendar
  * watch's schedule; it adds no call of its own.
  */
-export function LiveStatus({ entries, mode, nextCheckAt, unavailable }: {
+export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, onOpen }: {
   entries: readonly PresentedWorkingNowEntry<ActivityEntry>[];
   mode: HomeLiveStatus;
   /** When Clem next checks something on a schedule, if known. */
   nextCheckAt?: string | null;
   /** The working-now read failed: say nothing rather than "caught up". */
   unavailable?: boolean;
+  /** The header form: one pill, the same words, leading to the board on click
+   *  (owner 09-26: the band on Today was clutter; the header is where a
+   *  glance belongs). */
+  compact?: boolean;
+  onOpen?: () => void;
 }) {
   const running = entries.filter((p) => p.membership === 'running');
   const [index, setIndex] = useState(0);
@@ -40,6 +45,37 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable }: {
   const current = working ? running[index % running.length]! : null;
   const step = current ? runningMeta(current.entry) : '';
   const next = nextCheckAt ? clockLabel(nextCheckAt) : '';
+
+  if (compact) {
+    const second = current ? step : (next ? `Next check ${next}` : '');
+    return (
+      <button
+        type="button"
+        onClick={onOpen}
+        role="status"
+        aria-live="polite"
+        title="Everything Clementine is working on right now"
+        className={cn(
+          'live-band live-status-pill flex h-9 max-w-[22rem] items-center gap-2.5 rounded-md border px-3 text-left transition-colors hover:bg-canvas',
+          working ? 'is-working border-primary/40 bg-gradient-to-r from-primary-tint to-surface' : 'border-border bg-surface',
+          mode === 'still' && 'live-band-still',
+        )}
+      >
+        <span className={cn('live-dot h-2 w-2 shrink-0 rounded-full', working ? 'bg-primary' : 'bg-success')} aria-hidden />
+        <span className="flex min-w-0 flex-col leading-tight">
+          <span key={current?.entry.runKey ?? 'quiet'} className="truncate text-small font-semibold text-fg animate-fade-in">
+            {current ? (current.entry.headline || 'Working') : 'Caught up'}
+          </span>
+          {second && <span className="truncate text-caption text-muted">{second}</span>}
+        </span>
+        {running.length > 1 && (
+          <span className="inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
+            {running.length > 99 ? '99+' : running.length}
+          </span>
+        )}
+      </button>
+    );
+  }
 
   return (
     <div

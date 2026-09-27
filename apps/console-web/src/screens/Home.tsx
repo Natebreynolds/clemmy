@@ -47,7 +47,6 @@ import { WhileAwayPane } from '@/components/home/WhileAwayPane';
 import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { MadePane } from '@/components/home/MadePane';
 import { TodayPane } from '@/components/home/TodayPane';
-import { LiveStatus } from '@/components/home/LiveStatus';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
 import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
 import { cn } from '@/lib/cn';
@@ -92,7 +91,7 @@ function LiveHome() {
 
   const panes = visiblePanes(prefs);
   const shown = (id: HomePaneId) => panes.includes(id);
-  const today = useHomeToday(shown('today') || prefs.liveStatus !== 'off');
+  const today = useHomeToday(shown('today'));
 
   const needsYou = (cc.data?.needsYou ?? []) as HomeFeedItem[];
   const recent = (cc.data?.recentCompleted ?? []) as HomeFeedItem[];
@@ -345,12 +344,6 @@ function LiveHome() {
           </div>
           <Button variant="ghost" size="sm" onClick={openCustomizeHome} title="Which stacks show, in what style"><SlidersHorizontal className="h-4 w-4" aria-hidden /> Arrange</Button>
         </div>
-        <LiveStatus
-          entries={workingView.entries}
-          mode={prefs.liveStatus ?? 'animated'}
-          nextCheckAt={today.data?.nextCheckAt ?? null}
-          unavailable={!immediateSettled && !servingCached}
-        />
         <Composer
           inputRef={composerRef}
           busy={chat.busy || opening}

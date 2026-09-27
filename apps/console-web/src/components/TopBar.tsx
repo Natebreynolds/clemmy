@@ -1,4 +1,8 @@
-import { Activity, PanelLeftClose, PanelLeft, Search, Mic, SlidersHorizontal } from 'lucide-react';
+import { Activity, PanelLeftClose, PanelLeft, Search, Mic } from 'lucide-react';
+import type { ActivityEntry } from '@/lib/activity';
+import type { PresentedWorkingNowEntry } from '@/lib/activity-presentation';
+import type { HomeLiveStatus } from '@/lib/home-prefs';
+import { LiveStatus } from './home/LiveStatus';
 import { Button } from './ui/Button';
 import { ThemeToggle } from './ThemeToggle';
 import { HealthIndicator } from './HealthIndicator';
@@ -13,6 +17,10 @@ export function TopBar({
   runningCount,
   needsYouCount,
   onOpenTasks,
+  liveEntries,
+  liveMode,
+  nextCheckAt,
+  liveUnavailable,
 }: {
   title: string;
   onToggleSidebar: () => void;
@@ -22,12 +30,17 @@ export function TopBar({
   runningCount: number;
   needsYouCount: number;
   onOpenTasks: () => void;
+  /** Clem at work, said in the header: the presented working-now entries, the
+   *  owner's live-status style, and the next scheduled check. Off or unknown
+   *  falls back to the plain Running button; unknown is never "caught up". */
+  liveEntries: readonly PresentedWorkingNowEntry<ActivityEntry>[];
+  liveMode: HomeLiveStatus;
+  nextCheckAt?: string | null;
+  liveUnavailable?: boolean;
 }) {
   const openPalette = () => window.dispatchEvent(new Event('clem:command-palette'));
   const openVoice = () => window.dispatchEvent(new Event('clem:open-voice'));
-  // The customize panel is owned by the Home screen; the bar only rings the
-  // bell, on every route, so "shape my window" is always one click away.
-  const openCustomize = () => window.dispatchEvent(new Event('clem:customize-home'));
+  const showLive = liveMode !== 'off' && !liveUnavailable;
 
   return (
     <header className="app-drag flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface px-4">
@@ -61,41 +74,45 @@ export function TopBar({
           <Search className="h-5 w-5" aria-hidden />
         </Button>
 
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={onOpenTasks}
-          aria-label={[
-            'Running',
-            runningCount > 0 ? `${runningCount} running` : null,
-            needsYouCount > 0 ? `${needsYouCount} waiting on you` : null,
-          ].filter(Boolean).join(', ')}
-          title="Everything Clementine is working on right now"
-          className="relative gap-2"
-        >
-          <Activity className="h-4 w-4" aria-hidden />
-          <span className="hidden lg:inline">Running</span>
-          {/* Running and needs-you are two different invitations — never one
-              lump sum (the "37 current tasks" pill was dead tasks). */}
-          {runningCount > 0 && (
-            <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
-              {runningCount > 99 ? '99+' : runningCount}
-            </span>
-          )}
-        </Button>
+        {/* Clem at work, at a glance, on every route: "Caught up · next check
+            8:26 pm" or the running headline and its step, leading to the
+            board. The same words that used to sit as a band on Today. */}
+        {showLive ? (
+          <LiveStatus
+            compact
+            entries={liveEntries}
+            mode={liveMode}
+            nextCheckAt={nextCheckAt}
+            unavailable={liveUnavailable}
+            onOpen={onOpenTasks}
+          />
+        ) : (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onOpenTasks}
+            aria-label={[
+              'Running',
+              runningCount > 0 ? `${runningCount} running` : null,
+              needsYouCount > 0 ? `${needsYouCount} waiting on you` : null,
+            ].filter(Boolean).join(', ')}
+            title="Everything Clementine is working on right now"
+            className="relative gap-2"
+          >
+            <Activity className="h-4 w-4" aria-hidden />
+            <span className="hidden lg:inline">Running</span>
+            {/* Running and needs-you are two different invitations — never one
+                lump sum (the "37 current tasks" pill was dead tasks). */}
+            {runningCount > 0 && (
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-caption font-bold text-primary-fg">
+                {runningCount > 99 ? '99+' : runningCount}
+              </span>
+            )}
+          </Button>
+        )}
 
         <HealthIndicator />
         <ThemeToggle />
-
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={openCustomize}
-          aria-label="Customize home"
-          title="Customize home"
-        >
-          <SlidersHorizontal className="h-5 w-5" aria-hidden />
-        </Button>
 
         {/* Peer weight, deliberately. As a FILLED primary button this was the
             loudest control in the whole shell, which made the console's

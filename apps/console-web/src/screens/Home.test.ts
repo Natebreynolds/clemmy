@@ -38,8 +38,15 @@ test('two styles the owner picks, Clem\'s work as a live band, each Space summar
   assert.match(HOME, /needsPane\('strip', 3\)/, 'Briefing leads with decisions as cards');
   assert.match(HOME, /recentPane\('timeline'\)/);
   assert.match(HOME, /\[showToday && todayPane, showNeeds && needsPane\('list', 2\), showRecent && recentPane\('list'\)\]/, 'Dashboard: Today, Needs you, what came back');
-  assert.match(HOME, /<LiveStatus/);
-  assert.match(HOME, /mode=\{prefs\.liveStatus \?\? 'animated'\}/);
+  // The live band left Today for the header (owner 09-26): the shell feeds it
+  // and the bar renders it, in the owner's chosen style.
+  assert.doesNotMatch(HOME, /<LiveStatus/);
+  const TOPBAR = readFileSync(new URL('../components/TopBar.tsx', import.meta.url), 'utf8');
+  const SHELL = readFileSync(new URL('../components/AppShell.tsx', import.meta.url), 'utf8');
+  assert.match(TOPBAR, /<LiveStatus\s+compact/);
+  assert.match(SHELL, /liveMode=\{liveMode\}/);
+  assert.match(SHELL, /const liveMode = prefs\.liveStatus \?\? 'animated';/);
+  assert.doesNotMatch(TOPBAR, /Customize home/, 'Arrange lives on Today; the header does not repeat it');
   assert.match(HOME, /effectiveSpaceView\(chosenView\(spaceId\), summaries\.data\?\.find/, 'one rule, shared with Tune');
   const DATA = readFileSync(new URL('../lib/home-data.ts', import.meta.url), 'utf8');
   assert.match(DATA, /if \(chosen\) return chosen;/, 'the owner\'s choice wins');
