@@ -57,6 +57,7 @@ import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
 import { Workspaces } from './screens/Workspaces';
 import { Settings } from './screens/Settings';
+import { describeThisDevice } from './lib/device-name';
 import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
@@ -406,7 +407,7 @@ export function App() {
     };
     void (async () => {
       try {
-        await pairDevice(token, navigator.userAgent.slice(0, 80));
+        await pairDevice(token, describeThisDevice(navigator.userAgent, inNativeShell()));
         if (cancelled) return;
         cleanPairTokenFromUrl();
         await refreshAuth();

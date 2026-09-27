@@ -41,13 +41,18 @@ export function describeDevice(label: string | undefined | null): DeviceName {
           : /Windows/.test(given) ? 'windows'
             : 'other';
   const apple = platform === 'iphone' || platform === 'ipad';
+  // Pairing kept only the first 80 characters of older labels, which is
+  // before the product token; such a label can name the platform, never the
+  // app, and must not be read as the Clem app by default.
+  const truncated = given.length >= 80 && !/(Safari|Chrome|CriOS|FxiOS|Firefox|Mobile)\/\S*$/.test(given) && !/Safari\/|CriOS|Chrome\/|FxiOS|Firefox\//.test(given);
   const app: DeviceApp = /CriOS|Chrome\//.test(given) ? 'chrome'
     : /FxiOS|Firefox\//.test(given) ? 'firefox'
       : /Safari\//.test(given) ? 'safari'
-        // A WKWebView reports WebKit without the Safari product token: on an
-        // Apple phone that is Clem's own shell.
-        : apple ? 'clem'
-          : 'browser';
+        : truncated ? 'unknown'
+          // A WKWebView reports WebKit without the Safari product token: on an
+          // Apple phone that is Clem's own shell.
+          : apple ? 'clem'
+            : 'browser';
   const appWord = APP_WORDS[app];
   return { name: appWord ? `${PLATFORM_WORDS[platform]} · ${appWord}` : PLATFORM_WORDS[platform], platform, app, derived: true };
 }

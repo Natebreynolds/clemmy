@@ -12,6 +12,12 @@ test('the native shell on an iPhone is named as the Clem app, Safari as Safari',
   assert.equal(describeDevice(MAC_CHROME).name, 'Mac · Chrome');
 });
 
+test('an older label cut at 80 characters names the platform only, never the app', () => {
+  const cut = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHT';
+  assert.equal(cut.length, 80);
+  assert.equal(describeDevice(cut).name, 'iPhone');
+});
+
 test('a chosen label is kept as written; an empty one is called out', () => {
   assert.deepEqual(describeDevice('CLEMMY LIVE C8 HTTP proof').derived, false);
   assert.equal(describeDevice('CLEMMY LIVE C8 HTTP proof').name, 'CLEMMY LIVE C8 HTTP proof');
