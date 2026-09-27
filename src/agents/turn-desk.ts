@@ -98,7 +98,7 @@ export function deskRungForEvidence(kind: DeskEvidenceKind): DeskRung {
   let rung: DeskRung = 'lean';
   for (const name of deskDeclaredToolNames()) {
     const declaration = deskDeclarationFor(name);
-    if (declaration?.promotedBy === kind) rung = higher(rung, declaration.rung);
+    if (declaration?.promotedBy.includes(kind)) rung = higher(rung, declaration.rung);
   }
   return rung;
 }
@@ -179,6 +179,10 @@ export interface TurnDeskFactInput {
   /** The accepted request text, ranked the way the context packet ranks skills. */
   requestText: string;
   identifiedTarget: boolean;
+  /** Capabilities on the turn's host-fresh planning card. */
+  planningCapabilityCount: number;
+  /** Operations disclosed to this turn (card plus proven disclosure). */
+  disclosedOperationCount: number;
 }
 
 /** Read the host facts the desk decides on. Throws when a read fails. */
@@ -190,6 +194,7 @@ export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
     evidence: {
       retained_output: sessionHasRetainedToolOutputs(input.sessionId)
         || acceptedSourceHasAttachments({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq }),
+      delegation: input.planningCapabilityCount > 0 || input.disclosedOperationCount > 0,
       // The surface is built before the context packet exists; the desk ranks
       // the same accepted text with the packet's own ranker.
       listed_skill: rankSkills(input.requestText).length > 0,
@@ -223,6 +228,8 @@ export interface TurnDeskInput {
   surfaceNames: readonly string[];
   requestText: string;
   identifiedTarget: boolean;
+  planningCapabilityCount: number;
+  disclosedOperationCount: number;
 }
 
 /** The one desk decision for a build. Never throws. */
@@ -244,6 +251,8 @@ export function resolveTurnDesk(input: TurnDeskInput): TurnDeskDecision {
       sourceUserSeq,
       requestText: input.requestText,
       identifiedTarget: input.identifiedTarget,
+      planningCapabilityCount: input.planningCapabilityCount,
+      disclosedOperationCount: input.disclosedOperationCount,
     }), sourceUserSeq);
   } catch {
     return fullTurnDesk('facts_unavailable', sourceUserSeq);

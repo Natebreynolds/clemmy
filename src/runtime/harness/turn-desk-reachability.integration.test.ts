@@ -376,3 +376,32 @@ test('a turn whose context packet offers fan-out with run_worker carries run_wor
   assert.ok(run.requests[0]!.tools.includes('run_worker'), `run_worker rides round 1: ${run.requests[0]!.tools.join(',')}`);
   assert.ok(!namesLine(run.requests[0]!.instructions).includes('run_worker'), 'run_worker is not an on-request tool');
 });
+
+/** A local operation this session already used on an earlier source: the
+ * planning catalog seeds the next source's card from it, so that card holds a
+ * capability. */
+function discloseEarlierLocalOperation(sessionId: string, identifier: string) {
+  const earlier = acceptSource(sessionId, TARGETED);
+  eventlog.appendEvent({
+    sessionId, turn: earlier.turn, role: 'system', type: 'capability_discovered',
+    data: { sourceUserSeq: earlier.seq, capabilities: [{ identifier, providerKind: 'authorized_local_registry' }] },
+  });
+}
+
+test('delegation evidence starts the turn on the full rung: a planning card with a capability defers nothing', async () => {
+  const sessionId = 'turn-desk-delegation';
+  discloseEarlierLocalOperation(sessionId, 'space_get');
+  const source = acceptSource(sessionId, TARGETED);
+  const primed = await (await import('../semantic-boundary/admit-and-compile-accepted-source.js'))
+    .primePrimaryModelPlanningCatalog({ sessionId, sourceUserSeq: source.seq });
+  assert.ok(primed.ok && primed.planning.capabilities.length > 0,
+    `the host-fresh planning card holds a capability: ${JSON.stringify(primed.ok ? primed.planning.capabilities.map((entry) => entry.id) : primed)}`);
+  const agent = await buildFor(sessionId, source.seq, TARGETED, idleModel);
+  const desk = deskRecord(sessionId, source.seq);
+  assert.equal(desk?.fallbackReason, null, 'the turn is in scope');
+  assert.equal(desk?.rung, 'full', `delegation evidence is the full rung: ${JSON.stringify(desk)}`);
+  assert.ok(desk?.climbedBy.includes('delegation'), `the record names the evidence: ${JSON.stringify(desk)}`);
+  assert.deepEqual(desk?.deferred, []);
+  assert.deepEqual(deferredOn(agent), [], 'no desk tool loses its schema');
+  assert.equal(namesLine(agentInstructions(agent)), '', 'no names line');
+});

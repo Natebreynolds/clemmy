@@ -21,7 +21,7 @@ const DESK_TOOLS = TOOL_REGISTRY.filter((declaration) => declaration.desk).map((
 const READERS = DESK_TOOLS.filter((name) => deskDeclarationFor(name)?.rung === 'readers');
 const FULL_ONLY = DESK_TOOLS.filter((name) => deskDeclarationFor(name)?.rung === 'full');
 const SURFACE = ['tool_search', 'call_tool', 'ask_user_question', 'work_call', ...DESK_TOOLS, 'read_file'];
-const NONE = { retained_output: false, listed_skill: false, long_work: false } as const;
+const NONE = { retained_output: false, delegation: false, listed_skill: false, long_work: false } as const;
 const facts = (overrides: Partial<TurnDeskFacts> = {}): TurnDeskFacts => ({
   identifiedTarget: true,
   evidence: NONE,
@@ -48,6 +48,7 @@ test('evidence climbs to the rung of the tools that declare it', () => {
   assert.equal(deskRungForEvidence('retained_output'), 'readers');
   assert.equal(deskRungForEvidence('listed_skill'), 'full');
   assert.equal(deskRungForEvidence('long_work'), 'full');
+  assert.equal(deskRungForEvidence('delegation'), 'full', 'delegation evidence is the full rung');
 });
 
 test('an identified target with no evidence is the lean rung: every desk tool on the surface is deferred', () => {
@@ -73,7 +74,7 @@ test('retained output climbs to readers; any full-rung evidence climbs to full',
   const readers = decideTurnDesk(SURFACE, facts({ evidence: { ...NONE, retained_output: true } }), 7);
   assert.equal(readers.rung, 'readers');
   assert.deepEqual([...readers.deferred].sort(), FULL_ONLY);
-  for (const kind of ['listed_skill', 'long_work'] as const) {
+  for (const kind of ['delegation', 'listed_skill', 'long_work'] as const) {
     const full = decideTurnDesk(SURFACE, facts({ evidence: { ...NONE, [kind]: true } }), 7);
     assert.equal(full.rung, 'full', kind);
     assert.deepEqual(full.deferred, [], kind);
