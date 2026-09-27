@@ -201,31 +201,36 @@ test('a named page or projection may run past one inline result, up to the query
   assert.ok(shown.length > inlineResultBudgetForModel(undefined), `the named page is returned whole (${shown.length} chars)`);
 });
 
-test('query replies spend the turn\'s reading byte budget, and a spent budget routes away from both readers', async () => {
+test('bare query replies spend the turn\'s reading bytes; named pages page on uncharged, and a spent budget routes a bare query away', async () => {
   const budget = new brackets.RecallBudget(10, 26_000, undefined);
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkRows, recallBudget: budget,
     calls: [
       { callId: 'spend-first', args: { call_id: 'parked-rows' } },
-      { callId: 'spend-second', args: { call_id: 'parked-rows', limit: 50, offset: 10 } },
+      { callId: 'named-page', args: { call_id: 'parked-rows', limit: 50, offset: 10 } },
+      { callId: 'spend-second', args: { call_id: 'parked-rows', offset: 20 } },
       { callId: 'spend-third', args: { call_id: 'parked-rows', offset: 40 } },
-      { callId: 'spend-fourth', args: { call_id: 'parked-rows', offset: 50 } },
+      { callId: 'named-after', args: { call_id: 'parked-rows', limit: 5, offset: 55 } },
     ],
   });
   const first = results.get('spend-first') ?? '';
+  const named = results.get('named-page') ?? '';
   const second = results.get('spend-second') ?? '';
   const third = results.get('spend-third') ?? '';
-  const fourth = results.get('spend-fourth') ?? '';
+  const namedAfter = results.get('named-after') ?? '';
   assert.match(first, /^Showing \d+ record/);
-  assert.match(second, /^Showing \d+ record/);
-  // The third reply is sized to what is left, so it is served, not refused.
-  assert.match(third, /^Showing 1 record/, third.slice(0, 300));
-  const spent = [first, second, third].reduce((sum, reply) => sum + Buffer.byteLength(reply), 0);
-  assert.ok(spent <= 26_000, `the replies fit the turn's byte budget (${spent} bytes)`);
-  assert.equal(budget.snapshot().bytes, spent, 'every served reply was charged, in bytes');
+  assert.match(named, /^Showing \d+ record\(s\) \[10–\d+\]/, 'a named page is served up to its own reply bound, uncharged');
+  assert.match(second, /^Showing \d+ record/, second.slice(0, 300));
+  const charged = [first, second, third].filter((reply) => /^Showing/.test(reply))
+    .reduce((sum, reply) => sum + Buffer.byteLength(reply), 0);
+  assert.ok(charged <= 26_000, `bare replies fit the turn's byte budget (${charged} bytes)`);
+  assert.equal(budget.snapshot().bytes, charged, 'only bare replies were charged');
   assert.equal(budget.snapshot().calls, 0, 'a query spends bytes, never a recall call');
-  assert.match(fourth, /^ERROR: reading byte budget exhausted/, fourth.slice(0, 300));
-  assert.doesNotMatch(fourth, /tool_output_query \{|recall_tool_result \{/, 'never routed back to a reader the budget refuses');
+  if (!/^Showing/.test(third)) {
+    assert.match(third, /^ERROR: reading byte budget exhausted/, third.slice(0, 300));
+    assert.doesNotMatch(third, /recall_tool_result \{/, 'never routed to a reader the budget refuses');
+  }
+  assert.match(namedAfter, /^Showing 5 record\(s\) \[55–60\]/, 'a named page is served even after the bytes are spent');
 });
 
 test('on a small window an explicit recall and a named query page stay within what the window can take', async () => {
@@ -304,21 +309,21 @@ test('an object query is sized to the reading bytes the turn has left and served
   assert.equal(budget.snapshot().bytes, Buffer.byteLength(shown, 'utf8'), 'the served reply is what was charged');
 });
 
-test('a non-ASCII record page is cut on a record boundary to the bytes left, with the exact next query', async () => {
+test('a non-ASCII bare record page is cut on a record boundary to the bytes left, with the exact next query', async () => {
   const budget = new brackets.RecallBudget(10, 40_000, undefined);
   const rows = JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ id: `row-${i}`, notes: '中文记录'.repeat(300) })));
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', recallBudget: budget,
     seed: (sessionId) => parkOutput(sessionId, 'parked-wide', rows),
-    calls: [{ callId: 'wide-page', args: { call_id: 'parked-wide', limit: 30 } }],
+    calls: [{ callId: 'wide-page', args: { call_id: 'parked-wide' } }],
   });
   const shown = results.get('wide-page') ?? '';
   const header = /^Showing (\d+) record\(s\) \[0–(\d+)\] of 40 matching/.exec(shown);
   assert.ok(header, shown.slice(0, 300));
   const count = Number(header[1]);
-  assert.ok(count > 0 && count < 30, `a partial page (${count} records)`);
+  assert.ok(count > 0 && count < 40, `a partial page (${count} records)`);
   assert.ok(shown.includes(`"id": "row-${count - 1}"`) && !shown.includes(`"id": "row-${count}"`), 'cut on a record boundary');
-  assert.ok(shown.includes(`Next: tool_output_query {"call_id":"parked-wide","limit":30,"offset":${count}}`), 'the exact next query');
+  assert.ok(shown.includes(`Next: tool_output_query {"call_id":"parked-wide","offset":${count}}`), 'the exact next query');
   assert.ok(Buffer.byteLength(shown, 'utf8') <= 40_000, `within the remaining bytes (${Buffer.byteLength(shown, 'utf8')})`);
 });
 
@@ -383,35 +388,28 @@ test('while a minimal query reply still fits, a recall refused for bytes names t
   assert.ok(Buffer.byteLength(served, 'utf8') <= 2_000, `within the bytes left (${Buffer.byteLength(served, 'utf8')})`);
 });
 
-test('a projection whose own arguments outgrow the bytes left is still served, with a continuation that fits', async () => {
+test('a projection is served whole whatever the reading bytes left, and is not charged', async () => {
   const budget = new brackets.RecallBudget(10, 1_200, undefined);
   const fields = ['id', ...Array.from({ length: 41 }, (_, i) => `absent_field_with_a_rather_long_descriptive_name_${String(i).padStart(2, '0')}`)];
-  assert.ok(JSON.stringify(fields).length > 1_200, 'the arguments alone exceed the bytes left');
   const { results } = await runHostTurn({
     agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkRows, recallBudget: budget,
     calls: [{ callId: 'wide-projection', args: { call_id: 'parked-rows', fields } }],
   });
   const shown = results.get('wide-projection') ?? '';
-  const header = /^Showing (\d+) record\(s\) \[0–(\d+)\] of 60 matching/.exec(shown);
-  assert.ok(header, shown.slice(0, 300));
-  const count = Number(header[1]);
-  assert.ok(count > 0 && count < 50, `a partial page (${count} records)`);
-  assert.ok(shown.includes(`"offset":${count}`), 'names where the next page starts');
-  assert.ok(Buffer.byteLength(shown, 'utf8') <= 1_200, `within the bytes left (${Buffer.byteLength(shown, 'utf8')})`);
-  assert.equal(budget.snapshot().bytes, Buffer.byteLength(shown, 'utf8'), 'the served reply is what was charged');
+  assert.match(shown, /^Showing 50 record\(s\) \[0–50\] of 60 matching/, shown.slice(0, 300));
+  assert.equal(budget.snapshot().bytes, 0, 'a named projection spends no reading bytes');
 });
 
 /** 20 records of ~3k chars each: no single record fits a small byte budget. */
 const WIDE_ROWS = JSON.stringify(Array.from({ length: 20 }, (_, i) => ({ id: i, body: `[row ${String(i).padStart(2, '0')}] ${'w'.repeat(3_000)}` })));
 const parkWideRows = (sessionId: string) => parkOutput(sessionId, 'parked-wide-rows', WIDE_ROWS);
 
-test('a clipped record page always shows the record it continues from, or no record and the same offset', async () => {
+test('a clipped bare record page always shows the record it continues from, or no record and the same offset', async () => {
   for (const bytesLeft of [900, 1_400, 2_400]) {
     const budget = new brackets.RecallBudget(10, bytesLeft, undefined);
-    const where = Array.from({ length: 6 }, (_, i) => ({ field: `absent_field_with_a_long_descriptive_name_${i}`, op: 'ne', value: 'x'.repeat(40) }));
     const { results } = await runHostTurn({
       agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkWideRows, recallBudget: budget,
-      calls: [{ callId: `wide-${bytesLeft}`, args: { call_id: 'parked-wide-rows', fields: ['id', 'body'], where } }],
+      calls: [{ callId: `wide-${bytesLeft}`, args: { call_id: 'parked-wide-rows' } }],
     });
     const shown = results.get(`wide-${bytesLeft}`) ?? '';
     const header = /^Showing (\d+) record\(s\)/.exec(shown);

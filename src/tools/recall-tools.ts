@@ -100,6 +100,8 @@ const QUERY_MAX_CHARS = 50_000;
 interface QueryReplyBound {
   chars: number;
   bytes: number;
+  /** Whether the reply spends the turn's reading bytes (a bare query). */
+  charged: boolean;
 }
 
 const fitsQueryBound = (text: string, bound: QueryReplyBound): boolean =>
@@ -154,20 +156,26 @@ function queryNamesItsPage(input: Record<string, unknown>): boolean {
 
 /**
  * The most one tool_output_query reply may hold. A bare query (no limit, no
- * fields) is one inline result for the routed window, the same default a bare
- * recall gets; a named page or projection may use QUERY_MAX_CHARS. Either way
- * the reply fits the bytes the turn's reading budget still allows.
+ * fields) is the call every digest suggests: one inline result for the routed
+ * window, the same default a bare recall gets, and it spends the turn's
+ * reading bytes. A named page or projection is an explicit ask to page a
+ * structured result to its end: it may use QUERY_MAX_CHARS per reply and is
+ * not charged to the turn's reading bytes.
  */
 function queryReplyBound(input: Record<string, unknown>, ctx: HarnessRunContext): QueryReplyBound {
   const pageMax = Math.min(QUERY_MAX_CHARS, retainedReaderMaxChars(ctx.routedModelId));
-  const chars = queryNamesItsPage(input)
-    ? pageMax
-    : Math.min(pageMax, inlineResultBudgetForModel(ctx.routedModelId));
-  return { chars, bytes: ctx.recallBudget?.remainingBytes() ?? Number.POSITIVE_INFINITY };
+  if (queryNamesItsPage(input)) return { chars: pageMax, bytes: Number.POSITIVE_INFINITY, charged: false };
+  return {
+    chars: Math.min(pageMax, inlineResultBudgetForModel(ctx.routedModelId)),
+    bytes: ctx.recallBudget?.remainingBytes() ?? Number.POSITIVE_INFINITY,
+    charged: true,
+  };
 }
 
-/** The refusal when the turn's reading budget cannot hold even a minimal reply. */
+/** The refusal when the turn's reading budget cannot hold even a minimal bare
+ *  reply; a named page is never refused for bytes. */
 function queryBoundRefusal(bound: QueryReplyBound, ctx: HarnessRunContext, callId: string) {
+  if (!bound.charged) return null;
   if (bound.chars >= RecallBudget.QUERY_MIN_REPLY_BYTES && (ctx.recallBudget?.canServeQuery() ?? true)) return null;
   const refusal = ctx.recallBudget?.queryRefusal(RecallBudget.QUERY_MIN_REPLY_BYTES, callId);
   return refusal ? textResult(`ERROR: ${refusal}`) : null;
@@ -255,9 +263,11 @@ function fitRecordPage(
   return { count: fits, text: full(fits) };
 }
 
-/** Charge a query reply to the turn's reading byte budget. */
-function chargeQueryReply(ctx: HarnessRunContext, callId: string, bodyText: string) {
-  const refusal = ctx.recallBudget?.consumeQueryBytes(Buffer.byteLength(bodyText, 'utf8'), callId);
+/** Serve a query reply, charging a bare reply to the turn's reading bytes. */
+function chargeQueryReply(ctx: HarnessRunContext, callId: string, bodyText: string, bound: QueryReplyBound) {
+  const refusal = bound.charged
+    ? ctx.recallBudget?.consumeQueryBytes(Buffer.byteLength(bodyText, 'utf8'), callId)
+    : null;
   return refusal ? textResult(`ERROR: ${refusal}`) : textResult(bodyText, { maxChars: bodyText.length });
 }
 
@@ -733,13 +743,14 @@ export function registerRecallTools(server: McpServer): void {
             for (const group of shown) lines.push(aggregateLine(`${group.group}: `, aggregate, valueField, group.figure));
             if (result.groups.length > shown.length) lines.push(`…and ${result.groups.length - shown.length} more group(s)`);
           }
+          // An aggregate is an explicit computation over the records, like a
+          // named page: bounded per reply, not charged to the reading bytes.
           const aggregateBound: QueryReplyBound = {
             chars: Math.min(QUERY_MAX_CHARS, retainedReaderMaxChars(ctx.routedModelId)),
-            bytes: ctx.recallBudget?.remainingBytes() ?? Number.POSITIVE_INFINITY,
+            bytes: Number.POSITIVE_INFINITY,
+            charged: false,
           };
-          const aggregateRefusal = queryBoundRefusal(aggregateBound, ctx, callId);
-          if (aggregateRefusal) return aggregateRefusal;
-          return chargeQueryReply(ctx, callId, clipQueryBody(lines.join('\n'), aggregateBound));
+          return chargeQueryReply(ctx, callId, clipQueryBody(lines.join('\n'), aggregateBound), aggregateBound);
         }
         if (sortBy) rows = sortRows(rows, sortBy, input.order === 'desc' ? 'desc' : 'asc');
         const matched = rows.length;
@@ -795,7 +806,7 @@ export function registerRecallTools(server: McpServer): void {
           return { body: `${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}`, continuation, shortContinuation };
         };
         const fitted = fitRecordPage(page.length, render, bound, refHint);
-        return chargeQueryReply(ctx, callId, fitted.text);
+        return chargeQueryReply(ctx, callId, fitted.text, bound);
       }
 
       if (parsed && typeof parsed === 'object') {
@@ -819,7 +830,7 @@ export function registerRecallTools(server: McpServer): void {
           `Object (${Object.keys(parsed as object).length} top-level keys)\n\n${JSON.stringify(projected, null, 1)}`,
           bound,
           refHint,
-        ));
+        ), bound);
       }
 
       return textResult(`Tool output "${callId}" is a scalar: ${JSON.stringify(parsed)}`);
