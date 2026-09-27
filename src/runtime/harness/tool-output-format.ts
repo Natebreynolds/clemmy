@@ -116,6 +116,19 @@ export function presentationBudgetFor(input: PresentationBudgetInput): number {
   return inlineResultBudgetForModel(input.routedModelId);
 }
 
+/**
+ * The bound an outer transport applies to a result its invocation already
+ * presented: a carrier's MCP wire, or the host lane's model projection.
+ *
+ * The invocation's own presentation budget (the same resolver) bounded the
+ * result, so a transport is a backstop only. It never cuts below that budget,
+ * or it would clip a slice the reader shaped whole and whose paging frame
+ * names offsets the model would then silently skip.
+ */
+export function transportPresentationMaxChars(input: PresentationBudgetInput): number {
+  return Math.max(DEFAULT_TOOL_RESULT_MAX_CHARS, presentationBudgetFor(input));
+}
+
 
 // Host commentary explains a provider result; it never displaces it. The
 // annotation block receives at most this share of the result budget, each note

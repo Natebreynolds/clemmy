@@ -35,6 +35,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
+import { transportPresentationMaxChars } from '../runtime/harness/tool-output-format.js';
 import {
   harnessRunContextStorage,
   hostOwnsLogicalCallAccounting,
@@ -1585,7 +1586,16 @@ export function registerCallToolMcp(
       // identical payload could be sent straight back (live 2026-08-09).
       if (isToolMediaContent(output)) return { content: output };
       const rendered = jsonResult(output);
-      return textResult(rendered, { isError: isHarnessRefusalText(rendered) });
+      // The child already presented its result at the effective inner tool's
+      // budget; the wire must not clip it again.
+      return textResult(rendered, {
+        isError: isHarnessRefusalText(rendered),
+        maxChars: transportPresentationMaxChars({
+          toolName: 'call_tool',
+          args: { name, args_json },
+          routedModelId: harnessRunContextStorage.getStore()?.routedModelId,
+        }),
+      });
     },
   );
 }
