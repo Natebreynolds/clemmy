@@ -346,6 +346,10 @@ test('undo appears only while it would change something, and forgetting asks fir
   assert.equal(undoOutcomeText({ ok: false, reason: 'failed' }, 'restore').text, 'Couldn’t undo just now. Nothing was changed.');
   assert.equal(undoOutcomeText({ ok: false, reason: 'not_found' }, 'restore').text, 'That run is no longer in the history.');
   assert.deepEqual(undoOutcomeText(null, 'forget'), { ok: false, text: 'Couldn’t undo just now. Nothing was changed.' });
+  // An undo that gets no answer (offline included) says the Mac's sentence.
+  const parts = read('../components/MemoryWorkParts.tsx');
+  assert.match(parts, /catch \{[\s\S]{0,200}?setOutcome\(undoOutcomeText\(null, undo\.kind\)\);/);
+  assert.doesNotMatch(parts, /Can’t reach your Mac/, 'no phone-only undo sentence');
 });
 
 test('a run lists at most what the daemon sent and says how many more it changed', () => {

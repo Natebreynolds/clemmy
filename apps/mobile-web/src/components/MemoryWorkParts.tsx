@@ -11,7 +11,7 @@
 import { Fragment } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { MEMORY_ROLE_WORDS } from '@clem/chat-engine';
-import { isOfflineError, type MemoryWorkUndoResult } from '../lib/api';
+import type { MemoryWorkUndoResult } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
 import {
   hourCaption,
@@ -242,9 +242,11 @@ export function EventRow({ view, compact, onUndo }: {
       const said = undoOutcomeText(result, undo.kind);
       haptic(said.ok ? 'success' : 'error');
       setOutcome(said);
-    } catch (err) {
+    } catch {
+      // No answer: the Mac's words for it (the status line above already
+      // says when the Mac cannot be reached).
       haptic('error');
-      setOutcome(isOfflineError(err) ? { ok: false, text: 'Can’t reach your Mac right now.' } : undoOutcomeText(null, undo.kind));
+      setOutcome(undoOutcomeText(null, undo.kind));
     } finally {
       setBusy(false);
     }
