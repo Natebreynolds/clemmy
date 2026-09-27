@@ -71,9 +71,9 @@ function planOf(sql: string): string[] {
 test('the §5.1 statements are all exercised by the pin', () => {
   const sqls = perFactLinkStatements().map((sql) => sql.replace(/\s+/g, ' '));
   const has = (pattern: RegExp) => assert.ok(sqls.some((sql) => pattern.test(sql)), `no captured statement matches ${pattern}`);
-  has(/DELETE FROM fact_entities WHERE fact_id = \? AND \+?link_type = 'inferred_text'/);
+  has(/DELETE FROM fact_entities WHERE fact_id = \? AND entity_id = \? AND \+link_type = 'inferred_text'/);
   has(/DELETE FROM fact_entities WHERE fact_id = \? AND \+?link_type IN \('stored','extracted'\)/);
-  has(/DELETE FROM fact_resources WHERE fact_id = \? AND \+?link_type = 'inferred_text'/);
+  has(/DELETE FROM fact_resources WHERE fact_id = \? AND resource_id = \? AND \+link_type = 'inferred_text'/);
   has(/DELETE FROM fact_resources WHERE fact_id = \? AND \+?link_type IN \('stored','extracted'\)/);
   has(/FROM fact_entities fe WHERE fe\.fact_id = cf\.id AND \+?fe\.link_type = 'inferred_text'/);
   has(/FROM fact_resources fr WHERE fr\.fact_id = cf\.id AND \+?fr\.link_type = 'inferred_text'/);

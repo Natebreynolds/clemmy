@@ -180,7 +180,7 @@ function seedFixture(): Fixture {
   const heavyFactId = Number(insertFact.run(heavyContent, 'fixture-heavy', iso(5_000), iso(5_000), 0.9, null, iso(5_000)).lastInsertRowid);
   const heavyEpisode = recordMemoryEpisode({ kind: 'tool_result', sessionId: 'heavy-s', callId: 'heavy-c', content: heavyContent });
   linkFactEvidence({ factId: heavyFactId, episodeId: heavyEpisode.id, excerpt: heavyContent });
-  const stale = vendors.slice(30, 70).concat(companies.slice(10), people.slice(20)).slice(0, 60);
+  const stale = vendors.slice(20, 70).concat(companies.slice(10), people.slice(20)).slice(0, 60);
   const seedLink = db.prepare(`INSERT INTO fact_entities (fact_id, entity_id, created_at, link_type, confidence) VALUES (?, ?, ?, 'inferred_text', ?)`);
   for (const id of stale) seedLink.run(heavyFactId, id, iso(0), 0.55);
   seedLink.run(heavyFactId, people[0], iso(0), 0.4);
@@ -416,4 +416,81 @@ test('the synchronous passes leave memory exactly as the reference passes do', (
   };
   assert.deepEqual(stats, reference.stats);
   assertSameTables(dumpTables(), reference.dump);
+});
+
+// ── diff writes: a refresh writes only the rows that change ────────────────
+
+/** Counts row writes on the link tables through TEMP triggers on this connection. */
+function rowWriteMeter(db: Database.Database = openMemoryDb()): () => number {
+  db.exec(`
+    CREATE TEMP TABLE IF NOT EXISTS link_row_writes (n INTEGER NOT NULL);
+    DELETE FROM temp.link_row_writes;
+    INSERT INTO temp.link_row_writes (n) VALUES (0);
+  `);
+  for (const table of ['fact_entities', 'fact_resources', 'entity_edges']) {
+    for (const op of ['INSERT', 'UPDATE', 'DELETE']) {
+      db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS meter_${table}_${op.toLowerCase()} AFTER ${op} ON main.${table}
+        BEGIN UPDATE temp.link_row_writes SET n = n + 1; END;`);
+    }
+  }
+  return () => (db.prepare('SELECT n FROM temp.link_row_writes').get() as { n: number }).n;
+}
+
+function generation(db: Database.Database = openMemoryDb()): number {
+  return (db.prepare('SELECT generation FROM memory_generation WHERE id = 1').get() as { generation: number }).generation;
+}
+
+test('a refresh over unchanged memory writes no row and leaves the memory generation alone', () => {
+  restoreSnapshot();
+  relations.syncFactEntityLinks();
+  relations.syncFactResourceLinks();
+  const writes = rowWriteMeter();
+  const before = generation();
+  relations.syncFactEntityLinks();
+  relations.syncFactResourceLinks();
+  assert.equal(writes(), 0);
+  assert.equal(generation(), before);
+});
+
+test('a refresh keeps the created_at of every inferred row it leaves unchanged', () => {
+  restoreSnapshot();
+  const read = () => new Map((openMemoryDb().prepare(`
+    SELECT fact_id || ':' || entity_id AS k, created_at, confidence, evidence_episode_id FROM fact_entities WHERE link_type = 'inferred_text'
+  `).all() as Array<{ k: string; created_at: string; confidence: number; evidence_episode_id: string | null }>).map((row) => [row.k, row]));
+  const before = read();
+  relations.syncFactEntityLinks();
+  const after = read();
+  let kept = 0;
+  for (const [key, row] of after) {
+    const old = before.get(key);
+    if (!old || old.confidence !== row.confidence) continue;
+    assert.equal(row.created_at, old.created_at, key);
+    kept += 1;
+  }
+  assert.ok(kept > 1_000, `kept ${kept}`);
+});
+
+test('the heavy fact is refreshed by exactly its difference: stale rows out, missing rows in, the downgraded row rewritten', () => {
+  restoreSnapshot();
+  const db = openMemoryDb();
+  const tier = () => (db.prepare(`SELECT entity_id, confidence FROM fact_entities WHERE fact_id = ? AND link_type = 'inferred_text' ORDER BY entity_id`)
+    .all(fixture.heavyFactId) as Array<{ entity_id: number; confidence: number }>);
+  const old = tier();
+  assert.equal(old.length, 61);
+  const writes = rowWriteMeter(db);
+  const content = (db.prepare('SELECT content FROM consolidated_facts WHERE id = ?').get(fixture.heavyFactId) as { content: string }).content;
+  const wanted = relations.resolveEntityIdsForText(content, 100_000);
+  relations.setFactEntityLinks(fixture.heavyFactId, wanted, { linkType: 'inferred_text', confidence: 0.55 });
+  const now = tier();
+  const nowIds = new Set(now.map((row) => row.entity_id));
+  const grounded = new Set((db.prepare(`SELECT entity_id FROM fact_entities WHERE fact_id = ? AND link_type <> 'inferred_text'`)
+    .all(fixture.heavyFactId) as Array<{ entity_id: number }>).map((row) => row.entity_id));
+  const expected = new Set(wanted.filter((id) => !grounded.has(id)));
+  assert.deepEqual(nowIds, expected);
+  assert.ok(now.every((row) => row.confidence === 0.55));
+  const oldIds = new Set(old.map((row) => row.entity_id));
+  const deleted = old.filter((row) => !expected.has(row.entity_id) || row.confidence !== 0.55).length;
+  const inserted = [...expected].filter((id) => !oldIds.has(id) || old.find((row) => row.entity_id === id)!.confidence !== 0.55).length;
+  assert.equal(writes(), deleted + inserted);
+  assert.ok(deleted + inserted >= 150, `the heavy diff is ${deleted + inserted} rows`);
 });

@@ -229,7 +229,10 @@ export interface FactLinkProvenance {
  * costs a scan of the whole inferred tier.
  */
 interface LinkWriteStatements {
-  deleteInferredTier: Database.Statement;
+  /** The fact's whole link set, by primary key: what an inferred-tier diff starts from. */
+  readLinks: Database.Statement;
+  /** One inferred row, by primary key. */
+  deleteInferredLink: Database.Statement;
   deleteGroundedTier: Database.Statement;
   upsert: Database.Statement;
 }
@@ -241,7 +244,11 @@ function entityLinkStatements(db: Database.Database): LinkWriteStatements {
   let statements = factEntityWriteStatements.get(db);
   if (statements) return statements;
   statements = {
-    deleteInferredTier: db.prepare("DELETE FROM fact_entities WHERE fact_id = ? AND +link_type = 'inferred_text'"),
+    readLinks: db.prepare(`
+      SELECT entity_id AS id, link_type, confidence, evidence_episode_id, evidence_excerpt
+      FROM fact_entities WHERE fact_id = ?
+    `),
+    deleteInferredLink: db.prepare("DELETE FROM fact_entities WHERE fact_id = ? AND entity_id = ? AND +link_type = 'inferred_text'"),
     deleteGroundedTier: db.prepare("DELETE FROM fact_entities WHERE fact_id = ? AND +link_type IN ('stored','extracted')"),
     upsert: db.prepare(`
       INSERT INTO fact_entities
@@ -284,6 +291,82 @@ function entityLinkStatements(db: Database.Database): LinkWriteStatements {
   return statements;
 }
 
+interface StoredLinkRow {
+  id: number;
+  link_type: string;
+  confidence: number;
+  evidence_episode_id: string | null;
+  evidence_excerpt: string | null;
+}
+
+/** One row write of an inferred-tier refresh. */
+interface TierWrite {
+  kind: 'delete' | 'insert';
+  id: number;
+}
+
+interface InferredTierTarget {
+  confidence: number;
+  evidenceEpisodeId: string | null;
+  evidenceExcerpt: string | null;
+}
+
+/**
+ * The row writes that turn a fact's inferred tier into `wanted` (canonical,
+ * unique ids), deletes first, then inserts. The result equals replacing the
+ * whole tier, except that a row already exactly as wanted is left alone
+ * (keeping its created_at and not bumping the memory generation):
+ *   - an inferred row wanted with the same confidence and evidence is kept;
+ *   - every other inferred row is deleted (including a wanted row at another
+ *     confidence, which the replace would have re-inserted);
+ *   - a wanted id with no row, or whose row was just deleted, is inserted;
+ *   - a wanted id with a stored or extracted row is left alone, as the
+ *     replace's upsert left it.
+ */
+function planInferredTierWrites(have: readonly StoredLinkRow[], wanted: readonly number[], target: InferredTierTarget): TierWrite[] {
+  const wantedSet = new Set(wanted);
+  const kept = new Set<number>();
+  const grounded = new Set<number>();
+  const writes: TierWrite[] = [];
+  for (const row of have) {
+    if (row.link_type !== 'inferred_text') {
+      grounded.add(row.id);
+      continue;
+    }
+    if (wantedSet.has(row.id)
+      && row.confidence === target.confidence
+      && row.evidence_episode_id === target.evidenceEpisodeId
+      && row.evidence_excerpt === target.evidenceExcerpt) {
+      kept.add(row.id);
+    } else {
+      writes.push({ kind: 'delete', id: row.id });
+    }
+  }
+  for (const id of wanted) {
+    if (!kept.has(id) && !grounded.has(id)) writes.push({ kind: 'insert', id });
+  }
+  return writes;
+}
+
+function inferredTierTarget(confidence: number, provenance: FactLinkProvenance): InferredTierTarget {
+  return {
+    confidence,
+    evidenceEpisodeId: provenance.evidenceEpisodeId ?? null,
+    evidenceExcerpt: provenance.evidenceExcerpt?.trim().slice(0, 1_500) || null,
+  };
+}
+
+function applyTierWrite(
+  statements: LinkWriteStatements,
+  factId: number,
+  write: TierWrite,
+  target: InferredTierTarget,
+  now: string,
+): void {
+  if (write.kind === 'delete') statements.deleteInferredLink.run(factId, write.id);
+  else statements.upsert.run(factId, write.id, now, 'inferred_text', target.confidence, target.evidenceEpisodeId, target.evidenceExcerpt);
+}
+
 function writeFactEntityLinksInDatabase(
   db: Database.Database,
   factId: number,
@@ -300,11 +383,16 @@ function writeFactEntityLinksInDatabase(
       .map((id) => resolveCanonicalEntityIdInDatabase(db, id)),
   ));
   const statements = entityLinkStatements(db);
+  if (replaceTier && linkType === 'inferred_text') {
+    const target = inferredTierTarget(confidence, provenance);
+    db.transaction(() => {
+      const writes = planInferredTierWrites(statements.readLinks.all(factId) as StoredLinkRow[], unique, target);
+      for (const write of writes) applyTierWrite(statements, factId, write, target, now);
+    })();
+    return;
+  }
   const tx = db.transaction(() => {
-    if (replaceTier) {
-      if (linkType === 'inferred_text') statements.deleteInferredTier.run(factId);
-      else statements.deleteGroundedTier.run(factId);
-    }
+    if (replaceTier) statements.deleteGroundedTier.run(factId);
     for (const eid of unique) {
       statements.upsert.run(
         factId, eid, now, linkType, confidence,
@@ -422,7 +510,11 @@ function resourceLinkStatements(db: Database.Database): LinkWriteStatements {
   let statements = factResourceWriteStatements.get(db);
   if (statements) return statements;
   statements = {
-    deleteInferredTier: db.prepare("DELETE FROM fact_resources WHERE fact_id = ? AND +link_type = 'inferred_text'"),
+    readLinks: db.prepare(`
+      SELECT resource_id AS id, link_type, confidence, evidence_episode_id, evidence_excerpt
+      FROM fact_resources WHERE fact_id = ?
+    `),
+    deleteInferredLink: db.prepare("DELETE FROM fact_resources WHERE fact_id = ? AND resource_id = ? AND +link_type = 'inferred_text'"),
     deleteGroundedTier: db.prepare("DELETE FROM fact_resources WHERE fact_id = ? AND +link_type IN ('stored','extracted')"),
     upsert: db.prepare(`
       INSERT INTO fact_resources
@@ -477,11 +569,16 @@ function writeFactResourceLinksInDatabase(
   const confidence = Math.max(0, Math.min(1, provenance.confidence ?? (linkType === 'inferred_text' ? 0.55 : 1)));
   const unique = Array.from(new Set(resourceIds.filter((n) => Number.isInteger(n) && n > 0)));
   const statements = resourceLinkStatements(db);
+  if (replaceTier && linkType === 'inferred_text') {
+    const target = inferredTierTarget(confidence, provenance);
+    db.transaction(() => {
+      const writes = planInferredTierWrites(statements.readLinks.all(factId) as StoredLinkRow[], unique, target);
+      for (const write of writes) applyTierWrite(statements, factId, write, target, now);
+    })();
+    return;
+  }
   const tx = db.transaction(() => {
-    if (replaceTier) {
-      if (linkType === 'inferred_text') statements.deleteInferredTier.run(factId);
-      else statements.deleteGroundedTier.run(factId);
-    }
+    if (replaceTier) statements.deleteGroundedTier.run(factId);
     for (const rid of unique) statements.upsert.run(
       factId, rid, now, linkType, confidence,
       provenance.evidenceEpisodeId ?? null,
