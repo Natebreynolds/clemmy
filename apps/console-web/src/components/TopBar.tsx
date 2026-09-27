@@ -3,6 +3,7 @@ import type { ActivityEntry } from '@/lib/activity';
 import type { PresentedWorkingNowEntry } from '@/lib/activity-presentation';
 import type { HomeLiveStatus } from '@/lib/home-prefs';
 import { LiveStatus } from './home/LiveStatus';
+import { BrainChip } from './BrainChip';
 import { Button } from './ui/Button';
 import { ThemeToggle } from './ThemeToggle';
 import { HealthIndicator } from './HealthIndicator';
@@ -110,6 +111,9 @@ export function TopBar({
             )}
           </Button>
         )}
+
+        {/* Which model does the work, and whether it is a stand-in. */}
+        <BrainChip />
 
         <HealthIndicator />
         <ThemeToggle />
