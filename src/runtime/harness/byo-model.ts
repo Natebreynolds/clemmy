@@ -41,6 +41,7 @@ import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } fro
 import { withResilience } from './resilient-model.js';
 import {
   completionsReasoningEffort,
+  completionsThinkingSwitch,
   resolveModelCapability,
   modelParityEnabled,
   stripPromptCacheLayerSentinels,
@@ -79,11 +80,11 @@ function dropResponseFormatWithToolsEnabled(): boolean {
 }
 
 /** Carry the harness's per-turn effort decision onto a wire whose reasoning
- *  control is a binary `thinking` switch rather than `reasoning_effort`. Gated
- *  to the model ids that accept the switch; other compat backends 400 on an
- *  unknown `thinking` param. No-op if the caller already set `thinking`, or if
- *  the harness sent no effort (the wire keeps its default). Mutates `body` in
- *  place. Exported for unit tests.
+ *  control is a binary `thinking` switch rather than `reasoning_effort`. Only
+ *  a model whose wire-registry row declares the switch gets it; other compat
+ *  backends 400 on an unknown `thinking` param. No-op if the caller already
+ *  set `thinking`, or if the harness sent no effort (the wire keeps its
+ *  default). Mutates `body` in place. Exported for unit tests.
  *
  *  A structured-output call (json_schema / json_object) always runs with
  *  thinking disabled: extended thinking and a structured contract corrupt each
@@ -92,9 +93,8 @@ function dropResponseFormatWithToolsEnabled(): boolean {
  *  happened during the turn; its reliability is raised on the response side
  *  (schema-shape validation + targeted re-ask), which applies to every compat
  *  backend. */
-export function applyGlmThinking(body: Record<string, unknown>, effort: string | undefined): void {
-  const modelId = typeof body.model === 'string' ? body.model : '';
-  if (!/glm/i.test(modelId)) return;
+export function applyDeclaredThinkingSwitch(body: Record<string, unknown>, effort: string | undefined): void {
+  if (!completionsThinkingSwitch(typeof body.model === 'string' ? body.model : undefined)) return;
   if (body.thinking != null) return;
   const rfType = (body.response_format as { type?: string } | undefined)?.type;
   if (rfType === 'json_schema' || rfType === 'json_object') {
@@ -142,11 +142,6 @@ const downgradedBodies = new WeakSet<object>();
 // records its schema here.
 const downgradedSchemas = new WeakMap<object, unknown>();
 
-/** Backends steered through the `thinking` switch (see applyGlmThinking).
- *  Keyed on the model id because the control is a property of the model
- *  family, not of the transport. */
-const COMPAT_EFFORT_STEERABLE = /glm/i;
-
 /** Observed-once-per-body report that the harness chose an effort tier and this
  *  wire had no way to carry it. Telemetry only — it never touches the body and
  *  never blocks a turn. */
@@ -156,7 +151,7 @@ function noteDroppedCompatEffort(
 ): void {
   if (!effort) return;
   const modelId = typeof body.model === 'string' ? body.model : '';
-  if (!modelId || COMPAT_EFFORT_STEERABLE.test(modelId)) return;
+  if (!modelId || completionsThinkingSwitch(modelId)) return;
   if (body.thinking != null || typeof body.reasoning_effort === 'string') return;
   try {
     logger.debug(
@@ -183,7 +178,7 @@ export function relaxRequestForCompatBackend(body: unknown): unknown {
   }
 
   // A wire with a binary thinking switch takes the tier through that switch.
-  applyGlmThinking(next, requestedEffort);
+  applyDeclaredThinkingSwitch(next, requestedEffort);
   // A wire that accepts `reasoning_effort` gets the tier back in the values
   // its registry row declares.
   applyDeclaredReasoningEffort(next, requestedEffort);

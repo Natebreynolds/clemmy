@@ -205,6 +205,12 @@ export interface ModelCapability {
    *  the whole opt-in: `completionsReasoningEffort` places the harness tier on
    *  these values for any model that declares them. */
   completionsEffortValues?: readonly string[];
+  /** openai_completions only: the model's reasoning control is a binary
+   *  `thinking` switch (`{ type: 'enabled' | 'disabled' }`) rather than
+   *  `reasoning_effort`. Absent = the wire does not take the field (an unknown
+   *  field 400s these backends). Declaring it is the whole opt-in: the compat
+   *  relax sets the switch for any model that declares it. */
+  completionsThinkingSwitch?: boolean;
   /** How effort is delivered. 'effort' = output_config.effort (Anthropic GA);
    *  'budget_tokens' = legacy thinking budget (older Sonnet only); 'none'. */
   thinkingMode: ThinkingMode;
@@ -471,6 +477,7 @@ const REGISTRY: RegistryRow[] = [
       family: 'glm-5.2', apiShape: 'openai_completions',
       contextWindow: 512_000, maxOutput: 16_000, supportsEffort: false,
       effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      completionsThinkingSwitch: true,
       thinkingMode: 'none',
       supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
     },
@@ -482,6 +489,7 @@ const REGISTRY: RegistryRow[] = [
       family: 'glm', apiShape: 'openai_completions',
       contextWindow: 202_752, maxOutput: 16_000, supportsEffort: false,
       effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+      completionsThinkingSwitch: true,
       thinkingMode: 'none',
       supportsPromptCache: false, cacheMinTokens: 1024, retryClass: 'openai_compat',
     },
@@ -570,6 +578,14 @@ export function completionsReasoningEffort(
     if (EFFORT_LADDER_RANK[value]! <= rank) chosen = value;
   }
   return chosen;
+}
+
+/** Whether an openai_completions request for `modelId` takes its reasoning
+ *  control through the binary `thinking` switch its registry row declares.
+ *  Unknown ids are legitimate BYO models here, so the lookup does not warn. */
+export function completionsThinkingSwitch(modelId: string | undefined | null): boolean {
+  const cap = matchCapability((modelId ?? '').trim());
+  return cap?.apiShape === 'openai_completions' && cap.completionsThinkingSwitch === true;
 }
 
 /** The PROVIDER class that serves a model. Derived from the model's wire shape,

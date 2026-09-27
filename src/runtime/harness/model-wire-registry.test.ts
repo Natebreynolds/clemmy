@@ -258,3 +258,52 @@ test('registry: the reasoning Grok releases declare effort values; earlier and m
     assert.equal(completionsReasoningEffort(id, 'high', { structured: true }), undefined, id);
   }
 });
+
+// Regression: the compat relax recognized the binary `thinking` switch by a
+// model-name pattern of its own, so a new family taking the same switch needed
+// an adapter change. The registry row is now the only declaration.
+
+test('registry: a new openai_completions family that declares the thinking switch gets it from the real compat relax, no adapter change', async () => {
+  const { __test__, DEFAULT_CAPABILITY: base, completionsThinkingSwitch } = await import('./model-wire-registry.js');
+  const { relaxRequestForCompatBackend } = await import('./byo-model.js');
+  const relax = (body: Record<string, unknown>) =>
+    relaxRequestForCompatBackend({ messages: [{ role: 'user', content: 'hi' }], ...body }) as Record<string, unknown>;
+  const row = {
+    idMatch: /^fixture-switcher-7$/,
+    cap: { ...base, family: 'fixture-switcher', completionsThinkingSwitch: true },
+  };
+  // Before the row exists the id is an ordinary BYO model: no switch is sent.
+  assert.equal(completionsThinkingSwitch('fixture-switcher-7'), false);
+  assert.equal('thinking' in relax({ model: 'fixture-switcher-7', reasoning_effort: 'high' }), false);
+  __test__.REGISTRY.unshift(row);
+  try {
+    assert.equal(completionsThinkingSwitch('fixture-switcher-7'), true);
+    assert.deepEqual(relax({ model: 'fixture-switcher-7', reasoning_effort: 'high' }).thinking, { type: 'disabled' },
+      'no harness tier switches extended thinking on');
+    assert.deepEqual(relax({
+      model: 'fixture-switcher-7', reasoning_effort: 'low',
+      response_format: { type: 'json_schema', json_schema: { name: 'x', schema: { type: 'object' } } },
+    }).thinking, { type: 'disabled' }, 'a structured call never thinks');
+    assert.equal('thinking' in relax({ model: 'fixture-switcher-7' }), false, 'no harness decision leaves the wire default');
+    assert.equal('reasoning_effort' in relax({ model: 'fixture-switcher-7', reasoning_effort: 'high' }), false,
+      'the switch does not also send reasoning_effort');
+  } finally {
+    const at = __test__.REGISTRY.indexOf(row);
+    if (at >= 0) __test__.REGISTRY.splice(at, 1);
+  }
+});
+
+test('registry: the thinking switch is declared on the completions wire only, by the families that take it', async () => {
+  const { __test__, completionsThinkingSwitch } = await import('./model-wire-registry.js');
+  for (const { cap } of __test__.REGISTRY) {
+    if (cap.completionsThinkingSwitch === undefined) continue;
+    assert.equal(cap.apiShape, 'openai_completions', `${cap.family} declares the thinking switch on another wire`);
+    assert.equal(cap.completionsEffortValues, undefined, `${cap.family} declares two reasoning controls`);
+  }
+  for (const id of ['glm-5.2', 'glm-4.6', 'zai-org/GLM-5.2', 'GLM-5.1']) {
+    assert.equal(completionsThinkingSwitch(id), true, id);
+  }
+  for (const id of ['deepseek-chat', 'MiniMax-M3', 'grok-4.6', 'kimi-k3', 'gpt-5.6', 'claude-opus-4-8', 'unknown-model-x', '']) {
+    assert.equal(completionsThinkingSwitch(id), false, id);
+  }
+});
