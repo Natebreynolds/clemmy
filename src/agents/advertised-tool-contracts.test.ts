@@ -122,3 +122,10 @@ test('run_worker states each packet rule once', async () => {
   const fields = tool.parameters.properties as Record<string, { description?: string }>;
   assert.match(fields.items!.description ?? '', /run as one pool/);
 });
+
+test('read_file advertises what it returns without narrating runtime warm-up', async () => {
+  // 810 -> 657 B.
+  const tool = withinCeiling((await builtWire()).get('read_file'), 'read_file', 700);
+  assert.match(tool.description, /max_chars controls only the visible preview/);
+  assert.doesNotMatch(tool.description, /warm/);
+});

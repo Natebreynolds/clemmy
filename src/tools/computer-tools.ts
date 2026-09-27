@@ -1503,7 +1503,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     description: [
       'Read a file from an allowed workspace path.',
       'The complete content is retained for recall_tool_result and tool_output_query. max_chars controls only the visible preview, never how much of the file is retained; null uses the normal result preview.',
-      'UTF-8 text is returned as-is. Other formats are transparently extracted to Markdown: PDF/Word/Excel/PowerPoint/EPub via the bundled markitdown runtime, images via vision OCR, and audio via transcription. The first markitdown conversion may take ~30-60s while the runtime warms.',
+      'UTF-8 text is returned as-is; PDF, Office and EPub documents, images (OCR) and audio (transcript) are extracted to Markdown.',
     ].join('\n'),
     parameters: z.object(READ_FILE_PARAMS),
     needsApproval: needsApprovalForReadFile(),
