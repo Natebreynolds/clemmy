@@ -4107,21 +4107,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       !narrowSurface || (toolRef as { name?: string }).name !== 'run_worker'
     )),
     ...(carrierWork && workCallOptions ? [buildWorkCall(workCallOptions)] : []),
-    // Live 277906: skip already published the op on work_call; grok wrapped
-    // it through call_tool and spent a second frame. Live 278113: grok then
-    // fanned out run_worker onto the worker-lane model (requested glm-5.2)
-    // for a single disclosed read. Proven skip keeps the disclosed carrier
-    // and ask; fan-out and generic dispatch stay off this surface.
-    // tool_search stays on it: live 277962 the remembered op was withheld
-    // from the model's next move by its own confusion (a capability ref sent
-    // as a result handle) and the surface offered no door back to discovery,
-    // so the turn burned 13 identical query frames and ended blocked. A
-    // remembered operation is a shortcut, never the whole tool universe.
-    // Live 283712: with call_tool on a proven turn the brain wrapped the
-    // remembered read through it and lost a frame; the authoring dead end
-    // (live 282184) is closed by keeping the native authoring tools first-class
-    // through the proven skip instead (tool-catalog PROVEN_SKIP_KEEP_LOADED).
-    ...((callTool && !narrowSurface) ? [callTool] : []),
+    // Keep proven reads first-class and omit the worker schema for an exact
+    // remembered request. Discovery and contextual reading remain available:
+    // remembered operations cannot describe every follow-up need.
+    // A proven operation is a shortcut, not a new tool policy. In particular,
+    // skill_read and other deferred local readers still advertise call_tool
+    // in their discovery results. Keep that door on the narrow surface so a
+    // learned provider read cannot strand the instructions needed to use it.
+    ...(callTool ? [callTool] : []),
     ...nonStructuralDiscovery,
   ]);
   searchFirstClassCount = assembledTools.length;

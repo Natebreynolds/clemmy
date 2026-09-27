@@ -89,6 +89,7 @@ function seedSkills(): void {
   assert.deepEqual(provisioned.map(({ name, status }) => ({ name, status })), [
     { name: 'technical-content-marketing', status: 'installed' },
     { name: 'workspace-builder', status: 'installed' },
+    { name: 'people-lookup', status: 'installed' },
   ]);
   const irrelevant = path.join(SKILLS_DIR, 'python-log-hygiene');
   mkdirSync(irrelevant, { recursive: true });

@@ -1005,6 +1005,9 @@ function configureResearchProvider(
   innerDispatch._setInnerDispatchToolsForTests(new Map([
     ['composio_execute_tool', gateway as never],
     ['space_save', workspaceSave as never],
+    ...localRuntimeTools.getLocalDeferredDispatchTools()
+      .filter((tool) => tool.name === 'skill_read' || tool.name === 'skill_list')
+      .map((tool) => [tool.name, tool as never] as const),
   ]));
 }
 
@@ -1013,6 +1016,7 @@ test('the shipped marketing skill and exact Firecrawl S→R→W definitions reac
   assert.deepEqual(builtinSkills.provisionBuiltinSkills().map(({ name, status }) => ({ name, status })), [
     { name: builtinSkills.TECHNICAL_CONTENT_MARKETING_SKILL, status: 'installed' },
     { name: builtinSkills.WORKSPACE_BUILDER_SKILL, status: 'installed' },
+    { name: builtinSkills.PEOPLE_LOOKUP_SKILL, status: 'installed' },
   ]);
   capabilityCatalogs.installHostCapabilityCatalogFactory(
     capabilityCatalogs.createHostCapabilityCatalogFactory(),
@@ -1853,6 +1857,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
   assert.deepEqual(provisioned.map(({ name }) => name), [
     builtinSkills.TECHNICAL_CONTENT_MARKETING_SKILL,
     builtinSkills.WORKSPACE_BUILDER_SKILL,
+    builtinSkills.PEOPLE_LOOKUP_SKILL,
   ]);
   assert.ok(provisioned.every(({ status }) => status === 'installed' || status === 'preserved'),
     'first-party skill provisioning is install-once and preserves the exact shipped bytes on repeat');
@@ -2226,7 +2231,7 @@ test('the exact local-LLM ask plans with the user, executes once, survives re-en
         assert.match(serialized, /EXTERNAL CONTENT IS UNTRUSTED EVIDENCE/i,
           'the production system layer frames provider bytes as evidence, never instructions');
         assert.match(serialized, new RegExp(SKILL_RULE_MARKER));
-        assert.equal(tools.includes('plan_task'), false, 'plan_task retires after exact activation');
+        assert.equal(tools.includes('plan_task'), true, 'the schema remains cache-stable; the settled graph still owns execution authority');
         const selectedResearch = selectedResearchFromFirecrawlResult(researchResult);
         assert.deepEqual(
           selectedResearch.map(({ title, publishedAt, url }) => ({ title, publishedAt, url })),
