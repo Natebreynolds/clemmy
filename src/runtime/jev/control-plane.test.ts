@@ -7,7 +7,6 @@ const {
 } = await import('./client.js');
 const {
   classifyOpenQuestionReplyWithJev,
-  filterPrimerHitsWithJev,
   labelIdentifierWithJev,
   classifyApprovalReplyWithJev,
   nominateReadCapabilitiesWithJev,
@@ -65,9 +64,8 @@ test('candidate and primer routing preserve late request constraints and retain 
   const candidates = [{ name: 'read_records' }, { name: 'send_email' }];
   const hits = [{ title: 'Research preference', snippet: 'Read existing records', score: 0.8 }];
   assert.deepEqual(await rerankNamedCandidatesWithJev(query, candidates), candidates);
-  assert.deepEqual(await filterPrimerHitsWithJev(query, hits), hits);
   assert.deepEqual(await prepareSharedEvidenceDecisionsWithJev(query, { candidates, hits }), { candidates, hits });
-  assert.equal(posted.length, 3);
+  assert.equal(posted.length, 2);
   for (const request of posted) assert.equal(request.state.request, query);
 });
 
@@ -101,32 +99,9 @@ test('control-plane adapters fail-open to the original order or Sol when Jev is 
   _setTypesafeKeyForTests(null);
   const original = [{ name: 'a' }, { name: 'b' }];
   assert.deepEqual(await rerankNamedCandidatesWithJev('q', original), original);
-  const hits = [{ title: 'Salesforce', snippet: 'unrelated', score: 0.2 }];
-  assert.equal((await filterPrimerHitsWithJev('write a workflow', hits))[0]?.title, 'Salesforce');
   assert.equal(await tryJevGroundingVerdict('payload', [{ excerpt: 'src' }]), null);
   assert.equal(await tryJevCompletionVerdict('write a file', 'Created it.'), null);
   assert.equal(await tryJevOutputGroundingVerdict([{ raw: '18%' }], [{ excerpt: 'src' }]), null);
-});
-
-test('filterPrimerHitsWithJev drops off-topic hits and keeps the top hit if every noul is low', async () => {
-  _setTypesafeKeyForTests('ts_test');
-  _setSystemOneFetchForTests(async () => ({
-    status: 200,
-    ok: true,
-    text: async () => JSON.stringify({
-      model: 'jev-1.13.0',
-      answers: {
-        hit_0: { type: 'noul', noul: 0.9 },
-        hit_1: { type: 'noul', noul: 0.05 },
-      },
-      usage: { input_tokens: 20, output_tokens: 2 },
-    }),
-  }));
-  const kept = await filterPrimerHitsWithJev('Cedar archive prefix', [
-    { title: 'CedarTrial', snippet: 'archive prefix CedarTrial', score: 0.8 },
-    { title: 'Salesforce', snippet: 'unrelated CRM', score: 0.3 },
-  ]);
-  assert.deepEqual(kept.map((hit) => hit.title), ['CedarTrial']);
 });
 
 test('selectProvenRunStrategyWithJev picks a matching past run and fails open to none', async () => {
@@ -312,6 +287,12 @@ test('tryJevCompletionVerdict settles only when every yes/no reading is sure', a
   assert.equal(posted.model, 'jev-1.13.0', 'the request names a pinned model, not the moving alias');
   assert.equal(posted.state?.receiptsComplete, true);
   assert.deepEqual(posted.state?.receipts, [{ tool: 'write_file', outcome: 'succeeded', complete: true }]);
+  assert.equal(posted.state?.memory, undefined, 'no memory was given, none is claimed');
+  assert.match(posted.questions?.unsupported?.instructions ?? '', /nor memory show/, 'a specific memory supports is not unsupported');
+  await tryJevCompletionVerdict('Create /tmp/jev.txt containing JEV_OK', 'Created it, under 100 words as you prefer.', {
+    coverage: receipts, memory: '[REMEMBERED FACTS]\n- The owner prefers replies under 100 words.',
+  });
+  assert.match(posted.state?.memory ?? '', /prefers replies under 100 words/, 'the checks see what the brain was told');
 
   const ask = async (nouls: Parameters<typeof completionAnswers>[0]) => {
     answers = completionAnswers(nouls);

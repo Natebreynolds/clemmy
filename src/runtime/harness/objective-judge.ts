@@ -1471,8 +1471,11 @@ export async function judgeObjectiveComplete(
   const askJev = async (screening = false): Promise<Awaited<ReturnType<typeof import('../jev/control-plane.js').tryJevCompletionVerdict>>> => {
     try {
       const { tryJevCompletionVerdict } = await import('../jev/control-plane.js');
+      const { judgeMemoryFor } = await import('../../memory/judge-memory.js');
+      const memory = judgeMemoryFor(skillContext?.sessionId);
       return await tryJevCompletionVerdict(objective, assistantResponse, {
         ...(screening ? { screening: true } : {}),
+        ...(memory ? { memory } : {}),
         sessionId: skillContext?.sessionId,
         toolCallSummary: skillContext?.toolCallSummary,
         verifiedReads: skillContext?.verifiedReads,

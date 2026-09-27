@@ -38,6 +38,7 @@ import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { recordRecallRun } from '../../memory/recall-usage.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import { rememberTurnMemoryForJudges } from '../../memory/judge-memory.js';
 import {
   EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
   explicitlyOptsOutOfAutomaticMemoryRecall,
@@ -1237,6 +1238,7 @@ async function buildClaudeAgentBrainTurnContext(
       };
       if (unified.status === 'ok') {
         recall = unified.text ?? '';
+        rememberTurnMemoryForJudges(request.sessionId, recall);
       } else if (unified.status !== 'empty') {
         // Degraded fallback only: preserve the prior bounded fact/meeting path
         // when the unified ranker is killed, times out, or fails.

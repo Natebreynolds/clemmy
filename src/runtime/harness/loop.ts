@@ -245,6 +245,7 @@ import { listRecentEpisodicPointers } from '../../memory/reflection.js';
 import { formatSearchHits, searchVault, searchVaultAsync } from '../../memory/search.js';
 import { crossStoreBreadcrumbs } from '../../memory/unified-recall.js';
 import { buildUnifiedTurnPrimer } from '../../memory/turn-primer.js';
+import { rememberTurnMemoryForJudges } from '../../memory/judge-memory.js';
 import {
   EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
   explicitlyOptsOutOfAutomaticMemoryRecall,
@@ -11087,6 +11088,10 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       skippedReason: turnMemoryPrimer.skippedReason ?? null,
     },
   });
+  // The checks (Jev completion, grounding) see what the brain was told from
+  // memory this turn; a stated preference is then support, not an unsupported
+  // specific.
+  rememberTurnMemoryForJudges(options.sessionId, turnMemoryPrimer.text);
   const contextPacket = canonicalContext.turn;
   if (contextPacket.skills.length > 1) {
     try {

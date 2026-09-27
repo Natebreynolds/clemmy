@@ -799,7 +799,9 @@ async function shadowJevGrounding(
 ): Promise<{ grounded: boolean; model?: string } | null> {
   try {
     const { tryJevGroundingVerdict } = await import('../jev/control-plane.js');
-    const jevVerdict = await tryJevGroundingVerdict(payload, sources, { sessionId, recordMetric: false });
+    const { judgeMemoryFor } = await import('../../memory/judge-memory.js');
+    const memory = judgeMemoryFor(sessionId);
+    const jevVerdict = await tryJevGroundingVerdict(payload, sources, { sessionId, recordMetric: false, ...(memory ? { memory } : {}) });
     if (!jevVerdict) return null;
     return { grounded: jevVerdict.grounded, model: jevVerdict.model };
   } catch {

@@ -177,19 +177,6 @@ export async function rerankNamedCandidatesWithJev<T extends NamedCandidate>(
   return prepared.candidates;
 }
 
-export async function filterPrimerHitsWithJev<T extends PrimerHitLike>(
-  query: string,
-  hits: T[],
-  opts?: { sessionId?: string },
-): Promise<T[]> {
-  if (hits.length === 0) return hits;
-  const prepared = await prepareSharedEvidenceDecisionsWithJev(query, {
-    hits,
-    sessionId: opts?.sessionId,
-  });
-  return prepared.hits;
-}
-
 export interface ProvenStrategyCandidate {
   id: string;
   objective: string;
@@ -593,8 +580,9 @@ export async function selectProvenRunStrategyWithJev<T extends ProvenStrategyCan
 export async function tryJevGroundingVerdict(
   payload: string,
   sources: Array<{ excerpt: string }>,
-  opts?: { sessionId?: string; recordMetric?: boolean },
+  opts?: { sessionId?: string; recordMetric?: boolean; /** Remembered facts the brain saw this turn. */ memory?: string },
 ): Promise<{ grounded: boolean; reason: string; model: string } | null> {
+  const memory = (opts?.memory ?? '').trim().slice(0, 900);
   const questions: SystemOneQuestions = {
     verdict: {
       type: 'choice',
@@ -603,6 +591,7 @@ export async function tryJevGroundingVerdict(
         'Mark ungrounded only for a concrete load-bearing contradiction.',
         'A SUCCESS: send-confirmation proves a send happened, not that its content was correct. Prefer research/extraction artifacts.',
         'If two sources contradict each other about a load-bearing fact for this target, the payload is not grounded.',
+        ...(memory ? ['memory lists facts the owner stated earlier; a payload consistent with memory is not contradicted by it.'] : []),
       ].join(' '),
       criteria: {
         grounded: 'The payload is consistent with the sources, or any mismatch is generic/unverifiable.',
@@ -615,6 +604,7 @@ export async function tryJevGroundingVerdict(
     state: {
       payload: payload.slice(0, 6_000),
       sources: sources.map((source) => source.excerpt.slice(0, 5_000)),
+      ...(memory ? { memory } : {}),
     },
     questions,
     timeoutMs: GATE_TIMEOUT_MS,
@@ -819,6 +809,9 @@ export async function tryJevCompletionVerdict(
       complete: boolean;
       outcomeEvidence: Array<{ toolName: string; outcome: string; contentComplete?: boolean }>;
     };
+    /** What the brain was told from memory this turn (owner-stated facts,
+     *  preferences), so a specific that memory supports is not "unsupported". */
+    memory?: string;
   },
 ): Promise<JevCompletionVerdict | null> {
   const questions: SystemOneQuestions = {
@@ -840,10 +833,10 @@ export async function tryJevCompletionVerdict(
     },
     unsupported: {
       type: 'noul',
-      instructions: 'Does response state a specific fact (a name, number, date, time, amount or status) that neither receipts nor evidence show?',
+      instructions: 'Does response state a specific fact (a name, number, date, time, amount or status) that neither receipts, evidence nor memory show?',
       criteria: {
-        true: 'At least one stated specific does not appear in receipts or evidence.',
-        false: 'Every stated specific appears in receipts or evidence, or none is stated.',
+        true: 'At least one stated specific does not appear in receipts, evidence or memory.',
+        false: 'Every stated specific appears in receipts, evidence or memory, or none is stated.',
       },
     },
     computed: {
@@ -878,13 +871,15 @@ export async function tryJevCompletionVerdict(
     opts?.toolCallSummary ?? '',
     opts?.verifiedReads && !opts.toolCallSummary?.includes(opts.verifiedReads) ? opts.verifiedReads : '',
   ].filter(Boolean).join('\n\n');
-  const fixed = request.length + response.length + JSON.stringify(receipts).length + 400;
+  const memory = (opts?.memory ?? '').trim().slice(0, 900);
+  const fixed = request.length + response.length + JSON.stringify(receipts).length + memory.length + 400;
   const evidence = clipMiddle(evidenceText, Math.max(0, COMPLETION_STATE_BUDGET_CHARS - fixed));
   const state = {
     request,
     response,
     receipts,
     receiptsComplete: opts?.coverage?.complete === true,
+    ...(memory ? { memory } : {}),
     ...(evidence.text ? { evidence: evidence.text } : {}),
     ...(evidence.clipped ? { evidenceNote: 'The middle of evidence was elided for length; receipts lists every result.' } : {}),
   };
