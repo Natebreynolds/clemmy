@@ -4459,3 +4459,11 @@ textarea.cz-input { resize: vertical; }
 .chats-rename-input { min-height: 44px; padding: 0 12px; border: 1px solid var(--line-hot); border-radius: 12px; background: var(--bg-1); color: var(--fg); font-size: 16px; }
 .chats-rename-input:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 .chats-none { margin: var(--sp-3) 2px; color: var(--fg-3); font-size: var(--t-sm); }
+
+/* Hold to talk: the mic swells while held, pulses while the Mac writes it down. */
+.composer .chat-mic { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.composer .chat-mic.holding { color: var(--on-accent); background: var(--accent); transform: scale(1.08); box-shadow: 0 0 0 6px var(--accent-soft); }
+.composer .chat-mic.holding svg { animation: breathe 1.2s ease-in-out infinite; }
+.composer .chat-mic.transcribing { color: var(--accent); background: var(--accent-soft); }
+.composer .chat-mic.transcribing svg { animation: breathe 0.8s ease-in-out infinite; }
+.composer-note { margin: 0 8px 4px; color: var(--accent-fail); font-size: var(--t-xs); }

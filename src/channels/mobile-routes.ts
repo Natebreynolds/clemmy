@@ -3608,6 +3608,45 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * message that refers to it. Same converter and inbox as the desktop's
    * /api/attach; the id comes back and rides on /api/chat/send.
    */
+  /**
+   * Spoken words from the phone, transcribed on the Mac: the same on-device
+   * whisper the desktop's voice panel and Meetings use, with the OpenAI
+   * transcriber only as a fallback when the local model is not ready and a
+   * key exists. Bytes are 16 kHz mono WAV; nothing is kept.
+   */
+  router.post('/api/chat/transcribe', requireMobileSession, express.raw({ type: 'audio/*', limit: '15mb' }), async (req, res) => {
+    const bytes = Buffer.isBuffer(req.body) && req.body.length > 44 ? (req.body as Buffer) : undefined;
+    if (!bytes) { res.status(400).json({ error: 'AUDIO_REQUIRED' }); return; }
+    const os = await import('node:os');
+    const fsp = await import('node:fs/promises');
+    const tmp = path.join(os.tmpdir(), `clem-phone-voice-${randomBytes(8).toString('hex')}.wav`);
+    try {
+      await fsp.writeFile(tmp, bytes);
+      const { transcribeLocalMeetingAudio } = await import('../integrations/local-meetings/whisper-runtime.js');
+      try {
+        const local = await transcribeLocalMeetingAudio({ audioPath: tmp });
+        res.json({ text: (local.text || '').trim(), engine: 'local' });
+        return;
+      } catch (localErr) {
+        const { transcribeAudio, hasOpenAiKey } = await import('../runtime/transcribe.js');
+        if (hasOpenAiKey()) {
+          const result = await transcribeAudio(tmp);
+          if (result.ok) { res.json({ text: result.text.trim(), engine: 'openai' }); return; }
+          res.status(502).json({ error: 'TRANSCRIBE_FAILED', message: result.error });
+          return;
+        }
+        res.status(502).json({
+          error: 'TRANSCRIBER_NOT_READY',
+          message: localErr instanceof Error ? `On-device transcription isn't ready: ${localErr.message}` : 'On-device transcription is not ready yet. Open Meetings on your Mac once to install the local model.',
+        });
+      }
+    } catch (err) {
+      res.status(500).json({ error: 'TRANSCRIBE_FAILED', message: err instanceof Error ? err.message : String(err) });
+    } finally {
+      await fsp.unlink(tmp).catch(() => undefined);
+    }
+  });
+
   router.post('/api/chat/attach', requireMobileSession, express.raw({ type: '*/*', limit: '30mb' }), async (req, res) => {
     const name = typeof req.query.name === 'string' && req.query.name.trim() ? req.query.name.trim().slice(0, 200) : 'attachment';
     const bytes = Buffer.isBuffer(req.body) && req.body.length > 0 ? (req.body as Buffer) : undefined;

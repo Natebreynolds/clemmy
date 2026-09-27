@@ -1891,3 +1891,10 @@ export async function uploadChatAttachment(file: File): Promise<{ id: string; na
     { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file },
   );
 }
+
+/** Spoken words to text, on the Mac: raw 16 kHz mono WAV in, the transcript out. */
+export async function transcribeVoice(wav: Blob): Promise<{ text: string; engine: 'local' | 'openai' }> {
+  return api<{ text: string; engine: 'local' | 'openai' }>('/m/api/chat/transcribe', {
+    method: 'POST', headers: { 'content-type': 'audio/wav' }, body: wav,
+  });
+}

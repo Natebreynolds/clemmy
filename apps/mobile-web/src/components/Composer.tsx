@@ -13,6 +13,7 @@ import type { ChatAttachment } from '@clem/chat-engine';
 import { Sheet } from './Sheet';
 import { haptic } from '../lib/native-bridge';
 import { useDictation } from '../lib/use-dictation';
+import { HoldToTalk, holdToTalkAvailable } from '../lib/hold-to-talk';
 import { attachmentKind, attachmentLabel, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS } from '../lib/attachments';
 
 export interface UploadResult { id: string; name: string; ok: boolean; error: string | null }
@@ -51,11 +52,54 @@ export function Composer(props: ComposerProps) {
   const cameraRef = useRef<HTMLInputElement | null>(null);
   const photosRef = useRef<HTMLInputElement | null>(null);
   const filesRef = useRef<HTMLInputElement | null>(null);
-  const { available: dictation, listening, toggle: toggleDictation, stop: stopDictation } = useDictation(
+  const { available: dictation, listening: dictating, toggle: toggleDictation, stop: stopDictation } = useDictation(
     value,
     onChange,
     () => textareaRef.current?.focus(),
   );
+  // Hold to talk: the words are transcribed on the Mac. Web Speech remains
+  // the fallback where no microphone stream is available to the page.
+  const holdable = holdToTalkAvailable();
+  const talker = useRef<HoldToTalk | null>(null);
+  const [holding, setHolding] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [voiceNote, setVoiceNote] = useState<string | null>(null);
+  const listening = holding || dictating;
+  const beginHold = async (event: Event) => {
+    event.preventDefault();
+    if (disabled || holding || transcribing) return;
+    setVoiceNote(null);
+    const t = new HoldToTalk();
+    talker.current = t;
+    setHolding(true);
+    haptic('light');
+    try { await t.start(); } catch (err) {
+      setHolding(false);
+      talker.current = null;
+      setVoiceNote(err instanceof Error ? err.message : 'The microphone is not available.');
+    }
+  };
+  const endHold = async () => {
+    const t = talker.current;
+    if (!t) return;
+    talker.current = null;
+    setHolding(false);
+    setTranscribing(true);
+    try {
+      const words = await t.stop();
+      if (words) {
+        haptic('medium');
+        const joined = value.trim() ? `${value.replace(/\s+$/, '')} ${words}` : words;
+        onChange(joined);
+        textareaRef.current?.focus();
+      }
+    } catch (err) {
+      setVoiceNote(err instanceof Error ? err.message : 'Could not transcribe that.');
+    } finally {
+      setTranscribing(false);
+    }
+  };
+  useEffect(() => () => { talker.current?.cancel(); }, []);
 
   const autoresize = (el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -144,7 +188,7 @@ export function Composer(props: ComposerProps) {
         rows={1}
         value={value}
         aria-label={ariaLabel}
-        placeholder={listening ? 'Listening…' : placeholder}
+        placeholder={holding ? 'Listening… let go to finish' : transcribing ? 'Writing down what you said…' : dictating ? 'Listening…' : placeholder}
         enterkeyhint="send"
         autocomplete="off"
         disabled={disabled}
@@ -162,8 +206,25 @@ export function Composer(props: ComposerProps) {
         ) : null}
         {chips ? <div class="composer-chips">{chips}</div> : null}
         <span class="composer-spacer" aria-hidden="true" />
-        {dictation ? (
-          <button type="button" class="composer-icon chat-mic" aria-label={listening ? 'Stop dictation' : 'Dictate'} aria-pressed={listening} disabled={disabled} onClick={toggleDictation}>
+        {holdable ? (
+          <button
+            type="button"
+            class={`composer-icon chat-mic${holding ? ' holding' : ''}${transcribing ? ' transcribing' : ''}`}
+            aria-label={holding ? 'Let go to finish' : 'Hold to talk'}
+            aria-pressed={holding}
+            disabled={disabled || transcribing}
+            onPointerDown={(e) => { void beginHold(e); }}
+            onPointerUp={() => { void endHold(); }}
+            onPointerCancel={() => { void endHold(); }}
+            onPointerLeave={() => { if (holding) void endHold(); }}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
+            </svg>
+          </button>
+        ) : dictation ? (
+          <button type="button" class="composer-icon chat-mic" aria-label={dictating ? 'Stop dictation' : 'Dictate'} aria-pressed={dictating} disabled={disabled} onClick={toggleDictation}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
             </svg>
@@ -182,6 +243,7 @@ export function Composer(props: ComposerProps) {
           </svg>
         </button>
       </div>
+      {voiceNote ? <p class="composer-note" role="alert">{voiceNote}</p> : null}
       {upload ? (
         <>
           <input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={onFiles} />
