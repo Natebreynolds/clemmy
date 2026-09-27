@@ -157,6 +157,32 @@ test('a credential refresh that takes longer than the retry window to time out i
   assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0);
 });
 
+test('a rate-limited first request does not use up the retry a later slow refresh timeout is owed', async () => {
+  const session = HarnessSession.create({ kind: 'chat', title: 'rate limit then slow refresh recovers' });
+  const realNow = Date.now.bind(Date);
+  let skewMs = 0;
+  mock.method(Date, 'now', () => realNow() + skewMs);
+  let refreshes = 0;
+  fakeWire((attempt) => (attempt === 1 ? rateLimited() : answer('Here is the one-line summary.')));
+  const brain = productionBrain(session.id, async () => {
+    refreshes += 1;
+    // The request after the rate limit waits 25 s on a stalled network
+    // before its refresh deadline fires; the clock moves instead of the test.
+    if (refreshes === 2) {
+      skewMs += 25_000;
+      throw new Error('token refresh timed out after 25s. Check your network connection and try again.');
+    }
+    return 'fresh-access';
+  });
+  const result = await runChatTurn(session.id, brain);
+  assert.equal(result.status, 'completed', 'a rate-limit wait and one slow blip before any output must not end the turn');
+  assert.match(String(result.finalOutput), /one-line summary/);
+  assert.equal(refreshes, 3, 'rate-limited request, the slow failed refresh, then the one that answers');
+  assert.equal(wire.length, 2, 'the slow refresh never reached the provider');
+  assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0, 'no continuation question');
+  assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0);
+});
+
 test('a provider that never answers ends in a resumable question after one bounded round, never a failed run', async () => {
   const session = HarnessSession.create({ kind: 'chat', title: 'provider unreachable' });
   fakeWire(() => connectTimeout());
@@ -175,6 +201,11 @@ test('a provider that never answers ends in a resumable question after one bound
   const completed = eventlog.listEvents(session.id, { types: ['conversation_completed'] });
   assert.ok(completed.every(event => event.data.status !== 'failed'), 'the turn is not recorded as failed');
 });
+
+function rateLimited(): Response {
+  return new Response(JSON.stringify({ error: { message: 'Too many requests', type: 'rate_limit_error' } }),
+    { status: 429, headers: { 'content-type': 'application/json' } });
+}
 
 test('a connection lost after reply text streamed is never replayed at the model boundary', async () => {
   fakeWire(() => answerThenDrop('Partial reply'));
