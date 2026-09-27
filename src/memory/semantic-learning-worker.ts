@@ -178,6 +178,25 @@ function handedBackDueAt(handedBack: number, until: string | undefined, nowMs = 
   return new Date(from + Math.min(30 * 60_000, 30_000 * 2 ** (handedBack - 2))).toISOString();
 }
 
+/** Whether a part is due to be read now (the claim's own condition). When
+ *  the queue cannot be read, say yes: the note then names the real blocker. */
+function learningPartDue(nowMs = Date.now()): boolean {
+  try {
+    const now = new Date(nowMs).toISOString();
+    return Boolean(openMemoryDb().prepare(`
+      SELECT 1 FROM memory_learning_shards
+       WHERE attempts < ?
+         AND (
+           (status = 'pending' AND next_attempt_at <= ?)
+           OR (status = 'processing' AND lease_expires_at <= ?)
+         )
+       LIMIT 1
+    `).get(MAX_SHARD_ATTEMPTS, now, now));
+  } catch {
+    return true;
+  }
+}
+
 function claimNextShard(nowMs = Date.now()): ClaimedShard | null {
   const db = openMemoryDb();
   const now = new Date(nowMs).toISOString();
@@ -430,7 +449,10 @@ export async function drainTerminalSemanticLearning(options: {
     const blocker = interactiveForegroundBlocker();
     if (blocker) {
       summary.foregroundBusy = true;
-      noteLearningWaiting({ reason: 'busy', blocker });
+      // Learning waits behind the run only when a part is due now; with
+      // nothing to read, nothing is waiting.
+      if (learningPartDue()) noteLearningWaiting({ reason: 'busy', blocker });
+      else setMemoryLearningWaiting(null);
       return summary;
     }
   }

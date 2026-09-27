@@ -374,6 +374,27 @@ test('when the foreground is busy, the tab is told what learning waits behind an
   assert.deepEqual(worker.interactiveForegroundBlocker(), { kind: 'workflow', startedAt: note?.blocker?.startedAt });
 });
 
+test('with nothing to read, a busy foreground is not a wait', async () => {
+  memory.openMemoryDb().prepare("UPDATE memory_learning_shards SET status = 'completed', completed_at = ?").run(new Date().toISOString());
+  journal.setMemoryLearningWaiting({ reason: 'model_unavailable', problem: 'not_connected' }); // an earlier pass's note
+  const session = eventlog.createSession({ id: 'sess-busy-idle-queue', kind: 'chat' });
+  eventlog.beginRunAttempt(session.id, {});
+  const pass = await worker.drainTerminalSemanticLearning({ requireIdle: true });
+  assert.equal(pass.foregroundBusy, true);
+  assert.equal(pass.shardsClaimed, 0);
+  assert.equal(journal.readMemoryLearningWaiting(), null, 'no part is due, so learning is not waiting on anything');
+
+  // A part that is not due yet (its retry gap has not passed) is not waiting behind the run either.
+  memory.openMemoryDb().prepare("UPDATE memory_learning_shards SET status = 'pending', completed_at = NULL, next_attempt_at = ?")
+    .run(new Date(Date.now() + 60 * 60_000).toISOString());
+  await worker.drainTerminalSemanticLearning({ requireIdle: true });
+  assert.equal(journal.readMemoryLearningWaiting(), null);
+
+  makePartsDue();
+  await worker.drainTerminalSemanticLearning({ requireIdle: true });
+  assert.equal(journal.readMemoryLearningWaiting()?.reason, 'busy', 'a due part waits behind the run');
+});
+
 test('a chat run blocks learning as a conversation', async () => {
   const session = eventlog.createSession({ id: 'sess-chat', kind: 'chat' });
   eventlog.beginRunAttempt(session.id, {});
