@@ -160,16 +160,16 @@ test('a result still inside its own open lifecycle is offered to file_query', ()
   assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(routes));
 });
 
-test('a prose document with its data inside is routed to the query for the data and recall for the prose', () => {
+test('a prose document with data after a pseudo-call is text: recall reads it and file_query searches it', () => {
   const sessionId = stored('toolu_doc_with_data', [
     'Workspace "Board" (board) — active, v1.',
     'View source: reader({slug:"board"}) returns the saved HTML.',
     `Dataset (complete JSON): ${JSON.stringify({ rows: [{ id: 1 }, { id: 2 }] })}`,
   ].join('\n'));
   const routes = retainedResultRoutes({ sessionId, callId: 'toolu_doc_with_data' });
-  assert.deepEqual(routes.map((r) => r.tool), ['tool_output_query', 'recall_tool_result', 'file_query'], JSON.stringify(routes));
+  assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(routes));
   const spent = retainedResultRoutes({ sessionId, callId: 'toolu_doc_with_data', recallCallsRemaining: 0 });
-  assert.deepEqual(spent.map((r) => r.tool), ['tool_output_query', 'file_query']);
+  assert.deepEqual(spent.map((r) => r.tool), ['file_query']);
 });
 
 test('prose whose brackets happen to parse is routed as text, never to the record query', () => {
