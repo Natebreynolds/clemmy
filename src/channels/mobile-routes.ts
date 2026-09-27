@@ -78,6 +78,7 @@ import {
   removeWebPushDestinationByEndpoint,
   removeWebPushDestinationsByDeviceId,
   upsertApnsDestination,
+  listNotificationDestinations,
   upsertWebPushDestination,
   type NotificationRecord,
 } from '../runtime/notifications.js';
@@ -6168,19 +6169,65 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // the phone's own door. A safe projection only: session records hold token
   // hashes and device keys that must never leave the daemon.
 
-  router.get('/api/devices', requireMobileSession, (req, res) => {
+  router.get('/api/devices', requireMobileSession, async (req, res) => {
     const ctx = req.mobileSession!;
-    const devices = listSessions(stateOpts).map((row) => ({
-      deviceId: row.deviceId,
-      deviceLabel: row.deviceLabel,
-      createdAt: row.createdAt,
-      lastSeenAt: row.lastSeenAt,
-      expiresAt: row.expiresAt,
-      pushSubscribed: row.pushSubscribed === true,
-      binding: row.binding ?? 'cookie',
-      current: row.deviceId === ctx.record.deviceId,
-    }));
+    const { describeDevice } = await import('../runtime/device-name.js');
+    // A phone "receives pushes" when a live destination is bound to it: the
+    // native app's APNs token or a browser's Web Push subscription. The
+    // session's own pushSubscribed flag is only the phone's claim.
+    const pushDevices = new Set(
+      listNotificationDestinations()
+        .filter((d) => d.enabled && (d.type === 'apns' || d.type === 'web_push') && d.deviceId)
+        .map((d) => d.deviceId as string),
+    );
+    const devices = listSessions(stateOpts).map((row) => {
+      const named = describeDevice(row.deviceLabel);
+      return {
+        deviceId: row.deviceId,
+        deviceLabel: row.deviceLabel,
+        deviceName: named.name,
+        deviceApp: named.app,
+        createdAt: row.createdAt,
+        lastSeenAt: row.lastSeenAt,
+        expiresAt: row.expiresAt,
+        pushSubscribed: row.pushSubscribed === true,
+        pushRegistered: pushDevices.has(row.deviceId),
+        binding: row.binding ?? 'cookie',
+        current: row.deviceId === ctx.record.deviceId,
+      };
+    });
     res.json({ devices });
+  });
+
+  // ─── Heartbeats: what reaches the phone ─────────────────────────
+  //
+  // The same contracts the Mac's Heartbeats page edits. The phone changes one
+  // thing here, whether a heartbeat's items reach the phone or stay in the
+  // app; cadence and rules stay on the Mac.
+  router.get('/api/heartbeats', requireMobileSession, async (_req, res) => {
+    try {
+      const { listHeartbeats } = await import('../agents/heartbeats.js');
+      res.json({ heartbeats: (await listHeartbeats()).map(serializeHeartbeatForMobile) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.patch('/api/heartbeats/:id', requireMobileSession, async (req, res) => {
+    try {
+      const { isHeartbeatId, patchHeartbeat } = await import('../agents/heartbeats.js');
+      const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      if (!isHeartbeatId(id)) { res.status(404).json({ error: 'UNKNOWN_HEARTBEAT' }); return; }
+      const body = (req.body ?? {}) as { notify?: unknown; enabled?: unknown };
+      const patch = {
+        ...(body.notify === 'quiet' || body.notify === 'push' ? { notify: body.notify as 'quiet' | 'push' } : {}),
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+      };
+      if (Object.keys(patch).length === 0) { res.status(400).json({ error: 'NOTHING_TO_CHANGE' }); return; }
+      res.json({ heartbeat: serializeHeartbeatForMobile(await patchHeartbeat(id, patch)) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   router.post('/api/devices/revoke-all', requireMobileSession, async (_req, res) => {
@@ -6254,4 +6301,19 @@ export async function authenticateMobileRequest(
   const token = readSessionCookie(req);
   if (!token) return undefined;
   return validateSession(token, opts);
+}
+
+/** The phone's view of a heartbeat: what it is, whether it runs, and whether its items reach the phone. */
+function serializeHeartbeatForMobile(h: import('../agents/heartbeats.js').HeartbeatStatus) {
+  return {
+    id: h.id,
+    title: h.title,
+    purpose: h.purpose,
+    enabled: h.enabled,
+    cadenceMinutes: h.cadenceMinutes,
+    notify: h.contract.notify,
+    openItems: h.openItems.length,
+    ...(h.lastFinding ? { lastFinding: { at: h.lastFinding.at, summary: h.lastFinding.summary, quiet: h.lastFinding.quiet } } : {}),
+    phonePush: h.phonePush,
+  };
 }

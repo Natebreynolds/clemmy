@@ -1273,7 +1273,12 @@ input, textarea, select { font: inherit; font-size: 16px; }
   display: flex;
   flex-direction: column;
   padding: var(--sp-3) 0 calc(var(--chat-dock-h, 140px) + max(22px, env(safe-area-inset-bottom) + 10px) + var(--kb-inset, 0px) + 12px);
+  overscroll-behavior: contain;
+  touch-action: pan-y;
 }
+/* A column flex scroller squeezes its children before it overflows; every
+   message keeps its height so the transcript scrolls instead of compressing. */
+.chat-transcript > * { flex-shrink: 0; }
 .chat-jump {
   position: absolute;
   z-index: 41;
@@ -4467,3 +4472,93 @@ textarea.cz-input { resize: vertical; }
 .composer .chat-mic.transcribing { color: var(--accent); background: var(--accent-soft); }
 .composer .chat-mic.transcribing svg { animation: breathe 0.8s ease-in-out infinite; }
 .composer-note { margin: 0 8px 4px; color: var(--accent-fail); font-size: var(--t-xs); }
+
+/* ── Settings as an index ──────────────────────────────────────────
+   A few recognisable rows with one line of truth under each, grouped under
+   quiet small-caps labels, opening a page with a back link. */
+.settings-group { display: flex; flex-direction: column; gap: var(--sp-2); }
+/* Outranks the screen-wide `.app-main h2` display rule: a group label is a
+   quiet small-caps caption, not a title. */
+.app-main h2.settings-group-label,
+.settings-group-label {
+  margin: 0 var(--sp-2) 0;
+  font-family: var(--font-sans, inherit);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}
+.settings-index { padding: 0 var(--sp-3); }
+.settings-index-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 60px;
+  padding: var(--sp-2) 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  transition: transform 0.14s var(--ease-out);
+}
+.settings-index-row + .settings-index-row { border-top: 1px solid var(--line); }
+.settings-index-row:active { transform: scale(0.99); }
+.settings-index-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.settings-index-icon svg { width: 18px; height: 18px; }
+.settings-index-chevron { flex: 0 0 auto; width: 18px; height: 18px; color: var(--fg-3); }
+.settings-row-note.warning { color: var(--accent-warn); }
+.settings-foot { margin: var(--sp-2) var(--sp-2) 0; font-size: var(--t-xs); color: var(--fg-3); text-align: center; }
+
+/* A page: back link, one calm title, then its cards. The card's own shouting
+   title is gone; the page carries the name. */
+.settings-subhead { display: flex; flex-direction: column; gap: var(--sp-1); padding: 0 2px; }
+.settings-back {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 36px;
+  margin-left: -6px;
+  padding: 0 6px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--t-sm);
+  font-weight: 700;
+}
+.settings-back svg { width: 18px; height: 18px; }
+.settings-page-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--t-title);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.settings-page .settings-card-title { display: none; }
+.settings-caveat { color: var(--fg-2); }
+.settings-this-phone .settings-row { min-height: 56px; }
+.settings-this-phone .settings-row-label { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.settings-this-phone .settings-row-label > .truncate { min-width: 0; }
+.settings-this-device-pill {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--ok-soft, var(--accent-soft));
+  color: var(--accent-2);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.settings-signout-page { border-top: 0; padding-top: 0; margin-top: var(--sp-2); }

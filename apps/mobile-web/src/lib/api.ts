@@ -1846,11 +1846,17 @@ export async function getDaemonStatus(): Promise<DaemonStatus> {
 
 export interface MobileDeviceRow {
   deviceId: string;
+  /** What pairing recorded, often a raw user-agent string. */
   deviceLabel?: string;
+  /** What to show: "iPhone · Clem app", "Mac · Chrome", or the chosen label. */
+  deviceName?: string;
+  deviceApp?: 'clem' | 'safari' | 'chrome' | 'firefox' | 'browser' | 'unknown';
   createdAt: string;
   lastSeenAt: string;
   expiresAt: string;
   pushSubscribed: boolean;
+  /** A live push destination (APNs or Web Push) is bound to this device. */
+  pushRegistered?: boolean;
   binding: 'key' | 'cookie';
   current: boolean;
 }
@@ -1896,5 +1902,28 @@ export async function uploadChatAttachment(file: File): Promise<{ id: string; na
 export async function transcribeVoice(wav: Blob): Promise<{ text: string; engine: 'local' | 'openai' }> {
   return api<{ text: string; engine: 'local' | 'openai' }>('/m/api/chat/transcribe', {
     method: 'POST', headers: { 'content-type': 'audio/wav' }, body: wav,
+  });
+}
+
+/** A heartbeat as the phone sees it: what it watches and whether its items reach this phone. */
+export interface PhoneHeartbeat {
+  id: string;
+  title: string;
+  purpose: string;
+  enabled: boolean;
+  cadenceMinutes: number;
+  notify: 'quiet' | 'push';
+  openItems: number;
+  lastFinding?: { at: string; summary: string; quiet: boolean };
+  phonePush: { ready: boolean; reason?: 'no_phone_registered' | 'apns_key_missing'; phones: { webPush: number; apns: number } };
+}
+
+export async function listHeartbeats(): Promise<{ heartbeats: PhoneHeartbeat[] }> {
+  return api('/m/api/heartbeats');
+}
+
+export async function setHeartbeatNotify(id: string, notify: 'quiet' | 'push'): Promise<{ heartbeat: PhoneHeartbeat }> {
+  return api(`/m/api/heartbeats/${encodeURIComponent(id)}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ notify }),
   });
 }

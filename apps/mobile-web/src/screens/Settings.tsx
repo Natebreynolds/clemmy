@@ -7,23 +7,20 @@ import {
   getDaemonStatus,
   getModelSettings,
   setCompletionReview,
-  getTidyPlan,
-  applyTidy,
   getUsageStatus,
-  type TidyClass,
-  type TidyCounts,
-  type TidyResult,
-  type TidyScope,
   listDevices,
+  listHeartbeats,
   revokeAllDevices,
   revokeDevice,
   setCodexRescueModel,
+  setHeartbeatNotify,
   setJudgeFallback,
   type JudgeFallbackSetting,
   type CodexRescueSettings,
   type MobileDeviceRow,
   type ModelRoleName,
   type ModelSettings,
+  type PhoneHeartbeat,
 } from '../lib/api';
 import { useScreenData } from '../lib/use-screen-data';
 import { haptic, inNativeShell, type ConnectionDoor } from '../lib/native-bridge';
@@ -47,17 +44,32 @@ import {
   judgeFallbackValue,
 } from '../lib/model-roles';
 import { ScreenNotice } from '../components/ScreenNotice';
+import {
+  SECTION_TITLES,
+  connectionStateWords,
+  connectionsSummary,
+  deviceDisplayName,
+  devicesSummary,
+  groupConnections,
+  notificationsSummary,
+  phonePushCaveat,
+  relativeDay,
+  sectionFromSearch,
+  settingsSearch,
+  splitDevices,
+  type SettingsSection,
+} from '../lib/settings-index';
 
 /**
  * Settings — the pocket end of a trust relationship minted at home on the
- * Mac. Everything here is a read of daemon state or a routing choice among
- * things already connected; nothing credential-shaped ever renders, and a
- * broken connection points at the Mac instead of pretending the phone can
- * repair it.
+ * Mac. An index of a few recognisable rows, each with one line of truth under
+ * it, opening a page; never one long scroll of shouting cards. Everything here
+ * is a read of daemon state or a routing choice among things already
+ * connected; nothing credential-shaped ever renders, and a broken connection
+ * points at the Mac instead of pretending the phone can repair it.
  *
- * Deferred by design (a control that changes nothing is a lie): "what
- * reaches me" notification preferences, quiet hours, approval posture, the
- * cost section, schedule pause.
+ * Upkeep (clearing stale updates, stuck runs, old conversations) stays on the
+ * Mac: bulk actions with four-digit counts are not a thumb's job.
  */
 export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
   door: ConnectionDoor;
@@ -70,6 +82,30 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
   const daemon = useScreenData(getDaemonStatus);
   const models = useScreenData(getModelSettings);
   const connections = useScreenData(getConnectionsHealth);
+  const heartbeats = useScreenData(listHeartbeats);
+  const usage = useScreenData(getUsageStatus, { intervalMs: 30_000 });
+
+  // The open page lives in the URL (?tab=settings&section=…) so the back
+  // gesture, a reload and a deep link all agree on where the phone is.
+  const [section, setSection] = useState<SettingsSection | null>(() => sectionFromSearch(window.location.search));
+  useEffect(() => {
+    const sync = () => setSection(sectionFromSearch(window.location.search));
+    window.addEventListener('popstate', sync);
+    return () => window.removeEventListener('popstate', sync);
+  }, []);
+  const openSection = (next: SettingsSection) => {
+    haptic('light');
+    window.history.pushState({ clemSettings: next }, '', `${window.location.pathname}${settingsSearch(next)}`);
+    setSection(next);
+    document.querySelector('.app-main')?.scrollTo({ top: 0 });
+  };
+  const backToIndex = () => {
+    haptic('light');
+    const state = window.history.state as { clemSettings?: string } | null;
+    if (state?.clemSettings) { window.history.back(); return; }
+    window.history.replaceState(null, '', `${window.location.pathname}${settingsSearch(null)}`);
+    setSection(null);
+  };
 
   const thisDevice = devices.data?.devices.find((d) => d.current);
   const failedSections = [
@@ -79,8 +115,52 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
     connections.error ? 'connections' : '',
   ].filter(Boolean);
   const retryAll = () => Promise.allSettled([
-    devices.refresh(), daemon.refresh(), models.refresh(), connections.refresh(),
+    devices.refresh(), daemon.refresh(), models.refresh(), connections.refresh(), heartbeats.refresh(), usage.refresh(),
   ]).then(() => undefined);
+
+  if (section) {
+    return (
+      <div class="stack settings settings-page">
+        <header class="settings-subhead">
+          <button type="button" class="settings-back" onClick={backToIndex}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6" /></svg>
+            Settings
+          </button>
+          <h1 class="settings-page-title">{SECTION_TITLES[section]}</h1>
+        </header>
+        {section === 'notifications' ? (
+          <NotificationsPage
+            device={thisDevice}
+            devicesLoading={devices.loading}
+            heartbeats={heartbeats.data?.heartbeats}
+            heartbeatsError={heartbeats.error}
+            onChanged={() => Promise.all([heartbeats.refresh(), devices.refresh()])}
+          />
+        ) : section === 'models' ? (
+          <ModelsCard loaded={models.data} onRefresh={models.refresh} />
+        ) : section === 'accounts' ? (
+          <UsageCard />
+        ) : section === 'connections' ? (
+          <ConnectionsPage rows={connections.data?.connections} loading={connections.loading} />
+        ) : (
+          <DevicesPage
+            rows={devices.data?.devices}
+            loading={devices.loading}
+            onRevoked={() => void devices.refresh()}
+            onSignOut={onSignOut}
+          />
+        )}
+      </div>
+    );
+  }
+
+  const meters = presentUsageMeters(usage.data);
+  const outOfCredit = meters.filter((m) => m.outOfCredit).length;
+  const accountsNote = !usage.data
+    ? ''
+    : meters.length === 0
+      ? 'No model account connected yet'
+      : `${meters.length} account${meters.length === 1 ? '' : 's'}${outOfCredit ? ` · ${outOfCredit} refusing requests` : ''}`;
 
   return (
     <div class="stack settings">
@@ -98,41 +178,86 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         hasData={Boolean(devices.data || daemon.data || models.data || connections.data)}
       />
 
-      <section class="card settings-card" aria-label="Home">
-        <h2 class="settings-card-title">Home</h2>
-        <button type="button" class="settings-row" onClick={() => { haptic('light'); onCustomize(); }}>
-          <span class="settings-row-main">
-            <span class="settings-row-label">Customize your home</span>
-            <span class="settings-row-note">Panes, the title switcher, what opens on launch, quick actions. Same as your desktop.</span>
-          </span>
-          <span class="settings-row-action">Open</span>
-        </button>
-      </section>
+      <IndexGroup label="You">
+        <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>}
+          title="Notifications"
+          note={notificationsSummary({ registered: thisDevice ? Boolean(thisDevice.pushRegistered) : undefined, heartbeats: heartbeats.data?.heartbeats })}
+          onOpen={() => openSection('notifications')}
+        />
+        <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>}
+          title="Home"
+          note="What Today shows, what opens on launch, quick actions. Same as your Mac."
+          onOpen={() => { haptic('light'); onCustomize(); }}
+        />
+      </IndexGroup>
 
-      <NotificationsCard />
+      <IndexGroup label="Clementine">
+        <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a4 4 0 0 0-4 4v1a4 4 0 0 0-3 3.9A4 4 0 0 0 7 19h1a4 4 0 0 0 8 0h1a4 4 0 0 0 2-7.1V11a4 4 0 0 0-3-3.9V7a4 4 0 0 0-4-4z" /><path d="M12 3v18" /></svg>}
+          title="Models"
+          note={models.data ? `${brainSummary(models.data)} does the work` : ''}
+          onOpen={() => openSection('models')}
+        />
+        <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2" /><path d="M3 10h18" /><path d="M7 14h3" /></svg>}
+          title="Model accounts"
+          note={accountsNote}
+          tone={outOfCredit ? 'warn' : undefined}
+          onOpen={() => openSection('accounts')}
+        />
+        <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 7V3M15 7V3" /><path d="M6 7h12v4a6 6 0 0 1-12 0z" /><path d="M12 17v4" /></svg>}
+          title="Connections"
+          note={connectionsSummary(connections.data?.connections)}
+          onOpen={() => openSection('connections')}
+        />
+      </IndexGroup>
 
-      <ModelsCard loaded={models.data} onRefresh={models.refresh} />
+      <IndexGroup label="This phone">
+        <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2" /><path d="M11 18h2" /></svg>}
+          title="Devices & security"
+          note={devicesSummary(devices.data?.devices)}
+          onOpen={() => openSection('devices')}
+        />
+      </IndexGroup>
 
-      <UsageCard />
-
-      <CleanupCard />
-
-      <ConnectionsCard
-        rows={connections.data?.connections}
-        loading={connections.loading}
-      />
-
-      <DevicesCard
-        rows={devices.data?.devices}
-        loading={devices.loading}
-        onRevoked={() => void devices.refresh()}
-        onSignOut={onSignOut}
-      />
+      <p class="settings-foot">Sign-ins, keys and clean-up live on your Mac, in Settings.</p>
     </div>
   );
 }
 
-/** One glance = "am I safely connected": this device, the door, the daemon. */
+function IndexGroup({ label, children }: { label: string; children: preact.ComponentChildren }) {
+  return (
+    <section class="settings-group" aria-label={label}>
+      <h2 class="settings-group-label">{label}</h2>
+      <div class="card settings-index">{children}</div>
+    </section>
+  );
+}
+
+function IndexRow({ icon, title, note, tone, onOpen }: {
+  icon: preact.ComponentChildren;
+  title: string;
+  note: string;
+  tone?: 'warn';
+  onOpen: () => void;
+}) {
+  return (
+    <button type="button" class="settings-index-row" onClick={onOpen}>
+      <span class="settings-index-icon" aria-hidden="true">{icon}</span>
+      <span class="settings-row-main">
+        <span class="settings-row-label">{title}</span>
+        {note ? <span class={`settings-row-note${tone === 'warn' ? ' warning' : ''}`}>{note}</span> : null}
+      </span>
+      <svg class="settings-index-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+    </button>
+  );
+}
+
+/** One glance = "am I safely connected": this phone, the door, the Mac's version. */
 function StatusStrip({ device, door, doorCopy, version }: {
   device?: MobileDeviceRow;
   door: ConnectionDoor;
@@ -149,9 +274,9 @@ function StatusStrip({ device, door, doorCopy, version }: {
         <span class="settings-status-hint">{doorCopy.hint}</span>
       </div>
       <div class="settings-status-facts">
-        <span class="truncate">{device?.deviceLabel || 'This device'}</span>
+        <span class="truncate">{device ? deviceDisplayName(device) : 'This phone'}</span>
         {paired && !Number.isNaN(paired.getTime()) ? (
-          <span>Paired {paired.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+          <span>Paired {paired.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span>
         ) : null}
         {version ? <span>Clementine {version}</span> : null}
       </div>
@@ -169,26 +294,34 @@ type PushState =
   | { kind: 'error'; message: string };
 
 /**
- * Push on/off for THIS device only — the one notification control the daemon
- * actually enforces today. Server-side "what reaches me" preferences do not
- * exist yet, so no such switches are shown (deferred, not faked).
+ * Notifications, truthfully: whether anything can reach THIS phone (a live
+ * push destination bound to this device), then what does. Questions Clem
+ * needs answered and finished work always reach a registered phone; each
+ * heartbeat's findings reach it only when the owner says so, the same switch
+ * the Mac's Heartbeats page calls "reach my phone".
  */
-function NotificationsCard() {
-  const [state, setState] = useState<PushState>({ kind: 'loading' });
+function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError, onChanged }: {
+  device?: MobileDeviceRow;
+  devicesLoading: boolean;
+  heartbeats?: PhoneHeartbeat[];
+  heartbeatsError: string | null;
+  onChanged: () => Promise<unknown>;
+}) {
   const nativeShell = inNativeShell();
+  const registered = Boolean(device?.pushRegistered);
+  const [state, setState] = useState<PushState>({ kind: 'loading' });
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
+  // Browser (non-native) phones own a Web Push subscription; the switch below
+  // is the one control the daemon actually enforces for them.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       if (nativeShell) return;
-      if (!pushSupported()) {
-        const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
-        if (!cancelled) setState(isIOS && !isStandalonePwa() ? { kind: 'needs-pwa-install' } : { kind: 'unsupported' });
-        return;
-      }
       const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
-      if (isIOS && !isStandalonePwa()) {
-        if (!cancelled) setState({ kind: 'needs-pwa-install' });
+      if (!pushSupported() || (isIOS && !isStandalonePwa())) {
+        if (!cancelled) setState(isIOS && !isStandalonePwa() ? { kind: 'needs-pwa-install' } : { kind: 'unsupported' });
         return;
       }
       const existing = await getExistingSubscription();
@@ -197,60 +330,115 @@ function NotificationsCard() {
     return () => { cancelled = true; };
   }, [nativeShell]);
 
-  const enabled = state.kind === 'on';
-  const toggle = async () => {
+  const toggleWebPush = async () => {
     haptic('light');
-    const wasOn = enabled;
+    const wasOn = state.kind === 'on';
     setState({ kind: 'busy' });
     if (wasOn) {
       await unsubscribePush();
       setState({ kind: 'off' });
-      return;
+    } else {
+      const result = await requestAndSubscribe();
+      setState(result.ok ? { kind: 'on' } : { kind: 'error', message: result.reason });
     }
-    const result = await requestAndSubscribe();
-    setState(result.ok ? { kind: 'on' } : { kind: 'error', message: result.reason });
+    await onChanged();
   };
 
-  if (nativeShell) {
-    return (
-      <section class="card settings-card" aria-label="Notifications">
-        <h2 class="settings-card-title">Notifications</h2>
-        <div class="settings-row">
-          <span class="settings-row-main">
-            <span class="settings-row-label">Push to this iPhone</span>
-            <span class="settings-row-note">Managed in iOS Settings. Clem alerts you when a response or decision is needed.</span>
-          </span>
-          <span class="settings-row-kind">iOS</span>
-        </div>
-      </section>
-    );
-  }
+  const flip = async (h: PhoneHeartbeat) => {
+    haptic('light');
+    setBusyId(h.id);
+    setError(null);
+    try {
+      await setHeartbeatNotify(h.id, h.notify === 'push' ? 'quiet' : 'push');
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'The change was not confirmed. Try again.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const readiness = heartbeats?.[0]?.phonePush;
+  const caveat = registered ? '' : phonePushCaveat(readiness, nativeShell);
 
   return (
-    <section class="card settings-card" aria-label="Notifications">
-      <h2 class="settings-card-title">Notifications</h2>
-      {state.kind === 'needs-pwa-install' ? (
-        <p class="card-note">iOS delivers push only after Add to Home Screen. Tap Share, then Add to Home Screen, and reopen from there.</p>
-      ) : state.kind === 'unsupported' ? (
-        <p class="card-note">This browser cannot receive push notifications.</p>
-      ) : (
-        <button
-          type="button"
-          class="settings-row settings-toggle-row"
-          role="switch"
-          aria-checked={enabled}
-          disabled={state.kind === 'busy' || state.kind === 'loading'}
-          onClick={() => void toggle()}
-        >
-          <span class="settings-row-main">
-            <span class="settings-row-label">Push to this device</span>
-            <span class="settings-row-note">Approvals waiting, replies ready, finished work.</span>
-          </span>
-          <span class={`settings-switch${enabled ? ' on' : ''}`} aria-hidden="true"><i /></span>
-        </button>
-      )}
-      {state.kind === 'error' ? <p class="error card-note">Couldn't enable: {state.message}</p> : null}
-    </section>
+    <Fragment>
+      <section class="card settings-card" aria-label="This phone">
+        {devicesLoading && !device ? (
+          <div class="skeleton-stack" aria-hidden="true"><i /></div>
+        ) : nativeShell || registered ? (
+          <div class="settings-row">
+            <span class={`health-dot ${registered ? 'ok' : 'warn'}`} aria-hidden="true" />
+            <span class="settings-row-main">
+              <span class="settings-row-label">{device ? deviceDisplayName(device) : 'This phone'}</span>
+              <span class="settings-row-note">
+                {registered
+                  ? 'Receives notifications from your Mac.'
+                  : 'Not receiving notifications yet. Allow notifications for Clem in iOS Settings, then reopen the app.'}
+              </span>
+            </span>
+          </div>
+        ) : state.kind === 'needs-pwa-install' ? (
+          <p class="card-note">In Safari, notifications work once Clem is on your Home Screen: tap Share, then Add to Home Screen, and open it from there. The Clem app needs no such step.</p>
+        ) : state.kind === 'unsupported' ? (
+          <p class="card-note">This browser cannot receive notifications. The Clem app can.</p>
+        ) : (
+          <button
+            type="button"
+            class="settings-row settings-toggle-row"
+            role="switch"
+            aria-checked={state.kind === 'on'}
+            disabled={state.kind === 'busy' || state.kind === 'loading'}
+            onClick={() => void toggleWebPush()}
+          >
+            <span class="settings-row-main">
+              <span class="settings-row-label">Notify this phone</span>
+              <span class="settings-row-note">Questions waiting on you, and finished work.</span>
+            </span>
+            <span class={`settings-switch${state.kind === 'on' ? ' on' : ''}`} aria-hidden="true"><i /></span>
+          </button>
+        )}
+        {state.kind === 'error' ? <p class="error card-note">Couldn't enable: {state.message}</p> : null}
+      </section>
+
+      <section class="settings-group" aria-label="What reaches your phone">
+        <h2 class="settings-group-label">What reaches your phone</h2>
+        <div class="card settings-card">
+          <div class="settings-row">
+            <span class="settings-row-main">
+              <span class="settings-row-label">Questions and finished work</span>
+              <span class="settings-row-note">Always, when this phone receives notifications. Nothing else interrupts you.</span>
+            </span>
+            <span class="settings-row-kind">Always</span>
+          </div>
+          {heartbeatsError && !heartbeats ? (
+            <p class="card-note">Could not load what Clem watches right now.</p>
+          ) : !heartbeats ? (
+            <div class="skeleton-stack" aria-hidden="true"><i /><i /></div>
+          ) : heartbeats.map((h) => (
+            <button
+              key={h.id}
+              type="button"
+              class="settings-row settings-toggle-row"
+              role="switch"
+              aria-checked={h.notify === 'push'}
+              disabled={busyId !== null || !h.enabled}
+              onClick={() => void flip(h)}
+            >
+              <span class="settings-row-main">
+                <span class="settings-row-label">{h.title}</span>
+                <span class="settings-row-note">
+                  {!h.enabled ? 'Off on your Mac.' : h.notify === 'push' ? 'Findings reach this phone.' : 'Findings wait in the app.'}
+                </span>
+              </span>
+              <span class={`settings-switch${h.notify === 'push' ? ' on' : ''}`} aria-hidden="true"><i /></span>
+            </button>
+          ))}
+          {caveat ? <p class="card-note settings-caveat">{caveat}</p> : null}
+          {error ? <p class="error card-note">{error}</p> : null}
+        </div>
+      </section>
+    </Fragment>
   );
 }
 
@@ -298,7 +486,6 @@ function ModelsCard({ loaded, onRefresh }: {
 
   return (
     <section class="card settings-card" aria-label="Models">
-      <h2 class="settings-card-title">Models</h2>
       <p class="card-note">Which model handles each part of a request.</p>
       {!settings ? (
         <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
@@ -422,110 +609,6 @@ function RoleRow({ title, summary, note, warning, onOpen }: {
   );
 }
 
-const TIDY_ROWS: Array<{ id: TidyClass; label: string; note: string; verb: (n: number) => string }> = [
-  { id: 'updates', label: 'Updates', note: 'Unread updates from finished work. Open questions are never touched.', verb: (n) => `${n} marked read` },
-  { id: 'staleAsks', label: 'Asks', note: 'Approval cards, plan and trust proposals, check-in questions. Stale = unanswered for a day.', verb: (n) => `${n} cancelled` },
-  { id: 'stuckRuns', label: 'Stuck runs', note: 'Blocked or parked workflow runs, and chat turns no runner holds. Stale = over a day.', verb: (n) => `${n} stopped` },
-  { id: 'oldConversations', label: 'Conversations', note: 'Stale = quiet for two weeks; all = every unpinned conversation. Archived, never deleted.', verb: (n) => `${n} archived` },
-];
-
-/** Clean up: exact counts for what is stale and for everything, a button per
- *  class per scope, and "clear everything" behind one confirmation. Nothing
- *  is deleted; updates are read, asks cancelled, runs stopped, conversations
- *  archived. */
-function CleanupCard() {
-  const stale = useScreenData(() => getTidyPlan('stale'), { intervalMs: 60_000, resourceKey: 'tidy:stale' });
-  const all = useScreenData(() => getTidyPlan('all'), { intervalMs: 60_000, resourceKey: 'tidy:all' });
-  const [busy, setBusy] = useState<string | null>(null);
-  const [confirmAll, setConfirmAll] = useState(false);
-  const [outcome, setOutcome] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const sum = (c?: TidyCounts) => (c ? c.updates + c.staleAsks + c.stuckRuns + c.oldConversations : 0);
-  const staleCounts = stale.data?.counts;
-  const allCounts = all.data?.counts;
-
-  const run = async (classes: TidyClass[], scope: TidyScope, key: string) => {
-    setBusy(key);
-    setError(null);
-    setOutcome(null);
-    setConfirmAll(false);
-    try {
-      const { result } = await applyTidy(classes, scope);
-      haptic('light');
-      setOutcome(describeTidy(result));
-      await Promise.allSettled([stale.refresh(), all.refresh()]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not tidy up right now.');
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  if (!stale.data && !stale.error) return null;
-  return (
-    <section class="card settings-card" aria-label="Clean up">
-      <h2 class="settings-card-title">Clean up</h2>
-      {stale.error && !stale.data ? <p class="card-note">Could not check for clutter right now.</p> : null}
-      {staleCounts ? TIDY_ROWS.map((row) => {
-        const s = staleCounts[row.id];
-        const a = allCounts?.[row.id] ?? 0;
-        return (
-          <div class="tidy-row" key={row.id}>
-            <div class="settings-row-main">
-              <span class="settings-row-label">{row.label}</span>
-              <span class="settings-row-note">{row.note}</span>
-            </div>
-            <div class="tidy-actions">
-              <button type="button" class="tidy-action" disabled={s === 0 || busy !== null} onClick={() => void run([row.id], 'stale', `${row.id}:stale`)}>
-                {busy === `${row.id}:stale` ? 'Clearing…' : `Clear stale${s > 0 ? ` (${s})` : ''}`}
-              </button>
-              <button type="button" class="tidy-action" disabled={a === 0 || busy !== null} onClick={() => void run([row.id], 'all', `${row.id}:all`)}>
-                {busy === `${row.id}:all` ? 'Clearing…' : `Clear all${a > 0 ? ` (${a})` : ''}`}
-              </button>
-            </div>
-          </div>
-        );
-      }) : null}
-      {staleCounts ? (
-        confirmAll ? (
-          <div class="tidy-confirm">
-            <p class="card-note">Clear every item above — {sum(allCounts)} in total, including today's? Nothing is deleted.</p>
-            <div class="tidy-confirm-actions">
-              <button type="button" class="btn-approve" disabled={busy !== null} onClick={() => void run(TIDY_ROWS.map((r) => r.id), 'all', 'all:all')}>
-                {busy === 'all:all' ? 'Clearing…' : `Yes, clear ${sum(allCounts)}`}
-              </button>
-              <button type="button" class="btn-reject" disabled={busy !== null} onClick={() => setConfirmAll(false)}>Keep</button>
-            </div>
-          </div>
-        ) : (
-          <div class="tidy-confirm-actions">
-            <button type="button" class="btn tidy-all" disabled={sum(staleCounts) === 0 || busy !== null} onClick={() => void run(TIDY_ROWS.map((r) => r.id), 'stale', 'all:stale')}>
-              {busy === 'all:stale' ? 'Tidying…' : `Tidy up stale${sum(staleCounts) > 0 ? ` (${sum(staleCounts)})` : ''}`}
-            </button>
-            <button type="button" class="btn tidy-all" disabled={sum(allCounts) === 0 || busy !== null} onClick={() => setConfirmAll(true)}>
-              {`Clear everything${sum(allCounts) > 0 ? ` (${sum(allCounts)})` : ''}`}
-            </button>
-          </div>
-        )
-      ) : null}
-      {outcome ? <p class="card-note">{outcome}</p> : null}
-      {error ? <p class="warning card-note">{error}</p> : null}
-    </section>
-  );
-}
-
-function describeTidy(result: TidyResult): string {
-  const parts = [
-    result.updatesCleared > 0 ? TIDY_ROWS[0].verb(result.updatesCleared) : '',
-    result.asksCancelled > 0 ? TIDY_ROWS[1].verb(result.asksCancelled) : '',
-    result.runsStopped > 0 ? TIDY_ROWS[2].verb(result.runsStopped) : '',
-    result.conversationsArchived > 0 ? TIDY_ROWS[3].verb(result.conversationsArchived) : '',
-  ].filter(Boolean);
-  const held = result.updatesHeld > 0 ? ` ${result.updatesHeld} update${result.updatesHeld === 1 ? '' : 's'} still need an answer and were kept.` : '';
-  const errors = result.errors.length > 0 ? ` ${result.errors.length} item${result.errors.length === 1 ? '' : 's'} could not be cleared.` : '';
-  return (parts.length > 0 ? `Done: ${parts.join(', ')}.` : 'Nothing needed clearing.') + held + errors;
-}
-
 /** Usage meters: one row per connected model account, read from the same
  *  daemon builder as the desktop. An account whose provider publishes no
  *  window still shows today's spend, so a connected account is never blank. */
@@ -536,7 +619,6 @@ function UsageCard() {
   if (!usage.data && !usage.error) return null;
   return (
     <section class="card settings-card" aria-label="Model accounts">
-      <h2 class="settings-card-title">Model accounts</h2>
       {usage.error && !usage.data ? (
         <p class="card-note">Could not load usage right now.</p>
       ) : meters.length === 0 ? (
@@ -590,7 +672,6 @@ function UsageCard() {
           ) : null}
         </div>
       ))}
-      <p class="card-note">Sign-ins and keys are added on your Mac, in Settings › Models.</p>
     </section>
   );
 }
@@ -658,40 +739,60 @@ function CodexRescueRow({ settings, onChanged }: {
   );
 }
 
-/** Read-only health. v1 does no reauth from the phone — a broken row says
- *  where to fix it (on the Mac), which is the truth. */
-function ConnectionsCard({ rows, loading }: {
+/**
+ * Connections, as the owner named them: the apps Clem can reach, then the
+ * tools on the Mac. A row says what is true in plain words; fixing anything
+ * happens on the Mac, in Connect.
+ */
+function ConnectionsPage({ rows, loading }: {
   rows?: Array<{ id: string; name: string; kind: string; state: 'ok' | 'warn' | 'err'; cause: string | null }>;
   loading: boolean;
 }) {
+  if (loading && !rows) {
+    return <section class="card settings-card"><div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div></section>;
+  }
+  if (!rows || rows.length === 0) {
+    return <section class="card settings-card"><p class="card-note">Nothing connected yet. Connect apps on your Mac and they show up here.</p></section>;
+  }
+  const { apps, tools } = groupConnections(rows);
+  const list = (items: typeof rows) => (
+    <ul class="settings-list">
+      {items.map((row) => (
+        <li key={row.id} class="settings-list-row">
+          <span class={`health-dot ${row.state}`} aria-hidden="true" />
+          <span class="settings-row-main">
+            <span class="settings-row-label truncate">{row.name}</span>
+            <span class="settings-row-note">{connectionStateWords(row)}</span>
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
   return (
-    <section class="card settings-card" aria-label="Connections">
-      <h2 class="settings-card-title">Connections</h2>
-      {loading && !rows ? (
-        <div class="skeleton-stack" aria-hidden="true"><i /><i /></div>
-      ) : !rows || rows.length === 0 ? (
-        <p class="card-note">Nothing connected yet. Connect tools on your Mac and they show up here.</p>
-      ) : (
-        <ul class="settings-list">
-          {rows.map((row) => (
-            <li key={row.id} class="settings-list-row">
-              <span class={`health-dot ${row.state}`} aria-hidden="true" />
-              <span class="settings-row-main">
-                <span class="settings-row-label truncate">{row.name}</span>
-                <span class="settings-row-note">
-                  {row.cause ?? (row.state === 'ok' ? 'Connected' : row.state === 'warn' ? 'Needs attention' : 'Unavailable')}
-                </span>
-              </span>
-              <span class="settings-row-kind">{row.kind === 'cli' ? 'CLI' : 'App'}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
+    <Fragment>
+      {apps.length ? (
+        <section class="settings-group" aria-label="Apps">
+          <h2 class="settings-group-label">Apps</h2>
+          <div class="card settings-card">{list(apps)}</div>
+        </section>
+      ) : null}
+      {tools.length ? (
+        <section class="settings-group" aria-label="Tools on your Mac">
+          <h2 class="settings-group-label">Tools on your Mac</h2>
+          <div class="card settings-card">{list(tools)}</div>
+        </section>
+      ) : null}
+      <p class="settings-foot">Connect or fix anything here on your Mac, in Connect.</p>
+    </Fragment>
   );
 }
 
-function DevicesCard({ rows, loading, onRevoked, onSignOut }: {
+/**
+ * Devices, recognisably: this phone first, the others by when they were last
+ * seen, and the ones nobody has opened in two weeks set apart so revoking them
+ * is an obvious tidy. Revoking asks once; signing out everywhere asks once.
+ */
+function DevicesPage({ rows, loading, onRevoked, onSignOut }: {
   rows?: MobileDeviceRow[];
   loading: boolean;
   onRevoked: () => void;
@@ -730,109 +831,91 @@ function DevicesCard({ rows, loading, onRevoked, onSignOut }: {
     await onSignOut();
   };
 
+  const { current, active, stale } = splitDevices(rows ?? []);
+
+  const revokeControl = (device: MobileDeviceRow) => (
+    confirming === device.deviceId ? (
+      <span class="settings-danger-actions">
+        <button type="button" class="settings-danger-btn confirming" aria-label={`Confirm revoke ${deviceDisplayName(device)}`} disabled={busy !== null} onClick={() => void revoke(device.deviceId)}>
+          {busy === device.deviceId ? '…' : 'Confirm'}
+        </button>
+        <button type="button" class="settings-danger-btn" disabled={busy !== null} onClick={() => setConfirming(null)}>Cancel</button>
+      </span>
+    ) : (
+      <button type="button" class="settings-danger-btn" aria-label={`Revoke ${deviceDisplayName(device)}`} disabled={busy !== null} onClick={() => setConfirming(device.deviceId)}>
+        Revoke
+      </button>
+    )
+  );
+
+  const deviceRow = (device: MobileDeviceRow) => (
+    <li key={device.deviceId} class="settings-list-row">
+      <span class="settings-row-main">
+        <span class="settings-row-label truncate">{deviceDisplayName(device)}</span>
+        <span class="settings-row-note">
+          Last seen {relativeDay(device.lastSeenAt)}{device.pushRegistered ? ' · gets notifications' : ''}
+        </span>
+      </span>
+      {revokeControl(device)}
+    </li>
+  );
+
   return (
-    <section class="card settings-card" aria-label="Devices and security">
-      <h2 class="settings-card-title">Devices &amp; security</h2>
-      {loading && !rows ? (
-        <div class="skeleton-stack" aria-hidden="true"><i /><i /></div>
-      ) : (
-        <ul class="settings-list">
-          {(rows ?? []).map((device) => (
-            <li key={device.deviceId} class="settings-list-row">
-              <span class="settings-row-main">
-                <span class="settings-row-label truncate">
-                  {device.deviceLabel || device.deviceId}
-                  {device.current ? <span class="settings-this-device"> · this device</span> : null}
-                </span>
-                <span class="settings-row-note">
-                  Last seen {relativeDay(device.lastSeenAt)}
-                </span>
+    <Fragment>
+      <section class="card settings-card settings-this-phone" aria-label="This phone">
+        {loading && !rows ? (
+          <div class="skeleton-stack" aria-hidden="true"><i /></div>
+        ) : (
+          <div class="settings-row">
+            <span class="settings-row-main">
+              <span class="settings-row-label">
+                <span class="truncate">{current ? deviceDisplayName(current) : 'This phone'}</span>
+                <span class="settings-this-device-pill">This phone</span>
               </span>
-              {!device.current ? (
-                confirming === device.deviceId ? (
-                  <span class="settings-danger-actions">
-                    <button
-                      type="button"
-                      class="settings-danger-btn confirming"
-                      aria-label={`Confirm revoke ${device.deviceLabel || device.deviceId}`}
-                      disabled={busy !== null}
-                      onClick={() => void revoke(device.deviceId)}
-                    >
-                      {busy === device.deviceId ? '…' : 'Confirm'}
-                    </button>
-                    <button
-                      type="button"
-                      class="settings-danger-btn"
-                      disabled={busy !== null}
-                      onClick={() => setConfirming(null)}
-                    >
-                      Cancel
-                    </button>
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    class="settings-danger-btn"
-                    aria-label={`Revoke ${device.deviceLabel || device.deviceId}`}
-                    disabled={busy !== null}
-                    onClick={() => setConfirming(device.deviceId)}
-                  >
-                    Revoke
-                  </button>
-                )
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      )}
+              <span class="settings-row-note">
+                {current ? `Paired ${relativeDay(current.createdAt)} · ${current.pushRegistered ? 'gets notifications' : 'no notifications yet'}` : ''}
+              </span>
+            </span>
+          </div>
+        )}
+      </section>
+
+      {active.length ? (
+        <section class="settings-group" aria-label="Other devices">
+          <h2 class="settings-group-label">Other devices</h2>
+          <div class="card settings-card"><ul class="settings-list">{active.map(deviceRow)}</ul></div>
+        </section>
+      ) : null}
+
+      {stale.length ? (
+        <section class="settings-group" aria-label="Not seen in weeks">
+          <h2 class="settings-group-label">Not seen in weeks</h2>
+          <div class="card settings-card">
+            <ul class="settings-list">{stale.map(deviceRow)}</ul>
+            <p class="card-note">Revoking signs that device out of Clem. It can pair again from your Mac.</p>
+          </div>
+        </section>
+      ) : null}
+
       {error ? <p class="error card-note">{error}</p> : null}
-      <div class="settings-signout">
-        <button
-          type="button"
-          class="settings-signout-btn"
-          onClick={() => { haptic('light'); void onSignOut(); }}
-        >
-          Sign out on this device
+
+      <div class="settings-signout settings-signout-page">
+        <button type="button" class="settings-signout-btn" onClick={() => { haptic('light'); void onSignOut(); }}>
+          Sign out on this phone
         </button>
         {confirming === 'all' ? (
           <span class="settings-danger-actions">
-            <button
-              type="button"
-              class="settings-danger-btn confirming"
-              disabled={busy !== null}
-              onClick={() => void signOutEverywhere()}
-            >
+            <button type="button" class="settings-danger-btn confirming" disabled={busy !== null} onClick={() => void signOutEverywhere()}>
               {busy === 'all' ? '…' : 'Confirm sign out everywhere'}
             </button>
-            <button
-              type="button"
-              class="settings-danger-btn"
-              disabled={busy !== null}
-              onClick={() => setConfirming(null)}
-            >
-              Cancel
-            </button>
+            <button type="button" class="settings-danger-btn" disabled={busy !== null} onClick={() => setConfirming(null)}>Cancel</button>
           </span>
         ) : (
-          <button
-            type="button"
-            class="settings-danger-btn"
-            disabled={busy !== null}
-            onClick={() => setConfirming('all')}
-          >
+          <button type="button" class="settings-danger-btn" disabled={busy !== null} onClick={() => setConfirming('all')}>
             Sign out everywhere
           </button>
         )}
       </div>
-    </section>
+    </Fragment>
   );
-}
-
-function relativeDay(iso: string): string {
-  const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return 'recently';
-  const days = Math.floor((Date.now() - t) / 86_400_000);
-  if (days <= 0) return 'today';
-  if (days === 1) return 'yesterday';
-  return `${days} days ago`;
 }
