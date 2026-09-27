@@ -4651,7 +4651,7 @@ test('phone fallback judge setting shares the desktop policy and requires authen
   }
 });
 
-test('phone role route sets and clears writer and judge through the desktop owner', async () => {
+test('phone role route sets and clears writer, judge and memory through the desktop owner', async () => {
   const keys = [
     'AUTH_MODE', 'MODEL_ROUTING_MODE', 'BYO_MODEL_BASE_URL', 'BYO_MODEL_API_KEY', 'BYO_MODEL_ID',
     'BYO_BRAIN_MODEL_ID', 'CLEMMY_MODEL_ROLES', 'CLEMMY_DEBATE_JUDGE',
@@ -4677,13 +4677,13 @@ test('phone role route sets and clears writer and judge through the desktop owne
   writeFileSync(claudeAuthFile, JSON.stringify({ accessToken: 'sk-ant-api03-not-a-subscription-token' }), 'utf-8');
   const { readDurableBindings } = await import('../runtime/harness/model-roles.js');
 
-  type RoleRow = { modelId?: string; provider?: string; source?: string };
+  type RoleRow = { modelId?: string; provider?: string; source?: string; follows?: string | null; inactiveBinding?: { modelId: string } };
   type ModelsBody = {
     ok?: boolean;
     error?: string;
     brain?: RoleRow;
-    roles?: { writer?: RoleRow; judge?: RoleRow; worker?: RoleRow };
-    roleOptions?: Record<'writer' | 'judge' | 'worker', Array<{ provider: string; models: Array<{ id: string }> }>>;
+    roles?: { writer?: RoleRow; judge?: RoleRow; worker?: RoleRow; memory?: RoleRow };
+    roleOptions?: Record<'writer' | 'judge' | 'worker' | 'memory', Array<{ provider: string; models: Array<{ id: string }> }>>;
     judgeReviewsOwnFamily?: boolean;
   };
   const h = await startHarness();
@@ -4704,7 +4704,10 @@ test('phone role route sets and clears writer and judge through the desktop owne
     assert.equal(initial.roles?.writer?.modelId, initial.brain?.modelId, 'with no writer chosen, the brain writes');
     assert.equal(initial.roles?.judge?.source, 'default');
     assert.equal(initial.roles?.worker?.source, 'default');
-    for (const role of ['writer', 'judge', 'worker'] as const) {
+    assert.equal(initial.roles?.memory?.source, 'default', 'memory is automatic until the owner picks');
+    assert.ok(initial.roles?.memory?.modelId, 'the automatic memory model is named');
+    assert.ok('follows' in (initial.roles?.memory ?? {}), 'the row says whose model it borrows');
+    for (const role of ['writer', 'judge', 'worker', 'memory'] as const) {
       assert.ok(initial.roleOptions?.[role]?.some((group) => group.models.some((model) => model.id === 'glm-5.2')),
         `the connected model is offered for the ${role}`);
     }
@@ -4747,7 +4750,15 @@ test('phone role route sets and clears writer and judge through the desktop owne
     assert.equal(otherFamily.body.judgeReviewsOwnFamily, false);
     assert.equal(process.env.CLEMMY_DEBATE_JUDGE, 'codex', 'the legacy judge branch follows, as on desktop');
 
-    for (const role of ['writer', 'judge'] as const) {
+    const memory = await post(cookie, { role: 'memory', modelId: 'glm-5.2' });
+    assert.equal(memory.status, 200, memory.body.error);
+    assert.deepEqual(
+      { modelId: memory.body.roles?.memory?.modelId, source: memory.body.roles?.memory?.source, follows: memory.body.roles?.memory?.follows },
+      { modelId: 'glm-5.2', source: 'settings', follows: null },
+    );
+    assert.equal(process.env.CLEMMY_DEBATE_JUDGE, 'codex', 'choosing the memory model never moves the judge branch');
+
+    for (const role of ['writer', 'judge', 'memory'] as const) {
       const cleared = await post(cookie, { role, clear: true });
       assert.equal(cleared.status, 200, cleared.body.error);
       assert.equal(cleared.body.roles?.[role]?.source, 'default', `the ${role} is automatic again`);

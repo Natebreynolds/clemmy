@@ -228,7 +228,10 @@ test('each account carries its billing page, whether its provider refused for cr
     ]),
     BYO_PROVIDER_TOGETHER_API_KEY: 'together-secret',
     BYO_PROVIDER_MOONSHOT_API_KEY: 'moonshot-secret',
-    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'worker', modelId: 'zai-org/GLM-5.2', scope: 'durable', source: 'settings' }]),
+    CLEMMY_MODEL_ROLES: JSON.stringify([
+      { role: 'worker', modelId: 'zai-org/GLM-5.2', scope: 'durable', source: 'settings' },
+      { role: 'memory', modelId: 'kimi-k3', scope: 'durable', source: 'settings' },
+    ]),
   }, async () => {
     noteCreditRefused('together', { status: 402, detail: 'Credit limit exceeded' });
     const h = await boot();
@@ -255,6 +258,9 @@ test('each account carries its billing page, whether its provider refused for cr
         'Together serves its billed spend for the month, summed from its own line items');
       assert.ok(together?.roles?.includes('worker'), 'the account names the job it is doing');
       assert.ok(!body.byoProviders.find((p) => p.id === 'moonshot')?.billing?.roles?.includes('worker'));
+      assert.ok(body.byoProviders.find((p) => p.id === 'moonshot')?.billing?.roles?.includes('memory'),
+        'the account serving the chosen memory model says it keeps the memory');
+      assert.ok(!together?.roles?.includes('memory'));
 
       const moonshot = body.byoProviders.find((p) => p.id === 'moonshot')?.billing;
       assert.deepEqual(moonshot?.balance && { amount: moonshot.balance.amount, currency: moonshot.balance.currency }, { amount: 49.5, currency: 'USD' });
@@ -271,6 +277,7 @@ test('each account carries its billing page, whether its provider refused for cr
       // Memory runs on the local embedder by default, so the OpenAI key does
       // no job and says so; it is "memory search" only while it embeds.
       assert.equal(body.openai.billing?.roles, undefined, 'the OpenAI key does no job while memory runs locally');
+      assert.ok(!body.openai.billing?.roles?.includes('memory'), 'the embeddings key never serves the memory model');
       assert.equal(body.jev.connected, false);
       assert.equal(body.jev.billing?.url, 'https://console.typesafe.ai/settings/billing');
 

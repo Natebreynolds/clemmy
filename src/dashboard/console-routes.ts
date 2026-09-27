@@ -472,6 +472,7 @@ const CONSOLE_PROCESS_IDENTITY = Object.freeze({
 /** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
 const XAI_BASE_URL = 'https://api.x.ai/v1';
 import { resolveRoleModel, readDurableBindings, pinSessionBrain } from '../runtime/harness/model-roles.js';
+import { memoryRoleSettingsView } from '../memory/memory-model-route.js';
 import { isBindableModelRole, ModelRoleSettingError, persistModelRoleSetting } from '../runtime/harness/model-role-settings.js';
 import { judgeFallbackSettingsSnapshot, JudgeFallbackSettingError, persistJudgeFallbackSetting } from '../runtime/harness/judge-fallback-settings.js';
 import { listToolChoices, computeChoiceScore } from '../memory/tool-choice-store.js';
@@ -8696,6 +8697,9 @@ export function registerConsoleRoutes(
         worker: resolveRoleModel('worker'),
         judge: resolveRoleModel('judge'),
         writer: resolveRoleModel('writer'),
+        // The memory route's own resolution (never the checker's row, which
+        // can name a different model), with whose model it borrows.
+        memory: memoryRoleSettingsView(),
       },
       bindings: readDurableBindings(),
       available: catalog.available,
@@ -16282,7 +16286,7 @@ export function registerConsoleRoutes(
     try {
       const body = (req.body ?? {}) as { role?: unknown; modelId?: unknown; whenIntent?: unknown; clear?: unknown };
       if (!isBindableModelRole(body.role)) {
-        res.status(400).json({ error: 'role must be "worker", "judge" or "writer" (set the brain via /settings/active-brain)' });
+        res.status(400).json({ error: 'role must be "worker", "judge", "writer" or "memory" (set the brain via /settings/active-brain)' });
         return;
       }
       // The optional intent scope ("design", "writing", …) takes the same slug

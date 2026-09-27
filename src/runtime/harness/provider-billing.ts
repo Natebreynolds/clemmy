@@ -19,6 +19,7 @@ import { getByoProviders, providerToBackendConfig, resolveByoProviderForModel } 
 import { boundWriterModel, resolveRoleModel } from './model-roles.js';
 import { resolveProvider } from './model-wire-registry.js';
 import { activeEmbeddingProviderName } from '../../memory/embeddings.js';
+import { describeMemoryModel } from '../../memory/memory-model-route.js';
 
 const logger = pino({ name: 'clementine.provider-billing' });
 
@@ -34,7 +35,7 @@ export interface AccountBilling {
   balance?: MoneyReading;
   /** What the provider has billed this calendar month, in its own figures. */
   monthSpend?: MoneyReading;
-  /** Jobs this account is doing now: brain, writer, judge, worker,
+  /** Jobs this account is doing now: brain, writer, judge, worker, memory,
    *  quick_checks, memory_search. */
   roles?: string[];
 }
@@ -220,6 +221,12 @@ export function rolesByAccount(): Map<string, string[]> {
     try { add(accountForModel(resolveRoleModel(role).modelId), role); } catch { /* unresolved role names no account */ }
   }
   try { add(accountForModel(boundWriterModel()?.modelId ?? ''), 'writer'); } catch { /* no writer bound */ }
+  // Memory work always runs, on the memory route's own model (which can differ
+  // from the checker's). A pick that cannot be served runs on no account.
+  try {
+    const memory = describeMemoryModel();
+    if (memory.modelId && !memory.inactiveBinding) add(accountForModel(memory.modelId), 'memory');
+  } catch { /* an unresolved memory route names no account */ }
   return out;
 }
 
