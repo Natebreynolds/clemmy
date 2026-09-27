@@ -329,7 +329,11 @@ export class ResilientModel implements Model {
     attempt: number,
     authRefreshed: { value: boolean },
     path: 'getResponse' | 'getStreamedResponse',
+    call: { signal?: AbortSignal },
   ): Promise<boolean> {
+    // The caller withdrew the request (the owner stopped, or an outer
+    // deadline retired it). Another attempt could only fail the same way.
+    if (call.signal?.aborted) return false;
     const cls = classifyModelError(err);
     // Auth path FIRST: the one-shot token refresh is INDEPENDENT of the
     // transient-retry budget — an access-token-expiry 401 can land on the final
@@ -361,6 +365,7 @@ export class ResilientModel implements Model {
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
+    const call = { signal: request.signal };
     let effortStripped = false;
     for (let attempt = 0; ; attempt++) {
       try {
@@ -391,7 +396,7 @@ export class ResilientModel implements Model {
           logger.warn({ label: this.policy.label, path: 'getResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
           continue;
         }
-        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getResponse')) continue;
+        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getResponse', call)) continue;
         throw err;
       }
     }
@@ -400,6 +405,7 @@ export class ResilientModel implements Model {
   async *getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
+    const call = { signal: request.signal };
     let effortStripped = false;
 
     for (let attempt = 0; ; attempt++) {
@@ -457,7 +463,7 @@ export class ResilientModel implements Model {
           logger.warn({ label: this.policy.label, path: 'getStreamedResponse' }, 'model rejected the effort parameter — stripping effort and retrying');
           continue;
         }
-        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getStreamedResponse')) continue;
+        if (await this.handleAttemptFailure(err, attempt, authRefreshed, 'getStreamedResponse', call)) continue;
         throw err;
       }
 

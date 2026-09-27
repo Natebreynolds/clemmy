@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
-import { APIConnectionError, APIConnectionTimeoutError } from 'openai';
+import { APIConnectionError, APIConnectionTimeoutError, APIUserAbortError } from 'openai';
 import { withResilience, translateSettings, classifyModelError, type ResiliencePolicy } from './resilient-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
 import { BoundaryError } from '../boundary-error.js';
@@ -466,6 +466,25 @@ test('getStreamedResponse: the SDK connection timeout before content is retried 
   assert.equal(calls, 2);
   assert.ok(events.some((e: any) => e.type === 'output_text_delta' && e.delta === 'answered'));
 });
+
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  test(`${path}: a request the caller withdrew is never retried`, async () => {
+    const caller = new AbortController();
+    let calls = 0;
+    const sleeps: number[] = [];
+    const withdraw = (): never => { calls += 1; caller.abort(); throw new APIUserAbortError(); };
+    const inner = makeModel({
+      getResponse: async () => withdraw(),
+      // eslint-disable-next-line require-yield
+      getStreamedResponse: async function* () { withdraw(); },
+    });
+    const model = withResilience(inner, policy({ sleep: async (ms) => { sleeps.push(ms); } }));
+    const request = req({ signal: caller.signal });
+    await assert.rejects(path === 'getResponse' ? model.getResponse(request) : collect(model.getStreamedResponse(request)));
+    assert.equal(calls, 1, 'no second attempt after the caller stopped');
+    assert.deepEqual(sleeps, [], 'no backoff after the caller stopped');
+  });
+}
 
 // --- helpers ---------------------------------------------------------------
 
