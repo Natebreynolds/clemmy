@@ -284,6 +284,13 @@ test('a later step of a resumed request ranks its memory by the request, not the
   assert.match(String(primer.queryPreview), /quokka ledger/, 'the re-ask ranks memory by the accepted request');
 });
 
+// A workflow step resumed after its card keeps searching by its own memory
+// query on every later step, as its first activation did.
+test('a later step of a resumed workflow step ranks its memory by the step\'s memory query', async () => {
+  const { primer } = await resumedReask('workflow-query', { answerBySource: true, memoryPrimerQuery: 'Priority accounts in the quokka ledger' });
+  assert.equal(primer.queryPreview, 'Priority accounts in the quokka ledger', 'the re-ask ranks memory by the step\'s own query');
+});
+
 // A card answered by its button is accepted by a source the runtime records,
 // whose text is not a request. With no request text to rank by, the resumed
 // step and the re-ask carry the per-block rendering the prompt carried, not a

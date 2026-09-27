@@ -13554,6 +13554,7 @@ export async function runConversationFromResume(opts: {
             ...opts,
             agent: activeAgent,
             sourceUserSeq,
+            requestSourceUserSeq: resumeAgentSourceUserSeq,
           });
           if (result.status === 'dispatched') return { kind: 'dispatched', result };
           if (result.status === 'held') return { kind: 'held', result };
@@ -13595,6 +13596,10 @@ export async function runConversationFromResume(opts: {
       const sourceText = typeof acceptedSource.data.text === 'string'
         ? acceptedSource.data.text
         : `approval ${opts.decision}`;
+      // The recovery continues the request the card belongs to: it ranks
+      // memory by that request (or the caller's dedicated query).
+      const recoveryMemoryQuery = opts.memoryPrimerQuery
+        ?? acceptedRequestText(opts.sessionId, resumeAgentSourceUserSeq);
       scheduleHostCheckpointRecovery({
         ...(opts.agent ? { agent: opts.agent } : {}),
         ...(opts.buildAgent
@@ -13610,6 +13615,7 @@ export async function runConversationFromResume(opts: {
         sourceUserSeq,
         reuseRecordedUserInput: true,
         suppressMemoryCapture: true,
+        ...(recoveryMemoryQuery !== undefined ? { memoryPrimerQuery: recoveryMemoryQuery } : {}),
         turnEngine: resumeTurnEngine,
         runAttemptId: opts.runAttemptId,
         maxSteps: opts.maxSteps,
@@ -13650,6 +13656,9 @@ async function runConversationFromResumeCore(opts: {
   modifiedArgs?: string;
   changeRequest?: string;
   memoryPrimerQuery?: string;
+  /** The request the answered card belongs to (the parked source). The
+   *  source that accepted the answer may be a control edge or a reply. */
+  requestSourceUserSeq?: number;
   resolver?: string;
   maxSteps?: number;
   maxWallClockMs?: number;
@@ -13682,6 +13691,11 @@ async function runConversationFromResumeCore(opts: {
       return listEvents(opts.sessionId, { types: ['user_input_received'] }).at(-1)?.seq;
     } catch { return undefined; }
       })();
+  // A later step of this resume continues the request the card belongs to, so
+  // it ranks memory by that request (or the caller's dedicated query), never
+  // by the answer that accepted the card or the host's own directive.
+  const continuationMemoryQuery = opts.memoryPrimerQuery
+    ?? acceptedRequestText(opts.sessionId, opts.requestSourceUserSeq ?? activeSourceUserSeq);
   let lastCheckInAt = startedAt;
   // Stage 4 — resume-path twin of the primary loop's token-budget window
   // (self-baselined: an approval resume is a fresh user-consented window).
@@ -13844,6 +13858,7 @@ async function runConversationFromResumeCore(opts: {
       input: resumeContinuationInput,
       suppressMemoryCapture: true,
       internalContinuation: true,
+      ...(continuationMemoryQuery !== undefined ? { memoryPrimerQuery: continuationMemoryQuery } : {}),
       sourceUserSeq: activeSourceUserSeq,
       runAttemptId: opts.runAttemptId,
       ...(opts.deferToolCallsLimitTerminal
@@ -14465,6 +14480,7 @@ async function runConversationFromResumeCore(opts: {
       // Resume continuations are always harness-synthetic, never a user message.
       suppressMemoryCapture: true,
       internalContinuation: true,
+      ...(continuationMemoryQuery !== undefined ? { memoryPrimerQuery: continuationMemoryQuery } : {}),
       sourceUserSeq: activeSourceUserSeq,
       runAttemptId: opts.runAttemptId,
       infraRecoveryEpisodeId,
