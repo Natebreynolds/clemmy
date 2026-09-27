@@ -94,6 +94,13 @@ export interface UsageEvent {
   totalTokens: number;
   /** Wall-clock duration of the API call, in ms. Helpful for latency vs cost tradeoffs. */
   durationMs?: number;
+  /** Streamed calls: ms from request start to the first content or tool-call
+   *  delta. Prefill + hidden reasoning happen before it; generation after. */
+  firstTokenMs?: number;
+  /** The reasoning effort as SENT on the wire, after every adapter rewrite. A
+   *  ledger that only knows the harness's decision cannot tell whether a slow
+   *  round thought at the provider's default (live 2026-09-26, grok-4.7). */
+  reasoningEffort?: string;
   /** Provider-reported time spent in remote API calls, in ms. This is a subset
    *  of durationMs when the provider exposes both values (currently Claude SDK). */
   providerApiDurationMs?: number;
@@ -503,6 +510,8 @@ export function recordModelUsage(args: {
   reasoningTokens?: number;
   totalTokens?: number;
   durationMs?: number;
+  firstTokenMs?: number;
+  reasoningEffort?: string;
   providerApiDurationMs?: number;
   responseId?: string;
   promptComponents?: Record<string, number>;
@@ -601,6 +610,8 @@ export function recordModelUsage(args: {
     reasoningTokens: args.reasoningTokens,
     totalTokens: args.totalTokens ?? args.inputTokens + args.outputTokens,
     durationMs: args.durationMs,
+    ...(typeof args.firstTokenMs === 'number' ? { firstTokenMs: args.firstTokenMs } : {}),
+    ...(args.reasoningEffort ? { reasoningEffort: args.reasoningEffort } : {}),
     channel,
     ...(role ? { role } : {}),
     roleReason,
@@ -648,6 +659,8 @@ export function recordModelUsage(args: {
       reasoningTokens: event.reasoningTokens,
       totalTokens: event.totalTokens,
       durationMs: event.durationMs,
+      firstTokenMs: event.firstTokenMs,
+      reasoningEffort: event.reasoningEffort,
       providerApiDurationMs: event.providerApiDurationMs,
       responseId: event.responseId,
       runId: event.runId,

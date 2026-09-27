@@ -459,6 +459,30 @@ test('relax: Grok 4.5+ keeps the harness effort in xAI vocabulary instead of def
   assert.equal('thinking' in relax({ model: 'grok-4.7', reasoning_effort: 'low' }), false);
 });
 
+test('the ledger sees what the wire did: effort as sent, provider reasoning tokens, time to first token', async () => {
+  const { byoWireObservations, liftReasoningStream } = await import('./byo-model.js');
+  // Observations from the usage chunk and the wire, or nothing when absent.
+  assert.deepEqual(byoWireObservations(
+    { prompt_tokens: 100, completion_tokens: 40, completion_tokens_details: { reasoning_tokens: 1200 } },
+    { reasoningEffort: 'low', firstTokenAt: 1_000 + 8_500 }, 1_000,
+  ), { reasoningTokens: 1200, reasoningEffort: 'low', firstTokenMs: 8_500 });
+  assert.deepEqual(byoWireObservations({ prompt_tokens: 1, completion_tokens: 1 }, undefined, 1), {});
+  assert.deepEqual(byoWireObservations({ reasoning_tokens: 7 }, { reasoningEffort: undefined }, undefined), { reasoningTokens: 7 });
+  // The first visible delta is reported once, before the usage chunk.
+  const order: string[] = [];
+  async function* fake() {
+    yield { choices: [{ delta: { role: 'assistant' } }] };            // no content yet
+    yield { choices: [{ delta: { content: 'Hel' } }] };
+    yield { choices: [{ delta: { content: 'lo' } }] };
+    yield { choices: [], usage: { prompt_tokens: 5, completion_tokens: 2 } };
+  }
+  const lifted = await liftReasoningStream(fake(), () => order.push('usage'), () => order.push('first')) as AsyncIterable<unknown>;
+  let chunks = 0;
+  for await (const _ of lifted) chunks += 1;
+  assert.equal(chunks, 4, 'every chunk still passes through');
+  assert.deepEqual(order, ['first', 'usage']);
+});
+
 test('relax: non-GLM request strips reasoning_effort and adds no `thinking`', () => {
   const out = relaxRequestForCompatBackend({
     model: 'deepseek-chat', reasoning_effort: 'high',

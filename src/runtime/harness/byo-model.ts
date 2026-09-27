@@ -463,7 +463,7 @@ async function reAskForJson(
     // This is a real second provider call, not a local repair. Charge it to the
     // same accepted turn so correction cost cannot disappear from efficiency
     // comparisons (and promote its response id into the exact trace).
-    recordByoUsage(c, relaxed.model, undefined, reAskStartedAt);
+    recordByoUsage(c, relaxed.model, undefined, reAskStartedAt, { reasoningEffort: relaxed.reasoning_effort });
     return c?.choices?.[0]?.message?.content ?? null;
   } catch {
     return null;
@@ -522,15 +522,24 @@ export function liftReasoningChunk(chunk: unknown): unknown {
   return chunk;
 }
 
-async function liftReasoningStream(
+export async function liftReasoningStream(
   stream: unknown,
   onUsage?: (chunk: CompatCompletion) => void,
+  onFirstToken?: () => void,
 ): Promise<unknown> {
   if (!stream || typeof stream !== 'object' || !(Symbol.asyncIterator in stream)) {
     return stream;
   }
+  let firstTokenSeen = false;
   async function* lifted(): AsyncIterable<unknown> {
     for await (const chunk of stream as AsyncIterable<unknown>) {
+      // The first visible delta (text, reasoning text, or a tool call) ends the
+      // provider's silent phase: everything before it was prefill and hidden
+      // reasoning. Measured once per stream.
+      if (onFirstToken && !firstTokenSeen && chunkHasVisibleDelta(chunk)) {
+        firstTokenSeen = true;
+        try { onFirstToken(); } catch { /* measurement never breaks the stream */ }
+      }
       // The usage-only terminal chunk (`choices: []`, `usage: {...}`) is the
       // backend's bill for the whole stream; record it once, pass it through.
       if (onUsage && chunk && typeof chunk === 'object' && (chunk as { usage?: unknown }).usage) {
@@ -540,6 +549,36 @@ async function liftReasoningStream(
     }
   }
   return lifted();
+}
+
+function chunkHasVisibleDelta(chunk: unknown): boolean {
+  const choices = (chunk as { choices?: unknown })?.choices;
+  if (!Array.isArray(choices) || choices.length === 0) return false;
+  const delta = (choices[0] as { delta?: Record<string, unknown> })?.delta;
+  if (!delta || typeof delta !== 'object') return false;
+  return (typeof delta.content === 'string' && delta.content.length > 0)
+    || (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0)
+    || (typeof delta.reasoning === 'string' && delta.reasoning.length > 0)
+    || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0);
+}
+
+/** What the wire actually did on one call, for the usage ledger: the provider's
+ *  own reasoning-token count, the effort as sent, and the silent phase length. */
+export function byoWireObservations(
+  usage: Record<string, unknown> | undefined,
+  wire: { reasoningEffort?: unknown; firstTokenAt?: number } | undefined,
+  startedAt: number | undefined,
+): { reasoningTokens?: number; reasoningEffort?: string; firstTokenMs?: number } {
+  const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const details = usage?.completion_tokens_details as Record<string, unknown> | undefined;
+  const reasoningTokens = n(details?.reasoning_tokens) || n(usage?.reasoning_tokens);
+  return {
+    ...(reasoningTokens > 0 ? { reasoningTokens } : {}),
+    ...(typeof wire?.reasoningEffort === 'string' && wire.reasoningEffort ? { reasoningEffort: wire.reasoningEffort } : {}),
+    ...(typeof wire?.firstTokenAt === 'number' && typeof startedAt === 'number'
+      ? { firstTokenMs: Math.max(0, wire.firstTokenAt - startedAt) }
+      : {}),
+  };
 }
 
 /** Repair a structured (downgraded json_object) response's content into
@@ -805,10 +844,12 @@ async function wrappedCompletionsCreate(
           ? relaxed.stream_options as Record<string, unknown>
           : {};
         const streamStartedAt = Date.now();
+        const first: { at?: number } = {};
         const stream = await original({ ...relaxed, stream_options: { ...streamOptions, include_usage: true } }, options);
         return liftReasoningStream(stream, (usageChunk) => recordByoUsage(
           usageChunk, relaxed.model, harnessContext, streamStartedAt,
-        ));
+          { reasoningEffort: relaxed.reasoning_effort, firstTokenAt: first.at },
+        ), () => { first.at ??= Date.now(); });
       }
       // Reply text needs no repair, so it streams even where the rest of the
       // completion must be finished here first.
@@ -820,7 +861,7 @@ async function wrappedCompletionsCreate(
     const completion = (await original(relaxed, options)) as CompatCompletion;
     liftReasoning(completion);
     promoteReasoningFinal(completion);
-    recordByoUsage(completion, relaxed.model, undefined, plainStartedAt);
+    recordByoUsage(completion, relaxed.model, undefined, plainStartedAt, { reasoningEffort: relaxed.reasoning_effort });
     const msg = completion?.choices?.[0]?.message;
     if (Array.isArray(msg?.tool_calls) && msg!.tool_calls!.length > 0) {
       repairToolCallArguments(completion, relaxed.tools);
@@ -873,7 +914,7 @@ async function finishedCompletionStream(
 ): Promise<AsyncGenerator<unknown>> {
   liftReasoning(completion);
   promoteReasoningFinal(completion);
-  recordByoUsage(completion, relaxed.model, undefined, startedAt);
+  recordByoUsage(completion, relaxed.model, undefined, startedAt, { reasoningEffort: relaxed.reasoning_effort });
   const msg = completion?.choices?.[0]?.message;
   if (isToolOrEmpty(msg)) {
     repairToolCallArguments(completion, relaxed.tools);
@@ -984,7 +1025,7 @@ async function* replyTextStream(
   const completion = streamed.completion();
   liftReasoning(completion);
   promoteReasoningFinal(completion);
-  recordByoUsage(completion, relaxed.model, harnessContext, owner.startedAt);
+  recordByoUsage(completion, relaxed.model, harnessContext, owner.startedAt, { reasoningEffort: relaxed.reasoning_effort });
   const msg = completion.choices?.[0]?.message;
   if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) repairToolCallArguments(completion, relaxed.tools);
   const content = typeof msg?.content === 'string' ? msg.content : '';
@@ -1161,6 +1202,7 @@ function recordByoUsage(
   fallbackModel?: unknown,
   context: ReturnType<typeof harnessRunContextStorage.getStore> = harnessRunContextStorage.getStore(),
   startedAt?: number,
+  wire?: { reasoningEffort?: unknown; firstTokenAt?: number },
 ): void {
   try {
     const u = (completion as { usage?: Record<string, unknown> })?.usage;
@@ -1195,6 +1237,7 @@ function recordByoUsage(
       ...(typeof startedAt === 'number'
         ? { durationMs: Math.max(0, Date.now() - startedAt) }
         : {}),
+      ...byoWireObservations(u, wire, startedAt),
       promptComponents: harnessContext?.promptComponents,
     });
     // Proven-acceptance learning: an accepted request above our believed
