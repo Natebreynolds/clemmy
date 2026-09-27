@@ -29,3 +29,52 @@ export function groundedEntityMentionIds(text: string, entities: readonly NamedE
   return [...new Set(maximal.filter(m => (!canonicalOnly || m.canonical) && !maximal.some(other =>
     other.id !== m.id && other.start < m.end && other.end > m.start)).map(m => m.id))];
 }
+
+const ALNUM_RUN = /[a-z0-9]{2,}/g;
+
+function longestRun(runs: readonly string[]): string {
+  return [...runs].sort((a, b) => b.length - a.length || a.localeCompare(b))[0]!;
+}
+
+/**
+ * An exact prefilter for {@link groundedEntityMentionIds}: given the same
+ * text, it returns the only entities that can produce a mention, in their
+ * original order, so the mention ids (and their order) are unchanged.
+ *
+ * Why it is exact: a name is accepted only with a non-alphanumeric character
+ * (or the text edge) on both sides, so every alphanumeric run of the name is a
+ * maximal run of the lowercased text. The name's longest run of two or more
+ * characters (its anchor) is therefore one of the text's `[a-z0-9]{2,}`
+ * tokens. A name of four or more characters with no such run cannot be
+ * anchored and keeps its entity a candidate for every text; names under four
+ * characters never produce a mention and are ignored, as the matcher ignores
+ * them.
+ */
+export function groundedMentionPrefilter<T extends NamedEntityMentions>(entities: readonly T[]): (text: string) => T[] {
+  const byAnchor = new Map<string, number[]>();
+  const unanchored: number[] = [];
+  entities.forEach((entity, position) => {
+    const anchors = new Set<string>();
+    let alwaysCandidate = false;
+    for (const raw of new Set(entity.names)) {
+      const name = raw.trim().toLowerCase();
+      if (name.length < 4) continue;
+      const runs = name.match(ALNUM_RUN);
+      if (!runs) { alwaysCandidate = true; break; }
+      anchors.add(longestRun(runs));
+    }
+    if (alwaysCandidate) { unanchored.push(position); return; }
+    for (const anchor of anchors) {
+      const positions = byAnchor.get(anchor);
+      if (positions) positions.push(position);
+      else byAnchor.set(anchor, [position]);
+    }
+  });
+  return (text: string): T[] => {
+    const positions = new Set<number>(unanchored);
+    for (const token of new Set(text.toLowerCase().match(ALNUM_RUN) ?? [])) {
+      for (const position of byAnchor.get(token) ?? []) positions.add(position);
+    }
+    return [...positions].sort((a, b) => a - b).map((position) => entities[position]!);
+  };
+}

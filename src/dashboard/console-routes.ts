@@ -61,7 +61,7 @@ import { recallMemory } from '../memory/recall-memory.js';
 import { readRecallShadowSummary, scheduleRecallShadow } from '../memory/recall-shadow.js';
 import { readRecallUsageHealth } from '../memory/recall-usage.js';
 import { readPromptContextHealth } from '../memory/prompt-context-health.js';
-import { listMemoryPolicies, readTemporalEvidenceHealth, reconcileTemporalEvidence } from '../memory/temporal-memory.js';
+import { listMemoryPolicies, readTemporalEvidenceHealth, reconcileTemporalEvidenceAsync } from '../memory/temporal-memory.js';
 import { applyMemoryFix, detectMemoryHealCandidates, dismissMemoryFix } from '../memory/self-heal.js';
 import {
   getFocusSnapshot,
@@ -74,7 +74,8 @@ import {
   extractResourceIdFromApprovalArgs,
 } from '../memory/focus.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
-import { readEntityRelationshipHealth, reconcileMemoryRelationships } from '../memory/relations.js';
+import { readEntityRelationshipHealth, reconcileMemoryRelationshipsAsync } from '../memory/relations.js';
+import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { listEntityIdentityConflicts } from '../memory/entity-identity.js';
 import { consolidateFact, readReflectionReplayHealth } from '../memory/reflection.js';
 import { readReflectionCandidateHealth } from '../memory/reflection-candidates.js';
@@ -4787,8 +4788,9 @@ export function registerConsoleRoutes(
 
   /** Backup-first, bounded provenance reconciliation. Every processed fact is
    * classified as source-backed or explicitly unavailable, so repeated runs
-   * resume instead of rescanning the same missing sources. */
-  app.post('/api/console/memory/reconcile-evidence', (req, res) => {
+   * resume instead of rescanning the same missing sources. The work runs in
+   * slices, so the daemon keeps answering while it does. */
+  app.post('/api/console/memory/reconcile-evidence', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = (req.body ?? {}) as { maxFacts?: unknown; batchSize?: unknown };
     const maxFacts = typeof body.maxFacts === 'number' && Number.isFinite(body.maxFacts)
@@ -4798,7 +4800,11 @@ export function registerConsoleRoutes(
       ? Math.max(1, Math.min(1_000, Math.floor(body.batchSize)))
       : 200;
     try {
-      res.json(reconcileTemporalEvidence({ maxFacts, batchSize, requireBackup: true }));
+      res.json(await withDaemonRuntimePhase(
+        'daemon.http.memory_reconcile',
+        { route: 'reconcile-evidence', maxFacts, batchSize },
+        () => reconcileTemporalEvidenceAsync({ maxFacts, batchSize, requireBackup: true }),
+      ));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -4806,15 +4812,20 @@ export function registerConsoleRoutes(
 
   /** Backup-first graph reconciliation. Strong identifiers may converge an
    * identity; inferred joins are refreshed but remain inferred; only exact
-   * source excerpts can create stored entity relationships. */
-  app.post('/api/console/memory/reconcile-relationships', (req, res) => {
+   * source excerpts can create stored entity relationships. Every pass runs in
+   * slices, so the daemon keeps answering while it does. */
+  app.post('/api/console/memory/reconcile-relationships', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = (req.body ?? {}) as { maxFacts?: unknown };
     const maxFacts = typeof body.maxFacts === 'number' && Number.isFinite(body.maxFacts)
       ? Math.max(1, Math.min(50_000, Math.floor(body.maxFacts)))
       : 5_000;
     try {
-      res.json(reconcileMemoryRelationships({ factLimit: maxFacts, requireBackup: true }));
+      res.json(await withDaemonRuntimePhase(
+        'daemon.http.memory_reconcile',
+        { route: 'reconcile-relationships', maxFacts },
+        () => reconcileMemoryRelationshipsAsync({ factLimit: maxFacts, requireBackup: true }),
+      ));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

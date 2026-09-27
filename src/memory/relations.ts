@@ -1,9 +1,18 @@
 import { exactGroundedIdentifierMatch } from './grounded-identifier-match.js';
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import { backupMemoryDb, openMemoryDb } from './db.js';
+import { backupMemoryDb, openMemoryDb, type BackupResult } from './db.js';
 import { compileWordMatcher } from './word-match.js';
-import { groundedEntityMentionIds, type NamedEntityMentions } from './grounded-entity-mentions.js';
+import { NIGHTLY_SLICE, SliceClock, runSliced, runUnsliced, stepsOf } from './sliced-pass.js';
+import {
+  PassProgress,
+  comparePassKeys,
+  type PassCursorIO,
+  type PassCursorKey,
+  type PassPartialUnit,
+  type PassResume,
+} from './pass-cursor.js';
+import { groundedEntityMentionIds, groundedMentionPrefilter, type NamedEntityMentions } from './grounded-entity-mentions.js';
 import {
   autoReconcileStrongEntityIdentifiers,
   observeEntityFromEpisodeInDatabase,
@@ -106,8 +115,8 @@ function normalizedIso(value: string | undefined, fallback: string): string {
 }
 
 function namesForRelationshipEvidence(entityId: number): string[] {
-  const db = openMemoryDb();
-  const row = db.prepare('SELECT canonical_name, aliases_json FROM entities WHERE id = ?').get(entityId) as {
+  const statements = entityNameStatements(openMemoryDb());
+  const row = statements.entity.get(entityId) as {
     canonical_name: string; aliases_json: string;
   } | undefined;
   if (!row) return [];
@@ -116,7 +125,7 @@ function namesForRelationshipEvidence(entityId: number): string[] {
     const parsed = JSON.parse(row.aliases_json) as unknown;
     if (Array.isArray(parsed)) for (const alias of parsed) if (typeof alias === 'string') names.add(alias);
   } catch { /* malformed legacy aliases */ }
-  for (const item of db.prepare('SELECT alias FROM entity_aliases WHERE entity_id = ?').all(entityId) as Array<{ alias: string }>) names.add(item.alias);
+  for (const item of statements.aliases.all(entityId) as Array<{ alias: string }>) names.add(item.alias);
   return Array.from(names).map((name) => name.trim()).filter((name) => name.length >= 2 && !name.includes('@'));
 }
 
@@ -158,6 +167,8 @@ export interface LinkSyncStats {
   factsScanned: number;
   entitiesConsidered: number;
   linksWritten: number;
+  /** Writes refused by a constraint (the row's entity or resource was removed mid-pass); present only when some were. */
+  skipped?: number;
 }
 
 export interface EntityRelationshipBackfillStats {
@@ -167,6 +178,8 @@ export interface EntityRelationshipBackfillStats {
   added: number;
   reinforced: number;
   ignored: number;
+  /** Writes refused by a constraint (the row's entity or resource was removed mid-pass); present only when some were. */
+  skipped?: number;
 }
 
 export interface GroundedFactEntityBackfillStats {
@@ -176,6 +189,8 @@ export interface GroundedFactEntityBackfillStats {
   promoted: number;
   ambiguous: number;
   ignored: number;
+  /** Writes refused by a constraint (the row's entity or resource was removed mid-pass); present only when some were. */
+  skipped?: number;
 }
 
 export interface GroundedFactResourceBackfillStats {
@@ -185,6 +200,8 @@ export interface GroundedFactResourceBackfillStats {
   promoted: number;
   ambiguous: number;
   ignored: number;
+  /** Writes refused by a constraint (the row's entity or resource was removed mid-pass); present only when some were. */
+  skipped?: number;
 }
 
 export interface MemoryRelationshipReconciliationReport {
@@ -221,27 +238,36 @@ export interface FactLinkProvenance {
   incrementMention?: boolean;
 }
 
-function writeFactEntityLinksInDatabase(
-  db: Database.Database,
-  factId: number,
-  entityIds: number[],
-  provenance: FactLinkProvenance,
-  replaceTier: boolean,
-): void {
-  const now = new Date().toISOString();
-  const linkType = provenance.linkType ?? 'stored';
-  const confidence = Math.max(0, Math.min(1, provenance.confidence ?? (linkType === 'inferred_text' ? 0.55 : 1)));
-  const unique = Array.from(new Set(
-    entityIds
-      .filter((n) => Number.isInteger(n) && n > 0)
-      .map((id) => resolveCanonicalEntityIdInDatabase(db, id)),
-  ));
-  const tx = db.transaction(() => {
-    if (replaceTier) {
-      if (linkType === 'inferred_text') db.prepare("DELETE FROM fact_entities WHERE fact_id = ? AND link_type = 'inferred_text'").run(factId);
-      else db.prepare("DELETE FROM fact_entities WHERE fact_id = ? AND link_type IN ('stored','extracted')").run(factId);
-    }
-    const ins = db.prepare(`
+/**
+ * Statements prepared once per connection. Every per-fact statement names
+ * `+link_type` so SQLite seeks the primary key (fact_id, entity_id) instead of
+ * walking every row of `idx_*_truth (link_type, …)` for the tier: with no
+ * table statistics the planner otherwise prefers that index, and one call then
+ * costs a scan of the whole inferred tier.
+ */
+interface LinkWriteStatements {
+  /** The fact's whole link set, by primary key: what an inferred-tier diff starts from. */
+  readLinks: Database.Statement;
+  /** One inferred row, by primary key. */
+  deleteInferredLink: Database.Statement;
+  deleteGroundedTier: Database.Statement;
+  upsert: Database.Statement;
+}
+
+const factEntityWriteStatements = new WeakMap<Database.Database, LinkWriteStatements>();
+const factResourceWriteStatements = new WeakMap<Database.Database, LinkWriteStatements>();
+
+function entityLinkStatements(db: Database.Database): LinkWriteStatements {
+  let statements = factEntityWriteStatements.get(db);
+  if (statements) return statements;
+  statements = {
+    readLinks: db.prepare(`
+      SELECT entity_id AS id, link_type, confidence, evidence_episode_id, evidence_excerpt
+      FROM fact_entities WHERE fact_id = ?
+    `),
+    deleteInferredLink: db.prepare("DELETE FROM fact_entities WHERE fact_id = ? AND entity_id = ? AND +link_type = 'inferred_text'"),
+    deleteGroundedTier: db.prepare("DELETE FROM fact_entities WHERE fact_id = ? AND +link_type IN ('stored','extracted')"),
+    upsert: db.prepare(`
       INSERT INTO fact_entities
         (fact_id, entity_id, created_at, link_type, confidence, evidence_episode_id, evidence_excerpt)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -276,9 +302,116 @@ function writeFactEntityLinksInDatabase(
             THEN COALESCE(excluded.evidence_excerpt, fact_entities.evidence_excerpt)
           ELSE COALESCE(fact_entities.evidence_excerpt, excluded.evidence_excerpt)
         END
-    `);
+    `),
+  };
+  factEntityWriteStatements.set(db, statements);
+  return statements;
+}
+
+interface StoredLinkRow {
+  id: number;
+  link_type: string;
+  confidence: number;
+  evidence_episode_id: string | null;
+  evidence_excerpt: string | null;
+}
+
+/** One row write of an inferred-tier refresh. */
+interface TierWrite {
+  kind: 'delete' | 'insert';
+  id: number;
+}
+
+interface InferredTierTarget {
+  confidence: number;
+  evidenceEpisodeId: string | null;
+  evidenceExcerpt: string | null;
+}
+
+/**
+ * The row writes that turn a fact's inferred tier into `wanted` (canonical,
+ * unique ids), deletes first, then inserts. The result equals replacing the
+ * whole tier, except that a row already exactly as wanted is left alone
+ * (keeping its created_at and not bumping the memory generation):
+ *   - an inferred row wanted with the same confidence and evidence is kept;
+ *   - every other inferred row is deleted (including a wanted row at another
+ *     confidence, which the replace would have re-inserted);
+ *   - a wanted id with no row, or whose row was just deleted, is inserted;
+ *   - a wanted id with a stored or extracted row is left alone, as the
+ *     replace's upsert left it.
+ */
+function planInferredTierWrites(have: readonly StoredLinkRow[], wanted: readonly number[], target: InferredTierTarget): TierWrite[] {
+  const wantedSet = new Set(wanted);
+  const kept = new Set<number>();
+  const grounded = new Set<number>();
+  const writes: TierWrite[] = [];
+  for (const row of have) {
+    if (row.link_type !== 'inferred_text') {
+      grounded.add(row.id);
+      continue;
+    }
+    if (wantedSet.has(row.id)
+      && row.confidence === target.confidence
+      && row.evidence_episode_id === target.evidenceEpisodeId
+      && row.evidence_excerpt === target.evidenceExcerpt) {
+      kept.add(row.id);
+    } else {
+      writes.push({ kind: 'delete', id: row.id });
+    }
+  }
+  for (const id of wanted) {
+    if (!kept.has(id) && !grounded.has(id)) writes.push({ kind: 'insert', id });
+  }
+  return writes;
+}
+
+function inferredTierTarget(confidence: number, provenance: FactLinkProvenance): InferredTierTarget {
+  return {
+    confidence,
+    evidenceEpisodeId: provenance.evidenceEpisodeId ?? null,
+    evidenceExcerpt: provenance.evidenceExcerpt?.trim().slice(0, 1_500) || null,
+  };
+}
+
+function applyTierWrite(
+  statements: LinkWriteStatements,
+  factId: number,
+  write: TierWrite,
+  target: InferredTierTarget,
+  now: string,
+): void {
+  if (write.kind === 'delete') statements.deleteInferredLink.run(factId, write.id);
+  else statements.upsert.run(factId, write.id, now, 'inferred_text', target.confidence, target.evidenceEpisodeId, target.evidenceExcerpt);
+}
+
+function writeFactEntityLinksInDatabase(
+  db: Database.Database,
+  factId: number,
+  entityIds: number[],
+  provenance: FactLinkProvenance,
+  replaceTier: boolean,
+): void {
+  const now = new Date().toISOString();
+  const linkType = provenance.linkType ?? 'stored';
+  const confidence = Math.max(0, Math.min(1, provenance.confidence ?? (linkType === 'inferred_text' ? 0.55 : 1)));
+  const unique = Array.from(new Set(
+    entityIds
+      .filter((n) => Number.isInteger(n) && n > 0)
+      .map((id) => resolveCanonicalEntityIdInDatabase(db, id)),
+  ));
+  const statements = entityLinkStatements(db);
+  if (replaceTier && linkType === 'inferred_text') {
+    const target = inferredTierTarget(confidence, provenance);
+    db.transaction(() => {
+      const writes = planInferredTierWrites(statements.readLinks.all(factId) as StoredLinkRow[], unique, target);
+      for (const write of writes) applyTierWrite(statements, factId, write, target, now);
+    })();
+    return;
+  }
+  const tx = db.transaction(() => {
+    if (replaceTier) statements.deleteGroundedTier.run(factId);
     for (const eid of unique) {
-      ins.run(
+      statements.upsert.run(
         factId, eid, now, linkType, confidence,
         provenance.evidenceEpisodeId ?? null,
         provenance.evidenceExcerpt?.trim().slice(0, 1_500) || null,
@@ -390,23 +523,17 @@ export function loadFactEntityEdges(factIds: number[]): Array<{
 
 // ── fact ↔ resource links ──────────────────────────────────────────────
 
-function writeFactResourceLinksInDatabase(
-  db: Database.Database,
-  factId: number,
-  resourceIds: number[],
-  provenance: FactLinkProvenance,
-  replaceTier: boolean,
-): void {
-  const now = new Date().toISOString();
-  const linkType = provenance.linkType ?? 'stored';
-  const confidence = Math.max(0, Math.min(1, provenance.confidence ?? (linkType === 'inferred_text' ? 0.55 : 1)));
-  const unique = Array.from(new Set(resourceIds.filter((n) => Number.isInteger(n) && n > 0)));
-  const tx = db.transaction(() => {
-    if (replaceTier) {
-      if (linkType === 'inferred_text') db.prepare("DELETE FROM fact_resources WHERE fact_id = ? AND link_type = 'inferred_text'").run(factId);
-      else db.prepare("DELETE FROM fact_resources WHERE fact_id = ? AND link_type IN ('stored','extracted')").run(factId);
-    }
-    const ins = db.prepare(`
+function resourceLinkStatements(db: Database.Database): LinkWriteStatements {
+  let statements = factResourceWriteStatements.get(db);
+  if (statements) return statements;
+  statements = {
+    readLinks: db.prepare(`
+      SELECT resource_id AS id, link_type, confidence, evidence_episode_id, evidence_excerpt
+      FROM fact_resources WHERE fact_id = ?
+    `),
+    deleteInferredLink: db.prepare("DELETE FROM fact_resources WHERE fact_id = ? AND resource_id = ? AND +link_type = 'inferred_text'"),
+    deleteGroundedTier: db.prepare("DELETE FROM fact_resources WHERE fact_id = ? AND +link_type IN ('stored','extracted')"),
+    upsert: db.prepare(`
       INSERT INTO fact_resources
         (fact_id, resource_id, created_at, link_type, confidence, evidence_episode_id, evidence_excerpt)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -441,8 +568,35 @@ function writeFactResourceLinksInDatabase(
             THEN COALESCE(excluded.evidence_excerpt, fact_resources.evidence_excerpt)
           ELSE COALESCE(fact_resources.evidence_excerpt, excluded.evidence_excerpt)
         END
-    `);
-    for (const rid of unique) ins.run(
+    `),
+  };
+  factResourceWriteStatements.set(db, statements);
+  return statements;
+}
+
+function writeFactResourceLinksInDatabase(
+  db: Database.Database,
+  factId: number,
+  resourceIds: number[],
+  provenance: FactLinkProvenance,
+  replaceTier: boolean,
+): void {
+  const now = new Date().toISOString();
+  const linkType = provenance.linkType ?? 'stored';
+  const confidence = Math.max(0, Math.min(1, provenance.confidence ?? (linkType === 'inferred_text' ? 0.55 : 1)));
+  const unique = Array.from(new Set(resourceIds.filter((n) => Number.isInteger(n) && n > 0)));
+  const statements = resourceLinkStatements(db);
+  if (replaceTier && linkType === 'inferred_text') {
+    const target = inferredTierTarget(confidence, provenance);
+    db.transaction(() => {
+      const writes = planInferredTierWrites(statements.readLinks.all(factId) as StoredLinkRow[], unique, target);
+      for (const write of writes) applyTierWrite(statements, factId, write, target, now);
+    })();
+    return;
+  }
+  const tx = db.transaction(() => {
+    if (replaceTier) statements.deleteGroundedTier.run(factId);
+    for (const rid of unique) statements.upsert.run(
       factId, rid, now, linkType, confidence,
       provenance.evidenceEpisodeId ?? null,
       provenance.evidenceExcerpt?.trim().slice(0, 1_500) || null,
@@ -941,19 +1095,47 @@ function maskIdentifierSpans(text: string): string {
     .replace(/(^|\s)@[a-z0-9_.-]+/gi, '$1 ');
 }
 
-function identifierAppears(text: string, matcher: EntityMatcher['identifiers'][number]): boolean {
-  if (matcher.scheme === 'phone') {
-    const wanted = matcher.value.replace(/\D/g, '');
-    return wanted.length >= 7 && text.replace(/\D/g, '').includes(wanted);
-  }
-  return matcher.re?.test(text) ?? false;
-}
-
-function entityMatcherMatches(matcher: EntityMatcher, text: string): boolean {
+/**
+ * Entity ids whose names or identifiers appear in `text`, in matcher rank
+ * order, stopping at `limit`. The text is lowercased, masked and reduced to
+ * digits once for all candidate matchers rather than once per matcher. Names
+ * match against the masked text and identifiers against the unmasked
+ * lowercase text, as the per-matcher test did.
+ */
+function matchEntityIdsInText(index: EntityMatcherIndex, text: string, limit = Number.POSITIVE_INFINITY): number[] {
+  const matched: number[] = [];
+  const candidates = candidateEntityMatchers(index, text);
+  if (candidates.length === 0) return matched;
   const lower = text.toLowerCase();
   const namesOnly = maskIdentifierSpans(lower);
-  return matcher.nameRes.some((re) => re.test(namesOnly))
-    || matcher.identifiers.some((identifier) => identifierAppears(lower, identifier));
+  let lowerDigits: string | undefined;
+  const identifierAppears = (identifier: EntityMatcher['identifiers'][number]): boolean => {
+    if (identifier.scheme === 'phone') {
+      const wanted = identifier.value.replace(/\D/g, '');
+      if (wanted.length < 7) return false;
+      lowerDigits ??= lower.replace(/\D/g, '');
+      return lowerDigits.includes(wanted);
+    }
+    return identifier.re?.test(lower) ?? false;
+  };
+  for (const matcher of candidates) {
+    if (matcher.nameRes.some((re) => re.test(namesOnly)) || matcher.identifiers.some(identifierAppears)) {
+      matched.push(matcher.id);
+    }
+    if (matched.length >= limit) break;
+  }
+  return matched;
+}
+
+/** Test seam: the matcher index and the one-pass matcher, so a pin can hold
+ * them against a per-matcher reference loop. */
+export function entityMatcherInternalsForTest(): {
+  entityMatcherIndex: (limit?: number) => EntityMatcherIndex;
+  matchEntityIdsInText: (index: EntityMatcherIndex, text: string, limit?: number) => number[];
+  candidateEntityMatchers: (index: EntityMatcherIndex, text: string) => EntityMatcher[];
+  maskIdentifierSpans: (text: string) => string;
+} {
+  return { entityMatcherIndex, matchEntityIdsInText, candidateEntityMatchers, maskIdentifierSpans };
 }
 
 /** Compile word-boundary matchers for every entity (canonical name + aliases). */
@@ -1037,13 +1219,7 @@ function entityMatchers(limit = 100_000): EntityMatcher[] {
 export function resolveEntityIdsForText(text: string, limit = 8): number[] {
   const source = text || '';
   if (!source.trim()) return [];
-  const matched: number[] = [];
-  const index = entityMatcherIndex();
-  for (const m of candidateEntityMatchers(index, source)) {
-    if (entityMatcherMatches(m, source)) matched.push(m.id);
-    if (matched.length >= limit) break;
-  }
-  return matched;
+  return matchEntityIdsInText(entityMatcherIndex(), source, limit);
 }
 
 /** Direct fact links require an unambiguous name in both claim and evidence.
@@ -1056,60 +1232,279 @@ export function resolveGroundedEntityIdsForText(text: string, evidence: string, 
   return claimIds.filter(id => evidenceIds.has(id)).slice(0, limit);
 }
 
+// ── sliced passes: shared driver ───────────────────────────────────────
+
+/**
+ * Options every sliced (async) pass takes. Several passes may share one clock;
+ * its budget and turn hooks then apply across all of them.
+ */
+export interface SlicedPassOptions {
+  /** Slice budget and turn hooks. Default: the nightly budget. */
+  clock?: SliceClock;
+  /** Where the pass records committed progress so a restart the same day resumes it. Default: nowhere. */
+  cursor?: PassCursorIO;
+  /** Local day for the resume rule. Default: today. */
+  day?: string;
+  /** Minimum time between cursor writes. Default: 2 s. */
+  cursorWriteIntervalMs?: number;
+}
+
+/** Cursor ids of the resumable link passes. */
+export const LINK_PASS_IDS = Object.freeze({
+  entitySync: 'link_sync.entities',
+  resourceSync: 'link_sync.resources',
+  entityBackfill: 'grounded_backfill.entities',
+  resourceBackfill: 'grounded_backfill.resources',
+  relationships: 'grounded_backfill.relationships',
+});
+
+/**
+ * What a pass reports as committed after each slice. `stats` stays null until
+ * the pass has made its selection, so a resume never inherits counts from an
+ * attempt that stopped before it knew what it was scanning.
+ */
+interface PassPosition<S> {
+  after: PassCursorKey | null;
+  partial: PassPartialUnit | null;
+  stats: S | null;
+}
+
+interface PassRun<S> {
+  /** Yields after every unit of work and every row write (and after each setup statement). */
+  steps: Generator<void, void, undefined>;
+  position: () => PassPosition<S>;
+  result: () => S;
+}
+
+type PassFactory<S> = (db: Database.Database, clock: SliceClock, resume: PassResume<S> | null) => PassRun<S>;
+
+const UNBOUNDED_SLICE = Object.freeze({ maxMs: Number.POSITIVE_INFINITY, maxUnits: Number.POSITIVE_INFINITY, maxWrites: Number.POSITIVE_INFINITY });
+
+/** Sliced passes running in this process, by pass id. */
+const passesInFlight = new Map<string, Promise<unknown>>();
+
+/**
+ * One run of each pass at a time in this process: a second caller waits for
+ * the first run to finish (however it ends), then runs its own. Two runs of
+ * the same pass interleaving slice by slice would only redo each other's
+ * work and split the stats.
+ */
+async function runPassSliced<S>(
+  db: Database.Database,
+  passId: string,
+  factory: PassFactory<S>,
+  options: SlicedPassOptions,
+): Promise<S> {
+  for (let running = passesInFlight.get(passId); running; running = passesInFlight.get(passId)) {
+    await running.catch(() => undefined);
+  }
+  const run = runPassSlicedNow(db, passId, factory, options);
+  passesInFlight.set(passId, run);
+  try {
+    return await run;
+  } finally {
+    if (passesInFlight.get(passId) === run) passesInFlight.delete(passId);
+  }
+}
+
+async function runPassSlicedNow<S>(
+  db: Database.Database,
+  passId: string,
+  factory: PassFactory<S>,
+  options: SlicedPassOptions,
+): Promise<S> {
+  const clock = options.clock ?? new SliceClock(NIGHTLY_SLICE);
+  const progress = new PassProgress<S>({
+    io: options.cursor,
+    passId,
+    day: options.day,
+    minWriteIntervalMs: options.cursorWriteIntervalMs,
+  });
+  const run = factory(db, clock, progress.resume);
+  try {
+    await runSliced(db, clock, stepsOf(run.steps), { afterSlice: () => progress.checkpoint(run.position()) });
+  } catch (err) {
+    progress.flush();
+    throw err;
+  }
+  progress.complete();
+  return run.result();
+}
+
+/** The same steps in one transaction with no turn: the synchronous exports. */
+function runPassUnsliced<S>(db: Database.Database, factory: PassFactory<S>): S {
+  const run = factory(db, new SliceClock(UNBOUNDED_SLICE), null);
+  runUnsliced(db, stepsOf(run.steps));
+  return run.result();
+}
+
+function isConstraintError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && code.startsWith('SQLITE_CONSTRAINT');
+}
+
+/** Run one write; a constraint refusal (its entity or resource was removed mid-pass) is skipped, anything else propagates. */
+function writeOrSkip(write: () => void): boolean {
+  try {
+    write();
+    return true;
+  } catch (err) {
+    if (isConstraintError(err)) return false;
+    throw err;
+  }
+}
+
+function withSkipped<S extends { skipped?: number }>(stats: S, skipped: number): S {
+  const out = { ...stats };
+  delete out.skipped;
+  return skipped > 0 ? { ...out, skipped } : out;
+}
+
 // ── deterministic backfill sync ─────────────────────────────────────────
+
+const ACTIVE_FACT_IDS_SQL = 'SELECT id FROM consolidated_facts WHERE active = 1 ORDER BY updated_at DESC LIMIT ?';
+
+const INFERRED_TARGET: InferredTierTarget = Object.freeze({ confidence: 0.55, evidenceEpisodeId: null, evidenceExcerpt: null });
+
+/**
+ * One fact at a time, in ascending id: read its text, match it, plan the
+ * difference to its inferred tier, then write that difference one row per
+ * step. Facts are independent, so the order changes nothing. A fact counts as
+ * done (for its stats and for resume) only once all its writes are applied.
+ */
+function* inferredTierRefreshSteps(
+  clock: SliceClock,
+  statements: LinkWriteStatements,
+  ids: readonly number[],
+  after: () => number | null,
+  refresh: (factId: number) => { wanted: number[]; matched: number } | null,
+  done: (factId: number, matched: number) => void,
+  skip: () => void,
+): Generator<void, void, undefined> {
+  for (const factId of ids) {
+    const resumeAfter = after();
+    if (resumeAfter !== null && factId <= resumeAfter) continue;
+    const plan = refresh(factId);
+    const writes = plan ? planInferredTierWrites(statements.readLinks.all(factId) as StoredLinkRow[], plan.wanted, INFERRED_TARGET) : [];
+    clock.unit();
+    yield;
+    const now = new Date().toISOString();
+    for (const write of writes) {
+      if (!writeOrSkip(() => applyTierWrite(statements, factId, write, INFERRED_TARGET, now))) skip();
+      clock.wrote(1);
+      yield;
+    }
+    done(factId, plan?.matched ?? 0);
+  }
+}
+
+function entityLinkSyncPass(opts: { factLimit?: number; entityLimit?: number }): PassFactory<LinkSyncStats> {
+  return (db, clock, resume) => {
+    const factLimit = Math.max(1, opts.factLimit ?? 5000);
+    const stats: LinkSyncStats = { factsScanned: 0, entitiesConsidered: 0, linksWritten: resume?.stats?.linksWritten ?? 0 };
+    let skipped = resume?.stats?.skipped ?? 0;
+    let after = typeof resume?.after === 'number' ? resume.after : null;
+    let selected = false;
+    function* steps(): Generator<void, void, undefined> {
+      const ids = (db.prepare(ACTIVE_FACT_IDS_SQL).all(factLimit) as Array<{ id: number }>).map((row) => row.id).sort((a, b) => a - b);
+      stats.factsScanned = resume?.stats?.factsScanned ?? ids.length;
+      clock.boundary();
+      yield;
+      const index = entityMatcherIndex(opts.entityLimit ?? 100_000);
+      stats.entitiesConsidered = index.matchers.length;
+      selected = true;
+      clock.boundary();
+      yield;
+      const readContent = db.prepare('SELECT content FROM consolidated_facts WHERE id = ?');
+      yield* inferredTierRefreshSteps(clock, entityLinkStatements(db), ids, () => after, (factId) => {
+        const row = readContent.get(factId) as { content: string } | undefined;
+        if (!row) return null;
+        const matched = row.content ? matchEntityIdsInText(index, row.content) : [];
+        const wanted = Array.from(new Set(matched.map((id) => resolveCanonicalEntityIdInDatabase(db, id))));
+        return { wanted, matched: matched.length };
+      }, (factId, matched) => {
+        stats.linksWritten += matched;
+        after = factId;
+      }, () => { skipped += 1; });
+    }
+    return {
+      steps: steps(),
+      position: () => ({ after, partial: null, stats: selected ? withSkipped(stats, skipped) : null }),
+      result: () => withSkipped(stats, skipped),
+    };
+  };
+}
+
+function resourceLinkSyncPass(opts: { factLimit?: number; resourceLimit?: number }): PassFactory<LinkSyncStats> {
+  return (db, clock, resume) => {
+    const factLimit = Math.max(1, opts.factLimit ?? 5000);
+    const stats: LinkSyncStats = { factsScanned: 0, entitiesConsidered: 0, linksWritten: resume?.stats?.linksWritten ?? 0 };
+    let skipped = resume?.stats?.skipped ?? 0;
+    let after = typeof resume?.after === 'number' ? resume.after : null;
+    let selected = false;
+    function* steps(): Generator<void, void, undefined> {
+      const resourceRows = db.prepare(`
+        SELECT id, name FROM resource_pointers ORDER BY mention_count DESC, last_seen_at DESC LIMIT ?
+      `).all(Math.max(1, opts.resourceLimit ?? 2000)) as Array<{ id: number; name: string }>;
+      const matchers = resourceRows
+        .map((r) => ({ id: r.id, re: compileWordMatcher((r.name || '').toLowerCase()) }))
+        .filter((m): m is { id: number; re: RegExp } => m.re !== null);
+      stats.entitiesConsidered = matchers.length;
+      clock.boundary();
+      yield;
+      const ids = (db.prepare(ACTIVE_FACT_IDS_SQL).all(factLimit) as Array<{ id: number }>).map((row) => row.id).sort((a, b) => a - b);
+      stats.factsScanned = resume?.stats?.factsScanned ?? ids.length;
+      selected = true;
+      clock.boundary();
+      yield;
+      const readContent = db.prepare('SELECT content FROM consolidated_facts WHERE id = ?');
+      yield* inferredTierRefreshSteps(clock, resourceLinkStatements(db), ids, () => after, (factId) => {
+        const row = readContent.get(factId) as { content: string } | undefined;
+        if (!row) return null;
+        const lower = (row.content || '').toLowerCase();
+        const matched: number[] = [];
+        if (lower) for (const m of matchers) if (m.re.test(lower)) matched.push(m.id);
+        return { wanted: Array.from(new Set(matched)), matched: matched.length };
+      }, (factId, matched) => {
+        stats.linksWritten += matched;
+        after = factId;
+      }, () => { skipped += 1; });
+    }
+    return {
+      steps: steps(),
+      position: () => ({ after, partial: null, stats: selected ? withSkipped(stats, skipped) : null }),
+      result: () => withSkipped(stats, skipped),
+    };
+  };
+}
 
 /**
  * Persist the graph's word-boundary fact↔entity inference as `inferred_text`
- * candidates over every active fact. Idempotent (replaces only that tier), so
- * re-running is safe and cannot overwrite grounded links. Bounded so a large
- * vault stays snappy on the nightly tick.
+ * candidates over every active fact. Idempotent (rewrites only that tier's
+ * difference), so re-running is safe and cannot overwrite grounded links.
+ * Bounded so a large vault stays snappy on the nightly tick.
  */
 export function syncFactEntityLinks(opts: { factLimit?: number; entityLimit?: number } = {}): LinkSyncStats {
-  const factLimit = Math.max(1, opts.factLimit ?? 5000);
-  const db = openMemoryDb();
-  const index = entityMatcherIndex(opts.entityLimit ?? 100_000);
-  const matchers = index.matchers;
-  const facts = db.prepare(`
-    SELECT id, content FROM consolidated_facts WHERE active = 1 ORDER BY updated_at DESC LIMIT ?
-  `).all(factLimit) as Array<{ id: number; content: string }>;
-  let linksWritten = 0;
-  const tx = db.transaction(() => {
-    for (const f of facts) {
-      const ids: number[] = [];
-      if (f.content) for (const m of candidateEntityMatchers(index, f.content)) if (entityMatcherMatches(m, f.content)) ids.push(m.id);
-      setFactEntityLinks(f.id, ids, { linkType: 'inferred_text', confidence: 0.55 });
-      linksWritten += ids.length;
-    }
-  });
-  tx();
-  return { factsScanned: facts.length, entitiesConsidered: matchers.length, linksWritten };
+  return runPassUnsliced(openMemoryDb(), entityLinkSyncPass(opts));
+}
+
+/** {@link syncFactEntityLinks} in slices, with a turn between slices. */
+export async function syncFactEntityLinksAsync(
+  opts: { factLimit?: number; entityLimit?: number } & SlicedPassOptions = {},
+): Promise<LinkSyncStats> {
+  return runPassSliced(openMemoryDb(), LINK_PASS_IDS.entitySync, entityLinkSyncPass(opts), opts);
 }
 
 /** Same, for fact↔resource_pointers (word-boundary on the resource name). */
 export function syncFactResourceLinks(opts: { factLimit?: number; resourceLimit?: number } = {}): LinkSyncStats {
-  const factLimit = Math.max(1, opts.factLimit ?? 5000);
-  const db = openMemoryDb();
-  const resourceRows = db.prepare(`
-    SELECT id, name FROM resource_pointers ORDER BY mention_count DESC, last_seen_at DESC LIMIT ?
-  `).all(Math.max(1, opts.resourceLimit ?? 2000)) as Array<{ id: number; name: string }>;
-  const matchers = resourceRows
-    .map((r) => ({ id: r.id, re: compileWordMatcher((r.name || '').toLowerCase()) }))
-    .filter((m): m is { id: number; re: RegExp } => m.re !== null);
-  const facts = db.prepare(`
-    SELECT id, content FROM consolidated_facts WHERE active = 1 ORDER BY updated_at DESC LIMIT ?
-  `).all(factLimit) as Array<{ id: number; content: string }>;
-  let linksWritten = 0;
-  const tx = db.transaction(() => {
-    for (const f of facts) {
-      const lower = (f.content || '').toLowerCase();
-      const ids: number[] = [];
-      if (lower) for (const m of matchers) if (m.re.test(lower)) ids.push(m.id);
-      setFactResourceLinks(f.id, ids, { linkType: 'inferred_text', confidence: 0.55 });
-      linksWritten += ids.length;
-    }
-  });
-  tx();
-  return { factsScanned: facts.length, entitiesConsidered: matchers.length, linksWritten };
+  return runPassUnsliced(openMemoryDb(), resourceLinkSyncPass(opts));
+}
+
+/** {@link syncFactResourceLinks} in slices, with a turn between slices. */
+export async function syncFactResourceLinksAsync(
+  opts: { factLimit?: number; resourceLimit?: number } & SlicedPassOptions = {},
+): Promise<LinkSyncStats> {
+  return runPassSliced(openMemoryDb(), LINK_PASS_IDS.resourceSync, resourceLinkSyncPass(opts), opts);
 }
 
 const HIGH_PRECISION_BACKFILL_PREDICATES = [
@@ -1142,19 +1537,35 @@ function regexEscape(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+interface EntityNameStatements {
+  entity: Database.Statement;
+  aliases: Database.Statement;
+}
+
+const entityNameStatementsByDb = new WeakMap<Database.Database, EntityNameStatements>();
+
+function entityNameStatements(db: Database.Database): EntityNameStatements {
+  let statements = entityNameStatementsByDb.get(db);
+  if (!statements) {
+    statements = {
+      entity: db.prepare('SELECT canonical_name, aliases_json FROM entities WHERE id = ?'),
+      aliases: db.prepare('SELECT alias FROM entity_aliases WHERE entity_id = ?'),
+    };
+    entityNameStatementsByDb.set(db, statements);
+  }
+  return statements;
+}
+
 function entityNamesForBackfill(db: Database.Database, entityId: number): string[] {
-  const row = db.prepare(`
-    SELECT canonical_name, aliases_json FROM entities WHERE id = ?
-  `).get(entityId) as { canonical_name: string; aliases_json: string } | undefined;
+  const statements = entityNameStatements(db);
+  const row = statements.entity.get(entityId) as { canonical_name: string; aliases_json: string } | undefined;
   if (!row) return [];
   const names = new Set<string>([row.canonical_name]);
   try {
     const aliases = JSON.parse(row.aliases_json) as unknown;
     if (Array.isArray(aliases)) for (const alias of aliases) if (typeof alias === 'string') names.add(alias);
   } catch { /* malformed legacy aliases */ }
-  for (const alias of db.prepare(`
-    SELECT alias FROM entity_aliases WHERE entity_id = ?
-  `).all(entityId) as Array<{ alias: string }>) names.add(alias.alias);
+  for (const alias of statements.aliases.all(entityId) as Array<{ alias: string }>) names.add(alias.alias);
   return Array.from(names)
     .map((name) => name.trim())
     .filter((name) => name.length >= 2 && !name.includes('@') && !GENERIC_BACKFILL_ENTITY_NAMES.has(name.toLowerCase()))
@@ -1213,8 +1624,62 @@ function buildEntityGroundingIndex(db: Database.Database): EntityGroundingIndex 
   return { nameOwners, identifierOwners, mentions: [...mentionsById.values()] };
 }
 
+/** Test seam: the identity snapshot, name readers and decision helpers the
+ * grounding passes use, so a pin can replay the one-statement, per-candidate
+ * reference loops against them. */
+export function entityGroundingInternalsForTest(): {
+  buildEntityGroundingIndex: (db: Database.Database) => EntityGroundingIndex;
+  entityNamesForBackfill: (db: Database.Database, entityId: number) => string[];
+  maskIdentifierSpans: (text: string) => string;
+  buildResourceNameOwners: (db: Database.Database) => Map<string, Set<number>>;
+  exactResourceNameMatch: (text: string, name: string) => boolean;
+  resourceNameSpecificEnough: (value: string, app?: string, kind?: string) => boolean;
+  normalizedResourceGroundingName: (value: string) => string;
+  relationshipPredicates: readonly string[];
+  explicitlyStatedRelationship: (excerpt: string, subjectNames: string[], objectNames: string[], phrases: readonly string[]) => string | null;
+} {
+  return {
+    buildEntityGroundingIndex,
+    entityNamesForBackfill,
+    maskIdentifierSpans,
+    buildResourceNameOwners,
+    exactResourceNameMatch,
+    resourceNameSpecificEnough,
+    normalizedResourceGroundingName,
+    relationshipPredicates: HIGH_PRECISION_BACKFILL_PREDICATES,
+    explicitlyStatedRelationship,
+  };
+}
+
 function exactGroundingNameMatch(text: string, name: string): boolean {
   return compileWordMatcher(normalizedGroundingName(name), 2)?.test(text.toLowerCase()) ?? false;
+}
+
+/** {@link exactGroundingNameMatch} against an already-lowercased text, with
+ * each name's matcher compiled once per pass instead of once per test. */
+function groundingNameMatcher(): (lowerText: string, name: string) => boolean {
+  const compiled = new Map<string, RegExp | null>();
+  return (lowerText, name) => {
+    const key = normalizedGroundingName(name);
+    let re = compiled.get(key);
+    if (re === undefined) {
+      re = compileWordMatcher(key, 2);
+      compiled.set(key, re);
+    }
+    return re?.test(lowerText) ?? false;
+  };
+}
+
+/** Per-pass memo of a function of an entity id (names, identifiers). A pass
+ * reads an identity snapshot; promotions never change names or identifiers. */
+function perEntityMemo<T>(read: (entityId: number) => T): (entityId: number) => T {
+  const memo = new Map<number, T>();
+  return (entityId) => {
+    if (memo.has(entityId)) return memo.get(entityId)!;
+    const value = read(entityId);
+    memo.set(entityId, value);
+    return value;
+  };
 }
 
 function exactIdentifierMatch(text: string, value: string): boolean {
@@ -1505,118 +1970,343 @@ export function backfillGroundedFactEntityLinks(
   return backfillGroundedFactEntityLinksInDatabase(openMemoryDb(), opts);
 }
 
-export function backfillGroundedFactEntityLinksInDatabase(
+interface GroundingEvidence {
+  episode_id: string;
+  excerpt: string;
+  source_uri: string | null;
+}
+
+interface GroundingFact {
+  id: number;
+  content: string;
+  confidence: number | null;
+  trust_level: number | null;
+}
+
+interface EntityCandidate {
+  entity_id: number;
+  entity_type: string;
+}
+
+/** What one fact→entity grounding pass reads once: the identity snapshot, its
+ * exact mention prefilter, and per-entity memos (names and identifiers are
+ * read once per entity, not once per candidate). */
+interface EntityGroundingPass {
+  db: Database.Database;
+  index: EntityGroundingIndex;
+  mentionsFor: (text: string) => NamedEntityMentions[];
+  nameMatches: (lowerText: string, name: string) => boolean;
+  namesOf: (entityId: number) => string[];
+  identifiersOf: (entityId: number) => Array<{ scheme: string; value_norm: string }>;
+  readEvidence: Database.Statement;
+  readCandidates: Database.Statement;
+}
+
+function entityGroundingPass(db: Database.Database, index: EntityGroundingIndex): EntityGroundingPass {
+  const readIdentifiers = db.prepare(`
+    SELECT scheme, value_norm FROM entity_identifiers
+    WHERE entity_id = ? AND scheme IN ('email','domain')
+    ORDER BY confidence DESC
+  `);
+  return {
+    db,
+    index,
+    mentionsFor: groundedMentionPrefilter(index.mentions),
+    nameMatches: groundingNameMatcher(),
+    namesOf: perEntityMemo((entityId) => entityNamesForBackfill(db, entityId)),
+    identifiersOf: perEntityMemo((entityId) =>
+      readIdentifiers.all(entityId) as Array<{ scheme: string; value_norm: string }>),
+    readEvidence: db.prepare(`
+      SELECT fve.episode_id, fve.excerpt, COALESCE(fve.source_uri, me.source_uri) AS source_uri
+      FROM fact_evidence fve
+      JOIN memory_episodes me ON me.id = fve.episode_id
+      WHERE fve.fact_id = ? AND length(trim(fve.excerpt)) > 0
+        AND me.status IN ('available','partial')
+      ORDER BY me.occurred_at DESC, fve.ordinal ASC
+      LIMIT 12
+    `),
+    readCandidates: db.prepare(`
+      SELECT fe.entity_id, e.entity_type
+      FROM fact_entities fe
+      JOIN entities e ON e.id = fe.entity_id
+      WHERE fe.fact_id = ? AND +fe.link_type = 'inferred_text'
+        AND NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)
+      ORDER BY e.mention_count DESC, e.id
+    `),
+  };
+}
+
+/** One fact's claim and evidence as the grounding decision sees them. */
+interface FactGroundingView {
+  fact: GroundingFact;
+  contentLower: string;
+  evidence: Array<GroundingEvidence & { excerptLower: string; names: Set<number> }>;
+  claimNames: Set<number>;
+}
+
+function groundedMentionSet(pass: EntityGroundingPass, text: string): Set<number> {
+  const masked = maskIdentifierSpans(text);
+  return new Set(groundedEntityMentionIds(masked, pass.mentionsFor(masked), true));
+}
+
+function viewFactGrounding(pass: EntityGroundingPass, fact: GroundingFact): FactGroundingView {
+  const evidence = (pass.readEvidence.all(fact.id) as GroundingEvidence[]).map((item) => ({
+    ...item,
+    excerptLower: item.excerpt.toLowerCase(),
+    names: groundedMentionSet(pass, item.excerpt),
+  }));
+  return {
+    fact,
+    contentLower: fact.content.toLowerCase(),
+    evidence,
+    claimNames: groundedMentionSet(pass, fact.content),
+  };
+}
+
+type GroundingDecision =
+  | { kind: 'promote'; supporting: GroundingEvidence }
+  | { kind: 'ambiguous' }
+  | { kind: 'ignored' };
+
+function decideEntityCandidate(
+  pass: EntityGroundingPass,
+  view: FactGroundingView,
+  candidate: EntityCandidate,
+): GroundingDecision {
+  const { index, nameMatches } = pass;
+  const names = pass.namesOf(candidate.entity_id);
+  const strongNames = names.filter((name) => {
+    const normalized = normalizedGroundingName(name);
+    const specificEnough = candidate.entity_type === 'person'
+      ? normalized.split(' ').length >= 2
+      : normalized.length >= 3;
+    return specificEnough && (index.nameOwners.get(normalized)?.size ?? 0) === 1;
+  });
+  const identifiers = pass.identifiersOf(candidate.entity_id);
+  for (const item of view.evidence) {
+    const nameSupported = view.claimNames.has(candidate.entity_id)
+      && item.names.has(candidate.entity_id)
+      && strongNames.some((name) =>
+        nameMatches(view.contentLower, name) && nameMatches(item.excerptLower, name));
+    const identifierSupported = identifiers.some((identifier) =>
+      (index.identifierOwners.get(`${identifier.scheme}:${identifier.value_norm}`)?.size ?? 0) === 1
+      && exactIdentifierMatch(view.fact.content, identifier.value_norm)
+      && exactIdentifierMatch(item.excerpt, identifier.value_norm));
+    if (nameSupported || identifierSupported) {
+      return { kind: 'promote', supporting: { episode_id: item.episode_id, excerpt: item.excerpt, source_uri: item.source_uri } };
+    }
+  }
+  const weakOrSharedMatch = names.some((name) =>
+    nameMatches(view.contentLower, name)
+    && view.evidence.some((item) => nameMatches(item.excerptLower, name)));
+  return weakOrSharedMatch ? { kind: 'ambiguous' } : { kind: 'ignored' };
+}
+
+function promoteEntityCandidate(
   db: Database.Database,
-  opts: { factLimit?: number } = {},
-): GroundedFactEntityBackfillStats {
-  const factLimit = Math.max(1, Math.min(50_000, Math.floor(opts.factLimit ?? 5_000)));
-  const facts = db.prepare(`
-    SELECT cf.id, cf.content, cf.confidence, cf.trust_level
+  fact: GroundingFact,
+  entityId: number,
+  supporting: GroundingEvidence,
+): void {
+  addFactEntityLinksInDatabase(db, fact.id, [entityId], {
+    linkType: 'extracted',
+    confidence: fact.confidence ?? fact.trust_level ?? 0.7,
+    evidenceEpisodeId: supporting.episode_id,
+    evidenceExcerpt: supporting.excerpt,
+    sourceUri: supporting.source_uri ?? undefined,
+    sourceKind: 'fact_backfill',
+    incrementMention: false,
+  });
+}
+
+// ── grounded backfills: paged selection, then one fact / candidate per step ─
+
+interface GroundingSelectionRow {
+  id: number;
+  active: number;
+  updated_at: string;
+}
+
+/** The backfills' processing order: active first, newest first, highest id first. */
+const GROUNDING_ORDER: ReadonlyArray<1 | -1> = [-1, -1, -1];
+const SELECTION_PAGE_IDS = 250;
+
+function groundingKey(row: GroundingSelectionRow): [number, string, number] {
+  return [row.active, row.updated_at, row.id];
+}
+
+/**
+ * Facts with an inferred link and usable evidence, read one id range per
+ * slice, then ordered (active, updated_at, id, all descending) and limited in
+ * memory: the same facts in the same order as one ORDER BY … LIMIT statement,
+ * without one statement scanning every fact. Processing keeps this order, so
+ * when two facts promote the same identity from one shared episode the same
+ * fact names the observation.
+ */
+function* selectGroundingFacts(
+  db: Database.Database,
+  linkTable: 'fact_entities' | 'fact_resources',
+  factLimit: number,
+  clock: SliceClock,
+): Generator<void, GroundingSelectionRow[], undefined> {
+  const alias = linkTable === 'fact_entities' ? 'fe' : 'fr';
+  const maxId = (db.prepare('SELECT MAX(id) AS id FROM consolidated_facts').get() as { id: number | null }).id ?? 0;
+  const page = db.prepare(`
+    SELECT cf.id, cf.active, cf.updated_at
     FROM consolidated_facts cf
-    WHERE EXISTS (
-      SELECT 1 FROM fact_entities fe
-      WHERE fe.fact_id = cf.id AND fe.link_type = 'inferred_text'
-    )
+    WHERE cf.id > ? AND cf.id <= ?
+      AND EXISTS (
+        SELECT 1 FROM ${linkTable} ${alias}
+        WHERE ${alias}.fact_id = cf.id AND +${alias}.link_type = 'inferred_text'
+      )
       AND EXISTS (
         SELECT 1 FROM fact_evidence fve
         JOIN memory_episodes me ON me.id = fve.episode_id
         WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0
           AND me.status IN ('available','partial')
       )
-    ORDER BY cf.active DESC, cf.updated_at DESC, cf.id DESC
-    LIMIT ?
-  `).all(factLimit) as Array<{
-    id: number; content: string; confidence: number | null; trust_level: number | null;
-  }>;
-  const readEvidence = db.prepare(`
-    SELECT fve.episode_id, fve.excerpt, COALESCE(fve.source_uri, me.source_uri) AS source_uri
-    FROM fact_evidence fve
-    JOIN memory_episodes me ON me.id = fve.episode_id
-    WHERE fve.fact_id = ? AND length(trim(fve.excerpt)) > 0
-      AND me.status IN ('available','partial')
-    ORDER BY me.occurred_at DESC, fve.ordinal ASC
-    LIMIT 12
   `);
-  const readCandidates = db.prepare(`
-    SELECT fe.entity_id, e.entity_type
-    FROM fact_entities fe
-    JOIN entities e ON e.id = fe.entity_id
-    WHERE fe.fact_id = ? AND fe.link_type = 'inferred_text'
-      AND NOT EXISTS (SELECT 1 FROM entity_redirects er WHERE er.source_entity_id = e.id)
-    ORDER BY e.mention_count DESC, e.id
-  `);
-  const readIdentifiers = db.prepare(`
-    SELECT scheme, value_norm FROM entity_identifiers
-    WHERE entity_id = ? AND scheme IN ('email','domain')
-    ORDER BY confidence DESC
-  `);
-  const index = buildEntityGroundingIndex(db);
-  const stats: GroundedFactEntityBackfillStats = {
-    factsScanned: facts.length,
-    evidenceScanned: 0,
-    candidates: 0,
-    promoted: 0,
-    ambiguous: 0,
-    ignored: 0,
-  };
-
-  for (const fact of facts) {
-    const evidence = readEvidence.all(fact.id) as Array<{
-      episode_id: string; excerpt: string; source_uri: string | null;
-    }>;
-    stats.evidenceScanned += evidence.length;
-    const candidates = readCandidates.all(fact.id) as Array<{ entity_id: number; entity_type: string }>;
-    const claimNames = new Set(groundedEntityMentionIds(maskIdentifierSpans(fact.content), index.mentions, true));
-    const evidenceNames = new Map(evidence.map(item => [item,
-      new Set(groundedEntityMentionIds(maskIdentifierSpans(item.excerpt), index.mentions, true)),
-    ]));
-    for (const candidate of candidates) {
-      stats.candidates += 1;
-      const names = entityNamesForBackfill(db, candidate.entity_id);
-      const strongNames = names.filter((name) => {
-        const normalized = normalizedGroundingName(name);
-        const specificEnough = candidate.entity_type === 'person'
-          ? normalized.split(' ').length >= 2
-          : normalized.length >= 3;
-        return specificEnough && (index.nameOwners.get(normalized)?.size ?? 0) === 1;
-      });
-      const identifiers = readIdentifiers.all(candidate.entity_id) as Array<{ scheme: string; value_norm: string }>;
-      let supporting: { episode_id: string; excerpt: string; source_uri: string | null } | undefined;
-      for (const item of evidence) {
-        const nameSupported = claimNames.has(candidate.entity_id)
-          && evidenceNames.get(item)!.has(candidate.entity_id)
-          && strongNames.some((name) =>
-            exactGroundingNameMatch(fact.content, name) && exactGroundingNameMatch(item.excerpt, name));
-        const identifierSupported = identifiers.some((identifier) =>
-          (index.identifierOwners.get(`${identifier.scheme}:${identifier.value_norm}`)?.size ?? 0) === 1
-          && exactIdentifierMatch(fact.content, identifier.value_norm)
-          && exactIdentifierMatch(item.excerpt, identifier.value_norm));
-        if (nameSupported || identifierSupported) {
-          supporting = item;
-          break;
-        }
-      }
-      if (!supporting) {
-        const weakOrSharedMatch = names.some((name) =>
-          exactGroundingNameMatch(fact.content, name)
-          && evidence.some((item) => exactGroundingNameMatch(item.excerpt, name)));
-        if (weakOrSharedMatch) stats.ambiguous += 1;
-        else stats.ignored += 1;
-        continue;
-      }
-      addFactEntityLinksInDatabase(db, fact.id, [candidate.entity_id], {
-        linkType: 'extracted',
-        confidence: fact.confidence ?? fact.trust_level ?? 0.7,
-        evidenceEpisodeId: supporting.episode_id,
-        evidenceExcerpt: supporting.excerpt,
-        sourceUri: supporting.source_uri ?? undefined,
-        sourceKind: 'fact_backfill',
-        incrementMention: false,
-      });
-      stats.promoted += 1;
-    }
+  const rows: GroundingSelectionRow[] = [];
+  for (let from = 0; from < maxId; from += SELECTION_PAGE_IDS) {
+    for (const row of page.all(from, from + SELECTION_PAGE_IDS) as GroundingSelectionRow[]) rows.push(row);
+    clock.unit();
+    clock.boundary();
+    yield;
   }
-  return stats;
+  rows.sort((a, b) => comparePassKeys(groundingKey(a), groundingKey(b), GROUNDING_ORDER));
+  return rows.slice(0, factLimit);
+}
+
+interface GroundingBackfillHandlers<C> {
+  readFact: (factId: number) => GroundingFact | undefined;
+  /** Read one fact's evidence and candidates and prepare its decisions. */
+  open: (fact: GroundingFact) => { evidenceScanned: number; candidates: C[]; decide: (candidate: C) => GroundingDecision };
+  candidateId: (candidate: C) => number;
+  promote: (fact: GroundingFact, candidate: C, supporting: GroundingEvidence) => void;
+}
+
+type GroundingBackfillStats = GroundedFactEntityBackfillStats;
+
+/**
+ * A grounding backfill as steps: the paged selection (a slice per page), the
+ * pass's setup (a slice per index), then per fact one step to open it and one
+ * step per candidate. A fact is done once every candidate is decided; the
+ * candidates decided so far in the fact in progress are recorded too, so a
+ * resumed attempt neither re-counts nor re-decides them.
+ */
+function groundingBackfillPass<C>(
+  linkTable: 'fact_entities' | 'fact_resources',
+  opts: { factLimit?: number },
+  setup: (db: Database.Database, clock: SliceClock) => Generator<void, GroundingBackfillHandlers<C>, undefined>,
+): PassFactory<GroundingBackfillStats> {
+  return (db, clock, resume) => {
+    const factLimit = Math.max(1, Math.min(50_000, Math.floor(opts.factLimit ?? 5_000)));
+    const earlier = resume?.stats ?? null;
+    const stats: GroundingBackfillStats = {
+      factsScanned: 0,
+      evidenceScanned: earlier?.evidenceScanned ?? 0,
+      candidates: earlier?.candidates ?? 0,
+      promoted: earlier?.promoted ?? 0,
+      ambiguous: earlier?.ambiguous ?? 0,
+      ignored: earlier?.ignored ?? 0,
+    };
+    let skipped = earlier?.skipped ?? 0;
+    let after: PassCursorKey | null = resume?.after ?? null;
+    const resumedUnit = resume?.partial ?? null;
+    let partial: PassPartialUnit | null = null;
+    let selected = false;
+    function* steps(): Generator<void, void, undefined> {
+      const chosen = yield* selectGroundingFacts(db, linkTable, factLimit, clock);
+      // A resumed attempt reports the facts the day's first selection found:
+      // facts whose every candidate was promoted since are not selected again.
+      stats.factsScanned = earlier?.factsScanned ?? chosen.length;
+      selected = true;
+      const handlers = yield* setup(db, clock);
+      for (const selected of chosen) {
+        const key = groundingKey(selected);
+        if (after !== null && comparePassKeys(key, after, GROUNDING_ORDER) <= 0) continue;
+        const fact = handlers.readFact(selected.id);
+        if (!fact) {
+          after = key;
+          continue;
+        }
+        const continuing = resumedUnit !== null && comparePassKeys(resumedUnit.key, key) === 0;
+        const opened = handlers.open(fact);
+        if (!continuing) stats.evidenceScanned += opened.evidenceScanned;
+        const decided = new Set(continuing ? resumedUnit.done : []);
+        partial = { key, done: [...decided] };
+        clock.unit();
+        yield;
+        for (const candidate of opened.candidates) {
+          const candidateId = handlers.candidateId(candidate);
+          if (decided.has(candidateId)) continue;
+          stats.candidates += 1;
+          const decision = opened.decide(candidate);
+          if (decision.kind === 'ambiguous') stats.ambiguous += 1;
+          else if (decision.kind === 'ignored') stats.ignored += 1;
+          else if (writeOrSkip(() => handlers.promote(fact, candidate, decision.supporting))) {
+            stats.promoted += 1;
+            clock.wrote(1);
+          } else skipped += 1;
+          partial.done.push(candidateId);
+          clock.unit();
+          yield;
+        }
+        after = key;
+        partial = null;
+      }
+    }
+    return {
+      steps: steps(),
+      position: () => ({
+        after,
+        partial: partial ? { key: partial.key, done: [...partial.done] } : null,
+        stats: selected ? withSkipped(stats, skipped) : null,
+      }),
+      result: () => withSkipped(stats, skipped),
+    };
+  };
+}
+
+function* entityGroundingSetup(
+  db: Database.Database,
+  clock: SliceClock,
+): Generator<void, GroundingBackfillHandlers<EntityCandidate>, undefined> {
+  const index = buildEntityGroundingIndex(db);
+  clock.boundary();
+  yield;
+  const pass = entityGroundingPass(db, index);
+  clock.boundary();
+  yield;
+  const readFact = db.prepare('SELECT id, content, confidence, trust_level FROM consolidated_facts WHERE id = ?');
+  return {
+    readFact: (factId) => readFact.get(factId) as GroundingFact | undefined,
+    open: (fact) => {
+      const view = viewFactGrounding(pass, fact);
+      const candidates = pass.readCandidates.all(fact.id) as EntityCandidate[];
+      return { evidenceScanned: view.evidence.length, candidates, decide: (candidate) => decideEntityCandidate(pass, view, candidate) };
+    },
+    candidateId: (candidate) => candidate.entity_id,
+    promote: (fact, candidate, supporting) => promoteEntityCandidate(db, fact, candidate.entity_id, supporting),
+  };
+}
+
+function entityGroundingBackfillPass(opts: { factLimit?: number }): PassFactory<GroundedFactEntityBackfillStats> {
+  return groundingBackfillPass('fact_entities', opts, entityGroundingSetup);
+}
+
+export function backfillGroundedFactEntityLinksInDatabase(
+  db: Database.Database,
+  opts: { factLimit?: number } = {},
+): GroundedFactEntityBackfillStats {
+  return runPassUnsliced(db, entityGroundingBackfillPass(opts));
+}
+
+/** {@link backfillGroundedFactEntityLinks} in slices, with a turn between slices. */
+export async function backfillGroundedFactEntityLinksAsync(
+  opts: { factLimit?: number } & SlicedPassOptions = {},
+): Promise<GroundedFactEntityBackfillStats> {
+  return runPassSliced(openMemoryDb(), LINK_PASS_IDS.entityBackfill, entityGroundingBackfillPass(opts), opts);
 }
 
 /**
@@ -1632,29 +2322,34 @@ export function backfillGroundedFactResourceLinks(
   return backfillGroundedFactResourceLinksInDatabase(openMemoryDb(), opts);
 }
 
-export function backfillGroundedFactResourceLinksInDatabase(
+interface ResourceCandidate {
+  resource_id: number;
+  app: string;
+  kind: string;
+  name: string;
+}
+
+function decideResourceCandidate(
+  owners: Map<string, Set<number>>,
+  fact: GroundingFact,
+  evidence: ReadonlyArray<{ episode_id: string; excerpt: string }>,
+  candidate: ResourceCandidate,
+): GroundingDecision {
+  const factMatch = exactResourceNameMatch(fact.content, candidate.name);
+  const supporting = factMatch
+    ? evidence.find((item) => exactResourceNameMatch(item.excerpt, candidate.name))
+    : undefined;
+  if (!factMatch || !supporting || !resourceNameSpecificEnough(candidate.name, candidate.app, candidate.kind)) {
+    return { kind: 'ignored' };
+  }
+  if ((owners.get(normalizedResourceGroundingName(candidate.name))?.size ?? 0) !== 1) return { kind: 'ambiguous' };
+  return { kind: 'promote', supporting: { episode_id: supporting.episode_id, excerpt: supporting.excerpt, source_uri: null } };
+}
+
+function* resourceGroundingSetup(
   db: Database.Database,
-  opts: { factLimit?: number } = {},
-): GroundedFactResourceBackfillStats {
-  const factLimit = Math.max(1, Math.min(50_000, Math.floor(opts.factLimit ?? 5_000)));
-  const facts = db.prepare(`
-    SELECT cf.id, cf.content, cf.confidence, cf.trust_level
-    FROM consolidated_facts cf
-    WHERE EXISTS (
-      SELECT 1 FROM fact_resources fr
-      WHERE fr.fact_id = cf.id AND fr.link_type = 'inferred_text'
-    )
-      AND EXISTS (
-        SELECT 1 FROM fact_evidence fve
-        JOIN memory_episodes me ON me.id = fve.episode_id
-        WHERE fve.fact_id = cf.id AND length(trim(fve.excerpt)) > 0
-          AND me.status IN ('available','partial')
-      )
-    ORDER BY cf.active DESC, cf.updated_at DESC, cf.id DESC
-    LIMIT ?
-  `).all(factLimit) as Array<{
-    id: number; content: string; confidence: number | null; trust_level: number | null;
-  }>;
+  clock: SliceClock,
+): Generator<void, GroundingBackfillHandlers<ResourceCandidate>, undefined> {
   const readEvidence = db.prepare(`
     SELECT fve.episode_id, fve.excerpt
     FROM fact_evidence fve
@@ -1668,49 +2363,46 @@ export function backfillGroundedFactResourceLinksInDatabase(
     SELECT fr.resource_id, rp.app, rp.kind, rp.name
     FROM fact_resources fr
     JOIN resource_pointers rp ON rp.id = fr.resource_id
-    WHERE fr.fact_id = ? AND fr.link_type = 'inferred_text'
+    WHERE fr.fact_id = ? AND +fr.link_type = 'inferred_text'
     ORDER BY rp.mention_count DESC, rp.id ASC
   `);
+  const readFact = db.prepare('SELECT id, content, confidence, trust_level FROM consolidated_facts WHERE id = ?');
   const owners = buildResourceNameOwners(db);
-  const stats: GroundedFactResourceBackfillStats = {
-    factsScanned: facts.length,
-    evidenceScanned: 0,
-    candidates: 0,
-    promoted: 0,
-    ambiguous: 0,
-    ignored: 0,
+  clock.boundary();
+  yield;
+  return {
+    readFact: (factId) => readFact.get(factId) as GroundingFact | undefined,
+    open: (fact) => {
+      const evidence = readEvidence.all(fact.id) as Array<{ episode_id: string; excerpt: string }>;
+      const candidates = readCandidates.all(fact.id) as ResourceCandidate[];
+      return { evidenceScanned: evidence.length, candidates, decide: (candidate) => decideResourceCandidate(owners, fact, evidence, candidate) };
+    },
+    candidateId: (candidate) => candidate.resource_id,
+    promote: (fact, candidate, supporting) => addFactResourceLinksInDatabase(db, fact.id, [candidate.resource_id], {
+      linkType: 'extracted',
+      confidence: fact.confidence ?? fact.trust_level ?? 0.7,
+      evidenceEpisodeId: supporting.episode_id,
+      evidenceExcerpt: supporting.excerpt,
+    }),
   };
-  for (const fact of facts) {
-    const evidence = readEvidence.all(fact.id) as Array<{ episode_id: string; excerpt: string }>;
-    stats.evidenceScanned += evidence.length;
-    const candidates = readCandidates.all(fact.id) as Array<{
-      resource_id: number; app: string; kind: string; name: string;
-    }>;
-    for (const candidate of candidates) {
-      stats.candidates += 1;
-      const factMatch = exactResourceNameMatch(fact.content, candidate.name);
-      const supporting = factMatch
-        ? evidence.find((item) => exactResourceNameMatch(item.excerpt, candidate.name))
-        : undefined;
-      if (!factMatch || !supporting || !resourceNameSpecificEnough(candidate.name, candidate.app, candidate.kind)) {
-        stats.ignored += 1;
-        continue;
-      }
-      const key = normalizedResourceGroundingName(candidate.name);
-      if ((owners.get(key)?.size ?? 0) !== 1) {
-        stats.ambiguous += 1;
-        continue;
-      }
-      addFactResourceLinksInDatabase(db, fact.id, [candidate.resource_id], {
-        linkType: 'extracted',
-        confidence: fact.confidence ?? fact.trust_level ?? 0.7,
-        evidenceEpisodeId: supporting.episode_id,
-        evidenceExcerpt: supporting.excerpt,
-      });
-      stats.promoted += 1;
-    }
-  }
-  return stats;
+}
+
+function resourceGroundingBackfillPass(opts: { factLimit?: number }): PassFactory<GroundedFactResourceBackfillStats> {
+  return groundingBackfillPass('fact_resources', opts, resourceGroundingSetup);
+}
+
+export function backfillGroundedFactResourceLinksInDatabase(
+  db: Database.Database,
+  opts: { factLimit?: number } = {},
+): GroundedFactResourceBackfillStats {
+  return runPassUnsliced(db, resourceGroundingBackfillPass(opts));
+}
+
+/** {@link backfillGroundedFactResourceLinks} in slices, with a turn between slices. */
+export async function backfillGroundedFactResourceLinksAsync(
+  opts: { factLimit?: number } & SlicedPassOptions = {},
+): Promise<GroundedFactResourceBackfillStats> {
+  return runPassSliced(openMemoryDb(), LINK_PASS_IDS.resourceBackfill, resourceGroundingBackfillPass(opts), opts);
 }
 
 function explicitlyStatedRelationship(
@@ -1736,62 +2428,63 @@ function explicitlyStatedRelationship(
   return null;
 }
 
+interface RelationshipEvidenceRow {
+  fact_id: number;
+  updated_at: string;
+  confidence: number | null;
+  trust_level: number | null;
+  valid_from: string | null;
+  valid_to: string | null;
+  episode_id: string;
+  excerpt: string;
+  source_uri: string | null;
+  ordinal: number;
+}
+
 /**
- * Conservative historical relationship promotion. It reads only active facts
- * with surviving, source-derived evidence and promotes only direct syntactic
- * subject→predicate→object statements between already-linked named entities.
- * Mere co-occurrence can never become stored graph truth.
+ * The relationship pass's order: newest fact first, then evidence ordinal.
+ * Rows that tie on both (possible only for evidence rows sharing an ordinal)
+ * are ordered by fact id, then episode id, so the order is total and a resume
+ * key is exact.
  */
-export function backfillGroundedEntityRelationships(
-  opts: { factLimit?: number } = {},
-): EntityRelationshipBackfillStats {
-  const db = openMemoryDb();
-  const rows = db.prepare(`
-    SELECT cf.id AS fact_id, cf.confidence, cf.trust_level, cf.valid_from, cf.valid_to,
-           fe.episode_id, fe.excerpt, fe.source_uri
-    FROM consolidated_facts cf
-    JOIN fact_evidence fe ON fe.fact_id = cf.id AND length(trim(fe.excerpt)) > 0
-    JOIN memory_episodes me ON me.id = fe.episode_id AND me.status IN ('available','partial')
-    WHERE cf.active = 1
-      AND (SELECT COUNT(*) FROM fact_entities link WHERE link.fact_id = cf.id) >= 2
-    ORDER BY cf.updated_at DESC, fe.ordinal ASC
-    LIMIT ?
-  `).all(Math.max(1, opts.factLimit ?? 5_000)) as Array<{
-    fact_id: number; confidence: number | null; trust_level: number | null;
-    valid_from: string | null; valid_to: string | null; episode_id: string;
-    excerpt: string; source_uri: string | null;
-  }>;
-  const stats: EntityRelationshipBackfillStats = {
-    factsScanned: new Set(rows.map((row) => row.fact_id)).size,
-    evidenceScanned: rows.length,
-    candidates: 0,
-    added: 0,
-    reinforced: 0,
-    ignored: 0,
-  };
-  const names = new Map<number, string[]>();
-  for (const row of rows) {
-    const excerptLower = row.excerpt.toLowerCase();
-    const phrases = HIGH_PRECISION_BACKFILL_PREDICATES.filter((phrase) => excerptLower.includes(phrase));
-    if (phrases.length === 0) continue;
-    const ids = getEntityIdsForFact(row.fact_id).slice(0, 12);
-    for (const id of ids) if (!names.has(id)) names.set(id, entityNamesForBackfill(db, id));
-    const emitted = new Set<string>();
-    for (const subjectId of ids) {
-      for (const objectId of ids) {
-        if (subjectId === objectId) continue;
-        const predicate = explicitlyStatedRelationship(
-          row.excerpt,
-          names.get(subjectId) ?? [],
-          names.get(objectId) ?? [],
-          phrases,
-        );
-        if (!predicate) continue;
-        const key = `${subjectId}:${predicate}:${objectId}`;
-        if (emitted.has(key)) continue;
-        emitted.add(key);
-        stats.candidates += 1;
-        const result = recordGroundedEntityRelationship({
+const RELATIONSHIP_ORDER: ReadonlyArray<1 | -1> = [-1, 1, 1, 1];
+
+function relationshipKey(row: RelationshipEvidenceRow): [string, number, number, string] {
+  return [row.updated_at, row.ordinal, row.fact_id, row.episode_id];
+}
+
+/** Record every relationship one evidence row states directly. Returns the rows it wrote (about three per edge). */
+function recordRelationshipsFromEvidence(
+  db: Database.Database,
+  row: RelationshipEvidenceRow,
+  names: Map<number, string[]>,
+  stats: EntityRelationshipBackfillStats,
+  skip: () => void,
+): number {
+  const excerptLower = row.excerpt.toLowerCase();
+  const phrases = HIGH_PRECISION_BACKFILL_PREDICATES.filter((phrase) => excerptLower.includes(phrase));
+  if (phrases.length === 0) return 0;
+  const ids = getEntityIdsForFact(row.fact_id).slice(0, 12);
+  for (const id of ids) if (!names.has(id)) names.set(id, entityNamesForBackfill(db, id));
+  const emitted = new Set<string>();
+  let writes = 0;
+  for (const subjectId of ids) {
+    for (const objectId of ids) {
+      if (subjectId === objectId) continue;
+      const predicate = explicitlyStatedRelationship(
+        row.excerpt,
+        names.get(subjectId) ?? [],
+        names.get(objectId) ?? [],
+        phrases,
+      );
+      if (!predicate) continue;
+      const key = `${subjectId}:${predicate}:${objectId}`;
+      if (emitted.has(key)) continue;
+      emitted.add(key);
+      stats.candidates += 1;
+      let result: EntityRelationshipResult | undefined;
+      const recorded = writeOrSkip(() => {
+        result = recordGroundedEntityRelationship({
           subjectId,
           predicate,
           objectId,
@@ -1805,13 +2498,127 @@ export function backfillGroundedEntityRelationships(
           validTo: row.valid_to ?? undefined,
           extractionMethod: 'fact_backfill',
         });
-        if (result.outcome === 'add') stats.added += 1;
-        else if (result.outcome === 'reinforce' || result.outcome === 'supersede') stats.reinforced += 1;
-        else stats.ignored += 1;
+      });
+      if (!recorded || !result) {
+        skip();
+        continue;
       }
+      if (result.outcome === 'add') stats.added += 1;
+      else if (result.outcome === 'reinforce' || result.outcome === 'supersede') stats.reinforced += 1;
+      else stats.ignored += 1;
+      if (result.outcome !== 'ignore') writes += 3;
     }
   }
-  return stats;
+  return writes;
+}
+
+/**
+ * Evidence rows of active facts with at least two links, one id range per
+ * slice, then the pass order and the row limit in memory. "At least two
+ * links" stops at the second link instead of counting every link. The
+ * CROSS JOINs and `+cf.active` keep each page a primary-key range of facts,
+ * rather than a walk of every active fact or every usable episode.
+ */
+function* selectRelationshipEvidence(
+  db: Database.Database,
+  limit: number,
+  clock: SliceClock,
+): Generator<void, RelationshipEvidenceRow[], undefined> {
+  const maxId = (db.prepare('SELECT MAX(id) AS id FROM consolidated_facts').get() as { id: number | null }).id ?? 0;
+  const page = db.prepare(`
+    SELECT cf.id AS fact_id, cf.updated_at, cf.confidence, cf.trust_level, cf.valid_from, cf.valid_to,
+           fe.episode_id, fe.excerpt, fe.source_uri, fe.ordinal
+    FROM consolidated_facts cf
+    CROSS JOIN fact_evidence fe ON fe.fact_id = cf.id AND length(trim(fe.excerpt)) > 0
+    CROSS JOIN memory_episodes me ON me.id = fe.episode_id AND me.status IN ('available','partial')
+    WHERE cf.id > ? AND cf.id <= ? AND +cf.active = 1
+      AND EXISTS (SELECT 1 FROM fact_entities link WHERE link.fact_id = cf.id LIMIT 1 OFFSET 1)
+  `);
+  const rows: RelationshipEvidenceRow[] = [];
+  for (let from = 0; from < maxId; from += SELECTION_PAGE_IDS) {
+    for (const row of page.all(from, from + SELECTION_PAGE_IDS) as RelationshipEvidenceRow[]) rows.push(row);
+    clock.unit();
+    clock.boundary();
+    yield;
+  }
+  rows.sort((a, b) => comparePassKeys(relationshipKey(a), relationshipKey(b), RELATIONSHIP_ORDER));
+  return rows.slice(0, limit);
+}
+
+/** Test seam: the paged selections, drained at once, to hold against the one-statement selections. */
+export function linkPassSelectionsForTest(db: Database.Database): {
+  groundingFactIds: (linkTable: 'fact_entities' | 'fact_resources', factLimit: number) => number[];
+  relationshipRows: (limit: number) => string[];
+} {
+  const drain = <T>(steps: Generator<void, T, undefined>): T => {
+    for (;;) {
+      const next = steps.next();
+      if (next.done) return next.value;
+    }
+  };
+  const clock = new SliceClock(UNBOUNDED_SLICE);
+  return {
+    groundingFactIds: (linkTable, factLimit) => drain(selectGroundingFacts(db, linkTable, factLimit, clock)).map((row) => row.id),
+    relationshipRows: (limit) => drain(selectRelationshipEvidence(db, limit, clock)).map((row) => `${row.fact_id}:${row.episode_id}`),
+  };
+}
+
+function relationshipBackfillPass(opts: { factLimit?: number }): PassFactory<EntityRelationshipBackfillStats> {
+  return (db, clock, resume) => {
+    const limit = Math.max(1, opts.factLimit ?? 5_000);
+    const earlier = resume?.stats ?? null;
+    const stats: EntityRelationshipBackfillStats = {
+      factsScanned: 0,
+      evidenceScanned: 0,
+      candidates: earlier?.candidates ?? 0,
+      added: earlier?.added ?? 0,
+      reinforced: earlier?.reinforced ?? 0,
+      ignored: earlier?.ignored ?? 0,
+    };
+    let skipped = earlier?.skipped ?? 0;
+    let after: PassCursorKey | null = resume?.after ?? null;
+    let selected = false;
+    function* steps(): Generator<void, void, undefined> {
+      const chosen = yield* selectRelationshipEvidence(db, limit, clock);
+      stats.factsScanned = earlier?.factsScanned ?? new Set(chosen.map((row) => row.fact_id)).size;
+      stats.evidenceScanned = earlier?.evidenceScanned ?? chosen.length;
+      selected = true;
+      const names = new Map<number, string[]>();
+      for (const row of chosen) {
+        const key = relationshipKey(row);
+        if (after !== null && comparePassKeys(key, after, RELATIONSHIP_ORDER) <= 0) continue;
+        const writes = recordRelationshipsFromEvidence(db, row, names, stats, () => { skipped += 1; });
+        after = key;
+        clock.unit();
+        clock.wrote(writes);
+        yield;
+      }
+    }
+    return {
+      steps: steps(),
+      position: () => ({ after, partial: null, stats: selected ? withSkipped(stats, skipped) : null }),
+      result: () => withSkipped(stats, skipped),
+    };
+  };
+}
+
+/**
+ * Conservative historical relationship promotion. It reads only active facts
+ * with surviving, source-derived evidence and promotes only direct syntactic
+ * subject→predicate→object statements between already-linked named entities.
+ * Mere co-occurrence can never become stored graph truth.
+ */
+export function backfillGroundedEntityRelationships(
+  opts: { factLimit?: number } = {},
+): EntityRelationshipBackfillStats {
+  return runPassUnsliced(openMemoryDb(), relationshipBackfillPass(opts));
+}
+
+/** {@link backfillGroundedEntityRelationships} in slices, with a turn between slices. */
+export async function backfillGroundedEntityRelationshipsAsync(
+  opts: { factLimit?: number } & SlicedPassOptions = {},
+): Promise<EntityRelationshipBackfillStats> {
+  return runPassSliced(openMemoryDb(), LINK_PASS_IDS.relationships, relationshipBackfillPass(opts), opts);
 }
 
 /** Backup-first reconciliation used by maintenance and the desktop health UI.
@@ -1836,6 +2643,52 @@ export function reconcileMemoryRelationships(opts: {
   const factResourceLinks = syncFactResourceLinks({ factLimit });
   const groundedFactResourceLinks = backfillGroundedFactResourceLinks({ factLimit });
   const relationships = backfillGroundedEntityRelationships({ factLimit });
+  return {
+    backupPath: backup?.backupPath ?? null,
+    before,
+    identities,
+    factEntityLinks,
+    groundedFactEntityLinks,
+    factResourceLinks,
+    groundedFactResourceLinks,
+    relationships,
+    after: readEntityRelationshipHealth(),
+    elapsedMs: Date.now() - started,
+  };
+}
+
+/**
+ * {@link reconcileMemoryRelationships} with every pass in slices and a turn
+ * between steps, so a request that runs it never holds the loop for the
+ * whole reconciliation. Same steps, same order, same report.
+ *
+ * `backup` takes the rollback point; by default the synchronous backup. A
+ * caller that has an off-thread backup passes it here.
+ */
+export async function reconcileMemoryRelationshipsAsync(opts: {
+  factLimit?: number;
+  requireBackup?: boolean;
+  backup?: () => BackupResult | null | Promise<BackupResult | null>;
+  clock?: SliceClock;
+} = {}): Promise<MemoryRelationshipReconciliationReport> {
+  const started = Date.now();
+  const clock = opts.clock ?? new SliceClock(NIGHTLY_SLICE);
+  const before = readEntityRelationshipHealth();
+  await clock.next(true);
+  const takeBackup = opts.backup ?? (() => backupMemoryDb({ retain: 14 }));
+  const backup = opts.requireBackup === false ? null : await takeBackup();
+  if (opts.requireBackup !== false && !backup) {
+    throw new Error('relationship reconciliation requires a successful memory backup');
+  }
+  await clock.next(true);
+  const factLimit = Math.max(1, Math.min(50_000, Math.floor(opts.factLimit ?? 5_000)));
+  const identities = autoReconcileStrongEntityIdentifiers(500);
+  await clock.next(true);
+  const factEntityLinks = await syncFactEntityLinksAsync({ factLimit, clock });
+  const groundedFactEntityLinks = await backfillGroundedFactEntityLinksAsync({ factLimit, clock });
+  const factResourceLinks = await syncFactResourceLinksAsync({ factLimit, clock });
+  const groundedFactResourceLinks = await backfillGroundedFactResourceLinksAsync({ factLimit, clock });
+  const relationships = await backfillGroundedEntityRelationshipsAsync({ factLimit, clock });
   return {
     backupPath: backup?.backupPath ?? null,
     before,
