@@ -208,9 +208,9 @@ test('a text result digested on the real carrier path names recall and file_quer
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
   const slug = 'lineage-orchard-notes';
-  // A saved view is text: long enough to be digested when read through a
-  // carrier, with no structured records in it.
-  const paragraphs = Array.from({ length: 80 }, (_, index) =>
+  // A saved view is text with no structured records in it, longer than any
+  // presentation budget a carrier can give it, so the read is digested.
+  const paragraphs = Array.from({ length: 800 }, (_, index) =>
     `<p>Walk ${index + 1}: the east rows were checked for frost damage and the mulch was topped up.</p>`).join('\n');
   spaceStore.save({ id: slug, title: 'Orchard walk notes', initialData: { rows: [] },
     viewContent: `<!doctype html><html><head><style>body{margin:0}</style></head><body>\n${paragraphs}\n</body></html>` });
@@ -225,7 +225,7 @@ test('a text result digested on the real carrier path names recall and file_quer
   const model = stubModel([
     [toolCall('digest-view', 'call_tool', { name: 'space_get_view',
       args_json: JSON.stringify({ slug, grep: null, around: null }) })],
-    [textMessage('The notes record eighty orchard walks.')],
+    [textMessage('The notes record eight hundred orchard walks.')],
   ]);
   const agent = await buildOrchestratorAgent({ userInput: objective, ...identity,
     hostFreshPlanning: primed.planning, allowedToolNames: ['space_get_view', 'recall_tool_result', 'tool_output_query', 'file_query', 'tool_search'],
