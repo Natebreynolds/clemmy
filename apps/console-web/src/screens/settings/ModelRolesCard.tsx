@@ -3,7 +3,8 @@ import { ClaudeLoginForm } from './ClaudeLoginForm';
 import { useState } from 'react';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
-import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, useModelRoles } from '@/lib/model-roles';
+import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
+import { modelDisplayName } from '@clem/chat-engine';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -152,36 +153,36 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
     return resolved?.inactiveBinding && resolved.inactiveBinding.modelId !== resolved.modelId && (
       <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={resolved.inactiveBinding.reason}>
         <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
-        <span className="min-w-0">Saved {resolved.inactiveBinding.modelId} isn’t available, so {resolved.modelId} answers instead.</span>
+        <span className="min-w-0">Your pick, {modelDisplayName(resolved.inactiveBinding.modelId)}, isn’t available, so {modelDisplayName(resolved.modelId)} is used instead.</span>
       </div>
     );
   };
   return (
     <div>
       <div className="overflow-hidden rounded-lg border border-border bg-surface">
-        {row('Brain', 'Answers you and plans the work',
-          <Select disabled={busy === 'brain'} value={r.brainValue} onChange={(e) => void r.onBrain(e.target.value)} aria-label="Brain model">
+        {row(ROLE_WORDS.brain.title, ROLE_WORDS.brain.hint,
+          <Select disabled={busy === 'brain'} value={r.brainValue} onChange={(e) => void r.onBrain(e.target.value)} aria-label="Model that does the work">
             {r.brains.map((o) => <option key={o.value} value={o.value} disabled={!o.available}>{o.label}{o.note ? ` (${o.note})` : ''}</option>)}
           </Select>, inactive('brain'))}
-        {row('Workers', 'Parallel helpers on fan-out steps',
-          <Select disabled={busy === 'worker'} value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId} onChange={(e) => void r.onRole('worker', e.target.value)} aria-label="Workers model">
-            <option value="__default__">Follow the brain</option>
+        {row(ROLE_WORDS.worker.title, ROLE_WORDS.worker.hint,
+          <Select disabled={busy === 'worker'} value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId} onChange={(e) => void r.onRole('worker', e.target.value)} aria-label="Model that helps in parallel">
+            <option value="__default__">Same model that does the work</option>
             {workerFlat.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>, inactive('worker'))}
-        {writer && row('Writer', 'Writes the final answer from the gathered evidence on research-heavy turns',
-          <Select disabled={busy === 'writer'} value={writer.source === 'default' ? '__default__' : writer.modelId} onChange={(e) => void r.onRole('writer', e.target.value)} aria-label="Writer model">
-            <option value="__default__">The brain writes</option>
+        {writer && row(ROLE_WORDS.writer.title, ROLE_WORDS.writer.hint,
+          <Select disabled={busy === 'writer'} value={writer.source === 'default' ? '__default__' : writer.modelId} onChange={(e) => void r.onRole('writer', e.target.value)} aria-label="Model that writes the final answer">
+            <option value="__default__">Same model that does the work</option>
             {writerFlat.map((m) => <option key={`wr-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>,
           <>
             {inactive('writer')}
             {judgeSharesWriterFamily && (
-              <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The judge is from the same family as the writer, so it reviews its own family’s work. Pick a judge from another family.</div>
+              <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The checker is from the same family as the writer, so it reviews its own family’s work. Pick a checker from another family.</div>
             )}
           </>)}
-        {row('Judge', 'Checks finished work before it is called done',
-          <Select disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId} onChange={(e) => void r.onRole('judge', e.target.value)} aria-label="Judge model">
-            <option value="__default__">Automatic · different family, fast</option>
+        {row(ROLE_WORDS.judge.title, ROLE_WORDS.judge.hint,
+          <Select disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId} onChange={(e) => void r.onRole('judge', e.target.value)} aria-label="Model that checks the work">
+            <option value="__default__">Automatic · a fast model from another provider</option>
             {judgeFlat.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
           </Select>,
           <>
@@ -202,11 +203,11 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
               </div>
             )}
             {secondOpinionOn && judgeSameAsBrain && (
-              <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The judge is the same model as the brain, so a second opinion adds little.</div>
+              <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The checker is the same model that does the work, so a second opinion adds little.</div>
             )}
           </>)}
-        {fallback && row('Fallback judge', 'Used only when the primary judge cannot complete a review. A completed verdict is kept.',
-          <Select disabled={busy !== null} value={judgeFallbackValue(fallback)} onChange={(event) => void r.onJudgeFallback(event.target.value)} aria-label="Fallback judge model" aria-describedby="judge-fallback-note">
+        {fallback && row(ROLE_WORDS.fallback.title, ROLE_WORDS.fallback.hint,
+          <Select disabled={busy !== null} value={judgeFallbackValue(fallback)} onChange={(event) => void r.onJudgeFallback(event.target.value)} aria-label="Backup checker model" aria-describedby="judge-fallback-note">
             <option value="automatic">Automatic</option>
             <option value="off">No fallback</option>
             {fallbackChoices.map((model) => <option key={`jf-${model.provider}-${model.id}`} value={`model:${model.id}`} disabled={!model.available}>{model.label}{model.provider ? ` · ${PROVIDER_LABEL[model.provider] ?? model.provider}` : ''}{!model.available ? ' (unavailable)' : ''}</option>)}
@@ -214,7 +215,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
           <div id="judge-fallback-note" className={`mt-1 text-caption ${fallbackUnavailable ? 'text-warning' : 'text-muted'}`} role={busy === 'judge-fallback' ? 'status' : undefined}>
             {busy === 'judge-fallback' ? 'Saving…' : fallbackUnavailable
               ? `Your saved choice is unavailable. ${fallback.reason || 'Connect it again or choose another fallback.'}`
-              : fallback.mode === 'off' ? 'The primary judge handles review without a fallback.' : 'Applies to new requests.'}
+              : fallback.mode === 'off' ? 'The checker reviews without a backup.' : 'Applies to new requests.'}
           </div>)}
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">

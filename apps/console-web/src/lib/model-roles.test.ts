@@ -79,7 +79,17 @@ test('role labels read as the option label, falling back to the id', () => {
   assert.equal(currentBrainValue(mr), 'claude_oauth:claude-opus-5');
   assert.equal(roleLabel(mr, 'brain'), 'Claude Opus 5');
   assert.equal(roleLabel(mr, 'worker'), 'GLM 5.3');
-  assert.equal(roleLabel({ ...mr, roles: { ...mr.roles, judge: { modelId: 'mystery', provider: 'byo', source: 'settings' } } }, 'judge'), 'mystery');
+  assert.equal(roleLabel({ ...mr, roles: { ...mr.roles, judge: { modelId: 'mystery', provider: 'byo', source: 'settings' } } }, 'judge'), 'Mystery', 'an id nobody labelled is still said as a name');
+});
+
+test('a choice label that is only the provider id is named; a written label stays as written', async () => {
+  const { friendlyModelLabel, ROLE_WORDS } = await import('./model-roles.js');
+  assert.equal(friendlyModelLabel('deepseek-ai/DeepSeek-V4.1-Flash'), 'DeepSeek V4.1 Flash');
+  assert.equal(friendlyModelLabel('Together AI — deepseek-ai/DeepSeek-V4.1-Flash'), 'Together AI — DeepSeek V4.1 Flash');
+  assert.equal(friendlyModelLabel('Claude — Opus 4.8 (flagship)'), 'Claude — Opus 4.8 (flagship)');
+  assert.equal(friendlyModelLabel('GPT 5.6 Terra'), 'GPT 5.6 Terra');
+  assert.equal(ROLE_WORDS.brain.title, 'Does the work');
+  assert.equal(ROLE_WORDS.judge.title, 'Checks the work');
 });
 
 test('the chip label drops the provider prefix and the parenthetical tail', () => {

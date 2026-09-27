@@ -207,7 +207,7 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
           className="z-[120] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-surface pb-1 pt-2 shadow-lg outline-none"
         >
           <div className={ROLE_ROW}>
-            <span><span className="block text-small font-semibold text-fg">Brain</span><span className="block text-caption text-faint">{sessionId ? 'answers your next message' : 'answers new conversations'}</span></span>
+            <span><span className="block text-small font-semibold text-fg">Does the work</span><span className="block text-caption text-faint">{sessionId ? 'answers your next message' : 'answers new conversations'}</span></span>
             <button type="button" onClick={() => setRoster((v) => !v)} aria-expanded={roster} disabled={busy} title={brain} className={ROLE_TRIGGER}>
               <span className="inline-flex min-w-0 items-center gap-2"><span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden /><span className="truncate">{brain}</span></span>
               <ChevronUp className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform', !roster && 'rotate-180')} aria-hidden />
@@ -216,28 +216,28 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
           {roster && <Roster rows={roles.brains} value={roles.brainValue} busy={busy} onPick={(v) => { setRoster(false); setPicked(v); void roles.onBrain(v); }} />}
           {roles.claudeSignInFor && <div className="mx-4 mb-2"><ClaudeLoginForm embedded /></div>}
           <div className={cn(ROLE_ROW, 'border-t border-border')}>
-            <span><span className="block text-small font-semibold text-fg">Workers</span><span className="block text-caption text-faint">helpers · everywhere</span></span>
+            <span><span className="block text-small font-semibold text-fg">Helps in parallel</span><span className="block text-caption text-faint">side tasks · everywhere</span></span>
             <RoleSelect
-              label="Workers model"
-              title={mr.roles.worker.source === 'default' ? 'Follow the brain' : `${roleLabel(mr, 'worker')} · ${PROVIDER_LABEL[workerProv] ?? workerProv}`}
+              label="Model that helps in parallel"
+              title={mr.roles.worker.source === 'default' ? 'Same model that does the work' : `${roleLabel(mr, 'worker')} · ${PROVIDER_LABEL[workerProv] ?? workerProv}`}
               disabled={busy}
               value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId}
               onChange={(v) => void roles.onRole('worker', v)}
             >
-              <option value="__default__">Follow the brain</option>
+              <option value="__default__">Same model that does the work</option>
               {roles.workers.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
             </RoleSelect>
           </div>
           <div className={cn(ROLE_ROW, 'border-t border-border')}>
-            <span><span className="block text-small font-semibold text-fg">Judge</span><span className="block text-caption text-faint">checks · everywhere</span></span>
+            <span><span className="block text-small font-semibold text-fg">Checks the work</span><span className="block text-caption text-faint">reviews · everywhere</span></span>
             <RoleSelect
-              label="Judge model"
-              title={mr.roles.judge.source === 'default' ? 'Automatic · different family, fast' : `${roleLabel(mr, 'judge')} · ${PROVIDER_LABEL[judgeProv] ?? judgeProv}`}
+              label="Model that checks the work"
+              title={mr.roles.judge.source === 'default' ? 'Automatic · a fast model from another provider' : `${roleLabel(mr, 'judge')} · ${PROVIDER_LABEL[judgeProv] ?? judgeProv}`}
               disabled={busy}
               value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId}
               onChange={(v) => void roles.onRole('judge', v)}
             >
-              <option value="__default__">Automatic · different family, fast</option>
+              <option value="__default__">Automatic · a fast model from another provider</option>
               {roles.judges.map((m) => <option key={`j-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
             </RoleSelect>
           </div>

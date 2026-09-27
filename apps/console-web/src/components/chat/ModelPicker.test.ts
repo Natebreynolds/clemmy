@@ -40,9 +40,10 @@ test('a change is called saved only when the daemon reads back the same brain', 
   assert.doesNotMatch(SOURCE, /min-w-0 flex-1 truncate">\s*\{roles\.error/);
 });
 
-test('Workers and Judge stay native selects with a full-width label', () => {
+test('the helper and checker stay native selects with a full-width label, in the phone\'s words', () => {
   assert.match(SOURCE, /aria-label=\{label\}/);
-  assert.match(SOURCE, /label="Workers model"/);
-  assert.match(SOURCE, /label="Judge model"/);
+  assert.match(SOURCE, /label="Model that helps in parallel"/);
+  assert.match(SOURCE, /label="Model that checks the work"/);
+  assert.doesNotMatch(SOURCE, />Brain<|>Workers<|>Judge</, 'one vocabulary with the phone and Settings');
   assert.equal([...SOURCE.matchAll(/<RoleSelect/g)].length, 2);
 });

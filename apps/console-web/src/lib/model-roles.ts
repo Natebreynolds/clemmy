@@ -29,6 +29,34 @@ export const PROVIDER_LABEL: Record<string, string> = {
   claude: 'Claude', codex: 'Codex', byo: 'API key', xai: 'xAI', openai: 'OpenAI',
 };
 
+/** One vocabulary for the jobs, the phone's words, on every surface: no
+ *  Brain / Workers / Judge on the Mac beside Does the work / Helps in parallel
+ *  / Checks the work on the phone. */
+export const ROLE_WORDS = {
+  brain: { title: 'Does the work', hint: 'Reads your request, plans it and uses your tools.' },
+  worker: { title: 'Helps in parallel', hint: 'Side tasks that run at the same time, like looking into several companies at once.' },
+  writer: { title: 'Writes the final answer', hint: 'When a request gathers a lot of material, this model writes your reply from it. Short replies come from the model that does the work.' },
+  judge: { title: 'Checks the work', hint: 'Reviews finished work before Clem calls it done.' },
+  fallback: { title: 'Backup checker', hint: 'Used only when the checker cannot complete a review. A completed verdict is kept.' },
+} as const;
+
+const ID_SHAPED = /^[A-Za-z0-9][A-Za-z0-9_.:-]*(?:\/[A-Za-z0-9][A-Za-z0-9_.:-]*)?$/;
+
+/** A model as a person would say it. A label that is only the provider's id
+ *  ("deepseek-ai/DeepSeek-V4.1-Flash", "grok-4.6") becomes its display name;
+ *  a label someone wrote stays as written. A "Provider — id" pair keeps the
+ *  provider and names the id. */
+export function friendlyModelLabel(label: string): string {
+  const raw = (label ?? '').trim();
+  if (!raw) return raw;
+  const dash = raw.indexOf(' — ');
+  if (dash > 0) {
+    const head = raw.slice(0, dash); const tail = raw.slice(dash + 3).trim();
+    return ID_SHAPED.test(tail) ? `${head} — ${modelDisplayName(tail)}` : raw;
+  }
+  return ID_SHAPED.test(raw) && !/\s/.test(raw) ? modelDisplayName(raw) : raw;
+}
+
 /** Provider of a brain option value (`claude_oauth:…` → claude). */
 export function brainProvider(value: string): string {
   if (value.startsWith('claude_oauth')) return 'claude';
@@ -52,7 +80,7 @@ export function brainChoices(mr: ModelRolesSnapshot, claudeAuth?: SettingsSnapsh
     let note: string | undefined;
     if (!o.available) note = provider === 'claude' && /expired/i.test(claudeAuth?.reason ?? '') ? 'sign-in expired' : 'not connected';
     else if (provider === 'claude' && claudeAuth?.degraded) note = 'via Claude Code';
-    return { value: o.value, label: o.label, available: o.available, provider, ...(note ? { note } : {}) };
+    return { value: o.value, label: friendlyModelLabel(o.label), available: o.available, provider, ...(note ? { note } : {}) };
   });
 }
 
@@ -61,7 +89,7 @@ export function currentBrainValue(mr: ModelRolesSnapshot): string {
 }
 
 export function flatChoices(groups: ModelRolesSnapshot['available'] | undefined): ModelChoice[] {
-  return (groups ?? []).flatMap((p) => p.models.map((m) => ({ id: m.id, label: m.label, provider: p.provider })));
+  return (groups ?? []).flatMap((p) => p.models.map((m) => ({ id: m.id, label: friendlyModelLabel(m.label), provider: p.provider })));
 }
 
 export function judgeFallbackValue(setting: JudgeFallbackSetting): string {
@@ -90,11 +118,12 @@ export function judgeFallbackChoices(mr: ModelRolesSnapshot): Array<ModelChoice 
 export function roleLabel(mr: ModelRolesSnapshot, role: 'brain' | 'worker' | 'judge'): string {
   if (role === 'brain') {
     const v = currentBrainValue(mr);
-    return (mr.brainOptions ?? []).find((o) => o.value === v)?.label ?? mr.roles.brain.modelId;
+    const found = (mr.brainOptions ?? []).find((o) => o.value === v)?.label;
+    return found ? friendlyModelLabel(found) : modelDisplayName(mr.roles.brain.modelId);
   }
   const r = mr.roles[role];
   const flat = flatChoices(role === 'worker' ? (mr.roleOptions?.worker ?? mr.available) : (mr.roleOptions?.judge ?? mr.available));
-  return flat.find((m) => m.id === r.modelId)?.label ?? r.modelId;
+  return flat.find((m) => m.id === r.modelId)?.label ?? modelDisplayName(r.modelId);
 }
 
 export function useModelRoles(opts: { sessionId?: string } = {}) {

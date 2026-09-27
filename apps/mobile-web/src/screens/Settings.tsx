@@ -569,10 +569,10 @@ function FallbackJudgeRow({ settings, onChanged }: {
     <div class="settings-rescue settings-fallback">
       <label class="settings-row" for="judge-fallback-model">
         <span class="settings-row-main">
-          <span class="settings-row-label">Fallback judge</span>
-          <span class="settings-row-note" id="judge-fallback-description">Used only when the primary judge cannot complete a review. A completed verdict is kept.</span>
+          <span class="settings-row-label">Backup checker</span>
+          <span class="settings-row-note" id="judge-fallback-description">Used only when the checker cannot complete a review. A completed verdict is kept.</span>
         </span>
-        <select id="judge-fallback-model" class="settings-select" aria-label="Fallback judge model" aria-describedby="judge-fallback-description judge-fallback-status" disabled={busy} value={judgeFallbackValue(fallback)} onChange={(event) => void save(event.currentTarget.value)}>
+        <select id="judge-fallback-model" class="settings-select" aria-label="Backup checker model" aria-describedby="judge-fallback-description judge-fallback-status" disabled={busy} value={judgeFallbackValue(fallback)} onChange={(event) => void save(event.currentTarget.value)}>
           <option value="automatic">Automatic</option>
           <option value="off">No fallback</option>
           {choices.map((model) => <option key={model.id} value={`model:${model.id}`} disabled={!model.available}>{model.label}{!model.available ? ' (unavailable)' : ''}</option>)}
@@ -582,7 +582,7 @@ function FallbackJudgeRow({ settings, onChanged }: {
         {busy ? 'Saving…' : unavailable
           ? `Your saved choice is unavailable. ${fallback.reason || 'Connect it again or choose another fallback.'}`
           : saved ? 'Saved. Applies to new requests.'
-          : fallback.mode === 'off' ? 'The primary judge handles review without a fallback.' : 'Applies to new requests.'}
+          : fallback.mode === 'off' ? 'The checker reviews without a backup.' : 'Applies to new requests.'}
       </p>
       {error ? <p class="error card-note" role="alert">{error}</p> : null}
     </div>
