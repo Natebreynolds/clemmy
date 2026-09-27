@@ -142,6 +142,42 @@ function modelWaiting(): Omit<MemoryWorkWaiting, 'since'> | null {
  *  timeout or an error might be the part's own, so those still count. */
 const MODEL_OUT_OF_REACH: ReadonlySet<MemoryModelProblem> = new Set(['quota', 'credit', 'not_connected']);
 
+/**
+ * Parts the memory model refused as out of reach, in this process: how often
+ * each was handed back, how many parts the model had answered at its latest
+ * refusal, and whether its refusals are known to be its own. A handed-back
+ * part is claimed first once the pause lifts, so from its second hand-back it
+ * goes behind the pause and the parts queued after it: one part cannot hold
+ * up the rest. When the model answers another part while this one keeps being
+ * refused, the refusal is this part's own, and from then on it spends its try
+ * like any failure, so it still reaches dead letter. While nothing else gets
+ * an answer, nothing is spent: that is the model being out of reach.
+ */
+interface RefusedPart { handedBack: number; answeredAtRefusal: number; own: boolean }
+const refusedParts = new Map<string, RefusedPart>();
+const REFUSED_PARTS_KEPT = 1_000;
+/** Parts the memory model answered in this process (usable or not). */
+let partsAnswered = 0;
+
+function rememberRefusedPart(shardId: string, part: RefusedPart): void {
+  refusedParts.delete(shardId);
+  if (refusedParts.size >= REFUSED_PARTS_KEPT) {
+    const oldest = refusedParts.keys().next().value;
+    if (oldest !== undefined) refusedParts.delete(oldest);
+  }
+  refusedParts.set(shardId, part);
+}
+
+/** When a handed-back part is due again: at once the first time (the pause
+ *  holds the next pass anyway); after that, behind the pause plus a growing
+ *  gap, so the parts queued after it come up first. */
+function handedBackDueAt(handedBack: number, until: string | undefined, nowMs = Date.now()): string {
+  if (handedBack <= 1) return new Date(nowMs).toISOString();
+  const untilMs = until ? Date.parse(until) : Number.NaN;
+  const from = Number.isFinite(untilMs) && untilMs > nowMs ? untilMs : nowMs;
+  return new Date(from + Math.min(30 * 60_000, 30_000 * 2 ** (handedBack - 2))).toISOString();
+}
+
 function claimNextShard(nowMs = Date.now()): ClaimedShard | null {
   const db = openMemoryDb();
   const now = new Date(nowMs).toISOString();
@@ -279,6 +315,7 @@ function finishShard(shard: ClaimedShard): boolean {
      WHERE shard_id = ? AND status = 'processing' AND lease_token = ?
   `).run(now, now, shard.shardId, shard.leaseToken);
   if (Number(changed.changes) === 1) updateBatchStatus(shard.batchId, now);
+  refusedParts.delete(shard.shardId);
   return Number(changed.changes) === 1;
 }
 
@@ -294,14 +331,16 @@ function retryShard(shard: ClaimedShard, error: string): 'retried' | 'dead_lette
            next_attempt_at = ?, updated_at = ?, last_error = ?
      WHERE shard_id = ? AND status = 'processing' AND lease_token = ?
   `).run(terminal ? 'dead_letter' : 'pending', retryAt, now, error.slice(0, 1_000), shard.shardId, shard.leaseToken);
+  if (terminal || Number(changed.changes) !== 1) refusedParts.delete(shard.shardId);
   if (Number(changed.changes) !== 1) return 'lost_lease';
   updateBatchStatus(shard.batchId, now);
   return terminal ? 'dead_lettered' : 'retried';
 }
 
 /** Hand a claimed part back untried: the memory model became unavailable
- *  while it was being read, so the try it spent is returned. */
-function releaseShardForModel(shard: ClaimedShard, why: string): boolean {
+ *  while it was being read, so the try it spent is returned. It is due again
+ *  at `dueAt` (now unless it keeps being handed back). */
+function releaseShardForModel(shard: ClaimedShard, why: string, dueAt?: string): boolean {
   const db = openMemoryDb();
   const now = new Date().toISOString();
   const changed = db.prepare(`
@@ -309,7 +348,7 @@ function releaseShardForModel(shard: ClaimedShard, why: string): boolean {
        SET status = 'pending', attempts = MAX(0, attempts - 1), lease_token = NULL,
            lease_expires_at = NULL, next_attempt_at = ?, updated_at = ?, last_error = ?
      WHERE shard_id = ? AND status = 'processing' AND lease_token = ?
-  `).run(now, now, why.slice(0, 1_000), shard.shardId, shard.leaseToken);
+  `).run(dueAt ?? now, now, why.slice(0, 1_000), shard.shardId, shard.leaseToken);
   return Number(changed.changes) === 1;
 }
 
@@ -463,6 +502,7 @@ export async function drainTerminalSemanticLearning(options: {
       if (state === 'dead_lettered') summary.shardsDeadLettered += 1;
       continue;
     }
+    if (seen.asked && !seen.errored) partsAnswered += 1;
     if (completedWithoutAnotherExtraction(result, shard) && finishShard(shard)) {
       summary.shardsCompleted += 1;
       continue;
@@ -478,12 +518,23 @@ export async function drainTerminalSemanticLearning(options: {
       // there was no route) waits while the model is unavailable.
       const waiting = modelWaiting();
       const problem = seen.problem;
-      const outOfReach = seen.asked || seen.errored
+      const asked = seen.asked || seen.errored;
+      const outOfReach = asked
         ? problem !== null && MODEL_OUT_OF_REACH.has(problem)
         : waiting !== null;
-      if (outOfReach) {
+      // The model refused this part. If it has answered another part since
+      // this one was last refused, the refusal is the part's own: the try is
+      // spent below instead of handed back.
+      const refused = asked && outOfReach;
+      const prior = refused ? refusedParts.get(shard.shardId) : undefined;
+      const own = prior !== undefined && (prior.own || partsAnswered > prior.answeredAtRefusal);
+      if (prior && own) rememberRefusedPart(shard.shardId, { ...prior, answeredAtRefusal: partsAnswered, own: true });
+      if (outOfReach && !own) {
         const why = waiting ?? { reason: 'model_unavailable' as const, ...(problem ? { problem } : {}) };
-        if (releaseShardForModel(shard, `waiting for the memory model: ${why.problem ?? why.reason}`)) summary.shardsWaiting += 1;
+        const handedBack = (prior?.handedBack ?? 0) + 1;
+        if (refused) rememberRefusedPart(shard.shardId, { handedBack, answeredAtRefusal: partsAnswered, own: false });
+        const dueAt = handedBackDueAt(handedBack, why.until);
+        if (releaseShardForModel(shard, `waiting for the memory model: ${why.problem ?? why.reason}`, dueAt)) summary.shardsWaiting += 1;
         summary.modelWaiting = why.reason as TerminalSemanticLearningSummary['modelWaiting'];
         noteLearningWaiting(why);
         break;
@@ -500,6 +551,11 @@ export const _testOnlySemanticLearningWorker = {
   claimNextShard,
   parseManifest,
   rebuildShardInput,
+  /** Forget which parts the model refused (in-process state). */
+  resetRefusedParts(): void {
+    refusedParts.clear();
+    partsAnswered = 0;
+  },
   setShardInputRebuilder(fn: ((shardId: string) => string | null) | null): void {
     rebuildOverrideForTest = fn;
   },

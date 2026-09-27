@@ -154,6 +154,7 @@ beforeEach(() => {
   reflection.setReflectionExtractorPauseForTest(null);
   reflection._testOnly_setReflectionExtractor(null);
   worker._testOnlySemanticLearningWorker.setShardInputRebuilder(() => SOURCE);
+  worker._testOnlySemanticLearningWorker.resetRefusedParts();
   telemetry.resetOperationalTelemetryForTest();
   journal._resetMemoryWorkJournalForTest();
   memory.resetMemoryDb();
@@ -256,6 +257,60 @@ test('a part whose read times out spends its try, and the parts after it still g
   }
   assert.equal(shardRow().status, 'dead_letter', 'a part that keeps timing out stops after its tries');
   assert.equal(shardRow('shard-2').status, 'completed', 'the next part is read');
+});
+
+test('while the model refuses every part, the parts take turns and none spends a try', async () => {
+  // A handed-back part is due first when the pause lifts; handed back again,
+  // it goes behind the pause so the part after it gets its turn.
+  chooseCodexMemoryModel();
+  insertLaterShard('shard-2', 1);
+  worker._testOnlySemanticLearningWorker.setShardInputRebuilder((id: string) => `${id}\n${SOURCE}`);
+  const read: string[] = [];
+  reply = (asked) => {
+    read.push(asked.includes('shard-1') ? 'shard-1' : 'shard-2');
+    throw Object.assign(new Error('usage limit reached'), { status: 429 });
+  };
+  for (let pass = 0; pass < 5; pass += 1) {
+    reflection.setReflectionExtractorPauseForTest(null); // the pause lifts
+    await worker.drainTerminalSemanticLearning({ requireIdle: false, shardLimit: 1 });
+  }
+  assert.deepEqual(read, ['shard-1', 'shard-1', 'shard-2', 'shard-2'], 'the second part gets its turn; then both wait');
+  makePartsDue();
+  reflection.setReflectionExtractorPauseForTest(null);
+  const again = await worker.drainTerminalSemanticLearning({ requireIdle: false, shardLimit: 1 });
+  assert.equal(again.shardsWaiting, 1);
+  assert.deepEqual(shardRow(), { status: 'pending', attempts: 0 }, 'nothing is spent while the model is out of reach');
+  assert.deepEqual(shardRow('shard-2'), { status: 'pending', attempts: 0 });
+});
+
+test('a part the model keeps refusing while it answers the part after it spends its tries', async () => {
+  // The refusal is then the part's own (a request that part alone trips),
+  // so it must not wait forever or hold up the parts behind it.
+  chooseCodexMemoryModel();
+  insertLaterShard('shard-2', 1);
+  worker._testOnlySemanticLearningWorker.setShardInputRebuilder((id: string) => `${id}\n${SOURCE}`);
+  reply = (asked) => {
+    if (asked.includes('shard-1')) throw Object.assign(new Error('usage limit reached'), { status: 429 });
+    return EXTRACTION;
+  };
+  const pass = () => {
+    reflection.setReflectionExtractorPauseForTest(null); // the pause lifts
+    return worker.drainTerminalSemanticLearning({ requireIdle: false, shardLimit: 1 });
+  };
+  assert.equal((await pass()).shardsWaiting, 1);
+  assert.equal((await pass()).shardsWaiting, 1);
+  assert.deepEqual(shardRow(), { status: 'pending', attempts: 0 }, 'nothing else was answered yet: it waits');
+  assert.equal((await pass()).shardsCompleted, 1, 'handed back twice, it lets the next part go first');
+  assert.equal(shardRow('shard-2').status, 'completed');
+  makePartsDue();
+  const spent = await pass();
+  assert.equal(spent.shardsWaiting, 0);
+  assert.equal(spent.shardsRetried, 1, 'the model answers other parts, so this refusal is the part\'s own');
+  for (let tries = 0; tries < 6 && shardRow().status !== 'dead_letter'; tries += 1) {
+    makePartsDue();
+    await pass();
+  }
+  assert.equal(shardRow().status, 'dead_letter', 'it reaches dead letter like any failing part');
 });
 
 test('a part the model answered with nothing usable still spends its try', async () => {
