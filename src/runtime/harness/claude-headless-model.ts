@@ -12,7 +12,7 @@ import { recordModelUsage } from '../usage-log.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
-import { resolveModelCapability } from './model-wire-registry.js';
+import { resolveModelCapability, stripPromptCacheLayerSentinels } from './model-wire-registry.js';
 import type { ReasoningEffort } from './reasoning-effort.js';
 import { redactSensitiveText } from '../security.js';
 import pino from 'pino';
@@ -241,7 +241,8 @@ export async function buildClaudeHeadlessEnv(): Promise<NodeJS.ProcessEnv> {
 
 export function renderClaudeHeadlessPrompt(request: ModelRequest): string {
   const sections: string[] = [];
-  const system = (request.systemInstructions ?? '').trim();
+  // Cache-layer markers are harness-only; this transport has no cache layers.
+  const system = stripPromptCacheLayerSentinels(request.systemInstructions).trim();
   if (system) sections.push(`System instructions:\n${system}`);
 
   const toolCount = Array.isArray(request.tools) ? request.tools.length : 0;

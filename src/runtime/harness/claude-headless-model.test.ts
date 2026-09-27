@@ -161,6 +161,27 @@ test('renderClaudeHeadlessPrompt preserves system/input and marks text-specialis
   assert.match(prompt, /user:\nDraft a layout critique\./);
 });
 
+test('renderClaudeHeadlessPrompt sends the instructions without harness cache-layer markers', async () => {
+  const wire = await import('./model-wire-registry.js');
+  const markers = [
+    wire.CACHE_BREAK_SENTINEL,
+    wire.CACHE_MEMORY_CORE_SENTINEL,
+    wire.CACHE_MEMORY_CONTEXT_SENTINEL,
+  ];
+  const prompt = renderClaudeHeadlessPrompt({
+    systemInstructions: ['Rubric.', wire.CACHE_MEMORY_CORE_SENTINEL, '# Persistent Context', wire.CACHE_BREAK_SENTINEL,
+      wire.CACHE_MEMORY_CONTEXT_SENTINEL, '## Right Now'].join('\n'),
+    input: [{ role: 'user', content: [{ type: 'input_text', text: 'Summarize.' }] }],
+    modelSettings: {},
+    tools: [],
+    outputType: 'text',
+    handoffs: [],
+    tracing: false,
+  } as any);
+  for (const marker of markers) assert.equal(prompt.includes(marker), false, `no marker reaches the subprocess: ${marker}`);
+  assert.match(prompt, /Rubric\.[\s\S]*# Persistent Context[\s\S]*## Right Now/, 'the layers keep their order');
+});
+
 test('headless transcript preserves prior action facts without emitting echoable tool-call protocol', () => {
   const prompt = renderClaudeHeadlessPrompt({
     systemInstructions: 'Summarize the completed work.',
