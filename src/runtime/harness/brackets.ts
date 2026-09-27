@@ -524,31 +524,21 @@ export function withTimeout<T>(
 /**
  * Recommended per-tool timeouts. Caller can override per-tool.
  *
- * Calibrated from real workloads:
- *
  *   - `default` (60s): internal tools — memory_*, workspace_*, file
- *     reads, plan/note writes. All complete in <5s in practice; 60s
- *     gives 12x headroom for slow disk or large vault re-indexes.
+ *     reads, plan/note writes. These finish in seconds; 60s leaves wide
+ *     headroom for a slow disk or a large re-index.
  *
- *   - `shell` (10min): `run_shell_command` and shell_* — covers long
- *     Salesforce `sf` CLI queries, large `gh` API pages, slow npm
- *     installs in workspaces. 10 min matches the prior production
- *     value and has never false-killed a legitimate command.
+ *   - `shell` (10min): `run_shell_command` and shell_* — long CLI
+ *     queries, large API pages and package installs legitimately run
+ *     for minutes.
  *
- *   - `externalApi` (5min, NEW): `composio_execute_tool` and any
- *     other tool that fans out to a 3rd-party HTTP API. Without this
- *     bucket, Composio calls fell to `default` (60s) and would
- *     false-kill on a slow Salesforce SOQL or a large Google Sheets
- *     `values.get`. 5 minutes covers the p99 of real Composio
- *     calls observed in eventlog.
+ *   - `externalApi` (5min): any tool that fans out to a third-party HTTP
+ *     API. A slow upstream query or a large sheet read must not be
+ *     killed at the internal-tool default.
  *
- *   - `mcp` (10min, WAS 30s): MCP-namespaced tools like DataForSEO
- *     scrapes, Supabase queries, browser tool. DataForSEO scrapes
- *     ROUTINELY take 5-10 minutes — 30s would false-kill nearly
- *     every legitimate scrape. The original comment in this file
- *     called out "10-min DataForSEO scrape" as the justification for
- *     the kill check, yet the mcp timeout was 30s — a latent bug
- *     waiting for brackets to actually activate.
+ *   - `mcp` (10min): MCP-namespaced tools. Scrapes, database queries and
+ *     browser work routinely run for minutes, so a short budget would
+ *     kill nearly every legitimate long call.
  */
 export const DEFAULT_TIMEOUTS_MS = {
   default: 60_000,
@@ -629,26 +619,15 @@ export function timeoutForTool(toolName: string): number {
   if (/^(exec|spawn|launch|run_shell|shell_)/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.shell;
   }
-  // External-API tools that fan out to 3rd-party services. The
-  // canonical case is composio_execute_tool (single tool, hundreds
-  // of upstream toolkits). Pattern-matches future siblings.
+  // External-API tools that fan out to third-party services, including a
+  // single tool that fronts many upstream toolkits, and future siblings.
   if (toolName === 'composio_execute_tool' || /^(composio|external_api)_/.test(toolName)) {
     return DEFAULT_TIMEOUTS_MS.externalApi;
   }
-  // v0.5.20 Bug I — run_worker spawns a sub-agent that itself does
-  // tool calls (scrapes, SERP queries, file reads). Default 60s
-  // was way too short — the stream-timeout regression hit 60s on
-  // a worker doing firecrawl_search for LinkedIn URL lookup. The
-  // worker IS the external-API surface from the parent agent's
-  // perspective. 5min externalApi bucket is the right shape.
-  //
-  // v0.5.21.1 — extended to ALL sub-agent-as-tool wrappings. Verified
-  // In the plan-timeout regression, draft_plan (planner.asTool) timed
-  // out at 60s during a chronic Codex-flake window — same root cause
-  // as run_worker. Bucket policy: any tool that internally spins
-  // up another agent (which itself makes a Codex call) belongs in
-  // externalApi. Pattern-matched on the known names so we don't have
-  // to hand-curate every future asTool() wrap.
+  // A tool that spins up another agent (a worker, the planner) makes its own
+  // tool and model calls, so from the parent's side it IS an external-API
+  // call and gets that bucket. Matched on the known agent-as-tool names so a
+  // future wrap of the same kind is covered.
   if (
     toolName === 'run_worker' || /^run_worker/.test(toolName) ||
     toolName === 'draft_plan'
@@ -689,7 +668,7 @@ export function timeoutForTool(toolName: string): number {
  *  excluded: a timeout there is a genuine hang with no async recovery move, so the
  *  ask-user card is still correct. run_worker is handled by its own dedicated block
  *  (worker-specific message) — returned false here so it never reaches the general path.
- *  draft_plan stays excluded (a planner/Codex flake → ask-user is the right call). */
+ *  draft_plan stays excluded (a planner that times out needs the owner's choice). */
 export function isTimeoutSelfCorrectTool(toolName: string): boolean {
   if (toolName === 'run_worker' || /^run_worker/.test(toolName)) return false; // own block
   if (toolName === 'composio_execute_tool') return true;
