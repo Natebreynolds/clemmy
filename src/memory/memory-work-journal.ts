@@ -1,0 +1,505 @@
+/**
+ * Memory-work journal — the one recorder for background memory jobs.
+ *
+ * Every memory job (learn, reconcile, patterns, …; see memory-jobs.ts) runs
+ * through `runMemoryJob`. While it runs it is listed as running (in this
+ * process only: "working" is never inferred from a lease or a schedule). Its
+ * model calls carry the job's usage channel (`memory:<job>`), and the ledger
+ * hands them back to the job, so the event names the model that actually
+ * served, the tokens and the time. When the run is worth recording (a model
+ * call happened, something changed, it failed) ONE operational event is
+ * written with ids only, never fact or conversation text, and the day's
+ * per-job counters move in the same transaction.
+ *
+ * Retention is a cache: detailed events live 7 days, daily counters 90 days,
+ * then both are deleted on a persisted hourly clock (`sweepMemoryWorkIfDue`).
+ *
+ * Observability never breaks or slows a job: every write is guarded and
+ * synchronous, nothing here awaits the network.
+ */
+import { randomUUID } from 'node:crypto';
+import type Database from 'better-sqlite3';
+import { memoryJobChannel, memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
+import type {
+  MemoryModelProblem,
+  MemoryWorkOutcome,
+  MemoryWorkProduced,
+  MemoryWorkRunning,
+  MemoryWorkSource,
+  MemoryWorkWaiting,
+} from './memory-work-types.js';
+import {
+  openOperationalTelemetryDb,
+  recordOperationalEvent,
+  type OperationalEventType,
+} from '../runtime/operational-telemetry.js';
+import {
+  withModelUsageAttribution,
+  withModelUsageObserver,
+  type ModelUsageAttributionContext,
+  type ObservedModelUsage,
+} from '../runtime/usage-log.js';
+import { readRouteStandIn, withModelRouteObserver, type ObservedModelRoute } from '../runtime/model-route-metrics.js';
+import { classifyModelError } from '../runtime/harness/resilient-model.js';
+import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
+
+/** Detail events age out after `detailDays`; daily counters after `summaryDays`. */
+export const MEMORY_WORK_RETENTION = Object.freeze({ detailDays: 7, summaryDays: 90 });
+
+export const MEMORY_WORK_EVENT_TYPES = ['memory_work_completed', 'memory_work_failed'] as const satisfies readonly OperationalEventType[];
+
+/** A waiting note older than this is stale: the learn drain re-states it on
+ *  every pass (about once a minute), so silence means it stopped applying. */
+export const MEMORY_WORK_WAITING_FRESH_MS = 3 * 60_000;
+
+const DAY_MS = 24 * 60 * 60_000;
+const RETENTION_SWEEP_EVERY_MS = 60 * 60_000;
+const RETENTION_STAMP_KEY = 'retention_swept_at';
+
+export interface MemoryJobRunOptions {
+  /** conversation/workflow/owner/schedule/tool + sessionId. */
+  source?: MemoryWorkSource | null;
+  part?: number;
+  parts?: number;
+  /** Requested model for this run (from resolveMemoryModelRoute), to tell a stand-in. */
+  requestedModelId?: string | null;
+}
+
+export interface MemoryJobFacts {
+  learned?: string[];
+  updated?: string[];
+  reinforced?: string[];
+  faded?: string[];
+  restored?: string[];
+}
+
+export interface MemoryJobOutcome {
+  outcome: MemoryWorkOutcome;
+  produced?: MemoryWorkProduced;
+  facts?: MemoryJobFacts;
+  failure?: { problem: MemoryModelProblem } | null;
+  /** Record even when nothing changed and no model ran (default false: such a
+   *  run only refreshes the job's in-memory "last checked"). */
+  record?: boolean;
+}
+
+/** What one recorded event carries, as stored in `payload_json`. Token counts
+ *  sit at the top level on purpose: the telemetry redactor keeps numeric
+ *  `*Tokens` keys only there (a nested `inputTokens` reads as a secret name). */
+export interface MemoryWorkEventPayload {
+  job: MemoryJobId;
+  outcome: MemoryWorkOutcome;
+  startedAt: string;
+  durationMs: number;
+  model: { modelId: string; requestedModelId: string | null; standIn: boolean } | null;
+  usage: { calls: number; modelMs?: number };
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  produced: MemoryWorkProduced;
+  facts: MemoryJobFacts | null;
+  source: { kind: MemoryWorkSource['kind']; sessionId?: string } | null;
+  part?: number;
+  parts?: number;
+  failure: { problem: MemoryModelProblem } | null;
+}
+
+interface RunContext {
+  job: MemoryJobId;
+  opts: MemoryJobRunOptions;
+  calls: ObservedModelUsage[];
+  /** The routes those calls took: the only evidence of a stand-in. */
+  routes: ObservedModelRoute[];
+  startedAtMs: number;
+}
+
+const runningJobs = new Map<string, MemoryWorkRunning>();
+const lastChecked = new Map<MemoryJobId, string>();
+let learningWaiting: { value: MemoryWorkWaiting; setAtMs: number } | null = null;
+let nextRetentionSweepMs: number | null = null;
+
+// ───────────────────────────── running ─────────────────────────────
+
+/**
+ * Run one memory job: listed as running while `work` runs, its model calls
+ * attributed to `memory:<job>` (role `memory` for jobs the memory model
+ * governs) and observed, then one event recorded from `summarize`.
+ *
+ * Tokens are never charged to the conversation the job learns from: the
+ * scope names the `memory` pseudo-session with no user turn, so no run budget
+ * accrues; the originating conversation lives in the event's source. A scope
+ * opened here replaces any outer one, so the memory channel always wins.
+ * The value (or the error) of `work` passes through untouched.
+ */
+export async function runMemoryJob<T>(
+  job: MemoryJobId,
+  opts: MemoryJobRunOptions,
+  work: () => Promise<T>,
+  summarize: (value: T) => MemoryJobOutcome,
+): Promise<T> {
+  const token = randomUUID();
+  const run: RunContext = { job, opts, calls: [], routes: [], startedAtMs: Date.now() };
+  try {
+    runningJobs.set(token, runningEntry(job, new Date(run.startedAtMs).toISOString(), opts));
+  } catch { /* the job runs even if it cannot be listed */ }
+  try {
+    const value = await withModelUsageObserver(run.calls, () =>
+      withModelRouteObserver(run.routes, () =>
+        withModelUsageAttribution(memoryJobAttribution(job), work)));
+    settle(run, () => summarize(value));
+    return value;
+  } catch (error) {
+    return recordMemoryJobFailure(job, opts, error, run);
+  } finally {
+    runningJobs.delete(token);
+  }
+}
+
+/**
+ * Record a run that threw, then rethrow the original error. `runMemoryJob`
+ * calls this when its work throws; a caller that catches a job's error itself
+ * can call it with the calls it observed.
+ */
+export function recordMemoryJobFailure(
+  job: MemoryJobId,
+  opts: MemoryJobRunOptions,
+  error: unknown,
+  observed: { calls?: ObservedModelUsage[]; routes?: ObservedModelRoute[]; startedAtMs?: number } = {},
+): never {
+  try {
+    record({
+      job,
+      opts,
+      calls: observed.calls ?? [],
+      routes: observed.routes ?? [],
+      startedAtMs: observed.startedAtMs ?? Date.now(),
+    }, { outcome: 'failed', failure: { problem: memoryModelProblemFromError(error) } }, new Date());
+  } catch { /* observability never replaces the job's own error */ }
+  throw error;
+}
+
+/** Jobs running in THIS process right now, oldest first. */
+export function listRunningMemoryJobs(): MemoryWorkRunning[] {
+  return [...runningJobs.values()]
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+    .map((entry) => ({ ...entry, ...(entry.source ? { source: { ...entry.source } } : {}) }));
+}
+
+/** The learn drain states, on every pass, why learning is waiting (or null
+ *  when it proceeds). */
+export function setMemoryLearningWaiting(waiting: MemoryWorkWaiting | null): void {
+  learningWaiting = waiting ? { value: { ...waiting }, setAtMs: Date.now() } : null;
+}
+
+/** Why learning waits right now, or null. A note the drain has not re-stated
+ *  for `MEMORY_WORK_WAITING_FRESH_MS` no longer applies. */
+export function readMemoryLearningWaiting(now: Date = new Date()): MemoryWorkWaiting | null {
+  if (!learningWaiting) return null;
+  if (now.getTime() - learningWaiting.setAtMs > MEMORY_WORK_WAITING_FRESH_MS) return null;
+  return { ...learningWaiting.value };
+}
+
+/** When each job last ran without anything worth recording (this process). */
+export function lastCheckedByJob(): Partial<Record<MemoryJobId, string>> {
+  return Object.fromEntries(lastChecked) as Partial<Record<MemoryJobId, string>>;
+}
+
+/** The problem class of a thrown model error, in the Memory tab's words and
+ *  by the same rule the extractor's pause uses. Never a provider name. */
+export function memoryModelProblemFromError(error: unknown): MemoryModelProblem {
+  try {
+    const cls = classifyModelError(error);
+    if (cls.kind === 'model.rate_limited') return isProviderCreditRefusal(cls.status, error) ? 'credit' : 'quota';
+    if (cls.kind === 'model.auth_expired') return 'not_connected';
+    if (cls.kind === 'model.transport_timeout') return 'timeout';
+  } catch { /* unknown shape */ }
+  return 'error';
+}
+
+function runningEntry(job: MemoryJobId, startedAt: string, opts: MemoryJobRunOptions): MemoryWorkRunning {
+  const source = publicSource(opts.source);
+  return {
+    job,
+    startedAt,
+    ...(source ? { source } : {}),
+    ...(positiveInt(opts.part) ? { part: opts.part } : {}),
+    ...(positiveInt(opts.parts) ? { parts: opts.parts } : {}),
+  };
+}
+
+function memoryJobAttribution(job: MemoryJobId): ModelUsageAttributionContext {
+  return {
+    sessionId: 'memory',
+    sourceUserSeq: 0,
+    channel: memoryJobChannel(job),
+    ...(memoryJobUsesMemoryModel(job) ? { role: 'memory' as const } : {}),
+  };
+}
+
+function settle(run: RunContext, summarize: () => MemoryJobOutcome): void {
+  let outcome: MemoryJobOutcome;
+  try {
+    outcome = summarize();
+  } catch {
+    // The job succeeded; only its summary broke. Record what is known.
+    outcome = { outcome: 'ok' };
+  }
+  try {
+    record(run, outcome, new Date());
+  } catch { /* observability never breaks the job */ }
+}
+
+// ───────────────────────────── recording ─────────────────────────────
+
+function record(run: RunContext, result: MemoryJobOutcome, completedAt: Date): void {
+  const produced = cleanProduced(result.produced);
+  const facts = cleanFacts(result.facts);
+  const failed = result.outcome === 'failed';
+  const changed = Object.values(produced).some((n) => typeof n === 'number' && n > 0) || facts !== null;
+  if (!(run.calls.length > 0 || changed || failed || result.record === true)) {
+    if (result.outcome !== 'waiting') lastChecked.set(run.job, completedAt.toISOString());
+    return;
+  }
+  const db = openOperationalTelemetryDb();
+  const payload = eventPayload(run, result, produced, facts, completedAt);
+  const type: OperationalEventType = failed ? 'memory_work_failed' : 'memory_work_completed';
+  db.transaction(() => {
+    const conversations = countsAsNewConversation(db, run, result.outcome, completedAt) ? 1 : 0;
+    recordOperationalEvent({
+      source: 'memory',
+      type,
+      severity: failed ? 'warn' : 'info',
+      actor: run.job,
+      ...(payload.source?.sessionId ? { sessionId: payload.source.sessionId } : {}),
+      payload: payload as unknown as Record<string, unknown>,
+      now: completedAt,
+    }, db);
+    upsertDaily(db, payload, completedAt, conversations);
+  })();
+}
+
+function eventPayload(
+  run: RunContext,
+  result: MemoryJobOutcome,
+  produced: MemoryWorkProduced,
+  facts: MemoryJobFacts | null,
+  completedAt: Date,
+): MemoryWorkEventPayload {
+  const calls = run.calls;
+  const served = [...calls].reverse().find((call) => call.ok) ?? calls.at(-1);
+  const requestedModelId = typeof run.opts.requestedModelId === 'string' && run.opts.requestedModelId.trim()
+    ? run.opts.requestedModelId.trim()
+    : null;
+  const modelMs = calls.reduce((sum, call) => sum + (typeof call.durationMs === 'number' ? call.durationMs : 0), 0);
+  const cached = calls.reduce((sum, call) => sum + (typeof call.cachedInputTokens === 'number' ? call.cachedInputTokens : 0), 0);
+  const source = publicSource(run.opts.source);
+  return {
+    job: run.job,
+    outcome: result.outcome,
+    startedAt: new Date(run.startedAtMs).toISOString(),
+    durationMs: Math.max(0, completedAt.getTime() - run.startedAtMs),
+    // The model that served is what the ledger recorded; whether it stood in
+    // for another is the route's own evidence (a fallover, or a fallback
+    // lane), never a comparison of spellings.
+    model: served?.model
+      ? { modelId: served.model, requestedModelId, standIn: readRouteStandIn(run.routes)?.standIn === true }
+      : null,
+    usage: { calls: calls.length, ...(modelMs > 0 ? { modelMs } : {}) },
+    inputTokens: calls.reduce((sum, call) => sum + finite(call.inputTokens), 0),
+    outputTokens: calls.reduce((sum, call) => sum + finite(call.outputTokens), 0),
+    ...(cached > 0 ? { cachedInputTokens: cached } : {}),
+    produced,
+    facts,
+    source: source ? { kind: source.kind, ...(source.sessionId ? { sessionId: source.sessionId } : {}) } : null,
+    ...(positiveInt(run.opts.part) ? { part: run.opts.part } : {}),
+    ...(positiveInt(run.opts.parts) ? { parts: run.opts.parts } : {}),
+    failure: result.outcome === 'failed' ? (result.failure ?? { problem: 'error' }) : null,
+  };
+}
+
+/**
+ * "Conversations read" counts a conversation once per local day: a learn run
+ * that finished (ok or nothing new) for a session no earlier finished learn
+ * run named today. Parts of one conversation, and later turns of it the same
+ * day, do not count again. Runs without a session are not conversations.
+ */
+function countsAsNewConversation(db: Database.Database, run: RunContext, outcome: MemoryWorkOutcome, at: Date): boolean {
+  if (run.job !== 'learn' || (outcome !== 'ok' && outcome !== 'nothing_new')) return false;
+  const sessionId = run.opts.source?.sessionId?.trim();
+  if (!sessionId) return false;
+  const seen = db.prepare(`
+    SELECT 1 FROM operational_events
+     WHERE session_id = ? AND ts >= ? AND source = 'memory'
+       AND type = 'memory_work_completed' AND actor = 'learn'
+       AND json_extract(payload_json, '$.outcome') IN ('ok', 'nothing_new')
+     LIMIT 1
+  `).get(sessionId, localDayStart(at).toISOString());
+  return !seen;
+}
+
+function upsertDaily(db: Database.Database, payload: MemoryWorkEventPayload, at: Date, conversations: number): void {
+  const p = payload.produced;
+  const atIso = at.toISOString();
+  db.prepare(`
+    INSERT INTO memory_work_daily (
+      day, job, runs, model_calls, input_tokens, output_tokens, learned, updated,
+      faded, claims, left_out, set_aside, conversations, last_at, last_outcome,
+      last_duration_ms, last_model_id, last_model_at, last_model_stand_in
+    ) VALUES (
+      @day, @job, 1, @calls, @inputTokens, @outputTokens, @learned, @updated,
+      @faded, @claims, @leftOut, @setAside, @conversations, @at, @outcome,
+      @durationMs, @modelId, @modelAt, @standIn
+    )
+    ON CONFLICT(day, job) DO UPDATE SET
+      runs = runs + 1,
+      model_calls = model_calls + excluded.model_calls,
+      input_tokens = input_tokens + excluded.input_tokens,
+      output_tokens = output_tokens + excluded.output_tokens,
+      learned = learned + excluded.learned,
+      updated = updated + excluded.updated,
+      faded = faded + excluded.faded,
+      claims = claims + excluded.claims,
+      left_out = left_out + excluded.left_out,
+      set_aside = set_aside + excluded.set_aside,
+      conversations = conversations + excluded.conversations,
+      last_at = CASE WHEN last_at IS NULL OR excluded.last_at >= last_at THEN excluded.last_at ELSE last_at END,
+      last_outcome = CASE WHEN last_at IS NULL OR excluded.last_at >= last_at THEN excluded.last_outcome ELSE last_outcome END,
+      last_duration_ms = CASE WHEN last_at IS NULL OR excluded.last_at >= last_at THEN excluded.last_duration_ms ELSE last_duration_ms END,
+      last_model_id = CASE WHEN excluded.last_model_id IS NOT NULL AND (last_model_at IS NULL OR excluded.last_model_at >= last_model_at)
+        THEN excluded.last_model_id ELSE last_model_id END,
+      last_model_stand_in = CASE WHEN excluded.last_model_id IS NOT NULL AND (last_model_at IS NULL OR excluded.last_model_at >= last_model_at)
+        THEN excluded.last_model_stand_in ELSE last_model_stand_in END,
+      last_model_at = CASE WHEN excluded.last_model_id IS NOT NULL AND (last_model_at IS NULL OR excluded.last_model_at >= last_model_at)
+        THEN excluded.last_model_at ELSE last_model_at END
+  `).run({
+    day: localDayKey(at),
+    job: payload.job,
+    calls: payload.usage.calls,
+    inputTokens: payload.inputTokens,
+    outputTokens: payload.outputTokens,
+    learned: p.learned ?? 0,
+    updated: p.updated ?? 0,
+    faded: p.faded ?? 0,
+    claims: p.claims ?? 0,
+    leftOut: p.leftOut ?? 0,
+    setAside: p.setAside ?? 0,
+    conversations,
+    at: atIso,
+    outcome: payload.outcome,
+    durationMs: payload.durationMs,
+    modelId: payload.model?.modelId ?? null,
+    modelAt: payload.model ? atIso : null,
+    standIn: payload.model ? (payload.model.standIn ? 1 : 0) : null,
+  });
+}
+
+// ───────────────────────────── retention ─────────────────────────────
+
+/**
+ * Delete memory-work detail older than `detailDays` and daily counters older
+ * than `summaryDays` (local days). Other operational events keep their own
+ * 30-day reaper.
+ */
+export function decayMemoryWork(
+  now: Date = new Date(),
+  db: Database.Database = openOperationalTelemetryDb(),
+): { detailDeleted: number; dailyDeleted: number } {
+  const detailCutoff = new Date(now.getTime() - MEMORY_WORK_RETENTION.detailDays * DAY_MS).toISOString();
+  const dailyCutoff = localDayKey(new Date(now.getTime() - MEMORY_WORK_RETENTION.summaryDays * DAY_MS));
+  const detailDeleted = Number(db.prepare(`
+    DELETE FROM operational_events
+     WHERE source = 'memory' AND type IN ('memory_work_completed', 'memory_work_failed') AND ts < ?
+  `).run(detailCutoff).changes ?? 0);
+  const dailyDeleted = Number(db.prepare('DELETE FROM memory_work_daily WHERE day < ?').run(dailyCutoff).changes ?? 0);
+  return { detailDeleted, dailyDeleted };
+}
+
+/**
+ * Run `decayMemoryWork` at most hourly on a clock persisted in the telemetry
+ * DB, so a restart neither starves nor repeats it (a tick-count cadence
+ * restarts from zero on every boot). Cheap to call on every daemon tick: an
+ * in-process due time answers until the hour is up. Returns null when not due.
+ */
+export function sweepMemoryWorkIfDue(now: Date = new Date()): { detailDeleted: number; dailyDeleted: number } | null {
+  const nowMs = now.getTime();
+  if (nextRetentionSweepMs !== null && nowMs < nextRetentionSweepMs) return null;
+  const db = openOperationalTelemetryDb();
+  const row = db.prepare('SELECT value FROM memory_work_meta WHERE key = ?').get(RETENTION_STAMP_KEY) as { value: string } | undefined;
+  const lastMs = row ? Date.parse(row.value) : Number.NaN;
+  // A stamp from the future (the clock moved back) counts as "just swept".
+  if (Number.isFinite(lastMs) && nowMs - Math.min(lastMs, nowMs) < RETENTION_SWEEP_EVERY_MS) {
+    nextRetentionSweepMs = Math.min(lastMs, nowMs) + RETENTION_SWEEP_EVERY_MS;
+    return null;
+  }
+  const result = decayMemoryWork(now, db);
+  db.prepare(`
+    INSERT INTO memory_work_meta (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(RETENTION_STAMP_KEY, now.toISOString());
+  nextRetentionSweepMs = nowMs + RETENTION_SWEEP_EVERY_MS;
+  return result;
+}
+
+// ───────────────────────────── helpers ─────────────────────────────
+
+/** YYYY-MM-DD in the daemon's local time zone. */
+export function localDayKey(at: Date): string {
+  const y = at.getFullYear();
+  const m = String(at.getMonth() + 1).padStart(2, '0');
+  const d = String(at.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+export function localDayStart(at: Date): Date {
+  return new Date(at.getFullYear(), at.getMonth(), at.getDate());
+}
+
+const SOURCE_KINDS: ReadonlySet<MemoryWorkSource['kind']> = new Set(['conversation', 'workflow', 'owner', 'schedule', 'tool']);
+
+/** Only the kind and the session id are kept; a title is read at display time. */
+function publicSource(source: MemoryWorkSource | null | undefined): MemoryWorkSource | null {
+  if (!source || !SOURCE_KINDS.has(source.kind)) return null;
+  const sessionId = typeof source.sessionId === 'string' ? source.sessionId.trim() : '';
+  return { kind: source.kind, ...(sessionId ? { sessionId } : {}) };
+}
+
+const PRODUCED_KEYS: readonly (keyof MemoryWorkProduced)[] = [
+  'claims', 'learned', 'updated', 'reinforced', 'leftOut', 'setAside', 'faded',
+  'restored', 'patterns', 'skills', 'proposals', 'embedded', 'entities',
+];
+
+function cleanProduced(produced: MemoryWorkProduced | undefined): MemoryWorkProduced {
+  const out: MemoryWorkProduced = {};
+  for (const key of PRODUCED_KEYS) {
+    const value = produced?.[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) out[key] = Math.floor(value);
+  }
+  return out;
+}
+
+const FACT_KEYS: readonly (keyof MemoryJobFacts)[] = ['learned', 'updated', 'reinforced', 'faded', 'restored'];
+
+function cleanFacts(facts: MemoryJobFacts | undefined): MemoryJobFacts | null {
+  const out: MemoryJobFacts = {};
+  for (const key of FACT_KEYS) {
+    const ids = [...new Set((facts?.[key] ?? []).map((id) => String(id).trim()).filter(Boolean))];
+    if (ids.length > 0) out[key] = ids;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function finite(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function positiveInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+/** Test-only: forget running jobs, waiting, last-checked and the sweep clock. */
+export function _resetMemoryWorkJournalForTest(): void {
+  runningJobs.clear();
+  lastChecked.clear();
+  learningWaiting = null;
+  nextRetentionSweepMs = null;
+}

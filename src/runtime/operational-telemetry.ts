@@ -78,6 +78,11 @@ export const MEMORY_OPERATIONAL_EVENT_TYPES = [
   'memory_consolidation_completed',
   'memory_conflict_detected',
   'memory_conflict_resolved',
+  // One background memory job finished (or failed): which job, the model
+  // that served it, tokens, what it kept (ids only). Written by
+  // memory/memory-work-journal.ts; kept 7 days (decayMemoryWork).
+  'memory_work_completed',
+  'memory_work_failed',
 ] as const;
 
 export const SAFETY_OPERATIONAL_EVENT_TYPES = [
@@ -247,6 +252,43 @@ CREATE INDEX IF NOT EXISTS idx_operational_events_model_call
   ON operational_events(model_call_id) WHERE model_call_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_operational_events_tool_call
   ON operational_events(tool_call_id) WHERE tool_call_id IS NOT NULL;
+
+-- Memory at work: one row per local day and memory job, counted when each
+-- memory_work_* event is written, so the 30-day strip survives the 7-day
+-- detail window. The last_* columns name the newest recorded run and the
+-- newest model that served the job (read without scanning event payloads).
+-- Rows older than 90 days are deleted (memory-work-journal.ts).
+CREATE TABLE IF NOT EXISTS memory_work_daily (
+  day                 TEXT NOT NULL,
+  job                 TEXT NOT NULL,
+  runs                INTEGER NOT NULL DEFAULT 0,
+  model_calls         INTEGER NOT NULL DEFAULT 0,
+  input_tokens        INTEGER NOT NULL DEFAULT 0,
+  output_tokens       INTEGER NOT NULL DEFAULT 0,
+  learned             INTEGER NOT NULL DEFAULT 0,
+  updated             INTEGER NOT NULL DEFAULT 0,
+  faded               INTEGER NOT NULL DEFAULT 0,
+  claims              INTEGER NOT NULL DEFAULT 0,
+  left_out            INTEGER NOT NULL DEFAULT 0,
+  set_aside           INTEGER NOT NULL DEFAULT 0,
+  conversations       INTEGER NOT NULL DEFAULT 0,
+  last_at             TEXT,
+  last_outcome        TEXT,
+  last_duration_ms    INTEGER,
+  last_model_id       TEXT,
+  last_model_at       TEXT,
+  last_model_stand_in INTEGER,
+  PRIMARY KEY (day, job)
+);
+
+-- Memory-work bookkeeping: when the journal first opened (days before it are
+-- absent from the 30-day strip, never zero) and when retention last swept.
+CREATE TABLE IF NOT EXISTS memory_work_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+INSERT OR IGNORE INTO memory_work_meta (key, value)
+  VALUES ('journal_since', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 `;
 
 export interface ListOperationalEventsOptions {

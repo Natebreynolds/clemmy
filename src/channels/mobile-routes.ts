@@ -4,6 +4,7 @@ import { needsYouKey, needsYouReferents, notificationActionItemId, notificationN
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
+import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
@@ -4631,6 +4632,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
+
+  registerMobileMemoryWorkRoutes(router, requireMobileSession);
 
   /**
    * The Activity tab's feed. Delegates to the same collector as the desktop

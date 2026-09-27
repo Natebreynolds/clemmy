@@ -18,6 +18,7 @@ import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whis
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
+import { registerConsoleMemoryWorkRoutes } from './console-memory-work-routes.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
   BASE_DIR,
@@ -3859,6 +3860,7 @@ export function registerConsoleRoutes(
   // Read-only multi-agent workspace API (roster, canMessage graph, comms,
   // per-agent runs). Shares this function's auth gate.
   registerConsoleAgentsRoutes(app, isAuthorized);
+  registerConsoleMemoryWorkRoutes(app, { isAuthorized });
   armWorkflowListMemoWarm();
 
   /**

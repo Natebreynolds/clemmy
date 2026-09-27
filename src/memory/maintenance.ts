@@ -61,6 +61,7 @@ import {
 } from './reflection-candidates.js';
 import { drainTerminalSemanticLearning } from './semantic-learning-worker.js';
 import { MEMORY_JOB_CLOCKS } from './memory-jobs.js';
+import { sweepMemoryWorkIfDue } from './memory-work-journal.js';
 
 /**
  * Memory maintenance for the daemon tick.
@@ -725,6 +726,18 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // inside writeReport). Cold path: ~50-200ms for a busy day.
   if (tickCount % AUTORESEARCH_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('autoresearch')) {
     tickAutoresearchObservatory();
+  }
+
+  // Memory-work history is a cache (7-day detail, 90-day daily totals). It
+  // ages out on its own persisted hourly clock: tickCount restarts at every
+  // boot, so a tick-count cadence would starve it on a daemon that restarts.
+  try {
+    const memoryWork = sweepMemoryWorkIfDue();
+    if (memoryWork && (memoryWork.detailDeleted > 0 || memoryWork.dailyDeleted > 0)) {
+      logger.info({ memoryWork }, 'memory work retention tick');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'memory work retention tick failed');
   }
 
   // Keep conversation, result and Stop history unless the operator explicitly
