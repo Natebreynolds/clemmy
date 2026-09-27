@@ -2040,8 +2040,16 @@ export function renderFactsForInstructions(
   mode: 'all' | 'pinned' | 'scored' = 'all',
   // `omitCoreGroups`: every standing policy is rendered in the memory core
   // (renderCorePoliciesForInstructions), so this block leaves the policy
-  // groups out and carries only the ranked facts.
-  options: { omitCoreGroups?: boolean; excludeFactIds?: readonly number[] } = {},
+  // groups out and carries only the ranked facts. With `corePolicyIds` (the
+  // policies the core shows) it instead keeps the budgeted groups' selection
+  // as this block made it, ordered by the objective, minus those the core
+  // already shows: the core keeps the store's order, so a rule that fits the
+  // request can sit past its cut.
+  options: {
+    omitCoreGroups?: boolean;
+    corePolicyIds?: ReadonlySet<number>;
+    excludeFactIds?: readonly number[];
+  } = {},
 ): string {
   let facts: ConsolidatedFact[] = [];
   if (mode === 'pinned') {
@@ -2081,7 +2089,8 @@ export function renderFactsForInstructions(
   const { policyTypeByFactId, enforcementByFactId, dispatchBackedFactIds } = loaded;
   const pinned = loaded.pinned;
   const pinnedIds = new Set(pinned.map((f) => f.id));
-  const renderPinned = mode !== 'scored' && options.omitCoreGroups !== true;
+  const beyondCore = options.omitCoreGroups === true ? options.corePolicyIds : undefined;
+  const renderPinned = mode !== 'scored' && (options.omitCoreGroups !== true || beyondCore !== undefined);
   // `excludeFactIds`: facts the same request already shows elsewhere.
   const excluded = new Set(options.excludeFactIds ?? []);
   const scored = mode === 'pinned' ? [] : facts.filter((f) => !pinnedIds.has(f.id) && !excluded.has(f.id));
@@ -2148,6 +2157,14 @@ export function renderFactsForInstructions(
     ): string => {
       if (group.length === 0) return '';
       const { lines, shown } = fitPolicyRows(group, budget, present);
+      if (beyondCore) {
+        // The same selection, less what the core already shows. The core
+        // names its own overflow, so no second overflow line.
+        const kept = shown.map((fact, index) => ({ fact, line: lines[index]! }))
+          .filter(({ fact }) => !beyondCore.has(fact.id));
+        renderedPolicyFacts.push(...kept.map(({ fact }) => fact));
+        return kept.length > 0 ? [`**${title}**`, ...kept.map(({ line }) => line)].join('\n') : '';
+      }
       renderedPolicyFacts.push(...shown);
       const omitted = group.length - lines.length;
       return [`**${title}**`, ...lines, omitted > 0 ? suffix(omitted) : ''].filter(Boolean).join('\n');
@@ -2155,7 +2172,8 @@ export function renderFactsForInstructions(
     pinnedSection = [
       // The only unbudgeted group, so the per-rule display bound is what keeps
       // it finite; the budgeted groups below omit a row that does not fit.
-      renderGroup(
+      // The memory core shows every one of them.
+      beyondCore ? '' : renderGroup(
         'Dispatch-enforced constraints', groups.dispatch_constraint, dispatchBudget,
         (n) => `_… ${n} more constraint${n === 1 ? '' : 's'} omitted from this summary but still enforced._`,
         presentPolicyText,
@@ -2174,7 +2192,9 @@ export function renderFactsForInstructions(
         (n) => `_… ${n} more standing preference${n === 1 ? '' : 's'} available through memory_recall_all._`,
       ),
     ].filter(Boolean).join('\n\n');
-    pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${pinned.length} shown; ${groups.dispatch_constraint.length} dispatch-enforced, ${groups.prompt_instruction.length} prompt-only._`;
+    if (!beyondCore) {
+      pinnedSection += `\n\n_Policy manifest: ${renderedPolicyFacts.length}/${pinned.length} shown; ${groups.dispatch_constraint.length} dispatch-enforced, ${groups.prompt_instruction.length} prompt-only._`;
+    }
   }
 
   const byKind: Record<ConsolidatedFactKind, ConsolidatedFact[]> = {

@@ -272,6 +272,8 @@ function renderRequestRankedBlocks(input: {
   scopedFocus: { resourceRef?: string | null } | null;
   includeRememberedToolChoices?: boolean;
   omitCoreGroups: boolean;
+  /** With omitCoreGroups: the policies the memory core shows. */
+  corePolicyIds?: ReadonlySet<number>;
   excludeFactIds?: readonly number[];
 }): Array<{ title: string; text: string }> {
   let facts = '';
@@ -281,6 +283,7 @@ function renderRequestRankedBlocks(input: {
     // different task branch.
     facts = renderFactsForInstructions(10, 2600, input.requestObjective, 'all', {
       omitCoreGroups: input.omitCoreGroups,
+      ...(input.corePolicyIds ? { corePolicyIds: input.corePolicyIds } : {}),
       excludeFactIds: input.excludeFactIds,
     });
   } catch {
@@ -833,7 +836,9 @@ export function renderTurnMemoryTail(
   if (signal.kind === 'no_signal') {
     // A blind ranker must cost nothing: the per-block rendering stands in,
     // ranked by the same objective the prompt used before, minus the
-    // policies the memory core already carries. A fallback primer (which
+    // policies the memory core already shows (the budgeted policy groups keep
+    // the selection that objective made; the core keeps the store's order and
+    // can cut a rule that fits the request). A fallback primer (which
     // begins with the recall marker) goes first, so the tail's bytes from
     // the marker onward are the ones its recall run is proven against.
     if (signal.primerText) parts.push({ section: 'Memory Primer', tier: 'relevant', text: signal.primerText });
@@ -845,6 +850,9 @@ export function renderTurnMemoryTail(
       scopedFocus,
       includeRememberedToolChoices: scope.includeRememberedToolChoices,
       omitCoreGroups: true,
+      corePolicyIds: new Set([...scope.coreRefKeys]
+        .filter((key) => key.startsWith('policy:'))
+        .map((key) => Number(key.slice('policy:'.length)))),
       // A fact the fallback primer already lists is not listed twice.
       excludeFactIds: signal.primerFactIds,
     })) {
