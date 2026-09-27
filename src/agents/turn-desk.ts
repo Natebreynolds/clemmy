@@ -50,11 +50,14 @@ import { isUnattendedSession } from '../runtime/harness/unattended-session.js';
 export const DESK_RUNGS: readonly DeskRung[] = ['lean', 'readers', 'full'];
 
 /**
- * The no-signal rule. When false, an in-scope turn whose request identifies
- * no target through an existing host promotion is today's full surface, and
- * only a turn with an identified target starts on the lean rung.
+ * The no-signal rule. When true, nothing becomes unreachable is the rule: an
+ * in-scope turn with no identified target also starts on the lean rung, since
+ * every deferred tool stays named, one exact-name tool_search from its schema
+ * and callable through call_tool, and a miss costs one round and climbs the
+ * ladder. When false, such a turn is today's full surface and only a turn
+ * whose target an existing host promotion identifies starts lean.
  */
-export const NO_TARGET_STARTS_LEAN = false;
+export const NO_TARGET_STARTS_LEAN = true;
 
 export type TurnDeskFallbackReason = 'out_of_scope' | 'doors_absent' | 'facts_unavailable';
 /** Why an in-scope desk sits above the lean rung. */
