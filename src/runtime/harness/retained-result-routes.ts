@@ -160,6 +160,7 @@ function judgeRetainedOutput(input: RetainedResultRouteInput): RetainedOutputJud
 
   let record: ToolOutputRecord | null = null;
   let fileQuery = false;
+  let readFailed = false;
   try {
     if (inFlight) {
       record = getToolOutput(input.sessionId, readId);
@@ -174,10 +175,12 @@ function judgeRetainedOutput(input: RetainedResultRouteInput): RetainedOutputJud
         : getToolOutput(input.sessionId, readId);
     }
   } catch {
-    // A failed read leaves whatever was read before it; judged as found.
+    // A failed read leaves whatever was read before it; judged as found, and
+    // not remembered, so the next route reads the unchanged output again.
+    readFailed = true;
   }
   const judgement = judgeBytes(record, readId, fileQuery);
-  if (identity.canonicalSha256) rememberJudgement(memoKey, identity.key, judgement);
+  if (identity.canonicalSha256 && !readFailed) rememberJudgement(memoKey, identity.key, judgement);
   return judgement;
 }
 

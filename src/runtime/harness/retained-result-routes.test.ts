@@ -288,3 +288,26 @@ test('a preview formatted after its call returned never offers file_query for an
   const routes = retainedResultRoutes({ sessionId: s.id, callId: 'toolu_query_preview' });
   assert.ok(!routes.some((r) => r.tool === 'file_query'), JSON.stringify(routes));
 });
+
+test('a route judged while the stored output could not be read is not remembered', () => {
+  const sessionId = stored('toolu_busy_read', 'A plain narrative line about the orchard walk.\n'.repeat(200));
+  const db = eventlog.openEventLog();
+  const prepare = db.prepare.bind(db);
+  let failNextPayloadRead = true;
+  (db as { prepare: typeof db.prepare }).prepare = ((source: string) => {
+    if (failNextPayloadRead && /^\s*SELECT\s+output_full\b/i.test(source)) {
+      failNextPayloadRead = false;
+      throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+    }
+    return prepare(source);
+  }) as typeof db.prepare;
+  try {
+    const during = retainedResultRoutes({ sessionId, callId: 'toolu_busy_read' });
+    assert.ok(!failNextPayloadRead, 'precondition: the stored bytes could not be read');
+    assert.deepEqual(during, []);
+    const afterwards = retainedResultRoutes({ sessionId, callId: 'toolu_busy_read' });
+    assert.deepEqual(afterwards.map((r) => r.tool), ['recall_tool_result', 'file_query'], JSON.stringify(afterwards));
+  } finally {
+    (db as { prepare: typeof db.prepare }).prepare = prepare;
+  }
+});
