@@ -100,3 +100,16 @@ test('the chip label drops the provider prefix and the parenthetical tail', () =
   assert.equal(shortModelLabel('Host — vendor-ai/Vendor-V4.1-Fast'), 'Vendor V4.1 Fast', 'an id left after the provider is named too');
   assert.equal(shortModelLabel('Host — acme-large-4-5'), 'Acme Large 4.5');
 });
+
+test('the memory role speaks the shared words, and its row is where the Memory tab sends a change', async () => {
+  const { ROLE_WORDS } = await import('./model-roles.js');
+  const { MEMORY_ROLE_WORDS } = await import('@clem/chat-engine');
+  assert.equal(ROLE_WORDS.memory.title, MEMORY_ROLE_WORDS.title, 'one vocabulary with the phone');
+  assert.equal(ROLE_WORDS.memory.hint, MEMORY_ROLE_WORDS.explain);
+  const { readFileSync } = await import('node:fs');
+  const card = readFileSync(new URL('../screens/settings/ModelRolesCard.tsx', import.meta.url), 'utf8');
+  assert.match(card, /id="memory-model"/, 'the Memory tab’s Change lands on this row');
+  assert.match(card, /memoryRoleAutomaticText\(memory\.follows/, 'automatic says whose model it borrows, from the daemon');
+  assert.match(card, /r\.onRole\('memory'/, 'the row writes through the one role door');
+  assert.match(card, /learning waits until it is back/, 'a chosen model that is gone says learning waits, not that another model serves');
+});
