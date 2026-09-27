@@ -264,7 +264,7 @@ test('a job row says its model, whose model that is, when it last ran, and when 
   assert.equal(failed.jobs.learning[0]?.lastFailed, true);
 });
 
-test('a null model means "none available" only for a memory job; a checker or local job with no recorded run says "—"', () => {
+test('a null model means "none available" for a memory or checker job; the local index with none says "—"', () => {
   const jobs = memoryWorkFixture('resting', NOW).jobs.map((j) => ({ ...j, modelId: null, lastRun: null }));
   const view = memoryWorkViewModel(snapshot({ jobs }), NOW);
   const all = [...view.jobs.learning, ...view.jobs.upkeep];
@@ -272,8 +272,8 @@ test('a null model means "none available" only for a memory job; a checker or lo
   assert.equal(by('learn').modelText, 'None available', 'a memory job’s route resolved to nothing');
   assert.equal(by('learn').modelHint, null);
   for (const id of ['standing', 'verify']) {
-    assert.equal(by(id).modelText, UNKNOWN, `${id}: the checker’s model is reported from a recorded run`);
-    assert.equal(by(id).modelHint, 'named once a run is recorded');
+    assert.equal(by(id).modelText, 'None available', `${id}: the daemon names the checker it asks now, or none`);
+    assert.equal(by(id).modelHint, null);
     assert.equal(by(id).modelOwnerText, 'Checks the work');
     assert.equal(by(id).modelName, null);
   }

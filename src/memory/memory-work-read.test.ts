@@ -29,6 +29,8 @@ const { BASE_DIR, _setRuntimeConfigCaptureObserverForTest } = await import('../c
 const { createSession, resetEventLog } = await import('../runtime/harness/eventlog.js');
 const { recordModelUsage } = await import('../runtime/usage-log.js');
 const { resolveMemoryModelRoute } = await import('./memory-model-route.js');
+const { resolveBoundaryJudge } = await import('../runtime/harness/debate-model.js');
+const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
 const { MEMORY_JOB_IDS } = await import('./memory-jobs.js');
 
 const { readMemoryWork, undoMemoryWork } = read;
@@ -128,7 +130,8 @@ test('an empty home gives a resting snapshot with every contract key, zeros only
   }
   assert.equal(byId.get('tidy')?.modelId, null, 'tidy has no model');
   assert.equal(byId.get('index')?.modelId, null, 'the index names the embedder, off here');
-  assert.equal(byId.get('standing')?.modelId, null, 'a checker job with no history names none');
+  assert.equal(byId.get('standing')?.modelId, resolveBoundaryJudge().modelId, 'a checker job names the checker it would ask, before any run');
+  assert.equal(byId.get('verify')?.modelId, resolveRoleModel('judge').modelId);
   assert.equal(byId.get('skills')?.modelId, resolveMemoryModelRoute('skills')?.modelId ?? null, 'a governed job that has not run names the model it would ask for');
 });
 
@@ -303,10 +306,20 @@ test('a memory a nested reconcile added is undone once, from the run the owner r
   }, () => ({ outcome: 'ok', produced: { claims: 1, learned: 1 }, facts: { learned: [String(kept)] } }));
   await learnRun();
   let snap = readMemoryWork();
-  const byJob = new Map(snap.recent.map((e) => [e.job, e]));
-  assert.deepEqual(byJob.get('learn')?.undo, { kind: 'forget', count: 1 });
-  assert.equal(byJob.get('reconcile')?.undo, null, 'the learn run offers it; the reconcile inside it does not');
-  assert.deepEqual(undoMemoryWork(byJob.get('reconcile')!.id), { ok: false, reason: 'nothing_to_undo' });
+  // One row for the conversation read: the reconcile inside it is folded in,
+  // its calls and tokens included, so the memory is reported once.
+  assert.deepEqual(snap.recent.map((e) => e.job), ['learn']);
+  const [learnRow] = snap.recent;
+  assert.deepEqual(learnRow.undo, { kind: 'forget', count: 1 });
+  assert.deepEqual(
+    { calls: learnRow.usage?.calls, inputTokens: learnRow.usage?.inputTokens, outputTokens: learnRow.usage?.outputTokens },
+    { calls: 2, inputTokens: 140, outputTokens: 14 },
+  );
+  const reconcileEvent = telemetry.listOperationalEvents({ source: 'memory', type: 'memory_work_completed' })
+    .find((e) => e.actor === 'reconcile');
+  assert.ok(reconcileEvent, 'fixture: the nested run was recorded');
+  assert.deepEqual(undoMemoryWork(reconcileEvent.eventId), { ok: false, reason: 'nothing_to_undo' },
+    'the learn run offers it; the reconcile inside it does not');
   assert.equal(getFact(kept)?.active, true);
   assert.equal(snap.today.learned, 1, 'kept once in today\'s numbers');
   assert.equal(snap.hourly.at(-1)?.learned, 1, 'and once in the hour');
@@ -321,7 +334,7 @@ test('a memory a nested reconcile added is undone once, from the run the owner r
   }, () => ({ outcome: 'ok', produced: { patterns: 1 } }));
   snap = readMemoryWork();
   const nested = snap.recent.find((e) => e.job === 'reconcile' && e.facts?.[0]?.id === String(pattern));
-  assert.deepEqual(nested?.undo, { kind: 'forget', count: 1 });
+  assert.deepEqual(nested?.undo, { kind: 'forget', count: 1 }, 'a nested run with its own undo keeps its row');
   assert.deepEqual(undoMemoryWork(nested!.id), { ok: true, changed: 1 });
   assert.equal(getFact(pattern)?.active, false);
 });
@@ -371,11 +384,15 @@ test('today, the jobs and the memory model come from the recorded runs', async (
   assert.equal(snap.today.leftOut, 1);
   assert.equal(snap.today.setAside, 1);
   const byId = new Map(snap.jobs.map((j) => [j.id, j]));
-  assert.equal(byId.get('learn')?.modelId, 'memory-model');
+  // A job names the model it asks for now (as the chip does); the model that
+  // answered is on each run.
+  assert.equal(byId.get('learn')?.modelId, resolveMemoryModelRoute('learn')?.modelId ?? null);
+  assert.equal(snap.recent.find((e) => e.job === 'learn')?.model?.modelId, 'memory-model');
   assert.equal(byId.get('learn')?.today.modelCalls, 2);
   assert.equal(byId.get('learn')?.lastRun?.outcome, 'ok');
   assert.equal(typeof byId.get('learn')?.lastRun?.durationMs, 'number');
-  assert.equal(byId.get('standing')?.modelId, 'checker-model');
+  assert.equal(byId.get('standing')?.modelId, resolveBoundaryJudge().modelId);
+  assert.equal(snap.recent.find((e) => e.job === 'standing')?.model?.modelId, 'checker-model');
   // The memory model's "last served" is a governed job's model, never the checker's.
   assert.equal(snap.model.lastServed?.modelId, 'memory-model');
   assert.equal(snap.model.lastServed?.standIn, false);
@@ -385,6 +402,34 @@ test('today, the jobs and the memory model come from the recorded runs', async (
   assert.equal(hour.modelCalls, 3);
   assert.equal(hour.learned, 1);
   assert.deepEqual(snap.daily.at(-1), { day: localDayKey(new Date()), runs: 2, modelCalls: 3, learned: 1, inputTokens: 170, outputTokens: 17 });
+});
+
+test('a job names the model it asks for now, not the one that answered its last run', () => {
+  // Patterns runs once a night; after the owner picks a new memory model its
+  // row must say the new one, as the chip and Settings do.
+  const at = new Date().toISOString();
+  telemetry.openOperationalTelemetryDb().prepare(`
+    INSERT INTO memory_work_daily (day, job, runs, last_at, last_outcome, last_model_id, last_model_at, last_model_stand_in)
+    VALUES (?, 'patterns', 1, ?, 'ok', 'earlier-memory-model', ?, 0)
+  `).run(localDayKey(new Date()), at, at);
+  const keys = ['BYO_MODEL_BASE_URL', 'BYO_MODEL_API_KEY', 'BYO_MODEL_ID', 'CLEMMY_MODEL_ROLES'] as const;
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, {
+    BYO_MODEL_BASE_URL: 'https://byo.example.test/v1', BYO_MODEL_API_KEY: 'byo-key', BYO_MODEL_ID: 'memory-model',
+    CLEMMY_MODEL_ROLES: JSON.stringify([{ role: 'memory', modelId: 'memory-model', scope: 'durable', source: 'settings' }]),
+  });
+  try {
+    const snap = readMemoryWork();
+    assert.equal(snap.model.modelId, 'memory-model', 'fixture: the owner\'s pick is served');
+    const byId = new Map(snap.jobs.map((j) => [j.id, j]));
+    for (const job of ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const) {
+      assert.equal(byId.get(job)?.modelId, 'memory-model', job);
+    }
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
 });
 
 test('the 30-day strip leaves out days before the journal began and zero-fills the rest', () => {

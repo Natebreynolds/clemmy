@@ -293,10 +293,10 @@ export interface JobView {
   modelOwner: MemoryJobModelOwner;
   /** Display name of the model the snapshot names for this job; null when it names none. */
   modelName: string | null;
-  /** What the Model cell says: the name; "No model" (rules only); "None
-   *  available" (a memory job whose route resolved to nothing); or "—" when
-   *  it is not known (the read failed, or a checker/local job with no run
-   *  recorded — the daemon reports their model only from a recorded run). */
+  /** What the Model cell says: the model the job asks for now; "No model"
+   *  (rules only); "None available" (a memory or checker job whose model
+   *  cannot be named now); or "—" when it is not known (the read failed, or
+   *  the local index did not report one). */
   modelText: string;
   /** For screen readers, why the model is "—". */
   modelHint: string | null;
@@ -548,9 +548,9 @@ function jobDot(job: MemoryJobStatus, unknown: boolean): JobDot {
   return job.lastRun.outcome === 'failed' ? 'failed' : 'ok';
 }
 
-/** The Model cell. A null model id means different things by owner: for a
- *  memory job the route resolved to nothing; for a checker or local job the
- *  daemon names the model only from a recorded run, so null is "not reported". */
+/** The Model cell: the model the job asks for now. A null id from a read
+ *  that worked means no model can be named for a memory or checker job (its
+ *  model is not available); for the local index it is simply not reported. */
 function jobModel(owner: MemoryJobModelOwner, modelId: string | null, unknown: boolean): { name: string | null; text: string; hint: string | null } {
   if (owner === 'none') return { name: null, text: 'No model', hint: null };
   if (modelId) {
@@ -558,8 +558,8 @@ function jobModel(owner: MemoryJobModelOwner, modelId: string | null, unknown: b
     return { name, text: name, hint: null };
   }
   if (unknown) return { name: null, text: UNKNOWN, hint: 'couldn’t be read' };
-  if (owner === 'memory') return { name: null, text: 'None available', hint: null };
-  return { name: null, text: UNKNOWN, hint: owner === 'checker' ? 'named once a run is recorded' : 'not reported' };
+  if (owner === 'memory' || owner === 'checker') return { name: null, text: 'None available', hint: null };
+  return { name: null, text: UNKNOWN, hint: 'not reported' };
 }
 
 function jobView(job: MemoryJobStatus, snapshot: MemoryWorkSnapshot, fmt: MemoryTimeFormat, stale: boolean, unknown: boolean): JobView {

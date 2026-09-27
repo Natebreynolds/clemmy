@@ -11,8 +11,8 @@
  * - "working" only while a job runs in this process right now;
  * - a count it could not read is null, never 0; when the journal itself
  *   cannot be read the whole snapshot says `unknown`;
- * - the model named is the one that served the call (a stand-in says so);
- *   for a governed job that has not run yet, the one it would ask for.
+ * - a run names the model that served its calls (a stand-in says so); a
+ *   job names the model it asks for now, as the chip and Settings do.
  *
  * `undoMemoryWork()` turns off what a run learned, or brings back what it
  * faded, through the same soft forget / restore every Memory door uses.
@@ -36,6 +36,8 @@ import {
   type MemoryJobId,
 } from './memory-jobs.js';
 import { describeMemoryModel, memoryJobModelId, type MemoryModelDescription } from './memory-model-route.js';
+import { resolveBoundaryJudge } from '../runtime/harness/debate-model.js';
+import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { reflectionTurnedOff } from './reflection.js';
 import {
   MEMORY_WORK_EVENT_TYPES,
@@ -305,26 +307,36 @@ function jobStatus(id: MemoryJobId, ctx: {
     id,
     modelOwner: spec.modelOwner,
     state,
-    modelId: jobModelId(id, rows, ctx.described),
+    modelId: jobModelId(id, ctx.described),
     lastRun: lastRun(id, rows),
     next: off ? null : { trigger: spec.trigger, ...(clock ? { at: nextClockAt(clock, ctx.now) } : {}) },
     today: totalsOf(ctx.todayRows.filter((row) => row.job === id)),
   };
 }
 
-function jobModelId(id: MemoryJobId, rows: DailyRow[], described: MemoryModelDescription | null): string | null {
+/**
+ * The model a job asks for now, so a row agrees with the chip and Settings
+ * after the owner changes a model (a job that runs once a night would
+ * otherwise name last week's). What answered each run is on its event.
+ */
+function jobModelId(id: MemoryJobId, described: MemoryModelDescription | null): string | null {
   const owner = MEMORY_JOBS[id].modelOwner;
   if (owner === 'none') return null;
   if (owner === 'local') return safe(() => activeEmbeddingModel(), null);
-  let newest: DailyRow | null = null;
-  for (const row of rows) {
-    if (row.last_model_id && row.last_model_at && (!newest || row.last_model_at > (newest.last_model_at ?? ''))) newest = row;
-  }
-  if (newest?.last_model_id) return newest.last_model_id;
-  // A governed job that has not run yet: the model it would ask for, named
-  // from the one description (no model is built on a poll).
-  if (owner === 'memory' && described) return memoryJobModelId(id, described);
-  return null;
+  // Named from the one description: no model is built per job on a poll.
+  if (owner === 'memory') return described ? memoryJobModelId(id, described) : null;
+  return checkerJobModelId(id);
+}
+
+/** The checker's model for a checker job: the boundary checker for the
+ *  standing-instruction check, the checker role for memory repairs. Null
+ *  when the checker cannot be named (its pick is unavailable). */
+function checkerJobModelId(id: MemoryJobId): string | null {
+  return safe(() => {
+    if (id === 'standing') return resolveBoundaryJudge().modelId || null;
+    const checker = resolveRoleModel('judge');
+    return checker.inactiveBinding ? null : checker.modelId || null;
+  }, null);
 }
 
 function lastRun(id: MemoryJobId, rows: DailyRow[]): MemoryJobStatus['lastRun'] {
@@ -600,7 +612,7 @@ function recentEvents(rows: EventRow[], titles: Map<string, string>): MemoryWork
     memory = null; // no facts and no undo, rather than wrong ones
   }
   const targets = memory ? undoTargetReader(memory) : null;
-  return parsed.map(({ row, payload }, i) => {
+  return foldNestedRuns(parsed.map(({ row, payload }, i) => {
     let undo: MemoryWorkEvent['undo'] = null;
     if (targets) {
       try {
@@ -609,8 +621,48 @@ function recentEvents(rows: EventRow[], titles: Map<string, string>): MemoryWork
         undo = null;
       }
     }
-    return toEvent(row, payload, shown[i], facts, undo, titles);
-  });
+    return { payload, event: toEvent(row, payload, shown[i], facts, undo, titles) };
+  }));
+}
+
+/**
+ * One row per run the owner recognises. A run nested in a run this list also
+ * shows (a reconcile inside the conversation read that saved the memory) is
+ * folded into it: its calls and tokens join that row, and what it changed is
+ * already that row's. A nested run the owner can still undo on its own (its
+ * enclosing run offers no undo of that kind) keeps its row, and so does one
+ * whose enclosing run is not listed (still running, or older than the list).
+ */
+function foldNestedRuns(rows: Array<{ payload: Partial<MemoryWorkEventPayload>; event: MemoryWorkEvent }>): MemoryWorkEvent[] {
+  const byRun = new Map<string, (typeof rows)[number]>();
+  for (const row of rows) if (typeof row.payload.runId === 'string') byRun.set(row.payload.runId, row);
+  const parentOf = (row: (typeof rows)[number]) => {
+    const runId = row.payload.nestedIn?.runId;
+    return typeof runId === 'string' ? byRun.get(runId) : undefined;
+  };
+  const folded = new Set<(typeof rows)[number]>();
+  for (const row of rows) if (parentOf(row) && !row.event.undo) folded.add(row);
+  for (const row of rows) {
+    if (!folded.has(row)) continue;
+    // The nearest enclosing run that keeps its own row takes the usage.
+    let into = parentOf(row);
+    for (let depth = 0; into && folded.has(into) && depth < 8; depth += 1) into = parentOf(into);
+    if (!into || folded.has(into)) continue;
+    const usage = into.event.usage ?? { calls: 0, inputTokens: 0, outputTokens: 0 };
+    const extra = row.event.usage;
+    if (extra) {
+      const cached = num(usage.cachedInputTokens) + num(extra.cachedInputTokens);
+      into.event.usage = {
+        ...usage,
+        calls: num(usage.calls) + num(extra.calls),
+        inputTokens: num(usage.inputTokens) + num(extra.inputTokens),
+        outputTokens: num(usage.outputTokens) + num(extra.outputTokens),
+        ...(cached > 0 ? { cachedInputTokens: cached } : {}),
+      };
+    }
+    if (!into.event.model && row.event.model) into.event.model = row.event.model;
+  }
+  return rows.filter((row) => !folded.has(row)).map((row) => row.event);
 }
 
 /** Forget what a run learned that is still active; bring back what it faded

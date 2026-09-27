@@ -81,8 +81,9 @@ export interface MemoryJobStatus {
   id: MemoryJobId;
   modelOwner: MemoryJobModelOwner;
   state: 'running' | 'idle' | 'waiting' | 'off';
-  /** Last model that served this job (or, for a governed job that has not run
-   *  yet, the one it would use). */
+  /** The model this job asks for now: the memory model's for the jobs it
+   *  governs, the checker's for the checks, the embedder for the index. Null
+   *  when none can be named. What answered each run is on its event. */
   modelId?: string | null;
   lastRun?: { at: string; outcome: MemoryWorkOutcome; durationMs?: number } | null;
   next?: { trigger: MemoryJobTrigger; at?: string } | null;

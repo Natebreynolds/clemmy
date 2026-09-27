@@ -688,6 +688,9 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkView, modelName: Mode
   const words = MEMORY_JOB_WORDS[job.id];
   const fmt = memoryTimeFormat(now);
   const owner = memoryJobModelOwnerText(job.modelOwner);
+  // A journal the daemon could not read says nothing about when a job ran:
+  // its last run and today's figures are unknown, never "no run" or none.
+  const unread = snapshot.state === 'unknown';
   let model: string;
   if (job.modelOwner === 'none') model = owner;
   else if (job.modelOwner === 'local') {
@@ -695,7 +698,8 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkView, modelName: Mode
     const id = job.modelId ?? snapshot.embedder?.modelId ?? null;
     model = id ? `${id} · ${owner}` : owner;
   } else {
-    model = `${job.modelId ? modelName(job.modelId) : '—'} · ${owner}`;
+    // The model the job asks for now; none named means none is available.
+    model = `${job.modelId ? modelName(job.modelId) : unread ? '—' : 'None available'} · ${owner}`;
   }
   const running = job.state === 'running';
   const stateText = running
@@ -703,9 +707,6 @@ function jobView(job: MemoryJobStatus, snapshot: MemoryWorkView, modelName: Mode
     : job.state === 'waiting' ? 'Waiting'
     : job.state === 'off' ? 'Off'
     : '';
-  // A journal the daemon could not read says nothing about when a job ran:
-  // its last run and today's figures are unknown, never "no run" or none.
-  const unread = snapshot.state === 'unknown';
   const lastRun = job.lastRun;
   const detailDays = snapshot.retention && known(snapshot.retention.detailDays) ? snapshot.retention.detailDays : null;
   const last = unread ? 'Last run —'
