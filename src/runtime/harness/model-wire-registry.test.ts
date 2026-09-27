@@ -180,3 +180,81 @@ test('registry: a model with no effort knob still maps every tier to null', () =
   assert.equal(cap.supportsEffort, false);
   for (const tier of EFFORT_LADDER) assert.equal(cap.effortMap[tier], null);
 });
+
+// --- reasoning_effort on openai_completions wires ---------------------------
+// Regression: the compat relax used to recognize effort-capable models by a
+// model-name pattern of its own, so a newly documented family was stripped
+// until that adapter changed. The registry row is now the only declaration.
+
+test('registry: a new openai_completions family that declares effort values is mapped by the real compat relax, no adapter change', async () => {
+  const { __test__, DEFAULT_CAPABILITY: base } = await import('./model-wire-registry.js');
+  const { relaxRequestForCompatBackend } = await import('./byo-model.js');
+  const relax = (body: Record<string, unknown>) =>
+    relaxRequestForCompatBackend({ messages: [{ role: 'user', content: 'hi' }], ...body }) as Record<string, unknown>;
+  const row = {
+    idMatch: /^fixture-reasoner-9$/,
+    cap: {
+      ...base,
+      family: 'fixture-reasoner',
+      supportsEffort: true,
+      completionsEffortValues: ['minimal', 'high'] as const,
+    },
+  };
+  // Before the row exists the id is an ordinary BYO model: the field is stripped.
+  assert.equal('reasoning_effort' in relax({ model: 'fixture-reasoner-9', reasoning_effort: 'high' }), false);
+  __test__.REGISTRY.unshift(row);
+  try {
+    assert.equal(relax({ model: 'fixture-reasoner-9', reasoning_effort: 'none' }).reasoning_effort, 'minimal',
+      'a tier below every declared value becomes the cheapest');
+    assert.equal(relax({ model: 'fixture-reasoner-9', reasoning_effort: 'minimal' }).reasoning_effort, 'minimal');
+    assert.equal(relax({ model: 'fixture-reasoner-9', reasoning_effort: 'medium' }).reasoning_effort, 'minimal',
+      'a tier between declared values rounds down, never up');
+    assert.equal(relax({ model: 'fixture-reasoner-9', reasoning_effort: 'high' }).reasoning_effort, 'high');
+    assert.equal('reasoning_effort' in relax({ model: 'fixture-reasoner-9', reasoning_effort: 'max' }), false,
+      'a tier above every declared value is not translated');
+    assert.equal(relax({
+      model: 'fixture-reasoner-9', reasoning_effort: 'high',
+      response_format: { type: 'json_schema', json_schema: { name: 'x', schema: { type: 'object' } } },
+    }).reasoning_effort, 'minimal', 'a structured call uses the cheapest declared value');
+    assert.equal('reasoning_effort' in relax({ model: 'fixture-reasoner-9' }), false,
+      'no harness decision leaves the wire default');
+    assert.equal('thinking' in relax({ model: 'fixture-reasoner-9', reasoning_effort: 'low' }), false);
+  } finally {
+    const at = __test__.REGISTRY.indexOf(row);
+    if (at >= 0) __test__.REGISTRY.splice(at, 1);
+  }
+});
+
+test('registry: every declared completions effort value is a rung of the shared ladder, cheapest first, on the completions wire only', async () => {
+  const { __test__ } = await import('./model-wire-registry.js');
+  const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  for (const { cap } of __test__.REGISTRY) {
+    const values = cap.completionsEffortValues;
+    if (!values) continue;
+    assert.equal(cap.apiShape, 'openai_completions', `${cap.family} declares completions effort values on another wire`);
+    assert.equal(cap.supportsEffort, true, `${cap.family} declares effort values but says it has no effort knob`);
+    assert.ok(values.length > 0, `${cap.family} declares an empty vocabulary`);
+    let previous = -1;
+    for (const value of values) {
+      const rank = ladder.indexOf(value);
+      assert.ok(rank >= 0, `${cap.family} declares an off-ladder value ${value}`);
+      assert.ok(rank > previous, `${cap.family} values must be listed cheapest first`);
+      previous = rank;
+    }
+  }
+});
+
+test('registry: the reasoning Grok releases declare effort values; earlier and multi-agent releases do not', async () => {
+  const { completionsReasoningEffort } = await import('./model-wire-registry.js');
+  for (const id of ['grok-4.5', 'grok-4.6', 'grok-4.7', 'grok-4-7']) {
+    assert.deepEqual(resolveModelCapability(id).completionsEffortValues, ['low', 'medium', 'high', 'xhigh'], id);
+    assert.equal(resolveModelCapability(id).contextWindow, 256_000, `${id} keeps the family window`);
+    assert.equal(resolveModelCapability(id).supportsPromptCache, true, `${id} keeps the family cache seed`);
+    assert.equal(completionsReasoningEffort(id, 'xhigh', { structured: false }), 'xhigh');
+  }
+  for (const id of ['grok-4', 'grok-4.20-multi-agent', 'grok-3', 'deepseek-chat', 'glm-5.2', 'unknown-model-x']) {
+    assert.equal(resolveModelCapability(id).completionsEffortValues, undefined, id);
+    assert.equal(completionsReasoningEffort(id, 'high', { structured: false }), undefined, id);
+    assert.equal(completionsReasoningEffort(id, 'high', { structured: true }), undefined, id);
+  }
+});

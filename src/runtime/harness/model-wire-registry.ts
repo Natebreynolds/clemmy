@@ -196,8 +196,15 @@ export interface ModelCapability {
   /** True when the model accepts a reasoning-effort knob at all. */
   supportsEffort: boolean;
   /** Generic harness tier -> provider wire value (null = omit / use default).
-   *  For anthropic_messages this is the `output_config.effort` string. */
+   *  For anthropic_messages this is the `output_config.effort` string. An
+   *  openai_completions wire declares `completionsEffortValues` instead. */
   effortMap: Record<ReasoningEffort, string | null>;
+  /** openai_completions only: the `reasoning_effort` values this model accepts,
+   *  cheapest first, each a rung of the shared effort ladder. Absent = the wire
+   *  does not take the field, so the compat relax strips it. Declaring it is
+   *  the whole opt-in: `completionsReasoningEffort` places the harness tier on
+   *  these values for any model that declares them. */
+  completionsEffortValues?: readonly string[];
   /** How effort is delivered. 'effort' = output_config.effort (Anthropic GA);
    *  'budget_tokens' = legacy thinking budget (older Sonnet only); 'none'. */
   thinkingMode: ThinkingMode;
@@ -266,13 +273,35 @@ interface RegistryRow {
   cap: ModelCapability;
 }
 
+// One capability shared by both rows of this family; the reasoning releases
+// additionally accept `reasoning_effort`.
+const GROK_CAPABILITY: ModelCapability = {
+  family: 'grok', apiShape: 'openai_completions',
+  contextWindow: 256_000, maxOutput: 32_000, supportsEffort: false,
+  effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
+  thinkingMode: 'none',
+  supportsPromptCache: true, cacheMinTokens: 1_024, retryClass: 'openai_compat',
+};
+
 // Order matters: first match wins. More specific families first.
 const REGISTRY: RegistryRow[] = [
   // ---- xAI Grok (openai_chat via BYO/native OAuth) --------------------------
+  // Releases whose provider documentation lists `reasoning_effort`. Reasoning
+  // on these cannot be switched off and defaults to the top of the range when
+  // the field is absent, so the declared values are what let the harness tier
+  // reach the wire. Other releases in the family reject the field and fall to
+  // the family row below.
+  {
+    idMatch: /grok-4[.-](5|6|7)(?![0-9])/i,
+    cap: {
+      ...GROK_CAPABILITY,
+      supportsEffort: true,
+      completionsEffortValues: ['low', 'medium', 'high', 'xhigh'],
+    },
+  },
   // ONE LOOP, MANY BRAINS (2026-08-20): grok ids previously fell to
   // DEFAULT_CAPABILITY (128K/8K, generic retry) — mis-budgeted for fleet
-  // work. grok-4 family: 256K window per xAI docs; no effort knob on the chat
-  // shape.
+  // work. grok-4 family: 256K window per xAI docs.
   //
   // PROMPT CACHE: corrected 2026-09-12 from MEASUREMENT, not doctrine. The
   // 2026-08-20 seed said "no server-side prompt cache contract we can rely
@@ -301,13 +330,7 @@ const REGISTRY: RegistryRow[] = [
   // so the 2026-09-01 first-byte timeout that motivated it is unaffected.
   {
     idMatch: /grok-4|grok-3|grok-beta|grok-/i,
-    cap: {
-      family: 'grok', apiShape: 'openai_completions',
-      contextWindow: 256_000, maxOutput: 32_000, supportsEffort: false,
-      effortMap: { none: null, minimal: null, low: null, medium: null, high: null },
-      thinkingMode: 'none',
-      supportsPromptCache: true, cacheMinTokens: 1_024, retryClass: 'openai_compat',
-    },
+    cap: GROK_CAPABILITY,
   },
   // ---- Claude (anthropic_messages) ------------------------------------------
   // Opus 4.7/4.8 + Fable 5: budget_tokens thinking is REMOVED (HTTP 400) — must
@@ -482,13 +505,63 @@ const REGISTRY: RegistryRow[] = [
  */
 export function resolveModelCapability(modelId: string | undefined | null): ModelCapability {
   const id = (modelId ?? '').trim();
-  if (id) {
-    for (const row of REGISTRY) {
-      if (row.idMatch.test(id)) return row.cap;
-    }
-  }
+  const matched = matchCapability(id);
+  if (matched) return matched;
   logger.warn({ modelId: id || '(empty)' }, 'model-wire-registry: unknown model id — using conservative defaults');
   return DEFAULT_CAPABILITY;
+}
+
+/** First family row matching `id`, or undefined. Silent: callers that treat an
+ *  unrecognized id as legitimate (any BYO model) use this directly. */
+function matchCapability(id: string): ModelCapability | undefined {
+  if (!id) return undefined;
+  for (const row of REGISTRY) {
+    if (row.idMatch.test(id)) return row.cap;
+  }
+  return undefined;
+}
+
+/** The shared reasoning-effort ladder, cheapest first. Harness tiers occupy the
+ *  lower rungs; a caller may carry a higher one on the request. */
+const EFFORT_LADDER_RANK: Readonly<Record<string, number>> = {
+  none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6,
+};
+
+/**
+ * The `reasoning_effort` value an openai_completions request for `modelId`
+ * carries, or undefined when the field stays off the wire.
+ *
+ * - A model that declares no `completionsEffortValues` never carries it.
+ * - A structured (json) call carries the cheapest declared value: the shape is
+ *   the contract, and reasoning depth adds latency without improving it.
+ * - No tier chosen leaves the wire's own default in place.
+ * - Otherwise the tier becomes the most expensive declared value that does not
+ *   exceed it, and a tier cheaper than every declared value becomes the
+ *   cheapest. A tier above every declared value, or off the ladder, is not
+ *   translated.
+ *
+ * Unknown ids are legitimate BYO models here, so the lookup does not warn.
+ */
+export function completionsReasoningEffort(
+  modelId: string | undefined | null,
+  tier: string | undefined,
+  options: { structured: boolean },
+): string | undefined {
+  const cap = matchCapability((modelId ?? '').trim());
+  if (!cap || cap.apiShape !== 'openai_completions') return undefined;
+  const values = (cap.completionsEffortValues ?? [])
+    .filter((value) => EFFORT_LADDER_RANK[value] !== undefined);
+  if (values.length === 0) return undefined;
+  if (options.structured) return values[0];
+  const rank = tier ? EFFORT_LADDER_RANK[tier.toLowerCase()] : undefined;
+  if (rank === undefined) return undefined;
+  const top = EFFORT_LADDER_RANK[values[values.length - 1]!]!;
+  if (rank > top) return undefined;
+  let chosen = values[0];
+  for (const value of values) {
+    if (EFFORT_LADDER_RANK[value]! <= rank) chosen = value;
+  }
+  return chosen;
 }
 
 /** The PROVIDER class that serves a model. Derived from the model's wire shape,
@@ -504,19 +577,11 @@ export type ModelProviderClass = 'codex' | 'claude' | 'byo';
  * legitimate BYO model, not a misconfiguration.
  */
 export function resolveProvider(modelId: string | undefined | null): ModelProviderClass {
-  const id = (modelId ?? '').trim();
-  if (id) {
-    for (const row of REGISTRY) {
-      if (row.idMatch.test(id)) {
-        switch (row.cap.apiShape) {
-          case 'anthropic_messages': return 'claude';
-          case 'codex_responses': return 'codex';
-          default: return 'byo';
-        }
-      }
-    }
+  switch (matchCapability((modelId ?? '').trim())?.apiShape) {
+    case 'anthropic_messages': return 'claude';
+    case 'codex_responses': return 'codex';
+    default: return 'byo';
   }
-  return 'byo';
 }
 
 /** Rough token estimate (chars/4) for cache-min gating. Intentionally cheap +
