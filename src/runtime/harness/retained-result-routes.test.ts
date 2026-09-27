@@ -171,3 +171,16 @@ test('a prose document with its data inside is routed to the query for the data 
   const spent = retainedResultRoutes({ sessionId, callId: 'toolu_doc_with_data', recallCallsRemaining: 0 });
   assert.deepEqual(spent.map((r) => r.tool), ['tool_output_query', 'file_query']);
 });
+
+test('prose whose brackets happen to parse is routed as text, never to the record query', () => {
+  for (const [callId, output] of [
+    ['toolu_wiki_page', '[Jump to content](#bodyContent)\nThe valley runs through Oregon.[[1]](https://en.example.org/wiki/V#cite_note-1)'],
+    ['toolu_docs_page', '[Skip to main](#main)\nSend the body:\n```json\n{"email":"jane@example.com","name":"Jane"}\n```\nDone.'],
+    ['toolu_build_log', 'See [the docs](x) for details. Build [42] passed.'],
+    ['toolu_nan_export', '{"meta":{"page":1},"rows":[{"id":1,"v":NaN},{"id":2,"v":0.5}]}'],
+  ] as const) {
+    const sessionId = stored(callId, output);
+    const routes = retainedResultRoutes({ sessionId, callId });
+    assert.deepEqual(routes.map((r) => r.tool), ['recall_tool_result', 'file_query'], `${callId}: ${JSON.stringify(routes)}`);
+  }
+});

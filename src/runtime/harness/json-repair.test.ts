@@ -9,6 +9,7 @@ import {
   conformsToJsonSchemaShape,
   readHostCliEnvelope,
 } from './json-repair.js';
+import { parseShellToolOutput } from '../../tools/inner-dispatch.js';
 
 test('repair: ```json fenced object is unwrapped and parses', () => {
   const { text, repaired } = repairToParseableJson('```json\n{"done": true}\n```');
@@ -300,11 +301,79 @@ test('stored output: successive-opener recovery is bounded', () => {
   // bounded number of attempts instead of walking every bracket in the text.
   const payload = { records: Array.from({ length: 5 }, (_, i) => ({ id: i })) };
   const noise = Array.from({ length: 20 }, (_, i) => `item ${i}: [${i}]`).join('\n');
-  const got = parseStoredToolOutputJson(`${noise}\n${JSON.stringify(payload)}`);
-  assert.ok(got, 'a small early value is still recovered');
-  assert.notDeepEqual(got.value, payload, 'the payload lies beyond the attempt bound');
+  assert.equal(parseStoredToolOutputJson(`${noise}\n${JSON.stringify(payload)}`), null,
+    'the payload lies beyond the attempt bound, and a bracketed number is never a payload');
   const near = parseStoredToolOutputJson(`item: [1]\nitem: [2]\n${JSON.stringify(payload)}`);
   assert.deepEqual(near?.value, payload, 'within the bound the largest value wins');
+});
+
+test('stored output: a markdown citation is prose, not a payload', () => {
+  const raw = [
+    '[Jump to content](#bodyContent)',
+    '# Willamette Valley',
+    'The valley runs north to south through Oregon.[[1]](https://en.example.org/wiki/Willamette#cite_note-1)',
+    'Its soils favour orchards.[[2]](https://en.example.org/wiki/Willamette#cite_note-2)',
+  ].join('\n');
+  assert.equal(parseStoredToolOutputJson(raw), null);
+});
+
+test('stored output: a fenced example in scraped documentation is not the result', () => {
+  const raw = [
+    '[Skip to main](#main)',
+    '## Create a contact',
+    'Send a POST with the contact body:',
+    '```json',
+    '{"email":"jane@example.com","name":"Jane"}',
+    '```',
+    'The response echoes the created contact.',
+  ].join('\n');
+  assert.equal(parseStoredToolOutputJson(raw), null);
+});
+
+test('stored output: a bracketed number in prose is not a payload', () => {
+  assert.equal(parseStoredToolOutputJson('See [the docs](x) for details. Build [42] passed.'), null);
+});
+
+test('stored output: a complete but invalid JSON document stays text, never a fragment of itself', () => {
+  // A NaN (the default of some serializers) makes the document not JSON, and
+  // no value inside it is the whole result.
+  const raw = '{"meta":{"source":"export","page":1},"rows":[{"id":1,"v":NaN},{"id":2,"v":0.5}]}';
+  assert.equal(parseStoredToolOutputJson(raw), null);
+  assert.equal(parseStoredToolOutputJson(`Export follows.\n${raw}\nDone.`), null);
+});
+
+test('stored output: a shell array cut short by an invalid row keeps its honest partial prefix', () => {
+  const raw = [
+    'exit_code: 0',
+    'stdout:',
+    '[{"id":1,"score":0.9},{"id":2,"score":0.5},{"id":3,"score":0.4},{"id":4,"score":NaN}]',
+  ].join('\n');
+  const got = parseStoredToolOutputJson(raw, { shell: parseShellToolOutput });
+  assert.ok(got);
+  assert.equal(got.via, 'shell_objects');
+  assert.equal(got.partialArrayPrefix, true);
+  assert.deepEqual(got.value, [{ id: 1, score: 0.9 }, { id: 2, score: 0.5 }, { id: 3, score: 0.4 }]);
+});
+
+test('stored output: a host document read with prose, tags and a view pointer before its dataset is queryable', () => {
+  const dataset = {
+    meta: { title: 'Orchard yields', revision: 3 },
+    rows: [{ plot: 'Plot 7', kg: 410 }, { plot: 'Plot 8', kg: 385 }],
+  };
+  const raw = [
+    'Workspace "Orchard yields" (orchard-yields) — active, v1.',
+    'Success criteria: • Every plot listed [see note] • Renders on phone',
+    'View source: space_get_view({slug:"orchard-yields",grep:null,around:null}) returns the saved HTML.',
+    'For a root data edit, use space_save with replacement_data_json and this expected_revision.',
+    'Snapshot revision: 9959404df21542d5',
+    'Content mode: static_snapshot.',
+    `Dataset (complete JSON): ${JSON.stringify(dataset)}`,
+    'Notes: none [yet].',
+  ].join('\n');
+  const got = parseStoredToolOutputJson(raw);
+  assert.ok(got, 'the dataset after the host prose must be recovered');
+  assert.equal(got.via, 'embedded');
+  assert.deepEqual(got.value, dataset);
 });
 
 test('stored output: a record inside a clipped array is never taken for the payload', () => {

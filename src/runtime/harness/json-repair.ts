@@ -351,38 +351,112 @@ function balancedJsonEnd(text: string, start: number): number {
   return -1;
 }
 
+/** Whether a recovered value can be a document's payload: a non-empty object,
+ * or an array holding at least one object. A scalar or scalar-only array
+ * (`[42]`, `[[1]]`, `[]`) inside prose is a citation, a count or a checkbox,
+ * never the data the output was read for. */
+function isRecordShapedPayload(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some((item) => item !== null && typeof item === 'object' && !Array.isArray(item));
+  }
+  return value !== null && typeof value === 'object' && Object.keys(value).length > 0;
+}
+
+/** Character ranges of fenced code blocks (``` or ~~~ lines). A fence that is
+ * the whole document is its payload, not an example, so it yields no range.
+ * An unclosed fence runs to the end of the text. */
+function fencedCodeRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  let openAt = -1;
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    const newline = text.indexOf('\n', lineStart);
+    const lineEnd = newline === -1 ? text.length : newline;
+    const line = text.slice(lineStart, lineEnd).trimStart();
+    if (line.startsWith('```') || line.startsWith('~~~')) {
+      if (openAt === -1) openAt = lineStart;
+      else {
+        ranges.push([openAt, lineEnd]);
+        openAt = -1;
+      }
+    }
+    if (newline === -1) break;
+    lineStart = newline + 1;
+  }
+  if (openAt !== -1) ranges.push([openAt, text.length]);
+  if (ranges.length === 1) {
+    const [from, to] = ranges[0]!;
+    if (text.slice(0, from).trim() === '' && text.slice(to).trim() === '') return [];
+  }
+  return ranges;
+}
+
+function fenceContaining(ranges: ReadonlyArray<[number, number]>, index: number): [number, number] | null {
+  for (const range of ranges) {
+    if (index >= range[0] && index < range[1]) return range;
+  }
+  return null;
+}
+
+/** A candidate substring that parses, is record-shaped, and lies outside
+ * every fenced example; otherwise null. */
+function acceptedStoredPayload(
+  text: string,
+  candidate: string | null,
+  fences: ReadonlyArray<[number, number]>,
+): string | null {
+  if (candidate === null) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(candidate) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isRecordShapedPayload(value)) return null;
+  const at = text.indexOf(candidate);
+  if (at >= 0 && fenceContaining(fences, at)) return null;
+  return candidate;
+}
+
 /**
  * The largest complete JSON value embedded in a stored output. A host document
  * can carry prose with its own brackets before its data (a pseudo-call such as
  * `reader({slug:"x"})`, a `[note]`, a reader's `{"call_id":…}` hint), so the
  * first opener is not necessarily the data. Candidates are tried from
- * successive openers, a bounded number of scans, and the largest one that
- * parses wins: the payload, not an incidental example beside it. Only the
+ * successive openers, a bounded number of scans, and the largest record-shaped
+ * value that parses wins: the payload, not an incidental value beside it.
+ *
+ * A balanced candidate that does not parse is passed over whole, never looked
+ * inside: an invalid document is text, and no fragment of it is the result.
+ * A fenced code block is an example, not a result, and is skipped. Only the
  * stored-output reader uses this; parsing a model's own answer keeps the
  * first-candidate rule of `extractJsonCandidate`.
  */
 function largestEmbeddedStoredJson(raw: string): string | null {
-  let best = extractJsonCandidate(raw);
+  const fences = fencedCodeRanges(raw);
+  let best = acceptedStoredPayload(raw, extractJsonCandidate(raw), fences);
   let attempts = 0;
   for (let start = 0; start < raw.length && attempts < STORED_JSON_OPENER_ATTEMPTS; start += 1) {
     const ch = raw[start];
-    if ((ch !== '{' && ch !== '[') || !canOpenJsonValue(raw, start)) continue;
+    if (ch !== '{' && ch !== '[') continue;
+    const fence = fenceContaining(fences, start);
+    if (fence) {
+      start = fence[1];
+      continue;
+    }
+    if (!canOpenJsonValue(raw, start)) continue;
     attempts += 1;
     const end = balancedJsonEnd(raw, start);
     // Never closed: every later bracket lies inside this clipped value, so a
     // complete element found there is a fragment, not the payload.
     if (end === -1) break;
     const length = end + 1 - start;
-    if (best !== null && length <= best.length) {
-      // Nothing inside it can be larger than what is already held.
-      start = end;
-      continue;
+    if (best === null || length > best.length) {
+      const candidate = acceptedStoredPayload(raw, raw.slice(start, end + 1), []);
+      if (candidate !== null) best = candidate;
     }
-    const candidate = raw.slice(start, end + 1);
-    if (isParseableJson(candidate)) {
-      best = candidate;
-      start = end;
-    }
+    // Parsed or not, nothing inside this value is a separate payload.
+    start = end;
   }
   return best;
 }
@@ -394,18 +468,15 @@ function largestEmbeddedStoredJson(raw: string): string | null {
  * appends its own prose to it on the way in — composio route notes
  * (`[account-route] …`, `[sender-verify] …`), constraint banners, and
  * `recall_tool_result`'s own `Recalled chars A–B of N • tool=… ` preamble.
- * A whole-string `JSON.parse` therefore fails on a payload that IS JSON, and
- * every reader had its own ladder that stopped short of noticing.
+ * A whole-string `JSON.parse` therefore fails on a payload that IS JSON. A
+ * reader that calls data text sends the model paging for bytes it already
+ * holds, and a reader that calls prose data answers from a fragment; both are
+ * worse than an honest "this is text".
  *
- * Live 2026-09-03 (platform-49 run 6, Sonnet 5): `tool_output_query` told the
- * model its own valid JSON "is not JSON — use recall_tool_result", the model
- * obeyed, came back for the next handle, got the same falsehood, and the
- * no-progress governor killed the run after 894K input tokens with every byte
- * it needed already in hand. A reader that lies about the data is worse than
- * one that errors.
- *
- * Precedence preserves each caller's previous behavior exactly and only ADDS
- * the raw-embedded step, so no shape that resolved before resolves differently.
+ * Order: the exact parse; for a shell envelope, its stdout parsed exactly, then
+ * its first stdout candidate, then the complete objects of a clipped stdout
+ * array (marked as a prefix), and only then the embedded scan of stdout; for
+ * any other output, the embedded scan of the whole text.
  */
 export function parseStoredToolOutputJson(
   raw: string,
@@ -417,35 +488,35 @@ export function parseStoredToolOutputJson(
   } catch { /* fall through to recovery */ }
 
   const shell = options.shell?.(raw) ?? null;
-  // A run_shell_command wrapper (`exit_code:/stdout:/stderr:`) around a
-  // `--json` payload (sf, gh, aws…): the data is structured, the envelope is not.
-  if (shell?.stdout_json !== undefined) {
-    return { value: shell.stdout_json, via: 'shell_stdout' };
-  }
   if (shell) {
-    const embeddedStdout = extractJsonCandidate(shell.stdout);
-    if (embeddedStdout !== null) {
-      try {
-        return { value: JSON.parse(embeddedStdout) as unknown, via: 'shell_embedded' };
-      } catch { /* keep looking */ }
+    // A run_shell_command wrapper (`exit_code:/stdout:/stderr:`) around a
+    // `--json` payload (sf, gh, aws…): the data is structured, the envelope is not.
+    if (shell.stdout_json !== undefined) {
+      return { value: shell.stdout_json, via: 'shell_stdout' };
     }
+    const embeddedStdout = acceptedStoredPayload(
+      shell.stdout, extractJsonCandidate(shell.stdout), fencedCodeRanges(shell.stdout),
+    );
+    if (embeddedStdout !== null) {
+      return { value: JSON.parse(embeddedStdout) as unknown, via: 'shell_embedded' };
+    }
+    // A clipped or partly invalid array: recover the complete objects written
+    // so far, and say they are a prefix.
+    if (shell.stdout.includes('[')) {
+      const objects = extractCompleteJsonObjects(shell.stdout, 200);
+      if (objects.length > 0) {
+        return { value: objects, via: 'shell_objects', partialArrayPrefix: true };
+      }
+    }
+    const scanned = largestEmbeddedStoredJson(shell.stdout);
+    return scanned === null ? null : { value: JSON.parse(scanned) as unknown, via: 'shell_embedded' };
   }
 
   // A complete JSON value carrying prose before or after it. The string-aware
   // balanced scan lets a leading preamble and a trailing note fall away.
   const embedded = largestEmbeddedStoredJson(raw);
   if (embedded !== null) {
-    try {
-      return storedJsonValue(JSON.parse(embedded) as unknown, 'embedded');
-    } catch { /* keep looking */ }
-  }
-
-  // Last resort: a clipped array — recover the complete objects written so far.
-  if (shell?.stdout.includes('[')) {
-    const objects = extractCompleteJsonObjects(shell.stdout, 200);
-    if (objects.length > 0) {
-      return { value: objects, via: 'shell_objects', partialArrayPrefix: true };
-    }
+    return storedJsonValue(JSON.parse(embedded) as unknown, 'embedded');
   }
   return null;
 }
