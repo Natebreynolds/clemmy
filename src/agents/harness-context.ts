@@ -257,7 +257,7 @@ function resolveRequestObjective(sessionId: string | undefined, acceptedInput: s
   const requestObjective = [acceptedInput.trim(), focusObjective]
     .filter(Boolean)
     .join('\n') || undefined;
-  return { activeTaskContext, scopedFocus, requestObjective };
+  return { activeTaskContext, scopedFocus, focusObjective, requestObjective };
 }
 
 /**
@@ -885,6 +885,35 @@ export function renderTurnMemoryTail(
     text,
     manifest: parts.map((part) => manifestEntry(part.section, part.tier, part.text, part.refs ?? [])),
   };
+}
+
+/**
+ * What the shared ranker ranks a request's memory by: the request, and the
+ * objective the prompt's own per-block memory ranks by (the agent's focus
+ * input and the focus proven current for this session), each once. The
+ * ranker then sees every text the per-block memory would have ranked by, so
+ * the tail does not lose a fact the blocks showed for want of the words that
+ * ranked it. The request leads, since a lexical leg reads only the first
+ * words.
+ */
+export function memoryRankingQuery(scope: MemoryTailScope, request: string): string {
+  const focusInput = scope.focusInput ?? request;
+  let focusObjective = '';
+  try {
+    focusObjective = resolveRequestObjective(scope.sessionId, focusInput).focusObjective;
+  } catch {
+    focusObjective = '';
+  }
+  const ordered = [request, focusInput, focusObjective];
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const part of ordered) {
+    const text = part.replace(/\s+/g, ' ').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    parts.push(text);
+  }
+  return parts.join('\n');
 }
 
 /** The ranked tail's hit budget once the one proven-run line is set aside

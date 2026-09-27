@@ -256,6 +256,7 @@ import { buildUnifiedTurnPrimer, MEMORY_PRIMER_MARKER } from '../../memory/turn-
 import {
   RANKED_TAIL_POLICY_SLOTS,
   RANKED_TAIL_RELATIVE_FLOOR,
+  memoryRankingQuery,
   memoryTailScopeFor,
   rankedTailHitBudget,
   renderTurnMemoryTail,
@@ -5664,8 +5665,10 @@ function assemblyTimeoutPrimer(input: string, scope: MemoryTailScope | undefined
 }
 
 /** The primer for a turn whose agent was built by harnessInstructions: the
- *  prompt's one request-ranked memory tail (renderTurnMemoryTail). Any other
- *  agent keeps the plain primer. */
+ *  prompt's one request-ranked memory tail (renderTurnMemoryTail). The shared
+ *  ranker ranks by the request together with the objective the prompt's
+ *  per-block memory ranks by (memoryRankingQuery); whether it runs at all is
+ *  decided by the request alone. Any other agent keeps the plain primer. */
 async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: MemoryTailScope): Promise<TurnMemoryPrimer> {
   if (!scope) return buildPlainTurnMemoryPrimer(input, sessionId);
   const query = input.replace(/\s+/g, ' ').trim();
@@ -5693,8 +5696,9 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
   scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
   try {
     const sessionPointers = episodicBlockForPrimer(sessionId);
+    const rankingQuery = memoryRankingQuery(scope, query);
     const unified = await buildUnifiedTurnPrimer({
-      query,
+      query: rankingQuery,
       surface: 'automatic_primer',
       // Retrieve more than the tail shows so reserved policy slots can fill.
       limit: Math.max(10, TURN_MEMORY_PRIMER_TOP_K),
@@ -5711,7 +5715,7 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
     if (unified.status === 'ok' || unified.status === 'empty') {
       const primer = withTail({
         enabled: true,
-        query,
+        query: rankingQuery,
         hitCount: unified.hitCount,
         injectedBytes: 0,
         source: 'unified',
