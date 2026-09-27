@@ -33,6 +33,7 @@ import { codexModelsAvailable, claudeModelsAvailable } from './model-role-option
 import { withModelFallback, type FallbackTarget } from './fallback-model.js';
 import { maybeWrapWithFaultInjection } from './fault-inject.js';
 import { harnessRunContextStorage } from './brackets.js';
+import type { ByoBackendConfig } from '../../config.js';
 import {
   DEFAULT_CODEX_FAST_MODEL,
   DEFAULT_CLAUDE_FAST_MODEL,
@@ -141,6 +142,73 @@ function requestNeedsNativeTools(request: ModelRequest): boolean {
 
 function claudeHarnessSupportsRequest(request: ModelRequest): boolean {
   return !requestNeedsNativeTools(request) || claudeHarnessModelSupportsTools();
+}
+
+/** Where the router sends a model name first, before any fallover. */
+export interface RoutedPrimaryModel {
+  /** The name as asked for (the primary model when none was given). */
+  requested: string;
+  provider: BrainProvider;
+  /** The model id asked of that provider. */
+  modelId: string;
+  /** BYO only: the backend that serves it. */
+  backend?: ByoBackendConfig;
+  /** Why `modelId` is not the name asked for: all-in routing sends an
+   *  undeclared built-in-shaped id to the BYO primary; an active Claude
+   *  sign-in with no Codex sends a Codex-shaped id to the Claude brain. */
+  via?: 'all_in' | 'claude_no_codex';
+}
+
+/**
+ * The provider and model the router serves a model name on first, without
+ * building a model: ONE rule, used by the router itself and by anything that
+ * names the model a bare string reaches (the Memory tab's job rows, the token
+ * meter's "keeps your memory" tag). Throws as the router does when the name
+ * is ambiguous, or resolves to a BYO backend and none is configured.
+ */
+export function routedPrimaryModel(
+  modelName?: string,
+  deps: { resolveEffectiveProvider?: (modelId: string) => BrainProvider; codexAvailable?: () => boolean } = {},
+): RoutedPrimaryModel {
+  const mode = getModelRoutingMode();
+  const requested = typeof modelName === 'string' ? modelName.trim() : '';
+  const name = requested || MODELS.primary;
+  assertUnambiguousModelRouting(name, mode);
+
+  // Provider selection has ONE truth. In particular, the canonical classifier
+  // honors an explicit connected Claude id even while the ambient default is
+  // BYO all-in. The old router reimplemented all-in first and silently changed
+  // `claude-sonnet-5` into the BYO primary after workflow/session resolution
+  // had already selected Claude, so route metadata said Claude while GLM was
+  // billed. Keep all-in's fallback-to-primary behavior only when the canonical
+  // classifier actually chose BYO (disconnected/stale built-in ids included).
+  const effectiveProvider = (deps.resolveEffectiveProvider ?? resolveEffectiveProviderForModel)(name);
+  switch (effectiveProvider) {
+    case 'claude':
+      return { requested: name, provider: 'claude', modelId: name };
+    case 'byo': {
+      // Exact ownership declared by a named BYO provider beats model-id
+      // regexes. This is how an OpenAI-compatible endpoint can intentionally
+      // serve a model called `gpt-4o` or `claude-*` without being mistaken for
+      // a subscription. An undeclared built-in-shaped id in all-in still
+      // collapses to the configured BYO primary, preserving the dead-seat
+      // guard for ambient/stale defaults.
+      const declaredBackend = resolveDeclaredByoProviderForModel(name);
+      const backend = declaredBackend ?? resolveByoProviderForModel(name) ?? getByoBackendConfig();
+      if (!backend.configured) {
+        throw new Error(`Model ${name} resolves to a BYO/OpenAI-compatible backend, but no BYO backend is configured.`);
+      }
+      const collapse = mode === 'all_in' && !declaredBackend && resolveProvider(name) !== 'byo';
+      const modelId = collapse ? (backend.primaryId || name) : name;
+      return { requested: name, provider: 'byo', modelId, backend, ...(modelId !== name ? { via: 'all_in' as const } : {}) };
+    }
+    case 'codex':
+    default:
+      if (getActiveAuthMode() === 'claude_oauth' && !(deps.codexAvailable ?? codexModelsAvailable)()) {
+        return { requested: name, provider: 'claude', modelId: getClaudeBrainModel(), via: 'claude_no_codex' };
+      }
+      return { requested: name, provider: 'codex', modelId: name };
+  }
 }
 
 export class RouterModelProvider implements ModelProvider {
@@ -258,54 +326,32 @@ export class RouterModelProvider implements ModelProvider {
   }
 
   /** Resolve the single model the routing rules pick (no fallover) + which
-   *  provider it is, so the chain builder can append the OTHER providers. */
+   *  provider it is, so the chain builder can append the OTHER providers.
+   *  The pick itself is `routedPrimaryModel`; this builds it. */
   private resolvePrimary(modelName?: string): { model: Model; provider: BrainProvider; label: string } {
-    const byo = getByoBackendConfig();
-    const mode = getModelRoutingMode();
-    const requested = typeof modelName === 'string' ? modelName.trim() : '';
-    const name = requested || MODELS.primary;
-    assertUnambiguousModelRouting(name, mode);
-
-    // Provider selection has ONE truth. In particular, the canonical classifier
-    // honors an explicit connected Claude id even while the ambient default is
-    // BYO all-in. The old router reimplemented all-in first and silently changed
-    // `claude-sonnet-5` into the BYO primary after workflow/session resolution
-    // had already selected Claude, so route metadata said Claude while GLM was
-    // billed. Keep all-in's fallback-to-primary behavior only when the canonical
-    // classifier actually chose BYO (disconnected/stale built-in ids included).
-    const effectiveProvider = this.resolveEffectiveProvider(name);
-    switch (effectiveProvider) {
+    const routed = routedPrimaryModel(modelName, {
+      resolveEffectiveProvider: this.resolveEffectiveProvider,
+      codexAvailable: this.codexAvailable,
+    });
+    const allowOverloadFallback = harnessRunContextStorage.getStore()?.workerScope !== true;
+    switch (routed.provider) {
       case 'claude':
-        logger.debug({ requested: name, backend: 'claude' }, 'route');
-        return { model: this.claude.getModel(name, { allowOverloadFallback: harnessRunContextStorage.getStore()?.workerScope !== true }), provider: 'claude', label: name };
-      case 'byo': {
-        // Exact ownership declared by a named BYO provider beats model-id
-        // regexes. This is how an OpenAI-compatible endpoint can intentionally
-        // serve a model called `gpt-4o` or `claude-*` without being mistaken for
-        // a subscription. An undeclared built-in-shaped id in all-in still
-        // collapses to the configured BYO primary, preserving the dead-seat
-        // guard for ambient/stale defaults.
-        const declaredBackend = resolveDeclaredByoProviderForModel(name);
-        const backend = declaredBackend ?? resolveByoProviderForModel(name) ?? byo;
-        if (!backend.configured) {
-          throw new Error(`Model ${name} resolves to a BYO/OpenAI-compatible backend, but no BYO backend is configured.`);
+        if (routed.via === 'claude_no_codex') {
+          logger.debug({ requested: routed.requested, routedTo: routed.modelId, backend: 'claude' }, 'route (active claude, no codex)');
+        } else {
+          logger.debug({ requested: routed.requested, backend: 'claude' }, 'route');
         }
-        const id = mode === 'all_in' && !declaredBackend && resolveProvider(name) !== 'byo'
-          ? (backend.primaryId || name)
-          : name;
-        logger.debug({ requested: name, routedTo: id, backend: 'byo', provider: backend.providerLabel },
-          mode === 'all_in' ? 'route (all_in)' : 'route');
-        return { model: this.resolveByoModel(id, backend), provider: 'byo', label: id };
+        return { model: this.claude.getModel(routed.modelId, { allowOverloadFallback }), provider: 'claude', label: routed.modelId };
+      case 'byo': {
+        const backend = routed.backend!;
+        logger.debug({ requested: routed.requested, routedTo: routed.modelId, backend: 'byo', provider: backend.providerLabel },
+          getModelRoutingMode() === 'all_in' ? 'route (all_in)' : 'route');
+        return { model: this.resolveByoModel(routed.modelId, backend), provider: 'byo', label: routed.modelId };
       }
       case 'codex':
       default:
-        if (getActiveAuthMode() === 'claude_oauth' && !this.codexAvailable()) {
-          const id = getClaudeBrainModel();
-          logger.debug({ requested: name, routedTo: id, backend: 'claude' }, 'route (active claude, no codex)');
-          return { model: this.claude.getModel(id, { allowOverloadFallback: harnessRunContextStorage.getStore()?.workerScope !== true }), provider: 'claude', label: id };
-        }
-        logger.debug({ requested: name, backend: 'codex' }, 'route');
-        return { model: this.codex.getModel(name), provider: 'codex', label: name };
+        logger.debug({ requested: routed.requested, backend: 'codex' }, 'route');
+        return { model: this.codex.getModel(routed.modelId), provider: 'codex', label: routed.modelId };
     }
   }
 
