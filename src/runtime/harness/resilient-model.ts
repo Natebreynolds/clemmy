@@ -46,11 +46,12 @@ const DEFAULT_MAX_RETRIES = 3;
 const BASE_BACKOFF_MS = 750;
 const RATE_LIMIT_BASE_BACKOFF_MS = 2000;
 const MAX_BACKOFF_MS = 30_000;
-/** A provider that gave no answer (a transport failure or a 5xx) gets a new
- * attempt only while this much time has passed since the call's first one.
- * A connection that fails fast still gets every retry in the count budget; a
- * connection that takes its own timeout to fail gets one or two, so a
- * provider that is really down ends the call in seconds, not minutes. */
+/** A provider that gave no answer (a transport failure or a 5xx) always gets
+ * one new attempt, however long the first took to fail. Later attempts start
+ * only while this much time has passed since the call's first one. A
+ * connection that fails fast still gets every retry in the count budget; one
+ * that takes its own timeout to fail gets one retry, so a provider that is
+ * really down ends the call in about two of its timeouts, not minutes. */
 const NO_ANSWER_RETRY_WALL_MS = 20_000;
 const NO_ANSWER_KINDS: ReadonlySet<BoundaryErrorKind> = new Set(['model.transport_timeout', 'model.http_5xx']);
 
@@ -388,8 +389,10 @@ export class ResilientModel implements Model {
     const wait = backoffMs(attempt, cls);
     const elapsed = this.now() - call.startedAt;
     // A wait the provider named (Retry-After) is honored as before; the window
-    // bounds only this layer's own backoff over silent failures.
-    if (NO_ANSWER_KINDS.has(cls.kind) && cls.retryAfterMs == null && elapsed + wait > NO_ANSWER_RETRY_WALL_MS) {
+    // bounds only this layer's own backoff over silent failures. The first
+    // retry is never withheld: one slow failure is still a single blip, and
+    // an error marked spent must mean a retry really ran.
+    if (attempt >= 1 && NO_ANSWER_KINDS.has(cls.kind) && cls.retryAfterMs == null && elapsed + wait > NO_ANSWER_RETRY_WALL_MS) {
       markRetriesSpent(err);
       logger.warn(
         { label: this.policy.label, path, attempt: attempt + 1, kind: cls.kind, status: cls.status, elapsedMs: elapsed },

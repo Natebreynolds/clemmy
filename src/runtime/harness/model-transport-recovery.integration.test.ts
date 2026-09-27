@@ -131,6 +131,32 @@ test('a credential refresh that times out before the request is sent is retried 
   assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0);
 });
 
+test('a credential refresh that takes longer than the retry window to time out is still retried once and the turn answers', async () => {
+  const session = HarnessSession.create({ kind: 'chat', title: 'slow refresh timeout recovers' });
+  // The first refresh hangs on the network for 25 s of wall time before its
+  // own deadline fires; the clock moves instead of the test waiting.
+  const realNow = Date.now.bind(Date);
+  let skewMs = 0;
+  mock.method(Date, 'now', () => realNow() + skewMs);
+  let refreshes = 0;
+  fakeWire(() => answer('Here is the one-line summary.'));
+  const brain = productionBrain(session.id, async () => {
+    refreshes += 1;
+    if (refreshes === 1) {
+      skewMs += 25_000;
+      throw new Error('token refresh timed out after 25s. Check your network connection and try again.');
+    }
+    return 'fresh-access';
+  });
+  const result = await runChatTurn(session.id, brain);
+  assert.equal(result.status, 'completed', 'one slow blip before any output must not end the turn');
+  assert.match(String(result.finalOutput), /one-line summary/);
+  assert.equal(refreshes, 2);
+  assert.deepEqual(wire, ['Bearer fresh-access']);
+  assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0, 'no continuation question for a single blip');
+  assert.equal(eventlog.listEvents(session.id, { types: ['run_failed'] }).length, 0);
+});
+
 test('a provider that never answers ends in a resumable question after one bounded round, never a failed run', async () => {
   const session = HarnessSession.create({ kind: 'chat', title: 'provider unreachable' });
   fakeWire(() => connectTimeout());

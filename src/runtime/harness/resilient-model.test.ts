@@ -508,6 +508,49 @@ test('getStreamedResponse: a connection that takes its own timeout to fail is re
   assert.equal(resilient.modelRetriesSpentBeforeContent(err), true, 'outer layers see the retries were spent');
 });
 
+const slowFailures = {
+  'a reset socket': () => Object.assign(new TypeError('terminated'), { cause: { code: 'ECONNRESET' } }),
+  'a gateway 5xx with no Retry-After': () => ({ statusCode: 504, message: 'Gateway Timeout' }),
+};
+for (const path of ['getResponse', 'getStreamedResponse'] as const) {
+  for (const [shape, failure] of Object.entries(slowFailures)) {
+    test(`${path}: ${shape} that arrives after the no-answer window still gets one retry, and the answer arrives`, async () => {
+      const clock = { now: 0 };
+      let calls = 0;
+      const attempt = (): void => {
+        calls += 1;
+        if (calls === 1) { clock.now += 25_000; throw failure(); }
+      };
+      const inner = makeModel({
+        getResponse: async () => { attempt(); return resp([{ type: 'message', content: 'answered' }]); },
+        getStreamedResponse: async function* () {
+          attempt();
+          yield { type: 'output_text_delta', delta: 'answered' } as any;
+          yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+        },
+      });
+      const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+      if (path === 'getResponse') await model.getResponse(req());
+      else assert.ok((await collect(model.getStreamedResponse(req()))).some((e: any) => e.delta === 'answered'));
+      assert.equal(calls, 2, 'one slow failure is a single blip, not a spent budget');
+    });
+  }
+}
+
+test('getStreamedResponse: a slow failure that repeats is retried once, then surfaces marked as spent', async () => {
+  const clock = { now: 0 };
+  let calls = 0;
+  const inner = makeModel({
+    // eslint-disable-next-line require-yield
+    getStreamedResponse: async function* () { calls += 1; connectTimeoutAfter(clock, 25_000); },
+  });
+  const model = withResilience(inner, policy({ now: () => clock.now, sleep: async (ms) => { clock.now += ms; } }));
+  const err = await collect(model.getStreamedResponse(req())).then(() => assert.fail('must throw'), (e: unknown) => e);
+  assert.equal(calls, 2, 'the first retry always runs; the window stops the second');
+  assert.ok(clock.now <= 2 * 25_000 + 1_000, `bounded by about two attempts: ${clock.now} ms`);
+  assert.equal(resilient.modelRetriesSpentBeforeContent(err), true);
+});
+
 test('getResponse: a connection that fails fast keeps the full retry count, and the spent failure is marked', async () => {
   const clock = { now: 0 };
   let calls = 0;
