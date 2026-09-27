@@ -37,16 +37,18 @@ const memory = await import('./db.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const worker = await import('./semantic-learning-worker.js');
 const { closedCanonicalJson } = await import('../shared/closed-canonical-json.js');
+const { buildTransportTimeoutError } = await import('../runtime/codex-dispatcher.js');
 
-let reply: string | (() => never) = '{}';
+/** The model's answer, or a function of what it was asked (throw to fail). */
+let reply: string | ((asked: string) => string) = '{}';
 let calls = 0;
 
 function fixtureModel(modelId: string): Model {
   return {
-    async getResponse(): Promise<ModelResponse> {
+    async getResponse(request: { input?: unknown }): Promise<ModelResponse> {
       calls += 1;
       recordModelUsage({ sessionId: 'adapter-session', model: modelId, inputTokens: 40, outputTokens: 8 });
-      const text = typeof reply === 'function' ? reply() : reply;
+      const text = typeof reply === 'function' ? reply(JSON.stringify(request?.input ?? '')) : reply;
       return {
         output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] }],
         usage: new Usage(),
@@ -104,10 +106,32 @@ function insertShard(): void {
   `).run(manifestJson, createHash('sha256').update(manifestJson).digest('hex'), now, now, now);
 }
 
-function shardRow(): { status: string; attempts: number } {
+/** A second part of the same conversation, queued after the first. */
+function insertLaterShard(shardId: string, ordinal: number): void {
+  const db = memory.openMemoryDb();
+  const later = new Date(1_000 * ordinal).toISOString();
+  const first = db.prepare(`
+    SELECT manifest_json, manifest_hash FROM memory_learning_shards WHERE shard_id = 'shard-1'
+  `).get() as { manifest_json: string; manifest_hash: string };
+  db.prepare(`
+    INSERT INTO memory_learning_shards
+      (shard_id, batch_id, ordinal, manifest_json, manifest_hash,
+       reflection_call_id, status, attempts, lease_token, lease_expires_at,
+       next_attempt_at, last_error, created_at, updated_at, completed_at)
+    VALUES (?, 'batch-1', ?, ?, ?, ?, 'pending', 0, NULL, NULL, ?, NULL, ?, ?, NULL)
+  `).run(shardId, ordinal, first.manifest_json, first.manifest_hash, `terminal-learning:${shardId}`, later, later, later);
+}
+
+/** Every waiting part is due now: the backoff between tries has passed. */
+function makePartsDue(): void {
+  memory.openMemoryDb().prepare("UPDATE memory_learning_shards SET next_attempt_at = ? WHERE status = 'pending'")
+    .run(new Date(0).toISOString());
+}
+
+function shardRow(shardId = 'shard-1'): { status: string; attempts: number } {
   return memory.openMemoryDb().prepare(`
-    SELECT status, attempts FROM memory_learning_shards WHERE shard_id = 'shard-1'
-  `).get() as { status: string; attempts: number };
+    SELECT status, attempts FROM memory_learning_shards WHERE shard_id = ?
+  `).get(shardId) as { status: string; attempts: number };
 }
 
 function chooseCodexMemoryModel(): string {
@@ -205,6 +229,33 @@ test('a part that hits a used-up plan mid-read is handed back with its try retur
   reply = EXTRACTION;
   const learned = await worker.drainTerminalSemanticLearning({ requireIdle: false });
   assert.equal(learned.shardsCompleted, 1);
+});
+
+test('a part whose read times out spends its try, and the parts after it still get read', async () => {
+  // A timeout may be the part's own (and a timed-out read may be billed), so
+  // it counts like any failure, even though it pauses the extractor. Handing
+  // it back would read the same part first after every pause, forever.
+  chooseCodexMemoryModel();
+  insertLaterShard('shard-2', 1);
+  worker._testOnlySemanticLearningWorker.setShardInputRebuilder((id: string) => `${id}\n${SOURCE}`);
+  reply = (asked) => {
+    if (asked.includes('shard-1')) throw buildTransportTimeoutError('UND_ERR_BODY_TIMEOUT');
+    return EXTRACTION;
+  };
+  const first = await worker.drainTerminalSemanticLearning({ requireIdle: false, shardLimit: 1 });
+  assert.equal(first.shardsRetried, 1);
+  assert.equal(first.shardsWaiting, 0, 'the try is not handed back');
+  assert.equal(shardRow().attempts, 1);
+  const [event] = telemetry.listOperationalEvents({ source: 'memory', type: 'memory_work_failed' });
+  assert.deepEqual((event?.payload as { failure?: unknown }).failure, { problem: 'timeout' }, 'the failed read says why');
+
+  for (let pass = 0; pass < 8 && shardRow('shard-2').status !== 'completed'; pass += 1) {
+    reflection.setReflectionExtractorPauseForTest(null); // the pause lifts
+    makePartsDue();
+    await worker.drainTerminalSemanticLearning({ requireIdle: false, shardLimit: 1 });
+  }
+  assert.equal(shardRow().status, 'dead_letter', 'a part that keeps timing out stops after its tries');
+  assert.equal(shardRow('shard-2').status, 'completed', 'the next part is read');
 });
 
 test('a part the model answered with nothing usable still spends its try', async () => {

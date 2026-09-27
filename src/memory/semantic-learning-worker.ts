@@ -431,7 +431,13 @@ export async function drainTerminalSemanticLearning(options: {
     }
     summary.extractorInvocations += 1;
     let result: ReflectionResult;
-    const seen: { problem: MemoryModelProblem | null } = { problem: null };
+    // What this part's own read saw: whether its model was asked at all, and
+    // the model error it hit, with that error's problem class.
+    const seen: { asked: boolean; errored: boolean; problem: MemoryModelProblem | null } = {
+      asked: false,
+      errored: false,
+      problem: null,
+    };
     try {
       // Reading one part of a finished conversation is the `learn` memory job.
       result = await runMemoryModelJob('learn', {
@@ -446,6 +452,8 @@ export async function drainTerminalSemanticLearning(options: {
         sourceUri: `memory-batch://${shard.batchId}/${shard.shardId}`,
         learningMode: 'terminal_batch',
       }), (value, note) => {
+        seen.asked = typeof note.requestedModelId === 'string';
+        seen.errored = note.error !== undefined;
         seen.problem = notedMemoryModelProblem(note);
         return learnOutcome(value, note);
       });
@@ -460,12 +468,19 @@ export async function drainTerminalSemanticLearning(options: {
       continue;
     }
     if (result.skipped === 'extractor_failed') {
-      // The model was out of reach (refused for quota, credit or sign-in, or
-      // not callable at all when the part came up): hand the part back with
-      // its try returned and stop; the gate above holds the next pass.
+      // The model was out of reach: hand the part back with its try returned
+      // and stop; the gate above holds the next pass. A part that asked its
+      // model answers for what the model said: only a refusal for quota,
+      // credit or sign-in is out of reach. A timeout, any other error or
+      // unusable output spends the try, even when the error paused the
+      // extractor, so a part that keeps failing still reaches dead letter.
+      // A part whose model was never asked (the pause was already on, or
+      // there was no route) waits while the model is unavailable.
       const waiting = modelWaiting();
       const problem = seen.problem;
-      const outOfReach = problem ? MODEL_OUT_OF_REACH.has(problem) : waiting !== null;
+      const outOfReach = seen.asked || seen.errored
+        ? problem !== null && MODEL_OUT_OF_REACH.has(problem)
+        : waiting !== null;
       if (outOfReach) {
         const why = waiting ?? { reason: 'model_unavailable' as const, ...(problem ? { problem } : {}) };
         if (releaseShardForModel(shard, `waiting for the memory model: ${why.problem ?? why.reason}`)) summary.shardsWaiting += 1;

@@ -18,6 +18,7 @@ const telemetry = await import('../runtime/operational-telemetry.js');
 const { recordModelUsage, withModelUsageAttribution, modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
 const { withModelRouteMetrics } = await import('../runtime/model-route-metrics.js');
 const { BoundaryError } = await import('../runtime/boundary-error.js');
+const { buildTransportTimeoutError } = await import('../runtime/codex-dispatcher.js');
 const { pinnedBrainForSession, resolveRoleModel, __sessionBrainPinTest__ } = await import('../runtime/harness/model-roles.js');
 type Model = import('@openai/agents-core').Model;
 type ModelRequest = import('@openai/agents-core').ModelRequest;
@@ -303,6 +304,9 @@ test('a thrown model error names its problem class, never a provider', () => {
   assert.equal(memoryModelProblemFromError(boundary('model.empty_completion')), 'error');
   assert.equal(memoryModelProblemFromError(boundary('model.transport_timeout')), 'timeout');
   assert.equal(memoryModelProblemFromError(boundary('model.auth_expired')), 'not_connected');
+  // A model adapter's own transport timeout reads as the extractor's pause
+  // reads it, not as "not the model's".
+  assert.equal(memoryModelProblemFromError(buildTransportTimeoutError('UND_ERR_BODY_TIMEOUT')), 'timeout');
   // Not the model's: no problem is named.
   assert.equal(memoryModelProblemFromError(new Error('something else')), null);
   assert.equal(memoryModelProblemFromError(new TypeError('x is not a function')), null);

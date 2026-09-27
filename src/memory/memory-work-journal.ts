@@ -247,7 +247,10 @@ export function lastCheckedByJob(): Partial<Record<MemoryJobId, string>> {
 export function memoryModelProblemFromError(error: unknown): MemoryModelProblem | null {
   try {
     // The resilient model wrapper already names the model's failure class.
-    if (error instanceof BoundaryError) return problemOfKind(error.kind, error);
+    // Any other boundary kind (a model adapter's own transport timeout, say)
+    // is read by the classifier the extractor's pause uses, so the event and
+    // the pause name the same problem.
+    if (error instanceof BoundaryError && error.kind.startsWith('model.')) return problemOfKind(error.kind, error);
     const cls = classifyModelError(error);
     // An error with no HTTP status that is not a transport failure did not
     // come from a model; one with a status is the provider answering.
