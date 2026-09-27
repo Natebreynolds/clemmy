@@ -190,9 +190,12 @@ test('a Space read through the real call_tool carrier arrives whole', async () =
   });
   const shown = results.get('carrier-space-read');
   assert.ok(shown, 'the model received the carrier result');
-  assert.equal(shown, wholeSpaceRead, 'the carrier presents the inner read byte-for-byte');
-  assert.ok(shown.includes(MIDDLE_EVIDENCE));
-  assert.doesNotMatch(shown, /middle omitted/);
+  // Compact messages: a failing comparison of two 10k strings cannot cross
+  // the test runner's worker boundary.
+  assert.ok(shown === wholeSpaceRead,
+    `the carrier presents the inner read byte-for-byte (shown ${shown.length} of ${wholeSpaceRead.length} chars)`);
+  assert.ok(shown.includes(MIDDLE_EVIDENCE), 'the middle of the read reaches the model');
+  assert.ok(!shown.includes('middle omitted'), 'no head/tail digest');
 });
 
 test('the same Space read called directly produces the identical presentation', async () => {
@@ -201,7 +204,8 @@ test('the same Space read called directly produces the identical presentation', 
     toolName: 'space_get',
     calls: [{ callId: 'direct-space-read', args: { slug: SLUG } }],
   });
-  assert.equal(results.get('direct-space-read'), wholeSpaceRead);
+  const shown = results.get('direct-space-read') ?? '';
+  assert.ok(shown === wholeSpaceRead, `direct read shown ${shown.length} of ${wholeSpaceRead.length} chars`);
 });
 
 test('on a small window the carrier and the direct call present the same bounded read', async () => {
@@ -226,7 +230,8 @@ test('on a small window the carrier and the direct call present the same bounded
   assert.ok(viaCarrier.length <= budget && viaCarrier.length > PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
     `bounded by the window budget, above the keyhole (got ${viaCarrier.length})`);
   assert.equal((viaCarrier.match(/middle omitted/g) ?? []).length, 1, 'digested once, never a digest of a digest');
-  assert.equal(normalize(viaCarrier), normalize(viaDirect));
+  assert.ok(normalize(viaCarrier) === normalize(viaDirect),
+    `carrier and direct present the same read (${viaCarrier.length} vs ${viaDirect.length} chars)`);
 });
 
 test('recall_tool_result through call_tool is never re-clipped by the carrier', async () => {
@@ -241,9 +246,10 @@ test('recall_tool_result through call_tool is never re-clipped by the carrier', 
   });
   const recalled = results.get('recall-through-carrier');
   assert.ok(recalled);
-  assert.match(recalled, new RegExp(`^Recalled chars 0–${wholeSpaceRead.length} of ${wholeSpaceRead.length}`));
-  assert.ok(recalled.endsWith(wholeSpaceRead), 'the whole requested slice reaches the model');
-  assert.doesNotMatch(recalled, /middle omitted|recall_tool_result \{"call_id":"recall-through-carrier"/,
+  assert.ok(recalled.startsWith(`Recalled chars 0–${wholeSpaceRead.length} of ${wholeSpaceRead.length}`),
+    recalled.slice(0, 200));
+  assert.ok(recalled.endsWith(wholeSpaceRead), `the whole requested slice reaches the model (${recalled.length} chars)`);
+  assert.ok(!/middle omitted|recall_tool_result \{"call_id":"recall-through-carrier"/.test(recalled),
     'no digest, and no footer asking the model to recall its own recall');
 });
 
@@ -264,7 +270,7 @@ test('an explicit larger recall through call_tool is returned whole, up to the s
   const shown = results.get('explicit-recall')!;
   assert.ok(shown.startsWith(`Recalled chars 0–30000 of ${PARKED.length} `), `${shown.slice(0, 300)} … (${shown.length} chars)`);
   assert.ok(shown.endsWith(PARKED.slice(0, 30_000)), 'the whole 30,000-char slice reaches the model');
-  assert.doesNotMatch(shown, /middle omitted/);
+  assert.ok(!shown.includes('middle omitted'), 'no head/tail digest');
 });
 
 test('a bare recall through call_tool shows one inline result and names the exact next page', async () => {
@@ -275,8 +281,8 @@ test('a bare recall through call_tool shows one inline result and names the exac
   const shown = results.get('bare-recall')!;
   assert.ok(shown.startsWith(`Recalled chars 0–20000 of ${PARKED.length} `), `${shown.slice(0, 300)} … (${shown.length} chars)`);
   assert.ok(shown.includes('continue with recall_tool_result {"call_id":"parked-read","offset":20000}'), 'exact next page');
-  assert.ok(shown.endsWith(PARKED.slice(0, 20_000)));
-  assert.doesNotMatch(shown, /middle omitted/);
+  assert.ok(shown.endsWith(PARKED.slice(0, 20_000)), 'the whole default slice reaches the model');
+  assert.ok(!shown.includes('middle omitted'), 'no head/tail digest');
 });
 
 test('the per-turn RecallBudget governs recalls made through a carrier', async () => {
