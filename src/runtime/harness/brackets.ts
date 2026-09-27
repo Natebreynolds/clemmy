@@ -23,7 +23,7 @@ import {
   isTerminalPhysicalDispatchOwner,
 } from './terminal-physical-dispatch-owner.js';
 import { getToolOutputContext, withToolOutputContext } from './tool-output-context.js';
-import { formatRecallableToolText, explicitLocalReadPreviewBudget, presentationBudgetFor, PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from './tool-output-format.js';
+import { formatRecallableToolText, explicitLocalReadPreviewBudget, inlineResultBudgetForModel, presentationBudgetFor, PROMPT_INLINE_RECALLABLE_RESULT_CHARS } from './tool-output-format.js';
 import { steerBlockForToolBoundary } from './steer-notes.js';
 import { exactToolOutputForInvocation } from './tool-output-format.js';
 import { settleExternalWriteFromVerifiedArtifact } from './external-write-artifact-settlement.js';
@@ -4900,6 +4900,13 @@ export function wrapToolForHarness<T extends WrappableTool>(
           // once while its exact receipt is in scope and the carrier passes
           // that projection through instead of digesting it as new raw data.
           maxChars: presentationBudget,
+          // A direct call whose handler already projected its own reply from
+          // the exact bytes keeps that projection up to one whole inline result
+          // for the window, instead of a smaller view rebuilt from the same
+          // bytes; a nested or batch child keeps its carrier's or runner's view.
+          ...(ctx?.nestedDispatch || ctx?.batchItem
+            ? {}
+            : { verifiedProjectionMaxChars: inlineResultBudgetForModel(ctx?.routedModelId) }),
           hostAnnotations: [...settledResultAnnotations, ...hostAnnotations] })) : value;
       if (isTimeoutSelfCorrectTool(tool.name)) {
         try {

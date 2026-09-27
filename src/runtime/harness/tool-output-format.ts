@@ -218,6 +218,12 @@ export interface RecallableToolTextOptions {
   callId?: string;
   /** Host commentary, separate from the provider payload and its raw receipt. */
   hostAnnotations?: readonly string[];
+  /** A projection the handler itself already formatted from this invocation's
+   * exact bytes is kept whole up to this many characters, and re-rendered from
+   * those bytes at this budget above it, even when `maxChars` is smaller. Only
+   * a direct call's bracket passes it: a nested or batch child keeps the view
+   * its carrier or runner presents. */
+  verifiedProjectionMaxChars?: number;
 }
 
 const EXACT_OUTPUT_RECEIPT_RE = /\[exact-output-receipt:v1 nonce=([0-9a-f-]{36}) sha256=([0-9a-f]{64})\]/ig;
@@ -457,7 +463,7 @@ export function formatRecallableToolText(
     && (options.toolName == null || options.toolName === active.toolName)
     ? active.presentationBudget
     : undefined;
-  const maxChars = options.maxChars
+  let maxChars = options.maxChars
     ?? (sessionId && callId
       ? activeInvocationBudget ?? presentationBudgetFor({ toolName })
       : DEFAULT_TOOL_RESULT_MAX_CHARS);
@@ -473,6 +479,9 @@ export function formatRecallableToolText(
       compactResult: text, settlementNonce: active.settlementNonce });
     if (exact instanceof TruncatedToolOutputResult) return JSON.stringify(exact);
     if (typeof exact === 'string' && exact !== text) {
+      if (options.verifiedProjectionMaxChars !== undefined) {
+        maxChars = Math.max(maxChars, options.verifiedProjectionMaxChars);
+      }
       if ((options.maxChars === undefined || text.length <= maxChars) && hostAnnotations.length === 0) return text;
       // Only an explicit smaller display request should re-render a verified
       // projection; a second formatter's default must not reinterpret it.

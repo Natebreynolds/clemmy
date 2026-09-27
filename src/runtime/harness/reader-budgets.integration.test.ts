@@ -32,7 +32,10 @@ const envelopes = await import('../../agents/capability-envelope.js');
 const inner = await import('../../tools/inner-dispatch.js');
 const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
-const { MCP_TRANSPORT_MAX_CHARS, inlineResultBudgetForModel, retainedReaderMaxChars } = await import('./tool-output-format.js');
+const {
+  DEFAULT_TOOL_RESULT_MAX_CHARS, MCP_TRANSPORT_MAX_CHARS, PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+  inlineResultBudgetForModel, retainedReaderMaxChars,
+} = await import('./tool-output-format.js');
 const { recordCatalogWindow, recordWindowRejection } = await import('./model-window-observations.js');
 
 after(() => {
@@ -251,4 +254,22 @@ test('on a large window an explicit recall is bounded by what the MCP wire carri
   assert.ok(shown.startsWith(`Recalled chars 0–${readerMax} of ${large.length}`), shown.slice(0, 200));
   assert.ok(shown.includes(`"offset":${readerMax}`), 'the exact next page');
   assert.ok(shown.endsWith(large.slice(0, readerMax)), 'the whole slice reaches the model');
+});
+
+test('a direct business-role local tool keeps the projection its own handler formatted', async () => {
+  // table_ops formats its own reply (textResult) from the exact bytes of a
+  // result larger than one inline result; the bracket must not rebuild a
+  // smaller view of the same bytes for a direct call.
+  const rows = Array.from({ length: 20 }, (_, i) => ({
+    id: `r${i}`, email: `person${i}@example.test`, notes: `detail ${i} `.repeat(160),
+  }));
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('table_ops'), toolName: 'table_ops',
+    calls: [{ callId: 'direct-table', args: { op: 'select', left_rows: JSON.stringify(rows), limit: 20 } }],
+  });
+  const shown = results.get('direct-table') ?? '';
+  assert.ok(shown.length > PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+    `the handler's own projection reaches the model, not the 4,000-char view (got ${shown.length})`);
+  assert.ok(shown.length <= DEFAULT_TOOL_RESULT_MAX_CHARS, `bounded by one inline result (got ${shown.length})`);
+  assert.ok(shown.includes('"id":"r0"'), 'the projection carries the records');
 });
