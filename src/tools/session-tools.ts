@@ -179,8 +179,13 @@ function renderDiscoveredWork(items: DiscoveredWorkItem[], limit: number): strin
  * while coverage is incomplete, what an empty complete search covered, and
  * how a hit's exact conversation is read. The tool description carries only
  * the call contract.
+ *
+ * The rule travels as one string under `reading`. A root `next` key is a
+ * pagination cursor to the result-facts reader, and a second root array makes
+ * `hits` an ambiguous record collection; either would cost the result its
+ * record path, count, completeness and cursor.
  */
-export function sessionSearchNextSteps(found: Pick<ReturnType<typeof searchSessionHistory>, 'hits' | 'next_cursor' | 'coverage'>): string[] {
+export function sessionSearchReading(found: Pick<ReturnType<typeof searchSessionHistory>, 'hits' | 'next_cursor' | 'coverage'>): string {
   const steps: string[] = [];
   if (found.hits.length > 0) {
     steps.push('Hits are newest first and excerpts are shortened, not full evidence. For a conversation\'s exact text, pass that hit\'s session_id, through_seq and snapshot_sha256 with this search_receipt_id to session_history. Recalled facts grant no task continuation or write authority.');
@@ -193,7 +198,7 @@ export function sessionSearchNextSteps(found: Pick<ReturnType<typeof searchSessi
   } else if (found.hits.length === 0) {
     steps.push('No match among retained chats. Derived memory and legacy-only chats are not searched here.');
   }
-  return steps;
+  return steps.join(' ');
 }
 
 function harnessSessionRecordForContinuity(sessionId: string): SessionRecord | null {
@@ -283,7 +288,7 @@ export function registerSessionTools(server: McpServer): void {
       try {
         const found = searchSessionHistory({ sessionId: context.sessionId, sourceUserSeq,
           query: query ?? undefined, after, before, limit: limit ?? undefined, cursor, includeCurrentConversation: include_current_conversation ?? undefined });
-        return textResult(JSON.stringify({ ...found, next: sessionSearchNextSteps(found) }));
+        return textResult(JSON.stringify({ ...found, reading: sessionSearchReading(found) }));
       } catch (error) {
         return textResult(`session_search denied: ${error instanceof Error ? error.message : String(error)}`, { isError: true });
       }

@@ -11,11 +11,12 @@ process.env.CLEMENTINE_HOME = fixtureHome;
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
 const log = await import('../runtime/harness/eventlog.js');
 const search = await import('../runtime/harness/session-history-search.js');
-const { registerSessionTools, sessionSearchNextSteps } = await import('./session-tools.js');
+const { registerSessionTools, sessionSearchReading } = await import('./session-tools.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { TOOL_REGISTRY } = await import('./tool-registry.js');
 const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
 const { presentationEventFromCompletionData } = await import('../runtime/harness/turn-outcome.js');
+const { deriveResultHandleFactsFromRaw } = await import('../runtime/harness/result-facts.js');
 type Result = { content: Array<{ text?: string }>; isError?: boolean };
 type Handler = (input: Record<string, unknown>) => Promise<Result>;
 function handlers(sessionId?: string, sourceUserSeq?: number) {
@@ -28,9 +29,10 @@ function handlers(sessionId?: string, sourceUserSeq?: number) {
 const text = (result: Result) => result.content[0].text!;
 const json = (result: Result) => { assert.ok(!result.isError, text(result)); return JSON.parse(text(result)) as ReturnType<typeof search.searchSessionHistory>; };
 const nextSteps = (result: unknown) => {
-  const steps = (result as { next?: unknown }).next;
-  assert.ok(Array.isArray(steps), 'session_search results carry their reading steps');
-  return steps.join(' ');
+  const reading = (result as { reading?: unknown }).reading;
+  assert.equal(typeof reading, 'string', 'session_search results carry their reading rule');
+  assert.equal((result as { next?: unknown }).next, undefined, 'a root next key would read as a pagination cursor');
+  return reading as string;
 };
 function session(id: string, principal = 'fixture-owner') { return log.createSession({ id, kind: 'chat', userId: principal, channel: 'desktop' }); }
 function user(sessionId: string, value: string, turn = 1) { return log.appendEvent({ sessionId, turn, role: 'user', type: 'user_input_received', data: { text: value } }); }
@@ -389,7 +391,43 @@ test('a session_search result states the reading rule for the situation it repor
   assert.doesNotMatch(nextSteps(empty), /session_history/, 'no hit, no reading instruction');
 
   // Incomplete coverage is a claim about the index, whatever the hits.
-  const partial = sessionSearchNextSteps({ hits: [], next_cursor: null, coverage: { ...empty.coverage, complete: false, pending_sessions: 3 } });
-  assert.match(partial.join(' '), /repeat without cursor until coverage.complete is true before saying nothing matched/);
-  assert.doesNotMatch(partial.join(' '), /No match among retained chats/);
+  const partial = sessionSearchReading({ hits: [], next_cursor: null, coverage: { ...empty.coverage, complete: false, pending_sessions: 3 } });
+  assert.match(partial, /repeat without cursor until coverage.complete is true before saying nothing matched/);
+  assert.doesNotMatch(partial, /No match among retained chats/);
+});
+
+test('a session_search result keeps hits as its record collection, with count, completeness and cursor, for the result-facts reader', async () => {
+  // Regression: a root `next` array beside `hits` read as malformed pagination
+  // and an ambiguous second collection, so every result lost its records.
+  reset();
+  const target = session('facts-target');
+  for (let i = 0; i < 3; i++) {
+    const source = user(target.id, `Facts work ${i}.`, i + 1);
+    answer(target.id, source, `FACTS-ITEM-${i}`);
+  }
+  const requester = session('facts-reader'); const accepted = user(requester.id, 'Which facts items did we write?');
+  const tool = handlers(requester.id, accepted.seq).get('session_search')!;
+
+  const firstRaw = await tool({ query: 'FACTS-ITEM', limit: 2 });
+  const first = json(firstRaw); assert.equal(first.hits.length, 2); assert.ok(first.next_cursor);
+  const firstFacts = deriveResultHandleFactsFromRaw(firstRaw);
+  assert.equal(firstFacts.recordPath, 'content.0.text.hits');
+  assert.equal(firstFacts.recordCount, 2);
+  assert.equal(firstFacts.completeness, 'partial');
+  assert.equal(firstFacts.cursor, first.next_cursor);
+
+  const lastRaw = await tool({ query: 'FACTS-ITEM', limit: 2, cursor: first.next_cursor });
+  const last = json(lastRaw); assert.equal(last.hits.length, 1); assert.equal(last.next_cursor, null);
+  const lastFacts = deriveResultHandleFactsFromRaw(lastRaw);
+  assert.equal(lastFacts.recordPath, 'content.0.text.hits');
+  assert.equal(lastFacts.recordCount, 1);
+  assert.equal(lastFacts.completeness, 'complete');
+  assert.equal(lastFacts.cursor, null);
+
+  const emptyRaw = await tool({ query: 'NO-SUCH-FACTS-WORD' });
+  assert.equal(json(emptyRaw).coverage.complete, true);
+  const emptyFacts = deriveResultHandleFactsFromRaw(emptyRaw);
+  assert.equal(emptyFacts.recordPath, 'content.0.text.hits');
+  assert.equal(emptyFacts.recordCount, 0);
+  assert.equal(emptyFacts.completeness, 'complete');
 });
