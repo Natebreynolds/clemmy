@@ -7,11 +7,15 @@ import { actionTopologyRoleForRuntimeCall, unwrapRuntimeEffectiveToolIdentity } 
 import { effectiveContextWindow } from './model-window-observations.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 
-// The default inline budget passes a typical single-screen result whole, so a
-// normal "show me N" read needs no follow-up query round-trip, while a
-// genuinely huge output still digests and stays recoverable. Context pressure
-// is owned by compaction, which is budgeted from the routed model's real
-// window (compactionBudgetForModel).
+// Raised 4000 → 12000 (2026-05-29): 4000 clipped normal "show me N" results
+// (e.g. 10 Salesforce accounts ≈ 5.5KB) into head+tail, which read as
+// "aggressive" clipping. Raised 12000 → 20000 (2026-08-05): a 39KB calendar
+// day (6 Graph events) digested at 12K, forcing a follow-up tool_output_query
+// round-trip for data the model was about to need anyway; 20K (~5K tokens)
+// passes typical single-screen results whole while genuinely huge outputs
+// (100KB+ Composio dumps) still digest + stay recoverable. Context pressure is
+// owned by compaction, which is now budgeted from the routed model's REAL
+// window (compactionBudgetForModel) instead of a fixed 200K.
 export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
 /** When the full payload is parked for recall, the prompt keeps a smaller
  *  field/index view plus a source reference instead of re-reading the dump. */
@@ -361,11 +365,11 @@ export function extractResourceIdIndex(text: string): string {
  * `recall_tool_result`. Without call context it falls back to a plain
  * truncation marker, which is the best a detached MCP/dev path can do.
  */
-// ─── Scrape-head densifier ───
-// Scraped-page markdown reaches the model as a clipped head, and a raw head is
+// ─── Scrape-head densifier (live 2026-07-23, 120-account visibility run) ───
+// Scraped-page markdown reaches the model as a clipped head — and the head was
 // junk-dense: image markdown, data: URI blobs, asset links, and bare-URL nav
-// lines burn the budget while the useful content sits below the cut, sending
-// the model back to recall again and again. The STORED payload
+// lines burned the budget while the useful content sat below the cut (the
+// model went back via recall_tool_result 44× in one run). The STORED payload
 // stays raw (recall fidelity); only the model-visible head is computed from a
 // densified view, and only when the text is provably scrape-shaped.
 const MD_IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
