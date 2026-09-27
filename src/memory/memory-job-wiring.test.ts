@@ -321,6 +321,24 @@ test('a pattern run whose model failed on every group did not finish', () => {
   assert.deepEqual(outcome.failure, { problem: 'quota' });
 });
 
+test('a pattern run that had no model to ask says why it did not finish', () => {
+  // Nothing signed in: the route is null, so no group reached a model to fail.
+  writeFileSync(path.join(TEST_HOME, 'state', 'auth.json'), '{}');
+  writeFileSync(path.join(TEST_HOME, 'state', 'claude-auth.json'), '{}');
+  try {
+    assert.equal(jobs.memoryJobUnavailableProblem('patterns'), 'not_connected', 'fixture: nothing is signed in');
+    const outcome = reflection.recursiveReflectionOutcome({
+      patternsWritten: 0, patternsUpdated: 0, patternsNoop: 0, sourcesDemoted: 0,
+      groupsProcessed: 0, groupsSkipped: 3, factsConsidered: 20, groupsFailed: 1,
+      patternFactIds: { learned: [], updated: [] },
+    }, {});
+    assert.equal(outcome.outcome, 'failed');
+    assert.deepEqual(outcome.failure, { problem: 'not_connected' });
+  } finally {
+    writeAuth();
+  }
+});
+
 // ───────────────────────────── skills ─────────────────────────────
 
 function successReceipt(sourceId: string) {

@@ -35,8 +35,10 @@ import {
   memoryIndexOutcome,
   memoryJobFailed,
   memoryJobRoute,
+  memoryJobUnavailableProblem,
   memoryWorkSourceForSession,
   noteMemoryModelFailure,
+  notedMemoryModelProblem,
   runMemoryModelJob,
   type MemoryJobNote,
 } from './memory-job-context.js';
@@ -3116,7 +3118,9 @@ export async function runRecursivePatternExtractor(
 /**
  * The patterns job's record of one nightly run: the patterns it kept (their
  * facts count as learned or updated today, by id), or — when groups failed and
- * nothing was kept — that it did not finish, with the model's problem.
+ * nothing was kept — that it did not finish, with the model's problem: the
+ * error the extractor caught, or else why the memory model cannot serve (a
+ * group whose route was null never reached a model to fail).
  */
 export function recursiveReflectionOutcome(result: RecursiveReflectionResult, note: MemoryJobNote): MemoryJobOutcome {
   const facts = {
@@ -3128,7 +3132,9 @@ export function recursiveReflectionOutcome(result: RecursiveReflectionResult, no
     learned: facts.learned.length,
     updated: facts.updated.length,
   };
-  if (result.groupsFailed > 0 && produced.patterns === 0) return memoryJobFailed(note, { produced, facts });
+  if (result.groupsFailed > 0 && produced.patterns === 0) {
+    return memoryJobFailed(note, { produced, facts }, notedMemoryModelProblem(note) ?? memoryJobUnavailableProblem('patterns'));
+  }
   return { outcome: produced.patterns > 0 ? 'ok' : 'nothing_new', produced, facts };
 }
 

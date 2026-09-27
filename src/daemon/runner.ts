@@ -192,6 +192,7 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { MEMORY_JOB_CLOCKS } from '../memory/memory-jobs.js';
 import { memoryTidyOutcome, runMemoryModelJob } from '../memory/memory-job-context.js';
+import { memoryModelAvailability } from '../memory/memory-model-route.js';
 import type { AssistantResponse } from '../types.js';
 
 const logger = pino({ name: 'clementine-next.daemon' });
@@ -901,6 +902,14 @@ export function daemonRecursiveReflectionEnabled(): boolean {
   return !reflectionTurnedOff();
 }
 
+/** Whether the memory model can take the nightly patterns run now. When it
+ *  cannot (nothing signed in, out of quota), the run waits: the day stays
+ *  unspent and a later tick runs it once the model is back, instead of
+ *  recording a run that could not start. The Memory tab already says why. */
+export function recursiveReflectionModelReady(): boolean {
+  return memoryModelAvailability('patterns').ok;
+}
+
 function localDayKey(at: Date): string {
   const y = at.getFullYear();
   const m = String(at.getMonth() + 1).padStart(2, '0');
@@ -918,6 +927,7 @@ async function processRecursiveReflectionTick(state: DaemonState): Promise<void>
   if (now.getHours() < RECURSIVE_REFLECTION_LOCAL_HOUR) return;
   const day = localDayKey(now);
   if (state.lastRecursiveReflectionDay === day) return;
+  if (!recursiveReflectionModelReady()) return;
   state.lastRecursiveReflectionDay = day;
   saveState(state);
   // Phase A observability: the episodic→semantic distillation tick is the
