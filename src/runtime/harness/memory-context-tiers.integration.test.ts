@@ -71,6 +71,11 @@ const DISPATCH_RULE = 'Email sending constraint: ALWAYS send email via the Outlo
 rememberFact({ kind: 'constraint', content: DISPATCH_RULE });
 rememberFact({ kind: 'project', content: 'The quokka ledger lives in the finance workspace and closes on the fifth business day.' });
 rememberFact({ kind: 'project', content: 'Invoices are reviewed on Tuesdays by the operations desk.' });
+// A rule only the prompt enforces (no deterministic contract) and a personal
+// fact: neither belongs to the memory core.
+const PROMPT_ONLY_RULE = 'Never quote competitor pricing figures in anything written for a client.';
+rememberFact({ kind: 'constraint', content: PROMPT_ONLY_RULE });
+rememberFact({ kind: 'user', content: 'The owner has a daughter named Wren who turns nine in October.' });
 
 after(() => {
   semanticPorts.installTurnSemanticModelPort(null);
@@ -329,4 +334,52 @@ test('the accepted request records what memory it sent, by tier, and the console
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+/** The primer record of the turn, as the host logged it. */
+function primerRecord(run: Awaited<ReturnType<typeof hostTurn>>): Record<string, unknown> {
+  return (run.trace.filter((event) => event.type === 'turn_memory_primer').at(-1)?.data ?? {}) as Record<string, unknown>;
+}
+
+// Regression: a turn whose ranker was skipped on purpose (budget, opt-out)
+// once reached the model with none of the request-ranked memory it had
+// before the tail replaced the per-block sections.
+for (const [label, request] of [
+  ['skip-casual', 'thanks, that is perfect'],
+  ['skip-conversation', 'make the subject line punchier'],
+] as const) {
+  test(`a turn the ranker skips for its intent still carries the owner's rules and facts (${label})`, async () => {
+    const run = await hostTurn(label, request);
+    assert.equal(primerRecord(run).skippedReason, 'intent_budget', 'the ranker was not run for this intent');
+    const frame = run.frames[0]!;
+    const all = requestText(frame);
+    const fallback = memoryItem(frame, '## Persistent Facts');
+    assert.ok(fallback, `the per-block rendering stands in for the ranker: ${all.slice(-2500)}`);
+    assert.match(fallback!, /\*\*Prompt-only instructions/, 'the prompt-only group is listed');
+    assert.ok(fallback!.includes(PROMPT_ONLY_RULE), 'the prompt-only rule reaches the model');
+    assert.match(fallback!, /daughter named Wren/, 'a remembered fact reaches the model');
+    assert.doesNotMatch(fallback!, /owner@example\.com/, 'the core\'s rule is not repeated');
+    assert.equal(all.split(PROMPT_ONLY_RULE).length - 1, 1, 'the rule is stated once');
+    const memorySent = run.trace.filter((event) => event.type === 'guardrail_tripped'
+      && (event.data as { kind?: string }).kind === 'model_memory_context').at(-1)?.data as { manifest?: Array<{ section: string; tier: string }> } | undefined;
+    assert.ok(memorySent?.manifest?.some((entry) => entry.section === 'Persistent Facts' && entry.tier === 'relevant'),
+      'the memory record names what stood in');
+  });
+}
+
+test('a request that declines memory still carries the standing policies it is held to, and no facts', async () => {
+  const run = await hostTurn('skip-opt-out',
+    'Do not use memory for this request. Draft a client note comparing our pricing with a competitor.');
+  assert.equal(primerRecord(run).skippedReason, 'explicit_request_opt_out');
+  const frame = run.frames[0]!;
+  const all = requestText(frame);
+  const policies = memoryItem(frame, '## Persistent Facts');
+  assert.ok(policies, `the request's standing policies are sent: ${all.slice(-2500)}`);
+  assert.ok(policies!.includes(PROMPT_ONLY_RULE), 'the prompt-only rule still applies');
+  for (const absent of ['daughter named Wren', 'quokka ledger', 'Invoices are reviewed', '## Recently Learned',
+    '## Relevant To This Request', 'memory_recall_all searches all of it']) {
+    assert.equal(all.includes(absent), false, `no remembered fact or recall invitation: ${absent}`);
+  }
+  assert.ok(stableHalf(frame.system).includes('ALWAYS send email via the Outlook mailbox owner@example.com'),
+    'the enforced rule stays in the core');
 });

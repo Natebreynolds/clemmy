@@ -776,6 +776,9 @@ export const RANKED_TAIL_MAX_CHARS = 1_200;
  *  repeated. */
 export const RANKED_TAIL_RELATIVE_FLOOR = 0.5;
 export const RANKED_TAIL_POLICY_SLOTS = 2;
+/** Policy budget of a memory-declined request: the same share the policy
+ *  groups had inside Persistent Facts. */
+const OPT_OUT_POLICY_BUDGET = 1_600;
 
 /** What the shared ranker gave the turn. */
 export type TurnMemorySignal =
@@ -783,8 +786,12 @@ export type TurnMemorySignal =
   | { kind: 'ranked'; text: string; refs: Array<{ type: string; id: string }> }
   /** The ranker ran and nothing cleared it. */
   | { kind: 'empty' }
-  /** The ranker is off, failed or ran out of time. */
-  | { kind: 'no_signal'; primerText?: string; primerFactIds?: readonly number[] };
+  /** The ranker is off, failed, ran out of time, or was not run for this
+   *  request (a budget skip, a retry, a conversation-only surface). */
+  | { kind: 'no_signal'; primerText?: string; primerFactIds?: readonly number[] }
+  /** The request declined automatic memory: no remembered facts, but the
+   *  standing policies it is held to still apply. */
+  | { kind: 'policies_only' };
 
 export interface TurnMemoryTail {
   text: string;
@@ -815,7 +822,9 @@ function countsPointer(scope: MemoryTailScope): string {
  *     proven run that covers the request), then a counts pointer;
  *   - empty: the counts pointer alone;
  *   - no signal: the per-block rendering exactly as before, then whatever
- *     fallback primer the host built, so a blind ranker costs nothing.
+ *     fallback primer the host built, so a blind ranker costs nothing;
+ *   - policies only: the request-ranked standing policies, for a request
+ *     that declined automatic memory.
  * Session breadcrumbs (`sessionPointers`) ride along in every case.
  */
 export function renderTurnMemoryTail(
@@ -824,7 +833,21 @@ export function renderTurnMemoryTail(
   options: { request?: string; sessionPointers?: string } = {},
 ): TurnMemoryTail {
   const parts: Array<{ section: string; tier: MemoryTier; text: string; refs?: MemoryManifestEntry['refs'] }> = [];
-  if (signal.kind === 'no_signal') {
+  if (signal.kind === 'policies_only') {
+    // Declining memory for one request does not suspend the owner's standing
+    // rules: the prompt-only instructions and standing preferences render as
+    // they did in the instructions, ordered by the request, with no facts and
+    // no invitation to recall.
+    const acceptedInput = scope.focusInput ?? options.request ?? '';
+    const { requestObjective } = resolveRequestObjective(scope.sessionId, acceptedInput);
+    let policies = '';
+    try {
+      policies = renderFactsForInstructions(10, OPT_OUT_POLICY_BUDGET, requestObjective, 'pinned', { omitCoreGroups: true });
+    } catch {
+      policies = '';
+    }
+    if (policies) parts.push({ section: 'Persistent Facts', tier: 'relevant', text: section('Persistent Facts', policies) });
+  } else if (signal.kind === 'no_signal') {
     // A blind ranker must cost nothing: the per-block rendering stands in,
     // ranked by the same objective the prompt used before, minus the
     // policies the memory core already carries.

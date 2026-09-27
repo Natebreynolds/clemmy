@@ -5484,20 +5484,41 @@ async function plainFallbackPrimer(
   return formatTurnMemoryPrimer(query, ftsHits, 'fts5', sessionId, breadcrumbs);
 }
 
-/** The primer when assembly outran its hard outer timeout: no ranker signal. */
-function assemblyTimeoutPrimer(input: string, scope: MemoryTailScope | undefined): TurnMemoryPrimer {
+/**
+ * The primer of a turn whose shared ranker did not run: switched off, out of
+ * its outer time, or skipped for this request (empty, a stall retry, a budget
+ * skip, a conversation-only surface, a declined continuation, a request that
+ * declined automatic memory). An agent built by harnessInstructions carries no
+ * request-ranked memory in its prompt, so its tail stands in for the ranker:
+ * the per-block rendering, or, when the request declined memory, only the
+ * standing policies it is still held to. Any other agent gets the bare record.
+ */
+function primerWithoutRanker(
+  input: string,
+  skippedReason: string,
+  scope: MemoryTailScope | undefined,
+  opts: { enabled?: boolean; queryChars?: number } = {},
+): TurnMemoryPrimer {
   const query = input.replace(/\s+/g, ' ').trim();
   const primer: TurnMemoryPrimer = {
-    enabled: true,
-    query: query.slice(0, 160),
+    enabled: opts.enabled ?? true,
+    query: opts.queryChars ? query.slice(0, opts.queryChars) : query,
     hitCount: 0,
     injectedBytes: 0,
-    skippedReason: 'assembly_timeout',
+    skippedReason,
   };
   if (!scope) return primer;
-  const tail = renderTurnMemoryTail(scope, { kind: 'no_signal' }, { request: query });
+  const signal: TurnMemorySignal = skippedReason === EXPLICIT_MEMORY_RECALL_OPTOUT_REASON
+    ? { kind: 'policies_only' }
+    : { kind: 'no_signal' };
+  const tail = renderTurnMemoryTail(scope, signal, { request: query });
   registerMemoryTail(tail.text, tail.manifest);
   return { ...primer, text: tail.text || undefined, injectedBytes: Buffer.byteLength(tail.text, 'utf8'), manifest: tail.manifest };
+}
+
+/** The primer when assembly outran its hard outer timeout: no ranker signal. */
+function assemblyTimeoutPrimer(input: string, scope: MemoryTailScope | undefined): TurnMemoryPrimer {
+  return primerWithoutRanker(input, 'assembly_timeout', scope, { queryChars: 160 });
 }
 
 /** The primer for a turn whose agent was built by harnessInstructions: the
@@ -5517,19 +5538,14 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
     };
   };
   const enabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER', 'on') ?? 'on').toLowerCase() !== 'off';
-  if (!enabled) {
-    // The ranker is switched off: the per-block rendering stands in for it.
-    return withTail({ enabled: false, query, hitCount: 0, injectedBytes: 0, skippedReason: 'disabled' }, { kind: 'no_signal' });
-  }
-  if (!query) return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'empty_input' };
-  if (isSyntheticStallRetryInput(query)) {
-    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'synthetic_retry' };
-  }
+  if (!enabled) return primerWithoutRanker(query, 'disabled', scope, { enabled: false });
+  if (!query) return primerWithoutRanker(query, 'empty_input', scope);
+  if (isSyntheticStallRetryInput(query)) return primerWithoutRanker(query, 'synthetic_retry', scope);
   if (explicitlyOptsOutOfAutomaticMemoryRecall(query)) {
-    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: EXPLICIT_MEMORY_RECALL_OPTOUT_REASON };
+    return primerWithoutRanker(query, EXPLICIT_MEMORY_RECALL_OPTOUT_REASON, scope);
   }
   if (memoryBudgetFor(classifyMessageIntent(query).intent).vaultSearchTopK <= 0) {
-    return { enabled: true, query, hitCount: 0, injectedBytes: 0, skippedReason: 'intent_budget' };
+    return primerWithoutRanker(query, 'intent_budget', scope);
   }
   const hybridEnabled = (getRuntimeEnv('CLEMMY_TURN_MEMORY_PRIMER_HYBRID', 'on') ?? 'on').toLowerCase() !== 'off';
   scheduleRecallShadow({ query, surface: 'automatic_primer', limit: TURN_MEMORY_PRIMER_FACT_TOP_K });
@@ -10803,29 +10819,11 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
   // its own; the primer below is its one ranked tail.
   const memoryTailScope = memoryTailScopeFor((options.agent as { instructions?: unknown } | undefined)?.instructions);
   const assemblyPromise: Promise<TurnMemoryPrimer | null> = options.skipAutomaticMemoryPrimer
-    ? Promise.resolve({
-        enabled: true,
-        query: memoryPrimerInput.replace(/\s+/g, ' ').trim(),
-        hitCount: 0,
-        injectedBytes: 0,
-        skippedReason: 'plain_conversation_surface',
-      })
+    ? Promise.resolve(primerWithoutRanker(memoryPrimerInput, 'plain_conversation_surface', memoryTailScope))
     : declinedContinuation
-    ? Promise.resolve({
-        enabled: true,
-        query: memoryPrimerInput.replace(/\s+/g, ' ').trim(),
-        hitCount: 0,
-        injectedBytes: 0,
-        skippedReason: 'declined_continuation',
-      })
+    ? Promise.resolve(primerWithoutRanker(memoryPrimerInput, 'declined_continuation', memoryTailScope))
     : automaticMemoryOptedOut
-    ? Promise.resolve({
-        enabled: true,
-        query: memoryPrimerInput.replace(/\s+/g, ' ').trim(),
-        hitCount: 0,
-        injectedBytes: 0,
-        skippedReason: EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
-      })
+    ? Promise.resolve(primerWithoutRanker(memoryPrimerInput, EXPLICIT_MEMORY_RECALL_OPTOUT_REASON, memoryTailScope))
     : Promise.race([
         buildTurnMemoryPrimer(memoryPrimerInput, options.sessionId, memoryTailScope),
         new Promise<null>((resolve) => {
