@@ -6,11 +6,12 @@ import { readDurableBindings, type ModelRole, type RoleBinding } from './model-r
 
 /** The roles a settings door binds to a model. The brain has its own door (the
  * active-brain switch), because choosing it also moves the auth mode and the
- * provider slots. */
+ * provider slots. Memory is bound only from Settings (desktop or phone); the
+ * chat tool stays worker-only. */
 export type BindableModelRole = Exclude<ModelRole, 'brain'>;
 
 export function isBindableModelRole(value: unknown): value is BindableModelRole {
-  return value === 'worker' || value === 'judge' || value === 'writer';
+  return value === 'worker' || value === 'judge' || value === 'writer' || value === 'memory';
 }
 
 export type ModelRoleSettingErrorCode =

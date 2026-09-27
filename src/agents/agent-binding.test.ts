@@ -18,7 +18,7 @@ process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
 const { createAgentRecord } = await import('./agent-record.js');
-const { bindAgent, resolveAgentBinding, resolveWorkerAgentRequest } = await import('./agent-binding.js');
+const { agentModelIsRole, bindAgent, resolveAgentBinding, resolveWorkerAgentRequest } = await import('./agent-binding.js');
 const { SKILLS_DIR } = await import('../memory/skill-store.js');
 const { workerPacketKey } = await import('./worker-job-packet.js');
 
@@ -83,6 +83,15 @@ test('a bound call asks for the agent\'s model role only when the caller named n
   assert.equal(named.kind, 'bound');
   if (named.kind !== 'bound') return;
   assert.equal(named.model, 'owner-named-model', 'a model the caller named wins over the agent\'s role');
+});
+
+// The memory model is a Settings-only background role. An agent record whose
+// model says "memory" must name a model, never route its turns to the model
+// that keeps the owner's memory.
+test('memory is not a role an agent can run as', () => {
+  for (const role of ['brain', 'worker', 'judge', 'writer']) assert.equal(agentModelIsRole(role), true, role);
+  assert.equal(agentModelIsRole('memory'), false);
+  assert.equal(agentModelIsRole('Memory'), false);
 });
 
 test('running as an agent changes the packet key; a packet without one keeps its key', () => {

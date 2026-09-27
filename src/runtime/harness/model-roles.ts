@@ -56,9 +56,12 @@ import {
  *  reconciler and completion reviewer; writer = the model that writes the final
  *  answer from gathered evidence. The writer defaults to the brain (the brain
  *  writes its own answer); only an explicit binding makes it a separate step.
+ *  memory = the background memory work (learning from finished conversations,
+ *  settling conflicting facts, nightly patterns, skills, profile, imports); it
+ *  never grades another model's work, and only Settings binds it.
  *  (debate's draftA is intentionally NOT a registry role — it stays the flagship
  *  and the user never touches it.) */
-export type ModelRole = 'brain' | 'worker' | 'judge' | 'writer';
+export type ModelRole = 'brain' | 'worker' | 'judge' | 'writer' | 'memory';
 
 /** A user-set role→model assignment (from the Models UI or a chat rule). */
 export interface RoleBinding {
@@ -233,7 +236,8 @@ export function readDurableBindings(): RoleBinding[] {
         ((b as RoleBinding).role === 'brain' ||
           (b as RoleBinding).role === 'worker' ||
           (b as RoleBinding).role === 'judge' ||
-          (b as RoleBinding).role === 'writer') &&
+          (b as RoleBinding).role === 'writer' ||
+          (b as RoleBinding).role === 'memory') &&
         typeof (b as RoleBinding).modelId === 'string' &&
         (b as RoleBinding).modelId.length > 0,
     );
@@ -311,9 +315,29 @@ export function codexSafeFast(): string {
   return brainFamily === 'claude' ? boundaryClaudeJudgeModel() : boundaryCodexJudgeModel();
 }
 
+// The memory role's automatic model is the memory route's own answer: it
+// builds on the boundary checker (debate-model), which imports this module, so
+// the route registers its reader here instead of this module importing it.
+let memoryAutomaticModelReader: (() => string | null) | null = null;
+
+/** Called once by src/memory/memory-model-route.ts. `null` unregisters (tests). */
+export function registerMemoryAutomaticModel(read: (() => string | null) | null): void {
+  memoryAutomaticModelReader = read;
+}
+
 export function defaultForRole(role: ModelRole): string {
   // With no writer chosen, the brain writes its own final answer.
   if (role === 'writer') return defaultForRole('brain');
+  // With no memory model chosen, memory work keeps the model it runs on today:
+  // the memory route's automatic resolution. Before that route has loaded
+  // (nothing can run memory work yet), the checker's default stands in.
+  if (role === 'memory') {
+    try {
+      const automatic = memoryAutomaticModelReader?.();
+      if (automatic) return automatic;
+    } catch { /* an unresolvable automatic route reads as the checker default */ }
+    return defaultForRole('judge');
+  }
   const byo = getByoBackendConfig();
   const mode = getModelRoutingMode();
 
@@ -443,7 +467,9 @@ export function resolveRoleModel(role: ModelRole, intent?: string): ResolvedRole
   // policy table / kill-switch off ⇒ falls through byte-identically. The writer
   // is only ever the owner's explicit choice or the brain itself: the policy
   // only drifts toward cheaper models, which is the opposite of its purpose.
-  if (role !== 'writer') try {
+  // Memory is the owner's visible choice or today's automatic route, never a
+  // drifting one, and it has no task outcome to learn from.
+  if (role !== 'writer' && role !== 'memory') try {
     const pick = pickRoutePolicyModel(role, querySlug || undefined, modelId,
       (candidateId) => validateRoleModelBinding(role, candidateId).ok);
     if (pick) {

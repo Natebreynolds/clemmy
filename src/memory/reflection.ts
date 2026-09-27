@@ -28,6 +28,8 @@ import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { resolveBoundaryJudge, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
+import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
+import type { MemoryModelProblem } from './memory-model-route.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { looksLikeIncidentNarrative } from './incident-narrative.js';
@@ -1016,6 +1018,8 @@ export async function replayFailedReflections(
  *  multi-day reset). Cleared by the deadline passing; capped so a long reset
  *  hint still re-probes within the half hour. */
 let extractorPausedUntil = 0;
+/** What kind of trouble set the current pause, in the Memory tab's words. */
+let extractorPauseProblem: MemoryModelProblem = 'error';
 const EXTRACTOR_PAUSE_DEFAULT_MS = 5 * 60_000;
 const EXTRACTOR_PAUSE_MAX_MS = 30 * 60_000;
 
@@ -1023,8 +1027,23 @@ export function reflectionExtractorAvailable(): boolean {
   return Date.now() >= extractorPausedUntil;
 }
 
-export function setReflectionExtractorPauseForTest(untilMs: number | null): void {
+/** The extractor's backoff window while one is active: until when, and why.
+ *  Null when the extractor may run. In-process, like the pause itself. */
+export function reflectionExtractorPause(now: number = Date.now()): { until: number; problem: MemoryModelProblem } | null {
+  return now < extractorPausedUntil ? { until: extractorPausedUntil, problem: extractorPauseProblem } : null;
+}
+
+export function setReflectionExtractorPauseForTest(untilMs: number | null, problem: MemoryModelProblem = 'error'): void {
   extractorPausedUntil = untilMs ?? 0;
+  extractorPauseProblem = problem;
+}
+
+/** The model-error class as the owner-facing problem that paused learning. */
+function extractorPauseProblemFor(err: unknown, cls: ReturnType<typeof classifyModelError>): MemoryModelProblem {
+  if (cls.kind === 'model.rate_limited') return isProviderCreditRefusal(cls.status, err) ? 'credit' : 'quota';
+  if (cls.kind === 'model.auth_expired') return 'not_connected';
+  if (cls.kind === 'model.transport_timeout') return 'timeout';
+  return 'error';
 }
 
 /** Codex quota errors carry the reset in the JSON body (`resets_in_seconds`),
@@ -1102,6 +1121,7 @@ async function runExtractor(
           EXTRACTOR_PAUSE_MAX_MS,
         );
         extractorPausedUntil = Date.now() + pauseMs;
+        extractorPauseProblem = extractorPauseProblemFor(err, cls);
       }
       return null;
     }
@@ -1132,6 +1152,7 @@ async function runExtractor(
       EXTRACTOR_PAUSE_MAX_MS,
     );
     extractorPausedUntil = Date.now() + pauseMs;
+    extractorPauseProblem = extractorPauseProblemFor(err, cls);
     logger.warn({ pauseMs, kind: cls.kind }, 'reflection extractor paused — provider backoff window');
     return null;
   }

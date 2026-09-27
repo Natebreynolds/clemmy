@@ -1011,7 +1011,7 @@ function capturedByoBackend(selection: AvailableBoundaryJudgeSelection): ByoBack
  * MiniMax judge hits MiniMax, not whatever single backend is configured.
  */
 function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, haveCodex: boolean,
-  captured?: AvailableBoundaryJudgeSelection): Model | null {
+  captured?: AvailableBoundaryJudgeSelection, recording?: BoundaryRouteRecording): Model | null {
   let model: Model | null;
   if (checker.provider === 'codex') {
     model = haveCodex ? new CodexModelProvider().getModel(checker.modelId) : null;
@@ -1027,14 +1027,29 @@ function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, have
       : new ClaudeModelProvider().getModel();
   }
   if (!model) return null;
-  return withDirectModelRouteMetrics(
-    model,
-    'judge',
-    checker.provider,
-    checker.modelId,
-    routeSourceForResolvedRole(checker),
-    'judge',
-  );
+  return recording
+    ? withDirectModelRouteMetrics(model, recording.role, checker.provider, checker.modelId,
+      routeSourceForResolvedRole(checker), 'memory', { job: recording.job })
+    : withDirectModelRouteMetrics(
+      model,
+      'judge',
+      checker.provider,
+      checker.modelId,
+      routeSourceForResolvedRole(checker),
+      'judge',
+    );
+}
+
+/**
+ * Who a boundary route records its calls as. Memory work uses the checker's
+ * model selection unchanged but is not review: its route rows carry role
+ * `memory` and the job, so the ledger can tell the two apart and the judge's
+ * learned policy is not fed by background memory calls.
+ */
+export interface BoundaryRouteRecording {
+  role: 'memory';
+  /** The memory job id (src/memory/memory-jobs.ts). */
+  job: string;
 }
 
 /**
@@ -1043,7 +1058,11 @@ function buildJudgeForRole(checker: ResolvedRoleModel, haveClaude: boolean, have
  * became a different model would defeat the choice, so an unavailable provider
  * returns null and the caller keeps its own fallback.
  */
-export function buildExactRoleModel(resolved: ResolvedRoleModel, routeRole: ModelRouteRole): Model | null {
+export function buildExactRoleModel(
+  resolved: ResolvedRoleModel,
+  routeRole: ModelRouteRole,
+  reason?: Record<string, unknown>,
+): Model | null {
   let model: Model | null;
   if (resolved.provider === 'codex') {
     model = codexAvailable() ? new CodexModelProvider().getModel(resolved.modelId) : null;
@@ -1057,7 +1076,8 @@ export function buildExactRoleModel(resolved: ResolvedRoleModel, routeRole: Mode
   }
   if (!model) return null;
   return withDirectModelRouteMetrics(model, routeRole, resolved.provider, resolved.modelId,
-    routeSourceForResolvedRole(resolved), routeRole === 'writer' ? 'writer' : 'judge');
+    routeSourceForResolvedRole(resolved),
+    routeRole === 'writer' ? 'writer' : routeRole === 'memory' ? 'memory' : 'judge', reason);
 }
 
 function routeSourceForResolvedRole(checker: ResolvedRoleModel): ModelRouteDecisionSource {
@@ -1074,7 +1094,8 @@ function withDirectModelRouteMetrics(
   provider: ModelProviderClass,
   modelId: string,
   source: ModelRouteDecisionSource,
-  seam: 'draft' | 'judge' | 'writer',
+  seam: 'draft' | 'judge' | 'writer' | 'memory',
+  extraReason?: Record<string, unknown>,
 ): Model {
   const sessionId = harnessRunContextStorage.getStore()?.sessionId;
   const workflowRunId = sessionId?.startsWith('workflow:') ? sessionId.split(':')[1] : undefined;
@@ -1086,7 +1107,10 @@ function withDirectModelRouteMetrics(
     resolvedModel: modelId,
     provider,
     source,
-    reason: { seam: seam === 'writer' ? 'host_final_writer' : `fusion_${seam}` },
+    reason: {
+      ...(extraReason ?? {}),
+      seam: seam === 'writer' ? 'host_final_writer' : seam === 'memory' ? 'memory' : `fusion_${seam}`,
+    },
   });
 }
 
@@ -1176,7 +1200,8 @@ function boundaryTransport(provider: ModelProviderClass): BoundaryJudgeRouting['
  * model. Returning only a string lets the Agents SDK resolve that string via
  * the process-global provider, which can silently put a Claude/BYO judge on the
  * Codex wire (or vice versa). */
-function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel, captured?: AvailableBoundaryJudgeSelection): BoundaryJudgeRouting {
+function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel, captured?: AvailableBoundaryJudgeSelection,
+  recording?: BoundaryRouteRecording): BoundaryJudgeRouting {
   let checker: ResolvedRoleModel;
   if (brain.provider === 'codex') {
     checker = { modelId: captured?.defaultModels.codex ?? boundaryCodexJudgeModel(), provider: 'codex', source: 'default' };
@@ -1196,6 +1221,7 @@ function resolveSameFamilyBoundaryJudge(brain: ResolvedRoleModel, captured?: Ava
     captured ? claudeAvailable() : checker.provider === 'claude' || claudeAvailable(),
     captured ? codexAvailable() : checker.provider === 'codex' || codexAvailable(),
     captured,
+    recording,
   );
   if (!model) {
     throw new Error(`Boundary judge could not build a ${checker.provider} model for ${checker.modelId}.`);
@@ -1385,7 +1411,14 @@ function markIfSubstitute(routing: BoundaryJudgeRouting, captured?: AvailableBou
   };
 }
 
-export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection, author?: ResolvedRoleModel): BoundaryJudgeRouting {
+/** `recording` changes only how the built route's calls are recorded (memory
+ *  work records as itself); the model selection below is the same for every
+ *  caller. */
+export function resolveBoundaryJudge(
+  selection?: CapturedBoundaryJudgeSelection,
+  author?: ResolvedRoleModel,
+  recording?: BoundaryRouteRecording,
+): BoundaryJudgeRouting {
   if (selection?.status === 'unavailable') throw new Error(selection.reason);
   const captured = selection?.status === 'captured' ? selection : undefined;
   const configuredBrain = resolveRoleModel('brain');
@@ -1402,9 +1435,9 @@ export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection,
   // OFF changes the preference, never an explicit owner model/provider pin.
   // Missing credentials for that pin are unavailable in either switch position.
   if (!crossFamily && !hasExplicitJudgeBinding(checker)) {
-    return resolveSameFamilyBoundaryJudge(brain, captured);
+    return resolveSameFamilyBoundaryJudge(brain, captured, recording);
   }
-  const model = buildJudgeForRole(checker, claudeAvailable(), codexAvailable(), captured);
+  const model = buildJudgeForRole(checker, claudeAvailable(), codexAvailable(), captured, recording);
   if (model) {
     return {
       model,
@@ -1430,7 +1463,7 @@ export function resolveBoundaryJudge(selection?: CapturedBoundaryJudgeSelection,
   if (hasExplicitJudgeBinding(checker)) {
     throw new Error(`Configured boundary judge ${checker.modelId} is unavailable.`);
   }
-  return markIfSubstitute(resolveSameFamilyBoundaryJudge(brain, captured), captured);
+  return markIfSubstitute(resolveSameFamilyBoundaryJudge(brain, captured, recording), captured);
 }
 
 /**
