@@ -320,3 +320,28 @@ test('a covering run ranked below one that only shares words is still named with
   assert.match(rendered, /walrus_covering_tool/, 'the covering run takes the one slot');
   assert.doesNotMatch(rendered, /walrus_touching_tool/);
 });
+
+test('a turn whose surface is locked is not told about a proven run', async () => {
+  // Regression: the ranked tail named a proven run's tools even on a step
+  // that declined remembered tool choices, for tools it cannot call.
+  recordRunStrategy({
+    objective: 'reconcile narwhal invoices monthly figures',
+    toolsUsed: ['narwhal_covering_tool'],
+    workerCount: 0,
+    durationMs: 5_000,
+    learningReceipt: receipt('narwhal-covering'),
+  });
+  const { renderTurnMemoryTail, rankedTailHitBudget } = await import('../agents/harness-context.js');
+  const request = 'reconcile narwhal invoices monthly figures';
+  const scope = {
+    coreRefKeys: new Set<string>(),
+    policyCounts: { dispatchConstraint: 0, coreProfile: 0, promptInstruction: 0, standingPreference: 0 },
+  };
+  const signal = { kind: 'ranked' as const, text: '[MEMORY PRIMER]\n\n## Relevant To This Request\n- a hit', refs: [] };
+  const open = renderTurnMemoryTail(scope, signal, { request });
+  assert.match(open.text, /narwhal_covering_tool/, 'an open surface is told about the covering run');
+  const locked = renderTurnMemoryTail({ ...scope, includeRememberedToolChoices: false }, signal, { request });
+  assert.doesNotMatch(locked.text, /Proven Run Strategies|narwhal_covering_tool/, 'a locked surface is not');
+  assert.ok(rankedTailHitBudget(request, false) > rankedTailHitBudget(request),
+    'the hit budget reserves no room for a line that will not be sent');
+});

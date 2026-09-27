@@ -5583,7 +5583,7 @@ async function buildTurnMemoryPrimer(input: string, sessionId = '', scope?: Memo
       surface: 'automatic_primer',
       // Retrieve more than the tail shows so reserved policy slots can fill.
       limit: Math.max(10, TURN_MEMORY_PRIMER_TOP_K),
-      maxChars: rankedTailHitBudget(query),
+      maxChars: rankedTailHitBudget(query, scope.includeRememberedToolChoices),
       timeoutMs: TURN_MEMORY_PRIMER_HYBRID_TIMEOUT_MS,
       sessionId,
       format: 'tail',

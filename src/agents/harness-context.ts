@@ -848,7 +848,9 @@ export function renderTurnMemoryTail(
     if (signal.kind === 'ranked' && signal.text) {
       parts.push({ section: 'Relevant To This Request', tier: 'relevant', text: signal.text, refs: signal.refs });
     }
-    const strategy = signal.kind === 'ranked' && options.request
+    // A proven run names tools; a surface that declines remembered tool
+    // choices (a locked workflow step) is not told about tools it cannot call.
+    const strategy = signal.kind === 'ranked' && options.request && scope.includeRememberedToolChoices !== false
       ? renderRunStrategiesForContext(options.request, 1, options.request)
       : '';
     if (strategy) parts.push({ section: 'Proven Run Strategies', tier: 'relevant', text: section('Proven Run Strategies', strategy) });
@@ -868,9 +870,12 @@ export function renderTurnMemoryTail(
   };
 }
 
-/** The ranked tail's hit budget once the one proven-run line is set aside. */
-export function rankedTailHitBudget(request: string): number {
+/** The ranked tail's hit budget once the one proven-run line is set aside
+ *  (only when the surface takes remembered tool choices). */
+export function rankedTailHitBudget(request: string, includeRememberedToolChoices?: boolean): number {
   let strategy = '';
-  try { strategy = section('Proven Run Strategies', renderRunStrategiesForContext(request, 1, request)); } catch { strategy = ''; }
+  if (includeRememberedToolChoices !== false) {
+    try { strategy = section('Proven Run Strategies', renderRunStrategiesForContext(request, 1, request)); } catch { strategy = ''; }
+  }
   return Math.max(300, RANKED_TAIL_MAX_CHARS - (strategy ? strategy.length + 2 : 0));
 }
