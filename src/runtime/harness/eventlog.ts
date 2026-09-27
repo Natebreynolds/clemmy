@@ -4549,11 +4549,15 @@ export function listEvents(sessionId: string, options: ListEventsOptions = {}): 
 
 /** The `tool_called` rows recorded under one call id in a session, oldest
  *  first. Served by the tool-lifecycle index, so a caller following one call
- *  does not load every tool call the session ever made. */
+ *  does not load every tool call the session ever made. That index is partial
+ *  over both lifecycle types, and SQLite uses it only when the query states
+ *  that predicate itself, so the lifecycle IN list stays beside the narrower
+ *  type test. */
 export function listToolCalledEventsForCallId(sessionId: string, callId: string): EventRow[] {
   const rows = prepareCached(openEventLog(), `
     SELECT * FROM events
      WHERE session_id = ?
+       AND type IN ('tool_called', 'tool_returned')
        AND type = 'tool_called'
        AND json_extract(data_json, '$.callId') = ?
      ORDER BY seq ASC
