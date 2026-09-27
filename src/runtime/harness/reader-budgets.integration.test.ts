@@ -397,3 +397,31 @@ test('a projection whose own arguments outgrow the bytes left is still served, w
   assert.ok(Buffer.byteLength(shown, 'utf8') <= 1_200, `within the bytes left (${Buffer.byteLength(shown, 'utf8')})`);
   assert.equal(budget.snapshot().bytes, Buffer.byteLength(shown, 'utf8'), 'the served reply is what was charged');
 });
+
+/** 20 records of ~3k chars each: no single record fits a small byte budget. */
+const WIDE_ROWS = JSON.stringify(Array.from({ length: 20 }, (_, i) => ({ id: i, body: `[row ${String(i).padStart(2, '0')}] ${'w'.repeat(3_000)}` })));
+const parkWideRows = (sessionId: string) => events.writeToolOutput({
+  sessionId, callId: 'parked-wide-rows', tool: 'run_shell_command', output: WIDE_ROWS,
+});
+
+test('a clipped record page always shows the record it continues from, or no record and the same offset', async () => {
+  for (const bytesLeft of [900, 1_400, 2_400]) {
+    const budget = new brackets.RecallBudget(10, bytesLeft, undefined);
+    const where = Array.from({ length: 6 }, (_, i) => ({ field: `absent_field_with_a_long_descriptive_name_${i}`, op: 'ne', value: 'x'.repeat(40) }));
+    const { results } = await runHostTurn({
+      agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkWideRows, recallBudget: budget,
+      calls: [{ callId: `wide-${bytesLeft}`, args: { call_id: 'parked-wide-rows', fields: ['id', 'body'], where } }],
+    });
+    const shown = results.get(`wide-${bytesLeft}`) ?? '';
+    const header = /^Showing (\d+) record\(s\)/.exec(shown);
+    assert.ok(header || shown.startsWith('ERROR:'), shown.slice(0, 300));
+    if (!header) continue;
+    if (Number(header[1]) === 0) {
+      assert.doesNotMatch(shown, /"offset":1\b/, `no record shown, so nothing is skipped (${bytesLeft}): ${shown.slice(0, 400)}`);
+      assert.match(shown, /same offset/);
+    } else {
+      assert.match(shown, /\[row 00\] w{150}/, `a real slice of record 0 is shown beside its continuation (${bytesLeft}): ${shown.slice(0, 400)}`);
+    }
+    assert.ok(Buffer.byteLength(shown, 'utf8') <= bytesLeft, `within the bytes left (${Buffer.byteLength(shown, 'utf8')} of ${bytesLeft})`);
+  }
+});

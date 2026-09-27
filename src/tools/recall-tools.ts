@@ -123,6 +123,9 @@ function prefixWithin(text: string, chars: number, bytes: number): string {
   return text.slice(0, end);
 }
 
+/** The least of a record a clipped query reply shows beside its header. */
+const QUERY_MIN_RECORD_SLICE_CHARS = 200;
+
 const clipMarker = (keptChars: number): string =>
   `\n…[clipped to ${keptChars} chars — narrow with fields:[...], a filter, or a smaller limit]`;
 
@@ -207,11 +210,25 @@ function fitRecordPage(
     (parts) => parts.continuation,
     (parts) => parts.shortContinuation,
   ];
-  // The first tail that leaves room for a clipped record's marker; the last
-  // one always does, since it is short and a served bound holds a minimal reply.
+  // The first tail that still leaves room for the header and a real slice of
+  // the first record beside the clip marker: a continuation must never crowd
+  // out the record it continues from.
+  const first = render(Math.min(1, pageLength));
+  const headerEnd = first.body.indexOf('\n\n');
+  const minimalBody = first.body.slice(0, Math.min(first.body.length,
+    (headerEnd < 0 ? 0 : headerEnd + 2) + QUERY_MIN_RECORD_SLICE_CHARS));
   const tailFits = (tail: (parts: ReturnType<typeof render>) => string): boolean =>
-    fitsQueryBound(clipMarker(bound.chars) + tail(render(Math.min(1, pageLength))), bound);
-  const tail = tails.find(tailFits) ?? tails[tails.length - 1]!;
+    fitsQueryBound(minimalBody + clipMarker(minimalBody.length) + tail(first), bound);
+  const tail = tails.find(tailFits);
+  if (!tail) {
+    // Not even a slice of one record fits beside its continuation: serve no
+    // record rather than a header whose continuation skips the unseen one,
+    // and point back at this same offset with the way to narrow.
+    const none = render(0);
+    const headerOnly = none.body.slice(0, Math.max(0, none.body.indexOf('\n\n')));
+    const note = '\n\n[No record of this page fits the reading bytes left. Narrow the query (fields:[...], a filter, or a smaller limit) and repeat it from this same offset.]';
+    return { count: 0, text: clipQueryBody(headerOnly + note, bound) };
+  }
   const full = (count: number): string => {
     const parts = render(count);
     return parts.body + tail(parts);
