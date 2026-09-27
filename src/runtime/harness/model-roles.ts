@@ -178,6 +178,13 @@ function pinnedBrainLive(modelId: string, provider: ModelProviderClass): boolean
   }
 }
 
+/** Whether `provider` can serve `modelId` right now, by the liveness a
+ *  session's pinned brain is held to: signed in and usable for the two
+ *  subscription families, a configured provider declaring the model for BYO. */
+export function modelProviderLive(modelId: string, provider: ModelProviderClass): boolean {
+  return pinnedBrainLive(modelId, provider);
+}
+
 let sessionBrainPinValidator: SessionBrainPinValidator = pinnedBrainLive;
 
 function stampSessionBrainPin(sessionId: string, resolution: { modelId: string; provider: ModelProviderClass }): SessionBrainPin {

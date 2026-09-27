@@ -320,6 +320,11 @@ test('a thrown model error names its problem class, never a provider', () => {
   // A model adapter's own transport timeout reads as the extractor's pause
   // reads it, not as "not the model's".
   assert.equal(memoryModelProblemFromError(buildTransportTimeoutError('UND_ERR_BODY_TIMEOUT')), 'timeout');
+  // The app's own sign-in errors carry no status: a missing or expired
+  // sign-in is the model out of reach, not the job's own failure.
+  const signIn = (name: string) => Object.assign(new Error('no sign-in found'), { name });
+  assert.equal(memoryModelProblemFromError(signIn('ClaudeAuthError')), 'not_connected');
+  assert.equal(memoryModelProblemFromError(signIn('ClaudeSdkAuthExpiredError')), 'not_connected');
   // Not the model's: no problem is named.
   assert.equal(memoryModelProblemFromError(new Error('something else')), null);
   assert.equal(memoryModelProblemFromError(new TypeError('x is not a function')), null);

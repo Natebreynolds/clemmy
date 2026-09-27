@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -9,6 +9,13 @@ const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-terminal-learning-worker-'
 process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
+// A signed-in memory model: learning waits (claims nothing) without one.
+writeFileSync(path.join(HOME, 'state', 'auth.json'), JSON.stringify({
+  codexOauth: { accessToken: 'fixture-codex-access', refreshToken: 'fixture-codex-refresh' },
+}));
+writeFileSync(path.join(HOME, 'state', 'claude-auth.json'), JSON.stringify(
+  { accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 },
+));
 
 const memory = await import('./db.js');
 const eventlog = await import('../runtime/harness/eventlog.js');

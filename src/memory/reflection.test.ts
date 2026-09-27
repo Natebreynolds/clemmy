@@ -95,7 +95,11 @@ test.afterEach(() => {
   _testOnly_resetReflectionScopeBudgets();
 });
 
-test('reflection extractor binds to the active provider instead of a gpt-shaped global model string', () => {
+test('reflection extractor binds to the active provider instead of a gpt-shaped global model string', (t) => {
+  // Signed in: a route whose provider is signed out resolves nothing.
+  const claudeAuth = path.join(TMP_HOME, 'state', 'claude-auth.json');
+  writeFileSync(claudeAuth, JSON.stringify({ accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 }));
+  t.after(() => rmSync(claudeAuth, { force: true }));
   const common = {
     CLEMMY_JUDGE_CROSS_FAMILY: 'off',
     CLEMMY_MODEL_ROLES: undefined,

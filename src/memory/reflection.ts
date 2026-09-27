@@ -28,9 +28,8 @@ import { cosine, embedMissingFacts, isEmbeddingsEnabled, loadActiveFactEmbedding
 import { extractAnchors, canMergeEntitySafe, type EntityAnchors } from './memory-merge.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { boundaryTransport, resolveBoundaryJudgeHedge } from '../runtime/harness/debate-model.js';
-import { classifyModelError } from '../runtime/harness/resilient-model.js';
-import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
-import { resolveMemoryModelRoute, type MemoryModelProblem } from './memory-model-route.js';
+import { resolveMemoryModelRoute } from './memory-model-route.js';
+import type { MemoryModelProblem } from './memory-work-types.js';
 import {
   factIdStrings,
   memoryIndexOutcome,
@@ -41,7 +40,11 @@ import {
   runMemoryModelJob,
   type MemoryJobNote,
 } from './memory-job-context.js';
-import type { MemoryJobOutcome } from './memory-work-journal.js';
+import {
+  classifyMemoryModelError,
+  memoryModelProblemFromError,
+  type MemoryJobOutcome,
+} from './memory-work-journal.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { captureFactEvidence, linkFactEvidence, recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
 import { looksLikeIncidentNarrative } from './incident-narrative.js';
@@ -1061,12 +1064,11 @@ export function setReflectionExtractorPauseForTest(untilMs: number | null, probl
   extractorPauseProblem = problem;
 }
 
-/** The model-error class as the owner-facing problem that paused learning. */
-function extractorPauseProblemFor(err: unknown, cls: ReturnType<typeof classifyModelError>): MemoryModelProblem {
-  if (cls.kind === 'model.rate_limited') return isProviderCreditRefusal(cls.status, err) ? 'credit' : 'quota';
-  if (cls.kind === 'model.auth_expired') return 'not_connected';
-  if (cls.kind === 'model.transport_timeout') return 'timeout';
-  return 'error';
+/** The owner-facing problem that paused learning: the journal's classifier,
+ *  so the waiting note and the failed event name the same problem. A pause
+ *  is only set for a retryable model error, so an unnamed one is an error. */
+function extractorPauseProblemFor(err: unknown): MemoryModelProblem {
+  return memoryModelProblemFromError(err) ?? 'error';
 }
 
 /** Codex quota errors carry the reset in the JSON body (`resets_in_seconds`),
@@ -1131,7 +1133,7 @@ async function runExtractor(
   try {
     return await attempt(route.model);
   } catch (err) {
-    const cls = classifyModelError(err);
+    const cls = classifyMemoryModelError(err);
     logger.warn(
       { err: err instanceof Error ? err.message : String(err), kind: cls.kind },
       'reflection extractor failed',
@@ -1144,7 +1146,7 @@ async function runExtractor(
           EXTRACTOR_PAUSE_MAX_MS,
         );
         extractorPausedUntil = Date.now() + pauseMs;
-        extractorPauseProblem = extractorPauseProblemFor(err, cls);
+        extractorPauseProblem = extractorPauseProblemFor(err);
       }
       return null;
     }
@@ -1177,7 +1179,7 @@ async function runExtractor(
       EXTRACTOR_PAUSE_MAX_MS,
     );
     extractorPausedUntil = Date.now() + pauseMs;
-    extractorPauseProblem = extractorPauseProblemFor(err, cls);
+    extractorPauseProblem = extractorPauseProblemFor(err);
     logger.warn({ pauseMs, kind: cls.kind }, 'reflection extractor paused — provider backoff window');
     return null;
   }

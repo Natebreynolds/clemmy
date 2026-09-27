@@ -59,13 +59,13 @@ function fixtureModel(modelId: string): Model {
   } as Model;
 }
 
-function writeAuth(opts: { codex?: boolean } = {}): void {
+function writeAuth(opts: { codex?: boolean; claude?: boolean } = {}): void {
   writeFileSync(path.join(TEST_HOME, 'state', 'auth.json'), JSON.stringify(opts.codex === false ? {} : {
     codexOauth: { accessToken: 'fixture-codex-access', refreshToken: 'fixture-codex-refresh' },
   }));
-  writeFileSync(path.join(TEST_HOME, 'state', 'claude-auth.json'), JSON.stringify(
-    { accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 },
-  ));
+  writeFileSync(path.join(TEST_HOME, 'state', 'claude-auth.json'), JSON.stringify(opts.claude === false
+    ? { accessToken: 'sk-ant-api03-not-a-subscription-token' }
+    : { accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 }));
 }
 
 const SOURCE = [
@@ -208,6 +208,41 @@ test('a chosen memory model that cannot be served makes learning wait with the r
   const note = journal.readMemoryLearningWaiting();
   assert.equal(note?.reason, 'model_unavailable');
   assert.equal(note?.problem, 'not_connected');
+});
+
+test('with no model signed in, automatic learning claims nothing, spends no try, and says it is not connected', async () => {
+  // The checker's selection still builds a model for a signed-out family;
+  // the drain must not claim a part for it.
+  for (const crossFamily of ['on', 'off']) {
+    process.env.CLEMMY_JUDGE_CROSS_FAMILY = crossFamily;
+    writeAuth({ codex: false, claude: false });
+    for (let pass = 0; pass < 5; pass += 1) {
+      const waiting = await worker.drainTerminalSemanticLearning({ requireIdle: false, shardLimit: 2 });
+      assert.equal(waiting.shardsClaimed, 0, `cross-family ${crossFamily}, pass ${pass}`);
+      assert.equal(waiting.modelWaiting, 'model_unavailable');
+    }
+    assert.deepEqual(shardRow(), { status: 'pending', attempts: 0 }, 'no try was spent; nothing dead-letters');
+    assert.equal(calls, 0);
+    const note = journal.readMemoryLearningWaiting();
+    assert.equal(note?.reason, 'model_unavailable');
+    assert.equal(note?.problem, 'not_connected');
+  }
+  writeAuth();
+  const learned = await worker.drainTerminalSemanticLearning({ requireIdle: false });
+  assert.equal(learned.shardsCompleted, 1, 'signed back in, the part is learned');
+});
+
+test('a sign-in that fails mid-read hands the part back and pauses learning as not connected', async () => {
+  chooseCodexMemoryModel();
+  reply = () => { throw Object.assign(new Error('No sign-in found'), { name: 'ClaudeAuthError' }); };
+  const first = await worker.drainTerminalSemanticLearning({ requireIdle: false, shardLimit: 2 });
+  assert.equal(first.shardsClaimed, 1);
+  assert.equal(first.shardsWaiting, 1, 'the try is handed back');
+  assert.deepEqual(shardRow(), { status: 'pending', attempts: 0 });
+  assert.equal(reflection.reflectionExtractorPause()?.problem, 'not_connected');
+  assert.equal(journal.readMemoryLearningWaiting()?.problem, 'not_connected');
+  const [event] = telemetry.listOperationalEvents({ source: 'memory', type: 'memory_work_failed' });
+  assert.deepEqual((event?.payload as { failure?: unknown }).failure, { problem: 'not_connected' }, 'the failed read says why');
 });
 
 test('a part that hits a used-up plan mid-read is handed back with its try returned, and the next part waits', async () => {

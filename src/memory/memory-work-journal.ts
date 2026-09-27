@@ -51,6 +51,7 @@ import {
 import { readRouteStandIn, withModelRouteObserver, type ObservedModelRoute } from '../runtime/model-route-metrics.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { BoundaryError } from '../runtime/boundary-error.js';
+import { isAuthRecoverableError } from '../execution/transient-error.js';
 import { isProviderCreditRefusal } from '../shared/provider-capacity.js';
 
 /** Detail events age out after `detailDays`; daily counters after `summaryDays`. */
@@ -242,19 +243,35 @@ export function lastCheckedByJob(): Partial<Record<MemoryJobId, string>> {
 }
 
 /**
- * The problem class of a thrown model error, in the Memory tab's words and by
- * the same rule the extractor's pause uses. Never a provider name. Null when
- * the error is not the model's: a failure in the job's own code (a type or
- * database error) must not read as "the model returned an error".
+ * The model-error class memory work acts on: the shared classifier, plus a
+ * missing or expired sign-in. The app's own sign-in errors carry no HTTP
+ * status, so the shared classifier reads them as the job's own failure; for
+ * memory they mean the model is out of reach (the extractor pauses, and a
+ * part waits instead of spending its try). The canonical auth rule decides.
+ */
+export function classifyMemoryModelError(error: unknown): ReturnType<typeof classifyModelError> {
+  const cls = classifyModelError(error);
+  if (cls.kind === 'runtime.unknown' && isAuthRecoverableError(error)) {
+    return { ...cls, retryable: true, kind: 'model.auth_expired', isAuth: true };
+  }
+  return cls;
+}
+
+/**
+ * The problem class of a thrown model error, in the Memory tab's words. The
+ * one classifier for memory work: the extractor's pause names its problem
+ * with it too, so the waiting note and the failed event agree. Never a
+ * provider name. Null when the error is not the model's: a failure in the
+ * job's own code (a type or database error) must not read as "the model
+ * returned an error".
  */
 export function memoryModelProblemFromError(error: unknown): MemoryModelProblem | null {
   try {
     // The resilient model wrapper already names the model's failure class.
     // Any other boundary kind (a model adapter's own transport timeout, say)
-    // is read by the classifier the extractor's pause uses, so the event and
-    // the pause name the same problem.
+    // goes through the classifier.
     if (error instanceof BoundaryError && error.kind.startsWith('model.')) return problemOfKind(error.kind, error);
-    const cls = classifyModelError(error);
+    const cls = classifyMemoryModelError(error);
     // An error with no HTTP status that is not a transport failure did not
     // come from a model; one with a status is the provider answering.
     if (cls.kind === 'runtime.unknown') return typeof cls.status === 'number' ? 'error' : null;

@@ -407,3 +407,36 @@ test('a checker out of plan quota makes automatic learning wait until the plan s
     else process.env.NODE_ENV = previousNodeEnv;
   }
 });
+
+test('with no model signed in, the automatic route resolves nothing: every governed job waits as not connected', () => {
+  // The checker's selection still builds a model for a signed-out family
+  // (a review fails open); memory work must not spend tries on it.
+  const governed = ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import'] as const;
+  for (const crossFamily of ['on', 'off']) {
+    process.env.CLEMMY_JUDGE_CROSS_FAMILY = crossFamily;
+    writeAuth({ claude: false, codex: false });
+    assert.ok(resolveBoundaryJudge().model, 'fixture: the checker route still builds a model');
+    for (const job of governed) {
+      assert.equal(resolveMemoryModelRoute(job), null, `${job} (cross-family ${crossFamily})`);
+      assert.deepEqual(memoryModelAvailability(job), { ok: false, reason: 'model_unavailable', problem: 'not_connected' }, job);
+    }
+    const described = describeMemoryModel();
+    assert.deepEqual({ modelId: described.modelId, unavailable: described.unavailable },
+      { modelId: null, unavailable: { problem: 'not_connected' } });
+    for (const job of governed) assert.equal(memoryJobModelId(job, described), null, `${job} names no model nothing can serve`);
+    assert.deepEqual(memoryRoleSettingsView().unavailable, { problem: 'not_connected' });
+  }
+});
+
+test('a same-family automatic route on a signed-out brain family waits, while the model strings still reach a connected provider', () => {
+  Object.assign(process.env, { AUTH_MODE: 'claude_oauth', CLEMMY_JUDGE_CROSS_FAMILY: 'off' });
+  writeAuth({ claude: false });
+  assert.equal(resolveBoundaryJudge().judgeFamily, 'claude', 'fixture: the checker stays in the brain family');
+  assert.equal(resolveMemoryModelRoute('learn'), null);
+  assert.deepEqual(memoryModelAvailability('learn'), { ok: false, reason: 'model_unavailable', problem: 'not_connected' });
+  // A bare model string goes through the shared router, which reaches the
+  // provider that is signed in.
+  assert.ok(resolveMemoryModelRoute('skills'), 'skills still has a model that can answer');
+  writeAuth();
+  assert.ok(resolveMemoryModelRoute('learn'), 'signed back in, learning resumes');
+});

@@ -15,7 +15,9 @@
  *               role existed: learn / reconcile / patterns take exactly the
  *               model resolveBoundaryJudge() selects (explicit checker pins
  *               included); skills / identity / import keep today's fast-tier
- *               model string.
+ *               model string. When nothing signed in can serve that model
+ *               the route is null too, and learning waits: memory work never
+ *               spends a part's tries on a model that cannot answer.
  *
  * Either way the route records its calls under route role `memory` with the
  * job in the decision reason, so the ledger tells memory work apart from
@@ -29,9 +31,10 @@
  * Nothing here throws, and nothing here waits on the network.
  */
 import type { Model } from '@openai/agents-core';
-import { DEFAULT_CODEX_FAST_MODEL, MODELS } from '../config.js';
+import { DEFAULT_CODEX_FAST_MODEL, MODELS, getByoBackendConfig } from '../config.js';
 import { memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
 import {
+  modelProviderLive,
   readDurableBindings,
   registerMemoryAutomaticModel,
   resolveRoleModel,
@@ -41,18 +44,22 @@ import {
 import {
   buildExactRoleModel,
   resolveBoundaryJudge,
+  resolveBoundaryJudgeHedge,
   type BoundaryJudgeRouting,
 } from '../runtime/harness/debate-model.js';
-import { checkerQuotaExhaustion, judgeCrossFamilyEnabled } from '../runtime/harness/judge-family.js';
-import { resolveByoProviderForModel } from '../runtime/harness/byo-providers.js';
+import {
+  checkerQuotaExhaustion,
+  debateBrainsAvailable,
+  judgeCrossFamilyEnabled,
+} from '../runtime/harness/judge-family.js';
+import { resolveByoProviderForModel, resolveEffectiveProviderForModel } from '../runtime/harness/byo-providers.js';
 import type { ModelProviderClass } from '../runtime/harness/model-wire-registry.js';
 import { creditRefusal } from '../runtime/provider-credit.js';
 import { getRateLimitSnapshot } from '../runtime/harness/rate-limit-store.js';
 import { reflectionExtractorPause } from './reflection.js';
+import type { MemoryModelProblem } from './memory-work-types.js';
 
-/** Why a model call could not run. Never a provider name. Mirrors
- *  packages/chat-engine/src/memory-work.ts `MemoryModelProblem`. */
-export type MemoryModelProblem = 'quota' | 'credit' | 'not_connected' | 'timeout' | 'error';
+export type { MemoryModelProblem } from './memory-work-types.js';
 
 export interface MemoryModelRoute {
   job: MemoryJobId;
@@ -137,28 +144,81 @@ function automaticFastModelId(job: MemoryJobId): string {
   return job === 'import' ? (MODELS.fast || MODELS.primary || DEFAULT_CODEX_FAST_MODEL) : MODELS.fast;
 }
 
-function automaticRoute(job: MemoryJobId): MemoryModelRoute | null {
+/** Whether a bare model string can be served: the process-global router
+ *  serves it on its own provider, or falls over to another connected one.
+ *  Generous on purpose: this only holds work back when nothing can run it. */
+function modelStringServes(modelId: string): boolean {
+  try {
+    if (modelProviderLive(modelId, resolveEffectiveProviderForModel(modelId))) return true;
+  } catch { /* an ambiguous id still reaches whichever provider is connected */ }
+  try {
+    const brains = debateBrainsAvailable();
+    return brains.claude || brains.codex || getByoBackendConfig().configured;
+  } catch {
+    return false;
+  }
+}
+
+/** Why a bare model string cannot be served. */
+function modelStringProblem(modelId: string): MemoryModelUnavailable {
+  try {
+    return problemForModel(resolveEffectiveProviderForModel(modelId), modelId);
+  } catch {
+    return { problem: 'not_connected' };
+  }
+}
+
+/** Whether the extractor's cross-family hedge could take a call the route's
+ *  own provider cannot. */
+function hedgeServes(routing: BoundaryJudgeRouting): boolean {
+  try {
+    return Boolean(resolveBoundaryJudgeHedge(routing)?.model);
+  } catch {
+    return false;
+  }
+}
+
+/** The automatic route for a job, or why there is none right now. */
+type AutomaticResolution =
+  | { route: MemoryModelRoute; why?: undefined }
+  | { route: null; why: MemoryModelUnavailable };
+
+function resolveAutomatic(job: MemoryJobId): AutomaticResolution {
   if (!BOUNDARY_JOBS.has(job)) {
     const modelId = automaticFastModelId(job);
-    return modelId ? { job, model: modelId, modelId, source: 'automatic', follows: null } : null;
+    if (!modelId) return { route: null, why: { problem: 'not_connected' } };
+    if (!modelStringServes(modelId)) return { route: null, why: modelStringProblem(modelId) };
+    return { route: { job, model: modelId, modelId, source: 'automatic', follows: null } };
   }
   let routing: BoundaryJudgeRouting;
   try {
     routing = resolveBoundaryJudge(undefined, undefined, { role: 'memory', job });
   } catch {
-    return null; // the checker's route cannot be built right now: learning waits
+    return { route: null, why: automaticProblem() }; // the checker's route cannot be built right now: learning waits
   }
-  if (!routing.model) return null;
+  if (!routing.model) return { route: null, why: automaticProblem() };
+  // The checker's selection builds its model even when that provider is
+  // signed out (a review fails open). Memory work cannot fail open: it waits
+  // for the model, unless the extractor's hedge can take the call.
+  if (!modelProviderLive(routing.modelId, routing.judgeFamily) && !hedgeServes(routing)) {
+    return { route: null, why: problemForModel(routing.judgeFamily, routing.modelId) };
+  }
   return {
-    job,
-    model: routing.model,
-    modelId: routing.modelId,
-    source: 'automatic',
-    follows: followsFor(routing.modelId),
-    ...(typeof routing.timeoutMs === 'number' ? { timeoutMs: routing.timeoutMs } : {}),
-    provider: routing.judgeFamily,
-    boundary: routing,
+    route: {
+      job,
+      model: routing.model,
+      modelId: routing.modelId,
+      source: 'automatic',
+      follows: followsFor(routing.modelId),
+      ...(typeof routing.timeoutMs === 'number' ? { timeoutMs: routing.timeoutMs } : {}),
+      provider: routing.judgeFamily,
+      boundary: routing,
+    },
   };
+}
+
+function automaticRoute(job: MemoryJobId): MemoryModelRoute | null {
+  return resolveAutomatic(job).route;
 }
 
 /**
@@ -283,9 +343,9 @@ export function describeMemoryModel(): MemoryModelDescription {
         unavailable: route ? pausedFor(DESCRIBED_JOB) : problemForModel(chosen.provider, chosen.modelId),
       };
     }
-    const route = automaticRoute(DESCRIBED_JOB);
+    const { route, why } = resolveAutomatic(DESCRIBED_JOB);
     if (!route) {
-      return { source: 'automatic', modelId: null, follows: null, provider: null, inactiveBinding: null, unavailable: automaticProblem() };
+      return { source: 'automatic', modelId: null, follows: null, provider: null, inactiveBinding: null, unavailable: why };
     }
     return {
       source: 'automatic',
@@ -312,7 +372,9 @@ export function memoryJobModelId(job: MemoryJobId, described: MemoryModelDescrip
   try {
     if (!memoryJobUsesMemoryModel(job)) return null;
     if (described.source === 'chosen' || BOUNDARY_JOBS.has(job)) return described.modelId || null;
-    return automaticFastModelId(job) || null;
+    // A model string nothing connected can serve is not the job's model.
+    const modelId = automaticFastModelId(job);
+    return modelId && modelStringServes(modelId) ? modelId : null;
   } catch {
     return null;
   }
@@ -329,11 +391,14 @@ export function memoryModelAvailability(job: MemoryJobId): MemoryModelAvailabili
     if (!memoryJobUsesMemoryModel(job)) return { ok: true };
     const paused = pausedFor(job);
     if (paused) return { ok: false, reason: 'model_paused', ...paused };
-    if (resolveMemoryModelRoute(job)) return { ok: true };
     const chosen = chosenMemoryRole();
-    const target = chosen?.inactiveBinding ?? chosen;
-    const why = target ? problemForModel(target.provider, target.modelId) : automaticProblem();
-    return { ok: false, reason: 'model_unavailable', ...why };
+    if (!chosen) {
+      const { route, why } = resolveAutomatic(job);
+      return route ? { ok: true } : { ok: false, reason: 'model_unavailable', ...why };
+    }
+    if (resolveMemoryModelRoute(job)) return { ok: true };
+    const target = chosen.inactiveBinding ?? chosen;
+    return { ok: false, reason: 'model_unavailable', ...problemForModel(target.provider, target.modelId) };
   } catch {
     return { ok: false, reason: 'model_unavailable', problem: 'error' };
   }
