@@ -299,9 +299,13 @@ test('a later step of a resumed workflow step ranks its memory by the step\'s me
 });
 
 // A card answered by its button is accepted by a source the runtime records,
-// whose text is not a request. With no request text to rank by, the resumed
-// step and the re-ask carry the per-block rendering the prompt carried, not a
-// ranking of the control text or of the host's directive.
+// whose text is not a request. On this legacy runner seam the parked run state
+// names no request of its own (only the host path restores the parked source
+// the card belongs to), so the resumed step and the re-ask have no request
+// text to rank by: they carry the per-block rendering the prompt carried, not
+// a ranking of the control text or of the host's directive. The host path's
+// button answer, which ranks by the parked request, is pinned in
+// host-direct-write.integration.test.ts.
 test('a later step of a resumed request accepted by a control edge is not ranked by the host directive', async () => {
   const { reask, primer, resumedPrimer } = await resumedReask('control-edge', { answerBySource: false });
   assert.equal(resumedPrimer.skippedReason, 'empty_input', `the resumed step is not ranked by the control text: ${JSON.stringify(resumedPrimer)}`);

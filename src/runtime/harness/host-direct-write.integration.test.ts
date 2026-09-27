@@ -1153,6 +1153,112 @@ for (const [decision, ranker] of [['approve', 'on'], ['approve', 'off'], ['chang
   });
 }
 
+// A later step of a resumed request continues the request the card belongs
+// to, whichever source accepted the answer: the card's button (a control edge
+// the runtime records) or a chat reply. It ranks memory by the parked
+// request's text, never by the answer. Notes that share the host directive's
+// words and not the request's are stored first, so memory ranked by anything
+// else loses the request's fact. The later step here is the resume core
+// re-asking for the reply the resumed step did not give.
+// Regression: later steps were ranked by the accepting source; a button
+// answer has no request text and a reply's text is not the request.
+let laterStepLookalikesStored = false;
+for (const answer of ['button', 'reply'] as const) {
+  test(`a later step of a resume answered by ${answer} ranks its memory by the parked request`, async () => {
+    const { rememberFact, listActiveFacts } = await import('../../memory/facts.js');
+    const { judgeMemoryFor } = await import('../../memory/judge-memory.js');
+    if (!listActiveFacts({ limit: 80 }).some((fact) => fact.content === RESUME_FACT)) rememberFact({ kind: 'reference', content: RESUME_FACT });
+    if (!laterStepLookalikesStored) {
+      laterStepLookalikesStored = true;
+      for (let n = 1; n <= 12; n += 1) {
+        rememberFact({ kind: 'project', importance: 5,
+          content: `Visible answer ${n}: a completed turn that produced no reply for the user is answered again as plain text, stating the actual result and evidence (desk ${n}).` });
+      }
+    }
+    const previous = { primer: process.env.CLEMMY_UNIFIED_TURN_PRIMER, recall: process.env.CLEMMY_UNIFIED_RECALL, embeddings: process.env.EMBEDDINGS_DISABLED };
+    process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'on';
+    process.env.CLEMMY_UNIFIED_RECALL = 'on';
+    process.env.EMBEDDINGS_DISABLED = 'true';
+    try {
+      const fixture = await directWriteFixture('work_call', 'opaque', `resume-memory-later-step-${answer}`, false, 'args_json', 1, {
+        operationId: `MEMORY_RESUME_LATER_STEP_${answer.toUpperCase()}`, schema: INPUT_SCHEMA, payloads: [ARGS],
+      });
+      assert.ok(fixture);
+      const sent: string[] = [];
+      let resumedCalls = -1;
+      const respond = fixture.model.getResponse.bind(fixture.model);
+      fixture.model.getResponse = async (request: any) => {
+        sent.push([request.systemInstructions ?? '', JSON.stringify(request.input ?? [])].join('\n'));
+        const response = await respond(request);
+        if (resumedCalls < 0) return response;
+        resumedCalls += 1;
+        // The resumed step ends completed with no visible reply, so the resume
+        // core re-asks in a later step of the same request.
+        if (resumedCalls === 1) {
+          return { ...response, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
+            text: JSON.stringify({ summary: 'Resumed the approval.', reply: null, done: true, nextAction: 'completed', reason: null }) }] }] };
+        }
+        return response;
+      };
+      const { runConversation, runConversationFromResume } = await import('./loop.js');
+      const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+      const agent = await fixture.useProductionAgent();
+      const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+        sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+        suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+      assert.equal(paused.status, 'awaiting_approval', JSON.stringify(paused));
+      const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+      assert.ok(approval);
+      // Answered in chat, the reply owns the approval and accepts it.
+      const replySource = answer === 'reply'
+        ? eventlog.appendEvent({ sessionId: fixture.session.id, turn: 2, role: 'user', type: 'user_input_received',
+            data: { text: 'Yes, go ahead.', approvalId: approval.approvalId, decision: 'approve' } })
+        : undefined;
+      assert.equal(approvals.resolve(approval.approvalId, 'approved', `resume-memory-${answer}`).ok, true);
+      const before = sent.length;
+      resumedCalls = 0;
+      eventlog.closeEventLog();
+      const result = await runConversationFromResume({ sessionId: fixture.session.id,
+        approvalId: approval.approvalId, decision: 'approve', resolver: `resume-memory-${answer}`, turnEngine: 'host_v1',
+        ...(replySource ? { sourceUserSeq: replySource.seq } : {}),
+        makeRunner: () => fixture.runner as never, maxTurns: 3,
+        judgeFn: async () => ({ done: true, reason: 'fixture reply' }),
+        buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+          sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+          ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+          model: fixture.model as never, allowToolJit: true,
+        }),
+      });
+      assert.equal(fixture.counts().providerCalls, 1, JSON.stringify(result));
+      const reasks = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+        .filter((event) => event.data.kind === 'completed_without_reply' && event.data.path === 'resume');
+      assert.equal(reasks.length, 1, `the resume core re-asked in a later step: ${JSON.stringify(result)}`);
+      const accepting = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).at(-1)!;
+      assert.notEqual(accepting.seq, fixture.source.seq, 'the answer is accepted by a source other than the parked request');
+      assert.equal((accepting.data as { synthetic?: unknown }).synthetic === true, answer === 'button',
+        'a button answer is accepted by the runtime\'s control edge; a reply by the owner\'s own words');
+      // What the later step was told from memory, as the runtime recorded it.
+      // A button answer's later step runs under the control edge, which the
+      // model-request provenance gate does not accept as a request source, so
+      // only a reply's later step also reaches the brain.
+      assert.ok(judgeMemoryFor(fixture.session.id).includes(RESUME_FACT), 'the later step\'s memory carries the parked request\'s fact');
+      if (answer === 'reply') {
+        const resumed = sent.slice(before);
+        assert.equal(resumed.length, 2, 'the resumed step and the re-ask reached the brain');
+        assert.ok(resumed[1]!.includes(RESUME_FACT), 'the re-ask\'s model request carries the parked request\'s fact');
+      }
+      const later = eventlog.listEvents(fixture.session.id, { types: ['turn_memory_primer'] }).at(-1)!.data as Record<string, unknown>;
+      assert.equal(later.sourceUserSeq, accepting.seq, 'the last primer is the later step\'s');
+      assert.ok(String(later.queryPreview).startsWith(fixture.prompt.slice(0, 60)),
+        `the later step ranks memory by the parked request: ${JSON.stringify(later)}`);
+    } finally {
+      for (const [key, value] of [['CLEMMY_UNIFIED_TURN_PRIMER', previous.primer], ['CLEMMY_UNIFIED_RECALL', previous.recall], ['EMBEDDINGS_DISABLED', previous.embeddings]] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+}
+
 // The chat dock answers a card with a change in the owner's own words: the
 // reply owns the approval and the resume agent is built with the reply as its
 // focus. The prompt's per-block memory ranked the resumed request by that
