@@ -285,7 +285,8 @@ function LiveHome() {
   const spacesHeader = (
     <div className="flex min-h-5 items-center gap-3">
       <h2 id="home-spaces" className="text-small font-semibold text-muted">Your Spaces</h2>
-      <Link to="/workspaces" className="ml-auto rounded-sm text-caption font-semibold text-primary hover:underline">All Spaces</Link>
+      <button type="button" className="ml-auto rounded-sm text-caption font-semibold text-primary hover:underline disabled:opacity-50 cursor-pointer" disabled={!layout.data} onClick={() => setBuilding(true)}>Build</button>
+      <Link to="/workspaces" className="rounded-sm text-caption font-semibold text-primary hover:underline">All Spaces</Link>
     </div>
   );
   const tileWidth = (t: HomeTile) => t.width === 'wide'
@@ -342,10 +343,7 @@ function LiveHome() {
               ? <Skeleton className="h-4 w-64" />
               : <p className="text-body text-muted" aria-live="polite">{presence}</p>}
           </div>
-          <div className="flex items-center gap-2">
-            <Button variant="secondary" size="sm" disabled={!layout.data} onClick={() => setBuilding(true)}><Plus className="h-4 w-4" aria-hidden /> Build home</Button>
-            <Button variant="ghost" size="sm" onClick={openCustomizeHome}><SlidersHorizontal className="h-4 w-4" aria-hidden /> Tune</Button>
-          </div>
+          <Button variant="ghost" size="sm" onClick={openCustomizeHome} title="Which stacks show, in what style"><SlidersHorizontal className="h-4 w-4" aria-hidden /> Arrange</Button>
         </div>
         <LiveStatus
           entries={workingView.entries}

@@ -43,8 +43,8 @@ export function TopBar({
 
       <h1 className="max-w-[18rem] shrink-0 truncate text-h3 font-semibold text-fg">{title}</h1>
 
-      {/* Usage meters for every connected model account, on every screen. */}
-      <ModelStatusChips />
+      {/* Model account health as one quiet dot; the words on hover, the meters in Settings › Models. */}
+      <ModelStatusChips compact />
 
       {/* shrink-0: the controls on the right must never clip, whatever grows on the left */}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">

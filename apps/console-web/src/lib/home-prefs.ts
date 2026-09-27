@@ -100,7 +100,7 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   spaceViews: {},
   panes: { order: DEFAULT_HOME_PANE_ORDER, hidden: ['workstate'] },
   nav: {
-    pinned: ['/home', '/chat', '/inbox', '/tasks', '/workspaces'],
+    pinned: ['/chat', '/inbox', '/workspaces'],
     shown: ['/automate', '/connect'],
     more: ['/memory', '/meetings', '/goals', '/agents'],
   },
@@ -108,13 +108,17 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   phoneSwitcher: ['home', 'inbox', 'chats', 'spaces', 'more'],
 };
 
-/** Home is the command center; all other nav choices retain their relative
- *  order and grouping. This does not write the shared record. */
+/** Today (/chat) is the front door and comes first; a saved '/home' from
+ *  before Home and Chat merged means the same place. All other nav choices
+ *  retain their relative order and grouping. This does not write the record. */
+const TODAY_PATH = '/chat';
+const MERGED_INTO_TODAY = new Set(['/home', TODAY_PATH]);
 export function primaryHomeNavigation(nav: HomePreferences['nav']): HomePreferences['nav'] {
+  const rest = (paths: readonly string[]) => paths.filter((path) => !MERGED_INTO_TODAY.has(path));
   return {
-    pinned: ['/home', ...nav.pinned.filter(path => path !== '/home')],
-    shown: nav.shown.filter(path => path !== '/home'),
-    more: nav.more.filter(path => path !== '/home'),
+    pinned: [TODAY_PATH, ...rest(nav.pinned)],
+    shown: rest(nav.shown),
+    more: rest(nav.more),
   };
 }
 

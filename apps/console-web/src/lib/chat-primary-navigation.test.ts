@@ -3,16 +3,18 @@ import assert from 'node:assert/strict';
 import { DEFAULT_HOME_PREFERENCES, desktopHomePreferences, primaryHomeNavigation } from './home-prefs';
 import { PRIMARY_NAV, resolveSidebarNav } from './nav';
 
-test('Home is first and visible even when an older saved sidebar folded it into More', () => {
+test('Today is first and visible even when an older saved sidebar folded Home into More; Running is no longer primary', () => {
   const prefs = {
     ...DEFAULT_HOME_PREFERENCES,
     nav: { pinned: ['/chat', '/tasks'], shown: ['/connect'], more: ['/home', '/workspaces', '/memory'] },
   };
   const nav = resolveSidebarNav(prefs, { developerMode: false });
-  assert.equal(PRIMARY_NAV[0]?.path, '/home');
-  assert.deepEqual(nav.pinned.map(dest => dest.path), ['/home', '/chat', '/tasks']);
+  assert.equal(PRIMARY_NAV[0]?.path, '/chat');
+  assert.equal(PRIMARY_NAV[0]?.label, 'Today');
+  assert.equal(PRIMARY_NAV.some(dest => dest.path === '/home' || dest.path === '/tasks'), false, 'Home merged into Today; Running folded into it');
+  assert.deepEqual(nav.pinned.map(dest => dest.path), ['/chat']);
   assert.deepEqual(nav.shown.map(dest => dest.path), ['/connect']);
-  assert.equal(nav.more.some(dest => dest.path === '/home'), false);
+  assert.equal(nav.more.some(dest => dest.path === '/home' || dest.path === '/chat'), false);
   assert.deepEqual(prefs.nav.more, ['/home', '/workspaces', '/memory'], 'rendering must not mutate the shared saved preferences');
 });
 
@@ -33,9 +35,9 @@ test('a shipped chips-first home record is re-expressed before the desktop reads
   assert.deepEqual(chipsFirst.panes.order, DEFAULT_HOME_PREFERENCES.panes.order);
 });
 
-test('making Home primary preserves other groups and is stable when preferences are normalized twice', () => {
+test('making Today primary folds a saved Home into it, preserves other groups, and is stable when normalized twice', () => {
   const nav = { pinned: ['/memory', '/home', '/chat'], shown: ['/tasks', '/home'], more: ['/connect', '/home'] };
   const result = primaryHomeNavigation(nav);
-  assert.deepEqual(result, { pinned: ['/home', '/memory', '/chat'], shown: ['/tasks'], more: ['/connect'] });
+  assert.deepEqual(result, { pinned: ['/chat', '/memory'], shown: ['/tasks'], more: ['/connect'] });
   assert.deepEqual(primaryHomeNavigation(result), result);
 });

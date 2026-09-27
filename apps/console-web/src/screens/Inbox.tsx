@@ -60,6 +60,8 @@ export function Inbox() {
   const initialTab: Tab = tabParam === 'notifications' || tabParam === 'activity' ? 'notifications' : 'needs';
   const [tab, setTab] = useState<Tab>(initialTab);
   const [selected, setSelected] = useState<string | null>(searchParams.get('select'));
+  const userPicked = useRef(false);
+  const pick = (id: string | null) => { userPicked.current = id !== null; setSelected(id); };
   // Multi-select for bulk approve/reject — the "manage in the board" ask: clear
   // several held sends in one click instead of one card at a time. Each still
   // resolves through the same per-row decideApproval (kind routing + resume
@@ -111,6 +113,14 @@ export function Inbox() {
   const trustRows = trustProposals.data?.proposals ?? [];
   const planRows = planProposals.data?.proposals ?? [];
   const questionRows = questions.data?.questions ?? [];
+  // The detail pane never sits empty next to a list: the first decision opens
+  // itself until the person picks another ("Pick something on the left" was
+  // a blank slab beside fifty-one buttons, live 09-26).
+  useEffect(() => {
+    if (selected || userPicked.current || tab !== 'needs') return;
+    const first = approvalRows[0]?.approvalId ?? planRows[0]?.id ?? null;
+    if (first) setSelected(first);
+  }, [selected, tab, approvalRows, planRows]);
   // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
   // beside approvals (and leave once read); everything else stays in Notifications.
   // A carrier for a decision already on this list as a card is that decision.
@@ -473,7 +483,7 @@ export function Inbox() {
             <button
               key={t.key}
               type="button"
-              onClick={() => { setTab(t.key); setSelected(null); }}
+              onClick={() => { setTab(t.key); userPicked.current = false; setSelected(null); }}
               className={cn(
                 'inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium cursor-pointer -mb-px',
                 active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg',
@@ -542,7 +552,7 @@ export function Inbox() {
                     answer={questionAnswers[question.id] ?? ''}
                     busy={questionBusy === question.id}
                     globallyBusy={questionBusy !== null}
-                    onSelect={() => setSelected(question.id)}
+                    onSelect={() => pick(question.id)}
                     onAnswerChange={(answer) => setQuestionAnswers((previous) => ({ ...previous, [question.id]: answer }))}
                     onSubmit={(option) => { void onAnswerQuestion(question, option); }}
                   />
@@ -553,7 +563,7 @@ export function Inbox() {
                     row={plan}
                     selected={selected === plan.id}
                     busy={planBusy === plan.id}
-                    onSelect={() => setSelected(plan.id)}
+                    onSelect={() => pick(plan.id)}
                     onApprove={() => onDecidePlan(plan.id, 'approve')}
                     onReject={() => onDecidePlan(plan.id, 'reject')}
                   />
@@ -588,7 +598,7 @@ export function Inbox() {
                     decisionState={decisionStates[a.approvalId]}
                     disabled={bulkBusy}
                     onToggleCheck={() => toggleChecked(a.approvalId)}
-                    onSelect={() => setSelected(a.approvalId)}
+                    onSelect={() => pick(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
                     onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
                 ))}
@@ -605,7 +615,7 @@ export function Inbox() {
                     decisionState={decisionStates[a.approvalId]}
                     disabled={bulkBusy}
                     onToggleCheck={() => toggleChecked(a.approvalId)}
-                    onSelect={() => setSelected(a.approvalId)}
+                    onSelect={() => pick(a.approvalId)}
                     onApprove={() => onDecide(a.approvalId, 'approve')}
                     onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
                 ))}
@@ -629,7 +639,7 @@ export function Inbox() {
                       onResolve={(choice) => { void onResolveCapability(n.workflowCapability as WorkflowCapabilityInboxGate, choice); }}
                     />
                   ) : (
-                    <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
+                    <ListRow key={n.id} selected={selected === n.id} onSelect={() => pick(n.id)}
                       title={n.title || n.body || 'Needs attention'}
                       meta={`${relativeTime(n.createdAt)}${collapsedCount > 0 ? ` · +${collapsedCount} earlier` : ''}`}
                       tone={attentionPill(n)} />
@@ -652,7 +662,7 @@ export function Inbox() {
           {!loading && !queryUnavailable && tab === 'notifications' && (plainNotifRows.length === 0
             ? <EmptyState title="No notifications" description="Updates from completed work will appear here." />
             : plainNotifRows.map((n) => (
-              <ListRow key={n.id} selected={selected === n.id} onSelect={() => setSelected(n.id)}
+              <ListRow key={n.id} selected={selected === n.id} onSelect={() => pick(n.id)}
                 title={n.title || n.body || 'Notification'} meta={relativeTime(n.createdAt)}
                 tone={notifTone(n)} dim={n.read} />
             )))}
@@ -721,6 +731,62 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
   );
 }
 
+/** The name alone; the identifier is a caption, never part of the title. */
+function workspaceChoiceTitle(choice: { label: string; workspaceId: string }): string {
+  const label = choice.label.trim();
+  const suffix = ` (${choice.workspaceId})`;
+  return label.endsWith(suffix) ? label.slice(0, -suffix.length).trim() : label;
+}
+
+/** Up to three Workspaces are buttons; more is a picker with one "Use" button
+ *  (fifty-one buttons was a wall, live 09-26). "Prepare a new one" is always its own. */
+function WorkspaceChoices({ chooser, busy, onChoose }: {
+  chooser: WorkspaceDestinationChooser;
+  busy: boolean;
+  onChoose: (choiceId: string) => void;
+}) {
+  const existing = chooser.choices.filter((choice) => choice.kind === 'existing');
+  const createNew = chooser.choices.find((choice) => choice.kind === 'create_new');
+  const [picked, setPicked] = useState(existing[0]?.choiceId ?? '');
+  const pickedChoice = existing.find((choice) => choice.choiceId === picked) ?? existing[0];
+  if (existing.length > 3) {
+    return (
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <select
+          aria-label="Existing Workspaces"
+          className="min-w-[16rem] max-w-full rounded-md border border-border bg-canvas px-2.5 py-1.5 text-small text-fg"
+          value={pickedChoice?.choiceId ?? ''}
+          disabled={busy}
+          onChange={(e) => setPicked(e.target.value)}
+        >
+          {existing.map((choice) => <option key={choice.choiceId} value={choice.choiceId}>{workspaceChoiceTitle(choice)}</option>)}
+        </select>
+        {pickedChoice ? <span className="font-mono text-caption text-faint">{pickedChoice.workspaceId}</span> : null}
+        <Button size="sm" disabled={busy || !pickedChoice} onClick={() => { if (pickedChoice) onChoose(pickedChoice.choiceId); }}>
+          {busy ? 'Saving…' : `Use ${pickedChoice ? workspaceChoiceTitle(pickedChoice) : 'this'}`}
+        </Button>
+        {createNew ? <Button size="sm" variant="secondary" disabled={busy} onClick={() => onChoose(createNew.choiceId)}>Prepare a new one</Button> : null}
+      </div>
+    );
+  }
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      {chooser.choices.map((choice) => (
+        <Button
+          key={choice.choiceId}
+          size="sm"
+          {...(choice.kind === 'create_new' ? { variant: 'secondary' as const } : {})}
+          disabled={busy}
+          onClick={() => onChoose(choice.choiceId)}
+          title={choice.kind === 'existing' ? choice.workspaceId : undefined}
+        >
+          {busy ? 'Saving…' : choice.kind === 'existing' ? workspaceChoiceTitle(choice) : choice.label}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
 function WorkspaceChooserCard({ chooser, busy, onChoose }: {
   chooser: WorkspaceDestinationChooser;
   busy: boolean;
@@ -738,21 +804,7 @@ function WorkspaceChooserCard({ chooser, busy, onChoose }: {
         </div>
         <span className="shrink-0 text-caption text-faint">{relativeTime(chooser.createdAt)}</span>
       </div>
-      <div className="mt-3 flex flex-wrap gap-2">
-        {chooser.choices.map((choice) => (
-          <Button
-            key={choice.choiceId}
-            size="sm"
-            {...(choice.kind === 'create_new' ? { variant: 'secondary' as const } : {})}
-            disabled={busy}
-            onClick={() => onChoose(choice.choiceId)}
-          >
-            {busy
-              ? 'Saving…'
-              : choice.kind === 'existing' ? `${choice.label} (${choice.workspaceId})` : choice.label}
-          </Button>
-        ))}
-      </div>
+      <WorkspaceChoices chooser={chooser} busy={busy} onChoose={onChoose} />
     </div>
   );
 }

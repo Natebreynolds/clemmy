@@ -79,9 +79,10 @@ test('Chat empty state is a composer, not the briefing', () => {
   assert.match(CHAT, /New conversation only/);
 });
 
-test('the app lands on Home by default', () => {
-  assert.match(APP, /path="\/home" element=\{<Home \/>\}/);
-  assert.match(APP, /Navigate to="\/home" replace/);
+test('the app lands on Today by default: Home renders at the chat index and the old address forwards', () => {
+  assert.match(APP, /<Route index element=\{<Home \/>\} \/>/);
+  assert.match(APP, /path="\/home" element=\{<Navigate to="\/chat" replace \/>\}/);
+  assert.match(APP, /Navigate to="\/chat" replace/);
   assert.match(APP, /prefs\.data\?\.landing \?\? 'home'/);
   assert.match(APP, /path="\/made"/);
   assert.match(APP, /path="\/made\/:groupId"/);

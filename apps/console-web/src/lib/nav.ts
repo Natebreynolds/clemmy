@@ -1,8 +1,27 @@
 import {
-  Home, MessageCircle, Inbox, Zap, Plug, Brain, Video, LayoutDashboard,
-  BarChart3, Wrench, Stethoscope, Gauge, Sliders, Sparkles,
-  Settings, HelpCircle, Users, FlaskConical, Goal, Activity, GitBranch,
-  FolderOpen, Workflow, HeartPulse,
+  Sun,
+  Inbox,
+  Zap,
+  Plug,
+  Brain,
+  Video,
+  LayoutDashboard,
+  BarChart3,
+  Wrench,
+  Stethoscope,
+  Gauge,
+  Sliders,
+  Sparkles,
+  Settings,
+  HelpCircle,
+  Users,
+  FlaskConical,
+  Goal,
+  Activity,
+  GitBranch,
+  FolderOpen,
+  Workflow,
+  HeartPulse,
   type LucideIcon,
 } from 'lucide-react';
 import { primaryHomeNavigation, type HomePreferences } from './home-prefs';
@@ -34,10 +53,11 @@ export interface NavDest {
  * /inbox is now "Needs you", /tasks is "Running", /workspaces is "Projects".
  */
 export const PRIMARY_NAV: NavDest[] = [
-  { path: '/home', label: 'Home', icon: Home, hint: "What needs you, what's running, what got done" },
-  { path: '/chat', label: 'Chat', icon: MessageCircle, hint: 'Talk to Clementine' },
+  // Today is Home and Chat as one screen: the day before you type, the
+  // conversation the moment you send (owner 09-26). Running folded into it;
+  // the board stays one click away from Today's status line.
+  { path: '/chat', label: 'Today', icon: Sun, hint: 'Your day, and a conversation with Clementine' },
   { path: '/inbox', label: 'Needs you', icon: Inbox, hint: 'Approvals, questions & anything waiting on you' },
-  { path: '/tasks', label: 'Running', icon: Activity, hint: 'Everything Clementine is working on right now' },
   { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
   { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows & skills' },
   { path: '/heartbeats', label: 'Heartbeats', icon: HeartPulse, hint: 'What Clementine checks on her own, and how often' },
@@ -53,6 +73,7 @@ export const PRIMARY_NAV: NavDest[] = [
  * Developer link, shown when developer mode is on) and the command palette.
  */
 export const ADVANCED_NAV: NavDest[] = [
+  { path: '/tasks', label: 'Running', icon: Activity, hint: 'Everything Clementine is working on right now', tier: 'everyday' },
   { path: '/advanced/usage', label: 'Usage', icon: BarChart3, hint: 'Token spend & activity', tier: 'everyday' },
   { path: '/advanced/tools', label: 'Tools', icon: Wrench, hint: 'Registered tool catalog', tier: 'everyday' },
   { path: '/advanced/canvas', label: 'Canvas', icon: Workflow, hint: 'See a workflow as a graph & rewire its steps', tier: 'everyday' },

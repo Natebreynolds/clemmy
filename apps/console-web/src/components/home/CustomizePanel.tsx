@@ -76,7 +76,7 @@ const LIVE_STATUS_OPTIONS: { value: HomeLiveStatus; label: string; hint: string 
 // ── Landing ────────────────────────────────────────────────────────────────
 
 const LANDING_OPTIONS: { value: HomeLanding; label: string; hint?: string }[] = [
-  { value: 'home', label: 'Home', hint: 'Command center' },
+  { value: 'home', label: 'Today', hint: 'Your day, then the conversation' },
   { value: 'last_conversation', label: 'Last conversation', hint: 'Pick up where you left off' },
   { value: 'current_project', label: 'Current project', hint: 'The workspace you were in' },
 ];
@@ -94,9 +94,9 @@ const NAV_GROUPS: { key: NavGroup; label: string }[] = [
 const NAV_GROUP_KEYS = new Set<string>(NAV_GROUPS.map((g) => g.key));
 const isNavGroup = (key: string): key is NavGroup => NAV_GROUP_KEYS.has(key);
 
-const HOME_PATH = '/home';
+const HOME_PATH = '/chat';
 const CHAT_PATH = '/chat';
-const HOME_DEST: NavDest = { path: HOME_PATH, label: 'Home', icon: Home, hint: 'Your command center' };
+const HOME_DEST: NavDest = { path: HOME_PATH, label: 'Today', icon: Home, hint: 'Your day, and a conversation with Clementine' };
 
 /** Destination for a nav id; the sidebar's own catalog first, Home as the one built-in. */
 function navDest(path: string): NavDest | null {
@@ -104,7 +104,7 @@ function navDest(path: string): NavDest | null {
 }
 
 /** Every destination the sidebar can place. Anything known but unplaced lands in More. */
-const MANAGED_NAV_PATHS = [HOME_PATH, ...PRIMARY_NAV.map((d) => d.path)];
+const MANAGED_NAV_PATHS = [...new Set([HOME_PATH, ...PRIMARY_NAV.map((d) => d.path)])];
 
 function groupOf(nav: Nav, path: string): NavGroup | null {
   for (const g of NAV_GROUPS) if (nav[g.key].includes(path)) return g.key;

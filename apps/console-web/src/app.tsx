@@ -3,7 +3,6 @@ import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-quer
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AppShell } from './components/AppShell';
 import { Skeleton } from './components/ui/Skeleton';
-import { Chat } from './screens/Chat';
 import { Home } from './screens/Home';
 import { useHomePreferences } from './lib/home-prefs';
 import { lastChatSession } from './lib/last-session';
@@ -169,9 +168,9 @@ function LandingRedirect() {
   if (landing === 'current_project') {
     if (spaces.isPending && !waitedOut) return <LandingFallback />;
     const current = currentProject(spaces.data ?? []);
-    return <Navigate to={current ? `/workspaces/${encodeURIComponent(current.id)}` : '/home'} replace />;
+    return <Navigate to={current ? `/workspaces/${encodeURIComponent(current.id)}` : '/chat'} replace />;
   }
-  return <Navigate to="/home" replace />;
+  return <Navigate to="/chat" replace />;
 }
 
 function LandingFallback() {
@@ -196,12 +195,13 @@ export function App() {
 
           <Route element={<AppShell />}>
             <Route index element={<LandingRedirect />} />
-            <Route path="/home" element={<Home />} />
+            {/* Today: Home and Chat are one screen (owner 09-26). The old address forwards. */}
+            <Route path="/home" element={<Navigate to="/chat" replace />} />
             <Route path="/made" element={deferred(<MadeArchive />)} />
             <Route path="/made/:groupId" element={deferred(<MadeFolder />)} />
 
             <Route path="/chat" element={<ChatScreen />}>
-              <Route index element={<Chat />} />
+              <Route index element={<Home />} />
               <Route path=":sessionId" element={<ConversationThread />} />
             </Route>
             <Route path="/inbox" element={deferred(<Inbox />)} />
@@ -236,7 +236,7 @@ export function App() {
             <Route path="/settings" element={deferred(<Settings />)} />
             <Route path="/help" element={deferred(<Help />)} />
 
-            <Route path="*" element={<Navigate to="/home" replace />} />
+            <Route path="*" element={<Navigate to="/chat" replace />} />
           </Route>
         </Routes>
       </BrowserRouter>

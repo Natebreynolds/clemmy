@@ -88,11 +88,27 @@ function OutOfCreditChip({ meter, now }: { meter: UsageMeter; now: number }) {
  *  for lack of credit, which shows at every width because it needs its owner.
  *  Everything else is metered in Settings › Models. Chosen by what the meter
  *  reports, never by a list of provider names. */
-export function ModelStatusChips() {
+export function ModelStatusChips({ compact = false }: { compact?: boolean } = {}) {
   const { meters, now } = useUsageMeters();
   const out = meters.filter((meter) => meter.outOfCredit);
   const windowed = meters.filter((meter) => !meter.outOfCredit && meter.windows.length > 0);
   if (out.length === 0 && windowed.length === 0) return null;
+  if (compact) {
+    // One dot for the header (owner 09-26: a provider banner beside every
+    // page title was an engine fact in the person's face all day). Red when
+    // an account is refusing work, amber when a window is nearly used up,
+    // otherwise nothing at all. The words live in the tooltip; a refusing
+    // account still opens its billing page, because that is the fix.
+    const worst = out[0] ?? windowed.find((m) => meterTone(m) === 'danger') ?? windowed.find((m) => meterTone(m) === 'warning');
+    if (!worst) return null;
+    const tone: UsageTone = worst.outOfCredit ? 'danger' : meterTone(worst);
+    const title = [...out, ...windowed].map((m) => `${m.label}: ${m.outOfCredit ? CREDIT_REFUSAL_WORDS : usageChipText(m, now).text}`).join('\n');
+    const dot = <span className={cn('h-2 w-2 rounded-full', TONE_BAR[tone])} aria-hidden />;
+    const label = worst.outOfCredit ? `${worst.label} is ${CREDIT_REFUSAL_WORDS} for lack of credit` : `${worst.label} usage is ${meterTone(worst) === 'danger' ? 'nearly used up' : 'running high'}`;
+    return worst.outOfCredit && worst.billing
+      ? <a href={worst.billing.url} target="_blank" rel="noopener noreferrer" title={title} aria-label={`${label}. ${worst.billing.action} on the provider's billing page.`} className="app-no-drag inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md hover:bg-subtle" data-testid="usage-chips">{dot}</a>
+      : <span title={title} aria-label={label} role="img" className="inline-flex h-8 w-8 shrink-0 items-center justify-center" data-testid="usage-chips">{dot}</span>;
+  }
   return (
     <div className="flex min-w-0 shrink items-center gap-1.5 overflow-hidden whitespace-nowrap" data-testid="usage-chips">
       {out.map((meter) => <OutOfCreditChip key={meter.id} meter={meter} now={now} />)}
