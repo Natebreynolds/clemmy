@@ -1142,7 +1142,9 @@ export const DEFAULT_TOKEN_BUDGET: Readonly<TokenBudgetCounts> = Object.freeze({
  *
  * Bytes are the real resource, and every reader reply that enters the prompt
  * spends them: a recall slice and a query reply alike. The call count is a
- * recall runaway backstop only; a query spends bytes, never a recall call.
+ * recall runaway backstop only: a structured query reply spends bytes, never
+ * a recall call, while a query over text answers with recall's own slice and
+ * so spends a recall call like any recall.
  */
 export class RecallBudget {
   private calls = 0;
