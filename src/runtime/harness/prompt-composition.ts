@@ -36,6 +36,7 @@ import { estimateTokens } from './budget.js';
 import { CACHE_BREAK_SENTINEL, splitCacheDynamicContext } from './model-wire-registry.js';
 import { createHash } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
+import { serializeAdvertisedTools, toolsOnAdvertisedWire, type AdvertisableTool } from './advertised-tool-wire.js';
 
 export interface ToolSchemaCost {
   name: string;
@@ -44,30 +45,83 @@ export interface ToolSchemaCost {
   deferred: boolean;
 }
 
-/** Observe the same schema projection used by the host budget estimator.
- * Never include schema contents or mutate tools in telemetry. */
-export function measureToolPromptSurface(tools: readonly unknown[]) {
-  const costs: ToolSchemaCost[] = [];
-  for (const raw of tools) {
-    const tool = raw as Record<string, unknown>;
-    const deferred = tool.deferLoading === true;
-    const name = typeof tool.name === 'string' ? tool.name : String(tool.type ?? 'unnamed');
-    try {
-      const serialized = JSON.stringify({
-        type: tool.type, name: tool.name, description: tool.description,
-        ...(!deferred ? { parameters: tool.parameters, strict: tool.strict } : {}),
-      });
-      costs.push({ name, deferred, tokens: estimateTokens(serialized), bytes: Buffer.byteLength(serialized) });
-    } catch {
-      costs.push({ name, deferred: false, tokens: 50 });
-    }
+/** Measure one advertised schema entry as the provider adapters receive it:
+ *  name, description, compacted parameters and the strict flag. Never include
+ *  schema contents in telemetry. */
+function measureAdvertisedEntry(raw: unknown): ToolSchemaCost {
+  const tool = (raw ?? {}) as Record<string, unknown>;
+  const name = typeof tool.name === 'string' ? tool.name : String(tool.type ?? 'unnamed');
+  try {
+    const serialized = JSON.stringify({
+      type: tool.type, name: tool.name, description: tool.description,
+      parameters: tool.parameters, strict: tool.strict,
+    });
+    return { name, deferred: false, tokens: estimateTokens(serialized), bytes: Buffer.byteLength(serialized) };
+  } catch {
+    return { name, deferred: false, tokens: 50 };
   }
+}
+
+function summarizeToolCosts(costs: ToolSchemaCost[]) {
+  const sent = costs.filter((cost) => !cost.deferred);
   return {
-    toolNames: costs.filter(cost => !cost.deferred).map(cost => cost.name),
-    measuredToolSchemaTokens: costs.filter(cost => !cost.deferred).reduce((sum, cost) => sum + cost.tokens, 0),
-    deferredToolIndexTokens: costs.filter(cost => cost.deferred).reduce((sum, cost) => sum + cost.tokens, 0),
+    toolNames: sent.map((cost) => cost.name),
+    measuredToolSchemaTokens: sent.reduce((sum, cost) => sum + cost.tokens, 0),
+    // Nothing about a deferred tool is sent: its schema is off the wire and it
+    // is not listed in the names-only catalog either. An index bucket is only
+    // non-zero for a caller that measured index text it actually sends.
+    deferredToolIndexTokens: 0,
     toolSchemaCosts: costs,
   };
+}
+
+/** Measure the exact schemas one request advertises (the host runner's wire,
+ *  already compacted, already without the tools it left off). */
+export function measureAdvertisedToolSurface(wire: readonly unknown[]) {
+  return summarizeToolCosts(wire.map(measureAdvertisedEntry));
+}
+
+/** Measure an agent's tools as the host runner would advertise them: a
+ *  deferLoading tool left off the wire costs nothing, and every schema is
+ *  measured on the compacted projection the runner sends. For callers that
+ *  do not have the runner's per-request wire in hand. `compactionBudgetTokens`
+ *  is the in-flight compaction and archive budget's own estimate of the same
+ *  tools (see estimateAgentToolBudgetTokens), never the meter's reading. */
+export function measureToolPromptSurface(tools: readonly unknown[]) {
+  const named = tools.map((raw) => (raw ?? {}) as AdvertisableTool);
+  const onWire = new Set(toolsOnAdvertisedWire(named));
+  const costs = named.map((tool): ToolSchemaCost => {
+    if (!onWire.has(tool)) return { name: tool.name, deferred: true, tokens: 0, bytes: 0 };
+    try {
+      return measureAdvertisedEntry(serializeAdvertisedTools([tool])[0]);
+    } catch {
+      return { name: typeof tool.name === 'string' ? tool.name : 'unnamed', deferred: false, tokens: 50 };
+    }
+  });
+  return { ...summarizeToolCosts(costs), compactionBudgetTokens: estimateAgentToolBudgetTokens(tools) };
+}
+
+/** The in-flight compaction and archive budget's estimate of an agent's
+ *  tools: every schema on its raw JSON, and each deferLoading tool's name and
+ *  description as an index entry whether or not the runner sends it. This is
+ *  the budget's own reading, kept apart from the meter's advertised-wire
+ *  measurement so that correcting the meter never moves when history is
+ *  compacted or archived. */
+function estimateAgentToolBudgetTokens(tools: readonly unknown[]): number {
+  let total = 0;
+  for (const raw of tools) {
+    const tool = (raw ?? {}) as Record<string, unknown>;
+    const deferred = tool.deferLoading === true;
+    try {
+      total += estimateTokens(JSON.stringify({
+        type: tool.type, name: tool.name, description: tool.description,
+        ...(!deferred ? { parameters: tool.parameters, strict: tool.strict } : {}),
+      }));
+    } catch {
+      total += 50;
+    }
+  }
+  return total;
 }
 
 /** Does this bucket survive unchanged into the next turn's prompt? */
