@@ -34,6 +34,8 @@ const ENV_KEYS = [
   'BYO_PROVIDER_TOGETHER_API_KEY',
   'BYO_PROVIDER_MOONSHOT_API_KEY',
   'CLEMMY_MODEL_ROLES',
+  'CLEMMY_EMBED_PROVIDER',
+  'OPENAI_API_KEY',
 ];
 
 async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
@@ -266,7 +268,9 @@ test('each account carries its billing page, whether its provider refused for cr
       assert.equal(body.claude.billing?.url, 'https://claude.ai/settings/usage');
       assert.equal(body.claude.billing?.kind, 'plan');
       assert.equal(body.codex.billing?.kind, 'plan');
-      assert.deepEqual(body.openai.billing?.roles, ['memory_search']);
+      // Memory runs on the local embedder by default, so the OpenAI key does
+      // no job and says so; it is "memory search" only while it embeds.
+      assert.equal(body.openai.billing?.roles, undefined, 'the OpenAI key does no job while memory runs locally');
       assert.equal(body.jev.connected, false);
       assert.equal(body.jev.billing?.url, 'https://console.typesafe.ai/settings/billing');
 
@@ -290,4 +294,15 @@ test('a Coding Plan endpoint and a pay-as-you-go endpoint on one host get their 
   assert.equal(billingEntryForBaseURL('https://api.kimi.com/coding/v1')?.kind, 'plan');
   assert.equal(billingEntryForBaseURL('https://llm.internal.example/v1'), undefined, 'an unknown endpoint gets no guessed link');
   assert.equal(billingEntryForBaseURL('not a url'), undefined);
+});
+
+test('the OpenAI key is named for memory search only while it is the chosen embedder', async () => {
+  await withEnv({ CLEMMY_EMBED_PROVIDER: 'openai', OPENAI_API_KEY: 'sk-test-embedder' }, async () => {
+    const h = await boot();
+    try {
+      const res = await fetch(`${h.url}/api/console/model-status`);
+      const body = await res.json() as { openai?: { billing?: { roles?: string[] } } };
+      assert.deepEqual(body.openai?.billing?.roles, ['memory_search']);
+    } finally { await h.close(); }
+  });
 });

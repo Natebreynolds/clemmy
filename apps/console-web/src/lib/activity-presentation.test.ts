@@ -261,8 +261,14 @@ test('board feed uses durable terminal events and fails closed without one', () 
 test('Home words Clem\'s work from the shared presenter, stalled runs included', async () => {
   const { readFileSync } = await import('node:fs');
   const home = readFileSync(new URL('../screens/Home.tsx', import.meta.url), 'utf8');
-  assert.match(home, /presentWorkingNow\(/, 'the live band reads the shared presenter');
-  assert.match(home, /entries=\{workingView\.entries\}/, 'the band is handed the presented entries, not raw rows');
+  assert.match(home, /presentWorkingNow\(/, 'Home reads the shared presenter');
+  // The live band moved into the header (owner 09-26): the shell hands it the
+  // presented entries, never raw rows.
+  const shell = readFileSync(new URL('../components/AppShell.tsx', import.meta.url), 'utf8');
+  const bar = readFileSync(new URL('../components/TopBar.tsx', import.meta.url), 'utf8');
+  assert.match(shell, /presentWorkingNow\(/);
+  assert.match(shell, /liveEntries=\{workingView\.entries\}/, 'the header band is handed the presented entries');
+  assert.match(bar, /entries=\{liveEntries\}/);
   const { workLine } = await import('../components/home/home-model.js');
   assert.equal(workLine({ running: 0 }), 'Clem’s work: nothing running');
   assert.equal(workLine({ running: 2 }), 'Clem’s work: 2 running');
