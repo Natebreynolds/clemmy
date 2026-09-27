@@ -192,34 +192,35 @@ input, textarea, select { font: inherit; font-size: 16px; }
   font-size: inherit;
 }
 .app-title:focus { outline: none; }
-.title-switch {
+/* The mark is the menu's handle; the title is words. */
+.menu-mark {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  min-width: 44px;
   min-height: 44px;
-  max-width: 100%;
-  padding: 0 4px 0 2px;
+  margin-left: -8px;
+  padding: 0;
   border: 0;
-  border-radius: var(--r-sm);
+  border-radius: 12px;
   background: transparent;
-  color: var(--fg);
+  transition: transform 0.14s var(--ease-out), background 0.16s ease;
+}
+.menu-mark:active { transform: scale(0.94); background: var(--bg-2); }
+.menu-mark .brand-mark { border-radius: 8px; }
+.title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--font-display);
   font-size: 20px;
   font-weight: 800;
   letter-spacing: -0.01em;
-  transition: transform 0.14s var(--ease-out), background 0.16s ease;
+  color: var(--fg);
 }
-.title-switch:active { transform: scale(0.97); background: var(--bg-2); }
-.title-switch-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.title-chevron {
-  width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-  color: var(--fg-3);
-  stroke-width: 2.5;
-  transition: transform 0.2s var(--ease-out);
-}
-.title-switch[aria-expanded='true'] .title-chevron { transform: rotate(180deg); }
+.app-title { align-items: center; gap: 6px; }
 .title-badge {
   flex: 0 0 auto;
   min-width: 20px;
@@ -1072,6 +1073,11 @@ input, textarea, select { font: inherit; font-size: 16px; }
   line-height: 1;
 }
 .drawer-nav { display: flex; flex-direction: column; gap: 2px; }
+/* Two quieter doors under the six places: reachable, never competing. */
+.drawer-quiet { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line); }
+.drawer-item-quiet { min-height: 44px; color: var(--fg-3); }
+.drawer-item-quiet svg { width: 18px; height: 18px; }
+.drawer-item-quiet .drawer-item-label { font-size: 14px; font-weight: 600; }
 .drawer-item {
   display: flex;
   align-items: center;
@@ -4045,7 +4051,7 @@ textarea.cz-input { resize: vertical; }
    the whole press vocabulary here; pointers keep the richer treatment. */
 @media (hover: none) and (pointer: coarse) {
   :is(button, a, [role='button'], .card-tap, .chat-row, .workflow-row, .work-line, .home-row-tap,
-      .memory-fact-tap, .drawer-item, .settings-row, .switcher-row, .agent-card-main, .title-switch,
+      .memory-fact-tap, .drawer-item, .settings-row, .switcher-row, .agent-card-main,
       .running-tasks-trigger, .icon-btn, .btn, .btn-new, .chat-jump, .brain-chip):active {
     transform: none;
     filter: none;

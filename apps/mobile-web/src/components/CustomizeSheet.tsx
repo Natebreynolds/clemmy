@@ -14,8 +14,6 @@ import { whenLabel } from '../lib/schedule-label';
 import {
   panesFromPhoneRows,
   phonePaneRows,
-  phoneSwitcherIds,
-  SWITCHER_MORE,
   useHomePreferences,
   type HomeLanding,
   type HomePaneId,
@@ -30,8 +28,8 @@ export interface SectionOption {
 interface Props {
   open: boolean;
   onClose: () => void;
-  /** Every section this build knows, for the switcher chips. */
-  sections: SectionOption[];
+  /** Every section this build knows (kept for callers; the menu is fixed now). */
+  sections?: Array<{ id: string; label: string }>;
   /** The current project's name when the host knows one (the landing hint). */
   currentProject?: string | null;
 }
@@ -148,7 +146,7 @@ const LANDINGS: Array<{ id: HomeLanding; label: string }> = [
   { id: 'current_project', label: 'Current project' },
 ];
 
-export function CustomizeSheet({ open, onClose, sections, currentProject }: Props) {
+export function CustomizeSheet({ open, onClose, currentProject  }: Props) {
   const { prefs, loaded, saving, error, save, reload } = useHomePreferences({ enabled: open });
 
   // ── panes ──
@@ -158,19 +156,6 @@ export function CustomizeSheet({ open, onClose, sections, currentProject }: Prop
   };
   const panes = useReorder('y', (from, to) => savePanes(reorder(paneRows, from, to)));
 
-  // ── switcher ──
-  const switcherOn = phoneSwitcherIds(prefs, sections.map((s) => s.id)).filter((id) => id !== SWITCHER_MORE);
-  const switcherOff = sections.filter((s) => !switcherOn.includes(s.id)).map((s) => s.id);
-  const chipIds = [...switcherOn, ...switcherOff];
-  const saveSwitcher = (on: string[]) => {
-    void save({ phoneSwitcher: [...on, SWITCHER_MORE] }).catch(() => undefined);
-  };
-  const chips = useReorder('x', (from, to) => {
-    // Only the "on" chips have an order; dragging into the off group parks at the end.
-    if (from >= switcherOn.length) return;
-    saveSwitcher(reorder(switcherOn, from, Math.min(to, switcherOn.length - 1)));
-  });
-
   // ── quick actions ──
   const actions = prefs.quickActions;
   const saveActions = (next: QuickAction[]) => {
@@ -179,7 +164,6 @@ export function CustomizeSheet({ open, onClose, sections, currentProject }: Prop
   const quick = useReorder('y', (from, to) => saveActions(reorder(actions, from, to)));
   const [adding, setAdding] = useState(false);
 
-  const sectionLabel = (id: string) => sections.find((s) => s.id === id)?.label ?? id;
 
   return (
     <Sheet
@@ -242,37 +226,6 @@ export function CustomizeSheet({ open, onClose, sections, currentProject }: Prop
             </li>
           ))}
         </ul>
-      </section>
-
-      <section class="cz-section" aria-labelledby="cz-switcher">
-        <div class="cz-head-row">
-          <h3 id="cz-switcher" class="pane-head">Switcher order</h3>
-          <span class="cz-hint">Tap to add or remove · drag to reorder</span>
-        </div>
-        <div class="cz-chips" ref={(el) => { chips.listRef.current = el; }}>
-          {chipIds.map((id, i) => {
-            const on = i < switcherOn.length;
-            return (
-              <button
-                key={id}
-                type="button"
-                class={`cz-chip${on ? ' on' : ''}${chips.lifting(i) ? ' lifting' : ''}`}
-                aria-pressed={on}
-                data-reorder
-                style={chips.liftStyle(i)}
-                {...chips.handleProps(i)}
-                onClick={() => {
-                  if (chips.consumeClick()) return;
-                  haptic('light');
-                  saveSwitcher(on ? switcherOn.filter((s) => s !== id) : [...switcherOn, id]);
-                }}
-              >
-                {sectionLabel(id)}
-              </button>
-            );
-          })}
-          <span class="cz-chip cz-chip-fixed" aria-hidden="true">More</span>
-        </div>
       </section>
 
       <section class="cz-section" aria-labelledby="cz-landing">

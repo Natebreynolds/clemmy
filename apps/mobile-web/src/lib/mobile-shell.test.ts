@@ -56,11 +56,13 @@ test('navigation is a left drawer — the bottom dock is gone from code and styl
 
 test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the current screen', () => {
   const app = read('../app.tsx');
-  // The title is the navigator (owner design 2026-09-04): it opens the
-  // switcher sheet with a real touch target; "More" there opens the drawer.
-  assert.match(app, /class="title-switch"[\s\S]*?aria-haspopup="dialog"/);
-  assert.match(app, /aria-expanded=\{switcherOpen\}/);
-  assert.match(app, /onMore=\{\(\) => \{[\s\S]*?openDrawer\(\);/);
+  // ONE menu (owner 2026-08-25, 2026-09-26): the Clemmy mark opens the drawer
+  // with a real touch target, a rightward swipe across the header opens it too,
+  // and the title is words. The title-tap sheet is gone.
+  assert.match(app, /class="menu-mark"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{drawerOpen\}/);
+  assert.match(app, /clientX - sw\.x > 48 && !drawerOpen\) openDrawer\(\)/);
+  assert.match(app, /<span class="title-text">\{TAB_TITLES\[tab\]\}<\/span>/);
+  assert.doesNotMatch(app, /TitleSwitcher|switcherOpen|title-switch/);
   // Dialog semantics + Escape + scrim close.
   assert.match(app, /class=\{`drawer-layer\$\{drawerClosing \? ' closing' : ''\}`\}[\s\S]*?role=\{drawerClosing \? undefined : 'dialog'\}/);
   assert.match(app, /aria-hidden=\{drawerClosing \? true : undefined\}/);
@@ -76,7 +78,11 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   // The active section carries the page marker, accent-highlighted in CSS.
   assert.match(app, /aria-current=\{tab === t\.id \? 'page' : undefined\}/);
   const css = read('../styles.css');
-  assert.match(css, /\.title-switch \{[\s\S]*?min-height: 44px/);
+  assert.match(css, /\.menu-mark \{[\s\S]*?min-width: 44px;[\s\S]*?min-height: 44px/);
+  // Six places, two quiet doors, Settings at the foot.
+  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'inbox', 'spaces', 'workflows', 'agents', 'memory'\];/);
+  assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['chats', 'activity'\];/);
+  assert.match(app, /class="drawer-quiet"/);
   assert.match(css, /\.drawer \{[\s\S]*?width: min\(82vw, 320px\)/);
   assert.match(css, /\.drawer \{[\s\S]*?env\(safe-area-inset-left\)/);
   assert.match(css, /\.drawer-item \{[\s\S]*?min-height: 48px/);
@@ -195,11 +201,9 @@ test('the keyboard stays in daylight: color-scheme meta + shell trait override',
  * bottom sheet fed by HomePreferences.phoneSwitcher; the inline ask box on
  * Home is gone; the capsule floats above the safe area with 44px targets.
  */
-test('the title switcher and the ask capsule replace the hamburger and the inline ask box', () => {
+test('the one drawer and the ask capsule replace the hamburger, the title sheet and the inline ask box', () => {
   const app = read('../app.tsx');
-  assert.match(app, /<TitleSwitcher/);
-  assert.match(app, /phoneSwitcherIds\(prefs, TABS\.map/,
-    'the switcher lists the user\'s chosen destinations from the ONE preferences record');
+  assert.doesNotMatch(app, /<TitleSwitcher|phoneSwitcherIds\(/, 'the title-tap sheet and its preference are gone');
   assert.match(app, /<AskCapsule onAsk=\{\(draft, attachments\) => goToChat\(\{ draft, attachments, autoSend: true \}\)\}/,
     'the capsule sends through the same path Home\'s ask box used, files included');
   assert.doesNotMatch(app, /class="menu-btn"/);

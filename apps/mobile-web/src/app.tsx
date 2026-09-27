@@ -35,7 +35,6 @@ import {
   workspaceNavigationIntent,
 } from './lib/workspace-route';
 import {
-  TAB_IDS,
   destinationSearch,
   inboxNotificationFromSearch,
   runFromSearch,
@@ -43,7 +42,7 @@ import {
   tabFromSearch,
   type TabId as Tab,
 } from './lib/deep-link';
-import { SWITCHER_MORE, phoneSwitcherIds, useHomePreferences } from './lib/home-prefs';
+import { useHomePreferences } from './lib/home-prefs';
 import { phoneHeaderChrome } from './lib/home-presentation';
 import { appBadgeAuthAction, clearAppBadge, syncAppBadge } from './lib/app-badge';
 import { lastGoodAt } from './lib/last-good';
@@ -61,7 +60,6 @@ import { Settings } from './screens/Settings';
 import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
-import { TitleSwitcher, type SwitcherEntry } from './components/TitleSwitcher';
 import { AskCapsule } from './components/AskCapsule';
 import { CustomizeSheet } from './components/CustomizeSheet';
 
@@ -82,7 +80,8 @@ export function App() {
   const [runId, setRunId] = useState<string | null>(() => runFromSearch(window.location.search));
   // The title is the navigator: tapping it opens the switcher sheet. The
   // full section menu (the left drawer) stays behind "More".
-  const [switcherOpen, setSwitcherOpen] = useState(false);
+  // A rightward swipe across the header opens the menu.
+  const headerSwipe = useRef<{ x: number; y: number; horizontal: boolean | null }>({ x: 0, y: 0, horizontal: null });
   const [customizeOpen, setCustomizeOpen] = useState(false);
   // Left drawer (owner directive 2026-08-25): sections live in a slide-in
   // menu, never a bottom dock — content gets the full height.
@@ -584,22 +583,6 @@ export function App() {
   // the connection state — and the title was crushed to a sliver.)
   const headerChrome = phoneHeaderChrome({ tab, needsYouSignal: needsYou.show });
 
-  const switcherEntries: SwitcherEntry[] = phoneSwitcherIds(prefs, TABS.map((t) => t.id))
-    .filter((id) => id !== SWITCHER_MORE)
-    .flatMap((id) => {
-      const entry = TABS.find((t) => t.id === id);
-      if (!entry) return [];
-      const badged = id === 'inbox' && needsYou.show;
-      return [{
-        id,
-        label: entry.label,
-        icon: entry.icon,
-        badge: badged ? needsYou.badgeText : undefined,
-        badgeStale: badged ? needsYou.stale : undefined,
-        badgeLabel: badged ? needsYou.badgeAriaLabel : undefined,
-      }];
-    });
-
   // The capsule is the one persistent control — on Home, Needs you, and the
   // Chats list. An open thread has its own composer; other screens have
   // their own primary action.
@@ -607,28 +590,48 @@ export function App() {
 
   return (
     <>
-      <header class="app-header" hidden={tab === 'chats' && !chatsListVisible}>
-        <img class="brand-mark" src="/m/clemmy.png" alt="" width="28" height="28" />
+      <header
+        class="app-header"
+        hidden={tab === 'chats' && !chatsListVisible}
+        onTouchStart={(event) => {
+          const t = event.touches[0];
+          headerSwipe.current = { x: t.clientX, y: t.clientY, horizontal: null };
+        }}
+        onTouchMove={(event) => {
+          const t = event.touches[0];
+          const sw = headerSwipe.current;
+          if (sw.horizontal === null) {
+            const dx = Math.abs(t.clientX - sw.x);
+            const dy = Math.abs(t.clientY - sw.y);
+            if (dx > 12 || dy > 12) sw.horizontal = dx > dy;
+          }
+        }}
+        onTouchEnd={(event) => {
+          // A rightward swipe across the header opens the menu. The header
+          // only: the screen's left edge stays the system back gesture.
+          const sw = headerSwipe.current;
+          if (sw.horizontal && event.changedTouches[0].clientX - sw.x > 48 && !drawerOpen) openDrawer();
+        }}
+      >
+        {/* ONE menu (owner 08-25, 09-26): the Clemmy mark is its handle. */}
+        <button
+          ref={titleBtnRef}
+          type="button"
+          class="menu-mark"
+          aria-label="Menu"
+          aria-haspopup="dialog"
+          aria-expanded={drawerOpen}
+          onClick={() => { haptic('light'); openDrawer(); }}
+        >
+          <img class="brand-mark" src="/m/clemmy.png" alt="" width="28" height="28" />
+        </button>
         <h1 ref={routeTitleRef} class="app-title" tabIndex={-1}>
-          <button
-            ref={titleBtnRef}
-            type="button"
-            class="title-switch"
-            aria-haspopup="dialog"
-            aria-expanded={switcherOpen}
-            aria-label={`${TAB_TITLES[tab]}. Go to another section`}
-            onClick={() => { haptic('light'); setSwitcherOpen(true); }}
-          >
-            <span class="title-switch-text">{TAB_TITLES[tab]}</span>
-            {tab === 'inbox' && needsYou.show ? (
-              <span class={`title-badge${needsYou.stale ? ' badge-stale' : ''}`} title={needsYou.badgeAriaLabel} aria-hidden="true">
-                {needsYou.badgeText}
-              </span>
-            ) : null}
-            <svg class="title-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="m6 9 6 6 6-6" />
-            </svg>
-          </button>
+          <span class="title-text">{TAB_TITLES[tab]}</span>
+          {tab === 'inbox' && needsYou.show ? (
+            <span class={`title-badge${needsYou.stale ? ' badge-stale' : ''}`} title={needsYou.badgeAriaLabel} aria-hidden="true">
+              {needsYou.badgeText}
+            </span>
+          ) : null}
         </h1>
         <div class="meta">
           {/* Compact running-work chip — the sheet's trigger, which must not
@@ -676,21 +679,6 @@ export function App() {
           )}
         </div>
       </header>
-
-      <TitleSwitcher
-        open={switcherOpen}
-        onClose={() => setSwitcherOpen(false)}
-        current={tab}
-        entries={switcherEntries}
-        onSelect={(id) => {
-          setSwitcherOpen(false);
-          if (TAB_IDS.has(id as Tab)) navigateTo(id as Tab);
-        }}
-        onMore={() => {
-          setSwitcherOpen(false);
-          openDrawer();
-        }}
-      />
 
       <CustomizeSheet
         open={customizeOpen}
@@ -742,7 +730,7 @@ export function App() {
               <button class="drawer-close" type="button" aria-label="Close menu" onClick={() => closeDrawer()}>×</button>
             </div>
             <nav class="drawer-nav" aria-label="Sections">
-              {TABS.map((t) => (
+              {PRIMARY_TABS.map((id) => TABS.find((t) => t.id === id)!).map((t) => (
                 <button
                   key={t.id}
                   class="drawer-item"
@@ -762,6 +750,23 @@ export function App() {
                   ) : null}
                 </button>
               ))}
+              <div class="drawer-quiet" aria-label="Also">
+                {QUIET_TABS.map((id) => TABS.find((t) => t.id === id)!).map((t) => (
+                  <button
+                    key={t.id}
+                    class="drawer-item drawer-item-quiet"
+                    aria-current={tab === t.id ? 'page' : undefined}
+                    onClick={() => {
+                      if (tab !== t.id) haptic('light');
+                      navigateTo(t.id);
+                      closeDrawer(false);
+                    }}
+                  >
+                    <span class="drawer-item-icon">{t.icon}</span>
+                    <span class="drawer-item-label">{t.label}</span>
+                  </button>
+                ))}
+              </div>
             </nav>
             {/* Settings rides the bottom of the menu (owner IA): the pocket
                 end of trust minted on the Mac — quiet, always reachable. */}
@@ -915,6 +920,10 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
   relay: { label: 'Remote', hint: 'Reaching your Mac from away — still end-to-end encrypted, the relay only passes bytes' },
   offline: { label: 'Offline', hint: "Can't reach your Mac right now" },
 };
+
+/** The six places (owner 09-26): everything else is reached from inside them or from the quiet rows. */
+const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'inbox', 'spaces', 'workflows', 'agents', 'memory'];
+const QUIET_TABS: ReadonlyArray<Tab> = ['chats', 'activity'];
 
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Today',

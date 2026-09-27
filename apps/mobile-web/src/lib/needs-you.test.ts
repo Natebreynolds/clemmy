@@ -101,14 +101,10 @@ test('all three chrome surfaces read the one presenter, and the poll records pro
   assert.match(app, /\{needsYou\.pillText\}<\/span>/);
   assert.match(app, /class=\{`title-badge\$\{needsYou\.stale \? ' badge-stale' : ''\}`\}/);
   assert.match(app, /class=\{`drawer-badge\$\{needsYou\.stale \? ' badge-stale' : ''\}`\}/);
-  assert.match(app, /badgeStale: badged \? needsYou\.stale : undefined/, 'and the switcher');
   // The raw, undisclosed count must not be rendered anywhere in the chrome.
   assert.doesNotMatch(app, /Needs you · \{decisionsLabel\}/);
   assert.doesNotMatch(app, /decisions > 9 \? '9\+' : decisions/);
 
-  const switcher = read('../components/TitleSwitcher.tsx');
-  assert.match(switcher, /class=\{`switcher-badge\$\{entry\.badgeStale \? ' badge-stale' : ''\}`\}/);
-  assert.match(switcher, /aria-label=\{entry\.badgeLabel\}/);
 
   const css = read('../styles.css');
   assert.match(css, /\.badge-stale \{/, 'the marker a numeral needs to stop looking live');
