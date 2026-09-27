@@ -137,9 +137,15 @@ function sessionBrainPinningEnabled(): boolean {
 /** The session an in-flight turn is being served for, when resolution runs
  *  inside one. The usage-attribution ALS spans the whole accepted turn
  *  (agent build included), so this is the honest "is a turn being served"
- *  signal; no context ⇒ not a turn ⇒ no pin read and no stamping. */
+ *  signal; no context ⇒ not a turn ⇒ no pin read and no stamping. Only a
+ *  scope that carries an accepted user input is a turn: background scopes
+ *  (memory jobs, measurement probes, an unscoped review's route) use a fixed
+ *  label with seq 0, and pinning under that label would keep every later job
+ *  on whichever brain was active the first time one of them ran. */
 function activeTurnSessionId(): string | null {
   const attribution = modelUsageAttributionStorage.getStore();
+  const seq = attribution?.sourceUserSeq;
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq <= 0) return null;
   const sessionId = attribution?.sessionId?.trim();
   return sessionId ? sessionId : null;
 }

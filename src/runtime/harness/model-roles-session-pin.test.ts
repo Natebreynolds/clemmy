@@ -96,6 +96,22 @@ test('outside a turn (no session context) resolution follows the live global —
   });
 });
 
+test('a background scope (a fixed label, no accepted input) is not a turn: it neither stamps nor reads a pin', () => {
+  withEnv({ AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-test-model', CLEMMY_MODEL_ROLES: undefined, MODEL_ROUTING_MODE: undefined }, () => {
+    const inBackground = <T>(fn: () => T): T =>
+      modelUsageAttributionStorage.run({ sessionId: 'memory', sourceUserSeq: 0, channel: 'memory:learn' }, fn);
+    const first = inBackground(() => resolveRoleModel('brain'));
+    assert.equal(first.modelId, 'claude-test-model');
+    assert.notEqual(first.source, 'session');
+    assert.equal(pinnedBrainForSession('memory'), null, 'nothing is stamped under a background label');
+
+    process.env.AUTH_MODE = 'codex_oauth';
+    const next = inBackground(() => resolveRoleModel('brain'));
+    assert.notEqual(next.modelId, 'claude-test-model', 'the next background job sees the brain the owner chose');
+    assert.equal(next.modelId, resolveRoleModel('brain').modelId);
+  });
+});
+
 test('an explicit per-session switch re-pins THIS session without touching others', () => {
   withEnv({ AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8', CLEMMY_MODEL_ROLES: undefined, MODEL_ROUTING_MODE: undefined }, () => {
     inSessionTurn('sess-repin-a', () => resolveRoleModel('brain'));
