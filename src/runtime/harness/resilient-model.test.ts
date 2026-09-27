@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
+import { APIConnectionError, APIConnectionTimeoutError } from 'openai';
 import { withResilience, translateSettings, classifyModelError, type ResiliencePolicy } from './resilient-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
 import { BoundaryError } from '../boundary-error.js';
@@ -432,6 +433,38 @@ test('isEffortRejection: matches the Anthropic effort-400, not other 400s', asyn
   assert.equal(isEffortRejection({ statusCode: 400, message: 'This model does not support the effort parameter.' }), true);
   assert.equal(isEffortRejection({ statusCode: 400, message: 'messages.0: invalid' }), false);
   assert.equal(isEffortRejection({ statusCode: 429 }), false);
+});
+
+// --- a provider that gave no answer -----------------------------------------
+
+test('classifyModelError: the SDK connection class is transport even when its timeout carries no cause and no transport word', () => {
+  // The real SDK objects: the timeout subclass is thrown for any pre-response
+  // failure whose text says "timed out", and it keeps nothing of that failure.
+  const timedOut = new APIConnectionTimeoutError();
+  assert.equal(timedOut.message, 'Request timed out.');
+  assert.equal((timedOut as { cause?: unknown }).cause, undefined);
+  assert.deepEqual(pick(classifyModelError(timedOut)), { retryable: true, kind: 'model.transport_timeout', isAuth: false });
+  assert.deepEqual(pick(classifyModelError(new APIConnectionError({ message: 'Connection error.', cause: new Error('socket closed') }))),
+    { retryable: true, kind: 'model.transport_timeout', isAuth: false });
+  assert.deepEqual(pick(classifyModelError({ message: 'wrapped', cause: timedOut })), { retryable: true, kind: 'model.transport_timeout', isAuth: false },
+    'the class counts anywhere in the cause chain');
+  assert.equal(classifyModelError(new Error('Tool call timed out after 30s')).kind, 'runtime.unknown',
+    'prose that says "timed out" is not a dropped connection');
+});
+
+test('getStreamedResponse: the SDK connection timeout before content is retried transparently and the answer streams', async () => {
+  let calls = 0;
+  const inner = makeModel({
+    getStreamedResponse: async function* () {
+      calls += 1;
+      if (calls === 1) throw new APIConnectionTimeoutError();
+      yield { type: 'output_text_delta', delta: 'answered' } as any;
+      yield { type: 'response_done', response: { output: [{ type: 'message' }] } } as any;
+    },
+  });
+  const events = await collect(withResilience(inner, policy()).getStreamedResponse(req()));
+  assert.equal(calls, 2);
+  assert.ok(events.some((e: any) => e.type === 'output_text_delta' && e.delta === 'answered'));
 });
 
 // --- helpers ---------------------------------------------------------------

@@ -73,11 +73,27 @@ interface ErrorClass {
 
 const TRANSPORT_RE = /terminated|econnreset|etimedout|epipe|enotfound|econnrefused|fetch failed|socket hang up|network|und_err|aborted|timeout|connection error|apiconnection/i;
 
+/** Generated HTTP SDKs raise one class for a request that got no response —
+ *  refused, reset, or timed out before headers — named APIConnectionError.
+ *  Its timeout subclass carries no cause, no status, no name of its own and
+ *  the message "Request timed out.", so only the class says it is transport.
+ *  The same SDKs' caller-cancel class is a sibling, not a subclass, so an
+ *  aborted request never reads as a dropped connection here. */
+function isSdkConnectionFailure(err: object): boolean {
+  let proto: unknown = Object.getPrototypeOf(err);
+  for (let depth = 0; proto && depth < 8; depth++) {
+    if ((proto as { constructor?: { name?: unknown } }).constructor?.name === 'APIConnectionError') return true;
+    proto = Object.getPrototypeOf(proto);
+  }
+  return false;
+}
+
 /** A transport failure often arrives wrapped: an SDK's connection error whose
  *  cause is the socket error, which in turn may carry only a code. Any link
  *  of that chain naming a transport condition makes the whole error one. */
 function transportErrorInChain(err: unknown, depth = 0): boolean {
   if (!err || typeof err !== 'object' || depth > 3) return false;
+  if (isSdkConnectionFailure(err)) return true;
   const e = err as { message?: unknown; name?: unknown; code?: unknown; cause?: unknown };
   for (const field of [e.message, e.name, e.code]) {
     if (typeof field === 'string' && TRANSPORT_RE.test(field)) return true;
