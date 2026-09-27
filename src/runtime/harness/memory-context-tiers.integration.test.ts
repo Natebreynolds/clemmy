@@ -383,18 +383,25 @@ for (const [label, request] of [
   });
 }
 
-test('a request that declines memory still carries the standing policies it is held to, and no facts', async () => {
+// A request that declines automatic memory skips the query-driven recall only.
+// The per-block memory its prompt always carried still stands in, and the
+// standing policies it is held to stay in the core. Regression: the decline
+// once removed every remembered fact from the request.
+test('a request that declines memory skips the query-driven recall and keeps the prompt\'s memory', async () => {
   const run = await hostTurn('skip-opt-out',
     'Do not use memory for this request. Draft a client note comparing our pricing with a competitor.');
   assert.equal(primerRecord(run).skippedReason, 'explicit_request_opt_out');
-  assert.equal(primerRecord(run).injected, false, 'no per-turn memory');
+  assert.equal(primerRecord(run).injected, true, 'the per-block memory stands in');
   const frame = run.frames[0]!;
   const all = requestText(frame);
   const core = stableHalf(frame.system);
   assert.ok(core.includes(PROMPT_ONLY_RULE), 'the prompt-only rule still applies, from the core');
-  for (const absent of ['daughter named Wren', 'quokka ledger', 'Invoices are reviewed', '## Recently Learned',
-    '## Persistent Facts', '## Relevant To This Request', 'memory_recall_all searches all of it']) {
-    assert.equal(all.includes(absent), false, `no remembered fact or recall invitation: ${absent}`);
+  assert.equal(all.split(PROMPT_ONLY_RULE).length - 1, 1, 'the rule is stated once');
+  const fallback = memoryItem(frame, '## Persistent Facts');
+  assert.ok(fallback, `the per-block rendering stands in: ${all.slice(-2500)}`);
+  assert.match(fallback!, /daughter named Wren/, 'a remembered fact reaches the model');
+  for (const absent of ['## Relevant To This Request', '[REMEMBERED FACTS', 'memory_recall_all searches all of it']) {
+    assert.equal(all.includes(absent), false, `no query-driven recall or recall invitation: ${absent}`);
   }
   assert.ok(core.includes('ALWAYS send email via the Outlook mailbox owner@example.com'),
     'the enforced rule stays in the core');

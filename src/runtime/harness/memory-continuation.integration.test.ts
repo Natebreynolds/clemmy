@@ -7,7 +7,8 @@
  * runner re-enter the SAME accepted source in a fresh activation, with the
  * memory ranker held back. That hold is the runtime's, not the owner's: the
  * resumed activation must see the request's remembered facts as the first
- * one did. Only a request that itself declined memory keeps it declined.
+ * one did. Only a request that itself declined memory keeps its query-driven
+ * recall declined.
  */
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -153,13 +154,19 @@ test('a request resumed past the tool ceiling keeps the memory it started with',
   assert.match(resumed, /## Persistent Facts/, 'the per-block memory stands in for the held-back ranker');
 });
 
+// A request that declined automatic memory skips the query-driven recall on
+// every activation, and keeps the per-block memory its prompt always carried.
+// Regression: the decline once removed every remembered fact from the request.
 test('a request that declined memory stays declined when it resumes', async () => {
   const { requests, primers } = await ceilingRun('declined',
     'Do not use memory for this request. List my priority accounts in the quokka ledger.');
   assert.deepEqual(primers.map((primer) => primer.skippedReason), ['explicit_request_opt_out', 'explicit_request_opt_out']);
   for (const request of requests) {
-    assert.equal(request.includes('Priority_Account__c'), false, 'no remembered fact on a declined request');
-    assert.equal(request.includes('Invoices are reviewed on Tuesdays'), false, 'no remembered fact on a declined request');
+    assert.match(request, /Account\.Priority_Account__c is true/, 'the prompt\'s per-block memory still reaches the request');
+    assert.match(request, /## Persistent Facts/, 'the per-block memory stands in');
+    for (const absent of ['## Relevant To This Request', '[REMEMBERED FACTS', 'memory_recall_all searches all of it']) {
+      assert.equal(request.includes(absent), false, `no query-driven recall on a declined request: ${absent}`);
+    }
   }
 });
 

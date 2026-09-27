@@ -5491,8 +5491,9 @@ async function plainFallbackPrimer(
  * re-entry, a request that declined automatic memory). An agent built by
  * harnessInstructions carries no request-ranked memory in its prompt, so its
  * tail stands in for the ranker with the per-block rendering. A request that
- * declined memory gets no tail: the standing policies it is still held to ride
- * in the memory core. Any other agent gets the bare record.
+ * declined automatic memory skips only the query-driven recall; the per-block
+ * memory its prompt carried still stands in. Any other agent gets the bare
+ * record.
  */
 function primerWithoutRanker(
   input: string,
@@ -5508,7 +5509,7 @@ function primerWithoutRanker(
     injectedBytes: 0,
     skippedReason,
   };
-  if (!scope || skippedReason === EXPLICIT_MEMORY_RECALL_OPTOUT_REASON) return primer;
+  if (!scope) return primer;
   const tail = renderTurnMemoryTail(scope, { kind: 'no_signal' }, { request: query });
   registerMemoryTail(tail.text, tail.manifest);
   return { ...primer, text: tail.text || undefined, injectedBytes: Buffer.byteLength(tail.text, 'utf8'), manifest: tail.manifest };
@@ -5577,9 +5578,9 @@ const TURN_MEMORY_ASSEMBLY_TIMEOUT_MS = 15_000;
  * no request-ranked memory in its prompt, so the activation gets the tail a
  * fresh activation of that request gets: the shared ranker's, or the per-block
  * stand-in when the ranker gives no signal. A request that declined automatic
- * memory gets none. A source that cannot be read gets the stand-in, which is
- * what the prompt itself carried before the tail existed. Any other agent keeps
- * its own prompt and gets nothing here.
+ * memory, or a source that cannot be read, gets the stand-in, which is what
+ * the prompt itself carried before the tail existed. Any other agent keeps its
+ * own prompt and gets nothing here.
  */
 async function resumedActivationMemoryPrimer(input: {
   sessionId: string;
