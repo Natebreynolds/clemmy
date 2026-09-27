@@ -379,3 +379,21 @@ test('while a minimal query reply still fits, a recall refused for bytes names t
   assert.match(served, /^Showing 1 record\(s\) \[0–1\] of 60 matching/, served.slice(0, 300));
   assert.ok(Buffer.byteLength(served, 'utf8') <= 2_000, `within the bytes left (${Buffer.byteLength(served, 'utf8')})`);
 });
+
+test('a projection whose own arguments outgrow the bytes left is still served, with a continuation that fits', async () => {
+  const budget = new brackets.RecallBudget(10, 1_200, undefined);
+  const fields = ['id', ...Array.from({ length: 41 }, (_, i) => `absent_field_with_a_rather_long_descriptive_name_${String(i).padStart(2, '0')}`)];
+  assert.ok(JSON.stringify(fields).length > 1_200, 'the arguments alone exceed the bytes left');
+  const { results } = await runHostTurn({
+    agentTool: realLocalTool('tool_output_query'), toolName: 'tool_output_query', seed: parkRows, recallBudget: budget,
+    calls: [{ callId: 'wide-projection', args: { call_id: 'parked-rows', fields } }],
+  });
+  const shown = results.get('wide-projection') ?? '';
+  const header = /^Showing (\d+) record\(s\) \[0–(\d+)\] of 60 matching/.exec(shown);
+  assert.ok(header, shown.slice(0, 300));
+  const count = Number(header[1]);
+  assert.ok(count > 0 && count < 50, `a partial page (${count} records)`);
+  assert.ok(shown.includes(`"offset":${count}`), 'names where the next page starts');
+  assert.ok(Buffer.byteLength(shown, 'utf8') <= 1_200, `within the bytes left (${Buffer.byteLength(shown, 'utf8')})`);
+  assert.equal(budget.snapshot().bytes, Buffer.byteLength(shown, 'utf8'), 'the served reply is what was charged');
+});

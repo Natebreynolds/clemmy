@@ -189,18 +189,32 @@ function nextQueryCall(callId: string, input: Record<string, unknown>, offset: n
  * The largest leading run of a page that fits `bound` together with `suffix`,
  * cut on a record boundary, never inside a record. When not even one record
  * fits, that record is clipped with the narrowing marker, and the page's
- * continuation (the exact next query) and the suffix still follow it inside
- * the bound.
+ * continuation and the suffix still follow it inside the bound.
+ *
+ * The continuation echoes the caller's shaping arguments, so it can outgrow a
+ * small bound on its own. The tail is then shortened, never overshot: the
+ * suffix goes first, then the exact next query gives way to one naming only
+ * the next offset.
  */
 function fitRecordPage(
   pageLength: number,
-  render: (count: number) => { body: string; continuation: string },
+  render: (count: number) => { body: string; continuation: string; shortContinuation: string },
   bound: QueryReplyBound,
   suffix: string,
 ): { count: number; text: string } {
+  const tails: Array<(parts: ReturnType<typeof render>) => string> = [
+    (parts) => parts.continuation + suffix,
+    (parts) => parts.continuation,
+    (parts) => parts.shortContinuation,
+  ];
+  // The first tail that leaves room for a clipped record's marker; the last
+  // one always does, since it is short and a served bound holds a minimal reply.
+  const tailFits = (tail: (parts: ReturnType<typeof render>) => string): boolean =>
+    fitsQueryBound(clipMarker(bound.chars) + tail(render(Math.min(1, pageLength))), bound);
+  const tail = tails.find(tailFits) ?? tails[tails.length - 1]!;
   const full = (count: number): string => {
     const parts = render(count);
-    return parts.body + parts.continuation + suffix;
+    return parts.body + tail(parts);
   };
   const whole = full(pageLength);
   if (fitsQueryBound(whole, bound)) return { count: pageLength, text: whole };
@@ -219,7 +233,7 @@ function fitRecordPage(
   if (fits === 0) {
     const count = Math.min(1, pageLength);
     const parts = render(count);
-    return { count, text: clipQueryBody(parts.body, bound, parts.continuation + suffix) };
+    return { count, text: clipQueryBody(parts.body, bound, tail(parts)) };
   }
   return { count: fits, text: full(fits) };
 }
@@ -750,14 +764,18 @@ export function registerRecallTools(server: McpServer): void {
         // A page that does not fit the reply is cut on a record boundary, and
         // the header counts only the records shown and names the exact query
         // for the rest, so paging never skips a record the model did not see.
-        const render = (count: number): { body: string; continuation: string } => {
+        const render = (count: number): { body: string; continuation: string; shortContinuation: string } => {
           const header = recoveredClippedArrayPrefix
             ? `Showing ${count} record(s) [${offset}–${offset + count}] of ${matched} matching among ${(parsed as unknown[]).length} complete record(s) recovered from a clipped JSON-array prefix (full total unknown)`
             : `Showing ${count} record(s) [${offset}–${offset + count}] of ${matched} matching (${(parsed as unknown[]).length} total${from})${sortBy ? `, ordered by ${sortBy} ${input.order === 'desc' ? 'descending' : 'ascending'}` : ''}${skippedNote ? `.${skippedNote}` : ''}`;
+          const rest = page.length - count;
           const continuation = count < page.length
-            ? `\n\n[${page.length - count} more record(s) of this page did not fit this reply. Next: ${nextQueryCall(callId, input, offset + count)}; fields:[...] fits more records per reply.]`
+            ? `\n\n[${rest} more record(s) of this page did not fit this reply. Next: ${nextQueryCall(callId, input, offset + count)}; fields:[...] fits more records per reply.]`
             : '';
-          return { body: `${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}`, continuation };
+          const shortContinuation = count < page.length
+            ? `\n\n[${rest} more record(s) did not fit. Next: repeat this tool_output_query with "offset":${offset + count}, all other arguments unchanged.]`
+            : '';
+          return { body: `${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}`, continuation, shortContinuation };
         };
         const fitted = fitRecordPage(page.length, render, bound, refHint);
         return chargeQueryReply(ctx, callId, fitted.text);
