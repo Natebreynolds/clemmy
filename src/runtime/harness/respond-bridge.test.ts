@@ -5147,3 +5147,26 @@ test('a fresh Execute whose reviewed capability is not current stops before the 
     _setBridgeImplsForTests({});
   }
 });
+
+test('attachment-enriched accepted source replays by its durable display identity; foreign text and runs still refuse', async () => {
+  const sessionId = 'attachment-display-identity';
+  createSession({ id: sessionId, kind: 'chat' });
+  const attempt = beginRunAttempt(sessionId, { runId: 'image-original-run' });
+  const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
+    text: 'Read this image.\nAttachment: /fixture/image.png', displayText: 'Read this image.',
+  } });
+  const identity = { sessionId, turn: 1, sourceUserSeq: source.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+    presentation: { kind: 'answer', text: 'The fixture image says hello.' } });
+  _setBridgeImplsForTests({ configure: (async () => { throw Error('replay must not launch a model'); }) as never });
+  const req = { sessionId, sourceUserSeq: source.seq, runId: attempt.runId!,
+    message: String(source.data.text), displayMessage: String(source.data.displayText) };
+  const replay = await respondPreferHarness('home', req, async () => { throw Error('no legacy'); });
+  assert.equal(replay.text, 'The fixture image says hello.');
+  for (const changed of [{ ...req, displayMessage: 'Send an email instead.' }, { ...req, runId: 'foreign-run' }]) {
+    const refusal = await respondPreferHarness('home', changed, async () => { throw Error('no legacy'); });
+    assert.equal(refusal.stoppedReason, 'error');
+    assert.match(refusal.text, /did not match/);
+  }
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+});

@@ -887,7 +887,12 @@ function acceptedSourceIdentityForReplay(request: AssistantRequest): EventRow | 
   const source = durableSourceEventForRequest(request);
   if (!source) return null;
   const sourceUserSeq = source.seq;
-  const acceptedText = typeof source.data.text === 'string' ? source.data.text : null;
+  // Admission stores attachment-enriched model input separately from the
+  // owner's visible words. Compare like with like; an image must not look
+  // like a forged replay merely because its file context was preserved.
+  const acceptedText = typeof source.data.displayText === 'string'
+    ? source.data.displayText
+    : typeof source.data.text === 'string' ? source.data.text : null;
   if (acceptedText === null || acceptedText !== (request.displayMessage ?? request.message)) return null;
   const attempt = getRunAttemptBySourceUserSeq(request.sessionId, sourceUserSeq);
   if (!attempt) return null;

@@ -1548,3 +1548,39 @@ for (const variant of ['verified', 'naked-status', 'fast-terminal'] as const) {
     } finally { _setBridgeImplsForTests({}); await harness.close(); }
   });
 }
+
+test('image attachment reaches the bridge and closes the desktop turn instead of an orphaned spinner', async () => {
+  resetEventLog();
+  const { saveIngestedToInbox } = await import('../runtime/attachments.js');
+  const attachment = saveIngestedToInbox({ name: 'fixture-events.png', imagePath: '/fixture/events.png' });
+  let calls = 0;
+  let modelInput = '';
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    runConversation: (async (req: { sessionId: string; input: string; sourceUserSeq: number }) => {
+      calls++; modelInput = req.input;
+      const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+      const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+      const identity = { sessionId: req.sessionId, sourceUserSeq: req.sourceUserSeq, turn: 1 };
+      commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+        presentation: { kind: 'answer', text: 'Fixture image received.' } });
+      return { sessionId: req.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'Fixture image received.', done: true, nextAction: 'completed' } };
+    }) as never });
+  const server = await boot();
+  try {
+    const body = { input: 'Read these event dates.', attachments: [attachment], clientRequestId: 'image-identity-fixture' };
+    const send = () => fetch(`${server.url}/api/harness/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const response = await send(); assert.equal(response.status, 202);
+    const accepted = await response.json() as { sessionId: string };
+    await waitUntil(() => listEvents(accepted.sessionId, { types: ['conversation_completed'] }).length === 1, 'image turn did not settle');
+    assert.equal(calls, 1);
+    assert.match(modelInput, /fixture-events.png/);
+    assert.match(modelInput, /\/fixture\/events.png/);
+    assert.equal(getActiveRunAttempt(accepted.sessionId), null);
+    const source = listEvents(accepted.sessionId, { types: ['user_input_received'] })[0];
+    assert.equal(source.data.displayText, body.input);
+    assert.match(String(source.data.text), /fixture-events.png/);
+    await send();
+    assert.equal(calls, 1, 'retry never replays the work');
+  } finally { _setBridgeImplsForTests({}); await server.close(); }
+});

@@ -1,3 +1,8 @@
+import { composioApprovalDestinationLabel, type ApprovalDestinationEvidence } from '../../integrations/composio/approval-destination-label.js';
+import { loadPhysicalRequestEvidence } from './dispatch-ledger.js';
+import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
+import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { listAccountAliases } from '../../memory/account-alias-store.js';
 import { openEventLog } from './eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { evidenceAcceptedTaskId } from './host-completion-work.js';
@@ -110,21 +115,54 @@ export function recentSettledPayloads(input: {
   }
 }
 
+/** Exact source/account-scoped relations, with no inference or model calls. */
+export function settledDestinationEvidence(input: {
+  sessionId: string; sourceUserSeq: number; accountId: string;
+}): ApprovalDestinationEvidence[] {
+  const db = openEventLog();
+  const rows = db.prepare(`SELECT logical_tool_call_id AS callId FROM logical_call_settlements
+    WHERE session_id = ? AND source_user_seq = ? AND outcome_kind = 'succeeded'
+    ORDER BY rowid DESC LIMIT 200`).all(input.sessionId, input.sourceUserSeq) as Array<{ callId: string }>;
+  const evidence: ApprovalDestinationEvidence[] = [];
+  for (const row of rows) {
+    const binding = loadHostCallCapabilityBinding({ db, ...input, logicalToolCallId: row.callId });
+    if (binding.status !== 'ok' || binding.binding.accountId !== input.accountId) continue;
+    const redeemed = redeemSuccessfulSettlementResultForHost({ ...input,
+      acceptedTaskId: evidenceAcceptedTaskId(input.sessionId, input.sourceUserSeq), logicalToolCallId: row.callId });
+    if (redeemed.status !== 'ok' || redeemed.value.rawByteCount > MAX_PAYLOAD_CHARS) continue;
+    const request = loadPhysicalRequestEvidence({ ...input, logicalToolCallId: row.callId,
+      physicalDispatchId: redeemed.value.physicalDispatchId });
+    if (!request) continue;
+    const effective = unwrapRuntimeEffectiveToolIdentity(redeemed.value.toolName, request.args);
+    evidence.push({ operation: redeemed.value.toolName, accountId: input.accountId,
+      args: effective.args, result: redeemed.value.rawPayload });
+  }
+  return evidence;
+}
+
 /** value -> the name Jev is sure of, for each identifier on the card. */
 export async function approvalPreviewLabels(input: {
   sessionId: string;
   sourceUserSeq: number;
   preview: ApprovalCallPreview | null;
   nowMs?: number;
+  accountId?: string | null;
+  operationId?: string;
 }): Promise<Record<string, string> | undefined> {
   const fields = (input.preview?.fields ?? []).filter((field) => identifierValue(field.value));
   const values = [...new Set(fields.map((field) => field.value))].slice(0, MAX_LABELLED_VALUES);
   if (!input.preview || values.length === 0) return undefined;
-  const payloads = recentSettledPayloads(input);
-  if (payloads.length === 0) return undefined;
+  let payloads: unknown[] | undefined;
+  const evidence = input.accountId ? settledDestinationEvidence({ ...input, accountId: input.accountId }) : [];
+  const aliases = input.accountId ? listAccountAliases().filter(row => row.connectionId === input.accountId) : [];
+  const accountLabels = [...new Set(aliases.map(row => row.label))];
   const operation = input.preview.operation;
   const labelled = await Promise.all(values.map(async (value) => {
-    const candidates = labelCandidatesFor(payloads, value);
+    const exact = input.operationId && input.accountId ? composioApprovalDestinationLabel({
+      operation: input.operationId, accountId: input.accountId, value, evidence,
+    }) : undefined;
+    if (exact) return [value, `${exact}${accountLabels.length === 1 ? ` · ${accountLabels[0]}` : ''}`] as const;
+    const candidates = labelCandidatesFor(payloads ??= recentSettledPayloads(input), value);
     if (candidates.length === 0) return null;
     const field = fields.find((row) => row.value === value)?.name ?? '';
     const label = await labelIdentifierWithJev(

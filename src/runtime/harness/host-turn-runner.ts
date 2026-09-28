@@ -10832,6 +10832,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             sessionId: approvalIdentity.sessionId,
             sourceUserSeq: approvalIdentity.sourceUserSeq,
             preview,
+            accountId: pending.consentCall?.accountId,
+            operationId: unwrapRuntimeEffectiveToolIdentity(info.toolName, info.args).toolName ?? undefined,
           }).catch(() => undefined),
           // The owner's checker reads the exact content against their standing
           // rules before the card; the card shows what it found.

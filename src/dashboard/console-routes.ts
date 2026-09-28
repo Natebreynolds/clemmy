@@ -17946,6 +17946,21 @@ export function registerConsoleRoutes(
             heldOwnerEvidence = 'unreadable';
           }
         }
+        // A pre-run refusal can return without entering the turn loop. This
+        // route owns the accepted source, so settle that exact request instead
+        // of leaving the UI's durable running marker spinning forever. Never
+        // turn a success or a handoff with missing evidence into a completion.
+        if (response.stoppedReason === 'blocked' || response.stoppedReason === 'error') {
+          const terminal = listHarnessEvents(sessionId, { types: ['conversation_completed'], desc: true })
+            .find((event) => event.data.sourceUserSeq === requestSourceUserSeq);
+          if (!terminal && acceptedSourceOutcome(requestAcceptedUserEvent)?.kind !== 'dispatched') {
+            requestAttemptStatus = 'failed';
+            commitConsoleTerminal({ identity: requestTurnIdentity,
+              text: response.text || PUBLIC_RUN_FAILURE_TEXT,
+              status: 'failed', legacyReason: 'desktop_bridge_refused',
+            });
+          }
+        }
         if (response.stoppedReason === 'cancelled') requestAttemptStatus = 'cancelled';
       } catch (err) {
         requestAttemptStatus = 'failed';
