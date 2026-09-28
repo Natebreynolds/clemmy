@@ -781,13 +781,14 @@ export function registerRecallTools(server: McpServer): void {
         const boundRefusal = queryBoundRefusal(bound, ctx, callId);
         if (boundRefusal) return boundRefusal;
         const from = unwrappedPath ? ` from ${unwrappedPath}[*]` : '';
-        // Hand the model the EXACT, copy-paste reference for these values, so a
-        // downstream send binds them by reference instead of retyping (which is
-        // how a value gets invented or dropped). Root array + single projected
-        // field → a precise path.
+        // A wildcard references the entire original collection, not this
+        // query's filtered, sorted or paginated view. Only advertise it as an
+        // exact reuse when both the selection and projection are identical.
         const refBase = unwrappedPath ? `${unwrappedPath}[*]` : '[*]';
         const refPath = fields && fields.length === 1 ? `${refBase}.${fields[0]}` : refBase;
-        const refHint = resolved.receipt || decodedMcpPayload || recoveredClippedArrayPrefix ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
+        const completeSourceSelection = rows === parsed && offset === 0 && page.length === rows.length
+          && (!fields || fields.length === 1);
+        const refHint = resolved.receipt || decodedMcpPayload || recoveredClippedArrayPrefix || !completeSourceSelection ? '' : `\n\n[grounded reference] To use these EXACT values in a later send/write WITHOUT retyping them, pass this as the field value: {"$fromToolOutput":{"callId":"${callId}","path":"${refPath}"}} — the harness binds the real values before the call (fabrication-proof; a bad reference fails closed).`;
         // A page that does not fit the reply is cut on a record boundary, and
         // the header counts only the records shown and names the exact query
         // for the rest, so paging never skips a record the model did not see.
@@ -804,7 +805,11 @@ export function registerRecallTools(server: McpServer): void {
             : '';
           return { body: `${header}\n\n${JSON.stringify(page.slice(0, count), null, 1)}`, continuation, shortContinuation };
         };
-        const fitted = fitRecordPage(page.length, render, bound, refHint);
+        // Even an unshaped query can be clipped by the reading budget. Its
+        // whole-source reference must not include records or values unseen
+        // in the reply while claiming to represent precisely that reply.
+        const displayedRefHint = refHint && fitsQueryBound(render(page.length).body + refHint, bound) ? refHint : '';
+        const fitted = fitRecordPage(page.length, render, bound, displayedRefHint);
         return chargeQueryReply(ctx, callId, fitted.text, bound);
       }
 

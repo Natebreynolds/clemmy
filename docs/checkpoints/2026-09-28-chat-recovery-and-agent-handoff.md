@@ -93,3 +93,50 @@ provider-discovery regressions or weakening the release gate.
 No tag or release-readiness claim: exact-commit full suite/canonical journeys,
 builds, installed acceptance of these changes, matched task measurements, and
 signed package/fresh-install/upgrade/release-asset qualification remain owed.
+
+## Installed acceptance and reference-scope follow-up
+
+Candidate `2f59e9f71542dec19afa38d20bd780f1f172e828` was installed after the
+owner's active turn finished, with served fingerprint
+`bd8eb65887ff5bfb51358725ebc065b914e1d94aa65083b48d482007c6e847c0`.
+The daemon digest and both web trees matched the build. Native shell bytes and
+its executable signature remained unchanged; the runtime hotpatch does not
+constitute a fully signed release bundle. Rollback copies remain. The CUA tool
+refused Terminal control, so the same checked `.command` ran successfully from
+the command runner; Clem was quit and relaunched by exact path through CUA.
+
+The original Salesforce conversation reopened with its three saved questions
+and three answers, without the previously replayed answer. A fresh UI-driven
+Clem → Instagram Manager transition used the same question, "hey what do you
+do", with no corrective wording. Source 320567 routed to the saved Instagram
+agent on DeepSeek V4.1 Flash and answered with Instagram calendar, caption and
+review duties, including draft-only/no-DM limits. Authenticated retained request
+bytes contain both the profile and the new handoff. One terminal, no tools, no
+unfinished attempt. This is one successful transition, not universal role
+adherence. Its wall time was 2,936 ms versus the incorrect earlier 10,352 ms;
+uncached input was 17,834 versus 16,418. This is **not a token-efficiency win** or
+a controlled timing benchmark: the prompt/history and provider conditions differ.
+
+Controlled local retained-result check source 320593 read 51 synthetic records
+and queried offset 50, limit 1, fields Name. It returned `Framework record 50`,
+with no external service or file mutation. Three brain frames, 7,291 ms wall;
+canonical accounting distinguishes nested carrier mirrors from real calls.
+Jev completion returned fulfills=true, failedOpen=false. Jev turn-start timed
+out; do not describe Jev as universally healthy. Receipts and measurements are
+in `output/release-gates-0928/`.
+
+That live query exposed an additional release concern: its single-record reply
+advertised `$fromToolOutput` with `[*].Name`, which denotes the entire original
+51-record list. No write was attempted, but the hint falsely called the wider
+set "these EXACT values". The framework now emits a whole-source reuse hint
+only for an unchanged, fully displayed collection and an exactly representable
+projection. Filtering, sorting, paging, multiple-field projection or clipping
+omit that misleading hint. Explicit references and the reader's actual output
+remain available; this adds no capability or approval restriction.
+
+Two new regression tests fail on the preceding source: shaped views must not
+advertise a wider reference; clipped pages/records must not advertise unseen
+values. The retained reader, reference resolver and local-runtime suites pass
+67/67 with the fix. `reference-scope-red2.log` is the corrected red receipt;
+the first clipping fixture was too small to clip and is not the valid proof.
+This follow-up requires its own build/install/live verification after commit.

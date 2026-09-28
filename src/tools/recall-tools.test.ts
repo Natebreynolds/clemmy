@@ -857,3 +857,44 @@ test('actual shell reader does not turn a CLI help example into a customer resul
   assert.match(result.content[0].text, /No JSON value could be recovered/);
   assert.doesNotMatch(result.content[0].text, /sample@example\.test/);
 });
+
+test('retained query hints never widen a page, filter, ordering, or projection into the full source', async () => {
+  const sess = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: sess.id, callId: 'query-reference-scope', tool: 'read_file',
+    output: JSON.stringify([{ Name: 'First', rank: 2 }, { Name: 'Last', rank: 1 }]) });
+  const query = captureToolOutputQueryHandler();
+  for (const shaping of [
+    { fields: ['Name'], offset: 1, limit: 1 },
+    { fields: ['Name'], limit: 1 },
+    { fields: ['Name'], filter_field: 'Name', filter_equals: 'Last' },
+    { fields: ['Name'], where: [{ field: 'rank', op: 'eq', value: 1 }] },
+    { fields: ['Name'], sort_by: 'rank' },
+    { fields: ['Name', 'rank'] },
+  ]) {
+    const response = await withHarnessRunContext(
+      { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+      () => query({ call_id: 'query-reference-scope', ...shaping }),
+    );
+    assert.match(response.content[0].text, /Last|First/);
+    assert.doesNotMatch(response.content[0].text, /\$fromToolOutput/,
+      `a source-wide reference must not be described as these exact shaped values: ${JSON.stringify(shaping)}`);
+  }
+});
+
+test('retained query clipping never advertises unseen values as the displayed selection', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const query = captureToolOutputQueryHandler();
+  for (const [label, records] of [
+    ['partial-page', [{ Name: 'x'.repeat(30_000) }, { Name: 'y'.repeat(30_000) }]],
+    ['partial-record', [{ Name: 'z'.repeat(60_000) }]],
+  ] as const) {
+    writeToolOutput({ sessionId: sess.id, callId: label, tool: 'read_file', output: JSON.stringify(records) });
+    const response = await withHarnessRunContext(
+      { sessionId: sess.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 200_000) },
+      () => query({ call_id: label, fields: ['Name'] }),
+    );
+    assert.ok(/did not fit|clipped/.test(response.content[0].text), 'fixture must actually clip');
+    assert.doesNotMatch(response.content[0].text, /\$fromToolOutput/,
+      'a clipped display must not advertise all original values as its exact selection');
+  }
+});
