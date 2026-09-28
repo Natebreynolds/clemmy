@@ -1598,3 +1598,19 @@ test('lookup-backed completion avoids re-inflating bulk reads while preserving e
   assert.equal(lookup.resolve(compact.results[0]!.resultHandleId!)?.text, text);
   assert.equal(lookup.resolve('unrelated-source'), undefined);
 });
+
+
+test('completion read previews share one window budget across many selected pages', () => {
+  const identity = accepted('Compare all fixture result pages.');
+  const pages = Array.from({ length: 12 }, (_, i) => `Page ${i}: ` + 'source evidence '.repeat(1200) + ` END_${i}`);
+  for (const [i, page] of pages.entries()) retainedRead(identity, 'recall_tool_result', page, false, false, false,
+    { id: `budget-page-${i}`, args: { call_id: `source-${i}` } });
+  const evidence = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
+  const lookup = sourceEvidenceLookup(identity);
+  assert.equal(evidence.results.length, pages.length);
+  assert.ok(evidence.summary.length < 50_000, `packet was ${evidence.summary.length} characters`);
+  for (const [i, result] of evidence.results.entries()) {
+    assert.equal(result.contentComplete, false);
+    assert.equal(lookup.resolve(result.resultHandleId!)?.text, pages[i]);
+  }
+});

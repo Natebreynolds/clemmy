@@ -23,3 +23,14 @@ Framework repairs:
 ## Acceptance still owed
 
 Build and install this commit through the coordinated Terminal recipe, verify served identity, rerun the identical frozen-date Salesforce question with the current Together brain and Grok reviewer, independently inspect facts and review status, then perform exact-candidate release qualification. No live speed improvement or tag readiness is claimed here. The unchanged native executable signature is distinct from a fresh signed full package; runtime-only hotpatch does not restore the bundle resource seal.
+
+## First installed repeat and follow-up
+
+Installed db082f426, fingerprint 535e850e1b0f68d75285ebcc25d36ff50c3af91cf9ea49847d975c9866ff5635, source316560:
+191.601 seconds, 23 brain rounds, 980,924 recorded input tokens (116,412 uncached), 16,157 output. The review request fell from 385,886 to 191,159 normalized bytes, but Grok4.7 still hit its 90-second deadline. No completed reviewer usage returned: unknown remote spend is not zero. This is not successful release acceptance, and a single stochastic repeat does not establish causal brain efficiency.
+
+Follow-up changes share the existing model-relative inline read budget across original results and selected pages, including worker scopes; source-bound lookups retain every complete result. Write receipts and plan review are unchanged. Authenticated record paths guide the reviewer's default record query, including empty result lists beside larger carrier metadata arrays.
+
+CI investigation found two additional issues: learned procedure recall rendered the previous request's target in its title; it now renders operation knowledge without copying old request values. Today routing and CLI recovery fixtures assumed the old direct Home route and a locally installed binary respectively. The routing fixture now checks both ordinary Today landing and explicit New Chat/seeded composer routing; recovery fixtures explicitly supply installed-binary resolution while preserving the exact once-only recovery assertion. The existing learned-hint integration pin reproduced the target leakage before its fix. The recovery failures were observed on CI and passed on the developer Mac; this platform dependency is the defect in their fixture setup, not evidence of repaired OS credentials.
+
+Related CI/recall suites: 74 passed. Shared completion-budget/host suites: 391 passed, one skipped, zero failed. Latest follow-up still requires its own build and installed acceptance. No tag yet.

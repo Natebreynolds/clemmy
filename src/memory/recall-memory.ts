@@ -1120,7 +1120,10 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
     if (procedures.length > 0) usedStores.add('procedure');
     procedures.forEach((procedure, rank) => mergeHit(merged, {
       ref: { type: 'procedure', id: procedure.procedureId ?? procedure.intent },
-      title: procedure.intent,
+      // The matched intent can contain a previous user's concrete target.
+      // Reuse operation knowledge, not that old task's arguments. The retained
+      // procedure ref still opens its history when explicitly needed.
+      title: 'Previously verified operation',
       text: `proven tool → ${procedure.kind}:${procedure.identifier}`,
       score: clamp(0.62 - rank * 0.025, 0.25, 0.62),
       confidence: 0.75,

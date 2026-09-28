@@ -87,7 +87,10 @@ test('Chat empty state is a composer, not the briefing', () => {
 });
 
 test('the app lands on Today by default: Home renders at the chat index and the old address forwards', () => {
-  assert.match(APP, /<Route index element=\{<Home \/>\} \/>/);
+  assert.match(APP, /<Route index element=\{<ChatIndex \/>\} \/>/);
+  const index = APP.slice(APP.indexOf('function ChatIndex()'), APP.indexOf('export function App()'));
+  assert.match(index, /newChat \|\| new URLSearchParams\(location.search\).has\('prompt'\)/);
+  assert.match(index, /\? deferred\(<Chat key=\{newChat \?\? 'seeded-chat'\} \/>\)\s*: <Home \/>/);
   assert.match(APP, /path="\/home" element=\{<Navigate to="\/chat" replace \/>\}/);
   assert.match(APP, /Navigate to="\/chat" replace/);
   assert.match(APP, /prefs\.data\?\.landing \?\? 'home'/);

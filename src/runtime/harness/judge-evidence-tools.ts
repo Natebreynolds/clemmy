@@ -15,6 +15,8 @@ export interface JudgeEvidenceEntry {
   text: string;
   /** Its parsed JSON value, when it has one. */
   value?: unknown;
+  /** Authenticated retained record path, when the carrier supplied one. */
+  recordPath?: string;
 }
 
 export interface JudgeEvidenceSource {
@@ -207,7 +209,7 @@ export function judgeEvidenceTools(
         const input = queryInput.parse(raw);
         const entry = lookup(input.ref);
         if (typeof entry === 'string') return entry;
-        const records = recordsOf(judgeEvidenceJsonValue(entry), input.path);
+        const records = recordsOf(judgeEvidenceJsonValue(entry), input.path ?? entry.recordPath);
         if (typeof records === 'string') return records;
         let rows = records.rows.map((record, sourceIndex) => ({ record, sourceIndex }));
         if (input.where_field && (input.equals !== undefined || input.contains !== undefined)) {

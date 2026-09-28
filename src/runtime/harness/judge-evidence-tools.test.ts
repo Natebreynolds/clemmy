@@ -119,3 +119,15 @@ test('review queries reach records inside nested CLI JSON text without changing 
   assert.ok(String(await open.invoke({ context: {} }, JSON.stringify({ ref: 'cli' }))).endsWith(text));
   assert.equal(JSON.stringify(value), text);
 });
+
+
+test('an authenticated empty record path wins over a larger carrier metadata array', async () => {
+  const value = { result: { argv: ['query', '--all'], stdout: JSON.stringify({ result: { records: [] } }) } };
+  const source = { refKind: 'settled calls', refs: () => ['empty'], resolve: () => ({
+    text: JSON.stringify(value), value, recordPath: 'result.stdout.result.records',
+  }) };
+  const query = (judgeEvidenceTools(source) as unknown as Invokable[]).find(t => t.name === 'query_evidence')!;
+  const found = String(await query.invoke({ context: {} }, JSON.stringify({ ref: 'empty' })));
+  assert.match(found, /0 of 0 records at result\.stdout\.result\.records match/);
+  assert.doesNotMatch(found, /result\.argv match/);
+});

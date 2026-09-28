@@ -365,6 +365,7 @@ test('classifyProbeOutput is unchanged: the pure classifier still says error for
 for (const failure of ['No default environment found', 'security: SecKeychainItemCreateFromContent: passphrase is not correct']) {
   test(`a verified recovery from ${failure} wakes parked work exactly once`, async () => {
     const health = await import('./auth-health.js');
+    stubInstalled();
     health._testOnly_setProbeExec(async () => ({ exitCode: 1, output: failure, timedOut: false }));
     const bad = await health.getCliHealth('salesforce', { force: true });
     assert.ok(bad.issue);
