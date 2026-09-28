@@ -429,10 +429,10 @@ function desktopSearchText(record: SessionRecord): string {
   return `${record.title ?? ''} ${tail}`.toLowerCase();
 }
 
-function harnessSearchText(summary: UnifiedSessionSummary): string {
+function harnessSearchText(summary: UnifiedSessionSummary, allRows: HarnessSessionRow[]): string {
   const rawId = summary.id.slice(HARNESS_PREFIX.length);
-  const row = getHarnessSession(rawId);
-  const tail = (row ? reconstructHarnessDetailTurns(row, 40) : reconstructHarnessTranscript(rawId, 40))
+  const row = snapshotRow(allRows, rawId);
+  const tail = (row ? reconstructHarnessDetailTurns(row, 40, allRows) : reconstructHarnessTranscript(rawId, 40))
     .slice(-20)
     .map((t) => t.text)
     .join(' ');
@@ -662,7 +662,7 @@ export function buildUnifiedSessionList(query: SessionListQuery = {}): UnifiedRu
       if (s.store === 'desktop') {
         const rec = desktopRecords.get(s.id.slice(DESKTOP_PREFIX.length));
         if (rec && desktopSearchText(rec).includes(q)) return true;
-      } else if (harnessSearchText(s).includes(q)) {
+      } else if (harnessSearchText(s, harnessCollection.allRows).includes(q)) {
         return true;
       }
       return false;

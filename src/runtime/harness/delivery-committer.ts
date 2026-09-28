@@ -1,3 +1,4 @@
+import { completionEvidenceSource } from './recovery-activation.js';
 import { redactSensitiveText } from '../security.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
 /**
@@ -1218,9 +1219,10 @@ export function commitTurnOutcome(
   // This ref comes only from the complete immutable artifact published by this
   // exact accepted source. It is deliberately absent from the caller-metadata
   // allowlist, so a model reply cannot nominate a different plan for Execute.
+  const reviewIdentity = completionEvidenceSource(proposed.identity);
   const planSession = getSession(proposed.identity.sessionId);
   const publishedPlan = planSession ? getPlanRevisionForSource({
-    sessionId: proposed.identity.sessionId, sourceUserSeq: proposed.identity.sourceUserSeq,
+    sessionId: proposed.identity.sessionId, sourceUserSeq: reviewIdentity.sourceUserSeq,
     principalId: planSession.userId ?? planSession.id,
   }) : null;
   const planMetadata = publishedPlan ? { planArtifactRef: {
@@ -1233,7 +1235,7 @@ export function commitTurnOutcome(
   // another process binds the same verdict the first attempt would have.
   const publishedVerdict = completionVerdictForAcceptedSource({
     sessionId: proposed.identity.sessionId,
-    sourceUserSeq: proposed.identity.sourceUserSeq,
+    sourceUserSeq: reviewIdentity.sourceUserSeq,
   });
   // VALIDATE before attaching. Copying a same-source verdict without checking it
   // against the bytes actually being published let a mismatched reply, a stale
@@ -1246,7 +1248,7 @@ export function commitTurnOutcome(
   // stamp exists (a source accepted by an older build).
   const capturedRead = readCapturedCompletionPolicy({
     sessionId: proposed.identity.sessionId,
-    sourceUserSeq: proposed.identity.sourceUserSeq,
+    sourceUserSeq: reviewIdentity.sourceUserSeq,
   });
   // 'absent' is a legacy source with no stamp — today's setting is the honest
   // best answer. 'unreadable' is a STORE FAILURE and must never be quietly
@@ -1274,7 +1276,7 @@ export function commitTurnOutcome(
   // fail Plan and Execute, whose accepted expressions legitimately differ.
   const acceptedObjective = acceptedObjectiveForSource({
     sessionId: proposed.identity.sessionId,
-    sourceUserSeq: proposed.identity.sourceUserSeq,
+    sourceUserSeq: reviewIdentity.sourceUserSeq,
   });
   const objectiveMatches = publishedVerdict?.objectiveDigest
     ? (acceptedObjective !== null
@@ -1325,18 +1327,18 @@ export function commitTurnOutcome(
   // bundle against that final component generation instead of calling it drift.
   const settledNow = settledSourceArtifacts({
     sessionId: proposed.identity.sessionId,
-    sourceUserSeq: proposed.identity.sourceUserSeq,
+    sourceUserSeq: reviewIdentity.sourceUserSeq,
   });
   // A missing verdict alone proves nothing about WHY no review ran. Label the
   // narrow conversational skip only from matching host evidence and recheck
   // current-source work at publication, including after restart/re-entry.
   if (!publishedVerdict && !publishedPlan && capturedRead.status === 'captured'
     && reviewWasEnabled && acceptedObjective !== null && settledNow.count === 0
-    && settledNow.evidenceAvailable && !sourceAttemptedCompletionWork(proposed.identity)) {
+    && settledNow.evidenceAvailable && !sourceAttemptedCompletionWork(reviewIdentity)) {
     try {
       const skipped = listEvents(proposed.identity.sessionId, { types: ['completion_review_skipped'] })
         .some((event) => event.role === 'system' && conversationalReviewSkipMatches(event.data, {
-          sourceUserSeq: proposed.identity.sourceUserSeq, objective: acceptedObjective, reply: proposed.text,
+          sourceUserSeq: reviewIdentity.sourceUserSeq, objective: acceptedObjective, reply: proposed.text,
         }));
       if (skipped) reviewDisposition = 'not_required';
     } catch { /* Unreadable skip evidence remains unavailable, never invented. */ }
@@ -1616,6 +1618,7 @@ export function commitTurnOutcome(
   const verdictMetadata = publishedVerdict ? { completionVerdictRef: {
     ...(publishedPlan ? { planMatches, planDigest: publishedVerdict.planDigest } : {}),
     version: 1 as const,
+    sourceUserSeq: reviewIdentity.sourceUserSeq,
     eventId: publishedVerdict.eventId,
     seq: publishedVerdict.seq,
     fulfills: publishedVerdict.fulfills,

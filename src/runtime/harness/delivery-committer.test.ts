@@ -809,3 +809,49 @@ test('publication distinguishes an intentional history-only review skip from an 
     assert.equal((terminal.data.completionReview as {disposition:string}).disposition, includeReceipt ? 'not_required' : 'enabled_unavailable');
   }
 });
+
+for (const variant of ['valid', 'changed-reply', 'foreign-card', 'untrusted-marker', 'disabled'] as const) {
+  test(`approval resume review follows exact durable work lineage: ${variant}`, async () => {
+    const approvals = await import('./approval-registry.js');
+    const sessionId = `review-resume-${variant}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const original = acceptedAnswer(sessionId, 'Verified answer.');
+    const card = approvals.register({ sessionId, subject: 'fixture', tool: 'fixture_write', args: { value: 'one' } });
+    approvals.resolve(card.approvalId, 'approved', 'test');
+    appendEvent({ sessionId, turn: 1, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: original.identity.sourceUserSeq, enabled: variant !== 'disabled',
+    } });
+    const control = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: {
+      text: 'Approved.', approvalId: card.approvalId, decision: 'approve',
+    } });
+    appendEvent({ sessionId, turn: 2, role: variant === 'untrusted-marker' ? 'user' : 'system', type: 'run_resumed', data: {
+      reviewContinuationVersion: 1, deliverySourceUserSeq: control.seq,
+      executionSourceUserSeq: original.identity.sourceUserSeq,
+      approvalId: variant === 'foreign-card' ? 'other-card' : card.approvalId, decision: 'approve',
+    } });
+    if (variant !== 'disabled') appendEvent({ sessionId, turn: 2, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: original.identity.sourceUserSeq,
+      fulfills: true, failedOpen: false, settledEvidenceAvailable: true,
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update('Verified answer.').digest('hex'),
+    } });
+    const identity = { sessionId, sourceUserSeq: control.seq, turn: 2 };
+    const outcome = { ...original, identity, id: turnOutcomeId(identity),
+      presentation: { kind: 'answer' as const, text: variant === 'changed-reply' ? 'An unreviewed new claim.' : 'Verified answer.' } };
+    const prior = process.env.CLEMMY_COMPLETION_REVIEW;
+    process.env.CLEMMY_COMPLETION_REVIEW = 'on';
+    try {
+      const result = commitTurnOutcome(outcome);
+      const review = (result.event.data.completionVerdictRef ?? result.event.data.completionReview) as { disposition: string; policyEvidence: string };
+      assert.equal(result.presentation.identity.sourceUserSeq, control.seq, 'delivery remains bound to the control source');
+      if (variant === 'valid') {
+        assert.equal(review.disposition, 'reviewed');
+        assert.equal((result.event.data.completionVerdictRef as { verified: boolean }).verified, true);
+      } else if (variant === 'disabled') assert.equal(review.disposition, 'disabled_by_owner');
+      else assert.notEqual(review.disposition, 'reviewed');
+      assert.equal(review.policyEvidence, ['foreign-card','untrusted-marker'].includes(variant) ? 'absent' : 'captured');
+    } finally {
+      if (prior === undefined) delete process.env.CLEMMY_COMPLETION_REVIEW; else process.env.CLEMMY_COMPLETION_REVIEW = prior;
+    }
+  });
+}

@@ -1,7 +1,7 @@
 /** Delivery activation and execution source are distinct after an approval.
  * This scope changes checkpoint ownership only, never tool/batch authority. */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { getSession, openEventLog } from './eventlog.js';
+import { getSession, openEventLog, listEvents } from './eventlog.js';
 
 export interface RecoveryActivationOwner {
   sourceUserSeq: number;
@@ -54,4 +54,29 @@ export function readApprovalRecoveryActivation(sessionId: string): RecoveryActiv
   const state = JSON.parse(blob) as { sessionId?: string; sourceUserSeq?: number; __clemHostRecovery?: number };
   if (state.__clemHostRecovery !== 1 || state.sessionId !== sessionId || state.sourceUserSeq !== link.requestSourceUserSeq) return invalid();
   return { sourceUserSeq: raw.sourceUserSeq, ...(raw.attemptId ? { attemptId: raw.attemptId } : {}), approvalContinuation: { ...link } };
+}
+
+/** The host's durable resume marker binds publication to the work actually
+ * reviewed. Never borrow a latest-session verdict or trust a caller's source. */
+export function completionEvidenceSource(input: { sessionId: string; sourceUserSeq: number }): typeof input {
+  const db = openEventLog();
+  const row = db.prepare("SELECT data_json FROM events WHERE session_id = ? AND seq = ? AND type = 'user_input_received'")
+    .get(input.sessionId, input.sourceUserSeq) as { data_json: string } | undefined;
+  if (!row) return input;
+  const control = JSON.parse(row.data_json) as Record<string, unknown>;
+  if (typeof control.approvalId !== 'string' || !['approve', 'approve_with_edits', 'reject'].includes(String(control.decision))) return input;
+  const candidates = listEvents(input.sessionId, { types: ['run_resumed'], sinceSeq: input.sourceUserSeq })
+    .filter(event => event.role === 'system' && event.data.reviewContinuationVersion === 1
+      && event.data.deliverySourceUserSeq === input.sourceUserSeq
+      && event.data.approvalId === control.approvalId && event.data.decision === control.decision);
+  const sources = new Set(candidates.map(event => event.data.executionSourceUserSeq));
+  if (sources.size !== 1) return input;
+  const source = [...sources][0];
+  if (!Number.isSafeInteger(source) || Number(source) <= 0 || Number(source) >= input.sourceUserSeq) return input;
+  const card = db.prepare('SELECT status, resolution FROM pending_approvals WHERE session_id = ? AND approval_id = ?')
+    .get(input.sessionId, control.approvalId) as { status: string; resolution: string } | undefined;
+  if (card?.status !== 'resolved' || card.resolution !== (control.decision === 'reject' ? 'rejected' : 'approved')) return input;
+  if (!db.prepare("SELECT 1 FROM events WHERE session_id = ? AND seq = ? AND type = 'user_input_received'")
+    .get(input.sessionId, source)) return input;
+  return { sessionId: input.sessionId, sourceUserSeq: Number(source) };
 }

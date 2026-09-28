@@ -849,3 +849,21 @@ test('pinning a workflow run after a list build keeps each step\'s conversation 
     assert.deepEqual(row?.metadata.__conversation, state, 'a patch must never write back a display row');
   }
 });
+
+test('search reuses the lightweight session snapshot for every workflow member', () => {
+  for (let i = 0; i < 3; i++) {
+    const row = createSession({ kind: 'workflow', channel: 'workflow', title: `search-snapshot-${i}`,
+      metadata: { workflowName: `snapshot flow ${i}`, workflowRunId: `search-snapshot-run-${i}`, stepId: 'read' } });
+    appendEvent({ sessionId: row.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'snapshot needle' } });
+  }
+  const db = openEventLog();
+  const prepare = db.prepare.bind(db);
+  const sql: string[] = [];
+  db.prepare = ((statement: string) => { sql.push(statement); return prepare(statement); }) as typeof db.prepare;
+  try {
+    const matches = buildUnifiedSessionList({ q: 'snapshot needle', source: 'workflow', includeArchived: true });
+    assert.equal(matches.filter(row => row.title.startsWith('snapshot flow')).length, 3);
+    assert.equal(sql.filter(statement => /SELECT\s+\*\s+FROM\s+sessions\b/i.test(statement)).length, 0,
+      'search must not reload full model/recovery metadata per session or workflow');
+  } finally { db.prepare = prepare; }
+});

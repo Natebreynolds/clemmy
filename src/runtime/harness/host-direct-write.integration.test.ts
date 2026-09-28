@@ -1243,6 +1243,9 @@ for (const answer of ['button', 'reply'] as const) {
       assert.equal(reasks.length, 1, `the resume core re-asked in a later step: ${JSON.stringify(result)}`);
       const accepting = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).at(-1)!;
       assert.notEqual(accepting.seq, fixture.source.seq, 'the answer is accepted by a source other than the parked request');
+      const { completionEvidenceSource } = await import('./recovery-activation.js');
+      assert.deepEqual(completionEvidenceSource({ sessionId: fixture.session.id, sourceUserSeq: accepting.seq }),
+        { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq }, 'real resume journals the reviewed execution source');
       assert.equal((accepting.data as { synthetic?: unknown }).synthetic === true, answer === 'button',
         'a button answer is accepted by the runtime\'s control edge; a reply by the owner\'s own words');
       // Both paths must reach a second model frame, not merely record memory

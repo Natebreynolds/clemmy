@@ -12936,6 +12936,14 @@ export async function resumePendingApproval(
       totalPending: pending.length,
       approvalId: selectedApproval?.approvalId ?? null,
       decision: options.decision,
+      // Written only after exact parked-state/card validation and resolution.
+      // The click owns delivery; the paused business source owns review.
+      ...(state instanceof HostInterruptState && selectedApproval && resumeSourceUserSeq
+        && recoveryActivationOwner(options.sessionId, { sourceUserSeq: resumeSourceUserSeq }).sourceUserSeq !== resumeSourceUserSeq
+        ? { reviewContinuationVersion: 1,
+            executionSourceUserSeq: resumeSourceUserSeq,
+            deliverySourceUserSeq: recoveryActivationOwner(options.sessionId, { sourceUserSeq: resumeSourceUserSeq }).sourceUserSeq }
+        : {}),
     },
   });
   session.clearInterruptState({ emitEvent: false });
