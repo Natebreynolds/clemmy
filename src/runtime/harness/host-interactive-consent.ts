@@ -1,3 +1,4 @@
+import { exactCallDeliveryProof } from './exact-call-delivery.js';
 import { gateApprovedStepWriteCoverage } from './workflow-gate-write-coverage.js';
 import { reviewedFileCorrectionReservation, retainedFileCorrectionReservation } from './reviewed-file-correction.js';
 import path from 'node:path';
@@ -53,6 +54,7 @@ import {
   canonicalExternalInputSchemaDigestV1,
   deriveExternalCapabilityCallSignalsV1,
   loadFreshCatalogManifestExternalRiskAttestationV1,
+  type LoadCatalogManifestExternalRiskAttestationInputV1,
 } from './external-capability-risk-loader.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import {
@@ -1049,7 +1051,7 @@ async function semanticBasisForExactCall(input: {
   // raised for this source and resumed after its approval is evaluated on the
   // same facts both times, and a verdict learned meanwhile waits for the next.
   const learnedSemanticsAsOf = acceptedSourceCreatedAt(binding);
-  const loaded = await loadFreshCatalogManifestExternalRiskAttestationV1({
+  const riskRequest: LoadCatalogManifestExternalRiskAttestationInputV1 = {
     version: 1,
     binding: {
       bindingKind: 'catalog_manifest' as const,
@@ -1070,7 +1072,27 @@ async function semanticBasisForExactCall(input: {
     callSignals: callSignals.callSignals,
     safety: 'admissible' as const,
     ...(learnedSemanticsAsOf ? { learnedSemanticsAsOf } : {}),
-  });
+  };
+  let loaded = await loadFreshCatalogManifestExternalRiskAttestationV1(riskRequest);
+  if (loaded.ok && loaded.attestation.projection.risk.consequence === 'send'
+    && !loaded.attestation.projection.risk.destructive
+    && (loaded.attestation.manifest.providerKind === 'composio' || loaded.attestation.manifest.providerKind === 'native_mcp')
+    && input.prepared.sourceUserSeq !== null) {
+    const verdict = await exactCallDeliveryProof({
+      request: riskRequest, arguments: externalCall.arguments,
+      providerKind: loaded.attestation.manifest.providerKind,
+      semanticName: loaded.attestation.currentDefinition.semanticName,
+      sessionId: input.prepared.sessionId, sourceUserSeq: input.prepared.sourceUserSeq,
+      acceptedTaskId: input.prepared.acceptedTaskId, logicalToolCallId: input.prepared.logicalToolCallId,
+    });
+    if (verdict) {
+      // Models may take time; re-open the fresh account/schema/manifest before
+      // using their answer. The normal consent reducer still decides authority.
+      loaded = await loadFreshCatalogManifestExternalRiskAttestationV1({ ...riskRequest,
+        exactCallDelivery: { arguments: externalCall.arguments, verdict },
+      });
+    }
+  }
   if (!loaded.ok) {
     return {
       status: loaded.reason === 'schema_drift' || loaded.reason === 'malformed_input'

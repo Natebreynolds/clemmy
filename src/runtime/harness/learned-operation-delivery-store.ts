@@ -44,6 +44,8 @@ export interface LearnedOperationDeliveryVerdictV1 {
   /** Full canonical digest of that same input schema, comparable to the risk
    * loader's own digest of the current definition. */
   inputSchemaDigest: string;
+  /** Exact account/manifest/schema/argument scope; absent means the whole operation. */
+  callBindingDigest?: string;
   /** Stage one: the fast classifier's probabilities for the two questions. */
   screen: {
     model: string;
@@ -127,6 +129,7 @@ export function parseLearnedOperationDeliveryVerdictV1(
   if (!isRecord(value) || !hasExactKeys(value, [
     'version', 'providerKind', 'operationId', 'verdict', 'definitionDigest',
     'inputSchemaDigest', 'screen', 'confirm', 'learnedAt',
+    ...(Object.hasOwn(value, 'callBindingDigest') ? ['callBindingDigest'] : []),
   ])) return null;
   if (value.version !== LEARNED_OPERATION_DELIVERY_VERSION) return null;
   if (
@@ -143,6 +146,7 @@ export function parseLearnedOperationDeliveryVerdictV1(
     typeof value.definitionDigest !== 'string' || !SHA256.test(value.definitionDigest)
     || typeof value.inputSchemaDigest !== 'string' || !SHA256.test(value.inputSchemaDigest)
   ) return null;
+  if (value.callBindingDigest !== undefined && (typeof value.callBindingDigest !== 'string' || !SHA256.test(value.callBindingDigest))) return null;
   const screen = value.screen;
   if (
     !isRecord(screen)
@@ -173,6 +177,7 @@ export function parseLearnedOperationDeliveryVerdictV1(
     verdict: 'delivers_nothing_non_destructive',
     definitionDigest: value.definitionDigest,
     inputSchemaDigest: value.inputSchemaDigest,
+    ...(value.callBindingDigest ? { callBindingDigest: value.callBindingDigest as string } : {}),
     screen: {
       model: screen.model,
       deliveryProbability: screen.deliveryProbability,
@@ -217,18 +222,22 @@ function writeStore(file: StoreFile): void {
 export function learnedOperationDeliveryVerdict(
   providerKind: string,
   operationId: string,
+  callBindingDigest?: string,
 ): LearnedOperationDeliveryVerdictV1 | null {
-  const key = learnedOperationDeliveryKey(providerKind, operationId);
+  const base = learnedOperationDeliveryKey(providerKind, operationId);
+  const key = base && callBindingDigest ? `${base}:${callBindingDigest}` : base;
   if (!key) return null;
   const verdict = parseLearnedOperationDeliveryVerdictV1(readStore().verdicts[key]);
-  return verdict && learnedOperationDeliveryKey(verdict.providerKind, verdict.operationId) === key
+  return verdict && learnedOperationDeliveryKey(verdict.providerKind, verdict.operationId) === base
+    && verdict.callBindingDigest === callBindingDigest
     ? verdict
     : null;
 }
 
 export function rememberLearnedOperationDelivery(value: LearnedOperationDeliveryVerdictV1): boolean {
   const verdict = parseLearnedOperationDeliveryVerdictV1(value);
-  const key = verdict ? learnedOperationDeliveryKey(verdict.providerKind, verdict.operationId) : null;
+  const base = verdict ? learnedOperationDeliveryKey(verdict.providerKind, verdict.operationId) : null;
+  const key = base && verdict?.callBindingDigest ? `${base}:${verdict.callBindingDigest}` : base;
   if (!verdict || !key) return false;
   try {
     const verdicts: Record<string, unknown> = { ...readStore().verdicts, [key]: verdict };

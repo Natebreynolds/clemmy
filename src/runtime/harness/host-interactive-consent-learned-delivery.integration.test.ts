@@ -139,6 +139,7 @@ interface FixtureOptions {
   args: Record<string, unknown>;
   posture?: 'create_new' | 'named_existing' | 'not_applicable';
   destructive?: boolean | null;
+  accountId?: string;
   operationSemantics?: { version: 1; reversibility: 'reversible' | 'ordinary_non_destructive' | 'irreversible' };
 }
 
@@ -148,7 +149,7 @@ async function acceptedCall(options: FixtureOptions) {
   const schemaDigest = canonicalExternalInputSchemaDigestV1(options.schema)!;
   const effect = 'external_write' as const;
   const capabilityId = `cap:learned-delivery:${options.tag}`;
-  const accountId = 'account:learned-delivery:owner';
+  const accountId = options.accountId ?? 'account:learned-delivery:owner';
   const fingerprint = sha(`${operationId}:${schemaDigest}`);
   const manifest = manifests.attachSemanticContract({
     version: 1, manifestId: capabilityId, providerKind: 'composio', operationId,
@@ -471,4 +472,87 @@ test('a semantic the manifest seals wins over a learned verdict', async () => {
   // The same verdict does apply where nothing is sealed.
   const learned = await acceptedCall({ tag: 'open', operationId: OPEN_OPERATION, schema: OPEN_SCHEMA, args: { users: 'U7' } });
   assertProceedsWithoutCard(learned.result, 'without a sealed semantic the verdict applies');
+});
+
+const CONDITIONAL_SCHEMA = {
+  ...OPEN_SCHEMA,
+  description: 'Open or resume a conversation; the conditional lookup never creates or notifies.',
+  properties: { ...OPEN_SCHEMA.properties,
+    lookup_only: { type: 'boolean', description: 'When true, only find an existing conversation. Never create or notify.' } },
+};
+
+test('exact conditional lookup gets no setup card on its first call and reuses proof with models unavailable', async () => {
+  const args = { users: 'U-first', lookup_only: true };
+  const first = await acceptedCall({ tag: 'conditional', operationId: OPEN_OPERATION, schema: CONDITIONAL_SCHEMA, args });
+  const outcome = assertProceedsWithoutCard(first.result, 'first encounter uses exact schema and arguments');
+  assert.equal(jevRequests.length, 1);
+  assert.equal(judgeRequests.length, 1);
+  const schema = JSON.parse((jevRequests[0]!.state as { inputSchema: string }).inputSchema);
+  assert.deepEqual(schema.allOf, [CONDITIONAL_SCHEMA, { const: args }], 'the entire schema survives the exact-argument intersection');
+  assert.equal(deliveryStore.learnedOperationDeliveryVerdict('composio', OPEN_OPERATION), null,
+    'a conditional proof cannot become an operation-wide waiver');
+  const snapshots = eventlog.listEvents(first.request.attestation.sessionId, { types: ['exact_call_delivery_basis'] });
+  assert.equal(snapshots.length, 1);
+  assert.ok((snapshots[0]!.data.verdict as Record<string, unknown>).callBindingDigest);
+  jev._setTypesafeKeyForTests(null);
+  try {
+    const resumed = await consent.evaluateUncoveredHostMutationConsent(first.request);
+    assert.deepEqual(decided(resumed).call, outcome.call, 'same exact risk on replay');
+    const next = await acceptedCall({ tag: 'conditional', operationId: OPEN_OPERATION, schema: CONDITIONAL_SCHEMA, args });
+    assertProceedsWithoutCard(next.result, 'later turn uses the already checked exact call');
+    assert.equal(jevRequests.length, 1, 'no additional model calls');
+  } finally { jev._setTypesafeKeyForTests('fixture-key'); }
+});
+
+test('changed arguments, recipient and definition cannot inherit an exact lookup proof', async () => {
+  await acceptedCall({ tag: 'conditional-drift', operationId: OPEN_OPERATION, schema: CONDITIONAL_SCHEMA,
+    args: { users: 'U1', lookup_only: true } });
+  jevAnswers = { delivers: 0.8, irreversible: 0.3 };
+  for (const args of [{ users: 'U1', lookup_only: false }, { users: 'U2', lookup_only: true }]) {
+    const changed = await acceptedCall({ tag: 'conditional-drift', operationId: OPEN_OPERATION, schema: CONDITIONAL_SCHEMA, args });
+    assertAsks(changed.result, 'changed exact arguments retain approval without new proof');
+  }
+  const changed = await acceptedCall({ tag: 'conditional-drift-v2', operationId: OPEN_OPERATION,
+    schema: { ...CONDITIONAL_SCHEMA, description: 'This now notifies participants.' }, args: { users: 'U1', lookup_only: true } });
+  assertAsks(changed.result, 'changed definition retains approval');
+  assert.equal(judgeRequests.length, 1, 'only the first lookup passed the screen');
+});
+
+test('negative first-call evidence stays frozen after another source learns; explicit sends do not add semantic calls', async () => {
+  jevAnswers = { delivers: 0.8, irreversible: 0.2 };
+  const first = await acceptedCall({ tag: 'conditional-frozen', operationId: OPEN_OPERATION, schema: CONDITIONAL_SCHEMA,
+    args: { users: 'U-frozen', lookup_only: true } });
+  const card = assertAsks(first.result, 'uncertainty keeps the card');
+  const basis = eventlog.listEvents(first.request.attestation.sessionId, { types: ['exact_call_delivery_basis'] })[0]!;
+  assert.equal(basis.data.verdict, null);
+  jevAnswers = { delivers: 0.02, irreversible: 0.01 };
+  assert.equal(await learner.learnOperationDelivery({ providerKind: 'composio', operationId: OPEN_OPERATION,
+    description: CONDITIONAL_SCHEMA.description, inputSchema: CONDITIONAL_SCHEMA,
+    exactCall: { bindingDigest: String(basis.data.callBindingDigest), arguments: first.request.args } }), 'learned');
+  const again = await consent.evaluateUncoveredHostMutationConsent(first.request);
+  assert.deepEqual(decided(again).call, card.call, 'a later proof cannot rewrite the pending risk subject');
+  const count = jevRequests.length;
+  const send = await acceptedCall({ tag: 'actual-send', operationId: SEND_OPERATION,
+    schema: { ...SEND_SCHEMA, description: SEND_DESCRIPTION }, args: { channel: 'C1', text: 'Hello' } });
+  assertAsks(send.result, 'a real send still needs content approval');
+  assert.equal(jevRequests.length, count, 'an unambiguous send needs no new classifier call');
+});
+
+test('an exact lookup proof cannot cross accounts or override outbound/destructive evidence', async () => {
+  const args = { users: 'U-boundary', lookup_only: true };
+  const first = await acceptedCall({ tag: 'boundary', operationId: OPEN_OPERATION, schema: CONDITIONAL_SCHEMA, args });
+  assertProceedsWithoutCard(first.result, 'known exact lookup');
+  jevAnswers = { delivers: 0.8, irreversible: 0.3 };
+  const other = await acceptedCall({ tag: 'boundary-other', accountId: 'account:other', operationId: OPEN_OPERATION,
+    schema: CONDITIONAL_SCHEMA, args });
+  assertAsks(other.result, 'another account has no inherited proof');
+  const calls = jevRequests.length;
+  const destructive = await acceptedCall({ tag: 'boundary-destructive', operationId: OPEN_OPERATION,
+    schema: CONDITIONAL_SCHEMA, args, destructive: true });
+  assertAsks(destructive.result, 'destructive provider hint is never lowered');
+  const notify = await acceptedCall({ tag: 'boundary-notify', operationId: OPEN_OPERATION,
+    schema: { ...OPEN_WITH_NOTIFY_SCHEMA, description: CONDITIONAL_SCHEMA.description },
+    args: { users: 'U-boundary', notify_users: true } });
+  assertAsks(notify.result, 'outbound argument remains a send');
+  assert.equal(jevRequests.length, calls, 'destructive and outbound floors do not ask a model to waive them');
 });

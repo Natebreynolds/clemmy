@@ -392,6 +392,16 @@ function actionClass(token: string): StructuralConsequence | null {
   return null;
 }
 
+/** A communication noun can be mistaken for a verb when an earlier action
+ * is outside the structural vocabulary (for example, opening a DM). This
+ * requests semantic evidence only; it grants no permission by itself. */
+export function hasAmbiguousDeliveryAction(semanticName: string): boolean {
+  const tokens = operationTokens(semanticName);
+  const index = tokens.findIndex((token) => actionClass(token) !== null);
+  return index > 0 && actionClass(tokens[index]!) === 'send'
+    && COMMUNICATION_OBJECTS.has(tokens[index]!);
+}
+
 /** The destination posture the OPERATION declares through its own verb: an
  * update/delete addresses a record that already exists; a create/send/post
  * produces a new one. Derived from the operation identity (the tool Clem is

@@ -640,6 +640,7 @@ export const EVENT_TYPES = [
   // the carrier's own non-destructive declaration instead of minting a card.
   // Operational evidence for the write boundary; never a public projection.
   'interactive_consent_decided',
+  'exact_call_delivery_basis',
   'workflow_node_invocation_activated',
   // Immutable parent for one provider-neutral paginated workflow read. Every
   // page is a child call of this one activation/node attempt; no page is

@@ -121,6 +121,7 @@ export interface LoadExternalCapabilityRiskAttestationInputV1 {
    * Absent means none.
    */
   learnedDelivery?: LearnedOperationDeliveryVerdictV1;
+  exactCallBindingDigest?: string;
 }
 
 /** Where a projected semantic came from, when it was learned rather than
@@ -211,6 +212,7 @@ export interface LoadCatalogManifestExternalRiskAttestationInputV1 {
    * no learned verdict is consulted.
    */
   learnedSemanticsAsOf?: string;
+  exactCallDelivery?: { arguments: Record<string, unknown>; verdict: LearnedOperationDeliveryVerdictV1 };
 }
 
 /** Test seam. Production omits it and reopens the installed owners. */
@@ -283,7 +285,7 @@ const TOP_LEVEL_KEYS = new Set([
   'callSignals',
   'safety',
 ]);
-const OPTIONAL_TOP_LEVEL_KEYS = new Set(['learnedDelivery']);
+const OPTIONAL_TOP_LEVEL_KEYS = new Set(['learnedDelivery', 'exactCallBindingDigest']);
 const CURRENT_DEFINITION_KEYS = new Set([
   'version',
   'providerKind',
@@ -1028,6 +1030,8 @@ function closedInput(raw: unknown): LoadExternalCapabilityRiskAttestationInputV1
     || !Object.keys(parsed).every((key) => TOP_LEVEL_KEYS.has(key) || OPTIONAL_TOP_LEVEL_KEYS.has(key))
   ) return null;
   if (parsed.version !== EXTERNAL_CAPABILITY_RISK_LOADER_VERSION) return null;
+  if (parsed.exactCallBindingDigest !== undefined
+    && (typeof parsed.exactCallBindingDigest !== 'string' || !SHA256.test(parsed.exactCallBindingDigest))) return null;
   if (!isRecord(parsed.manifest) || !hasOnlyKeys(parsed.manifest, MANIFEST_KEYS)) return null;
 
   const definition = parsed.currentDefinition;
@@ -1177,6 +1181,7 @@ export function loadExternalCapabilityRiskAttestationV1(
         behaviorHints: definition.behaviorHints,
         callSignals: input.callSignals,
         learned: input.learnedDelivery,
+        exactCallBindingDigest: input.exactCallBindingDigest,
       });
   const projection = projectExternalCapabilityRiskV1({
     version: EXTERNAL_CAPABILITY_RISK_INPUT_VERSION,
@@ -1265,12 +1270,14 @@ function learnedDeliverySemantic(input: {
   behaviorHints: ExternalCapabilityBehaviorHintsV1;
   callSignals: ExternalCapabilityRiskInputV1['callSignals'];
   learned: unknown;
+  exactCallBindingDigest?: string;
 }): {
   semantic: NonNullable<ExternalCapabilityRiskInputV1['documentedSemantic']>;
   source: ExternalCapabilityLearnedSemanticSourceV1;
 } | null {
   const verdict = parseLearnedOperationDeliveryVerdictV1(input.learned);
   if (!verdict) return null;
+  if (verdict.callBindingDigest !== input.exactCallBindingDigest) return null;
   // The verdict names this exact provider operation...
   const operationKey = learnedOperationDeliveryKey(input.manifest.providerKind, input.manifest.operationId);
   if (!operationKey || learnedOperationDeliveryKey(verdict.providerKind, verdict.operationId) !== operationKey) {
@@ -1562,7 +1569,11 @@ export function loadCatalogManifestExternalRiskAttestationV1(
   const observed = observationMatchesManifest(manifest, resolved.observe(manifest));
   if (!observed.ok) return { ok: false, reason: 'current_definition_unavailable' };
 
-  const learnedDelivery = learnedDeliveryAsOf(manifest, input.learnedSemanticsAsOf);
+  const exactCallBindingDigest = input.exactCallDelivery
+    ? exactDeliveryCallBindingDigest(input.binding, input.inputSchema, input.exactCallDelivery.arguments)
+    : undefined;
+  const learnedDelivery = input.exactCallDelivery?.verdict
+    ?? learnedDeliveryAsOf(manifest, input.learnedSemanticsAsOf);
   return loadExternalCapabilityRiskAttestationV1({
     version: EXTERNAL_CAPABILITY_RISK_LOADER_VERSION,
     manifest,
@@ -1592,6 +1603,7 @@ export function loadCatalogManifestExternalRiskAttestationV1(
     callSignals: input.callSignals,
     safety: input.safety,
     ...(learnedDelivery ? { learnedDelivery } : {}),
+    ...(exactCallBindingDigest ? { exactCallBindingDigest } : {}),
   });
 }
 
@@ -1612,4 +1624,12 @@ export async function loadFreshCatalogManifestExternalRiskAttestationV1(
   if (manifest?.providerKind !== 'native_mcp' || !manifest.externalDefinition) return loaded;
   try { await resolved.refresh(manifest); } catch { return loaded; }
   return loadCatalogManifestExternalRiskAttestationV1(input, authority);
+}
+
+/** Complete scope for a conditional delivery verdict. No payload or account
+ * may inherit another call's proof, even when the operation slug is stable. */
+export function exactDeliveryCallBindingDigest(
+  binding: CatalogManifestExternalRiskBindingV1, inputSchema: unknown, args: Record<string, unknown>,
+): string {
+  return sha256(closedCanonicalJson({ domain: 'exact-call-delivery-v1', binding, inputSchema, arguments: args }));
 }
