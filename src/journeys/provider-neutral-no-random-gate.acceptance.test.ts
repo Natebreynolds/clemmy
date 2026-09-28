@@ -15,6 +15,8 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { after, test } from 'node:test';
 
@@ -86,6 +88,8 @@ const composioProviderIdentity = await import('../integrations/composio/provider
 const composioOperationSemantics = await import('../integrations/composio/operation-semantics.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const hostConsent = await import('../runtime/harness/host-interactive-consent.js');
+const semanticPorts = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
+const { currentSourceAccountReviewer } = await import('./gauntlet-sheet-account-review.fixture-support.js');
 
 after(() => {
   innerDispatch._setInnerDispatchToolsForTests(null);
@@ -162,6 +166,8 @@ const functionCall = (callId: string, name: string, args: Record<string, unknown
   name,
   arguments: JSON.stringify(args),
 });
+const planControlCall = (callId: string, args: Record<string, unknown>) =>
+  functionCall(callId, 'call_tool', { name: 'plan_task', args_json: JSON.stringify(args) });
 
 /** Exact model-wire shape after strict nullable preparation. Workflow steps
  * have many optional fields, and the current carrier canonicalizes every
@@ -1137,7 +1143,7 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       label: 'Workspace create',
       name: 'space_save',
       prompt: 'Create one Workspace named Planned Fixture Space.',
-      args: { slug: 'planned-fixture-space', title: 'Planned Fixture Space' },
+      args: { slug: 'planned-fixture-space', title: 'Planned Fixture Space', view_html: '<!doctype html><title>Planned Fixture Space</title><h1>Fixture</h1>' },
       result: JSON.stringify({ ok: true, slug: 'planned-fixture-space', revision: 1 }),
     },
     {
@@ -1157,6 +1163,7 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       args: {
         name: 'planned-fixture-workflow',
         description: 'Planned fixture workflow',
+        enabled: false,
         steps: [canonicalWorkflowInspectStep()],
       },
       result: workflowCommitFixture('Created disabled workflow planned-fixture-workflow.'),
@@ -1338,8 +1345,8 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
             );
             assert.equal(
               tools.includes('work_call'),
-              false,
-              'write work_call stays absent until plan_task freezes exact work',
+              true,
+              'the stable carrier is advertised without granting an effect binding',
             );
             assert.doesNotMatch(serialized, new RegExp(definition.capabilityRef));
             output = [functionCall(`planned-local-search-${index}`, 'tool_search', {
@@ -1348,12 +1355,10 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
               limit: 8,
             })];
           } else if (modelCalls === 2) {
-            assert.ok(
-              tools.includes('plan_task'),
-              'the same opaque planning authority must expose plan_task after exact disclosure',
-            );
+            assert.equal(tools.includes('plan_task'), false, 'discovery retains the stable deferred schema prefix');
+            assert.ok(tools.includes('call_tool'), 'the plan control is reachable through its advertised carrier');
             assert.match(serialized, new RegExp(definition.capabilityRef));
-            output = [functionCall(`planned-local-plan-${index}`, 'plan_task', {
+            output = [planControlCall(`planned-local-plan-${index}`, {
               preamble: `I’ll complete the requested ${candidate.label} now.`,
               draft: exactLocalPlanDraft({ label: candidate.label, operationId, definition }),
             })];
@@ -1555,6 +1560,46 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
         },
         model: model as never,
       });
+      // Native product authoring now uses its real refreshed handler. Observe
+      // its atomic commit rather than substituting a stale inner-dispatch stub.
+      // The check runs BEFORE rename, proving exact authority precedes effects.
+      const nativeCommitPath = candidate.name === 'space_save'
+        ? path.join(HOME, 'spaces/planned-fixture-space/view/index.html')
+        : candidate.name === 'workflow_create' || candidate.name === 'workflow_update'
+          ? path.join(HOME, 'vault/00-System/workflows/planned-fixture-workflow/SKILL.md')
+          : null;
+      const nativeCommits: Array<{ logicalCallId: string; argumentDigest: string }> = [];
+      if (nativeCommitPath) {
+        const rename = fs.renameSync;
+        const renameMock = caseTest.mock.method(fs, 'renameSync', (from, to) => {
+          if (String(to) === nativeCommitPath) {
+            const logical = attemptIdentity.currentLogicalCall();
+            const ambient = brackets.harnessRunContextStorage.getStore();
+            assert.equal(logical?.acceptedTaskId, `task:${plannedSession.id}#${source.seq}`);
+            assert.equal(logical?.logicalToolCallId, workCallId);
+            const contract = eventlog.openEventLog().prepare(`
+              SELECT tool_name, argument_digest FROM logical_tool_calls
+              WHERE accepted_task_id = ? AND logical_tool_call_id = ?
+            `).get(logical!.acceptedTaskId, workCallId) as { tool_name: string; argument_digest: string } | undefined;
+            assert.ok(contract);
+            assert.equal(contract.tool_name, candidate.name);
+            const binding = eventlog.openEventLog().prepare(`
+              SELECT argument_digest, requirement_id, effect_kind FROM expected_work_call_bindings
+              WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?
+            `).get(plannedSession.id, source.seq, workCallId) as Record<string, unknown> | undefined;
+            assert.ok(binding, 'the exact work binding must precede the native commit');
+            assert.equal(binding.requirement_id, operationId);
+            assert.equal(binding.effect_kind, 'local_write');
+            assert.equal(binding.argument_digest, contract.argument_digest);
+            assert.ok(ambient?.dispatchLease && dispatchLeases.isDispatchLeaseCurrent(ambient.dispatchLease));
+            assert.equal(ambient.dispatchLease.logicalToolCallId, workCallId);
+            nativeCommits.push({ logicalCallId: workCallId, argumentDigest: contract.argument_digest });
+          }
+          return rename(from, to);
+        });
+        syncBuiltinESMExports();
+        caseTest.after(() => { renameMock.mock.restore(); syncBuiltinESMExports(); });
+      }
       const parent = {
         sessionId: plannedSession.id,
         sourceUserSeq: source.seq,
@@ -1657,7 +1702,28 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       );
       assert.deepEqual(approvalEvents, [], `${candidate.label}: an approval callback escaped`);
       assert.equal(outcome.terminal, undefined, `${candidate.label}: generic host terminal`);
-      assert.equal(bodies, 1, `${candidate.label}: recording body must execute exactly once`);
+      if (nativeCommitPath) {
+        assert.equal(bodies, 0, 'native authoring must use its production handler');
+        assert.ok(nativeCommits.length > 0, 'a real native commit must have been observed');
+        const bytes = fs.readFileSync(nativeCommitPath, 'utf8');
+        if (candidate.name === 'space_save') {
+          assert.equal(bytes, candidate.args.view_html);
+          const { spaceStore } = await import('../spaces/store.js');
+          assert.equal(spaceStore.get('planned-fixture-space')?.title, candidate.args.title);
+        } else {
+          const { readWorkflow } = await import('../memory/workflow-store.js');
+          const saved = readWorkflow('planned-fixture-workflow');
+          assert.ok(saved);
+          assert.equal(saved.data.name, candidate.args.name);
+          assert.equal(saved.data.description, candidate.args.description);
+          assert.equal(saved.data.enabled, false);
+          assert.equal(saved.data.steps.length, 1);
+          assert.equal(saved.data.steps[0]!.id, 'inspect');
+          assert.equal(saved.data.steps[0]!.prompt, canonicalWorkflowInspectStep().prompt);
+        }
+      } else {
+        assert.equal(bodies, 1, `${candidate.label}: recording body must execute exactly once`);
+      }
       assert.deepEqual(
         physical.filter((row) => (
           (row as { logical_tool_call_id?: unknown }).logical_tool_call_id === workCallId
@@ -1703,26 +1769,28 @@ test('exact accepted local plans bind reversible Workspace, workflow, and file w
       );
       assert.equal(modelCalls, 4);
       assert.equal(outcome.finalOutput, `${candidate.label} completed from its exact accepted plan.`);
-      assert.equal(seen.length, 1, `${candidate.label}: effective body argument cardinality`);
-      const effectiveArgs = seen[0] ?? {};
-      for (const [key, value] of Object.entries(candidate.args)) {
-        assert.deepEqual(
-          effectiveArgs[key],
-          value,
-          `${candidate.label}: prepared body changed requested argument ${key}`,
+      if (!nativeCommitPath) {
+        assert.equal(seen.length, 1, `${candidate.label}: effective body argument cardinality`);
+        const effectiveArgs = seen[0] ?? {};
+        for (const [key, value] of Object.entries(candidate.args)) {
+          assert.deepEqual(
+            effectiveArgs[key],
+            value,
+            `${candidate.label}: prepared body changed requested argument ${key}`,
+          );
+        }
+        assert.ok(
+          Object.entries(effectiveArgs).every(([key, value]) => (
+            Object.prototype.hasOwnProperty.call(candidate.args, key) || value === null
+          )),
+          `${candidate.label}: schema preparation added a non-null unrequested argument`,
+        );
+        assert.equal(
+          (bodyAuthority[0]?.reconstructed as { argumentDigest?: unknown } | undefined)?.argumentDigest,
+          (workBindings[0] as { argument_digest?: unknown } | undefined)?.argument_digest,
+          `${candidate.label}: effective prepared arguments drifted from the frozen work binding`,
         );
       }
-      assert.ok(
-        Object.entries(effectiveArgs).every(([key, value]) => (
-          Object.prototype.hasOwnProperty.call(candidate.args, key) || value === null
-        )),
-        `${candidate.label}: schema preparation added a non-null unrequested argument`,
-      );
-      assert.equal(
-        (bodyAuthority[0]?.reconstructed as { argumentDigest?: unknown } | undefined)?.argumentDigest,
-        (workBindings[0] as { argument_digest?: unknown } | undefined)?.argument_digest,
-        `${candidate.label}: effective prepared arguments drifted from the frozen work binding`,
-      );
       assert.deepEqual(unmatchedFunctionCallIds({ input: outcome.history }), []);
       // Search results legitimately contain authoring documentation that says
       // malformed legacy runners "fail closed". That model-visible schema
@@ -1901,7 +1969,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
     {
       label: 'source-derived generic create without exact readback repairs before mutation I/O',
       expected: 'source_proof_repair',
-      operation: 'FIXTURE_CREATE_REPORT_FROM_RECORDS',
+      operation: 'GOOGLEDOCS_FIXTURE_CREATE_REPORT_FROM_RECORDS',
       destinationFamily: 'fixture',
       prompt: 'Create one fixture report from the exact source records and verify its content.',
       schema: {
@@ -1930,7 +1998,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       },
       result: { successful: true, id: 'must-not-run-without-readback' },
       source: {
-        operation: 'FIXTURE_LIST_REPORT_RECORDS',
+        operation: 'GOOGLEDOCS_FIXTURE_LIST_REPORT_RECORDS',
         schema: {
           type: 'object',
           additionalProperties: false,
@@ -1952,7 +2020,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       // Unknown means the carrier says nothing about destructiveness. A carrier
       // that declares a write non-destructive is bounded work and proceeds.
       carrierDestructiveHint: null,
-      operation: 'FIXTURE_SYNC_RESOURCE',
+      operation: 'GOOGLEDOCS_FIXTURE_SYNC_RESOURCE',
       destinationFamily: 'fixture',
       prompt: 'Synchronize one new fixture resource from this exact payload.',
       schema: {
@@ -1972,7 +2040,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       label: 'explicit outbound draft requests one user approval before I/O',
       expected: 'needs_user',
       resumeScenario: 'approve_restart',
-      operation: 'FIXTURE_SEND_DRAFT',
+      operation: 'GOOGLEDOCS_FIXTURE_SEND_DRAFT',
       destinationFamily: 'fixture',
       destinationPosture: 'named_existing',
       prompt: 'Update one exact fixture draft and then send it.',
@@ -1998,7 +2066,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       label: 'approved outbound checkpoint recovery never duplicates the send',
       expected: 'needs_user',
       resumeScenario: 'approve_checkpoint_recovery',
-      operation: 'FIXTURE_SEND_CHECKPOINT_RECOVERY',
+      operation: 'GOOGLEDOCS_FIXTURE_SEND_CHECKPOINT_RECOVERY',
       destinationFamily: 'fixture',
       destinationPosture: 'named_existing',
       prompt: 'Send one exact approved fixture and recover private bookkeeping without sending it twice.',
@@ -2024,7 +2092,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       label: 'approved exact outbound whose tool surface disappears replans before I/O',
       expected: 'needs_user',
       resumeScenario: 'approve_surface_loss',
-      operation: 'FIXTURE_SEND_SURFACE_LOSS',
+      operation: 'GOOGLEDOCS_FIXTURE_SEND_SURFACE_LOSS',
       destinationFamily: 'fixture',
       destinationPosture: 'named_existing',
       prompt: 'Send the exact approved fixture only if its admitted tool surface remains available.',
@@ -2050,7 +2118,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       label: 'approved exact outbound with an unknown crossing holds across restart',
       expected: 'needs_user',
       resumeScenario: 'approve_unknown_restart',
-      operation: 'FIXTURE_SEND_UNKNOWN',
+      operation: 'GOOGLEDOCS_FIXTURE_SEND_UNKNOWN',
       destinationFamily: 'fixture',
       destinationPosture: 'named_existing',
       prompt: 'Send the exact approved fixture once and never replay an uncertain crossing.',
@@ -2081,7 +2149,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       label,
       expected: 'needs_user' as const,
       resumeScenario,
-      operation: 'FIXTURE_SEND_DRAFT',
+      operation: 'GOOGLEDOCS_FIXTURE_SEND_DRAFT',
       destinationFamily: 'fixture',
       destinationPosture: 'named_existing' as const,
       prompt: `${label}.`,
@@ -2106,7 +2174,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
     {
       label: 'ambiguous outbound signal repairs before I/O',
       expected: 'repair',
-      operation: 'FIXTURE_CREATE_DRAFT_AMBIGUOUS',
+      operation: 'GOOGLEDOCS_FIXTURE_CREATE_DRAFT_AMBIGUOUS',
       destinationFamily: 'fixture',
       prompt: 'Create one fixture draft named Release Ambiguous Fixture.',
       schema: {
@@ -2127,7 +2195,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       expected: 'needs_user',
       resumeScenario: 'reject',
       includeDestination: false,
-      operation: 'FIXTURE_SEND_DESTINATIONLESS',
+      operation: 'GOOGLEDOCS_FIXTURE_SEND_DESTINATIONLESS',
       destinationFamily: 'fixture',
       destinationPosture: 'named_existing',
       prompt: 'Send one exact fixture to the named recipient.',
@@ -2195,7 +2263,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       const schemaDigest = externalRiskLoader.canonicalExternalInputSchemaDigestV1(candidate.schema);
       assert.ok(schemaDigest, 'provider schema must have one canonical full digest');
       const operationVersion = '1';
-      const invokePortId = `journey:provider-neutral:${index}:invoke`;
+      const invokePortId = `port:cap:resolved:${candidate.operation.toLowerCase()}:${candidate.operation}`;
       // `null` is an explicit provider-owned absence of an output schema;
       // `undefined` would mean the output surface was never observed and may
       // not mint execution authority.
@@ -2276,7 +2344,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       const sourceSchemaDigest = candidate.source
         ? externalRiskLoader.canonicalExternalInputSchemaDigestV1(candidate.source.schema)
         : null;
-      const sourceInvokePortId = `journey:provider-neutral:${index}:source-invoke`;
+      const sourceInvokePortId = candidate.source ? `port:cap:resolved:${candidate.source.operation.toLowerCase()}:${candidate.source.operation}` : `unused-source-${index}`;
       const sourceDefinitionFingerprint = candidate.source
         ? composioProviderIdentity.fingerprintComposioProviderDefinition({
             operationId: candidate.source.operation,
@@ -2517,28 +2585,29 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           },
         ],
       });
+      const priorSemanticPort = semanticPorts.peekTurnSemanticModelPort();
+      semanticPorts.installTurnSemanticModelPort({
+        interpret: async () => { throw new Error('fixture forbids a hidden planning model'); },
+        judgeAccountSelection: currentSourceAccountReviewer({
+          sessionId: () => plannedSession.id,
+          acceptedText: candidate.prompt,
+          toolkit: candidate.operation.split('_')[0]!.toLowerCase(),
+          accountIdentity: accountId,
+          acceptedSource: (sessionId, seq) => eventlog.listEvents(sessionId, {
+            sinceSeq: seq - 1, types: ['user_input_received'], limit: 1,
+          }).find((event) => event.seq === seq),
+        }),
+      });
+      caseTest.after(() => semanticPorts.installTurnSemanticModelPort(priorSemanticPort));
       const primed = await semanticPlanning.primePrimaryModelPlanningCatalog({
         sessionId: plannedSession.id,
         sourceUserSeq: source.seq,
       });
       assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
       if (!primed.ok) return;
-      assert.ok(
-        primed.planning.capabilities.some((entry) => entry.id === capabilityRef),
-        'the exact current catalog capability must be citable before plan_task',
-      );
-      if (ordinarySiblingCapabilityRef) {
-        assert.equal(
-          primed.planning.capabilities.some((entry) => entry.id === ordinarySiblingCapabilityRef),
-          false,
-          'the local ordinary sibling must be disclosed by foreground tool_search',
-        );
-      }
-      if (sourceCapabilityRef) {
-        assert.ok(
-          primed.planning.capabilities.some((entry) => entry.id === sourceCapabilityRef),
-          'the exact source capability must be citable before plan_task',
-        );
+      for (const ref of [capabilityRef, sourceCapabilityRef, ordinarySiblingCapabilityRef].filter(Boolean)) {
+        assert.equal(primed.planning.capabilities.some((entry) => entry.id === ref), false,
+          'advisory resolution text cannot grant current capability authority before discovery');
       }
 
       let bodies = 0;
@@ -2638,6 +2707,8 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           : []),
       ]));
 
+      const planModelCall = 2;
+      const workModelCall = planModelCall + 1;
       let modelCalls = 0;
       const modelInputs: unknown[] = [];
       const model = {
@@ -2646,12 +2717,10 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           modelInputs.push(structuredClone(request));
           const serialized = JSON.stringify(request);
           let output: unknown[];
-          const planModelCall = ordinarySiblingLocalName ? 2 : 1;
-          const workModelCall = planModelCall + 1;
-          if (ordinarySiblingLocalName && modelCalls === 1) {
-            assert.doesNotMatch(serialized, new RegExp(ordinarySiblingCapabilityRef!));
-            output = [functionCall(`planned-external-local-search-${index}`, 'tool_search', {
-              query: ordinarySiblingLocalName,
+          if (modelCalls === 1) {
+            assert.doesNotMatch(serialized, new RegExp(capabilityRef));
+            output = [functionCall(`planned-external-search-${index}`, 'tool_search', {
+              query: [candidate.operation, candidate.source?.operation, ordinarySiblingLocalName].filter(Boolean).join(' '),
               role_key: 'clause-0:write',
               limit: 8,
             })];
@@ -2660,7 +2729,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
             if (ordinarySiblingCapabilityRef) {
               assert.match(serialized, new RegExp(ordinarySiblingCapabilityRef));
             }
-            output = [functionCall(`planned-external-plan-${index}`, 'plan_task', {
+            output = [planControlCall(`planned-external-plan-${index}`, {
               preamble: `I’ll create the requested ${candidate.label} now.`,
               draft: exactExternalCreatePlanDraft({
                 label: candidate.label,
@@ -2776,6 +2845,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
         sourceUserSeq: source.seq,
         hostFreshPlanning: primed.planning,
         allowedToolNames: [
+          'tool_search',
           candidate.operation,
           ...(ordinarySiblingLocalName ? [ordinarySiblingLocalName, 'tool_search'] : []),
           ...(candidate.source ? [candidate.source.operation] : []),
@@ -2994,8 +3064,8 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
       assert.equal(
         modelCalls,
         candidate.expected === 'needs_user'
-          ? ordinarySiblingOperationId ? 3 : 2
-          : candidate.source ? 4 : 3,
+          ? workModelCall
+          : candidate.source ? workModelCall + 2 : workModelCall + 1,
       );
       if (candidate.expected === 'needs_user') {
         assert.equal(outcome.finalOutput, undefined);
@@ -3185,7 +3255,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           assert.equal(recovery.phase, 'finalize');
           assert.equal(recovery.acceptedModelBatchRef?.sessionId, plannedSession.id);
           assert.equal(recovery.acceptedModelBatchRef?.sourceUserSeq, source.seq);
-          assert.equal(modelCalls, 2, 'the uncheckpointed result reaches no later model request');
+          assert.equal(modelCalls, workModelCall, 'the uncheckpointed result reaches no later model request');
           assert.equal(bodies, 1, 'the approved provider body crosses exactly once before recovery');
           assert.equal(writeBodies, 1);
           assert.equal(localBodies, 0);
@@ -3355,7 +3425,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           assert.equal(continuation.acceptedModelBatchRef?.batchId,
             recovery.acceptedModelBatchRef?.batchId);
           assert.equal(bodies, 1, 'finalize wake cannot redispatch the provider body');
-          assert.equal(modelCalls, 2, 'finalize wake cannot replay the model');
+          assert.equal(modelCalls, workModelCall, 'finalize wake cannot replay the model');
           assert.deepEqual(resumedDb.prepare(`
             SELECT
               (SELECT COUNT(*) FROM logical_model_result_projection_receipts
@@ -3377,7 +3447,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
             `${candidate.label} completed from its exact accepted plan.`);
           assert.equal(bodies, 1, 'terminal continuation cannot duplicate the approved send');
           assert.equal(writeBodies, 1);
-          assert.equal(modelCalls, 3, 'only the ordinary post-checkpoint continuation reaches the model');
+          assert.equal(modelCalls, workModelCall + 1, 'only the ordinary post-checkpoint continuation reaches the model');
           assert.equal(HarnessSession.load(plannedSession.id)?.loadRecoveryState(), null);
           assert.deepEqual(resumedDb.prepare(`
             SELECT logical_tool_call_id, state FROM physical_dispatches
@@ -3396,10 +3466,10 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           }).filter((event) => event.data.sourceUserSeq === source.seq).length, 0,
           'private bookkeeping emits no new user-visible approval/question event');
           assert.equal(functionResultIds(
-            (modelInputs[2] as { input?: unknown } | undefined)?.input,
+            (modelInputs[workModelCall] as { input?: unknown } | undefined)?.input,
           ).filter((callId) => callId === workCallId).length, 1,
           'the next model sees the exact result once');
-          assert.deepEqual(unmatchedFunctionCallIds(modelInputs[2]), []);
+          assert.deepEqual(unmatchedFunctionCallIds(modelInputs[workModelCall]), []);
           assert.doesNotMatch(JSON.stringify(completedWake), FORBIDDEN_PUBLIC_GATE);
           try {
             resumedDb.prepare(`
@@ -3421,14 +3491,14 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           assert.equal(surfaceRefreshFailures >= 1, true, 'resume refresh observes the vanished surface');
           assert.equal(resumed.terminal, undefined, 'surface loss is paired for ordinary model replan');
           assert.equal(resumed.finalOutput, `${candidate.label} completed from its exact accepted plan.`);
-          assert.equal(modelCalls, 3, 'the paired no-effect result reaches one ordinary replan step');
+          assert.equal(modelCalls, workModelCall + 1, 'the paired no-effect result reaches one ordinary replan step');
           assert.equal(bodies, 0, 'surface loss remains before provider I/O');
           assert.equal(writeBodies, 0);
           assert.equal(localBodies, 0);
           assert.deepEqual(resumedPhysical, [], 'surface loss creates no physical crossing');
           assert.ok(functionResultIds(resumed.history).includes(workCallId));
           assert.deepEqual(unmatchedFunctionCallIds({ input: resumed.history }), []);
-          const replanRequest = modelInputs[2] as { input?: unknown; tools?: unknown } | undefined;
+          const replanRequest = modelInputs[workModelCall] as { input?: unknown; tools?: unknown } | undefined;
           assert.ok(functionResultIds(replanRequest?.input).includes(workCallId));
           assert.deepEqual(unmatchedFunctionCallIds(replanRequest), []);
           assert.deepEqual(replanRequest?.tools, [], 'the replan step exposes an empty callable surface');
@@ -3444,7 +3514,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
             resultIds: functionResultIds(resumed.history),
           })}`);
           assert.deepEqual(resumed.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' });
-          assert.equal(modelCalls, 2, 'an unknown crossing cannot advance to another model step');
+          assert.equal(modelCalls, workModelCall, 'an unknown crossing cannot advance to another model step');
           assert.equal(bodies, 1, 'the exact approved provider body starts once');
           assert.equal(writeBodies, 1);
           assert.equal(localBodies, 0);
@@ -3488,7 +3558,7 @@ test('exact accepted external plans execute ordinary Sheet and Google Doc create
           assert.deepEqual(replayed.terminal, { status: 'blocked', reason: 'tool_effect_uncertain' });
           assert.equal(bodies, 1, 'restart replay cannot redispatch an unknown write');
           assert.equal(writeBodies, 1);
-          assert.equal(modelCalls, 2);
+          assert.equal(modelCalls, workModelCall);
           assert.ok(functionResultIds(replayed.history).includes(workCallId));
           assert.deepEqual(unmatchedFunctionCallIds({ input: replayed.history }), []);
 
