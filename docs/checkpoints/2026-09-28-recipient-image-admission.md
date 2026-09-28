@@ -27,3 +27,22 @@ No tag/main merge here. Native shell/signature stays unchanged for a runtime-onl
 Candidate 2d4b411a4 served fingerprint 13f4ecb13e1871d8879481d6c352441ad54c9741916f4a92e667f79fc77bbdb0. Recipient test sess-desktop-abc0a381b82f60ab3cc4b7df visibly rendered “DM with Adam ... (email) · scorpion slack” beside the exact channel. One send card, zero sends; controlled apr-r4y3 rejected afterward. Original business approvals untouched.
 Image test sess-desktop-6247f7effc0a717f4b112889 entered the model but correctly reported unavailable vision: view_image existed only in the MCP server registration, absent from the local runtime and tool registry. This is NOT an image acceptance pass.
 Moved that same attachment-only pixel reader to one shared registration used by MCP and local runtime; declared it as a read in the canonical tool registry. No OCR/model fallback/provider switching, no broadened file permissions. Structured image content remains structured through the existing media adapter. Pins exercise actual local invocation, pixel preservation and outside-path refusal, alongside MCP and registry parity. Subsequent installed image evidence is required.
+
+## Provider-wire image loss found by installed acceptance
+
+The d73b2f447 installed run `sess-desktop-bea866750e92d47dae7a0825`
+(source 323753) correctly admitted the attachment and executed `view_image`,
+but failed transcription. Six identical reads plus one text read ended blocked.
+The SDK Chat Completions converter keeps only `input_text` in function outputs,
+silently dropping `input_image`. Host-level structured-result pins were not
+sufficient: the loss happened after that boundary.
+
+The BYO transport now projects tool images into a labeled user media message
+AFTER adjacent tool results, where the Chat Completions wire supports them.
+Canonical host history, exact settlements, consent and receipts remain intact.
+Text-only requests retain their input unchanged. Tests drive the actual SDK
+converter through both response and streaming paths and check exact pixel
+payload, tool pairing, no duplicated bytes, and no mutation of canonical input.
+78 provider/media tests passed; installed image transcription must still pass
+before declaring image understanding accepted. No business calendar writes are
+part of the controlled acceptance.

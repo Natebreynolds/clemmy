@@ -35,6 +35,7 @@ import { createHash } from 'node:crypto';
 import { OpenAIChatCompletionsModel } from '@openai/agents-openai';
 import type { Model } from '@openai/agents-core';
 import { withTracelessStep } from './traceless-step-model.js';
+import { withChatToolImages } from './chat-tool-images.js';
 import type { ByoBackendConfig } from '../../config.js';
 import { getRuntimeEnv } from '../../config.js';
 import { repairToParseableJson, isParseableJson, conformsToJsonSchemaShape } from './json-repair.js';
@@ -1327,9 +1328,9 @@ export function getByoModel(modelId: string, byo: ByoBackendConfig): Model {
     logger.info({ baseURL: byo.baseURL, provider: byo.providerLabel || 'custom' }, 'BYO model backend initialized');
   }
 
-  let model: Model = withTracelessStep(
+  let model: Model = withChatToolImages(withTracelessStep(
     new OpenAIChatCompletionsModel(client as unknown as ConstructorParameters<typeof OpenAIChatCompletionsModel>[0], modelId),
-  );
+  ));
   // Parity layer: the same provider-agnostic resilience the Claude path gets —
   // transparent retry on transient 429/5xx/transport blips + empty-completion
   // invariant. (BYO already lifts reasoning + repairs JSON at the client layer;
