@@ -112,9 +112,10 @@ export const PlanPublicationInputSchema = z.object({
   structured_plan: PlanPublicationOutlineSchema.optional(),
   readiness: z.enum(['ready', 'needs_input']).default('ready'),
   missing_prerequisites: z.array(z.string().min(1)).default([]),
-  base_ref_json: jsonObjectArgument().nullable().default(null).describe('Exact prior {planId,revision,digest} for a revision. With full_text and structured_plan omitted, reuse that ready plan unchanged and run fresh preparation/review; no need to retransmit it.'),
+  base_ref_json: jsonObjectArgument().nullable().default(null).describe('Exact prior {planId,revision,digest} for a revision. Pair with step_patches to correct existing steps without retransmitting unchanged steps. Omitted text and criteria are retained. Every revision receives fresh preparation/review.'),
   draft_digest: z.string().length(64).optional().describe('Repair only: copy the exact digest returned by a failed preparation. Omit this field entirely for a new full plan; never invent a digest. Requires step_patches.'),
-  step_patches: z.array(stepPatchSchema).min(1).optional().describe('Repair only: [{step_id, changes}] for existing steps, paired with the returned draft_digest. Put every changed step field inside changes. Omitted steps and full_text are retained. To add, remove or reorder steps, submit the complete structured_plan and full_text without draft_digest or step_patches.'),
+  step_patches: z.array(stepPatchSchema).min(1).optional().describe('[{step_id, changes}] for existing steps, paired with either a failed draft_digest or an exact saved base_ref_json. Put every changed step field inside changes. Omitted steps and full_text are retained. To add, remove or reorder steps, submit the complete structured_plan and full_text without draft_digest or step_patches.'),
+  success_criteria: PlanPreparationSchema.shape.successCriteria.optional().describe('Complete replacement criteria for a retained draft repair or saved plan revision. Omit to keep the existing criteria; for a full outline use structured_plan.successCriteria.'),
 }).strict();
 
 class RetainedPlanPreparationError extends Error {
@@ -152,7 +153,7 @@ export function applyPlanDraftPatches(draft: { fullText: string; structuredPlan:
     if (staticArgumentsJson !== undefined) step.staticArguments = JSON.parse(staticArgumentsJson);
   }
   return { fullText: args.full_text ?? draft.fullText, baseRefJson: draft.base ? JSON.stringify(draft.base) : null,
-    raw: { steps, successCriteria: outline.successCriteria, subagents: outline.subagents } };
+    raw: { steps, successCriteria: args.success_criteria ?? outline.successCriteria, subagents: outline.subagents } };
 }
 
 function issueDetails(error: z.ZodError) {
@@ -521,7 +522,7 @@ export function deriveExecutionDraft(
 export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
   return tool({
     name: 'publish_plan',
-    description: 'Publish the investigated plan for user review without executing it. For a ready plan supply full_text and structured_plan. If a user decision is missing, publish the partial plan and specific question in full_text with readiness needs_input; structured_plan may be omitted until the answer makes preparation useful. Do not invent bindings or a full graph merely to ask a question. Each executable step needs id, action, verification and, for a tool, its discovered capabilityRef plus staticArguments as an ordinary JSON object. The host derives tool effects, accounts, schemas, the execution graph and evidence contract. Omit unused lists and nulls. Assign subagents in either the steps or the role stepIds; do not repeat both. Use compute for synthesis and describe any conditional read-only investigation in its action; Execute can follow those sources before plan_step_result records the actual output. Graph dependencies require successful results, so a lookup allowed to fail or be absent belongs in that investigation method, not in mandatory dependencies. Indispensable reads remain required graph steps. Dynamic bindings use settled producer values; an empty outputPath passes the whole retained inner tool value, without a carrier wrapper. For text this is the string itself, not an object with output or content fields. For repeated work use forEach with known items or a reviewed read producerStepId, a memberIdPath and item-to-argument bindings. A repeated producer returns records {memberId,result}; a repeated consumer preserves /memberId and binds values under /result. For interpretation or reshaping, use a compute step and bind its output into the next tool input or batch array. Execute each member with the step requirement_id and that member’s universe_item_id; universe_selector can be omitted. Unresolved owner decisions use readiness needs_input. After a preparation failure, use the returned draft_digest and step_patches to correct only affected steps. base_ref_json selects an exact prior {planId,revision,digest} only for an explicit revision. Execute selects the complete saved artifact.',
+    description: 'Publish the investigated plan for user review without executing it. For a ready plan supply full_text and structured_plan. If a user decision is missing, publish the partial plan and specific question in full_text with readiness needs_input; structured_plan may be omitted until the answer makes preparation useful. Do not invent bindings or a full graph merely to ask a question. Each executable step needs id, action, verification and, for a tool, its discovered capabilityRef plus staticArguments as an ordinary JSON object. The host derives tool effects, accounts, schemas, the execution graph and evidence contract. Omit unused lists and nulls. Assign subagents in either the steps or the role stepIds; do not repeat both. Use compute for synthesis and describe any conditional read-only investigation in its action; Execute can follow those sources before plan_step_result records the actual output. Graph dependencies require successful results, so a lookup allowed to fail or be absent belongs in that investigation method, not in mandatory dependencies. Indispensable reads remain required graph steps. Dynamic bindings use settled producer values; an empty outputPath passes the whole retained inner tool value, without a carrier wrapper. For text this is the string itself, not an object with output or content fields. For repeated work use forEach with known items or a reviewed read producerStepId, a memberIdPath and item-to-argument bindings. A repeated producer returns records {memberId,result}; a repeated consumer preserves /memberId and binds values under /result. For interpretation or reshaping, use a compute step and bind its output into the next tool input or batch array. Execute each member with the step requirement_id and that member’s universe_item_id; universe_selector can be omitted. Unresolved owner decisions use readiness needs_input. After a preparation failure, use the returned draft_digest and step_patches to correct only affected steps. For a saved plan correction, pair base_ref_json with step_patches and, if needed, full_text or success_criteria; unchanged steps are retained and the complete revised plan is freshly prepared and reviewed. base_ref_json selects an exact prior {planId,revision,digest} only for an explicit revision. Execute selects the complete saved artifact.',
     parameters: z.toJSONSchema(PlanPublicationInputSchema, { unrepresentable: 'any', io: 'input' }) as any,
     strict: false,
     errorFunction: (_context, error) => publicationError(error),
@@ -547,23 +548,25 @@ export function buildPublishPlanTool(planning?: HostFreshPlanningContextV1) {
       const fullSubmission = Boolean(args.full_text && args.structured_plan);
       // A revision reference given as an object is serialized once here.
       const baseRefText = jsonArgumentText(args.base_ref_json) ?? null;
-      if (!fullSubmission && (args.draft_digest || args.step_patches)) {
+      if (args.success_criteria && (args.structured_plan || (!args.draft_digest && !baseRefText))) {
+        throw new Error('success_criteria replaces criteria only in a retained draft repair or saved plan revision. For a full outline use structured_plan.successCriteria.');
+      }
+      if (!fullSubmission && (args.draft_digest || (args.step_patches && !baseRefText))) {
         if (!args.draft_digest) throw new Error('Draft repair requires the exact draft_digest returned with the retained draft.');
         draft = applyPlanDraftPatches(loadRetainedPlanDraft({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: args.draft_digest }),
           { ...args, structured_plan: undefined, step_patches: args.step_patches ?? [] });
-      } else if (baseRefText && !args.full_text && !args.structured_plan) {
+      } else if (baseRefText && !args.structured_plan) {
         const prior = getPlanRevision({ sessionId: context.sessionId, principalId: source.principalId,
           ref: parsePlanRevisionRef(JSON.parse(baseRefText)) });
         if (prior.readiness !== 'ready' || prior.missingPrerequisites.length || !prior.structuredPlan) {
-          throw new Error('Only a ready plan without unresolved prerequisites can be reused unchanged.');
+          throw new Error('Only a ready plan without unresolved prerequisites can be reused or patched by reference.');
         }
         const refreshed = await refreshRetainedPlanPreparation(prior);
         assertActive();
         if (planning) await attachReviewedPlanPreparation(planning, refreshed.checked);
-        draft = { fullText: prior.fullText, baseRefJson: baseRefText, raw: {
-          steps: refreshed.artifact.structuredPlan!.steps, successCriteria: prior.structuredPlan.successCriteria,
-          subagents: prior.structuredPlan.subagents,
-        } };
+        draft = applyPlanDraftPatches({ fullText: prior.fullText,
+          structuredPlan: refreshed.artifact.structuredPlan!, base: JSON.parse(baseRefText) },
+          { ...args, base_ref_json: null });
       } else {
         if (!args.full_text || (!args.structured_plan && args.readiness !== 'needs_input')) throw new Error('A ready plan requires full_text and structured_plan. For an unresolved user question, publish full_text with readiness needs_input; the executable outline can wait.');
         const completedIds = args.structured_plan ? completedPlanStepIds(args.structured_plan) : [];

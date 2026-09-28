@@ -11378,6 +11378,7 @@ for (const variant of ['positive', 'correction', 'disabled', 'unavailable', 'tim
     assert.equal(options?.reviewsPlan, true, 'the reviewer is told it reviews a plan, so no completion reading of results sends it back');
     assert.equal(options?.reviewStakes, 'plan', 'a plan gets a fast review, confirmed at full depth before any send-back');
     assert.match(options?.toolCallSummary ?? '', /preparedBindings/);
+    assert.ok(!options?.toolCallSummary?.includes('"fullText":"Compare the evidence."'), 'the complete plan prose is already the reviewed reply; do not send it twice');
     assert.match(options?.toolCallSummary ?? '', /structuredPlan.steps is the complete reviewed graph/);
     assert.match(options?.toolCallSummary ?? '', /executionDraft is a host-derived tool-only projection/);
     // Plan validates what it will call: probes are preparation, an unexercised

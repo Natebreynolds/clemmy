@@ -154,6 +154,7 @@ export function Chat() {
       // index must not bounce straight back into the thread being left.
       rememberLastChatSession(null);
       stickRef.current = true;
+      composerRef.current?.focus();
     }
   }, [location.state, resetChat]);
 

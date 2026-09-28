@@ -46,7 +46,7 @@ export function ChatScreen() {
 
   // Selecting a conversation from the mobile overlay should reveal it
   // immediately; the rail must not remain over the newly opened thread.
-  useEffect(() => { setMobileOpen(false); }, [location.pathname]);
+  useEffect(() => { setMobileOpen(false); }, [location.key]);
   const closeMobileHistory = useCallback(() => {
     setMobileOpen(false);
     window.requestAnimationFrame(() => mobileHistoryButtonRef.current?.focus());

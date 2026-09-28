@@ -924,6 +924,37 @@ function compactSelectedSchema(value: unknown): unknown {
   return compact;
 }
 
+/** Reinvest spare page space in complete nested argument instructions. Arrays,
+ * unions and named schema maps are schema structure; enum/const values are
+ * instance data and must never be edited as annotations. The lossless handle
+ * and schema_read_required remain authoritative when any annotations yield. */
+function restoreNestedSchemaInstructions(original: unknown, compact: unknown, fits: () => boolean): void {
+  if (Array.isArray(original) && Array.isArray(compact)) {
+    original.forEach((value, index) => restoreNestedSchemaInstructions(value, compact[index], fits));
+    return;
+  }
+  if (!original || typeof original !== 'object' || Array.isArray(original)
+    || !compact || typeof compact !== 'object' || Array.isArray(compact)) return;
+  const source = original as Record<string, unknown>;
+  const target = compact as Record<string, unknown>;
+  const added = ['description', 'examples'].filter(key => (
+    Object.prototype.hasOwnProperty.call(source, key) && !Object.prototype.hasOwnProperty.call(target, key)
+  ));
+  for (const key of added) target[key] = source[key];
+  if (added.length && !fits()) for (const key of added) delete target[key];
+  for (const [key, value] of Object.entries(source)) {
+    if (JSON_SCHEMA_ANNOTATION_KEYS.has(key) || JSON_SCHEMA_INSTANCE_VALUE_KEYS.has(key)) continue;
+    if (JSON_SCHEMA_NAMED_MAP_KEYS.has(key) && value && typeof value === 'object' && !Array.isArray(value)) {
+      const map = target[key];
+      if (map && typeof map === 'object' && !Array.isArray(map)) {
+        for (const [name, child] of Object.entries(value)) {
+          restoreNestedSchemaInstructions(child, (map as Record<string, unknown>)[name], fits);
+        }
+      }
+    } else restoreNestedSchemaInstructions(value, target[key], fits);
+  }
+}
+
 /** Lazily-built, memoized name → schema/instructions map. Dynamic-imported so
  * this module (which the runtime tool registry imports) never forms an
  * eval-time import cycle. */
@@ -2102,13 +2133,24 @@ export function registerToolSearchTool(
               sessionId: continuationSessionId,
             })
           : null;
+        const primarySchemaName = selectedExactly?.name
+          ?? schemaNames.find((name) => schemas[name] !== undefined);
+        let compactSecondaryProse = false;
         const render = (): string => JSON.stringify({
           query,
           ...(role_key ? { role_key } : {}),
           page,
           page_count: pageCount,
           total_results: deferredPage?.totalResults ?? rankedWindow.length,
-          results: rows.map(publicResult),
+          results: rows.map(row => {
+            const result = publicResult(row);
+            if (!compactSecondaryProse || row.name === primarySchemaName) return result;
+            // Names, carrier, invocation, effect, exact authority and account
+            // choices remain intact. Repeated prose/examples yield before the
+            // selected operation's executable argument instructions.
+            const { summary: _summary, example: _example, ...contract } = result;
+            return contract;
+          }),
           ...(rows.some((row) => planningRefs[row.name]) ? {
             planning_arguments_hint: 'For publish_plan, staticArgumentsJson contains only the selected tool\'s direct input fields matching its schema (inline or reopened). The invocation/example wrapper is for execution, never inside staticArgumentsJson.',
           } : {}),
@@ -2136,8 +2178,6 @@ export function registerToolSearchTool(
         // current result. Exact selection takes precedence; broad discovery
         // must not evict its leading native/provider contract merely to keep
         // lower-ranked previews. Authority and the output ceiling are unchanged.
-        const primarySchemaName = selectedExactly?.name
-          ?? schemaNames.find((name) => schemas[name] !== undefined);
         const shownSchemaNames = [...schemaNames]
           .filter((name) => name !== primarySchemaName);
         while (text.length > DEFAULT_TOOL_RESULT_MAX_CHARS && shownSchemaNames.length > 0) {
@@ -2152,11 +2192,22 @@ export function registerToolSearchTool(
           && primarySchemaName
           && schemas[primarySchemaName] !== undefined
         ) {
+          compactSecondaryProse = true;
+          text = render();
+        }
+        if (
+          text.length > DEFAULT_TOOL_RESULT_MAX_CHARS
+          && primarySchemaName
+          && schemas[primarySchemaName] !== undefined
+        ) {
           // Preserve direct argument instructions/examples in the structural
           // preview, and retain the complete original behind its exact handle.
           ensureSchemaHandle(primarySchemaName);
-          schemas[primarySchemaName] = compactSelectedSchema(schemas[primarySchemaName]);
+          const original = schemas[primarySchemaName];
+          schemas[primarySchemaName] = compactSelectedSchema(original);
           schemaReadRequired.add(primarySchemaName);
+          restoreNestedSchemaInstructions(original, schemas[primarySchemaName],
+            () => render().length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
           text = render();
         }
         // Guidance is useful but is not an argument contract. If an unusually

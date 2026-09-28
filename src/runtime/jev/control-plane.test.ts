@@ -521,6 +521,10 @@ test('decideTurnStartWithJev asks both turn-start questions in one request', asy
   assert.equal(routed.route.pick?.id, 'space_preview');
   assert.equal(routed.failedOpen, false);
 
+  const longRequest = 'Show the workspace. '.repeat(180) + '\nCorrection: preview only; do not save or send anything.';
+  await decideTurnStartWithJev(longRequest, runs, operations, { timeoutMs: 1_000 });
+  assert.equal(posted.at(-1)!.state.request, longRequest, 'late corrections and their exact boundaries must reach the routing decision');
+
   which = 'strat-build';
   const remembered = await decideTurnStartWithJev('Show me the brief space', runs, operations, { timeoutMs: 1_000 });
   assert.equal(remembered.strategy?.id, 'strat-build', 'a fitting remembered run wins');

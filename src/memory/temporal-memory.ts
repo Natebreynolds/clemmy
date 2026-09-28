@@ -34,6 +34,7 @@ export interface MemoryEpisodeInput {
 
 export interface FactEvidence {
   episodeId: string;
+  sourceKind: MemoryEpisodeKind;
   excerpt: string;
   sourceUri?: string;
   occurredAt: string;
@@ -315,16 +316,17 @@ export function captureFactEvidence(input: {
 
 export function getFactEvidence(factId: number): FactEvidence[] {
   const rows = openMemoryDb().prepare(`
-    SELECT fe.episode_id, fe.excerpt, fe.source_uri, me.occurred_at, me.status
+    SELECT fe.episode_id, fe.excerpt, fe.source_uri, me.kind, me.occurred_at, me.status
     FROM fact_evidence fe
     JOIN memory_episodes me ON me.id = fe.episode_id
     WHERE fe.fact_id = ?
     ORDER BY me.occurred_at DESC, fe.ordinal ASC
   `).all(factId) as Array<{
-    episode_id: string; excerpt: string; source_uri: string | null; occurred_at: string; status: MemoryEpisodeStatus;
+    episode_id: string; excerpt: string; source_uri: string | null; kind: MemoryEpisodeKind; occurred_at: string; status: MemoryEpisodeStatus;
   }>;
   return rows.map((row) => ({
     episodeId: row.episode_id,
+    sourceKind: row.kind,
     excerpt: row.excerpt,
     sourceUri: row.source_uri ?? undefined,
     occurredAt: row.occurred_at,

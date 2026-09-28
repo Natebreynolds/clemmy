@@ -331,6 +331,57 @@ test('a minimal object-based plan repairs one retained step after SQLite reopen 
   assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0);
 });
 
+test('a saved ready plan accepts a bounded correction with fresh preparation and review after reopen', async () => {
+  const f = await fixture('write_file');
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const { withPlanCompletionReview } = await import('../runtime/harness/plan-publication-review.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  const destination = path.join(home, 'corrected.txt');
+  const prepared = await publisher.preparePlanOutline({ ...f, ready: true, raw: {
+    steps: [
+      { id: 'write', action: 'Save the chosen color', capabilityRef: f.capabilityRef,
+        staticArguments: { path: destination, content: 'BLUE\n' }, verification: 'Exact bytes saved' },
+      { id: 'report', action: 'Report the write receipt', dependsOn: ['write'],
+        dynamicBindings: [{ producerStepId: 'write', outputPath: '', targetPath: '/receipt' }], verification: 'Receipt cited' },
+    ], successCriteria: ['BLUE saved and its receipt reported'],
+  } });
+  const prior = plans.publishPlanRevision({ ...f, principalId: f.sessionId, fullText: 'Save BLUE and report the receipt.', structuredPlan: prepared, readiness: 'ready' });
+  const base = { planId: prior.planId, revision: prior.revision, digest: prior.digest };
+  log.closeEventLog();
+  const source = log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Change BLUE to GREEN. Keep the rest.', taskMode: { version: 1, kind: 'plan' } } });
+  const identity = { sessionId: f.sessionId, sourceUserSeq: source.seq };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok); if (!primed.ok) return;
+  const candidates: any[] = [];
+  const invoke = async (args: unknown) => JSON.parse(String(await withHarnessRunContext(identity,
+    () => withPlanCompletionReview(async candidate => { candidates.push(candidate); return 'done'; },
+      () => publisher.buildPublishPlanTool(primed.planning).invoke(new RunContext(), JSON.stringify(args))))));
+  const patch = { base_ref_json: base, full_text: 'Save GREEN and report the receipt.',
+    success_criteria: ['GREEN saved and its receipt reported'],
+    step_patches: [{ step_id: 'write', changes: { staticArguments: { path: destination, content: 'GREEN\n' } } }] };
+  const badRef = await invoke({ ...patch, base_ref_json: { ...base, digest: '0'.repeat(64) } });
+  assert.equal(badRef.code, 'plan_preparation_failed');
+  assert.equal(candidates.length, 0, 'a mismatched revision never reaches review');
+  const invalid = await invoke({ ...patch, step_patches: [{ step_id: 'write', changes: { staticArguments: { path: destination, content: 42 } } }] });
+  assert.equal(invalid.published, false);
+  assert.match(invalid.message, /content/);
+  assert.equal(candidates.length, 0, 'prior preparation cannot certify changed arguments');
+  const done = await invoke(patch);
+  assert.equal(done.ok, true, JSON.stringify(done));
+  assert.equal(done.planArtifactRef.planId, prior.planId);
+  assert.equal(done.planArtifactRef.revision, prior.revision + 1);
+  assert.notEqual(done.planArtifactRef.digest, prior.digest);
+  const artifact = plans.getPlanRevisionForSource({ ...identity, principalId: f.sessionId })!;
+  assert.equal(artifact.fullText, patch.full_text);
+  assert.deepEqual(artifact.structuredPlan!.steps[1], prepared.steps[1], 'bindings and dependencies of untouched steps survive');
+  assert.deepEqual(artifact.structuredPlan!.successCriteria, patch.success_criteria);
+  assert.equal((artifact.structuredPlan!.steps[0] as any).staticArguments.content, 'GREEN\n');
+  assert.equal(candidates.length, 1, 'the corrected graph receives its own review');
+  assert.deepEqual(candidates[0].structuredPlan, artifact.structuredPlan);
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0, 'correction does not execute the plan');
+});
+
 test('more than 32 distinct prepared steps do not require splitting the owner task', async () => {
   const f = await fixture('write_file');
   const steps = Array.from({ length: 40 }, (_, i) => ({ id: `file_${i}`, action: `Save file ${i}`, verification: 'Exact file contents',

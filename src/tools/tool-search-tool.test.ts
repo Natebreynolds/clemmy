@@ -729,6 +729,43 @@ test('a genuinely oversized first-ranked schema remains complete behind its hand
   assert.deepEqual(await redeemSchema(t.handler, 'primary oversized', body, name), schema);
 });
 
+test('bounded discovery preserves nested executable instructions before secondary prose', async () => {
+  const name = 'NESTED_CONTRACT_CREATE';
+  const instruction = 'Exact JSON text with version and expression fields; source code is not accepted.';
+  const schema = {
+    type: 'object', required: ['steps'], additionalProperties: false,
+    properties: { steps: { type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        payload: { anyOf: [{ type: 'string' }, { type: 'null' }],
+          description: instruction, examples: ['{"version":1,"expression":{"op":"count"}}'] },
+        background: { type: 'string', description: 'Optional reference background. '.repeat(2_000) },
+        literal: { const: { description: 'literal data', examples: ['not annotations'] } },
+      },
+    } } },
+  };
+  const t = captureToolSearch(new Set(['tool_search']), false, [{
+    kind: 'authorized_composio', async search() { return [
+      { name, schema, summary: 'Nested contract create', carrier: 'work_call' as const },
+      { name: 'SECONDARY_NESTED_CONTRACT', schema: { type: 'object' },
+        summary: 'Secondary option. '.repeat(30), carrier: 'work_call' as const },
+    ]; },
+  }]);
+  const raw = await t.handler({ query: 'nested contract create', limit: 8 });
+  const body = JSON.parse(raw.content[0].text);
+  assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+  const payload = body.schemas[name]?.properties.steps.items.properties.payload;
+  assert.equal(payload?.description, instruction, 'a nested string must retain its executable format');
+  assert.deepEqual(payload.examples, schema.properties.steps.items.properties.payload.examples);
+  assert.deepEqual(body.schemas[name].properties.steps.items.properties.literal.const,
+    schema.properties.steps.items.properties.literal.const);
+  assert.deepEqual(body.results.slice(0, 2).map((row: { name: string }) => row.name), [name, 'SECONDARY_NESTED_CONTRACT']);
+  assert.ok(body.schema_read_required.includes(name), 'the remaining omitted annotations are still explicit');
+  assert.deepEqual(await redeemSchema(t.handler, 'nested contract create', {
+    schemas: {}, schema_handles: body.schema_handles,
+  }, name), schema, 'full instructions remain losslessly available');
+});
+
 test('a selected schema object fits one redemption without escaping-driven model round trips', async () => {
   const sessionId = 'whole-schema-owner';
   const otherSessionId = 'whole-schema-other';
@@ -1053,7 +1090,8 @@ test('compact oversized schema keeps real properties whose names match annotatio
   assert.ok(compact.properties.payload.properties.description);
   assert.equal(compact.description, undefined, 'the schema-node annotation is removed');
   assert.equal(compact.properties.description.description, schema.properties.description.description, 'direct argument instructions survive selected-schema compaction');
-  assert.equal(compact.properties.payload.properties.description.description, undefined, 'deeper annotations remain compacted and losslessly addressable');
+  assert.equal(compact.properties.payload.properties.description.description, schema.properties.payload.properties.description.description, 'nested argument instructions use remaining page space');
+  assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
   assert.equal(compact.properties.title.title, undefined, 'title annotations are removed without deleting the title field');
   assert.equal(compact.properties.default.default, undefined, 'default annotations are removed without deleting the default field');
   assert.deepEqual(compact.properties.payload.const, {
@@ -1626,6 +1664,30 @@ test('workflow input encoding instructions remain in the actual selected schema 
   }
 });
 
+
+test('broad native workflow discovery retains the nested transform contract inside its fixed page budget', async () => {
+  const local = await import('../runtime/harness/local-planning-capability.js');
+  const { getCoreTools } = await import('./registry.js');
+  let handler!: Handler;
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+    allowedNames: new Set(getCoreTools().map(tool => tool.name)),
+    dispatchCarrierForName: () => 'work_call',
+    async discloseForPlanning(candidates) {
+      return Object.fromEntries(candidates.flatMap(candidate => {
+        const definitions = local.inspectAuthorizedLocalPlanningDisclosureCandidates(candidate);
+        return definitions?.length ? [[candidate.name, definitions[0]!.capabilityRef]] : [];
+      }));
+    },
+  });
+  const raw = await handler({ query: 'create a new manual workflow with a deterministic transform step and enable it', limit: 8 });
+  const body = JSON.parse(raw.content[0].text);
+  assert.equal(body.results[0].name, 'workflow_create');
+  assert.equal(body.results.length, 8, 'secondary operations remain discoverable');
+  assert.match(body.schemas.workflow_create.properties.steps.items.properties.transform.description, /JSON/);
+  assert.match(body.schemas.workflow_create.properties.steps.items.properties.transform.description, /expression/);
+  assert.ok(raw.content[0].text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
+  assert.equal(body.results[0].capabilityRef, 'cap:local:workflow_create:reversible');
+});
 
 test('ambiguous unified discovery uses Jev before selecting schemas, with exact-name and outage fallback', async () => {
   const { _setTypesafeKeyForTests, _setSystemOneFetchForTests } = await import('../runtime/jev/client.js');

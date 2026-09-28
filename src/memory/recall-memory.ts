@@ -48,7 +48,7 @@ export interface MemoryEvidenceHit {
   confidence: number;
   validFrom?: string;
   validTo?: string;
-  evidence: Array<{ episodeId: string; excerpt: string; sourceUri?: string }>;
+  evidence: Array<{ episodeId: string; excerpt: string; sourceUri?: string; sourceKind?: string; occurredAt?: string }>;
   whyRecalled: string[];
 }
 
@@ -277,6 +277,8 @@ function factHit(fact: ConsolidatedFact, score: number, why: string[]): MemoryEv
         episodeId: item.episodeId,
         excerpt: item.excerpt,
         sourceUri: item.sourceUri,
+        sourceKind: item.sourceKind,
+        occurredAt: item.occurredAt,
       })),
     whyRecalled: why,
   };
@@ -712,7 +714,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
       hit.whyRecalled = [
         semanticScore > 0 ? `semantic similarity ${semanticScore.toFixed(2)}` : '',
         lexicalScore > 0 ? `lexical relevance ${lexicalScore.toFixed(2)}` : '',
-        hit.evidence.length > 0 ? 'source-backed' : '',
+        hit.evidence.length > 0 ? 'retained source link; not independent verification' : '',
       ].filter(Boolean);
       if (wanted.has('fact')) mergeHit(merged, hit);
     }

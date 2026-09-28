@@ -44,6 +44,19 @@ test('every new direct fact receives durable, exact evidence', () => {
   assert.equal(evidence[0].status, 'available');
 });
 
+test('recall preserves the origin and time of a saved claim without upgrading its source link to verification', async () => {
+  const fact = rememberFact({ kind: 'user', content: 'The preferred reference color is ultramarine.' });
+  const stored = getFactEvidence(fact.id);
+  assert.equal(stored[0].sourceKind, 'manual');
+  const recalled = await recallMemory('preferred reference color ultramarine', { stores: ['fact'], graphDepth: 0 });
+  const hit = recalled.hits.find(hit => hit.ref.type === 'fact' && hit.ref.id === String(fact.id));
+  assert.ok(hit);
+  assert.equal(hit.evidence[0].sourceKind, 'manual');
+  assert.equal(hit.evidence[0].occurredAt, stored[0].occurredAt);
+  assert.ok(hit.whyRecalled.includes('retained source link; not independent verification'));
+  assert.ok(!hit.whyRecalled.includes('source-backed'));
+});
+
 test('derived fact evidence survives raw tool-output expiry', () => {
   const session = createSession({ kind: 'chat' });
   const called = appendEvent({
@@ -76,6 +89,7 @@ test('derived fact evidence survives raw tool-output expiry', () => {
   });
   const beforeExpiry = getFactEvidence(fact.id);
   assert.equal(beforeExpiry.length, 1);
+  assert.equal(beforeExpiry[0].sourceKind, 'tool_result');
   assert.match(beforeExpiry[0].excerpt, /September 30/);
 
   openEventLog().prepare('DELETE FROM tool_outputs WHERE session_id = ? AND call_id = ?')

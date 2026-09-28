@@ -26,6 +26,7 @@ function lazyNamed<T extends Record<K, ComponentType>, K extends keyof T>(
 // It was statically imported here AND in Home.tsx, so it rode the main chunk on
 // every cold start.
 const HomeMock = lazyNamed(() => import('./screens/HomeMock'), 'HomeMock');
+const Chat = lazyNamed(() => import('./screens/Chat'), 'Chat');
 const Inbox = lazyNamed(() => import('./screens/Inbox'), 'Inbox');
 const BackgroundTasks = lazyNamed(() => import('./screens/BackgroundTasks'), 'BackgroundTasks');
 const Goals = lazyNamed(() => import('./screens/Goals'), 'Goals');
@@ -181,6 +182,16 @@ const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
 });
 
+/** Today remains the landing page. Explicit New chat and seeded chat links
+ * open the conversation composer, whose reset handler owns the new session. */
+function ChatIndex() {
+  const location = useLocation();
+  const newChat = (location.state as { newChat?: number } | null)?.newChat;
+  return newChat || new URLSearchParams(location.search).has('prompt')
+    ? deferred(<Chat key={newChat ?? 'seeded-chat'} />)
+    : <Home />;
+}
+
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
@@ -201,7 +212,7 @@ export function App() {
             <Route path="/made/:groupId" element={deferred(<MadeFolder />)} />
 
             <Route path="/chat" element={<ChatScreen />}>
-              <Route index element={<Home />} />
+              <Route index element={<ChatIndex />} />
               <Route path=":sessionId" element={<ConversationThread />} />
             </Route>
             <Route path="/inbox" element={deferred(<Inbox />)} />

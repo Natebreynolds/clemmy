@@ -26,7 +26,7 @@ export function prioritizeNamedEntityFacts(
     return {
       ...hit,
       score: hit.score + 0.4 * (1 - hit.score),
-      whyRecalled: [...new Set([...hit.whyRecalled, 'source-backed fact for explicitly named entity'])],
+      whyRecalled: [...new Set([...hit.whyRecalled, 'source-linked memory for explicitly named entity; not independent verification'])],
     };
   });
 }

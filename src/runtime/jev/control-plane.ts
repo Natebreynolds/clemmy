@@ -308,7 +308,10 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
     });
   }
   const result = await evaluateSystemOne({
-    state: { request: request.replace(/\s+/g, ' ').trim().slice(0, 3_000) },
+    // Route against the entire accepted request: a late correction or scope
+    // restriction can change the first operation. Transport failure preserves
+    // ordinary discovery; a silently truncated request must not narrow it.
+    state: { request },
     questions,
     timeoutMs: Math.min(PROVEN_STRATEGY_TIMEOUT_MS, opts.timeoutMs ?? PROVEN_STRATEGY_TIMEOUT_MS),
     sessionId: opts.sessionId,
