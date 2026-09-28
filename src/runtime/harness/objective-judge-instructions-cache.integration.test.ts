@@ -80,18 +80,23 @@ test('a Claude review without evidence tools is unchanged', async () => {
   assert.equal(requests[0]!.systemInstructions, JUDGE_SYSTEM_PROMPT);
 });
 
-test('a review effort reaches a Claude reviewer and no other provider', async () => {
-  const claude = capturingModel();
-  await runRoutedJudgeAttempt(route('claude', claude.model) as never, JUDGE_SYSTEM_PROMPT, prompt, parseCompletionVerdict, true, evidence, undefined, 'medium');
-  assert.equal(claude.requests[0]!.modelSettings?.reasoning?.effort, 'medium');
-  for (const family of ['codex', 'byo'] as const) {
-    const other = capturingModel();
-    await runRoutedJudgeAttempt(route(family, other.model) as never, JUDGE_SYSTEM_PROMPT, prompt, parseCompletionVerdict, true, evidence, undefined, 'medium');
-    assert.equal(other.requests[0]!.modelSettings?.reasoning?.effort, undefined, `${family} keeps its own default`);
+test('requested review effort reaches every reviewer; omitted effort preserves the provider default', async () => {
+  // Depth is a harness decision; only the transport adapter decides how an
+  // explicitly requested effort maps onto the model's declared wire support.
+  for (const family of ['claude', 'codex', 'byo'] as const) {
+    for (const evidenceSource of [evidence, undefined]) {
+      const requested = capturingModel();
+      await runRoutedJudgeAttempt(route(family, requested.model) as never, JUDGE_SYSTEM_PROMPT, prompt,
+        parseCompletionVerdict, true, evidenceSource, undefined, 'medium');
+      assert.equal(requested.requests[0]!.modelSettings?.reasoning?.effort, 'medium',
+        `${family} receives the requested review depth with or without evidence tools`);
+      const unset = capturingModel();
+      await runRoutedJudgeAttempt(route(family, unset.model) as never, JUDGE_SYSTEM_PROMPT, prompt,
+        parseCompletionVerdict, true, evidenceSource);
+      assert.equal(unset.requests[0]!.modelSettings?.reasoning?.effort, undefined,
+        `${family}: no effort asked, none sent`);
+    }
   }
-  const unset = capturingModel();
-  await runRoutedJudgeAttempt(route('claude', unset.model) as never, JUDGE_SYSTEM_PROMPT, prompt, parseCompletionVerdict, true, evidence);
-  assert.equal(unset.requests[0]!.modelSettings?.reasoning?.effort, undefined, 'no effort asked, none sent');
 });
 
 test('on the Anthropic wire the instructions are a cache point and no marker text is sent', async () => {

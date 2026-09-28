@@ -217,7 +217,7 @@ function workCall(callId: string, ref: string, query: string) {
  *  only when the request carries a callable ref for it that no tool result
  *  supplied in this turn; otherwise it searches for it. After a failed call it
  *  searches once, then retries with what the search disclosed. */
-function disclosureFollowingBrain(label: string, query: string) {
+function disclosureFollowingBrain(label: string, query: string, probeDeferredSkill = false) {
   const frames: Frame[] = [];
   let step = 0;
   const resultText = (input: unknown[], callId: string): string => {
@@ -252,7 +252,15 @@ function disclosureFollowingBrain(label: string, query: string) {
       } else if (called(`${label}-search`) && !called(`${label}-after-search`)) {
         const ref = REF_PATTERN.exec(resultText(input, `${label}-search`))?.[0];
         output = ref ? [workCall(`${label}-after-search`, ref, query)] : [assistantText('I could not reach that operation.')];
+      } else if (probeDeferredSkill && !called(`${label}-skill`)) {
+        assert.match(text, /skill_read/, 'the deferred reader remains named on the model surface');
+        output = [functionCall(`${label}-skill`, 'call_tool', {
+          name: 'skill_read', args_json: JSON.stringify({ name: 'familiar-fixture-missing-skill' }),
+        })];
       } else {
+        if (probeDeferredSkill) assert.match(resultText(input, `${label}-skill`),
+          /familiar-fixture-missing-skill.*is not installed/,
+          'the production skill reader answered; no discovery round or unavailable-tool refusal');
         output = [assistantText(`Done (${label}).`)];
       }
       return {
@@ -270,14 +278,14 @@ function disclosureFollowingBrain(label: string, query: string) {
   return model;
 }
 
-async function hostTurn(label: string, text: string, query: string) {
+async function hostTurn(label: string, text: string, query: string, probeDeferredSkill = false) {
   const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: label });
   const attempt = eventlog.beginRunAttempt(session.id, { runId: `familiar-${label}:${session.id}` });
   const accepted = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
     text, taskMode: { version: 1, kind: 'normal' },
   } }, { armRunInFlight: true });
   const identity = { sessionId: session.id, sourceUserSeq: accepted.seq };
-  const brain = disclosureFollowingBrain(label, query);
+  const brain = disclosureFollowingBrain(label, query, probeDeferredSkill);
   const result = await runConversation({ ...identity, input: text, reuseRecordedUserInput: true,
     runAttemptId: attempt.attemptId, turnEngine: 'host_v1', maxSteps: 1, maxTurns: 6, toolCallsPerTurn: 8, judgeCompletion: false,
     buildAgent: async (context) => buildOrchestratorAgent({ sessionId: context.sessionId,
@@ -316,18 +324,19 @@ test('the second time a familiar kind of question is asked, the learned operatio
   assert.equal(strategies.listMatchingRunStrategies(request, 4).length, 0,
     'the wording shares no keyword floor with the first request, so only a judgement of kind can connect them');
   const turnStartsBefore = turnStartRequests.length;
-  const second = await hostTurn('second', request, 'budget spreadsheet');
+  const second = await hostTurn('second', request, 'budget spreadsheet', true);
   assert.equal(turnStartRequests.length, turnStartsBefore + 1, 'one turn-start decision');
   assert.equal(second.selected?.pickedBy, 'jev', debug(second));
   assert.equal(second.selected?.skipDiscoverySearch, true, debug(second));
   assert.ok((second.selected?.capabilityRefs as string[] | undefined)?.some((ref) => REF_PATTERN.test(ref)), debug(second));
   assert.ok(second.frames[0]?.tools.includes('tool_search'), 'search stays on the surface as the way back');
   // A same-kind judgement says the operations do the core of the request, not
-  // all of it: the rest of the ordinary surface stays.
+  // all of it: the ordinary tools stay reachable, including deferred readers.
   assert.equal(second.selected?.narrowSurface, false, debug(second));
-  for (const kernel of ['read_file', 'skill_read', 'call_tool']) {
+  for (const kernel of ['read_file', 'call_tool']) {
     assert.ok(second.frames[0]?.tools.includes(kernel), `${kernel} stays on a same-kind bound surface: ${debug(second)}`);
   }
+  assert.ok(second.toolCalls.includes('skill_read'), 'same-kind binding retains actual deferred reader dispatch');
   assert.deepEqual(second.toolCalls.filter((name) => name === 'tool_search'), [], `zero tool_search: ${debug(second)}`);
   assert.equal(transportCalls, 2, 'the bound operation ran once, directly');
   assert.equal(second.result.status, 'completed', debug(second));

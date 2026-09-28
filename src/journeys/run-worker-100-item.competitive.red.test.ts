@@ -3,7 +3,7 @@
  *   node scripts/run-tests-isolated.mjs src/journeys/run-worker-100-item.competitive.red.test.ts
  *
  * Test-only competitive acceptance for one cold 100-item fan-out. The model,
- * connected catalog, provider, and Claude worker adapter are hermetic; all
+ * connected catalog, provider, and worker model responses are hermetic; all
  * planning, disclosure, capability materialization, host execution, worker
  * pooling, reduction, durable manifests, replay, and gateway denial are the
  * production implementations.
@@ -348,7 +348,7 @@ after(async () => {
 
 test('GATE: cold host plans once, fans 100 read-only workers, replays exactly once, and commits one ordered batch', {
   timeout: 180_000,
-}, async () => {
+}, async (t) => {
   eventlog.resetEventLog();
   workerConcurrency._resetWorkerConcurrencyForTest();
   resetHarnessRuntimeConfig();
@@ -580,6 +580,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
   const workerPrompts: string[] = [];
   const workerItems: string[] = [];
   let workerModelCrossings = 0;
+  let legacyWorkerCrossings = 0;
   let workerInflight = 0;
   let peakWorkerInflight = 0;
   let adversarialWriteAttempts = 0;
@@ -592,7 +593,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     const keys = [...prompt.matchAll(/<<<ITEM key="([^"]+)" BEGIN/g)].map((match) => match[1]!);
     return JSON.stringify({ perItem: keys.map((itemKey) => ({ itemKey, gist: `stable gist for ${itemKey}` })) });
   });
-  workerAdapter.setClaudeAgentSdkWorkerRunForTest(async (options) => {
+  const answerWorker = async (options: Record<string, unknown>) => {
     const rawOptions = options as unknown as Record<string, unknown>;
     assert.equal(rawOptions.workerScope, true, 'the real adapter marks every nested crossing worker-scoped');
     const prompt = String(rawOptions.prompt ?? '');
@@ -601,9 +602,10 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     const index = ITEMS.indexOf(item);
     assert.ok(index >= 0, `worker packet contains one canonical item: ${item}`);
     workerModelCrossings += 1;
+    if (typeof rawOptions.recordedHostWire !== 'string') legacyWorkerCrossings += 1;
     workerItems.push(item);
     workerPrompts.push(prompt);
-    workerWires.push(workerVisibleWire(rawOptions));
+    workerWires.push(typeof rawOptions.recordedHostWire === 'string' ? rawOptions.recordedHostWire : workerVisibleWire(rawOptions));
     workerInflight += 1;
     peakWorkerInflight = Math.max(peakWorkerInflight, workerInflight);
     try {
@@ -639,11 +641,33 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
         toolUses: [],
         model: 'claude-sonnet-4-6',
         sessionId: `worker-${index + 1}`,
-        usage: { input_tokens: Math.ceil(Buffer.byteLength(prompt, 'utf8') / 4), output_tokens: 1_100 },
+        usage: { input_tokens: Math.ceil(Buffer.byteLength(String(rawOptions.recordedHostWire ?? prompt), 'utf8') / 4), output_tokens: 1_100 },
       };
     } finally {
       workerInflight -= 1;
     }
+  };
+  workerAdapter.setClaudeAgentSdkWorkerRunForTest(options => answerWorker(options as unknown as Record<string, unknown>));
+  const { RouterModelProvider } = await import('../runtime/harness/router-model.js');
+  t.mock.method(RouterModelProvider.prototype, 'getModel', (modelId?: string) => {
+    assert.equal(modelId, 'claude-sonnet-4-6', 'the configured worker model owns the recorded crossing');
+    return {
+      async getResponse(request: any) {
+        const user = request.input.find((entry: any) => entry.role === 'user');
+        const prompt = typeof user?.content === 'string' ? user.content
+          : user?.content?.map((part: any) => part.text ?? '').join('');
+        assert.equal(typeof prompt, 'string');
+        const result = await answerWorker({ prompt,
+          workerScope: brackets.harnessRunContextStorage.getStore()?.workerScope,
+          recordedHostWire: ['TOOLS', JSON.stringify(request.tools ?? []),
+            'SYSTEM', String(request.systemInstructions ?? ''), 'INPUT', JSON.stringify(request.input)].join('\n'),
+        });
+        return { usage: { inputTokens: result.usage.input_tokens, outputTokens: result.usage.output_tokens,
+          totalTokens: result.usage.input_tokens + result.usage.output_tokens, requests: 1 },
+          output: [textMessage(result.text)], responseId: result.sessionId };
+      },
+      getStreamedResponse: streamResponse,
+    };
   });
 
   const session = eventlog.createSession({
@@ -655,6 +679,8 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
   let parentStep = 0;
   let firstFanoutProjection = '';
   let replayFanoutProjection = '';
+  let middleRecallOffset = 0;
+  let middleReadbackExact = false;
   let eventlogRestarted = false;
   let restartReceiptComplete = false;
   let restartReceiptNoReplay = false;
@@ -750,8 +776,22 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
           },
         })];
       } else if (parentStep === 3) {
-        assert.equal(tools.includes('plan_task'), false,
-          `the exact plan must activate before worker execution: ${projectedToolResult(rawRequest, 'plan-benchmark-fanout')}`);
+        // Schema visibility is cache-stable; execution authority must come
+        // from the exact durable plan, not from a tool disappearing.
+        const plan = JSON.parse(projectedToolResult(rawRequest, 'plan-benchmark-fanout')) as {
+          ok: boolean; acceptedTaskId: string; contractId: string;
+          requirements: Array<{ id: string }>;
+        };
+        assert.equal(plan.ok, true, 'the plan call must succeed before worker execution');
+        assert.deepEqual(plan.requirements.map((entry) => entry.id).sort(),
+          [SOURCE_REQUIREMENT, COMMIT_REQUIREMENT, READBACK_REQUIREMENT].sort());
+        const authority = eventlog.openEventLog().prepare(
+          'SELECT work_contract_id, source_user_seq FROM accepted_task_authority WHERE accepted_task_id = ? AND session_id = ?',
+        ).get(plan.acceptedTaskId, session.id) as { work_contract_id: string; source_user_seq: number } | undefined;
+        const accepted = eventlog.listEvents(session.id, { types: ['user_input_received'] }).find(row => row.data.text === PROMPT);
+        assert.equal(authority?.source_user_seq, accepted?.seq);
+        assert.ok(authority && authority.work_contract_id === plan.contractId,
+          'the accepted parent source owns the frozen plan contract before any worker or write');
         assert.ok(tools.includes('work_call'));
         assert.ok(tools.includes('run_worker'));
         output = [functionCall('read-benchmark-set', 'work_call', {
@@ -767,9 +807,21 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
           }),
         })];
       } else if (parentStep === 4) {
-        assert.match(serialized, /benchmark-item-100/);
-        output = [functionCall('fanout-declare', 'run_worker', runWorkerPacket('declare'))];
+        const read = JSON.parse(projectedToolResult(rawRequest, 'read-benchmark-set'));
+        assert.equal(read.data.total, ITEM_COUNT);
+        assert.equal(read.data.has_more, false);
+        assert.equal(read.__clementine?.truncated, true);
+        assert.equal(read.__clementine.recovery.tool_output_query.call_id, 'read-benchmark-set');
+        assert.ok(tools.includes('tool_output_query'), 'the retained-result reader is reachable without discovery');
+        output = [functionCall('read-benchmark-identifiers', 'tool_output_query', {
+          call_id: 'read-benchmark-set', fields: ['id'], limit: ITEM_COUNT,
+        })];
       } else if (parentStep === 5) {
+        const identifiers = projectedToolResult(rawRequest, 'read-benchmark-identifiers');
+        assert.deepEqual([...identifiers.matchAll(/"id":\s*"([^"\n]+)"/g)].map(match => match[1]), ITEMS,
+          'the model must see all exact item identifiers through the retained reader before fan-out');
+        output = [functionCall('fanout-declare', 'run_worker', runWorkerPacket('declare'))];
+      } else if (parentStep === 6) {
         firstFanoutProjection = projectedToolResult(rawRequest, 'fanout-declare');
         assert.ok(firstFanoutProjection, 'the first 100-item result rejoined the parent model');
         // Close and reopen the durable store between calls. The next packet is
@@ -779,13 +831,28 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
         eventlog.openEventLog();
         eventlogRestarted = true;
         output = [functionCall('fanout-reconcile-after-restart', 'run_worker', runWorkerPacket('reconcile'))];
-      } else if (parentStep === 6) {
+      } else if (parentStep === 7) {
         replayFanoutProjection = projectedToolResult(rawRequest, 'fanout-reconcile-after-restart');
         // Keep large result bodies out of assertion diagnostics. Receipt gaps
         // belong in the compact aggregate RED below, alongside the crossing
         // and durable-output counts that explain them.
         restartReceiptComplete = /Durable receipt: all 100\/100 requested items were already complete/.test(replayFanoutProjection);
         restartReceiptNoReplay = /No worker ran and no action was repeated/.test(replayFanoutProjection);
+        const count = firstFanoutProjection.match(/\[digest: run_worker returned ([\d,]+) chars/);
+        assert.ok(count, 'a bounded parent result must disclose its full size and recovery route');
+        assert.match(firstFanoutProjection, /recall_tool_result/);
+        assert.ok(tools.includes('recall_tool_result'));
+        middleRecallOffset = Math.floor(Number(count[1]!.replaceAll(',', '')) / 2);
+        output = [functionCall('read-fanout-middle-after-restart', 'recall_tool_result', {
+          call_id: 'fanout-declare', offset: middleRecallOffset, max_chars: 4000,
+        })];
+      } else if (parentStep === 8) {
+        const recovered = projectedToolResult(rawRequest, 'read-fanout-middle-after-restart');
+        const retained = eventlog.getToolOutput(session.id, 'fanout-declare');
+        assert.ok(retained);
+        const exactMiddle = retained.output.slice(middleRecallOffset, middleRecallOffset + 4000);
+        middleReadbackExact = exactMiddle.length === 4000 && recovered.includes(exactMiddle);
+        assert.equal(middleReadbackExact, true, 'the actual reader must redeem omitted middle bytes exactly after reopen');
         output = [functionCall('commit-one-parent-batch', 'work_call', {
           requirement_id: COMMIT_REQUIREMENT,
           universe_item_id: null,
@@ -801,7 +868,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
             connected_account_id: 'conn-competitive',
           }),
         })];
-      } else if (parentStep === 7) {
+      } else if (parentStep === 9) {
         const commitProjection = projectedToolResult(rawRequest, 'commit-one-parent-batch');
         assert.match(commitProjection, /benchmark-batch-100/);
         output = [functionCall('verify-parent-batch', 'work_call', {
@@ -977,16 +1044,23 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
   const perItemWireBytes = totalWorkerWireBytes - cacheablePrefixBytes;
   const commonPrefixRatio = totalWorkerWireBytes === 0 ? 0 : cacheablePrefixBytes / totalWorkerWireBytes;
   const averageWorkerWireBytes = Math.round(totalWorkerWireBytes / Math.max(1, workerWires.length));
-  const firstItemOffset = workerWires[0]?.indexOf(ITEMS[0]!) ?? -1;
-  const firstSharedTailOffset = Math.max(
-    workerWires[0]?.lastIndexOf('"resolvedTools"') ?? -1,
-    workerWires[0]?.lastIndexOf('"context"') ?? -1,
-    workerWires[0]?.lastIndexOf('"instructions"') ?? -1,
-    workerWires[0]?.lastIndexOf('"expectedOutput"') ?? -1,
-    workerWires[0]?.lastIndexOf('"workManifest"') ?? -1,
-  );
-  const itemPayloadAppendedLast = firstItemOffset > firstSharedTailOffset;
-  const parentHandleCount = (firstFanoutProjection.match(/full output parked:/g) ?? []).length;
+  // Inspect the decoded prompt rather than searching escaped JSON wire bytes:
+  // missing shared keys must never make this ordering assertion pass vacuously.
+  const itemPayloadAppendedLast = workerPrompts.length === ITEM_COUNT && workerPrompts.every((prompt, index) => {
+    const marker = 'Packet JSON:\n';
+    const markerOffset = prompt.lastIndexOf(marker);
+    assert.ok(markerOffset >= 0, 'the host model receives the canonical worker packet');
+    const packetJson = prompt.slice(markerOffset + marker.length);
+    const packet = JSON.parse(packetJson) as Record<string, unknown>;
+    const keys = Object.keys(packet);
+    return ['resolvedTools', 'context', 'instructions', 'expectedOutput', 'workManifest']
+      .every(key => keys.includes(key)) && keys.at(-1) === 'item' && packet.item === workerItems[index];
+  });
+  // Verify complete batch coverage on the retained envelope, and separately
+  // bound what the parent actually sees. A clipped view is not 96 raw bodies.
+  const retainedFanout = eventlog.getToolOutput(session.id, 'fanout-declare')?.output ?? firstFanoutProjection;
+  const parentHandleCount = (retainedFanout.match(/full output parked:/g) ?? []).length;
+  const visibleVerbatimResults = (firstFanoutProjection.match(new RegExp('x'.repeat(RAW_DETAIL_BYTES), 'g')) ?? []).length;
   // A tail-aware digest deliberately carries RAW_TAIL_SENTINEL too, so the
   // sentinel no longer distinguishes verbatim results from compact envelopes.
   // The durable reader handle is the production protocol discriminator.
@@ -1023,7 +1097,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
   const parentModelBytes = parentModelRequests.reduce((sum, request) => sum + request.bytes, 0);
   const totalModelVisibleBytes = parentModelBytes + totalWorkerWireBytes + shardReducerPromptBytes;
   const estimatedVisibleTokens = Math.ceil(totalModelVisibleBytes / 4);
-  const orderedHeaders = ITEMS.map((item) => firstFanoutProjection.indexOf(`--- item: ${item} ---`));
+  const orderedHeaders = ITEMS.map((item) => retainedFanout.indexOf(`--- item: ${item} ---`));
   const stableParentOrder = orderedHeaders.every((offset, index) =>
     offset >= 0 && (index === 0 || offset > orderedHeaders[index - 1]!));
   const events = eventlog.listEvents(measurementSessionId);
@@ -1041,6 +1115,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     : null;
   const metrics = {
     itemCount: ITEM_COUNT,
+    hostWorkerFailures: eventlog.listEvents(session.id, { types: ['worker_result'] }).filter(row => row.data.ok === false).slice(0, 2).map(row => row.data),
     hostStatusAfterPlan: result.status,
     hostErrorAfterPlan: result.error ?? null,
     hostTerminalBlockedReason,
@@ -1057,6 +1132,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     noRetryTransportPreparations,
     workerProviderBodies,
     workerModelCrossings,
+    legacyWorkerCrossings,
     workerStarts: workerStarts.length,
     workerResultEvents: workerResults.length,
     peakWorkerInflight,
@@ -1066,8 +1142,6 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     durableRawOutputCountAfterRestart: durableRaw.count,
     durableRawOutputBytesAfterRestart: durableRaw.bytes,
     cachePrefixBreakOffset: prefixBytes,
-    firstItemOffset,
-    firstSharedTailOffset,
     itemPayloadAppendedLast,
     commonPrefixRatio: Number(commonPrefixRatio.toFixed(6)),
     cacheableCommonPrefixBytes: cacheablePrefixBytes,
@@ -1075,6 +1149,9 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     averageWorkerWireBytes,
     totalWorkerWireBytes,
     parentFanoutBytes,
+    retainedFanoutBytes: Buffer.byteLength(retainedFanout),
+    visibleVerbatimResults,
+    middleReadbackExact,
     replayFanoutBytes,
     rawWorkerOutputBytes,
     parentVerbatimResultCount,
@@ -1107,6 +1184,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     readbackReads,
     completion: metrics.completion,
     workerModelCrossings,
+    legacyWorkerCrossings,
     workerStarts: metrics.workerStarts,
     restartReplaySuppressedCrossings: metrics.restartReplaySuppressedCrossings,
     restartReceiptComplete,
@@ -1114,6 +1192,9 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     durableRawOutputCountAfterRestart: metrics.durableRawOutputCountAfterRestart,
     boundedPool: peakWorkerInflight >= 2 && peakWorkerInflight <= MAX_WORKER_WIDTH,
     stableParentOrder,
+    middleReadbackExact,
+    visibleBodiesBounded: visibleVerbatimResults <= parentDigestThreshold,
+    projectedParentIsSmaller: parentFanoutBytes < Buffer.byteLength(retainedFanout),
     itemPayloadAppendedLast,
     cacheablePrefixAtLeast85Percent: commonPrefixRatio >= MIN_CACHEABLE_PREFIX_RATIO,
     parentVerbatimWithinThreshold: metrics.parentVerbatimWithinThreshold,
@@ -1136,6 +1217,7 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     readbackReads: 1,
     completion: ITEM_COUNT,
     workerModelCrossings: ITEM_COUNT,
+    legacyWorkerCrossings: 0,
     workerStarts: ITEM_COUNT,
     restartReplaySuppressedCrossings: true,
     restartReceiptComplete: true,
@@ -1145,6 +1227,9 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
     durableRawOutputCountAfterRestart: ITEM_COUNT + 2,
     boundedPool: true,
     stableParentOrder: true,
+    middleReadbackExact: true,
+    visibleBodiesBounded: true,
+    projectedParentIsSmaller: true,
     itemPayloadAppendedLast: true,
     cacheablePrefixAtLeast85Percent: true,
     parentVerbatimWithinThreshold: true,
