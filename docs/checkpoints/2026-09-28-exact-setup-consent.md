@@ -25,3 +25,9 @@ Known limitation: a first ambiguous call with missing provider documentation, mo
 ## Qualification traps
 
 Do not hand-edit learned verdicts or backdate learning. Do not approve a business send as part of this test. A passed fixture suite does not establish installed/live-home behavior. Preserve native desktop files in the previously authorized runtime-only hotpatch; this is not a newly signed native release. Record served SHA/fingerprint, exact model results and both on/off trials before claiming completion.
+
+## First installed trial and correction
+
+Candidate 4e6302c6c was served with fingerprint 1bdf48fccc92f67941d53644dc91a320b5eb4c0c7387dd8041a97e5c3afb208b. Session sess-desktop-13740a11e5c0f4419d10bfbe stopped before dispatch: Jev returned delivery 0.27 and irreversible 0.11; no judge call or proof was issued. The call's approval was not accepted. This is a failed acceptance, not a pass.
+
+The conditional API still framed its questions around all accepted inputs, relying on the classifier to infer exact scope from nested schema constraints. The correction supplies explicit effectiveArguments to both semantic ports and uses an exact-call question for both delivery and irreversible effects. Full schema, argument binding, conservative uncertainty and confidence thresholds remain unchanged. 39 affected host/learner/semantic-port checks pass, with assertions that both models receive identical explicit arguments; TypeScript passes.

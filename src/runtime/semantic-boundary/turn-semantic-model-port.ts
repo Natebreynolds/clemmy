@@ -165,6 +165,8 @@ export interface OperationDeliveryJudgeCall {
   description: string;
   /** Canonical JSON text of the exact input schema. */
   inputSchema: string;
+  /** Present for a conditional call; do not judge other accepted inputs. */
+  effectiveArguments?: Readonly<Record<string, unknown>>;
   definitionDigest: string;
 }
 

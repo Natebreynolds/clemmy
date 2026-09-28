@@ -489,6 +489,8 @@ test('exact conditional lookup gets no setup card on its first call and reuses p
   assert.equal(judgeRequests.length, 1);
   const schema = JSON.parse((jevRequests[0]!.state as { inputSchema: string }).inputSchema);
   assert.deepEqual(schema.allOf, [CONDITIONAL_SCHEMA, { const: args }], 'the entire schema survives the exact-argument intersection');
+  assert.deepEqual((jevRequests[0]!.state as Record<string, unknown>).effectiveArguments, args);
+  assert.deepEqual(JSON.parse(judgeRequests[0]!.user).effectiveArguments, args);
   assert.equal(deliveryStore.learnedOperationDeliveryVerdict('composio', OPEN_OPERATION), null,
     'a conditional proof cannot become an operation-wide waiver');
   const snapshots = eventlog.listEvents(first.request.attestation.sessionId, { types: ['exact_call_delivery_basis'] });
