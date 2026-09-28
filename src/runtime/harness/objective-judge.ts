@@ -1080,9 +1080,12 @@ export async function runHedgedJudge<T>(
     // The hedge seam runs every attempt as the lane's own reviewer request, so
     // the usage log can rank judge spend per lane while the turn's own
     // session/source attribution is preserved.
-    const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (): Promise<T> => runRoutedJudgeAttempt<T>(
-      r, instructions, prompt, parse, opts.requireCompletePrompt === true, opts.evidence, signal, opts.effort,
-    );
+    const callerSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
+    const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (deadlineSignal?: AbortSignal): Promise<T> => {
+      const signals = [signal, deadlineSignal, callerSignal].filter((value): value is AbortSignal => Boolean(value));
+      return runRoutedJudgeAttempt<T>(r, instructions, prompt, parse, opts.requireCompletePrompt === true,
+        opts.evidence, signals.length ? AbortSignal.any(signals) : undefined, opts.effort);
+    };
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
     // exact pin, and ignoring it left a deliberately chosen flagship judge racing
@@ -1098,17 +1101,19 @@ export async function runHedgedJudge<T>(
     const chosen = routing;
     let answering = chosen;
     const primaryAttempt = opts.quotaAwareRoute && !hedgeRouting && fallbackMode === 'automatic'
-      ? async (): Promise<T> => {
+      ? async (signal?: AbortSignal): Promise<T> => {
           try {
-            return await attempt(chosen)();
+            return await attempt(chosen)(signal);
           } catch (error) {
+            signal?.throwIfAborted();
+            callerSignal?.throwIfAborted();
             const refusal = quotaRefusalWords(error);
             if (refusal === null) throw error;
             answering = debate.resolveCheckerQuotaFallthrough({
               modelId: chosen.modelId, provider: chosen.judgeFamily,
               why: `its provider refused the review for lack of quota or credit${refusal ? ` ("${refusal}")` : ''}`,
             }, selection, opts.reviewedAuthor);
-            return await attempt(answering)();
+            return await attempt(answering)(signal);
           }
         }
       : attempt(chosen);

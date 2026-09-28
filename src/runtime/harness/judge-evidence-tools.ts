@@ -74,9 +74,22 @@ function segments(path: string): string[] {
   return path.replace(/^\//, '').split(/[./]|\[(\d+)\]/).filter((part) => part !== undefined && part !== '');
 }
 
+/** Traverse JSON documents embedded in carrier text without rewriting their
+ * retained representation or interpreting ordinary prose as data. */
+function jsonContainer(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (!text.startsWith('{') && !text.startsWith('[')) return value;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === 'object' ? parsed : value;
+  } catch { return value; }
+}
+
 function at(value: unknown, path: string): unknown {
   let current = value;
   for (const part of segments(path)) {
+    current = jsonContainer(current);
     if (current === null || current === undefined) return undefined;
     if (Array.isArray(current)) {
       const index = Number(part);
@@ -115,8 +128,10 @@ export function judgeEvidenceJsonValue(entry: JudgeEvidenceEntry): unknown {
 function largestList(value: unknown): { rows: unknown[]; path: string } | undefined {
   let best: { rows: unknown[]; path: string; depth: number } | undefined;
   const visit = (node: unknown, path: string, depth: number): void => {
+    node = jsonContainer(node);
     if (depth > 5 || !node || typeof node !== 'object' || Array.isArray(node)) return;
-    for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+    for (const [key, rawChild] of Object.entries(node as Record<string, unknown>)) {
+      const child = jsonContainer(rawChild);
       const childPath = path ? `${path}.${key}` : key;
       if (Array.isArray(child)) {
         if (!best || child.length > best.rows.length || (child.length === best.rows.length && depth < best.depth)) {
@@ -133,7 +148,7 @@ function largestList(value: unknown): { rows: unknown[]; path: string } | undefi
 
 function recordsOf(value: unknown, path: string | undefined): { rows: unknown[]; from: string } | string {
   if (path) {
-    const selected = at(value, path);
+    const selected = jsonContainer(at(value, path));
     if (Array.isArray(selected)) return { rows: selected, from: path };
     return `Nothing list-shaped at path ${JSON.stringify(path)}. The result is ${describeJsonShape(value)}`;
   }

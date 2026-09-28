@@ -97,3 +97,25 @@ test('column projection over tuple records checks every row without dragging unr
     path: 'batches.0.cells', where_field: '0', equals: 'absent-date', fields: ['0'] })));
   assert.match(absent, /0 of 200 records/);
 });
+
+
+test('review queries reach records inside nested CLI JSON text without changing raw evidence', async () => {
+  const value = { result: { status: 0, argv: ['query'], stdout: JSON.stringify({ result: {
+    records: [{ id: 'a', incoming: false }, { id: 'b', incoming: true }], done: true,
+  } }) } };
+  const text = JSON.stringify(value);
+  const source = { refKind: 'settled calls', refs: () => ['cli'],
+    resolve: (ref: string) => ref === 'cli' ? { text, value } : undefined };
+  const built = judgeEvidenceTools(source) as unknown as Invokable[];
+  const query = built.find(t => t.name === 'query_evidence')!;
+  for (const path of [undefined, 'result.stdout.result.records']) {
+    const found = String(await query.invoke({ context: {} }, JSON.stringify({ ref: 'cli', path,
+      where_field: 'incoming', equals: 'true', fields: ['id'] })));
+    assert.match(found, /1 of 2 records at result\.stdout\.result\.records match/);
+    assert.match(found, /"sourceIndex": 1/);
+    assert.match(found, /"id": "b"/);
+  }
+  const open = built.find(t => t.name === 'open_evidence')!;
+  assert.ok(String(await open.invoke({ context: {} }, JSON.stringify({ ref: 'cli' }))).endsWith(text));
+  assert.equal(JSON.stringify(value), text);
+});

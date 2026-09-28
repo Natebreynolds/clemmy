@@ -7,7 +7,7 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { discoveryNavigation } from './discovered-tool-context.js';
-import { answererViewBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
+import { answererViewBudgetFor, presentationBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
@@ -471,6 +471,10 @@ export function sourceSettledReadEvidence(input: {
    * dumps; the prepared plan carries its selected contracts. Ordinary completion
    * review retains them. Actual input reads and failed discovery remain visible. */
   omitSuccessfulDiscovery?: boolean;
+  /** Completion has source-scoped evidence lookup tools: retain bulk reads at
+   * the ordinary recallable presentation size instead of re-inflating each
+   * into a full model window. Targeted pages and write receipts stay whole. */
+  lookupBacked?: boolean;
   /** Earlier results retain authenticated references; new distinct content
    * uses the answerer's bounded view for advisory trajectory review. */
   afterSettlementIndex?: number;
@@ -669,11 +673,12 @@ export function sourceSettledReadEvidence(input: {
       // Advisory reviews must not re-inflate bulk results the answerer saw
       // only through a bounded view. Targeted retained reads remain whole;
       // handles and explicit completeness preserve access to omitted bytes.
+      const lookupPreview = input.lookupBacked === true && !row.mutating && evidenceKind !== 'retained_projection';
       const view = evidenceKind === 'retained_projection'
         ? { text: shown.text, bounded: false }
         : answererView(shown.text, row.toolName, row.callId,
           `[review evidence: complete result handle=${value.resultHandleId} sha256=${value.rawPayloadSha256}]`,
-          answererViewBudgetFor({ toolName: row.toolName, args: requestArgs, routedModelId }));
+          (lookupPreview ? presentationBudgetFor : answererViewBudgetFor)({ toolName: row.toolName, args: requestArgs, routedModelId }));
       const bytes = Buffer.from(view.text, 'utf8');
       results.push({ ...base, ...projectedSource, status: 'verified', resultHandleId: value.resultHandleId,
         physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,
@@ -682,8 +687,10 @@ export function sourceSettledReadEvidence(input: {
       blocks.push([
         `${label}: authenticated ${evidenceKind}; handle=${value.resultHandleId}; dispatch=${value.physicalDispatchId}; sha256=${value.rawPayloadSha256}.`,
         view.bounded
-          ? `Records=${value.handle.recordCount}; completeness=${value.handle.completeness}; continuationRef=${value.handle.continuationRef ?? 'none'}; showing a BOUNDED view (${bytes.byteLength} of ${Buffer.byteLength(shown.text, 'utf8')} bytes, ${shown.format}; retained JSON ${value.rawByteCount} bytes), bounded the way the answerer's own view of this result was. Content outside it was not seen by the answerer unless another read shown here covers it.`
-          : `Records=${value.handle.recordCount}; completeness=${value.handle.completeness}; continuationRef=${value.handle.continuationRef ?? 'none'}; showing ALL content (${bytes.byteLength} bytes, ${shown.format}; retained JSON ${value.rawByteCount} bytes).`,
+          ? `Records=${value.handle.recordCount}; recordPath=${value.handle.recordPath ?? '(unknown)'}; completeness=${value.handle.completeness}; continuationRef=${value.handle.continuationRef ?? 'none'}; showing a BOUNDED view (${bytes.byteLength} of ${Buffer.byteLength(shown.text, 'utf8')} bytes, ${shown.format}; retained JSON ${value.rawByteCount} bytes). ${lookupPreview
+            ? 'This is a reviewer preview; all retained bytes remain available through the source-scoped evidence tools. Content omitted here is uninspected by this review, not absent from the source.'
+            : "Bounded the way the answerer's own view of this result was. Content outside it was not seen by the answerer unless another read shown here covers it."}`
+          : `Records=${value.handle.recordCount}; recordPath=${value.handle.recordPath ?? '(unknown)'}; completeness=${value.handle.completeness}; continuationRef=${value.handle.continuationRef ?? 'none'}; showing ALL content (${bytes.byteLength} bytes, ${shown.format}; retained JSON ${value.rawByteCount} bytes).`,
         `Retained binding value type=${Array.isArray(value.rawPayload) ? 'array' : value.rawPayload === null ? 'null' : typeof value.rawPayload}. A plan binds this inner value, not a carrier envelope. ${typeof value.rawPayload === 'string'
           ? 'For this string use outputPath="" (whole value), or itemPath="/result" in a repeated producer record. There is no /output or /content field; interpret or parse the string in a compute step if needed.'
           : 'Use only observed fields or a known output contract; unknown structure can be interpreted in a compute step.'}`,

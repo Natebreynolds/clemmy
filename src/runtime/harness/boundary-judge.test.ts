@@ -292,3 +292,16 @@ test('mutation constraint review appears in metric lanes and total latency', () 
     assert.equal(snapshot.lanes.find(lane => lane.lane === 'mutation_constraints')?.fastDecisions, 1);
   } finally { resetJudgeMetricsForTests(); }
 });
+
+
+test('judge deadline aborts transport work and late rejection cannot change the timeout receipt', async () => {
+  const { withJudgeHedge } = await import('./judge-family.js');
+  let cancelled = false;
+  const result = await withJudgeHedge((signal?: AbortSignal) => new Promise<string>((_resolve, reject) => {
+    signal?.addEventListener('abort', () => { cancelled = true; reject(new Error('transport aborted')); }, { once: true });
+  }), null, { lane: 'completion', timeoutMs: 20 });
+  await Promise.resolve();
+  assert.equal(cancelled, true);
+  assert.equal(result.value, null);
+  assert.deepEqual(result.errors, []);
+});

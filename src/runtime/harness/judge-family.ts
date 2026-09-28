@@ -231,17 +231,19 @@ export interface HedgedJudgeResult<T> {
  * Race a primary judge attempt against a delayed hedge attempt under one
  * deadline. Attempts are thunks that RESOLVE with a parsed verdict and THROW
  * on transport/parse failure — a primary failure before the hedge delay
- * starts the hedge immediately (no dead air). The loser is abandoned, never
- * awaited (both are single fail-open/advisory calls, safe to drop).
+ * starts the hedge immediately (no dead air). The loser is cancelled and never awaited; its late outcome cannot change
+ * the settled receipt. Transports receive the cancellation signal.
  */
 export async function withJudgeHedge<T>(
-  primary: () => Promise<T>,
-  hedge: (() => Promise<T>) | null,
+  primary: (signal?: AbortSignal) => Promise<T>,
+  hedge: ((signal?: AbortSignal) => Promise<T>) | null,
   opts: { lane: JudgeMetricLane; hedgeDelayMs?: number; timeoutMs?: number },
 ): Promise<HedgedJudgeResult<T>> {
   const timeoutMs = opts.timeoutMs ?? boundaryJudgeTimeoutMs();
+  const primaryController = new AbortController();
+  const hedgeController = new AbortController();
   const hedgeThunk = judgeHedgeEnabled() && hedge
-    ? () => asJudgeRequest(opts.lane, hedge)
+    ? () => asJudgeRequest(opts.lane, () => hedge(hedgeController.signal))
     : null;
   const hedgeDelayMs = Math.min(opts.hedgeDelayMs ?? judgeHedgeDelayMs(), timeoutMs);
   return await new Promise((resolve) => {
@@ -258,7 +260,12 @@ export async function withJudgeHedge<T>(
       settled = true;
       if (hedgeTimer) clearTimeout(hedgeTimer);
       if (deadlineTimer) clearTimeout(deadlineTimer);
-      resolve({ value, winner, hedgeFired, errors });
+      // Freeze failure evidence before cancellation triggers transport rejection.
+      // A late response cannot repair a verdict or spend further lookup turns.
+      const receipt = { value, winner, hedgeFired, errors: [...errors] };
+      if (winner !== 'primary') primaryController.abort();
+      if (winner !== 'hedge') hedgeController.abort();
+      resolve(receipt);
     };
 
     const startHedge = () => {
@@ -267,6 +274,7 @@ export async function withJudgeHedge<T>(
       hedgeThunk().then(
         (v) => finish(v, 'hedge'),
         (err) => {
+          if (settled) return;
           errors.push(err);
           hedgeFailed = true;
           if (primaryFailed) finish(null, null);
@@ -276,9 +284,10 @@ export async function withJudgeHedge<T>(
 
     deadlineTimer = setTimeout(() => finish(null, null), timeoutMs);
     if (hedgeThunk) hedgeTimer = setTimeout(startHedge, hedgeDelayMs);
-    asJudgeRequest(opts.lane, primary).then(
+    asJudgeRequest(opts.lane, () => primary(primaryController.signal)).then(
       (v) => finish(v, 'primary'),
       (err) => {
+        if (settled) return;
         errors.push(err);
         primaryFailed = true;
         if (!hedgeThunk || hedgeFailed) { finish(null, null); return; }

@@ -4147,7 +4147,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       }
       return 'done';
     }
-    const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: Boolean(planCandidate) });
+    const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: Boolean(planCandidate),
+      lookupBacked: !planCandidate });
     const judgedReply = decision?.reply?.trim() ? decision.reply : replyText;
     // Reuse a rejection only for the SAME reply and unchanged business work.
     // A read answer can correct missing records using already-retained evidence
@@ -4269,11 +4270,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // failed write otherwise reads as work never attempted, and the
           // reviewer cannot tell whether another attempt could help.
           sourceIncompleteAttemptsEvidence(identity),
-          // Each result is shown as the answerer received it: whole when it
-          // fit, otherwise the same bounded structure-aware view, and a
-          // repeated call by its latest read. A claim whose basis the answerer
-          // never saw is the gap to catch; bytes nobody read are not evidence
-          // for or against the reply.
+          // Bulk reads stay behind authenticated lookup handles instead of
+          // re-inflating every raw result into the reviewer prompt. Selected
+          // pages stay whole; preview omission is never proof of absence.
           `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${readEvidence.summary}`,
           // A reply may rest on a check an earlier turn made ("I checked
           // beforehand"); without it that claim reads as unverified.
@@ -4282,7 +4281,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           'Judge only the effective accepted objective. A successful empty result may complete a bounded lookup; '
             + 'a cancelled or replaced request does not owe its abandoned effects. Do not demand writes or '
             + 'artifacts the objective never requested. Unavailable optional or irrelevant reads do not create '
-            + 'new requirements. Each result above is shown whole or as the bounded view the answerer received, '
+            + 'new requirements. Each result above is shown whole or as an explicitly bounded reviewer preview, '
             + 'as its own line says. A claim that rests on content outside what is shown, including a claim that '
             + 'data is missing, empty, unavailable or complete, is unverified unless another read shown here covers '
             + 'it, such as a filtered query, a true count or a recalled page, or you open it with the evidence tools. '

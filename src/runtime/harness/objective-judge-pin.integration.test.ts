@@ -23,14 +23,20 @@ const { closeEventLog, createSession, appendEvent } = await import('./eventlog.j
 
 type Behavior = 'slow' | 'error' | 'invalid' | 'hung' | 'rate_limited';
 let claudeBehavior: Behavior = 'slow';
+let transportAborted = false;
 const calls: Array<{ provider: string; modelId?: string }> = [];
 
 function providerModel(provider: 'claude' | 'codex', modelId?: string): Model {
   return {
-    async getResponse(): Promise<ModelResponse> {
+    async getResponse(request): Promise<ModelResponse> {
       calls.push({ provider, modelId });
       if (provider === 'claude') {
-        if (claudeBehavior === 'hung') return new Promise(() => {});
+        if (claudeBehavior === 'hung') return new Promise((_resolve, reject) => {
+          request.signal?.addEventListener('abort', () => {
+            transportAborted = true;
+            reject(new DOMException('cancelled', 'AbortError'));
+          }, { once: true });
+        });
         if (claudeBehavior === 'error') throw new Error('fixture pinned judge transport unavailable');
         if (claudeBehavior === 'rate_limited') throw Object.assign(new Error('provider request rejected'), { status: 429 });
         if (claudeBehavior === 'slow') await new Promise(resolve => setTimeout(resolve, 650));
@@ -62,6 +68,7 @@ function writeAuth(claudeAvailable = true): void {
 beforeEach(() => {
   mock.restoreAll();
   calls.length = 0;
+  transportAborted = false;
   claudeBehavior = 'slow';
   Object.assign(process.env, {
     AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off', OPENAI_MODEL_PRIMARY: 'gpt-5.6-terra',
@@ -510,4 +517,14 @@ test('workflow report-back actual judge wire owns the parent source and captured
   assert.equal(ref.verified, true);
   assert.equal(ref.replyMatches, true);
   assert.equal(ref.judgeModelId, 'claude-sonnet-5');
+});
+
+
+test('an automatic-route completion timeout cancels the actual Runner provider request', async () => {
+  claudeBehavior = 'hung';
+  const result = await completion(80);
+  assert.equal(result.failure, 'timeout');
+  assert.equal(result.value, null);
+  assert.equal(transportAborted, true);
+  assert.equal(calls.length, 1);
 });

@@ -1577,3 +1577,24 @@ test('every review response carries the output bound, on whichever wire answers'
   assert.equal(seenMaxTokens, judgeMaxOutputTokens(), 'the bound travels on the request the wire receives');
   assert.ok(judgeMaxOutputTokens() <= 65_536 && judgeMaxOutputTokens() >= 2_048);
 });
+
+
+test('lookup-backed completion avoids re-inflating bulk reads while preserving exact bytes and selected pages', () => {
+  const identity = accepted('Read the complete fixture report.');
+  const text = Array.from({ length: 700 }, (_, i) => `Report row ${i}: evidence`).join('\n') + '\nDECISIVE_FINAL_RECORD';
+  retainedRead(identity, 'fixture_business_read', text);
+  const page = 'selected evidence '.repeat(350) + 'SELECTED_PAGE_END';
+  retainedRead(identity, 'recall_tool_result', page, false, false, false,
+    { id: 'recalled-fixture', args: { call_id: 'read:fixture_business_read' } });
+  events.closeEventLog();
+  const ordinary = sourceSettledReadEvidence(identity);
+  const compact = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
+  assert.ok(compact.summary.length < ordinary.summary.length - 8000);
+  assert.equal(compact.results[0]?.contentComplete, false);
+  assert.equal(compact.results[0]?.contentDigest, ordinary.results[0]?.contentDigest);
+  assert.match(compact.summary, /reviewer preview/);
+  assert.ok(compact.summary.includes(page), 'targeted selected evidence remains whole');
+  const lookup = sourceEvidenceLookup(identity);
+  assert.equal(lookup.resolve(compact.results[0]!.resultHandleId!)?.text, text);
+  assert.equal(lookup.resolve('unrelated-source'), undefined);
+});

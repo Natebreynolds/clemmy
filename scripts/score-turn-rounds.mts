@@ -170,11 +170,28 @@ export interface TurnRoundsScore {
     promptTokens: number;
     uncachedTokens: number;
     seconds: number;
-    verdicts: Array<{ seq: number; kind: string | null; fulfills: boolean | null; reviewDepth: string | null; judgeModelId: string | null }>;
+    verdicts: Array<ReturnType<typeof projectReviewVerdict>>;
   };
   other: LedgerCall[];
   nestedExcluded: LedgerCall[];
   routedModel: string | null;
+}
+
+/** A delivered fail-open answer is not a successful independent review. */
+export function projectReviewVerdict(seq: number, data: Record<string, unknown>) {
+  const failedOpen = data.failedOpen === true;
+  const reportedFulfills = typeof data.fulfills === 'boolean' ? data.fulfills : null;
+  return {
+    seq,
+    kind: typeof data.kind === 'string' ? data.kind : null,
+    fulfills: failedOpen ? null : reportedFulfills,
+    reportedFulfills,
+    failedOpen,
+    carriedVerdict: data.carriedVerdict === true,
+    reviewFailure: typeof data.reviewFailure === 'string' ? data.reviewFailure : null,
+    reviewDepth: typeof data.reviewDepth === 'string' ? data.reviewDepth : null,
+    judgeModelId: typeof data.judgeModelId === 'string' ? data.judgeModelId : null,
+  };
 }
 
 function openReadOnly(home: string): Database.Database {
@@ -536,16 +553,7 @@ export function scoreAcceptedTurnRounds(
       promptTokens: sum(reviewerCalls.map((call) => call.promptTokens)),
       uncachedTokens: sum(reviewerCalls.map((call) => call.uncachedTokens)),
       seconds: Math.round(sum(reviewerCalls.map((call) => call.durationMs)) / 100) / 10,
-      verdicts: verdictRows.map((row) => {
-        const data = parseObject(row.data_json) ?? {};
-        return {
-          seq: row.seq,
-          kind: typeof data.kind === 'string' ? data.kind : null,
-          fulfills: typeof data.fulfills === 'boolean' ? data.fulfills : null,
-          reviewDepth: typeof data.reviewDepth === 'string' ? data.reviewDepth : null,
-          judgeModelId: typeof data.judgeModelId === 'string' ? data.judgeModelId : null,
-        };
-      }),
+      verdicts: verdictRows.map((row) => projectReviewVerdict(row.seq, parseObject(row.data_json) ?? {})),
     },
     other,
     nestedExcluded,
@@ -597,7 +605,7 @@ export function formatTurnRoundsScore(score: TurnRoundsScore): string {
   lines.push(`turn: rounds=${t.rounds} requestBytes=${t.requestBytes} prompt=${t.brainPromptTokens} cached=${t.brainCachedTokens} uncached=${t.brainUncachedTokens} output=${t.brainOutputTokens} reasoning=${t.brainReasoningTokens} brainSecs=${t.brainSeconds} wallSecs=${t.wallSeconds ?? '-'} models=${t.servedBrainModels.join(',') || '-'}`);
   lines.push(`tools (top-level): ${score.topLevelToolCalls.map((call) => call.effectiveTool && call.effectiveTool !== call.tool ? `${call.tool}>${call.effectiveTool}` : call.tool).join(', ') || '-'}`);
   lines.push(`jev: arm=${score.jev.arm} calls=${score.jev.calls.length} secs=${score.jev.seconds} [${score.jev.calls.map((call) => `${call.channel}${call.ok ? '' : `:fail(${call.failReason ?? '?'})`}`).join(', ')}]`);
-  lines.push(`reviewer: calls=${score.reviewer.calls.length} prompt=${score.reviewer.promptTokens} uncached=${score.reviewer.uncachedTokens} secs=${score.reviewer.seconds} verdicts=[${score.reviewer.verdicts.map((verdict) => `${verdict.kind}:${verdict.fulfills}@${verdict.judgeModelId ?? '-'}/${verdict.reviewDepth ?? '-'}`).join(', ')}]`);
+  lines.push(`reviewer: calls=${score.reviewer.calls.length} prompt=${score.reviewer.promptTokens} uncached=${score.reviewer.uncachedTokens} secs=${score.reviewer.seconds} verdicts=[${score.reviewer.verdicts.map((verdict) => `${verdict.kind}:${verdict.failedOpen ? `unreviewed(${verdict.reviewFailure ?? 'unavailable'})` : verdict.fulfills}@${verdict.judgeModelId ?? '-'}/${verdict.reviewDepth ?? '-'}`).join(', ')}]`);
   if (score.nestedExcluded.length > 0) {
     lines.push(`nested rows excluded from rounds: ${score.nestedExcluded.length} [${score.nestedExcluded.map((call) => `${call.model}:${call.promptTokens}`).join(', ')}]`);
   }
