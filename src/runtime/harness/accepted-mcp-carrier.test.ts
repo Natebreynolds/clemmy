@@ -125,6 +125,7 @@ async function acquireGenericMcpCapability() {
 
 interface AcceptedCallFixture {
   installed: { manifest: CapabilityManifestV1 };
+  args?: Record<string, unknown>;
   beforeResolve?: () => void;
 }
 function resolveInsideAcceptedCall(input: AcceptedCallFixture): carrier.AcceptedExactMcpCarrierResolution;
@@ -160,7 +161,7 @@ function resolveInsideAcceptedCall<T>(input: AcceptedCallFixture & { invoke?: (a
   if (root.status !== 'ok') throw new Error(root.reason);
 
   const acceptedTaskId = identities.acceptedTaskIdFor(session.id, source.seq);
-  const args = { query: generated('current') };
+  const args = input.args ?? { query: generated('current') };
   const contract = logicalContracts.durableLogicalCallContract(
     acceptedTaskId,
     manifest.operationId,
@@ -243,6 +244,51 @@ test('generic live-read materializer authority resolves the exact accepted nativ
   const resolved = resolveInsideAcceptedCall({ installed: acquired.installed });
   assert.equal(resolved.ok, true, JSON.stringify(resolved));
   assert.deepEqual(acquired.live.counts, before, 'resolution performs no provider I/O');
+});
+
+test('missing required MCP arguments are corrected before any provider I/O', async () => {
+  const acquired = await acquireGenericMcpCapability();
+  const before = { ...acquired.live.counts };
+  const { ToolCallsCounter } = await import('./brackets.js');
+  await assert.rejects(resolveInsideAcceptedCall({
+    installed: acquired.installed,
+    args: { obsolete_query: 'do not forward this value' },
+    invoke: (args, sessionId) => carrier.invokeAcceptedExactMcpCarrier({
+      requestedOperationId: acquired.installed.manifest.operationId, args, sessionId,
+      counter: new ToolCallsCounter(5), requiresNestedAdmission: false,
+    }),
+  }), (error: unknown) => {
+    assert.ok(error instanceof carrier.ExactMcpCarrierPreDispatchError);
+    assert.match(error.message, /schema/);
+    assert.match(error.message, /query/);
+    assert.doesNotMatch(error.message, /do not forward this value/);
+    return true;
+  });
+  assert.deepEqual(acquired.live.counts, before, 'invalid arguments paid neither tools/list nor tools/call');
+});
+
+test('current MCP arguments preserve open provider data and execute once', async () => {
+  const live = generatedRuntime();
+  live.tool.inputSchema = {
+    type: 'object', properties: { query: { type: 'string' } }, required: ['query'],
+    additionalProperties: true,
+  };
+  resetAuthoritySurfaces();
+  const installed = await mcp.createProductionMcpReadCarrier({ serverName: live.server, runtime: live.runtime })
+    .materializeExact({ operationId: live.tool.name, inputSchema: live.tool.inputSchema });
+  assert.equal(installed.status, 'installed', JSON.stringify(installed));
+  if (installed.status !== 'installed') throw new Error(JSON.stringify(installed));
+  const { ToolCallsCounter } = await import('./brackets.js');
+  const before = { ...live.counts };
+  await resolveInsideAcceptedCall({
+    installed, args: { query: 'current', provider_extension: { values: [1, 'x'] } },
+    invoke: (args, sessionId) => carrier.invokeAcceptedExactMcpCarrier({
+      requestedOperationId: installed.manifest.operationId, args, sessionId,
+      counter: new ToolCallsCounter(5), requiresNestedAdmission: false,
+    }),
+  });
+  assert.equal(live.counts.list, before.list + 1, 'fresh preparation remains mandatory');
+  assert.equal(live.counts.call, before.call + 1, 'valid call executes exactly once');
 });
 
 test('revoked generic live-read manifest refuses before native-MCP provider I/O', async () => {

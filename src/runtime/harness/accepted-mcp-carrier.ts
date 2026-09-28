@@ -44,6 +44,11 @@ import { PhysicalDispatchPreDispatchError } from './attempt-identity.js';
 import { loadToolContract, type ToolContract } from '../../tools/tool-contract-store.js';
 import { stripMcpToolCarrier } from '../mcp-tool-authority.js';
 import { currentProviderDefinitionFromEntry } from './live-read-planning-authority.js';
+import {
+  collectProviderSchemaFailures,
+  renderBoundedSchemaSubtree,
+  type ProofProviderSchemaFailure,
+} from './proof-provider-args.js';
 
 export class ExactMcpCarrierPreDispatchError extends ExternalWritePreDispatchError {
   override readonly name = 'ExactMcpCarrierPreDispatchError';
@@ -235,6 +240,22 @@ export async function invokeAcceptedExactMcpCarrier(input: {
   const args = input.args && typeof input.args === 'object' && !Array.isArray(input.args)
     ? input.args as Record<string, unknown>
     : {};
+  // A freshly rebound operation can have new required fields while the model
+  // still supplies its learned old shape. Reject only provider-proven missing
+  // or closed-object fields before spending metadata/business I/O or consuming
+  // consent. The existing open schema walker preserves provider extensions.
+  const failures: ProofProviderSchemaFailure[] = [];
+  collectProviderSchemaFailures(args, resolved.binding.inputSchema, '', failures, {
+    maxEntries: 24, maxDepth: 6, policy: 'required_only',
+  });
+  if (failures.length > 0) {
+    const shape = renderBoundedSchemaSubtree(resolved.binding.inputSchema,
+      failures.map((failure) => failure.path), { maxDepth: 3, maxFields: 24, maxChars: 900 });
+    throw new ExactMcpCarrierPreDispatchError(
+      `arguments do not match the current input schema: ${JSON.stringify(failures)}. `
+      + `Correct this same operation using its current schema${shape ? `: ${shape}` : ''}.`,
+    );
+  }
   // A turn-budget checkpoint is not an execution attempt. Check it before the
   // one-shot nested admission CAS so an auto-resume can retain that authority.
   // ToolCallsCounter is synchronous; no await can interleave this check with

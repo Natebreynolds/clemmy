@@ -34,6 +34,7 @@ process.env.CLEMMY_UNIFIED_RECALL = 'off';
 process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
 process.env.CLEMMY_SEMANTIC_RECALL = 'off';
 process.env.CLEMMY_DEBATE_MODE = 'off';
+process.env.CLEMMY_COMPLETION_REVIEW = 'off';
 process.env.CLEMMY_BRAIN_FALLOVER = 'off';
 process.env.CLEMMY_AUTH_FALLOVER = 'off';
 process.env.CLEMMY_PROACTIVE_REPORT_DEFER = 'off';
@@ -68,6 +69,7 @@ const mcpServers = await import('../runtime/mcp-servers.js');
 const productionPorts = await import('../runtime/harness/production-capability-ports.js');
 const semanticPorts = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
 const memoryDb = await import('../memory/db.js');
+const jev = await import('../runtime/jev/client.js');
 
 const originalFetch = globalThis.fetch;
 
@@ -296,6 +298,8 @@ type ScriptedModel = {
 let activeModel: ScriptedModel | null = null;
 
 test.after(async () => {
+  jev._setSystemOneFetchForTests(undefined);
+  jev._setTypesafeKeyForTests(undefined);
   innerDispatch._setInnerDispatchToolsForTests(null);
   innerDispatch._setInnerDispatchMcpResolverForTests(null);
   semanticPorts.installTurnSemanticModelPort(null);
@@ -325,6 +329,30 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
   const changedField = generated(seed, 'revised_selector_field');
   const firstOperation = `${serverName}__${firstTool}`;
   const renamedOperation = `${serverName}__${renamedTool}`;
+  // Routing uses learned successful runs, not unconditional catalog injection.
+  // Record only Jev's turn-start selection; all business I/O still crosses the
+  // real mutable stdio peer. No strategy or manifest is planted by the test.
+  jev._setTypesafeKeyForTests('ts_fixture');
+  jev._setSystemOneFetchForTests(async (_url, init) => {
+    const body = JSON.parse(String(init.body)) as { questions: Record<string, {
+      type: string; instructions?: string; criteria?: Record<string, unknown>;
+    }> };
+    if (!Object.keys(body.questions).some((id) => id.startsWith('run_') || id === 'select')) {
+      return { status: 503, ok: false, text: async () => '' };
+    }
+    const matches = (value: unknown) => String(value).includes(firstOperation) || String(value).includes(renamedOperation);
+    const answers = Object.fromEntries(Object.entries(body.questions).map(([id, question]) => {
+      if (question.type === 'choice') {
+        const hit = Object.entries(question.criteria ?? {}).find(([key, text]) => key !== 'none' && matches(text));
+        const choice = hit?.[0] ?? 'none';
+        return [id, { type: 'choice', choice, confidence: 0.95, probabilities: { [choice]: 0.95 } }];
+      }
+      return [id, { type: 'noul', noul: matches(question.instructions) ? 0.95 : 0.02 }];
+    }));
+    return { status: 200, ok: true, text: async () => JSON.stringify({
+      model: 'jev-1.13.0', answers, usage: { input_tokens: 60, output_tokens: 6 },
+    }) };
+  });
   const prompt = `Retrieve the complete ${objective} from my connected account and report every record.`;
   const searchQuery = `retrieve complete ${objective}`;
   const selectorFor = (label: string): string => `${objective}:${generated(seed, `selector_${label}`)}`;
@@ -418,9 +446,16 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
     activeModel = {
       async getResponse(request: unknown) {
         modelSteps += 1;
+        let output: unknown[];
+        try {
+          output = input.model(structuredClone(request), modelSteps);
+        } catch (error) {
+          console.error(`lifecycle ${input.label} frame ${modelSteps}:`, error);
+          throw error;
+        }
         return {
           usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
-          output: input.model(structuredClone(request), modelSteps),
+          output,
           responseId: `capability-lifecycle-${input.label}-${modelSteps}`,
         };
       },
@@ -462,7 +497,9 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
       const tools = modelToolNames(request);
       if (step === 1) {
         assert.ok(tools.includes('tool_search'));
-        assert.equal(tools.includes('work_call'), false, 'blank state advertised business authority');
+        assert.ok(tools.includes('work_call'), 'stable carrier was hidden in cold state');
+        assert.equal(store.list().length, 0, 'cold carrier unexpectedly holds business authority');
+        assert.equal(providerLog().some((line) => line.startsWith('call:')), false);
         return [functionCall(coldSearchCall, 'tool_search', {
           query: searchQuery,
           role_key: 'clause-0:read',
@@ -488,6 +525,8 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
   const coldManifestId = coldCurrent[0]!.manifest.manifestId;
   assert.ok(factory.get(coldManifestId));
   assert.equal(providerLog().filter((line) => line === `call:${firstTool}`).length, 1);
+  assert.ok(eventlog.listEvents(cold.sessionId).some((event) => event.type === 'run_strategy_learned'),
+    'cold success must teach the warm routing strategy');
 
   const logBeforeWarm = providerLog().length;
   const warmReadCall = generated(seed, 'warm_read_call');
@@ -530,9 +569,10 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
     }),
   );
 
-  // Same operation, new required field: the stale warm binding must refuse at
-  // its live preparation probe, then one cold re-discovery publishes exactly
-  // one definition successor before a successful business crossing.
+  // Same operation, new required field: learned routing refreshes the exact
+  // definition before the first frame. A model that still supplies the old
+  // argument shape must receive a correction before business I/O. Discovery
+  // then returns that same successor, without duplicating its manifest.
   setProviderState({
     enabled: true,
     toolName: firstTool,
@@ -543,6 +583,7 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
   const staleAttempt = generated(seed, 'stale_attempt');
   const staleSearch = generated(seed, 'stale_search');
   const changedRead = generated(seed, 'changed_read');
+  const staleLogStart = providerLog().length;
   const stale = await runScenario({
     label: 'stale',
     model(request, step) {
@@ -572,6 +613,8 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
     },
   });
   assert.equal(stale.modelSteps, 4);
+  assert.equal(providerLog().slice(staleLogStart).filter((line) => line.startsWith('call:')).length, 1,
+    'only the corrected current-schema call may cross provider business I/O');
   const changedCurrent = store.list().filter((entry) => entry.manifest.lifecycle.state === 'current');
   assert.equal(changedCurrent.length, 1);
   assert.equal(changedCurrent[0]!.manifest.operationId, firstOperation);
@@ -713,11 +756,21 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
      WHERE session_id = ? AND source_user_seq = ?
      ORDER BY rowid
   `).all(removed.sessionId, removed.sourceUserSeq) as Array<Record<string, unknown>>;
-  assert.equal(removedSettlements.some((row) => (
-    row.logical_tool_call_id === removedAttempt
-    && row.outcome_kind !== 'succeeded'
-    && row.physical_crossing_count === 1
-  )), true, JSON.stringify(removedSettlements));
+  // Turn-start re-attestation already retired the missing operation. This is
+  // a pre-admission refusal, not a paid attempt with a fabricated settlement.
+  assert.equal(removedSettlements.some((row) => row.logical_tool_call_id === removedAttempt), false);
+  const removedEvents = eventlog.listEvents(removed.sessionId);
+  assert.ok(removedEvents.some((event) => (
+    event.type === 'guardrail_tripped'
+    && event.data.sourceUserSeq === removed.sourceUserSeq
+    && event.data.kind === 'refused_pre_dispatch'
+    && Array.isArray(event.data.calls)
+    && event.data.calls.some((call: { callId?: string }) => call.callId === removedAttempt)
+  )), 'removed operation must retain its exact pre-dispatch refusal receipt');
+  assert.ok(removedEvents.some((event) => (
+    event.type === 'tool_returned' && event.data.callId === removedAttempt
+    && /refused before dispatch/.test(String(event.data.result))
+  )), 'the model must receive the recorded refusal');
   assert.equal(removedSettlements.some((row) => row.logical_tool_call_id === removedSearch), true);
 
   t.diagnostic(`CAPABILITY_LIFECYCLE ${JSON.stringify({
