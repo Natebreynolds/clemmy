@@ -70,7 +70,7 @@ Output: `output/release-gates-0928/` in the release-gates worktree.
 
 ## Release continuity
 
-Candidate worktree: `/Users/nathan.reynolds/clem-worktrees/release-gates-0928`,
+Candidate worktree: `~/clem-worktrees/release-gates-0928`,
 branch `codex/release-gates-0928`, based on 292ce2ab3. Main and other owners'
 files remain untouched. Monitor remains paused.
 
@@ -140,3 +140,21 @@ values. The retained reader, reference resolver and local-runtime suites pass
 67/67 with the fix. `reference-scope-red2.log` is the corrected red receipt;
 the first clipping fixture was too small to clip and is not the valid proof.
 This follow-up requires its own build/install/live verification after commit.
+
+
+The reference-scope follow-up was then committed as `c9cc6a198`, built and
+hotpatched. Served fingerprint
+`9261952a1255fc31f1160fef29992c25100f86d4bbf578e466d25c8acac865ee`
+and both UI byte comparisons passed. Source 320637 repeated the same local
+read/pagination request: exact record 50, no wider reuse hint, no tool failure,
+one terminal, no unfinished attempt. Jev routing and completion succeeded;
+completion fulfills=true, failedOpen=false. Detailed receipts are under
+`output/reference-scope-0928/`. The cold and cached UI reopen checks each showed
+three answers exactly once. Full release qualification remains open.
+
+The public-repository hygiene check caught an absolute personal home path in
+this checkpoint. It is replaced with a home-relative path; detailed private
+receipts remain ignored local output. The first current-source unit shard
+passed; the partial suite was deliberately stopped before this documentation
+correction, not reported as a full pass. Resume qualification from the clean
+final source, and rebuild its fingerprint before the eventual release patch.
