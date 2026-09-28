@@ -1455,7 +1455,7 @@ function preservedPreexistingFiles(
 /** Shipped first-party instruction skills that setup seeds into `skills/` on
  * first boot (src/setup/builtin-skills.ts). Closed on purpose: the pin proves
  * this list equals the package's `builtin-skills/` directory. */
-export const BUILTIN_SKILL_SEED_IDS = Object.freeze(['technical-content-marketing', 'workspace-builder'] as const);
+export const BUILTIN_SKILL_SEED_IDS = Object.freeze(['people-lookup', 'technical-content-marketing', 'workspace-builder'] as const);
 
 /** The provisioner's record beside each seeded built-in: the digest of the exact
  * SKILL.md bytes it published, so a later release can tell its own untouched
@@ -1585,10 +1585,13 @@ export function validDeterministicBootSeed(home: string, relativePath: string): 
   }
   const builtinSkill = BUILTIN_SKILL_SEED_IDS.find((id) => relativePath === `skills/${id}/SKILL.md`);
   if (builtinSkill) {
-    // Exact seed semantics mirror the provisioner's own validation: bounded,
-    // front-matter `name` equal to the directory, and a non-empty body.
+    // Newly added seeds must be the exact reviewed bytes shipped by this
+    // candidate. A changed body plus a recomputed sidecar digest is not proof.
+    // Existing user-owned skills are not added files and remain preserved.
     const bytes = readFileSync(path.join(home, relativePath), 'utf8');
-    return Buffer.byteLength(bytes, 'utf8') <= 256 * 1024
+    const shipped = readFileSync(path.join(repoRoot, 'builtin-skills', builtinSkill, 'SKILL.md'), 'utf8');
+    return bytes === shipped
+      && Buffer.byteLength(bytes, 'utf8') <= 256 * 1024
       && bytes.startsWith('---\n')
       && new RegExp(`(?:^|\\n)name:\\s*${builtinSkill}(?:\\n|$)`).test(bytes)
       && bytes.split('\n---\n')[1]?.trim().length > 0;

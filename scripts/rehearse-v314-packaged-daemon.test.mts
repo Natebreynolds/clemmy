@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -289,6 +290,31 @@ test('first-boot added-file classifier is closed over causal recovery, seed, sch
   assert.equal(isExactDaemonLeaseOwnerRecord(lease, 123, lease.token), true);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, pid: 124 }, 123, lease.token), false);
   assert.equal(isExactDaemonLeaseOwnerRecord({ ...lease, extra: true }, 123, lease.token), false);
+});
+
+test('builtin seed validation requires shipped bytes even when a changed body has a matching digest', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-packaged-builtin-seeds-'));
+  try {
+    for (const id of BUILTIN_SKILL_SEED_IDS) {
+      const dir = path.join(home, 'skills', id);
+      mkdirSync(dir, { recursive: true });
+      const source = readFileSync(path.join(process.cwd(), 'builtin-skills', id, 'SKILL.md'));
+      const writeSeed = (bytes: Buffer) => {
+        writeFileSync(path.join(dir, 'SKILL.md'), bytes);
+        writeFileSync(path.join(dir, '.builtin.json'), JSON.stringify({ version: 1,
+          sha256: createHash('sha256').update(bytes).digest('hex') }));
+      };
+      writeSeed(source);
+      assert.equal(validDeterministicBootSeed(home, `skills/${id}/SKILL.md`), true);
+      assert.equal(validDeterministicBootSeed(home, `skills/${id}/.builtin.json`), true);
+      writeSeed(Buffer.concat([source, Buffer.from('\nUnshipped changed instructions.\n')]));
+      assert.equal(validDeterministicBootSeed(home, `skills/${id}/SKILL.md`), false,
+        'a matching self-reported digest is not proof of the shipped instruction bytes');
+      writeSeed(source);
+      writeFileSync(path.join(dir, '.builtin.json'), JSON.stringify({ version: 1, sha256: '0'.repeat(64) }));
+      assert.equal(validDeterministicBootSeed(home, `skills/${id}/.builtin.json`), false);
+    }
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
 test('deterministic check-in seed validation executes the typed identifier branch at runtime', () => {
