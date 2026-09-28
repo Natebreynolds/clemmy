@@ -593,8 +593,12 @@ test('matrix row 6: ordinary cold/warm/stale/renamed/removed capability lifecycl
       }
       if (step === 2) {
         const refused = resultText(request, staleAttempt) ?? '';
-        assert.match(refused, /drift|definition|preparation|refus/i,
-          'stale call did not return an actionable correction signal');
+        assert.match(refused, /current input schema/i,
+          'stale call must explain the current schema correction');
+        assert.match(refused, new RegExp(changedField), 'the newly required field must be named');
+        assert.match(refused, /missing_required/, 'the missing field must have a typed correction');
+        assert.match(refused, new RegExp(firstField), 'the obsolete field must be identified');
+        assert.match(refused, /unknown_field/, 'the obsolete field must have a typed correction');
         return [functionCall(staleSearch, 'tool_search', {
           query: searchQuery,
           role_key: 'clause-0:read',
