@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
-import { VAULT_DIR } from '../../memory/vault.js';
+import { MEETINGS_DIR } from '../../memory/vault.js';
 import { recordMemoryEpisode } from '../../memory/temporal-memory.js';
 import { openMemoryDb, type MemoryEpisodeRow } from '../../memory/db.js';
 import { upsertEntity } from '../../memory/entity-identity.js';
@@ -204,7 +204,6 @@ export interface RecallUploadToken {
 const SETTINGS_FILE = path.join(BASE_DIR, 'state', 'meeting-capture', 'recall-settings.json');
 const RECORDS_DIR = path.join(BASE_DIR, 'state', 'meeting-capture', 'recall-recordings');
 const ANALYSIS_DIR = path.join(BASE_DIR, 'state', 'meeting-capture', 'analysis');
-const VAULT_MEETINGS_DIR = path.join(VAULT_DIR, '04-Meetings');
 
 export const RECALL_REGIONS: Record<RecallRegion, string> = {
   'us-west-2': 'https://us-west-2.recall.ai',
@@ -1073,10 +1072,10 @@ function renderTranscriptArtifactBody(
 }
 
 function defaultArtifactPath(record: RecallMeetingRecord): string {
-  ensureDir(VAULT_MEETINGS_DIR);
+  ensureDir(MEETINGS_DIR);
   const date = record.startedAt.slice(0, 10);
   const label = safeId((record.title || record.platform || record.id).toLowerCase()).slice(0, 60);
-  return path.join(VAULT_MEETINGS_DIR, `${date}-${label}-${safeId(record.id)}.md`);
+  return path.join(MEETINGS_DIR, `${date}-${label}-${safeId(record.id)}.md`);
 }
 
 export function finalizeRecallMeeting(input: {

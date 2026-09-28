@@ -9,6 +9,8 @@ export const DAILY_NOTES_DIR = path.join(VAULT_DIR, '01-Daily-Notes');
 export const PEOPLE_DIR = path.join(VAULT_DIR, '02-People');
 export const PROJECTS_DIR = path.join(VAULT_DIR, '03-Projects');
 export const TOPICS_DIR = path.join(VAULT_DIR, '04-Topics');
+/** Existing meeting-note location; keep stable for installed vaults. */
+export const MEETINGS_DIR = path.join(VAULT_DIR, '04-Meetings');
 export const TASKS_DIR = path.join(VAULT_DIR, '05-Tasks');
 export const INBOX_DIR = path.join(VAULT_DIR, '07-Inbox');
 export const SOUL_FILE = path.join(SYSTEM_DIR, 'SOUL.md');
@@ -130,7 +132,7 @@ export function ensureVaultScaffold(): void {
   if (!existsSync(SYSTEM_DIR)) {
     mkdirSync(SYSTEM_DIR, { recursive: true });
   }
-  for (const dir of [DAILY_NOTES_DIR, PEOPLE_DIR, PROJECTS_DIR, TOPICS_DIR, TASKS_DIR, INBOX_DIR, WORKFLOWS_DIR]) {
+  for (const dir of [DAILY_NOTES_DIR, PEOPLE_DIR, PROJECTS_DIR, TOPICS_DIR, MEETINGS_DIR, TASKS_DIR, INBOX_DIR, WORKFLOWS_DIR]) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 }

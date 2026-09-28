@@ -33,7 +33,11 @@ test('registered analysis tool persists canonical analysis and files the existin
     assert.equal(name, 'meeting_analysis_save'); handler = callback;
   } } as never);
   assert.ok(handler);
-  await handler({ meeting_id: record.id, analysis });
+  const response = await handler({ meeting_id: record.id, analysis }) as { content: Array<{ text: string }> };
+  const receipt = JSON.parse(response.content[0]!.text);
+  assert.equal(receipt.meetingNotePath, artifactPath);
+  assert.equal(receipt.meetingsDirectory, path.join(home, 'vault', '04-Meetings'));
+  assert.equal(receipt.path, undefined, 'receipt directs the model to the usable note, not internal state');
   const saved = loadRecallMeetingAnalysis(record.id);
   assert.equal(saved?.summary, analysis.summary);
   assert.equal(saved?.source, 'agent');
@@ -66,4 +70,15 @@ test('Recall and local analyzer prompts use the typed save operation, not the pr
     assert.match(prompt, new RegExp(record.id));
     assert.doesNotMatch(prompt, /via write_file|\.analysis\.json/);
   }
+});
+
+test('ordinary file tool can save supporting notes in Meetings while internal state remains protected', async () => {
+  const { executeLocalFileWrite } = await import('./computer-tools.js');
+  const notePath = path.join(home, 'vault', '04-Meetings', 'follow-up-draft.md');
+  await executeLocalFileWrite({ path: notePath, content: 'Draft follow-up for review.', mode: 'create', append: null });
+  assert.equal(readFileSync(notePath, 'utf8'), 'Draft follow-up for review.\n');
+  const internalPath = path.join(home, 'state', 'meeting-capture', 'analysis', 'arbitrary.json');
+  const refused = await executeLocalFileWrite({ path: internalPath, content: '{}', mode: 'create', append: null });
+  assert.match(refused, /authorization state cannot be mutated/);
+  assert.equal(existsSync(internalPath), false);
 });

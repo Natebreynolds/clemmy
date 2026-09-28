@@ -7,7 +7,7 @@
  * (so it stays searchable / doesn't thrash the vault index), and a marker pasted
  * into curated text can't silently truncate the file on the next regeneration.
  */
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -24,6 +24,8 @@ const {
   loadMemoryContext,
   VAULT_DIR,
   SYSTEM_DIR,
+  MEETINGS_DIR,
+  ensureVaultScaffold,
 } = await import('./vault.js');
 
 test.after(() => rmSync(TMP_HOME, { recursive: true, force: true }));
@@ -101,4 +103,15 @@ test('compatible older-style marker also splits and is preserved', () => {
   assert.equal(s.curated, '# Memory\n\nCurated.');
   assert.equal(s.hadMarker, true);
   assert.ok(composeCuratedMemory('# Memory\n\nCurated2.', older).includes('- x'), 'older auto section preserved');
+});
+
+
+test('vault setup includes the stable Meetings folder and preserves existing notes', () => {
+  ensureVaultScaffold();
+  assert.equal(MEETINGS_DIR, path.join(VAULT_DIR, '04-Meetings'));
+  assert.ok(existsSync(MEETINGS_DIR));
+  const note = path.join(MEETINGS_DIR, 'follow-up.md');
+  writeFileSync(note, 'Keep this follow-up.');
+  ensureVaultScaffold();
+  assert.equal(readFileSync(note, 'utf8'), 'Keep this follow-up.');
 });
