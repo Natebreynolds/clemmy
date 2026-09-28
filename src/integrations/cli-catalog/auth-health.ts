@@ -451,7 +451,21 @@ function commitHealth(probed: CliHealth): CliHealth {
   return next;
 }
 
+/** Resolve metadata only: a unique command name is an alias for its registered
+ * scope, not a new CLI whose missing catalog row proves an absent binary. */
+export function resolveCliHealthId(input: string): string | undefined {
+  const id = input.trim();
+  const roster = rosterItems();
+  if (findCatalogEntry(id) || roster.some(item => item.id === id)) return id;
+  const matches = new Set([...CLI_CATALOG, ...roster]
+    .filter(item => item.command === id).map(item => item.id));
+  return matches.size === 1 ? [...matches][0] : undefined;
+}
+
 export async function getCliHealth(id: string, opts: { force?: boolean } = {}): Promise<CliHealth> {
+  const canonicalId = resolveCliHealthId(id);
+  if (!canonicalId) throw new Error(`Unknown or ambiguous CLI scope ${JSON.stringify(id)}; use a registered catalog or saved CLI id.`);
+  id = canonicalId;
   const cached = memo.get(id);
   if (!opts.force && cached && Date.now() - cached.at < HEALTH_MEMO_TTL_MS) return cached.value;
   const running = inFlight.get(id);
@@ -462,15 +476,7 @@ export async function getCliHealth(id: string, opts: { force?: boolean } = {}): 
       const catalog = findCatalogEntry(id);
       return catalog ? { id, command: catalog.command, probe: catalog.authProbe } : undefined;
     })();
-  if (!item) {
-    return {
-      id,
-      command: id.replace(/^saved:/, ''),
-      installed: false,
-      authStatus: 'unknown',
-      checkedAt: new Date().toISOString(),
-    };
-  }
+  if (!item) throw new Error(`CLI scope ${JSON.stringify(id)} is no longer registered; inspect the current roster.`);
   const promise = probeHealth(item)
     .then((probed) => {
       // Memoize the SETTLED record: a transient must not be served for 45s

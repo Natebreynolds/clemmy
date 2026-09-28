@@ -83,10 +83,12 @@ export function registerCliSetupTools(server: McpServer): void {
 }
 
 async function statusAction(catalogId?: string): Promise<ReturnType<typeof textResult>> {
-  const { getCliHealth, getRosterHealth, cliHealthStaleNote } = await import('../integrations/cli-catalog/auth-health.js');
+  const { getCliHealth, getRosterHealth, cliHealthStaleNote, resolveCliHealthId } = await import('../integrations/cli-catalog/auth-health.js');
   const { findCatalogEntry } = await import('../integrations/cli-catalog/catalog.js');
-  const id = catalogId?.trim();
-  if (catalogId !== undefined && !id) return textResult('status catalogId must name a CLI; omit it to inspect the whole roster.');
+  const requested = catalogId?.trim();
+  if (catalogId !== undefined && !requested) return textResult('status catalogId must name a CLI; omit it to inspect the whole roster.');
+  const id = requested ? resolveCliHealthId(requested) : undefined;
+  if (requested && !id) return textResult(`Unknown or ambiguous CLI scope ${JSON.stringify(requested)}. Use a registered catalog id or saved CLI id; no installation or authentication check was performed.`);
   // Scope before probing, not after: filtering a roster sweep still executes
   // unrelated credential checks and pays their latency.
   const roster = id ? [await getCliHealth(id)] : await getRosterHealth();
@@ -192,7 +194,10 @@ async function jobStatusAction(jobId: string | undefined): Promise<ReturnType<ty
 /** The declared repairs a CLI carries, or every CLI's when none is named. */
 async function repairsAction(catalogId: string | undefined): Promise<ReturnType<typeof textResult>> {
   const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
-  const wanted = catalogId?.trim().toLowerCase();
+  const { resolveCliHealthId } = await import('../integrations/cli-catalog/auth-health.js');
+  const requested = catalogId?.trim();
+  const wanted = requested ? resolveCliHealthId(requested) : undefined;
+  if (catalogId !== undefined && !wanted) return textResult(`Unknown or ambiguous CLI scope ${JSON.stringify(requested)}. Use a registered catalog id or saved CLI id.`);
   const entries = CLI_CATALOG.filter((entry) => (entry.repairs?.length ?? 0) > 0
     && (!wanted || entry.id === wanted));
   if (entries.length === 0) {

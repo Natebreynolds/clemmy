@@ -400,3 +400,13 @@ test('connection metadata rejects failed probes, malformed documents and secret-
     assert.equal(classifyProbeOutput(salesforceProbe,result).connectionOrigin,undefined);
   }
 });
+
+test('health API cannot turn an unknown scope into evidence that a binary is missing', async () => {
+  const { getCliHealth, resolveCliHealthId } = await import('./auth-health.js');
+  let probes = 0;
+  _testOnly_setProbeExec(async () => { probes++; throw new Error('must not probe'); });
+  assert.equal(resolveCliHealthId('sf'), 'salesforce');
+  assert.equal(resolveCliHealthId('unknown-cli'), undefined);
+  await assert.rejects(getCliHealth('unknown-cli'), /Unknown or ambiguous CLI scope/);
+  assert.equal(probes, 0);
+});

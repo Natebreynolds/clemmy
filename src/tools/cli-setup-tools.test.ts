@@ -237,3 +237,25 @@ test('CLI inspection reports fresh account-bound origins and drops them after a 
   const stale = await tools.get('cli_inspect')!({action:'status',catalogId:'salesforce'});
   assert.doesNotMatch(stale.content.map(part=>part.text??'').join('\n'), /tenant.example.com/);
 });
+
+test('CLI inspection resolves command names and never claims an unknown scope is not installed', async () => {
+  const { invalidateCliHealth } = await import('../integrations/cli-catalog/auth-health.js');
+  invalidateCliHealth();
+  const probes: string[][] = [];
+  _testOnly_setProbeExec(async (_binary,args) => {
+    probes.push(args);
+    return {exitCode:0,output:JSON.stringify({result:{username:'reader@example.com',instanceUrl:'https://tenant.example.com'}}),timedOut:false};
+  });
+  const result = await tools.get('cli_inspect')!({action:'status',catalogId:'sf'});
+  const text = result.content.map(part=>part.text??'').join('\n');
+  assert.match(text,/salesforce \(sf\): signed in as reader@example.com/);
+  assert.match(text,/https:\/\/tenant.example.com/);
+  assert.equal(probes.length,1);
+  const unknown = await tools.get('cli_inspect')!({action:'status',catalogId:'unknown-cli'});
+  const unknownText=unknown.content.map(part=>part.text??'').join('\n');
+  assert.match(unknownText,/unknown|ambiguous/i);
+  assert.doesNotMatch(unknownText,/NOT INSTALLED|cli_setup.*install/);
+  assert.equal(probes.length,1,'unknown scope must not broaden into a roster probe');
+  const repairs=await tools.get('cli_inspect')!({action:'repairs',catalogId:'sf'});
+  assert.match(repairs.content.map(part=>part.text??'').join('\n'),/salesforce.default-org/);
+});
