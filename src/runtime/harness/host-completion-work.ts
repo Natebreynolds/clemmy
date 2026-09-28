@@ -7,7 +7,7 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { discoveryNavigation } from './discovered-tool-context.js';
-import { answererViewBudgetFor, presentationBudgetFor, inlineResultBudgetForModel, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
+import { answererViewBudgetFor, presentationBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
@@ -474,8 +474,7 @@ export function sourceSettledReadEvidence(input: {
   omitSuccessfulDiscovery?: boolean;
   /** Completion has source-scoped evidence lookup tools: retain bulk reads at
    * the ordinary recallable presentation size instead of re-inflating each
-   * into a full model window. A shared inline budget also bounds selected
-   * pages; all their exact bytes remain openable. Writes keep their receipts. */
+   * into a full model window. Targeted pages and write receipts stay whole. */
   lookupBacked?: boolean;
   /** Earlier results retain authenticated references; new distinct content
    * uses the answerer's bounded view for advisory trajectory review. */
@@ -488,11 +487,10 @@ export function sourceSettledReadEvidence(input: {
   /** The model the answerer's results were presented to. Defaults to the
    * active run's routed model. */
   routedModelId?: string | null;
-}, sharedContent: Map<string, string> = new Map(), inlineBudget?: { remaining: number }): CompletionReadEvidence {
+}, sharedContent: Map<string, string> = new Map()): CompletionReadEvidence {
   const routedModelId = input.routedModelId !== undefined
     ? input.routedModelId
     : harnessRunContextStorage.getStore()?.routedModelId;
-  if (input.lookupBacked && !inlineBudget) inlineBudget = { remaining: inlineResultBudgetForModel(routedModelId) };
   try {
     const rows = openEventLog().prepare(`
       SELECT s.rowid AS settlementIndex, s.logical_tool_call_id AS callId, l.tool_name AS toolName,
@@ -510,7 +508,6 @@ export function sourceSettledReadEvidence(input: {
     }>;
     const results: CompletionReadEvidence['results'] = [];
     const blocks: string[] = [];
-    let remainingReadSlots = rows.filter(row => !row.mutating && ['succeeded', 'empty_result'].includes(row.outcome)).length;
     const incremental = input.afterSettlementIndex !== undefined;
     // A control-role write that committed a durable definition (workflow or
     // Space) is marked on its tool_returned row by the tool edge. That commit
@@ -677,20 +674,12 @@ export function sourceSettledReadEvidence(input: {
       // Advisory reviews must not re-inflate bulk results the answerer saw
       // only through a bounded view. Targeted retained reads remain whole;
       // handles and explicit completeness preserve access to omitted bytes.
-      const lookupPreview = input.lookupBacked === true && !row.mutating;
-      const reference = `[review evidence: complete result handle=${value.resultHandleId} sha256=${value.rawPayloadSha256}]`;
-      const allocation = lookupPreview && inlineBudget
-        ? Math.min(presentationBudgetFor({ toolName: row.toolName, args: requestArgs, routedModelId }),
-          Math.floor(inlineBudget.remaining / Math.max(1, remainingReadSlots--))) : undefined;
-      const view = allocation !== undefined
-        ? allocation < 400 && shown.text.length > allocation
-          ? { text: 'Content retained; open the authenticated handle above to inspect it.', bounded: true }
-          : answererView(shown.text, row.toolName, row.callId, reference, allocation)
-        : evidenceKind === 'retained_projection'
-          ? { text: shown.text, bounded: false }
-          : answererView(shown.text, row.toolName, row.callId, reference,
-            answererViewBudgetFor({ toolName: row.toolName, args: requestArgs, routedModelId }));
-      if (lookupPreview && inlineBudget) inlineBudget.remaining = Math.max(0, inlineBudget.remaining - view.text.length);
+      const lookupPreview = input.lookupBacked === true && !row.mutating && evidenceKind !== 'retained_projection';
+      const view = evidenceKind === 'retained_projection'
+        ? { text: shown.text, bounded: false }
+        : answererView(shown.text, row.toolName, row.callId,
+          `[review evidence: complete result handle=${value.resultHandleId} sha256=${value.rawPayloadSha256}]`,
+          (lookupPreview ? presentationBudgetFor : answererViewBudgetFor)({ toolName: row.toolName, args: requestArgs, routedModelId }));
       const bytes = Buffer.from(view.text, 'utf8');
       results.push({ ...base, ...projectedSource, status: 'verified', resultHandleId: value.resultHandleId,
         physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,
@@ -721,7 +710,7 @@ export function sourceSettledReadEvidence(input: {
       for (const worker of sourceWorkerEvidenceScopes(input)) {
         // A worker's results were presented to the model that worker ran.
         const evidence = sourceSettledReadEvidence({ ...input, ...worker, includeWorkerResults: false, includeWriteReceipts: false,
-          routedModelId: worker.executedRoute?.model ?? routedModelId }, seenContent, inlineBudget);
+          routedModelId: worker.executedRoute?.model ?? routedModelId }, seenContent);
         evidenceAvailable = evidenceAvailable && evidence.evidenceAvailable;
         throughSettlementIndex = Math.max(throughSettlementIndex, evidence.throughSettlementIndex ?? 0);
         results.push(...evidence.results);

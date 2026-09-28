@@ -1600,7 +1600,7 @@ test('lookup-backed completion avoids re-inflating bulk reads while preserving e
 });
 
 
-test('completion read previews share one window budget across many selected pages', () => {
+test('completion preserves selected pages needed for verification even across many reads', () => {
   const identity = accepted('Compare all fixture result pages.');
   const pages = Array.from({ length: 12 }, (_, i) => `Page ${i}: ` + 'source evidence '.repeat(1200) + ` END_${i}`);
   for (const [i, page] of pages.entries()) retainedRead(identity, 'recall_tool_result', page, false, false, false,
@@ -1608,9 +1608,10 @@ test('completion read previews share one window budget across many selected page
   const evidence = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
   const lookup = sourceEvidenceLookup(identity);
   assert.equal(evidence.results.length, pages.length);
-  assert.ok(evidence.summary.length < 50_000, `packet was ${evidence.summary.length} characters`);
+  assert.ok(evidence.summary.length > 50_000, 'selected evidence must not become an unavailable preview');
   for (const [i, result] of evidence.results.entries()) {
-    assert.equal(result.contentComplete, false);
+    assert.equal(result.contentComplete, true);
+    assert.ok(evidence.summary.includes(pages[i]!));
     assert.equal(lookup.resolve(result.resultHandleId!)?.text, pages[i]);
   }
 });

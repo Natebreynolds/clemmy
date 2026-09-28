@@ -50,6 +50,8 @@ export interface CliHealth {
   authStatus: CliAuthStatus;
   issue?: 'credential_store_unavailable' | 'configuration_required';
   username?: string;
+  /** Public connection origin from the same successful probe/account; not retained through failed refreshes. */
+  connectionOrigin?: string;
   checkedAt: string;
   /**
    * Present when `authStatus` is a KEPT verdict: the latest probe failed
@@ -138,6 +140,8 @@ export function onCliSignedOut(fn: RecoveredListener): () => void {
 export interface ProbeExecResult {
   exitCode: number | null;
   output: string;
+  /** Structured probe metadata is decoded only from stdout when available. */
+  stdout?: string;
   timedOut: boolean;
   /** stderr alone, when the executor can separate it (the real executor does). */
   stderr?: string;
@@ -155,11 +159,11 @@ const realExec: ProbeExec = (binaryPath, args, timeoutMs) =>
     }, (err, stdout, stderr) => {
       const output = [stdout, stderr].filter(Boolean).join('\n');
       if (err && (err as { killed?: boolean }).killed) {
-        resolve({ exitCode: null, output, timedOut: true, stderr });
+        resolve({ exitCode: null, output, stdout, timedOut: true, stderr });
         return;
       }
       const code = err ? ((err as { code?: unknown }).code as number | null ?? 1) : 0;
-      resolve({ exitCode: typeof code === 'number' ? code : 1, output, timedOut: false, stderr });
+      resolve({ exitCode: typeof code === 'number' ? code : 1, output, stdout, timedOut: false, stderr });
     });
   });
 
@@ -186,7 +190,7 @@ export function _testOnly_setCommandResolver(fn?: CommandResolver): void {
 export function classifyProbeOutput(
   probe: CliAuthProbe,
   result: ProbeExecResult,
-): Pick<CliHealth, 'authStatus' | 'username' | 'issue'> {
+): Pick<CliHealth, 'authStatus' | 'username' | 'issue' | 'connectionOrigin'> {
   const text = stripAnsi(result.output);
   if (result.timedOut) return { authStatus: 'error' };
   for (const failure of probe.failurePatterns ?? []) {
@@ -206,9 +210,29 @@ export function classifyProbeOutput(
         username = new RegExp(probe.usernameCapture, 'im').exec(text)?.[1];
       } catch { /* capture is best-effort */ }
     }
-    return { authStatus: 'ok', ...(username ? { username } : {}) };
+    const connectionOrigin = publicConnectionOrigin(probe, result.stdout ?? result.output);
+    return { authStatus: 'ok', ...(username ? { username } : {}), ...(connectionOrigin ? { connectionOrigin } : {}) };
   }
   return { authStatus: 'error' };
+}
+
+/** No broad auth-output projection: catalog selects one JSON field, and only
+ * a plain HTTPS origin can leave this boundary. Secret-bearing URLs are refused
+ * rather than trimmed into apparently trustworthy connection metadata. */
+function publicConnectionOrigin(probe: CliAuthProbe, stdout: string): string | undefined {
+  if (!probe.connectionOriginPath?.length) return undefined;
+  try {
+    let value: unknown = JSON.parse(stripAnsi(stdout));
+    for (const key of probe.connectionOriginPath) {
+      if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) return undefined;
+      value = (value as Record<string, unknown>)[key];
+    }
+    if (typeof value !== 'string') return undefined;
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') return undefined;
+    if (value !== url.origin && value !== url.origin + '/') return undefined;
+    return url.origin;
+  } catch { return undefined; }
 }
 
 // ─── Roster assembly ────────────────────────────────────────────────

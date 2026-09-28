@@ -221,3 +221,19 @@ test('invalid explicit status scope cannot silently expand to the roster', async
   }
   assert.equal(probes, 0);
 });
+
+
+test('CLI inspection reports fresh account-bound origins and drops them after a failed refresh', async () => {
+  const { invalidateCliHealth } = await import('../integrations/cli-catalog/auth-health.js');
+  invalidateCliHealth();
+  _testOnly_setProbeExec(async () => ({exitCode:0,output:JSON.stringify({result:{username:'reader@example.com',instanceUrl:'https://tenant.example.com',accessToken:'SECRET_ACCESS'}}),timedOut:false}));
+  const result = await tools.get('cli_inspect')!({action:'status',catalogId:'salesforce'});
+  const text = result.content.map(part => part.text ?? '').join('\n');
+  assert.match(text, /signed in as reader@example.com/);
+  assert.match(text, /connection origin for this account: https:\/\/tenant.example.com/);
+  assert.doesNotMatch(text, /SECRET_ACCESS|accessToken/);
+  invalidateCliHealth();
+  _testOnly_setProbeExec(async () => ({exitCode:1,output:'temporary failure',timedOut:false}));
+  const stale = await tools.get('cli_inspect')!({action:'status',catalogId:'salesforce'});
+  assert.doesNotMatch(stale.content.map(part=>part.text??'').join('\n'), /tenant.example.com/);
+});

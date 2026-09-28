@@ -379,3 +379,24 @@ for (const failure of ['No default environment found', 'security: SecKeychainIte
     } finally { unsubscribe(); }
   });
 }
+
+
+test('catalog-declared connection origin is bound to the probed account without credentials', () => {
+  const stdout = JSON.stringify({result:{username:'reader@example.com',instanceUrl:'https://tenant.example.com',accessToken:'SECRET_ACCESS',refreshToken:'SECRET_REFRESH'}});
+  const verdict = classifyProbeOutput(salesforceProbe, {exitCode:0, output:stdout+'\nUpdate available', stdout, timedOut:false});
+  assert.equal(verdict.connectionOrigin, 'https://tenant.example.com');
+  assert.equal(verdict.username, 'reader@example.com');
+  assert.doesNotMatch(JSON.stringify(verdict), /SECRET|accessToken|refreshToken/);
+  assert.equal(classifyProbeOutput({...salesforceProbe, connectionOriginPath:undefined}, {exitCode:0,output:stdout,timedOut:false}).connectionOrigin, undefined);
+});
+
+test('connection metadata rejects failed probes, malformed documents and secret-bearing URLs', () => {
+  for (const value of ['https://user:secret@tenant.example.com', 'https://tenant.example.com/?token=secret', 'https://tenant.example.com/#secret', 'https://tenant.example.com/secret', 'file:///private/secret', 'http://tenant.example.com', 'not a URL']) {
+    const output=JSON.stringify({result:{username:'reader@example.com',instanceUrl:value}});
+    assert.equal(classifyProbeOutput(salesforceProbe,{exitCode:0,output,timedOut:false}).connectionOrigin,undefined,value);
+  }
+  const output=JSON.stringify({result:{username:'reader@example.com',instanceUrl:'https://tenant.example.com'}});
+  for (const result of [{exitCode:1,output,timedOut:false},{exitCode:0,output,timedOut:true},{exitCode:0,output:output+' Not authenticated',timedOut:false},{exitCode:0,output:'not JSON',timedOut:false}]) {
+    assert.equal(classifyProbeOutput(salesforceProbe,result).connectionOrigin,undefined);
+  }
+});

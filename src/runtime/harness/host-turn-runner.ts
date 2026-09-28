@@ -4272,7 +4272,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           sourceIncompleteAttemptsEvidence(identity),
           // Bulk reads stay behind authenticated lookup handles instead of
           // re-inflating every raw result into the reviewer prompt. Selected
-          // pages share the read budget; omission is never proof of absence.
+          // pages stay whole; preview omission is never proof of absence.
           `Retained READ results for THIS accepted source (metadata/schema discovery is not the requested business data):\n${readEvidence.summary}`,
           // A reply may rest on a check an earlier turn made ("I checked
           // beforehand"); without it that claim reads as unverified.

@@ -107,7 +107,9 @@ async function statusAction(catalogId?: string): Promise<ReturnType<typeof textR
       const fix = !h.installed && entry ? ` — install: cli_setup {"action":"install","catalogId":"${h.id}"}`
         : h.authStatus === 'signed_out' && entry ? ` — fix: cli_setup {"action":"auth","catalogId":"${h.id}"}`
         : '';
-      return `${h.id} (${h.command}): ${state}${fix}`;
+      const connection = h.authStatus === 'ok' && !h.staleSince && h.username && h.connectionOrigin
+        ? `; connection origin for this account: ${h.connectionOrigin}` : '';
+      return `${h.id} (${h.command}): ${state}${connection}${fix}`;
     });
   return textResult(`CLI roster (${roster.length}):\n${lines.join('\n')}`);
 }

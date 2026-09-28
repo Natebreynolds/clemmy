@@ -47,6 +47,8 @@ export interface CliAuthProbe {
   signedOutPattern?: string;
   /** Regex source whose first capture group extracts the account name. */
   usernameCapture?: string;
+  /** Public HTTPS origin field in JSON stdout. Only this exact field is projected; never the full auth document. */
+  connectionOriginPath?: readonly string[];
   /** Probe timeout; default 5s in auth-health. */
   timeoutMs?: number;
   /** Known failures that are not evidence the user is signed out. */
@@ -251,6 +253,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
       ],
       signedOutPattern: 'No default org found|NoAuthInfoFound|no default org|Not authenticated|No org found|unable to refresh session',
       usernameCapture: '"username"\\s*:\\s*"([^"]+)"',
+      connectionOriginPath: ['result', 'instanceUrl'],
       timeoutMs: 15_000,
     },
     reviewedRead: {
