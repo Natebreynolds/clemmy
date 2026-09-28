@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -14,6 +15,36 @@ import {
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const emitScript = fileURLToPath(new URL('./emit-implementation-artifacts.mjs', import.meta.url));
 const devUp = readFileSync(new URL('./dev-up.sh', import.meta.url), 'utf8');
+
+test('Windows-style Git checkout preserves the shipped artifact content addresses', () => {
+  const checkout = mkdtempSync(path.join(os.tmpdir(), 'clem-artifact-checkout-'));
+  const relativeRoot = 'src/runtime/harness/implementation-artifacts/emitted';
+  const artifactRoot = path.join(checkout, relativeRoot);
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: checkout, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  };
+  try {
+    mkdirSync(path.dirname(artifactRoot), { recursive: true });
+    cpSync(path.join(repoRoot, relativeRoot), artifactRoot, { recursive: true });
+    if (existsSync(path.join(repoRoot, '.gitattributes'))) {
+      cpSync(path.join(repoRoot, '.gitattributes'), path.join(checkout, '.gitattributes'));
+    }
+    git('init', '--quiet');
+    git('-c', 'core.autocrlf=false', 'add', '--force', relativeRoot);
+    if (existsSync(path.join(checkout, '.gitattributes'))) git('add', '.gitattributes');
+    rmSync(artifactRoot, { recursive: true });
+    git('-c', 'core.autocrlf=true', 'checkout-index', '--all', '--force');
+    const manifest = JSON.parse(readFileSync(path.join(artifactRoot, 'manifest.json'), 'utf8'));
+    for (const [kind, artifact] of Object.entries(manifest.artifacts)) {
+      const bytes = readFileSync(path.join(artifactRoot, artifact.file));
+      assert.equal(createHash('sha256').update(bytes).digest('hex'), artifact.sha256,
+        `${kind}: checkout changed the executable bytes addressed by the manifest`);
+    }
+  } finally {
+    rmSync(checkout, { recursive: true, force: true });
+  }
+});
 
 test('dev-up emits artifacts before candidate capture and verifies them before launch', () => {
   const emitAt = devUp.indexOf(

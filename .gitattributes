@@ -1,0 +1,3 @@
+# Executable artifacts are addressed by a SHA-256 of their exact bytes.
+# Git's Windows autocrlf conversion must not invalidate the shipped manifest.
+src/runtime/harness/implementation-artifacts/emitted/** -text
