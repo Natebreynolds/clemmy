@@ -188,3 +188,36 @@ test('a planning turn may run a declared repair, and may not run an undeclared o
       `${JSON.stringify(args)} must stay refused in Plan`);
   }
 });
+
+
+test('scoped status probes only the requested CLI through both inspection surfaces', async () => {
+  const { invalidateCliHealth } = await import('../integrations/cli-catalog/auth-health.js');
+  const { recordConnectedCli, findCatalogEntry } = await import('../integrations/cli-catalog/catalog.js');
+  recordConnectedCli(findCatalogEntry('railway')!);
+  recordConnectedCli(findCatalogEntry('salesforce')!);
+  for (const toolName of ['cli_inspect', 'cli_setup']) {
+    invalidateCliHealth();
+    const probes: string[][] = [];
+    _testOnly_setProbeExec(async (_binary, args) => {
+      probes.push(args);
+      return { exitCode: 1, output: 'NoDefaultOrgFoundError: no default org', timedOut: false };
+    });
+    const result = await tools.get(toolName)!({ action: 'status', catalogId: 'salesforce' });
+    const text = result.content.map(part => part.text ?? '').join('\n');
+    assert.deepEqual(probes, [findCatalogEntry('salesforce')!.authProbe!.args]);
+    assert.match(text, /salesforce .*CONFIGURATION REQUIRED/);
+    assert.doesNotMatch(text, /railway/);
+  }
+});
+
+test('invalid explicit status scope cannot silently expand to the roster', async () => {
+  const { invalidateCliHealth } = await import('../integrations/cli-catalog/auth-health.js');
+  invalidateCliHealth();
+  let probes = 0;
+  _testOnly_setProbeExec(async () => { probes++; throw new Error('must not probe'); });
+  for (const catalogId of ['', '  ', 'unknown-cli']) {
+    const result = await tools.get('cli_inspect')!({ action: 'status', catalogId });
+    assert.doesNotMatch(result.content.map(part => part.text ?? '').join('\n'), /railway/);
+  }
+  assert.equal(probes, 0);
+});

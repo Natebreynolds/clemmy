@@ -30,7 +30,7 @@ export function registerCliSetupTools(server: McpServer): void {
     { action: z.enum(['status', 'repairs', 'job_status']), catalogId: z.string().max(60).optional(),
       jobId: z.string().max(120).optional() },
     async ({ action, catalogId, jobId }) => {
-      if (action === 'status') return statusAction();
+      if (action === 'status') return statusAction(catalogId);
       if (action === 'repairs') return repairsAction(catalogId);
       return jobStatusAction(jobId);
     });
@@ -40,7 +40,7 @@ export function registerCliSetupTools(server: McpServer): void {
     [
       'Install or re-authenticate a local CLI for the user, via the approved runners. Actions:',
       '- For read-only diagnostics prefer cli_inspect (status | repairs | job_status).',
-      '- status: auth/install state of every CLI the user has connected or saved (their roster).',
+      '- status: auth/install state of catalogId, or the connected/saved roster when catalogId is omitted.',
       '- install: install a CLI. Pass catalogId (preferred — e.g. "railway", "github") OR a raw command, which must match the install allowlist (npm install -g / brew install / uv tool install / pipx install / pip install --user / git clone https).',
       '- auth: sign a catalog CLI in again. The conversation shows its managed process and private input controls. Browser and system credential prompts remain user-owned. Never ask for a password in chat or run login through run_shell_command.',
       '- job_status: check a previously started install/auth job by id.',
@@ -51,7 +51,7 @@ export function registerCliSetupTools(server: McpServer): void {
     {
       action: ACTION.describe('What to do: status | install | auth | job_status.'),
       catalogId: z.string().max(60).optional()
-        .describe('Catalog CLI id for install/auth (e.g. "railway", "netlify", "github"). See status output for ids.'),
+        .describe('Catalog CLI id for status/install/auth (e.g. "railway", "netlify", "github"). See status output for ids.'),
       command: z.string().max(300).optional()
         .describe('install only: a raw install command when the CLI is not in the catalog. Validated against the allowlist server-side.'),
       saveAs: z.string().max(60).optional()
@@ -65,7 +65,7 @@ export function registerCliSetupTools(server: McpServer): void {
     },
     async ({ action, catalogId, command, saveAs, jobId, repairId, values }) => {
       try {
-        if (action === 'status') return await statusAction();
+        if (action === 'status') return await statusAction(catalogId);
         if (action === 'install') return await installAction(catalogId, command, saveAs);
         if (action === 'auth') return await authAction(catalogId);
         if (action === 'repairs') return await repairsAction(catalogId);
@@ -82,10 +82,14 @@ export function registerCliSetupTools(server: McpServer): void {
   );
 }
 
-async function statusAction(): Promise<ReturnType<typeof textResult>> {
-  const { getRosterHealth, cliHealthStaleNote } = await import('../integrations/cli-catalog/auth-health.js');
+async function statusAction(catalogId?: string): Promise<ReturnType<typeof textResult>> {
+  const { getCliHealth, getRosterHealth, cliHealthStaleNote } = await import('../integrations/cli-catalog/auth-health.js');
   const { findCatalogEntry } = await import('../integrations/cli-catalog/catalog.js');
-  const roster = await getRosterHealth();
+  const id = catalogId?.trim();
+  if (catalogId !== undefined && !id) return textResult('status catalogId must name a CLI; omit it to inspect the whole roster.');
+  // Scope before probing, not after: filtering a roster sweep still executes
+  // unrelated credential checks and pays their latency.
+  const roster = id ? [await getCliHealth(id)] : await getRosterHealth();
   if (roster.length === 0) {
     return textResult('The user has no connected or saved CLIs yet. Search the catalog from Connect, or use cli_setup install with a catalogId.');
   }
