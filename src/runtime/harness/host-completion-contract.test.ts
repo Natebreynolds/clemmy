@@ -1583,7 +1583,7 @@ test('lookup-backed completion avoids re-inflating bulk reads while preserving e
   const identity = accepted('Read the complete fixture report.');
   const text = Array.from({ length: 700 }, (_, i) => `Report row ${i}: evidence`).join('\n') + '\nDECISIVE_FINAL_RECORD';
   retainedRead(identity, 'fixture_business_read', text);
-  const page = 'selected evidence '.repeat(350) + 'SELECTED_PAGE_END';
+  const page = 'selected evidence '.repeat(100) + 'SELECTED_PAGE_END';
   retainedRead(identity, 'recall_tool_result', page, false, false, false,
     { id: 'recalled-fixture', args: { call_id: 'read:fixture_business_read' } });
   events.closeEventLog();
@@ -1600,18 +1600,30 @@ test('lookup-backed completion avoids re-inflating bulk reads while preserving e
 });
 
 
-test('completion preserves selected pages needed for verification even across many reads', () => {
+test('lookup-backed completion bounds bulk retained pages without losing exact source-scoped evidence', () => {
   const identity = accepted('Compare all fixture result pages.');
   const pages = Array.from({ length: 12 }, (_, i) => `Page ${i}: ` + 'source evidence '.repeat(1200) + ` END_${i}`);
   for (const [i, page] of pages.entries()) retainedRead(identity, 'recall_tool_result', page, false, false, false,
     { id: `budget-page-${i}`, args: { call_id: `source-${i}` } });
+  const ordinary = sourceSettledReadEvidence(identity);
+  assert.ok(ordinary.summary.length > 50_000);
+  for (const [i, result] of ordinary.results.entries()) {
+    assert.equal(result.contentComplete, true, 'without lookup the full selected page remains inline');
+    assert.ok(ordinary.summary.includes(pages[i]!));
+  }
   const evidence = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
   const lookup = sourceEvidenceLookup(identity);
   assert.equal(evidence.results.length, pages.length);
-  assert.ok(evidence.summary.length > 50_000, 'selected evidence must not become an unavailable preview');
+  assert.ok(evidence.summary.length < 80_000, 'bulk retained pages must not bypass the reviewer preview budget');
+  assert.match(evidence.summary, /Content omitted here is uninspected by this review, not absent/);
+  events.closeEventLog(); // handles must remain redeemable after reopening, not just from memory
   for (const [i, result] of evidence.results.entries()) {
-    assert.equal(result.contentComplete, true);
-    assert.ok(evidence.summary.includes(pages[i]!));
+    assert.equal(result.contentComplete, false);
+    assert.equal(result.viewBounded, true);
+    assert.ok(!evidence.summary.includes(pages[i]!));
     assert.equal(lookup.resolve(result.resultHandleId!)?.text, pages[i]);
   }
+  const other = accepted('Unrelated work.');
+  const unrelated = sourceEvidenceLookup(other);
+  assert.equal(unrelated.resolve(evidence.results[0]!.resultHandleId!), undefined);
 });

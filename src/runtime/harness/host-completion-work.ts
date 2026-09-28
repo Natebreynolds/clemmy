@@ -7,7 +7,7 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { discoveryNavigation } from './discovered-tool-context.js';
-import { answererViewBudgetFor, presentationBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
+import { PROMPT_INLINE_RECALLABLE_RESULT_CHARS, answererViewBudgetFor, presentationBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
@@ -474,7 +474,8 @@ export function sourceSettledReadEvidence(input: {
   omitSuccessfulDiscovery?: boolean;
   /** Completion has source-scoped evidence lookup tools: retain bulk reads at
    * the ordinary recallable presentation size instead of re-inflating each
-   * into a full model window. Targeted pages and write receipts stay whole. */
+   * into a full model window. This includes retained pages; complete bytes
+   * remain source-scoped and redeemable. Write receipts keep their usual view. */
   lookupBacked?: boolean;
   /** Earlier results retain authenticated references; new distinct content
    * uses the answerer's bounded view for advisory trajectory review. */
@@ -669,17 +670,20 @@ export function sourceSettledReadEvidence(input: {
           + (navigation?.length ? `\nDiscovered tool metadata (not proof that a nested operation or actor input is prepared): ${JSON.stringify(navigation)}` : ''));
         continue;
       }
-      // A reader of retained output hands the answerer its page whole, within
-      // that tool's own page bound, so its page is shown whole here too.
-      // Advisory reviews must not re-inflate bulk results the answerer saw
-      // only through a bounded view. Targeted retained reads remain whole;
-      // handles and explicit completeness preserve access to omitted bytes.
-      const lookupPreview = input.lookupBacked === true && !row.mutating && evidenceKind !== 'retained_projection';
-      const view = evidenceKind === 'retained_projection'
+      // A retained page can contain tens of thousands of characters. Its
+      // answerer-side reader budget is not a reviewer preview budget: replaying
+      // every page in full defeats source-scoped lookup. Keep small pages whole,
+      // mark large previews incomplete, and preserve their exact handles below.
+      // Callers without lookup still receive the answerer's whole retained page.
+      const lookupPreview = input.lookupBacked === true && !row.mutating;
+      const budgetInput = { toolName: row.toolName, args: requestArgs, routedModelId };
+      const view = evidenceKind === 'retained_projection' && !lookupPreview
         ? { text: shown.text, bounded: false }
         : answererView(shown.text, row.toolName, row.callId,
           `[review evidence: complete result handle=${value.resultHandleId} sha256=${value.rawPayloadSha256}]`,
-          (lookupPreview ? presentationBudgetFor : answererViewBudgetFor)({ toolName: row.toolName, args: requestArgs, routedModelId }));
+          lookupPreview
+            ? Math.min(PROMPT_INLINE_RECALLABLE_RESULT_CHARS, presentationBudgetFor(budgetInput))
+            : answererViewBudgetFor(budgetInput));
       const bytes = Buffer.from(view.text, 'utf8');
       results.push({ ...base, ...projectedSource, status: 'verified', resultHandleId: value.resultHandleId,
         physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,

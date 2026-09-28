@@ -56,6 +56,10 @@ interface ToolMetric {
 
 interface RequestMetric {
   step: number;
+  sessionId?: string;
+  sourceUserSeq?: number;
+  role?: string;
+  channel?: string;
   sdkBytes: number;
   sdkCodeUnits: number;
   sdkSha256: string;
@@ -207,9 +211,13 @@ function classifyInput(item: JsonRecord): string {
   if (/function_call_result|function_call_output/i.test(type)) return 'other_tool_projection';
   if (/function_call/i.test(type)) return 'assistant_tool_call';
   if (role === 'user' && serialized.includes(PROMPT)) return 'accepted_user_request';
-  if (role === 'system' && /# (?:Persistent Context|Current State \(refreshed this turn\))/i.test(serialized)) {
+  // An empty vault has no rendered memory block, but still carries its exact
+  // accepted-turn context packet. The mutable frame directive follows it.
+  if (role === 'system' && (serialized.includes('[AGENT CONTEXT PACKET]')
+    || /# (?:Persistent Context|Current State \(refreshed this turn\))/i.test(serialized))) {
     return 'accepted_turn_context_snapshot';
   }
+  if (role === 'system' && serialized.includes('[action-planning]')) return 'frame_control_directive';
   if (role === 'system') return 'other_system_context';
   if (role === 'assistant') return 'assistant_history';
   return type || role || 'other_history';
@@ -286,6 +294,7 @@ function commonPrefixBytes(left: Buffer | null, right: Buffer): number {
 }
 
 let buildWire: ((modelId: string, request: never) => JsonRecord) | null = null;
+let usageAttribution: typeof import('../runtime/usage-log.js').modelUsageAttributionStorage;
 
 function looksLikeModelRequest(value: unknown): value is JsonRecord {
   const row = record(value);
@@ -353,6 +362,10 @@ function captureRequest(request: JsonRecord): void {
   for (const item of input) inputBuckets[item.kind] = (inputBuckets[item.kind] ?? 0) + item.itemBytes;
   captures.push({
     step: captures.length + 1,
+    sessionId: usageAttribution?.getStore()?.sessionId,
+    sourceUserSeq: usageAttribution?.getStore()?.sourceUserSeq,
+    role: usageAttribution?.getStore()?.role,
+    channel: usageAttribution?.getStore()?.channel,
     sdkBytes,
     sdkCodeUnits,
     sdkSha256: digest(json(request)),
@@ -414,6 +427,7 @@ JSON.stringify = ((value: unknown, replacer?: unknown, space?: string | number) 
 // channel, bridge, host, provider, replay, or durability assertions.  It must
 // set its isolated environment before codex-model/config are imported.
 await import('./restaurant-sheet-natural-request.integration.test.js');
+({ modelUsageAttributionStorage: usageAttribution } = await import('../runtime/usage-log.js'));
 ({ buildCodexRequestBody: buildWire } = await import('../runtime/harness/codex-model.js') as unknown as {
   buildCodexRequestBody: (modelId: string, request: never) => JsonRecord;
 });
@@ -522,7 +536,7 @@ test('release byte ledger: cold natural request preserves the published surface 
     'provider_write_projection',
   ]);
   const discoveryOnly = new Set(['discovery_projection']);
-  const foregroundCaptures = captures.slice(0, 4);
+  const foregroundCaptures = captures.filter(request => request.sessionId === COLD_SESSION_ID && request.role === 'brain');
   assert.equal(foregroundCaptures.length, 4,
     `expected all four foreground model steps, captured ${captures.length} total requests`);
   assert.match(foregroundCaptures[0]?.input[0]?.preview ?? '', new RegExp(PROMPT),
@@ -554,6 +568,7 @@ test('release byte ledger: cold natural request preserves the published surface 
       count: items.length,
       indexes: items.map((item) => item.index),
       inputTailIndex: request.input.length - 1,
+      trailingKinds: request.input.slice((items[0]?.index ?? request.input.length) + 1).map(item => item.kind),
       digests: items.map((item) => item.sha256),
       bytes: items.reduce((sum, item) => sum + item.itemBytes, 0),
     };
@@ -669,8 +684,10 @@ test('release byte ledger: cold natural request preserves the published surface 
     'blank cold pre-plan cannot advertise plan_task before exact disclosure');
   assert.equal(toolNamesAt(1).includes('run_worker'), true,
     'scoped delegation is plan-optional on the first primary surface');
-  assert.equal(toolNamesAt(2).includes('plan_task'), true,
-    'exact discovery enables the plan control');
+  assert.equal(toolNamesAt(2).includes('plan_task'), false,
+    'exact discovery keeps the stable schema prefix; the plan control uses call_tool');
+  assert.equal(toolNamesAt(2).includes('call_tool'), true,
+    'the deferred plan control remains callable on the actual advertised surface');
   assert.equal(toolNamesAt(2).includes('run_worker'), true,
     'discovery keeps the plan-optional worker advertised without granting call authority');
   // Advertising the worker is not execution: the cold journey performs its
@@ -700,7 +717,7 @@ test('release byte ledger: cold natural request preserves the published surface 
   assert.ok(contextDigests.size <= 1,
     `one accepted turn must not re-render a different memory/context snapshot: ${json(contextSnapshotProjection)}`);
   assert.ok(contextSnapshotProjection.every((step) =>
-    step.indexes.length === 1 && step.indexes[0] === step.inputTailIndex),
+    step.indexes.length === 1 && step.trailingKinds.every(kind => kind === 'frame_control_directive')),
   `the source-bound context snapshot must remain at the cache-stable input tail: ${json(contextSnapshotProjection)}`);
   assert.equal(backgroundModelCandidates.length, 0,
     `accepted turn launched hidden post-terminal/background model candidates: ${json(backgroundModelCandidates)}`);
