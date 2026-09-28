@@ -383,6 +383,7 @@ test('host_v1 pure-local read execution is a small positive registry contract', 
     'time_slots',
     'user_profile_read',
     'workspace_list',
+    'view_image',
     'workspace_roots',
   ]);
   const actual = new Set(

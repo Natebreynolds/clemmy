@@ -1,3 +1,4 @@
+import { registerAttachmentTools } from './attachment-tools.js';
 import { tool, type Tool } from '@openai/agents';
 import { registeredToolSideEffect } from './tool-registry.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -282,6 +283,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   const server = fakeServer as unknown as McpServer;
 
   registerMemoryTools(server);
+  registerAttachmentTools(server);
   registerFocusTools(server);
   registerVaultTools(server);
   registerPlanTools(server);

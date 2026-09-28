@@ -21,3 +21,9 @@ The image HTTP pin fails on the previous bridge (zero model invocations); with t
 Typecheck passed before final build. Final test/build and installed acceptance are recorded in that output directory, not inferred from source changes.
 No business messages or calendar invitations are authorized for this task's controlled acceptance. Do not approve the owner's older pending Slack sends. The original screenshot lacks a year and contains TBD and multi-day dates: extracting it is not permission to invent event dates or attendees.
 No tag/main merge here. Native shell/signature stays unchanged for a runtime-only hotpatch. Full image read acceptance, not merely disappearance of Thinking, is required before calling the image path fixed.
+
+## Installed follow-through exposed a second image defect
+
+Candidate 2d4b411a4 served fingerprint 13f4ecb13e1871d8879481d6c352441ad54c9741916f4a92e667f79fc77bbdb0. Recipient test sess-desktop-abc0a381b82f60ab3cc4b7df visibly rendered “DM with Adam ... (email) · scorpion slack” beside the exact channel. One send card, zero sends; controlled apr-r4y3 rejected afterward. Original business approvals untouched.
+Image test sess-desktop-6247f7effc0a717f4b112889 entered the model but correctly reported unavailable vision: view_image existed only in the MCP server registration, absent from the local runtime and tool registry. This is NOT an image acceptance pass.
+Moved that same attachment-only pixel reader to one shared registration used by MCP and local runtime; declared it as a read in the canonical tool registry. No OCR/model fallback/provider switching, no broadened file permissions. Structured image content remains structured through the existing media adapter. Pins exercise actual local invocation, pixel preservation and outside-path refusal, alongside MCP and registry parity. Subsequent installed image evidence is required.
