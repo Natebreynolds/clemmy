@@ -912,6 +912,7 @@ export function positiveStringEnvelope(result: unknown): boolean {
 /** A successful no-op is useful progress, but never proof of a new write.
  * Inspect acknowledgement fields only, not records, echoed arguments or prose. */
 export function providerResultReportsNoChange(result: unknown): boolean {
+  if (inspectProviderEnvelope(result).verdict === 'contradicted') return false;
   const direct = record(result);
   const candidates: unknown[] = direct ? [completedAdapterProviderEnvelope(direct) ?? direct] : [];
   for (const text of stringCandidates(result)) {
@@ -922,8 +923,10 @@ export function providerResultReportsNoChange(result: unknown): boolean {
     const envelope = record(candidate);
     if (!envelope || (envelope.successful ?? envelope.success ?? envelope.ok) !== true) return false;
     if (envelope.error != null && envelope.error !== '') return false;
+    if ([envelope.successful, envelope.success, envelope.ok].includes(false) || envelope.isError === true) return false;
     const data = record(envelope.data);
-    if (data && ((data.successful ?? data.success ?? data.ok) === false || (data.error != null && data.error !== ''))) return false;
+    if (data && ([data.successful, data.success, data.ok].includes(false) || data.isError === true
+      || (data.error != null && data.error !== ''))) return false;
     return envelope.no_op === true || envelope.noop === true
       || (data?.ok === true && (data.no_op === true || data.noop === true));
   });

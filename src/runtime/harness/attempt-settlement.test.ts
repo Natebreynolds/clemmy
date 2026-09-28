@@ -56,6 +56,9 @@ test('explicit successful no-op is retained without interpreting records or pros
     'No changes were made', { ok: true, data: { record: { no_op: true } } },
     { successful: true, data: { ok: false, no_op: true } },
     { successful: true, error: 'failed', no_op: true },
+    { successful: true, ok: false, no_op: true },
+    { successful: true, data: { successful: true, ok: false, no_op: true } },
+    { successful: true, isError: true, no_op: true },
     { ok: true, no_op: 'true' }, { ok: true, data: { ok: true, channel: { id: 'D-existing' } } },
   ]) assert.equal(providerResultReportsNoChange(value), false);
   const out = classifyAttemptOutcome({ envelopeSuccessful: true, providerNoChange: true, mutating: true });

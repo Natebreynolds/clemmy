@@ -59,7 +59,8 @@ The last stage includes two DeepSeek brain frames with 118,370 input tokens comb
 - SDK bracket group including added no-op parity: 109/109 passed.
 - Existing learned-delivery consent integration pins passed, including real sends, schema drift, explicit notification controls and unavailable evidence.
 - Behavioral red check on pre-fix source: exactly the new host no-change/replay and deferred-definition learning pins fail for the expected missing behaviors (log `/tmp/clem-slack-regression-before-valid.log`). An earlier partial revert was invalid due to mixed module exports; it is not regression evidence.
-- Typecheck passed before final small parity edits; final build/check still recorded in output receipt separately.
+- Contradictory provider envelopes and host settlement group: 70/70 passed after the final guard. Explicit error/false acknowledgements cannot be promoted to no-change success.
+- Typecheck passed; final committed-source build identity is recorded in the output receipt separately.
 - These are prerequisites, not live acceptance. The isolated runner explicitly cannot certify a global-home sentinel while the installed daemon is active; tests use their fixture homes, and no live reset was used.
 
 Before claiming the extra setup approval eliminated: run current-definition learning with the real configured Jev/judge, verify an accepted verdict and exact risk projection, then perform controlled installed-app/live-home acceptance. If the judge disagrees or cannot classify, record that outcome rather than suppressing approval. Test partial approval, exact two-send receipts, and reopen/restart without replay using controlled fixtures; never resend these business messages. Preserve pending business approvals through any coordinated hotpatch. No tag or new installed acceptance claimed by this document.
