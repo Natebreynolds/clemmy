@@ -7,6 +7,9 @@
 # source of truth, so the project never rots in code review.
 name: Clem
 options:
+  # CI's macOS 14 runner uses Xcode 15.4. Do not inherit XcodeGen's
+  # periodically newer project format, which prevents that compiler opening it.
+  projectFormat: xcode15_3
   bundleIdPrefix: ai.breakthroughcoaching
   deploymentTarget:
     iOS: "17.0"
