@@ -131,6 +131,7 @@ export const OperationDeliveryJudgeV1Schema = z.object({
   deliversToOthers: z.enum(['yes', 'no', 'uncertain']),
   deletesOrIrreversible: z.enum(['yes', 'no', 'uncertain']),
   confidence: z.number(),
+  explanation: z.string().max(600).optional(),
   definitionDigest: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
 
@@ -141,6 +142,7 @@ const OPERATION_DELIVERY_SYSTEM = [
   'deletesOrIrreversible: yes when the operation can delete anything or change anything in a way that cannot be undone; no when it cannot; uncertain when the definition leaves this open.',
   'If effectiveArguments are supplied, both answers concern ONLY that exact call, not other inputs the schema accepts. Use the schema to interpret those arguments and retain documented defaults for omitted fields. Unused optional capabilities are not active. Unresolved behavior remains uncertain.',
   'confidence is your probability, from 0 to 1, that both answers are right.',
+  'For an exact call, include explanation: at most 600 characters explaining which provider-declared behavior and effective argument values support both answers. Do not invent guarantees missing from the definition; use uncertain when necessary.',
   'Copy definitionDigest exactly.',
   'Return only an OperationDeliveryJudgeV1 JSON object.',
 ].join(' ');
@@ -540,6 +542,7 @@ export function configuredBrainSemanticPort(
         deliversToOthers: confident ? parsed.data.deliversToOthers : 'uncertain',
         deletesOrIrreversible: confident ? parsed.data.deletesOrIrreversible : 'uncertain',
         confidence: confident ? parsed.data.confidence : 0,
+        ...(parsed.success && parsed.data.explanation ? { explanation: parsed.data.explanation } : {}),
         definitionDigest: parsed.success ? parsed.data.definitionDigest : '',
         modelIdentity: result.modelIdentity,
       };
