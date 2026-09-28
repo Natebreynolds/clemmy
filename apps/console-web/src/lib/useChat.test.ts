@@ -5,6 +5,7 @@ import {
   ChatPostCancelledError,
   activeTurnTaskMode,
   inFlightTurnSince,
+  readReattachTurn,
   appendLiveApprovalCard,
   applyApprovalResolution,
   applyBridgedWorkflowActivity,
@@ -1150,4 +1151,56 @@ test('discovery completion cannot erase meaningful progress between model calls'
   rows = reduceActivity(rows, ev('heartbeat', { kind: 'progress_check_in', message: 'Read 4 sources; preparing the plan.' }));
   assert.equal(rows.at(-1)?.status, 'running');
   assert.equal(rows.at(-1)?.label, 'Read 4 sources; preparing the plan.');
+});
+
+
+test('reopen reads through private and partial pages before deciding an old turn is running', async () => {
+  const urls: string[] = [];
+  const pages = [
+    { latestSeq: 60, events: [
+      { ...ev('user_input_received', { text: 'first' }), seq: 1 },
+      { ...ev('conversation_completed', { reply: 'first answer', sourceUserSeq: 1 }), seq: 10 },
+      { ...ev('user_input_received', { text: 'second' }), seq: 20 },
+    ], page: { version: 1 as const, scannedThroughSeq: 30, snapshotSeq: 60, hasMore: true } },
+    { latestSeq: 60, events: [], page: { version: 1 as const, scannedThroughSeq: 40, snapshotSeq: 60, hasMore: true } },
+    { latestSeq: 60, events: [
+      { ...ev('conversation_completed', { reply: 'second answer', sourceUserSeq: 20 }), seq: 50 },
+      { ...ev('user_input_received', { text: 'third' }), seq: 51 },
+      { ...ev('conversation_completed', { reply: 'third answer', sourceUserSeq: 51 }), seq: 60 },
+    ], page: { version: 1 as const, scannedThroughSeq: 60, snapshotSeq: 60, hasMore: false } },
+  ];
+  const active = await readReattachTurn('saved-chat', {
+    active: () => true,
+    fetchPage: async url => { urls.push(url); return pages[urls.length - 1]!; },
+  });
+  assert.equal(active, null, 'a completed chat must not replay an old answer into a new bubble');
+  assert.equal(urls.length, 3);
+  assert.match(urls[1], /sinceSeq=30.*throughSeq=60/);
+  assert.match(urls[2], /sinceSeq=40.*throughSeq=60/);
+});
+
+
+test('reopen attaches only the newest unfinished source and ignores a late older terminal', async () => {
+  const taskMode = { version: 1 as const, kind: 'plan' as const };
+  const result = await readReattachTurn('saved-chat', {
+    active: () => true,
+    fetchPage: async () => ({ latestSeq: 40, events: [
+      { ...ev('user_input_received', { text: 'latest question', taskMode }), seq: 30 },
+      { ...ev('conversation_completed', { sourceUserSeq: 10, reply: 'older answer' }), seq: 35 },
+      { ...ev('conversation_completed', { sourceUserSeq: 30, reply: 'other session' }), sessionId: 'another-chat', seq: 38 },
+    ], page: { version: 1, scannedThroughSeq: 40, snapshotSeq: 40, hasMore: false } }),
+  });
+  assert.deepEqual(result, { sourceUserSeq: 30, taskMode });
+});
+
+test('a cancelled or superseded reopen never attaches a stale source', async () => {
+  let active = true;
+  const result = await readReattachTurn('saved-chat', {
+    active: () => active,
+    fetchPage: async () => {
+      active = false;
+      return { latestSeq: 1, events: [{ ...ev('user_input_received', { text: 'old' }), seq: 1 }] };
+    },
+  });
+  assert.equal(result, null);
 });

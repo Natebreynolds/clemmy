@@ -22,6 +22,7 @@ import { cn } from '@/lib/cn';
 import { listFocusSnapshot } from '@/lib/focus';
 import { usePoll } from '@/lib/poll';
 import { useSession } from '../hooks/useSession';
+import { sessionHistoryReady } from '../hooks/session-history-readiness';
 import { useSessionMutations } from '../hooks/useSessionMutations';
 import { sessionKeys } from '../hooks/keys';
 import { rawId } from '../lib/ids';
@@ -186,7 +187,10 @@ export function ConversationThread() {
   const { sessionId } = useParams();
   const detail = useSession(sessionId);
 
-  if (detail.isLoading) {
+  // useChat seeds its local transcript once. A cached partial history must
+  // not mount it before this opening's fetch finishes; later refetches keep
+  // the live component and its composer intact.
+  if (!detail.isError && !sessionHistoryReady(detail)) {
     return (
       <div className="flex flex-1 items-center justify-center text-muted">
         <Loader2 className="h-5 w-5 animate-spin" />

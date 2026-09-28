@@ -20,7 +20,7 @@ mkdirSync(path.join(HOME, 'state'), { recursive: true });
 
 const { createAgentRecord } = await import('./agent-record.js');
 const { agentHandoffNote, sessionAgentState, setSessionAgent } = await import('./session-agent.js');
-const { createSession, getSession } = await import('../runtime/harness/eventlog.js');
+const { createSession, getSession, appendEvent } = await import('../runtime/harness/eventlog.js');
 const { buildUnifiedSessionList } = await import('../dashboard/sessions-api.js');
 const { sessionAgentFields } = await import('../runtime/harness/session-composition.js');
 
@@ -116,4 +116,29 @@ test("a conversation whose agent was deleted carries on with Clem", async () => 
   assert.deepEqual(sessionAgentFields(session.id), {});
   assert.deepEqual(setSessionAgent(session.id, gone.id, { by: 'owner' }), { ok: false, reason: 'agent_not_found' },
     'only the stale pointer falls back; naming a missing agent is still refused');
+});
+
+
+test('a current accepted source explains the first handoff from Clem without mistaking its own route for history', async () => {
+  const session = createSession({ kind: 'chat', title: 'first specialist handoff' });
+  const first = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'What do you do?' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'turn_model_routed', data: { sourceUserSeq: first.seq } });
+  setSessionAgent(session.id, social.id, { by: 'owner' });
+  const second = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'What do you do?' } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'turn_model_routed', data: { sourceUserSeq: second.seq, agentId: social.id, agentName: social.name } });
+  const note = agentHandoffNote(session.id, second.seq);
+  assert.match(note, /working as Clem/);
+  assert.match(note, /now working as Instagram Manager/);
+  assert.match(note, /Keep the facts and decisions/);
+  assert.match(note, /do not carry over/);
+  assert.doesNotMatch(note, /earlier.*working as Instagram Manager/);
+  const { buildOrchestratorAgent } = await import('./orchestrator.js');
+  const built = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: second.seq,
+    userInput: 'What do you do?', hostPlainConversation: true, acceptedRoute: 'direct_reply' });
+  const renderer = built.instructions;
+  const prompt = typeof renderer === 'function' ? String(await renderer({ context: {} } as never, built)) : String(renderer);
+  assert.match(prompt, /Working as Instagram Manager/);
+  assert.match(prompt, /Work as Instagram Manager\./);
+  assert.ok(prompt.includes(note), 'the real next-turn builder must carry the source-bound handoff to the model');
+  assert.deepEqual(built.tools, [], 'a role handoff does not create tool authority');
 });

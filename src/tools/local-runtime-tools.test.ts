@@ -598,3 +598,29 @@ test('the structural control lookup hands back schema handles when the host buil
   const reopened = await search.invoke(context, JSON.stringify({ query: 'plan_task schema', role_key: null, limit: 5, cursor: payload.schema_handles!.plan_task!.cursor }));
   assert.match(String(reopened), /"preamble"/, 'the handle redeems the complete current schema');
 });
+
+
+test('retained-output readers reject unsupported query semantics in both direct and deferred calls', async () => {
+  const { writeToolOutput, createSession } = await import('../runtime/harness/eventlog.js');
+  const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const sessionId = createSession({ id: 'retained-query-lane-parity', kind: 'chat' }).id;
+  writeToolOutput({ sessionId, callId: 'retained-records', tool: 'fixture_read',
+    output: JSON.stringify([{ Name: 'First' }, { Name: 'Last' }]) });
+  const { TOOL_OUTPUT_QUERY_SHAPE } = await import('./recall-tools.js');
+  const optionalFields = Object.fromEntries(Object.keys(TOOL_OUTPUT_QUERY_SHAPE).map(key => [key, null]));
+  const args = { ...optionalFields, call_id: 'retained-records', offset: 1, limit: 5, query: 'last record only: Name' };
+  for (const tools of [getLocalRuntimeTools(), getLocalDeferredDispatchTools()]) {
+    const reader = tools.find(candidate => candidate.name === 'tool_output_query');
+    assert.ok(reader && reader.type === 'function');
+    const invoke = (input: Record<string, unknown>) => harnessRunContextStorage.run({ sessionId },
+      () => reader.invoke(new RunContext({ sessionId }), JSON.stringify(input)));
+    const refused = await invoke(args);
+    assert.ok(refused instanceof InvalidArgumentsPreDispatchResult,
+      'an unsupported query must never be silently discarded and reported as a successful read');
+    assert.match(String(refused), /query/);
+    const corrected = await invoke({ ...optionalFields, call_id: args.call_id, fields: ['Name'], offset: 1, limit: 5 });
+    assert.equal(typeof corrected, 'string');
+    assert.match(String(corrected), /Last/);
+    assert.doesNotMatch(String(corrected), /First|InvalidToolInputError/);
+  }
+});

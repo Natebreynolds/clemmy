@@ -534,7 +534,9 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
   return tool({
     name: localTool.name,
     description: localTool.description,
-    parameters: z.object(normalizeShapeForResponses(localTool.parameters)),
+    // Match the advertised closed schema and the deferred carrier. Silently
+    // stripping an unknown filter/query changes the requested operation.
+    parameters: z.strictObject(normalizeShapeForResponses(localTool.parameters)),
     // Unified taxonomy. The captured tool's `approvalRequired` flag is
     // honored via a destructive-hint so dynamic tools that the runtime
     // marks as "always ask" still pause regardless of policy scope.

@@ -86,7 +86,7 @@ export function setSessionAgent(
  * apply. Empty when no other agent has taken part. Per-turn text: it belongs
  * after the cache boundary, never in the stable prefix.
  */
-export function agentHandoffNote(sessionId: string | null | undefined): string {
+export function agentHandoffNote(sessionId: string | null | undefined, sourceUserSeq?: number): string {
   if (!sessionId) return '';
   let state: SessionAgentState;
   try {
@@ -94,10 +94,32 @@ export function agentHandoffNote(sessionId: string | null | undefined): string {
   } catch {
     return '';
   }
-  const earlier = state.agentIds
+  let earlier = state.agentIds
     .filter((id) => id !== state.agentId)
     .map((id) => getAgentRecord(id)?.name ?? null)
     .filter((name): name is string => Boolean(name));
+  // The first switch from Clem has no prior saved agent in agentIds. Use
+  // the last accepted source's route receipt, excluding this source's own
+  // route (which is recorded before agent construction), to name that handoff.
+  if (Number.isSafeInteger(sourceUserSeq) && Number(sourceUserSeq) > 0) {
+    const previous = openEventLog().prepare(`
+      SELECT data_json FROM events
+      WHERE session_id = ? AND type = 'turn_model_routed'
+        AND json_extract(data_json, '$.sourceUserSeq') > 0
+        AND json_extract(data_json, '$.sourceUserSeq') < ?
+      ORDER BY seq DESC LIMIT 1
+    `).get(sessionId, sourceUserSeq) as { data_json: string } | undefined;
+    if (previous) {
+      const route = JSON.parse(previous.data_json) as { agentId?: unknown; agentName?: unknown };
+      const previousId = typeof route.agentId === 'string' && route.agentId.trim() ? route.agentId.trim() : null;
+      if (previousId !== state.agentId) {
+        const previousName = previousId
+          ? typeof route.agentName === 'string' && route.agentName.trim() ? route.agentName.trim() : 'a different saved agent'
+          : 'Clem';
+        earlier = [...new Set([previousName, ...earlier])];
+      }
+    }
+  }
   if (earlier.length === 0) return '';
   const now = state.agentId
     ? `You are now working as ${state.agentName ?? 'the agent named above'}; its standing instructions above apply from here.`

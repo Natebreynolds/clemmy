@@ -1182,6 +1182,40 @@ export function activeTurnTaskMode(
   return readTaskMode(events.find(event => event.type === 'user_input_received' && event.seq === sourceUserSeq)?.data?.taskMode);
 }
 
+/** Read reopen state before attaching a live reply to this conversation. */
+export async function readReattachTurn(sessionId: string, input: {
+  fetchPage(url: string): Promise<RecentEventsPage>;
+  active(): boolean;
+}): Promise<{ sourceUserSeq: number; taskMode?: TaskMode } | null> {
+  const cursor: { scanSeq: number; snapshotSeq?: number } = { scanSeq: 0 };
+  // Retain only the newest source and its terminal, never the whole tool
+  // trajectory. A page boundary is not evidence that a turn is still live.
+  let boundary: HarnessEvent[] = [];
+  while (input.active()) {
+    const page = await input.fetchPage(recentEventsUrl(sessionId, cursor, 200));
+    if (!input.active()) return null;
+    const continuation = advanceRunEventPage(cursor, page, 200);
+    for (const event of [...(page.events ?? [])].sort((a, b) => a.seq - b.seq)) {
+      if ((event.sessionId && event.sessionId !== sessionId) || readLiveApprovalControl(event)) continue;
+      if (event.type === 'user_input_received' && event.data?.synthetic !== true) {
+        boundary = [event];
+      } else if (boundary.length && isTerminalEvent(event.type)) {
+        const source = event.data?.sourceUserSeq;
+        if (typeof source === 'number' && source !== boundary[0].seq) continue;
+        boundary = [boundary[0], event];
+      }
+    }
+    // Finish the fixed snapshot even if newer events arrived during the scan.
+    // An active turn's stream resumes from its source and catches those events.
+    if (page.page ? !page.page.hasMore : continuation.complete) {
+      const sourceUserSeq = inFlightTurnSince(boundary);
+      return sourceUserSeq === null ? null : { sourceUserSeq, taskMode: activeTurnTaskMode(boundary, sourceUserSeq) };
+    }
+    if (!continuation.more) throw new Error('The conversation history could not be fully checked.');
+  }
+  return null;
+}
+
 export function useChat(options?: UseChatOptions) {
   const [messages, setMessages] = useState<ChatMessage[]>(options?.initialMessages ?? []);
   const [busy, setBusy] = useState(false);
@@ -1329,15 +1363,20 @@ export function useChat(options?: UseChatOptions) {
     if (!options?.reattachActiveRun || !options?.initialSessionId) return;
     const sid = options.initialSessionId;
     let cancelled = false;
+    let reattachedAssistantId: string | null = null;
     void (async () => {
       try {
-        const out = await apiGet<{ latestSeq: number; events: Array<{ seq: number; type: string; data?: Record<string, unknown> }> }>(
-          `/api/sessions/${encodeURIComponent(sid)}/events/recent?limit=200`,
-        );
-        if (cancelled) return;
-        const lastUserSeq = inFlightTurnSince(out.events ?? []);
-        if (lastUserSeq === null) return;
+        const runAtOpen = activeRunRef.current;
+        const stillOpening = () => !cancelled && activeRunRef.current === runAtOpen
+          && activeAssistantId.current === null && sessionIdRef.current === sid;
+        const active = await readReattachTurn(sid, {
+          fetchPage: (url) => apiGet<RecentEventsPage>(url),
+          active: stillOpening,
+        });
+        if (!active || !stillOpening()) return;
+        const lastUserSeq = active.sourceUserSeq;
         const assistantId = `reattach-${Date.now().toString(36)}`;
+        reattachedAssistantId = assistantId;
         setBusy(true);
         activeAssistantId.current = assistantId;
         setMessages((prev) => [...prev, {
@@ -1346,7 +1385,7 @@ export function useChat(options?: UseChatOptions) {
           text: '',
           status: 'thinking' as const,
           progress: 'Reconnecting to the run…',
-          taskMode: activeTurnTaskMode(out.events, lastUserSeq),
+          taskMode: active.taskMode,
         }]);
         const handle = runHarnessStream(sid, { sinceSeq: lastUserSeq, onEvent: (ev) => applyEvent(assistantId, ev) });
         streamRef.current = handle;
@@ -1357,10 +1396,16 @@ export function useChat(options?: UseChatOptions) {
           // net send() uses.
           lateWatchRef.current = watchForLateCompletion(sid, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev), { replayCursor: handle.getReplayCursor() });
         }
-        setBusy(false);
+        if (activeAssistantId.current === assistantId) {
+          activeAssistantId.current = null;
+          setBusy(false);
+        }
       } catch {
         // Reattach is best-effort; the transcript remains readable either way.
-        if (!cancelled) setBusy(false);
+        if (!cancelled && reattachedAssistantId && activeAssistantId.current === reattachedAssistantId) {
+          activeAssistantId.current = null;
+          setBusy(false);
+        }
       }
     })();
     return () => { cancelled = true; };
