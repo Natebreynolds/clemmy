@@ -1,6 +1,10 @@
 /**
  * One reminder for an approval nobody has answered.
  *
+ * Refresh the original approval notice; never mint a second delivery identity.
+ * Already-reached destinations keep their receipts, while a destination that
+ * has never received the ask can still receive its first notice.
+ *
  * A formal approval card pauses work until the owner decides, and its notice
  * goes out once, when the card is raised. An unread notice leaves the work
  * waiting with nothing to bring it back, however time-sensitive it is. Most
@@ -8,9 +12,10 @@
  * most likely gone unseen.
  *
  * So a formal approval still pending and actionable 30 minutes after it was
- * requested gets exactly one reminder, carrying what the card shows and how
- * long it has waited. The approval row records that the reminder went out, so
- * neither a restart nor a pruned notification can send a second one.
+ * requested refreshes its existing notice, carrying what the card shows and
+ * how long it has waited. The approval row records that refresh; the notice
+ * retains its delivery receipts so destinations already reached are not sent
+ * another message.
  *
  * Where it goes: the code cannot tell which surface the owner used most
  * recently. Desktop chat input records no surface, and the live-viewer ledger
@@ -48,10 +53,9 @@ const REMINDER_FIELD_MAX_CHARS = 240;
 const REMINDER_TITLE_MAX_CHARS = 120;
 const REMINDER_BODY_MAX_CHARS = 1_400;
 
-/** The stable notification id of an approval's one reminder. A retry after a
- * crash between sending and recording reuses it, so it never lands twice. */
+/** The original approval notice also owns its reminder refresh. */
 export function approvalReminderNotificationId(approvalId: string): string {
-  return `approval-reminder-${approvalId}`;
+  return `approval-${approvalId}`;
 }
 
 /** What the original notice said the approval belongs to, for display. */

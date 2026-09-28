@@ -946,6 +946,7 @@ function pruneNotifications(
       || exactReceiptNeedsRetention(item, nowMs)
       || deliveryAdmissionNeedsRetention(item)
       || unresolvedWorkflowGateNeedsRetention(item)
+      || (item.kind === 'approval' && !item.read)
     ) {
       protectedItems.push(item);
     } else {
@@ -1010,8 +1011,7 @@ function isDuplicateApprovalNotification(existing: NotificationRecord, next: Not
   return typeof existingApprovalId === 'string' &&
     existingApprovalId.length > 0 &&
     existingApprovalId === nextApprovalId &&
-    existing.title === next.title &&
-    existing.body === next.body;
+    existing.metadata?.sessionId === next.metadata?.sessionId;
 }
 
 /** Exact workflow-origin delivery already owns the transcript receipt. Reuse
@@ -1154,8 +1154,19 @@ export function listNotifications(limit = 20): NotificationRecord[] {
     if (compacted.length !== items.length) {
       atomicWriteJson(NOTIFICATIONS_FILE, compacted);
     }
+    // Legacy original/reminder carriers remain audit evidence, but represent
+    // one actionable approval in Activity. Distinct approval IDs stay distinct.
+    const seenApprovals = new Set<string>();
     return compacted
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .filter((item) => {
+        const id = item.kind === 'approval' ? item.metadata?.approvalId : undefined;
+        if (typeof id !== 'string' || !id) return true;
+        const key = JSON.stringify([item.metadata?.sessionId ?? null, id]);
+        if (seenApprovals.has(key)) return false;
+        seenApprovals.add(key);
+        return true;
+      })
       .slice(0, limit);
   });
 }
@@ -1174,6 +1185,27 @@ export function addNotification(item: NotificationRecord): void {
     let existingWithId = item.id
       ? items.find((existing) => existing.id === item.id)
       : undefined;
+    // Approval identity, not notification wording, owns the interruption.
+    // A reminder/replayed producer reuses the original carrier and its durable
+    // per-destination receipts. Never widen routes or revive a read/settled row.
+    existingWithId ??= items.find((existing) => isDuplicateApprovalNotification(existing, item));
+    if (existingWithId && isDuplicateApprovalNotification(existingWithId, item)
+      && item.metadata?.approvalReminder === true
+      && existingWithId.metadata?.approvalReminder !== true
+      && !existingWithId.read
+      && exactNotificationAuthorityDigest(existingWithId) === exactNotificationAuthorityDigest(item)) {
+      existingWithId.title = item.title;
+      existingWithId.body = item.body;
+      existingWithId.metadata = {
+        ...existingWithId.metadata,
+        approvalReminder: true,
+        requestedAt: item.metadata.requestedAt,
+        waitedMinutes: item.metadata.waitedMinutes,
+      };
+      // Persist the refresh before queue recovery. Do not emit notification.created:
+      // it is the same in-app card, and a desktop toast may already have fired.
+      saveNotificationsUnlocked(items);
+    }
     const capabilityRunId = item.kind === 'workflow'
       && item.metadata?.status === 'blocked_capability'
       && typeof item.metadata.runId === 'string'

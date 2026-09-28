@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -1207,6 +1207,9 @@ test('an approval reminder is not held behind an open chat view, carries its wor
     openEventLog().prepare('UPDATE pending_approvals SET requested_at = ? WHERE approval_id = ?')
       .run(new Date(Date.now() - 31 * 60_000).toISOString(), row.approvalId);
     reapOnce();
+    // Refresh preserves the original retry cursor rather than minting an
+    // immediate second job; let its existing presence delay become due.
+    await new Promise((resolve) => setTimeout(resolve, 1_300));
     await processNotificationDeliveries(assistantStub);
 
     assert.deepEqual(sent.map((message) => message.via).sort(), ['direct', 'team'],
@@ -1231,5 +1234,71 @@ test('an approval reminder is not held behind an open chat view, carries its wor
     resetSessionViewersForTest();
     removeNotificationDestination('dest-reminder-direct');
     removeNotificationDestination('dest-reminder-team');
+  }
+});
+
+
+test('a delivered approval is refreshed without another push, while a distinct approval still arrives', async () => {
+  const { createSession, openEventLog } = await import('../runtime/harness/eventlog.js');
+  const registry = await import('../runtime/harness/approval-registry.js');
+  const { reapOnce } = await import('../runtime/harness/reaper.js');
+  const { resetSessionViewersForTest } = await import('../runtime/harness/session-viewers.js');
+  replaceQueuedNotificationDeliveries([]);
+  resetSessionViewersForTest();
+  const session = createSession({ kind: 'chat' });
+  const row = registry.register({ sessionId: session.id, subject: 'Send first message', tool: 'work_call',
+    args: { recipient: 'first', text: 'first payload' } });
+  const destination = { id: 'dedupe-owner', name: 'Owner', type: 'discord_user' as const,
+    userId: 'owner-dedupe', enabled: true, createdAt: new Date().toISOString() };
+  upsertNotificationDestination(destination);
+  const sent: string[] = [];
+  _setNotificationDeliveryForTests(async (notification) => {
+    sent.push(notification.metadata?.approvalId as string); return { ok: true };
+  });
+  const raise = (approvalId: string, id = `approval-${approvalId}`) => addNotification({
+    id, kind: 'approval', title: 'Approval pending', body: 'Review this exact message',
+    createdAt: new Date().toISOString(), read: false,
+    metadata: { approvalId, sessionId: session.id },
+  });
+  try {
+    raise(row.approvalId);
+    await processNotificationDeliveries(assistantStub);
+    const firstCount = sent.length;
+    assert.ok(firstCount > 0, 'first notice reached its routes');
+    const original = getNotification(`approval-${row.approvalId}`)!;
+    const receipts = [...original.deliveredDestinations!];
+    openEventLog().prepare('UPDATE pending_approvals SET requested_at = ? WHERE approval_id = ?')
+      .run(new Date(Date.now() - 31 * 60_000).toISOString(), row.approvalId);
+    reapOnce();
+    await processNotificationDeliveries(assistantStub);
+    raise(row.approvalId, 'replayed-producer-copy');
+    reapOnce();
+    await processNotificationDeliveries(assistantStub);
+    assert.equal(sent.length, firstCount, 'neither aging nor producer replay resends a delivered approval');
+    assert.deepEqual(getNotification(original.id)?.deliveredDestinations, receipts);
+    assert.equal(listNotifications(1000).filter(n => n.metadata?.approvalId === row.approvalId).length, 1);
+    assert.equal(registry.get(row.approvalId)?.status, 'pending', 'dedupe grants no consent');
+    // Simulate an old build's distinct reminder carrier surviving a restart.
+    const legacyId = `approval-reminder-${row.approvalId}`;
+    const file = path.join(TMP_HOME, 'state', 'notifications.json');
+    const stored = JSON.parse(readFileSync(file, 'utf8'));
+    stored.push({ ...getNotification(original.id), id: legacyId,
+      deliveredAt: undefined, deliveredDestinations: [], deliveryPlanCompletedAt: undefined,
+      metadata: { ...original.metadata, approvalReminder: true } });
+    writeFileSync(file, JSON.stringify(stored));
+    requeueNotificationDelivery(legacyId);
+    await processNotificationDeliveries(assistantStub);
+    assert.equal(sent.length, firstCount, 'legacy reminder inherits only matching destination receipts, not another send');
+    assert.equal(listNotifications(1000).filter(n => n.metadata?.approvalId === row.approvalId).length, 1,
+      'legacy copies render as one approval');
+
+    const other = registry.register({ sessionId: session.id, subject: 'Send second message', tool: 'work_call',
+      args: { recipient: 'second', text: 'different payload' } });
+    raise(other.approvalId);
+    await processNotificationDeliveries(assistantStub);
+    assert.ok(sent.includes(other.approvalId), 'distinct action retains its own notice');
+  } finally {
+    _setNotificationDeliveryForTests(null);
+    removeNotificationDestination(destination.id);
   }
 });

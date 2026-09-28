@@ -174,6 +174,7 @@ import {
   isDeliveryJobStale,
   isExactOriginChatTerminalReportBack,
   listQueuedNotificationDeliveries,
+  loadNotifications,
   markNotificationRead,
   recoverCorruptedNotificationDeliveryQueue,
   registerNotificationDeliveryKick,
@@ -1850,6 +1851,23 @@ export async function processNotificationDeliveries(assistant: ClementineAssista
     const completed = new Set<string>();
     for (const durableReceipt of notification.deliveredDestinations ?? []) {
       if (validDestinationIds.has(durableReceipt)) completed.add(durableReceipt);
+    }
+    // Older builds minted a separate reminder carrier. Its exact approval
+    // and destination receipt still proves this ask already reached that route.
+    // Match route authority too: a reused destination id cannot inherit delivery.
+    if (notification.kind === 'approval' && typeof notification.metadata?.approvalId === 'string') {
+      for (const sibling of loadNotifications()) {
+        if (sibling.id === notification.id || sibling.kind !== 'approval'
+          || sibling.metadata?.approvalId !== notification.metadata.approvalId
+          || sibling.metadata?.sessionId !== notification.metadata.sessionId) continue;
+        for (const destinationId of sibling.deliveredDestinations ?? []) {
+          const digest = plannedCarrier.deliveryPlan?.destinationAuthorityDigests[destinationId];
+          if (validDestinationIds.has(destinationId) && digest
+            && sibling.deliveryPlan?.destinationAuthorityDigests[destinationId] === digest) {
+            completed.add(destinationId);
+          }
+        }
+      }
     }
     const attemptCountByDestination = {
       ...(notification.deliveryAttemptCountByDestination ?? {}),

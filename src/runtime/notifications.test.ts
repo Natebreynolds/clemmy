@@ -338,11 +338,19 @@ test('markNotificationsReadByApprovalId marks stable and metadata approval notif
     metadata: { approvalId: 'apr-other' },
   });
 
+  assert.equal(listNotifications(50).filter(item => item.metadata?.approvalId === 'apr-test').length, 1,
+    'different wording cannot mint another approval notice');
+  // A pre-upgrade duplicate still needs physical settlement even though the
+  // Activity projection displays only one ask.
+  const stored = JSON.parse(readFileSync(NOTIFICATIONS_FILE, 'utf8'));
+  const original = stored.find((item: { id: string }) => item.id === 'approval-apr-test');
+  stored.push({ ...original, id: 'legacy-copy-apr-test' });
+  writeFileSync(NOTIFICATIONS_FILE, JSON.stringify(stored));
   const changed = markNotificationsReadByApprovalId('apr-test', { approvalStatus: 'resolved' });
   assert.equal(changed.length, 2);
   const items = listNotifications(50);
   const mine = items.filter((item) => item.metadata?.approvalId === 'apr-test');
-  assert.equal(mine.length, 2);
+  assert.equal(mine.length, 1);
   assert.ok(mine.every((item) => item.read));
   assert.ok(mine.every((item) => item.metadata?.approvalStatus === 'resolved'));
   assert.equal(items.find((item) => item.id === 'approval-apr-other')?.read, false);

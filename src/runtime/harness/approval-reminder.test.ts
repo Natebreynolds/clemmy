@@ -143,7 +143,9 @@ test('an approval still unanswered 30 minutes after it was requested gets exactl
   reaper.reapOnce();
 
   const reminders = remindersFor(row.approvalId);
-  assert.equal(reminders.length, 1, 'one reminder');
+  assert.equal(reminders.length, 1, 'one refreshed notice');
+  assert.equal(listNotifications(1_000).filter(item => item.metadata?.approvalId === row.approvalId).length, 1,
+    'the original and reminder are one approval notice');
   const [reminder] = reminders;
   assert.equal(reminder!.id, approvalReminderNotificationId(row.approvalId));
   assert.equal(reminder!.kind, 'approval', 'the reminder is the approval ask, so it settles with it');
@@ -234,8 +236,8 @@ test('the reminder reaches the destinations the original notice named', () => {
   assert.ok(routes.includes('derived-desktop'), 'and the desktop record');
   assert.equal(reminder.metadata?.workflowName, 'Weekly summary');
   assert.equal(reminder.metadata?.stepId, 'send');
-  assert.equal(reminder.metadata?.discordInlineHandled, undefined,
-    'a new message, so an inline card elsewhere does not silence it');
+  assert.equal(reminder.metadata?.discordInlineHandled, true,
+    'the same ask retains the original inline-delivery suppression');
 });
 
 test('resolved, expired, conversational, fresh and long-stale approvals never get a reminder', () => {
