@@ -1342,3 +1342,65 @@ test('a change answered in chat carries the memory that fits the change to the r
     }
   }
 });
+
+// A real approval is spent before a settled result is checkpointed. A local
+// storage failure here must recover privately; asking again or replaying the
+// send would violate the same consent and exact-once contracts.
+test('an approved write held on checkpoint storage resumes by timer without repeating the effect', async () => {
+  const fixture = await directWriteFixture('work_call', 'opaque', 'approved-checkpoint-timer');
+  assert.ok(fixture);
+  const { runConversation, runConversationFromResume } = await import('./loop.js');
+  const { HarnessSession } = await import('./session.js');
+  const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+  const agent = await fixture.useProductionAgent();
+  const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+    sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+    suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+  assert.equal(paused.status, 'awaiting_approval', JSON.stringify(paused));
+  assert.equal(fixture.counts().providerCalls, 0);
+  const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+  assert.ok(approval);
+  assert.equal(approvals.resolve(approval.approvalId, 'approved', 'checkpoint-timer-fixture').ok, true);
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TEMP TRIGGER reject_approved_result_checkpoint
+    BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NEW.session_id = '${fixture.session.id}' AND NEW.call_id = 'exact-draft'
+    BEGIN SELECT RAISE(ABORT, 'fixture approved result checkpoint unavailable'); END`);
+  let result: Awaited<ReturnType<typeof runConversationFromResume>>;
+  try {
+    result = await runConversationFromResume({ sessionId: fixture.session.id,
+      approvalId: approval.approvalId, decision: 'approve', resolver: 'checkpoint-timer-fixture', turnEngine: 'host_v1',
+      makeRunner: () => fixture.runner as never, maxTurns: 3,
+      judgeFn: async () => ({ done: true, reason: 'fixture exact settled result' }),
+      buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+        sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+        ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+        model: fixture.model as never, allowToolJit: true,
+      }),
+    });
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS reject_approved_result_checkpoint');
+  }
+  assert.equal(result.status, 'held', JSON.stringify(result));
+  assert.equal(fixture.counts().providerCalls, 1, 'the approved physical effect already landed');
+  const heldCalls = fixture.counts().modelCalls;
+  const accepting = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).at(-1)!;
+  assert.notEqual(accepting.seq, fixture.source.seq);
+  assert.ok(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), JSON.stringify(eventlog.listEvents(fixture.session.id, { types: ['restart_recovery_decision'] }).map(event => event.data)));
+  const deadline = Date.now() + 15_000;
+  const terminals = () => eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+    .filter(event => event.data.sourceUserSeq === accepting.seq);
+  while (Date.now() < deadline && terminals().length === 0) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(terminals().length, 1, JSON.stringify(eventlog.listEvents(fixture.session.id).slice(-12)));
+  assert.equal(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), null);
+  assert.equal(fixture.counts().providerCalls, 1, 'recovery must adopt the settled effect');
+  assert.equal(fixture.counts().modelCalls, heldCalls + 1, 'only the post-result answer calls the model');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['approval_requested'] }).length, 1,
+    'storage recovery cannot ask the user to approve the same effect again');
+  const replay = await runConversationFromResume({ agent, sessionId: fixture.session.id,
+    sourceUserSeq: accepting.seq, approvalId: approval.approvalId, decision: 'approve',
+    resolver: 'checkpoint-timer-fixture', turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+  assert.equal(replay.status, 'completed', JSON.stringify(replay));
+  assert.equal(fixture.counts().providerCalls, 1);
+  assert.equal(fixture.counts().modelCalls, heldCalls + 1);
+});
