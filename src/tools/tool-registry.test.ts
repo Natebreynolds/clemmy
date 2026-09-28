@@ -371,6 +371,8 @@ test('host_v1 pure-local read execution is a small positive registry contract', 
   const expected = new Set([
     'home_get',
     'list_files',
+    'meeting_search',
+    'meeting_read',
     // Reading an installed SKILL.md is the same pure-local file read as
     // list_files. Live 2026-09-04 blank-state canary: the user's request named
     // "my outbound email skill", the model called skill_list, and the host

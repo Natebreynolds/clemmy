@@ -5422,9 +5422,48 @@ async function finishWorkerRun(
   logger.info({ taskId: task.id }, 'Background task completed');
 }
 
+/** A host continuation may settle after the original worker returned
+ * in-progress. Reconcile its exact-source parked terminal before counting
+ * capacity; otherwise no worker remains to clear a perpetual Thinking card.
+ * Never infer successful delivery here or interrupt an active attempt. */
+export async function reconcileSettledBackgroundTaskInputs(): Promise<number> {
+  const db = openEventLog();
+  let reconciled = 0;
+  for (const task of listBackgroundTasks().filter((t) => t.status === 'running' || t.status === 'cancelling')) {
+    const active = db.prepare('SELECT 1 FROM run_attempts WHERE session_id = ? AND finished_at IS NULL LIMIT 1')
+      .get(task.runSessionId);
+    if (active) continue;
+    const attempt = db.prepare('SELECT source_user_seq, started_at, finished_at FROM run_attempts WHERE session_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1')
+      .get(task.runSessionId) as { source_user_seq: number | null; started_at: string; finished_at: string | null } | undefined;
+    if (!attempt?.finished_at || !attempt.source_user_seq) continue;
+    if (task.startedAt && Date.parse(attempt.started_at) < Date.parse(task.startedAt)) continue;
+    const source = db.prepare("SELECT seq FROM events WHERE session_id = ? AND type = 'user_input_received' ORDER BY seq DESC LIMIT 1")
+      .get(task.runSessionId) as { seq: number } | undefined;
+    if (source?.seq !== attempt.source_user_seq) continue;
+    if (task.status === 'cancelling') {
+      await finishWorkerRun(task, { id: `run-${task.id}` }, { text: '', stoppedReason: 'cancelled' });
+      reconciled += 1;
+      continue;
+    }
+    const terminal = db.prepare("SELECT data_json FROM events WHERE session_id = ? AND type = 'conversation_completed' AND seq > ? ORDER BY seq DESC LIMIT 1")
+      .get(task.runSessionId, source.seq) as { data_json: string } | undefined;
+    if (!terminal) continue;
+    let data: { sourceUserSeq?: number; reason?: string; reply?: string };
+    try { data = JSON.parse(terminal.data_json); } catch { continue; }
+    if (data.sourceUserSeq !== source.seq || data.reason !== 'awaiting_user_input'
+      || typeof data.reply !== 'string' || !data.reply.trim()) continue;
+    // Recheck the record after asynchronous question resolution inside the
+    // ordinary settlement path; its existing CAS gives cancellation priority.
+    await finishWorkerRun(task, { id: `run-${task.id}` }, { text: data.reply, stoppedReason: 'awaiting-input' });
+    reconciled += 1;
+  }
+  return reconciled;
+}
+
 export async function processBackgroundTasks(assistant: ClementineAssistant, limit?: number): Promise<number> {
   try {
     backgroundDrainsInFlight += 1;
+    await reconcileSettledBackgroundTaskInputs();
     // The report outbox is independent of worker capacity. Drain it before the
     // running-count early return so a busy daemon cannot strand a completion.
     try {

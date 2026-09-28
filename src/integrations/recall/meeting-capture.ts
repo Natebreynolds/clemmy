@@ -1431,6 +1431,7 @@ export function saveRecallMeetingAnalysis(meetingId: string, analysis: RecallMee
   ensureDir(ANALYSIS_DIR);
   const filePath = analysisPathFor(meetingId);
   writeJsonAtomic(filePath, analysis);
+  analysisExistsCache = null;
   recordAnalysisPath(meetingId, filePath);
   return { path: filePath };
 }
@@ -1656,11 +1657,8 @@ export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeeti
     const ms = Date.parse(record.endedAt) - Date.parse(record.startedAt);
     if (Number.isFinite(ms) && ms > 0) durationSeconds = Math.round(ms / 1000);
   }
-  // Analysis path resolution: the agent writes via write_file directly to
-  // the canonical path (analysisPathFor(id)) — it doesn't go through
-  // saveRecallMeetingAnalysis, so the record itself won't have
-  // analysisPath set. Use the cached file set to avoid 2N existsSync
-  // calls when rendering the meetings list.
+  // Legacy analyses may lack a recorded path. Preserve canonical-path
+  // lookup for them; typed saves invalidate the listing cache immediately.
   const canonical = analysisPathFor(record.id);
   const fileSet = loadAnalysisFileSet();
   const resolvedAnalysisPath = record.analysisPath && fileSet.has(record.analysisPath)
