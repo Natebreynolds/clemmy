@@ -124,7 +124,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
       <Header session={session} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
-          <CollaborativeWorkstate snapshot={focus.data} compact />
+          <CollaborativeWorkstate snapshot={focus.data} sessionId={rawId(session.id)} compact />
           <CliSessions sessionId={chat.sessionId.current ?? undefined} />
           {chat.messages.map((m, index) => (
             <Fragment key={m.id}>

@@ -66,10 +66,12 @@ function MoreCount({ count }: { count: number }) {
 
 export function CollaborativeWorkstate({
   snapshot,
+  sessionId,
   compact = false,
   className,
 }: {
   snapshot: FocusSnapshot | null | undefined;
+  sessionId?: string;
   compact?: boolean;
   className?: string;
 }) {
@@ -78,7 +80,7 @@ export function CollaborativeWorkstate({
   const focus = snapshot?.active;
   // A bare title+summary card is an echo of the last chat message — render
   // only when there is structured detail or a context check to answer.
-  if (!focus || !shouldShowWorkstate(snapshot)) return null;
+  if (!focus || !shouldShowWorkstate(snapshot, sessionId)) return null;
   const state = focus.workstate;
   const resolveCheck = (action: 'confirm' | 'done') => {
     if (busy) return;

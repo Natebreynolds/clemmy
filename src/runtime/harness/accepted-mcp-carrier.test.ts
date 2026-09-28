@@ -246,23 +246,28 @@ test('generic live-read materializer authority resolves the exact accepted nativ
   assert.deepEqual(acquired.live.counts, before, 'resolution performs no provider I/O');
 });
 
-test('missing required MCP arguments are corrected before any provider I/O', async () => {
+test('missing required MCP arguments settle as repairable validation with no provider I/O', async () => {
   const acquired = await acquireGenericMcpCapability();
   const before = { ...acquired.live.counts };
   const { ToolCallsCounter } = await import('./brackets.js');
-  await assert.rejects(resolveInsideAcceptedCall({
+  const { InvalidArgumentsPreDispatchResult } = await import('./attempt-settlement.js');
+  await resolveInsideAcceptedCall({
     installed: acquired.installed,
     args: { obsolete_query: 'do not forward this value' },
-    invoke: (args, sessionId) => carrier.invokeAcceptedExactMcpCarrier({
-      requestedOperationId: acquired.installed.manifest.operationId, args, sessionId,
-      counter: new ToolCallsCounter(5), requiresNestedAdmission: false,
-    }),
-  }), (error: unknown) => {
-    assert.ok(error instanceof carrier.ExactMcpCarrierPreDispatchError);
-    assert.match(error.message, /schema/);
-    assert.match(error.message, /query/);
-    assert.doesNotMatch(error.message, /do not forward this value/);
-    return true;
+    invoke: async (args, sessionId) => {
+      const result = await carrier.invokeAcceptedExactMcpCarrier({
+        requestedOperationId: acquired.installed.manifest.operationId, args, sessionId,
+        counter: new ToolCallsCounter(5), requiresNestedAdmission: false,
+      });
+      assert.ok(result instanceof InvalidArgumentsPreDispatchResult);
+      assert.match(result.output, /schema/);
+      assert.match(result.output, /query/);
+      assert.doesNotMatch(result.output, /do not forward this value/);
+      const rows = eventlog.openEventLog().prepare(`SELECT execution_kind, outcome_kind, recovery_action
+        FROM logical_call_settlements WHERE session_id = ?`).all(sessionId);
+      assert.deepEqual(rows, [{ execution_kind: 'refused_pre_dispatch',
+        outcome_kind: 'invalid_arguments', recovery_action: 'repair_arguments' }]);
+    },
   });
   assert.deepEqual(acquired.live.counts, before, 'invalid arguments paid neither tools/list nor tools/call');
 });

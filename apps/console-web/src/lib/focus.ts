@@ -92,8 +92,20 @@ export function workstateHasStructure(workstate: FocusWorkstate | null | undefin
  * actions) or a context check the user needs to answer. A bare title+summary
  * card is an echo, so it stays hidden (owner feedback, 2026-07-30).
  */
-export function shouldShowWorkstate(snapshot: FocusSnapshot | null | undefined): boolean {
+export function shouldShowWorkstate(
+  snapshot: FocusSnapshot | null | undefined,
+  sessionId?: string,
+): boolean {
   if (!snapshot?.active) return false;
+  // Overview pages show shared focus. A conversation must not present another
+  // task's context (or its confirm/complete controls) as this chat's notebook.
+  if (sessionId !== undefined) {
+    const focus = snapshot.active;
+    const resourceSession = focus.resource_ref.startsWith('session:')
+      ? focus.resource_ref.slice('session:'.length) : null;
+    const owners = new Set([focus.related_session_id, resourceSession].filter(Boolean));
+    if (!sessionId || owners.size !== 1 || !owners.has(sessionId)) return false;
+  }
   return snapshot.needsConfirm || workstateHasStructure(snapshot.active.workstate);
 }
 

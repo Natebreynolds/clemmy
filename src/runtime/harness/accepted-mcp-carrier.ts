@@ -12,7 +12,8 @@ import {
   withPhysicalDispatch,
   withPhysicalPreparationDispatch,
 } from './attempt-identity.js';
-import { settleToolAttempt } from './attempt-settlement.js';
+import { InvalidArgumentsPreDispatchResult, settleToolAttempt } from './attempt-settlement.js';
+import { settleResolvedCarrierRefusal } from './resolved-carrier-refusal.js';
 import {
   currentHostCallAttestation,
   type HostCallAttestation,
@@ -251,10 +252,26 @@ export async function invokeAcceptedExactMcpCarrier(input: {
   if (failures.length > 0) {
     const shape = renderBoundedSchemaSubtree(resolved.binding.inputSchema,
       failures.map((failure) => failure.path), { maxDepth: 3, maxFields: 24, maxChars: 900 });
-    throw new ExactMcpCarrierPreDispatchError(
+    const refusal = new InvalidArgumentsPreDispatchResult(
       `arguments do not match the current input schema: ${JSON.stringify(failures)}. `
       + `Correct this same operation using its current schema${shape ? `: ${shape}` : ''}.`,
     );
+    // The carrier owns the exact inner settlement. Preserve validation truth
+    // before call_tool/work_call serialize the corrective for the model.
+    settleResolvedCarrierRefusal({
+      resolved: {
+        sessionId: attestation.sessionId,
+        sourceUserSeq: attestation.sourceUserSeq,
+        logicalToolCallId: attestation.logicalToolCallId,
+        targetName: operationId,
+        targetArgs: args,
+        targetInputSchema: resolved.binding.inputSchema,
+      },
+      lane: 'native_mcp',
+      refusal,
+      classification: 'invalid_arguments',
+    });
+    return refusal;
   }
   // A turn-budget checkpoint is not an execution attempt. Check it before the
   // one-shot nested admission CAS so an auto-resume can retain that authority.

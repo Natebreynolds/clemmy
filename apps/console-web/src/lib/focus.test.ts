@@ -95,3 +95,15 @@ test('only task-backed linked actions become internal Tasks deep links', () => {
     kind: 'background',
   }), null);
 });
+
+
+test('conversation workstate requires unambiguous session ownership, even for stale context checks', () => {
+  const owned = snapshot({ related_session_id: 'chat-a', resource_ref: 'session:chat-a' }, true);
+  assert.equal(shouldShowWorkstate(owned, 'chat-a'), true);
+  assert.equal(shouldShowWorkstate(owned, 'chat-b'), false);
+  assert.equal(shouldShowWorkstate(owned, ''), false);
+  assert.equal(shouldShowWorkstate(snapshot({}, true), 'chat-a'), false);
+  assert.equal(shouldShowWorkstate(snapshot({ resource_ref: 'session:chat-a' }, true), 'chat-a'), true);
+  assert.equal(shouldShowWorkstate(snapshot({ related_session_id: 'chat-a', resource_ref: 'session:chat-b' }, true), 'chat-a'), false);
+  assert.equal(shouldShowWorkstate(owned), true, 'overview keeps its shared context check');
+});
