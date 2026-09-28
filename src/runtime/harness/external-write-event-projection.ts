@@ -522,6 +522,8 @@ export function projectExternalWriteTerminal(input: {
           ? { semanticFingerprint: descriptor.semanticFingerprint }
           : {}),
         ...classification,
+        ...(input.type === 'external_write_succeeded' && input.reason === 'envelope_no_change'
+          ? { observedEffect: 'none' } : {}),
         targets: descriptor.targets,
         duplicateIdentityKeys: descriptor.duplicateIdentityKeys,
         ...(input.type === 'external_write_succeeded'

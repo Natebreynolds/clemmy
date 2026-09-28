@@ -24,6 +24,8 @@ import {
 
 export interface ResolvedWriteEvidence {
   confirmed: EventRow[];
+  /** Successful calls explicitly acknowledged as no change; never a new write. */
+  unchanged: EventRow[];
   /** Reservations whose exact call recorded a proved not-applied terminal.
    * Kept separate from `uncertain` so settlement/finalization can distinguish
    * a reconciled absence from an effect whose provider outcome is still
@@ -101,7 +103,7 @@ function sameWriteAttempt(
 export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWriteEvidence {
   const attempts: Array<{
     event: EventRow;
-    state: 'pending' | 'confirmed' | 'failed' | 'uncertain' | 'conflicted';
+    state: 'pending' | 'confirmed' | 'unchanged' | 'failed' | 'uncertain' | 'conflicted';
     decisive: boolean;
   }> = [];
   const unmatchedOrphans: EventRow[] = [];
@@ -148,13 +150,14 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
           attempt.state = 'uncertain';
         }
       } else if (event.type === 'external_write_succeeded') {
-        if ((attempt.state === 'failed' && attempt.decisive) || attempt.state === 'conflicted') {
+        const nextState = event.data.observedEffect === 'none' ? 'unchanged' : 'confirmed';
+        if ((attempt.decisive && attempt.state !== nextState) || attempt.state === 'conflicted') {
           attempt.state = 'conflicted';
         } else {
-          attempt.state = 'confirmed';
+          attempt.state = nextState;
           attempt.decisive = true;
         }
-      } else if ((attempt.state === 'confirmed' && attempt.decisive) || attempt.state === 'conflicted') {
+      } else if (((attempt.state === 'confirmed' || attempt.state === 'unchanged') && attempt.decisive) || attempt.state === 'conflicted') {
         attempt.state = 'conflicted';
       } else {
         attempt.state = 'failed';
@@ -168,6 +171,7 @@ export function resolveWriteEvidence(events: readonly EventRow[]): ResolvedWrite
   }
   return {
     confirmed: attempts.filter((attempt) => attempt.state === 'confirmed').map((attempt) => attempt.event),
+    unchanged: attempts.filter((attempt) => attempt.state === 'unchanged').map((attempt) => attempt.event),
     failed: attempts.filter((attempt) => attempt.state === 'failed').map((attempt) => attempt.event),
     uncertain: [
       ...attempts

@@ -43,3 +43,24 @@ test('prose settles nothing, and a contradicted envelope is not a success', asyn
   // And an explicit failure is never read as success.
   assert.equal(positiveStringEnvelope('{"successful":false,"error":"nope"}'), false);
 });
+
+
+test('explicit successful no-op is retained without interpreting records or prose', async () => {
+  const { providerResultReportsNoChange } = await import('./attempt-settlement.js');
+  const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
+  const reply = { successful: true, error: null, data: { ok: true, no_op: true, already_open: true, channel: { id: 'D-fixture' } } };
+  for (const value of [reply, JSON.stringify(reply), { output: JSON.stringify(reply) }]) {
+    assert.equal(providerResultReportsNoChange(value), true);
+  }
+  for (const value of [
+    'No changes were made', { ok: true, data: { record: { no_op: true } } },
+    { successful: true, data: { ok: false, no_op: true } },
+    { successful: true, error: 'failed', no_op: true },
+    { ok: true, no_op: 'true' }, { ok: true, data: { ok: true, channel: { id: 'D-existing' } } },
+  ]) assert.equal(providerResultReportsNoChange(value), false);
+  const out = classifyAttemptOutcome({ envelopeSuccessful: true, providerNoChange: true, mutating: true });
+  assert.equal(out.kind, 'succeeded');
+  assert.equal(out.detail, 'envelope_no_change');
+  assert.equal(out.directive.retrySameCandidate, false);
+  assert.notEqual(classifyAttemptOutcome({ envelopeSuccessful: false, providerNoChange: true }).kind, 'succeeded');
+});

@@ -3072,3 +3072,38 @@ test('whitespace-normalized model ids are rejected instead of silently remapped'
   assert.equal(rows(task).length, 0);
   leases.revokeDispatchLease(task.parentLease);
 });
+
+
+test('no-op provider success survives replay without claiming a write or replaying the operation', async () => {
+  const task = fixture('Resolve the existing resource, then prepare its next action.');
+  let bodies = 0;
+  const execute = () => runCall(task, {
+    callId: 'model:no-change', toolName: 'space_publish', args: { entry_id: 'existing' },
+    effect: 'external_write', boundary: 'host_owned_external', deadlineMs: 1000,
+    invoke: async () => { bodies++; return JSON.stringify({ successful: true, error: null,
+      data: { ok: true, no_op: true, channel: { id: 'D-fixture' } } }); },
+  });
+  const first = await execute();
+  assert.equal(first.settlement.outcome.kind, 'succeeded');
+  assert.equal(first.settlement.outcome.detail, 'envelope_no_change');
+  const events = eventlog.listEvents(task.sessionId);
+  const terminal = events.find(e => e.type === 'external_write_succeeded')!;
+  assert.equal(terminal.data.observedEffect, 'none');
+  const evidence = workReport.resolveWriteEvidence(events);
+  assert.equal(evidence.confirmed.length, 0);
+  assert.equal(evidence.unchanged.length, 1);
+  assert.equal(evidence.uncertain.length, 0);
+  const audit = settlementAudit.auditAcceptedSourceSettlementTruth({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+  assert.equal(audit.status, 'clean', JSON.stringify(audit));
+  assert.equal(audit.facts.confirmedWrites, 0);
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const { foldWriteLedger } = await import('../../../packages/chat-engine/src/write-ledger.js');
+  const publicEvents = events.flatMap(e => { const p = projectHarnessEventForPublic(e); return p ? [p] : []; });
+  const ledger = foldWriteLedger(publicEvents);
+  assert.equal(ledger.get('model:no-change')?.disposition, 'returned');
+  const replay = await execute();
+  assert.equal(replay.settlement.duplicate, true);
+  assert.equal(bodies, 1);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['external_write_succeeded'] }).length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});

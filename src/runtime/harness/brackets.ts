@@ -187,6 +187,7 @@ import {
 import {
   attemptSignalsFromShellExecutionOutcome,
   attemptSignalsFromTypedResult,
+  providerResultReportsNoChange,
   settleToolAttempt,
   ToolAttemptSettlementAuthorityError,
   unwrapHostLocalExecutionFailureResult,
@@ -2255,6 +2256,8 @@ function recordExternalWriteSettlement(
       typeof settlementResult !== 'string'
       || settlementResult.trim().length > 0
     );
+  const observedNoChange = !threw && toolName !== 'run_shell_command'
+    && providerResultReportsNoChange(settlementResult);
   const cleanAcknowledgement = !threw && resultCarriesAcknowledgement && (
     toolName === 'run_shell_command'
       ? shellOutcome?.dispatch === 'acknowledged' && shellOutcome.exitCode === 0
@@ -2262,7 +2265,7 @@ function recordExternalWriteSettlement(
   );
   const type = trustedNotStarted
     ? 'external_write_failed'
-    : cleanAcknowledgement
+    : cleanAcknowledgement || observedNoChange
       ? 'external_write_succeeded'
       : 'external_write_orphaned';
   const actionKey = canonicalExternalWriteActionKey(toolName, shapeKey);
@@ -2298,6 +2301,7 @@ function recordExternalWriteSettlement(
     descriptor,
     type,
     attribution,
+    ...(observedNoChange ? { reason: 'envelope_no_change' } : {}),
     ...(type !== 'external_write_succeeded'
       ? {
           reason: String(

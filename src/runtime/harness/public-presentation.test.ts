@@ -959,3 +959,16 @@ test('a hosted model id with one namespace segment reaches the chat as the route
     assert.equal(projected?.data.model, undefined, `${unsafe} must stay private`);
   }
 });
+
+
+test('observed no-change overrides predicted send in public receipts', () => {
+  const projected = projectHarnessEventForPublic(event('external_write_succeeded', {
+    callId: 'noop-receipt', shapeKey: 'EXAMPLE_OPEN_DM', consequence: 'send',
+    reversibility: 'irreversible', observedEffect: 'none',
+  }));
+  assert.equal(projected?.data.affirmsChange, false);
+  const sent = projectHarnessEventForPublic(event('external_write_succeeded', {
+    callId: 'real-send', consequence: 'send', reversibility: 'irreversible',
+  }));
+  assert.equal(sent?.data.affirmsChange, true);
+});

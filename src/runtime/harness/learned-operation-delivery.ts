@@ -470,8 +470,10 @@ function noteOutcome(prepared: PreparedDefinition, outcome: OperationDeliveryLea
     boundedSet(retryAfter, retryKey(prepared),
       Date.now() + (unavailable ? RETRY_AFTER_UNAVAILABLE_MS : RETRY_AFTER_ANSWER_MS));
   }
-  const log = outcome === 'learned' ? logger.info.bind(logger) : logger.debug.bind(logger);
-  log({ operationId: prepared.operationId, providerKind: prepared.providerKind, outcome },
+  // A missing learned verdict must be attributable, not silently retried as
+  // another user approval. Only bounded status/identity, never definition text.
+  const log = logger.info.bind(logger);
+  log({ operationId: prepared.operationId, providerKind: prepared.providerKind, definitionDigest: prepared.definitionDigest, outcome },
     'operation delivery learning finished');
 }
 

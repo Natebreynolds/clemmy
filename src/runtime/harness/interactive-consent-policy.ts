@@ -80,6 +80,7 @@ export function consentRiskAffirmsChange(
 /** The same verdict read back from a write's ledger row. A row recorded
  *  without a consent classification keeps its historical reading: a change. */
 export function recordedConsentAffirmsChange(data: Readonly<Record<string, unknown>>): boolean {
+  if (data.observedEffect === 'none') return false;
   return isInteractiveConsentConsequence(data.consequence)
     ? consentRiskAffirmsChange({ consequence: data.consequence, destructive: data.destructive === true })
     : true;

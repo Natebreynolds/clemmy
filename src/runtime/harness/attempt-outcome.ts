@@ -195,6 +195,8 @@ export interface AttemptSignals {
   errorName?: string;
   /** Provider envelope success flag, when the envelope is structured. */
   envelopeSuccessful?: boolean;
+  /** Explicit no-op in the provider acknowledgement; success without a new effect. */
+  providerNoChange?: boolean;
   /** Provider envelope error code, when the envelope carries one. */
   envelopeErrorCode?: string | number;
   /** The call mutated (or may have mutated) something outside Clementine. */
@@ -389,7 +391,7 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
   if (signals.envelopeSuccessful === true || signals.providerReportedError === false) {
     return signals.emptyResult
       ? outcome('empty_result', 'structured', 'envelope_empty')
-      : outcome('succeeded', 'structured', 'envelope');
+      : outcome('succeeded', 'structured', signals.providerNoChange === true ? 'envelope_no_change' : 'envelope');
   }
   if (signals.envelopeSuccessful === false) {
     // A structured failure is real, but WHY it failed is not stated. Keep the

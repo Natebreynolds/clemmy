@@ -667,6 +667,7 @@ function signalsFromResult(result: unknown): AttemptSignals {
     ?? structuralEnvelope.success
     ?? structuralEnvelope.ok;
   if (typeof successful === 'boolean') signals.envelopeSuccessful = successful;
+  if (providerResultReportsNoChange(result)) signals.providerNoChange = true;
   if (typeof structuralEnvelope.isError === 'boolean') {
     signals.providerReportedError = structuralEnvelope.isError;
   }
@@ -906,6 +907,26 @@ export function positiveStringEnvelope(result: unknown): boolean {
     return true;
   }
   return false;
+}
+
+/** A successful no-op is useful progress, but never proof of a new write.
+ * Inspect acknowledgement fields only, not records, echoed arguments or prose. */
+export function providerResultReportsNoChange(result: unknown): boolean {
+  const direct = record(result);
+  const candidates: unknown[] = direct ? [completedAdapterProviderEnvelope(direct) ?? direct] : [];
+  for (const text of stringCandidates(result)) {
+    if (Buffer.byteLength(text, 'utf8') > STRING_ENVELOPE_MAX_BYTES) continue;
+    try { candidates.push(JSON.parse(text)); } catch { /* prose is not evidence */ }
+  }
+  return candidates.some((candidate) => {
+    const envelope = record(candidate);
+    if (!envelope || (envelope.successful ?? envelope.success ?? envelope.ok) !== true) return false;
+    if (envelope.error != null && envelope.error !== '') return false;
+    const data = record(envelope.data);
+    if (data && ((data.successful ?? data.success ?? data.ok) === false || (data.error != null && data.error !== ''))) return false;
+    return envelope.no_op === true || envelope.noop === true
+      || (data?.ok === true && (data.no_op === true || data.noop === true));
+  });
 }
 
 /** A provider reply that is itself structured data: an object or array, or a
@@ -1165,6 +1186,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
         // A serialized envelope that states its own success, with no
         // contradicting error. See positiveStringEnvelope.
         extracted.envelopeSuccessful = true;
+        if (providerResultReportsNoChange(input.result)) extracted.providerNoChange = true;
       }
       if (negative) {
         extracted.envelopeSuccessful = false;

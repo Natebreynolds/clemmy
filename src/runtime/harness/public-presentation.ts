@@ -1139,6 +1139,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         ...selected(data, ['shapeKey', 'toolName', 'tool', 'callId', 'call_id', 'preDispatch']),
         targets: stringList(data.targets, 25),
         ...(app ? { app: app.name, ...(app.url ? { appUrl: app.url } : {}) } : {}),
+        ...(data.observedEffect === 'none' ? { affirmsChange: false } : {}),
         // The consent classification the ledger recorded, so a surface's
         // receipt states what the consent card stated. Closed values only.
         ...(isInteractiveConsentReversibility(data.reversibility) ? { reversibility: data.reversibility } : {}),

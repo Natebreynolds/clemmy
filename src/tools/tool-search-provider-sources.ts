@@ -2426,6 +2426,10 @@ export function buildAuthorizedToolSearchCandidateSources(
             deadlineAt,
           });
           if (signal?.aborted) return [];
+          scheduleOperationDeliveryLearning(exact.map((candidate) => ({
+            providerKind: 'composio' as const, operationId: candidate.slug,
+            description: candidate.description, inputSchema: candidate.inputParameters,
+          })), planningIdentity ? { sessionId: planningIdentity.sessionId } : {});
           const liveFingerprint = liveComposioSchemaFingerprint(exactOperation);
           if (liveFingerprint) reconcileExactSlugMemory(exactOperation, liveFingerprint);
           exactCandidates.push(...exact.map((candidate): ToolSearchBrokerCandidate => ({
@@ -2652,6 +2656,16 @@ export function buildAuthorizedToolSearchCandidateSources(
         return isRegisteredToolkitSlug(toolkit) ? [{ slug, toolkit }] : [];
       });
       const current = await materializeExactProviderBatch({ requests, signal, deadlineAt });
+      // Deferred/page preparation is the first complete provider definition on
+      // this path. Train from that definition, never the index or memory's prose.
+      // The scheduler deduplicates and returns immediately; consent stays closed
+      // until both checks have produced a current verdict.
+      scheduleOperationDeliveryLearning(current.map((candidate) => ({
+        providerKind: 'composio' as const,
+        operationId: candidate.slug,
+        description: candidate.description,
+        inputSchema: candidate.inputParameters,
+      })), planningIdentity ? { sessionId: planningIdentity.sessionId } : {});
       return [...alreadyPrepared, ...current.flatMap((candidate): ToolSearchBrokerCandidate[] => {
         const nominated = requested.get(candidate.slug);
         return nominated ? [{

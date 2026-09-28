@@ -56,10 +56,12 @@ composio.__test__.setComposioApiKeyOverride('delivery-learning-key');
 composio.__test__.setConnectedAccountsLoader(async () => [{
   id: 'ca_fixture_owner', status: 'ACTIVE', user_id: 'fixture-user', toolkit: { slug: TOOLKIT },
 }]);
+let exactDefinitionsAvailable = false;
 composio.__test__.setComposioClient({
   tools: {
     async getRawComposioTools(input: Record<string, unknown>) {
-      if (Array.isArray(input.tools) && input.tools.length > 0) return [];
+      if (Array.isArray(input.tools) && input.tools.length > 0) return exactDefinitionsAvailable
+        ? [OPEN, SEND, LIST].filter(slug => (input.tools as unknown[]).includes(slug)).map(fuzzyRow) : [];
       return [OPEN, SEND, LIST].map(fuzzyRow);
     },
     async execute() { throw new Error('discovery must never execute'); },
@@ -147,4 +149,23 @@ test('discovery schedules delivery learning for its send-shaped definitions and 
   assert.ok(verdict, 'the definition that delivers nothing was learned in the background');
   assert.equal(verdict.confirm.model, 'judge-fixture-model');
   assert.equal(deliveryStore.learnedOperationDeliveryVerdict('composio', SEND), null, 'the send was not');
+});
+
+
+test('deferred exact preparation learns from the full definition, not the index summary', async () => {
+  deliveryStore._resetLearnedOperationDeliveryForTests();
+  learner._resetOperationDeliveryLearningForTests();
+  screened.length = 0;
+  exactDefinitionsAvailable = true;
+  const sources = providerSources.buildAuthorizedToolSearchCandidateSources({
+    reason: 'deferred delivery learning', authority: 'catalog', allowedServerSlugs: [], toolPatterns: [], maxTools: 0,
+  } as never);
+  const source = sources.find((entry) => entry.kind === 'authorized_composio')!;
+  const prepared = await source.prepareCandidates!({
+    candidates: [{ name: OPEN, summary: 'Untrusted index prose', carrier: 'work_call' }],
+  });
+  assert.equal(prepared.length, 1);
+  await learner._drainOperationDeliveryLearningForTests();
+  assert.deepEqual(screened, [DESCRIPTIONS[OPEN]]);
+  assert.ok(deliveryStore.learnedOperationDeliveryVerdict('composio', OPEN));
 });

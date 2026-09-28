@@ -567,7 +567,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
         logicalToolCallId: required.logical_tool_call_id,
       });
       if (required.physical_dispatch_id !== expectedPhysicalDispatchId) return true;
-      const matches = writeEvidence.confirmed.filter((reservation) => (
+      const matches = [...writeEvidence.confirmed, ...writeEvidence.unchanged].filter((reservation) => (
         reservation.data.preDispatch === true
         && reservation.data.hostOwnedExternal === true
         && reservation.data.sourceUserSeq === input.sourceUserSeq
@@ -609,7 +609,7 @@ export function auditAcceptedSourceSettlementTruth(input: {
       reservationCountByCallId.set(callId, (reservationCountByCallId.get(callId) ?? 0) + 1);
     }
     const resolvedWriteCallIds = new Set(
-      [...writeEvidence.confirmed, ...writeEvidence.failed]
+      [...writeEvidence.confirmed, ...writeEvidence.unchanged, ...writeEvidence.failed]
         .map(writeCallId)
         .filter((callId) => Boolean(callId) && reservationCountByCallId.get(callId) === 1),
     );

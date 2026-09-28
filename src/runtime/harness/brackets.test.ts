@@ -3297,6 +3297,20 @@ test('external-write settlement requires a positive acknowledgement, never failu
     }));
     assert.equal(listEvents(successSession.id, { types: ['external_write_succeeded'] }).length, 1);
     assert.equal(listEvents(successSession.id, { types: ['external_write_orphaned'] }).length, 0);
+    const noChangeSession = createSession({ kind: 'chat' });
+    const noChangeAnchor = anchorAcceptedTask(noChangeSession.id, 'Ensure the record exists.');
+    const noChange = wrapToolForHarness({ name: 'composio_execute_tool',
+      execute: async () => ({ successful: true, data: { ok: true, no_op: true, id: 'rec-existing' } }),
+    });
+    await withHarnessRunContext({ sessionId: noChangeSession.id, sourceUserSeq: noChangeAnchor.sourceUserSeq,
+      behaviorScopeId: 'ack-no-change', counter: new ToolCallsCounter(20),
+    }, () => noChange.execute!({ tool_slug: 'AIRTABLE_CREATE_RECORD',
+      arguments: { base_id: 'app1', table_id: 'tbl1', fields: { Name: 'Existing' } },
+    }));
+    const [noChangeReceipt] = listEvents(noChangeSession.id, { types: ['external_write_succeeded'] });
+    assert.equal(noChangeReceipt?.data.observedEffect, 'none');
+    assert.equal(listEvents(noChangeSession.id, { types: ['external_write_orphaned'] }).length, 0);
+
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];

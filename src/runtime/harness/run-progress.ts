@@ -69,7 +69,7 @@ function settledOperationCounts(
   const unaffirmed = new Set<string>();
   const reservations = db.prepare(`
       SELECT data_json FROM events
-       WHERE session_id = ? AND type = 'external_write'
+       WHERE session_id = ? AND type IN ('external_write', 'external_write_succeeded')
          AND json_extract(data_json, '$.sourceUserSeq') = ?
     `).all(sessionId, sourceUserSeq) as Array<{ data_json: string }>;
   for (const row of reservations) {
