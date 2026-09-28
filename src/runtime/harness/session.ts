@@ -1,3 +1,4 @@
+import { recoveryActivationOwner, type RecoveryActivationOwner } from './recovery-activation.js';
 import type { AgentInputItem } from '@openai/agents';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
@@ -79,11 +80,7 @@ const META_RECOVERY_OWNER = '__host_recovery_owner';
 const META_CONTINUATION_OWNER = '__continuation_owner';
 
 /** The exact activation a recovery checkpoint belongs to. */
-export interface RecoveryOwner {
-  sourceUserSeq: number;
-  /** Distinguishes competing activations of the SAME accepted source. */
-  attemptId?: string | undefined;
-}
+export interface RecoveryOwner extends RecoveryActivationOwner {}
 
 export type RecoverySaveOutcome =
   | { installed: true }
@@ -101,6 +98,7 @@ function recoveryOwnerToken(owner: RecoveryOwner): string {
   return JSON.stringify({
     sourceUserSeq: owner.sourceUserSeq,
     attemptId: owner.attemptId ?? null,
+    ...(owner.approvalContinuation ? { approvalContinuation: owner.approvalContinuation } : {}),
   });
 }
 // Restart-recovery marker: set while a runConversation is in flight, cleared in
@@ -598,7 +596,7 @@ export class HarnessSession {
     const scope = options.mcpToolScope && typeof options.mcpToolScope.reason === 'string'
       ? JSON.parse(JSON.stringify(options.mcpToolScope)) as McpToolScope
       : null;
-    const owner = options.owner;
+    const owner = options.owner ? recoveryActivationOwner(this.row.id, options.owner) : undefined;
     const ownerToken = owner ? recoveryOwnerToken(owner) : null;
 
     if (owner && this.acceptedSourceHasTypedTerminal(owner.sourceUserSeq)) {
@@ -738,6 +736,7 @@ export class HarnessSession {
    * a newer source's claim replaces an older one's.
    */
   claimContinuationOwner(owner: { sourceUserSeq: number; attemptId?: string | undefined }): boolean {
+    owner = recoveryActivationOwner(this.row.id, owner);
     try {
       const result = openEventLog().prepare(`
         UPDATE sessions

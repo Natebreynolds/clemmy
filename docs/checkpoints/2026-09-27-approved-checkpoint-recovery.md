@@ -1,4 +1,4 @@
-# Approved-action checkpoint recovery — release blocker
+# Approved-action checkpoint recovery — repair and release qualification
 
 ## Reproduced defect
 
@@ -25,3 +25,21 @@ The new pin expects one original approval card, one physical action, one eventua
 Public repository hygiene passes after removing a personal path from the earlier checkpoint. Release asset tests pass 58/58, and release closure passes 141/141, including the isolated v3.14 store-upgrade rehearsal. A newly maintained schema-document guard fails on the stale upgrade document and passes with the schema-82 target. Historical release notes remain unchanged. These are focused preflight results, not the exact final release gate or packaged-app acceptance.
 
 The complete suite and canonical journeys still await an idle machine or the owner's explicit exception to the earlier scheduling rule. Full signed packaging, last-tag live performance comparison, installed long-conversation/fan-out/workflow acceptance and the tag remain outstanding. The goal remains active.
+
+## Implemented repair and focused qualification
+
+The bounded repair now keeps the original business request in the checkpoint and binds recovery delivery to the accepted approval answer. A persisted continuation link is validated against the exact session, accepted request, approval-answer event, decision and resolved card. Existing terminal and attempt ownership guards remain. The host reopens the existing batch and settled result; no consumed approval or physical effect is replayed. Boot recovery dispatches the delivery source while sharing the business frame's existing reentry budget with timer recovery.
+
+A shared active-conversation owner also covers approval resumes. A new concurrent-entry pin first exposed a second activation returning completion before the actual answer finished. The fixed wrapper makes both callers await one activation, including the interval after checkpoint adoption. A separate cancellation pin exposed approval-answer Stop being ignored: recovery now observes either the original request's exact stop or its scoped delivery owner's exact stop, without using the latest unrelated input.
+
+Evidence on the repair:
+
+- 91/91 focused recovery tests pass with no skipped/cancelled cases. Includes real approved-effect storage failure, timer recovery, concurrent-entry joining, exact no-replay, foreign/malformed owner rejection, continuation fencing and stopped recovery.
+- Real process-exit coverage prepares the approved action in one child process, terminates it with a durable held checkpoint, resumes through production boot recovery in a second child, and reopens completed delivery in a third. Across all three processes there is one physical effect, one post-result model call, one terminal for the approval answer, and no model/tool work on the final reopen. Providers are recording ports, not external services.
+- Concurrent-entry and approval-control Stop pins failed before their respective fixes. Both cancellation targets now pass; existing parked-versus-unrelated cancellation cases remain green.
+- 389/389 surrounding loop, restart-recovery, event-log, source-approval-checkpoint and approval-resume-source checks pass. This pack ran before the final narrow cancellation addition; the final 91-test pack and targeted four cancellation cases cover that addition.
+- Root TypeScript checking passes after the final change. No paid model calls, settings changes, installed-app restart or hotpatch occurred.
+
+Local receipts under output/release-3.18.22-2026-09-27: approved-recovery-pack.log, approved-surrounding.log, approved-concurrent-red.log, approved-stop-red.log, approved-stop-green.log and approved-typecheck.log. The isolated runner cannot certify unchanged live-home bytes while the installed daemon is active; these fixtures use disposable homes and are not installed-app acceptance.
+
+The original failure descriptions above are retained as the red baseline. The runtime repair is source-qualified by these focused checks, not yet built, installed, live-accepted or release-qualified. The 100-worker journey assertion repair remains a separate unexecuted change. Complete-suite/journey scheduling still awaits an idle machine or the owner's answer to the pending scheduling question; the unrelated management notifier remains busy. Full release packaging/signing, matched live performance, and controlled installed long-chat/fan-out/workflow/approval recovery acceptance remain owed. Do not tag from these focused results alone.

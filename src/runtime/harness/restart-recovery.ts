@@ -1,3 +1,4 @@
+import { readApprovalRecoveryActivation } from './recovery-activation.js';
 import { WORKFLOW_PARENT_LEASE_PREFIX } from './workflow-parent-activation.js';
 /**
  * Restart recovery for in-flight CHAT runs.
@@ -185,6 +186,7 @@ function autoResumeEnabled(): boolean {
 interface CheckpointRecoveryDescriptor {
   serializedState: string;
   sourceUserSeq: number;
+  executionSourceUserSeq?: number;
   phase: 'admit' | 'finalize' | 'continue';
   frameCallIds: string[];
 }
@@ -204,12 +206,14 @@ function checkpointRecoveryDescriptor(
       ? parsed.phase
       : null;
     const frameCallIds = exactCheckpointFrameCallIds(parsed.frameHistory);
+    const approvalOwner = readApprovalRecoveryActivation(sessionId);
     return parsed.__clemHostRecovery === 1
       && parsed.sessionId === sessionId
       && phase !== null
       && Number.isSafeInteger(sourceUserSeq)
       && sourceUserSeq > 0
-      ? { serializedState: blob, sourceUserSeq, phase, frameCallIds }
+      ? { serializedState: blob, sourceUserSeq: approvalOwner?.sourceUserSeq ?? sourceUserSeq,
+          ...(approvalOwner ? { executionSourceUserSeq: sourceUserSeq } : {}), phase, frameCallIds }
       : null;
   } catch {
     return null;
@@ -1570,7 +1574,7 @@ export function recoverInterruptedChatRuns(
       try {
         const finalized = options.finalizeExactCheckpointStop({
           sessionId: row.id,
-          sourceUserSeq: recoveryIdentity!.sourceUserSeq,
+          sourceUserSeq: checkpointRecovery.executionSourceUserSeq ?? recoveryIdentity!.sourceUserSeq,
           ownerLogicalToolCallId: checkpointRecovery.frameCallIds[0]!,
           runAttemptId: interruptedAttempt.attemptId,
           turn: recoveryIdentity!.turn,

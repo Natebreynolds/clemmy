@@ -3,13 +3,17 @@
  * against a deterministic exact catalog port. */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
 
-const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-host-direct-write-'));
+const PROCESS_HOME = process.env.CLEM_APPROVED_CHECKPOINT_FIXTURE_HOME;
+if (PROCESS_HOME) assert.ok(path.resolve(PROCESS_HOME).startsWith(path.resolve(os.tmpdir()) + path.sep));
+const TEST_HOME = PROCESS_HOME ?? mkdtempSync(path.join(os.tmpdir(), 'clem-host-direct-write-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -47,7 +51,7 @@ after(() => {
   ports.clearProductionCapabilityPorts();
   schemas.resetToolSchemaCache();
   eventlog.closeEventLog();
-  rmSync(TEST_HOME, { recursive: true, force: true });
+  if (!PROCESS_HOME) rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
 async function* modelStream(this: { getResponse(request: unknown): Promise<any> }, request: unknown) {
@@ -70,7 +74,7 @@ completion.registerCarrierCompleter((argumentsJson) => {
   return { argumentsJson: JSON.stringify({ ...rest, args_json: JSON.stringify(args) }), toolSlug: outer.name, changes: ['args renamed to args_json'] };
 });
 
-async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' | 'bounded' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; deferredAcrossSources?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias'; taskMode?: { version: 1; kind: 'plan' }; result?: unknown }) {
+async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' | 'bounded' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; deferredAcrossSources?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias'; taskMode?: { version: 1; kind: 'plan' }; result?: unknown; existingSourceSeq?: number }) {
   const inputSchema = providerFixture?.schema ?? INPUT_SCHEMA;
   const payloadForWrite = (ordinal: number): Record<string, unknown> => providerFixture?.payloads[ordinal - 1]
     ?? (writeCount === 1 ? ARGS : { body: `${ARGS.body} Item ${ordinal}.` });
@@ -135,8 +139,12 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
   const prompt = kind === 'draft'
     ? `Create ${writeCount} independent reversible drafts on my connected owner account from this validated content. Do not send anything.`
     : `Perform the exact ${kind} operation on my connected owner account from this validated content.`;
-  const session = eventlog.createSession({ id: `p3-direct-write-${carrierName}-${kind}-${suffix}`, kind: 'chat' });
-  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+  const sessionId = `p3-direct-write-${carrierName}-${kind}-${suffix}`;
+  const session = providerFixture?.existingSourceSeq ? eventlog.getSession(sessionId)! : eventlog.createSession({ id: sessionId, kind: 'chat' });
+  assert.ok(session);
+  const source = providerFixture?.existingSourceSeq
+    ? eventlog.listEvents(session.id, { types: ['user_input_received'] }).find(event => event.seq === providerFixture.existingSourceSeq)!
+    : eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: prompt, ...(providerFixture?.taskMode ? { taskMode: providerFixture.taskMode } : {}) } });
   let carrierBodies = 0;
   const carrier = brackets.wrapToolForHarness(carrierName === 'work_call'
@@ -1346,13 +1354,64 @@ test('a change answered in chat carries the memory that fits the change to the r
 // A real approval is spent before a settled result is checkpointed. A local
 // storage failure here must recover privately; asking again or replaying the
 // send would violate the same consent and exact-once contracts.
-test('an approved write held on checkpoint storage resumes by timer without repeating the effect', async () => {
-  const fixture = await directWriteFixture('work_call', 'opaque', 'approved-checkpoint-timer');
+async function approvedCheckpointFixture(stopTarget?: 'control' | 'business') {
+  const phase = process.env.CLEM_APPROVED_CHECKPOINT_FIXTURE_PHASE;
+  const handoffPath = path.join(TEST_HOME, 'checkpoint-handoff.json');
+  const saved = phase === 'recover' || phase === 'replay' ? JSON.parse(readFileSync(handoffPath, 'utf8')) as {
+    sourceUserSeq: number; acceptingSeq: number; approvalId: string;
+  } : undefined;
+  const fixture = await directWriteFixture('work_call', 'opaque', `approved-checkpoint-timer${stopTarget ? `-${stopTarget}` : ''}`, false, 'args_json', 1, {
+    operationId: `APPROVED_CHECKPOINT_FIXTURE${stopTarget ? `_${stopTarget.toUpperCase()}` : ''}`, schema: INPUT_SCHEMA, payloads: [ARGS], existingSourceSeq: saved?.sourceUserSeq,
+  });
   assert.ok(fixture);
   const { runConversation, runConversationFromResume } = await import('./loop.js');
   const { HarnessSession } = await import('./session.js');
   const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
   const agent = await fixture.useProductionAgent();
+  if (saved) {
+    const original = fixture.model.getResponse.bind(fixture.model);
+    fixture.model.getResponse = async (request: any) => ({ ...await original(request),
+      output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The approved action completed once.' }] }],
+    });
+    const continueSaved = () => runConversation({ sessionId: fixture.session.id, sourceUserSeq: saved.acceptingSeq,
+      input: `Approve ${saved.approvalId}.`, reuseRecordedUserInput: true, turnEngine: 'host_v1',
+      makeRunner: () => fixture.runner as never, judgeFn: async () => ({ done: true, reason: 'fixture exact settled result' }),
+      buildAgent: identity => buildOrchestratorAgentForApprovalResume({ ...identity,
+        acceptedRoute: identity.route ?? 'act', model: fixture.model as never, allowToolJit: true }),
+    });
+    if (phase === 'recover') {
+      const { recoverInterruptedChatRuns } = await import('./restart-recovery.js');
+      let settle!: (value: Awaited<ReturnType<typeof runConversation>>) => void;
+      let reject!: (reason: unknown) => void;
+      const finished = new Promise<Awaited<ReturnType<typeof runConversation>>>((resolve, fail) => { settle = resolve; reject = fail; });
+      let dispatches = 0;
+      const summary = recoverInterruptedChatRuns(Date.now, async dispatch => {
+        assert.equal(dispatch.sourceUserSeq, saved.acceptingSeq, 'boot dispatch owns the approval answer');
+        dispatches += 1;
+        try { settle(await continueSaved()); } catch (error) { reject(error); throw error; }
+      });
+      assert.equal(summary.records.find(row => row.sessionId === fixture.session.id)?.autoResumed, true, JSON.stringify(summary));
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([finished, new Promise<never>((_, fail) => {
+        timeout = setTimeout(() => fail(new Error('approved checkpoint boot recovery timed out')), 15_000);
+      })]).finally(() => { if (timeout) clearTimeout(timeout); });
+      assert.equal(result.status, 'completed', JSON.stringify(result));
+      assert.equal(dispatches, 1);
+      assert.equal(fixture.counts().modelCalls, 1);
+      const frame = fixture.modelInputs[0] as Array<{ type?: string; callId?: string }>;
+      assert.equal(frame.filter(item => item.type === 'function_call_result' && item.callId === 'exact-draft').length, 1);
+    } else {
+      const result = await continueSaved();
+      assert.equal(result.status, 'completed', JSON.stringify(result));
+      assert.equal(fixture.counts().modelCalls, 0, 'a second process reopening the completed source performs no model work');
+    }
+    assert.equal(fixture.counts().providerCalls, 0, 'a fresh process must never cross the settled provider again');
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+      .filter(event => event.data.sourceUserSeq === saved.acceptingSeq).length, 1);
+    assert.equal(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), null);
+    writeFileSync(path.join(TEST_HOME, `checkpoint-${phase}.json`), JSON.stringify({ ok: true, ...fixture.counts() }));
+    return;
+  }
   const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
     sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
     suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
@@ -1379,7 +1438,7 @@ test('an approved write held on checkpoint storage resumes by timer without repe
       }),
     });
   } finally {
-    db.exec('DROP TRIGGER IF EXISTS reject_approved_result_checkpoint');
+    if (phase !== 'prepare') db.exec('DROP TRIGGER IF EXISTS reject_approved_result_checkpoint');
   }
   assert.equal(result.status, 'held', JSON.stringify(result));
   assert.equal(fixture.counts().providerCalls, 1, 'the approved physical effect already landed');
@@ -1387,6 +1446,56 @@ test('an approved write held on checkpoint storage resumes by timer without repe
   const accepting = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).at(-1)!;
   assert.notEqual(accepting.seq, fixture.source.seq);
   assert.ok(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), JSON.stringify(eventlog.listEvents(fixture.session.id, { types: ['restart_recovery_decision'] }).map(event => event.data)));
+  if (phase === 'prepare') {
+    writeFileSync(handoffPath, JSON.stringify({ sourceUserSeq: fixture.source.seq,
+      acceptingSeq: accepting.seq, approvalId: approval.approvalId, ...fixture.counts() }));
+    // Simulate a process death while the storage fault is still present. The
+    // next process receives only durable rows; no timer or closure survives.
+    process.exit(0);
+  }
+  if (stopTarget) {
+    const stoppedSeq = stopTarget === 'control' ? accepting.seq : fixture.source.seq;
+    const stopAttempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `checkpoint-stop-${stopTarget}` });
+    eventlog.bindRunAttemptSourceUserEvent(stopAttempt, stoppedSeq);
+    eventlog.requestKill(fixture.session.id, 'Stop this recovery only.', stopAttempt);
+    const stopped = await runConversationFromResume({ agent, sessionId: fixture.session.id,
+      sourceUserSeq: accepting.seq, approvalId: approval.approvalId, decision: 'approve',
+      resolver: 'checkpoint-timer-fixture', turnEngine: 'host_v1', makeRunner: () => fixture.runner as never,
+      judgeFn: async () => ({ done: true, reason: 'fixture exact settled result' }) });
+    assert.equal(stopped.status, 'killed', JSON.stringify(stopped));
+    assert.equal(fixture.counts().providerCalls, 1, 'stopping recovery cannot repeat the landed effect');
+    assert.equal(fixture.counts().modelCalls, heldCalls, 'stopped recovery must not start another model frame');
+    assert.equal(eventlog.isKillRequested(fixture.session.id, { sourceUserSeq: stoppedSeq }), false);
+    return;
+  }
+  // Hold the timer's answer in flight while a second entry asks to recover
+  // the same approval. Both entries must share one accepted-source activation.
+  const originalAnswer = fixture.model.getResponse.bind(fixture.model);
+  let answerStarted!: () => void;
+  let releaseAnswer!: () => void;
+  const started = new Promise<void>(resolve => { answerStarted = resolve; });
+  const release = new Promise<void>(resolve => { releaseAnswer = resolve; });
+  fixture.model.getResponse = async (request: any) => {
+    const response = await originalAnswer(request);
+    answerStarted();
+    await release;
+    return response;
+  };
+  let startTimeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([started, new Promise<never>((_, reject) => {
+    startTimeout = setTimeout(() => reject(new Error('timer answer did not start')), 15_000);
+  })]).finally(() => { if (startTimeout) clearTimeout(startTimeout); });
+  const joined = runConversationFromResume({ agent, sessionId: fixture.session.id,
+    sourceUserSeq: accepting.seq, approvalId: approval.approvalId, decision: 'approve',
+    resolver: 'checkpoint-timer-fixture', turnEngine: 'host_v1', makeRunner: () => fixture.runner as never,
+    judgeFn: async () => ({ done: true, reason: 'fixture exact settled result' }) });
+  let joinedSettled = false;
+  void joined.then(() => { joinedSettled = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const deliveredBeforeAnswer = joinedSettled;
+  releaseAnswer();
+  assert.equal((await joined).status, 'completed');
+  assert.equal(deliveredBeforeAnswer, false, 'a second recovery entry must wait for the actual answer, not publish empty completion');
   const deadline = Date.now() + 15_000;
   const terminals = () => eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
     .filter(event => event.data.sourceUserSeq === accepting.seq);
@@ -1403,4 +1512,38 @@ test('an approved write held on checkpoint storage resumes by timer without repe
   assert.equal(replay.status, 'completed', JSON.stringify(replay));
   assert.equal(fixture.counts().providerCalls, 1);
   assert.equal(fixture.counts().modelCalls, heldCalls + 1);
+}
+
+test('an approved write held on checkpoint storage resumes by timer without repeating the effect', () => approvedCheckpointFixture());
+for (const target of ['control', 'business'] as const) {
+  test(`approved checkpoint recovery honors a stop on its ${target} source`, () => approvedCheckpointFixture(target));
+}
+
+test('approved checkpoint recovery survives real process exit and a second reopen', async () => {
+  const home = path.join(TEST_HOME, 'approved-checkpoint-process');
+  mkdirSync(home, { recursive: true });
+  for (const phase of ['prepare', 'recover', 'replay']) {
+    await new Promise<void>((resolve, reject) => {
+      const childEnv = { ...process.env };
+      delete childEnv.NODE_TEST_CONTEXT;
+      const child = spawn(process.execPath, ['--import', 'tsx', '--test',
+        '--test-name-pattern=approved write held on checkpoint storage', fileURLToPath(import.meta.url)], {
+        env: { ...childEnv, CLEM_APPROVED_CHECKPOINT_FIXTURE_HOME: home,
+          CLEM_APPROVED_CHECKPOINT_FIXTURE_PHASE: phase }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = '';
+      child.stdout.on('data', data => { output += data; });
+      child.stderr.on('data', data => { output += data; });
+      const timeout = setTimeout(() => { child.kill('SIGKILL'); }, 30_000);
+      child.on('error', error => { clearTimeout(timeout); reject(error); });
+      child.on('close', code => { clearTimeout(timeout); writeFileSync(path.join(home, `child-${phase}.log`), output); code === 0 ? resolve() : reject(new Error(`${phase} exited ${code}: ${output}`)); });
+    });
+  }
+  const prepared = JSON.parse(readFileSync(path.join(home, 'checkpoint-handoff.json'), 'utf8'));
+  const recovered = JSON.parse(readFileSync(path.join(home, 'checkpoint-recover.json'), 'utf8'));
+  const replayed = JSON.parse(readFileSync(path.join(home, 'checkpoint-replay.json'), 'utf8'));
+  assert.equal(prepared.providerCalls, 1);
+  assert.equal(recovered.providerCalls + replayed.providerCalls, 0);
+  assert.equal(recovered.modelCalls, 1);
+  assert.equal(replayed.modelCalls, 0);
 });

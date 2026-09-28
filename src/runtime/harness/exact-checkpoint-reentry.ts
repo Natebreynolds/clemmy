@@ -28,9 +28,9 @@ const exactCheckpointReentryNoticed = new Set<string>();
 
 export function exactCheckpointReentryKey(
   sessionId: string,
-  descriptor: { sourceUserSeq: number; phase: string; frameCallIds: readonly string[] },
+  descriptor: { sourceUserSeq: number; executionSourceUserSeq?: number; phase: string; frameCallIds: readonly string[] },
 ): string {
-  return `${sessionId}:${descriptor.sourceUserSeq}:${descriptor.phase}:${descriptor.frameCallIds.join('|')}`;
+  return `${sessionId}:${descriptor.executionSourceUserSeq ?? descriptor.sourceUserSeq}:${descriptor.phase}:${descriptor.frameCallIds.join('|')}`;
 }
 
 /** The frame's call ids, in order, as the re-entry key sees them.

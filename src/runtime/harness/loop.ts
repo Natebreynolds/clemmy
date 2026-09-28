@@ -1,3 +1,4 @@
+import { readApprovalRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
 import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
 import { archivedTaskMessageReferences, type ArchivedTaskMessageReference } from './archived-task-context.js';
 import { projectArchivedContext } from './archived-context-projection.js';
@@ -6054,7 +6055,9 @@ function scheduleHostCheckpointRecovery(
         if (!session || !recoveryBlob) return;
         let recovery: HostRecoveryState;
         try { recovery = HostRecoveryState.fromString(recoveryBlob); } catch { return; }
-        if (recovery.sessionId !== options.sessionId || recovery.sourceUserSeq !== sourceUserSeq) return;
+        const approvalOwner = readApprovalRecoveryActivation(options.sessionId);
+        if (recovery.sessionId !== options.sessionId || (recovery.sourceUserSeq !== sourceUserSeq
+          && approvalOwner?.sourceUserSeq !== sourceUserSeq)) return;
         const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
         const sourceText = typeof source.data.text === 'string' ? source.data.text : options.input;
         const {
@@ -6080,7 +6083,8 @@ function scheduleHostCheckpointRecovery(
           try {
             const blob = HarnessSession.load(options.sessionId)?.loadRecoveryState();
             const held = blob ? HostRecoveryState.fromString(blob) : undefined;
-            if (held?.sessionId === options.sessionId && held.sourceUserSeq === sourceUserSeq) {
+            if (held?.sessionId === options.sessionId && (held.sourceUserSeq === sourceUserSeq
+              || readApprovalRecoveryActivation(options.sessionId)?.sourceUserSeq === sourceUserSeq)) {
               scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
             }
           } catch { /* unreadable private state is not wake authority */ }
@@ -6096,6 +6100,12 @@ function scheduleHostCheckpointRecovery(
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
+  const approvalRecovery = readApprovalRecoveryActivation(options.sessionId);
+  if (approvalRecovery && approvalRecovery.sourceUserSeq === options.sourceUserSeq && approvalRecovery.approvalContinuation) {
+    const link = approvalRecovery.approvalContinuation;
+    return runConversationFromResume({ ...options, approvalId: link.approvalId, decision: link.decision,
+      ...(options.buildAgent ? { buildAgent: identity => options.buildAgent!(identity) } : {}) });
+  }
   return withRuntimeConfigSnapshot(() => withAcceptedSourceCatalogManifestScope(
     options.acceptedCatalogScope,
     async () => {
@@ -10556,7 +10566,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
       let ownerPublishedTypedTerminal = false;
       try {
         ownerPublishedTypedTerminal = resolveExactTerminalForAcceptedSource(
-          acceptedUserEvent(options.sessionId, persistedRecoveryState.sourceUserSeq),
+          acceptedUserEvent(options.sessionId, readApprovalRecoveryActivation(options.sessionId)?.sourceUserSeq ?? persistedRecoveryState.sourceUserSeq),
         ).kind === 'terminal';
       } catch { /* unreadable ⇒ treat the blob as live and hold */ }
       if (ownerPublishedTypedTerminal) {
@@ -13317,7 +13327,29 @@ export async function resumePendingApproval(
  * Returns RunConversationResult so the caller sees one unified
  * shape whether the resume was one-shot or multi-step.
  */
-export async function runConversationFromResume(opts: {
+/** Approval recovery shares the same per-source activation owner as fresh
+ * conversations, including the interval after checkpoint adoption. */
+export async function runConversationFromResume(
+  opts: Parameters<typeof runConversationFromResumeOwned>[0],
+): Promise<RunConversationResult> {
+  const source = existingResumeConversationSource(opts);
+  if (source) {
+    const active = activeHostConversations.get(`${opts.sessionId}:${source.seq}`);
+    if (active) return active;
+    const replay = replayedRunConversationResult(source);
+    if (replay) return replay;
+  }
+  const sourceUserSeq = acceptResumeConversationInput(opts);
+  const key = `${opts.sessionId}:${sourceUserSeq}`;
+  const prior = activeHostConversations.get(key);
+  if (prior) return prior;
+  const owned = Promise.resolve().then(() => runConversationFromResumeOwned({ ...opts, sourceUserSeq }));
+  activeHostConversations.set(key, owned);
+  try { return await owned; }
+  finally { if (activeHostConversations.get(key) === owned) activeHostConversations.delete(key); }
+}
+
+async function runConversationFromResumeOwned(opts: {
   /** Pre-built agent retained for isolated tests and legacy callers. Production
    * surfaces should use `buildAgent` so accepted route authority exists before
    * any tool surface is assembled. */
@@ -13381,6 +13413,14 @@ export async function runConversationFromResume(opts: {
   }
   const sourceUserSeq = acceptResumeConversationInput(opts);
   let resumeAgentSourceUserSeq = sourceUserSeq;
+  const checkpointActivation = readApprovalRecoveryActivation(opts.sessionId);
+  const checkpointContinuation = checkpointActivation && checkpointActivation.sourceUserSeq === sourceUserSeq
+    && checkpointActivation.approvalContinuation
+    && checkpointActivation.approvalContinuation.approvalId === opts.approvalId
+    && checkpointActivation.approvalContinuation.decision === opts.decision
+    ? checkpointActivation.approvalContinuation : null;
+  if (checkpointContinuation) resumeAgentSourceUserSeq = checkpointContinuation.requestSourceUserSeq;
+
   // A resume continues a turn the user already approved. Give it the same
   // ownership rule a fresh turn gets: when the host engine owns it, skip the
   // semantic compile exactly as runConversation does at its own seam. Compiling
@@ -13421,6 +13461,11 @@ export async function runConversationFromResume(opts: {
           error: `The paused task could not be restored: ${normalizeError(error)}` };
       }
     }
+  }
+  if (checkpointContinuation && opts.buildAgent) {
+    const primed = await primePrimaryModelPlanningCatalog({ sessionId: opts.sessionId, sourceUserSeq: resumeAgentSourceUserSeq });
+    if (!primed.ok) throw new Error(primed.reason);
+    resumePlanning = primed.planning;
   }
   const acceptedSource = acceptedUserEvent(opts.sessionId, sourceUserSeq);
   const graphEvent = resumeHostOwns ? null : await recordAcceptedSourceGraph({
@@ -13543,7 +13588,12 @@ export async function runConversationFromResume(opts: {
       }
     : undefined;
   let foregroundRelease: 'terminal' | 'transfer' | null = null;
-  return withModelUsageAttribution(
+  return withRecoveryActivation(opts.sessionId, {
+    sourceUserSeq, ...(opts.runAttemptId ? { attemptId: opts.runAttemptId } : {}),
+    ...(opts.approvalId && resumeAgentSourceUserSeq !== sourceUserSeq ? {
+      approvalContinuation: { requestSourceUserSeq: resumeAgentSourceUserSeq, approvalId: opts.approvalId, decision: opts.decision },
+    } : {}),
+  }, () => withModelUsageAttribution(
     {
       sessionId: opts.sessionId,
       sourceUserSeq,
@@ -13647,6 +13697,7 @@ export async function runConversationFromResume(opts: {
         maxRunTokens: opts.maxRunTokens,
         makeRunner: opts.makeRunner,
         runRunner: opts.runRunner,
+        judgeFn: opts.judgeFn,
       }, sourceUserSeq);
       return core.result;
     }
@@ -13665,11 +13716,12 @@ export async function runConversationFromResume(opts: {
     }
   }
     },
-  );
+  ));
 }
 
 async function runConversationFromResumeCore(opts: {
   agent: Agent<any, any>;
+  turnEngine?: TurnEngineMode;
   sessionId: string;
   runAttemptId?: string;
   sourceUserSeq: number;
@@ -13783,7 +13835,18 @@ async function runConversationFromResumeCore(opts: {
   };
 
   // Step 1: resume the paused approval.
-  let firstResult = await resumePendingApproval({
+  const recoveringApproval = readApprovalRecoveryActivation(opts.sessionId);
+  let firstResult = recoveringApproval && recoveringApproval.sourceUserSeq === activeSourceUserSeq
+    && recoveringApproval.approvalContinuation
+    && recoveringApproval.approvalContinuation.requestSourceUserSeq === continuationSourceUserSeq
+    && recoveringApproval.approvalContinuation.approvalId === opts.approvalId
+    ? await runTurn({ agent: opts.agent, sessionId: opts.sessionId,
+        input: acceptedRequestText(opts.sessionId, continuationSourceUserSeq) ?? '',
+        sourceUserSeq: continuationSourceUserSeq, runAttemptId: opts.runAttemptId,
+        internalContinuation: true, suppressMemoryCapture: true,
+        memoryPrimerQuery: continuationMemoryQuery, turnEngine: opts.turnEngine,
+        maxTurns, toolCallsPerTurn, makeRunner: opts.makeRunner, runRunner: opts.runRunner })
+    : await resumePendingApproval({
     agent: opts.agent,
     sessionId: opts.sessionId,
     runAttemptId: opts.runAttemptId,
@@ -14773,11 +14836,18 @@ function isKillBeforeStart(
   session: HarnessSession,
   sourceUserSeq?: number,
 ): boolean {
-  const target: KillRequestTarget | undefined = sourceUserSeq
+  let target: KillRequestTarget | undefined = sourceUserSeq
     ? { sourceUserSeq }
     : getActiveRunAttempt(sessionId) ?? undefined;
   try {
     assertNotKilled(sessionId, target);
+    // An approval answer owns delivery while execution keeps the original
+    // request. Honor either exact stop; never consult a newer unrelated input.
+    const delivery = sourceUserSeq ? recoveryActivationOwner(sessionId, { sourceUserSeq }) : undefined;
+    if (delivery && delivery.sourceUserSeq !== sourceUserSeq) {
+      target = { sourceUserSeq: delivery.sourceUserSeq };
+      assertNotKilled(sessionId, target);
+    }
     return false;
   } catch (err) {
     if (!(err instanceof KillRequested)) throw err;
