@@ -265,14 +265,14 @@ test('public release docs match fail-closed Windows production signing and the e
 
 test('version-matched curated release notes publish when present and other versions retain generated-note fallback', () => {
   assert.equal(existsSync(v3ReleaseNotesPath), true, 'the required v3.0.0 notes source must be checked in');
-  assert.equal(existsSync(v316ReleaseNotesPath), true, 'the current v3.16.0 notes source must be checked in');
+  assert.equal(existsSync(v316ReleaseNotesPath), true, 'the historical v3.16.0 notes source must be checked in');
   const notes = existsSync(v3ReleaseNotesPath) ? readFileSync(v3ReleaseNotesPath, 'utf-8') : '';
   const currentNotes = existsSync(v316ReleaseNotesPath) ? readFileSync(v316ReleaseNotesPath, 'utf-8') : '';
   assert.match(notes, /^# Clementine 3\.0\.0/m);
   assert.match(currentNotes, /^# v3\.16\.0/m);
-  const schemaVersion = harnessSchemaVersionText.match(/HARNESS_SCHEMA_VERSION\s*=\s*(\d+)\s*;/)?.[1];
-  assert.ok(schemaVersion, 'the release schema version must be readable');
-  assert.match(currentNotes, new RegExp(`^## Schemas? v(?:\\d+ and v)?${schemaVersion}\\b`, 'im'));
+  // Historical notes describe their own migration. Current-version coverage
+  // belongs to the maintained upgrade contract, not retroactive release edits.
+  assert.match(currentNotes, /^## Schema v69\b/m);
   assert.match(currentNotes, /logical_model_result_projection_receipts/);
   assert.match(currentNotes, /metadata-only/i);
   assert.match(notes, /long-horizon/i);
@@ -293,6 +293,14 @@ test('version-matched curated release notes publish when present and other versi
     'a retried v3 publication must replace generic notes on an existing release',
   );
   assert.match(publisher, /Missing required curated release notes/);
+});
+
+test('the maintained upgrade contract names the schema shipped by this candidate', () => {
+  const schemaVersion = harnessSchemaVersionText.match(/HARNESS_SCHEMA_VERSION\s*=\s*(\d+)\s*;/)?.[1];
+  assert.ok(schemaVersion, 'the release schema version must be readable');
+  const contract = readFileSync(new URL('../docs/V314-UPGRADE-REHEARSAL.md', import.meta.url), 'utf-8');
+  assert.match(contract, new RegExp(`^## Current candidate: harness schema v${schemaVersion}\\b`, 'm'));
+  assert.ok(contract.includes('`HARNESS_SCHEMA_VERSION` (currently ' + schemaVersion + ')'));
 });
 
 test('candidate dispatcher defaults to the next patch prerelease and rejects downgrade candidates', () => {
