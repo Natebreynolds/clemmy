@@ -174,7 +174,6 @@ export interface OperationDeliveryJudgeResult {
   deliversToOthers: 'yes' | 'no' | 'uncertain';
   deletesOrIrreversible: 'yes' | 'no' | 'uncertain';
   confidence: number;
-  explanation?: string;
   definitionDigest: string;
   modelIdentity: string;
 }

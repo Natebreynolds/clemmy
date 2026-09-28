@@ -558,3 +558,27 @@ test('an exact lookup proof cannot cross accounts or override outbound/destructi
   assertAsks(notify.result, 'outbound argument remains a send');
   assert.equal(jevRequests.length, calls, 'destructive and outbound floors do not ask a model to waive them');
 });
+
+test('schema-bound provider preparation contract avoids setup cards without any semantic model', async () => {
+  const { validatedDocumentedComposioDefinitionContracts } = await import('../../integrations/composio/operation-semantics.js');
+  const schema = { type: 'object', properties: {
+    users: { type: 'string' }, channel: { type: 'string' },
+    prevent_creation: { type: 'boolean' }, return_im: { type: 'boolean' },
+  } };
+  const contract = validatedDocumentedComposioDefinitionContracts({ operationId: 'SLACK_OPEN_DM', inputSchema: schema, outputSchema: null });
+  assert.ok(contract.ok && contract.operationSemantics);
+  if (!contract.ok || !contract.operationSemantics) throw Error('adapter contract missing');
+  jev._setTypesafeKeyForTests(null);
+  try {
+    const call = await acceptedCall({ tag: 'documented-setup', operationId: 'SLACK_OPEN_DM', schema,
+      args: { users: 'U1' }, destructive: false,
+      operationSemantics: contract.operationSemantics as FixtureOptions['operationSemantics'] });
+    assertProceedsWithoutCard(call.result, 'documented non-delivery setup is ordinary work');
+    assert.equal(decided(call.result).call.effect, 'external_write', 'creation never masquerades as a read');
+    assert.equal(jevRequests.length, 0);
+    assert.equal(judgeRequests.length, 0);
+    const send = await acceptedCall({ tag: 'documented-real-send', operationId: 'SLACK_SEND_MESSAGE', schema: SEND_SCHEMA,
+      args: { channel: 'D1', text: 'Test' } });
+    assertAsks(send.result, 'a real message retains content approval');
+  } finally { jev._setTypesafeKeyForTests('fixture-key'); }
+});

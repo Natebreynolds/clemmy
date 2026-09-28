@@ -59,7 +59,6 @@ export interface LearnedOperationDeliveryVerdictV1 {
     deliversToOthers: 'no';
     deletesOrIrreversible: 'no';
     confidence: number;
-    explanation?: string;
   };
   learnedAt: string;
 }
@@ -159,8 +158,7 @@ export function parseLearnedOperationDeliveryVerdictV1(
   const confirm = value.confirm;
   if (
     !isRecord(confirm)
-    || !hasExactKeys(confirm, ['role', 'model', 'deliversToOthers', 'deletesOrIrreversible', 'confidence', ...(Object.hasOwn(confirm, 'explanation') ? ['explanation'] : [])])
-    || (confirm.explanation !== undefined && !boundedText(confirm.explanation, 600))
+    || !hasExactKeys(confirm, ['role', 'model', 'deliversToOthers', 'deletesOrIrreversible', 'confidence'])
     || confirm.role !== 'judge'
     || !boundedText(confirm.model, MAX_MODEL_CHARS)
     || confirm.deliversToOthers !== 'no'
@@ -191,7 +189,6 @@ export function parseLearnedOperationDeliveryVerdictV1(
       deliversToOthers: 'no',
       deletesOrIrreversible: 'no',
       confidence: confirm.confidence,
-      ...(confirm.explanation ? { explanation: confirm.explanation as string } : {}),
     },
     learnedAt: value.learnedAt,
   };
