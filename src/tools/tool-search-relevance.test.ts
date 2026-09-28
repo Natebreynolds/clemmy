@@ -126,3 +126,12 @@ test('looking at a Workspace finds the preview, and authoring queries still find
     assert.equal(body.results[0].name, expected, `${query}: ${body.results.map((row: { name: string }) => row.name).join(', ')}`);
   }
 });
+
+test('connection metadata is discoverable from an instance URL question without a shell command', async () => {
+  const body = await search('salesforce sf cli org display instance url', [
+    {name:'OUTLOOK_LIST_EVENT_INSTANCES',summary:'List recurring event instances in Outlook calendar.',carrier:'work_call',score:1},
+    {name:'SALESFORCE_GET_ORG_LIMITS',summary:'Read Salesforce organization API and storage usage limits.',carrier:'work_call',score:1},
+  ]);
+  assert.ok(body.results.some((row: {name:string}) => row.name === 'cli_inspect'),
+    `the first discovery page must expose the safe connection reader: ${body.results.map((row: {name:string})=>row.name).join(', ')}`);
+});

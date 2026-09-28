@@ -26,7 +26,7 @@ const ACTION = z.enum(['status', 'install', 'auth', 'job_status', 'repairs', 're
 
 export function registerCliSetupTools(server: McpServer): void {
   server.tool('cli_inspect',
-    'Read CLI health, available repairs, or a managed job. Does not start or repeat any operation.',
+    'Read CLI health, signed-in account and its public connection origin (instance URL / hostname), available repairs, or a managed job. Does not start or repeat any operation.',
     { action: z.enum(['status', 'repairs', 'job_status']), catalogId: z.string().max(60).optional(),
       jobId: z.string().max(120).optional() },
     async ({ action, catalogId, jobId }) => {

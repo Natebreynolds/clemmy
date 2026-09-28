@@ -1375,7 +1375,9 @@ export function registerToolSearchTool(
               sourceRank: Number.isFinite(candidate.score)
                 ? candidate.score!
                 : Math.max(0, 1 - index / Math.max(1, sourceCandidates.length)),
-              acquiredLiveRead: isAcquiredLiveReadCandidate(candidate),
+              // Authority proves callability, not relevance. Only a query-bound
+              // acquired read may bypass ordinary ranking.
+              acquiredLiveRead: acquiredLiveReadAnswersQuery(query, [candidate]),
               lifecycleSuccessor: candidate.lifecycleSuccessor === true,
             })),
             ...scopedCatalog.map((entry) => ({

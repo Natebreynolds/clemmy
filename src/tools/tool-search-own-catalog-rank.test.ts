@@ -47,13 +47,13 @@ test('relevant native metadata beats weak provider rank in planning and ordinary
 });
 
 test('query-bound acquired read retains precedence on planning discovery', async () => {
-  const result = await search('create a new Space with a static HTML view', true, [weakProvider, acquired]);
+  const result = await search('read local workspace inventory', true, [weakProvider, acquired]);
   assert.equal(result.results[0]?.name, 'local_workspace_inventory');
   assert.equal(result.results[0]?.capabilityRef, undefined, 'ranking alone grants no callable authority');
 });
 
 test('acquired read precedence does not depend on a planning-membership boost', async () => {
-  const result = await search('create a new Space with a static HTML view', false, [weakProvider, acquired]);
+  const result = await search('read local workspace inventory', false, [weakProvider, acquired]);
   assert.equal(result.results[0]?.name, 'local_workspace_inventory');
 });
 
@@ -464,4 +464,16 @@ test('empty memory fetches the callable successor instead of dispatching an unma
   assert.ok(queries.includes('OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR'), 'empty memory must exact-fetch the successor');
   assert.equal(result.results[0]?.name, 'OUTLOOK_UPDATE_CALENDAR_EVENT_IN_CALENDAR');
   assert.equal(result.results[0]?.capabilityRef, 'cap:resolved:outlook_update_calendar_event_in_calendar');
+});
+
+
+test('authorization of a remembered read cannot outrank a relevant operation for a different request', async () => {
+  const unrelated: ToolSearchCandidateSource = { kind: AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE, search: async () => [{
+    name: 'calendar_list_event_instances', summary: 'Read occurrences of a calendar event.', carrier: 'work_call', score: 1,
+  }] };
+  for (const planning of [false, true]) {
+    const result = await search('create a new Space with a static HTML view', planning, [unrelated]);
+    assert.equal(result.results[0]?.name, 'space_save');
+    assert.ok(result.results.some((row: {name:string})=>row.name==='calendar_list_event_instances'), 'a rank correction must not revoke a callable tool');
+  }
 });
