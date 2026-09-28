@@ -1776,7 +1776,7 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_set_enabled',
-    'Approve or disable a workflow. Sub-agents (Executor / Deployer) only fire approved workflows. Use enabled=true to approve a workflow for autonomous execution; enabled=false to pause it without deleting.',
+    'Approve or disable a workflow by exact saved name or slug (the created workflow ID). Sub-agents (Executor / Deployer) only fire approved workflows. Use enabled=true to approve a workflow for autonomous execution; enabled=false to pause it without deleting.',
     {
       name: z.string().min(1),
       enabled: z.boolean(),
@@ -1791,8 +1791,15 @@ export function registerOrchestrationTools(server: McpServer): void {
           return nonWriteTextResult('invalid_test_inputs', error instanceof Error ? error.message : String(error));
         }
       }
-      const entry = listWorkflowFiles().find((w) => w.data.name === name);
-      if (!entry) return nonWriteTextResult('not_found', `Workflow "${name}" not found.`);
+      // Creation returns the durable slug; lifecycle writes accept that same
+      // identity as well as the exact title. Never let a name/slug collision
+      // select a different workflow according to filesystem listing order.
+      const exactMatches = listWorkflowFiles().filter((w) => w.data.name === name || w.name === name);
+      if (exactMatches.length > 1) {
+        return nonWriteTextResult('ambiguous_identity', `Workflow identity "${name}" is ambiguous. Use a unique exact saved name or slug.`);
+      }
+      const entry = exactMatches[0];
+      if (!entry) return nonWriteTextResult('not_found', `Workflow "${name}" not found. Use its exact saved name or slug.`);
       // A workflow whose data can't flow can't be ENABLED (disabling is
       // always allowed). Auto-repair the fixable binding gaps first, so
       // enabling an older workflow with a dangling reference fixes it in

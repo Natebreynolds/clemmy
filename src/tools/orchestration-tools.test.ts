@@ -966,6 +966,50 @@ test('workflow_create uses test_inputs to queue an external-read creation test w
   assert.equal(run.inputs.url, 'https://example.com');
 });
 
+test('workflow_set_enabled accepts the created slug and preserves exact target identity', async () => {
+  const slug = 'acceptance-readable-title';
+  writeWorkflow(slug, {
+    name: 'Acceptance Readable Title', description: 'Manual local fixture.',
+    enabled: true, trigger: { manual: true },
+    steps: [{ id: 'answer', sideEffect: 'read', transform: {
+      version: 1, expression: { op: 'literal', value: 'ready' },
+    } }],
+  });
+  const disabled = await workflowSetEnabled()({ name: slug, enabled: false });
+  assert.notEqual(disabled.isError, true, resultText(disabled));
+  assert.equal(readWorkflow(slug)!.data.enabled, false);
+  assert.equal(parseHostLocalWriteCommitFacts(resultText(disabled))?.createdId, slug);
+  const enabled = await workflowSetEnabled()({ name: slug, enabled: true });
+  assert.notEqual(enabled.isError, true, resultText(enabled));
+  assert.equal(readWorkflow(slug)!.data.enabled, true);
+  assert.deepEqual(workflowRunFiles(), [], 'manual constant workflow does not acquire an extra execution');
+});
+
+test('workflow_set_enabled refuses fuzzy or colliding identities before either write', async () => {
+  const definition = { description: 'Exact identity only.', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'answer', sideEffect: 'read' as const, transform: {
+      version: 1 as const, expression: { op: 'literal' as const, value: 'ready' },
+    } }],
+  };
+  writeWorkflow('chosen-workflow', { ...definition, name: 'Chosen Workflow' });
+  const file = readWorkflow('chosen-workflow')!.filePath;
+  const original = readFileSync(file, 'utf8');
+  const fuzzy = await workflowSetEnabled()({ name: 'Chosen', enabled: false });
+  assert.equal(fuzzy.isError, true);
+  assert.equal(readFileSync(file, 'utf8'), original);
+  writeWorkflow('other-workflow', { ...definition, name: 'chosen-workflow' });
+  const otherFile = readWorkflow('other-workflow')!.filePath;
+  const otherOriginal = readFileSync(otherFile, 'utf8');
+  for (const enabled of [true, false]) {
+    const collision = await workflowSetEnabled()({ name: 'chosen-workflow', enabled });
+    assert.equal(collision.isError, true);
+    assert.match(resultText(collision), /ambiguous/);
+    assert.equal(readFileSync(file, 'utf8'), original);
+    assert.equal(readFileSync(otherFile, 'utf8'), otherOriginal);
+  }
+  assert.deepEqual(workflowRunFiles(), []);
+});
+
 test('workflow_set_enabled requires smoke inputs before approving external-read workflows', async () => {
   writeWorkflow('enable-smoke-input-wf', {
     name: 'enable-smoke-input-wf',
