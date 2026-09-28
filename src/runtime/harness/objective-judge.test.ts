@@ -588,6 +588,28 @@ test('review depth follows what the review protects', async () => {
   assert.equal(once.reviewConfirmation, 'upheld');
 });
 
+test('incomplete read evidence gets one default-depth review instead of a fast positive shortcut', async () => {
+  const { reviewAtStakes } = await import('./objective-judge.js');
+  for (const verdict of [{ done: true, reason: 'Supported after inspection.' },
+    { done: false, reason: 'A coverage claim contradicts retained records.', repairScope: 'claims' as const }, null]) {
+    const asked: unknown[] = [];
+    const result = await reviewAtStakes('read', async (depth) => {
+      asked.push(depth);
+      return { verdict, failure: verdict ? null : 'timeout' as const };
+    }, { readEvidenceComplete: false });
+    assert.deepEqual(asked, [{}], 'do not reduce effort or add a second judge call when receipt coverage is incomplete');
+    assert.equal(result.reviewDepth, 'full');
+    assert.deepEqual(result.verdict, verdict, 'preserve correction and unavailable-review semantics');
+  }
+  const asked: unknown[] = [];
+  const complete = await reviewAtStakes('read', async depth => {
+    asked.push(depth);
+    return { verdict: { done: true, reason: 'Complete bounded evidence.' }, failure: null };
+  }, { readEvidenceComplete: true });
+  assert.deepEqual(asked, [{ effort: 'medium' }]);
+  assert.equal(complete.reviewDepth, 'fast');
+});
+
 test('a bounded reply correction goes to repair before a second review of the unchanged draft', async () => {
   const { reviewAtStakes, WRITE_REVIEW_TIMEOUT_MS } = await import('./objective-judge.js');
   for (const repairScope of ['claims', 'reply_format'] as const) {

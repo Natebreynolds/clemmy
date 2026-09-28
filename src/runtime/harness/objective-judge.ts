@@ -1267,7 +1267,11 @@ async function runCompletionJudge(
       ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),
       ...(run.invalidDetail ? { invalidDetail: run.invalidDetail } : {}) };
   };
-  return skillContext?.reviewStakes ? reviewAtStakes(skillContext.reviewStakes, review) : review({});
+  return skillContext?.reviewStakes ? reviewAtStakes(skillContext.reviewStakes, review, {
+    readEvidenceComplete: assessCompletionEvidenceCoverage({
+      objective, results: skillContext.verifiedReadResults,
+    }).complete,
+  }) : review({});
 }
 
 export type ReviewStakes = 'write' | 'plan' | 'read';
@@ -1280,8 +1284,8 @@ export const WRITE_REVIEW_TIMEOUT_MS = 180_000;
  * Review depth follows what the review protects. Work that wrote to an app or
  * file gets the reviewer's full depth, with time to finish: that review is the
  * guarantee that what was written is right before the turn says done. A plan
- * (nothing runs until the owner approves it) and a read-only answer (already on
- * the owner's screen while it is checked) get a fast review first; a fast
+ * (nothing runs until the owner approves it) and a read-only answer with
+ * complete inspectable evidence get a fast review first; a fast
  * review that finds missing work is checked by a full review, whose
  * verdict decides. A scoped reply correction already verifies that the work
  * is present: send it to the existing repair owner, which must have the revised
@@ -1294,9 +1298,18 @@ export const WRITE_REVIEW_TIMEOUT_MS = 180_000;
 export async function reviewAtStakes(
   stakes: ReviewStakes,
   review: (depth: ReviewDepthRequest) => Promise<CompletionJudgeRun>,
+  evidence: { readEvidenceComplete?: boolean } = {},
 ): Promise<CompletionJudgeRun> {
   if (stakes === 'write') {
     return { ...(await review({ timeoutMs: WRITE_REVIEW_TIMEOUT_MS })), reviewDepth: 'full' };
+  }
+  // Read-only is an effect classification, not proof that a factual answer is
+  // cheap to verify. Incomplete receipts may require inspecting retained data
+  // before accepting coverage/absence claims. Keep the selected model's default
+  // depth in that case; never downgrade it merely because no write occurred.
+  // This buys no extra call, grants no authority and changes no deadline.
+  if (stakes === 'read' && evidence.readEvidenceComplete === false) {
+    return { ...(await review({})), reviewDepth: 'full' };
   }
   const fast = await review({ effort: 'medium' });
   if (!fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
