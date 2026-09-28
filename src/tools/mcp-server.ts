@@ -50,6 +50,7 @@ import { registerMcpServerTools } from './mcp-server-tools.js';
 import { registerToolChoiceTools } from './tool-choice-tools.js';
 import { registerModelRoleTools } from './model-role-tools.js';
 import { registerRecallTools } from './recall-tools.js';
+import { registerMeetingAnalysisTools } from './meeting-analysis-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
 import { registerArtifactBundleTools } from './artifact-bundle-tools.js';
@@ -571,6 +572,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
   // 25-row `sf data query`) the harness clipped — without them it hits the same
   // "tool not found" the @openai/agents lane was fixed for.
   registerRecallTools(server);
+  registerMeetingAnalysisTools(server);
   registerArtifactClaimTools(server);
   // Exact JSON slices from run-workspace artifacts/offloaded step context.
   registerWorkspaceArtifactTools(server);

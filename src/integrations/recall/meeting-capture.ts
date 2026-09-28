@@ -1773,7 +1773,6 @@ export function reapStuckRecallRecordings(opts: { idleMs?: number } = {}): Array
  * route) so the analyzer prompt evolves with the data model.
  */
 export function buildAnalyzerPrompt(record: RecallMeetingRecord, artifactPath: string): string {
-  const expectedAnalysisPath = analysisPathFor(record.id);
   return [
     record.provider === 'local'
       ? 'You just received a locally recorded and locally transcribed meeting transcript.'
@@ -1809,7 +1808,8 @@ export function buildAnalyzerPrompt(record: RecallMeetingRecord, artifactPath: s
     '     "topics": ["short tag", ...],                // 3–8 topic tags',
     '     "participants": ["name", ...]                // people who spoke',
     '   }',
-    `3. Save that JSON to ${expectedAnalysisPath} via write_file.`,
+    `3. Call meeting_analysis_save with meeting_id: ${record.id} and analysis: that JSON object. Discover this tool with tool_search if necessary.`,
+    'The host saves the analysis in its internal meeting store. Do not write to state directories or create workflows to save it.',
     '4. After saving, return a one-line confirmation message — do NOT include the JSON in your response.',
     '',
     'Hard rules:',

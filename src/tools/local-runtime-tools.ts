@@ -45,6 +45,7 @@ import { registerExtractStructuredTools } from './extract-structured-tools.js';
 import { registerPlanTools } from './plan-tools.js';
 import { registerProfileTools } from './profile-tools.js';
 import { registerRecallTools } from './recall-tools.js';
+import { registerMeetingAnalysisTools } from './meeting-analysis-tools.js';
 import { registerArtifactClaimTools } from './artifact-claim-tools.js';
 import { registerWorkspaceArtifactTools } from './workspace-artifact-tools.js';
 import { registerArtifactBundleTools } from './artifact-bundle-tools.js';
@@ -317,6 +318,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerExecutionTools(server);
   registerProfileTools(server);
   registerRecallTools(server);
+  registerMeetingAnalysisTools(server);
   registerWorkspaceArtifactTools(server);
   registerArtifactBundleTools(server);
   // Schema-on-demand discovery entry — read-only catalog search
