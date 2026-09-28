@@ -25,13 +25,24 @@ import { textResult } from './shared.js';
 const ACTION = z.enum(['status', 'install', 'auth', 'job_status', 'repairs', 'repair']);
 
 export function registerCliSetupTools(server: McpServer): void {
+  server.tool('cli_inspect',
+    'Read CLI health, available repairs, or a managed job. Does not start or repeat any operation.',
+    { action: z.enum(['status', 'repairs', 'job_status']), catalogId: z.string().max(60).optional(),
+      jobId: z.string().max(120).optional() },
+    async ({ action, catalogId, jobId }) => {
+      if (action === 'status') return statusAction();
+      if (action === 'repairs') return repairsAction(catalogId);
+      return jobStatusAction(jobId);
+    });
+
   server.tool(
     'cli_setup',
     [
       'Install or re-authenticate a local CLI for the user, via the approved runners. Actions:',
+      '- For read-only diagnostics prefer cli_inspect (status | repairs | job_status).',
       '- status: auth/install state of every CLI the user has connected or saved (their roster).',
       '- install: install a CLI. Pass catalogId (preferred — e.g. "railway", "github") OR a raw command, which must match the install allowlist (npm install -g / brew install / uv tool install / pipx install / pip install --user / git clone https).',
-      '- auth: sign a catalog CLI in again. Browser-based flows run as a background job; interactive logins open the user\'s Terminal with the login already running (tell them to finish the prompts there). Never run a login through run_shell_command yourself.',
+      '- auth: sign a catalog CLI in again. The conversation shows its managed process and private input controls. Browser and system credential prompts remain user-owned. Never ask for a password in chat or run login through run_shell_command.',
       '- job_status: check a previously started install/auth job by id.',
       '- repairs: the bounded fixes a CLI declares for its own local configuration (for example: it is authenticated but no default account/org/project is selected, so every command fails).',
       '- repair: run one of those declared fixes. Pass catalogId, repairId and values. The argv is fixed in the catalog; values are single plain arguments, never shell.',
@@ -83,6 +94,8 @@ async function statusAction(): Promise<ReturnType<typeof textResult>> {
     .map((h) => {
       const entry = findCatalogEntry(h.id);
       const state = !h.installed ? 'NOT INSTALLED'
+        : h.issue === 'credential_store_unavailable' ? 'CREDENTIAL STORE UNAVAILABLE — the OS could not open saved credentials; this does not prove sign-out. Ask the user to resolve the system credential prompt; do not erase credentials or repeatedly start login.'
+        : h.issue === 'configuration_required' ? 'CONFIGURATION REQUIRED — select an authenticated account with a declared repair; missing defaults do not prove sign-out.'
         : h.authStatus === 'ok' ? `signed in${h.username ? ` as ${h.username}` : ''}${cliHealthStaleNote(h) ? ` (${cliHealthStaleNote(h)})` : ''}`
         : h.authStatus === 'signed_out' ? 'SIGNED OUT'
         : h.authStatus === 'error' ? 'auth check failed'
@@ -109,7 +122,7 @@ async function installAction(
     return textResult([
       `Installing ${entry.name} (${entry.installCommand}) — job ${job.id}.`,
       `Check progress with cli_setup {"action":"job_status","jobId":"${job.id}"}.`,
-      entry.authCommand ? `After install, sign in: ${entry.authHeadless ? `cli_setup {"action":"auth","catalogId":"${entry.id}"}` : `the user runs \`${entry.authCommand}\` in their terminal`}.` : '',
+      entry.authCommand ? `After install, sign in: ${(entry.authHeadless || process.platform === 'darwin') ? `cli_setup {"action":"auth","catalogId":"${entry.id}"}` : `the user runs \`${entry.authCommand}\` in their terminal`}.` : '',
     ].filter(Boolean).join('\n'));
   }
   if (!command?.trim()) return textResult('install needs a catalogId or a raw install command.');
@@ -131,7 +144,7 @@ async function authAction(catalogId: string | undefined): Promise<ReturnType<typ
   const { findCatalogEntry } = await import('../integrations/cli-catalog/catalog.js');
   const entry = findCatalogEntry(catalogId.trim());
   if (!entry) return textResult(`Unknown catalog CLI "${catalogId}". Use cli_setup status for known ids.`);
-  if (!entry.authHeadless || !entry.authCommand) {
+  if ((!entry.authHeadless && process.platform !== 'darwin') || !entry.authCommand) {
     // Interactive login — the daemon's job runner has no TTY, so we hand
     // the flow to a REAL Terminal window the user owns: open it with the
     // login already running, then watch the auth probe for the flip.
@@ -153,7 +166,8 @@ async function authAction(catalogId: string | undefined): Promise<ReturnType<typ
   const { startCatalogAuthJob } = await import('../runtime/managed-cli-jobs.js');
   const job = await startCatalogAuthJob(entry.id);
   return textResult([
-    `Sign-in started for ${entry.name} — a browser window should open on the user's machine; they finish there.`,
+    `Sign-in job for ${entry.name}: ${job.status}. ${job.detail ?? ''}`,
+    ...(job.sessionId ? ['Progress stays inside this conversation. While running, the user can inspect progress, enter interactive responses, or stop it in the CLI activity card. Browser/system credential prompts still belong to the user.'] : []),
     `Job ${job.id}; check with cli_setup {"action":"job_status","jobId":"${job.id}"}.`,
   ].join('\n'));
 }
@@ -164,9 +178,9 @@ async function jobStatusAction(jobId: string | undefined): Promise<ReturnType<ty
   const { getManagedCliJob } = await import('../runtime/managed-cli-jobs.js');
   const { getInstallJob } = await import('../integrations/browser-harness.js');
   const job = getManagedCliJob(id) ?? getInstallJob(id);
-  if (!job) return textResult(`No install/auth job found with id "${id}" (jobs do not survive a daemon restart — start a fresh one if needed).`);
-  const tail = job.output ? `\n--- output tail ---\n${job.output.slice(-1500)}` : '';
-  return textResult(`${job.title}: ${job.status}${job.status !== 'running' && 'exitCode' in job ? ` (exit ${String(job.exitCode)})` : ''}${tail}`);
+  if (!job) return textResult(`No install/auth job found with id "${id}". Do not assume it failed or repeat it: inspect current CLI health first.`);
+  const tail = (!('action' in job) || job.action !== 'auth') && job.output ? `\n--- output tail ---\n${job.output.slice(-1500)}` : '';
+  return textResult(`${job.title}: ${job.status}${job.status !== 'running' && 'exitCode' in job ? ` (exit ${String(job.exitCode)})` : ''}${'detail' in job && job.detail ? `\n${job.detail}` : ''}${tail}`);
 }
 
 /** The declared repairs a CLI carries, or every CLI's when none is named. */

@@ -55,6 +55,25 @@ const POSITIVE_NAMES = [
   'write_file',
 ] as const;
 
+test('CLI recovery publishes exact action variants and a separate read-only inspection capability', async () => {
+  const run = await createPlanningSource('cli-recovery', 'Help me sign back in to my connected CLI.');
+  const body = await searchExact(run.planning, new Set(['cli_setup', 'cli_inspect']), 'cli_setup');
+  const row = body.results.find(entry => entry.name === 'cli_setup');
+  assert.ok(row, JSON.stringify(body));
+  assert.deepEqual(row.capabilityVariants?.map(v => v.capabilityRef).sort(), [
+    'cap:local:cli_setup:auth', 'cap:local:cli_setup:install', 'cap:local:cli_setup:repair',
+  ]);
+  const auth = await local.observeCurrentLocalPlanningDefinition({ name: 'cli_setup', carrier: 'work_call' });
+  assert.equal(auth.ok, true);
+  if (!auth.ok) return;
+  assert.equal(local.localPlanningArgumentsMatch(auth.definition, { action: 'auth', catalogId: 'salesforce' }), true);
+  assert.equal(local.localPlanningArgumentsMatch(auth.definition, { action: 'install', catalogId: 'salesforce' }), false);
+  assert.equal(local.localPlanningArgumentsMatch(auth.definition, { action: 'auth', catalogId: 'salesforce', command: 'untrusted' }), false);
+  const inspection = await local.observeCurrentLocalPlanningDefinition({ name: 'cli_inspect', carrier: 'work_call' });
+  assert.equal(inspection.ok, true);
+  if (inspection.ok) assert.equal(inspection.definition.descriptor.effect, 'read');
+});
+
 function proposalFor(input: {
   objective: string;
   capabilityRef: string;

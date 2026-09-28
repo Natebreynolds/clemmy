@@ -184,6 +184,21 @@ export function takeUndeliveredSteerNotes(sessionId: string | undefined, sourceU
   }
 }
 
+/** A pre-dispatch check must not mark a note delivered before the next model
+ * request can carry it. Newer accepted sources and approval acknowledgements
+ * have the same boundaries as the actual delivery path. */
+export function hasUndeliveredSteerNotes(sessionId: string, sourceUserSeq: number): boolean {
+  if (!sessionSupportsSteering(sessionId)) return false;
+  const rows = listEvents(sessionId, { sinceSeq: sourceUserSeq,
+    types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'] });
+  const next = rows.find(row => row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row))?.seq
+    ?? Number.MAX_SAFE_INTEGER;
+  const delivered = new Set(rows.flatMap(row => row.type === 'user_steer_note_delivered'
+    && Array.isArray(row.data.noteSeqs) ? row.data.noteSeqs : []));
+  return rows.some(row => row.type === 'user_steer_note' && row.seq < next && !delivered.has(row.seq)
+    && typeof row.data.text === 'string' && row.data.text.trim().length > 0);
+}
+
 /** The model-facing block appended to the next tool result. Verbatim user
  *  words first; the frame is a DIRECTIVE (allowed), not voice-cosplay. */
 export function formatSteerBlock(notes: SteerNote[]): string {

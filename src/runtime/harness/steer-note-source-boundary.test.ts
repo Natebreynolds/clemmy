@@ -6,7 +6,7 @@ import os from 'node:os';
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-steer-source-'));
 process.env.CLEMENTINE_HOME = home;
 const events = await import('./eventlog.js');
-const { appendSteerNote, takeUndeliveredSteerNotes, adoptedSteerNotesForSource } = await import('./steer-notes.js');
+const { appendSteerNote, takeUndeliveredSteerNotes, adoptedSteerNotesForSource, hasUndeliveredSteerNotes } = await import('./steer-notes.js');
 after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 
 test('all six notes retain complete accepted text and exact source order across reopen', () => {
@@ -17,11 +17,16 @@ test('all six notes retain complete accepted text and exact source order across 
   const texts = ['  '+ 'Original instruction. '.repeat(130) + ' FULL TAIL BEYOND 2000  ', ...Array.from({ length: 5 }, (_, i) => `Instruction ${i + 2}`)];
   const notes = texts.map((text) => appendSteerNote(session.id, text));
   events.closeEventLog();
+  assert.equal(hasUndeliveredSteerNotes(session.id, first.seq), true);
+  assert.equal(hasUndeliveredSteerNotes(session.id, second.seq), true);
   assert.deepEqual(takeUndeliveredSteerNotes(session.id, first.seq).map((note) => note.seq), [old.seq], 'a prior task never consumes a newer source note');
+  assert.equal(hasUndeliveredSteerNotes(session.id, first.seq), false, 'newer-task instructions do not retire an older frame');
+  assert.equal(hasUndeliveredSteerNotes(session.id, second.seq), true, 'a pre-dispatch check never consumes the instruction');
   assert.deepEqual(adoptedSteerNotesForSource({ sessionId: session.id, sourceUserSeq: first.seq }).map((note) => note.seq), [old.seq]);
   const current = takeUndeliveredSteerNotes(session.id, second.seq);
   assert.deepEqual(current.map((note) => [note.seq, note.text]), notes.map((note, i) => [note.seq, texts[i]]));
   assert.equal(takeUndeliveredSteerNotes(session.id, second.seq).length, 0);
+  assert.equal(hasUndeliveredSteerNotes(session.id, second.seq), false);
   events.closeEventLog();
   assert.deepEqual(adoptedSteerNotesForSource({ sessionId: session.id, sourceUserSeq: second.seq }).map((note) => note.text), texts);
 });

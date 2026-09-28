@@ -407,7 +407,7 @@ export type ManagedCliKind = 'github' | 'composio';
 export type ManagedCliAction = 'install' | 'auth' | 'repair';
 export interface ManagedCliJob {
   id: string; kind: string; action: string; title: string; command: string;
-  status: 'running' | 'succeeded' | 'failed'; output: string; exitCode?: number | null;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'; output: string; detail?: string; exitCode?: number | null;
 }
 export const getManagedClis = () => apiGet<ManagedClisResp>('/api/console/managed-clis');
 export const startManagedCliJob = (kind: ManagedCliKind, action: ManagedCliAction) =>

@@ -1,3 +1,4 @@
+import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
 import { patchUnifiedSession } from '../dashboard/sessions-api.js';
 import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
@@ -2874,6 +2875,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   //
   // Keep mobile on the /m surface. The public mobile hostname deliberately
   // hides /api/console/*, so approval actions cannot depend on desktop routes.
+
+  registerCliSessionRoutes(router, requireMobileSession, '/api');
 
   router.get('/api/approvals', requireMobileSession, (_req, res) => {
     try {

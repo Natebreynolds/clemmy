@@ -3,7 +3,7 @@
  *
  * Pins for the chat-side cli_setup tool. The dangerous surfaces are
  * pinned hard: raw install commands must pass the SAME allowlist as the
- * Connect route, interactive logins must never start a job, and status
+ * Connect route, interactive logins must stay in their owning conversation, and status
  * must never spawn anything (it reads the health engine, whose exec is
  * injected here).
  */
@@ -84,26 +84,28 @@ test('sudo and multi-command forms are refused', async () => {
   }
 });
 
-test('auth on a non-headless CLI opens the Terminal hand-off (stubbed) and starts NO background job', macOnly, async () => {
+test('interactive auth runs inside Clem without launching Terminal or exposing output to the model', macOnly, async () => {
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  const jobs = await import('../runtime/managed-cli-jobs.js');
+  jobs._testOnly_setCliResolver(command => ({ skipped: false, command, path: process.execPath }));
   const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
-  const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
-  const scripts: string[] = [];
-  _testOnly_setOsaExec(async (args) => { scripts.push(args.join(' ')); return { ok: true, stderr: '' }; });
-  const out = await call({ action: 'auth', catalogId: interactive.id });
-  assert.match(out, /Terminal window just opened|Opened Terminal/i);
-  assert.ok(out.includes(interactive.authCommand!), 'the exact login command is named for the user');
-  assert.equal(scripts.length, 1, 'exactly one Terminal hand-off');
-  assert.ok(scripts[0].includes(interactive.authCommand!), 'the Terminal runs the catalog command');
-  assert.doesNotMatch(out, /Job [a-z0-9-]+;/, 'no background job may start for an interactive login');
-});
-
-test('when the Terminal hand-off is unavailable, auth falls back to the manual hand-over text', async () => {
-  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
-  const interactive = CLI_CATALOG.find((entry) => entry.authCommand && !entry.authHeadless)!;
-  _testOnly_setOsaExec(async () => ({ ok: false, stderr: 'no window server' }));
-  const out = await call({ action: 'auth', catalogId: interactive.id });
-  assert.match(out, /interactive sign-in that only the user can complete/i);
-  assert.ok(out.includes(interactive.authCommand!), 'the exact login command is relayed');
+  const interactive = CLI_CATALOG.find(entry => entry.authCommand && !entry.authHeadless)!;
+  const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+  jobs._testOnly_setCliSpawn(((command: string, args: string[]) => {
+    assert.equal(command, '/usr/bin/expect'); assert.deepEqual(args.slice(3), interactive.authCommand!.split(/\s+/).slice(1)); return child;
+  }) as never);
+  _testOnly_setOsaExec(async () => { throw new Error('must not open Terminal'); });
+  try {
+    const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+    const out = await withToolOutputContext({ sessionId: 'sess-cli-tool', sourceUserSeq: 1, callId: 'auth-fixture' }, () => call({ action: 'auth', catalogId: interactive.id }));
+    assert.match(out, /inside this conversation/);
+    const id = /Job (cli-[a-f0-9-]+)/.exec(out)![1]!;
+    child.stdout.write('Private sign-in challenge XYZ');
+    const status = await call({ action: 'job_status', jobId: id });
+    assert.doesNotMatch(status, /XYZ|Private sign-in challenge/);
+    child.emit('close', 1, null);
+  } finally { jobs._testOnly_setCliSpawn(); jobs._testOnly_setCliResolver(); }
 });
 
 test('auth on an unknown id fails closed', async () => {

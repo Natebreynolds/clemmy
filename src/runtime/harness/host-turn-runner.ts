@@ -10,7 +10,7 @@ import { currentManifestOperationContract } from './current-manifest-operation-s
 import { redactSensitiveText } from '../security.js';
 import { workspaceDatasetHostFileCommit } from '../../spaces/workspace-set-data-contract.js';
 import { reviewedPlanCallRefusal, materializeReviewedPlanCallArguments } from './reviewed-plan-runtime.js';
-import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, formatSteerBlock, type SteerNote } from './steer-notes.js';
+import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, hasUndeliveredSteerNotes, formatSteerBlock, type SteerNote } from './steer-notes.js';
 import { autoCaptureProvenanceFromAcceptedEvent, captureInteractionSignals, explicitMemoryInstructionFor } from '../../memory/auto-capture.js';
 import { TOOL_REGISTRY,
   toolReadsRetainedOutput,
@@ -6611,9 +6611,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             deadlineMs,
             callerSignal: signal,
             isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
-            ...(exactProduction?.prepareBeforePhysical && boundary === 'host_owned_external'
-              ? { beforePhysicalPreparation: exactProduction.prepareBeforePhysical }
-              : {}),
+            ...(boundary !== 'nested_owned' ? {
+              beforePhysicalPreparation: async () => {
+                const prepared = boundary === 'host_owned_external'
+                  ? await exactProduction?.prepareBeforePhysical?.() : undefined;
+                if (hasUndeliveredSteerNotes(exactSource.sessionId, exactSource.sourceUserSeq)) {
+                  // The invocation kernel owns the zero-crossing settlement;
+                  // this is a changed objective, not a failed provider write.
+                  throw new HostCallAuthorityBoundaryError('owner_steering_before_physical_dispatch');
+                }
+                return prepared;
+              },
+            } : {}),
             ...(exactProduction
               && boundary === 'host_owned_external'
               && materialGate.status === 'delegated'
@@ -9544,6 +9553,23 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (ranModelStep && pendingHostModelDirective === pendingDirectiveForStep) {
       pendingHostModelDirective = undefined;
     }
+    // A user can correct the objective while the provider is thinking. Do not
+    // dispatch a frame authored without that correction, or publish its final
+    // answer. Nothing from this fresh frame has been admitted or executed yet;
+    // retain prior settlements and let the next request see the durable note.
+    if (hostProduction && ranModelStep) {
+      const identity = exactHostIdentity();
+      const arrived = takeUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+      if (arrived.length > 0) {
+        captureExplicitSteerInstructions(identity.sessionId, arrived);
+        answerDraft?.retract();
+        journalHostGuide('owner_steering_before_dispatch', {
+          noteSeqs: arrived.map(note => note.seq), rejectedFrameExecuted: false,
+          proposedCalls: step.toolCalls.length,
+        });
+        continue;
+      }
+    }
     // ADMIT BEFORE COMMIT.
     //
     // The response used to be appended to `history` — and its id adopted as
@@ -10696,6 +10722,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       } catch {
         preApprovalRefused = true;
         break;
+      }
+    }
+    // Preparation may itself await schemas or consent attestations. A note
+    // arriving there invalidates the unstarted batch just as one arriving
+    // during model thinking does. Release its exact prepared identities below.
+    if (hostProduction) {
+      const identity = exactHostIdentity();
+      if (hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq)) {
+        preApprovalRefused = true;
+        for (const call of canonicalCalls) preApprovalRepairDiagnostics.set(call.callId, {
+          diagnostic: 'The owner corrected the task during preparation. This call did not execute. Reconsider it using the pending owner instruction.',
+        });
       }
     }
     if (preApprovalRefused) {

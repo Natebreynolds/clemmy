@@ -49,6 +49,8 @@ export interface CliAuthProbe {
   usernameCapture?: string;
   /** Probe timeout; default 5s in auth-health. */
   timeoutMs?: number;
+  /** Known failures that are not evidence the user is signed out. */
+  failurePatterns?: Array<{ pattern: string; kind: 'credential_store_unavailable' | 'configuration_required' }>;
 }
 
 export interface CliCatalogEntry {
@@ -243,6 +245,10 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     // as signed-out even when the default org is Connected.
     authProbe: {
       args: ['org', 'display', '--json'],
+      failurePatterns: [
+        { pattern: 'SecKeychain|keychain.*(?:locked|incorrect|not correct)|user name or passphrase you entered is not correct', kind: 'credential_store_unavailable' },
+        { pattern: 'NoDefault(?:Env|OrgFound)Error|no default (?:environment|org)', kind: 'configuration_required' },
+      ],
       signedOutPattern: 'No default org found|NoAuthInfoFound|no default org|Not authenticated|No org found|unable to refresh session',
       usernameCapture: '"username"\\s*:\\s*"([^"]+)"',
       timeoutMs: 15_000,

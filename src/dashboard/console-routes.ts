@@ -1,3 +1,4 @@
+import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
@@ -9721,6 +9722,11 @@ export function registerConsoleRoutes(
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
+
+  registerCliSessionRoutes(app, (req, res, next) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    next();
+  }, '/api/console');
 
   app.get('/api/console/managed-clis', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }

@@ -1,3 +1,4 @@
+import { CliSessions } from '@/components/chat/CliSessions';
 import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
@@ -227,6 +228,7 @@ export function Chat() {
             />
             </Fragment>
           ))}
+          <CliSessions sessionId={chat.sessionId.current ?? undefined} />
           <div ref={bottomRef} />
         </div>
       </div>

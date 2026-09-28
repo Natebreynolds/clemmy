@@ -1,3 +1,4 @@
+import { CliSessions } from '../components/CliSessions';
 /**
  * The chat screen, rebuilt on the shared chat engine (@clem/chat-engine —
  * the same transport/presentation core the desktop console is converging on).
@@ -486,6 +487,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           />
           </Fragment>
         ))}
+        <CliSessions sessionId={snapshot?.sessionId ?? initialSessionId} />
       </div>
       {showJumpToLatest ? (
         <button type="button" class="chat-jump" onClick={jumpToLatest}>Jump to latest</button>

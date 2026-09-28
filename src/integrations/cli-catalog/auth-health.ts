@@ -48,6 +48,7 @@ export interface CliHealth {
   command: string;
   installed: boolean;
   authStatus: CliAuthStatus;
+  issue?: 'credential_store_unavailable' | 'configuration_required';
   username?: string;
   checkedAt: string;
   /**
@@ -185,9 +186,14 @@ export function _testOnly_setCommandResolver(fn?: CommandResolver): void {
 export function classifyProbeOutput(
   probe: CliAuthProbe,
   result: ProbeExecResult,
-): { authStatus: CliAuthStatus; username?: string } {
+): Pick<CliHealth, 'authStatus' | 'username' | 'issue'> {
   const text = stripAnsi(result.output);
   if (result.timedOut) return { authStatus: 'error' };
+  for (const failure of probe.failurePatterns ?? []) {
+    try {
+      if (new RegExp(failure.pattern, 'im').test(text)) return { authStatus: 'error', issue: failure.kind };
+    } catch { /* invalid catalog pattern cannot turn a failed probe into success */ }
+  }
   if (probe.signedOutPattern) {
     try {
       if (new RegExp(probe.signedOutPattern, 'im').test(text)) return { authStatus: 'signed_out' };
@@ -325,7 +331,7 @@ async function probeHealth(item: RosterItem): Promise<CliHealth> {
     // exit that did not match the signed-out pattern, or silence. Record what
     // happened so commit can keep the last real verdict instead of caching a
     // transient as if the login had failed.
-    ...(verdict.authStatus === 'error'
+    ...(verdict.authStatus === 'error' && !verdict.issue
       ? {
           lastProbeError: {
             exitCode: result.exitCode,
@@ -398,7 +404,9 @@ function commitHealth(probed: CliHealth): CliHealth {
   const next = settleTransientProbe(probed, previous);
   entries[next.id] = next;
   writeHealthFile(entries);
-  if (previous?.authStatus === 'signed_out' && next.authStatus === 'ok') {
+  const recoveredKnownFailure = previous?.authStatus === 'signed_out'
+    || previous?.issue === 'configuration_required' || previous?.issue === 'credential_store_unavailable';
+  if (recoveredKnownFailure && next.authStatus === 'ok' && !next.lastProbeError && !next.staleSince) {
     for (const listener of recoveredListeners) {
       try {
         listener(next);

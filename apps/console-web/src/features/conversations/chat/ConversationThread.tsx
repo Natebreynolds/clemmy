@@ -1,3 +1,4 @@
+import { CliSessions } from '@/components/chat/CliSessions';
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
 import type { TaskMode } from '@/lib/task-mode';
@@ -124,6 +125,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
           <CollaborativeWorkstate snapshot={focus.data} compact />
+          <CliSessions sessionId={chat.sessionId.current ?? undefined} />
           {chat.messages.map((m, index) => (
             <Fragment key={m.id}>
             {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}

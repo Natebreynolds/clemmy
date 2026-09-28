@@ -133,13 +133,23 @@ test('Salesforce org-list JSON with one inactive sibling is not the auth probe â
   assert.equal(displayVerdict.authStatus, 'ok');
 });
 
-test('Salesforce no-default-org output classifies signed_out', () => {
+test('missing default org is configuration failure, not proof of sign-out', () => {
   const verdict = classifyProbeOutput(salesforceProbe, {
     exitCode: 1,
     output: 'Error (NoDefaultOrgFoundError): No default org found. Use "sf org login web" or set a default.',
     timedOut: false,
   });
-  assert.equal(verdict.authStatus, 'signed_out');
+  assert.deepEqual(verdict, { authStatus: 'error', issue: 'configuration_required' });
+});
+
+test('credential store warnings override exit zero and signed-out text', () => {
+  for (const exitCode of [0, 1]) {
+    const verdict = classifyProbeOutput(salesforceProbe, { exitCode, timedOut: false,
+      output: JSON.stringify({ status: 0, result: { nonScratchOrgs: [] }, warnings: [
+        'No authorization information found. security: SecKeychainItemCreateFromContent (<default>): The user name or passphrase you entered is not correct.',
+      ] }) });
+    assert.deepEqual(verdict, { authStatus: 'error', issue: 'credential_store_unavailable' });
+  }
 });
 
 test('exit 0 with output classifies ok and captures the username', () => {
@@ -351,3 +361,20 @@ test('classifyProbeOutput is unchanged: the pure classifier still says error for
   // handling lives in commit, where the previous verdict is known.
   assert.equal(classifyProbeOutput(railway, { exitCode: 1, output: 'connect ETIMEDOUT', timedOut: false }).authStatus, 'error');
 });
+
+for (const failure of ['No default environment found', 'security: SecKeychainItemCreateFromContent: passphrase is not correct']) {
+  test(`a verified recovery from ${failure} wakes parked work exactly once`, async () => {
+    const health = await import('./auth-health.js');
+    health._testOnly_setProbeExec(async () => ({ exitCode: 1, output: failure, timedOut: false }));
+    const bad = await health.getCliHealth('salesforce', { force: true });
+    assert.ok(bad.issue);
+    let recovered = 0;
+    const unsubscribe = health.onCliAuthRecovered(() => { recovered += 1; });
+    try {
+      health._testOnly_setProbeExec(async () => ({ exitCode: 0, output: '{"status":0,"result":{"username":"fixture@example.test"}}', timedOut: false }));
+      await health.getCliHealth('salesforce', { force: true });
+      await health.getCliHealth('salesforce', { force: true });
+      assert.equal(recovered, 1);
+    } finally { unsubscribe(); }
+  });
+}

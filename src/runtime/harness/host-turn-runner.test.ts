@@ -9662,6 +9662,37 @@ function scriptedRecordingModel(responses: unknown[][]) {
   };
 }
 
+for (const staleKind of ['call', 'answer'] as const) test(`owner steering during model thinking retires stale ${staleKind} before dispatch`, async () => {
+  const steering = await import('./steer-notes.js');
+  const session = eventlog.createSession({ id: `sess-inflight-steer-${++acceptedSerial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'Read the requested records.' } });
+  const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq },
+    parent: { sessionId: session.id, sourceUserSeq: source.seq, counter: new brackets.ToolCallsCounter(8),
+      behaviorScopeId: `${session.id}::turn:1` } };
+  const model = scriptedRecordingModel([
+    staleKind === 'call' ? [toolCall('stale-call', 'list_files', { path: '.' })] : [textMsg('Stale answer')],
+    [textMsg('13')],
+  ]);
+  const response = model.getResponse.bind(model);
+  model.getResponse = async request => {
+    const result = await response(request);
+    if (model.calls() === 1) steering.appendSteerNote(session.id, 'Stop the lookup. Answer only 13.');
+    return result;
+  };
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never, [{ role: 'user', content: source.data.text }] as never,
+    { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never,
+  ));
+  assert.equal(result.finalOutput, '13');
+  assert.equal(model.calls(), 2);
+  assert.match(JSON.stringify(model.requests[1]), /Stop the lookup\. Answer only 13\./);
+  assert.doesNotMatch(JSON.stringify(result.history), /stale-call|Stale answer/);
+  assert.equal(eventlog.listEvents(session.id, { types: ['tool_called'] }).length, 0);
+});
+
 /** A real accepted source whose text is the request the judge measures against. */
 function acceptJudgedSource(label: string, text: string) {
   const session = eventlog.createSession({ id: `host-judged-${++acceptedSerial}-${label}`, kind: 'chat' });
@@ -11550,7 +11581,7 @@ test('the host model request liveness clears on both a response and a rejected r
 
 // A declared reversible provider write gives transport tests real call authority.
 // The provider body is recording-only; no network or live-home mutation occurs.
-async function transportWriteFixture(write: () => Promise<string>, late: () => Promise<string>) {
+async function transportWriteFixture(write: () => Promise<string>, late: () => Promise<string>, prepare?: () => void) {
   const adapters = await import('./production-capability-adapter.js');
   const observations = await import('./independent-capability-observation.js');
   const schemas = await import('../../tools/composio-schema-cache.js');
@@ -11592,7 +11623,7 @@ async function transportWriteFixture(write: () => Promise<string>, late: () => P
   };
   assert.equal(productionPorts.registerFixtureCapabilityPort(productionPorts.productionPortIdentityFromManifest(manifest), {
     invoke: invoke as never, admitPreparation: () => undefined,
-    prepareInvocation: async () => ({ fixture: true }),
+    prepareInvocation: async () => { prepare?.(); return { fixture: true }; },
     invokeWithPreparation: async (_proof: unknown, work: () => Promise<unknown>) => work(),
   }).ok, true);
   const factory = capabilityCatalogs.createHostCapabilityCatalogFactory();
@@ -12107,4 +12138,35 @@ for (const variant of ['identical', 'mutation_between', 'external_change', 'unde
     assert.doesNotMatch(secondFrameInput, /harness settled-read replay/);
   }
   if (variant === 'mutation_between') assert.equal(writes, 1, 'the intervening call must have executed for the pin to mean anything');
+});
+
+
+test('owner steering during preparation retires the unstarted provider write', async () => {
+  const steering = await import('./steer-notes.js');
+  const session = eventlog.createSession({ id: `sess-steer-preparation-${++acceptedSerial}`, kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Create one reversible draft on the controlled provider account and report its receipt.' } });
+  const fixture = { session, source, context: { sessionId: session.id, sourceUserSeq: source.seq },
+    parent: { sessionId: session.id, sourceUserSeq: source.seq, counter: new brackets.ToolCallsCounter(8),
+      behaviorScopeId: `${session.id}::turn:1` } };
+  let writes = 0, prepared = 0;
+  const operation = await transportWriteFixture(async () => { writes++; return 'must not execute'; }, async () => 'unused', () => {
+    prepared++;
+    steering.appendSteerNote(fixture.session.id, 'Do not create the draft. Answer only 13.');
+  });
+  const model = scriptedRecordingModel([[operation.call('retire-prepared-write')], [textMsg('13')]]);
+  try {
+    const agent = { model, tools: [operation.carrier] };
+    bindHostCanarySurface(fixture, agent, agent.tools);
+    const outcome = await runProductionHost(fixture, agent, undefined, { maxTurns: 4 });
+    assert.equal(prepared, 1, 'exercise real preparation before the correction');
+    assert.equal(writes, 0, 'a correction must prevent dispatch of the prepared write');
+    const receipt = eventlog.openEventLog().prepare(`SELECT execution_kind, physical_crossing_count
+      FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+      .get(session.id, source.seq, 'retire-prepared-write') as { execution_kind: string; physical_crossing_count: number };
+    assert.equal(receipt.execution_kind, 'refused_pre_dispatch');
+    assert.equal(receipt.physical_crossing_count, 0);
+    assert.equal(outcome.finalOutput, '13');
+    assert.match(JSON.stringify(model.requests[1]), /Do not create the draft/);
+  } finally { operation.restore(); }
 });
