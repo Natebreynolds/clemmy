@@ -4152,8 +4152,6 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         identifiedTarget: deskIdentifiedTarget
           || (hostFreshPlanning?.capabilities.length ?? 0) > 0
           || disclosedOperations.length > 0,
-        planningCapabilityCount: hostFreshPlanning?.capabilities.length ?? 0,
-        disclosedOperationCount: disclosedOperations.length,
       })
     : null;
   const deskDeferred = new Set(turnDesk?.deferred ?? []);

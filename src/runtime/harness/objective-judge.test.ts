@@ -588,6 +588,32 @@ test('review depth follows what the review protects', async () => {
   assert.equal(once.reviewConfirmation, 'upheld');
 });
 
+test('a bounded reply correction goes to repair before a second review of the unchanged draft', async () => {
+  const { reviewAtStakes, WRITE_REVIEW_TIMEOUT_MS } = await import('./objective-judge.js');
+  for (const repairScope of ['claims', 'reply_format'] as const) {
+    for (const stakes of ['read', 'plan'] as const) {
+      const asked: unknown[] = [];
+      const result = await reviewAtStakes(stakes, async (depth) => {
+        asked.push(depth);
+        return { verdict: { done: false, repairScope, reason: 'Correct the named part of the reply against the retained evidence.' }, failure: null };
+      });
+      assert.deepEqual(asked, [{ effort: 'medium' }], `${stakes}/${repairScope}: do not buy another review of an unchanged draft`);
+      assert.equal(result.verdict?.done, false, 'a correction is not a completed turn');
+      assert.equal(result.verdict?.repairScope, repairScope, 'the existing repair owner receives the precise scope');
+      assert.equal(result.reviewDepth, 'fast');
+      assert.equal(result.reviewConfirmation, undefined, 'do not invent a confirmation that did not happen');
+    }
+    const asked: unknown[] = [];
+    const result = await reviewAtStakes('write', async (depth) => {
+      asked.push(depth);
+      return { verdict: { done: false, repairScope, reason: 'A write still requires full review.' }, failure: null };
+    });
+    assert.deepEqual(asked, [{ timeoutMs: WRITE_REVIEW_TIMEOUT_MS }]);
+    assert.equal(result.verdict?.done, false);
+    assert.equal(result.reviewDepth, 'full');
+  }
+});
+
 test('work that wrote something is never closed by Jev alone', async () => {
   _setTypesafeKeyForTests('ts_test');
   const jev = { count: 0 };

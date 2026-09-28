@@ -407,8 +407,8 @@ function discloseEarlierLocalOperation(sessionId: string, identifier: string) {
   });
 }
 
-test('delegation evidence starts the turn on the full rung: a planning card with a capability defers nothing', async () => {
-  const sessionId = 'turn-desk-delegation';
+test('a remembered read capability stays callable without promoting the session to delegation', async () => {
+  const sessionId = 'turn-desk-remembered-read';
   discloseEarlierLocalOperation(sessionId, 'space_get');
   const source = acceptSource(sessionId, TARGETED);
   const primed = await (await import('../semantic-boundary/admit-and-compile-accepted-source.js'))
@@ -418,11 +418,50 @@ test('delegation evidence starts the turn on the full rung: a planning card with
   const agent = await buildFor(sessionId, source.seq, TARGETED, idleModel);
   const desk = deskRecord(sessionId, source.seq);
   assert.equal(desk?.fallbackReason, null, 'the turn is in scope');
-  assert.equal(desk?.rung, 'full', `delegation evidence is the full rung: ${JSON.stringify(desk)}`);
-  assert.ok(desk?.climbedBy.includes('delegation'), `the record names the evidence: ${JSON.stringify(desk)}`);
-  assert.deepEqual(desk?.deferred, []);
-  assert.deepEqual(deferredOn(agent), [], 'no desk tool loses its schema');
-  assert.equal(namesLine(agentInstructions(agent)), '', 'no names line');
+  assert.equal(desk?.rung, 'lean', `discovery is not delegation: ${JSON.stringify(desk)}`);
+  assert.ok(!desk?.climbedBy.includes('delegation'));
+  assert.deepEqual(deferredOn(agent), DESK_TOOLS);
+  assert.ok(agentTools(agent).some((tool) => tool.name === 'run_worker' && !tool.deferLoading), 'new fan-out remains first class');
+  const read = await hostTurn(sessionId, 'Read the retained workspace metadata.', [
+    () => ({ name: 'call_tool', args: { name: 'space_get', args_json: JSON.stringify({ slug: 'desk-test-absent' }) } }),
+  ]);
+  assert.equal(deskRecord(sessionId, read.source.seq)?.rung, 'lean');
+  assert.ok(namesLine(read.requests[0]!.instructions).includes('tool_search'), 'the rendered prompt names the deferred-schema door');
+  assert.match(read.outputs.get(read.callId(0)) ?? '', /No workspace named/, 'the known read reaches its real handler');
+});
+
+test('recorded direct and carried delegation retain the full desk after database reopen', async () => {
+  for (const carried of [false, true]) {
+    const sessionId = `turn-desk-actual-delegation-${carried}`;
+    const earlier = acceptSource(sessionId, FANOUT);
+    eventlog.appendEvent({
+      sessionId, turn: earlier.turn, role: 'tool', type: 'tool_called',
+      data: { sourceUserSeq: earlier.seq, tool: carried ? 'call_tool' : 'run_worker',
+        ...(carried ? { effectiveTool: 'run_worker' } : {}), callId: `worker-${carried}` },
+    });
+    eventlog.closeEventLog();
+    const source = acceptSource(sessionId, 'Continue the pending work.');
+    const agent = await buildFor(sessionId, source.seq, 'Continue the pending work.', idleModel);
+    const desk = deskRecord(sessionId, source.seq);
+    assert.equal(desk?.rung, 'full');
+    assert.ok(desk?.climbedBy.includes('delegation'));
+    assert.deepEqual(deferredOn(agent), [], 'delegation readers and progress tools keep their schemas');
+  }
+});
+
+test('unfinished long work retains the full desk without any discovered capability or worker call', async () => {
+  const sessionId = 'turn-desk-pending-manifest';
+  acceptSource(sessionId, 'Prepare the requested records.');
+  const { declareWorkManifest } = await import('./work-manifest.js');
+  declareWorkManifest({ sessionId, manifestId: 'pending', contractVersion: 1,
+    phases: [{ id: 'read' }], items: [{ id: 'item-a' }, { id: 'item-b' }] });
+  eventlog.closeEventLog();
+  const source = acceptSource(sessionId, 'Continue the pending work.');
+  const agent = await buildFor(sessionId, source.seq, 'Continue the pending work.', idleModel);
+  const desk = deskRecord(sessionId, source.seq);
+  assert.equal(desk?.rung, 'full');
+  assert.ok(desk?.climbedBy.includes('long_work'));
+  assert.deepEqual(deferredOn(agent), []);
 });
 
 /** Longer than every inline presentation budget, so it is shown in part. */

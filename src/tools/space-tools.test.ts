@@ -794,6 +794,23 @@ test('space_list + space_get read back', async () => {
   assert.match(got, /Dataset history: no retained observations yet/i);
 });
 
+test('a missing workspace read returns current locator candidates without substituting or editing their data', async () => {
+  const slug = 'harbor-reference';
+  await tools.space_save({ slug, title: 'Harbor comparison', view_html: '<html><body>fixture</body></html>',
+    objective: 'Compare harborwidgets.example with its peers.' });
+  const before = store.spaceStore.get(slug)!;
+  const answer = text(await tools.space_get({ slug: 'harborwidgets', metadata_only: true }));
+  assert.match(answer, /No workspace named "harborwidgets"/);
+  assert.match(answer, /"slug":"harbor-reference"/);
+  assert.match(answer, /navigation candidates, not an exact match/);
+  assert.doesNotMatch(answer, /Dataset \(/);
+  assert.deepEqual(store.spaceStore.get(slug), before);
+  assert.equal(store.spaceStore.get('harborwidgets'), undefined, 'a suggestion cannot create a new workspace');
+  assert.doesNotMatch(text(await tools.space_get({ slug: 'unrelated-missing-name' })), /harbor-reference/);
+  await store.spaceStore.archive(slug);
+  assert.doesNotMatch(text(await tools.space_get({ slug: 'harborwidgets' })), /harbor-reference/, 'a removed resource cannot survive as a stale hint');
+});
+
 test('space_edit_view applies a targeted change + bumps version + snapshots', async () => {
   const draft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-edit-view.html');
   writeFileSync(draft, '<html><body><button>Call</button></body></html>', 'utf-8');

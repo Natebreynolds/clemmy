@@ -37,6 +37,7 @@
 import {
   deskDeclarationFor,
   deskDeclaredToolNames,
+  TOOL_REGISTRY,
   type DeskEvidenceKind,
   type DeskRung,
 } from '../tools/tool-registry.js';
@@ -181,10 +182,6 @@ export interface TurnDeskFactInput {
   /** The accepted request text, ranked the way the context packet ranks skills. */
   requestText: string;
   identifiedTarget: boolean;
-  /** Capabilities on the turn's host-fresh planning card. */
-  planningCapabilityCount: number;
-  /** Operations disclosed to this turn (card plus proven disclosure). */
-  disclosedOperationCount: number;
 }
 
 /** Read the host facts the desk decides on. Throws when a read fails. */
@@ -199,7 +196,12 @@ export function gatherTurnDeskFacts(input: TurnDeskFactInput): TurnDeskFacts {
       // result shown whole needs none; reaching for a reader later is a miss.
       retained_output: sessionHasRetainedToolOutputLongerThan(input.sessionId, PROMPT_INLINE_RECALLABLE_RESULT_CHARS)
         || acceptedSourceHasAttachments({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq }),
-      delegation: input.planningCapabilityCount > 0 || input.disclosedOperationCount > 0,
+      // Knowing how to call an operation is not evidence of delegation. A
+      // remembered read must not permanently inflate this session's desk.
+      // Actual delegated work retains the full surface; run_worker itself is
+      // advertised on every rung, so a first delegation needs no promotion.
+      delegation: sessionDispatchedToolsSince(input.sessionId, previous?.sourceUserSeq ?? 0,
+        TOOL_REGISTRY.filter((tool) => tool.delegationPrimitive).map((tool) => tool.name)).length > 0,
       // The surface is built before the context packet exists; the desk ranks
       // the same accepted text with the packet's own ranker.
       listed_skill: rankSkills(input.requestText).length > 0,
@@ -243,8 +245,6 @@ export interface TurnDeskInput {
   surfaceNames: readonly string[];
   requestText: string;
   identifiedTarget: boolean;
-  planningCapabilityCount: number;
-  disclosedOperationCount: number;
 }
 
 /** The one desk decision for a build. Never throws. */
@@ -266,8 +266,6 @@ export function resolveTurnDesk(input: TurnDeskInput): TurnDeskDecision {
       sourceUserSeq,
       requestText: input.requestText,
       identifiedTarget: input.identifiedTarget,
-      planningCapabilityCount: input.planningCapabilityCount,
-      disclosedOperationCount: input.disclosedOperationCount,
     }), sourceUserSeq);
   } catch {
     return fullTurnDesk('facts_unavailable', sourceUserSeq);

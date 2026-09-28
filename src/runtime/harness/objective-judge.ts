@@ -1254,11 +1254,14 @@ export const WRITE_REVIEW_TIMEOUT_MS = 180_000;
  * guarantee that what was written is right before the turn says done. A plan
  * (nothing runs until the owner approves it) and a read-only answer (already on
  * the owner's screen while it is checked) get a fast review first; a fast
- * review that wants to send the work back is checked by a full review, whose
- * verdict decides, so a fast misreading never costs the owner a rewrite. When
+ * review that finds missing work is checked by a full review, whose
+ * verdict decides. A scoped reply correction already verifies that the work
+ * is present: send it to the existing repair owner, which must have the revised
+ * reply reviewed before completion. Reviewing the unchanged draft again only
+ * delays that repair and cannot verify the eventual corrected reply. When
  * the full review cannot finish, the fast review's completed finding stands.
- * Adapters map the requested effort through declared wire capabilities. A
- * negative fast verdict receives the same confirmation on every provider.
+ * Adapters map the requested effort through declared wire capabilities. An
+ * unscoped negative fast verdict receives the same confirmation on every provider.
  */
 export async function reviewAtStakes(
   stakes: ReviewStakes,
@@ -1269,6 +1272,9 @@ export async function reviewAtStakes(
   }
   const fast = await review({ effort: 'medium' });
   if (!fast.verdict || fast.verdict.done) return { ...fast, reviewDepth: 'fast' };
+  if (fast.verdict.repairScope === 'claims' || fast.verdict.repairScope === 'reply_format') {
+    return { ...fast, reviewDepth: 'fast' };
+  }
   const full = await review({});
   if (!full.verdict) return { ...fast, reviewDepth: 'fast', reviewConfirmation: 'unavailable' };
   return { ...full, reviewDepth: 'full', reviewConfirmation: full.verdict.done ? 'overruled' : 'upheld' };

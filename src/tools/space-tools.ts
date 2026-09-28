@@ -79,6 +79,23 @@ export { deriveRunnerProvenance };
 
 const observationBootstrapChecks = new WeakMap<object, Set<string>>();
 
+/** A missing locator is a discovery problem, not permission to substitute a
+ * different resource. Return current metadata candidates, never their data or
+ * an automatically selected replacement. The caller still reads an exact id. */
+function missingWorkspaceRead(slug: string): string {
+  const tokens = [...new Set(slug.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((part) => part.length > 1))];
+  const candidates = spaceStore.list().map((space) => {
+    const terms = `${space.id} ${space.title} ${space.contract?.objective ?? ''}`.toLowerCase().split(/[^\p{L}\p{N}]+/u);
+    const matched = tokens.filter((token) => terms.includes(token));
+    return { space, score: matched.length };
+  }).filter((row) => row.score > 0)
+    .sort((a, b) => b.score - a.score || a.space.id.localeCompare(b.space.id));
+  const shown = candidates.slice(0, 5).map(({ space }) => ({ slug: space.id, title: space.title }));
+  return `No workspace named ${JSON.stringify(slug)}.`
+    + (shown.length ? `\nCurrent metadata matches (navigation candidates, not an exact match): ${JSON.stringify(shown)}.` : '')
+    + '\nUse an exact matching slug with space_get; space_list lists the current Workspaces. No replacement was read or changed.';
+}
+
 function safeWorkspaceObservationError(value: unknown): string {
   return redactSensitiveText(value).replace(/\s+/g, ' ').trim().slice(0, 500)
     || 'workspace observation store unavailable';
@@ -1331,7 +1348,7 @@ export function registerSpaceTools(server: McpServer): void {
       if (metadata_only && source_id?.trim()) return invalidArgumentsTextResult('Choose metadata_only or source_id, not both.');
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       let rec = spaceStore.get(slug);
-      if (!rec) return textResult(`No workspace named "${slug}".`);
+      if (!rec) return textResult(missingWorkspaceRead(slug));
       const observationStore = prepareWorkspaceObservationStore(rec);
       const snapshot = spaceStore.snapshot(slug);
       if (!snapshot) return textResult(`No workspace named "${slug}".`);
