@@ -134,3 +134,22 @@ test('re-break (i): host-turn-runner continues instead of completing, on the sin
   assert.match(src.slice(at, at + 1200), /ACCEPTED READ EXECUTION/);
   assert.match(src.slice(at, at + 1200), /Call call_tool now/);
 });
+
+test('deferred plan nominations retain read and workflow continuations through the tool carrier', async () => {
+  const { pendingGraphNeutralReadFromHistory, pendingUniqueWorkflowNameFromHistory } = await import('./host-turn-runner.js');
+  const carried = { ...nomination[0], name: 'call_tool',
+    arguments: JSON.stringify({ name: 'plan_task', args_json: '{}' }) };
+  assert.equal(pendingGraphNeutralReadFromHistory([carried, nomination[1]] as never), true);
+  assert.equal(pendingGraphNeutralReadFromHistory([
+    { ...carried, arguments: JSON.stringify({ name: 'unrelated_tool', args_json: '{}' }) }, nomination[1],
+  ] as never), false, 'a result from another operation cannot nominate a read');
+  const workflowResult = { ...nomination[1], output: { type: 'text', text: JSON.stringify({
+    ok: false, code: 'plan_not_required', workflowName: 'fixture-workflow', recoveryTool: 'workflow_run',
+    detail: 'Run the uniquely selected workflow.', repair: 'Call workflow_run.',
+  }) } };
+  assert.equal(pendingUniqueWorkflowNameFromHistory([carried, workflowResult] as never), 'fixture-workflow');
+  assert.equal(pendingUniqueWorkflowNameFromHistory([carried, workflowResult,
+    { type: 'function_call', callId: 'queued', name: 'call_tool',
+      arguments: JSON.stringify({ name: 'workflow_run', args_json: '{"name":"fixture-workflow"}' }) },
+  ] as never), null, 'an issued run spends the continuation exactly once');
+});

@@ -12,7 +12,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { after, test } from 'node:test';
+import { after, mock, test } from 'node:test';
+import { currentSourceAccountReviewer } from './gauntlet-sheet-account-review.fixture-support.js';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-balanced-user-stops-'));
 process.env.CLEMENTINE_HOME = HOME;
@@ -29,12 +30,17 @@ process.env.CLEMMY_UNIFIED_RECALL = 'off';
 process.env.CLEMMY_UNIFIED_TURN_PRIMER = 'off';
 process.env.CLEMMY_SEMANTIC_RECALL = 'off';
 process.env.CLEMMY_DEBATE_MODE = 'off';
+process.env.CLEMMY_COMPLETION_REVIEW = 'on';
+process.env.CLEMMY_MODEL_ROLES = JSON.stringify([
+  { role: 'judge', modelId: 'gpt-5.5', scope: 'durable', source: 'settings' },
+]);
 process.env.CLEMMY_BRAIN_FALLOVER = 'off';
 process.env.CLEMMY_AUTH_FALLOVER = 'off';
 process.env.CLEMMY_PLAN_FIRST = 'off';
 process.env.CLEMMY_DYNAMIC_REASONING = 'off';
 process.env.CLEMMY_EVAL_AUTO_PROMOTE = 'off';
 process.env.COMPOSIO_API_KEY = 'fixture-balanced-user-stops-key';
+process.env.COMPOSIO_USER_ID = 'balanced-user-stops-user';
 
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-balanced-user-stops\n');
@@ -50,6 +56,9 @@ writeFileSync(path.join(HOME, 'state', 'proactivity-policy.json'), JSON.stringif
   autoApproveScope: 'strict',
 }));
 
+const { Usage } = await import('@openai/agents');
+const { CodexModelProvider } = await import('../runtime/harness/codex-model.js');
+const { modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
 const discord = await import('../channels/discord-harness.js');
 const bridge = await import('../runtime/harness/respond-bridge.js');
 const runtimeConfig = await import('../runtime/harness/codex-client.js');
@@ -66,7 +75,9 @@ const externalRisk = await import('../runtime/harness/external-capability-risk-l
 const innerDispatch = await import('../tools/inner-dispatch.js');
 const composioSchemas = await import('../tools/composio-schema-cache.js');
 const composioClient = await import('../integrations/composio/client.js');
+const composioTools = await import('../tools/composio-tools.js');
 const composioProviderIdentity = await import('../integrations/composio/provider-definition-identity.js');
+const operationEffects = await import('../integrations/composio/learned-operation-effect.js');
 
 composioClient.__test__.setComposioApiKeyOverride('fixture-balanced-user-stops-key');
 
@@ -134,8 +145,8 @@ const ATOMIC_CONTENT = Object.freeze({
   resultIdentity: Object.freeze({
     version: 1 as const,
     kind: 'pointer_resource_identity_v1' as const,
-    idPointers: Object.freeze(['/resource_id']),
-    handlePointers: Object.freeze(['/resource_url']),
+    idPointers: Object.freeze(['/data/resource_id']),
+    handlePointers: Object.freeze(['/data/resource_url']),
     handleTemplate: Object.freeze({
       version: 1 as const,
       kind: 'prefix_suffix_v1' as const,
@@ -175,7 +186,7 @@ function fixtureCapability(
   const operationId = `${provider}_${operationWord}`;
   const schema = INPUT_SCHEMAS[key];
   const accountId = `account:${provider.toLowerCase()}`;
-  const invokePortId = `port:${operationId}:invoke`;
+  const invokePortId = `port:cap:resolved:${operationId.toLowerCase()}:${operationId}`;
   const definitionFingerprint = composioProviderIdentity.fingerprintComposioProviderDefinition({
     operationId,
     operationVersion: '1',
@@ -294,19 +305,25 @@ interface FunctionTool {
 
 const bodyCounts = new Map<string, number>();
 
-function installCapabilities(order: readonly CapabilityFixture[]): void {
+async function installCapabilities(order: readonly CapabilityFixture[]): Promise<void> {
   const store = manifestStores.createCapabilityManifestStore(order.map((entry) => entry.manifest));
   const factory = catalogs.createHostCapabilityCatalogFactory();
   productionPorts.clearProductionCapabilityPorts();
   const tools = new Map<string, FunctionTool>();
   const observedAt = Date.now();
-  const connectedManifest = order.find((entry) => entry.key === 'read')!.manifest;
-  composioClient.__test__.setConnectedAccountsLoader(async () => active?.kind === 'credential' ? [] : [{
-    id: connectedManifest.accountId,
-    status: 'ACTIVE',
-    user_id: 'balanced-user-stops-user',
-    toolkit: { slug: connectedManifest.operationId.split('_')[0]!.toLowerCase() },
-  }]);
+  composioClient.__test__.setConnectedAccountsLoader(async () => active?.kind === 'credential' ? []
+    : [{ id: order[0]!.manifest.accountId, status: 'ACTIVE',
+      user_id: 'balanced-user-stops-user', toolkit: { slug: order[0]!.manifest.operationId.split('_')[0]!.toLowerCase() } }]);
+  // Randomized names deliberately carry no verb evidence. Supply the effect
+  // model's answer from the same fixture definitions as the installed ports,
+  // rather than letting an unavailable real model turn every read into a write.
+  await operationEffects.learnComposioOperationEffects(order.map(fixture => ({
+    slug: fixture.manifest.operationId, inputSchema: fixture.schema,
+    description: fixture.key === 'read' ? 'Only retrieve the accepted records.' : 'Create or publish a resource.',
+  })), { evaluate: async ({ slug }) => ({ ok: true,
+    readOnly: order.find(fixture => fixture.manifest.operationId === slug)!.key === 'read' ? 1 : 0,
+    model: 'fixture-effect-review',
+  }) });
   composioSchemas._setToolSchemaLoaderForTests(async (identifier) => {
     const fixture = order.find((candidate) => candidate.manifest.operationId === identifier);
     return fixture
@@ -375,36 +392,31 @@ function installCapabilities(order: readonly CapabilityFixture[]): void {
       observe,
     }), { ok: true });
   }
-  tools.set('composio_execute_tool', {
-      type: 'function',
-      name: 'composio_execute_tool',
-      description: 'Execute one exact connected generated provider operation.',
-      strict: true,
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['tool_slug', 'arguments', 'connected_account_id'],
-        properties: {
-          tool_slug: { type: 'string' },
-          arguments: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-          connected_account_id: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-        },
-      },
-      needsApproval: async () => false,
-      invoke: async (_context, raw) => {
-        const parsed = JSON.parse(raw) as Record<string, unknown>;
-        const slug = typeof parsed.tool_slug === 'string' ? parsed.tool_slug : '';
+  composioClient.__test__.setComposioClient({
+    client: { baseURL: 'https://backend.composio.dev' },
+    tools: { async getRawComposioTools() { return order.map(fixture => ({
+      slug: fixture.manifest.operationId, name: fixture.manifest.operationId,
+      description: fixture.key === 'read' ? 'Only retrieve the accepted records.' : 'Create or publish a resource.',
+      toolkit: { slug: fixture.manifest.operationId.split('_')[0]!.toLowerCase() },
+      inputParameters: fixture.schema, outputParameters: null, version: '1',
+    })); } },
+    getClient: () => ({ withOptions: () => ({ tools: {
+      execute: async (slug: string, parsed: { arguments: unknown; connected_account_id: string }) => {
         const fixture = order.find((candidate) => candidate.manifest.operationId === slug);
         assert.ok(fixture, `unexpected generated operation ${slug}`);
         assert.equal(parsed.connected_account_id, fixture.manifest.accountId);
-        assert.deepEqual(JSON.parse(String(parsed.arguments ?? '{}')), fixture.args);
+        assert.deepEqual(parsed.arguments, fixture.args);
         bodyCounts.set(slug, (bodyCounts.get(slug) ?? 0) + 1);
         if (fixture.key === 'uncertain') {
           throw new Error('generated provider connection was lost after the accepted start');
         }
-        return fixture.result;
+        return { data: fixture.result, successful: true, error: null, log_id: `fixture-${slug}-${bodyCounts.get(slug)}` };
       },
-    });
+    } }) }),
+  });
+  const gateway = composioTools.getComposioRuntimeTools().find(tool => tool.name === 'composio_execute_tool');
+  assert.ok(gateway);
+  tools.set('composio_execute_tool', gateway as unknown as FunctionTool);
   manifestStores.installCapabilityManifestStore(store);
   catalogs.installHostCapabilityCatalogFactory(factory);
   productionAdapters.installProductionCapabilityAdapter(
@@ -457,6 +469,40 @@ interface ActiveCase extends CorpusCase {
 }
 
 let active: ActiveCase | null = null;
+mock.method(CodexModelProvider.prototype, 'getModel', () => ({
+  async getResponse(request: unknown) {
+    if (modelUsageAttributionStorage.getStore()?.channel === 'memory:standing') {
+      return { usage: new Usage(), output: [textMessage(JSON.stringify({ scope: 'task', text: '', reason: 'One-time fixture task.' }))] };
+    }
+    assert.ok(active && active.sourceUserSeq !== null);
+    assert.ok(JSON.stringify(request).includes(active.prompt), 'judge receives this accepted objective');
+    const settled = eventlog.listEvents(active.sessionId, { types: ['tool_attempt_settled'] })
+      .filter(event => event.data.sourceUserSeq === active!.sourceUserSeq
+        && event.data.logicalToolCallId === `work-${active!.kind}-${active!.rotation}`);
+    assert.equal(settled.length, 1, 'a review is grounded in this exact attempted business call');
+    const succeeded = settled[0]!.data.kind === 'succeeded';
+    return { usage: new Usage(), output: [textMessage(succeeded
+      ? 'DONE: The exact requested operation has a successful settled result.'
+      : 'BLOCKED: The provider outcome is uncertain; the operation must not be repeated.')] };
+  },
+  async *getStreamedResponse() { throw new Error('fixture reviewer uses the ordinary nonstreaming runner'); },
+}) as never);
+const semanticPorts = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
+semanticPorts.installTurnSemanticModelPort({
+  async judgeAccountSelection(call) {
+    assert.ok(active, 'account review must belong to the running corpus case');
+    const fixture = CAPABILITIES.find(row => row.manifest.accountId === call.accountIdentity);
+    assert.ok(fixture, 'only a connected fixture account may be reviewed');
+    return currentSourceAccountReviewer({
+      sessionId: () => active!.sessionId, acceptedText: active.prompt,
+      toolkit: fixture.manifest.operationId.split('_')[0]!.toLowerCase(),
+      accountIdentity: fixture.manifest.accountId,
+      acceptedSource: (sessionId, seq) => eventlog.listEvents(sessionId,
+        { sinceSeq: seq - 1, types: ['user_input_received'], limit: 1 })[0],
+    })(call);
+  },
+  async interpret() { throw new Error('No hidden source interpretation in this corpus'); },
+});
 
 function textMessage(text: string) {
   return {
@@ -577,7 +623,9 @@ const scriptedModel = {
   async getResponse(rawRequest: unknown) {
     assert.ok(active);
     active.modelCalls += 1;
-    const callIndex = active.modelCalls;
+    const plannedCase = !['conversation', 'choice', 'credential'].includes(active.kind);
+    const callIndex = active.modelCalls - (plannedCase ? 1 : 0);
+    const discoveryId = `discover-${active.kind}-${active.rotation}`;
     const request = rawRequest as { tools?: Array<{ name?: string }> };
     const toolNames = (request.tools ?? []).map((entry) => entry.name).filter(Boolean);
     let output: unknown[];
@@ -601,12 +649,27 @@ const scriptedModel = {
           'the primary model must receive the typed no_connections source result');
         output = [awaitingMessage(active.kind)];
       }
+    } else if (callIndex === 0) {
+      assert.ok(toolNames.includes('tool_search'));
+      const names = [active.fixture!.manifest.operationId, 'plan_task'];
+      if (active.kind === 'create' || active.kind === 'uncertain') names.push(CAPABILITIES[0].manifest.operationId);
+      output = [functionCall(discoveryId, 'tool_search', {query:names.join(' '), limit:8, cursor:null, role_key:null, account_selection:null})];
     } else if (callIndex === 1) {
-      assert.ok(toolNames.includes('plan_task'));
-      assert.match(JSON.stringify(rawRequest), new RegExp(active.fixture!.manifest.manifestId));
-      output = [functionCall(`plan-${active.kind}-${active.rotation}`, 'plan_task', {
-        preamble: `I’ll run the generated ${active.kind} operation now.`,
-        draft: planDraft(active),
+      assert.ok(toolNames.includes('call_tool'), 'deferred structural controls retain their production carrier');
+      const results = (rawRequest as {input?:Array<{type?:string;callId?:string;output?:unknown}>}).input ?? [];
+      const found = results.find(item=>item.type==='function_call_result' && item.callId===discoveryId)?.output;
+      const text = typeof found === 'string' ? found : (found as {text?:string})?.text;
+      assert.ok(text, 'the model must receive the real discovery receipt');
+      const body = JSON.parse(text) as {results:Array<{name:string;capabilityRef?:string}>};
+      const draft = planDraft(active);
+      for (const binding of draft.bindings as Array<{capabilityRef:string}>) {
+        const fixture = CAPABILITIES.find(candidate=>candidate.manifest.manifestId===binding.capabilityRef)!;
+        const row = body.results.find(candidate=>candidate.name===fixture.manifest.operationId);
+        assert.ok(row?.capabilityRef, 'only a currently disclosed capability can be planned');
+        binding.capabilityRef = row.capabilityRef;
+      }
+      output = [functionCall(`plan-${active.kind}-${active.rotation}`, 'call_tool', {
+        name:'plan_task', args_json:JSON.stringify({preamble:`I’ll run the generated ${active.kind} operation now.`,draft}),
       })];
     } else if (
       callIndex === 2
@@ -775,6 +838,8 @@ function nearestRankP95(values: readonly number[]): number {
 }
 
 after(async () => {
+  mock.restoreAll();
+  semanticPorts.installTurnSemanticModelPort(null);
   innerDispatch._setInnerDispatchToolsForTests(null);
   composioClient.__test__.setConnectedAccountsLoader(null);
   composioClient.__test__.setComposioApiKeyOverride(null);
@@ -842,7 +907,7 @@ test('balanced ordinary-channel corpus has only real typed user stops', { timeou
       ...CAPABILITIES.slice(rotation),
       ...CAPABILITIES.slice(0, rotation),
     ];
-    installCapabilities(ordered);
+    await installCapabilities(ordered);
     for (const corpusCase of cases) {
       const sessionId = `balanced-${rotation}-${corpusCase.kind}`;
       eventlog.createSession({ id: sessionId, kind: 'chat', userId: `user-${rotation}` });

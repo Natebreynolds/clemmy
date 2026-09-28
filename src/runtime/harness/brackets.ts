@@ -77,12 +77,11 @@ import {
 } from './tool-effect.js';
 import { getRuntimeEnv } from '../../config.js';
 import {
-  isMutatingExternalWrite,
   isGateEnabled as isExecutionGateEnabled,
   MissingExecutionWrapError,
 } from './execution-gate.js';
 import {
-  classifyExternalWrite,
+  classifyExternalWrite as classifyUnboundExternalWrite,
   decideInstructionReview,
   isConfirmFirstEnabled,
   ConfirmFirstRequiredError,
@@ -2664,6 +2663,37 @@ export function _setAfterSharedWriteReservationForTests(
   afterSharedWriteReservationForTests = hook;
 }
 
+/** Reopen the exact catalog effect for this call, never a same-name sibling. */
+function currentBoundCatalogEffect(toolName: string, args: unknown) {
+  const attestation = currentHostCallAttestation();
+  const logical = currentLogicalCall();
+  const context = harnessRunContextStorage.getStore();
+  if (attestation?.bindingKind !== 'catalog_manifest' || !logical
+    || attestation.sessionId !== context?.sessionId || attestation.sourceUserSeq !== context?.sourceUserSeq
+    || attestation.acceptedTaskId !== logical.acceptedTaskId
+    || attestation.logicalToolCallId !== logical.logicalToolCallId) return null;
+  const contract = durableLogicalCallContract(logical.acceptedTaskId, toolName, args);
+  if (!contract) return null;
+  const loaded = loadHostCallCapabilityBinding({ db: openEventLog(), sessionId: attestation.sessionId,
+    sourceUserSeq: attestation.sourceUserSeq, logicalToolCallId: logical.logicalToolCallId });
+  return loaded.status === 'ok'
+    && hostCallCapabilityBindingMatchesAttestation(loaded.binding, attestation)
+    && loaded.binding.toolName === contract.toolName
+    && loaded.binding.effectiveArgumentDigest === contract.argumentDigest
+      ? loaded.binding.effect : null;
+}
+
+function classifyExternalWrite(toolName: string, args: unknown) {
+  const effect = currentBoundCatalogEffect(toolName, args);
+  const shape = classifyUnboundExternalWrite(toolName, args);
+  // A source-bound read cannot become an unknown write just because its
+  // carrier spelling has less information than the selected catalog binding.
+  return effect === 'read' || effect === 'compute'
+    ? { ...shape, mutating: false, irreversible: false, reversibility: 'read_only' as const,
+        shapeKey: undefined, classificationKnown: true }
+    : shape;
+}
+
 /** Preserve the exact host-admitted native effect in its inner settlement. */
 function settlementCallIsMutating(toolName: string, args: unknown): boolean {
   const attestation = currentHostCallAttestation();
@@ -2702,7 +2732,7 @@ function settlementCallIsMutating(toolName: string, args: unknown): boolean {
       return loaded.binding.effect === 'local_write';
     }
   }
-  return isMutatingExternalWrite(toolName, args);
+  return classifyExternalWrite(toolName, args).mutating;
 }
 
 /**
@@ -2761,7 +2791,7 @@ function expectedWorkBindingCarriesExecutionAuthority(
     const logical = currentLogicalCall();
     if (!binding || !logical) return false;
     return binding.effect === 'external_write'
-      && classifyRuntimeToolEffect(toolName, args).effect === binding.effect
+      && (currentBoundCatalogEffect(toolName, args) ?? classifyRuntimeToolEffect(toolName, args).effect) === binding.effect
       && binding.sessionId === ctx.sessionId
       && binding.sourceUserSeq === ctx.sourceUserSeq
       && binding.acceptedTaskId === logical.acceptedTaskId
@@ -3140,7 +3170,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
       // session's execution row is not active.
       const grantCarried = Boolean(ctx.certifiedBatch)
         || expectedWorkBindingCarriesExecutionAuthority(ctx, tool.name, parsedInput);
-      if (!grantCarried && isExecutionGateEnabled() && isMutatingExternalWrite(tool.name, parsedInput)) {
+      if (!grantCarried && isExecutionGateEnabled() && classifyExternalWrite(tool.name, parsedInput).mutating) {
         const sessionRow = getSession(ctx.sessionId);
         if (sessionRow?.kind === 'chat') {
           const { ExecutionStore } = await import('../../execution/store.js');

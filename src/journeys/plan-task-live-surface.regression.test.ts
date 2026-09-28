@@ -455,9 +455,9 @@ test('an accepted read plan cannot stop at prose: host continues once to a bound
       surfaces.push(tools);
       const serialized = JSON.stringify(request);
       const output = modelCalls === 1
-        ? [functionCall('accept-outlook-read-plan', 'plan_task', {
-            preamble: 'I’ll read the newest Inbox message now.',
-            draft,
+        ? [functionCall('accept-outlook-read-plan', 'call_tool', {
+            name: 'plan_task',
+            args_json: JSON.stringify({ preamble: 'I’ll read the newest Inbox message now.', draft }),
           })]
         : modelCalls === 2
           ? [assistantText('I have not read the mailbox yet.')]
@@ -560,7 +560,8 @@ test('an accepted read plan cannot stop at prose: host continues once to a bound
     2,
     'exactly one nomination and one forced read attempt: the continuation is spent once',
   );
-  assert.ok(surfaces[0]?.includes('plan_task'));
+  assert.ok(surfaces[0]?.includes('call_tool'));
+  assert.ok(!surfaces[0]?.includes('plan_task'), 'a warm ordinary turn keeps the planning schema deferred');
   assert.ok(surfaces[2]?.includes('call_tool'));
   // Plan-optional delegation freezes nothing for one graph-neutral read; the
   // host's own plan_not_required nomination is the accepted read.

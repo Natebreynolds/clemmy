@@ -279,7 +279,10 @@ function settleCurrentCatalogProductionAttempt(input: {
       businessCall: input.effect !== 'host_only',
       ...(thrownPresent ? { thrown: input.thrown } : { result }),
       ...(thrownPresent
-        ? {}
+        // The terminal owner observed a throw, even if it carries no HTTP
+        // status. Keep that nominal failure before the SDK renders its text.
+        // Narrower pre-dispatch/auth/timeout signals retain precedence.
+        ? { signals: { executionFailed: true } }
         : {
             signals: {
               hostExecuted: true,

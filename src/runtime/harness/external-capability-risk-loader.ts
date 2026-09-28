@@ -1495,12 +1495,15 @@ export function loadCatalogManifestExternalRiskAttestationV1(
   }
   const catalog = resolved.catalogFactory.get(binding.capabilityId);
   const canonical = catalog ? canonicalCatalogIdentityOf(catalog) : null;
-  // Parallel connected accounts are separate current authorities for the same
-  // provider operation. Uniqueness belongs to the exact bound tuple, not to a
-  // global operation-name bucket; two rows for the SAME tuple remain an
-  // ambiguity and fail closed.
+  // Selection already belongs to the host's exact capability binding. Another
+  // current manifest for this operation/account must not veto that selection.
+  // Reopen the complete selected tuple; this loader projects risk and cannot
+  // choose a manifest or grant invocation authority from a name alone.
   const currentBindingRows = resolved.catalogFactory.snapshot().filter((entry) => (
     isCurrentCallableCatalogEntry(entry)
+    && entry.capabilityId === binding.capabilityId
+    && entry.manifest.manifestId === binding.manifestId
+    && capabilityManifestDigest(entry.manifest) === binding.manifestDigest
     && entry.manifest.operationId === manifest.operationId
     && entry.manifest.providerKind === manifest.providerKind
     && entry.manifest.providerIdentity === manifest.providerIdentity

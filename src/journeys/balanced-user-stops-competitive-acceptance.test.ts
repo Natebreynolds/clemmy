@@ -301,7 +301,7 @@ test('generated exact reversible creates stay card-free under catalog-order perm
   }
 });
 
-test('incomplete, irreversible, destructive, and ambiguous creates retain typed stops', () => {
+test('incomplete, irreversible, and destructive creates retain stops; exact selections tolerate siblings', () => {
   const { operationSemantics: _omittedSemantics, ...missingFields } = generatedManifest(101);
   // No sealed semantics and a carrier that declares nothing: the exact-call
   // card stays. The same manifest whose carrier declares destructive:false is
@@ -351,8 +351,8 @@ test('incomplete, irreversible, destructive, and ambiguous creates retain typed 
   const ambiguous = generatedManifest(105);
   const siblingBase = generatedManifest(106);
   const sibling = generatedManifest(106, {
-    // Ambiguity is scoped to the exact provider/account tuple. A same-named
-    // operation on another provider or account is independently bindable.
+    // The host already selected an exact manifest. Another current definition
+    // on the same provider/account must not invalidate that sealed selection.
     providerKind: ambiguous.providerKind,
     operationId: ambiguous.operationId,
     providerIdentity: ambiguous.providerIdentity,
@@ -364,7 +364,12 @@ test('incomplete, irreversible, destructive, and ambiguous creates retain typed 
   });
   assert.deepEqual(
     evaluateGeneratedCreate({ manifest: ambiguous, cohort: [sibling, ambiguous] }),
-    { status: 'loader_refusal', reason: 'catalog_binding_mismatch' },
+    evaluateGeneratedCreate({ manifest: ambiguous, cohort: [ambiguous] }),
+  );
+  // Removing the selected manifest cannot silently substitute its sibling.
+  assert.equal(
+    evaluateGeneratedCreate({ manifest: ambiguous, cohort: [sibling] }).status,
+    'loader_refusal',
   );
 });
 

@@ -70,7 +70,7 @@ test.after(() => {
 
 const digest = (value: string): string => createHash('sha256').update(value).digest('hex');
 
-async function runNestedCatalogLiveRead(remappedCarrier: boolean, localEnvelopeOnly = false): Promise<void> {
+async function runNestedCatalogLiveRead(remappedCarrier: boolean, localEnvelopeOnly = false, readFails = false): Promise<void> {
   const previousFactory = capabilityCatalogs.peekHostCapabilityCatalogFactory();
   const previousStore = manifestStores.peekCapabilityManifestStore();
   const store = manifestStores.createCapabilityManifestStore([], { durable: true });
@@ -223,6 +223,7 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean, localEnvelopeO
           'a remapped work_call-compatible carrier must own the business body',
         );
         preparationOrder.push('business');
+        if (readFails) throw new Error('Provider rejected the requested field; repair the read.');
         assert.equal(
           emittedTransportAccountCurrent,
           true,
@@ -239,7 +240,8 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean, localEnvelopeO
   const session = createSession({
     id: remappedCarrier
       ? 'sess-catalog-nested-settlement-remapped'
-      : localEnvelopeOnly ? 'sess-catalog-nested-settlement-wrapper-only' : 'sess-catalog-nested-settlement-direct',
+      : localEnvelopeOnly ? 'sess-catalog-nested-settlement-wrapper-only'
+        : readFails ? 'sess-catalog-nested-settlement-failed-read' : 'sess-catalog-nested-settlement-direct',
     kind: 'chat',
   });
   const source = appendEvent({
@@ -476,7 +478,16 @@ async function runNestedCatalogLiveRead(remappedCarrier: boolean, localEnvelopeO
     assert.equal(durableBinding.binding.manifestId, manifest.manifestId);
     assert.equal(durableBinding.binding.accountId, manifest.accountId);
     assert.doesNotMatch(String(invoked.value), /not_reachable/, String(invoked.value));
-    assert.match(String(invoked.value), /alex\.rivera@acme\.example/);
+    if (readFails) {
+      assert.match(String(invoked.value), /Provider rejected the requested field/);
+      const row = openEventLog().prepare(`SELECT outcome_kind, outcome_evidence, outcome_detail, mutating
+        FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+        .get(session.id, source.seq, callId) as Record<string, unknown>;
+      assert.deepEqual(row, { outcome_kind: 'unknown', outcome_evidence: 'nominal',
+        outcome_detail: 'execution_failed', mutating: 0 }, 'a thrown catalog failure retains host execution truth across the SDK wrapper');
+    } else {
+      assert.match(String(invoked.value), /alex\.rivera@acme\.example/);
+    }
     if (remappedCarrier) {
       assert.equal(
         resolvedCarrierTarget,
@@ -572,4 +583,9 @@ test('cold emitted transport is prepared once on the real work_call normalized g
 
 test('a local wrapper envelope cannot borrow the unique current catalog read or enter its port', () => (
   runNestedCatalogLiveRead(false, true)
+));
+
+
+test('a catalog read failure remains nominal failure with its model-visible diagnostic', () => (
+  runNestedCatalogLiveRead(false, false, true)
 ));

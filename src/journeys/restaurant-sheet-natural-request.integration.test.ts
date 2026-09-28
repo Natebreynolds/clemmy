@@ -142,6 +142,9 @@ const bridge = await import('../runtime/harness/respond-bridge.js');
 const { configureHarnessRuntime, resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
 const { buildOrchestratorAgent } = await import('../agents/orchestrator.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+const planActivation = await import('../runtime/harness/plan-task-post-settlement.js');
+const writeLearning = await import('../runtime/harness/verified-write-capability-learning.js');
+const { modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
 const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
 const productionPorts = await import('../runtime/harness/production-capability-ports.js');
@@ -198,6 +201,10 @@ function textMessage(text: string) {
 }
 
 function functionCall(callId: string, name: string, args: Record<string, unknown>) {
+  // Planning is a deferred structural control on the current production
+  // surface. Use its advertised carrier rather than planting a first-class schema.
+  if (name === PLAN_CONTROL) return { type: 'function_call', callId, name: 'call_tool',
+    arguments: JSON.stringify({ name, args_json: JSON.stringify(args) }) };
   return { type: 'function_call', callId, name, arguments: JSON.stringify(args) };
 }
 
@@ -594,11 +601,23 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
     assert.equal(modelId, 'gpt-5.5', 'the isolated owner-selected same-provider reviewer is honored');
     return {
       async getResponse(request: unknown) {
+        if (modelUsageAttributionStorage.getStore()?.channel === 'memory:standing') {
+          // Background scope review is a separate model request from the
+          // completion judge. These fixture requests are one-time tasks.
+          assert.match(JSON.stringify(request), /source/, 'standing review receives its actual source');
+          return { usage: new Usage(), responseId: 'standing-scope-review',
+            output: [textMessage(JSON.stringify({ scope: 'task', text: '', reason: 'One-time collection and sheet creation request.' }))] };
+        }
         assert.ok(completionReviewSource, 'a reviewer cannot precede the accepted source');
         const source = eventlog.listEvents(completionReviewSource.sessionId,
           { sinceSeq: completionReviewSource.seq - 1, types: ['user_input_received'], limit: 1 })[0];
         assert.equal(source?.seq, completionReviewSource.seq);
         assert.equal(source?.sessionId, completionReviewSource.sessionId);
+        if (source?.data.displayText === BOUNDED_PROMPT || source?.data.text === BOUNDED_PROMPT) {
+          assert.ok(Buffer.byteLength(JSON.stringify(request), 'utf8') < 768 * 1024,
+            'the reviewer gets a bounded packet with evidence lookup, not a 16MiB inline dump');
+          throw new Error('fixture completion reviewer unavailable');
+        }
         assert.equal(source?.data.displayText || source?.data.text, PROMPT);
         const textValues: string[] = [];
         const collect = (value: unknown): void => {
@@ -608,7 +627,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
         };
         collect(request);
         const actualJudgeText = textValues.join('\n');
-        assert.ok(actualJudgeText.includes(`Objective: ${PROMPT}`));
+        assert.ok(actualJudgeText.includes(`Objective: ${PROMPT}`), 'completion review contains the accepted objective');
         assert.ok(actualJudgeText.includes(SUCCESS));
         assert.ok(actualJudgeText.includes(SHEET_URL));
         assert.ok(actualJudgeText.includes('Retained READ results for THIS accepted source'));
@@ -729,8 +748,8 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
         assert.equal(tools.includes(PLAN_CONTROL), false,
           'an empty initial planning catalog keeps the impossible plan control off the first model surface');
         assert.ok(tools.includes('tool_search'), 'blank state exposes metadata discovery before planning');
-        assert.equal(tools.includes('work_call'), false,
-          'the proposal-free carrier stays hidden until exact disclosure can also expose plan_task');
+        assert.ok(tools.includes('work_call'),
+          'the stable carrier is visible; exact operation disclosure still owns dispatch authority');
         assert.ok(tools.includes('run_worker'), 'scoped delegation is plan-optional on the first primary surface');
         assert.equal(providerCalls.length, 0, 'advertising a worker grants no provider crossing');
         assert.equal(eventlog.listEvents(session.id, { types: ['worker_started', 'worker_result'] }).length, 0,
@@ -745,7 +764,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
         assert.match(serialized, new RegExp(SHEET_OPERATION), 'foreground discovery returns the Sheet operation');
         assert.match(serialized, /cap:resolved:restaurants_search/, 'the exact disclosed read ref reaches the model');
         assert.match(serialized, /cap:resolved:googlesheets_sheet_from_json/, 'the exact disclosed write ref reaches the model');
-        assert.ok(tools.includes(PLAN_CONTROL), 'the plan control stays available until exact refs are resolved');
+        assert.ok(tools.includes('call_tool'), 'the deferred plan control remains reachable through the carrier');
         assert.ok(tools.includes('work_call'),
           'search disclosure exposes the proposal-free carrier but grants no standalone business-call authority');
         output = [
@@ -898,10 +917,10 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
   assert.equal(primaryStep, 4);
   assert.equal(modelRequests[0]?.tools.includes(PLAN_CONTROL), false,
     'the empty initial catalog exposes discovery but not plan_task');
-  assert.ok(modelRequests[1]?.tools.includes(PLAN_CONTROL),
-    'the exact foreground disclosure enables plan_task on the next model surface');
-  assert.equal(modelRequests[0]?.tools.includes('work_call'), false,
-    'blank discovery does not pay or advertise the not-yet-usable business carrier');
+  assert.ok(modelRequests[1]?.tools.includes('call_tool'),
+    'the exact foreground disclosure permits planning through the advertised carrier');
+  assert.ok(modelRequests[0]?.tools.includes('work_call'),
+    'the stable carrier is visible without pre-granting operation authority');
   assert.ok(modelRequests[1]?.tools.includes('work_call'));
   assert.ok(modelRequests[2]?.tools.includes('work_call'),
     'work_call remains usable after the source-bound plan is admitted');
@@ -909,7 +928,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
     'the plan schema is absent from read, write, and final model steps');
   assert.ok(discoveryListings >= 1, 'cold discovery reaches live connected definitions');
   assert.ok(accountReviews > 0, 'current source/default account compatibility is reviewed, not assumed');
-  assert.ok(builtSurfaces.some((surface) => surface.includes(PLAN_CONTROL)));
+  assert.ok(builtSurfaces.some((surface) => surface.includes('call_tool')));
   assert.ok(builtSurfaces.some((surface) => surface.includes('tool_search')));
   assert.ok(builtSurfaces.some((surface) => surface.includes('work_call')));
 
@@ -1367,6 +1386,23 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
     'verified capability memory skips rediscovery but never grants call, effect, account, or approval authority',
     { timeout: 60_000 },
     async () => {
+      const learnedWrite = await writeLearning.learnVerifiedWriteCapabilitiesForAcceptedTask({
+        sessionId: session.id, sourceUserSeq: acceptedSource!.seq,
+      });
+      assert.notEqual(learnedWrite.status, 'not_proven', JSON.stringify(learnedWrite));
+      assert.ok(learnedWrite.status !== 'not_proven');
+      const writeRecord = learnedWrite.records[0]!;
+      assert.ok(await writeLearning.canonicalVerifiedWriteCapability(writeRecord));
+      for (const changed of [
+        { accountIdentity: 'different-account' },
+        { operationId: 'DIFFERENT_OPERATION' },
+        { capabilityRef: 'cap:different' },
+        { origin: { ...writeRecord.origin, sourceUserSeq: writeRecord.origin.sourceUserSeq + 1 } },
+        { origin: { ...writeRecord.origin, hostBindingDigest: '0'.repeat(64) } },
+      ]) {
+        assert.equal(await writeLearning.canonicalVerifiedWriteCapability({ ...writeRecord, ...changed }), null,
+          'write recall must reject a mismatched account, operation, capability, source or binding');
+      }
       const resolved = await capabilityCandidates.resolveTurnCapabilityCandidates({
         userInput: PROMPT,
         semantic: false,
@@ -1438,7 +1474,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
             }, 'candidate recall is context only; it mints no call/effect/account/approval rows');
             assert.match(serialized, new RegExp(RESTAURANT_OPERATION));
             assert.match(serialized, /advisory|nothing here is pre-authorized/i);
-            assert.ok(tools.includes(PLAN_CONTROL));
+            assert.ok(tools.includes('call_tool'), 'deferred planning remains callable');
             assert.ok(tools.includes('work_call'));
             assert.deepEqual({ restaurantReads, sheetCreates, calls: providerCalls.length }, providerBefore,
               'remembered capability context cannot cross before this response admits a fresh plan');
@@ -1515,7 +1551,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
             };
           }
           if (warmStep === 2) {
-            assert.equal(tools.includes(PLAN_CONTROL), false);
+            assert.equal(planActivation.settledPlanTaskActivationWinner({
+              sessionId: warmSession.id, sourceUserSeq: warmAcceptedSource!.seq,
+            }).status, 'ok', 'the warm write uses its own settled plan');
             assert.ok(settledReadRows);
             return {
               ...cacheReceipt,
@@ -1579,7 +1617,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
 
       assert.ok(preModelAuthority);
       assert.equal(warmStep, 3,
-        'verified capability memory removes discovery without adding a refusal/model round');
+        'verified capability memory removes discovery without adding a refusal/model round: ' + JSON.stringify({plan: eventlog.getToolOutput(warmSession.id, 'admit-warm-natural-task'), errors: eventlog.listEvents(warmSession.id).filter(e => e.type === 'run_failed')}));
       assert.equal(warmModelRequests.length, 3);
       const coldCacheUsage = cacheUsageRecords.filter((entry) => entry.run === 'cold');
       const warmCacheUsage = cacheUsageRecords.filter((entry) => entry.run === 'warm');
@@ -1695,7 +1733,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
           if (step === 1) {
             assert.ok(accepted, 'the long collection source is durable before its planning card');
             assert.match(serialized, new RegExp(RESTAURANT_OPERATION));
-            assert.ok(tools.includes(PLAN_CONTROL));
+            assert.ok(tools.includes('call_tool'), 'deferred planning remains callable');
             assert.ok(tools.includes('work_call'));
             return {
               usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
@@ -1738,8 +1776,12 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
             };
           }
           if (step >= 2 && step <= 7) {
-            assert.equal(tools.includes(PLAN_CONTROL), false,
-              'the accepted long task keeps one frozen plan across every read wave');
+            const winner = planActivation.settledPlanTaskActivationWinner({
+              sessionId: boundedSession.id, sourceUserSeq: accepted!.seq,
+            });
+            assert.equal(winner.status, 'ok', 'every read wave retains its exact settled plan');
+            assert.deepEqual(tools, modelRequests[0]!.tools,
+              'the advertised schema prefix remains stable after plan execution is disabled');
             const offset = (step - 2) * 4;
             return {
               usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
@@ -1800,6 +1842,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
             runId: 'discord-natural-restaurant-collection-bounded-request',
             onSourceAccepted(source: { seq: number; turn: number }) {
               accepted = { seq: source.seq, turn: source.turn };
+              completionReviewSource = { sessionId: boundedSession.id, seq: source.seq };
             },
           },
         });
@@ -1808,7 +1851,7 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       }
 
       assert.ok(accepted);
-      assert.equal(step, 8, JSON.stringify(modelRequests));
+      assert.equal(step, 8, JSON.stringify({ requests: modelRequests, plan: eventlog.getToolOutput(boundedSession.id, 'admit-bounded-collection'), errors: eventlog.listEvents(boundedSession.id).filter(e => e.type === 'run_failed') }));
       assert.equal(restaurantReads - restaurantReadStart, BOUNDED_LOCATIONS.length);
       assert.equal(providerCalls.length - providerCallStart, BOUNDED_LOCATIONS.length);
       assert.ok(boundedProviderPayloadBytes > 16 * 1024 * 1024,
@@ -1851,10 +1894,10 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       assert.equal(durable.raw_bytes, boundedProviderPayloadBytes,
         'all provider result bytes remain durably addressable even when absent from model context');
       const boundedEvents = eventlog.listEvents(boundedSession.id);
-      const inFlightCompaction = boundedEvents.find((event) =>
-        event.type === 'condenser_applied' && event.data.inFlight === true);
-      assert.ok(inFlightCompaction, JSON.stringify(boundedEvents.filter((event) =>
-        event.type === 'condenser_applied')));
+      // Result handles can now keep the entire collection below compaction's
+      // threshold. Require bounded context and complete durable evidence below,
+      // not an unnecessary condenser pass. Forced-compaction continuity has
+      // its own acceptance test.
       const maximumRequestBytes = Math.max(...modelRequests.map((request) => request.bytes));
       const lateRequestBytes = modelRequests.at(-1)!.bytes;
       assert.ok(modelRequests[0]!.bytes < 80_000,
@@ -1894,9 +1937,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
       const boundedReview = boundedEvents.find(event => event.id === boundedReviewRef.eventId);
       assert.equal(boundedReview?.type, 'goal_alignment_judged');
       assert.equal(boundedReview?.data.sourceUserSeq, seq);
-      assert.match(String(boundedReview?.data.reason), /Complete evidence review unavailable/);
+      assert.match(String(boundedReview?.data.reason), /fixture completion reviewer unavailable/);
       assert.equal(completionReviews.length, reviewCallsBeforeBounded,
-        'the real model-window admission never sends a clipped 16MiB evidence set to the reviewer');
+        'the unavailable fixture reviewer never publishes a positive verdict');
       assert.ok(delivery.edits.at(-1)?.startsWith(`${BOUNDED_SUCCESS}\n\nVerification note:`));
       // The unavailability reason stays on the review row for the console;
       // the chat gets one plain sentence saying the result stands unreviewed.

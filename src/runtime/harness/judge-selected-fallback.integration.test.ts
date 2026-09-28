@@ -30,6 +30,7 @@ const FALLBACK = 'gpt-5.6-terra';
 type Behavior = 'negative' | '429' | 'quota' | '503' | 'network' | 'auth' | 'hung' | 'invalid' | 'cancel';
 let behavior: Behavior = 'negative';
 let fallbackFails = false;
+let reportedModel: string | undefined;
 let onPrimaryStarted: (() => void) | undefined;
 const calls: Array<{ provider: string; modelId?: string; signal?: AbortSignal }> = [];
 
@@ -54,7 +55,7 @@ function wire(provider: 'claude' | 'codex', modelId?: string): Model {
       const text = isPrimary ? behavior === 'invalid' ? 'not a verdict' : 'INCOMPLETE: one receipt is missing'
         : 'DONE: all receipts checked';
       return { output: [{ type: 'message', role: 'assistant', status: 'completed',
-        content: [{ type: 'output_text', text, providerData: {} }] }], usage: new Usage(), responseId: 'fixture' } as ModelResponse;
+        content: [{ type: 'output_text', text, providerData: {} }] }], usage: new Usage(), responseId: 'fixture', ...(reportedModel ? { providerData: { model: reportedModel } } : {}) } as ModelResponse;
     },
     async *getStreamedResponse() { throw new Error('Unexpected streamed checker request'); },
   };
@@ -77,6 +78,7 @@ beforeEach(() => {
   calls.length = 0;
   behavior = 'negative';
   fallbackFails = false;
+  reportedModel = undefined;
   onPrimaryStarted = undefined;
   Object.assign(process.env, {
     AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off', OPENAI_MODEL_PRIMARY: FALLBACK,
@@ -144,6 +146,18 @@ for (const failure of ['invalid', 'cancel'] as const) {
     assert.deepEqual(calls.map(c => c.modelId), failure === 'invalid' ? [PRIMARY, PRIMARY] : [PRIMARY]);
   });
 }
+
+test('an invalid verdict still records the provider-reported reviewer without claiming a review', async () => {
+  behavior = 'invalid';
+  reportedModel = 'served-invalid-reviewer';
+  const result = await review();
+  assert.equal(result.value, null);
+  assert.equal(result.failure, 'invalid');
+  assert.equal(result.routing?.modelId, reportedModel);
+  assert.equal(result.routing?.requestedModelId, PRIMARY);
+  assert.equal(result.routing?.substituteReason, 'provider_reported_model');
+  assert.deepEqual(calls.map(c => c.modelId), [PRIMARY, PRIMARY]);
+});
 
 test('a user stop while the primary is hung cancels the review without starting the fallback', async () => {
   const controller = new AbortController();
@@ -394,3 +408,16 @@ for (const change of ['endpoint', 'owner', 'model'] as const) {
     assert.equal((globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length, 0);
   });
 }
+
+
+test('a provider-served alias version is carried in the winning route without changing the requested setting', async () => {
+  reportedModel = 'served-model-revision';
+  const result = await review();
+  assert.equal(result.value?.done, false, 'a negative verdict remains negative');
+  assert.equal(result.routing?.modelId, reportedModel);
+  assert.equal(result.routing?.requestedModelId, PRIMARY);
+  assert.equal(result.routing?.substituteForExactPin, true);
+  assert.equal(result.routing?.substituteReason, 'provider_reported_model');
+  assert.deepEqual(calls.map(c => c.modelId), [PRIMARY], 'observed identity does not launch a fallback');
+  assert.equal(resolveBoundaryJudge(captureBoundaryJudgeSelection()).modelId, PRIMARY, 'settings retain the user selection');
+});

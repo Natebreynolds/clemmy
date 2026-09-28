@@ -86,3 +86,17 @@ test('a verdict that parses the first time is never re-asked', async () => {
   assert.equal(requests.length, 2);
   assert.ok(JSON.stringify(requests[1]!.input).includes(lateFinding));
 });
+
+
+test('the judge reports the provider response model, including a verdict repair, rather than only the requested alias', async () => {
+  const { model } = scripted([LONG_REVIEW, 'DONE: requested artifact verified']);
+  const original = model.getResponse.bind(model);
+  let count = 0;
+  model.getResponse = async (request) => ({ ...await original(request),
+    providerData: { model: ++count === 1 ? 'served-review-version' : 'served-verdict-version' } });
+  const responders: string[] = [];
+  const verdict = await runRoutedJudgeAttempt(route(model), 'Audit.', 'Objective.', parseCompletionVerdict,
+    false, undefined, undefined, undefined, (id) => responders.push(id));
+  assert.equal(verdict.done, true);
+  assert.deepEqual(responders, ['served-review-version', 'served-verdict-version']);
+});

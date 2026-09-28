@@ -417,10 +417,13 @@ test('parallel accounts load risk from the exact bound provider/account lineage 
   authority.catalogFactory.register(
     duplicate.authority.catalogFactory.get(duplicateA.manifest.manifestId)!,
   );
-  assert.deepEqual(loadCatalogManifestExternalRiskAttestationV1(request, authority), {
-    ok: false,
-    reason: 'catalog_binding_mismatch',
-  });
+  const withSibling = loadCatalogManifestExternalRiskAttestationV1(request, authority);
+  assert.equal(withSibling.ok, true, 'another current manifest cannot replace the exact selected binding');
+  if (withSibling.ok) assert.equal(withSibling.attestation.manifest.manifestId, binding.manifestId);
+  assert.deepEqual(loadCatalogManifestExternalRiskAttestationV1({ ...request,
+    binding: { ...binding, capabilityId: duplicateA.manifest.manifestId },
+  }, authority), { ok: false, reason: 'catalog_binding_mismatch' },
+  'a sibling reference cannot borrow the selected manifest identity');
 });
 
 test('production catalog loader consumes the fresh shipped independent observer without a parallel direct port', () => {

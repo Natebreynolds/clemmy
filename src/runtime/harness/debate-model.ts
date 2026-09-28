@@ -1168,7 +1168,7 @@ export interface BoundaryJudgeRouting {
   /** Why a substitute is standing in: the exact pin never resolved, it led
    *  the chain and this is a later fallback lane, or its provider's plan quota
    *  is used up (resolveCheckerQuotaFallthrough). */
-  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin' | 'exact_pin_quota_exhausted';
+  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin' | 'exact_pin_quota_exhausted' | 'provider_reported_model';
   /** Concrete provider adapter used for the call. A non-null model plus this
    * field prevents a model-id string from being resolved through a different
    * globally registered provider. */

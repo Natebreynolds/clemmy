@@ -45,7 +45,7 @@ export interface RecordedVerdict {
   judgeModelId?: string | undefined;
   substituteForExactPin?: boolean | undefined;
   requestedJudgeModelId?: string | undefined;
-  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin' | 'exact_pin_quota_exhausted' | undefined;
+  substituteReason?: 'exact_pin_unresolved' | 'chain_fallback_after_exact_pin' | 'exact_pin_quota_exhausted' | 'provider_reported_model' | undefined;
   /** Per-criterion scorecard where the door has one (goal validation). */
   criteriaMet?: number | undefined;
   criteriaTotal?: number | undefined;

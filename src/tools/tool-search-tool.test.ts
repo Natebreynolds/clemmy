@@ -1113,6 +1113,7 @@ test('TIERED RANKING: an acquired live-read outranks fuzzy Composio membership o
   );
   const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
   const server = new McpServer({ name: 'live-read-rank-pin', version: '1.0.0' });
+  let broadSearches = 0;
   registerToolSearchTool(server as never, {
     // Compare the two source classes directly; unrelated fuzzy membership is
     // not entitled to outrank the native catalog merely to remain on page one.
@@ -1130,13 +1131,13 @@ test('TIERED RANKING: an acquired live-read outranks fuzzy Composio membership o
       },
       {
         kind: 'authorized_composio',
-        search: async () => [{
+        search: async () => { broadSearches += 1; return [{
           name: 'UNRELATED_BROKER_QUERY_TABLE',
           summary: 'Fuzzy connected-app membership that does not answer this query.',
           schema: { type: 'object', properties: { spreadsheet_id: { type: 'string' } } },
           carrier: 'work_call',
           score: 1.05,
-        }],
+        }]; },
       },
     ],
     discloseForPlanning: async (candidates) => Object.fromEntries(
@@ -1147,7 +1148,9 @@ test('TIERED RANKING: an acquired live-read outranks fuzzy Composio membership o
   });
   const handler = (server as never as { _registeredTools: Record<string, { handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }> }> })._registeredTools.tool_search.handler;
   const result = await handler({
-    query: 'query Salesforce open opportunities via sf CLI data query',
+    // Authority alone is not relevance: the generated operation must answer
+    // the same query used to compare the two source classes.
+    query: 'read acquired live inventory',
     role_key: 'clause-0:write',
     limit: 8,
   });
@@ -1158,8 +1161,9 @@ test('TIERED RANKING: an acquired live-read outranks fuzzy Composio membership o
     'acquired_live_read',
     `exact live-read acquisition must lead the card, got: ${names.join(', ')}`,
   );
-  const broker = names.indexOf('UNRELATED_BROKER_QUERY_TABLE');
-  assert.ok(broker > 0, 'fuzzy broker membership may still appear, but not as rank one');
+  assert.equal(broadSearches, 0, 'a query-matched acquired read avoids the broad provider round trip');
+  assert.equal(names.includes('UNRELATED_BROKER_QUERY_TABLE'), false,
+    'unrelated broad membership cannot displace the relevant acquired read');
 });
 
 test('malformed or empty disclosure refs cannot appear as executable capabilities', async () => {

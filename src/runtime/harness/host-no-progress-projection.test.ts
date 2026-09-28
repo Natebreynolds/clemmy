@@ -2865,3 +2865,35 @@ test('repeated identical parked-output MISSES meter as an identical outcome — 
     assert.equal(second.identicalOutcome, true, 'an identical parked-output miss is zero information and must meter');
   }
 });
+
+
+test('failed business reads spend the existing repair budget without gaining authority or replaying writes', () => {
+  for (const executionKind of ['local_execution', 'provider_execution'] as const) {
+    const identity = accepted(`bounded-read-${executionKind}`);
+    const rows = Array.from({ length: NO_PROGRESS_RETRY_BUDGET + 1 }, (_, index) => ({
+      callId: `query-${index}`, outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+      executionKind, businessCall: 1, mutating: 0,
+      physicalCrossingCount: executionKind === 'provider_execution' ? 1 : 0,
+    }));
+    const db = settlementDb(rows, identity);
+    let state = initializeNoProgressGovernor({ taskKey: `accepted:${identity.sourceUserSeq}`, authority: { operation: [], account: [], target: [], evidence: [], effect: [] } });
+    for (const [index, row] of rows.entries()) {
+      const projected = projectHostNoProgressAttempt({ ...identity, historyDelta: [
+        call(row.callId, 'query_records', { query: `changed query ${index}` }),
+        result(row.callId, 'query_records', `different provider diagnostic ${index}`),
+      ] }, db);
+      assert.equal(projected.status, 'ok');
+      if (projected.status !== 'ok') throw new Error('projection missing');
+      assert.equal(projected.attemptClass, 'read_repair', 'a proven non-mutating business failure is a bounded read repair');
+      const decision = observeNoProgress(state, { taskKey: state.taskKey,
+        attemptClass: projected.attemptClass, consequence: projected.consequence, authority: state.authority });
+      assert.equal(decision.action, index < NO_PROGRESS_RETRY_BUDGET ? 'continue' : 'terminalize',
+        'the second query error must not strand an available repair; repeated failures still exhaust the fixed budget');
+      assert.equal(decision.state.retriesRemaining, Math.max(0, NO_PROGRESS_RETRY_BUDGET - index - 1));
+      assert.deepEqual(decision.gained, [], 'query/error wording cannot manufacture progress');
+      assert.equal(decision.state.stageTransitionsRemaining, state.stageTransitionsRemaining);
+      state = decision.state;
+    }
+    db.close();
+  }
+});

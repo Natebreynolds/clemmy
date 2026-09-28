@@ -4052,14 +4052,12 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // leave the prefix. The host advertises it normally when the acquisition
       // doors are absent.
       ? [...reviewedComputeResults, Object.assign(buildPlanTaskTool({ planning: hostFreshPlanning }), {
-          // Evidence, not a route label (ordinary host chat turns carry no
-          // accepted-route label): plan_task rides the prefix from frame one
-          // when the turn is already planning-primed — an act route, or a
-          // planning catalog that holds capabilities at build time. Otherwise
-          // it is reached by search then call; the structural lookup hands
-          // back its schema handle, and enablement later in the turn never
-          // changes the prefix.
-          deferLoading: options.acceptedRoute !== 'act' && hostFreshPlanning.capabilities.length === 0,
+          // Remembering a capability should remove discovery, not add the full
+          // planning schema to every ordinary chat frame. Keep the same deferred
+          // control on cold and warm turns. Explicit act work advertises it;
+          // toolsOnAdvertisedWire also exposes it when acquisition doors are
+          // absent. Enablement and exact plan admission are unchanged.
+          deferLoading: options.acceptedRoute !== 'act',
         }), buildAskUserQuestionTool(), runWorkerTool]
       : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool]
     : localMemoryScope

@@ -253,6 +253,7 @@ export type NoProgressAttemptClass =
   | 'plan_admission'
   | 'zero_crossing_repair'
   | 'provider_repair'
+  | 'read_repair'
   | 'task_work'
   | 'terminal_projection';
 
@@ -394,6 +395,7 @@ const METERED_ATTEMPTS = new Set<NoProgressAttemptClass>([
   'plan_admission',
   'zero_crossing_repair',
   'provider_repair',
+  'read_repair',
 ]);
 
 const ATTEMPT_CLASSES = new Set<NoProgressAttemptClass>([
@@ -628,7 +630,7 @@ export function observeNoProgress(
     // The provider may reject the very call that established this binding.
     // Keep that failure as the first attempt of the new authority sequence,
     // otherwise its next identical failure incorrectly earns a second retry.
-    const providerRejection = input.attemptClass === 'provider_repair'
+    const providerRejection = (input.attemptClass === 'provider_repair' || input.attemptClass === 'read_repair')
       && consequence?.recovery === 'repair_model'
       && consequence.effectState === 'known_terminal'
       ? consequence
@@ -688,12 +690,13 @@ export function observeNoProgress(
   if (consequence) {
     if (state.seenConsequenceKeys.includes(consequence.key)) {
       if (
-        input.attemptClass === 'zero_crossing_repair'
+        ((input.attemptClass === 'zero_crossing_repair' && consequence.effectState === 'not_started')
+          || (input.attemptClass === 'read_repair' && consequence.effectState === 'known_terminal'))
         && consequence.recovery === 'repair_model'
-        && consequence.effectState === 'not_started'
         && state.retriesRemaining > 0
       ) {
-        // The host proved that no effect started. Let the model use an existing
+        // The host proved either a pre-dispatch refusal or a failed business
+        // read. Neither can have left a write to replay. Use an existing
         // repair opportunity without treating changed arguments as progress,
         // granting authority, or refilling the distinct-stage allowance.
         return Object.freeze({

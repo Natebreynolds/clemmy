@@ -4,7 +4,7 @@ import {
   type HostModelFrameClass,
 } from '../../tools/tool-registry.js';
 import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
-import type { RuntimeToolEffect } from './tool-effect.js';
+import { unwrapRuntimeEffectiveToolIdentity, type RuntimeToolEffect } from './tool-effect.js';
 
 /** Immutable facts projected from one admitted model frame before any tool
  * admission. Tool-object provenance is supplied by the host runner; model
@@ -57,7 +57,10 @@ function exactRootOperation(input: {
   plan: HostModelFrameCall;
   sibling: HostModelFrameCall;
 }): { requirementId: string } | null {
-  const planInput = input.plan.argumentsValue;
+  const effectivePlan = unwrapRuntimeEffectiveToolIdentity(input.plan.name, input.plan.argumentsValue);
+  if (effectivePlan.toolName !== input.plan.effectiveName) return null;
+  const planInput = effectivePlan.args && typeof effectivePlan.args === 'object' && !Array.isArray(effectivePlan.args)
+    ? effectivePlan.args as Record<string, unknown> : null;
   const siblingInput = input.sibling.argumentsValue;
   if (!planInput || !siblingInput) return null;
   // The proposal-free schema is an authority property of the configured tool,

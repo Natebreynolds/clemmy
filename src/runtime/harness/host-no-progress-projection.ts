@@ -1513,7 +1513,12 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
       status: 'ok',
       attemptClass: isProviderCrossedInvalidArguments(failed.settlement)
         ? 'provider_repair'
-        : 'zero_crossing_repair',
+        : failed.settlement.mutating === 0
+          && failed.settlement.business_call === 1
+          && failed.settlement.outcome_kind === 'unknown'
+          && failed.consequence.effectState === 'known_terminal'
+          ? 'read_repair'
+          : 'zero_crossing_repair',
       consequence: failed.consequence,
     };
 

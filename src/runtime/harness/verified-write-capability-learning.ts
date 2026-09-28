@@ -191,7 +191,14 @@ function exactCatalogIdentityForBinding(
       snapshot_digest: string;
       snapshot_json: string;
     } | undefined;
-    if (!row || row.snapshot_digest !== binding.catalogRevisionDigest) return null;
+    // The binding's catalogRevisionDigest authenticates the immutable host
+    // surface, including its graph-neutral planning root. It is not the digest
+    // of the subsequently frozen catalog array. loadHostCallCapabilityBinding
+    // already reopens that exact root and binding. Independently validate the
+    // source's frozen array below, then require its complete identity to match
+    // the authenticated binding; comparing the two different digests rejected
+    // every real planned write before it could become an advisory memory.
+    if (!row) return null;
     const identities = JSON.parse(row.snapshot_json) as unknown;
     if (!Array.isArray(identities)
       || catalogSnapshotDigestOf(identities as CanonicalCatalogIdentityV1[]) !== row.snapshot_digest) return null;
@@ -346,7 +353,10 @@ export async function canonicalVerifiedWriteCapability(
   const node = nodes[0]!;
   if (
     !node.obligations.includes('commit_effect')
-    || node.resolvedTool !== record.operationId
+    // The host's executable tool name and the provider's operation ID can
+    // differ (for example, normalized callable spelling). The authenticated
+    // binding proves that mapping; never compare or normalize them by guess.
+    || node.resolvedTool !== binding.toolName
     || !effectMatchesManifestNode(record.effect, node.effectKind)
   ) return null;
 

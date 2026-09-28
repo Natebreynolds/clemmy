@@ -50,6 +50,8 @@ import { appendEvent, getEvent, getSession, getTurnGraphEventForSource, listEven
 import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { computeResultHasSubstance } from './expected-work-matcher.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
+import { currentHostCallAttestation } from './accepted-turn-call-authority.js';
+import { hostCallCapabilityBindingMatchesAttestation, loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { REPAIR_ARGUMENTS_NEEDS_INPUT_TEXT } from './recovery-presentation-truth.js';
 import { detectMultiItemIntent } from './multi-item-intent.js';
@@ -2836,7 +2838,29 @@ export function admitExpectedWorkInvocation(input: {
       return null;
     }
   })();
-  const admittedEffect = input.hostSealedEffect ? sealedEffect : runtime.effect;
+  // The exact foreground catalog binding already attests operation/account/
+  // arguments/effect. Reclassifying a transport wrapper by spelling can turn
+  // that proven read (or authorized write) back into unknown, stranding a
+  // valid frozen plan. Reopen the durable binding; model-supplied effects or
+  // a same-name capability cannot substitute for this identity.
+  const hostAttestation = currentHostCallAttestation();
+  const hostCatalogEffect = (() => {
+    if (hostAttestation?.bindingKind !== 'catalog_manifest') return undefined;
+    if (hostAttestation.sessionId !== input.sessionId
+      || hostAttestation.sourceUserSeq !== input.sourceUserSeq
+      || hostAttestation.logicalToolCallId !== input.logicalToolCallId
+      || hostAttestation.acceptedTaskId !== contract.acceptedTaskId) return null;
+    const exact = durableLogicalCallContract(contract.acceptedTaskId, input.tool, input.args);
+    const bound = loadHostCallCapabilityBinding({ db, sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq, logicalToolCallId: input.logicalToolCallId });
+    if (!exact || bound.status !== 'ok'
+      || !hostCallCapabilityBindingMatchesAttestation(bound.binding, hostAttestation)
+      || bound.binding.toolName !== exact.toolName
+      || bound.binding.effectiveArgumentDigest !== exact.argumentDigest) return null;
+    return bound.binding.effect;
+  })();
+  const admittedEffect = input.hostSealedEffect ? sealedEffect
+    : hostCatalogEffect === undefined ? runtime.effect : hostCatalogEffect;
   if (!admittedEffect || admittedEffect === 'unknown' || admittedEffect !== operation.effect) {
     return refusedWithPlan(
       'work_effect_mismatch',

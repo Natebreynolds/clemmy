@@ -940,6 +940,7 @@ export async function runRoutedJudgeAttempt<T>(
   evidence?: JudgeEvidenceSource,
   signal?: AbortSignal,
   effort?: JudgeReviewEffort,
+  onResponder?: (modelId: string) => void,
 ): Promise<T> {
   // Keep per-review handles out of tool schemas and stable instructions.
   // Supply them once with the evidence whose handles they identify.
@@ -972,6 +973,17 @@ export async function runRoutedJudgeAttempt<T>(
     : buildJudgeAgent(routing, instructions, [], reviewEffort);
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
+  const observeResponder = (responses: typeof result.rawResponses): void => {
+    // Adapter response metadata is wire evidence; assistant prose and the
+    // requested routing alias are not proof of which model answered.
+    for (const response of responses ?? []) {
+      const reported = response.providerData?.model;
+      if (typeof reported === 'string' && reported.trim() && reported.length <= 256) {
+        onResponder?.(reported.trim());
+      }
+    }
+  };
+  observeResponder(result.rawResponses);
   let value = parse(result.finalOutput);
   if (value === null) {
     // Live 2026-09-24 (source 294528): a flagship reviewer wrote a 2,800-token
@@ -1004,6 +1016,8 @@ export async function runRoutedJudgeAttempt<T>(
         const repaired = await new Runner({ workflowName: 'clementine-objective-judge-verdict' }).run(
           repairAgent, repairPrompt, { maxTurns: 1, signal },
         );
+        signal?.throwIfAborted();
+        observeResponder(repaired.rawResponses);
         value = parse(repaired.finalOutput);
       } catch (error) {
         logDebugSafe(error);
@@ -1081,10 +1095,17 @@ export async function runHedgedJudge<T>(
     // the usage log can rank judge spend per lane while the turn's own
     // session/source attribution is preserved.
     const callerSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
+    const observedRoutes = new Map<BoundaryJudgeRouting, BoundaryJudgeRouting>();
     const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (deadlineSignal?: AbortSignal): Promise<T> => {
       const signals = [signal, deadlineSignal, callerSignal].filter((value): value is AbortSignal => Boolean(value));
       return runRoutedJudgeAttempt<T>(r, instructions, prompt, parse, opts.requireCompletePrompt === true,
-        opts.evidence, signals.length ? AbortSignal.any(signals) : undefined, opts.effort);
+        opts.evidence, signals.length ? AbortSignal.any(signals) : undefined, opts.effort, (modelId) => {
+          observedRoutes.set(r, modelId === r.modelId ? r : { ...r, modelId,
+            requestedModelId: r.requestedModelId ?? r.modelId,
+            substituteForExactPin: true,
+            substituteReason: r.substituteReason ?? 'provider_reported_model',
+          });
+        });
     };
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -1159,7 +1180,8 @@ export async function runHedgedJudge<T>(
         { lane, ...(effectiveTimeoutMs ? { timeoutMs: effectiveTimeoutMs } : {}) },
       );
     }
-    const winner = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : answering;
+    const winningRoute = raced.winner === 'hedge' && hedgeRouting ? hedgeRouting : answering;
+    const winner = observedRoutes.get(winningRoute) ?? winningRoute;
     if (raced.value !== null) {
       recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
       return { value: raced.value, failure: null, routing: winner };
@@ -1173,7 +1195,8 @@ export async function runHedgedJudge<T>(
     const invalidDetail = failure === 'invalid'
       ? raced.errors.find((e) => e instanceof JudgeVerdictParseError)?.message.replace(/^judge output did not parse;?\s*/, '').slice(0, 260)
       : undefined;
-    recordCompletionJudgeMetric(failure, startedAt, answering, lane);
+    const failedRoute = observedRoutes.get(answering) ?? answering;
+    recordCompletionJudgeMetric(failure, startedAt, failedRoute, lane);
     const quotaUnavailable = raced.errors.find((error) => error instanceof CheckerQuotaUnavailableError);
     const contextFailure = raced.errors.find((error) => error instanceof JudgeContextUnavailableError);
     const rateLimited = raced.errors.some((error) => classifyModelError(error).kind === 'model.rate_limited');
@@ -1184,7 +1207,7 @@ export async function runHedgedJudge<T>(
         : transportError instanceof Error
           ? `The completion reviewer was unavailable; no review was completed. ${redactSensitiveText(transportError.message).replace(/\s+/g, ' ').slice(0, 400)}`
         : undefined;
-    return { value: null, failure, routing: answering, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
+    return { value: null, failure, routing: failedRoute, ...(unavailableReason ? { unavailableReason } : {}), ...(invalidDetail ? { invalidDetail } : {}) };
   } catch (err) {
     recordCompletionJudgeMetric('error', startedAt, routing, lane);
     logDebugSafe(err);

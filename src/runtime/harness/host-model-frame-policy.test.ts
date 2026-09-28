@@ -237,3 +237,15 @@ test('a carried control is classified as that control, not refused', () => {
   assert.notEqual(result.kind, 'refused',
     'the host already resolved the effective identity; refusing discards it');
 });
+
+
+test('a deferred plan and its exact root read share the same frame rules as a direct plan', () => {
+  const direct = plan();
+  const carried = { ...direct, name: 'call_tool', argumentsValue: { name: 'plan_task', args_json: JSON.stringify(direct.argumentsValue) } };
+  assert.equal(classifyHostModelFrame({ calls: [carried, work()], planActivated: false, allowFreshPlanReadFusion: true }).kind,
+    'fresh_plan_then_root_read');
+  assert.equal(classifyHostModelFrame({ calls: [carried, work({ effect: 'external_write' })], planActivated: false, allowFreshPlanReadFusion: true }).kind,
+    'refused');
+  const forged = { ...carried, argumentsValue: { name: 'other_control', args_json: JSON.stringify(direct.argumentsValue) } };
+  assert.equal(classifyHostModelFrame({ calls: [forged, work()], planActivated: false, allowFreshPlanReadFusion: true }).kind, 'refused');
+});

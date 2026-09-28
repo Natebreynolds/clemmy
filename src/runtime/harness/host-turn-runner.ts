@@ -714,6 +714,7 @@ import {
   canonicalCatalogIdentityOf,
   canonicalResolvedCapabilityId,
   freezeCatalogSnapshotForSource,
+  loadSealedNodeBinding,
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
   resolveProvenLiveCatalogEntry,
@@ -1479,11 +1480,12 @@ export function pendingUniqueWorkflowNameFromHistory(
   const planCallIds = new Set<string>();
   for (const item of history) {
     if (workflowName && uniqueRunQueueCarrierIssued(item)) queued = true;
-    const row = item as unknown as { type?: unknown; callId?: unknown; name?: unknown };
+    const row = item as unknown as { type?: unknown; callId?: unknown; name?: unknown; arguments?: unknown };
     if (
       row.type === 'function_call'
       && typeof row.callId === 'string'
-      && row.name === 'plan_task'
+      && typeof row.name === 'string'
+      && isPlainOrClementineLocalTool(unwrapRuntimeEffectiveToolIdentity(row.name, row.arguments).toolName ?? row.name, 'plan_task')
     ) {
       planCallIds.add(row.callId);
       continue;
@@ -1535,11 +1537,12 @@ export function pendingGraphNeutralReadFromHistory(
   const planCallIds = new Set<string>();
   for (const item of history) {
     if (pending && graphNeutralReadAttemptIssued(item)) pending = false;
-    const row = item as unknown as { type?: unknown; callId?: unknown; name?: unknown };
+    const row = item as unknown as { type?: unknown; callId?: unknown; name?: unknown; arguments?: unknown };
     if (
       row.type === 'function_call'
       && typeof row.callId === 'string'
-      && row.name === 'plan_task'
+      && typeof row.name === 'string'
+      && isPlainOrClementineLocalTool(unwrapRuntimeEffectiveToolIdentity(row.name, row.arguments).toolName ?? row.name, 'plan_task')
     ) {
       planCallIds.add(row.callId);
       continue;
@@ -5509,7 +5512,21 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           && isRecord(row.identity) && row.identity.kind !== 'local_registry',
       ) as { capabilityRef: string } | undefined
       : undefined;
-    const reviewedCapabilityRef = reviewedBinding?.capabilityRef;
+    // Foreground plan_task also seals an exact selection. A second current
+    // manifest for the same operation must not erase that selection or turn
+    // it into name-only ambiguity. This only narrows the current catalog;
+    // every schema/account/effect/port check below still applies.
+    const plannedBinding = isPlainOrClementineLocalTool(name, 'work_call')
+      && typeof args.requirement_id === 'string'
+      && runtimeToolAuthorityBinding(decision) !== 'local_envelope'
+      && settledFreshPlanControl(identity)
+      ? loadSealedNodeBinding(identity.sessionId, identity.sourceUserSeq, args.requirement_id)
+      : null;
+    if (reviewedBinding && plannedBinding
+      && reviewedBinding.capabilityRef !== plannedBinding.capabilityId) {
+      return miss('reviewed_and_activated_capability_mismatch');
+    }
+    const reviewedCapabilityRef = reviewedBinding?.capabilityRef ?? plannedBinding?.capabilityId;
     const exactCandidates = decision.effect === 'unknown'
       ? []
       : surface.snapshot.entries.filter(entry => exactEntryMatches(entry)
