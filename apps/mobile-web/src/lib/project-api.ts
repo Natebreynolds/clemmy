@@ -110,6 +110,19 @@ export async function linkLocalProject(projectId: string, path: string): Promise
   return post(`${PROJECTS}/${id(projectId)}/resources`, { kind: 'folder', ref: path });
 }
 
+/**
+ * One part of a page, rendered on the Mac at the asked width. Each part takes
+ * the Mac a few seconds and it renders one at a time, so a reader asks for
+ * the next part only once the last one has arrived.
+ */
+export async function getProjectPageImage(projectId: string, pageId: string, part: {
+  width: number;
+  height: number;
+  offset: number;
+}): Promise<unknown> {
+  return api(`${PROJECTS}/${id(projectId)}/pages/${id(pageId)}/image?width=${part.width}&height=${part.height}&offset=${part.offset}`);
+}
+
 /** The accounts connected right now for one app, for the owner to choose from. */
 export async function listAccountChoices(projectId: string, toolkit: string): Promise<{ toolkit: string; accounts: ProjectAccountChoice[] }> {
   return api(`${PROJECTS}/${id(projectId)}/account-choices?toolkit=${id(toolkit)}`);

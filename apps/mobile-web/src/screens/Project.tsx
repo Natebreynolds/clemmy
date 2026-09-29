@@ -18,11 +18,17 @@ import {
   PROJECT_LOCAL_COMMANDS_HINT,
   PROJECT_LOCAL_COMMANDS_LABEL,
   PROJECT_LOCAL_TOOL_SERVERS_LABEL,
+  PROJECT_PAGES_EMPTY,
+  PROJECT_PAGES_HINT,
+  PROJECT_PAGES_LABEL,
   projectLinkedLocalProject,
   projectLocalProjectCommands,
   projectLocalProjectGitLine,
   projectLocalProjectMissingLine,
   projectLocalProjectToolServers,
+  projectPagePlace,
+  projectPages,
+  projectPageTitle,
   projectDecisionConsequence,
   projectResourceApp,
   projectDecisionSource,
@@ -32,12 +38,14 @@ import {
   type ProjectAssignmentView,
   type ProjectDecisionView,
   type ProjectOverview,
+  type ProjectPageView,
   type ProjectResourceView,
 } from '@clem/chat-engine';
 import { listApprovals, type ApprovalRow } from '../lib/api';
 import { Decisions, relativeTime } from '../components/Approvals';
 import { ChatBackButton } from '../components/ChatBackButton';
 import { DelegatedTaskCard, DelegatedTaskList } from '../components/DelegatedTaskCard';
+import { ProjectPageViewer } from '../components/ProjectPageViewer';
 import { AccountBinderSheet, AssignAgentSheet, AssignmentSheet, LocalProjectSheet } from '../components/ProjectSheets';
 import { ScreenNotice, type ScreenNote } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
@@ -117,6 +125,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
   const [assigning, setAssigning] = useState(false);
   const [binding, setBinding] = useState(false);
   const [linking, setLinking] = useState(false);
+  const [viewing, setViewing] = useState<ProjectPageView | null>(null);
   const [endedOpen, setEndedOpen] = useState(false);
 
   /** A decision settled here settles it everywhere: read the project and the count again. */
@@ -143,6 +152,8 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
   const localProjects = resources.find((group) => group.kind === 'folder')?.items ?? [];
   const otherResources = resources.filter((group) => group.kind !== 'folder');
   const codingRuns = readCodingRuns(overview);
+  // Absent from a Mac that predates pages: then there are none to list.
+  const pages = projectPages(overview);
 
   return (
     <div class="workflow-detail project-detail">
@@ -380,6 +391,35 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
             ) : null}
           </section>
 
+          {/* Looking at a page changes nothing, so an archived project lists them too. */}
+          {pages.length > 0 || localProjects.length > 0 ? (
+            <section aria-labelledby="project-pages">
+              <h2 id="project-pages" class="section-head">{PROJECT_PAGES_LABEL}</h2>
+              <p class="project-hint">{PROJECT_PAGES_HINT}</p>
+              {pages.length === 0 ? <p class="section-empty">{PROJECT_PAGES_EMPTY}</p> : (
+                <div class="home-card">
+                  {pages.map((page) => (
+                    <button
+                      key={page.id}
+                      type="button"
+                      class="home-row home-row-tap project-line"
+                      onClick={() => { haptic('light'); setNote(null); setViewing(page); }}
+                    >
+                      <span class="project-line-text">
+                        <span class="project-line-title project-line-clamp">{projectPageTitle(page)}</span>
+                        <span class="project-page-where">{projectPagePlace(page)}</span>
+                        {relativeTime(page.madeAt) ? (
+                          <time class="project-line-sub" dateTime={page.madeAt}>{relativeTime(page.madeAt)}</time>
+                        ) : null}
+                      </span>
+                      <Chevron />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </section>
+          ) : null}
+
           <section aria-labelledby="project-chats">
             <h2 id="project-chats" class="section-head">Conversations</h2>
             {overview.conversations.length === 0 ? (
@@ -448,6 +488,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
             onClose={() => setLinking(false)}
             onSaved={(next, name) => { setLinking(false); setNote({ tone: 'success', text: `${name} linked to this project.` }); settle(next); }}
           />
+          <ProjectPageViewer projectId={project.id} page={viewing} onClose={() => setViewing(null)} />
           <AccountBinderSheet
             open={binding}
             projectId={project.id}
