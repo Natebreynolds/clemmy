@@ -199,3 +199,53 @@ test('when nothing was ever kept for a scope, reading is exactly what it was', (
   assert.equal(scope.currentMemoryReadScope(), 'unrestricted');
 });
 void strategies;
+
+test('what is kept for another project never crowds out what a reader may see', () => {
+  const mine = facts.rememberFact({ kind: 'feedback', content: 'Crowding: keep the summary to one page.', scope: null, importance: 3 });
+  facts.setFactPinned(mine.id, true);
+  for (let index = 0; index < 14; index += 1) {
+    const theirs = facts.rememberFact({ kind: 'feedback', content: `Crowding: hiring rule number ${index} about interview panels.`, scope: HIRING, importance: 9 });
+    facts.setFactPinned(theirs.id, true);
+  }
+  const pinnedInPlain = as('chat-plain', () => facts.listPinnedFacts(12));
+  assert.ok(pinnedInPlain.some((fact) => fact.id === mine.id), 'fourteen more important rules of another project do not push it out');
+  assert.ok(pinnedInPlain.every((fact) => !/hiring rule number/.test(fact.content)));
+  assert.ok(pinnedInPlain.length <= 12);
+  const recent = as('chat-sales', () => facts.listActiveFacts({ limit: 3 }));
+  assert.ok(recent.length > 0 && recent.every((fact) => !/hiring rule number/.test(fact.content)));
+  assert.ok(as('chat-plain', () => facts.findActiveFactsByContentPrefix('feedback', 'Crowding:', 1)).length === 1);
+});
+
+test('a fact edited where it is kept stays there, and the same sentence learned elsewhere is its own record', () => {
+  const inHiring = facts.rememberFact({ kind: 'reference', content: 'Edited: the panel meets on Tuesdays.', scope: HIRING });
+  const edited = facts.updateFact(inHiring.id, { content: 'Edited: the panel meets on Wednesdays.' });
+  assert.deepEqual(facts.factScope(edited!.id), HIRING);
+  const inPlain = as('chat-plain', () => facts.rememberFact({ kind: 'reference', content: 'Edited: the panel meets on Wednesdays.', sessionId: 'chat-plain' }));
+  assert.notEqual(inPlain.id, inHiring.id);
+  assert.ok(as('chat-plain', () => facts.getFact(inPlain.id)), 'the conversation that learned it can see it');
+  assert.equal(as('chat-plain', () => facts.getFact(inHiring.id)), null);
+});
+
+test('the evidence of a fact is shown only where the fact is', async () => {
+  const { episodesSupportingOnly, linkFactEvidence } = await import('./temporal-memory.js');
+  const kept = facts.rememberFact({ kind: 'reference', content: 'Evidence: the vendor is Northwind Freight.', scope: null });
+  const episode = recordMemoryEpisode({ kind: 'tool_result', sourceApp: 'Fixture', sessionId: 'chat-plain', title: 'vendor',
+    content: 'The vendor is Northwind Freight.' });
+  linkFactEvidence({ factId: kept.id, episodeId: episode.id, excerpt: 'The vendor is Northwind Freight.', sourceUri: null });
+  assert.deepEqual(episodesSupportingOnly([kept.id]).includes(episode.id), true);
+  // Moved into a project: its evidence supports nothing a plain conversation may see.
+  assert.ok(facts.moveFactToScope(kept.id, HIRING));
+  const hidden = [...scope.scopedRecords('fact').entries()]
+    .filter(([, keptFor]) => !scope.scopeVisible(keptFor, { projectId: null, agentKey: null })).map(([id]) => Number(id));
+  assert.ok(episodesSupportingOnly(hidden).includes(episode.id));
+  // Evidence that also supports a fact the reader may see stays visible.
+  const shared = facts.rememberFact({ kind: 'reference', content: 'Evidence: Northwind Freight ships on Fridays.', scope: null });
+  linkFactEvidence({ factId: shared.id, episodeId: episode.id, excerpt: 'ships on Fridays', sourceUri: null });
+  assert.equal(episodesSupportingOnly(hidden).includes(episode.id), false);
+});
+
+test('a rule still applies when what it is kept for cannot be read', () => {
+  assert.equal(scope.recordVisible('fact', 987_654_321, { projectId: null, agentKey: null }, 'everything'), true);
+  assert.equal(scope.hiddenFromScope('fact', 'unrestricted'), 0);
+  assert.ok(scope.hiddenFromScope('fact', { projectId: null, agentKey: null }) >= 14);
+});

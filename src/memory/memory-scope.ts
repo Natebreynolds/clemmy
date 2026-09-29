@@ -206,9 +206,11 @@ export function stampMemoryScope(
 ): void {
   const conn = db();
   if (isEverywhere(scope)) {
+    localWrites += 1;
     conn.prepare('DELETE FROM memory_scopes WHERE target_kind = ? AND target_id = ?').run(kind, String(id));
     return;
   }
+  localWrites += 1;
   conn.prepare(`
     INSERT INTO memory_scopes (target_kind, target_id, scope_project_id, scope_agent_key, source_session_id, stamped_by, stamped_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -223,15 +225,24 @@ export function stampMemoryScope(
 }
 
 export function memoryScopeOf(kind: ScopedKind, id: string | number): MemoryScope | null {
-  const row = db().prepare(
-    'SELECT target_id, scope_project_id, scope_agent_key FROM memory_scopes WHERE target_kind = ? AND target_id = ?',
-  ).get(kind, String(id)) as ScopeRow | undefined;
-  return row ? toScope(row) : null;
+  return scopedRecords(kind).get(String(id)) ?? null;
 }
 
-/** Every record of one kind that is kept for a scope. The table holds only
- * those, so it stays small however large memory grows. */
-export function scopedRecords(kind: ScopedKind): Map<string, MemoryScope> {
+/** Writes this process made through its own connection. */
+let localWrites = 0;
+
+interface ScopeSnapshot { dataVersion: unknown; localWrites: number; byKind: Map<ScopedKind, Map<string, MemoryScope>> }
+const snapshots = new WeakMap<Database.Database, ScopeSnapshot>();
+
+/**
+ * Every record of one kind that is kept for a scope. The table holds only
+ * those, so it stays small however large memory grows. Read once and kept
+ * until the table changes: a turn asks this many times, and the answer
+ * changes only when something is learned or moved. The database's own
+ * change counter covers writes by another process; this process counts its
+ * own.
+ */
+export function scopedRecords(kind: ScopedKind): ReadonlyMap<string, MemoryScope> {
   let conn: Database.Database;
   try {
     conn = db();
@@ -241,10 +252,38 @@ export function scopedRecords(kind: ScopedKind): Map<string, MemoryScope> {
     if (!tableExists(openMemoryDb())) return new Map();
     throw error;
   }
-  const rows = conn.prepare(
-    'SELECT target_id, scope_project_id, scope_agent_key FROM memory_scopes WHERE target_kind = ?',
-  ).all(kind) as ScopeRow[];
-  return new Map(rows.map((row) => [row.target_id, toScope(row)]));
+  const dataVersion = conn.pragma('data_version', { simple: true });
+  let snapshot = snapshots.get(conn);
+  if (!snapshot || snapshot.dataVersion !== dataVersion || snapshot.localWrites !== localWrites) {
+    snapshot = { dataVersion, localWrites, byKind: new Map() };
+    snapshots.set(conn, snapshot);
+  }
+  let records = snapshot.byKind.get(kind);
+  if (!records) {
+    const rows = conn.prepare(
+      'SELECT target_id, scope_project_id, scope_agent_key FROM memory_scopes WHERE target_kind = ?',
+    ).all(kind) as ScopeRow[];
+    records = new Map(rows.map((row) => [row.target_id, toScope(row)]));
+    snapshot.byKind.set(kind, records);
+  }
+  return records;
+}
+
+/**
+ * How many more rows a reader must ask the store for so that, once what it
+ * may not see is taken out, it still has as many as it wanted. The store
+ * cuts a list before this module sees it; without the allowance, records
+ * kept for another project could push out every record the reader may see.
+ */
+export function hiddenFromScope(kind: ScopedKind, readScope: MemoryReadScope = currentMemoryReadScope()): number {
+  if (readScope === 'unrestricted') return 0;
+  try {
+    let hidden = 0;
+    for (const scope of scopedRecords(kind).values()) if (!scopeVisible(scope, readScope)) hidden += 1;
+    return hidden;
+  } catch {
+    return 0;
+  }
 }
 
 /** The ids kept for exactly this scope. */
@@ -272,7 +311,7 @@ export function visibleInScope<T>(
   onUnreadable: 'nothing' | 'everything' = 'nothing',
 ): T[] {
   if (readScope === 'unrestricted' || rows.length === 0) return [...rows];
-  let scoped: Map<string, MemoryScope>;
+  let scoped: ReadonlyMap<string, MemoryScope>;
   try {
     scoped = scopedRecords(kind);
   } catch {
@@ -282,11 +321,16 @@ export function visibleInScope<T>(
   return rows.filter((row) => scopeVisible(scoped.get(String(idOf(row))), readScope));
 }
 
-export function recordVisible(kind: ScopedKind, id: string | number, readScope: MemoryReadScope = currentMemoryReadScope()): boolean {
+export function recordVisible(
+  kind: ScopedKind,
+  id: string | number,
+  readScope: MemoryReadScope = currentMemoryReadScope(),
+  onUnreadable: 'nothing' | 'everything' = 'nothing',
+): boolean {
   if (readScope === 'unrestricted') return true;
   try {
     return scopeVisible(memoryScopeOf(kind, id), readScope);
   } catch {
-    return false;
+    return onUnreadable === 'everything';
   }
 }

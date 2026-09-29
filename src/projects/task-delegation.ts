@@ -113,8 +113,7 @@ export async function resolveTaskDelegation(
       ownChoiceSetAside = true;
     } else {
       return { kind: 'refuse', reason: `${name} is not assigned to the project ${project.name}, so no task started. `
-        + `Assigned to it: ${assignedNames(project)}. Assign ${name} with project_save, delegate to someone assigned, `
-        + 'or dispatch with project: null to run it outside the project.' };
+        + `Assigned to it: ${assignedNames(project)}. Assign ${name} with project_save, or delegate to someone assigned.` };
     }
   }
 

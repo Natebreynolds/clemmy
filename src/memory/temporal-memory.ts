@@ -321,6 +321,31 @@ export function captureFactEvidence(input: {
   return episode;
 }
 
+/**
+ * The episodes that are evidence for these facts and for no other fact.
+ * An episode that also supports a fact outside the list is not among them.
+ */
+export function episodesSupportingOnly(factIds: readonly number[]): string[] {
+  if (factIds.length === 0) return [];
+  const db = openMemoryDb();
+  const given = new Set(factIds);
+  const candidates = new Set<string>();
+  for (let start = 0; start < factIds.length; start += 400) {
+    const batch = factIds.slice(start, start + 400);
+    const rows = db.prepare(
+      `SELECT DISTINCT episode_id FROM fact_evidence WHERE fact_id IN (${batch.map(() => '?').join(',')})`,
+    ).all(...batch) as Array<{ episode_id: string }>;
+    for (const row of rows) candidates.add(row.episode_id);
+  }
+  const only: string[] = [];
+  const supported = db.prepare('SELECT fact_id FROM fact_evidence WHERE episode_id = ?');
+  for (const episodeId of candidates) {
+    const facts = supported.all(episodeId) as Array<{ fact_id: number }>;
+    if (facts.every((row) => given.has(row.fact_id))) only.push(episodeId);
+  }
+  return only;
+}
+
 export function getFactEvidence(factId: number): FactEvidence[] {
   const rows = openMemoryDb().prepare(`
     SELECT fe.episode_id, fe.excerpt, fe.source_uri, me.kind, me.occurred_at, me.status

@@ -827,6 +827,16 @@ export function renderTurnMemoryTail(
   signal: TurnMemorySignal,
   options: { request?: string; sessionPointers?: string } = {},
 ): TurnMemoryTail {
+  // The prompt is assembled before the turn's run begins, so nothing ambient
+  // says whose turn this is: the session is named here.
+  return withSessionMemoryScope(scope.sessionId, () => renderTurnMemoryTailInScope(scope, signal, options));
+}
+
+function renderTurnMemoryTailInScope(
+  scope: MemoryTailScope,
+  signal: TurnMemorySignal,
+  options: { request?: string; sessionPointers?: string },
+): TurnMemoryTail {
   const parts: Array<{ section: string; tier: MemoryTier; text: string; refs?: MemoryManifestEntry['refs'] }> = [];
   if (signal.kind === 'no_signal') {
     // A blind ranker must cost nothing: the per-block rendering stands in,

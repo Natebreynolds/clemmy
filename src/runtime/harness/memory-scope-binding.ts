@@ -35,7 +35,36 @@ function scopeFromRow(sessionId: string, depth: number): MemoryScope | null {
   return { projectId, agentKey: agent ? agentScopeKey(agent) : null };
 }
 
+/**
+ * What each request is working in, fixed when the request first asks. A
+ * conversation can be moved to another project while a request is still
+ * running; what that request reads and learns stays with the project it
+ * began in, and the move applies from the next request.
+ */
+const pinned = new Map<string, MemoryScope | null>();
+
+function requestOf(sessionId: string): string | null {
+  const run = harnessRunContextStorage.getStore();
+  if (!run || run.sessionId?.trim() !== sessionId) return null;
+  const source = run.sourceUserSeq;
+  return typeof source === 'number' && Number.isSafeInteger(source) && source > 0 ? `${sessionId}#${source}` : null;
+}
+
 function scopeOfSession(sessionId: string): MemoryScope | null {
+  const request = requestOf(sessionId);
+  if (request && pinned.has(request)) return pinned.get(request) ?? null;
+  const scope = liveScopeOfSession(sessionId);
+  if (request) {
+    if (pinned.size >= 512) {
+      const oldest = pinned.keys().next().value;
+      if (oldest !== undefined) pinned.delete(oldest);
+    }
+    pinned.set(request, scope);
+  }
+  return scope;
+}
+
+function liveScopeOfSession(sessionId: string): MemoryScope | null {
   const now = Date.now();
   const hit = cache.get(sessionId);
   if (hit && now - hit.at < CACHE_MS) return hit.scope;
@@ -43,6 +72,11 @@ function scopeOfSession(sessionId: string): MemoryScope | null {
   if (cache.size > 512) cache.clear();
   cache.set(sessionId, { at: now, key: sessionId, scope });
   return scope;
+}
+
+/** Test seam: forget every request's fixed scope. */
+export function _forgetPinnedMemoryScopesForTests(): void {
+  pinned.clear();
 }
 
 /** Drop what is remembered about a session's scope, after its agent or

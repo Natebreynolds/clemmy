@@ -25,7 +25,7 @@ import {
 import { getResourcePointersByIds, listAllResourcePointers, type ResourcePointer } from './source-map.js';
 import { matchToolChoicesForStep } from './tool-choice-store.js';
 import { extractAnchors, type EntityAnchors } from './memory-merge.js';
-import { getFactEvidence, listMemoryPolicies } from './temporal-memory.js';
+import { episodesSupportingOnly, getFactEvidence, listMemoryPolicies } from './temporal-memory.js';
 import { currentMemoryReadScope, scopeOfSession, scopeVisible, scopedRecords, type MemoryScope } from './memory-scope.js';
 import {
   readRecallRefUtilitySignals,
@@ -449,8 +449,8 @@ export function accountScopeExcludesFromRecall(activeAnchors: EntityAnchors, fac
 function scopeGate(): (hit: MemoryEvidenceHit) => boolean {
   const readScope = currentMemoryReadScope();
   if (readScope === 'unrestricted') return () => true;
-  let facts: Map<string, MemoryScope>;
-  let episodes: Map<string, MemoryScope>;
+  let facts: ReadonlyMap<string, MemoryScope>;
+  let episodes: ReadonlyMap<string, MemoryScope>;
   try {
     facts = scopedRecords('fact');
     episodes = scopedRecords('episode');
@@ -460,12 +460,23 @@ function scopeGate(): (hit: MemoryEvidenceHit) => boolean {
   if (facts.size === 0 && episodes.size === 0) return () => true;
   const factVisible = (id: string | number): boolean => scopeVisible(facts.get(String(id)), readScope);
   const linkedVisible = (ids: number[]): boolean => ids.length === 0 || ids.some(factVisible);
+  // An episode that is the evidence of a fact repeats the fact. It is shown
+  // only when one of the facts it supports may be seen. Read once, and only
+  // for the facts this read may not see.
+  let evidenceOfHiddenOnly: Set<string> | null = null;
+  const supportsOnlyHidden = (episodeId: string | number): boolean => {
+    if (!evidenceOfHiddenOnly) {
+      const hidden = [...facts.keys()].filter((id) => !factVisible(id)).map(Number).filter(Number.isInteger);
+      evidenceOfHiddenOnly = new Set(episodesSupportingOnly(hidden).map(String));
+    }
+    return evidenceOfHiddenOnly.has(String(episodeId));
+  };
   return (hit) => {
     try {
       switch (hit.ref.type) {
         case 'fact':
         case 'policy': return factVisible(hit.ref.id);
-        case 'episode': return scopeVisible(episodes.get(String(hit.ref.id)), readScope);
+        case 'episode': return scopeVisible(episodes.get(String(hit.ref.id)), readScope) && !supportsOnlyHidden(hit.ref.id);
         case 'entity': return linkedVisible(getFactIdsForEntity(hit.ref.id, 200));
         case 'resource': return linkedVisible(getFactIdsForResource(hit.ref.id, 200));
         default: return true;

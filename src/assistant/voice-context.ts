@@ -7,6 +7,7 @@ import { loadWorkingMemoryForSession } from '../memory/working-memory.js';
 import { getSession as getHarnessSession } from '../runtime/harness/eventlog.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import { renderProfileForInstructions } from '../runtime/user-profile.js';
+import { withSessionMemoryScope } from '../memory/memory-scope.js';
 
 function section(title: string, body?: string, maxChars = 1800): string {
   const trimmed = body?.trim();
@@ -54,7 +55,7 @@ export function buildRealtimeVoiceInstructions(sessionId = 'console:home'): stri
   const sessionContinuity = buildVoiceSessionContinuity(sessionId);
   const sessionWorkingMemory = loadWorkingMemoryForSession(sessionId) ?? baseContext.workingMemory;
   const profile = renderProfileForInstructions();
-  const facts = renderFactsForInstructions(8);
+  const facts = withSessionMemoryScope(sessionId, () => renderFactsForInstructions(8));
   const goals = buildVoiceGoalsContext();
 
   return [

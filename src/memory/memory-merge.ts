@@ -3,6 +3,7 @@ import { getRuntimeEnv } from '../config.js';
 import { openMemoryDb, ConsolidatedFactRow } from './db.js';
 import { cosine } from './embeddings.js';
 import { appendHygieneAudit, readHygieneAudit, HygieneAuditEntry } from './hygiene-audit.js';
+import { scopedRecords } from './memory-scope.js';
 
 const logger = pino({ name: 'clementine-next.memory.merge' });
 
@@ -384,11 +385,22 @@ export async function mergeParaphrases(): Promise<MergeStats> {
       anchorsMap.set(fact.id, extractAnchors(fact));
     }
 
-    // Group by kind to avoid cross-kind merges
+    // Group by kind to avoid cross-kind merges, and by what each fact is
+    // kept for: the same sentence learned in a project and known everywhere
+    // are two records, and folding one into the other would take it away
+    // from whoever could see it.
+    // If what facts are kept for cannot be read, nothing is folded tonight.
+    let scopes: ReturnType<typeof scopedRecords>;
+    try { scopes = scopedRecords('fact'); } catch { return stats; }
+    const keptFor = (fact: Fact): string => {
+      const scope = scopes.get(String(fact.id));
+      return scope ? `${scope.projectId ?? ''}\u0000${scope.agentKey ?? ''}` : '';
+    };
     const byKind = new Map<string, Fact[]>();
     for (const fact of factsWithEmbedding) {
-      if (!byKind.has(fact.kind)) byKind.set(fact.kind, []);
-      byKind.get(fact.kind)!.push(fact);
+      const group = `${fact.kind}\u0000${keptFor(fact)}`;
+      if (!byKind.has(group)) byKind.set(group, []);
+      byKind.get(group)!.push(fact);
     }
 
     const mergeAudit: HygieneAuditEntry[] = [];

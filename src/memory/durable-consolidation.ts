@@ -8,6 +8,7 @@ import {
   resolveReflectionCandidateById,
 } from './reflection-candidates.js';
 import { recordMemoryEpisode, selectSupportingExcerpt } from './temporal-memory.js';
+import { EVERYWHERE, memoryScopeOf, type MemoryScope } from './memory-scope.js';
 import { attachGroundedUserPeople, attachGroundedUserProjects } from './grounded-user-entities.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { explicitMemoryNeedsScopeReview, reviewStandingMemory } from './standing-memory-review.js';
@@ -37,6 +38,20 @@ const EXPLICIT_STABLE_CONTEXT_REASONS = new Set([
  * which drops the message exactly as today, or 'standing', which is currently
  * unreachable no matter how plainly the owner states a preference.
  */
+/**
+ * What a memory settled later is kept for: what the conversation was working
+ * in when it was said, which its episode recorded then. The conversation may
+ * have moved to another project by the time this runs.
+ */
+function learnedInScope(kind: ConsolidatedFactKind, episodeId: string | null | undefined): { scope?: MemoryScope } {
+  if (kind === 'user' || kind === 'constraint' || !episodeId) return {};
+  try {
+    return { scope: memoryScopeOf('episode', episodeId) ?? EVERYWHERE };
+  } catch {
+    return {};
+  }
+}
+
 export const UNJUDGED_OWNER_STATEMENT_REASON = 'owner statement — model decides durability';
 
 export interface DurableAutoCaptureCandidate {
@@ -305,7 +320,8 @@ export async function drainDurableConsolidationCandidates(options: {
           excerpt,
           sourceUri: row.source_uri ?? row.episode_source_uri,
         },
-      }, { sessionId: row.session_id }, options.resolver ? { resolver: options.resolver } : {}));
+      }, { sessionId: row.session_id, ...learnedInScope(row.kind, row.episode_id) },
+      options.resolver ? { resolver: options.resolver } : {}));
       const people = attachGroundedUserPeople({
         factId: outcome.factId,
         episodeId: row.episode_id,

@@ -1586,6 +1586,24 @@ test('consolidateActiveFacts (stored embeddings): full-coverage pairwise dedup k
   assert.equal(getFact(c.id)?.active, true, 'the distinct fact C is untouched');
 });
 
+test('consolidateActiveFacts never folds a fact kept for a project into the same sentence kept for everywhere', async () => {
+  resetMemoryDb();
+  _setEmbeddingProviderForTest({ name: 'test', model: 'test', dim: 4, async embed(texts) { return texts.map(() => new Float32Array(4)); } });
+  const db = openMemoryDb();
+  const embed = db.prepare(`INSERT INTO fact_embeddings (fact_id, model, dim, vector, content_hash, created_at)
+                            VALUES (?, 'test', 4, ?, ?, datetime('now'))`);
+  const everywhere = rememberFact({ kind: 'project', content: 'The briefing is due on Monday.', score: 1.0, scope: null });
+  const inProject = rememberFact({ kind: 'project', content: 'The briefing is due on Monday.', score: 1.0,
+    scope: { projectId: 'prj_foldguardaaaaa', agentKey: null } });
+  assert.notEqual(everywhere.id, inProject.id);
+  for (const fact of [everywhere, inProject]) embed.run(fact.id, vectorToBuffer(Float32Array.from([1, 0, 0, 0])), factContentHash(fact.id));
+
+  const res = await consolidateActiveFacts({ useStoredEmbeddings: true, simThreshold: 0.95 });
+  assert.equal(res.merged, 0);
+  assert.equal(getFact(everywhere.id)?.active, true, 'ordinary conversation keeps its fact');
+  assert.equal(getFact(inProject.id)?.active, true);
+});
+
 test('consolidateActiveFacts (entity guard): never folds two facts about DISTINCT entities even at cosine 1.0', async () => {
   resetMemoryDb();
   _setEmbeddingProviderForTest({

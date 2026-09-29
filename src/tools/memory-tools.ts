@@ -1,4 +1,8 @@
-import { scopeOfSession } from '../memory/memory-scope.js';
+import { recordVisible, scopeOfSession } from '../memory/memory-scope.js';
+
+function factMayBeSeen(id: number): boolean {
+  return recordVisible('fact', id);
+}
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -764,7 +768,9 @@ export function registerMemoryTools(server: McpServer): void {
             ...(inferredSource ? { derivedFrom: inferredSource } : {}),
             ...(keepFor === 'everywhere'
               ? { scope: null }
-              : keepFor === 'here'
+              // A rule, or something true of the owner, holds everywhere. It is
+              // narrowed to one project only by the owner, in Memory.
+              : keepFor === 'here' && kind !== 'constraint' && kind !== 'user'
                 ? { scope: scopeOfSession(effectiveSessionId) ?? null }
                 : {}),
           },
@@ -1063,6 +1069,10 @@ export function registerMemoryTools(server: McpServer): void {
       id: z.number().int().positive(),
     },
     async ({ id }) => {
+      // Only what this conversation may see is brought back from it.
+      if (!factMayBeSeen(id)) {
+        return textResult(`Could not restore fact #${id} — it is either already active or was hard-deleted.`);
+      }
       const ok = reactivateFact(id);
       if (ok) bumpStableContextGeneration();
       const fact = ok ? getFact(id) : null;

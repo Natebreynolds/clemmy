@@ -9,7 +9,7 @@ import {
   type ConsolidatedFactRow,
 } from './db.js';
 import {
-  EVERYWHERE, currentMemoryReadScope, currentMemoryWriteScope, isEverywhere, memoryScopeOf, recordVisible, sameScope,
+  EVERYWHERE, currentMemoryReadScope, currentMemoryWriteScope, hiddenFromScope, isEverywhere, memoryScopeOf, recordVisible, sameScope,
   scopeHashSuffix, scopeOfSession, scopedRecords, stampMemoryScope, visibleInScope, type MemoryScope,
 } from './memory-scope.js';
 import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadArchivedFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
@@ -476,7 +476,10 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
     ? JSON.stringify(input.derivedFromFactIds.filter((n) => Number.isInteger(n)))
     : null;
 
-  const info = db.prepare(`
+  // The row and what it is kept for are written together: a row that was
+  // hashed for a scope and never stamped would read as being for everywhere.
+  const info = db.transaction(() => {
+    const written = db.prepare(`
     INSERT INTO consolidated_facts
       (kind, content, content_hash, source_session_id, source_path,
        score, active, created_at, updated_at,
@@ -490,11 +493,16 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
          dfSession, dfCall, dfTool, trust, extractedAt, importance,
          derivationDepth, derivedFromIdsJson, input.sourceApp ?? null, autoPin,
          input.occurredAt ?? now, trust);
+    if (!isEverywhere(scope)) {
+      stampMemoryScope('fact', Number(written.lastInsertRowid), scope,
+        { sessionId: input.derivedFrom?.sessionId ?? input.sessionId ?? null });
+    }
+    return written;
+  })();
 
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;
   const insertedFact = rowToFact(inserted);
-  keepScope(insertedFact, scope, input);
   syncMemoryPolicyForFact(insertedFact.id);
   captureEvidenceBestEffort(insertedFact, input);
   captureDirectFactEntityLinksBestEffort(insertedFact, input);
@@ -579,7 +587,8 @@ export function updateFact(
   let newHash = existing.content_hash;
   if (typeof patch.content === 'string' && patch.content.trim() && patch.content !== existing.content) {
     newContent = normalizeContent(patch.content);
-    newHash = hashContent(existing.kind, newContent);
+    // Edited where it is kept: the same sentence learned elsewhere is another record.
+    newHash = hashContent(existing.kind, newContent, factScope(existing.id));
   }
   const newTrust = typeof patch.trustLevel === 'number'
     ? Math.max(existing.trust_level ?? 0, Math.min(1, patch.trustLevel))
@@ -673,8 +682,8 @@ export function findActiveFactsByContentPrefix(kind: ConsolidatedFactKind, prefi
     SELECT * FROM consolidated_facts
      WHERE active = 1 AND kind = ? AND lower(substr(content, 1, ?)) = ?
      ORDER BY id DESC LIMIT ?
-  `).all(kind, lead.length, lead, Math.max(1, Math.min(50, limit))) as ConsolidatedFactRow[];
-  return visibleInScope('fact', rows.map(rowToFact), (fact) => fact.id);
+  `).all(kind, lead.length, lead, reach(Math.max(1, Math.min(50, limit)))) as ConsolidatedFactRow[];
+  return visibleInScope('fact', rows.map(rowToFact), (fact) => fact.id).slice(0, Math.max(1, Math.min(50, limit)));
 }
 
 /**
@@ -683,6 +692,12 @@ export function findActiveFactsByContentPrefix(kind: ConsolidatedFactKind, prefi
  * scope by the owner's own act. When scopes cannot be read every rule
  * applies.
  */
+/** How many rows to ask the store for so that `wanted` are left once the
+ * ones kept for someone else are taken out. */
+function reach(wanted: number): number {
+  return wanted + hiddenFromScope('fact');
+}
+
 function rulesInScope<T extends { id: number }>(rows: readonly T[]): T[] {
   return visibleInScope('fact', rows, (row) => row.id, currentMemoryReadScope(), 'everything');
 }
@@ -700,7 +715,7 @@ export function factScope(id: number): MemoryScope {
 export function factScopes(ids: readonly number[]): Map<number, MemoryScope> {
   const found = new Map<number, MemoryScope>();
   if (ids.length === 0) return found;
-  let scoped: Map<string, MemoryScope>;
+  let scoped: ReadonlyMap<string, MemoryScope>;
   try { scoped = scopedRecords('fact'); } catch { return found; }
   for (const id of ids) found.set(id, scoped.get(String(id)) ?? EVERYWHERE);
   return found;
@@ -709,7 +724,7 @@ export function factScopes(ids: readonly number[]): Map<number, MemoryScope> {
 /** The facts out of a list that are for exactly this scope and no other. */
 export function factsInExactScope(facts: readonly ConsolidatedFact[], scope: MemoryScope | null | undefined): ConsolidatedFact[] {
   if (facts.length === 0) return [];
-  let scoped: Map<string, MemoryScope>;
+  let scoped: ReadonlyMap<string, MemoryScope>;
   try { scoped = scopedRecords('fact'); } catch { return []; }
   return facts.filter((fact) => sameScope(scoped.get(String(fact.id)) ?? EVERYWHERE, scope ?? EVERYWHERE));
 }
@@ -1034,8 +1049,8 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
          AND f.active = 1
        ORDER BY fts_rank
        LIMIT ?
-    `).all(match, Math.max(1, limit) * 4) as (ConsolidatedFactRow & { fts_rank: number })[];
-    const readable = visibleInScope('fact', found, (row) => row.id);
+    `).all(match, reach(Math.max(1, limit) * 4)) as (ConsolidatedFactRow & { fts_rank: number })[];
+    const readable = visibleInScope('fact', found, (row) => row.id).slice(0, Math.max(1, limit) * 4);
     // Only when every match was for someone else does the fallback below
     // run; it is held to the same scope.
     const rows = found.length > 0 && readable.length === 0 ? [] : readable;
@@ -1307,8 +1322,8 @@ export function listRecentlyLearnedFacts(options: { sinceHours?: number; limit?:
       AND extracted_at >= ?
     ORDER BY importance DESC, extracted_at DESC, id DESC
     LIMIT ?
-  `).all(since, limit) as ConsolidatedFactRow[];
-  return visibleInScope('fact', rows, (row) => row.id).map(rowToFact);
+  `).all(since, reach(limit)) as ConsolidatedFactRow[];
+  return visibleInScope('fact', rows, (row) => row.id).slice(0, limit).map(rowToFact);
 }
 
 /**
@@ -1614,14 +1629,14 @@ export function listActiveFacts(options: {
         WHERE active = 1 AND kind = ?
         ORDER BY score DESC, updated_at DESC
         LIMIT ?
-      `).all(options.kind, limit) as ConsolidatedFactRow[]
+      `).all(options.kind, reach(limit)) as ConsolidatedFactRow[]
     : db.prepare(`
         SELECT * FROM consolidated_facts
         WHERE active = 1
         ORDER BY score DESC, updated_at DESC
         LIMIT ?
-      `).all(limit) as ConsolidatedFactRow[];
-  return visibleInScope('fact', rows, (row) => row.id).map(rowToFact);
+      `).all(reach(limit)) as ConsolidatedFactRow[];
+  return visibleInScope('fact', rows, (row) => row.id).slice(0, limit).map(rowToFact);
 }
 
 export function listAllFacts(limit = 50, kind?: ConsolidatedFactKind): ConsolidatedFact[] {
@@ -1632,13 +1647,19 @@ export function listAllFacts(limit = 50, kind?: ConsolidatedFactKind): Consolida
         WHERE kind = ?
         ORDER BY active DESC, score DESC, updated_at DESC
         LIMIT ?
-      `).all(kind, limit) as ConsolidatedFactRow[]
+      `).all(kind, reach(limit)) as ConsolidatedFactRow[]
     : db.prepare(`
         SELECT * FROM consolidated_facts
         ORDER BY active DESC, score DESC, updated_at DESC
         LIMIT ?
-      `).all(limit) as ConsolidatedFactRow[];
-  return visibleInScope('fact', rows, (row) => row.id).map(rowToFact);
+      `).all(reach(limit)) as ConsolidatedFactRow[];
+  return visibleInScope('fact', rows, (row) => row.id).slice(0, limit).map(rowToFact);
+}
+
+/** For a caller that has already decided the record may be seen. */
+function getFactWhateverItsScope(id: number): ConsolidatedFact | null {
+  const row = openMemoryDb().prepare('SELECT * FROM consolidated_facts WHERE id = ?').get(id) as ConsolidatedFactRow | undefined;
+  return row ? rowToFact(row) : null;
 }
 
 export function getFact(id: number): ConsolidatedFact | null {
@@ -1834,8 +1855,8 @@ export function listPinnedFacts(limit = 12): ConsolidatedFact[] {
     WHERE active = 1 AND pinned = 1
     ORDER BY COALESCE(importance, 5) DESC, updated_at DESC
     LIMIT ?
-  `).all(Math.max(1, limit)) as ConsolidatedFactRow[];
-  return rulesInScope(rows).map(rowToFact);
+  `).all(reach(Math.max(1, limit))) as ConsolidatedFactRow[];
+  return rulesInScope(rows).slice(0, Math.max(1, limit)).map(rowToFact);
 }
 
 /** List every active legacy constraint-shaped instruction for prompt context
@@ -1851,9 +1872,10 @@ export function listConstraints(limit?: number): ConsolidatedFact[] {
     WHERE active = 1 AND kind = 'constraint'
     ORDER BY COALESCE(importance, 5) DESC, updated_at DESC`;
   const rows = (typeof limit === 'number'
-    ? db.prepare(`${base} LIMIT ?`).all(Math.max(1, limit))
+    ? db.prepare(`${base} LIMIT ?`).all(reach(Math.max(1, limit)))
     : db.prepare(base).all()) as ConsolidatedFactRow[];
-  return rulesInScope(rows).map(rowToFact);
+  const inScope = rulesInScope(rows);
+  return (typeof limit === 'number' ? inScope.slice(0, Math.max(1, limit)) : inScope).map(rowToFact);
 }
 
 /**
@@ -1968,7 +1990,10 @@ interface PromptPolicies {
  *  own deterministic order. */
 function loadPromptPolicies(): PromptPolicies {
   try {
-    const policies = listMemoryPolicies().slice(0, POLICY_RUNAWAY_CAP);
+    // A standing rule that cannot be checked against a scope still applies.
+    const policies = listMemoryPolicies()
+      .filter((policy) => recordVisible('fact', policy.fact_id, currentMemoryReadScope(), 'everything'))
+      .slice(0, POLICY_RUNAWAY_CAP);
     return {
       policyTypeByFactId: new Map(policies.map((policy) => [policy.fact_id, policy.policy_type])),
       enforcementByFactId: new Map(policies.map((policy) => [policy.fact_id, policy.enforcement])),
@@ -1978,7 +2003,7 @@ function loadPromptPolicies(): PromptPolicies {
           try { return JSON.parse(policy.applies_to_json)?.deterministic === true; } catch { return false; }
         })
         .map((policy) => policy.fact_id)),
-      pinned: policies.map((policy) => getFact(policy.fact_id)).filter((fact): fact is ConsolidatedFact => Boolean(fact)),
+      pinned: policies.map((policy) => getFactWhateverItsScope(policy.fact_id)).filter((fact): fact is ConsolidatedFact => Boolean(fact)),
     };
   } catch {
     // Partially migrated fallback: keep prompt assembly available, but never

@@ -167,3 +167,33 @@ test('an agent deleted and saved again under the same name starts with nothing t
     assert.equal(scope.withSessionMemoryScope(after, () => facts.searchFactsByText('reports two hundred words', 5)).length, 0);
   }
 });
+
+test('a request keeps the project it began in when the conversation is moved while it runs', async () => {
+  const { _forgetPinnedMemoryScopesForTests } = await import('./memory-scope-binding.js');
+  _forgetPinnedMemoryScopesForTests();
+  const moving = conversation('scope-moving-in-flight', { project: sales.id });
+  const run = { sessionId: moving, sourceUserSeq: 7, counter: { count: 0 } } as never;
+  harnessRunContextStorage.run(run, () => {
+    assert.equal((scope.currentMemoryReadScope() as { projectId: string | null }).projectId, sales.id);
+    assert.equal(setSessionProject(moving, hiring.id, { by: 'owner' }).ok, true);
+    assert.equal((scope.currentMemoryReadScope() as { projectId: string | null }).projectId, sales.id, 'the request in flight stays where it began');
+    const learned = facts.rememberFact({ kind: 'reference', content: 'Moving: the quarter closes on the fifth.', sessionId: moving });
+    assert.equal(facts.factScope(learned.id).projectId, sales.id);
+  });
+  // The next request works in the new project.
+  harnessRunContextStorage.run({ sessionId: moving, sourceUserSeq: 9, counter: { count: 0 } } as never, () => {
+    assert.equal((scope.currentMemoryReadScope() as { projectId: string | null }).projectId, hiring.id);
+  });
+});
+
+test('work moved to the background stays in the project and with the agent of its conversation', async () => {
+  const { inheritedTaskDelegation } = await import('../../projects/inherited-delegation.js');
+  assert.equal(inheritedTaskDelegation(plain), null, 'a conversation in no project and no agent hands on nothing');
+  assert.deepEqual(inheritedTaskDelegation(clemInSales, 4), { agentId: null, agentName: null, agentCreatedAt: null,
+    projectId: sales.id, projectName: 'Scope Sales', assignedBy: 'clem', originSourceUserSeq: 4 });
+  const both = inheritedTaskDelegation(analystInSales);
+  assert.deepEqual([both?.agentId, both?.projectId, both?.assignedBy], [analyst.id, sales.id, 'owner']);
+  const alone = inheritedTaskDelegation(analystAlone);
+  assert.deepEqual([alone?.agentId, alone?.projectId], [analyst.id, null]);
+  assert.equal(inheritedTaskDelegation('no-such-session'), null);
+});

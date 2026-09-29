@@ -15,6 +15,7 @@ import { renderActiveBackgroundWorkForInstructions } from '../execution/backgrou
 import { findCatalogEntry, readConnectedClis } from '../integrations/cli-catalog/catalog.js';
 import { readPersistedHealth } from '../integrations/cli-catalog/auth-health.js';
 import type { MessageIntent } from './message-intent.js';
+import { withSessionMemoryScope } from '../memory/memory-scope.js';
 
 
 /**
@@ -281,6 +282,16 @@ export function buildAssistantInstructions(
   message?: string,
   sessionId?: string,
 ): string {
+  return withSessionMemoryScope(sessionId, () => buildAssistantInstructionsInScope(context, channel, intent, message, sessionId));
+}
+
+function buildAssistantInstructionsInScope(
+  context: MemoryContext,
+  channel?: string,
+  intent?: MessageIntent,
+  message?: string,
+  sessionId?: string,
+): string {
   const owner = OWNER_NAME || 'the user';
   const channelDirective = renderChannelDirective(channel);
   const actionDirective = renderActionDisciplineDirective(intent, message);
@@ -409,6 +420,15 @@ export function buildAssistantInstructions(
  * these by intent so casual turns skip them; Step 1 includes them every turn.)
  */
 export function buildTurnContextBlock(
+  context: MemoryContext,
+  intent?: MessageIntent,
+  message?: string,
+  sessionId?: string,
+): string {
+  return withSessionMemoryScope(sessionId, () => buildTurnContextBlockInScope(context, intent, message, sessionId));
+}
+
+function buildTurnContextBlockInScope(
   context: MemoryContext,
   intent?: MessageIntent,
   message?: string,

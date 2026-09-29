@@ -4,6 +4,7 @@ import { extractJsonCandidate } from './json-repair.js';
 import { openEventLog } from './eventlog.js';
 import { renderFactsForInstructions } from '../../memory/facts.js';
 import type { ApprovalCallPreview } from './approval-call-preview.js';
+import { withSessionMemoryScope } from '../../memory/memory-scope.js';
 
 /**
  * Check an outgoing action against the owner's standing rules before its
@@ -134,7 +135,9 @@ export async function approvalPrecheck(input: {
     ...input.preview.fields.map((field) => `${field.name}: ${field.label ? `${field.label} (${field.value})` : field.value}`),
   ].join('\n');
   let ownerRules = '';
-  try { ownerRules = renderFactsForInstructions(12, 2_400, content, 'all'); } catch { ownerRules = ''; }
+  try {
+    ownerRules = withSessionMemoryScope(input.sessionId, () => renderFactsForInstructions(12, 2_400, content, 'all'));
+  } catch { ownerRules = ''; }
   try {
     const raw = await (runOverride ?? runWithCheckerModel)({
       content,

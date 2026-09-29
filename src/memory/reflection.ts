@@ -21,7 +21,7 @@ import {
   type ConsolidatedFact,
   defaultFactWriteScope,
 } from './facts.js';
-import { EVERYWHERE, withMemorySettledFor, type MemoryScope } from './memory-scope.js';
+import { EVERYWHERE, sameScope, scopedRecords, visibleInScope, withMemorySettledFor, type MemoryScope } from './memory-scope.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
 import { attachGroundedFactResources, recordGroundedEntityRelationship, resolveGroundedEntityIdsForText, setFactEntityLinks } from './relations.js';
@@ -3203,7 +3203,7 @@ export async function runRecursiveReflection(
 
   let producedAnything = false;
   for (const kind of kinds) {
-    const rows = db.prepare(`
+    const candidates = db.prepare(`
       SELECT * FROM consolidated_facts
       WHERE active = 1
         AND kind = ?
@@ -3211,7 +3211,13 @@ export async function runRecursiveReflection(
         AND updated_at >= ?
       ORDER BY updated_at DESC
       LIMIT ?
-    `).all(kind, RECURSIVE_REFLECTION_MAX_DEPTH, sinceIso, RECURSIVE_REFLECTION_MAX_GROUP_SIZE) as ConsolidatedFactRow[];
+    `).all(kind, RECURSIVE_REFLECTION_MAX_DEPTH, sinceIso, RECURSIVE_REFLECTION_MAX_GROUP_SIZE + scopedRecords('fact').size) as ConsolidatedFactRow[];
+    // A pattern is drawn only from what is known everywhere, and is kept for
+    // everywhere. What was learned inside a project or by one agent is not
+    // generalised out of it here: its sentences would be copied into the
+    // pattern's evidence and its content into the pattern.
+    const rows = visibleInScope('fact', candidates, (row) => row.id, { ...EVERYWHERE, exact: true })
+      .slice(0, RECURSIVE_REFLECTION_MAX_GROUP_SIZE);
 
     if (rows.length < RECURSIVE_REFLECTION_MIN_GROUP_SIZE) {
       result.groupsSkipped += 1;
@@ -3403,6 +3409,9 @@ export async function consolidateActiveFacts(
   const db = openMemoryDb();
   const kinds: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference'];
   const folded = new Set<number>();
+  // If what facts are kept for cannot be read, nothing is folded tonight.
+  let keptFor: ReturnType<typeof scopedRecords>;
+  try { keptFor = scopedRecords('fact'); } catch { return result; }
 
   if (useStored) {
     for (const kind of kinds) {
@@ -3439,6 +3448,8 @@ export async function consolidateActiveFacts(
           if (folded.has(b.id)) continue;
           const vb = vecs.get(b.id);
           if (!vb || cosine(va, vb) < simThreshold) continue;
+          // Kept for different scopes: two records, never one.
+          if (!sameScope(keptFor.get(String(a.id)), keptFor.get(String(b.id)))) continue;
           // Entity guard — subtractive (only ever PREVENTS a fold), no recall regression.
           if (!canMergeEntitySafe(anchorsById.get(a.id)!, anchorsById.get(b.id)!)) continue;
           // Keep the higher-scored fact (tie → larger id = newer); drop the other.
@@ -3476,6 +3487,7 @@ export async function consolidateActiveFacts(
         if (s.fact.id === row.id || folded.has(s.fact.id)) continue;
         // scored is cosine-desc; once below the bar, no later one qualifies.
         if (s.sim === null || s.sim < simThreshold) break;
+        if (!sameScope(keptFor.get(String(row.id)), keptFor.get(String(s.fact.id)))) continue;
         // Entity guard — never fold across distinct entities even at high cosine.
         if (!canMergeEntitySafe(extractAnchors(row), extractAnchors(s.fact))) continue;
 

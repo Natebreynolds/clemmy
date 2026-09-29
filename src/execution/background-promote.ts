@@ -37,6 +37,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { getActiveObjectiveForSession } from '../memory/focus.js';
 import { getActiveGoalForSession, bindBackgroundRunGoal } from '../agents/plan-proposals.js';
+import { inheritedTaskDelegation } from '../projects/inherited-delegation.js';
 import { effectiveTurnObjective } from '../runtime/harness/turn-control.js';
 import { checkpointCapsule, endHandoff, projectCapsuleFromDurableState, stepHandoff } from './continuation-capsule.js';
 import { handoffRank, reservedBackgroundTaskId } from './handoff-store.js';
@@ -387,6 +388,11 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
       if (goalObjective) title = deriveTitle(goalObjective) || title;
     } catch { /* raw-message title stands */ }
   }
+  // Work started in a project, or in a conversation with an agent, stays
+  // there when it moves to the background, whichever path moved it.
+  const delegation = input.delegation
+    ?? inheritedTaskDelegation(input.sessionId, input.foregroundHandoff?.sourceUserSeq)
+    ?? undefined;
   const task = createBackgroundTask({
     title,
     prompt,
@@ -409,7 +415,7 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     // runs on the model its caller resolved for it (the agent's own, or the
     // helper role), never silently on the brain the owner is talking to.
     model: input.model ?? resolveRoleModel('brain').modelId,
-    ...(input.delegation ? { delegation: input.delegation } : {}),
+    ...(delegation ? { delegation } : {}),
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',
   });
