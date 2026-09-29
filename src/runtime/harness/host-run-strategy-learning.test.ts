@@ -153,3 +153,42 @@ test('a provider carrier\'s own arguments, serialized once more inside the envel
   assert.deepEqual(shapes, [{ tool: 'samplemail_search_messages', shape: '{"tool_slug":"SAMPLEMAIL_SEARCH_MESSAGES","arguments":{"query":"string","top":"number"}}' }]);
   assert.doesNotMatch(JSON.stringify(shapes), /Dana Lee/, 'the person\'s name is a value, not a role');
 });
+
+test('the part each operation played is read from the order and effect of its settled calls', async () => {
+  const shadow = await import('../graph/turn-graph-shadow.js');
+  const dispatch = await import('./dispatch-ledger.js');
+  const identities = await import('./attempt-identity.js');
+  const outcomes = await import('./attempt-outcome.js');
+  const store = await import('./logical-call-settlement-store.js');
+  const { provenStepsForSource } = await import('./host-run-strategy-learning.js');
+  const session = createSession({ id: 'steps-learning', kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'post the digest and confirm it landed' } });
+  assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 } }));
+  const task = { sessionId: session.id, sourceUserSeq: source.seq, acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq) };
+  const settle = (id: string, tool: string, mutating: boolean, failed = false) => {
+    const started = dispatch.beginPhysicalDispatch({ identity: { ...task, logicalToolCallId: id, physicalDispatchId: `${id}:1`, ordinal: 0 }, tool, args: { id } });
+    assert.equal(started.status, 'inserted');
+    if (started.status !== 'inserted') return;
+    assert.equal(dispatch.settlePhysicalDispatch({ identity: started.identity, tool, outcome: 'returned' }).status, 'inserted');
+    assert.equal(store.commitLogicalCallSettlement({
+      identity: { ...task, logicalToolCallId: id }, contract: { toolName: tool, args: { id } },
+      execution: { kind: 'provider_execution' }, result: { payload: { ok: !failed } },
+      outcome: outcomes.classifyAttemptOutcome(failed ? { argumentValidationFailed: true } : { envelopeSuccessful: true }),
+      recovery: { businessCall: true, mutating }, observer: { lane: 'byo', turn: 1 },
+    }).status, 'committed');
+  };
+  settle('lc-1', 'deskscope__find_channel', false);
+  settle('lc-2', 'deskscope__read_channel', false);
+  settle('lc-3', 'deskscope__post_message', true, true);   // refused: not a change that happened
+  settle('lc-4', 'deskscope__post_message', true);
+  settle('lc-5', 'deskscope__read_channel', false);
+  const tools = ['deskscope__find_channel', 'deskscope__read_channel', 'deskscope__post_message'];
+  assert.deepEqual(provenStepsForSource({ sessionId: session.id, sourceUserSeq: source.seq }, tools), [
+    { tool: 'deskscope__find_channel', role: 'prepare' },
+    { tool: 'deskscope__read_channel', role: 'prepare' },
+    { tool: 'deskscope__post_message', role: 'effect' },
+    { tool: 'deskscope__read_channel', role: 'verify' },
+  ], 'the same read before and after the change played two parts; a refused change is not a change');
+  assert.deepEqual(provenStepsForSource({ sessionId: session.id, sourceUserSeq: source.seq }, ['deskscope__find_channel']), [],
+    'with no change among the learned tools there are no parts to tell apart');
+});

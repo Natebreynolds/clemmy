@@ -29,11 +29,27 @@ export interface ProvenCallShape {
   shape: string;
 }
 
+/** What an operation did in a proven run, read from the order and effect of
+ * its settled calls: it ran before the change, made the change, or ran after
+ * the change and read back what was changed. */
+export type ProvenStepRole = 'prepare' | 'effect' | 'verify';
+
+export interface ProvenStep {
+  tool: string;
+  role: ProvenStepRole;
+}
+
 export interface RunStrategyRecord {
   id: string;
   objective: string;
   keywords: string[];
   toolsUsed: string[];
+  /** The part each operation played. A run that reuses a strategy inherits
+   *  its steps: leaving one out is a choice the brain has to make knowingly,
+   *  never something a shorter run quietly teaches (live 2026-09-28: a run
+   *  that read its write back taught two tools with no roles, and the next
+   *  run under it skipped the readback). */
+  provenSteps?: ProvenStep[];
   /** Request shapes that succeeded when this strategy was learned. Live
    *  2026-09-24 (source 299146): a generic MCP passthrough was re-called with
    *  `targets` after `target` had already succeeded and paid an invalid-field
@@ -70,6 +86,38 @@ interface StrategyFile {
 const STORE_FILE = path.join(BASE_DIR, 'state', 'run-strategies.json');
 const MAX_PROVEN_SHAPES = 8;
 const MAX_SHAPE_CHARS = 400;
+
+const MAX_PROVEN_STEPS = 12;
+const STEP_ORDER: Record<ProvenStepRole, number> = { prepare: 0, effect: 1, verify: 2 };
+
+/** Steps accumulate: a later run that did less does not erase what an earlier
+ *  proven run did. Ordered prepare, effect, verify. */
+function mergeProvenSteps(
+  existing: readonly ProvenStep[] | undefined,
+  incoming: readonly ProvenStep[] | undefined,
+): ProvenStep[] {
+  const out: ProvenStep[] = [];
+  const seen = new Set<string>();
+  for (const row of [...(existing ?? []), ...(incoming ?? [])]) {
+    const tool = String(row?.tool ?? '').trim();
+    const role = row?.role;
+    if (!tool || (role !== 'prepare' && role !== 'effect' && role !== 'verify')) continue;
+    const key = `${tool}\u0000${role}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ tool, role });
+  }
+  return out.sort((left, right) => STEP_ORDER[left.role] - STEP_ORDER[right.role]).slice(0, MAX_PROVEN_STEPS);
+}
+
+/** One sentence on how a proven run checked its own work; null when it made
+ *  no change or did not read it back. Names operations only. */
+export function describeProvenVerification(steps: readonly ProvenStep[] | undefined): string | null {
+  const effects = [...new Set((steps ?? []).filter((row) => row.role === 'effect').map((row) => row.tool))];
+  const checks = [...new Set((steps ?? []).filter((row) => row.role === 'verify').map((row) => row.tool))];
+  if (effects.length === 0 || checks.length === 0) return null;
+  return `The proven run made its change with ${effects.join(', ')} and then read it back with ${checks.join(', ')}. Read this request's change back the same way before saying it is done.`;
+}
 
 function mergeProvenShapes(
   existing: readonly ProvenCallShape[] | undefined,
@@ -275,6 +323,10 @@ export interface RecordRunStrategyInput {
   objective: string;
   toolsUsed: string[];
   provenShapes?: ProvenCallShape[];
+  provenSteps?: ProvenStep[];
+  /** The remembered strategy this run was handed before its first frame. A
+   *  run that worked within it is one more use of it, whatever its wording. */
+  reusedStrategyId?: string;
   workerCount: number;
   durationMs: number;
   deliverable?: string;
@@ -313,6 +365,29 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
   const scope: RunStrategyScope = input.scope ?? runStrategyScopeForSession(input.learningReceipt.sessionId);
   // Evidence accumulates within a scope only: a step that restates a chat
   // request must not inflate the chat strategy's proof, or the reverse.
+  // A run handed a remembered strategy, that used nothing outside it, is that
+  // strategy at work again. Recording it as a strategy of its own would split
+  // the evidence and let the thinner of two runs be the one recalled.
+  const reused = input.reusedStrategyId
+    ? file.strategies.find((s) => s.id === input.reusedStrategyId && scopeOf(s) === scope
+      && toolsUsed.every((tool) => s.toolsUsed.some((known) => known.toLowerCase() === tool.toLowerCase())))
+    : undefined;
+  if (reused) {
+    if (isValidLearningReceipt(reused.learningReceipt, { target: 'strategy' })
+      && reused.learningReceipt.sessionId === input.learningReceipt.sessionId
+      && reused.learningReceipt.sourceId === input.learningReceipt.sourceId) return reused;
+    const wasVerified = isValidLearningReceipt(reused.learningReceipt, { target: 'strategy' });
+    // Its own request, tools and steps stand; this run adds proof and shapes.
+    reused.provenShapes = mergeProvenShapes(reused.provenShapes, input.provenShapes);
+    const steps = mergeProvenSteps(reused.provenSteps, input.provenSteps);
+    if (steps.length) reused.provenSteps = steps;
+    if (!wasVerified && reused.uses > 0) reused.legacyUses = reused.uses;
+    reused.uses = wasVerified ? reused.uses + 1 : 1;
+    reused.lastUsedAt = now;
+    reused.learningReceipt = input.learningReceipt;
+    writeStore(file);
+    return reused;
+  }
   const existing = file.strategies.find((s) => scopeOf(s) === scope && overlapScore(keywords, s.keywords) >= 0.8);
   if (existing) {
     // Close the write-before-learning-event crash window as well. Replaying
@@ -326,6 +401,10 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     existing.keywords = keywords;
     existing.toolsUsed = toolsUsed;
     existing.provenShapes = mergeProvenShapes(existing.provenShapes, input.provenShapes);
+    {
+      const steps = mergeProvenSteps(existing.provenSteps, input.provenSteps);
+      if (steps.length) existing.provenSteps = steps;
+    }
     existing.workerCount = input.workerCount;
     existing.durationMs = input.durationMs;
     if (input.deliverable?.trim()) existing.deliverable = input.deliverable.trim().slice(0, 240);
@@ -342,6 +421,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     keywords,
     toolsUsed,
     ...(mergeProvenShapes(undefined, input.provenShapes).length ? { provenShapes: mergeProvenShapes(undefined, input.provenShapes) } : {}),
+    ...(mergeProvenSteps(undefined, input.provenSteps).length ? { provenSteps: mergeProvenSteps(undefined, input.provenSteps) } : {}),
     workerCount: Math.max(0, Math.round(input.workerCount)),
     durationMs: Math.max(0, Math.round(input.durationMs)),
     ...(input.deliverable?.trim() ? { deliverable: input.deliverable.trim().slice(0, 240) } : {}),
@@ -370,7 +450,8 @@ function renderOne(s: RunStrategyRecord): string {
     const roles = describeProvenShapeRoles(s.provenShapes, tool);
     return roles ? `${tool} (${roles})` : tool;
   });
-  return `- Prior verified run (candidate only; confirm it fits this request) used: ${tools.join('; ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}. Use this request's own targets and values.`;
+  const verification = describeProvenVerification(s.provenSteps);
+  return `- Prior verified run (candidate only; confirm it fits this request) used: ${tools.join('; ')} · ${shape} · ~${minutes} min${s.uses > 1 ? ` · proven ${s.uses}×` : ''}. Use this request's own targets and values.${verification ? ` ${verification}` : ''}`;
 }
 
 export interface MatchedRunStrategy {

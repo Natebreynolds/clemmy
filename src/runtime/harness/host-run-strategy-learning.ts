@@ -14,7 +14,7 @@ import {
   evaluateLearningCandidate,
   recordLearningDecision,
 } from '../../memory/learning-receipt.js';
-import { recordRunStrategy, runStrategyScopeForSession, shapeOfProvenArguments, type ProvenCallShape } from '../../memory/run-strategy-store.js';
+import { recordRunStrategy, runStrategyScopeForSession, shapeOfProvenArguments, type ProvenCallShape, type ProvenStep } from '../../memory/run-strategy-store.js';
 import { actionTopologyRoleFor, TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { TOOL_SEARCH_ALWAYS_LOADED } from '../../agents/tool-catalog.js';
 
@@ -103,6 +103,57 @@ export function provenCallShapesForSource(
   }
 }
 
+/** The part each learned operation played, from the order and effect of the
+ * settled successful calls: before the first change, the change, or after a
+ * change. A run that changed nothing has no steps to tell apart. */
+export function provenStepsForSource(
+  input: { sessionId: string; sourceUserSeq: number },
+  toolsUsed: readonly string[],
+): ProvenStep[] {
+  if (toolsUsed.length === 0) return [];
+  try {
+    const wanted = new Set(toolsUsed);
+    const settled = (openEventLog().prepare(`
+      SELECT l.tool_name AS toolName, s.mutating AS mutating
+        FROM logical_call_settlements s
+        JOIN logical_tool_calls l
+          ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+       WHERE s.session_id = ? AND s.source_user_seq = ?
+         AND s.outcome_kind IN ('succeeded', 'empty_result')
+       ORDER BY s.rowid
+    `).all(input.sessionId, input.sourceUserSeq) as Array<{ toolName: string; mutating: number }>)
+      .filter((row) => wanted.has(row.toolName));
+    const firstChange = settled.findIndex((row) => Boolean(row.mutating));
+    if (firstChange < 0) return [];
+    const steps: ProvenStep[] = [];
+    const seen = new Set<string>();
+    settled.forEach((row, index) => {
+      const role = row.mutating ? 'effect' as const : index < firstChange ? 'prepare' as const : 'verify' as const;
+      const key = `${row.toolName}\u0000${role}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      steps.push({ tool: row.toolName, role });
+    });
+    return steps;
+  } catch {
+    return [];
+  }
+}
+
+/** The remembered strategy the host handed this source before its first
+ * frame, from the host's own selection record. */
+function reusedStrategyForSource(input: { sessionId: string; sourceUserSeq: number }): string | undefined {
+  try {
+    const selected = listEvents(input.sessionId, { types: ['proven_operation_selected'] })
+      .filter((event) => event.data.sourceUserSeq === input.sourceUserSeq).at(-1);
+    const id = selected?.data.strategyId;
+    return typeof id === 'string' && id.startsWith('strat-') ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function durationMsForSource(input: { sessionId: string; sourceUserSeq: number }): number {
   try {
     const start = listEvents(input.sessionId, {
@@ -167,10 +218,14 @@ export function learnHostRunStrategyForAcceptedTask(input: {
     return { status: 'not_proven', reason: decision.reasons.join('; ') || 'ineligible' };
   }
   const provenShapes = provenCallShapesForSource(input, toolsUsed);
+  const provenSteps = provenStepsForSource(input, toolsUsed);
+  const reusedStrategyId = reusedStrategyForSource(input);
   const recorded = recordRunStrategy({
     objective,
     toolsUsed,
     ...(provenShapes.length ? { provenShapes } : {}),
+    ...(provenSteps.length ? { provenSteps } : {}),
+    ...(reusedStrategyId ? { reusedStrategyId } : {}),
     scope: runStrategyScopeForSession(input.sessionId),
     workerCount: 0,
     durationMs: durationMsForSource(input),
@@ -190,6 +245,10 @@ export function learnHostRunStrategyForAcceptedTask(input: {
         status,
         toolsUsed,
         provenShapes: provenShapes.length,
+        ...(provenSteps.length ? { provenSteps } : {}),
+        // The record this run added its proof to, when it was not its own.
+        strategyId: recorded.id,
+        ...(reusedStrategyId && recorded.id === reusedStrategyId ? { reinforced: true } : {}),
         objective: objective.slice(0, 240),
       },
     });

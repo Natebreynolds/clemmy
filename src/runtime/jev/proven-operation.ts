@@ -8,7 +8,7 @@ import {
   isCurrentCallableCatalogEntry,
   peekHostCapabilityCatalogFactory,
 } from '../harness/host-capability-catalog-factory.js';
-import { strategyRestatesRequest, STRATEGY_COVERAGE_MIN_OVERLAP, listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyCoversRequest, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
+import { describeProvenVerification, strategyRestatesRequest, STRATEGY_COVERAGE_MIN_OVERLAP, listMatchingRunStrategies, listVerifiedRunStrategies, runStrategyScopeForSession, strategyCoversRequest, type MatchedRunStrategy, type RunStrategyRecord } from '../../memory/run-strategy-store.js';
 import { selectLearnedStrategyTools } from '../harness/host-run-strategy-learning.js';
 import { peekConnectedToolkits, peekCurrentConnectedToolkits } from '../../integrations/composio/client.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../../integrations/composio/toolkit-slug.js';
@@ -439,6 +439,12 @@ export function renderProvenOperationGuidance(
     callable
       ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
       : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
+    // How the proven run checked its own work travels with the run. A faster
+    // second run must not be a less careful one.
+    ...(() => {
+      const verification = describeProvenVerification(strategy.provenSteps);
+      return verification ? [verification] : [];
+    })(),
     'Connected provider operations go through work_call: name composio_execute_tool, args_json a JSON string with tool_slug and arguments.',
     'Local operations use their exact callable name.',
     // Live 277962: the cap:… ref below was sent to tool_output_query as a

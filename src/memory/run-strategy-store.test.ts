@@ -308,3 +308,75 @@ test('a turn whose surface is locked is not told about a proven run', async () =
   assert.ok(rankedTailHitBudget(request, false) > rankedTailHitBudget(request),
     'the hit budget reserves no room for a line that will not be sent');
 });
+
+// Live 2026-09-28: a run that sent a message and read it back taught two tools
+// with no roles. The next run, handed that strategy, sent and did not read
+// back, and was then learned as a thinner strategy of its own.
+test('a proven run keeps the part each operation played, and says how it checked its work', async () => {
+  const { describeProvenVerification } = await import('./run-strategy-store.js');
+  const rec = recordRunStrategy({
+    objective: 'post the weekly ridgeline digest to the harbor channel',
+    toolsUsed: ['deskscope__find_channel', 'deskscope__post_message', 'deskscope__read_channel'],
+    provenSteps: [
+      { tool: 'deskscope__post_message', role: 'effect' },
+      { tool: 'deskscope__read_channel', role: 'verify' },
+      { tool: 'deskscope__find_channel', role: 'prepare' },
+    ],
+    workerCount: 0, durationMs: 30_000, learningReceipt: receipt('steps-a'),
+  });
+  assert.deepEqual(rec!.provenSteps, [
+    { tool: 'deskscope__find_channel', role: 'prepare' },
+    { tool: 'deskscope__post_message', role: 'effect' },
+    { tool: 'deskscope__read_channel', role: 'verify' },
+  ], 'steps are kept in the order the work goes');
+  const sentence = describeProvenVerification(rec!.provenSteps)!;
+  assert.match(sentence, /made its change with deskscope__post_message and then read it back with deskscope__read_channel/);
+  assert.match(renderRunStrategiesForContext('post the ridgeline digest to the harbor channel'), /read it back with deskscope__read_channel/);
+  assert.equal(describeProvenVerification([{ tool: 'a', role: 'effect' }]), null, 'a run that did not read its change back says nothing about checking');
+  assert.equal(describeProvenVerification([{ tool: 'a', role: 'prepare' }, { tool: 'b', role: 'verify' }]), null, 'without a change there is nothing to read back');
+});
+
+test('a run handed a remembered strategy adds its proof to that strategy and cannot thin it', () => {
+  const first = recordRunStrategy({
+    objective: 'file the quarterly juniper summary in the ledger app',
+    toolsUsed: ['ledgerscope__create_entry', 'ledgerscope__get_entry'],
+    provenSteps: [{ tool: 'ledgerscope__create_entry', role: 'effect' }, { tool: 'ledgerscope__get_entry', role: 'verify' }],
+    workerCount: 0, durationMs: 20_000, learningReceipt: receipt('reuse-a'),
+  })!;
+  // Worded differently, handed the first strategy, and it skipped the readback.
+  const second = recordRunStrategy({
+    objective: 'please add a short note about willow staffing',
+    toolsUsed: ['ledgerscope__create_entry'],
+    provenSteps: [{ tool: 'ledgerscope__create_entry', role: 'effect' }],
+    reusedStrategyId: first.id,
+    workerCount: 0, durationMs: 5_000, learningReceipt: receipt('reuse-b'),
+  })!;
+  assert.equal(second.id, first.id, 'no second strategy is created for the same kind of work');
+  assert.equal(second.uses, 2);
+  assert.deepEqual(second.toolsUsed, ['ledgerscope__create_entry', 'ledgerscope__get_entry'], 'the thinner run does not erase an operation');
+  assert.deepEqual(second.provenSteps!.map((row) => row.role), ['effect', 'verify'], 'or the way the work was checked');
+  assert.match(second.objective, /juniper summary/, 'the strategy keeps the request it was proven on');
+  assert.equal(listMatchingRunStrategies('add a short note about willow staffing', 4).filter((row) => row.strategy.toolsUsed.includes('ledgerscope__create_entry')).length <= 1, true);
+
+  // Replaying the same proof is one observation.
+  const replay = recordRunStrategy({
+    objective: 'please add a short note about willow staffing', toolsUsed: ['ledgerscope__create_entry'],
+    reusedStrategyId: first.id, workerCount: 0, durationMs: 5_000, learningReceipt: receipt('reuse-b'),
+  })!;
+  assert.equal(replay.uses, 2);
+
+  // A run that went outside the strategy it was handed is its own work.
+  const wider = recordRunStrategy({
+    objective: 'export the cedar roster to a spreadsheet',
+    toolsUsed: ['ledgerscope__create_entry', 'sheetscope__create_sheet'],
+    reusedStrategyId: first.id,
+    workerCount: 0, durationMs: 5_000, learningReceipt: receipt('reuse-c'),
+  })!;
+  assert.notEqual(wider.id, first.id);
+  // An id that names no stored strategy changes nothing.
+  const unknown = recordRunStrategy({
+    objective: 'archive the birch meeting minutes', toolsUsed: ['notescope__archive'],
+    reusedStrategyId: 'strat-does-not-exist', workerCount: 0, durationMs: 5_000, learningReceipt: receipt('reuse-d'),
+  })!;
+  assert.match(unknown.objective, /birch meeting minutes/);
+});
