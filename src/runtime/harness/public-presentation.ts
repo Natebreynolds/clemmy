@@ -52,6 +52,7 @@ import {
 /** The host-built approval preview (operation + argument values the owner is
  * approving), admitted only in its exact bounded shape. */
 type ApprovalPreviewField = { name: string; value: string; label?: string };
+type ApprovalPreview = { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck; items?: ApprovalPreview[] };
 type ApprovalPreviewCheck = { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 
 function approvalPreviewCheck(value: unknown): ApprovalPreviewCheck | null | undefined {
@@ -65,7 +66,7 @@ function approvalPreviewCheck(value: unknown): ApprovalPreviewCheck | null | und
   return { status, conflicts: conflicts as string[] };
 }
 
-export function approvalPreviewProjection(value: unknown): { preview: { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck } } | null {
+export function approvalPreviewProjection(value: unknown): { preview: ApprovalPreview } | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   if (typeof record.operation !== 'string' || !record.operation.trim() || record.operation.length > 80) return null;
@@ -85,7 +86,20 @@ export function approvalPreviewProjection(value: unknown): { preview: { operatio
   }
   const check = approvalPreviewCheck(record.check);
   if (check === null) return null;
-  return { preview: { operation: record.operation, fields, ...(check ? { check } : {}) } };
+  let items: ApprovalPreview[] | undefined;
+  if (record.items !== undefined) {
+    if (!Array.isArray(record.items) || record.items.length < 2 || record.items.length > 100) return null;
+    items = [];
+    for (const item of record.items) {
+      if (!item || typeof item !== 'object' || 'items' in item) return null;
+      const admitted = approvalPreviewProjection(item);
+      if (!admitted) return null;
+      totalCharacters += JSON.stringify(admitted.preview).length;
+      if (totalCharacters > 256_000) return null;
+      items.push(admitted.preview);
+    }
+  }
+  return { preview: { operation: record.operation, fields, ...(check ? { check } : {}), ...(items ? { items } : {}) } };
 }
 
 export function publicPlanArtifactRef(value: unknown): PlanRevisionRef | undefined {

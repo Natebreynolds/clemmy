@@ -1,3 +1,4 @@
+import { ApprovalReview } from '../components/ApprovalReview';
 import { CliSessions } from '../components/CliSessions';
 /**
  * The chat screen, rebuilt on the shared chat engine (@clem/chat-engine —
@@ -607,7 +608,7 @@ function MessageRow({
     const approvalId = message.approval.approvalId;
     return (
       <div class="turn turn-approval">
-        <div class="approval-head">Waiting on you — {message.approval.subject}</div>
+        <div class="approval-head">{message.approval.preview?.items ? `Review ${message.approval.preview.items.length} actions` : `Waiting on you — ${message.approval.subject}`}</div>
         {message.approval.reason ? <div class="approval-reason">{message.approval.reason}</div> : null}
         {message.approval.preview?.check?.status === 'conflicts' && message.approval.preview.check.conflicts?.length ? (
           <div class="approval-check approval-check-warn" role="note">
@@ -624,7 +625,7 @@ function MessageRow({
               : 'Couldn’t check this against your standing rules.'}
           </div>
         ) : null}
-        {message.approval.preview && message.approval.preview.fields.length > 0 ? (
+        {message.approval.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 ? (
           // What approving would actually send, from the host's frozen call.
           <dl class="approval-preview">
             {message.approval.preview.fields.map((field) => (
@@ -639,6 +640,7 @@ function MessageRow({
             ))}
           </dl>
         ) : null}
+        {message.approval.preview?.items && <ApprovalReview preview={message.approval.preview} />}
         {approvalId && !approvalDecided ? (
           <div class="plan-actions">
             <button
@@ -646,7 +648,7 @@ function MessageRow({
               disabled={approvalActing !== null}
               onClick={() => onApprovalAction(approvalId, 'approve')}
             >
-              {approvalActing === approvalId ? '…' : 'Approve'}
+              {approvalActing === approvalId ? '…' : message.approval.preview?.items ? `Approve all ${message.approval.preview.items.length}` : 'Approve'}
             </button>
             <button
               class="reject"

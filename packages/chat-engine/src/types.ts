@@ -31,6 +31,7 @@ export interface ReplayPayload {
 }
 
 export interface ApprovalPreview {
+  items?: ApprovalPreview[];
   operation: string;
   /** `label` is the name the host found for an id-like value, display only. */
   fields: Array<{ name: string; value: string; label?: string }>;
@@ -71,9 +72,22 @@ export function approvalPreviewFrom(value: unknown): ApprovalPreview | undefined
   const conflicts = check && Array.isArray(check.conflicts)
     ? check.conflicts.filter((line): line is string => typeof line === 'string' && line.trim().length > 0).slice(0, 3)
     : [];
+  let items: ApprovalPreview[] | undefined;
+  if (record.items !== undefined) {
+    if (!Array.isArray(record.items) || record.items.length < 2 || record.items.length > 100) return undefined;
+    items = [];
+    for (const item of record.items) {
+      if (!item || typeof item !== 'object' || 'items' in item) return undefined;
+      const admitted = approvalPreviewFrom(item);
+      if (!admitted) return undefined;
+      items.push(admitted);
+    }
+    if (JSON.stringify(items).length > 256_000) return undefined;
+  }
   return {
     operation: record.operation,
     fields,
+    ...(items ? { items } : {}),
     ...(status ? { check: { status, ...(conflicts.length ? { conflicts } : {}) } } : {}),
   };
 }

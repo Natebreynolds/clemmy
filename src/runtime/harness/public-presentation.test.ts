@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EventRow, EventType } from './eventlog.js';
 import {
+  approvalPreviewProjection,
   projectHarnessEventForPublic,
   projectHarnessEventsForPublic,
   publicAsyncWorkDispatchedData,
@@ -987,4 +988,13 @@ test('a complete grouped approval preview survives public projection without tru
     approvalId: 'apr-group', preview: { operation: 'Review', fields: [{ name: 'Actions', value: 'x'.repeat(256_001) }] },
   }));
   assert.equal(oversized?.data.preview, undefined);
+});
+
+
+test('structured grouped approval preserves exact members and rejects nested or oversized sets', () => {
+  const item = { operation: 'Create event', fields: [{ name: 'subject', value: 'One' }] };
+  const group = { operation: 'Review 2 prepared actions', fields: [], items: [item, item] };
+  assert.deepEqual(approvalPreviewProjection(group)?.preview, group);
+  assert.equal(approvalPreviewProjection({ ...group, items: [{ ...item, items: [item] }, item] }), null);
+  assert.equal(approvalPreviewProjection({ ...group, items: Array.from({ length: 101 }, () => item) }), null);
 });

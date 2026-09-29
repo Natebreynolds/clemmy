@@ -512,3 +512,19 @@
   .memory-link.is-flowing .memory-line::after { animation: none; display: none; }
   .memory-line { transition: none; }
 }
+
+/* One decision, a readable list, and exact arguments on demand. */
+.approval-review { font-size: 0.875rem; line-height: 1.5; overflow-wrap: anywhere; }
+.approval-review-scope { margin: 12px 0; }
+.approval-review-fields { margin: 8px 0; }
+.approval-review-fields > div { margin-top: 6px; }
+.approval-review-fields dt { font-size: 0.75rem; text-transform: capitalize; opacity: .85; }
+.approval-review-fields dd { margin: 0; white-space: pre-wrap; }
+.approval-review-list { list-style: none; padding: 0; margin: 16px 0; }
+.approval-review-list > li { padding: 14px 0; border-top: 1px solid currentColor; border-top-color: color-mix(in srgb, currentColor 18%, transparent); }
+.approval-review-title { margin: 0; font-weight: 600; }
+.approval-review-when { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.approval-review details { margin-top: 8px; font-size: .75rem; }
+.approval-review summary { cursor: pointer; padding: 4px 0; width: fit-content; }
+.approval-review summary:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.approval-review-warning { margin: 8px 0; font-weight: 600; }

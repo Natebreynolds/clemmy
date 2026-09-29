@@ -25,10 +25,14 @@ export function describePendingApproval(row: approvalRegistry.PendingApprovalRow
     : row.tool ? approvalCallPreview({ toolName: row.tool, args: row.args, rawArgs: '' })
     : null;
   if (!preview) return row.subject;
-  const fields = preview.fields.map((field) => (
+  const fields = preview.fields.filter(field => !preview.items || field.name !== 'Prepared actions').map((field) => (
     `${field.name}: ${field.label ? `${field.label} (${field.value})` : field.value}`
   ));
-  return [preview.operation, ...fields].join('\n').slice(0, 2_000);
+  const members = (preview.items ?? []).map((item, index) => [
+    `${index + 1}. ${item.operation}`,
+    ...item.fields.map(field => `${field.name}: ${field.label ? `${field.label} (${field.value})` : field.value}`),
+  ].join('\n'));
+  return [preview.operation, ...fields, ...members].join('\n').slice(0, 2_000);
 }
 
 /** Exact decisions use the existing deterministic executor without a model

@@ -985,7 +985,7 @@ export function approvalGroupMembers(row: PendingApprovalRow): PendingApprovalRo
 
 export function registerApprovalGroup(
   rows: PendingApprovalRow[],
-  preview: { operation: string; fields: Array<{ name: string; value: string }> },
+  preview: import('./approval-call-preview.js').ApprovalCallPreview,
 ): PendingApprovalRow {
   if (rows.length < 2 || new Set(rows.map(row => row.approvalId)).size !== rows.length
     || rows.some(row => row.sessionId !== rows[0]!.sessionId || !row.resumeKey

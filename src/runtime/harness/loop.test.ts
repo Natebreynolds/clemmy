@@ -14737,6 +14737,9 @@ test('compatible prepared writes publish one review and one decision approves on
   assert.equal(events.length, 1, 'one carrier and notification, no hidden duplicate cards');
   assert.match(JSON.stringify(events[0]!.data.preview), /first@example.test/);
   assert.match(JSON.stringify(events[0]!.data.preview), /second@example.test/);
+  const shown = events[0]!.data.preview as { fields: Array<{name: string; value: string}>; items: unknown[] };
+  assert.equal(shown.items.length, 2);
+  assert.match(shown.fields.find(field => field.name === 'Prepared actions')!.value, /second@example.test/, 'already-open clients retain a full legacy review');
   let approvedIds: string[] = [];
   await resumePendingApproval({ agent, sessionId: session.id, approvalId: cards[0]!.approvalId,
     decision: 'approve', resolver: 'fixture owner', makeRunner: makeRunnerStub,

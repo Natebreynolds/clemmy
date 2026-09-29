@@ -239,3 +239,16 @@ test('Jev receives the grouped human review rather than private execution keys',
   assert.match(describePendingApproval(group), /Second calendar event/);
   assert.doesNotMatch(describePendingApproval(group), /private-execution-key|__host_approval_group__/);
 });
+
+
+test('Jev receives structured grouped action content without execution keys', () => {
+  const session = eventlog.createSession({ id: `approval-reply-${++serial}`, kind: 'chat' });
+  const members = ['one', 'two'].map(name => registry.register({ sessionId: session.id,
+    tool: 'fixture_send', subject: name, args: { to: name }, resumeKey: `private-key:${name}` }));
+  const group = registry.registerApprovalGroup(members, { operation: 'Review 2 actions', fields: [], items: [
+    { operation: 'Create event', fields: [{ name: 'subject', value: 'First event' }] },
+    { operation: 'Create event', fields: [{ name: 'subject', value: 'Second event' }] },
+  ] });
+  assert.match(describePendingApproval(group), /Second event/);
+  assert.doesNotMatch(describePendingApproval(group), /private-key|__host_approval_group__/);
+});

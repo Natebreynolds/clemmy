@@ -1,3 +1,4 @@
+import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useState } from 'react';
@@ -420,7 +421,8 @@ export function ChatBubble({
                 ? 'Approve this plan to continue?'
                 : pendingAction
                   ? `Ready to execute: ${pendingAction.title}`
-                  : `Approve: ${message.approval?.subject ?? 'this action'}`}
+                  : message.approval?.preview?.items ? `Review ${message.approval.preview.items.length} actions`
+                    : `Approve: ${message.approval?.subject ?? 'this action'}`}
             </p>
             {pendingAction && (
               <div className="mt-1 space-y-0.5 text-caption text-muted">
@@ -436,7 +438,7 @@ export function ChatBubble({
             {!pendingAction && message.approval?.preview?.check && (
               <ApprovalCheckNote check={message.approval.preview.check} />
             )}
-            {!pendingAction && message.approval?.preview && message.approval.preview.fields.length > 0 && (
+            {!pendingAction && message.approval?.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 && (
               // What approving would actually send: each argument the tool
               // receives, from the host's frozen call, so the owner never
               // approves on an operation's name alone.
@@ -453,6 +455,7 @@ export function ChatBubble({
                 ))}
               </dl>
             )}
+            {!pendingAction && message.approval?.preview?.items && <ApprovalReview preview={message.approval.preview} />}
             {pendingAction && <PayloadPreview value={pendingAction.payload} />}
             {canOfferStandingSendTrust(pendingAction) && !resolved && (
               <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">
@@ -490,7 +493,7 @@ export function ChatBubble({
                 onClick={pendingAction ? runExecute : () => { void resolvePlainDecision('approve'); }}
               >
                 {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-                {pendingAction ? 'Execute queued action' : 'Approve'}
+                {pendingAction ? 'Execute queued action' : message.approval?.preview?.items ? `Approve all ${message.approval.preview.items.length}` : 'Approve'}
               </Button>
               <Button size="sm" variant="secondary" disabled={resolved || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> Decline</Button>
               {!resolved && exec.phase === 'idle' && (

@@ -32,6 +32,8 @@ export function approvalJsonRecord(value: unknown): Record<string, unknown> | nu
 export interface ApprovalCallPreview {
   operation: string;
   fields: Array<{ name: string; value: string; label?: string }>;
+  /** Exact prepared members; display only, never approval authority. */
+  items?: ApprovalCallPreview[];
   /** The pre-send check against the owner's standing rules, when one ran. */
   check?: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 }

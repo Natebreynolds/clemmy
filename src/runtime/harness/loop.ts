@@ -2877,18 +2877,18 @@ function registerAndEmitApprovalsOnce(
       && entry.interruption.consentCall?.effect === firstConsent.effect
       && entry.interruption.consentCall?.accountId === firstConsent.accountId
       && approvalCallPreview(entry.interruption)?.operation === firstOperation)) {
-    const review = registrations.map((entry, index) => {
-      const preview = approvalCallPreview(entry.interruption, true, true);
-      return `${index + 1}. ${entry.subject}\n${(preview?.fields ?? [])
-        .map(field => `${field.name.replace(/_/g, ' ')}: ${field.label ? `${field.label} · ` : ''}${field.value}`).join('\n')}${preview?.check ? `\nStanding-rule check: ${preview.check.status}${preview.check.conflicts?.length ? ` — ${preview.check.conflicts.join('; ')}` : ''}` : ''}`;
-    }).join('\n\n');
+    const items = registrations.map(entry => approvalCallPreview(entry.interruption, true, true)!);
+    // Keep a complete legacy view for an already-open desktop/mobile client.
+    // New clients render typed items; old clients must never show just an account.
+    const legacyReview = items.map((item, index) => `${index + 1}. ${item.operation}\n${item.fields
+      .map(field => `${field.name}: ${field.label ? `${field.label} · ` : ''}${field.value}`).join('\n')}${item.check ? `\nStanding-rule check: ${item.check.status}${item.check.conflicts?.length ? ` — ${item.check.conflicts.join('; ')}` : ''}` : ''}`).join('\n\n');
     const groupPreview = {
       operation: `Review ${registrations.length} prepared actions`,
       fields: [
-        { name: 'Scope', value: 'Approval covers only the actions listed below. Additional or changed actions require a new review.' },
         { name: 'Account', value: firstConsent.accountId ?? 'Bound account on each action' },
-        { name: 'Prepared actions', value: review },
+        { name: 'Prepared actions', value: legacyReview },
       ],
+      items,
     };
     // Never publish a combined card whose full review cannot reach clients.
     // An unusually large prepared set retains the existing individual cards.
