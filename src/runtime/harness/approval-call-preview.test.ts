@@ -105,3 +105,13 @@ test('the pre-send check rides on the preview beside the fields', () => {
   });
   assert.deepEqual(previewed?.check, { status: 'clear' });
 });
+
+
+test('complete grouped preview retains long nested arguments and later fields', () => {
+  const payload = { body: 'long content '.repeat(220), attendees: Array.from({ length: 25 }, (_, i) => ({ email: `person${i}@example.test` })),
+    ...Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`field${i}`, `value${i}`])) };
+  const preview = approvalCallPreview(workCall('OUTLOOK_CALENDAR_CREATE_EVENT', payload), true, true)!;
+  assert.equal(preview.fields.find(field => field.name === 'body')?.value, payload.body.trim());
+  assert.equal(preview.fields.find(field => field.name === 'attendees')?.value, JSON.stringify(payload.attendees));
+  assert.equal(preview.fields.at(-1)?.name, 'field19');
+});

@@ -1,5 +1,6 @@
 import * as approvalRegistry from './approval-registry.js';
 import { approvalCallPreview } from './approval-call-preview.js';
+import { approvalPreviewProjection } from './public-presentation.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { APPROVAL_REPLY_SURE, classifyApprovalReplyWithJev } from '../jev/control-plane.js';
 import { approvalReplyTargets, parseApprovalIntent } from './approval-intent.js';
@@ -19,8 +20,9 @@ export function isExactApprovalDecision(text: string): boolean {
 
 /** What the card will do, as Jev reads it: the operation and its fields. */
 export function describePendingApproval(row: approvalRegistry.PendingApprovalRow): string {
-  const preview = row.tool
-    ? approvalCallPreview({ toolName: row.tool, args: row.args, rawArgs: '' })
+  const preview = approvalRegistry.isApprovalGroup(row)
+    ? approvalPreviewProjection(row.args?.preview)?.preview
+    : row.tool ? approvalCallPreview({ toolName: row.tool, args: row.args, rawArgs: '' })
     : null;
   if (!preview) return row.subject;
   const fields = preview.fields.map((field) => (

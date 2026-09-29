@@ -14709,3 +14709,45 @@ test('an Execute stop after the claim still commits the typed blocked terminal a
     fixtureCapabilityCatalog.installHostCapabilityCatalogFactory(previousFactory);
   }
 });
+
+test('compatible prepared writes publish one review and one decision approves only its frozen members', async () => {
+  resetEventLog();
+  const agent = new Agent({ name: 'GroupedApprovalTest', instructions: 'test' });
+  const session = HarnessSession.create({ kind: 'chat', title: 'grouped writes' });
+  const args = ['first@example.test', 'second@example.test'].map(to => ({
+    tool_slug: 'OUTLOOK_CALENDAR_CREATE_EVENT', arguments: { subject: 'Controlled event', attendees: [to], start_datetime: '2026-10-05T09:00:00' },
+  }));
+  const calls = args.map((value, i) => ({ toolName: 'composio_execute_tool', callId: `group-call-${i}`, argumentsJson: JSON.stringify(value) }));
+  const serializedState = makeApprovalRunStateWithInterruptions(agent, calls);
+  await runTurn({ agent, sessionId: session.id, input: 'Prepare these two exact events.', makeRunner: makeRunnerStub,
+    runRunner: async () => ({ history: [], lastResponseId: undefined, finalOutput: undefined,
+      hasInterruptions: true, serializedState,
+      interruptions: calls.map((call, i) => ({ toolName: call.toolName, args: args[i]!, rawArgs: call.argumentsJson,
+        approvalResumeKey: `group-fixture:${session.id}:${i}`,
+        consentCall: { effect: 'external_write', accountId: 'fixture-account', risk: { reversibility: 'irreversible', consequence: 'send', destructive: false } },
+      })),
+    }),
+  });
+  const cards = approvalRegistry.listPending({ sessionId: session.id });
+  assert.equal(cards.length, 1, 'one user decision covers the prepared set');
+  assert.equal(cards[0]!.tool, approvalRegistry.APPROVAL_GROUP_TOOL);
+  const members = approvalRegistry.approvalGroupMembers(cards[0]!);
+  assert.equal(members?.length, 2);
+  const events = listEventsForConv(session.id, { types: ['approval_requested'] });
+  assert.equal(events.length, 1, 'one carrier and notification, no hidden duplicate cards');
+  assert.match(JSON.stringify(events[0]!.data.preview), /first@example.test/);
+  assert.match(JSON.stringify(events[0]!.data.preview), /second@example.test/);
+  let approvedIds: string[] = [];
+  await resumePendingApproval({ agent, sessionId: session.id, approvalId: cards[0]!.approvalId,
+    decision: 'approve', resolver: 'fixture owner', makeRunner: makeRunnerStub,
+    runRunner: async (_runner, _agent, state) => {
+      const serialized = (state as unknown as RunState).toJSON() as { context?: { approvals?: Record<string, { approved?: string[] }> } };
+      approvedIds = serialized.context?.approvals?.composio_execute_tool?.approved ?? [];
+      return { history: [], lastResponseId: undefined, finalOutput: 'Completed the approved fixture actions.' };
+    },
+  });
+  assert.deepEqual(approvedIds.sort(), ['group-call-0', 'group-call-1']);
+  assert.ok(members!.every(member => approvalRegistry.get(member.approvalId)?.resolution === 'approved'));
+  const resolved = listEventsForConv(session.id, { types: ['approval_resolved'] });
+  assert.ok(resolved.some(event => event.data.approvalId === cards[0]!.approvalId), 'shared desktop/mobile card resolves');
+});

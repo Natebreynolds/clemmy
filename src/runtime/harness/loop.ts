@@ -142,6 +142,7 @@ import { runWatcherJudge, shouldStartWatcherCheck, watcherCheckIntervalTools, wa
 import { verifyDelivered, verifyDeliveredEnabled, type DeliveryVerdict } from './verify-delivered.js';
 import { synthesizeTurnReport } from './work-report.js';
 import {
+  approvalPreviewProjection,
   PUBLIC_RUN_FAILURE_TEXT,
   PUBLIC_VAULT_NOT_READY_TEXT,
   publicAsyncWorkDispatchedData,
@@ -2866,6 +2867,42 @@ function registerAndEmitApprovalsOnce(
     }
   }
 
+  // One host-owned decision for the exact compatible set already prepared in
+  // this model batch. Never infer permission for a future or unprepared item.
+  const firstConsent = registrations[0]?.interruption.consentCall;
+  const firstOperation = registrations[0] && approvalCallPreview(registrations[0].interruption)?.operation;
+  if (session.sessionRow.kind === 'chat' && registrations.length > 1
+    && firstConsent?.effect === 'external_write' && firstOperation
+    && registrations.every(entry => entry.row.resumeKey && !entry.row.presentation && !existingApprovalCarrier(entry.row)
+      && entry.interruption.consentCall?.effect === firstConsent.effect
+      && entry.interruption.consentCall?.accountId === firstConsent.accountId
+      && approvalCallPreview(entry.interruption)?.operation === firstOperation)) {
+    const review = registrations.map((entry, index) => {
+      const preview = approvalCallPreview(entry.interruption, true, true);
+      return `${index + 1}. ${entry.subject}\n${(preview?.fields ?? [])
+        .map(field => `${field.name.replace(/_/g, ' ')}: ${field.label ? `${field.label} · ` : ''}${field.value}`).join('\n')}${preview?.check ? `\nStanding-rule check: ${preview.check.status}${preview.check.conflicts?.length ? ` — ${preview.check.conflicts.join('; ')}` : ''}` : ''}`;
+    }).join('\n\n');
+    const groupPreview = {
+      operation: `Review ${registrations.length} prepared actions`,
+      fields: [
+        { name: 'Scope', value: 'Approval covers only the actions listed below. Additional or changed actions require a new review.' },
+        { name: 'Account', value: firstConsent.accountId ?? 'Bound account on each action' },
+        { name: 'Prepared actions', value: review },
+      ],
+    };
+    // Never publish a combined card whose full review cannot reach clients.
+    // An unusually large prepared set retains the existing individual cards.
+    if (approvalPreviewProjection(groupPreview)) {
+      const group = approvalRegistry.registerApprovalGroup(registrations.map(entry => entry.row), groupPreview);
+      registrations.splice(0, registrations.length, {
+        row: group, approvalArgs: group.args, subject: group.subject,
+        approvalCreated: !existingApprovalCarrier(group),
+        interruption: { toolName: approvalRegistry.APPROVAL_GROUP_TOOL,
+          args: group.args, rawArgs: JSON.stringify(group.args) } as InterruptionInfo,
+      });
+    }
+  }
+
   // Register every row before emitting any carrier. A sibling registration can
   // atomically demote conversational questions to formal cards; re-reading here
   // guarantees the public event reflects the final durable presentation.
@@ -2905,7 +2942,7 @@ function registerAndEmitApprovalsOnce(
             ...(pendingActionApprovalViewFromArgs(row.args)
               ? {}
               : {
-                preview: approvalCallPreview({
+                preview: approvalRegistry.isApprovalGroup(row) ? row.args?.preview : approvalCallPreview({
                   ...registered.interruption,
                   args: row.args,
                 }) ?? undefined,
@@ -12549,6 +12586,11 @@ function selectedHostApprovalMatchesPause(
   if (!approvalId || (!state.acceptedModelBatchRef && !state.pending.some(call => call.consentSubject))) return true;
   const selected = approvalRegistry.get(approvalId);
   if (!selected || selected.sessionId !== sessionId) return false;
+  if (approvalRegistry.isApprovalGroup(selected)) {
+    const members = approvalRegistry.approvalGroupMembers(selected);
+    return Boolean(members && members.every(member =>
+      selectedHostApprovalMatchesPause(state, sessionId, member.approvalId)));
+  }
   // Identical arguments can belong to two distinct user requests. The durable
   // consent identity also binds source, logical call, account, schema and risk.
   return state.pending.filter(call => {
@@ -12702,14 +12744,14 @@ export async function resumePendingApproval(
     const selectedBeforeRepair = options.approvalId
       ? approvalRegistry.get(options.approvalId)
       : undefined;
-    const needsRegistration = interruptions.filter((interruption) => !(
-      selectedBeforeRepair
-      && selectedBeforeRepair.status === 'resolved'
-      && approvalAuthorityMatchesToolCall(
-        selectedBeforeRepair,
-        interruption.toolName,
-        interruption.rawArgs,
-      )
+    const decidedRows = selectedBeforeRepair?.status === 'resolved'
+      ? approvalRegistry.isApprovalGroup(selectedBeforeRepair)
+        ? approvalRegistry.approvalGroupMembers(selectedBeforeRepair) ?? []
+        : [selectedBeforeRepair]
+      : [];
+    const needsRegistration = interruptions.filter((interruption) => !decidedRows.some(decided =>
+      decided.status === 'resolved'
+      && approvalAuthorityMatchesToolCall(decided, interruption.toolName, interruption.rawArgs)
     ));
     const resolvableCarrierIdsBefore = new Set(
       approvalRegistry.listPending({ sessionId: options.sessionId, status: 'pending' })
@@ -12785,28 +12827,33 @@ export async function resumePendingApproval(
     return authorityRefusal('Multiple approval interruptions require one exact approval ID; no decision was applied.');
   }
 
-  let selectedInterruption: unknown;
+  const selectedItems: Array<{ item: unknown; row: approvalRegistry.PendingApprovalRow }> = [];
   if (pending.length > 0) {
-    if (!selectedApproval) {
-      return authorityRefusal('No durable approval card identifies the interrupted action.');
+    if (!selectedApproval) return authorityRefusal('No durable approval card identifies the interrupted action.');
+    if (approvalRegistry.isApprovalGroup(selectedApproval) && options.decision === 'approve_with_edits') {
+      return authorityRefusal('Request changes to the prepared set before approving a revised review.');
     }
-    const matches = pending.filter((item) => {
-      const raw = (item as {
-        rawItem?: { name?: unknown; arguments?: unknown };
-        toolName?: unknown;
-      } | null)?.rawItem;
-      const tool = raw?.name
-        ?? (item as { toolName?: unknown } | null)?.toolName;
-      return approvalAuthorityMatchesToolCall(selectedApproval!, tool, raw?.arguments);
-    });
-    if (matches.length !== 1) {
-      return authorityRefusal(
-        matches.length === 0
-          ? 'The selected approval does not match any serialized tool payload.'
-          : 'The selected approval ambiguously matches multiple serialized tool calls.',
-      );
+    const selectedRows = approvalRegistry.isApprovalGroup(selectedApproval)
+      ? approvalRegistry.approvalGroupMembers(selectedApproval)
+      : [selectedApproval];
+    if (!selectedRows) return authorityRefusal('The prepared approval set has changed; review it again.');
+    for (const selectedRow of selectedRows) {
+      const matches = pending.filter((item) => {
+        const raw = (item as { rawItem?: { name?: unknown; arguments?: unknown }; toolName?: unknown } | null)?.rawItem;
+        const tool = raw?.name ?? (item as { toolName?: unknown } | null)?.toolName;
+        return approvalAuthorityMatchesToolCall(selectedRow, tool, raw?.arguments)
+          && (!(state instanceof HostInterruptState)
+            || selectedHostApprovalMatchesPause(state, options.sessionId, selectedRow.approvalId));
+      });
+      if (matches.length !== 1 || selectedItems.some(entry => entry.item === matches[0])) {
+        return authorityRefusal('An approval does not identify exactly one parked action; no decision was applied.');
+      }
+      selectedItems.push({ item: matches[0], row: selectedRow });
     }
-    selectedInterruption = matches[0];
+    if (selectedApproval.status === 'resolved' && selectedItems.some(entry =>
+      entry.row.status !== 'resolved' || entry.row.resolution !== wantedResolution)) {
+      return authorityRefusal('The prepared set no longer shares the recorded decision.');
+    }
   }
 
   if (selectedApproval) {
@@ -12839,8 +12886,8 @@ export async function resumePendingApproval(
   }
 
   const resolvedApprovals: Array<{ tool: string; approvalId: string | null }> = [];
-  if (selectedInterruption) {
-    const item = selectedInterruption;
+  for (const selectedItem of selectedItems) {
+    const item = selectedItem.item;
     if (options.decision === 'approve' || options.decision === 'approve_with_edits') {
       // EDIT-AND-APPROVE: when the user supplied modifiedArgs (e.g.
       // changed the calendar time in the dashboard / Discord edit
@@ -12894,8 +12941,11 @@ export async function resumePendingApproval(
     const raw = (item as { rawItem?: { name?: string } } | null)?.rawItem;
     resolvedApprovals.push({
       tool: raw?.name ?? 'unknown',
-      approvalId: selectedApproval?.approvalId ?? null,
+      approvalId: selectedItem.row.approvalId,
     });
+  }
+  if (selectedApproval && approvalRegistry.isApprovalGroup(selectedApproval)) {
+    resolvedApprovals.push({ tool: approvalRegistry.APPROVAL_GROUP_TOOL, approvalId: selectedApproval.approvalId });
   }
   for (const resolvedApproval of resolvedApprovals) {
     safeAppend({
@@ -12932,7 +12982,7 @@ export async function resumePendingApproval(
     role: 'system',
     type: 'run_resumed',
     data: {
-      pending: selectedInterruption ? 1 : 0,
+      pending: selectedItems.length,
       totalPending: pending.length,
       approvalId: selectedApproval?.approvalId ?? null,
       decision: options.decision,

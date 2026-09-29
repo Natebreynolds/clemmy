@@ -20,7 +20,7 @@ const eventlog = await import('./eventlog.js');
 const registry = await import('./approval-registry.js');
 const pending = await import('./pending-actions.js');
 const jev = await import('../jev/client.js');
-const { routeReplyToPendingApproval, isExactApprovalDecision } = await import('./approval-reply-routing.js');
+const { routeReplyToPendingApproval, isExactApprovalDecision, describePendingApproval } = await import('./approval-reply-routing.js');
 const { parseApprovalIntent } = await import('./approval-intent.js');
 
 test.after(() => {
@@ -226,4 +226,16 @@ test('even an empty or non-ASCII explicit target prevents sole-card fallback', a
     assert.equal(await routeReplyToPendingApproval({ sessionId: card.sessionId, text, parsed: null }), null, text);
   }
   assert.equal(asked.length, before);
+});
+
+
+test('Jev receives the grouped human review rather than private execution keys', () => {
+  const session = eventlog.createSession({ id: `approval-reply-${++serial}`, kind: 'chat' });
+  const members = ['one', 'two'].map(name => registry.register({ sessionId: session.id,
+    tool: 'fixture_send', subject: name, args: { to: name }, resumeKey: `private-execution-key:${name}` }));
+  const group = registry.registerApprovalGroup(members, { operation: 'Review 2 prepared actions', fields: [
+    { name: 'Prepared actions', value: '1. First calendar event\n2. Second calendar event' },
+  ] });
+  assert.match(describePendingApproval(group), /Second calendar event/);
+  assert.doesNotMatch(describePendingApproval(group), /private-execution-key|__host_approval_group__/);
 });

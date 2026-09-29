@@ -12170,3 +12170,43 @@ test('owner steering during preparation retires the unstarted provider write', a
     assert.match(JSON.stringify(model.requests[1]), /Do not create the draft/);
   } finally { operation.restore(); }
 });
+
+for (const decision of ['approve', 'reject'] as const) test(`grouped external approvals survive reopen and ${decision} each exact member through the public resume`, async () => {
+  const fixture = acceptHostCanarySource('group-public-resume', 'Send the two controlled fixture messages after approval.');
+  const mcp = await installMcpSendFixture('group_public_resume');
+  try {
+    const agent = { model: stubModel([
+      ['one', 'two'].map((name, i) => toolCall(`group-send-${i}`, 'call_tool', {
+        name: mcp.operationId, args_json: JSON.stringify({ recipient: `${name}@example.invalid`, message: `Controlled ${name}` }),
+      })),
+      [textMsg('The approved fixture messages completed.')],
+    ]), tools: [mcp.carrier] };
+    mcp.bind(agent); bindHostCanarySurface(fixture, agent, [mcp.carrier]);
+    const paused = await runProductionHost(fixture, agent);
+    assert.equal(paused.hasInterruptions, true); assert.equal(mcp.sends(), 0);
+    HarnessSession.load(fixture.session.id)!.saveInterruptState(paused.serializedState!);
+    const registry = await import('./approval-registry.js');
+    const loop = await import('./loop.js');
+    eventlog.closeEventLog();
+    loop.recoverParkedApprovalSurfaces();
+    const cards = registry.listPending({ sessionId: fixture.session.id });
+    assert.equal(cards.length, 1);
+    assert.equal(cards[0]!.tool, registry.APPROVAL_GROUP_TOOL);
+    assert.equal(registry.approvalGroupMembers(cards[0]!)?.length, 2);
+    eventlog.closeEventLog();
+    loop.recoverParkedApprovalSurfaces();
+    assert.equal(registry.listPending({ sessionId: fixture.session.id })[0]?.approvalId, cards[0]!.approvalId);
+    // Crash after the durable decision, before the execution owner resumes.
+    assert.equal(registry.resolve(cards[0]!.approvalId, decision === 'approve' ? 'approved' : 'rejected', 'fixture owner').ok, true);
+    eventlog.closeEventLog();
+    loop.recoverParkedApprovalSurfaces();
+    assert.equal(registry.listPending({ sessionId: fixture.session.id }).length, 0);
+    const outcome = await loop.resumePendingApproval({ sessionId: fixture.session.id,
+      approvalId: cards[0]!.approvalId, decision, agent: agent as never, makeRunner: throwingRunner as never });
+    assert.equal(outcome.status, 'completed');
+    assert.equal(mcp.sends(), decision === 'approve' ? 2 : 0);
+    await loop.resumePendingApproval({ sessionId: fixture.session.id,
+      approvalId: cards[0]!.approvalId, decision, agent: agent as never, makeRunner: throwingRunner as never });
+    assert.equal(mcp.sends(), decision === 'approve' ? 2 : 0, 'repeat click/reopen cannot replay completed effects');
+  } finally { mcp.restore(); }
+});

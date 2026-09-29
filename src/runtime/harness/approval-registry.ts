@@ -949,6 +949,69 @@ export function get(approvalId: string): PendingApprovalRow | undefined {
   return row ? rowToPublic(row) : undefined;
 }
 
+/** Host-owned review group. Members retain their own immutable execution
+ * authority; the group only owns the single human decision over that set. */
+export const APPROVAL_GROUP_TOOL = '__host_approval_group__';
+export interface ApprovalGroupMember {
+  approvalId: string;
+  sessionId: string;
+  tool: string | null;
+  args: Record<string, unknown> | null;
+  resumeKey: string | null;
+}
+
+export function isApprovalGroup(row: PendingApprovalRow): boolean {
+  return row.tool === APPROVAL_GROUP_TOOL;
+}
+
+/** Fail closed on changed, missing, duplicate, cross-session or nested members. */
+export function approvalGroupMembers(row: PendingApprovalRow): PendingApprovalRow[] | null {
+  if (!isApprovalGroup(row) || row.args?.version !== 1 || !Array.isArray(row.args.members)
+    || row.args.members.length < 2) return null;
+  const members: PendingApprovalRow[] = [];
+  const ids = new Set<string>();
+  for (const value of row.args.members) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const snapshot = value as ApprovalGroupMember;
+    if (typeof snapshot.approvalId !== 'string' || ids.has(snapshot.approvalId)) return null;
+    const member = get(snapshot.approvalId);
+    if (!member || member.sessionId !== row.sessionId || isApprovalGroup(member)
+      || !member.resumeKey || !exactApprovalAuthorityMatches(member, snapshot)) return null;
+    ids.add(member.approvalId);
+    members.push(member);
+  }
+  return members;
+}
+
+export function registerApprovalGroup(
+  rows: PendingApprovalRow[],
+  preview: { operation: string; fields: Array<{ name: string; value: string }> },
+): PendingApprovalRow {
+  if (rows.length < 2 || new Set(rows.map(row => row.approvalId)).size !== rows.length
+    || rows.some(row => row.sessionId !== rows[0]!.sessionId || !row.resumeKey
+      || row.presentation || isApprovalGroup(row) || !isActionable(row)
+      || !get(row.approvalId) || !isActionable(get(row.approvalId)!)
+      || !exactApprovalAuthorityMatches(get(row.approvalId)!, row))) {
+    throw new Error('Approval group requires distinct exact, pending actions in one session');
+  }
+  const members: ApprovalGroupMember[] = rows.map(({ approvalId, sessionId, tool, args, resumeKey }) =>
+    ({ approvalId, sessionId, tool, args, resumeKey }));
+  const pendingGroups = listPending({ sessionId: rows[0]!.sessionId, status: 'any' })
+    .filter(row => isApprovalGroup(row) && row.status === 'pending');
+  const existing = pendingGroups.find(row =>
+    JSON.stringify(row.args?.members) === JSON.stringify(members));
+  if (existing) return existing;
+  if (pendingGroups.some(group => approvalGroupMembers(group)?.some(member =>
+    rows.some(row => row.approvalId === member.approvalId)))) {
+    throw new Error('An action already belongs to a pending approval group');
+  }
+  return register({ sessionId: rows[0]!.sessionId, channel: rows[0]!.channel,
+    channelId: rows[0]!.channelId, subject: `Review ${rows.length} prepared actions`,
+    tool: APPROVAL_GROUP_TOOL, args: { version: 1, members, preview },
+    ttlMs: Math.max(0, Math.min(...rows.map(row => Date.parse(row.expiresAt))) - Date.now()),
+  });
+}
+
 /**
  * List approvals that match the filter. Used by the chat-surface
  * routing to figure out whether a bare "approve" should resolve THIS
@@ -990,7 +1053,16 @@ export function listPending(filter: ListFilter = {}): PendingApprovalRow[] {
   const rows = db
     .prepare(`SELECT * FROM pending_approvals ${where} ORDER BY requested_at DESC`)
     .all(...params) as ApprovalSqlRow[];
-  return rows.map(rowToPublic);
+  const publicRows = rows.map(rowToPublic);
+  if (status === 'any') return publicRows;
+  // Public routing/counts expose one decision. Raw execution ownership remains
+  // addressable by ID and is included in the explicit history/authority view.
+  const groupedIds = new Set(publicRows.filter(isApprovalGroup).flatMap(row => {
+    const members = approvalGroupMembers(row);
+    return members?.every(member => member.status === row.status)
+      ? members.map(member => member.approvalId) : [];
+  }));
+  return publicRows.filter(row => !groupedIds.has(row.approvalId));
 }
 
 /** True when a row belongs on formal approval-card surfaces. A conversational
@@ -1417,7 +1489,7 @@ export function hasPending(sessionId: string): boolean {
  */
 export interface ResolveResult {
   ok: boolean;
-  reason?: 'already_resolved' | 'not_found' | 'expired';
+  reason?: 'already_resolved' | 'not_found' | 'expired' | 'group_changed' | 'grouped_member';
   row?: PendingApprovalRow;
 }
 
@@ -1574,7 +1646,7 @@ export function resolve(
   resolution: ApprovalResolution,
   resolver: string,
 ): ResolveResult {
-  return resolveStored(approvalId, resolution, resolver, finalizeResolvedRow);
+  return withApprovalControlCommit(resolveDecision => resolveDecision(approvalId, resolution, resolver));
 }
 
 /** Commit an approval control and its acknowledgement before waking an executor.
@@ -1585,9 +1657,36 @@ export function withApprovalControlCommit<T>(
   commit: (resolveDecision: typeof resolve) => T,
 ): T {
   return withEventPublicationTransaction(() => {
-    const value = commit((id, decision, actor) => resolveStored(
-      id, decision, actor, (row) => afterEventPublicationCommit(() => finalizeResolvedRow(row)),
-    ));
+    const resolveExact: typeof resolve = (id, decision, actor) => {
+      const row = get(id);
+      if (row && !isApprovalGroup(row) && (decision === 'approved' || decision === 'rejected')
+        && listPending({ sessionId: row.sessionId, status: 'any' }).some(group =>
+          isApprovalGroup(group) && group.status === 'pending'
+          && approvalGroupMembers(group)?.some(member => member.approvalId === id))) {
+        return { ok: false, reason: 'grouped_member', row };
+      }
+      if (row && isApprovalGroup(row) && row.status === 'pending') {
+        if ((decision === 'approved' || decision === 'rejected') && !isActionable(row)) {
+          return { ok: false, reason: 'expired', row };
+        }
+        const members = approvalGroupMembers(row);
+        if ((decision === 'approved' || decision === 'rejected')
+          && (!members || members.some(member => !isActionable(member)))) {
+          return { ok: false, reason: 'group_changed', row };
+        }
+        // Validate all members before changing any. Publication/listeners wait
+        // for the outer commit, including a chat acknowledgement transaction.
+        for (const member of members ?? []) {
+          if (member.status !== 'pending') continue;
+          const result = resolveStored(member.approvalId, decision, actor,
+            resolved => afterEventPublicationCommit(() => finalizeResolvedRow(resolved)));
+          if (!result.ok) throw new Error('Approval group member changed during resolution');
+        }
+      }
+      return resolveStored(id, decision, actor,
+        resolved => afterEventPublicationCommit(() => finalizeResolvedRow(resolved)));
+    };
+    const value = commit(resolveExact);
     if (value && typeof (value as { then?: unknown }).then === 'function') {
       throw new Error('Approval control commit must be synchronous');
     }
@@ -1635,7 +1734,8 @@ export function listPendingAwaitingReminder(
        AND expires_at > ?
      ORDER BY requested_at ASC, rowid ASC
   `).all(requestedAtOrBefore.toISOString(), now.toISOString()) as ApprovalSqlRow[];
-  return rows.map(rowToPublic);
+  const visible = new Set(listPending({ status: 'pending' }).map(row => row.approvalId));
+  return rows.map(rowToPublic).filter(row => visible.has(row.approvalId));
 }
 
 /** Record that the one reminder went out. False when it was already recorded,

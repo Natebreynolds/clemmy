@@ -13819,6 +13819,10 @@ export function registerConsoleRoutes(
       res.status(404).json({ error: 'approval not found' });
       return;
     }
+    if (approvalRegistry.isApprovalGroup(existing) && decision === 'approve_with_edits') {
+      res.status(409).json({ error: 'Request changes to the prepared set, then review the revised actions before approving.' });
+      return;
+    }
     if (!approvalRegistry.isFormalApprovalSurface(existing)) {
       res.status(409).json({
         error: 'This protected send is an ordinary conversation question, not a formal approval card. Answer it in the exact original conversation.',

@@ -40,11 +40,11 @@ const APPROVAL_PREVIEW_MAX_FIELDS = 16;
 const APPROVAL_PREVIEW_TEXT_MAX_CHARS = 2_000;
 const APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS = 600;
 
-function approvalPreviewValue(value: unknown): string | null {
+function approvalPreviewValue(value: unknown, complete = false): string | null {
   if (typeof value === 'string') {
     const text = value.trim();
     if (!text) return null;
-    return text.length > APPROVAL_PREVIEW_TEXT_MAX_CHARS
+    return !complete && text.length > APPROVAL_PREVIEW_TEXT_MAX_CHARS
       ? `${text.slice(0, APPROVAL_PREVIEW_TEXT_MAX_CHARS)}… (${text.length - APPROVAL_PREVIEW_TEXT_MAX_CHARS} more characters)`
       : text;
   }
@@ -53,7 +53,7 @@ function approvalPreviewValue(value: unknown): string | null {
   try {
     const json = JSON.stringify(value);
     if (!json || json === '{}' || json === '[]') return null;
-    return json.length > APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS
+    return !complete && json.length > APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS
       ? `${json.slice(0, APPROVAL_PREVIEW_STRUCTURED_MAX_CHARS)}…`
       : json;
   } catch {
@@ -68,7 +68,7 @@ function approvalPreviewValue(value: unknown): string | null {
  * Display only: authority and resume keep pinning the untouched arguments,
  * and a value that looks like a secret is withheld.
  */
-export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true): ApprovalCallPreview | null {
+export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true, complete = false): ApprovalCallPreview | null {
   const args = (info.args ?? {}) as Record<string, unknown>;
   // Both carriers hold the real call as { name, args_json }: work_call for
   // planned work, call_tool for a schema-on-demand (MCP) operation.
@@ -79,7 +79,7 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
     const targetName = typeof args.name === 'string' ? args.name.trim() : '';
     const targetArgs = approvalJsonRecord(args.args_json);
     return targetName && targetArgs
-      ? approvalCallPreview({ ...info, toolName: targetName, args: targetArgs }, false)
+      ? approvalCallPreview({ ...info, toolName: targetName, args: targetArgs }, false, complete)
       : null;
   }
   const slug = typeof args.tool_slug === 'string' ? args.tool_slug.trim() : '';
@@ -87,8 +87,8 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
   const provider = slug ? approvalJsonRecord(args.arguments) ?? {} : args;
   const fields: ApprovalCallPreview['fields'] = [];
   for (const [name, raw] of Object.entries(provider)) {
-    if (fields.length >= APPROVAL_PREVIEW_MAX_FIELDS) break;
-    const value = approvalPreviewValue(raw);
+    if (!complete && fields.length >= APPROVAL_PREVIEW_MAX_FIELDS) break;
+    const value = approvalPreviewValue(raw, complete);
     if (value === null) continue;
     const secret = scanSecrets(value).length > 0;
     const label = secret ? undefined : info.previewLabels?.[value];

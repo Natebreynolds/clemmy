@@ -972,3 +972,19 @@ test('observed no-change overrides predicted send in public receipts', () => {
   }));
   assert.equal(sent?.data.affirmsChange, true);
 });
+
+
+test('a complete grouped approval preview survives public projection without truncating later actions', () => {
+  const prepared = 'First action: ' + 'detail '.repeat(400) + '\nSecond action: final-recipient@example.test';
+  const projected = projectHarnessEventForPublic(event('approval_requested', {
+    approvalId: 'apr-group', subject: 'Review two prepared actions',
+    preview: { operation: 'Review two prepared actions', fields: [{ name: 'Prepared actions', value: prepared }] },
+  }));
+  assert.deepEqual(projected?.data.preview, {
+    operation: 'Review two prepared actions', fields: [{ name: 'Prepared actions', value: prepared }],
+  });
+  const oversized = projectHarnessEventForPublic(event('approval_requested', {
+    approvalId: 'apr-group', preview: { operation: 'Review', fields: [{ name: 'Actions', value: 'x'.repeat(256_001) }] },
+  }));
+  assert.equal(oversized?.data.preview, undefined);
+});

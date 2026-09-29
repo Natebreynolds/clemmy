@@ -71,10 +71,15 @@ export function approvalPreviewProjection(value: unknown): { preview: { operatio
   if (typeof record.operation !== 'string' || !record.operation.trim() || record.operation.length > 80) return null;
   if (!Array.isArray(record.fields) || record.fields.length > 16) return null;
   const fields: ApprovalPreviewField[] = [];
+  let totalCharacters = 0;
   for (const field of record.fields) {
     if (!field || typeof field !== 'object' || Array.isArray(field)) return null;
     const { name, value: shown, label } = field as Record<string, unknown>;
-    if (typeof name !== 'string' || typeof shown !== 'string' || !name || name.length > 80 || shown.length > 2_100) return null;
+    if (typeof name !== 'string' || typeof shown !== 'string' || !name || name.length > 80) return null;
+    // A grouped review contains all prepared actions. Keep the total bounded
+    // without silently dropping its preview at the former per-field limit.
+    totalCharacters += shown.length;
+    if (totalCharacters > 256_000) return null;
     if (label !== undefined && (typeof label !== 'string' || !label.trim() || label.length > 120)) return null;
     fields.push({ name, value: shown, ...(typeof label === 'string' ? { label } : {}) });
   }
