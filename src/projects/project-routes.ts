@@ -279,7 +279,9 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     });
     if (corrected.kind === 'refused') {
       const status = corrected.reason === 'instruction_required' ? 400 : corrected.reason === 'task_not_found' ? 404 : 409;
-      res.status(status).json({ error: corrected.reason.toUpperCase(), task: delegatedTaskById(taskId) });
+      const code = corrected.reason === 'not_resumable' || corrected.reason === 'resume_first'
+        ? 'TASK_NOT_RESUMABLE' : corrected.reason.toUpperCase();
+      res.status(status).json({ error: code, task: delegatedTaskById(taskId) });
       return;
     }
     if (corrected.kind === 'revised') {

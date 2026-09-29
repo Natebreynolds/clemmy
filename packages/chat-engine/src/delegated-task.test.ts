@@ -139,8 +139,15 @@ test('open work is steered; ended work is corrected by a new task, and stays end
 
   const ended = delegatedTaskCard(task({ phase: 'finished', controls: { canSteer: true, canStop: false, canResume: false, canAnswer: false } }));
   assert.deepEqual([ended.steer.control, ended.steer.startsNewTask, ended.controls.steer], ['Correct this', true, true]);
-  assert.equal(ended.steer.note, 'This task has ended, so your correction starts a new task for Sales Assistant that follows it.');
+  assert.equal(ended.steer.note, 'This task has finished, so your correction starts a new task for Sales Assistant that follows it.');
   assert.deepEqual(ended.phase, { label: 'Finished', tone: 'success', settled: true }, 'a correction never makes ended work look running');
+
+  // Stopped or failed before finishing: the same task takes the correction and resumes.
+  for (const phase of ['stopped', 'failed'] as const) {
+    const cut = delegatedTaskCard(task({ phase, controls: { canSteer: true, canStop: false, canResume: true, canAnswer: false } }));
+    assert.deepEqual([cut.steer.control, cut.steer.startsNewTask], ['Correct and resume', false]);
+    assert.match(cut.steer.note, /resumes where it was with your correction/);
+  }
 });
 
 test('a steer answer says whether the task was revised or followed', () => {

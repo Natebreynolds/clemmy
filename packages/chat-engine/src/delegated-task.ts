@@ -121,9 +121,9 @@ export interface DelegatedTaskCardView {
   controls: { steer: boolean; stop: boolean; resume: boolean; answer: boolean };
   /**
    * The words for correcting it. Work still open is steered: the same task
-   * takes the change at its next step. Work that ended is corrected: the
-   * change becomes a new task for the same owner, and the ended one stays
-   * ended.
+   * takes the change at its next step. Work that finished is corrected: the
+   * change becomes a new task for the same owner, and the finished one stays
+   * finished. Work that stopped before finishing resumes with the change.
    */
   steer: { control: string; note: string; startsNewTask: boolean };
 }
@@ -148,13 +148,21 @@ export function delegatedTaskCard(task: DelegatedTask, options: { resultChars?: 
     result: task.phase === 'finished' && task.resultPreview?.trim() ? opening(task.resultPreview, options.resultChars ?? 360) : null,
     problem: task.phase === 'failed' && task.error?.trim() ? opening(task.error, 360) : null,
     followsTaskId: task.followsTaskId?.trim() || null,
-    steer: phase.settled
+    steer: task.phase === 'finished'
       ? {
         control: 'Correct this',
-        note: `This task has ended, so your correction starts a new task for ${delegatedTaskOwner(task)} that follows it.`,
+        note: `This task has finished, so your correction starts a new task for ${delegatedTaskOwner(task)} that follows it.`,
         startsNewTask: true,
       }
-      : { control: 'Steer', note: 'The same task continues with your change; nothing starts over.', startsNewTask: false },
+      : phase.settled
+        // Stopped or failed before it finished: still this task. It holds the
+        // record of what it already did, so it takes the correction itself.
+        ? {
+          control: 'Correct and resume',
+          note: 'This task stopped before it finished. It resumes where it was with your correction, and repeats nothing it already did.',
+          startsNewTask: false,
+        }
+        : { control: 'Steer', note: 'The same task continues with your change; nothing starts over.', startsNewTask: false },
     controls: {
       steer: task.controls?.canSteer === true,
       stop: task.controls?.canStop === true,
