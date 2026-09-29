@@ -157,6 +157,37 @@ export function approvalResolutionWithinLifetime(row: Pick<
     && resolvedAt <= expiresAt;
 }
 
+/** Where a person presses a button on a formal card. */
+const PERSON_CARD_SURFACES: ReadonlySet<string> = new Set([
+  'desktop-command-center', 'desktop-tasks-board', 'desktop-chat-card', 'mobile-inbox',
+]);
+
+/**
+ * Whether this approval was given by a person acting on it, as opposed to a
+ * rule, a runner, a recovery pass, an expiry or a duplicate the server
+ * resolved on someone's behalf.
+ *
+ * `resolver` is written by whichever surface resolved the row and nothing
+ * else classifies it. This is the one place that does, and it fails closed:
+ * a surface it does not know confers nothing. A reply in words counts only
+ * with the record of who replied and in which accepted message.
+ */
+export function approvalDecidedByPerson(row: Pick<
+  PendingApprovalRow,
+  'status' | 'resolution' | 'resolver' | 'presentation' | 'requestedAt' | 'expiresAt' | 'resolvedAt'
+>): boolean {
+  if (row.status !== 'resolved' || row.resolution !== 'approved' || !approvalResolutionWithinLifetime(row)) return false;
+  const resolver = row.resolver ?? '';
+  if (PERSON_CARD_SURFACES.has(resolver)) return row.presentation === null;
+  // A channel's own button or typed decision: "<channel>-user".
+  if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-user$/.test(resolver)) return true;
+  if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-conversation$/.test(resolver) || resolver === 'daemon-conversation-recovery') {
+    return Number.isSafeInteger(row.presentation?.responseSourceUserSeq)
+      && typeof row.presentation?.responseUserId === 'string' && row.presentation.responseUserId.trim() !== '';
+  }
+  return false;
+}
+
 /** How long an unanswered approval stays in the urgent "needs you" surfaces.
  * Long-TTL standing-grant asks (e.g. a 90-day CLI trust freeze) otherwise ride
  * the header until they expire — live 2026-08-09: two space-trust cards from

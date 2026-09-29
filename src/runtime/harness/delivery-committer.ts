@@ -1829,15 +1829,20 @@ export function commitTurnOutcome(
         // After the terminal and off its path: it cannot delay or change it.
         void learnResolvedReferencesForAcceptedTask({ ...workIdentity, occurredAt: terminal.event.createdAt })
           .then((kept) => {
-            if (kept.references.length === 0) return;
+            // What was considered and not kept is recorded too: a resolution
+            // that silently fails to be learned looks the same as one that
+            // was never there.
+            if (kept.references.length === 0 && kept.passedOver.length === 0) return;
             appendEvent({
               sessionId: workIdentity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
               data: {
                 kind: 'resolved_references_learned', sourceUserSeq: workIdentity.sourceUserSeq,
-                learned: kept.learned, superseded: kept.superseded,
+                learned: kept.learned, superseded: kept.superseded, held: kept.held,
                 // Which names and arguments, never the values: those live in memory with their provenance.
                 references: kept.references.map((row) => ({ named: row.named, operation: row.operation,
-                  argument: row.argument, effect: row.effect, foundIn: row.foundIn.tool })),
+                  argument: row.argument, effect: row.effect, foundIn: row.foundIn.tool,
+                  grade: row.grade, basis: row.basis, outcome: row.outcome })),
+                passedOver: kept.passedOver.slice(0, 24),
               },
             });
           }).catch(() => { /* memory stays additive */ });

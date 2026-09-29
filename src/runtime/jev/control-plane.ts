@@ -602,6 +602,76 @@ export async function labelIdentifierWithJev(
   return label;
 }
 
+/** A learned resolution is relied on by later requests, so it is called
+ *  confirmed on the same bar a card's name is shown on. */
+export const RESOLUTION_NAME_SURE = APPROVAL_LABEL_SURE;
+/** Under this the router has not picked a name, only failed to rule one out. */
+export const RESOLUTION_NAME_LEAN = 0.5;
+/** Asked after the terminal and off its path: nothing waits on the answer. */
+const RESOLUTION_NAME_TIMEOUT_MS = 4_000;
+
+export interface ResolutionNameReading {
+  /** The string the router chose, whatever its confidence; null for none. */
+  name: string | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+/**
+ * Finished work used a value the request never stated. The host found the
+ * record that value belongs to in the same request's own results; Jev picks
+ * which of that record's strings is what the request's words called it, or
+ * none. The reading is returned with its confidence and no bar applied: what
+ * a sure, a leaning and an unsure answer are worth is the learner's decision.
+ */
+export async function nameResolvedValueWithJev(
+  input: {
+    request: string;
+    operation: string;
+    field: string;
+    value: string;
+    candidates: readonly string[];
+  },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<ResolutionNameReading> {
+  const candidates = [...new Set(input.candidates.map((candidate) => candidate.trim())
+    .filter((candidate) => candidate && candidate !== input.value))]
+    .slice(0, APPROVAL_LABEL_MAX_CANDIDATES);
+  if (candidates.length === 0) return { name: null, failedOpen: false };
+  const criteria: Record<string, string | null> = {};
+  candidates.forEach((candidate, index) => { criteria[`c${index}`] = candidate; });
+  criteria.none = 'None of these is what the request called it.';
+  const result = await evaluateSystemOne({
+    state: {
+      requestSaid: clipMiddle(input.request.trim(), 600).text,
+      operationCalled: input.operation,
+      argument: input.field,
+      value: input.value,
+    },
+    questions: {
+      name: {
+        type: 'choice',
+        instructions: 'A finished request led to an operation being called with this value, which the request never stated. The choices are strings from the record the value belongs to. Which one is what the request\'s own words called the thing this value identifies? Choose none when the request\'s words refer to something else in the record, or when the choice is another detail of it: a title, a time, a status, a setting or another id.',
+        criteria,
+      },
+    },
+    timeoutMs: Math.min(RESOLUTION_NAME_TIMEOUT_MS, opts.timeoutMs ?? RESOLUTION_NAME_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-resolution-name',
+  });
+  if (!result.ok) return { name: null, failedOpen: true };
+  const answer = result.answers.name as ChoiceAnswer | undefined;
+  const index = answer && /^c\d+$/.test(answer.choice) ? Number(answer.choice.slice(1)) : -1;
+  const name = candidates[index] ?? null;
+  const confidence = answer?.confidence ?? 0;
+  noteJevDecisionOutcome(result.decisionId, !name ? 'none'
+    : confidence >= RESOLUTION_NAME_SURE ? 'sure'
+      : confidence >= RESOLUTION_NAME_LEAN ? 'leaning' : 'unsure', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { name, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 /** Work is handed to an agent on the router's word only when it is sure:
  *  an agent that does not fit does the work worse than no agent at all. */
 export const AGENT_SELECT_SURE = 0.8;

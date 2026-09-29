@@ -8,6 +8,7 @@ const {
 const {
   classifyOpenQuestionReplyWithJev,
   labelIdentifierWithJev,
+  nameResolvedValueWithJev,
   selectAgentForTaskWithJev,
   classifyApprovalReplyWithJev,
   nominateReadCapabilitiesWithJev,
@@ -656,6 +657,45 @@ test('labelIdentifierWithJev names an id only when Jev is sure, and never offers
   assert.equal(posted.length, 3);
   _setTypesafeKeyForTests(null);
   assert.equal(await labelIdentifierWithJev(input), null, 'no Jev, no name');
+});
+
+
+// Live 2026-09-29: asked the card's question, the router leaned to the right
+// name at 0.72 and the learner was told nothing. The learner's question is its
+// own, about the request's words, and the reading comes back with no bar applied.
+test('nameResolvedValueWithJev returns the chosen name with its confidence, whatever the confidence is', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  let choice = 'c1';
+  let confidence = 0.72;
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      name: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } },
+    }, usage: { input_tokens: 40, output_tokens: 2 } }) };
+  });
+  const input = {
+    request: 'Open the Harbor Ledger and count its entries.',
+    operation: 'read_file', field: 'path', value: '/fixtures/ledger-7f3a.json',
+    candidates: ['2026-09-01', 'Harbor Ledger', '/fixtures/ledger-7f3a.json', 'Harbor Ledger'],
+  };
+  assert.deepEqual(await nameResolvedValueWithJev(input), { name: 'Harbor Ledger', confidence: 0.72, failedOpen: false });
+  const body = posted[0]!;
+  assert.deepEqual(Object.keys(body.questions), ['name']);
+  assert.deepEqual(body.questions.name.criteria, {
+    c0: '2026-09-01', c1: 'Harbor Ledger', none: 'None of these is what the request called it.',
+  }, 'duplicates and the value itself are not choices');
+  assert.match(JSON.stringify(body.state), /Open the Harbor Ledger/, 'the question is asked beside the request\'s own words');
+  assert.doesNotMatch(body.questions.name.instructions, /approval card/);
+  confidence = 0.31;
+  assert.deepEqual(await nameResolvedValueWithJev(input), { name: 'Harbor Ledger', confidence: 0.31, failedOpen: false });
+  choice = 'none'; confidence = 0.97;
+  assert.deepEqual(await nameResolvedValueWithJev(input), { name: null, confidence: 0.97, failedOpen: false });
+  assert.deepEqual(await nameResolvedValueWithJev({ ...input, candidates: [input.value] }), { name: null, failedOpen: false },
+    'nothing to choose from asks nothing');
+  assert.equal(posted.length, 3);
+  _setTypesafeKeyForTests(null);
+  assert.deepEqual(await nameResolvedValueWithJev(input), { name: null, failedOpen: true }, 'no router, no reading');
 });
 
 
