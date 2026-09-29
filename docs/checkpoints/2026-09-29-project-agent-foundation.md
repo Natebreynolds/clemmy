@@ -76,6 +76,12 @@ plan graph.
 | `98b48f3cf` | The card says what a correction will do |
 | `d74884f68` | Found live: `project_save` is a host control; promoted work finds its agent; each turn is told about delegated work |
 | `724a3d569` | Found live: `delegated_task_correct`, a control for handing a correction to the task's owner on an ordinary turn |
+| `ec7c91836` | Each chip beside the composer stays whole when the row is short of room |
+| `014c96896` | `src/projects` tests join the suite every release runs |
+| `69380dcf9` | A workflow does not ask which account when one account was only registered more than once |
+| `3028b8bea` | A project links to the local projects its work happens in; coding runs from its conversations are listed with its work |
+| `918da9edb`, `69dc284e7`, `cbcd2ec5f` | The words for local projects and coding work in the shared chat engine; the desktop and the phone |
+| `4d7c3c6a3` | Test example paths without a home folder, so the public hygiene check passes |
 
 ### Who sees what
 
@@ -114,6 +120,24 @@ Each turn of a conversation is told which tasks were delegated from it, or belon
 and where its result is (`src/projects/delegated-work-pointers.ts`). Clem hands a correction over with
 `delegated_task_correct`; the turn ends on the handover.
 
+### Local projects
+
+Owner, 2026-09-29: "project need to be able to link to local projects that clem will work in." A project's
+resource of kind `folder` is a link to one of the machine's own local projects (the roster the app already keeps
+under Connect), chosen by name or by folder. A folder that is not on that roster is refused with the roster to
+choose from, by the routes and by `project_save` alike; a partial name is not guessed. The project's context names
+each linked local project and its folder. The overview says whether the folder is still there and whether it is a
+git repository, and lists the coding runs started from the project's conversations. Linking grants no access:
+what may be read or written in a folder is decided where it always was.
+
+### A workflow's account
+
+A scheduled run paused with "N accounts are registered" although one account existed: every disclosure of an
+operation in a conversation registers it again under a new capability id, and the compiler counted registrations.
+It now asks only when the accounts differ, and otherwise uses the registration issued last. The store still
+accumulates registrations and nothing prunes them; a saved choice between real accounts is still invalidated when
+the set changes.
+
 ## Baseline on the installed build, before this work
 
 `47f192e2d`, fixture `project-agent-foundation-0929`, one run each, 2026-09-29.
@@ -136,6 +160,10 @@ only after five lookups through conversation history.
 
 | Check | Result |
 | --- | --- |
+| Full suite on `4d7c3c6a3` (the final tip, what is installed), two files at a time beside the live app | 18,660 tests, 18,654 pass, 0 fail, 6 skipped. Typecheck, hygiene checker and operation identity check pass |
+| Journeys, engine tests and release checks on `4d7c3c6a3` | Still running when the tag was made. Last results on earlier tips are below and in the release notes |
+| App, shared chat engine and project tests on `cbcd2ec5f`, run by name | 1,196 tests, 1,195 pass. The one is the TopBar pin |
+| Full suite on `3028b8bea`, two files at a time beside the live app | 18,652 tests, 18,575 pass, 70 fail: all in `workflow-run-queue.test.ts`, all "database or disk is full" with 1.3 GB free. After space was freed the file passed alone, 99 of 99 |
 | Full suite on a frozen copy of `014c96896` (the first to include `src/projects`) | 18,649 tests, 18,643 pass, 0 fail, 6 skipped |
 | Release checks on `014c96896` | typecheck, four builds, hygiene checker, release closure 141 of 141, release assets 59 of 59, packed candidate: all pass. On `2540f9284`: measurement 98 of 98, proof self-tests 239 of 239, gate benchmark, fresh install and its end-to-end, packaged upgrade 22 of 22: all pass |
 | Full suite on a frozen copy of `724a3d569` (what is installed) | 18,632 tests, 18,625 pass, 0 fail, 7 skipped |
@@ -151,9 +179,18 @@ write authority. Both found defects, fixed in `17e2a29a3` and `cb69249c6` and pi
 
 ## Installed and live
 
-Three installs on 2026-09-29, each guarded by its predecessor, each leaving the native shell unchanged:
-`98b48f3cf` 11:47Z, `99152cc60` 12:55Z, `724a3d569` 13:42Z. The app serves `724a3d569`. The second and third
-were corrections to defects the first and second showed in the installed app; they are the same work.
+Four installs on 2026-09-29, each guarded by its predecessor, each leaving the native shell unchanged:
+`98b48f3cf` 11:47Z, `99152cc60` 12:55Z, `724a3d569` 13:42Z, `4d7c3c6a3` 16:35Z. The app serves `4d7c3c6a3`. The
+second and third were corrections to defects the first and second showed in the installed app; the fourth adds
+the chips, the workflow account fix and local project links.
+
+On `4d7c3c6a3`: a local project was linked by name to a fixture project; a folder that is not a local project
+and a partial name were refused with the roster; the desktop and the phone (a paired headless phone, revoked by
+its own id) show the link; Clem named the linked local project and its folder in a new conversation in the
+project. The owner's pending approvals were 7 before and after. The workflow account fix: the state that paused
+a run was reproduced (one account, registered 3 more times since the install) and the controlled workflow
+`handoff-account-fixture` was started; its result was NOT read in this session, so the fix is proven by its test
+and not live.
 
 Results, measurements and the acceptance table are in `output/project-agent-foundation-0929/LIVE-RESULTS.md`
 (private). In short: the correction reaches the owner of the work and finishes (59 s, done) where the baseline
@@ -162,8 +199,8 @@ without; one agent in two projects keeps their meanings and their learning apart
 
 Fixture objects left in the live home, to be removed only after the owner has seen this list: agent
 `fixture-analyst`; projects Harbor Sales Fixture, Harbor Hiring Fixture, Harbor Sales Cold Fixture; their
-conversations and 5 tasks; 4 facts and the episodes kept for those projects; drafts under the worktree's
-`output/`.
+conversations and tasks; the facts and episodes kept for those projects; the link from Harbor Sales Cold Fixture
+to a local project; one run of the workflow `handoff-account-fixture`; drafts under the worktree's `output/`.
 
 ## Limits
 
@@ -197,7 +234,11 @@ conversations and 5 tasks; 4 facts and the episodes kept for those projects; dra
 - `packages/` is in no test gate, and one test there fails on main. Owner decision.
 - `src/projects` was in no test gate until `014c96896`; release qualification found it. The three suites before
   that did not include its 17 tests, which were run by name.
-- `ec7c91836` (the chips beside the composer) and `014c96896` are not installed.
+- The result of the controlled workflow run on `4d7c3c6a3`, and a project's coding work seen populated.
+- The machine's disk was 99 % full during qualification. A full disk fails tests that open databases.
 - The chip that says who answers loses its chevron behind the model chip at 1280 px.
 - Promotion of a method across projects (`shareMethods`), a pause, and enforcing an agent's tool list.
-- Not pushed. Not tagged. The version number is the owner's.
+- Owner, 2026-09-29: "lets tag 3.18.23 when ready", "push when the tag is ready". Then, with the full suite clean on the final tip and the rest of
+  the checks still running: "lets commit push and tag please i think we are in a good spot". Main was
+  fast-forwarded to `4d7c3c6a3`, these documents were committed on it, and `v3.18.23` was tagged on the release
+  commit and pushed.
