@@ -304,7 +304,7 @@ test('work moved to the background from a project finds its agent once, when it 
   // The conversation is told what was delegated, who owns it, and what to do with a correction.
   const pointers = delegatedWorkPointers(origin.id);
   assert.match(pointers, new RegExp(`- ${queued.id} ".*": Briefing Analyst in Delegated Sales, `));
-  assert.match(pointers, /hand the change to the task with background_task_revise and its id/);
+  assert.match(pointers, /hand the change to the task: delegated_task_correct with id \(the task id below\) and instruction/);
   // Another conversation in the same project is told too; one outside it is not.
   const sibling = createSession({ id: 'promoted-sibling', kind: 'chat' });
   setSessionProject(sibling.id, sales.id, { by: 'owner' });

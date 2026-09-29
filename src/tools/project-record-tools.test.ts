@@ -141,3 +141,37 @@ test('organising a project is a host control: it needs no declared work and no c
   assert.deepEqual(carried, { toolName: 'project_save', args: { project: null, name: 'Carried' } });
   assert.equal(classifyRuntimeToolEffect('project_save', { project: null, name: 'Carried' }).effect, 'host_only');
 });
+
+
+test('a correction handed to delegated work reaches its owner, and is a host control any ordinary turn can use', async () => {
+  const tasks = await import('../execution/background-tasks.js');
+  const { classifyRuntimeToolEffect, resolveCarriedHostControl } = await import('../runtime/harness/tool-effect.js');
+  const { actionControlAdmittedForTaskState } = await import('./tool-registry.js');
+  const { renderTerminalToolReply, terminalToolShouldHalt } = await import('../runtime/harness/terminal-tool.js');
+  assert.equal(actionControlAdmittedForTaskState('delegated_task_correct', 'fresh'), true, 'a correction arrives on an ordinary turn');
+  assert.equal(classifyRuntimeToolEffect('delegated_task_correct', { id: 'x', instruction: 'y' }).effect, 'host_only');
+  assert.ok(resolveCarriedHostControl('call_tool', { name: 'delegated_task_correct', args_json: '{"id":"x","instruction":"change it"}' }));
+
+  const chat = createSession({ id: 'correcting-chat', kind: 'chat' });
+  const agent = findAgentRecord('Sales Assistant')!;
+  const project = projects.findProject('Weekly Sales')!;
+  const task = tasks.createBackgroundTask({ title: 'Draft the briefing', prompt: 'Objective: draft', originSessionId: chat.id, source: 'desktop',
+    delegation: { agentId: agent.id, agentName: agent.name, agentCreatedAt: agent.createdAt, projectId: project.id, projectName: project.name, assignedBy: 'clem' } });
+  tasks.markBackgroundTaskRunning(task.id);
+  tasks.markBackgroundTaskDone(task.id, 'Draft saved.');
+
+  const receipt = await call('delegated_task_correct', { id: task.id, instruction: 'Focus on this week only.' }, chat.id);
+  assert.deepEqual([receipt.ok, receipt.applied, receipt.follows, receipt.owner, receipt.project], [true, 'followed', task.id, 'Sales Assistant', 'Weekly Sales']);
+  const follow = tasks.getBackgroundTask(receipt.task)!;
+  assert.deepEqual([follow.delegation?.agentId, follow.delegation?.followsTaskId, follow.delegation?.assignedBy], [agent.id, task.id, 'clem']);
+  const text = JSON.stringify(receipt);
+  assert.equal(terminalToolShouldHalt('delegated_task_correct', text), true, 'the turn ends on the handover; Clem does not redo the work');
+  assert.equal(renderTerminalToolReply('delegated_task_correct', null, text),
+    'Sales Assistant has your correction as a new task that follows the finished one, starting from what it produced. It reports back here when it’s done.');
+
+  const refused = await call('delegated_task_correct', { id: 'bg-none-000000', instruction: 'Anything at all.' }, chat.id);
+  assert.deepEqual([refused.ok, refused.code], [false, 'task_not_found']);
+  assert.equal(terminalToolShouldHalt('delegated_task_correct', JSON.stringify(refused)), false, 'a refusal goes back to the model');
+  const run = createSession({ id: 'background:bg-correcting-0c0c0c', kind: 'execution', metadata: { delegatedTaskId: 'bg-correcting-0c0c0c' } });
+  assert.equal((await call('delegated_task_correct', { id: task.id, instruction: 'From a run.' }, run.id)).code, 'not_in_conversation');
+});

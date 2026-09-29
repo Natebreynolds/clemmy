@@ -20,6 +20,8 @@ import {
   type ProjectAssignment, type ProjectRecord, type ProjectResource,
 } from '../projects/project-record.js';
 import { setSessionProject } from '../projects/session-project.js';
+import { correctDelegatedTask } from '../projects/task-follow-up.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { getSession } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
@@ -280,6 +282,60 @@ export function registerProjectRecordTools(server: McpServer): void {
           ? { askTheOwner: questions,
               next: 'Ask the owner these in ONE message, then call project_save again with their answers. Bind nothing they did not choose.' }
           : {}),
+      });
+    },
+  );
+
+  server.tool(
+    'delegated_task_correct',
+    [
+      'Give the owner\'s change or correction to a delegated task, by its id. The task\'s own agent applies it, in the task\'s project, starting from what the task already did.',
+      'A task that is still open takes it as the next version of its request. A task that has finished is followed by a new task for the same agent. A task that stopped before it finished is resumed only by the owner, from its card.',
+      'Use this whenever the owner changes or corrects work that was delegated. Do not redo that work in the conversation.',
+    ].join(' '),
+    {
+      id: z.string().min(1).describe('The delegated task\'s id, as listed under Delegated Work or returned when it was started.'),
+      instruction: z.string().min(4).describe('The owner\'s change, in their terms, complete enough to act on without this conversation.'),
+      evidence_policy: z.enum(['preserve', 'revalidate', 'invalidate']).nullable().optional()
+        .describe('How what the task already found should be treated. Omit to have it checked again.'),
+    },
+    async ({ id, instruction, evidence_policy }) => {
+      const sessionId = getToolOutputContext()?.sessionId;
+      if (sessionId && !isConversation(sessionId)) {
+        return json({ ok: false, code: 'not_in_conversation',
+          detail: 'Delegated work is corrected from a conversation with the owner. Nothing was changed.' });
+      }
+      const sourceUserSeq = harnessRunContextStorage.getStore()?.sourceUserSeq;
+      const corrected = correctDelegatedTask(id, {
+        instruction, evidencePolicy: evidence_policy ?? 'revalidate', by: 'clem',
+        ...(typeof sourceUserSeq === 'number' ? { sourceUserSeq } : {}),
+      });
+      if (corrected.kind === 'refused') {
+        const detail: Record<typeof corrected.reason, string> = {
+          task_not_found: 'No task has that id. Use an id listed under Delegated Work.',
+          not_delegated: 'That task was not delegated to anyone, so there is no owner to correct it.',
+          instruction_required: 'Say what should change.',
+          stopping: 'The task is being stopped. It can be corrected once it has stopped.',
+          owner_unavailable: 'The agent that did this work is no longer saved, so the correction was handed to nobody. Ask the owner who should take it.',
+          resume_first: 'The task stopped before it finished, and only the owner resumes stopped work. Nothing was changed and nothing was started. Tell the owner it did not finish, and that correcting it from its card resumes it in place with the correction.',
+          not_resumable: 'The task stopped before it finished and cannot be resumed. Nothing was changed.',
+        };
+        return json({ ok: false, code: corrected.reason, detail: detail[corrected.reason],
+          next: 'Tell the owner this. Do not do the task\'s work yourself.' });
+      }
+      const owner = corrected.task.delegation?.agentName ?? 'Clem';
+      const project = corrected.task.delegation?.projectName ?? null;
+      return json({
+        ok: true,
+        applied: corrected.kind,
+        task: corrected.task.id,
+        ...(corrected.kind === 'followed' ? { follows: corrected.follows.id } : {}),
+        owner,
+        ...(project ? { project } : {}),
+        requestVersion: corrected.task.contractVersion ?? 1,
+        next: corrected.kind === 'followed'
+          ? `${owner} has the correction as task ${corrected.task.id}, which follows the finished one and starts from what it produced. It reports back here when it is done. Tell the owner that in one or two sentences and stop: do not do the corrected work yourself.`
+          : `${owner} applies the correction at its next step, on the same task. Tell the owner that in one or two sentences and stop: do not do the corrected work yourself.`,
       });
     },
   );

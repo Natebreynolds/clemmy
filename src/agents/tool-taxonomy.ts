@@ -265,6 +265,10 @@ const ALWAYS_READ = new Set<string>([
   // state. It must not introduce an approval pause between the user's explicit
   // correction and the next safe model boundary.
   'background_task_revise',
+  // The same for a correction handed to the owner of delegated work: the
+  // owner's correction is the consent, and what the task then does is gated
+  // inside the task.
+  'delegated_task_correct',
   // dispatch_background_task is a WRITE (it queues autonomous work), but the
   // user just AGREED to it in conversation — the conversation IS the consent, so
   // it must not re-prompt for approval (same rationale as execution_create /

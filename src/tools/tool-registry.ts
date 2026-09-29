@@ -402,6 +402,10 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'project_run', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], loopClass: 'mutating', blockedFor: ['workflow-step', 'worker'], delegationPrimitive: true, description: 'Inspect or stop coding runs in the user\'s local projects: status | runs | kill. New runs start with dispatch_coding_task.' },
   // A project is the host's own record of how the owner's work is organised:
   // it grants no authority and crosses no boundary, like a focus or a memory.
+  // Handing the owner's correction to the task that owns the work writes the
+  // host's own task record. What the task then does passes every gate a task
+  // passes.
+  { name: 'delegated_task_correct', sideEffect: 'read', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Give the owner\'s change or correction to a delegated task; its own agent applies it.' },
   { name: 'project_save', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['workflow-step', 'worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Create or change a project: purpose, goals, context, the agents assigned to it, and the accounts and resources it uses.' },
   { name: 'check_delegation', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Check a delegated task by ID or list delegations for an agent.' },
   { name: 'composio_execute_tool', sideEffect: 'send', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'write', loopClass: 'mutating', description: 'Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search,…' },

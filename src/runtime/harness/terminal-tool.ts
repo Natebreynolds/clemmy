@@ -26,6 +26,7 @@ const TERMINAL_TOOL_NAMES = new Set([
   'background_task_status',
   'background_task_revise',
   'background_task_cancel',
+  'delegated_task_correct',
 ]);
 
 export function bareTerminalToolName(rawName: string): string {
@@ -81,6 +82,7 @@ const BACKGROUND_CONTROL_TOOLS: ReadonlySet<string> = new Set([
   'background_task_status',
   'background_task_revise',
   'background_task_cancel',
+  'delegated_task_correct',
 ]);
 
 /**
@@ -143,6 +145,17 @@ export function renderTerminalToolReply(rawName: string, input: unknown, output:
     // 2026-08-11, first dev-daemon acceptance ask). Plain voice, no ids —
     // the surrounding thread already names the task.
     return 'Got it — I’ve folded that into the running task; it picks up the change at its next step.';
+  }
+  if (bare === 'delegated_task_correct') {
+    // The receipt names who has the correction and whether it is the same
+    // task or one that follows a finished one. No ids: the thread and the
+    // task's card already name it.
+    let receipt: { applied?: unknown; owner?: unknown } = {};
+    try { receipt = JSON.parse(output) as typeof receipt; } catch { return output.trim() || 'The correction was handed over.'; }
+    const owner = typeof receipt.owner === 'string' && receipt.owner.trim() ? receipt.owner.trim() : 'The task’s owner';
+    return receipt.applied === 'followed'
+      ? `${owner} has your correction as a new task that follows the finished one, starting from what it produced. It reports back here when it’s done.`
+      : `Got it — ${owner} picks up the change at the task’s next step.`;
   }
   if (bare === 'background_task_cancel') {
     return output.trim().startsWith('{')
