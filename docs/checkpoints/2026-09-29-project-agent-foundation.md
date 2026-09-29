@@ -136,7 +136,9 @@ only after five lookups through conversation history.
 
 | Check | Result |
 | --- | --- |
-| Full suite on a frozen copy of `724a3d569` | 18,632 tests, 18,625 pass, 0 fail, 7 skipped |
+| Full suite on a frozen copy of `014c96896` (the first to include `src/projects`) | 18,649 tests, 18,643 pass, 0 fail, 6 skipped |
+| Release checks on `014c96896` | typecheck, four builds, hygiene checker, release closure 141 of 141, release assets 59 of 59, packed candidate: all pass. On `2540f9284`: measurement 98 of 98, proof self-tests 239 of 239, gate benchmark, fresh install and its end-to-end, packaged upgrade 22 of 22: all pass |
+| Full suite on a frozen copy of `724a3d569` (what is installed) | 18,632 tests, 18,625 pass, 0 fail, 7 skipped |
 | Journeys, serial | 200 of 201. The one is the ordinary-conversation benchmark, as at v3.18.22 |
 | Shared chat engine tests (run by name: `packages/` is in no gate) | 242 of 243. The one is the TopBar pin, which fails at `78ca875ab` without this work |
 | Typecheck: runtime, desktop, phone | clean |
@@ -193,6 +195,9 @@ conversations and 5 tasks; 4 facts and the episodes kept for those projects; dra
 - The first task in a project costs more with an agent than without. Not investigated.
 - A task started by the owner's words names no request, so its cost is attributed by start time.
 - `packages/` is in no test gate, and one test there fails on main. Owner decision.
+- `src/projects` was in no test gate until `014c96896`; release qualification found it. The three suites before
+  that did not include its 17 tests, which were run by name.
+- `ec7c91836` (the chips beside the composer) and `014c96896` are not installed.
 - The chip that says who answers loses its chevron behind the model chip at 1280 px.
 - Promotion of a method across projects (`shareMethods`), a pause, and enforcing an agent's tool list.
 - Not pushed. Not tagged. The version number is the owner's.
