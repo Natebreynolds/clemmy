@@ -39,6 +39,16 @@ import {
   updatesClearScope, notificationTitle, needsYouCardLabel } from '../lib/inbox-presentation';
 import { inboxNeedsCountKnown, mergeInboxLastGood, type InboxLastGood } from '../lib/inbox-last-good';
 import { stoppableWorkflowRunIds } from '../lib/running-tasks';
+import {
+  approvalSessions,
+  inboxLabelSessions,
+  indexProjectLabels,
+  notificationSessions,
+  projectNameFor,
+  questionSessions,
+  type ProjectLabel,
+} from '../lib/inbox-projects';
+import { listProjectLabels } from '../lib/project-api';
 import { useScreenData } from '../lib/use-screen-data';
 
 type InboxTab = 'needs' | 'updates';
@@ -69,7 +79,13 @@ interface InboxData {
   /** Needs-you items no feed has a row for (dashboard/needs-you.ts), so this
    *  list and the header's number are the same set. */
   unlisted: InboxUnlistedItem[];
+  /** Which project each row's session works in. Empty when none does, or
+   *  when the Mac could not say: a row then reads as it always did. */
+  projectLabels: ProjectLabel[];
 }
+
+/** How long one answer about projects is reused for the same set of rows. */
+const PROJECT_LABELS_FRESH_MS = 60_000;
 
 type InboxPart<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
@@ -117,6 +133,9 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   // slot so a stale snapshot can never leak into the decision sets above.
   const lastStoppableRunIds = useRef<string[] | null>(null);
   const lastUnlisted = useRef<InboxUnlistedItem[]>([]);
+  // Labels are presentation, so they never hold up or fail the Inbox: asked
+  // once for the rows on screen, and again only when those rows change.
+  const lastLabels = useRef<{ key: string; at: number; labels: ProjectLabel[] }>({ key: '', at: 0, labels: [] });
   const load = useCallback(async (): Promise<InboxData> => {
     const exactNotification = initialNotificationId
       ? getInboxNotification(initialNotificationId)
@@ -163,6 +182,19 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
         ...notificationRows.filter((row) => row.id !== exact.value?.notification.id),
       ];
     }
+    const labelSessions = inboxLabelSessions({
+      questions: lastGood.current.questions,
+      approvals: lastGood.current.approvals,
+      notifications: notificationRows.filter((row) => row.needsAttention && !row.read),
+    });
+    const labelKey = labelSessions.join(',');
+    if (labelSessions.length === 0) {
+      lastLabels.current = { key: '', at: Date.now(), labels: [] };
+    } else if (labelKey !== lastLabels.current.key || Date.now() - lastLabels.current.at > PROJECT_LABELS_FRESH_MS) {
+      const labels = await loadInboxPart(listProjectLabels(labelSessions));
+      // A Mac that cannot say keeps whatever it last said for these rows.
+      if (labels.ok) lastLabels.current = { key: labelKey, at: Date.now(), labels: labels.value.labels ?? [] };
+    }
     const exactStatus = exact.ok ? null : (exact.error as { status?: number }).status;
     const exactInRows = Boolean(
       initialNotificationId && notificationRows.some((row) => row.id === initialNotificationId),
@@ -198,6 +230,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       updatesKnown: lastGood.current.notifications !== undefined,
       stoppableRunIds: lastStoppableRunIds.current,
       unlisted: lastUnlisted.current,
+      projectLabels: lastLabels.current.labels,
     };
   }, [initialNotificationId]);
   const { data, loading, refreshing, error, offline, refresh } = useScreenData(load, { intervalMs: 6_000, resourceKey: initialNotificationId ?? 'inbox' });
@@ -235,6 +268,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
     () => applyLocalReads(data?.notifications ?? [], locallyRead),
     [data?.notifications, locallyRead],
   );
+  const projectLabels = useMemo(() => indexProjectLabels(data?.projectLabels), [data?.projectLabels]);
   const questionIds = useMemo(() => new Set(questions.map((row) => row.id)), [questions]);
   const approvalIds = useMemo(() => new Set(approvals.map((row) => row.approvalId)), [approvals]);
   const planIds = useMemo(() => new Set(plans.map((row) => row.id)), [plans]);
@@ -568,6 +602,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             <QuestionCard
               key={question.id}
               question={question}
+              project={projectNameFor(question, questionSessions(question), projectLabels)}
               onAnswered={(receipt) => answered(question, receipt)}
               onReply={onReply}
             />
@@ -583,6 +618,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             workspaceChoosers={workspaceChoosers}
             onResolved={resolved}
             onReply={(sessionId, draft) => onReply(sessionId || null, draft)}
+            projectOf={(row) => projectNameFor(row, approvalSessions(row), projectLabels)}
           />
 
           {unlisted.map((item) => (
@@ -619,6 +655,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 tabIndex={-1}
               >
                 <CardMeta label={needsYouCardLabel(row)} at={row.createdAt} urgent />
+                <ProjectChip name={projectNameFor({}, notificationSessions(row), projectLabels)} />
                 <h2>{notificationTitle(row.title) || 'I need your attention'}</h2>
                 {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
                 {earlier > 0 ? <p class="inbox-card-fine">+{earlier} earlier update{earlier === 1 ? '' : 's'} like this</p> : null}
@@ -1031,8 +1068,15 @@ function TrustProposalCard({ proposal, onResolved }: {
   );
 }
 
-function QuestionCard({ question, onAnswered, onReply }: {
+/** Which project a row belongs to. Nothing is drawn for a row in none. */
+function ProjectChip({ name }: { name: string | null }) {
+  return name ? <span class="chip chip-project inbox-project">{name}</span> : null;
+}
+
+function QuestionCard({ question, project, onAnswered, onReply }: {
   question: InboxQuestion;
+  /** The project this question belongs to; null when it belongs to none. */
+  project: string | null;
   onAnswered: (receipt: Omit<AnswerReceipt, 'id'>) => void;
   onReply: Props['onReply'];
 }) {
@@ -1093,6 +1137,7 @@ function QuestionCard({ question, onAnswered, onReply }: {
         at={question.askedAt}
         urgent={question.urgency === 'high'}
       />
+      <ProjectChip name={project} />
       <h2>{question.question}</h2>
       {question.context && question.context.trim() !== question.question.trim() ? (
         <details class="inbox-context">

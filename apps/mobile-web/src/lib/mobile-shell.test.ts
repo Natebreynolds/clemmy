@@ -79,8 +79,9 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   assert.match(app, /aria-current=\{tab === t\.id \? 'page' : undefined\}/);
   const css = read('../styles.css');
   assert.match(css, /\.menu-mark \{[\s\S]*?min-width: 44px;[\s\S]*?min-height: 44px/);
-  // Six places, two quiet doors, Settings at the foot.
-  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'inbox', 'spaces', 'workflows', 'agents', 'memory'\];/);
+  // Seven places (Projects joined them 2026-09-29), two quiet doors, Settings
+  // at the foot.
+  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'\];/);
   assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['chats', 'activity'\];/);
   assert.match(app, /class="drawer-quiet"/);
   assert.match(css, /\.drawer \{[\s\S]*?width: min\(82vw, 320px\)/);
@@ -228,4 +229,24 @@ test('one working-now poll feeds the header chip and Home', () => {
   assert.doesNotMatch(sheet, /useScreenData\(listWorkingNow/);
   const app = read('../app.tsx');
   assert.match(app, /useWorkingNow\(authenticated\)/, 'the shell keeps the poll alive while signed in');
+});
+
+/**
+ * Projects is a place of its own in the menu, a link can open one project,
+ * and a decision settled inside a project moves the ONE Needs-you count at
+ * once instead of at the next poll.
+ */
+test('Projects is a primary place, deep-linkable, and settles the shared Needs-you count', () => {
+  const app = read('../app.tsx');
+  assert.match(app, /projects: 'Projects',/, 'the screen is titled in the product\'s own word');
+  assert.match(app, /useState<string \| null>\(\(\) => projectFromSearch\(window\.location\.search\)\)/,
+    'a cold open on a project link lands on that project');
+  assert.match(app, /setProjectId\(projectFromSearch\(window\.location\.search\)\)/,
+    'a link arriving while the app is open moves it too');
+  assert.match(app, /<Projects[\s\S]*?onProjectChange=\{\(id\) => navigateTo\('projects', \{ projectId: id \}\)\}/);
+  assert.match(app, /<Projects[\s\S]*?onDecided=\{\(\) => recountNeedsYou\.current\(\)\}/);
+  assert.match(app, /recountNeedsYou\.current = \(\) => \{ void refreshCount\(\); \};/,
+    'the recount is the shell\'s own poll, not a second source for the number');
+  const deepLink = read('./deep-link.ts');
+  assert.match(deepLink, /if \(input\.tab === 'projects' && input\.projectId\) params\.set\('project', input\.projectId\);/);
 });

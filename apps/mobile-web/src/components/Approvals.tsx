@@ -43,9 +43,11 @@ interface DecisionsProps {
   workspaceChoosers: WorkspaceDestinationChooser[];
   onResolved: (message: string) => void;
   onReply?: (sessionId: string, draft: string) => void;
+  /** The project an approval belongs to, by name; absent or null draws none. */
+  projectOf?: (row: ApprovalRow) => string | null;
 }
 
-export function Decisions({ approvals, plans, workspaceChoosers, onResolved, onReply }: DecisionsProps) {
+export function Decisions({ approvals, plans, workspaceChoosers, onResolved, onReply, projectOf }: DecisionsProps) {
   const [acting, setActing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const actionLock = useRef(false);
@@ -127,6 +129,7 @@ export function Decisions({ approvals, plans, workspaceChoosers, onResolved, onR
           acting={acting === row.approvalId}
           disabled={acting !== null}
           onReply={onReply}
+          project={projectOf ? projectOf(row) : row.projectName?.trim() || null}
           onAct={(action, note) => run(
             row.approvalId,
             () => action === 'approve' ? approveApproval(row.approvalId) : rejectApproval(row.approvalId, note),
@@ -275,8 +278,10 @@ function PlanCard({ row, index, acting, disabled, onAct, onReply }: {
   );
 }
 
-function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
+function ApprovalCard({ row, index, acting, disabled, onAct, onReply, project }: {
   row: ApprovalRow;
+  /** The project this approval belongs to; null when it belongs to none. */
+  project: string | null;
   index: number;
   acting: boolean;
   disabled: boolean;
@@ -306,6 +311,7 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply }: {
           </time>
         </span>
       </header>
+      {project ? <span class="chip chip-project inbox-project">{project}</span> : null}
       <h2 class="card-title">{approvalQuestion(row.subject)}</h2>
       {row.resourceFingerprint?.warning ? (
         <p class="card-warn">{row.resourceFingerprint.warning}</p>

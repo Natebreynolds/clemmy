@@ -23,8 +23,11 @@ test('the shell makes a run a destination and hands every surface the same door'
   const app = read('../app.tsx');
   assert.match(app, /const openRun = useCallback\(\(sessionId: string\) => \{/);
   assert.match(app, /navigateTo\('activity', \{ runId: sessionId \}\)/);
-  // Home, the Inbox and the header sheet all reach the SAME run screen.
-  assert.equal((app.match(/onOpenRun=\{openRun\}/g) ?? []).length, 3, 'Home, Inbox and the running sheet');
+  // Home, the Inbox and the header sheet all reach the SAME run screen, and so
+  // does every surface that draws a delegated task: a conversation, a
+  // project, an agent (2026-09-29).
+  assert.equal((app.match(/onOpenRun=\{openRun\}/g) ?? []).length, 6,
+    'Home, Inbox, the running sheet, Chats, Projects and Agents');
   assert.match(app, /initialRunId=\{runId\}/, 'a URL-addressed run opens on arrival');
   assert.match(app, /onRunChange=\{\(sessionId\) => navigateTo\('activity', \{ runId: sessionId \}\)\}/,
     'opening a run inside Activity updates the URL, so reload and swipe-back land in the same place');

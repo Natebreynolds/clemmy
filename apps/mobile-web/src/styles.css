@@ -4860,3 +4860,261 @@ textarea.cz-input { resize: vertical; }
 .approval-review summary { cursor: pointer; padding: 4px 0; width: fit-content; }
 .approval-review summary:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
 .approval-review-warning { margin: 8px 0; font-weight: 600; }
+
+/* ── Projects, delegated tasks, scoped memory ─────────────────────────────
+   One vocabulary for three screens. A project, a task and a scope are drawn
+   with what the app already has: hairline cards, the warm surface for what
+   waits on the owner, the accent only where a tap or a decision is. Nothing
+   here animates except the press every control already has. */
+.section-empty { margin: 0 2px var(--sp-2); color: var(--fg-3); font-size: var(--t-sm); line-height: 1.5; }
+
+/* The list: name, purpose, who and how much, in one glance. */
+.project-row { color: inherit; font: inherit; text-align: left; }
+.project-row-text { display: grid; gap: 3px; flex: 1 1 auto; }
+.project-row-top { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.project-row-top .card-title-sm { min-width: 0; }
+.project-row-purpose {
+  font-size: var(--t-sm);
+  color: var(--fg-2);
+  line-height: 1.45;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.project-row .card-when { margin-top: 2px; }
+.project-row-needs { border-color: rgba(239, 95, 12, 0.28); }
+.project-list-head { margin-top: var(--sp-5); }
+/* Tinted, not filled: the header already spends the filled accent on the one
+   count, and a list of filled chips would compete with it. */
+.chip-needs { flex: 0 0 auto; font-family: var(--font-display); color: var(--accent-deep); background: var(--accent-soft); }
+.chip-project { color: var(--fg-2); background: var(--bg-3); font-family: var(--font-display); }
+.chip-gone { flex: 0 0 auto; font-family: var(--font-display); color: var(--accent-warn); background: var(--warn-soft); }
+.chat-card-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 3px; }
+.chat-card-chips .chip-agent { margin-top: 0; }
+.chat-card-chips .chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; }
+.inbox-project { margin-top: var(--sp-2); }
+
+/* One project, top to bottom. */
+.project-detail .chat-header .btn-quiet { flex: 0 0 auto; }
+.project-sections { display: flex; flex-direction: column; gap: var(--sp-5); padding-bottom: var(--sp-4); }
+.project-sections > section { display: flex; flex-direction: column; min-width: 0; }
+.project-sections .section-head { margin-bottom: var(--sp-2); }
+.project-purpose { margin: 0; font-size: var(--t-body); line-height: 1.5; color: var(--fg); overflow-wrap: anywhere; }
+.project-purpose.is-empty { color: var(--fg-3); font-size: var(--t-sm); }
+.project-sections .project-sub {
+  margin: var(--sp-3) 2px var(--sp-1);
+  font-family: var(--font-display);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  color: var(--fg-3);
+}
+.project-goals { margin: 0; padding-left: 20px; font-size: var(--t-sm); color: var(--fg-2); line-height: 1.5; }
+.project-goals li + li { margin-top: 3px; }
+.project-context { margin: 0; font-size: var(--t-sm); color: var(--fg-2); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.project-flag {
+  margin: 0 0 var(--sp-2);
+  padding: 10px 12px;
+  border: 1px solid rgba(176, 125, 10, 0.22);
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+  color: var(--fg);
+  font-size: var(--t-sm);
+  line-height: 1.45;
+}
+.project-add {
+  width: 100%;
+  min-height: 48px;
+  margin-top: var(--sp-2);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--accent-deep);
+  font-family: var(--font-display);
+  font-size: var(--t-sm);
+  font-weight: 700;
+  transition: transform 0.14s var(--ease-out), background 0.16s ease;
+}
+.project-add:active { transform: scale(0.985); background: var(--accent-soft); }
+.project-line { min-height: 56px; }
+.project-line-text { display: grid; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.project-line-title { font-weight: 650; font-size: var(--t-body); line-height: 1.35; overflow-wrap: anywhere; }
+.project-line-sub {
+  font-size: var(--t-xs);
+  color: var(--fg-3);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.project-check.is-verified { color: var(--accent-2); }
+.project-group + .project-group { margin-top: var(--sp-2); }
+.project-resource { flex-wrap: wrap; }
+.project-resource-remove { flex: 0 0 auto; padding: 8px 0 8px 12px; color: var(--fg-2); }
+.project-resource-confirm { display: flex; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+.project-form { display: grid; gap: var(--sp-3); }
+.project-sheet-note { margin: 0 4px var(--sp-2); font-size: var(--t-sm); color: var(--fg-2); line-height: 1.5; }
+.project-confirm {
+  display: grid;
+  gap: var(--sp-2);
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+}
+.project-confirm p { margin: 0; font-size: var(--t-sm); line-height: 1.45; }
+.project-toggle { display: flex; align-items: flex-start; gap: 12px; min-height: 44px; }
+.project-toggle input { flex: 0 0 auto; width: 22px; height: 22px; margin: 2px 0 0; accent-color: var(--accent); }
+.project-toggle strong { display: block; font-size: var(--t-sm); font-weight: 650; }
+.project-toggle small { display: block; font-size: var(--t-xs); color: var(--fg-3); }
+.app-main .sheet-group {
+  margin: var(--sp-3) 8px 4px;
+  font-family: var(--font-display);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  color: var(--fg-3);
+}
+
+/* One delegated task: where it stands, what it is, who owns it. */
+.task-list { display: grid; gap: var(--sp-3); min-width: 0; }
+.task-card {
+  min-width: 0;
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
+}
+.chat-transcript .task-card { margin: 0 0 var(--sp-4); }
+.task-waiting {
+  border-color: rgba(239, 95, 12, 0.28);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.5), transparent 42%), var(--accent-soft);
+}
+.task-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+.task-phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-display);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  color: var(--fg-2);
+}
+/* A still dot. The task view says where the record stands; it is not a
+   certificate that something is running this second, so nothing pulses. */
+.task-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line-strong); }
+.task-live .task-dot { background: var(--accent); }
+.task-warning .task-dot { background: var(--accent-warn); }
+.task-warning .task-phase { color: var(--accent-deep); }
+.task-success .task-dot { background: var(--accent-2); }
+.task-danger .task-dot { background: var(--accent-fail); }
+.task-danger .task-phase { color: var(--accent-fail); }
+.task-when { flex: 0 0 auto; font-size: var(--t-xs); color: var(--fg-3); }
+.task-card .task-title {
+  margin: 6px 0 2px;
+  font-family: var(--font-display);
+  font-size: var(--t-body);
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.task-who { margin: 0; font-size: var(--t-sm); color: var(--fg-2); overflow-wrap: anywhere; }
+.task-follows { margin: 2px 0 0; font-size: var(--t-xs); color: var(--fg-3); overflow-wrap: anywhere; }
+.task-request { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin: 6px 0 0; font-size: var(--t-xs); color: var(--fg-2); }
+.task-request-mark { font-weight: 700; color: var(--accent-deep); }
+.task-question { margin-top: var(--sp-3); }
+.task-question-text { margin: 0; font-size: var(--t-body); line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-result,
+.task-problem {
+  margin: var(--sp-3) 0 0;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: var(--bg-2);
+  color: var(--fg-2);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+}
+.task-problem { background: var(--fail-soft); color: var(--fg); }
+.task-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3); }
+.task-actions .run-control { margin-left: 0; }
+.task-steer .task-actions { margin-top: 0; }
+.task-send { flex: 0 0 auto; min-height: 46px; padding: 0 18px; }
+.task-fine { margin: 0; font-size: var(--t-xs); color: var(--fg-3); }
+.task-receipt { margin: var(--sp-2) 0 0; font-size: var(--t-xs); font-weight: 700; color: var(--accent-2); }
+
+/* The conversation: who answered, and which project the next message works in.
+   With both choices showing, they take a row of their own so the title keeps
+   its width; with one, the header is exactly the row it was. */
+.reply-speaker {
+  margin: 0 0 4px;
+  font-family: var(--font-display);
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--fg-3);
+}
+.chat-header .project-chip { max-width: 30vw; }
+.chat-header .project-chip.is-set { color: var(--fg); }
+.chat-header .project-chip.is-unset { justify-content: center; width: 44px; padding: 0; }
+.chat-header .project-chip.is-unset svg { color: var(--fg-3); }
+.chat-header .project-chip[disabled] { opacity: 1; }
+.chat-header-two { flex-wrap: wrap; row-gap: 6px; }
+.chat-header-two .chat-title,
+.app-main .chat-header-two h2.chat-title { flex: 1 1 0; }
+.chat-header-two .conn-pill { order: 1; }
+.chat-header-two::after { content: ''; order: 2; flex: 0 0 100%; height: 0; }
+.chat-header-two .agent-chip,
+.chat-header-two .project-chip { order: 3; flex: 0 1 auto; min-width: 0; max-width: calc(50% - 6px); }
+
+/* An agent's own screen. */
+.agent-card .agent-edit { min-width: 88px; }
+.project-about .agent-message { flex: 0 0 auto; width: 100%; margin-top: var(--sp-3); }
+.agent-pins-read { margin-top: 0; }
+
+/* Where a fact applies. */
+.fact-scope {
+  max-width: 60%;
+  margin-left: auto;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-2);
+  color: var(--fg-3);
+  font-size: 11px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fact-scope-narrow { border-color: transparent; background: var(--accent-soft); color: var(--accent-deep); }
+.memory-scope-pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  margin-bottom: var(--sp-2);
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-1);
+  color: var(--fg);
+  text-align: left;
+}
+.memory-scope-pick:active { background: var(--bg-2); }
+.memory-scope-pick-label { flex: 0 0 auto; font-size: var(--t-xs); font-weight: 700; color: var(--fg-3); }
+.memory-scope-pick-value { flex: 1 1 auto; min-width: 0; font-size: var(--t-sm); font-weight: 650; }
+.memory-scope-pick svg { flex: 0 0 auto; width: 16px; height: 16px; color: var(--fg-3); }
+.memory-scope-pick.active { border-color: var(--line-hot); background: var(--accent-soft); }
+.memory-scope-pick.active .memory-scope-pick-value { color: var(--accent-deep); }
+.memory-scope-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0 8px; margin: var(--sp-2) 0 0; font-size: var(--t-xs); color: var(--fg-3); }
+.memory-scope-save { width: 100%; }

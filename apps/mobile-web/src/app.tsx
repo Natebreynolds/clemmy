@@ -35,8 +35,10 @@ import {
   workspaceNavigationIntent,
 } from './lib/workspace-route';
 import {
+  agentFromSearch,
   destinationSearch,
   inboxNotificationFromSearch,
+  projectFromSearch,
   runFromSearch,
   searchHasDestination,
   tabFromSearch,
@@ -53,6 +55,7 @@ import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
 import { Chats } from './screens/Chats';
 import { Agents } from './screens/Agents';
+import { Projects } from './screens/Projects';
 import { Memory } from './screens/Memory';
 import { Workflows } from './screens/Workflows';
 import { Workspaces } from './screens/Workspaces';
@@ -79,6 +82,9 @@ export function App() {
   /** The run a URL addresses — a push, a reload, or a tap from any surface
    *  that shows running work. Activity owns the run view. */
   const [runId, setRunId] = useState<string | null>(() => runFromSearch(window.location.search));
+  /** The project and the agent a URL addresses; each tab owns its own view. */
+  const [projectId, setProjectId] = useState<string | null>(() => projectFromSearch(window.location.search));
+  const [agentId, setAgentId] = useState<string | null>(() => agentFromSearch(window.location.search));
   // The title is the navigator: tapping it opens the switcher sheet. The
   // full section menu (the left drawer) stays behind "More".
   // A rightward swipe across the header opens the menu.
@@ -113,6 +119,8 @@ export function App() {
   const [chatsListVisible, setChatsListVisible] = useState(false);
   const [door, setDoor] = useState<ConnectionDoor>(connectionDoor() ?? 'direct');
   const authenticated = Boolean(authStatus?.authenticated);
+  /** Reads the ONE Needs-you count again; set by the poll that owns it. */
+  const recountNeedsYou = useRef<() => void>(() => undefined);
 
   // ONE record shapes the window (panes, switcher, landing, quick actions),
   // and ONE working-now poll feeds Home, the header chip, and the sheet.
@@ -222,6 +230,8 @@ export function App() {
       setInboxNotification(inboxNotificationFromSearch(window.location.search));
       setWorkspaceId(workspaceFromSearch(window.location.search));
       setRunId(runFromSearch(window.location.search));
+      setProjectId(projectFromSearch(window.location.search));
+      setAgentId(agentFromSearch(window.location.search));
     };
     window.addEventListener('popstate', syncLocation);
     return () => window.removeEventListener('popstate', syncLocation);
@@ -259,12 +269,16 @@ export function App() {
       }
     };
     void refreshCount();
+    // A decision settled on another screen (a project, an agent) changes this
+    // count now, not at the next tick.
+    recountNeedsYou.current = () => { void refreshCount(); };
     const onWake = () => { if (document.visibilityState === 'visible') void refreshCount(); };
     document.addEventListener('visibilitychange', onWake);
     window.addEventListener('online', onWake);
     const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void refreshCount(); }, 8_000);
     return () => {
       cancelled = true;
+      recountNeedsYou.current = () => undefined;
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onWake);
       window.removeEventListener('online', onWake);
@@ -435,7 +449,7 @@ export function App() {
 
   const navigateTo = useCallback((
     next: Tab,
-    target?: { notificationId?: string | null; runId?: string | null },
+    target?: { notificationId?: string | null; runId?: string | null; projectId?: string | null; agentId?: string | null },
   ) => {
     userNavigated.current = true;
     setTab(next);
@@ -444,9 +458,19 @@ export function App() {
     // owns that rule so the URL and this state cannot disagree.
     const selectedNotification = next === 'inbox' ? target?.notificationId ?? null : null;
     const selectedRun = next === 'activity' ? target?.runId ?? null : null;
+    const selectedProject = next === 'projects' ? target?.projectId ?? null : null;
+    const selectedAgent = next === 'agents' ? target?.agentId ?? null : null;
     setInboxNotification(selectedNotification);
     setRunId(selectedRun);
-    const search = destinationSearch({ tab: next, notificationId: selectedNotification, runId: selectedRun });
+    setProjectId(selectedProject);
+    setAgentId(selectedAgent);
+    const search = destinationSearch({
+      tab: next,
+      notificationId: selectedNotification,
+      runId: selectedRun,
+      projectId: selectedProject,
+      agentId: selectedAgent,
+    });
     window.history.replaceState(null, '', `${window.location.pathname}${search}`);
   }, []);
 
@@ -829,9 +853,26 @@ export function App() {
               handoff={handoff}
               onHandoffConsumed={() => setHandoff(null)}
               onListVisibleChange={setChatsListVisible}
+              onOpenRun={openRun}
+              onOpenNeedsYou={() => navigateTo('inbox')}
+            />
+          ) : tab === 'projects' ? (
+            <Projects
+              initialProjectId={projectId}
+              onProjectChange={(id) => navigateTo('projects', { projectId: id })}
+              onOpenChat={goToChat}
+              onOpenRun={openRun}
+              onOpenAgent={(id) => navigateTo('agents', { agentId: id })}
+              onOpenNeedsYou={() => navigateTo('inbox')}
+              onDecided={() => recountNeedsYou.current()}
             />
           ) : tab === 'agents' ? (
             <Agents
+              initialAgentId={agentId}
+              onAgentChange={(id) => navigateTo('agents', { agentId: id })}
+              onOpenProject={(id) => navigateTo('projects', { projectId: id })}
+              onOpenRun={openRun}
+              onOpenNeedsYou={() => navigateTo('inbox')}
               onMessage={(agent) => {
                 // Messaging an agent opens a NEW conversation inside it: the
                 // agent is the working context every turn there starts from.
@@ -922,14 +963,15 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
   offline: { label: 'Offline', hint: "Can't reach your Mac right now" },
 };
 
-/** The six places (owner 09-26): everything else is reached from inside them or from the quiet rows. */
-const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'inbox', 'spaces', 'workflows', 'agents', 'memory'];
+/** The places (owner 09-26, Projects added 09-29): everything else is reached from inside them or from the quiet rows. */
+const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'];
 const QUIET_TABS: ReadonlyArray<Tab> = ['chats', 'activity'];
 
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Today',
   inbox: 'Needs you',
   chats: 'Chats',
+  projects: 'Projects',
   agents: 'Agents',
   spaces: 'Spaces',
   workflows: 'Flows',
@@ -965,6 +1007,15 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'projects',
+    label: 'Projects',
+    icon: (
+      <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
       </svg>
     ),
   },

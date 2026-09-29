@@ -30,7 +30,10 @@ import {
   liveActivityHeadline,
   narrateActivity,
   observedEvidenceChips,
+  delegatedTaskFollowsLine,
   outsideWorkCards,
+  projectSwitchLabel,
+  projectThreadMarks,
   renderMarkdown,
   timelineBounds,
   timelineSpan,
@@ -42,7 +45,9 @@ import {
   type ActivityItem,
   type ModelRuleOffer,
   type ChatMessage,
+  type DelegatedTask,
   type EngineSnapshot,
+  type ProjectSummary,
   workflowCardLevels,
   workflowCards,
   type WorkflowCardData,
@@ -62,6 +67,11 @@ import {
   switchChatAgent,
   type MobileAgent,
 } from '../lib/api';
+import { listChatDelegatedTasks, listProjects, setChatProject } from '../lib/project-api';
+import { anyTaskCanMove, conversationTasksPollMs, delegatedRowsSignature, placeDelegatedTasks } from '../lib/chat-delegated';
+import { useScreenData } from '../lib/use-screen-data';
+import { replySpeakers } from '../lib/chat-speakers';
+import { refusalWords } from '../lib/project-words';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { getModelSettings } from '../lib/api';
@@ -74,6 +84,7 @@ import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 import { ProgressRail } from '../components/ProgressRail';
+import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 
 interface Props {
   sessionId?: string;
@@ -88,10 +99,18 @@ interface Props {
    *  thread already lives in (from its session row). */
   agentId?: string;
   agentName?: string;
+  /** The project a NEW conversation opens inside, or the one a reopened
+   *  thread already works in (from its session row). */
+  projectId?: string;
+  projectName?: string;
+  /** Opens the run view for a delegated task's work. */
+  onOpenRun?: (runSessionId: string) => void;
+  /** Where an approval a task waits on is decided. */
+  onOpenNeedsYou?: () => void;
   onBack: () => void;
 }
 
-export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, onBack }: Props) {
+export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialAttachments, initialAutoSend, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onBack }: Props) {
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
   // Who answers the next message — changeable at any time, like the brain.
   // A new conversation opens inside it; after that a change is applied just
@@ -114,6 +133,31 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       .catch(() => { if (!cancelled) setAgentChoices([]); });
     return () => { cancelled = true; };
   }, [agentPickOpen]);
+  // Which project the next message works in: changeable at any time, like
+  // who answers. A new conversation opens inside it; after that a change is
+  // applied just before the next message (see sendMessage).
+  const [project, setProject] = useState<{ id: string; name: string } | null>(
+    initialProjectId ? { id: initialProjectId, name: initialProjectName ?? '' } : null,
+  );
+  /** The project the daemon has for this conversation, so a send only reports a real change. */
+  const sessionProjectId = useRef<string | null>(initialSessionId ? initialProjectId ?? null : null);
+  /** Read by the engine's send when it creates the conversation. */
+  const projectRef = useRef(project);
+  projectRef.current = project;
+  /** A retried send carries the project its first attempt carried. */
+  const openedInProject = useRef(new Map<string, string | null>());
+  const [projectPickOpen, setProjectPickOpen] = useState(false);
+  const [projectChoices, setProjectChoices] = useState<ProjectSummary[] | null>(null);
+  useEffect(() => {
+    // A Space dock works in its Space, never in a project: it asks for none.
+    if ((initialSessionId ?? '').startsWith('space-')) { setProjectChoices([]); return; }
+    let cancelled = false;
+    listProjects()
+      .then((result) => { if (!cancelled) setProjectChoices(result.projects.filter((row) => row.status === 'active')); })
+      // A Mac that does not know projects yet simply offers none.
+      .catch(() => { if (!cancelled) setProjectChoices([]); });
+    return () => { cancelled = true; };
+  }, [projectPickOpen]);
   const [title, setTitle] = useState(initialTitle ?? '');
   const [draft, setDraft] = useState(initialDraft ?? '');
   const [composerMode, setComposerMode] = useState<ComposerMode>('normal');
@@ -149,7 +193,19 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     pendingStore: createPendingMessageStore(localStorage, `clem.pending.mobile:${initialSessionId ?? 'new'}`),
     api: {
       send: async ({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId, attachments }) => {
-        const result = await sendChatMessageAsync({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId, attachments });
+        // Only the message that creates the conversation names its project.
+        let projectId: string | null = null;
+        if (!sessionId) {
+          if (!openedInProject.current.has(idempotencyKey)) {
+            openedInProject.current.set(idempotencyKey, projectRef.current?.id ?? null);
+          }
+          projectId = openedInProject.current.get(idempotencyKey) ?? null;
+        }
+        const result = await sendChatMessageAsync({
+          message, sessionId, idempotencyKey, steerOnly, taskMode, agentId, attachments,
+          ...(projectId ? { projectId } : {}),
+        });
+        if (!sessionId) sessionProjectId.current = projectId;
         return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered };
       },
       loadSession: async (sessionId) => {
@@ -158,6 +214,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           setTitle(result.session.title);
           setAgent(result.session.agentId ? { id: result.session.agentId, name: result.session.agentName ?? '' } : null);
           sessionAgentId.current = result.session.agentId ?? null;
+          setProject(result.session.projectId ? { id: result.session.projectId, name: result.session.projectName ?? '' } : null);
+          sessionProjectId.current = result.session.projectId ?? null;
           return { events: result.events, latestSeq: result.latestSeq };
         } catch (err) {
           // Workspace threads use a STABLE session id (space-<slug>) that may
@@ -225,6 +283,50 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const showAgentChip = takesAgent && (Boolean(agent) || (agentChoices?.length ?? 0) > 0);
   const agentLabel = agent?.name || (agent ? 'Agent' : 'Clem');
   const agentMarks = agentThreadMarks(messages, agent?.name ?? null);
+  const speakers = replySpeakers(messages, agentMarks);
+  // A Space dock works in its Space, never in a project.
+  const showProjectChip = takesAgent && (Boolean(project) || (projectChoices?.length ?? 0) > 0);
+  const projectMarks = projectThreadMarks(messages, project?.name || null);
+
+  // Tasks this conversation delegated. What a task IS comes from the Mac.
+  // The stream is only a nudge, and it is closed between turns, which is
+  // when a task usually moves: so while any task can still move the view is
+  // read again on a timer and on every wake, stream or no stream.
+  const taskSignature = delegatedRowsSignature(messages);
+  const liveSessionId = snapshot?.sessionId ?? null;
+  const [tasksMoving, setTasksMoving] = useState(false);
+  const taskView = useScreenData(
+    async () => (liveSessionId ? (await listChatDelegatedTasks(liveSessionId)).tasks : []),
+    {
+      // An ordinary conversation delegated nothing and asks for nothing.
+      disabled: !liveSessionId || !taskSignature,
+      intervalMs: conversationTasksPollMs(tasksMoving),
+      resourceKey: `tasks:${liveSessionId ?? ''}`,
+    },
+  );
+  const tasks: DelegatedTask[] = taskView.data ?? [];
+  const refreshTasks = taskView.refresh;
+  useEffect(() => { setTasksMoving(anyTaskCanMove(tasks)); }, [taskView.data]);
+  useEffect(() => { if (liveSessionId && taskSignature) void refreshTasks(); }, [liveSessionId, taskSignature, refreshTasks]);
+  const placedTasks = placeDelegatedTasks(messages, tasks);
+  const listedTasks = new Set(tasks.map((task) => task.taskId));
+  const taskCard = (task: DelegatedTask) => (
+    <DelegatedTaskCard
+      key={task.taskId}
+      task={task}
+      follows={delegatedTaskFollowsLine(task, tasks)}
+      listed={listedTasks}
+      onChanged={() => void refreshTasks()}
+      onOpenRun={onOpenRun}
+      onOpenNeedsYou={onOpenNeedsYou}
+    />
+  );
+
+  function pickProject(next: { id: string; name: string } | null) {
+    haptic('light');
+    setProject(next);
+    setProjectPickOpen(false);
+  }
 
   function pickAgent(next: { id: string; name: string } | null) {
     haptic('light');
@@ -248,6 +350,25 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       // Who actually replies (a deleted agent falls back to Clem).
       if ((result.agentId ?? null) !== wanted) {
         setAgent(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
+      }
+    }
+    // The same rule for the project: told only when it changed.
+    const wantedProject = project?.id ?? null;
+    if (sessionId && !busy && takesAgent && wantedProject !== sessionProjectId.current) {
+      try {
+        const result = await setChatProject(sessionId, wantedProject);
+        sessionProjectId.current = result.projectId ?? null;
+        if ((result.projectId ?? null) !== wantedProject) {
+          setProject(result.projectId ? { id: result.projectId, name: result.projectName ?? '' } : null);
+        }
+      } catch (err) {
+        // The message was written for a project it cannot work in. It is not
+        // sent somewhere else instead: the words go back to the composer and
+        // the chip goes back to what the conversation really has.
+        const known = projectChoices?.find((row) => row.id === sessionProjectId.current);
+        setProject(sessionProjectId.current ? { id: sessionProjectId.current, name: known?.name ?? '' } : null);
+        setDraft((current) => current || text);
+        throw new Error(refusalWords(err, 'That project could not be used, so your message was not sent.'));
       }
     }
     await engine.send(text, mode, { attachments });
@@ -383,7 +504,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       class="chat-shell"
       style={{ '--kb-inset': `${keyboardInset}px`, '--chat-dock-h': `${dockH}px` }}
     >
-      <div class="chat-header">
+      {/* Two named choices take a row of their own. With no project chosen the
+          choice is a single quiet icon, so a conversation outside any project
+          keeps the header it always had. */}
+      <div class={`chat-header${showAgentChip && showProjectChip && project ? ' chat-header-two' : ''}`}>
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
         {showAgentChip ? (
@@ -400,6 +524,45 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             <span class="truncate">{agentLabel}</span>
           </button>
         ) : null}
+        {showProjectChip ? (
+          <button
+            type="button"
+            class={`brain-chip project-chip${project ? ' is-set' : ' is-unset'}`}
+            disabled={executing}
+            title="Which project your next message works in"
+            aria-label={project ? `Project: ${project.name || 'this project'}` : 'No project'}
+            onClick={() => { haptic('light'); setProjectPickOpen(true); }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+            </svg>
+            {project ? <span class="truncate">{project.name || 'Project'}</span> : null}
+          </button>
+        ) : null}
+        <Sheet open={projectPickOpen} onClose={() => setProjectPickOpen(false)} title="Project" class="sheet-compact">
+          {projectChoices === null ? (
+            <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
+          ) : (
+            <ul class="agent-pick-list">
+              <li>
+                <button type="button" aria-pressed={!project} onClick={() => pickProject(null)}>
+                  <span class="agent-name">No project</span>
+                  <span class="agent-desc">As usual, outside any project</span>
+                </button>
+              </li>
+              {projectChoices.map((choice) => (
+                <li key={choice.id}>
+                  <button type="button" aria-pressed={project?.id === choice.id} onClick={() => pickProject({ id: choice.id, name: choice.name })}>
+                    <span class="agent-name">{choice.name}</span>
+                    {choice.purpose ? <span class="agent-desc">{choice.purpose}</span> : null}
+                  </button>
+                </li>
+              ))}
+              {projectChoices.length === 0 ? <li><p class="agent-desc">No projects yet. Make one on the Projects screen.</p></li> : null}
+            </ul>
+          )}
+          {busy ? <p class="project-sheet-note">The reply being written keeps its project. This applies to your next message.</p> : null}
+        </Sheet>
         <Sheet open={agentPickOpen} onClose={() => setAgentPickOpen(false)} title="Who answers" class="sheet-compact">
           {agentChoices === null ? (
             <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
@@ -460,8 +623,14 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           {agentMarks[index]?.switchedTo ? (
             <div class="agent-switch-line" role="separator">{agentSwitchLabel(agentMarks[index].switchedTo!.name)}</div>
           ) : null}
+          {projectMarks[index]?.movedTo ? (
+            <div class="agent-switch-line" role="separator">
+              {projectSwitchLabel(projectMarks[index].movedTo!.name, projectMarks[index].movedTo!.from)}
+            </div>
+          ) : null}
           <MessageRow
             message={message}
+            speaker={speakers[index] ?? undefined}
             sessionId={snapshot?.sessionId ?? undefined}
             busy={busy}
             onExecutePlan={ref => engine.send(`Execute the reviewed plan, revision ${ref.revision}.`, { version: 1, kind: 'execute', executeRef: ref })}
@@ -486,8 +655,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             }}
             onDelegatedChanged={() => engine.resume()}
           />
+          {placedTasks.byMessage.get(message.id)?.map(taskCard)}
           </Fragment>
         ))}
+        {placedTasks.unplaced.map(taskCard)}
         <CliSessions sessionId={snapshot?.sessionId ?? initialSessionId} />
       </div>
       {showJumpToLatest ? (
@@ -546,11 +717,13 @@ function approvalFieldLabel(name: string): string {
 }
 
 function MessageRow({
-  message, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
+  message, speaker, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction,
   onDelegatedStateChange, onDelegatedChanged, onAnswer,
 }: {
   message: ChatMessage;
+  /** Who wrote this reply, drawn above it. Absent in a thread only Clem answered. */
+  speaker?: string;
   sessionId?: string;
   busy: boolean;
   onExecutePlan: (ref: PlanRevisionRef) => Promise<void>;
@@ -673,6 +846,7 @@ function MessageRow({
 
   return (
     <div class={`turn turn-assistant${message.status === 'failed' ? ' turn-failed' : ''}`}>
+      {speaker ? <div class="reply-speaker">{speaker}</div> : null}
       {message.taskMode?.kind === 'plan' && <div class="plan-mode-label">Plan mode · read-only investigation</div>}
       {message.planArtifactRef && <PlanReview planRef={message.planArtifactRef} sessionId={sessionId} busy={busy} onExecute={onExecutePlan} onRevise={onRevisePlan} />}
       {/* The work Clem did is ONE quiet line, not a stack of tool rows: while

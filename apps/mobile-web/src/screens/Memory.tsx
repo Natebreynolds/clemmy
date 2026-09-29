@@ -15,6 +15,7 @@
  *    a full dossier (claims, relationships, aliases).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { memoryScopeHint, memoryScopeLabel, type MemoryScope } from '@clem/chat-engine';
 import {
   addFact,
   correctFact,
@@ -23,11 +24,13 @@ import {
   getFactDetail,
   getMemoryWork,
   getModelSettings,
+  listAgents,
   listEntities,
   listFacts,
   pinFact,
   restoreFact,
   searchMemory,
+  setFactScope,
   undoMemoryWork,
   type MemoryEntity,
   type MemoryFact,
@@ -35,6 +38,20 @@ import {
   type ModelSettings,
 } from '../lib/api';
 import { humanizeReasons } from '../lib/memory-reasons';
+import {
+  ALL_MEMORY,
+  factsCarryScope,
+  memoryScopeChoices,
+  memoryScopeFilterKey,
+  memoryScopeFilterLabel,
+  memoryScopeQuery,
+  sameMemoryScopeFilter,
+  scopeMove,
+  type MemoryScopeFilter,
+} from '../lib/memory-scope';
+import { listProjects } from '../lib/project-api';
+import { refusalWords } from '../lib/project-words';
+import { Sheet } from '../components/Sheet';
 import { MEMORY_WORK_LIVE_MS, MEMORY_WORK_POLL_MS, normalizeMemoryWork, type MemoryWorkRead } from '../lib/memory-work';
 import { modelLabel } from '../lib/model-roles';
 import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
@@ -71,16 +88,26 @@ export function Memory() {
   const [openFactId, setOpenFactId] = useState<number | null>(null);
   const [openEntityId, setOpenEntityId] = useState<number | null>(null);
 
+  // Where the listed facts apply. "All memories" asks exactly what this
+  // screen always asked, so a Mac that does not scope memory sees no change.
+  const [scopeFilter, setScopeFilter] = useState<MemoryScopeFilter>(ALL_MEMORY);
+  const [scopeSheet, setScopeSheet] = useState(false);
+  const scopeKey = memoryScopeFilterKey(scopeFilter);
+
   const loadFacts = useCallback(
-    () => listFacts(kindFilter === 'all' ? undefined : kindFilter, 60),
-    [kindFilter],
+    () => listFacts(kindFilter === 'all' ? undefined : kindFilter, 60, memoryScopeQuery(scopeFilter)),
+    [kindFilter, scopeKey],
   );
   const {
     data: factsData, loading: factsLoading, error: factsError, offline: factsOffline, refresh: refreshFacts,
-  } = useScreenData(loadFacts, { disabled: tab !== 'facts' || openFactId !== null });
+  } = useScreenData(loadFacts, { disabled: tab !== 'facts' || openFactId !== null, resourceKey: `facts:${scopeKey}` });
   const facts = factsData?.facts ?? [];
   // The hook refreshes on wake/pull; a filter change is its own trigger.
-  useEffect(() => { if (tab === 'facts') void refreshFacts(); }, [kindFilter, tab, refreshFacts]);
+  useEffect(() => { if (tab === 'facts') void refreshFacts(); }, [kindFilter, scopeKey, tab, refreshFacts]);
+  // The filter is offered once the Mac has said where any fact applies, and
+  // stays while a narrowed list happens to be empty.
+  const [scopeLive, setScopeLive] = useState(false);
+  useEffect(() => { if (factsCarryScope(facts)) setScopeLive(true); }, [facts]);
 
   const {
     data: entityData, loading: entitiesLoading, error: entitiesError, offline: entitiesOffline, refresh: refreshEntities,
@@ -273,6 +300,14 @@ export function Memory() {
                 kindFilter={kindFilter}
                 onKind={setKindFilter}
                 onOpen={(id) => setOpenFactId(id)}
+                scopeFilter={scopeLive ? scopeFilter : null}
+                onScope={() => { haptic('light'); setScopeSheet(true); }}
+              />
+              <ScopeFilterSheet
+                open={scopeSheet}
+                current={scopeFilter}
+                onClose={() => setScopeSheet(false)}
+                onPick={(next) => { setScopeSheet(false); setScopeFilter(next); }}
               />
             </>
           ) : (
@@ -425,11 +460,29 @@ function Browse(props: {
   kindFilter: FactKindFilter;
   onKind: (kind: FactKindFilter) => void;
   onOpen: (id: number) => void;
+  /** Null while the Mac does not say where facts apply: no filter is drawn. */
+  scopeFilter: MemoryScopeFilter | null;
+  onScope: () => void;
 }) {
-  const { facts, loading, pinnedCount, kindFilter, onKind, onOpen } = props;
+  const { facts, loading, pinnedCount, kindFilter, onKind, onOpen, scopeFilter, onScope } = props;
+  const narrowed = scopeFilter !== null && scopeFilter.kind !== 'all';
 
   return (
     <div class="memory-section">
+      {scopeFilter ? (
+        <button
+          type="button"
+          class={`memory-scope-pick${narrowed ? ' active' : ''}`}
+          aria-haspopup="dialog"
+          onClick={onScope}
+        >
+          <span class="memory-scope-pick-label">Applies to</span>
+          <span class="memory-scope-pick-value truncate">{memoryScopeFilterLabel(scopeFilter)}</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        </button>
+      ) : null}
       <div class="memory-filter">
         {KIND_OPTIONS.map((option) => (
           <button
@@ -456,7 +509,11 @@ function Browse(props: {
       {!loading && facts.length === 0 ? (
         <div class="empty">
           <p class="empty-title">Nothing here yet</p>
-          <p class="empty-body">What Clem learns about this lands here automatically.</p>
+          <p class="empty-body">
+            {narrowed
+              ? `Nothing is kept only for ${memoryScopeFilterLabel(scopeFilter!)} yet. What applies everywhere is used there too.`
+              : 'What Clem learns about this lands here automatically.'}
+          </p>
         </div>
       ) : null}
 
@@ -470,6 +527,7 @@ function Browse(props: {
             {typeof fact.importance === 'number' ? (
               <span class="fact-importance" title="importance">★ {fact.importance.toFixed(1)}</span>
             ) : null}
+            {fact.scope ? <ScopeChip scope={fact.scope} /> : null}
           </div>
           <div class="memory-fact-content">{fact.content}</div>
           <div class="memory-fact-meta">updated {formatDate(fact.updatedAt)}</div>
@@ -494,6 +552,7 @@ function FactDetailView({ id, onBack, onOpenFact }: {
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState('');
   const [confirmForget, setConfirmForget] = useState(false);
+  const [moving, setMoving] = useState(false);
 
   async function act(name: string, run: () => Promise<unknown>): Promise<void> {
     if (busyAction) return;
@@ -527,7 +586,31 @@ function FactDetailView({ id, onBack, onOpenFact }: {
               {fact.pinned ? <span class="fact-pinned"><PinIcon /> pinned</span> : null}
               {fact.active === false ? <span class="fact-historical">historical</span> : null}
               {typeof fact.importance === 'number' ? <span class="fact-importance">★ {fact.importance.toFixed(1)}</span> : null}
+              {fact.scope ? <ScopeChip scope={fact.scope} /> : null}
             </div>
+            {fact.scope ? (
+              <p class="memory-scope-line">
+                {memoryScopeHint(fact.scope)}.
+                {fact.active === false ? null : (
+                  <button type="button" class="link-btn" disabled={busyAction !== null} onClick={() => { haptic('light'); setMoving(true); }}>
+                    Change
+                  </button>
+                )}
+              </p>
+            ) : null}
+            {fact.scope ? (
+              <ScopeMoveSheet
+                open={moving}
+                scope={fact.scope}
+                onClose={() => setMoving(false)}
+                onMove={async (next) => {
+                  await setFactScope(fact.id, next);
+                  setMoving(false);
+                  haptic('success');
+                  await refresh();
+                }}
+              />
+            ) : null}
             {fact.supersededByFactId ? (
               <button class="memory-superseded" onClick={() => onOpenFact(fact.supersededByFactId!)}>
                 Continued as #{fact.supersededByFactId} →
@@ -752,6 +835,181 @@ function EntityDetailView({ id, onBack, onOpenFact }: {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** Where a fact applies, in the same words the desktop uses. */
+function ScopeChip({ scope }: { scope: MemoryScope }) {
+  return (
+    <span class={`fact-scope${scope.kind === 'user' ? '' : ' fact-scope-narrow'}`} title={memoryScopeHint(scope)}>
+      {memoryScopeLabel(scope)}
+    </span>
+  );
+}
+
+interface ScopeNames {
+  projects: Array<{ id: string; name: string; status?: string }>;
+  agents: Array<{ id: string; name: string }>;
+}
+
+/** The projects and agents a scope can name, read when a sheet opens. */
+function useScopeNames(open: boolean): { names: ScopeNames | null; failure: string | null } {
+  const [names, setNames] = useState<ScopeNames | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setFailure(null);
+    void Promise.all([
+      listProjects().then((result) => result.projects, () => null),
+      listAgents().then((result) => result.agents, () => null),
+    ]).then(([projects, agents]) => {
+      if (cancelled) return;
+      if (!projects && !agents) setFailure('Could not load your projects and agents.');
+      setNames({ projects: projects ?? [], agents: agents ?? [] });
+    });
+    return () => { cancelled = true; };
+  }, [open]);
+  return { names, failure };
+}
+
+/** Narrow the list to where facts apply: one choice, from a sheet. */
+function ScopeFilterSheet({ open, current, onClose, onPick }: {
+  open: boolean;
+  current: MemoryScopeFilter;
+  onClose: () => void;
+  onPick: (next: MemoryScopeFilter) => void;
+}) {
+  const { names, failure } = useScopeNames(open);
+  const choices = memoryScopeChoices(names ?? { projects: [], agents: [] });
+  const row = (choice: MemoryScopeFilter, note?: string) => (
+    <li key={memoryScopeFilterKey(choice)}>
+      <button type="button" aria-pressed={sameMemoryScopeFilter(choice, current)} onClick={() => { haptic('light'); onPick(choice); }}>
+        <span class="agent-name">{memoryScopeFilterLabel(choice)}</span>
+        {note ? <span class="agent-desc">{note}</span> : null}
+      </button>
+    </li>
+  );
+  return (
+    <Sheet open={open} onClose={onClose} title="Applies to" class="sheet-compact">
+      <ul class="agent-pick-list">
+        {row(choices.top[0]!, 'Everything Clem remembers')}
+        {row(choices.top[1]!, 'Only what is used in every conversation')}
+      </ul>
+      {names === null ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}
+      {failure ? <p class="agent-failure" role="alert">{failure}</p> : null}
+      {choices.projects.length > 0 ? (
+        <>
+          <h3 class="sheet-group">Projects</h3>
+          <ul class="agent-pick-list">{choices.projects.map((choice) => row(choice))}</ul>
+        </>
+      ) : null}
+      {choices.agents.length > 0 ? (
+        <>
+          <h3 class="sheet-group">Agents</h3>
+          <ul class="agent-pick-list">{choices.agents.map((choice) => row(choice))}</ul>
+        </>
+      ) : null}
+    </Sheet>
+  );
+}
+
+/** Move one fact to where it should apply. */
+function ScopeMoveSheet({ open, scope, onClose, onMove }: {
+  open: boolean;
+  scope: MemoryScope;
+  onClose: () => void;
+  onMove: (next: { projectId: string | null; agentId: string | null }) => Promise<void>;
+}) {
+  const { names, failure: loadFailure } = useScopeNames(open);
+  const [target, setTarget] = useState(() => scopeMove(scope));
+  const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    setTarget(scopeMove(scope));
+    setFailure(null);
+  }, [open]);
+  const choices = memoryScopeChoices(names ?? { projects: [], agents: [] });
+  const before = scopeMove(scope);
+  const changed = target.projectId !== before.projectId || target.agentId !== before.agentId;
+
+  const save = async () => {
+    if (busy || !changed) return;
+    setBusy(true);
+    setFailure(null);
+    try {
+      await onMove(target);
+    } catch (err) {
+      haptic('error');
+      setFailure(refusalWords(err, 'That did not save. Try again.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Sheet
+      open={open}
+      onClose={onClose}
+      title="Where this applies"
+      footer={(
+        <div class="agent-actions memory-scope-save">
+          <button type="button" class="agent-save" disabled={busy || !changed} onClick={() => void save()}>
+            {busy ? 'Saving…' : 'Save'}
+          </button>
+          <button type="button" class="agent-cancel" disabled={busy} onClick={onClose}>Cancel</button>
+        </div>
+      )}
+    >
+      {names === null ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}
+      {loadFailure ? <p class="agent-failure" role="alert">{loadFailure}</p> : null}
+      <h3 class="sheet-group">Project</h3>
+      <ul class="agent-pick-list">
+        <li>
+          <button type="button" aria-pressed={target.projectId === null} onClick={() => setTarget({ ...target, projectId: null })}>
+            <span class="agent-name">Every project</span>
+          </button>
+        </li>
+        {scope.projectId && !choices.projects.some((choice) => choice.kind === 'project' && choice.projectId === scope.projectId) ? (
+          <li>
+            <button type="button" aria-pressed={target.projectId === scope.projectId} onClick={() => setTarget({ ...target, projectId: scope.projectId })}>
+              <span class="agent-name">{scope.projectName || 'Its current project'}</span>
+            </button>
+          </li>
+        ) : null}
+        {choices.projects.map((choice) => (choice.kind === 'project' ? (
+          <li key={choice.projectId}>
+            <button type="button" aria-pressed={target.projectId === choice.projectId} onClick={() => setTarget({ ...target, projectId: choice.projectId })}>
+              <span class="agent-name">{choice.name}</span>
+            </button>
+          </li>
+        ) : null))}
+      </ul>
+      <h3 class="sheet-group">Agent</h3>
+      <ul class="agent-pick-list">
+        <li>
+          <button type="button" aria-pressed={target.agentId === null} onClick={() => setTarget({ ...target, agentId: null })}>
+            <span class="agent-name">Clem and every agent</span>
+          </button>
+        </li>
+        {scope.agentId && !choices.agents.some((choice) => choice.kind === 'agent' && choice.agentId === scope.agentId) ? (
+          <li>
+            <button type="button" aria-pressed={target.agentId === scope.agentId} onClick={() => setTarget({ ...target, agentId: scope.agentId })}>
+              <span class="agent-name">{scope.agentName || 'Its current agent'}</span>
+            </button>
+          </li>
+        ) : null}
+        {choices.agents.map((choice) => (choice.kind === 'agent' ? (
+          <li key={choice.agentId}>
+            <button type="button" aria-pressed={target.agentId === choice.agentId} onClick={() => setTarget({ ...target, agentId: choice.agentId })}>
+              <span class="agent-name">{choice.name}</span>
+            </button>
+          </li>
+        ) : null))}
+      </ul>
+      {failure ? <p class="agent-failure" role="alert">{failure}</p> : null}
+    </Sheet>
   );
 }
 

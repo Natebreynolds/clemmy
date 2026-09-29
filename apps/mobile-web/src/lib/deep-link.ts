@@ -12,15 +12,15 @@
  * testable without a renderer.
  */
 export type TabId =
-  | 'home' | 'inbox' | 'chats' | 'agents' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
+  | 'home' | 'inbox' | 'chats' | 'projects' | 'agents' | 'spaces' | 'workflows' | 'memory' | 'activity' | 'settings';
 
 export const TAB_IDS: ReadonlySet<TabId> = new Set<TabId>([
-  'home', 'inbox', 'chats', 'agents', 'spaces', 'workflows', 'memory', 'activity', 'settings',
+  'home', 'inbox', 'chats', 'projects', 'agents', 'spaces', 'workflows', 'memory', 'activity', 'settings',
 ]);
 
 /** Every parameter that names a destination. A cold launch carrying any of
  *  them is an explicit request and outranks the "open on launch" preference. */
-const DESTINATION_KEYS = ['tab', 'notification', 'workspace', 'run', 'pair', 'adopt'] as const;
+const DESTINATION_KEYS = ['tab', 'notification', 'workspace', 'run', 'project', 'agent', 'pair', 'adopt'] as const;
 
 export function tabFromSearch(search: string): TabId {
   const value = new URLSearchParams(search).get('tab');
@@ -44,6 +44,26 @@ export function runFromSearch(search: string): string | null {
   return value && value.trim() ? value : null;
 }
 
+/**
+ * The project a URL addresses, by its record id. Only meaningful on the
+ * Projects tab, which owns the project view, for the same reason a run is
+ * only meaningful on Activity.
+ */
+export function projectFromSearch(search: string): string | null {
+  const params = new URLSearchParams(search);
+  if (params.get('tab') !== 'projects') return null;
+  const value = params.get('project');
+  return value && value.trim() ? value.trim() : null;
+}
+
+/** The agent a URL addresses, by its record id; only on the Agents tab. */
+export function agentFromSearch(search: string): string | null {
+  const params = new URLSearchParams(search);
+  if (params.get('tab') !== 'agents') return null;
+  const value = params.get('agent');
+  return value && value.trim() ? value.trim() : null;
+}
+
 export function searchHasDestination(search: string): boolean {
   const params = new URLSearchParams(search);
   return DESTINATION_KEYS.some((key) => params.has(key));
@@ -55,11 +75,15 @@ export function destinationSearch(input: {
   tab: TabId;
   notificationId?: string | null;
   runId?: string | null;
+  projectId?: string | null;
+  agentId?: string | null;
 }): string {
   const params = new URLSearchParams();
   if (input.tab !== 'home') params.set('tab', input.tab);
   if (input.tab === 'inbox' && input.notificationId) params.set('notification', input.notificationId);
   if (input.tab === 'activity' && input.runId) params.set('run', input.runId);
+  if (input.tab === 'projects' && input.projectId) params.set('project', input.projectId);
+  if (input.tab === 'agents' && input.agentId) params.set('agent', input.agentId);
   const query = params.toString();
   return query ? `?${query}` : '';
 }

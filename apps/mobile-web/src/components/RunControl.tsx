@@ -21,6 +21,8 @@ import {
   controlTask,
   isOfflineError,
 } from '../lib/api';
+import { resumeDelegatedTask, stopDelegatedTask } from '../lib/project-api';
+import { refusalWords } from '../lib/project-words';
 import { haptic } from '../lib/native-bridge';
 
 export type RunControlTarget =
@@ -28,7 +30,17 @@ export type RunControlTarget =
   | { kind: 'chat'; sessionId: string; attemptId: string }
   | { kind: 'workflow'; workflow: string; runId: string }
   | { kind: 'workflow-runs'; runIds: string[] }
-  | { kind: 'task'; taskId: string };
+  | { kind: 'task'; taskId: string }
+  /** A task delegated to an agent, stopped and resumed through its own record. */
+  | { kind: 'delegated-task'; taskId: string };
+
+/** Why a control did not go through, in words. A delegated task's refusal has
+ *  a name the owner should never read; everything else says what it said. */
+function controlFailure(target: RunControlTarget, err: unknown): string {
+  if (isOfflineError(err)) return "Can't reach your Mac — try again when you're back on";
+  if (target.kind === 'delegated-task') return refusalWords(err, 'That did not go through. Try again.');
+  return (err as Error).message;
+}
 
 export interface DelegatedRunControlProjection {
   sourceUserSeq: number;
@@ -101,6 +113,7 @@ export function RunControl({ target, resumable, compact = false, state, onChange
       }
       else if (target.kind === 'run') await cancelRun(target.runId);
       else if (target.kind === 'chat') await cancelChatTurn(target.sessionId, target.attemptId);
+      else if (target.kind === 'delegated-task') await stopDelegatedTask(target.taskId);
       else await controlTask(target.taskId, 'cancel');
       haptic('success');
       setConfirming(false);
@@ -109,24 +122,28 @@ export function RunControl({ target, resumable, compact = false, state, onChange
     } catch (err) {
       haptic('error');
       onStateChange?.('running');
-      setError(isOfflineError(err) ? "Can't reach your Mac — try again when you're back on" : (err as Error).message);
+      setError(controlFailure(target, err));
+      // A refused delegated task has usually moved on; show where it stands.
+      if (target.kind === 'delegated-task' && !isOfflineError(err)) { setConfirming(false); onChanged(); }
     } finally {
       setBusy(null);
     }
   }
 
   async function resume() {
-    if (target.kind !== 'task') return;
+    if (target.kind !== 'task' && target.kind !== 'delegated-task') return;
     setBusy('resume');
     setError(null);
     haptic('medium');
     try {
-      await controlTask(target.taskId, 'resume');
+      if (target.kind === 'delegated-task') await resumeDelegatedTask(target.taskId);
+      else await controlTask(target.taskId, 'resume');
       haptic('success');
       onChanged();
     } catch (err) {
       haptic('error');
-      setError(isOfflineError(err) ? "Can't reach your Mac — try again when you're back on" : (err as Error).message);
+      setError(controlFailure(target, err));
+      if (target.kind === 'delegated-task' && !isOfflineError(err)) onChanged();
     } finally {
       setBusy(null);
     }

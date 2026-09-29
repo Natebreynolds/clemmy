@@ -1,4 +1,4 @@
-import { readCompletionReviewResponse, type MemoryModelProblem, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
+import { readCompletionReviewResponse, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
@@ -395,6 +395,9 @@ export interface ApprovalRow {
   resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system' | null;
   kind?: 'harness' | 'runtime';
   resourceFingerprint?: { warning?: string };
+  /** The project this approval belongs to, when the Mac says so. */
+  projectId?: string | null;
+  projectName?: string | null;
 }
 
 export interface ApprovalsListResponse {
@@ -525,6 +528,9 @@ export interface InboxQuestion {
   stepId: string | null;
   answerable: boolean;
   unavailableReason: string | null;
+  /** The project this question belongs to, when the Mac says so. */
+  projectId?: string | null;
+  projectName?: string | null;
 }
 
 export interface InboxTrustProposal {
@@ -947,6 +953,10 @@ export interface ChatSession {
   /** Saved agent answering this conversation's next message; null = Clem. */
   agentId: string | null;
   agentName: string | null;
+  /** The project this conversation works in from its next message; null or
+   *  absent = none. Absent on a Mac that does not know projects yet. */
+  projectId?: string | null;
+  projectName?: string | null;
   /** Kept at the top of the list by the owner. */
   pinned?: boolean;
   /** Out of the list until restored; the conversation itself is kept. */
@@ -1056,6 +1066,8 @@ export async function sendChatMessageAsync(
     taskMode?: TaskMode;
     /** Binds a NEW conversation to this saved agent; ignored once it exists. */
     agentId?: string;
+    /** Opens a NEW conversation inside this project; ignored once it exists. */
+    projectId?: string;
     /** Inbox ids from uploadChatAttachment, sent with this message. */
     attachments?: string[];
   },
@@ -1068,6 +1080,7 @@ export async function sendChatMessageAsync(
       ...(input.taskMode ? { taskMode: input.taskMode } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(input.agentId ? { agentId: input.agentId } : {}),
+      ...(input.projectId ? { projectId: input.projectId } : {}),
       async: true,
       ...(input.steerOnly ? { steerOnly: true } : {}),
       ...(input.attachments?.length ? { attachments: input.attachments } : {}),
@@ -1186,6 +1199,10 @@ export async function searchMemory(query: string, limit = 20): Promise<MemorySea
   return api<MemorySearchResult>(url);
 }
 
+/** Where a fact applies: everywhere, in one project, for one agent, or for
+ *  one agent inside one project. The shape is the shared engine's. */
+export type MemoryFactScope = MemoryScope;
+
 export interface MemoryFact {
   id: number;
   kind: 'user' | 'project' | 'feedback' | 'reference';
@@ -1194,6 +1211,8 @@ export interface MemoryFact {
   updatedAt: string;
   lastAccessedAt: string | null;
   pinned?: boolean;
+  /** Absent on a Mac that does not scope memory yet; the list reads as before. */
+  scope?: MemoryFactScope;
 }
 
 /** Full fact detail — evidence, validity history, policy. Mirrors the
@@ -1259,11 +1278,26 @@ export async function getEntityDetail(id: number): Promise<Record<string, unknow
   return api(`/m/api/memory/entities/${id}`);
 }
 
-export async function listFacts(kind?: MemoryFact['kind'], limit = 60): Promise<{ facts: MemoryFact[] }> {
+/** Narrow the facts list to where they apply. Combinable; none = every fact. */
+export interface MemoryScopeQuery {
+  scopeKind?: 'user';
+  scopeProject?: string;
+  scopeAgent?: string;
+}
+
+export async function listFacts(kind?: MemoryFact['kind'], limit = 60, scope: MemoryScopeQuery = {}): Promise<{ facts: MemoryFact[] }> {
   const params = new URLSearchParams();
   if (kind) params.set('kind', kind);
   params.set('limit', String(limit));
+  if (scope.scopeKind) params.set('scopeKind', scope.scopeKind);
+  if (scope.scopeProject) params.set('scopeProject', scope.scopeProject);
+  if (scope.scopeAgent) params.set('scopeAgent', scope.scopeAgent);
   return api<{ facts: MemoryFact[] }>(`/m/api/memory/facts?${params.toString()}`);
+}
+
+/** Move a fact to where it applies. Both null = it applies everywhere. */
+export async function setFactScope(id: number, scope: { projectId: string | null; agentId: string | null }): Promise<unknown> {
+  return api(`/m/api/memory/facts/${id}/scope`, { method: 'POST', body: JSON.stringify(scope) });
 }
 
 // Memory at work. The contract is shared with the desktop, not restated here.

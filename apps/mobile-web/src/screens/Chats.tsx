@@ -25,6 +25,9 @@ export interface ChatHandoff {
   /** Start a NEW conversation inside this saved agent. */
   agentId?: string;
   agentName?: string;
+  /** Start a NEW conversation inside this project. */
+  projectId?: string;
+  projectName?: string;
 }
 
 interface Props {
@@ -34,9 +37,12 @@ interface Props {
   /** The shell shows the floating ask capsule only over the LIST — an open
    *  thread has its own composer. */
   onListVisibleChange?: (visible: boolean) => void;
+  /** Opens the run view for a delegated task's work. */
+  onOpenRun?: (runSessionId: string) => void;
+  onOpenNeedsYou?: () => void;
 }
 
-export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props) {
+export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenRun, onOpenNeedsYou }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
   const [selectedTitle, setSelectedTitle] = useState<string | undefined>();
@@ -46,7 +52,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
     setSelectedTitle(undefined);
   };
   useBackGesture(selectedId !== null, closeSelected);
-  const [composing, setComposing] = useState<{ draft?: string; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string } | null>(null);
+  const [composing, setComposing] = useState<{ draft?: string; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(null);
   const [pendingLatest, setPendingLatest] = useState(false);
   const [query, setQuery] = useState('');
   const [showArchived, setShowArchived] = useState(false);
@@ -115,7 +121,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
       setSelectedDraft(handoff.draft);
     }
     else if (handoff.openLatest) setPendingLatest(true);
-    else setComposing({ draft: handoff.draft, attachments: handoff.attachments, autoSend: handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName });
+    else setComposing({ draft: handoff.draft, attachments: handoff.attachments, autoSend: handoff.autoSend, agentId: handoff.agentId, agentName: handoff.agentName, projectId: handoff.projectId, projectName: handoff.projectName });
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
 
@@ -127,6 +133,10 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
         initialAutoSend={composing.autoSend}
         agentId={composing.agentId}
         agentName={composing.agentName}
+        projectId={composing.projectId}
+        projectName={composing.projectName}
+        onOpenRun={onOpenRun}
+        onOpenNeedsYou={onOpenNeedsYou}
         onBack={() => { setComposing(null); void refresh(); }}
       />
     );
@@ -141,6 +151,10 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange }: Props
         initialDraft={selectedDraft}
         agentId={session?.agentId ?? undefined}
         agentName={session?.agentName ?? undefined}
+        projectId={session?.projectId ?? undefined}
+        projectName={session?.projectName ?? undefined}
+        onOpenRun={onOpenRun}
+        onOpenNeedsYou={onOpenNeedsYou}
         onBack={() => { closeSelected(); void refresh(); }}
       />
     );
@@ -233,7 +247,12 @@ function ChatRow({ session, index, onOpen, onMenu }: { session: ChatSession; ind
       <button type="button" class="chat-card-main" onClick={onOpen}>
         <div class="min-w-0">
           <div class="card-title-sm truncate">{session.title || 'Untitled'}</div>
-          {session.agentName ? <span class="chip chip-agent">{session.agentName}</span> : null}
+          {session.agentName || session.projectName ? (
+            <span class="chat-card-chips">
+              {session.agentName ? <span class="chip chip-agent">{session.agentName}</span> : null}
+              {session.projectName ? <span class="chip chip-project">{session.projectName}</span> : null}
+            </span>
+          ) : null}
           <div class="card-when">
             {session.status === 'failed' || session.status === 'cancelled' ? (
               <>

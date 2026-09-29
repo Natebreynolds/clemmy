@@ -1,5 +1,5 @@
-import { useState } from 'preact/hooks';
-import { useBackGesture } from '../lib/back-gesture';
+import { useEffect, useState } from 'preact/hooks';
+import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import {
   createAgent,
   deleteAgent,
@@ -11,6 +11,7 @@ import {
 import { ScreenNotice } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import { useScreenData } from '../lib/use-screen-data';
+import { AgentDetail } from './AgentDetail';
 
 /**
  * Named agents — a person's own standing helpers.
@@ -20,9 +21,31 @@ import { useScreenData } from '../lib/use-screen-data';
  * rediscovered every time, so this screen never implies it can do something a
  * plain message could not.
  */
-export function Agents({ onMessage }: { onMessage: (agent: MobileAgent) => void }) {
+interface Props {
+  onMessage: (agent: MobileAgent) => void;
+  /** An agent addressed by the URL or by another screen. */
+  initialAgentId?: string | null;
+  /** Keeps the URL in step with the agent that is open. */
+  onAgentChange?: (agentId: string | null) => void;
+  onOpenProject?: (projectId: string) => void;
+  onOpenRun?: (runSessionId: string) => void;
+  onOpenNeedsYou?: () => void;
+}
+
+export function Agents({ onMessage, initialAgentId, onAgentChange, onOpenProject, onOpenRun, onOpenNeedsYou }: Props) {
   const [editing, setEditing] = useState<MobileAgent | 'new' | null>(null);
+  // An agent's own screen is depth under the list; its editor is depth under that.
+  const [viewingId, setViewingId] = useState<string | null>(initialAgentId ?? null);
+  useBackGesture(viewingId !== null, () => { setViewingId(null); onAgentChange?.(null); });
+  useEffect(() => { setViewingId(initialAgentId ?? null); }, [initialAgentId]);
   useBackGesture(editing !== null, () => setEditing(null));
+  const view = (agentId: string | null): void => {
+    withDepthTransition(() => {
+      setViewingId(agentId);
+      onAgentChange?.(agentId);
+    });
+    if (agentId) document.querySelector('.app-main')?.scrollTo({ top: 0 });
+  };
   const { data, loading, error, offline, refresh } = useScreenData<MobileAgentsResponse>(
     listAgents,
     { intervalMs: 20_000, disabled: editing !== null },
@@ -45,6 +68,32 @@ export function Agents({ onMessage }: { onMessage: (agent: MobileAgent) => void 
   }
   if ((error || offline) && agents.length === 0) {
     return <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} />;
+  }
+
+  if (viewingId) {
+    const viewing = agents.find((agent) => agent.id === viewingId);
+    if (viewing) {
+      return (
+        <AgentDetail
+          key={viewing.id}
+          agent={viewing}
+          onBack={() => { view(null); void refresh(); }}
+          onMessage={onMessage}
+          onEdit={(agent) => setEditing(agent)}
+          onOpenProject={onOpenProject}
+          onOpenRun={onOpenRun}
+          onOpenNeedsYou={onOpenNeedsYou}
+        />
+      );
+    }
+    // Deleted here or on the desktop while its screen was open.
+    return (
+      <div class="empty">
+        <p class="empty-title">That agent is no longer here</p>
+        <p class="empty-body">It was deleted or replaced. Your other agents are on the list.</p>
+        <button class="login-repair" type="button" onClick={() => view(null)}>Back to agents</button>
+      </div>
+    );
   }
 
   return (
@@ -70,7 +119,8 @@ export function Agents({ onMessage }: { onMessage: (agent: MobileAgent) => void 
             <button
               class="agent-card-main"
               type="button"
-              onClick={() => { haptic('light'); onMessage(agent); }}
+              aria-label={`Open ${agent.name}`}
+              onClick={() => { haptic('light'); view(agent.id); }}
             >
               <span class="agent-name">{agent.name}</span>
               {agent.handles ? <span class="agent-desc">{agent.handles}</span> : null}
@@ -80,13 +130,15 @@ export function Agents({ onMessage }: { onMessage: (agent: MobileAgent) => void 
                 {agent.model ? <span>{agent.model}</span> : null}
               </span>
             </button>
+            {/* Messaging was the row's own tap before an agent had a screen of
+                its own; it stays one tap away. Editing lives on that screen. */}
             <button
               class="agent-edit"
               type="button"
-              aria-label={`Edit ${agent.name}`}
-              onClick={() => { haptic('light'); setEditing(agent); }}
+              aria-label={`Message ${agent.name}`}
+              onClick={() => { haptic('light'); onMessage(agent); }}
             >
-              Edit
+              Message
             </button>
           </li>
         ))}
