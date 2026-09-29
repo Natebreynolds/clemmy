@@ -190,9 +190,11 @@ test('work moved to the background stays in the project and with the agent of it
   const { inheritedTaskDelegation } = await import('../../projects/inherited-delegation.js');
   assert.equal(inheritedTaskDelegation(plain), null, 'a conversation in no project and no agent hands on nothing');
   assert.deepEqual(inheritedTaskDelegation(clemInSales, 4), { agentId: null, agentName: null, agentCreatedAt: null,
-    projectId: sales.id, projectName: 'Scope Sales', assignedBy: 'clem', originSourceUserSeq: 4 });
+    projectId: sales.id, projectName: 'Scope Sales', assignedBy: 'clem', originSourceUserSeq: 4, agentChoice: 'open' },
+  'nobody was named and the project has an agent assigned: who it belongs to is asked when it starts');
   const both = inheritedTaskDelegation(analystInSales);
   assert.deepEqual([both?.agentId, both?.projectId, both?.assignedBy], [analyst.id, sales.id, 'owner']);
+  assert.equal(both?.agentChoice, undefined, 'a conversation already in an agent has made the choice');
   const alone = inheritedTaskDelegation(analystAlone);
   assert.deepEqual([alone?.agentId, alone?.projectId], [analyst.id, null]);
   assert.equal(inheritedTaskDelegation('no-such-session'), null);

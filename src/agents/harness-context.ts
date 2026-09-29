@@ -1,4 +1,5 @@
 import { withSessionMemoryScope } from '../memory/memory-scope.js';
+import { delegatedWorkPointers } from '../projects/delegated-work-pointers.js';
 import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
 /**
  * Persistent memory context for the 0.3 harness.
@@ -882,6 +883,8 @@ function renderTurnMemoryTailInScope(
     const pointer = countsPointer(scope, visibleFacts);
     if (pointer) parts.push({ section: 'Memory Pointer', tier: 'relevant', text: pointer });
   }
+  const delegated = delegatedWorkPointers(scope.sessionId);
+  if (delegated) parts.push({ section: 'Delegated Work', tier: 'now', text: delegated });
   if (options.sessionPointers?.trim()) {
     parts.push({ section: 'Session Pointers', tier: 'now', text: options.sessionPointers.trim() });
   }

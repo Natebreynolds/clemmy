@@ -272,3 +272,42 @@ test('a delegated run given to one agent does not mount another saved later unde
   const mount = composition.composeSession({ sessionId: session.id, sessionKind: session.kind, metadata: getSession(session.id)?.metadata ?? null });
   assert.equal(mount.agent, null);
 });
+
+
+test('work moved to the background from a project finds its agent once, when it starts', async () => {
+  for (const existing of tasks.listBackgroundTasks({ includeArchived: true })) tasks.archiveBackgroundTask(existing.id);
+  const { enqueueDurableChatTask } = await import('./background-promote.js');
+  const { _setOpenAgentChooserForTests } = await import('../projects/inherited-delegation.js');
+  const { delegatedWorkPointers } = await import('../projects/delegated-work-pointers.js');
+  const origin = createSession({ id: 'promoted-origin', kind: 'chat' });
+  setSessionProject(origin.id, sales.id, { by: 'owner' });
+
+  const queued = enqueueDurableChatTask({ message: 'Have the Briefing Analyst draft the weekly briefing.', sessionId: origin.id, source: 'desktop' });
+  assert.deepEqual([queued.delegation?.projectId, queued.delegation?.agentId, queued.delegation?.agentChoice], [sales.id, null, 'open']);
+
+  const asked: string[] = [];
+  _setOpenAgentChooserForTests(async (objective, candidates) => { asked.push(`${objective}|${candidates.map((row) => row.name).join(',')}`); return { id: analyst.id }; });
+  let prompt = '';
+  const assistant = { getRuntime: () => ({}) as never,
+    async respond(request: { message: string; sessionId: string }) { prompt = request.message; return { text: 'Done. Draft saved.', sessionId: request.sessionId, stoppedReason: 'success' as const }; } };
+  try {
+    assert.equal(await tasks.processBackgroundTasks(assistant as never, 1), 1);
+  } finally {
+    _setOpenAgentChooserForTests(null);
+  }
+  assert.deepEqual(asked, ['Have the Briefing Analyst draft the weekly briefing.|Briefing Analyst']);
+  const ran = tasks.getBackgroundTask(queued.id)!;
+  assert.deepEqual([ran.delegation?.agentId, ran.delegation?.assignedBy, ran.delegation?.agentChoice], [analyst.id, 'router', undefined]);
+  assert.match(prompt, /Clem delegated this task to you, Briefing Analyst\./);
+  assert.equal(getSession(ran.runSessionId)?.metadata?.agentId, analyst.id);
+
+  // The conversation is told what was delegated, who owns it, and what to do with a correction.
+  const pointers = delegatedWorkPointers(origin.id);
+  assert.match(pointers, new RegExp(`- ${queued.id} ".*": Briefing Analyst in Delegated Sales, `));
+  assert.match(pointers, /hand the change to the task with background_task_revise and its id/);
+  // Another conversation in the same project is told too; one outside it is not.
+  const sibling = createSession({ id: 'promoted-sibling', kind: 'chat' });
+  setSessionProject(sibling.id, sales.id, { by: 'owner' });
+  assert.match(delegatedWorkPointers(sibling.id), new RegExp(queued.id));
+  assert.equal(delegatedWorkPointers(createSession({ id: 'promoted-outsider', kind: 'chat' }).id), '');
+});

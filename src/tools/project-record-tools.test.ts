@@ -134,3 +134,10 @@ test('work that runs unattended does not reorganise the project it was given', a
   assert.deepEqual(await call('project_get', { project: 'Weekly Sales' }), before);
   assert.equal(findAgentRecord('Made Up'), null);
 });
+
+test('organising a project is a host control: it needs no declared work and no carrier refuses it', async () => {
+  const { classifyRuntimeToolEffect, resolveCarriedHostControl } = await import('../runtime/harness/tool-effect.js');
+  const carried = resolveCarriedHostControl('call_tool', { name: 'project_save', args_json: JSON.stringify({ project: null, name: 'Carried' }) });
+  assert.deepEqual(carried, { toolName: 'project_save', args: { project: null, name: 'Carried' } });
+  assert.equal(classifyRuntimeToolEffect('project_save', { project: null, name: 'Carried' }).effect, 'host_only');
+});

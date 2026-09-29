@@ -421,6 +421,11 @@ export interface BackgroundTaskDelegation {
   /** The finished task this one follows, when the owner corrected work that
    * had already ended. */
   followsTaskId?: string;
+  /**
+   * Nobody was named for this work and its project has agents assigned: who
+   * it belongs to is asked once, when the task starts. Absent once decided.
+   */
+  agentChoice?: 'open';
 }
 
 export interface BackgroundTaskContractRevision {
@@ -5722,6 +5727,27 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	    let task: BackgroundTaskRecord = runningTask;
 	    processed += 1;
 	    logger.info({ taskId: task.id, title: task.title }, 'Background task started');
+
+	    // Work that came from a project with nobody named: ask once which of
+	    // the agents assigned there it belongs to, and keep the answer.
+	    if (task.delegation?.agentChoice === 'open') {
+	      try {
+	        const { settleOpenAgentChoice } = await import('../projects/inherited-delegation.js');
+	        const settled = await settleOpenAgentChoice(task);
+	        const updated = updateBackgroundTaskWhere(task.id, (current) => current.status === 'running', {
+	          delegation: settled.delegation,
+	          ...(settled.model ? { model: settled.model } : {}),
+	        });
+	        if (updated) {
+	          task = updated;
+	          ensureDelegatedRunSession(task);
+	          if (task.delegation?.agentId) publishDelegatedTaskState(task, 'started');
+	        }
+	      } catch (error) {
+	        logger.warn({ taskId: task.id, error: error instanceof Error ? error.message : String(error) },
+	          'Could not decide who a task belongs to; it runs in its project without an agent');
+	      }
+	    }
 
 	    // Launching a background task authorizes its reversible work. Exact
 	    // irreversible sends remain owned by the concrete approval card because
