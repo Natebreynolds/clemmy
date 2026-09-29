@@ -621,6 +621,20 @@ export function markFactSupersededBy(
   return true;
 }
 
+/** Active facts of one kind whose content begins with a lead. The lead is
+ * matched literally, never as a pattern, and without regard to case, as the
+ * store itself treats two spellings of one fact as that fact. */
+export function findActiveFactsByContentPrefix(kind: ConsolidatedFactKind, prefix: string, limit = 8): ConsolidatedFact[] {
+  const lead = normalizeContent(prefix).toLowerCase();
+  if (!lead) return [];
+  const rows = openMemoryDb().prepare(`
+    SELECT * FROM consolidated_facts
+     WHERE active = 1 AND kind = ? AND lower(substr(content, 1, ?)) = ?
+     ORDER BY id DESC LIMIT ?
+  `).all(kind, lead.length, lead, Math.max(1, Math.min(50, limit))) as ConsolidatedFactRow[];
+  return rows.map(rowToFact);
+}
+
 export function supersedeFact(
   id: number,
   input: Omit<RememberInput, 'kind'> & { content: string },

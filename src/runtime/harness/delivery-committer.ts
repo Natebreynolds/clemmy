@@ -61,6 +61,7 @@ import { workEvidenceForAcceptedSource, type WorkEvidenceRef } from './work-mani
 import { constrainNeedsInputPresentationForRecovery } from './recovery-presentation-truth.js';
 import { learnVerifiedWriteCapabilitiesForAcceptedTask } from './verified-write-capability-learning.js';
 import { learnHostRunStrategyForAcceptedTask } from './host-run-strategy-learning.js';
+import { learnResolvedReferencesForAcceptedTask } from './resolved-reference-learning.js';
 import { renderFailureWithRetainedWork } from './retained-work-terminal.js';
 import { pendingAcceptedLocalWork } from './local-work-completion.js';
 import { getPlanRevisionForSource } from './plan-artifacts.js';
@@ -1821,7 +1822,26 @@ export function commitTurnOutcome(
     };
     try { workIdentity = completionEvidenceSource(workIdentity); } catch { /* the published source stands */ }
     try {
-      learnHostRunStrategyForAcceptedTask(workIdentity);
+      const strategy = learnHostRunStrategyForAcceptedTask(workIdentity);
+      // What the work resolved is kept on the same authority that admitted
+      // how it was done: a verified, reviewed finish, observed once.
+      if (strategy.status === 'learned' || strategy.status === 'updated') {
+        // After the terminal and off its path: it cannot delay or change it.
+        void learnResolvedReferencesForAcceptedTask({ ...workIdentity, occurredAt: terminal.event.createdAt })
+          .then((kept) => {
+            if (kept.references.length === 0) return;
+            appendEvent({
+              sessionId: workIdentity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+              data: {
+                kind: 'resolved_references_learned', sourceUserSeq: workIdentity.sourceUserSeq,
+                learned: kept.learned, superseded: kept.superseded,
+                // Which names and arguments, never the values: those live in memory with their provenance.
+                references: kept.references.map((row) => ({ named: row.named, operation: row.operation,
+                  argument: row.argument, effect: row.effect, foundIn: row.foundIn.tool })),
+              },
+            });
+          }).catch(() => { /* memory stays additive */ });
+      }
     } catch { /* strategy recall stays additive */ }
     // The reviewed answer and where its results live, for a later chat to reuse with its age.
     recordAnswerWorkEpisode({ ...workIdentity, text: persisted.text });
