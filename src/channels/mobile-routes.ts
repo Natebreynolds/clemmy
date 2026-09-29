@@ -154,6 +154,8 @@ import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import { setSessionAgent } from '../agents/session-agent.js';
+import { registerProjectRecordRoutes } from '../projects/project-routes.js';
+import { sessionProjectState } from '../projects/session-project-state.js';
 import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import {
@@ -340,6 +342,8 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
   updatedAt: number;
   agentId: string | null;
   agentName: string | null;
+  projectId: string | null;
+  projectName: string | null;
   pinned: boolean;
   archived: boolean;
 } {
@@ -352,6 +356,10 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
     title,
     agentId,
     agentName: agentId && typeof session.metadata?.agentName === 'string' ? session.metadata.agentName : null,
+    ...(() => {
+      const { projectId, projectName } = sessionProjectState(session.metadata);
+      return { projectId, projectName };
+    })(),
     pinned: session.metadata?.pinned === true,
     archived: session.metadata?.archived === true,
     kind: session.kind,
@@ -5713,6 +5721,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // PROJECTS — the same handlers the desktop mounts, under the phone's own
+  // session check, so both read and change the same records the same way.
+  registerProjectRecordRoutes({
+    add: (method, path, handler) => { router[method](path, requireMobileSession, (req, res) => { void handler(req, res); }); },
+    projects: '/api/project-records',
+    tasks: '/api/delegated-tasks',
+    sessions: '/api/chat/sessions',
+    agents: '/api/agents',
+    origin: 'phone',
+    surfaceName: 'the phone',
   });
 
   // AGENTS — the same records the desktop Agents page edits. Reads and edits

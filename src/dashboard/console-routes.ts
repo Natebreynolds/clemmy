@@ -19,6 +19,7 @@ import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whis
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
+import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { registerConsoleMemoryWorkRoutes } from './console-memory-work-routes.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
@@ -3862,6 +3863,22 @@ export function registerConsoleRoutes(
 
   // Read-only multi-agent workspace API (roster, canMessage graph, comms,
   // per-agent runs). Shares this function's auth gate.
+  // Projects are registered before the agent routes so that
+  // `/api/console/agents/:id/assignments` is matched ahead of `/agents/:id`.
+  registerProjectRecordRoutes({
+    add: (method, path, handler) => {
+      app[method](path, (req, res) => {
+        if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+        void handler(req, res);
+      });
+    },
+    projects: '/api/console/project-records',
+    tasks: '/api/console/delegated-tasks',
+    sessions: '/api/console/sessions',
+    agents: '/api/console/agents',
+    origin: 'console',
+    surfaceName: 'the desktop',
+  });
   registerConsoleAgentsRoutes(app, isAuthorized);
   registerConsoleMemoryWorkRoutes(app, { isAuthorized });
   armWorkflowListMemoWarm();

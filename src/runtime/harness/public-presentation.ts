@@ -971,11 +971,14 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // The saved agent the turn ran as is a name the owner chose; bounded,
       // never an id or a path.
       const agentName = typeof data.agentName === 'string' ? data.agentName.trim().slice(0, 64) : '';
+      // The project the turn worked in, by the name the owner gave it.
+      const projectName = typeof data.projectName === 'string' ? data.projectName.trim().slice(0, 80) : '';
       return {
         phase: 'model',
         ...(model ? { model } : {}),
         ...(provider ? { provider } : {}),
         ...(agentName ? { agentName } : {}),
+        ...(projectName ? { projectName } : {}),
         fallover: data.fallover === true,
         preselected: data.preselected === true,
       };

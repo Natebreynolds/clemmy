@@ -30,6 +30,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
 import { reconstructHarnessTranscript, harnessPreview, humanHarnessText } from '../runtime/harness/transcript.js';
 import { sessionAgentState } from '../agents/session-agent-state.js';
+import { sessionProjectState } from '../projects/session-project-state.js';
 import { approvalPreviewProjection, publicUserInputText } from '../runtime/harness/public-presentation.js';
 import {
   archiveAuthorityPayloadsForSession,
@@ -181,9 +182,13 @@ function summarizeDesktop(record: SessionRecord): UnifiedSessionSummary {
   };
 }
 
-function metaAgent(meta: Record<string, unknown> | undefined): { agentId: string | null; agentName: string | null; agentIds: string[] } {
+function metaAgent(meta: Record<string, unknown> | undefined): {
+  agentId: string | null; agentName: string | null; agentIds: string[];
+  projectId: string | null; projectName: string | null;
+} {
   const { agentId, agentName, agentIds } = sessionAgentState(meta);
-  return { agentId, agentName, agentIds };
+  const { projectId, projectName } = sessionProjectState(meta);
+  return { agentId, agentName, agentIds, projectId, projectName };
 }
 
 function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): UnifiedSessionSummary {

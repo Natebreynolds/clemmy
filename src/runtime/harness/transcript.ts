@@ -177,6 +177,8 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
   // agent the turn ran as, or none (Clem). A separate read, so the marker
   // count never shortens the window of visible turns.
   const answeredBy = new Map<string, string | null>();
+  // ...and which project it worked in, from the same marker.
+  const workedIn = new Map<string, string | null>();
   for (const event of listEvents(sessionId, { types: ['turn_model_routed'], limit })) {
     const seq = positiveSeq(event.data.sourceUserSeq);
     if (seq === null) continue;
@@ -184,9 +186,16 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     if (answeredBy.has(key)) continue;
     const name = typeof event.data.agentName === 'string' ? event.data.agentName.trim().slice(0, 64) : '';
     answeredBy.set(key, name || null);
+    const project = typeof event.data.projectName === 'string' ? event.data.projectName.trim().slice(0, 80) : '';
+    workedIn.set(key, project || null);
   }
   const attributed = (key: string, turns: UnifiedSessionTurn[]): UnifiedSessionTurn[] => (
-    answeredBy.has(key) ? turns.map((turn) => ({ ...turn, agentName: answeredBy.get(key) ?? null })) : turns
+    answeredBy.has(key)
+      ? turns.map((turn) => ({ ...turn, agentName: answeredBy.get(key) ?? null,
+          // Absent on a conversation that never worked in a project, so its
+          // saved turns read exactly as they did.
+          ...(workedIn.get(key) ? { projectName: workedIn.get(key) } : {}) }))
+      : turns
   );
 
   // Pair typed terminals by the exact accepted event and elect the durable

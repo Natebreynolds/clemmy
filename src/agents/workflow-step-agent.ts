@@ -108,6 +108,9 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   'update_agent',
   'delete_agent',
   'delegate_task',
+  // Organising the owner's work into projects and assigning agents to them
+  // is the owner's conversation with Clem, never a side effect of a step.
+  'project_save',
   // Environment mutation: installing or re-authenticating CLIs is a user-
   // approved conversational act (cli_setup's contract), never a side effect
   // of a workflow step grinding through its prompt.

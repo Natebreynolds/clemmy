@@ -163,6 +163,9 @@ export interface UnifiedSessionSummary {
   /** The saved agent answering this conversation's next turn; null = Clem. */
   agentId: string | null;
   agentName: string | null;
+  /** The project the conversation works in from its next turn; null = none. */
+  projectId?: string | null;
+  projectName?: string | null;
   /** Every saved agent that has answered here, oldest first. */
   agentIds?: string[];
 }
@@ -185,6 +188,8 @@ export interface UnifiedSessionTurn {
   /** Who this exchange was answered by: a saved agent's name, null for Clem
    *  without an agent. Absent when the turn left no route marker. */
   agentName?: string | null;
+  /** The project the turn worked in: a name, null for none, absent when unrecorded. */
+  projectName?: string | null;
   /** Workflows this reply created or changed, as saved, so a reopened
    *  conversation shows the same card the live reply did. */
   workflows?: import('./execution/workflow-saved-event.js').WorkflowSavedEventData[];

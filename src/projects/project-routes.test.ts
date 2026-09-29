@@ -1,0 +1,171 @@
+/**
+ * Run: node scripts/run-tests-isolated.mjs src/projects/project-routes.test.ts
+ */
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after, test } from 'node:test';
+import assert from 'node:assert/strict';
+
+const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-project-routes-'));
+process.env.CLEMENTINE_HOME = HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+mkdirSync(path.join(HOME, 'state'), { recursive: true });
+
+const { registerProjectRecordRoutes } = await import('./project-routes.js');
+const projects = await import('./project-record.js');
+const accounts = await import('./connected-accounts.js');
+const tasks = await import('../execution/background-tasks.js');
+const approvals = await import('../runtime/harness/approval-registry.js');
+const { createAgentRecord } = await import('../agents/agent-record.js');
+const { setSessionAgent } = await import('../agents/session-agent.js');
+const { createSession, getSession, listEvents, closeEventLog } = await import('../runtime/harness/eventlog.js');
+const { buildUnifiedSessionList } = await import('../dashboard/sessions-api.js');
+
+after(() => {
+  accounts._setConnectedAccountDirectoryForTests(null);
+  projects._closeProjectStoreForTests();
+  closeEventLog();
+  try { rmSync(HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
+
+type Handler = (req: any, res: any) => void | Promise<void>;
+function surface(prefix: { projects: string; tasks: string; sessions: string; agents: string }, origin: 'console' | 'phone') {
+  const routes: Array<{ method: string; path: string; keys: string[]; pattern: RegExp; handler: Handler }> = [];
+  registerProjectRecordRoutes({
+    add: (method, routePath, handler) => {
+      const keys: string[] = [];
+      const pattern = new RegExp(`^${routePath.replace(/:([A-Za-z]+)/g, (_m, key) => { keys.push(key); return '([^/]+)'; })}$`);
+      routes.push({ method, path: routePath, keys, pattern, handler });
+    },
+    ...prefix, origin, surfaceName: origin === 'phone' ? 'the phone' : 'the desktop',
+  });
+  return async (method: 'get' | 'post', url: string, body: unknown = undefined) => {
+    const [pathname, search = ''] = url.split('?');
+    for (const route of routes) {
+      if (route.method !== method) continue;
+      const match = route.pattern.exec(pathname!);
+      if (!match) continue;
+      const params = Object.fromEntries(route.keys.map((key, index) => [key, decodeURIComponent(match[index + 1]!)]));
+      const query = Object.fromEntries(new URLSearchParams(search));
+      let status = 200;
+      let payload: any;
+      const res = { headersSent: false, status(code: number) { status = code; return res; }, json(value: unknown) { payload = value; res.headersSent = true; return res; } };
+      await route.handler({ params, query, body }, res);
+      return { status, body: payload };
+    }
+    throw new Error(`no route for ${method} ${url}`);
+  };
+}
+const desktop = surface({ projects: '/api/console/project-records', tasks: '/api/console/delegated-tasks', sessions: '/api/console/sessions', agents: '/api/console/agents' }, 'console');
+const phone = surface({ projects: '/api/project-records', tasks: '/api/delegated-tasks', sessions: '/api/chat/sessions', agents: '/api/agents' }, 'phone');
+
+accounts._setConnectedAccountDirectoryForTests(async (toolkit) => [
+  { toolkit: 'ledgerscope', accountId: 'conn-east', label: 'East ledger', names: [] },
+  { toolkit: 'ledgerscope', accountId: 'conn-west', label: 'West ledger', names: [] },
+].filter((row) => row.toolkit === toolkit));
+const made = createAgentRecord({ name: 'Route Analyst', handles: 'Reporting.', createdFrom: 'console' });
+if (!made.ok) throw new Error('fixture agent');
+const analyst = made.agent;
+
+test('a project made on the desktop is the same project on the phone, with the same work and the same decision', async () => {
+  const created = await desktop('post', '/api/console/project-records', { name: 'Route Sales', purpose: 'Weekly briefing.', goals: ['Draft by Monday'] });
+  assert.equal(created.status, 200);
+  const id = created.body.overview.project.id as string;
+  assert.equal(created.body.overview.project.createdFrom, 'console');
+  assert.deepEqual((await desktop('post', '/api/console/project-records', { name: 'route sales' })).body, { error: 'NAME_TAKEN' });
+
+  // Assigned from the phone, seen on the desktop.
+  const assigned = await phone('post', `/api/project-records/${id}/agents/${analyst.id}`, { responsibility: 'Prepare the briefing.', skills: [], shareMethods: false });
+  assert.equal(assigned.status, 200);
+  assert.deepEqual((await desktop('get', `/api/console/project-records/${id}`)).body.overview.agents.map((row: any) => [row.agentName, row.responsibility, row.available]),
+    [['Route Analyst', 'Prepare the briefing.', true]]);
+  assert.equal((await phone('post', `/api/project-records/${id}/agents/nobody`, {})).status, 404);
+
+  // An account comes only from what is connected, and a second one is never swapped in.
+  const choices = await desktop('get', `/api/console/project-records/${id}/account-choices?toolkit=LedgerScope`);
+  assert.deepEqual(choices.body.accounts, [{ accountId: 'conn-east', label: 'East ledger' }, { accountId: 'conn-west', label: 'West ledger' }]);
+  const ambiguous = await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'account', toolkit: 'ledgerscope' });
+  assert.deepEqual([ambiguous.status, ambiguous.body.error], [409, 'ACCOUNT_CHOICE_REQUIRED']);
+  const invented = await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'account', toolkit: 'ledgerscope', accountId: 'conn-made-up' });
+  assert.equal(invented.body.error, 'ACCOUNT_CHOICE_REQUIRED', 'an account that is not connected is never bound');
+  assert.equal((await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'account', toolkit: 'ledgerscope', accountId: 'conn-east' })).status, 200);
+  const rival = await phone('post', `/api/project-records/${id}/resources`, { kind: 'account', toolkit: 'ledgerscope', accountId: 'conn-west' });
+  assert.deepEqual([rival.status, rival.body.error, rival.body.bound], [409, 'CONFLICTING_ACCOUNT', { accountId: 'conn-east', label: 'East ledger' }]);
+
+  // A conversation enters the project from the phone; the desktop's list says so.
+  const chat = createSession({ id: 'route-chat', kind: 'chat', title: 'Briefing chat' });
+  assert.deepEqual((await phone('post', `/api/chat/sessions/${chat.id}/project`, { projectId: id })).body,
+    { sessionId: chat.id, projectId: id, projectName: 'Route Sales', changed: true });
+  assert.equal((await desktop('post', `/api/console/sessions/harness:${chat.id}/project`, { projectId: id })).body.changed, false);
+  assert.equal((await desktop('post', `/api/console/sessions/${chat.id}/project`, { projectId: 7 })).status, 400);
+  assert.equal((await desktop('post', '/api/console/sessions/no-such/project', { projectId: id })).status, 404);
+  const listed = buildUnifiedSessionList({ limit: 50 }).find((row) => row.id.endsWith(chat.id));
+  assert.deepEqual([listed?.projectId, listed?.projectName], [id, 'Route Sales']);
+
+  // A delegated task: the same view on both, and its question is the project's one decision.
+  setSessionAgent(chat.id, null, { by: 'owner' });
+  const task = tasks.createBackgroundTask({ title: 'Draft the briefing', prompt: 'Objective: Draft the briefing', originSessionId: chat.id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: id, projectName: 'Route Sales', assignedBy: 'clem' } });
+  tasks.markBackgroundTaskRunning(task.id);
+  const onDesktop = (await desktop('get', `/api/console/delegated-tasks/${task.id}`)).body.task;
+  const onPhone = (await phone('get', `/api/delegated-tasks/${task.id}`)).body.task;
+  assert.deepEqual(onDesktop, onPhone);
+  assert.deepEqual([onDesktop.phase, onDesktop.owner.agentName, onDesktop.project.name, onDesktop.requestVersion, onDesktop.controls],
+    ['working', 'Route Analyst', 'Route Sales', 1, { canSteer: true, canStop: true, canResume: false, canAnswer: false }]);
+  assert.deepEqual((await phone('get', `/api/chat/sessions/${chat.id}/delegated-tasks`)).body.tasks.map((row: any) => row.taskId), [task.id]);
+
+  // Steered from the phone: the same task, the next version, announced in the conversation.
+  assert.equal((await phone('post', `/api/delegated-tasks/${task.id}/steer`, { instruction: 'no' })).status, 400);
+  const steered = (await phone('post', `/api/delegated-tasks/${task.id}/steer`, { instruction: 'Focus on this week and exclude unqualified leads.' })).body.task;
+  assert.deepEqual([steered.taskId, steered.requestVersion, steered.correctionPending, steered.revisions.at(-1).instruction],
+    [task.id, 2, true, 'Focus on this week and exclude unqualified leads.']);
+  assert.ok(listEvents(chat.id, { types: ['delegated_task_state'] }).some((event) => event.data.phase === 'revised' && event.data.contractVersion === 2));
+
+  // It asks; the project shows one decision; answered on the phone, settled on the desktop.
+  tasks.markBackgroundTaskAwaitingInput(task.id, 'q-region', 'Which region should the briefing cover?', { options: ['East', 'West'] });
+  const waiting = (await desktop('get', `/api/console/project-records/${id}`)).body.overview;
+  assert.deepEqual(waiting.decisions.map((row: any) => [row.kind, row.taskId, row.detail, row.owner]),
+    [['question', task.id, 'Which region should the briefing cover?', 'Route Analyst']]);
+  assert.equal((await phone('get', '/api/project-records')).body.projects.find((row: any) => row.id === id).needsYou, 1);
+  assert.equal((await desktop('post', `/api/console/delegated-tasks/${task.id}/answer`, { answer: ' ' })).status, 400);
+  const answered = await phone('post', `/api/delegated-tasks/${task.id}/answer`, { answer: 'East' });
+  assert.equal(answered.status, 200);
+  assert.equal((await desktop('get', `/api/console/project-records/${id}`)).body.overview.decisions.length, 0);
+  assert.equal((await desktop('post', `/api/console/delegated-tasks/${task.id}/answer`, { answer: 'West' })).status, 409, 'a question is answered once');
+
+  // An approval asked by the task's own run belongs to the project too.
+  const approval = approvals.register({ sessionId: task.runSessionId, subject: 'Save the draft to the shared folder', tool: 'fixture_write', args: { path: 'draft.md' } });
+  assert.deepEqual((await phone('get', `/api/project-records/${id}`)).body.overview.decisions.map((row: any) => [row.kind, row.approvalId, row.taskId]),
+    [['approval', approval.approvalId, task.id]]);
+  approvals.resolve(approval.approvalId, 'rejected', 'mobile-inbox');
+  assert.equal((await desktop('get', `/api/console/project-records/${id}`)).body.overview.decisions.length, 0, 'declined on the phone, gone on the desktop');
+
+  // Stopped from the desktop, resumed from the phone, in place.
+  const stopped = (await desktop('post', `/api/console/delegated-tasks/${task.id}/stop`)).body.task;
+  assert.ok(['stopped', 'stopping'].includes(stopped.phase), stopped.phase);
+  const work = (await phone('get', `/api/agents/${analyst.id}/assignments`)).body.work;
+  assert.deepEqual(work.projects.map((row: any) => [row.projectName, row.responsibility]), [['Route Sales', 'Prepare the briefing.']]);
+  if (stopped.phase === 'stopped') {
+    assert.deepEqual(work.recentOutcomes.map((row: any) => row.taskId), [task.id]);
+    const resumed = await phone('post', `/api/delegated-tasks/${task.id}/resume`);
+    assert.equal(resumed.status, 200);
+    assert.equal(resumed.body.task.runSessionId, task.runSessionId, 'the same run, never a copy');
+  }
+  assert.equal((await desktop('get', '/api/console/delegated-tasks/bg-none')).status, 404);
+
+  // Put away: nothing waits on the owner for it, and no conversation can enter it.
+  assert.equal((await desktop('post', `/api/console/project-records/${id}/archive`)).body.overview.project.status, 'archived');
+  assert.deepEqual((await phone('get', '/api/project-records')).body.projects.map((row: any) => row.id).includes(id), false);
+  assert.equal((await phone('get', '/api/project-records?archived=1')).body.projects.some((row: any) => row.id === id), true);
+  const other = createSession({ id: 'route-chat-2', kind: 'chat' });
+  assert.deepEqual((await phone('post', `/api/chat/sessions/${other.id}/project`, { projectId: id })).body, { error: 'PROJECT_ARCHIVED' });
+  void getSession;
+});
+
+test('a task nobody delegated is not a delegated task on any surface', async () => {
+  const plain = tasks.createBackgroundTask({ title: 'Plain', prompt: 'plain', source: 'desktop' });
+  assert.equal((await desktop('get', `/api/console/delegated-tasks/${plain.id}`)).status, 404);
+  assert.equal((await phone('post', `/api/delegated-tasks/${plain.id}/stop`)).status, 404);
+  assert.equal(tasks.getBackgroundTask(plain.id)?.status, 'pending', 'and these routes cannot touch it');
+});
