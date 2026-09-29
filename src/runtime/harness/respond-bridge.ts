@@ -1,3 +1,4 @@
+import './memory-scope-binding.js';
 import { admitPlanExecutionBridgeSource } from './plan-execution-bridge.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { getPlanRevision, type PlanArtifactV1 } from './plan-artifacts.js';

@@ -30,7 +30,7 @@ after(() => {
 });
 
 type Handler = (req: any, res: any) => void | Promise<void>;
-function surface(prefix: { projects: string; tasks: string; sessions: string; agents: string }, origin: 'console' | 'phone') {
+function surface(prefix: { projects: string; tasks: string; sessions: string; agents: string; memory: string }, origin: 'console' | 'phone') {
   const routes: Array<{ method: string; path: string; keys: string[]; pattern: RegExp; handler: Handler }> = [];
   registerProjectRecordRoutes({
     add: (method, routePath, handler) => {
@@ -57,8 +57,8 @@ function surface(prefix: { projects: string; tasks: string; sessions: string; ag
     throw new Error(`no route for ${method} ${url}`);
   };
 }
-const desktop = surface({ projects: '/api/console/project-records', tasks: '/api/console/delegated-tasks', sessions: '/api/console/sessions', agents: '/api/console/agents' }, 'console');
-const phone = surface({ projects: '/api/project-records', tasks: '/api/delegated-tasks', sessions: '/api/chat/sessions', agents: '/api/agents' }, 'phone');
+const desktop = surface({ projects: '/api/console/project-records', tasks: '/api/console/delegated-tasks', sessions: '/api/console/sessions', agents: '/api/console/agents', memory: '/api/console/memory' }, 'console');
+const phone = surface({ projects: '/api/project-records', tasks: '/api/delegated-tasks', sessions: '/api/chat/sessions', agents: '/api/agents', memory: '/api/memory' }, 'phone');
 
 accounts._setConnectedAccountDirectoryForTests(async (toolkit) => [
   { toolkit: 'ledgerscope', accountId: 'conn-east', label: 'East ledger', names: [] },
@@ -168,4 +168,34 @@ test('a task nobody delegated is not a delegated task on any surface', async () 
   assert.equal((await desktop('get', `/api/console/delegated-tasks/${plain.id}`)).status, 404);
   assert.equal((await phone('post', `/api/delegated-tasks/${plain.id}/stop`)).status, 404);
   assert.equal(tasks.getBackgroundTask(plain.id)?.status, 'pending', 'and these routes cannot touch it');
+});
+
+test('the owner sees who each memory is for, by name, and can move it', async () => {
+  const { rememberFact, factScope } = await import('../memory/facts.js');
+  const { agentScopeKey } = await import('../memory/memory-scope.js');
+  const { withScopeViews, listFactsByScope, describeScope } = await import('./memory-scope-views.js');
+  const made = projects.createProject({ name: 'Memory Views' });
+  if (!made.ok) throw new Error('fixture');
+  const inProject = rememberFact({ kind: 'project', content: 'Memory Views closes its books on the fifth.', scope: { projectId: made.project.id, agentKey: null } });
+  const byAgentThere = rememberFact({ kind: 'feedback', content: 'Route Analyst rounds to whole numbers in Memory Views.',
+    scope: { projectId: made.project.id, agentKey: agentScopeKey(analyst) } });
+  const everywhere = rememberFact({ kind: 'reference', content: 'The office printer is on the second floor.', scope: null });
+
+  assert.deepEqual(withScopeViews([inProject, byAgentThere, everywhere]).map((fact) => [fact.scope.kind, fact.scope.projectName, fact.scope.agentName]), [
+    ['project', 'Memory Views', null], ['project_agent', 'Memory Views', 'Route Analyst'], ['user', null, null]]);
+  assert.deepEqual(listFactsByScope({ everywhereOnly: false, projectId: made.project.id, agentId: null }, { limit: 20 }).facts.map((fact) => fact.id).sort(),
+    [inProject.id, byAgentThere.id].sort(), 'a project lists what its agents learned in it too');
+  assert.deepEqual(listFactsByScope({ everywhereOnly: false, projectId: null, agentId: analyst.id }, { limit: 20 }).facts.map((fact) => fact.id), [byAgentThere.id]);
+  assert.ok(listFactsByScope({ everywhereOnly: true, projectId: null, agentId: null }, { limit: 50 }).facts.every((fact) => fact.id !== inProject.id));
+  assert.equal(describeScope({ projectId: null, agentKey: 'route-analyst@1999-01-01T00:00:00.000Z' }).agentName, null,
+    'a memory kept for an earlier agent of the same name is not shown under the new one\'s name');
+
+  const moved = await phone('post', `/api/memory/facts/${inProject.id}/scope`, { projectId: null, agentId: null });
+  assert.deepEqual([moved.status, moved.body.fact.scope.kind], [200, 'user']);
+  assert.deepEqual(factScope(inProject.id), { projectId: null, agentKey: null });
+  const back = await desktop('post', `/api/console/memory/facts/${inProject.id}/scope`, { projectId: made.project.id, agentId: analyst.id });
+  assert.deepEqual([back.body.fact.scope.kind, back.body.fact.scope.agentName], ['project_agent', 'Route Analyst']);
+  assert.equal((await desktop('post', '/api/console/memory/facts/999999/scope', { projectId: null, agentId: null })).status, 404);
+  assert.equal((await desktop('post', `/api/console/memory/facts/${inProject.id}/scope`, { projectId: 'prj_aaaaaaaaaaaaaa', agentId: null })).body.error, 'PROJECT_NOT_FOUND');
+  assert.equal((await desktop('post', '/api/console/memory/facts/nope/scope', {})).status, 400);
 });

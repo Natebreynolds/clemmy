@@ -1,3 +1,4 @@
+import '../runtime/harness/memory-scope-binding.js';
 import { registerAttachmentTools } from './attachment-tools.js';
 import {
   TOOL_REGISTRY,

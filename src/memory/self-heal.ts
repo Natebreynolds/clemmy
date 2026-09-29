@@ -12,6 +12,8 @@ import {
 import { backupMemoryDbAsync } from './memory-backup.js';
 import { loadFactEmbeddings, cosine } from './embeddings.js';
 import { canMergeEntitySafe, extractAnchors } from './memory-merge.js';
+import { factScope, factScopes } from './facts.js';
+import { sameScope } from './memory-scope.js';
 import { appendHygieneAudit, readHygieneAudit, type HygieneAuditEntry } from './hygiene-audit.js';
 import { readFactRecallTrace, type FactRecallSurface } from './recall-trace.js';
 import { isSelfReferentialTool } from './reflection.js';
@@ -350,6 +352,7 @@ function detectMergeDuplicates(nowIso: string, cap: number): ProposedMemoryFix[]
     byKind.set(row.kind, arr);
   }
 
+  const scopes = factScopes(rows.map((row) => row.id));
   const out: ProposedMemoryFix[] = [];
   const alreadyDropping = new Set<number>();
   for (const kindRows of byKind.values()) {
@@ -365,6 +368,8 @@ function detectMergeDuplicates(nowIso: string, cap: number): ProposedMemoryFix[]
         if (!vb) continue;
         const sim = cosine(va, vb);
         if (sim < MERGE_SIMILARITY_THRESHOLD) continue;
+        // The same sentence kept for two scopes is two memories, on purpose.
+        if (!sameScope(scopes.get(a.id), scopes.get(b.id))) continue;
         if (!canMergeEntitySafe(anchors.get(a.id)!, anchors.get(b.id)!)) continue;
         const keep = factQuality(a) >= factQuality(b) ? a : b;
         const drop = keep.id === a.id ? b : a;
@@ -775,6 +780,7 @@ function validateFixProbe(fix: ProposedMemoryFix): { ok: true } | { ok: false; r
     if (!keep || !drop) return { ok: false, reason: 'merge target missing, inactive, or pinned' };
     if (keep.id === drop.id) return { ok: false, reason: 'merge target is self' };
     if (keep.kind !== drop.kind) return { ok: false, reason: 'merge target kind changed' };
+    if (!sameScope(factScope(keep.id), factScope(drop.id))) return { ok: false, reason: 'the two facts are kept for different scopes' };
     if (!canMergeEntitySafe(extractAnchors(keep), extractAnchors(drop))) return { ok: false, reason: 'entity anchors are no longer compatible' };
     const vectors = loadFactEmbeddings([keep.id, drop.id]);
     const vk = vectors.get(keep.id);
@@ -789,6 +795,7 @@ function validateFixProbe(fix: ProposedMemoryFix): { ok: true } | { ok: false; r
   const stale = requireRow(p.staleId);
   const replacement = requireRow(p.replacementId);
   if (!stale || !replacement) return { ok: false, reason: 'supersession target missing, inactive, or pinned' };
+  if (!sameScope(factScope(stale.id), factScope(replacement.id))) return { ok: false, reason: 'the two facts are kept for different scopes' };
   const staleParsed = parsePreferenceFact(stale.content);
   const replacementParsed = parsePreferenceFact(replacement.content);
   if (!staleParsed || !replacementParsed) return { ok: false, reason: 'supersession facts no longer parse as preferences' };

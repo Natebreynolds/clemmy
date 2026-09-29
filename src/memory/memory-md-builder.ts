@@ -45,6 +45,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { MEMORY_AUTO_SECTION_MARKER, MEMORY_FILE, MEMORY_PROMPT_READ_CHARS } from './vault.js';
 import { listActiveFacts, countActiveFacts, type ConsolidatedFact } from './facts.js';
+import { EVERYWHERE, withMemoryReadScope } from './memory-scope.js';
 
 const logger = pino({ name: 'clementine-next.memory.md-builder' });
 
@@ -197,7 +198,10 @@ export function regenerateMemoryMd(): RegenerateMemoryMdResult {
   // headroom. MAX_FACTS_PER_KIND * SECTIONS.length is the rendered
   // ceiling; we ask for 4x that to give the sort some slack across
   // kinds even when one kind dominates the active list.
-  const facts = listActiveFacts({ limit: MAX_FACTS_PER_KIND * SECTIONS.length * 4 });
+  // This file is part of every turn's standing context, so it holds only
+  // what is for everywhere: a fact kept for one project or one agent never
+  // reaches it.
+  const facts = withMemoryReadScope(EVERYWHERE, () => listActiveFacts({ limit: MAX_FACTS_PER_KIND * SECTIONS.length * 4 }));
 
   const existing = existsSync(MEMORY_FILE) ? readFileSync(MEMORY_FILE, 'utf-8') : '# Memory\n\n';
   const { userPart, hadMarker } = splitAtMarker(existing);

@@ -21,6 +21,7 @@ import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
 import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { getProject as getProjectRecord } from '../projects/project-record.js';
+import { listFactsByScope, scopeFilterFromQuery, withScopeViews } from '../projects/memory-scope-views.js';
 import { registerConsoleMemoryWorkRoutes } from './console-memory-work-routes.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
@@ -3877,6 +3878,7 @@ export function registerConsoleRoutes(
     tasks: '/api/console/delegated-tasks',
     sessions: '/api/console/sessions',
     agents: '/api/console/agents',
+    memory: '/api/console/memory',
     origin: 'console',
     surfaceName: 'the desktop',
   });
@@ -4191,11 +4193,16 @@ export function registerConsoleRoutes(
     const includeInactive = req.query.includeInactive === '1' || req.query.includeInactive === 'true';
     const limit = Math.max(1, Math.min(200, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '60', 10) || 60));
     try {
-      const facts = includeInactive
+      // The owner's own screen: every scope is listed, each fact saying who
+      // it is for. A scope filter narrows the list to one.
+      const scopeFilter = scopeFilterFromQuery(req.query as Record<string, unknown>);
+      const scopedList = scopeFilter ? listFactsByScope(scopeFilter, { kind, limit, includeInactive }) : null;
+      const listed = scopedList?.facts ?? (includeInactive
         ? listAllFacts(limit, kind)
-        : listActiveFacts({ kind, limit });
+        : listActiveFacts({ kind, limit }));
+      const facts = withScopeViews(listed);
       const db = openMemoryDb();
-      const total = kind
+      const total = scopedList ? scopedList.total : kind
         ? (db.prepare(`SELECT COUNT(*) AS count FROM consolidated_facts WHERE ${includeInactive ? '1 = 1' : 'active = 1'} AND kind = ?`).get(kind) as { count: number }).count
         : (db.prepare(`SELECT COUNT(*) AS count FROM consolidated_facts WHERE ${includeInactive ? '1 = 1' : 'active = 1'}`).get() as { count: number }).count;
       const policies = new Map(listMemoryPolicies().map((policy) => [policy.fact_id, policy]));

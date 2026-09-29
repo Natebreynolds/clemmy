@@ -1,3 +1,4 @@
+import '../runtime/harness/memory-scope-binding.js';
 import { randomBytes } from 'node:crypto';
 import { getSavedClis } from '../runtime/saved-clis.js';
 import { readConnectedClis } from '../integrations/cli-catalog/catalog.js';

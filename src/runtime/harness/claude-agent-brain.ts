@@ -1,3 +1,4 @@
+import './memory-scope-binding.js';
 import { renderCanonicalMemoryContext } from './canonical-context.js';
 import { acceptedPlanOwnerScopeInput } from './accepted-plan-execution.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';

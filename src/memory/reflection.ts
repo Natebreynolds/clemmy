@@ -19,7 +19,9 @@ import {
   searchFactsByText,
   type RememberInput,
   type ConsolidatedFact,
+  defaultFactWriteScope,
 } from './facts.js';
+import { EVERYWHERE, withMemorySettledFor, type MemoryScope } from './memory-scope.js';
 import { recordToolEvent } from '../agents/tool-observability.js';
 import { classifySource, isSourceTrustEnabled, AUTHORITATIVE_TRUST } from './authoritative-sources.js';
 import { attachGroundedFactResources, recordGroundedEntityRelationship, resolveGroundedEntityIdsForText, setFactEntityLinks } from './relations.js';
@@ -1343,6 +1345,9 @@ export interface ConsolidateCandidate {
 export interface ConsolidateContext {
   sessionId?: string;
   derivedFrom?: { sessionId?: string; callId?: string; tool?: string };
+  /** Who the memory is for, when the caller knows. Null is everywhere. Left
+   * out, it is decided by the memory's kind and the session it came from. */
+  scope?: MemoryScope | null;
 }
 
 export interface ConsolidateOutcome {
@@ -1672,10 +1677,16 @@ export async function consolidateFact(
   // Settling a new memory is the `reconcile` memory job. It is recorded when
   // its conflict review asked the memory model (or it failed); a deterministic
   // save only refreshes the job's "last checked".
+  // A memory is settled for one scope: it is compared only with what is
+  // kept for that same scope, so what is learned in one project can never
+  // replace what is kept for another, or for everywhere.
+  const settledFor = ctx.scope !== undefined
+    ? ctx.scope ?? EVERYWHERE
+    : defaultFactWriteScope(candidate.kind, ctx.derivedFrom?.sessionId ?? ctx.sessionId);
   const out = await runMemoryModelJob(
     'reconcile',
     { source: consolidationSource(candidate, ctx) },
-    () => consolidateFactInner(candidate, ctx, opts),
+    () => withMemorySettledFor(settledFor, () => consolidateFactInner(candidate, ctx, opts)),
     reconcileOutcome,
   );
   // Tally the resolver decision (a fact is exactly one of these per call).

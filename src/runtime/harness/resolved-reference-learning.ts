@@ -35,7 +35,9 @@ import { labelIdentifierWithJev } from '../jev/control-plane.js';
 import { judgeEvidenceJsonValue } from './judge-evidence-tools.js';
 import { scanSecrets } from './guardrails.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
-import { findActiveFactsByContentPrefix, rememberFact, supersedeFact } from '../../memory/facts.js';
+import {
+  defaultFactWriteScope, factsInExactScope, findActiveFactsByContentPrefix, rememberFact, supersedeFact,
+} from '../../memory/facts.js';
 
 export interface SettledCall {
   tool: string;
@@ -282,18 +284,22 @@ export async function learnResolvedReferencesForAcceptedTask(input: {
   });
   let learned = 0;
   let superseded = 0;
+  const keptFor = defaultFactWriteScope('reference', input.sessionId);
   for (const reference of references) {
     try {
       const content = resolvedReferenceContent(reference);
       const memory = {
         content,
+        scope: keptFor,
         sessionId: input.sessionId,
         derivedFrom: { sessionId: input.sessionId, callId: reference.callId, tool: reference.operation },
         // Both ends are on receipts, but the world can change after them.
         trustLevel: 0.8,
         ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
       };
-      const earlier = findActiveFactsByContentPrefix('reference', resolvedReferenceLead(reference))
+      // A resolution replaces an earlier one kept for the same project and
+      // agent. What another project resolved the same name to is its own.
+      const earlier = factsInExactScope(findActiveFactsByContentPrefix('reference', resolvedReferenceLead(reference)), keptFor)
         .filter((fact) => fact.content !== content);
       if (earlier.length > 0) {
         for (const fact of earlier) if (supersedeFact(fact.id, memory)) superseded += 1;

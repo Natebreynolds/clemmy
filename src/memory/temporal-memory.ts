@@ -10,6 +10,7 @@ import {
   type MemoryEpisodeStatus,
   type MemoryPolicyRow,
 } from './db.js';
+import { currentMemoryWriteScope, isEverywhere, scopeOfSession, stampMemoryScope } from './memory-scope.js';
 import { resolveToolOutputForAuthority, type ToolOutputRecord } from '../runtime/harness/eventlog.js';
 import { compileComposioStandingPolicy } from '../integrations/composio/standing-policy-compiler.js';
 import { compilePromptStandingPolicyDescriptor } from './policy-enforcement.js';
@@ -156,6 +157,12 @@ export function recordMemoryEpisode(input: MemoryEpisodeInput): MemoryEpisodeRow
     title,
     metadataJson,
   );
+  // An episode is kept for the project and agent of the session it happened
+  // in. One that happened outside any is for everywhere, as before.
+  try {
+    const scope = currentMemoryWriteScope() ?? scopeOfSession(input.sessionId);
+    if (scope && !isEverywhere(scope)) stampMemoryScope('episode', id, scope, { sessionId: input.sessionId ?? null });
+  } catch { /* the episode is kept; it is then for everywhere */ }
   return db.prepare('SELECT * FROM memory_episodes WHERE id = ?').get(id) as MemoryEpisodeRow;
 }
 

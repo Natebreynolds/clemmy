@@ -157,6 +157,7 @@ import { setSessionAgent } from '../agents/session-agent.js';
 import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { sessionProjectState } from '../projects/session-project-state.js';
 import { getProject as getProjectRecord } from '../projects/project-record.js';
+import { listFactsByScope, scopeFilterFromQuery, withScopeViews } from '../projects/memory-scope-views.js';
 import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import {
@@ -4426,7 +4427,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const kind = (validKinds as string[]).includes(kindRaw) ? (kindRaw as ConsolidatedFactKind) : undefined;
     const limit = clampInt(req.query.limit, 40, 1, 120);
     try {
-      const facts = listActiveFacts({ kind, limit });
+      const scopeFilter = scopeFilterFromQuery(req.query as Record<string, unknown>);
+      const facts = withScopeViews(scopeFilter
+        ? listFactsByScope(scopeFilter, { kind, limit }).facts
+        : listActiveFacts({ kind, limit }));
       res.json({
         facts: facts.map((fact) => ({
           id: fact.id,
@@ -4436,6 +4440,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           updatedAt: fact.updatedAt,
           lastAccessedAt: fact.lastAccessedAt ?? null,
           pinned: fact.pinned === true,
+          scope: fact.scope,
         })),
       });
     } catch (err) {
@@ -4455,8 +4460,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     try {
       const { getFactWithEvidence } = await import('../memory/facts.js');
       const { listMemoryPolicies } = await import('../memory/temporal-memory.js');
-      const fact = getFactWithEvidence(id);
-      if (!fact) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      const found = getFactWithEvidence(id);
+      if (!found) { res.status(404).json({ error: `no fact #${id}` }); return; }
+      const fact = withScopeViews([found])[0]!;
       const policy = listMemoryPolicies().find((p) => p.fact_id === id) ?? null;
       res.json({ fact, policy });
     } catch (err) {
@@ -5739,6 +5745,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     tasks: '/api/delegated-tasks',
     sessions: '/api/chat/sessions',
     agents: '/api/agents',
+    memory: '/api/memory',
     origin: 'phone',
     surfaceName: 'the phone',
   });

@@ -8,6 +8,10 @@ import {
   type ConsolidatedFactKind,
   type ConsolidatedFactRow,
 } from './db.js';
+import {
+  EVERYWHERE, currentMemoryReadScope, currentMemoryWriteScope, isEverywhere, memoryScopeOf, recordVisible, sameScope,
+  scopeHashSuffix, scopeOfSession, scopedRecords, stampMemoryScope, visibleInScope, type MemoryScope,
+} from './memory-scope.js';
 import { cosine, embedQuery, isEmbeddingsEnabled, loadActiveFactEmbeddings, loadArchivedFactEmbeddings, loadFactEmbeddings } from './embeddings.js';
 import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
@@ -168,8 +172,36 @@ function normalizeContent(content: string): string {
   return content.replace(/\s+/g, ' ').trim();
 }
 
-function hashContent(kind: ConsolidatedFactKind, content: string): string {
-  return createHash('sha1').update(`${kind}::${normalizeContent(content).toLowerCase()}`).digest('hex');
+function hashContent(kind: ConsolidatedFactKind, content: string, scope?: MemoryScope | null): string {
+  // The same sentence learned in two scopes is two facts. A fact for
+  // everywhere hashes as it always did.
+  return createHash('sha1').update(`${kind}::${normalizeContent(content).toLowerCase()}${scopeHashSuffix(scope)}`).digest('hex');
+}
+
+/**
+ * Who a fact of this kind, learned in this session, is for when nobody said.
+ * What is true of the owner, and a rule that must hold, hold everywhere.
+ * Anything else is for the project and agent of the session it came from.
+ */
+export function defaultFactWriteScope(kind: ConsolidatedFactKind, sessionId: string | null | undefined): MemoryScope {
+  if (kind === 'user' || kind === 'constraint') return EVERYWHERE;
+  const learnedIn = scopeOfSession(sessionId);
+  if (learnedIn) return { projectId: learnedIn.projectId, agentKey: learnedIn.agentKey };
+  const ambient = currentMemoryReadScope();
+  return ambient === 'unrestricted' ? EVERYWHERE : { projectId: ambient.projectId, agentKey: ambient.agentKey };
+}
+
+/** Who a fact being written is for. */
+function writeScopeFor(input: RememberInput): MemoryScope {
+  if (input.scope !== undefined) return input.scope ?? EVERYWHERE;
+  const settledFor = currentMemoryWriteScope();
+  if (settledFor !== undefined) return settledFor;
+  return defaultFactWriteScope(input.kind, input.derivedFrom?.sessionId ?? input.sessionId);
+}
+
+function keepScope(fact: ConsolidatedFact, scope: MemoryScope, input: RememberInput): void {
+  if (isEverywhere(scope)) return;
+  stampMemoryScope('fact', fact.id, scope, { sessionId: input.derivedFrom?.sessionId ?? input.sessionId ?? null });
 }
 
 function rowToFact(row: ConsolidatedFactRow): ConsolidatedFact {
@@ -227,6 +259,13 @@ function safeParseFactIds(json: string): number[] | null {
 export interface RememberInput {
   kind: ConsolidatedFactKind;
   content: string;
+  /**
+   * Who the fact is for. Null is everywhere. Left out, it is decided by the
+   * kind and by where it was learned: a fact about the owner or a standing
+   * rule is for everywhere; anything else is for the project and agent of
+   * the session it came from, when that session has one.
+   */
+  scope?: MemoryScope | null;
   sessionId?: string;
   path?: string;
   score?: number;
@@ -354,7 +393,8 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
   }
 
   const db = openMemoryDb();
-  const hash = hashContent(input.kind, content);
+  const scope = writeScopeFor(input);
+  const hash = hashContent(input.kind, content, scope);
   const now = new Date().toISOString();
   const initialScore = input.score ?? 1.0;
 
@@ -422,6 +462,7 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
     const refreshed = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
       .get(existing.id) as ConsolidatedFactRow;
     const updatedFact = rowToFact(refreshed);
+    keepScope(updatedFact, scope, input);
     syncMemoryPolicyForFact(updatedFact.id);
     captureEvidenceBestEffort(updatedFact, input);
     captureDirectFactEntityLinksBestEffort(updatedFact, input);
@@ -453,6 +494,7 @@ export function rememberFact(input: RememberInput): ConsolidatedFact {
   const inserted = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?')
     .get(info.lastInsertRowid) as ConsolidatedFactRow;
   const insertedFact = rowToFact(inserted);
+  keepScope(insertedFact, scope, input);
   syncMemoryPolicyForFact(insertedFact.id);
   captureEvidenceBestEffort(insertedFact, input);
   captureDirectFactEntityLinksBestEffort(insertedFact, input);
@@ -632,7 +674,62 @@ export function findActiveFactsByContentPrefix(kind: ConsolidatedFactKind, prefi
      WHERE active = 1 AND kind = ? AND lower(substr(content, 1, ?)) = ?
      ORDER BY id DESC LIMIT ?
   `).all(kind, lead.length, lead, Math.max(1, Math.min(50, limit))) as ConsolidatedFactRow[];
-  return rows.map(rowToFact);
+  return visibleInScope('fact', rows.map(rowToFact), (fact) => fact.id);
+}
+
+/**
+ * The standing rules a read is held to: every rule for everywhere, and the
+ * ones kept for its own project and agent. A rule is only ever kept for a
+ * scope by the owner's own act. When scopes cannot be read every rule
+ * applies.
+ */
+function rulesInScope<T extends { id: number }>(rows: readonly T[]): T[] {
+  return visibleInScope('fact', rows, (row) => row.id, currentMemoryReadScope(), 'everything');
+}
+
+/** Who a fact is for; everywhere when it was never kept for a scope. */
+export function factScope(id: number): MemoryScope {
+  try {
+    return memoryScopeOf('fact', id) ?? EVERYWHERE;
+  } catch {
+    return EVERYWHERE;
+  }
+}
+
+/** Who each fact in a list is for, read once. */
+export function factScopes(ids: readonly number[]): Map<number, MemoryScope> {
+  const found = new Map<number, MemoryScope>();
+  if (ids.length === 0) return found;
+  let scoped: Map<string, MemoryScope>;
+  try { scoped = scopedRecords('fact'); } catch { return found; }
+  for (const id of ids) found.set(id, scoped.get(String(id)) ?? EVERYWHERE);
+  return found;
+}
+
+/** The facts out of a list that are for exactly this scope and no other. */
+export function factsInExactScope(facts: readonly ConsolidatedFact[], scope: MemoryScope | null | undefined): ConsolidatedFact[] {
+  if (facts.length === 0) return [];
+  let scoped: Map<string, MemoryScope>;
+  try { scoped = scopedRecords('fact'); } catch { return []; }
+  return facts.filter((fact) => sameScope(scoped.get(String(fact.id)) ?? EVERYWHERE, scope ?? EVERYWHERE));
+}
+
+/**
+ * Move a fact to another scope, or to everywhere. The owner's own act: the
+ * fact keeps its id, its evidence and its history.
+ */
+export function moveFactToScope(id: number, scope: MemoryScope | null): ConsolidatedFact | null {
+  const db = openMemoryDb();
+  const row = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?').get(id) as ConsolidatedFactRow | undefined;
+  if (!row) return null;
+  const next = scope ?? EVERYWHERE;
+  const hash = hashContent(row.kind, row.content, next);
+  const taken = db.prepare('SELECT id FROM consolidated_facts WHERE content_hash = ? AND id <> ?').get(hash, id) as { id: number } | undefined;
+  // The same fact is already kept there: nothing to move.
+  if (taken) return null;
+  db.prepare('UPDATE consolidated_facts SET content_hash = ?, updated_at = ? WHERE id = ?').run(hash, new Date().toISOString(), id);
+  stampMemoryScope('fact', id, next, { stampedBy: 'owner' });
+  return rowToFact(db.prepare('SELECT * FROM consolidated_facts WHERE id = ?').get(id) as ConsolidatedFactRow);
 }
 
 export function supersedeFact(
@@ -646,6 +743,8 @@ export function supersedeFact(
   const existing = rowToFact(existingRow);
   const replacement = rememberFact({
     ...input,
+    // A correction is for whoever the fact it corrects was for.
+    scope: input.scope !== undefined ? input.scope : factScope(existing.id),
     kind: existing.kind,
     trustLevel: input.trustLevel ?? existing.trustLevel ?? undefined,
     importance: input.importance ?? existing.importance ?? undefined,
@@ -802,7 +901,7 @@ export async function findSimilarFactsScored(
               ${options.kind ? 'AND cf.kind = ?' : ''}
           `).all(historicalAt, historicalAt, ...(options.kind ? [options.kind] : [])) as Array<{ id: number }>).map((row) => row.id))
         : loadActiveFactEmbeddings(options.kind);
-      const ids = Array.from(vectors.keys());
+      const ids = visibleInScope('fact', Array.from(vectors.keys()), (id) => id);
       if (vectors.size > 0) {
         const queryVector = await embedQuery(normalized);
         if (queryVector) {
@@ -869,7 +968,7 @@ export async function findSimilarFactsScored(
 
   // Score by token-occurrence count, return top-K. No cosine available on
   // this path, so sim is null (callers must not threshold against it).
-  const scored = matches.map((row) => {
+  const scored = visibleInScope('fact', matches, (row) => row.id).map((row) => {
     const lc = row.content.toLowerCase();
     const hits = tokens.reduce((sum, t) => sum + (lc.includes(t) ? 1 : 0), 0);
     return { row, hits };
@@ -927,7 +1026,7 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
   // old leg was relevant facts evicted by common-token matches before scoring.
   try {
     const match = tokens.map((token) => `"${token.replace(/"/g, '')}"`).join(' OR ');
-    const rows = db.prepare(`
+    const found = db.prepare(`
       SELECT f.*, bm25(consolidated_facts_fts) AS fts_rank
         FROM consolidated_facts_fts
         JOIN consolidated_facts f ON f.id = consolidated_facts_fts.rowid
@@ -936,6 +1035,10 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
        ORDER BY fts_rank
        LIMIT ?
     `).all(match, Math.max(1, limit) * 4) as (ConsolidatedFactRow & { fts_rank: number })[];
+    const readable = visibleInScope('fact', found, (row) => row.id);
+    // Only when every match was for someone else does the fallback below
+    // run; it is held to the same scope.
+    const rows = found.length > 0 && readable.length === 0 ? [] : readable;
     if (rows.length > 0) {
       // Preserve the historical tie-break shape: exact-token hit count first
       // (bm25 already ordered candidates; hit count keeps multi-term queries
@@ -960,7 +1063,7 @@ export function searchFactsByText(query: string, limit = 5): ConsolidatedFact[] 
         AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
       ORDER BY updated_at DESC
     `).all(...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
-    const scored = matches.map((row) => {
+    const scored = visibleInScope('fact', matches, (row) => row.id).map((row) => {
       const lc = row.content.toLowerCase();
       const hits = tokens.reduce((sum, t) => sum + (lc.includes(t) ? 1 : 0), 0);
       return { row, hits };
@@ -995,7 +1098,7 @@ export function searchFactsByTextAt(query: string, asOf: string, limit = 5): Con
         AND (fvi.valid_to IS NULL OR fvi.valid_to > ?)
         AND (${tokens.map(() => 'LOWER(cf.content) LIKE ?').join(' OR ')})
     `).all(at, at, ...tokens.map((token) => `%${token}%`)) as Array<ConsolidatedFactRow & { interval_valid_from: string; interval_valid_to: string | null }>;
-    return rows
+    return visibleInScope('fact', rows, (row) => row.id)
       .map((row) => ({
         row,
         hits: tokens.reduce((sum, token) => sum + (row.content.toLowerCase().includes(token) ? 1 : 0), 0),
@@ -1085,7 +1188,9 @@ export async function searchArchivedFactsScored(
         const queryVector = await embedQuery(normalized);
         if (queryVector) {
           const scored: Array<{ id: number; sim: number }> = [];
+          const readable = new Set(visibleInScope('fact', Array.from(vectors.keys()), (id) => id));
           for (const [id, vec] of vectors) {
+            if (!readable.has(id)) continue;
             const sim = cosine(queryVector, vec);
             if (sim >= ARCHIVED_MIN_SIM) scored.push({ id, sim });
           }
@@ -1125,7 +1230,7 @@ export async function searchArchivedFactsScored(
         AND superseded_by_fact_id IS NULL
         AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
     `).all(...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
-    return matches
+    return visibleInScope('fact', matches, (row) => row.id)
       .map((row) => {
         const lc = row.content.toLowerCase();
         return { row, hits: tokens.reduce((sum, t) => sum + (lc.includes(t) ? 1 : 0), 0) };
@@ -1203,7 +1308,7 @@ export function listRecentlyLearnedFacts(options: { sinceHours?: number; limit?:
     ORDER BY importance DESC, extracted_at DESC, id DESC
     LIMIT ?
   `).all(since, limit) as ConsolidatedFactRow[];
-  return rows.map(rowToFact);
+  return visibleInScope('fact', rows, (row) => row.id).map(rowToFact);
 }
 
 /**
@@ -1488,7 +1593,7 @@ export function listActiveFacts(options: {
     const queryVec = semanticRecallEnabled() ? getActiveTurnQueryVector(now) : null;
     const factVectors = queryVec ? loadActiveFactEmbeddings(options.kind) : null;
     const wSem = semanticRecallWeight();
-    return rows
+    return visibleInScope('fact', rows, (row) => row.id)
       .map(rowToFact)
       .map((fact) => {
         let s = scoreOf(fact);
@@ -1516,7 +1621,7 @@ export function listActiveFacts(options: {
         ORDER BY score DESC, updated_at DESC
         LIMIT ?
       `).all(limit) as ConsolidatedFactRow[];
-  return rows.map(rowToFact);
+  return visibleInScope('fact', rows, (row) => row.id).map(rowToFact);
 }
 
 export function listAllFacts(limit = 50, kind?: ConsolidatedFactKind): ConsolidatedFact[] {
@@ -1533,13 +1638,14 @@ export function listAllFacts(limit = 50, kind?: ConsolidatedFactKind): Consolida
         ORDER BY active DESC, score DESC, updated_at DESC
         LIMIT ?
       `).all(limit) as ConsolidatedFactRow[];
-  return rows.map(rowToFact);
+  return visibleInScope('fact', rows, (row) => row.id).map(rowToFact);
 }
 
 export function getFact(id: number): ConsolidatedFact | null {
   const db = openMemoryDb();
   const row = db.prepare('SELECT * FROM consolidated_facts WHERE id = ?').get(id) as ConsolidatedFactRow | undefined;
-  return row ? rowToFact(row) : null;
+  // A turn is not shown, by id, a fact it would not be shown by search.
+  return row && recordVisible('fact', row.id) ? rowToFact(row) : null;
 }
 
 /** Return the exact asserted period containing `asOf`, if any. */
@@ -1555,7 +1661,9 @@ export function getFactAt(id: number, asOf: string): ConsolidatedFact | null {
     ORDER BY fvi.valid_from DESC
     LIMIT 1
   `).get(id, at, at) as (ConsolidatedFactRow & { interval_valid_from: string; interval_valid_to: string | null }) | undefined;
-  return row ? { ...rowToFact(row), validFrom: row.interval_valid_from, validTo: row.interval_valid_to } : null;
+  return row && recordVisible('fact', row.id)
+    ? { ...rowToFact(row), validFrom: row.interval_valid_from, validTo: row.interval_valid_to }
+    : null;
 }
 
 export function getFactValidityIntervals(id: number): FactValidityInterval[] {
@@ -1671,7 +1779,7 @@ export function listCompiledConstraintStandingPolicies(
     policy_type: string;
     enforcement: string;
   }>;
-  return parseCompiledConstraintStandingPolicyRows(rows, options.supportedAdapterIds);
+  return parseCompiledConstraintStandingPolicyRows(rulesInScope(rows), options.supportedAdapterIds);
 }
 
 /**
@@ -1697,7 +1805,7 @@ export function listDispatchStandingPolicies(
     policy_type: string;
     enforcement: string;
   }>;
-  return parseCompiledConstraintStandingPolicyRows(rows, options.supportedAdapterIds).map((policy) => {
+  return parseCompiledConstraintStandingPolicyRows(rulesInScope(rows), options.supportedAdapterIds).map((policy) => {
     const { constraint, descriptor, priority } = policy;
     if (!descriptor.deterministic || descriptor.directives.length === 0) {
       throw new Error(`standing policy #${constraint.id} is dispatch-enforced without an executable directive`);
@@ -1727,7 +1835,7 @@ export function listPinnedFacts(limit = 12): ConsolidatedFact[] {
     ORDER BY COALESCE(importance, 5) DESC, updated_at DESC
     LIMIT ?
   `).all(Math.max(1, limit)) as ConsolidatedFactRow[];
-  return rows.map(rowToFact);
+  return rulesInScope(rows).map(rowToFact);
 }
 
 /** List every active legacy constraint-shaped instruction for prompt context
@@ -1745,7 +1853,7 @@ export function listConstraints(limit?: number): ConsolidatedFact[] {
   const rows = (typeof limit === 'number'
     ? db.prepare(`${base} LIMIT ?`).all(Math.max(1, limit))
     : db.prepare(base).all()) as ConsolidatedFactRow[];
-  return rows.map(rowToFact);
+  return rulesInScope(rows).map(rowToFact);
 }
 
 /**

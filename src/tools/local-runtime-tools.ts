@@ -1,3 +1,4 @@
+import '../runtime/harness/memory-scope-binding.js';
 import { registerAttachmentTools } from './attachment-tools.js';
 import { tool, type Tool } from '@openai/agents';
 import { registeredToolSideEffect } from './tool-registry.js';

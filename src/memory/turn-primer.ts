@@ -1,3 +1,4 @@
+import { withSessionMemoryScope } from './memory-scope.js';
 import { getRuntimeEnv } from '../config.js';
 import { getFact, recordFactImpression, type ConsolidatedFact } from './facts.js';
 import { appendFactRecallTrace } from './recall-trace.js';
@@ -175,6 +176,13 @@ export async function buildUnifiedTurnPrimer(input: {
    *  the primer preamble and header. */
   format?: 'primer' | 'tail';
 }): Promise<UnifiedTurnPrimerResult> {
+  // A primer is built for one session and shows what that session may see.
+  return withSessionMemoryScope(input.sessionId, () => buildUnifiedTurnPrimerInScope(input));
+}
+
+async function buildUnifiedTurnPrimerInScope(
+  input: Parameters<typeof buildUnifiedTurnPrimer>[0],
+): Promise<UnifiedTurnPrimerResult> {
   const started = Date.now();
   const query = input.query.replace(/\s+/g, ' ').trim();
   if (!unifiedTurnPrimerEnabled()) {

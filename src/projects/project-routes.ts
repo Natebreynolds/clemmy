@@ -25,6 +25,7 @@ import {
   agentWork, delegatedTaskById, delegatedTasksForSession, projectOverview, projectSummaries,
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
+import { moveFact } from './memory-scope-views.js';
 
 type Handler = (req: Request, res: Response) => void | Promise<void>;
 
@@ -39,6 +40,8 @@ export interface ProjectRouteMount {
   sessions: string;
   /** e.g. `/api/console/agents`; the agent id follows. */
   agents: string;
+  /** e.g. `/api/console/memory`. */
+  memory: string;
   origin: ProjectOrigin;
   /** Who is recorded as having stopped or corrected a task from here. */
   surfaceName: string;
@@ -225,6 +228,22 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     const raw = param(req, 'sessionId');
     const sessionId = raw.startsWith('harness:') ? raw.slice('harness:'.length) : raw;
     res.json({ tasks: delegatedTasksForSession(sessionId), generatedAt: new Date().toISOString() });
+  });
+
+  // Who a memory is for is the owner's to change: to a project, to an agent,
+  // to both, or to everywhere (both null).
+  add('post', `${mount.memory}/facts/:id/scope`, (req, res) => {
+    const id = Number.parseInt(param(req, 'id'), 10);
+    if (!Number.isSafeInteger(id) || id <= 0) { res.status(400).json({ error: 'INVALID_FACT' }); return; }
+    const input = body(req);
+    const projectId = typeof input.projectId === 'string' && input.projectId.trim() ? input.projectId.trim() : null;
+    const agentId = typeof input.agentId === 'string' && input.agentId.trim() ? input.agentId.trim() : null;
+    const moved = moveFact(id, { projectId, agentId });
+    if (!moved.ok) {
+      res.status(moved.reason === 'already_kept_there' ? 409 : 404).json({ error: moved.reason.toUpperCase() });
+      return;
+    }
+    res.json({ fact: moved.fact });
   });
 
   add('get', `${mount.tasks}/:taskId`, (req, res) => {

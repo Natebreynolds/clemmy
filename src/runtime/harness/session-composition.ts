@@ -171,6 +171,20 @@ function freezeNames(names: readonly string[] | null | undefined): readonly stri
  * dispatch. Callers apply primers and pins; `dispatchAdmittedSource` stays
  * the one kernel.
  */
+/**
+ * Whether a session takes a saved agent and a project: a plain conversation,
+ * or a task the host delegated. Decided from identity alone, without
+ * resolving either binding, so it is cheap enough to ask on every read.
+ */
+export function sessionTakesIdentity(input: ComposeSessionInput): boolean {
+  const sessionId = (input.sessionId ?? '').trim();
+  if (sessionId && workspaceSlugFromMountLineage(sessionId, input.metadata)) return false;
+  const givenKind = asSessionKind(input.sessionKind ?? null);
+  if (workflowIdentity(sessionId, givenKind ?? input.sessionKind, input.metadata)) return false;
+  if (givenKind === 'execution') return isDelegatedTask(input.metadata);
+  return givenKind !== 'agent';
+}
+
 export function composeSession(input: ComposeSessionInput): SessionMount {
   const sessionId = (input.sessionId ?? '').trim();
   const workspaceSlug = sessionId

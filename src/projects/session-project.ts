@@ -15,6 +15,7 @@ import { getSession, openEventLog } from '../runtime/harness/eventlog.js';
 import { composeSession } from '../runtime/harness/session-composition.js';
 import { getProject } from './project-record.js';
 import { sessionProjectState, type SessionProjectState } from './session-project-state.js';
+import { forgetSessionMemoryScope } from '../runtime/harness/memory-scope-binding.js';
 
 export { sessionProjectState, type SessionProjectState };
 
@@ -74,6 +75,7 @@ export function setSessionProject(
        WHERE id = ?`,
     ).run(JSON.stringify(current.projectIds), opts.by, now, sessionId);
   }
+  forgetSessionMemoryScope(sessionId);
   return { ok: true, changed: true, projectId: project?.id ?? null, projectName: project?.name ?? null };
 }
 

@@ -3,6 +3,7 @@
  * tool_search. Fail-open: no match, low confidence, missing schema, or a
  * provision miss leaves discovery unchanged.
  */
+import { withSessionMemoryScope } from '../../memory/memory-scope.js';
 import { listEvents } from '../harness/eventlog.js';
 import {
   isCurrentCallableCatalogEntry,
@@ -665,6 +666,15 @@ export async function prepareProvenOperationForRequest(input: {
   /** The request's MCP scope; a proven native read outside it is not warmed. */
   mcpToolScope?: McpToolScope | null;
 }, dependencies: ProvenOperationDependencies = {}): Promise<ProvenOperationPreparation> {
+  // A remembered method is offered to the session it may be offered to: one
+  // proved inside another project is not this request's method.
+  return withSessionMemoryScope(input.sessionId, () => prepareProvenOperationInScope(input, dependencies));
+}
+
+async function prepareProvenOperationInScope(
+  input: Parameters<typeof prepareProvenOperationForRequest>[0],
+  dependencies: ProvenOperationDependencies = {},
+): Promise<ProvenOperationPreparation> {
   const empty: ProvenOperationPreparation = {
     tools: [],
     nativeTools: [],

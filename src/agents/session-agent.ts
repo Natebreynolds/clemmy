@@ -17,6 +17,7 @@ import { getSession, openEventLog } from '../runtime/harness/eventlog.js';
 import { composeSession } from '../runtime/harness/session-composition.js';
 import { getAgentRecord } from './agent-record.js';
 import { sessionAgentState, type SessionAgentState } from './session-agent-state.js';
+import { forgetSessionMemoryScope } from '../runtime/harness/memory-scope-binding.js';
 
 export { sessionAgentState, type SessionAgentState };
 
@@ -77,6 +78,7 @@ export function setSessionAgent(
        WHERE id = ?`,
     ).run(JSON.stringify(current.agentIds), opts.by, now, sessionId);
   }
+  forgetSessionMemoryScope(sessionId);
   return { ok: true, changed: true, agentId: agent?.id ?? null, agentName: agent?.name ?? null };
 }
 

@@ -1,3 +1,4 @@
+import { withSessionMemoryScope } from '../memory/memory-scope.js';
 import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
 /**
  * Persistent memory context for the 0.3 harness.
@@ -407,6 +408,13 @@ function composeHarnessMemoryContext(
   opts?: HarnessMemoryContextOptions,
   loaded?: LoadedMemoryContext,
 ): { text: string; manifest: MemoryManifestEntry[] } {
+  return withSessionMemoryScope(opts?.sessionId, () => composeHarnessMemoryContextInScope(opts, loaded));
+}
+
+function composeHarnessMemoryContextInScope(
+  opts?: HarnessMemoryContextOptions,
+  loaded?: LoadedMemoryContext,
+): { text: string; manifest: MemoryManifestEntry[] } {
   const variableLayout = opts?.layout === 'variable';
   const memContext: Partial<LoadedMemoryContext> = loaded ?? readMemoryContext();
 
@@ -683,7 +691,9 @@ export function harnessInstructions(roleInstructions: string, opts?: {
   // The core is content-addressed and joins the cached prefix after the
   // rubric; everything request- or time-dependent follows the boundary.
   const loaded = readMemoryContext();
-  const core = renderMemoryCore(loaded);
+  // Both are read as the session this turn belongs to: its standing rules
+  // and what it knows are those of its own project and agent.
+  const core = withSessionMemoryScope(opts?.sessionId, () => renderMemoryCore(loaded));
   const variable = composeHarnessMemoryContext({
     sessionId: opts?.sessionId,
     sourceUserSeq: opts?.sourceUserSeq,

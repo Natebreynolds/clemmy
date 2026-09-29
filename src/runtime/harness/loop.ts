@@ -1,3 +1,4 @@
+import './memory-scope-binding.js';
 import { readApprovalRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
 import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
 import { archivedTaskMessageReferences, type ArchivedTaskMessageReference } from './archived-task-context.js';

@@ -26,6 +26,7 @@ import { getResourcePointersByIds, listAllResourcePointers, type ResourcePointer
 import { matchToolChoicesForStep } from './tool-choice-store.js';
 import { extractAnchors, type EntityAnchors } from './memory-merge.js';
 import { getFactEvidence, listMemoryPolicies } from './temporal-memory.js';
+import { currentMemoryReadScope, scopeOfSession, scopeVisible, scopedRecords, type MemoryScope } from './memory-scope.js';
 import {
   readRecallRefUtilitySignals,
   serializeRecallRef,
@@ -439,6 +440,42 @@ export function accountScopeExcludesFromRecall(activeAnchors: EntityAnchors, fac
   }
 }
 
+/**
+ * Whether a hit may be shown to the read in progress. Facts and episodes are
+ * checked against the scope they were kept for. An entity or a resource is
+ * shown when it is linked to at least one fact the read may see, or to none:
+ * a name that is known only from another project's facts stays there.
+ */
+function scopeGate(): (hit: MemoryEvidenceHit) => boolean {
+  const readScope = currentMemoryReadScope();
+  if (readScope === 'unrestricted') return () => true;
+  let facts: Map<string, MemoryScope>;
+  let episodes: Map<string, MemoryScope>;
+  try {
+    facts = scopedRecords('fact');
+    episodes = scopedRecords('episode');
+  } catch {
+    return (hit) => hit.ref.type === 'note' || hit.ref.type === 'procedure';
+  }
+  if (facts.size === 0 && episodes.size === 0) return () => true;
+  const factVisible = (id: string | number): boolean => scopeVisible(facts.get(String(id)), readScope);
+  const linkedVisible = (ids: number[]): boolean => ids.length === 0 || ids.some(factVisible);
+  return (hit) => {
+    try {
+      switch (hit.ref.type) {
+        case 'fact':
+        case 'policy': return factVisible(hit.ref.id);
+        case 'episode': return scopeVisible(episodes.get(String(hit.ref.id)), readScope);
+        case 'entity': return linkedVisible(getFactIdsForEntity(hit.ref.id, 200));
+        case 'resource': return linkedVisible(getFactIdsForResource(hit.ref.id, 200));
+        default: return true;
+      }
+    } catch {
+      return false;
+    }
+  };
+}
+
 function applyUtilityRerank(
   hits: MemoryEvidenceHit[],
   nowMs: number,
@@ -454,7 +491,11 @@ function applyUtilityRerank(
   const activeAnchors = objective ? extractAnchors({ content: objective }) : null;
   const accountScoped = Boolean(activeAnchors && accountScopedRecallEnabled() && activeContextHasAccountScope(activeAnchors));
   let adjusted = 0;
+  const allowed = scopeGate();
   const survivors = hits.filter((hit) => {
+    // What is kept for another project or another agent never reaches this
+    // read, whichever store offered it.
+    if (!allowed(hit)) return false;
     const signal = signals.get(serializeRecallRef({ type: hit.ref.type, id: String(hit.ref.id) }));
     if (correctionExcludesFromRecall(signal, nowMs)) {
       adjusted += 1;
@@ -651,6 +692,7 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   const nowMs = Number.isFinite(contextNowMs) ? contextNowMs : Date.now();
   const timeZone = resolveRecallTimeZone(context.timeZone);
   const ambient = context.purpose === 'ambient';
+  const readScope = currentMemoryReadScope();
   // A whole business objective can name several unrelated dates and types.
   // Such words do not authorize a global historical/meeting filter. Explicit
   // asOf remains a caller-supplied scope; targeted query behavior is unchanged.
@@ -893,6 +935,8 @@ export async function recallMemory(query: string, context: MemoryRecallContext =
   if (wanted.has('deliverable')) {
     usedStores.add('deliverable');
     for (const d of searchDeliverables(objective, perStore)) {
+      // Work delivered inside a project or by an agent is found from there.
+      if (!scopeVisible(scopeOfSession(d.sessionId), readScope)) continue;
       const gone = d.kind === 'file' && d.stillExists === false;
       const score = deliverableRecallScore(d.score, gone, ambient);
       if (score === null) continue;

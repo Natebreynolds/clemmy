@@ -1,3 +1,4 @@
+import { scopeOfSession } from '../memory/memory-scope.js';
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -714,6 +715,7 @@ export function registerMemoryTools(server: McpServer): void {
       content: z.string().min(3),
       sessionId: z.string().optional(),
       sourcePath: z.string().optional(),
+      keepFor: z.enum(['everywhere', 'here']).optional().describe('Who the memory is for. "here": only the project and agent this conversation is working in. "everywhere": every conversation. Omit to let the kind decide: facts about the owner and standing rules are for everywhere; project facts, references and corrections are for here.'),
       entities: z.array(z.object({
         type: z.enum(MEMORY_ENTITY_TYPES),
         name: z.string().min(2).max(120),
@@ -734,7 +736,7 @@ export function registerMemoryTools(server: McpServer): void {
         validTo: z.string().max(64).optional(),
       })).max(12).optional(),
     },
-    async ({ kind, content, sessionId, sourcePath, entities, relationships }) => {
+    async ({ kind, content, sessionId, sourcePath, keepFor, entities, relationships }) => {
       try {
         if (looksLikeHighConfidenceTransientRequest(content)) {
           return textResult(
@@ -760,6 +762,11 @@ export function registerMemoryTools(server: McpServer): void {
           {
             sessionId: effectiveSessionId,
             ...(inferredSource ? { derivedFrom: inferredSource } : {}),
+            ...(keepFor === 'everywhere'
+              ? { scope: null }
+              : keepFor === 'here'
+                ? { scope: scopeOfSession(effectiveSessionId) ?? null }
+                : {}),
           },
           { noveltyFastPathSim: REMEMBER_NOVELTY_FAST_PATH_SIM },
         );

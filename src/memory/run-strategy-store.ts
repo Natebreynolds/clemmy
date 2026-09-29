@@ -34,6 +34,10 @@ export interface ProvenCallShape {
  * the change and read back what was changed. */
 export type ProvenStepRole = 'prepare' | 'effect' | 'verify';
 
+import {
+  EVERYWHERE, currentMemoryReadScope, isEverywhere, sameScope, scopeOfSession, scopeVisible, type MemoryScope,
+} from './memory-scope.js';
+
 export interface ProvenStep {
   tool: string;
   role: ProvenStepRole;
@@ -74,6 +78,9 @@ export interface RunStrategyRecord {
    *  matched to an authoring request). Missing = learned before scopes and
    *  resolved from the receipt's session on read. */
   scope?: RunStrategyScope;
+  /** Who the method is for: the project and agent of the session that
+   *  proved it. Missing = everywhere, as every method was before. */
+  keptFor?: MemoryScope;
 }
 
 export type RunStrategyScope = 'chat' | 'workflow_step';
@@ -332,6 +339,9 @@ export interface RecordRunStrategyInput {
   deliverable?: string;
   learningReceipt: LearningReceipt;
   scope?: RunStrategyScope;
+  /** Who the method is for. Null is everywhere. Left out, it is the project
+   *  and agent of the session that proved it. */
+  keptFor?: MemoryScope | null;
 }
 
 /** The scope a receipt's session implies: a workflow-kind session learned a
@@ -363,13 +373,19 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
   const file = readStore();
   const now = new Date().toISOString();
   const scope: RunStrategyScope = input.scope ?? runStrategyScopeForSession(input.learningReceipt.sessionId);
+  // A method proved inside a project, or by an agent, is kept for them.
+  // Evidence accumulates only among methods kept for the same.
+  const keptFor: MemoryScope = input.keptFor !== undefined
+    ? input.keptFor ?? EVERYWHERE
+    : scopeOfSession(input.learningReceipt.sessionId) ?? EVERYWHERE;
+  const keptForSame = (strategy: RunStrategyRecord): boolean => sameScope(strategy.keptFor, keptFor);
   // Evidence accumulates within a scope only: a step that restates a chat
   // request must not inflate the chat strategy's proof, or the reverse.
   // A run handed a remembered strategy, that used nothing outside it, is that
   // strategy at work again. Recording it as a strategy of its own would split
   // the evidence and let the thinner of two runs be the one recalled.
   const reused = input.reusedStrategyId
-    ? file.strategies.find((s) => s.id === input.reusedStrategyId && scopeOf(s) === scope
+    ? file.strategies.find((s) => s.id === input.reusedStrategyId && scopeOf(s) === scope && keptForSame(s)
       && toolsUsed.every((tool) => s.toolsUsed.some((known) => known.toLowerCase() === tool.toLowerCase())))
     : undefined;
   if (reused) {
@@ -388,7 +404,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     writeStore(file);
     return reused;
   }
-  const existing = file.strategies.find((s) => scopeOf(s) === scope && overlapScore(keywords, s.keywords) >= 0.8);
+  const existing = file.strategies.find((s) => scopeOf(s) === scope && keptForSame(s) && overlapScore(keywords, s.keywords) >= 0.8);
   if (existing) {
     // Close the write-before-learning-event crash window as well. Replaying
     // the same proof does not turn one successful run into two observations.
@@ -429,6 +445,7 @@ export function recordRunStrategy(input: RecordRunStrategyInput): RunStrategyRec
     uses: 1,
     learningReceipt: input.learningReceipt,
     scope,
+    ...(isEverywhere(keptFor) ? {} : { keptFor: { projectId: keptFor.projectId ?? null, agentKey: keptFor.agentKey ?? null } }),
   };
   file.strategies.push(record);
   if (file.strategies.length > MAX_RECORDS) {
@@ -461,8 +478,10 @@ export interface MatchedRunStrategy {
 
 /** Every receipt-backed strategy, newest-used first. Heartbeat schema staging reads this. */
 export function listVerifiedRunStrategies(): RunStrategyRecord[] {
+  const readScope = currentMemoryReadScope();
   return readStore().strategies
     .filter((strategy) => isValidLearningReceipt(strategy.learningReceipt, { target: 'strategy' }))
+    .filter((strategy) => scopeVisible(strategy.keptFor, readScope))
     .sort((a, b) => (b.lastUsedAt ?? b.createdAt).localeCompare(a.lastUsedAt ?? a.createdAt));
 }
 
@@ -477,9 +496,11 @@ export function listMatchingRunStrategies(
   if (keywords.length === 0) return [];
   const scope = options.scope ?? 'chat';
   const file = readStore();
+  const readScope = currentMemoryReadScope();
   return file.strategies
     .filter((s) => isValidLearningReceipt(s.learningReceipt, { target: 'strategy' }))
     .filter((s) => scope === 'any' || scopeOf(s) === scope)
+    .filter((s) => scopeVisible(s.keptFor, readScope))
     .map((s) => ({ strategy: s, score: overlapScore(keywords, s.keywords) }))
     .filter((x) => x.score >= 0.34)
     .sort((a, b) => b.score - a.score)
