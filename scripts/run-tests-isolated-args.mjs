@@ -18,6 +18,7 @@ export const DEFAULT_TEST_TARGETS = Object.freeze([
   'src/memory/**/*.test.ts',
   'src/planning/**/*.test.ts',
   'src/plugins/**/*.test.ts',
+  'src/projects/**/*.test.ts',
   'src/runtime/**/*.test.ts',
   'src/setup/**/*.test.ts',
   'src/shared/**/*.test.ts',
