@@ -156,6 +156,7 @@ import { resolveAgentBinding } from '../agents/agent-binding.js';
 import { setSessionAgent } from '../agents/session-agent.js';
 import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { sessionProjectState } from '../projects/session-project-state.js';
+import { getProject as getProjectRecord } from '../projects/project-record.js';
 import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
 import { assertReviewedPlanExecuteSessionIdle, resolveReviewedPlanOwnerControl, reviewedPlanExecuteInputHash, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import {
@@ -250,12 +251,12 @@ function mobileChatDigest(deviceId: string, idempotencyKey: string): string {
     .digest('hex');
 }
 
-function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode, agentId?: string): string {
+function mobileChatPayloadHash(message: string, requestedSessionId: string | null, taskMode?: TaskMode, agentId?: string, projectId?: string): string {
   if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: message, taskMode });
   // A request opened inside a saved agent is a different request; one that
   // named none keeps its historical hash.
   return createHash('sha256')
-    .update(JSON.stringify({ message, requestedSessionId, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}) }))
+    .update(JSON.stringify({ message, requestedSessionId, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}), ...(projectId ? { projectId } : {}) }))
     .digest('hex');
 }
 
@@ -4004,7 +4005,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const requestedAgentId = typeof req.body?.agentId === 'string' ? req.body.agentId.trim() : '';
     const requestedAgent = requestedAgentId ? resolveAgentBinding(requestedAgentId) : null;
     if (requestedAgentId && !requestedAgent) { res.status(400).json({ error: 'AGENT_NOT_FOUND' }); return; }
-    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode, requestedAgent?.agent.id);
+    // Opening a new conversation inside a project, the same way.
+    const requestedProjectId = typeof req.body?.projectId === 'string' ? req.body.projectId.trim() : '';
+    const requestedProject = requestedProjectId ? getProjectRecord(requestedProjectId) : null;
+    if (requestedProjectId && (!requestedProject || requestedProject.status !== 'active')) { res.status(400).json({ error: 'PROJECT_NOT_FOUND' }); return; }
+    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode, requestedAgent?.agent.id, requestedProject?.id);
     if (taskMode?.kind === 'execute' && !requestedSessionId) {
       res.status(400).json({ error: 'PLAN_CONVERSATION_REQUIRED' });
       return;
@@ -4171,6 +4176,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             ...(spaceSlug ? { spaceSlug } : {}),
             ...(validatedMount ? { __session_mount: validatedMount } : {}),
             ...(requestedAgent ? { agentId: requestedAgent.agent.id, agentName: requestedAgent.agent.name } : {}),
+            ...(requestedProject
+              ? { projectId: requestedProject.id, projectName: requestedProject.name, projectIds: [requestedProject.id], projectSetBy: 'owner' }
+              : {}),
           },
         });
       }

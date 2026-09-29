@@ -20,6 +20,7 @@ import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
 import { registerConsoleAgentsRoutes } from './console-agents-routes.js';
 import { registerProjectRecordRoutes } from '../projects/project-routes.js';
+import { getProject as getProjectRecord } from '../projects/project-record.js';
 import { registerConsoleMemoryWorkRoutes } from './console-memory-work-routes.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
@@ -3286,12 +3287,12 @@ function harnessChatStableDigest(requestId: string): string {
   return createHash('sha256').update(requestId).digest('hex');
 }
 
-function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode?: TaskMode, agentId?: string): string {
+function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode?: TaskMode, agentId?: string, projectId?: string): string {
   if (taskMode?.kind === 'execute') return reviewedPlanExecuteInputHash({ text: input, attachmentIds, taskMode });
   // A request opened inside a saved agent is a different request; one that
   // named none keeps its historical hash.
   return createHash('sha256')
-    .update(JSON.stringify({ input, attachmentIds, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}) }))
+    .update(JSON.stringify({ input, attachmentIds, ...taskModeFields(taskMode), ...(agentId ? { agentId } : {}), ...(projectId ? { projectId } : {}) }))
     .digest('hex');
 }
 
@@ -16653,6 +16654,14 @@ export function registerConsoleRoutes(
     const requestedAgentId = typeof body.agentId === 'string' ? body.agentId.trim() : '';
     const requestedAgent = requestedAgentId ? resolveAgentBinding(requestedAgentId) : null;
     if (requestedAgentId && !requestedAgent) { res.status(400).json({ error: 'AGENT_NOT_FOUND', code: 'AGENT_NOT_FOUND' }); return; }
+    // Opening a new conversation inside a project, the same way. Included in
+    // the payload hash only when set, so every other request hashes as before.
+    const requestedProjectId = typeof body.projectId === 'string' ? body.projectId.trim() : '';
+    const requestedProject = requestedProjectId ? getProjectRecord(requestedProjectId) : null;
+    if (requestedProjectId && (!requestedProject || requestedProject.status !== 'active')) {
+      res.status(400).json({ error: 'PROJECT_NOT_FOUND', code: 'PROJECT_NOT_FOUND' });
+      return;
+    }
 
     let requestIdentity: ReturnType<typeof harnessChatRequestIdentity>;
     try {
@@ -16665,7 +16674,7 @@ export function registerConsoleRoutes(
       });
       return;
     }
-    const payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode, requestedAgent?.agent.id);
+    const payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode, requestedAgent?.agent.id, requestedProject?.id);
     const priorReceipt = getHarnessChatRequestReceipt(requestIdentity.requestId);
     if (priorReceipt && priorReceipt.inputHash !== payloadHash) {
       res.status(409).json({ error: 'client request id is already bound to different input' });
@@ -16738,6 +16747,9 @@ export function registerConsoleRoutes(
           channelId: deterministicSessionId || undefined,
           userId: 'desktop',
           ...(requestedAgent ? { agentId: requestedAgent.agent.id, agentName: requestedAgent.agent.name } : {}),
+          ...(requestedProject
+            ? { projectId: requestedProject.id, projectName: requestedProject.name, projectIds: [requestedProject.id], projectSetBy: 'owner' }
+            : {}),
         },
       });
     }

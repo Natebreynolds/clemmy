@@ -15,6 +15,7 @@ import { previewPersistedSessionConversationProtocolInTransaction } from './conv
 import { publicCompletionText, publicUserInputText, validTypedCompletionPresentation } from './public-presentation.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { sessionAgentState } from '../../agents/session-agent-state.js';
+import { sessionProjectState } from '../../projects/session-project-state.js';
 
 const BRANCH_META = '__accepted_source_branch';
 const MOUNT_META = '__session_mount';
@@ -583,7 +584,23 @@ function safeChildMetadata(input: {
   } catch {
     parentAgent = null;
   }
+  // The project follows the conversation the same way.
+  let parentProject: Record<string, unknown> | null = null;
+  try {
+    const parentMeta = JSON.parse(input.parent.metadata_json || '{}') as Record<string, unknown>;
+    const state = sessionProjectState(parentMeta);
+    if (state.projectId || state.projectIds.length > 0) {
+      parentProject = {
+        ...(state.projectId ? { projectId: state.projectId } : {}),
+        ...(state.projectName ? { projectName: state.projectName } : {}),
+        ...(state.projectIds.length > 0 ? { projectIds: state.projectIds } : {}),
+      };
+    }
+  } catch {
+    parentProject = null;
+  }
   return {
+    ...(parentProject ?? {}),
     source: mount ? 'workspace' : input.continuity.provider,
     ingressProvider: input.continuity.provider,
     channelId: input.continuity.conversationId,
