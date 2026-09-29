@@ -6,6 +6,8 @@ import assert from 'node:assert/strict';
 import {
   arrangeProjects, groupProjectResources, memoryScopeHint, memoryScopeIsNarrow, memoryScopeLabel,
   projectAgentsLine, projectDecisionConsequence, projectDecisionSource, projectNeedsYouLabel,
+  middleTruncatePath, projectCodingRunPhase, projectCodingRunPlace, projectLinkedLocalProject, projectLocalProjectChoices,
+  projectLocalProjectGitLine, projectLocalProjectMissingLine, projectLocalProjectRefusal, PROJECT_LOCAL_PROJECTS_HINT,
   projectDecisionIsFormal, projectDecisionOptions, projectLabelsBySession, projectResourceApp,
   projectResourceKindLabel, projectResourceName, projectResourceVerification, projectWorkLine, sessionProjectLabelText,
   type MemoryScope, type ProjectSummary,
@@ -63,7 +65,7 @@ test('what waits on the owner leads the list; archived projects are kept apart',
   assert.deepEqual(arranged.archived.map((p) => p.id), ['archived']);
 });
 
-test('resources group by kind with accounts first, and only an account is ever verified', () => {
+test('resources group by kind, and only an account is ever verified', () => {
   const resources = [
     { id: 'r1', kind: 'link' as const, label: '', ref: 'https://example.test/plan', toolkit: null, verifiedAt: null },
     { id: 'r2', kind: 'account' as const, label: 'Work mail', ref: null, toolkit: 'mail', verifiedAt: '2026-09-29T09:00:00.000Z' },
@@ -122,4 +124,76 @@ test('what waits on the owner is labelled by the session it came from', () => {
   assert.equal(sessionProjectLabelText(labels.get('chat-1')!), 'Weekly Sales');
   assert.equal(labels.has('chat-2'), false, 'a project with no name labels nothing');
   assert.equal(labels.has('chat-9'), false, 'a session in no project has no label');
+});
+
+test('local projects are their own group, first, and say what they are for', () => {
+  const groups = groupProjectResources([
+    { id: 'a', kind: 'account' as const },
+    { id: 'f1', kind: 'folder' as const },
+    { id: 'l', kind: 'link' as const },
+    { id: 'f2', kind: 'folder' as const },
+  ]);
+  assert.deepEqual(groups.map((group) => [group.label, group.items.map((item) => item.id)]), [
+    ['Local projects', ['f1', 'f2']],
+    ['Accounts', ['a']],
+    ['Links', ['l']],
+  ]);
+  assert.equal(groups[0].hint, PROJECT_LOCAL_PROJECTS_HINT);
+  assert.equal(PROJECT_LOCAL_PROJECTS_HINT, 'Where Clem works on files and code for this project.');
+  assert.equal(groups[1].hint, undefined);
+  assert.equal(projectResourceKindLabel('folder'), 'Local project', 'never a bare "project"');
+  assert.equal(projectResourceKindLabel('folder', true), 'Local projects');
+});
+
+test('a linked local project says when its folder is gone, and when coding work cannot run in it', () => {
+  const here = projectLinkedLocalProject({ kind: 'folder', label: 'clem', ref: '/Users/o/code/clem', localProject: { name: 'clem', path: '/Users/o/code/clem', present: true, git: true } });
+  assert.deepEqual(here, { name: 'clem', path: '/Users/o/code/clem', present: true, git: true, known: true });
+  assert.equal(projectLocalProjectMissingLine(here!), null);
+  assert.equal(projectLocalProjectGitLine(here!), null);
+
+  const gone = { name: 'old', path: '/Users/o/code/old', present: false, git: false };
+  assert.match(projectLocalProjectMissingLine(gone)!, /no longer on this Mac/);
+  assert.equal(projectLocalProjectGitLine(gone), null, 'a folder that is gone gets one line, not two');
+
+  const plain = { name: 'notes', path: '/Users/o/notes', present: true, git: false };
+  assert.equal(projectLocalProjectMissingLine(plain), null);
+  assert.equal(projectLocalProjectGitLine(plain), 'Coding work cannot run here yet: this folder is not a git repository.');
+
+  const older = projectLinkedLocalProject({ kind: 'folder', label: '', ref: '/Users/o/code/app', localProject: null });
+  assert.deepEqual([older?.name, older?.known], ['app', false], 'nothing is claimed about a folder the server did not describe');
+  assert.equal(projectLinkedLocalProject({ kind: 'link', label: 'x', ref: 'https://example.test' }), null);
+});
+
+test('a path is cut in the middle, keeping where it starts and the folder it ends in', () => {
+  assert.equal(middleTruncatePath('/Users/o/code/app'), '/Users/o/code/app');
+  const cut = middleTruncatePath('/Users/owner/Documents/clients/acme/projects/2026/spring-launch-site', 40);
+  assert.equal(cut.length, 40);
+  assert.ok(cut.startsWith('/Users/owner/'));
+  assert.ok(cut.endsWith('spring-launch-site'));
+  assert.ok(cut.includes('…'));
+});
+
+test('the picker marks what is already linked and lists each folder once', () => {
+  const roster = [
+    { name: 'site', path: '/c/site' }, { name: 'app', path: '/c/app' }, { name: 'app', path: '/c/app' }, { name: 'api', path: '/c/api' },
+  ];
+  const choices = projectLocalProjectChoices(roster, [{ kind: 'folder', ref: '/c/app' }, { kind: 'link', ref: '/c/site' }]);
+  assert.deepEqual(choices.map((choice) => [choice.localProject.name, choice.linked]), [['api', false], ['app', true], ['site', false]]);
+});
+
+test('a refused link is said in plain words', () => {
+  assert.equal(projectLocalProjectRefusal('LOCAL_PROJECT_CHOICE_REQUIRED', 'app'), 'More than one local project is called “app”. Choose the one you mean.');
+  assert.equal(projectLocalProjectRefusal('LOCAL_PROJECT_CHOICE_REQUIRED', ''), 'Choose which local project to link.');
+  assert.match(projectLocalProjectRefusal('LOCAL_PROJECT_NOT_FOUND', '/tmp/x')!, /^“\/tmp\/x” is not among the code folders on this Mac/);
+  assert.equal(projectLocalProjectRefusal('NAME_TAKEN'), null);
+});
+
+test('coding work says its phase and where it runs', () => {
+  assert.deepEqual(
+    (['waiting_to_start', 'working', 'handed_to_you', 'finished'] as const).map((phase) => projectCodingRunPhase(phase).label),
+    ['Waiting to start', 'Working', 'Handed to you', 'Finished'],
+  );
+  assert.deepEqual(projectCodingRunPhase('something-new'), { label: 'Working', tone: 'live', settled: false });
+  assert.equal(projectCodingRunPlace({ localProject: { name: 'clem', path: '/c/clem', linked: true } }), 'In clem');
+  assert.equal(projectCodingRunPlace({ localProject: { name: '', path: '/c/clem', linked: false } }), 'In clem, which is not linked to this project');
 });

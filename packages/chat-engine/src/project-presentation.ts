@@ -51,6 +51,45 @@ export interface ProjectAssignmentView {
 
 export type ProjectResourceKind = 'account' | 'space' | 'workflow' | 'folder' | 'link';
 
+/**
+ * A local project: a code folder on this machine, from the roster the app
+ * keeps. A project links to local projects; it never is one, and a local
+ * project is never called a "project" on its own.
+ */
+export interface ProjectLocalProject {
+  name: string;
+  path: string;
+  /** What kind of code it holds, as the roster detects it. */
+  type: string;
+  description: string;
+  /** Whether it is a repository, which coding work needs. */
+  git: boolean;
+}
+
+/** A local project as a project's resource shows it: what the folder is now. */
+export interface ProjectLinkedLocalProject {
+  name: string;
+  path: string;
+  /** False when the folder is no longer on this machine. */
+  present: boolean;
+  git: boolean;
+}
+
+export type ProjectCodingRunPhase = 'waiting_to_start' | 'working' | 'handed_to_you' | 'finished';
+
+/** One coding run started from a conversation of the project. */
+export interface ProjectCodingRunView {
+  runId: string;
+  objective: string;
+  /** The local project it works in, and whether that one is linked to the project. */
+  localProject: { name: string; path: string; linked: boolean };
+  branch: string;
+  phase: ProjectCodingRunPhase;
+  originSessionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ProjectResourceView {
   id: string;
   projectId: string;
@@ -59,6 +98,9 @@ export interface ProjectResourceView {
   toolkit: string | null;
   /** For an account: the app's name as a person writes it. */
   appName?: string | null;
+  /** For a linked local project (kind 'folder'): what the folder is now.
+   *  Null for every other kind; absent from a service that predates it. */
+  localProject?: ProjectLinkedLocalProject | null;
   accountId: string | null;
   ref: string | null;
   verifiedAt: string | null;
@@ -102,6 +144,9 @@ export interface ProjectOverview {
   agents: ProjectAssignmentView[];
   resources: ProjectResourceView[];
   tasks: DelegatedTask[];
+  /** Coding runs started from the project's conversations, newest first.
+   *  Absent from a service that predates them. */
+  codingRuns?: ProjectCodingRunView[];
   conversations: ProjectConversationView[];
   decisions: ProjectDecisionView[];
 }
@@ -233,7 +278,7 @@ const RESOURCE_KIND_WORDS: Record<ProjectResourceKind, { one: string; many: stri
   account: { one: 'Account', many: 'Accounts' },
   space: { one: 'Space', many: 'Spaces' },
   workflow: { one: 'Workflow', many: 'Workflows' },
-  folder: { one: 'Folder', many: 'Folders' },
+  folder: { one: 'Local project', many: 'Local projects' },
   link: { one: 'Link', many: 'Links' },
 };
 
@@ -262,14 +307,124 @@ export function projectResourceVerification(
     : { verified: false, label: 'Not verified' };
 }
 
-/** Resources grouped by kind, accounts first, each group in the order given. */
+/** Said once under the "Local projects" heading. */
+export const PROJECT_LOCAL_PROJECTS_HINT = 'Where Clem works on files and code for this project.';
+
+/**
+ * Resources grouped by kind: local projects first, then accounts, then the
+ * rest; each group in the order given. A group may carry one line that says
+ * what it is for.
+ */
 export function groupProjectResources<T extends Pick<ProjectResourceView, 'kind'>>(
   resources: readonly T[],
-): Array<{ kind: ProjectResourceKind; label: string; items: T[] }> {
-  const order: ProjectResourceKind[] = ['account', 'space', 'workflow', 'folder', 'link'];
+): Array<{ kind: ProjectResourceKind; label: string; hint?: string; items: T[] }> {
+  const order: ProjectResourceKind[] = ['folder', 'account', 'space', 'workflow', 'link'];
   return order
-    .map((kind) => ({ kind, label: projectResourceKindLabel(kind, true), items: resources.filter((resource) => resource.kind === kind) }))
+    .map((kind) => ({
+      kind,
+      label: projectResourceKindLabel(kind, true),
+      ...(kind === 'folder' ? { hint: PROJECT_LOCAL_PROJECTS_HINT } : {}),
+      items: resources.filter((resource) => resource.kind === kind),
+    }))
     .filter((group) => group.items.length > 0);
+}
+
+// ─── Local projects and coding work ───
+
+/**
+ * The local project a folder resource links to. A resource saved before the
+ * server described folders has only its label and path; nothing is claimed
+ * about whether that folder is still there.
+ */
+export function projectLinkedLocalProject(
+  resource: Pick<ProjectResourceView, 'kind' | 'label' | 'ref' | 'localProject'>,
+): (ProjectLinkedLocalProject & { known: boolean }) | null {
+  if (resource.kind !== 'folder') return null;
+  const described = resource.localProject;
+  if (described) {
+    return {
+      name: described.name?.trim() || pathLeaf(described.path) || 'Local project',
+      path: described.path,
+      present: described.present === true,
+      git: described.git === true,
+      known: true,
+    };
+  }
+  const path = resource.ref?.trim() ?? '';
+  return { name: resource.label?.trim() || pathLeaf(path) || 'Local project', path, present: true, git: true, known: false };
+}
+
+function pathLeaf(path: string | null | undefined): string {
+  const parts = (path ?? '').split(/[\\/]+/).filter(Boolean);
+  return parts[parts.length - 1] ?? '';
+}
+
+/** Said when the folder is gone; null while it is there. */
+export function projectLocalProjectMissingLine(localProject: Pick<ProjectLinkedLocalProject, 'present'>): string | null {
+  return localProject.present ? null : 'This folder is no longer on this Mac. Remove it, or link the local project where it lives now.';
+}
+
+/** Said when the folder is there and is not a repository; null otherwise. */
+export function projectLocalProjectGitLine(localProject: Pick<ProjectLinkedLocalProject, 'present' | 'git'>): string | null {
+  return localProject.present && !localProject.git ? 'Coding work cannot run here yet: this folder is not a git repository.' : null;
+}
+
+/**
+ * A path short enough for one line, cut in the middle so that where it
+ * starts and the folder it ends in both stay readable.
+ */
+export function middleTruncatePath(path: string, max = 48): string {
+  const text = (path ?? '').trim();
+  if (text.length <= max || max < 8) return text;
+  const keep = max - 1;
+  const tail = Math.ceil(keep * 0.6);
+  const head = keep - tail;
+  return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
+}
+
+/** The roster as a picker shows it: each local project, and whether the project already links it. */
+export function projectLocalProjectChoices<T extends Pick<ProjectLocalProject, 'path' | 'name'>>(
+  roster: readonly T[],
+  resources: readonly Pick<ProjectResourceView, 'kind' | 'ref'>[],
+): Array<{ localProject: T; linked: boolean }> {
+  const linked = new Set(resources.filter((resource) => resource.kind === 'folder' && resource.ref).map((resource) => resource.ref as string));
+  const seen = new Set<string>();
+  return roster
+    .filter((row) => (row.path && !seen.has(row.path) ? (seen.add(row.path), true) : false))
+    .map((localProject) => ({ localProject, linked: linked.has(localProject.path) }))
+    .sort((a, b) => a.localProject.name.localeCompare(b.localProject.name));
+}
+
+/** Why a local project was not linked, in words; null for anything else. */
+export function projectLocalProjectRefusal(code: string | null | undefined, named?: string | null): string | null {
+  const name = named?.trim();
+  if (code === 'LOCAL_PROJECT_CHOICE_REQUIRED') {
+    return name ? `More than one local project is called “${name}”. Choose the one you mean.` : 'Choose which local project to link.';
+  }
+  if (code === 'LOCAL_PROJECT_NOT_FOUND') {
+    return name
+      ? `“${name}” is not among the code folders on this Mac. Choose one of these, or add the folder in Connect first.`
+      : 'That folder is not among the code folders on this Mac. Choose one of these, or add the folder in Connect first.';
+  }
+  return null;
+}
+
+const CODING_PHASE_WORDS: Record<ProjectCodingRunPhase, { label: string; tone: 'neutral' | 'live' | 'info' | 'success'; settled: boolean }> = {
+  waiting_to_start: { label: 'Waiting to start', tone: 'neutral', settled: false },
+  working: { label: 'Working', tone: 'live', settled: false },
+  handed_to_you: { label: 'Handed to you', tone: 'info', settled: false },
+  finished: { label: 'Finished', tone: 'success', settled: true },
+};
+
+/** A coding run's phase in words. One this build does not know reads as working, never as finished. */
+export function projectCodingRunPhase(phase: string): { label: string; tone: 'neutral' | 'live' | 'info' | 'success'; settled: boolean } {
+  return CODING_PHASE_WORDS[phase as ProjectCodingRunPhase] ?? CODING_PHASE_WORDS.working;
+}
+
+/** Where a coding run works: "in clementine-next", and that it is not linked here when it is not. */
+export function projectCodingRunPlace(run: Pick<ProjectCodingRunView, 'localProject'>): string {
+  const name = run.localProject?.name?.trim() || pathLeaf(run.localProject?.path) || 'a local project';
+  return run.localProject?.linked === false ? `In ${name}, which is not linked to this project` : `In ${name}`;
 }
 
 /** Who is asking and about what: "Sales Assistant · Draft the weekly briefing". */
