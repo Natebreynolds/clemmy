@@ -161,7 +161,11 @@ only after five lookups through conversation history.
 | Check | Result |
 | --- | --- |
 | Full suite on `4d7c3c6a3` (the final tip, what is installed), two files at a time beside the live app | 18,660 tests, 18,654 pass, 0 fail, 6 skipped. Typecheck, hygiene checker and operation identity check pass |
-| Journeys, engine tests and release checks on `4d7c3c6a3` | Still running when the tag was made. Last results on earlier tips are below and in the release notes |
+| Journeys, engine tests and release checks on `4d7c3c6a3` | Still running when the tag was made; finished after it, below |
+| After the tag, on `4d7c3c6a3`: release assets, release closure, measurement, gate benchmark, packed candidate, packaged upgrade | 59 of 59, 141 of 141, 98 of 98, pass, pass (1,474 files), 22 of 22 |
+| After the tag: desktop build, fresh install gates and end to end | pass. They first exited at once because the desktop build was absent from the worktree; built, then run |
+| After the tag: shared chat engine tests | 249 tests, 248 pass. The one is the TopBar pin |
+| After the tag: journeys | 201 tests, 199 pass. One is the ordinary-conversation benchmark. The other, `automation-partition-ledger.acceptance.test.ts`, timed out at 600 s with the machine's load near 13; run alone it passed in 399 s |
 | App, shared chat engine and project tests on `cbcd2ec5f`, run by name | 1,196 tests, 1,195 pass. The one is the TopBar pin |
 | Full suite on `3028b8bea`, two files at a time beside the live app | 18,652 tests, 18,575 pass, 70 fail: all in `workflow-run-queue.test.ts`, all "database or disk is full" with 1.3 GB free. After space was freed the file passed alone, 99 of 99 |
 | Full suite on a frozen copy of `014c96896` (the first to include `src/projects`) | 18,649 tests, 18,643 pass, 0 fail, 6 skipped |
