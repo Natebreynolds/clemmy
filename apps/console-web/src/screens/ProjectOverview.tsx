@@ -19,6 +19,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { ScopedFacts } from '@/components/memory/ScopedFacts';
 import { DelegatedTaskCard } from '@/components/projects/DelegatedTaskCard';
 import { ProjectAgents } from '@/components/projects/ProjectAgents';
+import { ProjectCodingWork } from '@/components/projects/ProjectCodingWork';
 import { ProjectConversations, useStartProjectConversation } from '@/components/projects/ProjectConversations';
 import { ProjectDecisions } from '@/components/projects/ProjectDecisions';
 import { ProjectIdentity } from '@/components/projects/ProjectIdentity';
@@ -169,9 +170,9 @@ function ProjectBody({ overview, onSettled, onReread }: {
         <ProjectSection title="Current work" count={open.length}>
           {open.length === 0 ? (
             <QuietNote>
-              {ended.length === 0
+              {ended.length === 0 && (overview.codingRuns ?? []).length === 0
                 ? 'No work has been handed off in this project yet. Ask for something in a conversation here and it shows up as a task.'
-                : 'Nothing is running right now.'}
+                : 'No task is running right now.'}
             </QuietNote>
           ) : (
             <ul className="space-y-2">
@@ -183,6 +184,7 @@ function ProjectBody({ overview, onSettled, onReread }: {
               ))}
             </ul>
           )}
+          <ProjectCodingWork runs={overview.codingRuns ?? []} />
           {ended.length > 0 && (
             <div>
               <button

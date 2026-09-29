@@ -7,7 +7,6 @@ import { useState } from 'react';
 import { Pencil } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Field, Input, Textarea } from '@/components/ui/Field';
-import { cn } from '@/lib/cn';
 import {
   goalsFromText, goalsToText, refusalText, updateProject, type ProjectInput, type ProjectOverview,
 } from '@/lib/projects';
@@ -128,7 +127,7 @@ export function ProjectIdentity({ overview, onSaved }: {
         {project.context && (
           <div className="mt-4">
             <div className="text-label text-faint">Standing context</div>
-            <p className={cn('reading mt-1.5 whitespace-pre-wrap text-body text-muted', longContext && !showAll && 'line-clamp-5')}>
+            <p className={`reading mt-1.5 whitespace-pre-wrap text-body text-muted ${longContext && !showAll ? 'line-clamp-5' : ''}`}>
               {project.context}
             </p>
             {longContext && (

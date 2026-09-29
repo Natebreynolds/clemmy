@@ -83,7 +83,7 @@ export function ScopedFacts({
       <ul className={cn('overflow-hidden rounded-lg border border-border bg-surface', compact && 'rounded-md')}>
         {answer.facts.map((fact) => (
           <li key={fact.id} className={cn('border-t border-border first:border-t-0', compact ? 'px-3 py-2.5' : 'px-5 py-3')}>
-            <p className={cn('text-fg', compact ? 'line-clamp-4 text-small' : 'line-clamp-3 text-body')}>{fact.content}</p>
+            <p className={`text-fg ${compact ? 'line-clamp-4 text-small' : 'line-clamp-3 text-body'}`}>{fact.content}</p>
             <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
               {fact.derivedFrom?.tool || fact.derivedFrom?.callId
                 ? <StatusPill tone="neutral">she learned this</StatusPill>

@@ -12,16 +12,16 @@
  * door to the server.
  */
 import type {
-  AgentAssignments, DelegatedTask, DelegatedTaskCorrection, ProjectAccountChoice, ProjectConnectedApp, ProjectOverview,
-  ProjectResourceKind, ProjectSummary, SessionProjectLabel,
+  AgentAssignments, DelegatedTask, DelegatedTaskCorrection, ProjectAccountChoice, ProjectConnectedApp, ProjectLocalProject,
+  ProjectOverview, ProjectResourceKind, ProjectSummary, SessionProjectLabel,
 } from '@clem/chat-engine';
 import { apiGet, apiPost, type ApiError } from './api';
 import { unifiedChatSessionId } from './last-session';
 
 export type {
   AgentAssignments, DelegatedTask, DelegatedTaskCorrection, ProjectAccountChoice, ProjectAssignmentView,
-  ProjectConnectedApp, ProjectConversationView, ProjectDecisionView, ProjectOverview, ProjectResourceKind,
-  ProjectResourceView, ProjectSummary,
+  ProjectCodingRunView, ProjectConnectedApp, ProjectConversationView, ProjectDecisionView, ProjectLocalProject,
+  ProjectOverview, ProjectResourceKind, ProjectResourceView, ProjectSummary,
 } from '@clem/chat-engine';
 
 const BASE = '/api/console/project-records';
@@ -35,6 +35,7 @@ export const projectKeys = {
   overview: (projectId: string) => ['project-records', 'overview', projectId] as const,
   accountChoices: (projectId: string, toolkit: string) => ['project-records', 'account-choices', projectId, toolkit] as const,
   connectedApps: ['project-records', 'connected-apps'] as const,
+  localProjects: ['project-records', 'local-projects'] as const,
   sessionTasks: (sessionId: string) => ['delegated-tasks', 'session', sessionId] as const,
   agentAssignments: (agentId: string) => ['agents', 'assignments', agentId] as const,
 };
@@ -67,6 +68,8 @@ const REFUSALS: Record<string, string> = {
   TOOLKIT_REQUIRED: 'Choose an app first.',
   RESOURCE_INCOMPLETE: 'That is missing what it points at.',
   TOO_MANY_RESOURCES: 'This project already lists as many resources as it can hold. Remove one first.',
+  LOCAL_PROJECT_CHOICE_REQUIRED: 'Choose which local project to link.',
+  LOCAL_PROJECT_NOT_FOUND: 'That folder is not among the code folders on this Mac. Add it in Connect first.',
   ACCOUNT_NOT_CONNECTED: 'No account is connected for that app. Connect one first.',
   ACCOUNT_CHOICE_REQUIRED: 'Choose which account this project uses.',
   CONFLICTING_ACCOUNT: 'This project already uses another account for that app.',
@@ -206,9 +209,63 @@ export async function bindAccount(
   }
 }
 
+// ─── Local projects ───
+// A local project is a code folder on this machine, from the roster Connect
+// keeps. A project links to it by its path; nothing off the roster is linked.
+
+function rosterRows(value: unknown): ProjectLocalProject[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((row): ProjectLocalProject[] => {
+    const entry = row as Partial<ProjectLocalProject> | null;
+    return entry && typeof entry.path === 'string' && entry.path
+      ? [{
+        name: typeof entry.name === 'string' && entry.name.trim() ? entry.name : entry.path.split('/').filter(Boolean).pop() ?? entry.path,
+        path: entry.path,
+        type: typeof entry.type === 'string' ? entry.type : '',
+        description: typeof entry.description === 'string' ? entry.description : '',
+        git: entry.git === true,
+      }]
+      : [];
+  });
+}
+
+/** The code folders on this machine. The first read can take a few seconds. */
+export const getLocalProjects = () =>
+  apiGet<{ localProjects?: unknown }>(`${BASE}-local-projects`).then((r) => rosterRows(r.localProjects));
+
+/**
+ * What linking a local project came to. A refusal that names the folders to
+ * choose from is an answer the picker acts on, not a failure.
+ */
+export type LocalProjectLink =
+  | { kind: 'linked'; overview: ProjectOverview }
+  | { kind: 'choose' | 'not_found'; named: string; localProjects: ProjectLocalProject[] };
+
+export function localProjectLinkFromRefusal(error: unknown): Exclude<LocalProjectLink, { kind: 'linked' }> | null {
+  const code = apiErrorCode(error);
+  if (code !== 'LOCAL_PROJECT_CHOICE_REQUIRED' && code !== 'LOCAL_PROJECT_NOT_FOUND') return null;
+  const body = apiErrorBody(error);
+  return {
+    kind: code === 'LOCAL_PROJECT_CHOICE_REQUIRED' ? 'choose' : 'not_found',
+    named: typeof body.named === 'string' ? body.named : '',
+    localProjects: rosterRows(body.localProjects),
+  };
+}
+
+export async function linkLocalProject(projectId: string, path: string): Promise<LocalProjectLink> {
+  try {
+    const result = await apiPost<{ overview: ProjectOverview }>(`${BASE}/${id(projectId)}/resources`, { kind: 'folder', ref: path });
+    return { kind: 'linked', overview: result.overview };
+  } catch (error) {
+    const refusal = localProjectLinkFromRefusal(error);
+    if (refusal) return refusal;
+    throw error;
+  }
+}
+
 export const attachResource = (
   projectId: string,
-  input: { kind: Exclude<ProjectResourceKind, 'account'>; ref: string; label?: string },
+  input: { kind: Exclude<ProjectResourceKind, 'account' | 'folder'>; ref: string; label?: string },
 ) => apiPost<{ overview: ProjectOverview }>(`${BASE}/${id(projectId)}/resources`, input).then(overviewOf);
 
 export const removeResource = (projectId: string, resourceId: string) =>

@@ -7,7 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  accountBindingFromRefusal, apiErrorCode, conversationPath, goalsFromText, goalsToText, projectKeys, refusalText,
+  accountBindingFromRefusal, apiErrorCode, conversationPath, goalsFromText, goalsToText, localProjectLinkFromRefusal,
+  projectKeys, refusalText,
   taskFromRefusal, taskRunPath,
 } from './projects.js';
 
@@ -77,4 +78,29 @@ test('a task opens on its run, a conversation in Chat, and the keys stay clear o
     assert.notEqual(key[0], 'projects', 'Connect\'s code folders own that key');
   }
   assert.notDeepEqual(projectKeys.list(false), projectKeys.list(true));
+});
+
+test('linking a local project: a refusal hands back the folders to choose from', () => {
+  const roster = [
+    { name: 'app', path: '/Users/o/code/app', type: 'node', description: '', git: true },
+    { name: 'notes', path: '/Users/o/notes', git: false },
+    { name: 'no path' },
+  ];
+  assert.deepEqual(
+    localProjectLinkFromRefusal(refused(409, { error: 'LOCAL_PROJECT_CHOICE_REQUIRED', named: 'app', localProjects: roster })),
+    {
+      kind: 'choose', named: 'app',
+      localProjects: [
+        { name: 'app', path: '/Users/o/code/app', type: 'node', description: '', git: true },
+        { name: 'notes', path: '/Users/o/notes', type: '', description: '', git: false },
+      ],
+    },
+  );
+  assert.deepEqual(
+    localProjectLinkFromRefusal(refused(409, { error: 'LOCAL_PROJECT_NOT_FOUND', named: '/tmp/gone' })),
+    { kind: 'not_found', named: '/tmp/gone', localProjects: [] },
+  );
+  assert.equal(localProjectLinkFromRefusal(refused(409, { error: 'PROJECT_ARCHIVED' })), null, 'any other refusal is a failure');
+  assert.equal(refusalText(refused(409, { error: 'LOCAL_PROJECT_NOT_FOUND' })), 'That folder is not among the code folders on this Mac. Add it in Connect first.');
+  assert.notEqual(projectKeys.localProjects[0], 'projects', 'Connect\'s code folders own that key');
 });

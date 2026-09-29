@@ -1,6 +1,7 @@
 /**
- * What the project uses: the accounts its work goes through, and the Spaces,
- * workflows, folders and links that belong to it.
+ * What the project uses: the local projects its work happens in, the
+ * accounts that work goes through, and the Spaces, workflows and links that
+ * belong to it.
  *
  * An account is bound only from what is connected right now, and says
  * whether that was checked. Everything else is a pointer the owner attached.
@@ -9,7 +10,7 @@
  */
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { CheckCircle2, CircleDashed, Plus } from 'lucide-react';
+import { CheckCircle2, CircleDashed, FolderGit2, Plus } from 'lucide-react';
 import {
   groupProjectResources, projectResourceApp, projectResourceKindLabel, projectResourceName, projectResourceVerification,
 } from '@clem/chat-engine';
@@ -24,9 +25,10 @@ import {
   type ProjectAccountChoice, type ProjectConnectedApp, type ProjectOverview, type ProjectResourceKind, type ProjectResourceView,
 } from '@/lib/projects';
 import { listSpaces } from '@/lib/spaces';
+import { LinkLocalProject, LocalProjectRow } from './LocalProjects';
 import { ProjectSection, QuietNote } from './ProjectSection';
 
-const KINDS: ProjectResourceKind[] = ['account', 'space', 'workflow', 'folder', 'link'];
+const KINDS: ProjectResourceKind[] = ['folder', 'account', 'space', 'workflow', 'link'];
 
 function appName(toolkit: string | null, apps: readonly ProjectConnectedApp[]): string {
   if (!toolkit) return '';
@@ -79,7 +81,7 @@ function ResourceRow({ projectId, resource, readOnly, onSaved }: {
             )}
             {verification && (
               <span
-                className={cn('inline-flex items-center gap-1 text-caption font-semibold', verification.verified ? 'text-success' : 'text-warning')}
+                className={`inline-flex items-center gap-1 text-caption font-semibold ${verification.verified ? 'text-success' : 'text-warning'}`}
                 title={verification.verified
                   ? `Checked against your connected accounts${checkedOn(resource.verifiedAt) ? ` on ${checkedOn(resource.verifiedAt)}` : ''}`
                   : 'Nobody has checked this against your connected accounts, so it is not used to pick an account'}
@@ -253,7 +255,7 @@ function AddAccount({ projectId, onSaved, onClose }: {
 
 function AddPointer({ projectId, kind, taken, onSaved, onClose }: {
   projectId: string;
-  kind: Exclude<ProjectResourceKind, 'account'>;
+  kind: Exclude<ProjectResourceKind, 'account' | 'folder'>;
   /** What the project already lists of this kind. */
   taken: ReadonlySet<string>;
   onSaved: (overview: ProjectOverview) => void;
@@ -317,16 +319,16 @@ function AddPointer({ projectId, kind, taken, onSaved, onClose }: {
           )
       ) : (
         <>
-          <Field label={kind === 'folder' ? 'Folder' : 'Address'} hint={kind === 'folder' ? 'The full path on this machine.' : undefined}>
+          <Field label="Address">
             {(id) => (
               <Input
                 id={id}
                 value={ref}
                 onChange={(event) => { setRef(event.target.value); setError(''); }}
-                placeholder={kind === 'folder' ? '~/Documents/Weekly sales' : 'https://'}
+                placeholder="https://"
                 disabled={busy}
                 autoFocus
-                inputMode={kind === 'link' ? 'url' : undefined}
+                inputMode="url"
               />
             )}
           </Field>
@@ -355,22 +357,36 @@ export function ProjectResources({ overview, onSaved }: {
   return (
     <ProjectSection
       title="Accounts and resources"
-      hint="The accounts this project’s work goes through, and what else belongs to it."
+      hint="Where this project’s work happens, the accounts it goes through, and what else belongs to it."
       action={!archived && adding === null && (
-        <Button variant="secondary" size="sm" onClick={() => setAdding('account')}>
-          <Plus className="h-4 w-4" aria-hidden /> Add
-        </Button>
+        <>
+          <Button variant="secondary" size="sm" onClick={() => setAdding('folder')}>
+            <FolderGit2 className="h-4 w-4" aria-hidden /> Link a local project
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => setAdding('account')}>
+            <Plus className="h-4 w-4" aria-hidden /> Add
+          </Button>
+        </>
       )}
     >
       {groups.length === 0 && adding === null && (
-        <QuietNote>Nothing attached. Work here uses whichever account Clem would normally pick, and asks when it is not clear.</QuietNote>
+        <QuietNote>Nothing attached. Work here uses whichever account Clem would normally pick, and asks when it is not clear. Link a local project to say where its files and code are.</QuietNote>
       )}
 
       {groups.map((group) => (
         <div key={group.kind}>
-          <div className="mb-1.5 text-label text-faint">{group.label}</div>
+          <div className={`text-label text-faint ${group.hint ? '' : 'mb-1.5'}`}>{group.label}</div>
+          {group.hint && <p className="mb-1.5 text-caption text-muted">{group.hint}</p>}
           <ul className="overflow-hidden rounded-lg border border-border bg-surface">
-            {group.items.map((resource) => (
+            {group.items.map((resource) => (group.kind === 'folder' ? (
+              <LocalProjectRow
+                key={resource.id}
+                projectId={overview.project.id}
+                resource={resource}
+                readOnly={archived}
+                onSaved={onSaved}
+              />
+            ) : (
               <ResourceRow
                 key={resource.id}
                 projectId={overview.project.id}
@@ -378,7 +394,7 @@ export function ProjectResources({ overview, onSaved }: {
                 readOnly={archived}
                 onSaved={onSaved}
               />
-            ))}
+            )))}
           </ul>
         </div>
       ))}
@@ -402,7 +418,14 @@ export function ProjectResources({ overview, onSaved }: {
               </button>
             ))}
           </div>
-          {adding === 'account' ? (
+          {adding === 'folder' ? (
+            <LinkLocalProject
+              projectId={overview.project.id}
+              resources={overview.resources}
+              onSaved={onSaved}
+              onClose={() => setAdding(null)}
+            />
+          ) : adding === 'account' ? (
             <AddAccount
               projectId={overview.project.id}
               onSaved={onSaved}

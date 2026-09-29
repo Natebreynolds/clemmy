@@ -166,7 +166,7 @@ export function DelegatedTaskCard({
           <div className={cn('flex gap-x-2 gap-y-1', compact ? 'flex-col items-start' : 'flex-wrap items-center')}>
             <StatusPill tone={PILL_TONE[card.phase.tone]}>{busy === 'stop' ? 'Stopping' : card.phase.label}</StatusPill>
             <h4
-              className={cn('min-w-0 font-semibold text-fg', compact ? 'line-clamp-2 text-small' : 'flex-1 truncate text-body')}
+              className={`min-w-0 font-semibold text-fg ${compact ? 'line-clamp-2 text-small' : 'flex-1 truncate text-body'}`}
               title={card.title}
             >
               {card.title}
