@@ -316,7 +316,10 @@ test('the accepted request records what memory it sent, by tier, and the console
   assert.ok(manifest.some((entry) => entry.tier === 'core' && entry.section === 'Standing Policies' && entry.refs.some((ref) => ref.type === 'policy')));
   assert.ok(manifest.some((entry) => entry.tier === 'relevant' && entry.section === 'Relevant To This Request' && entry.refs.length > 0),
     JSON.stringify(manifest));
-  assert.equal(manifest.filter((entry) => entry.section === 'Memory Pointer').length, 1, 'each section is listed once');
+  // The pointer is sent only when memory holds more than the view shows. With
+  // what is known placed ahead of earlier work, every fact on file may fit.
+  assert.ok(manifest.filter((entry) => entry.section === 'Memory Pointer').length <= 1, 'no section is listed twice');
+  assert.equal(new Set(manifest.map((entry) => entry.section)).size, manifest.length, 'each section is listed once');
   assert.ok(manifest.some((entry) => entry.tier === 'now' && entry.section === 'Right Now'));
   const { renderMemoryCore } = await import('../../agents/harness-context.js');
   assert.equal(row!.coreSha, renderMemoryCore().sha256, 'the record names the content-addressed core');

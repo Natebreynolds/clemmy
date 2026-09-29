@@ -66,9 +66,21 @@ export function selectRankedTailHits(hits: readonly UnifiedHit[], selection: Ran
   if (candidates.length === 0) return [];
   const policies = candidates.filter((hit) => hit.type === 'policy').slice(0, Math.max(0, selection.reservedPolicySlots));
   const reserved = new Set(policies);
+  const fraction = Math.max(0, Math.min(1, selection.relativeFloor));
   const best = Math.max(...candidates.map((hit) => hit.score));
-  const floor = best * Math.max(0, Math.min(1, selection.relativeFloor));
-  return [...policies, ...candidates.filter((hit) => !reserved.has(hit) && hit.score >= floor)];
+  // A record of earlier work on the same request matches it by construction:
+  // it repeats the request's own words. Its score says the request was seen
+  // before, not that what is known about the subject matters less, so it sets
+  // no floor for the other stores. The more work is remembered, the more a
+  // repeated request would otherwise lose its facts to its own history.
+  const known = candidates.filter((hit) => hit.type !== 'episode');
+  const bestKnown = known.length > 0 ? Math.max(...known.map((hit) => hit.score)) : best;
+  const clears = (hit: UnifiedHit): boolean => hit.score >= (hit.type === 'episode' ? best : bestKnown) * fraction;
+  const kept = candidates.filter((hit) => !reserved.has(hit) && clears(hit));
+  // The block is filled in this order and a line that does not fit is left
+  // out. A record of earlier work is several times the length of a fact, so
+  // what is known takes its place first and earlier work takes what remains.
+  return [...policies, ...kept.filter((hit) => hit.type !== 'episode'), ...kept.filter((hit) => hit.type === 'episode')];
 }
 
 type RecallEverythingFn = typeof recallEverything;
