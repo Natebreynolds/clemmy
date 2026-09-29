@@ -44,6 +44,36 @@ Live record since 2026-09-28T00:00Z: 4 approval-resumed `done` terminals, 0 lear
 
 No threshold for a sure pick changed. No new model call, no new tool, no provider or model name in a branch.
 
+## Learning as a framework — added 2026-09-29
+
+Owner direction: learning is a property of the framework, not a list of things to remember. A finished, verified
+piece of work teaches three things, each read from settled receipts and none from an operation, provider or
+field name.
+
+| What | Meaning | Before | Now |
+| --- | --- | --- | --- |
+| Method | Which operations ran and the part each played: prepare, change, verify | Tools only, no parts | `provenSteps` on the strategy; the verification travels with the run |
+| Resolutions | How something the request named became an exact value an accepted call used | Not kept | Kept as a `reference` memory with its source, replaced when the value changes |
+| Outcome | What was done and where its results live | Work episode, direct runs only | Work episode for approved runs too |
+
+4. **The part each operation played is learned.** From the order and effect of the settled calls: before the
+   first change, the change, after a change. When a proven run read its change back, the guidance says so and
+   asks for the same. Found live: request A sent and read back; request B, handed A's strategy, sent and did not.
+5. **A run handed a remembered strategy reinforces it.** If it used nothing outside that strategy it adds its
+   proof to it. It is no longer learned as a strategy of its own, and it cannot erase a step. Found live: B was
+   learned as a second, thinner strategy for the same kind of work.
+6. **What the work resolved is kept.** A value is kept when it is an argument of a call that settled
+   successfully, the request did not state it, a settled result of the same request holds a record with that
+   exact value, and the request used the name that record gives it. Which of a record's strings is the value's
+   name is decided by the typed check approval cards already use (`labelIdentifierWithJev`); without a sure
+   answer nothing is kept. Dates, numbers, flags, prose and anything that looks like a secret are never kept.
+   It runs after the terminal and off its path, and only when the same request's strategy was admitted as
+   learned. A different value for the same name and argument supersedes the earlier one, which stays in history.
+
+Dry run on the nine-event run (source 325147), read-only: one value was used and not stated; records carrying it
+exactly exist in the calendar read and in all nine create results; they give it one name, and the request used
+that name.
+
 ## Evidence for the offer rule
 
 166 recorded turn-start decisions, 2026-09-25 to 2026-09-29, first decision per accepted source:
@@ -73,8 +103,12 @@ Seven is a small sample. The one miss queued a pending action instead of calling
 
 - Verified-write capability learning (`learnVerifiedWriteCapabilitiesForAcceptedTask`) still reads the decision's
   source and the published terminal of that task. It is unchanged and still learns nothing from approved work.
-- A remembered address reaches a later request only if the work episode that holds it is recalled and fits. No
-  typed person-to-address record is written. Whether the lookups in the two-event run disappear is a live question.
+- A kept resolution reaches a later request through ordinary memory recall. Whether it is recalled, fits the
+  primer and removes the lookups of the two-event run is a live question.
+- A resolution is learned only when a settled record carries the value in a field of its own. A value that was
+  found inside prose, as a history search returns it, has no record to name it and is not learned.
+- The naming check is one model call per distinct value, after the terminal. When it is unavailable nothing is
+  learned from that run, and nothing retries it.
 - The offer rule rests on 7 historical cases.
 - Work already finished before this change is not learned retroactively.
 
