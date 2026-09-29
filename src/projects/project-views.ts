@@ -329,3 +329,47 @@ export function agentWork(agentId: string): AgentWorkView {
     recentOutcomes: tasks.filter((task) => TERMINAL.has(task.status)).slice(0, 12),
   };
 }
+
+export interface SessionProjectLabel {
+  sessionId: string;
+  projectId: string;
+  projectName: string;
+  /** The agent that owns the work there, when there is one. */
+  agentName: string | null;
+  /** Set when the session is a delegated task's own run. */
+  taskId: string | null;
+}
+
+/**
+ * Which project each of these sessions works in, for labelling what waits on
+ * the owner. A conversation is labelled by its own project; a delegated
+ * task's run by the project it was delegated into. A session in no project
+ * is left out.
+ */
+export function projectLabelsForSessions(sessionIds: readonly string[]): SessionProjectLabel[] {
+  const wanted = [...new Set(sessionIds.map((id) => id.trim()).filter(Boolean))].slice(0, 200);
+  if (wanted.length === 0) return [];
+  const labels: SessionProjectLabel[] = [];
+  const runs = new Map(listBackgroundTasks({ includeArchived: false })
+    .filter((task) => task.delegation?.projectId)
+    .map((task) => [task.runSessionId, task] as const));
+  const db = openEventLog();
+  for (const sessionId of wanted) {
+    const task = runs.get(sessionId);
+    if (task?.delegation?.projectId) {
+      const project = getProject(task.delegation.projectId);
+      if (project) labels.push({ sessionId, projectId: project.id, projectName: project.name, agentName: task.delegation.agentName, taskId: task.id });
+      continue;
+    }
+    try {
+      const row = db.prepare('SELECT metadata_json AS metadata FROM sessions WHERE id = ?').get(sessionId) as { metadata: string | null } | undefined;
+      if (!row) continue;
+      const metadata = JSON.parse(row.metadata ?? '{}') as Record<string, unknown>;
+      const project = typeof metadata.projectId === 'string' ? getProject(metadata.projectId) : null;
+      if (!project) continue;
+      labels.push({ sessionId, projectId: project.id, projectName: project.name,
+        agentName: typeof metadata.agentName === 'string' && metadata.agentId ? metadata.agentName : null, taskId: null });
+    } catch { /* an unreadable session is left unlabelled */ }
+  }
+  return labels;
+}

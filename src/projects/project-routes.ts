@@ -22,7 +22,7 @@ import {
   saveAssignment, saveResource, updateProject, type ProjectOrigin, type ProjectResourceKind,
 } from './project-record.js';
 import {
-  agentWork, delegatedTaskById, delegatedTasksForSession, projectOverview, projectSummaries,
+  agentWork, delegatedTaskById, delegatedTasksForSession, projectLabelsForSessions, projectOverview, projectSummaries,
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
 import { moveFact } from './memory-scope-views.js';
@@ -85,6 +85,13 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
 
   add('get', mount.projects, (req, res) => {
     res.json({ projects: projectSummaries({ includeArchived: req.query.archived === '1' }), generatedAt: new Date().toISOString() });
+  });
+
+  // Which project each session works in, so that what waits on the owner
+  // can say where it came from. Sessions in no project are left out.
+  add('get', `${mount.projects}-labels`, (req, res) => {
+    const ids = String(req.query.sessions ?? '').split(',');
+    res.json({ labels: projectLabelsForSessions(ids) });
   });
 
   add('post', mount.projects, (req, res) => {
