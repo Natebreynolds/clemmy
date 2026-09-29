@@ -42,6 +42,7 @@ const Workspaces = lazyNamed(() => import('./screens/Workspaces'), 'Workspaces')
 const WorkspaceView = lazyNamed(() => import('./screens/WorkspaceView'), 'WorkspaceView');
 const Projects = lazyNamed(() => import('./screens/Projects'), 'Projects');
 const ProjectOverview = lazyNamed(() => import('./screens/ProjectOverview'), 'ProjectOverview');
+const ProjectPageViewer = lazyNamed(() => import('./screens/ProjectPageViewer'), 'ProjectPageViewer');
 const Agents = lazyNamed(() => import('./screens/Agents'), 'Agents');
 const AgentWorkspace = lazyNamed(() => import('./screens/AgentWorkspace'), 'AgentWorkspace');
 const Advanced = lazyNamed(() => import('./screens/Advanced'), 'Advanced');
@@ -233,6 +234,7 @@ export function App() {
             <Route path="/workspaces/:id" element={deferred(<WorkspaceView />)} />
             <Route path="/projects" element={deferred(<Projects />)} />
             <Route path="/projects/:id" element={deferred(<ProjectOverview />)} />
+            <Route path="/projects/:id/pages/:pageId" element={deferred(<ProjectPageViewer />)} />
             <Route path="/agents" element={deferred(<Agents />)} />
             <Route path="/agents/:id" element={deferred(<AgentWorkspace />)} />
             <Route path="/agents/:id/t/:sessionId" element={deferred(<AgentWorkspace />)} />

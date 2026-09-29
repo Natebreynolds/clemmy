@@ -15,13 +15,14 @@ import type {
   AgentAssignments, DelegatedTask, DelegatedTaskCorrection, ProjectAccountChoice, ProjectConnectedApp, ProjectLocalProject,
   ProjectOverview, ProjectResourceKind, ProjectSummary, SessionProjectLabel,
 } from '@clem/chat-engine';
-import { apiGet, apiPost, type ApiError } from './api';
+import { projectPageRefusal } from '@clem/chat-engine';
+import { apiGet, apiPost, withToken, type ApiError } from './api';
 import { unifiedChatSessionId } from './last-session';
 
 export type {
   AgentAssignments, DelegatedTask, DelegatedTaskCorrection, ProjectAccountChoice, ProjectAssignmentView,
   ProjectCodingRunView, ProjectConnectedApp, ProjectConversationView, ProjectDecisionView, ProjectLocalProject,
-  ProjectOverview, ProjectResourceKind, ProjectResourceView, ProjectSummary,
+  ProjectOverview, ProjectPageView, ProjectResourceKind, ProjectResourceView, ProjectSummary,
 } from '@clem/chat-engine';
 
 const BASE = '/api/console/project-records';
@@ -36,6 +37,7 @@ export const projectKeys = {
   accountChoices: (projectId: string, toolkit: string) => ['project-records', 'account-choices', projectId, toolkit] as const,
   connectedApps: ['project-records', 'connected-apps'] as const,
   localProjects: ['project-records', 'local-projects'] as const,
+  pageDocument: (projectId: string, pageId: string, reload: number) => ['project-records', 'page-document', projectId, pageId, reload] as const,
   sessionTasks: (sessionId: string) => ['delegated-tasks', 'session', sessionId] as const,
   agentAssignments: (agentId: string) => ['agents', 'assignments', agentId] as const,
 };
@@ -284,6 +286,62 @@ export const getConnectedApps = () =>
 export const getProjectLabels = (sessionIds: readonly string[]) =>
   apiGet<{ labels?: SessionProjectLabel[] }>(`${BASE}-labels?sessions=${sessionIds.map(encodeURIComponent).join(',')}`)
     .then((r) => r.labels ?? []);
+
+// ─── Pages made in a project ───
+// A page is an HTML file that work in the project wrote into a linked local
+// project. The desktop frames the document itself, in a sandbox; what a page
+// is called and what a refusal says are the shared engine's words.
+
+/** Where a page opens to be looked at. */
+export function pageViewerPath(projectId: string, pageId: string): string {
+  return `/projects/${id(projectId)}/pages/${id(pageId)}`;
+}
+
+/**
+ * The address the frame loads. It never carries the session token: a page
+ * can read its own address, and the session cookie already authorizes the
+ * frame. `reload` only makes the address new, so the frame asks again.
+ */
+export function pageDocumentUrl(projectId: string, pageId: string, reload = 0): string {
+  const url = `${BASE}/${id(projectId)}/pages/${id(pageId)}/document`;
+  return Number.isInteger(reload) && reload > 0 ? `${url}?reload=${reload}` : url;
+}
+
+/**
+ * Ask for the document before it is framed. A sandboxed frame cannot say why
+ * it is empty, so a refusal is read here, where it can be said in words.
+ * Nothing of the document is kept: the frame reads it for itself.
+ */
+export async function checkPageDocument(projectId: string, pageId: string): Promise<true> {
+  let response: Response;
+  try {
+    response = await fetch(withToken(pageDocumentUrl(projectId, pageId)), { credentials: 'same-origin', cache: 'no-store' });
+  } catch {
+    throw Object.assign(new Error('Clementine’s local service is restarting or unavailable. Wait a few seconds, then try again.'), { status: 0 });
+  }
+  if (response.ok) {
+    void response.body?.cancel().catch(() => undefined);
+    // A value, not nothing: a read that answers with nothing is taken for a failed one.
+    return true;
+  }
+  let body: unknown = null;
+  try { body = await response.json(); } catch { body = null; }
+  throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status, body });
+}
+
+/** Open the page in the owner's own browser, on the Mac. */
+export const openPageInBrowser = (projectId: string, pageId: string) =>
+  apiPost<{ ok?: boolean }>(`${BASE}/${id(projectId)}/pages/${id(pageId)}/open`).then(() => undefined);
+
+/**
+ * A refusal about a page as a sentence: the shared words when they name the
+ * code, else what any other refusal from a project says.
+ */
+export function pageRefusalText(error: unknown, fallback: string): string {
+  const code = apiErrorCode(error);
+  const words = code ? projectPageRefusal(code) : '';
+  return words && words !== projectPageRefusal(null) ? words : refusalText(error, fallback);
+}
 
 // ─── A conversation's project ───
 

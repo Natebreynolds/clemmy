@@ -6,9 +6,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { projectPageRefusal } from '@clem/chat-engine';
 import {
   accountBindingFromRefusal, apiErrorCode, conversationPath, goalsFromText, goalsToText, localProjectLinkFromRefusal,
-  projectKeys, refusalText,
+  checkPageDocument, pageDocumentUrl, pageRefusalText, pageViewerPath, projectKeys, refusalText,
   taskFromRefusal, taskRunPath,
 } from './projects.js';
 
@@ -103,4 +104,79 @@ test('linking a local project: a refusal hands back the folders to choose from',
   assert.equal(localProjectLinkFromRefusal(refused(409, { error: 'PROJECT_ARCHIVED' })), null, 'any other refusal is a failure');
   assert.equal(refusalText(refused(409, { error: 'LOCAL_PROJECT_NOT_FOUND' })), 'That folder is not among the code folders on this Mac. Add it in Connect first.');
   assert.notEqual(projectKeys.localProjects[0], 'projects', 'Connect\'s code folders own that key');
+});
+
+test('a page opens in its viewer, and its frame loads the document by both ids', () => {
+  assert.equal(pageViewerPath('p1', 'pg1'), '/projects/p1/pages/pg1');
+  assert.equal(pageViewerPath('p 1/x', 'a/b?c#d'), '/projects/p%201%2Fx/pages/a%2Fb%3Fc%23d');
+  assert.equal(pageDocumentUrl('p1', 'pg1'), '/api/console/project-records/p1/pages/pg1/document');
+  assert.equal(
+    pageDocumentUrl('p 1/x', '../open?x=1&y#z'),
+    '/api/console/project-records/p%201%2Fx/pages/..%2Fopen%3Fx%3D1%26y%23z/document',
+    'an id never becomes a part of the path, a query or a fragment',
+  );
+  assert.equal(new URL(pageDocumentUrl('p1', '%2e%2e'), 'http://clem.test').pathname, '/api/console/project-records/p1/pages/%252e%252e/document');
+});
+
+test('reloading a page only makes its address new, and the address never carries the session', () => {
+  assert.equal(pageDocumentUrl('p1', 'pg1', 0), pageDocumentUrl('p1', 'pg1'));
+  assert.equal(pageDocumentUrl('p1', 'pg1', 3), '/api/console/project-records/p1/pages/pg1/document?reload=3');
+  assert.notEqual(pageDocumentUrl('p1', 'pg1', 1), pageDocumentUrl('p1', 'pg1', 2));
+  for (const odd of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(pageDocumentUrl('p1', 'pg1', odd), pageDocumentUrl('p1', 'pg1'), `${odd} is not a reload`);
+  }
+  for (const url of [pageDocumentUrl('p1', 'pg1'), pageDocumentUrl('p1', 'pg1', 2)]) {
+    assert.doesNotMatch(url, /token/i, 'a page can read its own address');
+  }
+  assert.notEqual(projectKeys.pageDocument('p1', 'pg1', 0)[0], 'projects', 'Connect\'s code folders own that key');
+  assert.notDeepEqual(projectKeys.pageDocument('p1', 'pg1', 0), projectKeys.pageDocument('p1', 'pg1', 1));
+});
+
+test('a refusal about a page is said in the shared words, and any other refusal as a project says it', () => {
+  for (const code of ['PAGE_NOT_FOUND', 'PAGE_TOO_LARGE', 'THIS_MACHINE_ONLY', 'NOT_SUPPORTED_HERE']) {
+    assert.equal(pageRefusalText(refused(400, { error: code }), 'Try again.'), projectPageRefusal(code), code);
+    assert.notEqual(projectPageRefusal(code), projectPageRefusal(null), `${code} has words of its own`);
+  }
+  assert.equal(pageRefusalText(refused(404, { error: 'PROJECT_NOT_FOUND' }), 'Try again.'), 'This project no longer exists.');
+  assert.equal(pageRefusalText(refused(400, { error: 'SOMETHING_NEW' }), 'Try again.'), 'Try again.', 'an unknown code is never shown');
+  assert.equal(pageRefusalText(refused(502, null), 'Try again.'), 'Try again.', 'nor is a bare status');
+  assert.equal(pageRefusalText(refused(413, '<html>too large</html>'), 'Try again.'), 'Try again.');
+  assert.equal(
+    pageRefusalText(Object.assign(new Error('Clementine\'s local service is restarting.'), { status: 0 }), 'Try again.'),
+    'Clementine\'s local service is restarting.',
+    'a sentence the client already wrote is kept',
+  );
+});
+
+test('asking for a page before framing it answers with a value, and a refusal keeps its code', async () => {
+  const asked: string[] = [];
+  const real = globalThis.fetch;
+  const scope = globalThis as unknown as { window?: unknown };
+  const hadWindow = 'window' in scope;
+  const realWindow = scope.window;
+  // The app reads its token from what the daemon plants in the page.
+  scope.window = { __CLEM_BOOTSTRAP__: { token: 'fixture-token' } };
+  try {
+    globalThis.fetch = (async (input: unknown) => {
+      asked.push(String(input));
+      return new Response('<!doctype html><title>x</title>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch;
+    // A read that answers with nothing is taken for a failed one, and the frame is never drawn.
+    assert.equal(await checkPageDocument('prj_1', 'pg_1'), true);
+    assert.match(asked[0]!, /\/api\/console\/project-records\/prj_1\/pages\/pg_1\/document/);
+    assert.ok(!pageDocumentUrl('prj_1', 'pg_1').includes('token'), 'the address a page can read of itself never carries the token');
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({ error: 'PAGE_TOO_LARGE' }), { status: 413, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+    const refused = await checkPageDocument('prj_1', 'pg_1').then(() => null, (error: unknown) => error);
+    assert.equal(apiErrorCode(refused), 'PAGE_TOO_LARGE');
+    assert.equal(pageRefusalText(refused, 'fallback'), projectPageRefusal('PAGE_TOO_LARGE'));
+
+    globalThis.fetch = (async () => { throw new TypeError('network'); }) as typeof fetch;
+    const unreachable = await checkPageDocument('prj_1', 'pg_1').then(() => null, (error: unknown) => error) as { status?: number; message?: string } | null;
+    assert.equal(unreachable?.status, 0);
+    assert.match(unreachable?.message ?? '', /restarting or unavailable/);
+  } finally {
+    globalThis.fetch = real;
+    if (hadWindow) scope.window = realWindow; else delete scope.window;
+  }
 });

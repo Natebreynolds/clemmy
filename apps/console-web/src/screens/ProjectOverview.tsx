@@ -1,7 +1,8 @@
 /**
  * One project's page, in the order the owner needs it: what the project is,
  * what is waiting on them, the work moving in it, who is on it, what it
- * uses, the conversations that worked in it, and what was learned there.
+ * uses, the pages made in it, the conversations that worked in it, and what
+ * was learned there.
  *
  * Every section is drawn from the project's one overview record, and every
  * change shows the record the server answered with.
@@ -23,6 +24,7 @@ import { ProjectCodingWork } from '@/components/projects/ProjectCodingWork';
 import { ProjectConversations, useStartProjectConversation } from '@/components/projects/ProjectConversations';
 import { ProjectDecisions } from '@/components/projects/ProjectDecisions';
 import { ProjectIdentity } from '@/components/projects/ProjectIdentity';
+import { ProjectPages } from '@/components/projects/ProjectPages';
 import { ProjectResources } from '@/components/projects/ProjectResources';
 import { ProjectSection, QuietNote } from '@/components/projects/ProjectSection';
 import { cn } from '@/lib/cn';
@@ -210,6 +212,7 @@ function ProjectBody({ overview, onSettled, onReread }: {
 
         <ProjectAgents overview={overview} onSaved={onSettled} />
         <ProjectResources overview={overview} onSaved={onSettled} />
+        <ProjectPages overview={overview} />
         <ProjectConversations overview={overview} />
 
         <ProjectSection title="What was learned here" hint="What Clem and the agents on this project keep for it. It is used in this project and nowhere else.">
