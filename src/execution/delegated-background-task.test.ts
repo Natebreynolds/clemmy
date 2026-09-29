@@ -92,10 +92,13 @@ test('who does the work is decided once: names are checked, the association is e
   setSessionAgent(chat.id, analyst.id, { by: 'owner' });
   const own = await resolveTaskDelegation({ sessionId: chat.id, objective: 'x' }, { selectAgent: never });
   assert.equal(own.kind === 'bound' && own.delegation.assignedBy, 'owner');
-  // ...and one that is not assigned to the project does not block the task.
+  assert.equal(own.kind === 'bound' && own.model, undefined, 'a task from a conversation already in the agent keeps the model it always ran on');
+  // ...and one that is not assigned to the project does not block the task,
+  // and is not replaced by somebody the router would have suggested.
   setSessionAgent(chat.id, outsider.id, { by: 'owner' });
-  const notAssigned = await resolveTaskDelegation({ sessionId: chat.id, objective: 'x' }, { selectAgent: async () => null });
+  const notAssigned = await resolveTaskDelegation({ sessionId: chat.id, objective: 'x' }, { selectAgent: never });
   assert.equal(notAssigned.kind === 'bound' && notAssigned.delegation.agentId, null);
+  assert.equal(notAssigned.kind === 'bound' && notAssigned.delegation.projectId, sales.id);
 });
 
 test('a task nobody delegated is exactly what it was', async () => {
@@ -196,7 +199,7 @@ test('a correction to work that has ended goes to the same owner as a task that 
 
   // Open: the same task, the next version.
   tasks.markBackgroundTaskRunning(first.id);
-  const revised = correctDelegatedTask(first.id, { instruction: 'Use whole numbers only.' });
+  const revised = correctDelegatedTask(first.id, { instruction: 'Use whole numbers only.', by: 'owner' });
   assert.equal(revised.kind, 'revised');
   assert.equal(revised.kind === 'revised' && revised.task.id, first.id);
   assert.equal(revised.kind === 'revised' && revised.task.contractVersion, 2);
@@ -204,7 +207,7 @@ test('a correction to work that has ended goes to the same owner as a task that 
 
   // Ended: a task that follows it, for the same agent in the same project.
   assert.equal(tasks.markBackgroundTaskDone(first.id, 'Draft saved. Total 367,000 across 26 records.')?.status, 'done');
-  const followed = correctDelegatedTask(first.id, { instruction: 'Focus on this week and exclude unqualified leads.', sourceUserSeq: 9 });
+  const followed = correctDelegatedTask(first.id, { instruction: 'Focus on this week and exclude unqualified leads.', sourceUserSeq: 9, by: 'owner' });
   assert.equal(followed.kind, 'followed');
   if (followed.kind !== 'followed') return;
   assert.notEqual(followed.task.id, first.id);
@@ -218,6 +221,13 @@ test('a correction to work that has ended goes to the same owner as a task that 
   assert.equal(tasks.getBackgroundTask(first.id)?.contractVersion, 2);
   assert.equal(getSession(followed.task.runSessionId)?.metadata?.agentId, analyst.id);
 
+  // Said twice, or corrected again while the follow-up is open: the same follow-up, its next version.
+  const again = correctDelegatedTask(first.id, { instruction: 'And round to thousands.', by: 'owner' });
+  assert.deepEqual([again.kind, again.kind === 'followed' && again.task.id, again.kind === 'followed' && again.task.contractVersion],
+    ['followed', followed.task.id, 2]);
+  assert.equal(tasks.listBackgroundTasks({ includeArchived: false }).filter((task) => task.originSessionId === origin.id).length, 2,
+    'one finished task and one follow-up, however often the correction is sent');
+
   let prompt = '';
   const assistant = { getRuntime: () => ({}) as never,
     async respond(request: { message: string; sessionId: string }) { prompt = request.message; return { text: 'Done. Corrected draft saved.', sessionId: request.sessionId, stoppedReason: 'success' as const }; } };
@@ -225,8 +235,40 @@ test('a correction to work that has ended goes to the same owner as a task that 
   assert.match(prompt, new RegExp(`This follows task ${first.id}, which you finished\\. The owner has corrected it\\.`));
   assert.ok(states(origin.id).some((row) => row.taskId === followed.task.id && row.followsTaskId === first.id && row.phase === 'dispatched'));
 
-  assert.deepEqual(correctDelegatedTask(first.id, { instruction: 'no' }), { kind: 'refused', reason: 'instruction_required' });
-  assert.deepEqual(correctDelegatedTask('bg-none', { instruction: 'anything at all' }), { kind: 'refused', reason: 'task_not_found' });
+  assert.deepEqual(correctDelegatedTask(first.id, { instruction: 'no', by: 'owner' }), { kind: 'refused', reason: 'instruction_required' });
+  assert.deepEqual(correctDelegatedTask('bg-none', { instruction: 'anything at all', by: 'owner' }), { kind: 'refused', reason: 'task_not_found' });
   const plain = tasks.createBackgroundTask({ title: 'Plain', prompt: 'plain', source: 'desktop' });
-  assert.deepEqual(correctDelegatedTask(plain.id, { instruction: 'anything at all' }), { kind: 'refused', reason: 'not_delegated' });
+  assert.deepEqual(correctDelegatedTask(plain.id, { instruction: 'anything at all', by: 'owner' }), { kind: 'refused', reason: 'not_delegated' });
+});
+
+test('work that stopped before it finished is corrected in place, and only the owner restarts it', async () => {
+  for (const existing of tasks.listBackgroundTasks({ includeArchived: true })) tasks.archiveBackgroundTask(existing.id);
+  const { correctDelegatedTask } = await import('../projects/task-follow-up.js');
+  const origin = createSession({ id: 'cut-off-origin', kind: 'chat' });
+  const task = tasks.createBackgroundTask({ title: 'Send the summaries', prompt: 'Objective: Send the summaries', originSessionId: origin.id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: sales.id, projectName: sales.name, assignedBy: 'clem' } });
+  tasks.markBackgroundTaskRunning(task.id);
+  assert.equal(tasks.markBackgroundTaskFailed(task.id, 'The app restarted while this was running.', 'interrupted')?.status, 'interrupted');
+  assert.equal(states(origin.id).filter((row) => row.taskId === task.id).at(-1)?.phase, 'parked', 'cut off by a restart is not shown as a failure');
+
+  // Relayed by the model: nothing restarts, nothing new starts.
+  assert.deepEqual(correctDelegatedTask(task.id, { instruction: 'Leave out the draft ones.', by: 'clem' }), { kind: 'refused', reason: 'resume_first' });
+  assert.equal(tasks.getBackgroundTask(task.id)?.status, 'interrupted');
+
+  // From the owner: the same task and run take the correction.
+  const corrected = correctDelegatedTask(task.id, { instruction: 'Leave out the draft ones.', by: 'owner' });
+  assert.equal(corrected.kind, 'revised');
+  if (corrected.kind !== 'revised') return;
+  assert.deepEqual([corrected.task.id, corrected.task.runSessionId, corrected.resumed, corrected.task.contractRevisions?.at(-1)?.instruction],
+    [task.id, task.runSessionId, true, 'Leave out the draft ones.']);
+  assert.ok(!['interrupted', 'failed', 'aborted', 'done'].includes(corrected.task.status), corrected.task.status);
+  assert.deepEqual(tasks.listBackgroundTasks({ includeArchived: false }).filter((row) => row.originSessionId === origin.id).map((row) => row.id), [task.id],
+    'no second task exists to repeat what the first already wrote');
+});
+
+test('a delegated run given to one agent does not mount another saved later under the same name', () => {
+  const session = createSession({ id: 'background:bg-renamed-0a0a0a', kind: 'execution',
+    metadata: { delegatedTaskId: 'bg-renamed-0a0a0a', agentId: analyst.id, agentName: analyst.name, delegatedAgentCreatedAt: '1999-01-01T00:00:00.000Z' } });
+  const mount = composition.composeSession({ sessionId: session.id, sessionKind: session.kind, metadata: getSession(session.id)?.metadata ?? null });
+  assert.equal(mount.agent, null);
 });

@@ -100,7 +100,7 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     question: task.status === 'awaiting_input' && task.pendingQuestionId && task.pendingQuestion
       ? { id: task.pendingQuestionId, text: task.pendingQuestion.slice(0, 2_000), options: (task.pendingQuestionOptions ?? []).slice(0, 8) }
       : null,
-    approvalId: task.status === 'awaiting_approval' ? task.pendingApprovalId ?? null : null,
+    approvalId: task.status === 'awaiting_approval' ? cardApprovalId(task.pendingApprovalId) : null,
     resultPreview: task.result ? task.result.slice(0, 1_200) : null,
     resultPath: task.resultPath ?? null,
     error: task.error ? task.error.slice(0, 600) : null,
@@ -211,6 +211,17 @@ export function conversationsForProject(projectId: string, limit = 20): ProjectC
     });
   } catch {
     return [];
+  }
+}
+
+/** The id of an approval that is decided on a card, and of no other. */
+function cardApprovalId(approvalId: string | undefined): string | null {
+  if (!approvalId) return null;
+  try {
+    const row = approvalRegistry.get(approvalId);
+    return row && approvalRegistry.isFormalApprovalSurface(row) ? approvalId : null;
+  } catch {
+    return null;
   }
 }
 

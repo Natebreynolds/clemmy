@@ -41,7 +41,9 @@ export interface ProjectBinding {
 }
 
 function describeResource(resource: ProjectResource): string {
-  const verified = resource.verifiedAt ? `verified ${resource.verifiedAt.slice(0, 10)}` : 'not verified';
+  // No date: this text is part of the stable prefix, and a date would change
+  // it every time the same account is confirmed again.
+  const verified = resource.verifiedAt ? 'verified' : 'not verified';
   if (resource.kind === 'account') {
     return `- account for ${resource.toolkit}: ${resource.label || resource.accountId} (${resource.accountId}; ${verified})`;
   }

@@ -20,8 +20,20 @@ import {
   type ProjectAssignment, type ProjectRecord, type ProjectResource,
 } from '../projects/project-record.js';
 import { setSessionProject } from '../projects/session-project.js';
+import { getSession } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { textResult } from './shared.js';
+
+/** True when the session is one the owner is talking in. */
+function isConversation(sessionId: string): boolean {
+  try {
+    const row = getSession(sessionId);
+    if (!row) return true; // no record of it: not a run the host started
+    return row.kind === 'chat' && typeof row.metadata?.delegatedTaskId !== 'string';
+  } catch {
+    return false;
+  }
+}
 
 function json(value: unknown): ReturnType<typeof textResult> {
   return textResult(JSON.stringify(value, null, 1), { maxChars: 12_000 });
@@ -142,6 +154,12 @@ export function registerProjectRecordTools(server: McpServer): void {
     },
     async ({ project, name, purpose, goals, context, agents, accounts, resources, attach_conversation }) => {
       const sessionId = getToolOutputContext()?.sessionId;
+      // A project is organised with the owner, in a conversation. Work that
+      // runs unattended does not rewrite the project it was given.
+      if (sessionId && !isConversation(sessionId)) {
+        return json({ ok: false, code: 'not_in_conversation',
+          detail: 'Projects are changed only in a conversation with the owner. Nothing was changed. Report what you think should change and why.' });
+      }
       const wanted = String(project ?? '').trim();
       let record: ProjectRecord;
       let created = false;

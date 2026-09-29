@@ -65,6 +65,8 @@ import { isPromiseShapedReply, judgeRunProgress } from '../runtime/harness/objec
 import { respondPreferHarness } from '../runtime/harness/respond-bridge.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { getAgentRecord } from '../agents/agent-record.js';
+import { getProject } from '../projects/project-record.js';
 import { completedItemIds, loadCapsule } from './continuation-capsule.js';
 import { markHandoffOwnerActive } from './handoff-store.js';
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
@@ -640,6 +642,7 @@ function delegatedSessionMetadata(task: BackgroundTaskRecord): Record<string, st
     delegatedTaskId: task.id,
     ...(delegation.agentId ? { agentId: delegation.agentId, agentIds: [delegation.agentId] } : {}),
     ...(delegation.agentId && delegation.agentName ? { agentName: delegation.agentName } : {}),
+    ...(delegation.agentId && delegation.agentCreatedAt ? { delegatedAgentCreatedAt: delegation.agentCreatedAt } : {}),
     ...(delegation.projectId ? { projectId: delegation.projectId, projectIds: [delegation.projectId] } : {}),
     ...(delegation.projectId && delegation.projectName ? { projectName: delegation.projectName } : {}),
     ...(task.originSessionId ? { delegatedFromSessionId: task.originSessionId } : {}),
@@ -714,10 +717,22 @@ function publishDelegatedTaskState(
         ...(detail.reason ? { reason: clean(detail.reason, 400) } : {}),
         ...(delegation.followsTaskId ? { followsTaskId: delegation.followsTaskId } : {}),
         ...(phase === 'needs_you' && task.pendingQuestion ? { question: clean(task.pendingQuestion, 400) } : {}),
-        ...(phase === 'needs_you' && task.pendingApprovalId ? { approvalId: task.pendingApprovalId } : {}),
+        ...(phase === 'needs_you' ? cardApprovalId(task.pendingApprovalId) : {}),
       },
     });
   } catch { /* the task record is the authority; the projection is best-effort */ }
+}
+
+/** The id of an approval that is decided on a card. One asked in the
+ * conversation's own words keeps its id to itself. */
+function cardApprovalId(approvalId: string | undefined): { approvalId?: string } {
+  if (!approvalId) return {};
+  try {
+    const row = approvalRegistry.get(approvalId);
+    return row && approvalRegistry.isFormalApprovalSurface(row) ? { approvalId } : {};
+  } catch {
+    return {};
+  }
 }
 
 function delegatedPhaseFor(type: BackgroundTaskOperationalType, task: BackgroundTaskRecord): DelegatedTaskPhase | null {
@@ -728,6 +743,8 @@ function delegatedPhaseFor(type: BackgroundTaskOperationalType, task: Background
   }
   if (type === 'background_task_finished') {
     if (task.status === 'done') return 'finished';
+    // Cut off by a restart is not a failure: the task resumes in place.
+    if (task.status === 'interrupted') return 'parked';
     return task.status === 'aborted' ? 'stopped' : 'failed';
   }
   return null;
@@ -1479,15 +1496,40 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
 }
 
 /** Empty for a task nobody delegated, so its prompt is what it always was. */
+function delegatedAgentStillSaved(delegation: BackgroundTaskDelegation): boolean {
+  if (!delegation.agentId) return false;
+  try {
+    const agent = getAgentRecord(delegation.agentId);
+    return Boolean(agent) && !(delegation.agentCreatedAt && agent!.createdAt && delegation.agentCreatedAt !== agent!.createdAt);
+  } catch {
+    return false;
+  }
+}
+
+function delegatedProjectStillActive(delegation: BackgroundTaskDelegation): boolean {
+  if (!delegation.projectId) return false;
+  try {
+    return getProject(delegation.projectId)?.status === 'active';
+  } catch {
+    return false;
+  }
+}
+
 function renderDelegationBlock(task: BackgroundTaskRecord): string {
   const delegation = task.delegation;
   if (!delegation || (!delegation.agentId && !delegation.projectId)) return '';
   return [
     '## Delegated Task',
     delegation.agentName
-      ? `Clem delegated this task to you, ${delegation.agentName}. Your standing instructions are above; this task is one bounded piece of work, not a conversation.`
+      ? delegatedAgentStillSaved(delegation)
+        ? `Clem delegated this task to you, ${delegation.agentName}. Your standing instructions are above; this task is one bounded piece of work, not a conversation.`
+        : `This task was delegated to ${delegation.agentName}, an agent that is no longer saved, so its standing instructions are not above. Do the task as Clem and say in your report that ${delegation.agentName} was not available.`
       : 'Clem delegated this task.',
-    delegation.projectName ? `It belongs to the project ${delegation.projectName}, whose context is above.` : '',
+    delegation.projectName
+      ? delegatedProjectStillActive(delegation)
+        ? `It belongs to the project ${delegation.projectName}, whose context is above.`
+        : `It belongs to the project ${delegation.projectName}, which has been put away, so its context is not above. Say so in your report.`
+      : '',
     delegation.artifactDestination ? `Put the result here: ${delegation.artifactDestination}` : '',
     delegation.followsTaskId
       ? `This follows task ${delegation.followsTaskId}, which you finished. The owner has corrected it. Start from what that task produced; do not redo what the correction leaves standing, and do not repeat anything it sent or wrote elsewhere.`
@@ -2139,7 +2181,12 @@ export function reviseBackgroundTaskContract(
     } catch { /* task revision remains canonical if approval cleanup fails */ }
   }
 
-  publishDelegatedTaskState(updated, 'revised', { instruction, evidencePolicy });
+  // A correction that stopped the task instead of reaching it is said as that.
+  if (updated.status === 'blocked' && (updated.undeliveredContractRevisions ?? 0) >= UNDELIVERED_CONTRACT_REVISION_LIMIT) {
+    publishDelegatedTaskState(updated, 'parked', { instruction, evidencePolicy, reason: updated.error });
+  } else {
+    publishDelegatedTaskState(updated, 'revised', { instruction, evidencePolicy });
+  }
   // Pre-register a pending task's trace so the revision is visible immediately.
   try {
     ensureDelegatedRunSession(updated);

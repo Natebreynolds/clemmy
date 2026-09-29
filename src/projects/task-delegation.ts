@@ -83,6 +83,10 @@ export async function resolveTaskDelegation(
   const namedAgent = String(request.agent ?? '').trim();
   let agentId: string | null = null;
   let assignedBy: BackgroundTaskDelegation['assignedBy'] = 'clem';
+  // The agent came from the conversation rather than from the request.
+  let inherited = false;
+  // The conversation's own agent cannot take the task in this project.
+  let ownChoiceSetAside = false;
   if (namedAgent) {
     const binding = resolveAgentBinding(namedAgent);
     if (!binding) {
@@ -94,6 +98,7 @@ export async function resolveTaskDelegation(
     const current = sessionAgentState(metadata);
     if (current.agentId && getAgentRecord(current.agentId)) {
       agentId = current.agentId;
+      inherited = true;
       assignedBy = metadata?.agentSetBy === 'clem' ? 'clem' : 'owner';
     }
   }
@@ -104,6 +109,8 @@ export async function resolveTaskDelegation(
     // goes to the project without it rather than being refused.
     if (!namedAgent) {
       agentId = null;
+      inherited = false;
+      ownChoiceSetAside = true;
     } else {
       return { kind: 'refuse', reason: `${name} is not assigned to the project ${project.name}, so no task started. `
         + `Assigned to it: ${assignedNames(project)}. Assign ${name} with project_save, delegate to someone assigned, `
@@ -111,7 +118,9 @@ export async function resolveTaskDelegation(
     }
   }
 
-  if (project && !agentId) {
+  // The router suggests only when nobody was chosen. A conversation already
+  // in an agent is a choice, and it is not replaced by a suggestion.
+  if (project && !agentId && !ownChoiceSetAside) {
     const candidates = listAssignments(project.id).flatMap((row) => {
       const agent = getAgentRecord(row.agentId);
       if (!agent) return [];
@@ -139,11 +148,13 @@ export async function resolveTaskDelegation(
   if (agent) {
     // One bounded piece of work: the model the agent asks for, otherwise the
     // owner's helper role. Both go through the owner's own model settings.
+    // A task started from a conversation already in the agent keeps the model
+    // such a task has always run on, unless the agent asks for its own.
     model = agent.model
       ? agentModelIsRole(agent.model)
         ? resolveRoleModel(agent.model.trim().toLowerCase() as ModelRole).modelId
         : agent.model
-      : resolveRoleModel('worker').modelId;
+      : inherited ? undefined : resolveRoleModel('worker').modelId;
   }
   const destination = String(request.artifactDestination ?? '').replace(/\s+/g, ' ').trim().slice(0, 400);
   return {

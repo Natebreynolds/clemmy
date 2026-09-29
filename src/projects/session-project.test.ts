@@ -103,7 +103,8 @@ test('one agent in two projects gets each project\'s context and never the other
   const inHiring = resolveProjectBinding(hiring.id, { agentId: helper.id })!;
   assert.match(inSales.context, /## Project: Sales Fixture/);
   assert.match(inSales.context, /open opportunity/);
-  assert.match(inSales.context, /acct-sales-east; verified 2026-09-29/);
+  assert.match(inSales.context, /acct-sales-east; verified\)/);
+  assert.doesNotMatch(inSales.context, /20\d\d-\d\d-\d\d/, 'no date in the stable prefix: confirming the same account again must not change it');
   assert.match(inSales.context, /### Your part in this project\nResponsible for: Prepare the briefing\./);
   assert.match(inSales.context, /Exclude unqualified leads\./);
   for (const foreign of [/hiring manager/, /acct-people-ops/, /Summarise applicants/, /candidate/, /Hiring Fixture/]) {

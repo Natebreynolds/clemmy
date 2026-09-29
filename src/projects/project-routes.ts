@@ -275,7 +275,7 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     const input = body(req);
     const policy = input.evidencePolicy === 'preserve' || input.evidencePolicy === 'invalidate' ? input.evidencePolicy : 'revalidate';
     const corrected = correctDelegatedTask(taskId, {
-      instruction: typeof input.instruction === 'string' ? input.instruction : '', evidencePolicy: policy,
+      instruction: typeof input.instruction === 'string' ? input.instruction : '', evidencePolicy: policy, by: 'owner',
     });
     if (corrected.kind === 'refused') {
       const status = corrected.reason === 'instruction_required' ? 400 : corrected.reason === 'task_not_found' ? 404 : 409;
@@ -286,7 +286,7 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
       try {
         updateLinkedFocusAction(corrected.task.id, { status: 'running', note: `Course-corrected to request v${corrected.task.contractVersion ?? 1}.` });
       } catch { /* the revision is on the task; the focus note is a convenience */ }
-      res.json({ task: delegatedTaskById(taskId), applied: 'revised' });
+      res.json({ task: delegatedTaskById(taskId), applied: 'revised', resumed: corrected.resumed });
       return;
     }
     res.json({ task: delegatedTaskById(corrected.task.id), applied: 'followed', follows: delegatedTaskById(taskId) });

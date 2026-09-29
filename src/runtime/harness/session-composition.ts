@@ -70,7 +70,12 @@ function agentFromMetadata(metadata: Record<string, unknown> | null | undefined)
   const id = typeof metadata?.agentId === 'string' ? metadata.agentId.trim() : '';
   if (!id) return null;
   try {
-    return resolveAgentBinding(id);
+    const binding = resolveAgentBinding(id);
+    // A delegated task was given to one agent. A different agent saved later
+    // under the same name is not the one it was given to.
+    const given = typeof metadata?.delegatedAgentCreatedAt === 'string' ? metadata.delegatedAgentCreatedAt.trim() : '';
+    if (binding && given && binding.agent.createdAt && binding.agent.createdAt !== given) return null;
+    return binding;
   } catch {
     return null;
   }

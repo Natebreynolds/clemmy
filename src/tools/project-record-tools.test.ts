@@ -124,3 +124,13 @@ test('what cannot be found or made changes nothing and says what can be', async 
   const unknown = await call('project_get', { project: 'No Such Project' });
   assert.equal(unknown.code, 'project_not_found');
 });
+
+test('work that runs unattended does not reorganise the project it was given', async () => {
+  const before = await call('project_get', { project: 'Weekly Sales' });
+  const run = createSession({ id: 'background:bg-unattended-0b0b0b', kind: 'execution', metadata: { delegatedTaskId: 'bg-unattended-0b0b0b' } });
+  const refused = await call('project_save', { project: 'Weekly Sales', name: null, context: 'Rewritten by the run.',
+    agents: [{ agent: 'Sales Assistant', share_methods: true }, { agent: 'Made Up', create_if_missing: { handles: 'Anything.' } }] }, run.id);
+  assert.deepEqual([refused.ok, refused.code], [false, 'not_in_conversation']);
+  assert.deepEqual(await call('project_get', { project: 'Weekly Sales' }), before);
+  assert.equal(findAgentRecord('Made Up'), null);
+});

@@ -269,7 +269,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       let task: BackgroundTaskRecord | null;
       if (getBackgroundTask(id)?.delegation) {
         const runContext = harnessRunContextStorage.getStore();
-        const corrected = correctDelegatedTask(id, { instruction, evidencePolicy,
+        const corrected = correctDelegatedTask(id, { instruction, evidencePolicy, by: 'clem',
           ...(typeof runContext?.sourceUserSeq === 'number' ? { sourceUserSeq: runContext.sourceUserSeq } : {}) });
         if (corrected.kind === 'followed') {
           const owner = corrected.task.delegation?.agentName ?? 'the same owner';
@@ -282,7 +282,10 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           return textResult(JSON.stringify({ ok: false, code: corrected.reason,
             detail: corrected.reason === 'owner_unavailable'
               ? 'The agent that did this work is no longer saved, so the correction was not handed to anyone. Ask the owner who should take it.'
-              : corrected.reason === 'stopping' ? 'The task is being stopped; correct it after it has stopped.' : 'The correction was not applied.' }));
+              : corrected.reason === 'stopping' ? 'The task is being stopped; correct it after it has stopped.'
+              : corrected.reason === 'resume_first'
+                ? 'The task stopped before it finished, and only the owner resumes stopped work. Nothing was changed and nothing new was started. Tell the owner the task did not finish and that they can correct it from its card, which resumes it in place with the correction. Do not do the work yourself.'
+                : 'The correction was not applied.' }));
         }
         task = corrected.task;
       } else {
