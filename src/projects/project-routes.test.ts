@@ -17,6 +17,7 @@ const projects = await import('./project-record.js');
 const accounts = await import('./connected-accounts.js');
 const tasks = await import('../execution/background-tasks.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
+const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
 const { createAgentRecord } = await import('../agents/agent-record.js');
 const { setSessionAgent } = await import('../agents/session-agent.js');
 const { createSession, getSession, listEvents, closeEventLog } = await import('../runtime/harness/eventlog.js');
@@ -90,6 +91,14 @@ test('a project made on the desktop is the same project on the phone, with the s
   const invented = await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'account', toolkit: 'ledgerscope', accountId: 'conn-made-up' });
   assert.equal(invented.body.error, 'ACCOUNT_CHOICE_REQUIRED', 'an account that is not connected is never bound');
   assert.equal((await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'account', toolkit: 'ledgerscope', accountId: 'conn-east' })).status, 200);
+  const bound = (await phone('get', `/api/project-records/${id}`)).body.overview.resources;
+  assert.deepEqual(bound.map((row: any) => [row.kind, row.toolkit, typeof row.appName === 'string' && row.appName.length > 0]), [['account', 'ledgerscope', true]]);
+  accounts._setConnectedAppsForTests(async () => [{ toolkit: 'ledgerscope', name: 'LedgerScope', accounts: [{ accountId: 'conn-east', label: 'East ledger' }] }]);
+  assert.deepEqual((await phone('get', '/api/project-records-connected-apps')).body,
+    (await desktop('get', '/api/console/project-records-connected-apps')).body);
+  assert.deepEqual((await phone('get', '/api/project-records-connected-apps')).body.apps.map((row: any) => [row.toolkit, row.name, row.accounts.length]),
+    [['ledgerscope', 'LedgerScope', 1]]);
+  accounts._setConnectedAppsForTests(null);
   const rival = await phone('post', `/api/project-records/${id}/resources`, { kind: 'account', toolkit: 'ledgerscope', accountId: 'conn-west' });
   assert.deepEqual([rival.status, rival.body.error, rival.body.bound], [409, 'CONFLICTING_ACCOUNT', { accountId: 'conn-east', label: 'East ledger' }]);
 
@@ -140,8 +149,20 @@ test('a project made on the desktop is the same project on the phone, with the s
   const approval = approvals.register({ sessionId: task.runSessionId, subject: 'Save the draft to the shared folder', tool: 'fixture_write', args: { path: 'draft.md' } });
   assert.deepEqual((await phone('get', `/api/project-records/${id}`)).body.overview.decisions.map((row: any) => [row.kind, row.approvalId, row.taskId]),
     [['approval', approval.approvalId, task.id]]);
+  assert.equal((await phone('get', `/api/project-records/${id}`)).body.overview.decisions[0].formal, true, 'decided on a card');
   approvals.resolve(approval.approvalId, 'rejected', 'mobile-inbox');
   assert.equal((await desktop('get', `/api/console/project-records/${id}`)).body.overview.decisions.length, 0, 'declined on the phone, gone on the desktop');
+
+  // One asked in the conversation's own words is answered there: the project
+  // shows the question and where it was asked, and never the id a card decides.
+  const replyTo = { type: 'discord_channel' as const, channelId: 'route-consent' };
+  const asked = approvals.register({ sessionId: chat.id, subject: 'Send the briefing', tool: 'fixture_send', args: { to: 'owner@example.com' },
+    presentation: { version: 1, kind: 'autonomous_send_consent', question: 'Send the briefing to owner@example.com?', actionLabel: 'email',
+      target: 'owner@example.com', subject: 'Briefing', bodyPreview: null, resultUrl: null, sourceUserSeq: 1, originReplyTarget: replyTo,
+      originReplyTargetDigest: exactOriginDeliveryTargetDigest(replyTo), conversationKey: 'discord:route-consent', audienceUserId: 'owner' } });
+  assert.deepEqual((await phone('get', `/api/project-records/${id}`)).body.overview.decisions.map((row: any) => [row.kind, row.formal, row.approvalId, row.sessionId, row.detail]),
+    [['approval', false, null, chat.id, 'Send the briefing to owner@example.com?']]);
+  approvals.resolve(asked.approvalId, 'cancelled_by_system', 'fixture');
 
   // Stopped from the desktop, resumed from the phone, in place.
   const stopped = (await desktop('post', `/api/console/delegated-tasks/${task.id}/stop`)).body.task;

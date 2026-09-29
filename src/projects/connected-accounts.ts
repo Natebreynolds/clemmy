@@ -7,7 +7,7 @@
  * Nothing is read from memory: a remembered account that is no longer
  * connected is not an account.
  */
-import { listConnectedToolkits } from '../integrations/composio/client.js';
+import { displayNameFor, listConnectedToolkits } from '../integrations/composio/client.js';
 import { accountChoiceLabels } from '../tools/source-account-routing.js';
 
 export interface ConnectedAccount {
@@ -21,6 +21,45 @@ export interface ConnectedAccount {
 }
 
 export type ConnectedAccountDirectory = (toolkit: string) => Promise<ConnectedAccount[]>;
+
+export interface ConnectedApp {
+  toolkit: string;
+  /** The app's name as a person writes it. */
+  name: string;
+  accounts: Array<{ accountId: string; label: string }>;
+}
+
+/** How a person writes an app's name. Falls back to the toolkit's own. */
+export function connectedAppName(toolkit: string): string {
+  const wanted = toolkit.trim();
+  if (!wanted) return '';
+  try {
+    return displayNameFor(wanted.toLowerCase()) || wanted;
+  } catch {
+    return wanted;
+  }
+}
+
+let appsForTests: (() => Promise<ConnectedApp[]>) | null = null;
+
+/** Test seam. Null restores the live list. */
+export function _setConnectedAppsForTests(list: (() => Promise<ConnectedApp[]>) | null): void {
+  appsForTests = list;
+}
+
+/** Every app that has an account connected right now, with its accounts. */
+export async function connectedApps(): Promise<ConnectedApp[]> {
+  if (appsForTests) return appsForTests();
+  const active = (await listConnectedToolkits({ requireFresh: true }))
+    .filter((row) => /^active$/i.test(row.status.trim()));
+  const toolkits = [...new Set(active.map((row) => row.slug.trim().toLowerCase()).filter(Boolean))].sort();
+  const apps: ConnectedApp[] = [];
+  for (const toolkit of toolkits) {
+    const accounts = await connectedAccountsFor(toolkit);
+    apps.push({ toolkit, name: connectedAppName(toolkit), accounts: accounts.map((row) => ({ accountId: row.accountId, label: row.label })) });
+  }
+  return apps;
+}
 
 let directoryForTests: ConnectedAccountDirectory | null = null;
 

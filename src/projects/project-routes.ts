@@ -16,7 +16,7 @@ import {
 } from '../execution/background-tasks.js';
 import { correctDelegatedTask } from './task-follow-up.js';
 import { updateLinkedFocusAction } from '../memory/focus.js';
-import { chooseConnectedAccount, connectedAccountsFor } from './connected-accounts.js';
+import { chooseConnectedAccount, connectedAccountsFor, connectedApps } from './connected-accounts.js';
 import {
   archiveProject, createProject, getProject, removeAssignment, removeResource, restoreProject,
   saveAssignment, saveResource, updateProject, type ProjectOrigin, type ProjectResourceKind,
@@ -92,6 +92,12 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
   add('get', `${mount.projects}-labels`, (req, res) => {
     const ids = String(req.query.sessions ?? '').split(',');
     res.json({ labels: projectLabelsForSessions(ids) });
+  });
+
+  // The apps that have an account connected right now, for choosing one to
+  // bind. Read from the live connection list each time.
+  add('get', `${mount.projects}-connected-apps`, async (_req, res) => {
+    res.json({ apps: await connectedApps() });
   });
 
   add('post', mount.projects, (req, res) => {

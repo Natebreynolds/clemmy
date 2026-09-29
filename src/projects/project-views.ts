@@ -12,6 +12,7 @@ import {
   getBackgroundTask, listBackgroundTasks, type BackgroundTaskRecord,
 } from '../execution/background-tasks.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { connectedAppName } from './connected-accounts.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import {
   getProject, listAssignments, listAssignmentsForAgent, listProjects, listResources,
@@ -213,6 +214,9 @@ export function conversationsForProject(projectId: string, limit = 20): ProjectC
 
 export interface ProjectDecisionView {
   kind: 'question' | 'approval';
+  /** For an approval: whether it is decided on a card. One that was asked in
+   * the conversation's own words is answered there, never from a card. */
+  formal: boolean;
   /** Where answering it happens. */
   taskId: string | null;
   sessionId: string;
@@ -236,7 +240,7 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
     sessions.set(task.runSessionId, { taskId: task.id, owner, title: task.title });
     if (task.status === 'awaiting_input' && task.pendingQuestionId && task.pendingQuestion) {
       decisions.push({ kind: 'question', taskId: task.id, sessionId: task.originSessionId ?? task.runSessionId,
-        approvalId: null, questionId: task.pendingQuestionId, title: task.title,
+        formal: true, approvalId: null, questionId: task.pendingQuestionId, title: task.title,
         detail: task.pendingQuestion.slice(0, 600), owner, askedAt: task.updatedAt });
     }
   }
@@ -248,8 +252,14 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
     for (const approval of approvalRegistry.listPending({ status: 'pending' })) {
       const from = sessions.get(approval.sessionId);
       if (!from || approvalRegistry.isExpired(approval)) continue;
-      decisions.push({ kind: 'approval', taskId: from.taskId, sessionId: approval.sessionId, approvalId: approval.approvalId,
-        questionId: null, title: from.title, detail: approval.subject.slice(0, 600), owner: from.owner, askedAt: approval.requestedAt });
+      // The registry says what a pending row may show: a card's id, or, for
+      // one asked in the conversation's own words, only the question.
+      const shown = approvalRegistry.projectPendingApprovalUserDependency(approval);
+      decisions.push(shown.kind === 'approval'
+        ? { kind: 'approval', formal: true, taskId: from.taskId, sessionId: approval.sessionId, approvalId: shown.approvalId,
+          questionId: null, title: from.title, detail: approval.subject.slice(0, 600), owner: from.owner, askedAt: approval.requestedAt }
+        : { kind: 'approval', formal: false, taskId: from.taskId, sessionId: approval.sessionId, approvalId: null,
+          questionId: null, title: from.title, detail: shown.question.slice(0, 600), owner: from.owner, askedAt: approval.requestedAt });
     }
   } catch { /* the registry is read elsewhere too; a project view never fails on it */ }
   return decisions.sort((a, b) => b.askedAt.localeCompare(a.askedAt)).slice(0, limit);
@@ -286,10 +296,15 @@ export function projectSummaries(options: { includeArchived?: boolean } = {}): P
   return listProjects(options).map(projectSummary);
 }
 
+export type ProjectResourceView = ProjectResource & {
+  /** For an account: the app's name as a person writes it. */
+  appName: string | null;
+};
+
 export interface ProjectOverviewView {
   project: ProjectRecord;
   agents: AssignmentView[];
-  resources: ProjectResource[];
+  resources: ProjectResourceView[];
   tasks: DelegatedTaskView[];
   conversations: ProjectConversationView[];
   decisions: ProjectDecisionView[];
@@ -301,7 +316,9 @@ export function projectOverview(projectId: string): ProjectOverviewView | null {
   return {
     project,
     agents: listAssignments(project.id).map(assignmentView),
-    resources: listResources(project.id),
+    resources: listResources(project.id).map((resource) => ({
+      ...resource, appName: resource.toolkit ? connectedAppName(resource.toolkit) : null,
+    })),
     tasks: delegatedTasksForProject(project.id),
     conversations: conversationsForProject(project.id),
     decisions: project.status === 'active' ? decisionsForProject(project.id) : [],
