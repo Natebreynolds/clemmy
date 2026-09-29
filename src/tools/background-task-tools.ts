@@ -33,6 +33,7 @@ import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { publicConversationPreambleData } from '../runtime/harness/public-presentation.js';
 import { textResult } from './shared.js';
 import { resolveTaskDelegation } from '../projects/task-delegation.js';
+import { correctDelegatedTask } from '../projects/task-follow-up.js';
 
 /** Split an agreed plan (markdown bullets / numbered lines) into discrete next
  *  actions for the goal contract's step list. Best-effort + bounded. */
@@ -262,10 +263,31 @@ export function registerBackgroundTaskTools(server: McpServer): void {
     },
     async ({ id, instruction, evidence_policy }) => {
       const evidencePolicy = evidence_policy ?? 'revalidate';
-      const task = reviseBackgroundTaskContract(id, {
-        instruction,
-        evidencePolicy,
-      });
+      // Work that was delegated is corrected by its owner. If it has already
+      // ended, the correction goes to the same owner as a task that follows
+      // it, instead of being redone by whoever is in the conversation.
+      let task: BackgroundTaskRecord | null;
+      if (getBackgroundTask(id)?.delegation) {
+        const runContext = harnessRunContextStorage.getStore();
+        const corrected = correctDelegatedTask(id, { instruction, evidencePolicy,
+          ...(typeof runContext?.sourceUserSeq === 'number' ? { sourceUserSeq: runContext.sourceUserSeq } : {}) });
+        if (corrected.kind === 'followed') {
+          const owner = corrected.task.delegation?.agentName ?? 'the same owner';
+          return textResult(
+            `Task ${id} had already finished, so the correction was given to ${owner} as task ${corrected.task.id}, which follows it and starts from what it produced. `
+            + 'It reports back here when it is done. Tell the owner that, and do not do the corrected work yourself.',
+          );
+        }
+        if (corrected.kind === 'refused') {
+          return textResult(JSON.stringify({ ok: false, code: corrected.reason,
+            detail: corrected.reason === 'owner_unavailable'
+              ? 'The agent that did this work is no longer saved, so the correction was not handed to anyone. Ask the owner who should take it.'
+              : corrected.reason === 'stopping' ? 'The task is being stopped; correct it after it has stopped.' : 'The correction was not applied.' }));
+        }
+        task = corrected.task;
+      } else {
+        task = reviseBackgroundTaskContract(id, { instruction, evidencePolicy });
+      }
       if (!task) {
         return textResult(`Task ${id} was not found or is already terminal, so its contract was not changed.`);
       }

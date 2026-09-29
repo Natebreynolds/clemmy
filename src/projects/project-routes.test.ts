@@ -117,7 +117,9 @@ test('a project made on the desktop is the same project on the phone, with the s
 
   // Steered from the phone: the same task, the next version, announced in the conversation.
   assert.equal((await phone('post', `/api/delegated-tasks/${task.id}/steer`, { instruction: 'no' })).status, 400);
-  const steered = (await phone('post', `/api/delegated-tasks/${task.id}/steer`, { instruction: 'Focus on this week and exclude unqualified leads.' })).body.task;
+  const steering = await phone('post', `/api/delegated-tasks/${task.id}/steer`, { instruction: 'Focus on this week and exclude unqualified leads.' });
+  assert.equal(steering.body.applied, 'revised');
+  const steered = steering.body.task;
   assert.deepEqual([steered.taskId, steered.requestVersion, steered.correctionPending, steered.revisions.at(-1).instruction],
     [task.id, 2, true, 'Focus on this week and exclude unqualified leads.']);
   assert.ok(listEvents(chat.id, { types: ['delegated_task_state'] }).some((event) => event.data.phase === 'revised' && event.data.contractVersion === 2));

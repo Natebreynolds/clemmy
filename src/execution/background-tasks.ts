@@ -416,6 +416,9 @@ export interface BackgroundTaskDelegation {
   assignedBy: 'owner' | 'clem' | 'router';
   /** The accepted request that asked for the work. */
   originSourceUserSeq?: number;
+  /** The finished task this one follows, when the owner corrected work that
+   * had already ended. */
+  followsTaskId?: string;
 }
 
 export interface BackgroundTaskContractRevision {
@@ -709,6 +712,7 @@ function publishDelegatedTaskState(
         ...(detail.instruction ? { instruction: clean(detail.instruction, 400) } : {}),
         ...(detail.evidencePolicy ? { evidencePolicy: detail.evidencePolicy } : {}),
         ...(detail.reason ? { reason: clean(detail.reason, 400) } : {}),
+        ...(delegation.followsTaskId ? { followsTaskId: delegation.followsTaskId } : {}),
         ...(phase === 'needs_you' && task.pendingQuestion ? { question: clean(task.pendingQuestion, 400) } : {}),
         ...(phase === 'needs_you' && task.pendingApprovalId ? { approvalId: task.pendingApprovalId } : {}),
       },
@@ -1485,6 +1489,9 @@ function renderDelegationBlock(task: BackgroundTaskRecord): string {
       : 'Clem delegated this task.',
     delegation.projectName ? `It belongs to the project ${delegation.projectName}, whose context is above.` : '',
     delegation.artifactDestination ? `Put the result here: ${delegation.artifactDestination}` : '',
+    delegation.followsTaskId
+      ? `This follows task ${delegation.followsTaskId}, which you finished. The owner has corrected it. Start from what that task produced; do not redo what the correction leaves standing, and do not repeat anything it sent or wrote elsewhere.`
+      : '',
     'Report what you did and what you found with its evidence. Clem checks the result before it is reported as done: '
       + 'saying it is finished does not make it so. If the owner corrects the task while you work, the correction arrives as a contract revision below and overrides what it conflicts with.',
   ].filter(Boolean).join('\n');

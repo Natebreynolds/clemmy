@@ -12,9 +12,9 @@
 import type { Request, Response } from 'express';
 import { getAgentRecord } from '../agents/agent-record.js';
 import {
-  cancelBackgroundTask, getBackgroundTask, queueBackgroundTaskInputResolution,
-  resumeBackgroundTask, reviseBackgroundTaskContract,
+  cancelBackgroundTask, getBackgroundTask, queueBackgroundTaskInputResolution, resumeBackgroundTask,
 } from '../execution/background-tasks.js';
+import { correctDelegatedTask } from './task-follow-up.js';
 import { updateLinkedFocusAction } from '../memory/focus.js';
 import { chooseConnectedAccount, connectedAccountsFor } from './connected-accounts.js';
 import {
@@ -259,21 +259,30 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     res.json({ task, generatedAt: new Date().toISOString() });
   });
 
-  // A correction revises the task that is already running; it never starts
-  // a second one. It reaches the agent at its next model boundary.
+  // A correction revises the task while it is open. Once the task has ended
+  // the correction becomes a task that follows it, for the same owner in the
+  // same project; the answer says which happened.
   add('post', `${mount.tasks}/:taskId/steer`, (req, res) => {
     const taskId = param(req, 'taskId');
     if (!delegatedTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
     const input = body(req);
-    const instruction = typeof input.instruction === 'string' ? input.instruction.trim() : '';
-    if (instruction.length < 4) { res.status(400).json({ error: 'INSTRUCTION_REQUIRED' }); return; }
     const policy = input.evidencePolicy === 'preserve' || input.evidencePolicy === 'invalidate' ? input.evidencePolicy : 'revalidate';
-    const revised = reviseBackgroundTaskContract(taskId, { instruction, evidencePolicy: policy });
-    if (!revised) { res.status(409).json({ error: 'TASK_NOT_OPEN', task: delegatedTaskById(taskId) }); return; }
-    try {
-      updateLinkedFocusAction(revised.id, { status: 'running', note: `Course-corrected to request v${revised.contractVersion ?? 1}.` });
-    } catch { /* the revision is on the task; the focus note is a convenience */ }
-    res.json({ task: delegatedTaskById(taskId) });
+    const corrected = correctDelegatedTask(taskId, {
+      instruction: typeof input.instruction === 'string' ? input.instruction : '', evidencePolicy: policy,
+    });
+    if (corrected.kind === 'refused') {
+      const status = corrected.reason === 'instruction_required' ? 400 : corrected.reason === 'task_not_found' ? 404 : 409;
+      res.status(status).json({ error: corrected.reason.toUpperCase(), task: delegatedTaskById(taskId) });
+      return;
+    }
+    if (corrected.kind === 'revised') {
+      try {
+        updateLinkedFocusAction(corrected.task.id, { status: 'running', note: `Course-corrected to request v${corrected.task.contractVersion ?? 1}.` });
+      } catch { /* the revision is on the task; the focus note is a convenience */ }
+      res.json({ task: delegatedTaskById(taskId), applied: 'revised' });
+      return;
+    }
+    res.json({ task: delegatedTaskById(corrected.task.id), applied: 'followed', follows: delegatedTaskById(taskId) });
   });
 
   add('post', `${mount.tasks}/:taskId/stop`, (req, res) => {

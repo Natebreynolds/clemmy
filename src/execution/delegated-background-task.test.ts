@@ -186,3 +186,47 @@ test('a correction revises the same task, is announced with its version, and a s
   assert.deepEqual(Object.keys((projected?.data ?? {}) as Record<string, unknown>).sort(),
     ['agentId', 'agentName', 'contractVersion', 'evidencePolicy', 'instruction', 'phase', 'projectId', 'projectName', 'status', 'taskId', 'title']);
 });
+
+test('a correction to work that has ended goes to the same owner as a task that follows it', async () => {
+  for (const existing of tasks.listBackgroundTasks({ includeArchived: true })) tasks.archiveBackgroundTask(existing.id);
+  const { correctDelegatedTask } = await import('../projects/task-follow-up.js');
+  const origin = createSession({ id: 'follow-origin', kind: 'chat' });
+  const first = tasks.createBackgroundTask({ title: 'Draft the briefing', prompt: 'Objective: Draft the briefing from the ledger', originSessionId: origin.id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: sales.id, projectName: sales.name, assignedBy: 'clem', originSourceUserSeq: 3 } });
+
+  // Open: the same task, the next version.
+  tasks.markBackgroundTaskRunning(first.id);
+  const revised = correctDelegatedTask(first.id, { instruction: 'Use whole numbers only.' });
+  assert.equal(revised.kind, 'revised');
+  assert.equal(revised.kind === 'revised' && revised.task.id, first.id);
+  assert.equal(revised.kind === 'revised' && revised.task.contractVersion, 2);
+  assert.equal(tasks.listBackgroundTasks({ includeArchived: false }).filter((task) => task.originSessionId === origin.id).length, 1);
+
+  // Ended: a task that follows it, for the same agent in the same project.
+  assert.equal(tasks.markBackgroundTaskDone(first.id, 'Draft saved. Total 367,000 across 26 records.')?.status, 'done');
+  const followed = correctDelegatedTask(first.id, { instruction: 'Focus on this week and exclude unqualified leads.', sourceUserSeq: 9 });
+  assert.equal(followed.kind, 'followed');
+  if (followed.kind !== 'followed') return;
+  assert.notEqual(followed.task.id, first.id);
+  assert.deepEqual([followed.task.delegation?.agentId, followed.task.delegation?.projectId, followed.task.delegation?.followsTaskId,
+    followed.task.delegation?.assignedBy, followed.task.delegation?.originSourceUserSeq, followed.task.originSessionId],
+    [analyst.id, sales.id, first.id, 'owner', 9, origin.id]);
+  assert.match(followed.task.prompt, /Correction: Focus on this week and exclude unqualified leads\./);
+  assert.match(followed.task.prompt, /Correction v2: Use whole numbers only\./, 'what the first task was already told still stands');
+  assert.match(followed.task.prompt, /Its report began:\nDraft saved\. Total 367,000/);
+  assert.equal(tasks.getBackgroundTask(first.id)?.status, 'done', 'the finished task is not reopened or rewritten');
+  assert.equal(tasks.getBackgroundTask(first.id)?.contractVersion, 2);
+  assert.equal(getSession(followed.task.runSessionId)?.metadata?.agentId, analyst.id);
+
+  let prompt = '';
+  const assistant = { getRuntime: () => ({}) as never,
+    async respond(request: { message: string; sessionId: string }) { prompt = request.message; return { text: 'Done. Corrected draft saved.', sessionId: request.sessionId, stoppedReason: 'success' as const }; } };
+  assert.equal(await tasks.processBackgroundTasks(assistant as never, 1), 1);
+  assert.match(prompt, new RegExp(`This follows task ${first.id}, which you finished\\. The owner has corrected it\\.`));
+  assert.ok(states(origin.id).some((row) => row.taskId === followed.task.id && row.followsTaskId === first.id && row.phase === 'dispatched'));
+
+  assert.deepEqual(correctDelegatedTask(first.id, { instruction: 'no' }), { kind: 'refused', reason: 'instruction_required' });
+  assert.deepEqual(correctDelegatedTask('bg-none', { instruction: 'anything at all' }), { kind: 'refused', reason: 'task_not_found' });
+  const plain = tasks.createBackgroundTask({ title: 'Plain', prompt: 'plain', source: 'desktop' });
+  assert.deepEqual(correctDelegatedTask(plain.id, { instruction: 'anything at all' }), { kind: 'refused', reason: 'not_delegated' });
+});

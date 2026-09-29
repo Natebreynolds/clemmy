@@ -734,7 +734,7 @@ function publicDelegatedTaskState(data: Record<string, unknown>): Record<string,
   };
   return {
     ...selected(data, ['taskId', 'phase', 'status', 'contractVersion', 'agentId', 'projectId',
-      'sourceUserSeq', 'evidencePolicy', 'approvalId']),
+      'sourceUserSeq', 'evidencePolicy', 'approvalId', 'followsTaskId']),
     ...text('title', 200),
     ...text('agentName', 64),
     ...text('projectName', 80),

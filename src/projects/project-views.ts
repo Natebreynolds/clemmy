@@ -35,6 +35,8 @@ export interface DelegatedTaskView {
   /** A correction that has not reached the agent yet. */
   correctionPending: boolean;
   artifactDestination: string | null;
+  /** The finished task this one corrects, when it is a follow-up. */
+  followsTaskId: string | null;
   question: { id: string; text: string; options: string[] } | null;
   approvalId: string | null;
   /** The opening of the result, when there is one. The full text is the report. */
@@ -78,7 +80,6 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     queuedAt: revision.queuedAt,
     applied: Boolean(revision.appliedAt),
   }));
-  const open = !task.archived && !TERMINAL.has(task.status) && task.status !== 'cancelling';
   return {
     taskId: task.id,
     title: task.title,
@@ -94,6 +95,7 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     revisions,
     correctionPending: Boolean(task.pendingContractRevision),
     artifactDestination: delegation?.artifactDestination ?? null,
+    followsTaskId: delegation?.followsTaskId ?? null,
     question: task.status === 'awaiting_input' && task.pendingQuestionId && task.pendingQuestion
       ? { id: task.pendingQuestionId, text: task.pendingQuestion.slice(0, 2_000), options: (task.pendingQuestionOptions ?? []).slice(0, 8) }
       : null,
@@ -108,7 +110,9 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     completedAt: task.completedAt ?? null,
     updatedAt: task.updatedAt,
     controls: {
-      canSteer: open,
+      // A finished task can still be corrected: the correction becomes a
+      // task that follows it.
+      canSteer: !task.archived && task.status !== 'cancelling',
       canStop: !task.archived && !TERMINAL.has(task.status) && task.status !== 'cancelling',
       canResume: !task.archived && RESUMABLE.has(task.status),
       canAnswer: task.status === 'awaiting_input' && Boolean(task.pendingQuestionId),
