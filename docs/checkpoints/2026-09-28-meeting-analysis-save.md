@@ -14,7 +14,7 @@ An additional record recall-mulligw6-998540 began immediately afterward and stil
 
 ## Bounded framework correction
 
-Branch codex/meeting-analysis-save, worktree /Users/nathan.reynolds/clem-worktrees/meeting-analysis-save. New meeting_analysis_save tool validates structured analysis and requires an existing completed meeting with a transcript artifact. Destination is derived by the host, never supplied by the model. It uses the existing canonical analysis persistence and note-filing path, retaining the transcript and user-locked title. Exact retries preserve generatedAt for unchanged normalized content. Tool registered on local and MCP surfaces and shared registry; analyzer prompt for Recall and local recordings requests this operation instead of write_file.
+Branch codex/meeting-analysis-save, worktree ~/clem-worktrees/meeting-analysis-save. New meeting_analysis_save tool validates structured analysis and requires an existing completed meeting with a transcript artifact. Destination is derived by the host, never supplied by the model. It uses the existing canonical analysis persistence and note-filing path, retaining the transcript and user-locked title. Exact retries preserve generatedAt for unchanged normalized content. Tool registered on local and MCP surfaces and shared registry; analyzer prompt for Recall and local recordings requests this operation instead of write_file.
 
 Protected-state write_file restrictions remain intact. No credential changes, model launches, release/tag modifications, or hotpatch performed.
 
