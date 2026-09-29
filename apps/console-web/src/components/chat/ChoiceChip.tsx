@@ -35,6 +35,7 @@ export function ChoiceChip({
   rows,
   footer,
   className,
+  quietDefault,
 }: {
   icon: LucideIcon;
   /** What the chip says: the choice in force. */
@@ -48,6 +49,10 @@ export function ChoiceChip({
   rows: ChoiceRow[];
   footer?: ReactNode;
   className?: string;
+  /** While the plain default is in force, show the icon alone. The row beside
+   *  the composer holds several chips; one that only says "none" gives its
+   *  room to the ones that say something. Its name is still read out. */
+  quietDefault?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -112,7 +117,7 @@ export function ChoiceChip({
   }, [open, close]);
 
   return (
-    <div ref={rootRef} className={cn('relative min-w-0', className)}>
+    <div ref={rootRef} className={cn('relative shrink', quietDefault && !chosen ? 'shrink-0' : 'min-w-[6.25rem]', className)}>
       <button
         ref={chipRef}
         type="button"
@@ -121,11 +126,14 @@ export function ChoiceChip({
         aria-haspopup="dialog"
         aria-label={`${heading}: ${label}`}
         title={title}
-        className={cn(CHOICE_CHIP, 'max-w-full transition-colors hover:border-border-strong', !chosen && 'text-muted')}
+        className={cn(CHOICE_CHIP, 'w-full max-w-full transition-colors hover:border-border-strong', !chosen && 'text-muted')}
       >
         <Icon className={cn('h-3.5 w-3.5 shrink-0', chosen ? 'text-primary' : 'text-faint')} aria-hidden />
-        {/* Never narrower than a short name: a chip that shrinks to its icon says nothing. */}
-        <span className="min-w-[2.75rem] max-w-[150px] truncate text-left">{label}</span>
+        {/* The name gives way before the icon and the arrow do, so a chip
+            squeezed for room is still whole. */}
+        {quietDefault && !chosen
+          ? <span className="sr-only">{label}</span>
+          : <span className="min-w-[2.25rem] max-w-[150px] flex-1 truncate text-left">{label}</span>}
         <ChevronUp className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform', open && 'rotate-180')} aria-hidden />
       </button>
       {open && createPortal(

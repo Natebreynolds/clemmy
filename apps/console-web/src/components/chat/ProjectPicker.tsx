@@ -36,6 +36,7 @@ export function ProjectPicker({
     <ChoiceChip
       icon={FolderKanban}
       label={current?.name || 'No project'}
+      quietDefault
       chosen={Boolean(current)}
       title={started ? 'Which project your next message works in' : 'Which project this conversation works in'}
       heading="Project"
