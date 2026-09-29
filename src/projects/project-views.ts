@@ -14,6 +14,9 @@ import {
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { connectedAppName } from './connected-accounts.js';
 import { localProjectAt } from './local-projects.js';
+import { localProjectOffers } from './local-project-offers.js';
+import { discoverMcpServers } from '../runtime/mcp-config.js';
+import { slugifyServerName } from '../runtime/mcp-namespace-shim.js';
 import { listCodingRuns } from '../execution/coding-run-store.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import {
@@ -321,7 +324,15 @@ export type ProjectResourceView = ProjectResource & {
   appName: string | null;
   /** For a linked local project: whether the folder is still there, and
    * whether it is a repository. Null for every other kind. */
-  localProject: { name: string; path: string; present: boolean; git: boolean } | null;
+  localProject: {
+    name: string; path: string; present: boolean; git: boolean;
+    /** What the folder offers: its instruction files, the commands it names,
+     * and the tool servers it declares with whether Clem is connected to one
+     * of the same name. */
+    instructions: string[];
+    commands: string[];
+    toolServers: Array<{ name: string; connected: boolean }>;
+  } | null;
 };
 
 /** One coding run started from a conversation of the project. */
@@ -336,6 +347,36 @@ export interface ProjectCodingRunView {
   originSessionId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+type ConnectedToolServers = () => string[];
+let connectedToolServersForTests: ConnectedToolServers | null = null;
+
+/** Test seam. Null restores Clem's own connections. */
+export function _setConnectedToolServersForTests(list: ConnectedToolServers | null): void {
+  connectedToolServersForTests = list;
+}
+
+function connectedToolServers(): Set<string> {
+  try {
+    const names = connectedToolServersForTests
+      ? connectedToolServersForTests()
+      : discoverMcpServers().filter((server) => server.enabled !== false).map((server) => server.name);
+    return new Set(names.map(slugifyServerName));
+  } catch {
+    // Unknown is shown as not connected: the page never claims a connection it could not read.
+    return new Set();
+  }
+}
+
+function offersView(folder: string): { instructions: string[]; commands: string[]; toolServers: Array<{ name: string; connected: boolean }> } {
+  const offers = localProjectOffers(folder);
+  const connected = offers.toolServers.length > 0 ? connectedToolServers() : new Set<string>();
+  return {
+    instructions: offers.instructions,
+    commands: offers.commands.map((row) => row.name),
+    toolServers: offers.toolServers.map((name) => ({ name, connected: connected.has(slugifyServerName(name)) })),
+  };
 }
 
 function codingPhase(state: string): ProjectCodingRunView['phase'] {
@@ -388,7 +429,7 @@ export function projectOverview(projectId: string): ProjectOverviewView | null {
     resources: listResources(project.id).map((resource) => ({
       ...resource, appName: resource.toolkit ? connectedAppName(resource.toolkit) : null,
       localProject: resource.kind === 'folder' && resource.ref
-        ? { name: resource.label || resource.ref, path: resource.ref, ...localProjectAt(resource.ref) }
+        ? { name: resource.label || resource.ref, path: resource.ref, ...localProjectAt(resource.ref), ...offersView(resource.ref) }
         : null,
     })),
     tasks: delegatedTasksForProject(project.id),

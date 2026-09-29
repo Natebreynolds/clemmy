@@ -239,6 +239,52 @@ test('a project links to a local project from the machine\'s own list, and to no
   }
 });
 
+test('a linked local project says what it offers, to the work and on both surfaces', async () => {
+  const { mkdirSync: makeDir, writeFileSync: write } = await import('node:fs');
+  const local = await import('./local-projects.js');
+  const views = await import('./project-views.js');
+  const { bindProject } = await import('./project-binding.js');
+  const folder = path.join(HOME, 'fixture-audits');
+  makeDir(path.join(folder, '.claude', 'commands'), { recursive: true });
+  write(path.join(folder, 'AGENTS.md'), '# How this folder is worked in', 'utf8');
+  write(path.join(folder, '.claude', 'commands', 'build-report.md'), '# Build the report', 'utf8');
+  write(path.join(folder, '.mcp.json'), JSON.stringify({ mcpServers: {
+    'Fixture Search': { command: 'npx', env: { FIXTURE_TOKEN: 'fixture-secret-value' } },
+    'fixture-hosting': { command: 'npx' },
+  } }), 'utf8');
+  local._setLocalProjectsForTests(() => [{ name: 'fixture-audits', path: folder, type: 'node', description: '', git: false }]);
+  views._setConnectedToolServersForTests(() => ['fixture-hosting']);
+  try {
+    const made = await desktop('post', '/api/console/project-records', { name: 'Route Offered Work' });
+    const id = made.body.overview.project.id as string;
+    const linked = await phone('post', `/api/project-records/${id}/resources`, { kind: 'folder', ref: 'fixture-audits' });
+    assert.equal(linked.status, 200);
+    const expected = {
+      name: 'fixture-audits', path: folder, present: true, git: false,
+      instructions: ['AGENTS.md'], commands: ['build-report'],
+      // 'Fixture Search' is not a name a server can have here, so it is not listed at all.
+      toolServers: [{ name: 'fixture-hosting', connected: true }],
+    };
+    assert.deepEqual(linked.body.overview.resources[0].localProject, expected);
+    assert.deepEqual((await desktop('get', `/api/console/project-records/${id}`)).body.overview.resources[0].localProject, expected);
+    views._setConnectedToolServersForTests(() => []);
+    assert.deepEqual((await desktop('get', `/api/console/project-records/${id}`)).body.overview.resources[0].localProject.toolServers,
+      [{ name: 'fixture-hosting', connected: false }], 'a server Clem is not connected to is said to be missing');
+
+    const bound = bindProject(projects.getProject(id)!, { agentId: null });
+    assert.match(bound.context, /- local project: fixture-audits at .*fixture-audits\n  its own instructions, to read before working in it: AGENTS\.md\n  commands it names.*build-report \(\.claude\/commands\/build-report\.md\)\n  tool servers it declares: fixture-hosting\./);
+    assert.ok(!/fixture-secret-value|FIXTURE_TOKEN/.test(bound.context + JSON.stringify(linked.body)), 'nothing of a declaration but its name leaves the file');
+    // The context changes when the folder does, and its revision with it.
+    write(path.join(folder, '.claude', 'commands', 'second-report.md'), '# Another', 'utf8');
+    const again = bindProject(projects.getProject(id)!, { agentId: null });
+    assert.match(again.context, /build-report \(.*\), second-report \(/);
+    assert.notEqual(again.revision, bound.revision);
+  } finally {
+    local._setLocalProjectsForTests(null);
+    views._setConnectedToolServersForTests(null);
+  }
+});
+
 test('a task nobody delegated is not a delegated task on any surface', async () => {
   const plain = tasks.createBackgroundTask({ title: 'Plain', prompt: 'plain', source: 'desktop' });
   assert.equal((await desktop('get', `/api/console/delegated-tasks/${plain.id}`)).status, 404);

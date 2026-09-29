@@ -17,6 +17,7 @@
 import { createHash } from 'node:crypto';
 import { loadSkill } from '../memory/skill-store.js';
 import { getAgentRecord } from '../agents/agent-record.js';
+import { describeLocalProjectOffers, localProjectOffers } from './local-project-offers.js';
 import {
   getAssignment, getProject, listAssignments, listResources,
   type ProjectAssignment, type ProjectRecord, type ProjectResource,
@@ -31,7 +32,8 @@ export interface ProjectBinding {
   assignment: ProjectAssignment | null;
   resources: ProjectResource[];
   /** Standing context text for the system prefix. Stable until the project,
-   * its resources or the assignment change. */
+   * its resources, the assignment, or what a linked local project offers
+   * change. */
   context: string;
   /** Skills the assignment pinned in, in order. */
   pinnedSkills: string[];
@@ -49,7 +51,10 @@ function describeResource(resource: ProjectResource): string {
   }
   if (resource.kind === 'folder') {
     // Where this project's work on files and code happens.
-    return `- local project: ${resource.label ? `${resource.label} at ${resource.ref}` : resource.ref}`;
+    return [
+      `- local project: ${resource.label ? `${resource.label} at ${resource.ref}` : resource.ref}`,
+      ...describeLocalProjectOffers(localProjectOffers(resource.ref)),
+    ].join('\n');
   }
   return `- ${resource.kind}: ${resource.label ? `${resource.label} (${resource.ref})` : resource.ref}`;
 }
