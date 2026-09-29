@@ -9,6 +9,7 @@
  * The prefix is `project-records`, never `projects`: that path already
  * serves local code folders.
  */
+import { spawn } from 'node:child_process';
 import type { Request, Response } from 'express';
 import { getAgentRecord } from '../agents/agent-record.js';
 import {
@@ -26,6 +27,7 @@ import {
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
 import { chooseLocalProject, localProjects } from './local-projects.js';
+import { localPageContentPolicy, pageImageIsBlank, pageOfProject, pagesMadeInProject, readPageDocument } from './local-pages.js';
 import { moveFact } from './memory-scope-views.js';
 
 type Handler = (req: Request, res: Response) => void | Promise<void>;
@@ -71,9 +73,52 @@ function guarded(handler: Handler): Handler {
   };
 }
 
+type PageRenderer = (input: { file: string; width?: number; height?: number; offsetY?: number }) =>
+  Promise<{ ok: true; png: Buffer; width: number; height: number; offsetY: number } | { ok: false; reason: string }>;
+type PageOpener = (file: string) => { ok: true } | { ok: false; reason: string };
+let pageRendererForTests: PageRenderer | null = null;
+let pageOpenerForTests: PageOpener | null = null;
+
+/** Test seams. Null restores the machine's own browser and opener. */
+export function _setPageRendererForTests(renderer: PageRenderer | null): void { pageRendererForTests = renderer; }
+export function _setPageOpenerForTests(opener: PageOpener | null): void { pageOpenerForTests = opener; }
+
+// One page is rendered at a time: each render starts a browser.
+let rendering: Promise<unknown> = Promise.resolve();
+function renderPage(input: Parameters<PageRenderer>[0]): ReturnType<PageRenderer> {
+  const next = rendering.then(async () => {
+    if (pageRendererForTests) return pageRendererForTests(input);
+    const { renderLocalPagePreview } = await import('../spaces/space-preview.js');
+    return renderLocalPagePreview(input);
+  });
+  rendering = next.catch(() => undefined);
+  return next;
+}
+
+function openPage(file: string): ReturnType<PageOpener> {
+  if (pageOpenerForTests) return pageOpenerForTests(file);
+  if (process.platform !== 'darwin') return { ok: false, reason: 'not_supported_here' };
+  // Detached, so a slow hand-off to the browser never holds the answer.
+  const child = spawn('open', [file], { detached: true, stdio: 'ignore' });
+  child.on('error', () => undefined);
+  child.unref();
+  return { ok: true };
+}
+
+function wholeNumber(value: unknown, smallest: number, largest: number): number | undefined {
+  const parsed = Number(Array.isArray(value) ? value[0] : value);
+  return Number.isFinite(parsed) ? Math.min(largest, Math.max(smallest, Math.round(parsed))) : undefined;
+}
+
+function fromThisMachine(req: Request): boolean {
+  const address = req.socket?.remoteAddress ?? '';
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1' || address === '';
+}
+
 const REASON_STATUS: Record<string, number> = {
   name_required: 400, name_taken: 409, not_found: 404, archived: 409,
   project_not_found: 404, project_archived: 409, agent_required: 400,
+  page_not_found: 404, page_too_large: 413, page_not_rendered: 503, not_supported_here: 501,
   resource_incomplete: 400, too_many_resources: 409, conflicting_account: 409,
 };
 
@@ -105,6 +150,61 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
   add('get', `${mount.projects}-local-projects`, (_req, res) => {
     res.json({ localProjects: localProjects() });
   });
+
+  // The pages work in the project wrote into its linked local projects.
+  add('get', `${mount.projects}/:id/pages`, (req, res) => {
+    if (!projectOverview(param(req, 'id'))) { refuse(res, 'project_not_found'); return; }
+    res.json({ pages: pagesMadeInProject(param(req, 'id')) });
+  });
+
+  // A page rendered on this machine at the asked width, one part at a time.
+  // `end` says the part shows nothing, which is how a reader finds the end.
+  add('get', `${mount.projects}/:id/pages/:pageId/image`, async (req, res) => {
+    const page = pageOfProject(param(req, 'id'), param(req, 'pageId'));
+    if (!page.ok) { refuse(res, page.reason === 'too_large' ? 'page_too_large' : 'page_not_found'); return; }
+    const rendered = await renderPage({
+      file: page.file,
+      width: wholeNumber(req.query.width, 360, 2000),
+      height: wholeNumber(req.query.height, 480, 2000),
+      offsetY: wholeNumber(req.query.offset, 0, 20_000),
+    });
+    if (!rendered.ok) { refuse(res, 'page_not_rendered', { message: rendered.reason }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      page: page.view,
+      image: rendered.png.toString('base64'),
+      mimeType: 'image/png',
+      width: rendered.width, height: rendered.height, offsetY: rendered.offsetY,
+      end: pageImageIsBlank(rendered.png),
+    });
+  });
+
+  if (mount.origin === 'console') {
+    // The document itself, for the desktop to frame. The answer carries its
+    // own policy: no origin, nothing it can call, nothing it can be framed by
+    // but the app. Only this machine is answered.
+    add('get', `${mount.projects}/:id/pages/:pageId/document`, (req, res) => {
+      if (!fromThisMachine(req)) { res.status(403).json({ error: 'THIS_MACHINE_ONLY' }); return; }
+      const page = pageOfProject(param(req, 'id'), param(req, 'pageId'));
+      if (!page.ok) { refuse(res, page.reason === 'too_large' ? 'page_too_large' : 'page_not_found'); return; }
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Content-Security-Policy', localPageContentPolicy());
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.send(readPageDocument(page.file));
+    });
+
+    // Open the page in the owner's own browser, on this machine.
+    add('post', `${mount.projects}/:id/pages/:pageId/open`, (req, res) => {
+      if (!fromThisMachine(req)) { res.status(403).json({ error: 'THIS_MACHINE_ONLY' }); return; }
+      const page = pageOfProject(param(req, 'id'), param(req, 'pageId'));
+      // A page too large to frame is still the owner's to open.
+      if (!page.ok && page.reason === 'not_found') { refuse(res, 'page_not_found'); return; }
+      const opened = openPage(page.file);
+      if (!opened.ok) { refuse(res, opened.reason); return; }
+      res.json({ ok: true, page: page.view });
+    });
+  }
 
   add('post', mount.projects, (req, res) => {
     const input = body(req);

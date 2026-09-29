@@ -15,6 +15,7 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { connectedAppName } from './connected-accounts.js';
 import { localProjectAt } from './local-projects.js';
 import { localProjectOffers } from './local-project-offers.js';
+import { pagesMadeInProject, type ProjectPageView } from './local-pages.js';
 import { discoverMcpServers } from '../runtime/mcp-config.js';
 import { slugifyServerName } from '../runtime/mcp-namespace-shim.js';
 import { listCodingRuns } from '../execution/coding-run-store.js';
@@ -416,6 +417,8 @@ export interface ProjectOverviewView {
   resources: ProjectResourceView[];
   tasks: DelegatedTaskView[];
   codingRuns: ProjectCodingRunView[];
+  /** HTML pages that work in the project wrote into its linked local projects. */
+  pages: ProjectPageView[];
   conversations: ProjectConversationView[];
   decisions: ProjectDecisionView[];
 }
@@ -434,6 +437,7 @@ export function projectOverview(projectId: string): ProjectOverviewView | null {
     })),
     tasks: delegatedTasksForProject(project.id),
     codingRuns: codingRunsForProject(project.id),
+    pages: pagesMadeInProject(project.id),
     conversations: conversationsForProject(project.id),
     decisions: project.status === 'active' ? decisionsForProject(project.id) : [],
   };

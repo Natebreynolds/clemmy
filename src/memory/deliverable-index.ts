@@ -137,6 +137,27 @@ export function listRecentDeliverables(limit = 30): DeliverableHit[] {
   }
 }
 
+/** Files recorded under any of these folders, newest first. Each root is a
+ *  folder path; a file is under it when its path continues past the folder's
+ *  separator, so `/work/app` never claims `/work/app-old/x`. */
+export function listFileDeliverablesUnder(roots: readonly string[], limit = 200): DeliverableRecord[] {
+  const folders = [...new Set(roots.map((root) => root.trim().replace(/[\\/]+$/, '')).filter(Boolean))].slice(0, 20);
+  if (folders.length === 0) return [];
+  try {
+    const db = ensureTable();
+    const under = folders.map(() => "target LIKE ? ESCAPE '\\'").join(' OR ');
+    return db.prepare(`
+      SELECT id, created_at AS createdAt, kind, target, title, why, session_id AS sessionId, lane
+      FROM deliverables WHERE kind = 'file' AND (${under}) ORDER BY created_at DESC LIMIT ?
+    `).all(
+      ...folders.map((folder) => `${folder.replace(/[\\%_]/g, (match) => `\\${match}`)}/%`),
+      Math.max(1, Math.min(limit, 500)),
+    ) as DeliverableRecord[];
+  } catch {
+    return [];
+  }
+}
+
 export interface DeliveredArtifact {
   kind: string;
   title: string;
