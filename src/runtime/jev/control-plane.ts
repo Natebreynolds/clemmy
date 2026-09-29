@@ -212,6 +212,15 @@ const PROVEN_STRATEGY_WINDOW = 8;
 // bound before the first frame and the brain is told discovery already ran.
 const PROVEN_STRATEGY_CHOICE_MIN = 0.35;
 const PROVEN_STRATEGY_FIT_MIN = 0.8;
+// The two questions are answered independently. When neither is sure by
+// itself but both lean the same way and name the same operation, that
+// agreement is evidence neither holds alone: the remembered run Jev leans to
+// used the very operation Jev would run first. It is offered, never bound as
+// the whole job: the surface stays whole and discovery stays available.
+// Measured on 166 recorded turn-start decisions (2026-09-25 to 09-29): 7 met
+// this rule with no pick, and 6 of those turns went on to use the operation.
+const CORROBORATED_CHOICE_MIN = 0.35;
+const CORROBORATED_FIT_MIN = 0.5;
 
 export interface RoutableOperation {
   id: string;
@@ -232,9 +241,20 @@ export interface StrategyJudgement {
   fit?: number;
 }
 
+/** Two unsure answers that agree: the remembered run Jev leans to used the
+ * operation Jev would run first. */
+export interface CorroboratedTurnStart<S extends ProvenStrategyCandidate, O extends RoutableOperation> {
+  strategy: S;
+  operation: O;
+  run: { confidence: number; fit: number };
+  route: { confidence: number; fit: number };
+}
+
 export interface TurnStartDecision<S extends ProvenStrategyCandidate, O extends RoutableOperation> {
   /** A remembered run Jev judged to fit; it wins over a routed operation. */
   strategy: S | null;
+  /** Set only when nothing was picked and the two answers agree. */
+  corroborated?: CorroboratedTurnStart<S, O>;
   /** Why the remembered run was or was not taken. Absent when none was offered. */
   strategyJudgement?: StrategyJudgement;
   route: OperationRoute<O>;
@@ -367,17 +387,40 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
     }
     return { pick, outcome: 'picked', confidence: answer.confidence, fit };
   })();
+  const corroborated = ((): CorroboratedTurnStart<S, O> | undefined => {
+    if (strategy || route.pick) return undefined;
+    const which = result.answers.which as ChoiceAnswer | undefined;
+    const select = result.answers.select as ChoiceAnswer | undefined;
+    if (!which || !select) return undefined;
+    const runIndex = runs.findIndex((run) => run.id === which.choice);
+    const opIndex = Number(/^op_(\d+)$/.exec(select.choice)?.[1] ?? -1);
+    const run = runs[runIndex];
+    const operation = ops[opIndex];
+    if (!run || !operation) return undefined;
+    const runFit = (result.answers[`run_${runIndex}`] as NoulAnswer | undefined)?.noul;
+    const opFit = (result.answers[`fit_${opIndex}`] as NoulAnswer | undefined)?.noul;
+    if (typeof runFit !== 'number' || typeof opFit !== 'number') return undefined;
+    if (which.confidence < CORROBORATED_CHOICE_MIN || select.confidence < CORROBORATED_CHOICE_MIN) return undefined;
+    if (runFit < CORROBORATED_FIT_MIN || opFit < CORROBORATED_FIT_MIN) return undefined;
+    // Agreement is identity of the operation, never likeness of names.
+    const named = operation.id.trim().toLowerCase();
+    if (!run.toolsUsed.some((tool) => tool.trim().toLowerCase() === named)) return undefined;
+    return { strategy: run, operation,
+      run: { confidence: which.confidence, fit: runFit }, route: { confidence: select.confidence, fit: opFit } };
+  })();
   noteJevDecisionOutcome(
     result.decisionId,
-    strategy ? 'strategy' : route.pick ? 'routed' : 'none',
+    strategy ? 'strategy' : route.pick ? 'routed' : corroborated ? 'corroborated' : 'none',
     {
       ...(strategy ? { strategy: strategy.id } : {}),
       ...(judged ? { run: judged.judgement.outcome } : {}),
       ...(ops.length > 0 ? { route: route.outcome, ...(route.pick ? { pick: route.pick.id } : {}) } : {}),
+      ...(corroborated ? { corroborated: { strategy: corroborated.strategy.id, operation: corroborated.operation.id } } : {}),
     },
   );
   return {
     strategy,
+    ...(corroborated ? { corroborated } : {}),
     ...(judged ? { strategyJudgement: judged.judgement } : {}),
     route,
     failedOpen: false,

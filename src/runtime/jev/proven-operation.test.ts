@@ -465,6 +465,8 @@ function decideWith(
   calls: DecisionCall[],
   answer: (strategies: Array<{ id: string; objective: string }>, operations: Array<{ id: string; purpose: string }>) => {
     strategy?: string; route?: string; failedOpen?: boolean;
+    /** Neither answer sure; the run named here used the operation named here. */
+    corroborated?: { strategy: string | undefined; operation: string };
   },
 ) {
   return async <S extends { id: string; objective: string; toolsUsed: string[] }, O extends { id: string; purpose: string }>(
@@ -477,8 +479,13 @@ function decideWith(
     const chosen = answer([...strategies], [...operations]);
     const strategy = strategies.find((row) => row.id === chosen.strategy) ?? null;
     const pick = operations.find((row) => row.id === chosen.route) ?? null;
+    const agreedRun = strategies.find((row) => row.id === chosen.corroborated?.strategy);
+    const agreedOperation = operations.find((row) => row.id === chosen.corroborated?.operation)
+      ?? (chosen.corroborated ? { id: chosen.corroborated.operation, purpose: '' } as O : undefined);
     return {
       strategy,
+      ...(agreedRun && agreedOperation ? { corroborated: { strategy: agreedRun, operation: agreedOperation,
+        run: { confidence: 0.56, fit: 0.67 }, route: { confidence: 0.49, fit: 0.63 } } } : {}),
       route: pick ? { pick, outcome: 'picked' as const, confidence: 0.9, fit: 0.9 } : { pick: null, outcome: 'none' as const },
       failedOpen: chosen.failedOpen === true,
     };
@@ -782,4 +789,73 @@ test('shared words never bind a remembered destructive operation to a read reque
   assert.equal(prepared.strategyId, undefined);
   assert.deepEqual(prepared.tools, []);
   assert.equal(prepared.skipDiscoverySearch, false);
+});
+
+test('a corroborated run is re-attested and offered on the first frame without narrowing the surface', async () => {
+  const { createSession, appendEvent } = await import('../harness/eventlog.js');
+  const { provenCapabilityEntriesForTurn } = await import('../harness/capability-resolution.js');
+  recordZephyrStrategy('how many open tickets does the northwind queue hold', 'deskscope__queue_summary', 'desk-corroborated');
+  const request = 'give me the state of the southbay support queue';
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'corroborated queue' });
+  const accepted = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: request } });
+  const calls: DecisionCall[] = [];
+  const acquired: string[] = [];
+  const prepared = await prepareProvenOperationForRequest(
+    { query: request, sessionId: session.id, sourceUserSeq: accepted.seq, acceptedInput: request },
+    {
+      decideTurnStart: decideWith(calls, (strategies) => ({
+        corroborated: { strategy: strategies.find((row) => /northwind/.test(row.objective))?.id, operation: 'deskscope__queue_summary' },
+      })),
+      acquireLiveRead: async ({ operation }) => {
+        acquired.push(operation);
+        return { status: 'installed', kind: 'mcp', operation, accountId: 'native_mcp:deskscope:acct' };
+      },
+    },
+  );
+  assert.equal(calls.length, 1, 'no further question is asked to reach the offer');
+  assert.equal(prepared.pickedBy, 'jev_corroborated');
+  assert.deepEqual(acquired, ['deskscope__queue_summary'], 'the offered operation is re-attested against the live source, not taken from memory');
+  assert.deepEqual(prepared.liveReads.map((row) => row.operation), ['deskscope__queue_summary']);
+  assert.equal(prepared.narrowSurface, false, 'an offer never thins the surface');
+  assert.ok(provenCapabilityEntriesForTurn({ sessionId: session.id, sourceUserSeq: accepted.seq })
+    .some((entry) => entry.identifier === 'deskscope__queue_summary' && entry.status === 'proven'));
+  assert.match(prepared.text ?? '', /what looks like the same kind of request used these tools: deskscope__queue_summary/);
+  assert.match(prepared.text ?? '', /anything else this request needs is still yours to find/);
+  assert.doesNotMatch(prepared.text ?? '', /already proved these tools/, 'an offer is not worded as a certainty');
+  assert.doesNotMatch(prepared.text ?? '', /northwind/, "another request's target never reaches the brain as guidance");
+
+  // The live source no longer offers the operation: nothing is published.
+  const gone = createSession({ kind: 'chat', channel: 'desktop', title: 'corroborated queue gone' });
+  const goneAccepted = appendEvent({ sessionId: gone.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: request } });
+  const unavailable = await prepareProvenOperationForRequest(
+    { query: request, sessionId: gone.id, sourceUserSeq: goneAccepted.seq, acceptedInput: request },
+    {
+      decideTurnStart: decideWith([], (strategies) => ({
+        corroborated: { strategy: strategies.find((row) => /northwind/.test(row.objective))?.id, operation: 'deskscope__queue_summary' },
+      })),
+      acquireLiveRead: async () => ({ status: 'skipped', reason: 'not_in_live_manifest' }),
+    },
+  );
+  assert.deepEqual(unavailable.liveReads, [], 'a remembered name is not authority');
+  assert.equal(unavailable.skipDiscoverySearch, false);
+  assert.ok(!provenCapabilityEntriesForTurn({ sessionId: gone.id, sourceUserSeq: goneAccepted.seq })
+    .some((entry) => entry.identifier === 'deskscope__queue_summary'));
+  assert.deepEqual(unavailable.liveReadOutcomes.map((row) => [row.operation, row.status, row.reason]),
+    [['deskscope__queue_summary', 'skipped', 'not_in_live_manifest']], 'why it was not offered is on the record');
+});
+
+test('a sure pick still wins over a corroborated one, and an unavailable decision offers nothing', async () => {
+  recordZephyrStrategy('summarise the eastgate billing ledger', 'ledgerscope__billing_summary', 'ledger-sure');
+  const sure = await prepareProvenOperationForRequest({ query: 'what does the westgate billing ledger show' }, {
+    decideTurnStart: decideWith([], (strategies) => {
+      const run = strategies.find((row) => /eastgate/.test(row.objective))?.id;
+      return { strategy: run, corroborated: { strategy: run, operation: 'ledgerscope__billing_summary' } };
+    }),
+  });
+  assert.equal(sure.pickedBy, 'jev');
+  const none = await prepareProvenOperationForRequest({ query: 'what does the westgate billing ledger show' }, {
+    decideTurnStart: decideWith([], () => ({ failedOpen: true })),
+  });
+  assert.equal(none.pickedBy, undefined);
+  assert.equal(none.text, undefined);
 });

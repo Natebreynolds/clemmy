@@ -684,3 +684,65 @@ test('classifyApprovalReplyWithJev reads a written reply to a waiting card as on
   _setTypesafeKeyForTests(null);
   assert.deepEqual(await classifyApprovalReplyWithJev(input), { kind: null, failedOpen: true });
 });
+
+// Live 2026-09-28 (source 325491): Jev leaned to the right remembered run
+// (0.56, fit 0.67) and to the right operation (0.49, fit 0.63). Neither
+// cleared its own bar, nothing was handed over, and the brain spent 9.5 s
+// rediscovering an operation it had used nine times two hours earlier.
+test('two unsure answers that name the same operation are reported as corroborated, never as a pick', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let answers: Record<string, unknown> = {};
+  _setSystemOneFetchForTests(async () => ({
+    status: 200, ok: true,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0', answers, usage: { input_tokens: 90, output_tokens: 8 } }),
+  }));
+  const choice = (value: string, confidence: number) => ({ type: 'choice', choice: value, confidence, probabilities: { [value]: confidence } });
+  const noul = (value: number) => ({ type: 'noul', noul: value });
+  const runs = [
+    { id: 'strat-events', objective: 'add events to the shared calendar', toolsUsed: ['CALENDAR_LIST_VIEW', 'CALENDAR_CREATE_EVENT'] },
+    { id: 'strat-mail', objective: 'draft a reply', toolsUsed: ['mail_create_draft'] },
+  ];
+  const operations = [
+    { id: 'calendar_create_event', purpose: 'Create a calendar event' },
+    { id: 'mail_create_draft', purpose: 'Create a mail draft' },
+  ];
+  const decide = () => decideTurnStartWithJev('Prepare two invitations for next week', runs, operations, { timeoutMs: 1_000 });
+
+  answers = { which: choice('strat-events', 0.56), run_0: noul(0.67), run_1: noul(0.05),
+    select: choice('op_0', 0.49), fit_0: noul(0.63), fit_1: noul(0.02) };
+  const agreed = await decide();
+  assert.equal(agreed.strategy, null, 'neither answer is a pick by itself');
+  assert.equal(agreed.route.pick, null);
+  assert.equal(agreed.route.outcome, 'low_confidence');
+  assert.equal(agreed.corroborated?.strategy.id, 'strat-events');
+  assert.equal(agreed.corroborated?.operation.id, 'calendar_create_event', 'operation identity is matched without regard to case');
+  assert.deepEqual(agreed.corroborated?.run, { confidence: 0.56, fit: 0.67 });
+  assert.deepEqual(agreed.corroborated?.route, { confidence: 0.49, fit: 0.63 });
+
+  // The run Jev leans to did not use the operation Jev would run first.
+  answers = { which: choice('strat-mail', 0.56), run_0: noul(0.05), run_1: noul(0.67),
+    select: choice('op_0', 0.49), fit_0: noul(0.63), fit_1: noul(0.02) };
+  assert.equal((await decide()).corroborated, undefined, 'answers that point at different operations corroborate nothing');
+
+  // Each answer must lean by itself; agreement cannot rescue a faint one.
+  answers = { which: choice('strat-events', 0.56), run_0: noul(0.49), run_1: noul(0.05),
+    select: choice('op_0', 0.49), fit_0: noul(0.63), fit_1: noul(0.02) };
+  assert.equal((await decide()).corroborated, undefined, 'a run whose fit does not lean yes');
+  answers = { which: choice('strat-events', 0.56), run_0: noul(0.67), run_1: noul(0.05),
+    select: choice('op_0', 0.2), fit_0: noul(0.63), fit_1: noul(0.02) };
+  assert.equal((await decide()).corroborated, undefined, 'a faint operation choice');
+  answers = { which: choice('none', 0.9), run_0: noul(0.67), run_1: noul(0.05),
+    select: choice('op_0', 0.49), fit_0: noul(0.63), fit_1: noul(0.02) };
+  assert.equal((await decide()).corroborated, undefined, 'no remembered run chosen');
+
+  // A sure answer is a pick and is never also reported as corroborated.
+  answers = { which: choice('strat-events', 0.9), run_0: noul(0.92), run_1: noul(0.05),
+    select: choice('op_0', 0.49), fit_0: noul(0.63), fit_1: noul(0.02) };
+  const sure = await decide();
+  assert.equal(sure.strategy?.id, 'strat-events');
+  assert.equal(sure.corroborated, undefined);
+
+  // With only one question asked there is nothing to agree with.
+  answers = { which: choice('strat-events', 0.56), run_0: noul(0.67), run_1: noul(0.05) };
+  assert.equal((await decideTurnStartWithJev('Prepare two invitations', runs, [], { timeoutMs: 1_000 })).corroborated, undefined);
+});

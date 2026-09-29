@@ -44,11 +44,14 @@ const FAMILIAR_RUN_CANDIDATES = 8;
 /** How the turn's remembered run was chosen:
  *  - request_identity: the accepted request exactly restates the proven run;
  *  - jev: Jev judged, inside the budget, that the run did the same kind of work;
- *  - jev_route: Jev routed the request to one operation the host can hand over.
+ *  - jev_route: Jev routed the request to one operation the host can hand over;
+ *  - jev_corroborated: Jev was sure of neither, but the run it leaned to used
+ *    the operation it would run first. The run is offered, not bound as the
+ *    whole job.
  *  Without a turn-start judgement, remembered runs that disagree are never
  *  settled by how many words the request shares with one of them: nothing is
  *  picked, and discovery runs as usual. */
-export type ProvenPickSource = 'request_identity' | 'jev' | 'jev_route';
+export type ProvenPickSource = 'request_identity' | 'jev' | 'jev_route' | 'jev_corroborated';
 
 export interface ProvenLiveRead {
   operation: string;
@@ -399,7 +402,7 @@ export function renderProvenOperationGuidance(
   invocations: readonly unknown[] = [],
   boundAccounts: readonly ProvenBoundAccount[] = [],
   liveReads: readonly ProvenLiveRead[] = [],
-  opts: { routed?: boolean } = {},
+  opts: { routed?: boolean; likely?: boolean } = {},
 ): string {
   const tools = strategy.toolsUsed;
   if (opts.routed === true && tools.every(isHandoverRegistryTool)) {
@@ -428,7 +431,11 @@ export function renderProvenOperationGuidance(
     // the tools and the roles of their arguments only.
     opts.routed
       ? `This request most likely needs ${tools.join(', ')}.`
-      : `A prior successful run of this same kind of request already proved these tools: ${tools.join(', ')}. Use this request's own targets and values.`,
+      : opts.likely
+        // Offered on agreement, not certainty: say so, so the brain checks the
+        // fit itself instead of taking the run as the whole job.
+        ? `A prior successful run of what looks like the same kind of request used these tools: ${tools.join(', ')}. They are verified and callable now. Use them where they do what this request asks, with this request's own targets and values; anything else this request needs is still yours to find.`
+        : `A prior successful run of this same kind of request already proved these tools: ${tools.join(', ')}. Use this request's own targets and values.`,
     callable
       ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
       : 'Prefer these tools. Use tool_search once if their requirement_id is not already disclosed on work_call.',
@@ -714,6 +721,13 @@ export async function prepareProvenOperationForRequest(input: {
         strategy = judged;
         pickedBy = 'jev';
       }
+      const agreed = !strategy && !decision.route.pick && decision.corroborated
+        ? familiar.find((row) => row.id === decision.corroborated!.strategy.id) ?? null
+        : null;
+      if (agreed) {
+        strategy = agreed;
+        pickedBy = 'jev_corroborated';
+      }
       if (!strategy && decision.route.pick) {
         routed = true;
         pickedBy = 'jev_route';
@@ -747,7 +761,8 @@ export async function prepareProvenOperationForRequest(input: {
   // time provisioning its operations. Coverage is either the request restating the run
   // (its own keywords), or a turn-start judgement inside the budget that the
   // run did this same kind of work or that the routed operation does its core.
-  const coversRequest = routed || pickedBy === 'jev' || provenStrategyCoversRequest(input.query, strategy);
+  const coversRequest = routed || pickedBy === 'jev' || pickedBy === 'jev_corroborated'
+    || provenStrategyCoversRequest(input.query, strategy);
   if (
     coversRequest
     && composioSlugs.length > 0
@@ -887,12 +902,15 @@ export async function prepareProvenOperationForRequest(input: {
   return {
     text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads, {
       routed,
+      ...(pickedBy === 'jev_corroborated' ? { likely: true } : {}),
     }),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
     nativeTools: coversRequest ? strategy.toolsUsed.filter(isHandoverRegistryTool) : [],
     skipDiscoverySearch,
-    narrowSurface: skipDiscoverySearch && pickedBy !== 'jev',
+    // A judgement that a run did the same kind of work, sure or corroborated,
+    // says its operations do the core of the request, not all of it.
+    narrowSurface: skipDiscoverySearch && pickedBy !== 'jev' && pickedBy !== 'jev_corroborated',
     boundAccounts,
     capabilityRefs,
     descriptors,
