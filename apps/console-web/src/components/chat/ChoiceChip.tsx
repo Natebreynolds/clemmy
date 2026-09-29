@@ -124,7 +124,8 @@ export function ChoiceChip({
         className={cn(CHOICE_CHIP, 'max-w-full transition-colors hover:border-border-strong', !chosen && 'text-muted')}
       >
         <Icon className={cn('h-3.5 w-3.5 shrink-0', chosen ? 'text-primary' : 'text-faint')} aria-hidden />
-        <span className="min-w-0 max-w-[150px] truncate">{label}</span>
+        {/* Never narrower than a short name: a chip that shrinks to its icon says nothing. */}
+        <span className="min-w-[2.75rem] max-w-[150px] truncate text-left">{label}</span>
         <ChevronUp className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform', open && 'rotate-180')} aria-hidden />
       </button>
       {open && createPortal(

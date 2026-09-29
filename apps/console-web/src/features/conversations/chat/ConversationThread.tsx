@@ -43,18 +43,18 @@ function Header({ session }: { session: Session }) {
     <div className="flex items-center gap-3 border-b border-border bg-surface px-5 py-3">
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <h2 className="truncate text-h3 text-fg">{session.title || 'New chat'}</h2>
-          <Tag>{meta.label}</Tag>
-          {session.agentName && <Tag title="Answering this conversation">{session.agentName}</Tag>}
+          <h2 className="min-w-0 truncate text-h3 text-fg">{session.title || 'New chat'}</h2>
+          <Tag className="shrink-0 whitespace-nowrap">{meta.label}</Tag>
+          {session.agentName && <Tag title="Answering this conversation" className="max-w-[12rem] shrink-0 truncate whitespace-nowrap">{session.agentName}</Tag>}
           {session.projectId && session.projectName && (
             <Link
               to={`/projects/${encodeURIComponent(session.projectId)}`}
               aria-label={`Project: ${session.projectName}`}
-              className="rounded-sm transition-opacity hover:opacity-80"
+              className="min-w-0 shrink-0 rounded-sm transition-opacity hover:opacity-80"
             >
-              <Tag title="The project this conversation works in" className="gap-1">
-                <FolderKanban className="h-3 w-3" aria-hidden />
-                {session.projectName}
+              <Tag title="The project this conversation works in" className="max-w-[14rem] gap-1 whitespace-nowrap">
+                <FolderKanban className="h-3 w-3 shrink-0" aria-hidden />
+                <span className="truncate">{session.projectName}</span>
               </Tag>
             </Link>
           )}
