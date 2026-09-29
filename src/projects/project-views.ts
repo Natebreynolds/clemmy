@@ -238,10 +238,10 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
   const tasks = listBackgroundTasks({ includeArchived: false })
     .filter((task) => task.delegation?.projectId === projectId && !task.internal);
   const decisions: ProjectDecisionView[] = [];
-  const sessions = new Map<string, { taskId: string | null; owner: string; title: string }>();
+  const sessions = new Map<string, { taskId: string | null; owner: string; title: string; conversation: string | null }>();
   for (const task of tasks) {
     const owner = task.delegation?.agentName ?? 'Clem';
-    sessions.set(task.runSessionId, { taskId: task.id, owner, title: task.title });
+    sessions.set(task.runSessionId, { taskId: task.id, owner, title: task.title, conversation: task.originSessionId ?? null });
     if (task.status === 'awaiting_input' && task.pendingQuestionId && task.pendingQuestion) {
       decisions.push({ kind: 'question', taskId: task.id, sessionId: task.originSessionId ?? task.runSessionId,
         options: (task.pendingQuestionOptions ?? []).slice(0, 8),
@@ -251,7 +251,8 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
   }
   for (const conversation of conversationsForProject(projectId, 50)) {
     if (!conversation.current) continue;
-    sessions.set(conversation.sessionId, { taskId: null, owner: conversation.agentName ?? 'Clem', title: conversation.title ?? 'Conversation' });
+    sessions.set(conversation.sessionId, { taskId: null, owner: conversation.agentName ?? 'Clem', title: conversation.title ?? 'Conversation',
+      conversation: conversation.sessionId });
   }
   try {
     for (const approval of approvalRegistry.listPending({ status: 'pending' })) {
@@ -263,7 +264,8 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
       decisions.push(shown.kind === 'approval'
         ? { kind: 'approval', options: [], formal: true, taskId: from.taskId, sessionId: approval.sessionId, approvalId: shown.approvalId,
           questionId: null, title: from.title, detail: approval.subject.slice(0, 600), owner: from.owner, askedAt: approval.requestedAt }
-        : { kind: 'approval', options: [], formal: false, taskId: from.taskId, sessionId: approval.sessionId, approvalId: null,
+        // Answered in a conversation, so it names one: the task's own when a task asked.
+        : { kind: 'approval', options: [], formal: false, taskId: from.taskId, sessionId: from.conversation ?? approval.sessionId, approvalId: null,
           questionId: null, title: from.title, detail: shown.question.slice(0, 600), owner: from.owner, askedAt: approval.requestedAt });
     }
   } catch { /* the registry is read elsewhere too; a project view never fails on it */ }
