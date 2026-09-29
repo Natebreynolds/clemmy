@@ -175,3 +175,27 @@ test('a correction handed to delegated work reaches its owner, and is a host con
   const run = createSession({ id: 'background:bg-correcting-0c0c0c', kind: 'execution', metadata: { delegatedTaskId: 'bg-correcting-0c0c0c' } });
   assert.equal((await call('delegated_task_correct', { id: task.id, instruction: 'From a run.' }, run.id)).code, 'not_in_conversation');
 });
+
+
+test('Clem links a local project by the name the owner used, and asks when the name is not one folder', async () => {
+  const local = await import('../projects/local-projects.js');
+  local._setLocalProjectsForTests(() => [
+    { name: 'harbor-app', path: '/fixture/code/harbor-app', type: 'node', description: '', git: true },
+    { name: 'harbor-docs', path: '/fixture/code/harbor-docs', type: 'docs', description: '', git: false },
+  ]);
+  try {
+    const chat = createSession({ id: 'linking-chat', kind: 'chat' });
+    const saved = await call('project_save', { project: 'Weekly Sales', name: null,
+      resources: [{ kind: 'folder', ref: 'harbor-app' }, { kind: 'folder', ref: 'harbor-docs' }, { kind: 'folder', ref: 'harbour-ap' }] }, chat.id);
+    assert.equal(saved.ok, true);
+    assert.ok(saved.notes.includes('The local project harbor-app (/fixture/code/harbor-app) is linked.'));
+    assert.ok(saved.notes.includes('The local project harbor-docs (/fixture/code/harbor-docs) is linked. It is not a git repository, so coding work cannot run in it yet.'));
+    assert.deepEqual(saved.askTheOwner.filter((row: any) => row.about === 'which_local_project'), [{ about: 'which_local_project', named: 'harbour-ap',
+      problem: 'no local project has that name or path',
+      choices: [{ name: 'harbor-app', path: '/fixture/code/harbor-app' }, { name: 'harbor-docs', path: '/fixture/code/harbor-docs' }] }]);
+    const folders = projects.listResources(projects.findProject('Weekly Sales')!.id).filter((row) => row.kind === 'folder').map((row) => row.ref);
+    assert.deepEqual(folders.sort(), ['/fixture/code/harbor-app', '/fixture/code/harbor-docs']);
+  } finally {
+    local._setLocalProjectsForTests(null);
+  }
+});

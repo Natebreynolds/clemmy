@@ -13,6 +13,8 @@ import {
 } from '../execution/background-tasks.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { connectedAppName } from './connected-accounts.js';
+import { localProjectAt } from './local-projects.js';
+import { listCodingRuns } from '../execution/coding-run-store.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import {
   getProject, listAssignments, listAssignmentsForAgent, listProjects, listResources,
@@ -317,13 +319,62 @@ export function projectSummaries(options: { includeArchived?: boolean } = {}): P
 export type ProjectResourceView = ProjectResource & {
   /** For an account: the app's name as a person writes it. */
   appName: string | null;
+  /** For a linked local project: whether the folder is still there, and
+   * whether it is a repository. Null for every other kind. */
+  localProject: { name: string; path: string; present: boolean; git: boolean } | null;
 };
+
+/** One coding run started from a conversation of the project. */
+export interface ProjectCodingRunView {
+  runId: string;
+  objective: string;
+  /** The local project it works in, and whether that one is linked here. */
+  localProject: { name: string; path: string; linked: boolean };
+  branch: string;
+  /** `working` until the run has settled; what it came to is read from the run. */
+  phase: 'waiting_to_start' | 'working' | 'handed_to_you' | 'finished';
+  originSessionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function codingPhase(state: string): ProjectCodingRunView['phase'] {
+  if (state === 'admitted') return 'waiting_to_start';
+  if (state === 'detached') return 'handed_to_you';
+  return state === 'settled' ? 'finished' : 'working';
+}
+
+/** The coding runs that conversations of this project started, newest first. */
+export function codingRunsForProject(projectId: string, limit = 12): ProjectCodingRunView[] {
+  try {
+    const linked = new Set(listResources(projectId).filter((row) => row.kind === 'folder' && row.ref).map((row) => row.ref!));
+    const sessions = new Set(conversationsForProject(projectId, 100).map((row) => row.sessionId));
+    if (sessions.size === 0) return [];
+    return listCodingRuns({ limit: 200 })
+      .filter((run) => run.originSessionId !== null && sessions.has(run.originSessionId))
+      .slice(0, Math.max(1, Math.min(50, limit)))
+      .map((run) => ({
+        runId: run.runId,
+        objective: run.objective.slice(0, 300),
+        localProject: { name: run.projectName, path: run.projectPath, linked: linked.has(run.projectPath) },
+        branch: run.branch,
+        phase: codingPhase(run.state),
+        originSessionId: run.originSessionId,
+        createdAt: run.createdAt,
+        updatedAt: run.updatedAt,
+      }));
+  } catch {
+    // The coding store is read elsewhere too; a project view never fails on it.
+    return [];
+  }
+}
 
 export interface ProjectOverviewView {
   project: ProjectRecord;
   agents: AssignmentView[];
   resources: ProjectResourceView[];
   tasks: DelegatedTaskView[];
+  codingRuns: ProjectCodingRunView[];
   conversations: ProjectConversationView[];
   decisions: ProjectDecisionView[];
 }
@@ -336,8 +387,12 @@ export function projectOverview(projectId: string): ProjectOverviewView | null {
     agents: listAssignments(project.id).map(assignmentView),
     resources: listResources(project.id).map((resource) => ({
       ...resource, appName: resource.toolkit ? connectedAppName(resource.toolkit) : null,
+      localProject: resource.kind === 'folder' && resource.ref
+        ? { name: resource.label || resource.ref, path: resource.ref, ...localProjectAt(resource.ref) }
+        : null,
     })),
     tasks: delegatedTasksForProject(project.id),
+    codingRuns: codingRunsForProject(project.id),
     conversations: conversationsForProject(project.id),
     decisions: project.status === 'active' ? decisionsForProject(project.id) : [],
   };

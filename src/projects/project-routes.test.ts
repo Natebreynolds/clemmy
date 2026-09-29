@@ -198,6 +198,47 @@ test('an assignment whose agent is gone still says who it was, and says it is un
     [['Departing Clerk', false, 'Files the records.']]);
 });
 
+test('a project links to a local project from the machine\'s own list, and to nothing else', async () => {
+  const local = await import('./local-projects.js');
+  const { bindProject } = await import('./project-binding.js');
+  const roster = [
+    { name: 'harbor-app', path: '/fixture/code/harbor-app', type: 'node', description: 'The app.', git: true },
+    { name: 'harbor-site', path: '/fixture/code/harbor-site', type: 'node', description: 'The site.', git: false },
+    { name: 'harbor-site', path: '/fixture/archive/harbor-site', type: 'node', description: 'An old copy.', git: true },
+  ];
+  local._setLocalProjectsForTests(() => roster);
+  try {
+    const made = await desktop('post', '/api/console/project-records', { name: 'Route Local Work' });
+    const id = made.body.overview.project.id as string;
+    assert.deepEqual((await phone('get', '/api/project-records-local-projects')).body.localProjects.map((row: any) => row.path), roster.map((row) => row.path));
+
+    // By name, when the name is one folder.
+    const linked = await phone('post', `/api/project-records/${id}/resources`, { kind: 'folder', ref: 'Harbor-App' });
+    assert.equal(linked.status, 200);
+    assert.deepEqual(linked.body.overview.resources.map((row: any) => [row.kind, row.label, row.ref, Boolean(row.verifiedAt), row.localProject.name, row.localProject.path]),
+      [['folder', 'harbor-app', '/fixture/code/harbor-app', true, 'harbor-app', '/fixture/code/harbor-app']]);
+    assert.equal(linked.body.overview.resources[0].localProject.present, false, 'a folder that is not on disk is said to be missing');
+    // Twice is once.
+    assert.equal((await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'folder', ref: '/fixture/code/harbor-app' })).body.overview.resources.length, 1);
+
+    // A name two folders share is a question, with exactly those two.
+    const shared = await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'folder', ref: 'harbor-site' });
+    assert.deepEqual([shared.status, shared.body.error, shared.body.localProjects.map((row: any) => row.path)],
+      [409, 'LOCAL_PROJECT_CHOICE_REQUIRED', ['/fixture/code/harbor-site', '/fixture/archive/harbor-site']]);
+    // A folder that is not on the list is never linked, whatever it is called.
+    const invented = await desktop('post', `/api/console/project-records/${id}/resources`, { kind: 'folder', ref: '/etc' });
+    assert.deepEqual([invented.status, invented.body.error, invented.body.localProjects.length], [409, 'LOCAL_PROJECT_NOT_FOUND', 3]);
+    assert.equal((await desktop('get', `/api/console/project-records/${id}`)).body.overview.resources.length, 1);
+
+    // Work inside the project is told where its files are.
+    const bound = bindProject(projects.getProject(id)!, { agentId: null });
+    assert.match(bound.context, /- local project: harbor-app at \/fixture\/code\/harbor-app/);
+    assert.deepEqual((await desktop('get', `/api/console/project-records/${id}`)).body.overview.codingRuns, []);
+  } finally {
+    local._setLocalProjectsForTests(null);
+  }
+});
+
 test('a task nobody delegated is not a delegated task on any surface', async () => {
   const plain = tasks.createBackgroundTask({ title: 'Plain', prompt: 'plain', source: 'desktop' });
   assert.equal((await desktop('get', `/api/console/delegated-tasks/${plain.id}`)).status, 404);

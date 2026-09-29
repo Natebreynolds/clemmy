@@ -47,6 +47,10 @@ function describeResource(resource: ProjectResource): string {
   if (resource.kind === 'account') {
     return `- account for ${resource.toolkit}: ${resource.label || resource.accountId} (${resource.accountId}; ${verified})`;
   }
+  if (resource.kind === 'folder') {
+    // Where this project's work on files and code happens.
+    return `- local project: ${resource.label ? `${resource.label} at ${resource.ref}` : resource.ref}`;
+  }
   return `- ${resource.kind}: ${resource.label ? `${resource.label} (${resource.ref})` : resource.ref}`;
 }
 

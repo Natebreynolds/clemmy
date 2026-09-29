@@ -14,6 +14,7 @@ import { createAgentRecord, findAgentRecord, getAgentRecord } from '../agents/ag
 import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { loadSkill } from '../memory/skill-store.js';
 import { chooseConnectedAccount } from '../projects/connected-accounts.js';
+import { chooseLocalProject } from '../projects/local-projects.js';
 import {
   createProject, findProject, listAssignments, listAssignmentsForAgent, listProjects, listResources,
   removeAssignment, saveAssignment, saveResource, updateProject,
@@ -149,7 +150,7 @@ export function registerProjectRecordTools(server: McpServer): void {
       })).nullable().optional(),
       resources: z.array(z.object({
         kind: z.enum(['space', 'workflow', 'folder', 'link']),
-        ref: z.string().min(1).describe('The Space\'s id, the workflow\'s name, the folder\'s path or the address.'),
+        ref: z.string().min(1).describe('The Space\'s id, the workflow\'s name or the address. For kind "folder": the name or absolute path of a local project on this machine, as workspace_list names it; it is linked only when it is exactly one of those.'),
         label: z.string().nullable().optional(),
       })).nullable().optional(),
       attach_conversation: z.boolean().nullable().optional().describe('Whether this conversation should work in the project from its next turn. Defaults to true when the project is created here.'),
@@ -262,6 +263,24 @@ export function registerProjectRecordTools(server: McpServer): void {
       }
 
       for (const entry of resources ?? []) {
+        if (entry.kind === 'folder') {
+          // A local project is linked from the machine's own roster, never
+          // from what it was called.
+          const choice = chooseLocalProject(entry.ref);
+          if (choice.kind !== 'found') {
+            questions.push({ about: 'which_local_project', named: entry.ref,
+              problem: choice.kind === 'choose' ? 'more than one local project has that name' : 'no local project has that name or path',
+              choices: choice.choices.slice(0, 20).map((row) => ({ name: row.name, path: row.path })) });
+            continue;
+          }
+          const linked = saveResource(record.id, { kind: 'folder', ref: choice.project.path, label: choice.project.name,
+            verifiedAt: new Date().toISOString(), verification: { against: 'local_projects', type: choice.project.type, git: choice.project.git } });
+          notes.push(linked.ok
+            ? `The local project ${choice.project.name} (${choice.project.path}) is ${linked.created ? 'linked' : 'already linked'}.`
+              + (choice.project.git ? '' : ' It is not a git repository, so coding work cannot run in it yet.')
+            : `The local project ${choice.project.name} was not linked: ${linked.reason}.`);
+          continue;
+        }
         const saved = saveResource(record.id, { kind: entry.kind, ref: entry.ref, label: entry.label ?? undefined });
         notes.push(saved.ok ? `${entry.kind} ${entry.ref} is ${saved.created ? 'attached' : 'already attached'}.` : `${entry.kind} ${entry.ref} was not attached: ${saved.reason}.`);
       }

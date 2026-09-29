@@ -25,6 +25,7 @@ import {
   agentWork, delegatedTaskById, delegatedTasksForSession, projectLabelsForSessions, projectOverview, projectSummaries,
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
+import { chooseLocalProject, localProjects } from './local-projects.js';
 import { moveFact } from './memory-scope-views.js';
 
 type Handler = (req: Request, res: Response) => void | Promise<void>;
@@ -98,6 +99,11 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
   // bind. Read from the live connection list each time.
   add('get', `${mount.projects}-connected-apps`, async (_req, res) => {
     res.json({ apps: await connectedApps() });
+  });
+
+  // The local projects on this machine, for linking one to a project.
+  add('get', `${mount.projects}-local-projects`, (_req, res) => {
+    res.json({ localProjects: localProjects() });
   });
 
   add('post', mount.projects, (req, res) => {
@@ -198,6 +204,26 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
         refuse(res, saved.reason, saved.conflict ? { bound: { accountId: saved.conflict.accountId, label: saved.conflict.label } } : {});
         return;
       }
+      res.json({ overview: projectOverview(projectId) });
+      return;
+    }
+    if (kind === 'folder') {
+      // A local project is linked only from the machine's own roster, by the
+      // one folder the name or path means.
+      const choice = chooseLocalProject(typeof input.ref === 'string' ? input.ref : null);
+      if (choice.kind !== 'found') {
+        res.status(409).json({
+          error: choice.kind === 'choose' ? 'LOCAL_PROJECT_CHOICE_REQUIRED' : 'LOCAL_PROJECT_NOT_FOUND',
+          named: choice.named, localProjects: choice.choices,
+        });
+        return;
+      }
+      const saved = saveResource(projectId, {
+        kind: 'folder', ref: choice.project.path, label: choice.project.name,
+        verifiedAt: new Date().toISOString(),
+        verification: { against: 'local_projects', type: choice.project.type, git: choice.project.git },
+      });
+      if (!saved.ok) { refuse(res, saved.reason); return; }
       res.json({ overview: projectOverview(projectId) });
       return;
     }
