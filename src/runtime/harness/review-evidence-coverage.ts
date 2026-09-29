@@ -2,14 +2,15 @@
  *
  * A reviewer is shown large results as bounded views and can open the rest.
  * Whether it did is a host fact, recorded per lookup. A verdict names the
- * results it rests on; a result shown only in part supports a statement about
- * what is absent from it, about all of it, or about how many it holds only
- * when the reviewer inspected the rest and the source itself had no further
- * page. A record count or a successful outcome is never that inspection.
+ * results it needs the whole of; a result shown only in part supports a
+ * statement about what is absent from it, about all of it, or about how many
+ * it holds only when the reviewer inspected the rest and the source itself had
+ * no further page. A record count or a successful outcome is never that
+ * inspection. A verdict resting on what was shown needs no more than that.
  *
  * Nothing here reads the reply or the objective. Which results a verdict
- * rests on is the reviewer's typed answer; what was inspected is the host's
- * record; this module only compares the two. */
+ * needs the whole of is the reviewer's typed answer; what was inspected is the
+ * host's record; this module only compares the two. */
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import type { JudgeEvidenceLookup } from './judge-evidence-tools.js';
 
@@ -66,11 +67,11 @@ export interface EvidenceCoverageRow {
 }
 
 export type ReviewCoverageStatus =
-  /** Every result the verdict rests on was inspected in full. */
+  /** Every result the verdict needs the whole of was inspected in full. */
   | 'sufficient'
-  /** The verdict did not say what it rests on, and results were shown in part. */
+  /** The verdict did not say what it needs the whole of, and results were shown in part. */
   | 'unattested'
-  /** The verdict rests on a result that was not inspected in full. */
+  /** The verdict needs the whole of a result that was not inspected in full. */
   | 'insufficient';
 
 export interface ReviewCoverageAssessment {
@@ -82,8 +83,8 @@ export interface ReviewCoverageAssessment {
   unsupported: EvidenceCoverageRow[];
   /** Refs the verdict named that match no judged result. */
   unknownRefs: string[];
-  /** What the verdict said it rests on; null when it did not say. */
-  restsOn: string[] | null;
+  /** The results the verdict said it needs the whole of; null when it did not say. */
+  needsAllOf: string[] | null;
 }
 
 const succeeded = (row: ReviewedEvidenceRow): boolean => row.outcome === 'succeeded' || row.outcome === 'empty_result';
@@ -189,12 +190,14 @@ export function reviewEvidenceCoverage(
   return rows;
 }
 
-const RESTS_ON_LINE = /^\s*RESTS ON\s*[:\-]\s*(.*)$/im;
+const NEEDS_ALL_OF_LINE = /^\s*NEEDS ALL OF\s*[:\-]\s*(.*)$/im;
 
-/** The results a verdict says it rests on. Null when the verdict did not say;
- * an empty list when it said none. Refs are matched exactly, never guessed. */
-export function parseRestsOn(finalOutput: unknown): string[] | null {
-  const match = RESTS_ON_LINE.exec(String(finalOutput ?? ''));
+/** The results a verdict says it needs the whole of: where something must be
+ * absent from the result or true of every record in it. A verdict
+ * resting only on what it was shown names none. Null when the verdict did
+ * not say; an empty list when it said none. Refs are matched exactly. */
+export function parseNeedsAllOf(finalOutput: unknown): string[] | null {
+  const match = NEEDS_ALL_OF_LINE.exec(String(finalOutput ?? ''));
   if (!match) return null;
   const listed = (match[1] ?? '').trim();
   if (!listed || /^none\b/i.test(listed)) return [];
@@ -205,13 +208,13 @@ export function parseRestsOn(finalOutput: unknown): string[] | null {
 export function assessReviewCoverage(input: {
   results: readonly ReviewedEvidenceRow[];
   lookups?: readonly JudgeEvidenceLookup[];
-  restsOn: readonly string[] | null;
+  needsAllOf: readonly string[] | null;
 }): ReviewCoverageAssessment {
   const rows = reviewEvidenceCoverage(input.results, input.lookups ?? []);
   const open = rows.filter((row) => !row.exhaustive);
-  const restsOn = input.restsOn === null ? null : [...input.restsOn];
-  if (restsOn === null) {
-    return { status: open.length > 0 ? 'unattested' : 'sufficient', rows, open, unsupported: [], unknownRefs: [], restsOn };
+  const needsAllOf = input.needsAllOf === null ? null : [...input.needsAllOf];
+  if (needsAllOf === null) {
+    return { status: open.length > 0 ? 'unattested' : 'sufficient', rows, open, unsupported: [], unknownRefs: [], needsAllOf };
   }
   const byRef = new Map<string, EvidenceCoverageRow>();
   for (const row of rows) {
@@ -233,7 +236,7 @@ export function assessReviewCoverage(input: {
   const known = new Set(input.results.flatMap(rowRefs));
   const unsupported: EvidenceCoverageRow[] = [];
   const unknownRefs: string[] = [];
-  for (const ref of restsOn) {
+  for (const ref of needsAllOf) {
     const row = byRef.get(ref);
     if (row) {
       if (!row.exhaustive && !unsupported.includes(row)) unsupported.push(row);
@@ -241,7 +244,7 @@ export function assessReviewCoverage(input: {
       unknownRefs.push(ref);
     }
   }
-  return { status: unsupported.length > 0 ? 'insufficient' : 'sufficient', rows, open, unsupported, unknownRefs, restsOn };
+  return { status: unsupported.length > 0 ? 'insufficient' : 'sufficient', rows, open, unsupported, unknownRefs, needsAllOf };
 }
 
 function describeRow(row: EvidenceCoverageRow): string {
@@ -276,14 +279,15 @@ export function reviewCoverageFollowUp(assessment: ReviewCoverageAssessment): st
   return [
     'COVERAGE CHECK (host record of this review):',
     assessment.status === 'unattested'
-      ? 'Your verdict did not say which results it rests on. These were shown to you only in part:'
-      : 'Your verdict rests on these results, which you have not inspected in full:',
+      ? 'Your verdict did not say which results it needs the whole of. These were shown to you only in part:'
+      : 'Your verdict needs the whole of these results, which you have not inspected in full:',
     ...rows.map((row) => `- ${describeRow(row)}`),
     ...(assessment.unknownRefs.length ? [`These refs match no result under review: ${assessment.unknownRefs.join(', ')}.`] : []),
     '',
-    'Decide whether the response, or your verdict, states that something is absent from one of these results, is true of all of it, or counts what it holds. If so, inspect that result now with the evidence tools: query every record for the criterion, or open the rest.',
+    'Decide whether the response, or your verdict, states that something is absent from one of these results, is true of all of it, or that so many of its records match something. If so, inspect that result now with the evidence tools: query every record for the criterion, or open the rest.',
     'Where a result reports more at its source, no inspection of what was returned can show what the source holds beyond it.',
-    'Then give the verdict again in the required format, with its RESTS ON line. When the response makes such a statement and what you inspected does not support it, the verdict is CORRECT, quoting the words.',
+    'A verdict that rests only on what you were shown of a result does not need the whole of it.',
+    'Then give the verdict again in the required format, with its NEEDS ALL OF line. When the response makes such a statement and what you inspected does not support it, the verdict is CORRECT, quoting the words.',
   ].join('\n');
 }
 
@@ -297,7 +301,7 @@ export function reviewCoverageFinding(assessment: ReviewCoverageAssessment): str
       : typeof row.recordCount === 'number'
         ? `it holds ${row.recordCount} records and only part of it was read`
         : 'only part of it was read';
-    return `(${index + 1}) The review rests on ${row.toolName} [${row.ref}], but ${limit}. `
+    return `(${index + 1}) The review needs the whole of ${row.toolName} [${row.ref}], but ${limit}. `
       + 'Check every record for what the response states (query the retained result, or fetch the remaining pages), '
       + 'or say plainly what was checked and what was not.';
   }).join(' ');

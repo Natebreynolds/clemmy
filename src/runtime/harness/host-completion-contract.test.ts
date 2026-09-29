@@ -1661,7 +1661,7 @@ test('a bounded list read carries its denominator, its source completeness and i
   const ledger = reviewCoverageLedger(evidence.results)!;
   assert.match(ledger, /list-month \(calendar_list_events\): \d+ of \d+ bytes shown; 94 records; nothing else opened; read before a write by this request/);
   assert.doesNotMatch(ledger, /create-1|readback-1/);
-  assert.equal(assessReviewCoverage({ results: evidence.results, restsOn: ['list-month'] }).status, 'insufficient');
+  assert.equal(assessReviewCoverage({ results: evidence.results, needsAllOf: ['list-month'] }).status, 'insufficient');
 
   // The reviewer's own tools, over the same source-scoped lookup the host
   // gives a review, settle it: one exhaustive query finds the late record.
@@ -1673,7 +1673,7 @@ test('a bounded list read carries its denominator, its source completeness and i
     ref: 'list-month', where_field: 'subject', contains: 'picture day', fields: ['subject', 'start.dateTime'] })));
   assert.match(found, /1 of 94 records at data\.value match; showing 1 from offset 0 \(end\)/);
   assert.match(found, /"sourceIndex": 71/);
-  const covered = assessReviewCoverage({ results: evidence.results, lookups, restsOn: ['list-month'] });
+  const covered = assessReviewCoverage({ results: evidence.results, lookups, needsAllOf: ['list-month'] });
   assert.equal(covered.status, 'sufficient');
   assert.equal(covered.rows.find((row) => row.ref === 'list-month')?.inspection, 'queried');
 });
@@ -1693,7 +1693,7 @@ test('a page that names a next page is not the whole answer, however completely 
   assert.equal(page.sourceExhausted, false, 'the source said there is more');
   assert.equal(empty.sourceExhausted, true);
   assert.equal(empty.recordCount, 0);
-  const assessed = assessReviewCoverage({ results: evidence.results, restsOn: ['first-page', 'empty-complete'] });
+  const assessed = assessReviewCoverage({ results: evidence.results, needsAllOf: ['first-page', 'empty-complete'] });
   assert.deepEqual(assessed.unsupported.map((row) => row.ref), ['first-page']);
   assert.equal(assessed.rows.find((row) => row.ref === 'empty-complete')?.exhaustive, true,
     'an empty result from a source with nothing further is evidence of an empty result');

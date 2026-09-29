@@ -19,7 +19,7 @@ import {
   type JudgeEvidenceLookup, type JudgeEvidenceLookupObserver, type JudgeEvidenceSource,
 } from './judge-evidence-tools.js';
 import {
-  assessReviewCoverage, parseRestsOn, reviewCoverageFinding, reviewCoverageFollowUp, reviewCoverageLedger,
+  assessReviewCoverage, parseNeedsAllOf, reviewCoverageFinding, reviewCoverageFollowUp, reviewCoverageLedger,
   type EvidenceCoverageRow, type ReviewCoverageStatus,
 } from './review-evidence-coverage.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
@@ -176,7 +176,7 @@ const COVERAGE_RECORD_MAX_LOOKUPS = 2 * JUDGE_EVIDENCE_LOOKUP_BUDGET;
 export interface ReviewEvidenceCoverageRecord {
   status: ReviewCoverageStatus;
   /** Refs the verdict named; null when it named none and did not say "none". */
-  restsOn: string[] | null;
+  needsAllOf: string[] | null;
   /** Every lookup the deciding review made, in order. */
   lookups: JudgeEvidenceLookup[];
   /** Results that were never inspected in full, whatever they were used for. */
@@ -1331,7 +1331,7 @@ function coverageRecord(
 ): ReviewEvidenceCoverageRecord {
   return {
     status: assessment.status,
-    restsOn: assessment.restsOn ? assessment.restsOn.slice(0, COVERAGE_RECORD_MAX_ROWS) : null,
+    needsAllOf: assessment.needsAllOf ? assessment.needsAllOf.slice(0, COVERAGE_RECORD_MAX_ROWS) : null,
     lookups: lookups.slice(0, COVERAGE_RECORD_MAX_LOOKUPS),
     open: assessment.open.slice(0, COVERAGE_RECORD_MAX_ROWS),
     unsupported: assessment.unsupported.slice(0, COVERAGE_RECORD_MAX_ROWS),
@@ -1350,10 +1350,10 @@ async function runCompletionJudge(
   const results = skillContext?.verifiedReadResults ?? [];
   // What the verdict rests on is read from the same output the verdict line
   // is, so the two can never come from different answers.
-  type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { restsOn?: string[] | null };
+  type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { needsAllOf?: string[] | null };
   const parse = (output: unknown): Parsed | null => {
     const verdict = parseCompletionVerdict(output);
-    return verdict && checksCoverage ? { ...verdict, restsOn: parseRestsOn(output) } : verdict;
+    return verdict && checksCoverage ? { ...verdict, needsAllOf: parseNeedsAllOf(output) } : verdict;
   };
   const hedged = (reviewPrompt: string, depth: ReviewDepthRequest) => {
     const timeoutMs = judge.timeoutMs ?? depth.timeoutMs;
@@ -1372,7 +1372,7 @@ async function runCompletionJudge(
         quotaAwareRoute: true },
     );
   };
-  const plain = ({ restsOn: _restsOn, ...verdict }: Parsed): NonNullable<CompletionJudgeRun['verdict']> => verdict;
+  const plain = ({ needsAllOf: _needsAllOf, ...verdict }: Parsed): NonNullable<CompletionJudgeRun['verdict']> => verdict;
   const review = async (depth: ReviewDepthRequest): Promise<CompletionJudgeRun> => {
     const first = await hedged(prompt, depth);
     const run: CompletionJudgeRun = { verdict: first.value ? plain(first.value) : null, failure: first.failure, routing: first.routing,
@@ -1384,7 +1384,7 @@ async function runCompletionJudge(
     const accepts = (value: Parsed | null): value is Parsed => Boolean(value?.done && !value.awaitingUser && !value.blocked);
     if (!checksCoverage || !accepts(first.value)) return run;
     const lookups = [...(first.lookups ?? [])];
-    let assessment = assessReviewCoverage({ results, lookups, restsOn: first.value.restsOn ?? null });
+    let assessment = assessReviewCoverage({ results, lookups, needsAllOf: first.value.needsAllOf ?? null });
     let followUp: ReviewEvidenceCoverageRecord['followUp'];
     if (assessment.status !== 'sufficient') {
       // ONE follow-up, in the reviewer's own lane: it names the exact results
@@ -1403,7 +1403,7 @@ async function runCompletionJudge(
         if (!accepts(second.value)) {
           return { ...run, evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
         }
-        assessment = assessReviewCoverage({ results, lookups, restsOn: second.value.restsOn ?? null });
+        assessment = assessReviewCoverage({ results, lookups, needsAllOf: second.value.needsAllOf ?? null });
       }
     }
     // Asked, and the accepted verdict still rests on a result nobody read in

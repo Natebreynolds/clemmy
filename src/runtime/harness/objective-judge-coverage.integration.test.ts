@@ -116,7 +116,7 @@ after(() => {
 });
 
 test('the reviewer is told before it rules which results it holds only in part', async () => {
-  script = ['DONE: the event was created, confirmed by its write receipt.\nRESTS ON: call_write'];
+  script = ['DONE: the event was created, confirmed by its write receipt.\nNEEDS ALL OF: call_write'];
   const verdict = await review();
   assert.equal(verdict.done, true);
   assert.equal(requests.length, 1, 'a verdict resting on results shown whole costs no further call');
@@ -124,7 +124,7 @@ test('the reviewer is told before it rules which results it holds only in part',
   assert.match(promptOf(requests[0]!), /call_list \(provider_list_records\): 3600 of 51000 bytes shown; 94 records; nothing else opened/);
   assert.match(promptOf(requests[0]!), /read before a write by this request/);
   assert.equal(verdict.evidenceCoverage?.status, 'sufficient');
-  assert.deepEqual(verdict.evidenceCoverage?.restsOn, ['call_write']);
+  assert.deepEqual(verdict.evidenceCoverage?.needsAllOf, ['call_write']);
   assert.deepEqual(verdict.evidenceCoverage?.open.map((row) => row.ref), ['call_list'],
     'the uninspected result stays on the record even though the verdict does not rest on it');
   assert.equal(verdict.evidenceCoverage?.followUp, undefined);
@@ -132,16 +132,16 @@ test('the reviewer is told before it rules which results it holds only in part',
 
 test('an acceptance resting on an unopened result is asked once to inspect it, and the lookup is recorded', async () => {
   script = [
-    'DONE: the event was created; the earlier read of 94 records confirms none pre-existed.\nRESTS ON: call_write, call_list',
+    'DONE: the event was created; the earlier read of 94 records confirms none pre-existed.\nNEEDS ALL OF: call_write, call_list',
     { tool: 'query_evidence', args: { ref: 'call_list', where_field: 'subject', contains: 'picture day', fields: ['subject', 'start.dateTime'] } },
-    'DONE: the event was created; no record of 94 carries that title.\nRESTS ON: call_write, call_list',
+    'DONE: the event was created; no record of 94 carries that title.\nNEEDS ALL OF: call_write, call_list',
   ];
   const verdict = await review();
   assert.equal(verdict.done, true);
   assert.equal(requests.length, 3);
   const followUp = promptOf(requests[1]!);
   assert.match(followUp, /COVERAGE CHECK/);
-  assert.match(followUp, /Your verdict rests on these results, which you have not inspected in full/);
+  assert.match(followUp, /Your verdict needs the whole of these results, which you have not inspected in full/);
   assert.match(followUp, /Retained READ results for THIS accepted source/, 'the evidence is resent unchanged ahead of the check');
   assert.equal(verdict.evidenceCoverage?.status, 'sufficient');
   assert.equal(verdict.evidenceCoverage?.followUp, 'answered');
@@ -153,7 +153,7 @@ test('an acceptance resting on an unopened result is asked once to inspect it, a
 test('inspection can overturn the acceptance: a match on a later page becomes a correction', async () => {
   source = { data: { value: records(true) } };
   script = [
-    'DONE: created; the month read confirms none pre-existed.\nRESTS ON: call_list',
+    'DONE: created; the month read confirms none pre-existed.\nNEEDS ALL OF: call_list',
     { tool: 'query_evidence', args: { ref: 'call_list', where_field: 'subject', contains: 'picture day', fields: ['subject'] } },
     'CORRECT: (1) "none of these existed" — record 71 of the month read is "Autumn Picture Day"',
   ];
@@ -167,14 +167,14 @@ test('inspection can overturn the acceptance: a match on a later page becomes a 
 
 test('a reviewer that keeps accepting on a result it never read does not get its acceptance', async () => {
   script = [
-    'DONE: created; 94 records were returned and none pre-existed.\nRESTS ON: call_list',
-    'DONE: created; the read succeeded with 94 records, so nothing pre-existed.\nRESTS ON: call_list',
+    'DONE: created; 94 records were returned and none pre-existed.\nNEEDS ALL OF: call_list',
+    'DONE: created; the read succeeded with 94 records, so nothing pre-existed.\nNEEDS ALL OF: call_list',
   ];
   const verdict = await review();
   assert.equal(requests.length, 2, 'one follow-up, never a loop');
   assert.equal(verdict.done, false, 'a count and a success are not an inspection');
   assert.equal(verdict.repairScope, 'claims');
-  assert.match(verdict.reason, /provider_list_records \[call_list\]/);
+  assert.match(verdict.reason, /needs the whole of provider_list_records \[call_list\]/);
   assert.match(verdict.reason, /holds 94 records and only part of it was read/);
   assert.equal(verdict.evidenceCoverage?.status, 'insufficient');
   assert.equal(verdict.evidenceCoverage?.returnedForCorrection, true);
@@ -184,9 +184,9 @@ test('a reviewer that keeps accepting on a result it never read does not get its
 test('one page of two is not the list: the second page completes the inspection', async () => {
   script = [
     { tool: 'query_evidence', args: { ref: 'call_list', fields: ['subject'], limit: 50 } },
-    'DONE: created; none pre-existed.\nRESTS ON: call_list',
+    'DONE: created; none pre-existed.\nNEEDS ALL OF: call_list',
     { tool: 'query_evidence', args: { ref: 'call_list', fields: ['subject'], offset: 50, limit: 50 } },
-    'DONE: created; all 94 subjects read, none matches.\nRESTS ON: call_list',
+    'DONE: created; all 94 subjects read, none matches.\nNEEDS ALL OF: call_list',
   ];
   const verdict = await review();
   assert.equal(verdict.done, true);
@@ -195,14 +195,14 @@ test('one page of two is not the list: the second page completes the inspection'
   assert.deepEqual(verdict.evidenceCoverage?.lookups.map((lookup) => [lookup.offset, lookup.recordsReturned]), [[0, 50], [50, 44]]);
 });
 
-test('a verdict that never says what it rests on is asked once, then stands as unattested', async () => {
+test('a verdict that never says what it needs the whole of is asked once, then stands as unattested', async () => {
   script = ['DONE: the event was created.', 'DONE: the event was created, confirmed by its receipt.'];
   const verdict = await review();
   assert.equal(requests.length, 2);
-  assert.match(promptOf(requests[1]!), /did not say which results it rests on/);
-  assert.equal(verdict.done, true, 'nothing shows the verdict rests on the unopened result, so the work is not sent back');
+  assert.match(promptOf(requests[1]!), /did not say which results it needs the whole of/);
+  assert.equal(verdict.done, true, 'nothing shows the verdict needs the unopened result, so the work is not sent back');
   assert.equal(verdict.evidenceCoverage?.status, 'unattested');
-  assert.equal(verdict.evidenceCoverage?.restsOn, null);
+  assert.equal(verdict.evidenceCoverage?.needsAllOf, null);
 });
 
 test('a follow-up that gets no answer leaves the first verdict and its record standing', async () => {
@@ -215,8 +215,8 @@ test('a follow-up that gets no answer leaves the first verdict and its record st
 
 test('a source that reported more than it returned cannot support absence, however much was read', async () => {
   script = [
-    'DONE: created; the read shows none pre-existed.\nRESTS ON: call_list',
-    'DONE: created; every returned record was read.\nRESTS ON: call_list',
+    'DONE: created; the read shows none pre-existed.\nNEEDS ALL OF: call_list',
+    'DONE: created; every returned record was read.\nNEEDS ALL OF: call_list',
   ];
   const verdict = await review({ verifiedReadResults: [
     { ...boundedList, contentComplete: true, shownByteCount: 51_000, sourceExhausted: false }, writeReceipt] });

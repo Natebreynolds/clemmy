@@ -31,16 +31,18 @@ The defect is therefore unauditable and unenforced evidence, not a wrong outcome
 2. **Evidence rows carry coverage facts.** Read rows on the verdict record the retained result's record count,
    whether the source reported nothing further for that request, and whether a write by the same request settled
    after the read.
-3. **A verdict names what it rests on.** After a DONE line the reviewer adds `RESTS ON: <refs>` or `RESTS ON: none`.
-   The review prompt lists, from the host record, the results the reviewer holds only in part.
-4. **The host compares the two.** A result shown in part supports the verdict only when the rest was opened, every
+3. **A verdict names what it needs the whole of.** After a DONE line the reviewer adds `NEEDS ALL OF: <refs>`, naming
+   each result where something must be absent from it or true of every record in it, or `NEEDS ALL OF: none` when
+   the verdict rests only on what it was shown, including a result's stated record count. The review prompt lists, from the host record, the results the
+   reviewer holds only in part.
+4. **The host compares the two.** A result shown in part supports such a verdict only when the rest was opened, every
    record was paged, or a criterion was queried against every record, and the source reported nothing further. A
    record count, a successful outcome or a matching schema is not an inspection.
-5. **One follow-up, then correction.** When an acceptance rests on an uninspected result, or does not say what it
-   rests on while results are held in part, the reviewer is asked once, with the exact results and what was read
+5. **One follow-up, then correction.** When an acceptance needs the whole of an uninspected result, or does not say
+   what it needs while results are held in part, the reviewer is asked once, with the exact results and what was read
    of them. If it still accepts on a result nobody read in full, the acceptance does not stand: the work returns to
    the assistant as a claims correction, to read every record or to say what was checked. A verdict that never says
-   what it rests on stands as `unattested`; nothing shows it rests on the unopened result, so the work is not sent back.
+   what it needs stands as `unattested`; nothing shows it needs the unopened result, so the work is not sent back.
 6. **The verdict record carries all of it** (`evidenceCoverage` on `goal_alignment_judged`; a non-sufficient status
    on the published verdict reference).
 7. **The answerer's bounded list view states its denominator**: records in the source list, records shown, and the
@@ -50,7 +52,7 @@ The defect is therefore unauditable and unenforced evidence, not a wrong outcome
 9. **An approval batch asks an identical label question once.** Nine members of the owner's run asked the same
    question nine times and received the same answer. Display only; authority unchanged.
 
-No regex reads the reply or the objective. Which results a verdict rests on is the reviewer's typed answer; what
+No regex reads the reply or the objective. Which results a verdict needs the whole of is the reviewer's typed answer; what
 was inspected is the host's record.
 
 ## Unchanged
@@ -62,7 +64,7 @@ receipts and is unchanged. No new execution layer, no provider or model name in 
 ## Verification before installation
 
 - `tsc --noEmit` clean.
-- New pins: 16 coverage checks, 11 reviewer-flow checks driving the real judge runner with a scripted model that
+- New pins: 17 coverage checks, 11 reviewer-flow checks driving the real judge runner with a scripted model that
   makes real lookups, 2 host evidence checks over real settlements, 4 lookup-recording checks, 1 restatement check,
   2 bounded-view checks, 2 label checks.
 - Baseline falsification: the 11 reviewer-flow pins run against `8d4a03956` fail 9 of 11; the two that pass pin
@@ -82,7 +84,7 @@ receipts and is unchanged. No new execution layer, no provider or model name in 
 - An unattested acceptance is recorded and delivered. It is not yet shown on the desktop or mobile card.
 - The bounded view still chooses which fields to show by spread and cost. On a calendar-shaped list under a
   4,000-character budget it showed only the end time. The view now says so; it does not yet choose better.
-- Whether the owner's configured reviewer writes the `RESTS ON` line is a live question. When it does not, each
+- Whether the owner's configured reviewer writes the `NEEDS ALL OF` line is a live question. When it does not, each
   such review costs one follow-up call.
 
 ## Measured in the recorded runs, not yet changed
