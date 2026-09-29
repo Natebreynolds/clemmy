@@ -5,14 +5,17 @@
  * A project links to local projects; it never becomes one. Linking records
  * where the work is and grants nothing. A row says its name first and its
  * path second, says when the folder is gone, and says when coding work
- * cannot run in it yet. Unlinking leaves the folder exactly where it is.
+ * cannot run in it yet. A folder that says how it is worked in shows the
+ * commands it offers and the tools it expects, with the ones Clem is not
+ * connected to marked. Unlinking leaves the folder exactly where it is.
  */
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { CheckCircle2, FolderGit2, FolderX } from 'lucide-react';
+import { CheckCircle2, CircleAlert, FolderGit2, FolderX } from 'lucide-react';
 import {
-  middleTruncatePath, projectLinkedLocalProject, projectLocalProjectChoices, projectLocalProjectGitLine,
-  projectLocalProjectMissingLine, projectLocalProjectRefusal,
+  PROJECT_LOCAL_COMMANDS_HINT, PROJECT_LOCAL_COMMANDS_LABEL, PROJECT_LOCAL_TOOL_SERVERS_LABEL,
+  middleTruncatePath, projectLinkedLocalProject, projectLocalProjectChoices, projectLocalProjectCommands,
+  projectLocalProjectGitLine, projectLocalProjectMissingLine, projectLocalProjectRefusal, projectLocalProjectToolServers,
 } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -38,6 +41,8 @@ export function LocalProjectRow({ projectId, resource, readOnly, onSaved }: {
   if (!local) return null;
   const missing = projectLocalProjectMissingLine(local);
   const noGit = projectLocalProjectGitLine(local);
+  const commands = missing ? [] : projectLocalProjectCommands(local);
+  const tools = projectLocalProjectToolServers(missing ? {} : local);
 
   const remove = async () => {
     setBusy(true);
@@ -62,6 +67,42 @@ export function LocalProjectRow({ projectId, resource, readOnly, onSaved }: {
           )}
           {missing && <p className="mt-1 text-small text-warning" role="status">{missing}</p>}
           {noGit && <p className="mt-1 text-caption text-muted">{noGit}</p>}
+          {commands.length > 0 && (
+            <div className="mt-2">
+              <p className="text-caption text-muted">{PROJECT_LOCAL_COMMANDS_LABEL}</p>
+              <ul className="mt-1 flex flex-wrap gap-1.5" aria-label={`${PROJECT_LOCAL_COMMANDS_LABEL} in ${local.name}`}>
+                {commands.map((name) => (
+                  <li key={name} className="rounded-md border border-border bg-subtle px-2 py-0.5 font-mono text-caption text-fg">{name}</li>
+                ))}
+              </ul>
+              <p className="mt-1 text-caption text-faint">{PROJECT_LOCAL_COMMANDS_HINT}</p>
+            </div>
+          )}
+          {tools.servers.length > 0 && (
+            <div className="mt-2">
+              <p className="text-caption text-muted">{PROJECT_LOCAL_TOOL_SERVERS_LABEL}</p>
+              <ul className="mt-1 flex flex-wrap gap-1.5" aria-label={`${PROJECT_LOCAL_TOOL_SERVERS_LABEL} in ${local.name}`}>
+                {tools.servers.map((server) => (
+                  <li
+                    key={server.name}
+                    className={`flex items-center gap-1 rounded-md border px-2 py-0.5 text-caption ${server.connected ? 'border-border bg-subtle text-fg' : 'border-warning/40 bg-warning-tint text-fg'}`}
+                  >
+                    {server.connected
+                      ? <CheckCircle2 className="h-3 w-3 shrink-0 text-success" aria-hidden />
+                      : <CircleAlert className="h-3 w-3 shrink-0 text-warning" aria-hidden />}
+                    <span className="font-mono">{server.name}</span>
+                    <span className="sr-only">{server.connected ? 'connected' : 'not connected'}</span>
+                  </li>
+                ))}
+              </ul>
+              {tools.missingLine && (
+                <p className="mt-1 text-caption text-muted" role="status">
+                  {tools.missingLine}{' '}
+                  <Link to="/connect" className="font-semibold text-primary hover:underline">Open Connect</Link>
+                </p>
+              )}
+            </div>
+          )}
         </div>
         {!readOnly && !confirming && (
           <Button

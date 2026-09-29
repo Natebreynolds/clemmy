@@ -73,6 +73,18 @@ export interface ProjectLinkedLocalProject {
   /** False when the folder is no longer on this machine. */
   present: boolean;
   git: boolean;
+  /** What the folder offers whoever works in it. Absent from a server that
+   * does not describe it; nothing is claimed then. */
+  instructions?: string[];
+  commands?: string[];
+  toolServers?: ProjectLocalToolServer[];
+}
+
+/** A tool server a local project declares, and whether Clem is connected to
+ * one of the same name. Declaring one connects nothing. */
+export interface ProjectLocalToolServer {
+  name: string;
+  connected: boolean;
 }
 
 export type ProjectCodingRunPhase = 'waiting_to_start' | 'working' | 'handed_to_you' | 'finished';
@@ -347,11 +359,38 @@ export function projectLinkedLocalProject(
       path: described.path,
       present: described.present === true,
       git: described.git === true,
+      instructions: names(described.instructions),
+      commands: names(described.commands),
+      toolServers: toolServers(described.toolServers),
       known: true,
     };
   }
   const path = resource.ref?.trim() ?? '';
   return { name: resource.label?.trim() || pathLeaf(path) || 'Local project', path, present: true, git: true, known: false };
+}
+
+/** Only what is a name is kept; an answer this build cannot read is left out. */
+function names(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const kept: string[] = [];
+  for (const entry of value) {
+    const name = typeof entry === 'string' ? entry.trim() : '';
+    if (name && !kept.includes(name)) kept.push(name);
+  }
+  return kept;
+}
+
+function toolServers(value: unknown): ProjectLocalToolServer[] {
+  if (!Array.isArray(value)) return [];
+  const kept: ProjectLocalToolServer[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const raw = entry as { name?: unknown; connected?: unknown };
+    const name = typeof raw.name === 'string' ? raw.name.trim() : '';
+    // Only an explicit yes says Clem can reach it.
+    if (name && !kept.some((row) => row.name === name)) kept.push({ name, connected: raw.connected === true });
+  }
+  return kept;
 }
 
 function pathLeaf(path: string | null | undefined): string {
@@ -362,6 +401,38 @@ function pathLeaf(path: string | null | undefined): string {
 /** Said when the folder is gone; null while it is there. */
 export function projectLocalProjectMissingLine(localProject: Pick<ProjectLinkedLocalProject, 'present'>): string | null {
   return localProject.present ? null : 'This folder is no longer on this Mac. Remove it, or link the local project where it lives now.';
+}
+
+export const PROJECT_LOCAL_COMMANDS_LABEL = 'Commands it offers';
+export const PROJECT_LOCAL_COMMANDS_HINT = 'Ask for one by name in a conversation in this project.';
+export const PROJECT_LOCAL_TOOL_SERVERS_LABEL = 'Tools it expects';
+
+/** The commands a local project names, in its own order; empty when it names none. */
+export function projectLocalProjectCommands(localProject: Pick<ProjectLinkedLocalProject, 'commands'>): string[] {
+  return names(localProject.commands);
+}
+
+/**
+ * The tool servers a local project declares, the connected ones first, and
+ * what to say about the ones Clem cannot reach. Null line when none is missing.
+ */
+export function projectLocalProjectToolServers(localProject: Pick<ProjectLinkedLocalProject, 'toolServers'>): {
+  servers: ProjectLocalToolServer[];
+  missing: string[];
+  missingLine: string | null;
+} {
+  const all = toolServers(localProject.toolServers);
+  const servers = [...all.filter((row) => row.connected), ...all.filter((row) => !row.connected)];
+  const missing = servers.filter((row) => !row.connected).map((row) => row.name);
+  const missingLine = missing.length === 0 ? null
+    : missing.length === 1
+      ? `${missing[0]} is not connected. Work here that needs it will say so until it is connected in Connect.`
+      : `${listOf(missing)} are not connected. Work here that needs them will say so until they are connected in Connect.`;
+  return { servers, missing, missingLine };
+}
+
+function listOf(items: string[]): string {
+  return items.length <= 2 ? items.join(' and ') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
 /** Said when the folder is there and is not a repository; null otherwise. */

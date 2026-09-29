@@ -8,6 +8,8 @@ import {
   projectAgentsLine, projectDecisionConsequence, projectDecisionSource, projectNeedsYouLabel,
   middleTruncatePath, projectCodingRunPhase, projectCodingRunPlace, projectLinkedLocalProject, projectLocalProjectChoices,
   projectLocalProjectGitLine, projectLocalProjectMissingLine, projectLocalProjectRefusal, PROJECT_LOCAL_PROJECTS_HINT,
+  projectLocalProjectCommands, projectLocalProjectToolServers,
+  PROJECT_LOCAL_COMMANDS_HINT, PROJECT_LOCAL_COMMANDS_LABEL, PROJECT_LOCAL_TOOL_SERVERS_LABEL,
   projectDecisionIsFormal, projectDecisionOptions, projectLabelsBySession, projectResourceApp,
   projectResourceKindLabel, projectResourceName, projectResourceVerification, projectWorkLine, sessionProjectLabelText,
   type MemoryScope, type ProjectSummary,
@@ -147,7 +149,7 @@ test('local projects are their own group, first, and say what they are for', () 
 
 test('a linked local project says when its folder is gone, and when coding work cannot run in it', () => {
   const here = projectLinkedLocalProject({ kind: 'folder', label: 'clem', ref: '/srv/o/code/clem', localProject: { name: 'clem', path: '/srv/o/code/clem', present: true, git: true } });
-  assert.deepEqual(here, { name: 'clem', path: '/srv/o/code/clem', present: true, git: true, known: true });
+  assert.deepEqual(here, { name: 'clem', path: '/srv/o/code/clem', present: true, git: true, instructions: [], commands: [], toolServers: [], known: true });
   assert.equal(projectLocalProjectMissingLine(here!), null);
   assert.equal(projectLocalProjectGitLine(here!), null);
 
@@ -162,6 +164,36 @@ test('a linked local project says when its folder is gone, and when coding work 
   const older = projectLinkedLocalProject({ kind: 'folder', label: '', ref: '/srv/o/code/app', localProject: null });
   assert.deepEqual([older?.name, older?.known], ['app', false], 'nothing is claimed about a folder the server did not describe');
   assert.equal(projectLinkedLocalProject({ kind: 'link', label: 'x', ref: 'https://example.test' }), null);
+});
+
+test('a linked local project says which commands it offers and which of its tools are not connected', () => {
+  const local = projectLinkedLocalProject({ kind: 'folder', label: 'audits', ref: '/srv/o/audits', localProject: {
+    name: 'audits', path: '/srv/o/audits', present: true, git: true,
+    instructions: ['AGENTS.md'],
+    commands: ['build-report', ' seo-audit ', 'build-report', '', 7 as unknown as string],
+    toolServers: [
+      { name: 'hosting', connected: false }, { name: 'search', connected: true },
+      { name: 'scraper', connected: 'yes' as unknown as boolean }, { name: 'search', connected: false },
+      null as unknown as { name: string; connected: boolean },
+    ],
+  } })!;
+  assert.deepEqual(projectLocalProjectCommands(local), ['build-report', 'seo-audit']);
+  const tools = projectLocalProjectToolServers(local);
+  assert.deepEqual(tools.servers, [
+    { name: 'search', connected: true }, { name: 'hosting', connected: false }, { name: 'scraper', connected: false },
+  ], 'connected first; only an explicit yes is a connection');
+  assert.deepEqual(tools.missing, ['hosting', 'scraper']);
+  assert.equal(tools.missingLine, 'hosting and scraper are not connected. Work here that needs them will say so until they are connected in Connect.');
+  assert.equal(projectLocalProjectToolServers({ toolServers: [{ name: 'hosting', connected: false }] }).missingLine,
+    'hosting is not connected. Work here that needs it will say so until it is connected in Connect.');
+  assert.match(projectLocalProjectToolServers({ toolServers: ['a', 'b', 'c'].map((name) => ({ name, connected: false })) }).missingLine!, /^a, b and c are not connected/);
+  assert.equal(projectLocalProjectToolServers({ toolServers: [{ name: 'search', connected: true }] }).missingLine, null);
+  // A server that does not describe what a folder offers claims nothing.
+  assert.deepEqual(projectLocalProjectCommands({}), []);
+  assert.deepEqual(projectLocalProjectToolServers({}), { servers: [], missing: [], missingLine: null });
+  assert.equal(PROJECT_LOCAL_COMMANDS_LABEL, 'Commands it offers');
+  assert.equal(PROJECT_LOCAL_TOOL_SERVERS_LABEL, 'Tools it expects');
+  assert.equal(PROJECT_LOCAL_COMMANDS_HINT, 'Ask for one by name in a conversation in this project.');
 });
 
 test('a path is cut in the middle, keeping where it starts and the folder it ends in', () => {

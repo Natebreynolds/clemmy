@@ -4955,6 +4955,17 @@ textarea.cz-input { resize: vertical; }
 .project-path { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: -0.01em; overflow-wrap: anywhere; }
 .project-line-note { font-size: var(--t-xs); color: var(--fg-3); line-height: 1.45; }
 .project-line-note.is-gone { color: var(--accent-warn); }
+/* A row that lists what its folder offers is tall: its action sits at the top, beside the name. */
+.project-resource.has-offers { align-items: flex-start; }
+.project-resource.has-offers .project-resource-remove { padding-top: 2px; }
+.project-offers { display: flex; flex-direction: column; gap: 4px; margin-top: var(--sp-2); min-width: 0; }
+.project-offers-label { font-size: var(--t-xs); color: var(--fg-2); }
+.project-offers-list { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.project-offer { display: inline-flex; align-items: baseline; gap: 6px; max-width: 100%; padding: 3px 8px; border: 1px solid var(--line); border-radius: 8px; font-size: var(--t-xs); color: var(--fg-1, inherit); overflow-wrap: anywhere; }
+.project-offer.is-command { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+.project-offer.is-missing { border-color: var(--line-hot); background: var(--warn-soft, rgba(176, 125, 10, 0.09)); }
+.project-offer-state { color: var(--fg-3); }
+.project-offer.is-missing .project-offer-state { color: var(--accent-warn); }
 .project-line-clamp { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .pick-top { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
 .pick-top .agent-name { min-width: 0; overflow-wrap: anywhere; }

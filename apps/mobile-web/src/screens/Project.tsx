@@ -15,9 +15,14 @@ import {
   middleTruncatePath,
   projectCodingRunPhase,
   projectCodingRunPlace,
+  PROJECT_LOCAL_COMMANDS_HINT,
+  PROJECT_LOCAL_COMMANDS_LABEL,
+  PROJECT_LOCAL_TOOL_SERVERS_LABEL,
   projectLinkedLocalProject,
+  projectLocalProjectCommands,
   projectLocalProjectGitLine,
   projectLocalProjectMissingLine,
+  projectLocalProjectToolServers,
   projectDecisionConsequence,
   projectResourceApp,
   projectDecisionSource,
@@ -588,6 +593,9 @@ function ResourceRow({ resource, onRemoved }: {
   const local = projectLinkedLocalProject(resource);
   const missing = local ? projectLocalProjectMissingLine(local) : null;
   const noCoding = local ? projectLocalProjectGitLine(local) : null;
+  // What the folder offers is said only while the folder is there.
+  const commands = local && !missing ? projectLocalProjectCommands(local) : [];
+  const tools = projectLocalProjectToolServers(local && !missing ? local : {});
   const name = local?.name ?? projectResourceName(resource);
   // The app as a person writes it, in the words the desktop uses.
   const app = projectResourceApp(resource) || null;
@@ -611,7 +619,7 @@ function ResourceRow({ resource, onRemoved }: {
   };
 
   return (
-    <div class="home-row project-line project-resource">
+    <div class={`home-row project-line project-resource${commands.length > 0 || tools.servers.length > 0 ? ' has-offers' : ''}`}>
       <span class="project-line-text">
         <span class="project-line-title">{name}</span>
         {local ? (
@@ -619,6 +627,29 @@ function ResourceRow({ resource, onRemoved }: {
         ) : null}
         {missing ? <span class="project-line-note is-gone" role="note">{missing}</span> : null}
         {noCoding ? <span class="project-line-note">{noCoding}</span> : null}
+        {commands.length > 0 ? (
+          <span class="project-offers">
+            <span class="project-offers-label">{PROJECT_LOCAL_COMMANDS_LABEL}</span>
+            <span class="project-offers-list" role="list" aria-label={`${PROJECT_LOCAL_COMMANDS_LABEL} in ${name}`}>
+              {commands.map((command) => <span key={command} role="listitem" class="project-offer is-command">{command}</span>)}
+            </span>
+            <span class="project-line-note">{PROJECT_LOCAL_COMMANDS_HINT}</span>
+          </span>
+        ) : null}
+        {tools.servers.length > 0 ? (
+          <span class="project-offers">
+            <span class="project-offers-label">{PROJECT_LOCAL_TOOL_SERVERS_LABEL}</span>
+            <span class="project-offers-list" role="list" aria-label={`${PROJECT_LOCAL_TOOL_SERVERS_LABEL} in ${name}`}>
+              {tools.servers.map((server) => (
+                <span key={server.name} role="listitem" class={`project-offer${server.connected ? ' is-connected' : ' is-missing'}`}>
+                  {server.name}
+                  <span class="project-offer-state">{server.connected ? 'connected' : 'not connected'}</span>
+                </span>
+              ))}
+            </span>
+            {tools.missingLine ? <span class="project-line-note" role="note">{tools.missingLine}</span> : null}
+          </span>
+        ) : null}
         {local ? null : (
           <span class="project-line-sub">
             {app}
