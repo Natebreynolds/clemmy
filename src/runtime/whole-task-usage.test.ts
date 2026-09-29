@@ -105,3 +105,13 @@ test('what is not known is said', () => {
   assert.deepEqual(nothing.unknown.slice(0, 1), ['The accepted request was not found in the event log; times are unknown.']);
   assert.ok(nothing.unknown.includes('No usage rows were found for this request.'));
 });
+
+test('a task that names no request is given to the one it was started under, and that is said', () => {
+  const unnamed: WholeTaskUsageSources = { ...sources, tasks: () => sources.tasks().map((task) => ({ ...task, delegation: undefined })) };
+  const first = wholeTaskUsage({ sessionId: 'chat-1', sourceUserSeq: 10 }, unnamed, new Date(at(120)));
+  assert.deepEqual(first.participants.filter((row) => row.relation === 'delegated_task').map((row) => row.taskId), ['bg-1', 'bg-other'],
+    'both were started after this request and before the next');
+  const second = wholeTaskUsage({ sessionId: 'chat-1', sourceUserSeq: 20 }, unnamed, new Date(at(120)));
+  assert.deepEqual(second.participants.filter((row) => row.relation === 'delegated_task').map((row) => row.taskId), []);
+  assert.ok(first.unknown.some((line) => /name no request and were given to this one by when they started/.test(line)));
+});

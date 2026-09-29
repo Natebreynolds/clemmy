@@ -168,8 +168,19 @@ export function wholeTaskUsage(
   const participants: TaskParticipant[] = [{ relation: 'request', sessionId, sourceUserSeq }];
   participants.push(...helpersOf(sources, sessionId, sourceUserSeq, 'helper'));
 
-  const tasks = sources.tasks().filter((task) => task.originSessionId === sessionId
-    && (task.delegation?.originSourceUserSeq === sourceUserSeq || task.foregroundHandoff?.sourceUserSeq === sourceUserSeq));
+  const tasks = sources.tasks().filter((task) => {
+    if (task.originSessionId !== sessionId) return false;
+    const named = task.delegation?.originSourceUserSeq ?? task.foregroundHandoff?.sourceUserSeq;
+    if (named !== undefined) return named === sourceUserSeq;
+    // A task that names no request belongs to the request it was started
+    // under: the one accepted last before it was created.
+    if (!accepted) return false;
+    return task.createdAt >= accepted.createdAt && (!nextRequest || task.createdAt < nextRequest.createdAt);
+  });
+  const unnamed = tasks.filter((task) => task.delegation?.originSourceUserSeq === undefined && task.foregroundHandoff?.sourceUserSeq === undefined);
+  if (unnamed.length > 0) {
+    unknown.push(`${unnamed.length} task${unnamed.length === 1 ? ' names' : 's name'} no request and ${unnamed.length === 1 ? 'was' : 'were'} given to this one by when ${unnamed.length === 1 ? 'it' : 'they'} started.`);
+  }
   for (const task of tasks) {
     participants.push({ relation: 'delegated_task', sessionId: task.runSessionId, taskId: task.id,
       owner: task.delegation?.agentName ?? null });
