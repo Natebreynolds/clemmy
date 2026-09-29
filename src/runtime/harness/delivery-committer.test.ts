@@ -855,3 +855,83 @@ for (const variant of ['valid', 'changed-reply', 'foreign-card', 'untrusted-mark
     }
   });
 }
+
+// Live 2026-09-28: four approved runs finished done and taught nothing, because
+// learning was keyed to the approval decision's source while the objective,
+// the settled calls and the verdict belong to the request that was approved.
+for (const variant of ['valid', 'untrusted-marker'] as const) {
+  test(`approved work is learned under the request that asked for it: ${variant}`, async () => {
+    const approvals = await import('./approval-registry.js');
+    const dispatch = await import('./dispatch-ledger.js');
+    const identities = await import('./attempt-identity.js');
+    const outcomes = await import('./attempt-outcome.js');
+    const store = await import('./logical-call-settlement-store.js');
+    const { hasWorkEpisode } = await import('../../memory/work-episodes.js');
+    const sessionId = `learn-resume-${variant}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const original = acceptedAnswer(sessionId, 'Both records were created.');
+    const workSeq = original.identity.sourceUserSeq!;
+    assert.ok(turnGraph.recordTurnGraphShadow({ identity: { sessionId, sourceUserSeq: workSeq, turn: 1 } }));
+    const task = { sessionId, sourceUserSeq: workSeq, acceptedTaskId: identities.acceptedTaskIdFor(sessionId, workSeq) };
+    const args = { title: 'fixture record', owner: 'fixture' };
+    const started = dispatch.beginPhysicalDispatch({
+      identity: { ...task, logicalToolCallId: 'lc-approved-1', physicalDispatchId: 'lc-approved-1:1', ordinal: 0 },
+      tool: 'ledgerscope__create_record', args });
+    assert.equal(started.status, 'inserted');
+    if (started.status !== 'inserted') return;
+    assert.equal(dispatch.settlePhysicalDispatch({ identity: started.identity, tool: 'ledgerscope__create_record', outcome: 'returned' }).status, 'inserted');
+    assert.equal(store.commitLogicalCallSettlement({
+      identity: { ...task, logicalToolCallId: 'lc-approved-1' },
+      contract: { toolName: 'ledgerscope__create_record', args },
+      execution: { kind: 'provider_execution' },
+      result: { payload: { id: 'record-1', ok: true } },
+      outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+      recovery: { businessCall: true, mutating: true }, observer: { lane: 'byo', turn: 1 },
+    }).status, 'committed');
+    const card = approvals.register({ sessionId, subject: 'fixture', tool: 'ledgerscope__create_record', args });
+    approvals.resolve(card.approvalId, 'approved', 'test');
+    appendEvent({ sessionId, turn: 1, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: workSeq, enabled: true,
+    } });
+    const control = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: {
+      text: 'Approved.', approvalId: card.approvalId, decision: 'approve',
+    } });
+    appendEvent({ sessionId, turn: 2, role: variant === 'untrusted-marker' ? 'user' : 'system', type: 'run_resumed', data: {
+      reviewContinuationVersion: 1, deliverySourceUserSeq: control.seq, executionSourceUserSeq: workSeq,
+      approvalId: card.approvalId, decision: 'approve',
+    } });
+    appendEvent({ sessionId, turn: 2, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: workSeq, ownerSelectedJudge: true,
+      fulfills: true, failedOpen: false, settledEvidenceAvailable: true,
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update('Both records were created.').digest('hex'),
+    } });
+    const identity = { sessionId, sourceUserSeq: control.seq, turn: 2 };
+    const prior = process.env.CLEMMY_COMPLETION_REVIEW;
+    process.env.CLEMMY_COMPLETION_REVIEW = 'on';
+    try {
+      const result = commitTurnOutcome({ ...original, identity, id: turnOutcomeId(identity) });
+      assert.equal(result.presentation.identity.sourceUserSeq, control.seq, 'delivery stays bound to the decision');
+      const learned = listEvents(sessionId, { types: ['run_strategy_learned'] });
+      const episode = (sourceUserSeq: number) => hasWorkEpisode({ sessionId, kind: 'answer', sourceUserSeq });
+      if (variant === 'valid') {
+        assert.equal(result.presentation.status, 'done');
+        assert.equal(learned.length, 1, 'approved work teaches one strategy');
+        assert.equal(learned[0]!.data.sourceUserSeq, workSeq, 'under the request, never the decision');
+        assert.deepEqual(learned[0]!.data.toolsUsed, ['ledgerscope__create_record']);
+        assert.match(String(learned[0]!.data.objective), /Accepted request/);
+        assert.equal(episode(workSeq), true, 'the finished work is remembered under the request');
+        assert.equal(episode(control.seq), false, 'nothing is remembered as the work of "Approved."');
+        // Replaying the terminal is one observation, not another success.
+        commitTurnOutcome({ ...original, identity, id: turnOutcomeId(identity) });
+        assert.equal(listEvents(sessionId, { types: ['run_strategy_learned'] }).length, 1);
+      } else {
+        // A marker the host did not write names no work: nothing is borrowed.
+        assert.ok(!learned.some((event) => event.data.sourceUserSeq === workSeq));
+        assert.equal(episode(workSeq), false);
+      }
+    } finally {
+      if (prior === undefined) delete process.env.CLEMMY_COMPLETION_REVIEW; else process.env.CLEMMY_COMPLETION_REVIEW = prior;
+    }
+  });
+}

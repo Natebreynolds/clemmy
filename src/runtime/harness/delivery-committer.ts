@@ -1804,18 +1804,27 @@ export function commitTurnOutcome(
       sessionId: persisted.identity.sessionId,
       sourceUserSeq: persisted.identity.sourceUserSeq,
     }).catch(() => {});
-    try {
-      learnHostRunStrategyForAcceptedTask({
-        sessionId: persisted.identity.sessionId,
-        sourceUserSeq: persisted.identity.sourceUserSeq,
-      });
-    } catch { /* strategy recall stays additive */ }
-    // The reviewed answer and where its results live, for a later chat to reuse with its age.
-    recordAnswerWorkEpisode({
+    // WHAT WAS DONE BELONGS TO THE REQUEST THAT ASKED FOR IT.
+    //
+    // A run finished after an approval publishes under the approval decision's
+    // source, while its objective, settled calls, results and verdict belong to
+    // the request that was approved. Learning keyed to the decision found no
+    // objective and no settled work, so approved work taught nothing. Live
+    // 2026-09-28: four approved runs finished done and none was learned, while
+    // 11 of 13 runs that needed no approval were; two hours after nine confirmed
+    // writes the same operation was rediscovered from scratch (source 325491).
+    // The work's source is read from the host's own durable resume marker, the
+    // same one publication uses for the verdict, never from the caller.
+    let workIdentity: { sessionId: string; sourceUserSeq: number } = {
       sessionId: persisted.identity.sessionId,
       sourceUserSeq: persisted.identity.sourceUserSeq,
-      text: persisted.text,
-    });
+    };
+    try { workIdentity = completionEvidenceSource(workIdentity); } catch { /* the published source stands */ }
+    try {
+      learnHostRunStrategyForAcceptedTask(workIdentity);
+    } catch { /* strategy recall stays additive */ }
+    // The reviewed answer and where its results live, for a later chat to reuse with its age.
+    recordAnswerWorkEpisode({ ...workIdentity, text: persisted.text });
   }
   // NOTE: the run attempt is closed by the terminal publication itself, in the
   // same transaction (eventlog `terminalOwner` branch). A best-effort finish
