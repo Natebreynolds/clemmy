@@ -86,7 +86,7 @@ import {
 } from '../../agents/capability-envelope.js';
 import type { InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
 import { approvalCallPreview } from './approval-call-preview.js';
-import { approvalPreviewLabels } from './approval-preview-labels.js';
+import { approvalPreviewLabels, type ApprovalLabelMemo } from './approval-preview-labels.js';
 import { approvalPrecheck } from './approval-precheck.js';
 import { removeReviewedClaims } from './reviewed-claim-removal.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
@@ -10825,6 +10825,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // The card names what its ids refer to, from this conversation's own
       // results; bounded, display-only, and absent when Jev is not sure.
       const approvalIdentity = exactHostIdentity();
+      const labelMemo: ApprovalLabelMemo = new Map();
       const interruptions = await Promise.all(approvals.map(async (pending) => {
         const info = {
           toolName: pending.name,
@@ -10839,6 +10840,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             preview,
             accountId: pending.consentCall?.accountId,
             operationId: unwrapRuntimeEffectiveToolIdentity(info.toolName, info.args).toolName ?? undefined,
+            memo: labelMemo,
           }).catch(() => undefined),
           // The owner's checker reads the exact content against their standing
           // rules before the card; the card shows what it found.

@@ -140,6 +140,26 @@ export function settledDestinationEvidence(input: {
   return evidence;
 }
 
+/** One approval batch's asked label questions, keyed by the exact question. */
+export type ApprovalLabelMemo = Map<string, Promise<string | null>>;
+
+/** The answer to one exact label question, asked at most once per memo. The
+ * key is the whole question, candidates in order: a different value, field,
+ * operation or candidate list is a different question. An ask that fails
+ * answers null, as it does unmemoized. */
+export function labelAskedOnce(
+  memo: ApprovalLabelMemo | undefined,
+  question: { operation: string; field: string; value: string; candidates: readonly string[] },
+  ask: () => Promise<string | null | undefined>,
+): Promise<string | null> {
+  const key = JSON.stringify([question.operation, question.field, question.value, question.candidates]);
+  const known = memo?.get(key);
+  if (known) return known;
+  const asked = Promise.resolve().then(ask).then((answer) => answer ?? null).catch(() => null);
+  memo?.set(key, asked);
+  return asked;
+}
+
 /** value -> the name Jev is sure of, for each identifier on the card. */
 export async function approvalPreviewLabels(input: {
   sessionId: string;
@@ -148,6 +168,11 @@ export async function approvalPreviewLabels(input: {
   nowMs?: number;
   accountId?: string | null;
   operationId?: string;
+  /** Answers already asked for within one approval batch. The members of a
+   * batch often carry the same identifier beside the same results; the same
+   * question has the same answer, so it is asked once. Never reuse a memo
+   * across batches: a later batch reads later results. */
+  memo?: ApprovalLabelMemo;
 }): Promise<Record<string, string> | undefined> {
   const fields = (input.preview?.fields ?? []).filter((field) => identifierValue(field.value));
   const values = [...new Set(fields.map((field) => field.value))].slice(0, MAX_LABELLED_VALUES);
@@ -165,10 +190,9 @@ export async function approvalPreviewLabels(input: {
     const candidates = labelCandidatesFor(payloads ??= recentSettledPayloads(input), value);
     if (candidates.length === 0) return null;
     const field = fields.find((row) => row.value === value)?.name ?? '';
-    const label = await labelIdentifierWithJev(
-      { operation, field, value, candidates },
-      { sessionId: input.sessionId },
-    ).catch(() => null);
+    const question = { operation, field, value, candidates };
+    const label = await labelAskedOnce(input.memo, question,
+      () => labelIdentifierWithJev(question, { sessionId: input.sessionId }));
     return label ? [value, label] as const : null;
   }));
   const entries = labelled.filter((entry): entry is readonly [string, string] => entry !== null);
