@@ -73,7 +73,7 @@ function guarded(handler: Handler): Handler {
   };
 }
 
-type PageRenderer = (input: { file: string; width?: number; height?: number; offsetY?: number }) =>
+type PageRenderer = (input: { file: string; width?: number; height?: number; offsetY?: number; scale?: 1 | 2 }) =>
   Promise<{ ok: true; png: Buffer; width: number; height: number; offsetY: number } | { ok: false; reason: string }>;
 type PageOpener = (file: string) => { ok: true } | { ok: false; reason: string };
 let pageRendererForTests: PageRenderer | null = null;
@@ -167,6 +167,8 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
       width: wholeNumber(req.query.width, 360, 2000),
       height: wholeNumber(req.query.height, 480, 2000),
       offsetY: wholeNumber(req.query.offset, 0, 20_000),
+      // A picture for a person, on a fine screen.
+      scale: 2,
     });
     if (!rendered.ok) { refuse(res, 'page_not_rendered', { message: rendered.reason }); return; }
     res.setHeader('Cache-Control', 'no-store');

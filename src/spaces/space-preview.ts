@@ -150,7 +150,7 @@ function stopProcessTree(child: ReturnType<typeof spawn>): void {
 /** Screenshot the index.html of one prepared directory headlessly. The
  *  directory is the caller's to create and to remove. */
 async function captureHostPage(
-  input: { dir: string; browser: string; width: number; height: number },
+  input: { dir: string; browser: string; width: number; height: number; scale?: number },
   dependencies: SpacePreviewDependencies,
 ): Promise<{ ok: true; png: Buffer } | { ok: false; reason: string }> {
   const shot = path.join(input.dir, 'preview.png');
@@ -166,6 +166,8 @@ async function captureHostPage(
       '--disable-background-networking',
       `--user-data-dir=${path.join(input.dir, 'profile')}`,
       `--window-size=${input.width},${input.height}`,
+      // Device pixels per CSS pixel: the layout is the same, the picture is finer.
+      ...(input.scale && input.scale > 1 ? [`--force-device-scale-factor=${input.scale}`] : []),
       '--virtual-time-budget=6000',
       `--screenshot=${shot}`,
       `file://${path.join(input.dir, 'index.html')}`,
@@ -259,6 +261,9 @@ export async function renderLocalPagePreview(
     height?: number;
     /** Pixels from the top of the page to start the screenshot at. */
     offsetY?: number;
+    /** 2 renders twice the pixels for a picture a person looks at on a fine
+     *  screen. Width, height and offset stay in CSS pixels. Default 1. */
+    scale?: 1 | 2;
   },
   dependencies: SpacePreviewDependencies = {},
 ): Promise<LocalPagePreviewResult> {
@@ -272,7 +277,7 @@ export async function renderLocalPagePreview(
     writeFileSync(path.join(dir, 'index.html'), localPageHostPage({
       fileUrl: pathToFileURL(input.file).href, width, offsetY,
     }), 'utf8');
-    const captured = await captureHostPage({ dir, browser, width, height }, dependencies);
+    const captured = await captureHostPage({ dir, browser, width, height, scale: input.scale === 2 ? 2 : 1 }, dependencies);
     if (!captured.ok) return captured;
     return { ok: true, png: captured.png, width, height, offsetY };
   } catch (error) {

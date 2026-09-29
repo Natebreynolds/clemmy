@@ -239,6 +239,7 @@ test('both surfaces list pages and get them rendered; only the desktop is given 
   const clamped = await desktop('get', `/p/${id}/pages/${pageId}/image?width=99999&height=1&offset=-5`);
   assert.deepEqual([clamped.body.width, clamped.body.height, clamped.body.offsetY], [2000, 480, 0]);
   assert.deepEqual(asked.map((input: any) => input.file), [realpathSync(file), realpathSync(file), realpathSync(file)], 'the file rendered is the one found from the project');
+  assert.deepEqual(asked.map((input: any) => input.scale), [2, 2, 2], 'a picture for a person is rendered fine');
   assert.equal((await phone('get', `/p/${id}/pages/pg_000000000000000000000000/image`)).status, 404);
   routes._setPageRendererForTests(async () => ({ ok: false, reason: 'no browser' }));
   const failed = await phone('get', `/p/${id}/pages/${pageId}/image`);

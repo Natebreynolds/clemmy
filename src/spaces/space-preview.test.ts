@@ -140,6 +140,19 @@ test('a real installed browser renders a local page with what lies beside it', {
   assert.deepEqual(pixel, [0, 255, 0], `the page loaded its own stylesheet and saw a 390-pixel viewport (first pixel ${pixel.join(',')})`);
 });
 
+test('a real installed browser renders a page finer without laying it out wider', { skip: process.env.CLEMMY_TEST_REAL_BROWSER !== '1' }, async () => {
+  const browser = preview.findPreviewBrowser();
+  assert.ok(browser, 'CLEMMY_TEST_REAL_BROWSER=1 needs an installed Chromium-family browser');
+  const pageDir = mkdtempSync(path.join(HOME, 'fine-page-'));
+  writeFileSync(path.join(pageDir, 'index.html'), '<!doctype html><html><head><style>html,body{margin:0;height:100%;background:#ff0000}@media (max-width:390px){html,body{background:#00ff00}}</style></head><body></body></html>', 'utf8');
+  const result = await preview.renderLocalPagePreview({ file: path.join(pageDir, 'index.html'), width: 390, height: 600, scale: 2 }, { browser });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (!result.ok) return;
+  assert.deepEqual([result.width, result.height], [390, 600], 'the size answered is the layout size');
+  assert.deepEqual([result.png.readUInt32BE(16), result.png.readUInt32BE(20)], [780, 1200], 'the picture has twice the pixels each way');
+  assert.deepEqual(await firstPixel(result.png), [0, 255, 0], 'the page still saw a 390-pixel viewport');
+});
+
 test('a real installed browser renders a Workspace document', { skip: process.env.CLEMMY_TEST_REAL_BROWSER !== '1' }, async () => {
   const browser = preview.findPreviewBrowser();
   assert.ok(browser, 'CLEMMY_TEST_REAL_BROWSER=1 needs an installed Chromium-family browser');
