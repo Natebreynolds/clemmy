@@ -29,15 +29,13 @@ import {
 } from '../../runtime/harness/mutation-verification-contract.js';
 
 export type DocumentedComposioEffect = 'read' | 'write';
-export type DocumentedComposioReversibility = 'read_only' | 'reversible' | 'ordinary_non_destructive' | 'irreversible';
+export type DocumentedComposioReversibility = 'read_only' | 'reversible' | 'irreversible';
 export type DocumentedComposioConsequence = 'read' | 'create' | 'update' | 'delete' | 'send' | 'other';
 
 export interface DocumentedComposioOperationSemantic {
   effect: DocumentedComposioEffect;
   reversibility: DocumentedComposioReversibility;
   consequence: DocumentedComposioConsequence;
-  /** Reviewed adapter facts apply only to this complete provider input shape. */
-  inputFieldTypes?: Readonly<Record<string, 'string' | 'boolean'>>;
   /** Present only when the operation creates the root deliverable itself. */
   rootArtifact?: {
     kind: 'resource' | 'google_doc';
@@ -58,20 +56,6 @@ const SLACK_CONVERSATIONS_HISTORY = Object.freeze({
   effect: 'read',
   reversibility: 'read_only',
   consequence: 'read',
-} satisfies DocumentedComposioOperationSemantic);
-
-/** Slack documents conversation preparation separately from message delivery:
- * https://docs.slack.dev/reference/methods/conversations.open/#usage-info
- * Opening/resuming returns the conversation; chat.postMessage sends content.
- * This remains a provider write (it can create a conversation), never a read
- * exemption. The exact schema guard below retires this declaration on drift. */
-const SLACK_OPEN_DM = Object.freeze({
-  effect: 'write',
-  reversibility: 'ordinary_non_destructive',
-  consequence: 'create',
-  inputFieldTypes: Object.freeze({
-    channel: 'string', users: 'string', prevent_creation: 'boolean', return_im: 'boolean',
-  }),
 } satisfies DocumentedComposioOperationSemantic);
 
 const TWITTER_USER_TIMELINE = Object.freeze({
@@ -178,7 +162,6 @@ const GOOGLE_SHEETS_BATCH_GET_VERIFICATION = Object.freeze({
 
 const DOCUMENTED_OPERATION_SEMANTICS: ReadonlyMap<string, DocumentedComposioOperationSemantic> = new Map<string, DocumentedComposioOperationSemantic>([
   ['SLACKCONVERSATIONSHISTORY', SLACK_CONVERSATIONS_HISTORY],
-  ['SLACKOPENDM', SLACK_OPEN_DM],
   ['TWITTERUSERTIMELINE', TWITTER_USER_TIMELINE],
   ['GOOGLEDRIVEDOWNLOADFILE', GOOGLE_DRIVE_DOWNLOAD_FILE],
   // Composio has exposed both GOOGLE_SHEET and GOOGLE_SHEETS toolkit spellings.
@@ -275,19 +258,6 @@ export function validateDocumentedComposioManifestOperationSemantics(input: {
   inputSchema: unknown;
 }): CapabilityManifestOperationSemanticsV1 | null {
   const semantics = documentedComposioManifestOperationSemantics(input.operationId);
-  const fields = documentedComposioOperationSemantic(input.operationId)?.inputFieldTypes;
-  if (fields) {
-    const schema = record(input.inputSchema) ? input.inputSchema : null;
-    const properties = schema && record(schema.properties) ? schema.properties : null;
-    const allowedSchemaKeys = new Set(['type', 'properties', 'required', 'description', 'title', 'additionalProperties']);
-    if (!schema || schema.type !== 'object' || !properties
-      || Object.keys(schema).some((key) => !allowedSchemaKeys.has(key))
-      || (schema.additionalProperties !== undefined && schema.additionalProperties !== false)
-      || Object.keys(properties).length !== Object.keys(fields).length
-      || Object.entries(fields).some(([key, type]) => !record(properties[key]) || properties[key].type !== type)
-      || (schema.required !== undefined && (!Array.isArray(schema.required)
-        || schema.required.some((key: unknown) => typeof key !== 'string' || !(key in fields))))) return null;
-  }
   if (!semantics?.atomicInputContent) return semantics;
   const declaration = semantics.atomicInputContent.compiler;
   const name = schemaAtPointer(input.inputSchema, declaration.namePointer);

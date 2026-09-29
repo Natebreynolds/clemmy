@@ -559,26 +559,24 @@ test('an exact lookup proof cannot cross accounts or override outbound/destructi
   assert.equal(jevRequests.length, calls, 'destructive and outbound floors do not ask a model to waive them');
 });
 
-test('schema-bound provider preparation contract avoids setup cards without any semantic model', async () => {
-  const { validatedDocumentedComposioDefinitionContracts } = await import('../../integrations/composio/operation-semantics.js');
+test('no declared provider contract lowers consent: an unlearned preparation call is carded until the learner is sure', async () => {
+  // A reviewed table of operation names was once allowed to waive this card.
+  // What an operation does is learned from its own definition and the exact
+  // call, by models that must agree, and is never compiled in by name.
+  const { documentedComposioManifestOperationSemantics } = await import('../../integrations/composio/operation-semantics.js');
   const schema = { type: 'object', properties: {
     users: { type: 'string' }, channel: { type: 'string' },
     prevent_creation: { type: 'boolean' }, return_im: { type: 'boolean' },
   } };
-  const contract = validatedDocumentedComposioDefinitionContracts({ operationId: 'SLACK_OPEN_DM', inputSchema: schema, outputSchema: null });
-  assert.ok(contract.ok && contract.operationSemantics);
-  if (!contract.ok || !contract.operationSemantics) throw Error('adapter contract missing');
+  for (const operationId of ['SLACK_OPEN_DM', 'CHATSCOPE_OPEN_DM']) {
+    assert.equal(documentedComposioManifestOperationSemantics(operationId), null, `${operationId} has no compiled-in semantics`);
+  }
   jev._setTypesafeKeyForTests(null);
   try {
-    const call = await acceptedCall({ tag: 'documented-setup', operationId: 'SLACK_OPEN_DM', schema,
-      args: { users: 'U1' }, destructive: false,
-      operationSemantics: contract.operationSemantics as FixtureOptions['operationSemantics'] });
-    assertProceedsWithoutCard(call.result, 'documented non-delivery setup is ordinary work');
-    assert.equal(decided(call.result).call.effect, 'external_write', 'creation never masquerades as a read');
-    assert.equal(jevRequests.length, 0);
-    assert.equal(judgeRequests.length, 0);
-    const send = await acceptedCall({ tag: 'documented-real-send', operationId: 'SLACK_SEND_MESSAGE', schema: SEND_SCHEMA,
-      args: { channel: 'D1', text: 'Test' } });
-    assertAsks(send.result, 'a real message retains content approval');
+    const calls = jevRequests.length;
+    const call = await acceptedCall({ tag: 'unlearned-setup', operationId: 'CHATSCOPE_OPEN_DM', schema,
+      args: { users: 'U1' }, destructive: false });
+    assertAsks(call.result, 'with the learner unavailable the conservative card stands');
+    assert.equal(jevRequests.length, calls);
   } finally { jev._setTypesafeKeyForTests('fixture-key'); }
 });

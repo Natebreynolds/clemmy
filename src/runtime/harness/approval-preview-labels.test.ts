@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { labelAskedOnce, labelCandidatesFor, type ApprovalLabelMemo } from './approval-preview-labels.js';
+import { labelAskedOnce, labelCandidatesFor, producedFromIdentifier, type ApprovalLabelMemo, type SettledCallEvidence } from './approval-preview-labels.js';
 
 test('candidates are the strings of the records that carry the exact id, most repeated first, without URLs', () => {
   const directory = { data: { members: [{
@@ -54,4 +54,45 @@ test('a label ask that fails answers no name for every member that shared it', a
   const failing = async (): Promise<string | null> => { asks += 1; throw new Error('router unavailable'); };
   assert.deepEqual(await Promise.all([labelAskedOnce(memo, question, failing), labelAskedOnce(memo, question, failing)]), [null, null]);
   assert.equal(asks, 1);
+});
+
+// Live 2026-09-28: an approval showed only the id of a conversation that an
+// earlier call had opened for one person. The record carrying that id named
+// nobody; the person was named in another result. The first repair joined the
+// two by operation name. The relation is the call itself, whatever it is called.
+const person: SettledCallEvidence = { operation: 'chatscope__find_person', accountId: 'work', args: { email: 'sam@example.test' },
+  result: { data: { ok: true, person: { id: 'P123', fullName: 'Sam Rivera', profile: { email: 'sam@example.test' } } } } };
+const opened: SettledCallEvidence = { operation: 'chatscope__open_thread', accountId: 'work', args: { people: 'P123' },
+  result: { data: { ok: true, thread: { id: 'T456' }, alreadyOpen: true } } };
+const made = (evidence: SettledCallEvidence[], accountId = 'work', value = 'T456') => producedFromIdentifier({ accountId, value, evidence });
+
+test('a returned value is traced to the one identifier the call was given, whatever the operation is called', () => {
+  assert.equal(made([person, opened]), 'P123');
+  // Another kind of thing entirely: a share link made for one folder.
+  const share: SettledCallEvidence = { operation: 'vaultscope__create_link', accountId: 'work', args: { target: { folder: 'fld_heron_22' }, expires: true },
+    result: { link: { token: 'lnk_9c1e77' } } };
+  assert.equal(made([share], 'work', 'lnk_9c1e77'), 'fld_heron_22', 'a flag beside the identifier is a setting, not something the value was made from');
+  assert.deepEqual(labelCandidatesFor([person.result, opened.result], 'P123').includes('Sam Rivera'), true,
+    'naming the identifier is the ordinary question over the ordinary records');
+});
+
+test('an inexact relation names nothing', () => {
+  assert.equal(made([person]), undefined, 'no call returned the value');
+  assert.equal(made([person, opened], 'personal'), undefined, 'another account');
+  assert.equal(made([person, { ...opened, accountId: 'personal' }]), undefined, 'the call ran on another account');
+  assert.equal(made([person, opened], 'work', 'Tother'), undefined, 'another value');
+  assert.equal(made([person, { ...opened, args: { thread: 'T456' } }]), undefined, 'the value was passed in, not returned');
+  assert.equal(made([person, { ...opened, args: { people: 'P123', workspace: 'W777' } }]), undefined, 'two identifiers: which one it was made from is not known');
+  assert.equal(made([person, opened, { ...opened, args: { people: 'P999' } }]), undefined, 'two calls returned it for different identifiers');
+  assert.equal(made([person, { ...opened, result: { data: { ok: false, error: 'not_allowed', thread: { id: 'T456' } } } }]), undefined,
+    'the provider reported a failure');
+  assert.equal(made([person, { ...opened, args: { people: 'P123 P999' } }]), undefined, 'a list in one argument is not one identifier');
+  assert.equal(producedFromIdentifier({ accountId: '', value: 'T456', evidence: [opened] }), undefined, 'no account, no relation');
+});
+
+test('several identifiers in one token are one argument that no record carries, so nothing is named', () => {
+  const group = { ...opened, args: { people: 'P123,P999' } };
+  const source = made([person, group]);
+  assert.equal(source, 'P123,P999');
+  assert.deepEqual(labelCandidatesFor([person.result, group.result], source!), [], 'a group is never given one person\'s name');
 });

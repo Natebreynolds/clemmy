@@ -1,4 +1,4 @@
-import { composioApprovalDestinationLabel, type ApprovalDestinationEvidence } from '../../integrations/composio/approval-destination-label.js';
+import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import { loadPhysicalRequestEvidence } from './dispatch-ledger.js';
 import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
@@ -115,15 +115,79 @@ export function recentSettledPayloads(input: {
   }
 }
 
+/** One settled call on one account: what it was asked and what it returned. */
+export interface SettledCallEvidence {
+  operation: string;
+  accountId: string;
+  args: unknown;
+  result: unknown;
+}
+
+/** Whether some record of a result holds `value` as one of its own fields. */
+function carriesValue(node: unknown, value: string, depth = 0): boolean {
+  if (depth > 12 || !node || typeof node !== 'object') return false;
+  if (Array.isArray(node)) return node.slice(0, 2_000).some((item) => carriesValue(item, value, depth + 1));
+  const fields = Object.values(node as Record<string, unknown>);
+  return fields.some((field) => field === value) || fields.some((field) => carriesValue(field, value, depth + 1));
+}
+
+/** The identifier-shaped string arguments of a call, at any depth. */
+function identifierArguments(args: unknown, depth = 0): string[] {
+  if (depth > 8 || args === null || args === undefined) return [];
+  if (typeof args === 'string') return identifierValue(args.trim()) ? [args.trim()] : [];
+  if (typeof args !== 'object') return [];
+  const children = Array.isArray(args) ? args.slice(0, 200) : Object.values(args as Record<string, unknown>);
+  return children.flatMap((child) => identifierArguments(child, depth + 1));
+}
+
+/**
+ * What a returned value was made from.
+ *
+ * Some values an approval shows were never looked up: an operation returned
+ * them. The record that carries such a value often names nothing (an opened
+ * conversation is an id and a flag), while the thing it was opened FOR has a
+ * name in another result. The link between the two is the call itself: its
+ * arguments are what it was made from, its result is the value.
+ *
+ * This returns the one identifier a value was made from, or undefined when
+ * the relation is not exact:
+ *  - the calls are on the account the approval will use, and nowhere else;
+ *  - the value was returned by the call, not passed to it;
+ *  - the provider's own envelope reports no failure;
+ *  - every call that returned the value was given the same single identifier.
+ * Several identifiers, or calls that disagree, name nothing. It knows no
+ * operation, provider or field name, and it asks no model: naming the
+ * identifier is the caller's existing question.
+ */
+export function producedFromIdentifier(input: {
+  accountId: string;
+  value: string;
+  evidence: readonly SettledCallEvidence[];
+}): string | undefined {
+  if (!input.accountId) return undefined;
+  const made = new Set<string>();
+  for (const call of input.evidence) {
+    if (call.accountId !== input.accountId) continue;
+    if (!carriesValue(call.result, input.value)) continue;
+    if (inspectProviderEnvelope(call.result).verdict !== 'clean') continue;
+    const given = [...new Set(identifierArguments(call.args))];
+    // Passed in, so not produced by this call.
+    if (given.includes(input.value)) continue;
+    if (given.length !== 1) return undefined;
+    made.add(given[0]!);
+  }
+  return made.size === 1 ? [...made][0] : undefined;
+}
+
 /** Exact source/account-scoped relations, with no inference or model calls. */
 export function settledDestinationEvidence(input: {
   sessionId: string; sourceUserSeq: number; accountId: string;
-}): ApprovalDestinationEvidence[] {
+}): SettledCallEvidence[] {
   const db = openEventLog();
   const rows = db.prepare(`SELECT logical_tool_call_id AS callId FROM logical_call_settlements
     WHERE session_id = ? AND source_user_seq = ? AND outcome_kind = 'succeeded'
     ORDER BY rowid DESC LIMIT 200`).all(input.sessionId, input.sourceUserSeq) as Array<{ callId: string }>;
-  const evidence: ApprovalDestinationEvidence[] = [];
+  const evidence: SettledCallEvidence[] = [];
   for (const row of rows) {
     const binding = loadHostCallCapabilityBinding({ db, ...input, logicalToolCallId: row.callId });
     if (binding.status !== 'ok' || binding.binding.accountId !== input.accountId) continue;
@@ -167,6 +231,7 @@ export async function approvalPreviewLabels(input: {
   preview: ApprovalCallPreview | null;
   nowMs?: number;
   accountId?: string | null;
+  /** Accepted for callers that pass it; no rule here reads an operation's name. */
   operationId?: string;
   /** Answers already asked for within one approval batch. The members of a
    * batch often carry the same identifier beside the same results; the same
@@ -182,18 +247,23 @@ export async function approvalPreviewLabels(input: {
   const aliases = input.accountId ? listAccountAliases().filter(row => row.connectionId === input.accountId) : [];
   const accountLabels = [...new Set(aliases.map(row => row.label))];
   const operation = input.preview.operation;
-  const labelled = await Promise.all(values.map(async (value) => {
-    const exact = input.operationId && input.accountId ? composioApprovalDestinationLabel({
-      operation: input.operationId, accountId: input.accountId, value, evidence,
-    }) : undefined;
-    if (exact) return [value, `${exact}${accountLabels.length === 1 ? ` · ${accountLabels[0]}` : ''}`] as const;
-    const candidates = labelCandidatesFor(payloads ??= recentSettledPayloads(input), value);
+  const named = async (field: string, value: string, records: readonly unknown[]): Promise<string | null> => {
+    const candidates = labelCandidatesFor(records, value);
     if (candidates.length === 0) return null;
-    const field = fields.find((row) => row.value === value)?.name ?? '';
     const question = { operation, field, value, candidates };
-    const label = await labelAskedOnce(input.memo, question,
+    return labelAskedOnce(input.memo, question,
       () => labelIdentifierWithJev(question, { sessionId: input.sessionId }));
-    return label ? [value, label] as const : null;
+  };
+  const labelled = await Promise.all(values.map(async (value) => {
+    const field = fields.find((row) => row.value === value)?.name ?? '';
+    const direct = await named(field, value, payloads ??= recentSettledPayloads(input));
+    if (direct) return [value, direct] as const;
+    // The record that carries the value names nothing. Name what the value
+    // was made from instead, on this account only, and say which account.
+    const source = input.accountId ? producedFromIdentifier({ accountId: input.accountId, value, evidence }) : undefined;
+    if (!source) return null;
+    const through = await named(field, source, [...(payloads ??= recentSettledPayloads(input)), ...evidence.map((row) => row.result)]);
+    return through ? [value, `${through}${accountLabels.length === 1 ? ` · ${accountLabels[0]}` : ''}`] as const : null;
   }));
   const entries = labelled.filter((entry): entry is readonly [string, string] => entry !== null);
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
