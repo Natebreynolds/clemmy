@@ -100,7 +100,7 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   spaceViews: {},
   panes: { order: DEFAULT_HOME_PANE_ORDER, hidden: ['workstate'] },
   nav: {
-    pinned: ['/chat', '/inbox', '/workspaces'],
+    pinned: ['/chat', '/inbox', '/projects', '/workspaces'],
     shown: ['/automate', '/connect', '/memory', '/agents'],
     more: ['/meetings', '/goals'],
   },
@@ -118,6 +118,12 @@ const MERGED_INTO_TODAY = new Set(['/home', TODAY_PATH]);
  *  shows them below the pinned group instead of behind More. Pinning either
  *  is still the owner's choice and is kept. */
 export const ALWAYS_VISIBLE_PATHS: readonly string[] = ['/memory', '/agents'];
+/** Destinations that arrived after sidebars were already saved. A saved
+ *  sidebar that never placed one shows it first below the pinned group: left
+ *  to the rule for unplaced destinations it would land in More, and a new
+ *  part of the product would go unseen. Once the owner pins it or folds it
+ *  away, the record names it and that choice is kept. */
+export const SHOWN_UNTIL_PLACED_PATHS: readonly string[] = ['/projects'];
 export function primaryHomeNavigation(nav: HomePreferences['nav']): HomePreferences['nav'] {
   const rest = (paths: readonly string[]) => paths.filter((path) => !MERGED_INTO_TODAY.has(path));
   const pinned = [TODAY_PATH, ...rest(nav.pinned)];
@@ -126,7 +132,8 @@ export function primaryHomeNavigation(nav: HomePreferences['nav']): HomePreferen
   for (const path of ALWAYS_VISIBLE_PATHS) {
     if (!pinned.includes(path) && !shown.includes(path)) shown.push(path);
   }
-  return { pinned, shown, more };
+  const unplaced = SHOWN_UNTIL_PLACED_PATHS.filter((path) => !pinned.includes(path) && !shown.includes(path) && !more.includes(path));
+  return { pinned, shown: [...unplaced, ...shown], more };
 }
 
 /** Only the server's explicit untouched-default marker changes the landing.

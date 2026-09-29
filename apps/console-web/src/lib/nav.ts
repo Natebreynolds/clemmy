@@ -22,6 +22,7 @@ import {
   FolderOpen,
   Workflow,
   HeartPulse,
+  FolderKanban,
   type LucideIcon,
 } from 'lucide-react';
 import { primaryHomeNavigation, type HomePreferences } from './home-prefs';
@@ -50,7 +51,9 @@ export interface NavDest {
  * The destinations a user can shape into their sidebar (pin / show / fold
  * into More — see HomePreferences.nav). Every path here is a real route, so
  * deep links from older builds keep working even where a label changed:
- * /inbox is now "Needs you", /tasks is "Running", /workspaces is "Projects".
+ * /inbox is now "Needs you", /tasks is "Running", /workspaces is "Spaces".
+ * /projects is a body of work with the agents assigned to it; the code
+ * folders Connect lists are a different thing and keep their own door.
  */
 export const PRIMARY_NAV: NavDest[] = [
   // Today is Home and Chat as one screen: the day before you type, the
@@ -58,6 +61,7 @@ export const PRIMARY_NAV: NavDest[] = [
   // the board stays one click away from Today's status line.
   { path: '/chat', label: 'Today', icon: Sun, hint: 'Your day, and a conversation with Clementine' },
   { path: '/inbox', label: 'Needs you', icon: Inbox, hint: 'Approvals, questions & anything waiting on you' },
+  { path: '/projects', label: 'Projects', icon: FolderKanban, hint: 'What you are working on, who is on it and what it needs from you' },
   { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
   { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows & skills' },
   { path: '/heartbeats', label: 'Heartbeats', icon: HeartPulse, hint: 'What Clementine checks on her own, and how often' },

@@ -12,9 +12,14 @@ import type { CommandCenter, CommandCenterItem } from '@/lib/types';
 import type { TaskMode } from '@/lib/task-mode';
 import { Composer } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
-import { AgentSwitchLine } from '@/components/chat/AgentSwitchLine';
-import { agentThreadMarks } from '@clem/chat-engine';
+import { ProjectPicker } from '@/components/chat/ProjectPicker';
+import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
+import { ConversationTasks } from '@/components/chat/ConversationTasks';
+import { agentThreadMarks, projectThreadMarks } from '@clem/chat-engine';
 import { useConversationAgent } from '@/lib/conversation-agent';
+import { useConversationProject } from '@/lib/conversation-project';
+import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
+import type { ConversationProject } from '@/lib/projects';
 import { sessionKeys } from '@/features/conversations/hooks/keys';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -74,6 +79,14 @@ function AttentionStrip({ needsYou, onDismiss }: { needsYou: CommandCenterItem[]
   );
 }
 
+/** The project a new conversation was opened in, from the link that opened it. */
+function openedInProject(state: unknown): ConversationProject | null {
+  const project = (state as { project?: Partial<ConversationProject> } | null)?.project;
+  return project && typeof project.id === 'string' && project.id && typeof project.name === 'string'
+    ? { id: project.id, name: project.name }
+    : null;
+}
+
 export function Chat() {
   const qc = useQueryClient();
   const cc = usePoll(['command-center'], () => apiGet<CommandCenter>('/api/console/home/command-center'), 6000);
@@ -91,6 +104,13 @@ export function Chat() {
     onSwitched: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); },
   });
   const agent = agentChoice.chosen;
+  const location = useLocation();
+  // "New conversation in this project" arrives with the project already
+  // chosen; the first message opens the conversation inside it.
+  const projectChoice = useConversationProject(openedInProject(location.state), {
+    onMoved: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); },
+  });
+  const delegated = useConversationTasks(chat.sessionId.current, chat.delegatedTaskTick);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -99,17 +119,25 @@ export function Chat() {
   // (so streaming tokens don't yank them back down mid-read).
   const stickRef = useRef(true);
   const [searchParams, setSearchParams] = useSearchParams();
-  const location = useLocation();
   const seededRef = useRef(false);
 
   const needsYou = cc.data?.needsYou ?? [];
   const hasThread = chat.messages.length > 0;
   const send = async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode }) => {
-    const addressed = await agentChoice.prepare(chat.sessionId.current, chat.busy);
-    await chat.send({ ...input, ...addressed });
+    const [addressed, placed] = await Promise.all([
+      agentChoice.prepare(chat.sessionId.current, chat.busy),
+      projectChoice.prepare(chat.sessionId.current, chat.busy),
+    ]);
+    await chat.send({ ...input, ...addressed, ...placed });
   };
-  const agentSlot = <AgentPicker value={agent} onChange={agentChoice.choose} started={hasThread} />;
+  const agentSlot = (
+    <>
+      <ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started={hasThread} />
+      <AgentPicker value={agent} onChange={agentChoice.choose} started={hasThread} />
+    </>
+  );
   const marks = agentThreadMarks(chat.messages);
+  const projectMarks = projectThreadMarks(chat.messages);
   const resolveDecision = async (message: ChatMessage, decision: 'approve' | 'reject') => {
     const intent = chatDecisionIntent(message, decision);
     if (intent.kind === 'invalid-plan') throw new Error(intent.message);
@@ -151,6 +179,7 @@ export function Chat() {
       lastNewChatRef.current = stamp;
       resetChat();
       agentChoice.choose(null);
+      projectChoice.choose(openedInProject(location.state));
       // An explicit "New chat" releases the active-conversation pointer — the
       // index must not bounce straight back into the thread being left.
       rememberLastChatSession(null);
@@ -209,10 +238,12 @@ export function Chat() {
           )}
           {chat.messages.map((m, index) => (
             <Fragment key={m.id}>
-            {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
+            <ConversationChangeLine agent={marks[index]?.switchedTo} project={projectMarks[index]?.movedTo} />
             <ChatBubble
               message={m}
-              speaker={marks[index]?.speaker ?? undefined}
+              speaker={reportOwner(m, delegated.tasks) ?? marks[index]?.speaker ?? undefined}
+              project={projectMarks[index]?.project ?? undefined}
+              ownedTaskIds={delegated.ownedIds}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -229,6 +260,7 @@ export function Chat() {
             </Fragment>
           ))}
           <CliSessions sessionId={chat.sessionId.current ?? undefined} />
+          <ConversationTasks cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
           <div ref={bottomRef} />
         </div>
       </div>

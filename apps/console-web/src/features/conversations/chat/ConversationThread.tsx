@@ -3,14 +3,18 @@ import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
 import type { TaskMode } from '@/lib/task-mode';
 import { Fragment, useEffect, useRef } from 'react';
-import { useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Pin, Loader2 } from 'lucide-react';
+import { FolderKanban, Pin, Loader2 } from 'lucide-react';
 import { Composer } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
-import { AgentSwitchLine } from '@/components/chat/AgentSwitchLine';
-import { agentThreadMarks } from '@clem/chat-engine';
+import { ProjectPicker } from '@/components/chat/ProjectPicker';
+import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
+import { ConversationTasks } from '@/components/chat/ConversationTasks';
+import { agentThreadMarks, projectThreadMarks } from '@clem/chat-engine';
 import { useConversationAgent } from '@/lib/conversation-agent';
+import { useConversationProject } from '@/lib/conversation-project';
+import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
@@ -42,6 +46,18 @@ function Header({ session }: { session: Session }) {
           <h2 className="truncate text-h3 text-fg">{session.title || 'New chat'}</h2>
           <Tag>{meta.label}</Tag>
           {session.agentName && <Tag title="Answering this conversation">{session.agentName}</Tag>}
+          {session.projectId && session.projectName && (
+            <Link
+              to={`/projects/${encodeURIComponent(session.projectId)}`}
+              aria-label={`Project: ${session.projectName}`}
+              className="rounded-sm transition-opacity hover:opacity-80"
+            >
+              <Tag title="The project this conversation works in" className="gap-1">
+                <FolderKanban className="h-3 w-3" aria-hidden />
+                {session.projectName}
+              </Tag>
+            </Link>
+          )}
         </div>
       </div>
       <Button
@@ -77,6 +93,13 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     { onSwitched: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); } },
   );
   const marks = agentThreadMarks(chat.messages, session.agentName ?? null);
+  // Which project applies next: the conversation's own until the chip changes it.
+  const projectChoice = useConversationProject(
+    session.projectId && session.projectName ? { id: session.projectId, name: session.projectName } : null,
+    { onMoved: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); } },
+  );
+  const projectMarks = projectThreadMarks(chat.messages, session.projectName ?? null);
+  const delegated = useConversationTasks(chat.sessionId.current, chat.delegatedTaskTick);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -96,8 +119,13 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
   }, [chat.messages, chat.busy]);
 
   const send = async (input: { text: string; attachmentIds: string[]; attachmentNames: string[]; taskMode?: TaskMode }) => {
-    const addressed = takesAgent ? await agentChoice.prepare(chat.sessionId.current, chat.busy) : {};
-    await chat.send({ ...input, ...addressed });
+    const [addressed, placed] = takesAgent
+      ? await Promise.all([
+          agentChoice.prepare(chat.sessionId.current, chat.busy),
+          projectChoice.prepare(chat.sessionId.current, chat.busy),
+        ])
+      : [{}, {}];
+    await chat.send({ ...input, ...addressed, ...placed });
     // Re-sort + re-title the list now that this conversation has a new turn.
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
   };
@@ -129,10 +157,12 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
           <CliSessions sessionId={chat.sessionId.current ?? undefined} />
           {chat.messages.map((m, index) => (
             <Fragment key={m.id}>
-            {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
+            <ConversationChangeLine agent={marks[index]?.switchedTo} project={projectMarks[index]?.movedTo} />
             <ChatBubble
               message={m}
-              speaker={marks[index]?.speaker ?? undefined}
+              speaker={reportOwner(m, delegated.tasks) ?? marks[index]?.speaker ?? undefined}
+              project={projectMarks[index]?.project ?? undefined}
+              ownedTaskIds={delegated.ownedIds}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -147,11 +177,12 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
             />
             </Fragment>
           ))}
+          <ConversationTasks cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
           <div ref={bottomRef} />
         </div>
       </div>
       <div className={CHAT_COMPOSER_WRAP}>
-        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={takesAgent ? <AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} started /> : undefined} placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined} />
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} agentSlot={takesAgent ? <><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} started /></> : undefined} placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined} />
       </div>
     </div>
   );
@@ -161,6 +192,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
 function ReadOnlyThread({ session, history }: { session: Session; history: Turn[] }) {
   const messages = historyToMessages(history);
   const marks = agentThreadMarks(messages, session.agentName ?? null);
+  const projectMarks = projectThreadMarks(messages, session.projectName ?? null);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
@@ -171,8 +203,8 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
           ) : (
             messages.map((m, index) => (
               <Fragment key={m.id}>
-                {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
-                <ChatBubble message={m} speaker={marks[index]?.speaker ?? undefined} sessionId={rawId(session.id)} />
+                <ConversationChangeLine agent={marks[index]?.switchedTo} project={projectMarks[index]?.movedTo} />
+                <ChatBubble message={m} speaker={marks[index]?.speaker ?? undefined} project={projectMarks[index]?.project ?? undefined} sessionId={rawId(session.id)} />
               </Fragment>
             ))
           )}

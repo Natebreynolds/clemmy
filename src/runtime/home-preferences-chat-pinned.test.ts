@@ -68,3 +68,10 @@ test('Home style, the live status header and per-Space views persist; anything e
   assert.deepEqual(older.panes, { order: ['running', 'made'], hidden: ['projects'] });
   assert.equal(older.style, 'dashboard');
 });
+
+test('the default sidebar pins Projects, and a shaped sidebar that never named it is left alone', () => {
+  assert.ok(DEFAULT_HOME_PREFERENCES.nav.pinned.includes('/projects'), 'projects is pinned');
+  assert.ok(!DEFAULT_HOME_PREFERENCES.nav.more.includes('/projects'), 'projects is not under More');
+  const shaped = { pinned: ['/home', '/chat'], shown: ['/inbox'], more: ['/workspaces'] };
+  assert.deepEqual(normalizeHomePreferences({ nav: { ...shaped } }).nav, shaped);
+});

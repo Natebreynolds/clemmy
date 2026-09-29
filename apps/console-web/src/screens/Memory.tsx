@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
   Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
-  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Layers,
+  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Layers, Globe,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
@@ -25,7 +25,7 @@ import {
   getEntityMemory,
   listMemoryReviewCandidates, applyMemoryReviewCandidate, dismissMemoryReviewCandidate,
   discoverImportSources, scanImportPath, runMemoryImport, listImportBatches, undoImportBatch,
-  restoreFact, updateFact, reconcileMemoryEvidence, reconcileMemoryRelationships,
+  restoreFact, updateFact, moveFactScope, reconcileMemoryEvidence, reconcileMemoryRelationships,
   getMemoryReadiness, listReflectionCandidates,
   listMemoryEpisodes, promoteMemoryEpisodeCandidate, rejectMemoryEpisodeCandidate,
   listIdentityProposals, approveIdentityProposal, rejectIdentityProposal, type IdentityProposal,
@@ -42,8 +42,14 @@ import { LearnedPane } from '@/components/memory/LearnedPane';
 import { MemoryDetail } from '@/components/memory/MemoryDetail';
 import { MemoryWorkPanel } from '@/components/memory/work/MemoryWorkPanel';
 import type { MemoryStore } from '@/lib/memory';
+import { memoryScopeLabel } from '@clem/chat-engine';
+import { ScopeChip } from '@/components/memory/ScopeChip';
+import { canMoveToEverywhere, factScopeChoices, factScopeFromKey, factScopeKey, scopedFacts } from '@/lib/memory-scope';
+import { apiErrorCode, listProjects, projectKeys, refusalText } from '@/lib/projects';
+import { listAgents } from '@/lib/agents';
 
 type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources';
+const TABS: readonly Tab[] = ['overview', 'facts', 'tools', 'episodes', 'entities', 'sources'];
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference', constraint: 'Hard constraint' };
 
 const KIND_FACETS: Array<{ key: MemoryStore | 'all'; label: string }> = [
@@ -71,7 +77,11 @@ function factToHit(f: Fact): MemoryHit {
 
 export function Memory() {
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>('overview');
+  // A link from a project or an agent opens the facts kept for it.
+  const [params] = useSearchParams();
+  const linkedTab = TABS.find((key) => key === params.get('tab'));
+  const linkedScope = factScopeKey(factScopeFromKey(params.get('scope') ?? ''));
+  const [tab, setTab] = useState<Tab>(linkedTab ?? (linkedScope !== 'all' ? 'facts' : 'overview'));
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const [kind, setKind] = useState<MemoryStore | 'all'>('all');
@@ -191,7 +201,7 @@ export function Memory() {
                 })}
               </div>
               {tab === 'overview' && <OverviewTab onNavigate={setTab} />}
-              {tab === 'facts' && <FactsTab qc={qc} />}
+              {tab === 'facts' && <FactsTab qc={qc} initialScope={linkedScope} />}
               {tab === 'tools' && <ToolRecallSection />}
               {tab === 'episodes' && <EpisodesTab />}
               {tab === 'entities' && <EntitiesTab />}
@@ -721,13 +731,43 @@ function CouldNotRead({ what, onRetry }: { what: string; onRetry: () => void }) 
   );
 }
 
-function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
+function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQueryClient>; initialScope?: string }) {
   const [kind, setKind] = useState<Fact['kind'] | 'all'>('all');
   const [showForgotten, setShowForgotten] = useState(false);
-  const facts = usePoll(['facts', kind, showForgotten], () => listFacts(kind === 'all' ? undefined : kind, 120, showForgotten), 15000);
+  // Where the facts shown apply: everything, everywhere only, one project or one agent.
+  const [scopeKey, setScopeKey] = useState(initialScope);
+  const scopeFilter = factScopeFromKey(scopeKey);
+  const facts = usePoll(['facts', kind, showForgotten, scopeKey], () => listFacts(kind === 'all' ? undefined : kind, 120, showForgotten, scopeFilter), 15000);
   const reviews = usePoll(['memory-review-candidates'], () => listMemoryReviewCandidates(25), 30000);
   const learning = usePoll(['reflection-candidates'], () => listReflectionCandidates(40), 30000);
-  const rows = facts.data?.facts ?? [];
+  const projects = usePoll(projectKeys.list(true), () => listProjects(true), 60000);
+  const agents = usePoll(['agents'], listAgents, 60000);
+  // A narrowed list shows only facts that say they belong there.
+  const scoped = scopedFacts(facts.data?.facts ?? [], scopeFilter);
+  const rows = scoped.facts;
+  const scopeChoices = factScopeChoices(projects.data ?? [], agents.data ?? []);
+  // The scope in force always has a row, even when its project is archived
+  // out of the list or the rosters could not be read.
+  if (!scopeChoices.some((choice) => choice.key === scopeKey)) {
+    const named = rows.find((fact) => fact.scope && fact.scope.kind !== 'user')?.scope;
+    scopeChoices.push({
+      group: scopeFilter.kind === 'agent' ? 'agents' : 'projects',
+      key: scopeKey,
+      label: (scopeFilter.kind === 'agent' ? named?.agentName : named?.projectName) || (scopeFilter.kind === 'agent' ? 'This agent' : 'This project'),
+    });
+  }
+  const scopeLabel = scopeChoices.find((choice) => choice.key === scopeKey)?.label ?? 'All facts';
+  const showScopeFilter = scopeKey !== 'all' || scopeChoices.length > 2;
+  const onMoveEverywhere = async (id: Fact['id']) => {
+    try {
+      await moveFactScope(id, { projectId: null, agentId: null });
+    } catch (error) {
+      // Already everywhere is what was asked for; anything else is said in words.
+      if (apiErrorCode(error) !== 'ALREADY_KEPT_THERE') throw new Error(refusalText(error, 'It could not be moved just now. Try again.'));
+    } finally {
+      void qc.invalidateQueries({ queryKey: ['facts'] });
+    }
+  };
   const [resolvingReview, setResolvingReview] = useState('');
   const [draft, setDraft] = useState('');
   const [draftKind, setDraftKind] = useState<Fact['kind']>('user');
@@ -799,12 +839,33 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
           <button key={k.key} type="button" onClick={() => setKind(k.key)}
             className={cn('rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', kind === k.key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>{k.label}</button>
         ))}
+        {showScopeFilter && (
+          <Select
+            value={scopeKey}
+            onChange={(e) => setScopeKey(e.target.value)}
+            aria-label="Show facts that apply to"
+            title="Where the facts shown apply"
+            className={cn('h-8 w-auto max-w-56 rounded-full py-0 pl-3 pr-8 text-small', scopeKey !== 'all' && 'border-primary bg-primary-tint text-primary')}
+          >
+            {scopeChoices.filter((choice) => choice.group === 'general').map((choice) => <option key={choice.key} value={choice.key}>{choice.label}</option>)}
+            {scopeChoices.some((choice) => choice.group === 'projects') && (
+              <optgroup label="A project">
+                {scopeChoices.filter((choice) => choice.group === 'projects').map((choice) => <option key={choice.key} value={choice.key}>{choice.label}</option>)}
+              </optgroup>
+            )}
+            {scopeChoices.some((choice) => choice.group === 'agents') && (
+              <optgroup label="An agent">
+                {scopeChoices.filter((choice) => choice.group === 'agents').map((choice) => <option key={choice.key} value={choice.key}>{choice.label}</option>)}
+              </optgroup>
+            )}
+          </Select>
+        )}
         <button type="button" onClick={() => setShowForgotten((value) => !value)}
           className={cn('ml-auto inline-flex items-center gap-1 rounded-full border px-3 py-1 text-small transition-colors cursor-pointer', showForgotten ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}>
           <History className="h-3.5 w-3.5" aria-hidden /> {showForgotten ? 'Showing history' : 'Show history'}
         </button>
-        {facts.data && <span className="basis-full text-caption text-faint sm:ml-auto sm:basis-auto">
-          Showing {facts.data.visible} of {facts.data.total} {showForgotten ? 'current and historical' : 'current'} facts{facts.data.visible < facts.data.total ? ' · use memory search for the full archive' : ''}
+        {facts.data && scoped.supported && <span className="basis-full text-caption text-faint sm:ml-auto sm:basis-auto">
+          Showing {rows.length} of {facts.data.total} {showForgotten ? 'current and historical' : 'current'} facts{scopeKey === 'all' ? '' : scopeKey === 'everywhere' ? ' that apply everywhere' : ` kept for ${scopeLabel}`}{rows.length < facts.data.total ? ' · use memory search for the full archive' : ''}
         </span>}
       </div>
       <div className="mb-4 flex flex-wrap gap-2">
@@ -815,8 +876,18 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
       </div>
       {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
         : facts.isError && !facts.data ? <CouldNotRead what="Your facts" onRetry={() => { void facts.refetch(); }} />
-        : rows.length === 0 ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
-          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} onImportance={(value) => { void updateFact(f.id, { importance: value }).finally(() => qc.invalidateQueries({ queryKey: ['facts'] })); }} />)}</div>}
+        : !scoped.supported ? (
+          // Asked for one scope and answered with facts that do not say where
+          // they apply: none of them can be claimed for it.
+          <Card className="p-4 text-body text-muted" role="status">
+            This version of Clementine’s service does not yet keep memory by project or agent, so this view cannot be shown. Nothing has been lost.{' '}
+            <button type="button" onClick={() => setScopeKey('all')} className="cursor-pointer font-medium text-primary hover:underline">Show all facts</button>
+          </Card>
+        )
+        : rows.length === 0 ? (scopeKey === 'all'
+          ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
+          : <Card><EmptyState title={scopeKey === 'everywhere' ? 'Nothing here applies everywhere yet' : `Nothing is kept for ${scopeLabel} yet`} description="What is learned there lands here, with where it came from." action={<Button variant="secondary" size="sm" onClick={() => setScopeKey('all')}>Show all facts</Button>} /></Card>)
+          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onMoveEverywhere={canMoveToEverywhere(f) ? () => onMoveEverywhere(f.id) : undefined} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} onImportance={(value) => { void updateFact(f.id, { importance: value }).finally(() => qc.invalidateQueries({ queryKey: ['facts'] })); }} />)}</div>}
       {(reviews.data?.candidates.length ?? 0) > 0 && <Card className="mt-4 border-warning/40 bg-warning/5 p-4">
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <div className="text-body font-medium text-fg">Memory review</div>
@@ -926,9 +997,18 @@ function FactsTab({ qc }: { qc: ReturnType<typeof useQueryClient> }) {
   );
 }
 
-function FactCard({ fact, onPin, onForget, onRestore, onEdit, onImportance }: { fact: Fact; onPin: () => void; onForget: () => void; onRestore: () => void; onEdit: (content: string) => Promise<void>; onImportance?: (value: number) => void }) {
+function FactCard({ fact, onPin, onForget, onRestore, onEdit, onImportance, onMoveEverywhere }: { fact: Fact; onPin: () => void; onForget: () => void; onRestore: () => void; onEdit: (content: string) => Promise<void>; onImportance?: (value: number) => void; /** Present only on a fact kept for a project or an agent. */ onMoveEverywhere?: () => Promise<void> }) {
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [moving, setMoving] = useState<'confirm' | 'busy' | null>(null);
+  const [moveError, setMoveError] = useState('');
+  const moveEverywhere = async () => {
+    if (!onMoveEverywhere) return;
+    setMoving('busy');
+    setMoveError('');
+    try { await onMoveEverywhere(); setMoving(null); }
+    catch (error) { setMoveError(error instanceof Error && error.message.trim() ? error.message : 'It could not be moved just now. Try again.'); setMoving('confirm'); }
+  };
   const [draft, setDraft] = useState(fact.content);
   const long = (fact.content?.length ?? 0) > 180;
   const usableEvidence = (fact.evidence ?? []).filter((item) =>
@@ -951,6 +1031,9 @@ function FactCard({ fact, onPin, onForget, onRestore, onEdit, onImportance }: { 
           {fact.derivedFrom?.tool || fact.derivedFrom?.callId
             ? <span title={fact.derivedFrom?.tool ? `Learned from ${fact.derivedFrom.tool}` : 'Learned from a tool result'}><StatusPill tone="neutral">she learned this</StatusPill></span>
             : <StatusPill tone="success">you told her</StatusPill>}
+          {/* Where it applies. A service that predates scopes says nothing,
+              and nothing is shown rather than "Everywhere" assumed. */}
+          {fact.scope && <ScopeChip scope={fact.scope} />}
           {fact.policy && <span title={policyReason || undefined}><StatusPill tone={fact.policy.enforcement === 'dispatch' ? 'warning' : 'neutral'}>{fact.policy.policy_type.replace(/_/g, ' ')} · {fact.policy.enforcement}</StatusPill></span>}
           {fact.active === false && <StatusPill tone="warning">historical</StatusPill>}
           {fact.active === false && fact.supersededByFactId != null && <StatusPill tone="neutral">continued as #{fact.supersededByFactId}</StatusPill>}
@@ -971,11 +1054,22 @@ function FactCard({ fact, onPin, onForget, onRestore, onEdit, onImportance }: { 
           )}
         </div>
         {fact.pinned && <div className="mt-0.5 text-caption text-primary">Pinned — always in her context, never ages out.</div>}
+        {moving && onMoveEverywhere && (
+          <div className="mt-2 rounded-md border border-border bg-subtle px-3 py-2" role="group" aria-label="Confirm using this fact everywhere">
+            <p className="text-small text-fg">Use this everywhere? It is kept for {memoryScopeLabel(fact.scope)} now; after this it applies in every conversation.</p>
+            {moveError && <p role="alert" className="mt-1 text-caption text-danger">{moveError}</p>}
+            <div className="mt-2 flex gap-2">
+              <Button size="sm" disabled={moving === 'busy'} onClick={() => { void moveEverywhere(); }}>{moving === 'busy' ? 'Moving…' : 'Use everywhere'}</Button>
+              <Button size="sm" variant="ghost" disabled={moving === 'busy'} onClick={() => { setMoving(null); setMoveError(''); }}>Cancel</Button>
+            </div>
+          </div>
+        )}
         {(fact.evidence?.length ?? 0) > 0 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View provenance</summary><div className="mt-1 space-y-1">{fact.evidence?.map((item) => <div key={`${item.episodeId}:${item.excerpt}`} className="rounded bg-subtle p-2"><div>{item.excerpt || 'Supporting excerpt unavailable — the source expired before durable capture.'}</div><div className="mt-1 text-faint">{item.status ?? 'available'}{item.sourceUri ? ` · ${item.sourceUri}` : ''}</div></div>)}</div></details>}
         {(fact.validityIntervals?.length ?? 0) > 1 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View validity history ({fact.validityIntervals?.length} periods)</summary><div className="mt-1 space-y-1">{fact.validityIntervals?.map((interval) => <div key={interval.id} className="rounded bg-subtle p-2"><div>{new Date(interval.validFrom).toLocaleString()} → {interval.validTo ? new Date(interval.validTo).toLocaleString() : 'current'}</div><div className="mt-1 text-faint">{interval.openedReason}{interval.closedReason ? ` · ${interval.closedReason}` : ''}</div></div>)}</div></details>}
       </div>
       <div className="flex shrink-0 gap-1">
         {fact.active === false ? <Button variant="ghost" size="icon" aria-label="Restore" title="Restore" onClick={onRestore}><Undo2 className="h-4 w-4" aria-hidden /></Button> : <>
+          {onMoveEverywhere && <Button variant="ghost" size="icon" aria-label="Use this everywhere" title="Use this everywhere" aria-expanded={moving !== null} onClick={() => setMoving((value) => (value ? null : 'confirm'))}><Globe className="h-4 w-4" aria-hidden /></Button>}
           <Button variant="ghost" size="icon" aria-label="Correct" title="Correct with temporal history" onClick={() => setEditing(true)}><Pencil className="h-4 w-4" aria-hidden /></Button>
           <Button variant="ghost" size="icon" aria-label={fact.pinned ? 'Unpin' : 'Pin'} title={fact.pinned ? 'Unpin' : 'Pin'} onClick={onPin}><Pin className={cn('h-4 w-4', fact.pinned && 'fill-primary text-primary')} aria-hidden /></Button>
           <Button variant="ghost" size="icon" aria-label="Forget this" title="Forget this" onClick={onForget}><Trash2 className="h-4 w-4" aria-hidden /></Button>

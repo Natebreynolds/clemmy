@@ -15,6 +15,8 @@ import {
 } from './home-model';
 import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
 import { plainText } from '@/components/home/home-model';
+import { ProjectLabelTag } from '@/components/projects/ProjectLabelTag';
+import { useProjectLabels } from '@/lib/project-labels';
 
 const MAX_ROWS = 4;
 
@@ -255,6 +257,8 @@ export function NeedsYouPane({
   };
 
   const visible = items.slice(0, maxRows);
+  // Which project each row belongs to, by the session that asked.
+  const projectOf = useProjectLabels(visible);
   const strip = layout === 'strip' && !loading && !error && visible.length > 0;
   // A function, not a component: the rows keep their state (a typed answer)
   // across re-renders because the element types never change identity.
@@ -320,6 +324,7 @@ export function NeedsYouPane({
                     )}
                   </div>
                   {item.meta && <p className="text-small text-muted">{plainText(item.meta, 160)}</p>}
+                  <ProjectLabelTag label={projectOf(item)} link className="self-start" />
                   {state.notice ? (
                     <p
                       role="status"

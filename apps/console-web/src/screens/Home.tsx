@@ -40,6 +40,8 @@ import type { CommandCenter } from '@/lib/types';
 import { Composer } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { useConversationAgent } from '@/lib/conversation-agent';
+import { ProjectPicker } from '@/components/chat/ProjectPicker';
+import { useConversationProject } from '@/lib/conversation-project';
 import { CollaborativeWorkstate } from '@/components/CollaborativeWorkstate';
 import { ModelStatusChips } from '@/components/ModelStatusChips';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -133,13 +135,18 @@ function LiveHome() {
   // same chip the thread composer has (owner 09-26: "I don't have the agent
   // picker on the home page"); a brand-new conversation opens inside the pick.
   const agentChoice = useConversationAgent(null);
+  // Which project it opens in, chosen the same way.
+  const projectChoice = useConversationProject(null);
   const sendAndOpen = useCallback((input: { text: string; attachmentIds: string[]; attachmentNames: string[] }) => {
     if (chat.busy || opening) return;
     setNotice(null);
     setOpening(true);
     void (async () => {
-      const addressed = await agentChoice.prepare(chat.sessionId.current, chat.busy).catch(() => ({}));
-      await chat.send({ ...input, ...addressed });
+      const [addressed, placed] = await Promise.all([
+        agentChoice.prepare(chat.sessionId.current, chat.busy).catch(() => ({})),
+        projectChoice.prepare(chat.sessionId.current, chat.busy).catch(() => ({})),
+      ]);
+      await chat.send({ ...input, ...addressed, ...placed });
     })();
     const started = Date.now();
     const tick = () => {
@@ -155,7 +162,7 @@ function LiveHome() {
       openTimerRef.current = window.setTimeout(tick, 100);
     };
     tick();
-  }, [agentChoice, chat, navigate, opening]);
+  }, [agentChoice, projectChoice, chat, navigate, opening]);
 
   useEffect(() => {
     if (!opening || chat.busy || chat.sessionId.current) return;
@@ -364,7 +371,7 @@ function LiveHome() {
           onModeChange={chat.setComposerMode}
           onSend={sendAndOpen}
           onStop={chat.stop}
-          agentSlot={<AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} />}
+          agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} /></>}
           placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined}
         />
         {shown('quick_actions') && (

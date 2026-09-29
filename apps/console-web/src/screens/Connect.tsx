@@ -315,7 +315,7 @@ export function Connect() {
       {/* Browser harness — drive the user's real Chrome */}
       <BrowserHarness />
 
-      {/* Projects & folders */}
+      {/* Code folders (local code, not the Projects screen) */}
       <ProjectsPanel />
 
       {setupForm && (

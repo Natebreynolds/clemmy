@@ -69,7 +69,8 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   nav: {
     // Chat is the main feature; it is pinned, not folded. Spaces (/workspaces)
     // keep the product name the phone already uses.
-    pinned: ['/home', '/chat', '/inbox', '/tasks', '/workspaces'],
+    // Projects (/projects) are bodies of work, pinned beside what needs the owner.
+    pinned: ['/home', '/chat', '/inbox', '/projects', '/tasks', '/workspaces'],
     shown: ['/automate', '/connect'],
     more: ['/memory', '/meetings', '/goals', '/agents'],
   },

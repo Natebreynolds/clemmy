@@ -38,6 +38,10 @@ export function ConversationSidebar({
   const [search, setSearch] = useState(searchParams.get('q') ?? '');
   useEffect(() => {
     const t = setTimeout(() => {
+      // Nothing to mirror: leave the location alone. Replacing it here on
+      // every mount dropped the state a link into Chat arrived with (a new
+      // chat opened from another screen fell back to Today).
+      if ((new URLSearchParams(window.location.search).get('q') ?? '') === search.trim()) return;
       setSearchParams((prev) => {
         const next = new URLSearchParams(prev);
         if (search.trim()) next.set('q', search.trim());

@@ -24,6 +24,9 @@ export interface Session {
   agentName?: string | null;
   /** Every agent that has answered here, oldest first. */
   agentIds?: string[];
+  /** The project this conversation works in from its next message; null = none. */
+  projectId?: string | null;
+  projectName?: string | null;
   /** Exact step sessions supplied by the backend for a collapsed run. */
   runSteps?: RunStep[];
   runCoverage?: RunSourceCoverage;
@@ -40,6 +43,9 @@ export interface Turn {
   /** Who answered this exchange: an agent's name, null for Clem. Absent when
    *  the turn left no record of it. */
   agentName?: string | null;
+  /** The project this exchange worked in, by name. Absent when it worked in
+   *  none, or when the turn left no record. */
+  projectName?: string | null;
   /** Exact still-pending plan proposal restored by the server on reopen. */
   planProposalId?: string;
   /** A still-pending approval attached by the server so a reopened chat

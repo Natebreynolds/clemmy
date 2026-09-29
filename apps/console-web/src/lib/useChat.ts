@@ -128,6 +128,10 @@ export interface ChatMessage {
    *  a sent message from the composer's choice and on reopened history; a
    *  live reply says it on its model-phase activity row instead. */
   agentName?: string | null;
+  /** Which project this exchange works in: its name, null for none. Set on
+   *  a sent message from the composer's choice and on reopened history; a
+   *  live reply says it on its model-phase activity row instead. */
+  projectName?: string | null;
   /** Mid-run steering: this user message was sent while a run was active and
    *  rides to the model at its next step instead of starting a new turn. */
   steer?: 'pending' | 'delivered' | 'failed';
@@ -349,6 +353,9 @@ export interface PendingChatPost {
   /** The agent a brand-new session should start in. Part of the request
    *  identity: a retry under a different agent is a different request. */
   agentId?: string;
+  /** The project a brand-new session should start in; part of the request
+   *  identity the same way. */
+  projectId?: string;
 }
 
 export class ChatPostCancelledError extends Error {
@@ -373,15 +380,19 @@ function throwIfChatPostCancelled(signal?: AbortSignal): void {
  * second model/tool run. */
 export function retainPendingChatPost(
   previous: PendingChatPost | null,
-  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode; agentId?: string },
+  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode; agentId?: string; projectId?: string },
   createId: () => string = createChatClientRequestId,
 ): PendingChatPost {
   const taskMode = snapshotTaskMode(payload.taskMode);
   const agentId = payload.agentId || undefined;
+  const projectId = payload.projectId || undefined;
   const fingerprint = JSON.stringify([
     payload.sessionId ?? '', payload.input, payload.attachments,
     ...(taskMode ? [taskMode] : []),
     ...(agentId ? [{ agentId }] : []),
+    // Only a request that names a project adds to the identity, so every
+    // other request keeps the fingerprint it always had.
+    ...(projectId ? [{ projectId }] : []),
   ]);
   if (previous?.fingerprint === fingerprint) return previous;
   return {
@@ -392,6 +403,7 @@ export function retainPendingChatPost(
     attachments: [...payload.attachments],
     ...(taskMode ? { taskMode } : {}),
     ...(agentId ? { agentId } : {}),
+    ...(projectId ? { projectId } : {}),
   };
 }
 
@@ -402,6 +414,7 @@ export function loadPendingChatPost(storage: Pick<Storage, 'getItem'>, key: stri
       || typeof row.input !== 'string' || (row.sessionId !== null && typeof row.sessionId !== 'string')
       || !Array.isArray(row.attachments) || !row.attachments.every(id => typeof id === 'string')
       || (row.agentId !== undefined && typeof row.agentId !== 'string')
+      || (row.projectId !== undefined && typeof row.projectId !== 'string')
       || (row.taskMode !== undefined && !readTaskMode(row.taskMode))) return null;
     const checked = retainPendingChatPost(null, row, () => row.clientRequestId);
     return checked.fingerprint === row.fingerprint ? checked : null;
@@ -470,7 +483,7 @@ export async function postPendingChatWithRetry(
         pending.taskMode,
         // Only a request that names an agent carries the extra argument, so a
         // plain request keeps the exact transport call it always made.
-        ...(pending.agentId ? [pending.agentId] : []),
+        ...(pending.projectId ? [pending.agentId, pending.projectId] : pending.agentId ? [pending.agentId] : []),
       );
       if (options.signal?.aborted) {
         try {
@@ -1243,6 +1256,11 @@ export function useChat(options?: UseChatOptions) {
   /** Host dispatch ends the foreground stream; keep watching for the later origin terminal. */
   const awaitingWorkflowReportRef = useRef(false);
 
+  // Rises each time a task this conversation delegated changed state. The
+  // event is a nudge: whoever shows the task re-reads its record.
+  const [delegatedTaskTick, setDelegatedTaskTick] = useState(0);
+  const noteDelegatedTask = useCallback(() => setDelegatedTaskTick((n) => n + 1), []);
+
   const patch = useCallback((id: string, fields: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...fields } : m)));
   }, []);
@@ -1432,6 +1450,9 @@ export function useChat(options?: UseChatOptions) {
     const sid = sessionIdRef.current;
     if (!sid) return;
     return subscribeDelegatedActivity(sid, (ev) => {
+      // Activity bridged from a task's own run does not say the task record
+      // moved, but a finished or parked run usually means it did.
+      if (ev.type === 'conversation_completed' || ev.type === 'approval_requested' || ev.type === 'approval_resolved') noteDelegatedTask();
       const label = progressLabel(ev);
       const evData = (ev.data ?? {}) as Record<string, unknown>;
       const taskId = ev.sessionId?.startsWith('background:')
@@ -1488,10 +1509,11 @@ export function useChat(options?: UseChatOptions) {
         };
         return next;
       });
-    });
-  }, [busy]);
+    }, noteDelegatedTask);
+  }, [busy, noteDelegatedTask]);
 
   const applyEvent = useCallback((assistantId: string, ev: HarnessEvent) => {
+    if (ev.type === 'delegated_task_state') noteDelegatedTask();
     const d = (ev.data ?? {}) as Record<string, unknown>;
     if (readLiveApprovalControl(ev)) {
       if (ev.sessionId && ev.sessionId !== sessionIdRef.current) return;
@@ -1602,7 +1624,7 @@ export function useChat(options?: UseChatOptions) {
         };
       }));
     }
-  }, [patch]);
+  }, [patch, noteDelegatedTask]);
 
   const handoffAcceptedRun = useCallback(async (
     accepted: ChatPostResult,
@@ -1635,7 +1657,7 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null }, retryRequest?: PendingChatPost) => {
+  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null }, retryRequest?: PendingChatPost) => {
     const taskMode = snapshotTaskMode(input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
     if (busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
@@ -1648,8 +1670,10 @@ export function useChat(options?: UseChatOptions) {
     // session, a switch travels separately (lib/conversation-agent) and the
     // field is dropped so a retry fingerprint never differs by it.
     const agentId = sessionIdRef.current ? undefined : (input.agentId || undefined);
+    // The same for the project a new session opens in (lib/conversation-project).
+    const projectId = sessionIdRef.current ? undefined : (input.projectId || undefined);
     if (!busy && pendingPostRef.current && !retryRequest) {
-      const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode, agentId });
+      const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode, agentId, projectId });
       if (candidate !== pendingPostRef.current) throw new Error('Retry or cancel the unconfirmed request before sending a different one.');
     }
     if (busy) {
@@ -1692,7 +1716,8 @@ export function useChat(options?: UseChatOptions) {
     setMessages((prev) => [
       ...prev,
       { id: userId, role: 'user', text, attachmentNames: input.attachmentNames, taskMode,
-        ...(input.agentName !== undefined ? { agentName: input.agentName } : {}) },
+        ...(input.agentName !== undefined ? { agentName: input.agentName } : {}),
+        ...(input.projectName !== undefined ? { projectName: input.projectName } : {}) },
       { id: assistantId, role: 'assistant', text: '', status: 'thinking', startedAt: Date.now(), taskMode, progress: taskMode?.kind === 'plan' ? 'Investigating with read-only tools…' : 'Starting up…' },
     ]);
     setBusy(true);
@@ -1707,6 +1732,7 @@ export function useChat(options?: UseChatOptions) {
         attachments: attachmentIds,
         ...(taskMode ? { taskMode } : {}),
         ...(agentId ? { agentId } : {}),
+        ...(projectId ? { projectId } : {}),
       });
       retainPending(pending);
       const body = await postPendingChatWithRetry(pending, {
@@ -1898,7 +1924,7 @@ export function useChat(options?: UseChatOptions) {
       + 'revision. Only ask me about something that genuinely needs my answer.',
     taskMode: { version: 1, kind: 'plan' },
   });
-  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending };
+  return { messages, busy, send, stop, background, reset, sessionId: sessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending, delegatedTaskTick };
 }
 
 

@@ -1,5 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
-import { approvalPreviewFrom } from '@clem/chat-engine';
+import { approvalPreviewFrom, recordedTurnProject } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -9,7 +9,7 @@ let seedSeq = 0;
  * the chat UI. Durable plan and approval identities survive navigation; plain
  * assistant history remains terminal text. */
 export function historyToMessages(turns: Turn[]): ChatMessage[] {
-  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...savedWorkflows(turn) }));
+  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...workedIn(turn), ...savedWorkflows(turn) }));
 }
 
 /** The workflows the reply saved, as the receipt-only rows the live card is
@@ -32,6 +32,12 @@ function savedWorkflows(turn: Turn): Pick<ChatMessage, 'activity'> {
 /** Who answered the exchange, when the server recorded it. */
 function answeredBy(turn: Turn): Pick<ChatMessage, 'agentName'> {
   return turn.agentName !== undefined ? { agentName: turn.agentName } : {};
+}
+
+/** Which project the exchange worked in, when the server recorded it. */
+function workedIn(turn: Turn): Pick<ChatMessage, 'projectName'> {
+  const project = recordedTurnProject(turn);
+  return project !== undefined ? { projectName: project } : {};
 }
 
 /** When the turn was written, for the reply's header. Display only. */

@@ -1,6 +1,11 @@
+import type { MemoryScope } from '@clem/chat-engine';
 import { apiGet, apiPatch, apiPost } from './api';
+import { factScopeQuery, type FactScopeFilter } from './memory-scope';
 
 export interface Fact {
+  /** Where the fact applies: everywhere, one project, one agent, or one
+   *  agent in one project. Absent from a service that predates scopes. */
+  scope?: MemoryScope;
   id: number | string;
   kind: 'user' | 'project' | 'feedback' | 'reference' | 'constraint';
   content: string;
@@ -55,8 +60,13 @@ export const FACT_KINDS: { key: Fact['kind']; label: string }[] = [
   { key: 'constraint', label: 'Constraints' },
 ];
 
-export const listFacts = (kind?: Fact['kind'], limit = 80, includeInactive = false) =>
-  apiGet<{ facts: Fact[]; total: number; visible: number }>(`/api/console/memory/facts?${kind ? `kind=${kind}&` : ''}limit=${limit}${includeInactive ? '&includeInactive=1' : ''}`);
+export const listFacts = (kind?: Fact['kind'], limit = 80, includeInactive = false, scope?: FactScopeFilter) =>
+  apiGet<{ facts: Fact[]; total: number; visible: number }>(`/api/console/memory/facts?${kind ? `kind=${kind}&` : ''}limit=${limit}${includeInactive ? '&includeInactive=1' : ''}${factScopeQuery(scope)}`);
+
+/** Move a fact to a project, an agent, both, or (both null) everywhere. */
+export const moveFactScope = (id: Fact['id'], target: { projectId: string | null; agentId: string | null }) =>
+  apiPost<Fact | { fact: Fact }>(`/api/console/memory/facts/${encodeURIComponent(String(id))}/scope`, target)
+    .then((r): Fact => ((r as { fact?: Fact }).fact ?? (r as Fact)));
 
 export const forgetFact = (id: Fact['id']) =>
   apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/forget`);

@@ -10,6 +10,8 @@ import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { setWorkflowEnabled } from '@/lib/automate';
 import { usePoll } from '@/lib/poll';
+import { ProjectLabelTag } from '@/components/projects/ProjectLabelTag';
+import { useProjectLabels, type SessionProjectLabel } from '@/lib/project-labels';
 import { applyTidy, describeTidy } from '@/lib/tidy';
 import { cn } from '@/lib/cn';
 import { plainText } from '@/components/home/home-model';
@@ -113,6 +115,8 @@ export function Inbox() {
   const trustRows = trustProposals.data?.proposals ?? [];
   const planRows = planProposals.data?.proposals ?? [];
   const questionRows = questions.data?.questions ?? [];
+  // Which project each waiting item belongs to, by the session that asked.
+  const projectOf = useProjectLabels([...approvalRows, ...planRows, ...questionRows]);
   // The detail pane never sits empty next to a list: the first decision opens
   // itself until the person picks another ("Pick something on the left" was
   // a blank slab beside fifty-one buttons, live 09-26).
@@ -548,6 +552,7 @@ export function Inbox() {
                   <InboxQuestionCard
                     key={question.id}
                     row={question}
+                    project={projectOf(question)}
                     selected={selected === question.id}
                     answer={questionAnswers[question.id] ?? ''}
                     busy={questionBusy === question.id}
@@ -561,6 +566,7 @@ export function Inbox() {
                   <PlanProposalCard
                     key={plan.id}
                     row={plan}
+                    project={projectOf(plan)}
                     selected={selected === plan.id}
                     busy={planBusy === plan.id}
                     onSelect={() => pick(plan.id)}
@@ -593,7 +599,7 @@ export function Inbox() {
                   </div>
                 )}
                 {urgentApprovalRows.map((a) => (
-                  <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
+                  <ApprovalCard key={a.approvalId} row={a} project={projectOf(a)} selected={selected === a.approvalId}
                     checked={checked.has(a.approvalId)}
                     decisionState={decisionStates[a.approvalId]}
                     disabled={bulkBusy}
@@ -610,7 +616,7 @@ export function Inbox() {
                   </div>
                 )}
                 {agedApprovalRows.map((a) => (
-                  <ApprovalCard key={a.approvalId} row={a} selected={selected === a.approvalId}
+                  <ApprovalCard key={a.approvalId} row={a} project={projectOf(a)} selected={selected === a.approvalId}
                     checked={checked.has(a.approvalId)}
                     decisionState={decisionStates[a.approvalId]}
                     disabled={bulkBusy}
@@ -676,6 +682,7 @@ export function Inbox() {
             {selApproval && (
               <ApprovalDetail
                 row={selApproval}
+                project={projectOf(selApproval)}
                 decisionState={decisionStates[selApproval.approvalId]}
                 disabled={bulkBusy}
                 onApprove={() => onDecide(selApproval.approvalId, 'approve')}
@@ -685,6 +692,7 @@ export function Inbox() {
             {selPlan && (
               <PlanProposalDetail
                 row={selPlan}
+                project={projectOf(selPlan)}
                 busy={planBusy === selPlan.id}
                 onApprove={() => onDecidePlan(selPlan.id, 'approve')}
                 onReject={() => onDecidePlan(selPlan.id, 'reject')}
@@ -809,8 +817,10 @@ function WorkspaceChooserCard({ chooser, busy, onChoose }: {
   );
 }
 
-function InboxQuestionCard({ row, selected, answer, busy, globallyBusy, onSelect, onAnswerChange, onSubmit }: {
+function InboxQuestionCard({ row, project, selected, answer, busy, globallyBusy, onSelect, onAnswerChange, onSubmit }: {
   row: InboxQuestionRow;
+  /** The project the asking session works in, when it works in one. */
+  project?: SessionProjectLabel;
   selected: boolean;
   answer: string;
   busy: boolean;
@@ -831,6 +841,7 @@ function InboxQuestionCard({ row, selected, answer, busy, globallyBusy, onSelect
           </div>
         </div>
       </button>
+      <ProjectLabelTag label={project} link className="mt-2" />
       {row.context && <p className="mt-2 whitespace-pre-wrap text-small text-muted">{row.context}</p>}
       {row.unavailableReason && <p role="status" className="mt-2 text-small text-warning">{row.unavailableReason}</p>}
       {row.options.length > 0 && (
@@ -862,8 +873,9 @@ function InboxQuestionCard({ row, selected, answer, busy, globallyBusy, onSelect
   );
 }
 
-function PlanProposalCard({ row, selected, busy, onSelect, onApprove, onReject }: {
+function PlanProposalCard({ row, project, selected, busy, onSelect, onApprove, onReject }: {
   row: PlanProposalRow;
+  project?: SessionProjectLabel;
   selected: boolean;
   busy: boolean;
   onSelect: () => void;
@@ -880,6 +892,7 @@ function PlanProposalCard({ row, selected, busy, onSelect, onApprove, onReject }
         <span className="shrink-0 text-caption text-faint">{relativeTime(row.proposedAt)}</span>
       </button>
       <p className="mt-1 line-clamp-2 text-caption text-muted">{row.originatingRequest}</p>
+      <ProjectLabelTag label={project} link className="mt-1.5" />
       {needsInput && (
         <div className="mt-2 text-small text-muted">
           <p className="font-medium text-fg">Clem needs these answers before this plan can be approved:</p>
@@ -907,8 +920,9 @@ function PlanProposalCard({ row, selected, busy, onSelect, onApprove, onReject }
   );
 }
 
-function PlanProposalDetail({ row, busy, onApprove, onReject }: {
+function PlanProposalDetail({ row, project, busy, onApprove, onReject }: {
   row: PlanProposalRow;
+  project?: SessionProjectLabel;
   busy: boolean;
   onApprove: () => void;
   onReject: () => void;
@@ -919,6 +933,7 @@ function PlanProposalDetail({ row, busy, onApprove, onReject }: {
   return (
     <div>
       <h3 className="mb-3 text-h3 text-fg">{row.plan.objective || 'Proposed plan'}</h3>
+      {project && <Field label="Project"><ProjectLabelTag label={project} link /></Field>}
       <Field label="You asked"><span className="whitespace-pre-wrap">{row.originatingRequest}</span></Field>
       {row.context && <Field label="Context"><span className="whitespace-pre-wrap">{row.context}</span></Field>}
       <Field label="Proposed">{relativeTime(row.proposedAt) || row.proposedAt}</Field>
@@ -1012,6 +1027,7 @@ function WorkflowCapabilityCard({ gate, title, body, createdAt, busy, globallyBu
 
 function ApprovalCard({
   row,
+  project,
   selected,
   checked,
   decisionState,
@@ -1021,7 +1037,7 @@ function ApprovalCard({
   onApprove,
   onReject,
 }: {
-  row: ApprovalRow; selected: boolean; checked: boolean; onToggleCheck: () => void;
+  row: ApprovalRow; project?: SessionProjectLabel; selected: boolean; checked: boolean; onToggleCheck: () => void;
   decisionState?: RowDecisionState; disabled?: boolean;
   onSelect: () => void; onApprove: () => void; onReject: (note?: string) => void;
 }) {
@@ -1057,6 +1073,7 @@ function ApprovalCard({
           {queued.toolName} · {queued.targetSummary || queued.kind} · hash {queued.payloadHash}
         </div>
       )}
+      <ProjectLabelTag label={project} link className="ml-7 mt-1.5" />
       {draft && (
         <div className="mt-2 rounded border border-border bg-surface px-3 py-2" aria-label="What you are approving">
           <p className="text-caption font-semibold uppercase tracking-wider text-faint">Draft</p>
@@ -1173,12 +1190,14 @@ function Mono({ value }: { value: unknown }) {
 
 function ApprovalDetail({
   row,
+  project,
   decisionState,
   disabled,
   onApprove,
   onReject,
 }: {
   row: ApprovalRow;
+  project?: SessionProjectLabel;
   decisionState?: RowDecisionState;
   disabled?: boolean;
   onApprove: () => void;
@@ -1190,6 +1209,7 @@ function ApprovalDetail({
     <div>
       <h3 className="mb-3 text-h3 text-fg">{queued ? `Ready for approval: ${queued.title}` : row.subject}</h3>
       {queued && <PendingActionDetail action={queued} />}
+      {project && <Field label="Project"><ProjectLabelTag label={project} link /></Field>}
       <Field label="Action">{row.presentation?.action || row.tool || '—'}</Field>
       {row.presentation?.app && <Field label="App">{row.presentation.app}{row.presentation.operation ? ` · ${row.presentation.operation}` : ''}</Field>}
       <Field label="Requested">{relativeTime(row.requestedAt) || '—'}</Field>

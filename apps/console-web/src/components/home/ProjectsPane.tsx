@@ -41,7 +41,7 @@ export function ProjectsPane({
         }
       />
       {error ? (
-        <PaneCard><LoadFailedLine what="your projects" onRetry={onRetry} /></PaneCard>
+        <PaneCard><LoadFailedLine what="your Spaces" onRetry={onRetry} /></PaneCard>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {loading

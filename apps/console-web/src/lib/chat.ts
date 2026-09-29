@@ -73,6 +73,8 @@ export async function postChat(
   /** The agent a NEW session starts in. An existing session keeps its own
    *  binding; the server ignores this for one. */
   agentId?: string,
+  /** The project a NEW session starts in, the same way. */
+  projectId?: string,
 ): Promise<ChatPostResult> {
   const result = await apiPost<ChatPostResult>('/api/harness/chat', {
     input,
@@ -81,6 +83,7 @@ export async function postChat(
     clientRequestId,
     ...(taskMode ? { taskMode } : {}),
     ...(agentId ? { agentId } : {}),
+    ...(projectId ? { projectId } : {}),
   });
   if (!result || typeof result.sessionId !== 'string' || !result.sessionId) {
     throw Object.assign(new TypeError('chat acknowledgement was incomplete'), { status: 0 });
@@ -452,6 +455,10 @@ export function watchForLateCompletion(
 export function subscribeDelegatedActivity(
   sessionId: string,
   onEvent: (ev: HarnessEvent) => void,
+  /** A delegated task changed state. The task's owner writes that on this
+   *  conversation's own stream, so it is the one own-session frame an idle
+   *  chat still has to hear. */
+  onTaskState?: (ev: HarnessEvent) => void,
 ): () => void {
   let closed = false;
   let es: EventSource | null = null;
@@ -462,7 +469,11 @@ export function subscribeDelegatedActivity(
     es = new EventSource(withToken(`/api/sessions/${encodeURIComponent(sessionId)}/events`));
     const handleForeign = (ev: HarnessEvent) => {
       if (!ev || typeof ev.type !== 'string') return;
-      if (!ev.sessionId || ev.sessionId === sessionId) return; // own-turn frames belong to the turn stream
+      if (!ev.sessionId || ev.sessionId === sessionId) {
+        // Own-turn frames belong to the turn stream.
+        if (ev.type === 'delegated_task_state') onTaskState?.(ev);
+        return;
+      }
       onEvent(ev);
     };
     es.addEventListener('replay', (e) => {

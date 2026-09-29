@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Pin, MoreVertical, Pencil, Tag, Archive, ArchiveRestore, Trash2 } from 'lucide-react';
+import { Pin, MoreVertical, Pencil, Tag, Archive, ArchiveRestore, Trash2, Users, FolderKanban } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { originMeta } from '../lib/origin';
@@ -120,6 +120,25 @@ export function ConversationListItem({ session, actions }: { session: Session; a
             </span>
           )}
         </div>
+        {/* Who answers here and which project it works in, when either is set. */}
+        {!isRun && (session.agentName || session.projectName) && (
+          <div className="mt-1 flex min-w-0 items-center gap-2.5 pr-6 text-caption text-faint">
+            {session.agentName && (
+              <span className="inline-flex min-w-0 items-center gap-1">
+                <Users className="h-3 w-3 shrink-0" aria-hidden />
+                <span className="sr-only">Agent: </span>
+                <span className="truncate">{session.agentName}</span>
+              </span>
+            )}
+            {session.projectName && (
+              <span className="inline-flex min-w-0 items-center gap-1">
+                <FolderKanban className="h-3 w-3 shrink-0" aria-hidden />
+                <span className="sr-only">Project: </span>
+                <span className="truncate">{session.projectName}</span>
+              </span>
+            )}
+          </div>
+        )}
         {session.tags.length > 0 && (
           <div className="mt-1 flex flex-wrap gap-1">
             {session.tags.map((t) => (

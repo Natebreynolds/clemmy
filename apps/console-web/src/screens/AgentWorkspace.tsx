@@ -18,11 +18,17 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { AgentPicker } from '@/components/chat/AgentPicker';
-import { AgentSwitchLine } from '@/components/chat/AgentSwitchLine';
-import { agentThreadMarks } from '@clem/chat-engine';
+import { ProjectPicker } from '@/components/chat/ProjectPicker';
+import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
+import { ConversationTasks } from '@/components/chat/ConversationTasks';
+import { agentThreadMarks, projectThreadMarks } from '@clem/chat-engine';
 import { useConversationAgent } from '@/lib/conversation-agent';
+import { useConversationProject } from '@/lib/conversation-project';
+import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { AgentForm } from '@/components/agents/AgentForm';
+import { AgentAssignments } from '@/components/agents/AgentAssignments';
+import { ScopedFacts } from '@/components/memory/ScopedFacts';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
 import { unifiedChatSessionId } from '@/lib/last-session';
@@ -243,7 +249,14 @@ function BoundThread({ agent, session, history }: { agent: AgentRecord; session:
     initialMessages: historyToMessages(history),
     reattachActiveRun: true,
   });
-  return <ThreadBody agent={agent} chat={chat} sessionId={session.id} />;
+  return (
+    <ThreadBody
+      agent={agent}
+      chat={chat}
+      sessionId={session.id}
+      project={session.projectId && session.projectName ? { id: session.projectId, name: session.projectName } : null}
+    />
+  );
 }
 
 /** A thread that does not exist yet: the first send carries the agent id,
@@ -256,7 +269,13 @@ function FreshThread({ agent }: { agent: AgentRecord }) {
 type ChatHandle = ReturnType<typeof useChat>;
 type SendInput = { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode };
 
-function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: ChatHandle; sessionId?: string }) {
+function ThreadBody({ agent, chat, sessionId, project = null }: {
+  agent: AgentRecord;
+  chat: ChatHandle;
+  sessionId?: string;
+  /** The project the thread works in when it was opened. */
+  project?: { id: string; name: string } | null;
+}) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
@@ -269,6 +288,11 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
   // including in a thread that was switched to another one elsewhere.
   const agentChoice = useConversationAgent({ id: agent.id, name: agent.name });
   const marks = agentThreadMarks(chat.messages, agent.name);
+  const projectChoice = useConversationProject(project, {
+    onMoved: () => { void qc.invalidateQueries({ queryKey: sessionKeys.all }); },
+  });
+  const projectMarks = projectThreadMarks(chat.messages, project?.name ?? null);
+  const delegated = useConversationTasks(chat.sessionId.current, chat.delegatedTaskTick);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -294,8 +318,11 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
   }, [location.state, fresh, resetChat]);
 
   const send = async (input: SendInput) => {
-    const addressed = await agentChoice.prepare(chat.sessionId.current, chat.busy);
-    await chat.send({ ...input, ...addressed });
+    const [addressed, placed] = await Promise.all([
+      agentChoice.prepare(chat.sessionId.current, chat.busy),
+      projectChoice.prepare(chat.sessionId.current, chat.busy),
+    ]);
+    await chat.send({ ...input, ...addressed, ...placed });
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
     // The server minted the session on that first send; from here the thread
     // is addressable, so the URL says which one it is.
@@ -336,10 +363,12 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
           )}
           {chat.messages.map((m, index) => (
             <Fragment key={m.id}>
-            {marks[index]?.switchedTo && <AgentSwitchLine name={marks[index].switchedTo!.name} />}
+            <ConversationChangeLine agent={marks[index]?.switchedTo} project={projectMarks[index]?.movedTo} />
             <ChatBubble
               message={m}
-              speaker={marks[index]?.speaker ?? undefined}
+              speaker={reportOwner(m, delegated.tasks) ?? marks[index]?.speaker ?? undefined}
+              project={projectMarks[index]?.project ?? undefined}
+              ownedTaskIds={delegated.ownedIds}
               sessionId={chat.sessionId.current ?? undefined}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
@@ -353,6 +382,7 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
             />
             </Fragment>
           ))}
+          <ConversationTasks cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
           <div ref={bottomRef} />
         </div>
       </div>
@@ -372,7 +402,7 @@ function ThreadBody({ agent, chat, sessionId }: { agent: AgentRecord; chat: Chat
           onStop={chat.stop}
           onBackground={chat.background}
           placeholder={`Message ${agent.name}…`}
-          agentSlot={<AgentPicker bound={agent.name} />}
+          agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started={!fresh} /><AgentPicker bound={agent.name} /></>}
         />
       </div>
     </div>
@@ -415,7 +445,7 @@ function AgentPanel({
   };
 
   return (
-    <aside aria-label={`About ${agent.name}`} className="flex w-[300px] shrink-0 flex-col border-l border-border bg-subtle">
+    <aside aria-label={`About ${agent.name}`} className="flex w-[320px] shrink-0 flex-col border-l border-border bg-subtle">
       <div className="flex items-center gap-1 border-b border-border px-3 py-2">
         <span className="min-w-0 flex-1 truncate text-small font-semibold text-fg">About</span>
         <Button variant="ghost" size="sm" onClick={onEdit}>
@@ -440,6 +470,20 @@ function AgentPanel({
               )}
             </div>
           )}
+        </section>
+
+        <AgentAssignments agent={agent} />
+
+        <section>
+          <div className="text-caption font-semibold text-faint">What it has learned</div>
+          <p className="mb-1.5 mt-0.5 text-caption text-muted">Kept for this agent, in any project it works in.</p>
+          <ScopedFacts
+            filter={{ kind: 'agent', agentId: agent.id }}
+            limit={5}
+            compact
+            empty="Nothing kept for this agent yet."
+            unavailableTitle="What it has learned is unavailable"
+          />
         </section>
 
         <section>
@@ -502,9 +546,12 @@ function workerLabel(w: AgentWorker): string {
   return w.task;
 }
 
-/** Worker runs spawned from this agent's threads — the same row the board's
- *  agents panel draws. The full work-product is fetched on open when the run
- *  is addressable; otherwise the stored preview stands in. */
+/** Helper runs spawned from this agent's threads — the same row the board's
+ *  agents panel draws. A helper is a temporary worker for one step: it is
+ *  not the agent, and it ends when the step does. The tasks the agent itself
+ *  owned are listed above (AgentAssignments). The full work-product is
+ *  fetched on open when the run is addressable; otherwise the stored preview
+ *  stands in. */
 function RecentWork({ agent }: { agent: AgentRecord }) {
   const work = usePoll(['agents', 'work', agent.id], () => getAgentWork(agent.id), 10_000);
   const workers = work.data?.workers ?? [];
@@ -524,10 +571,13 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
 
   return (
     <section>
-      <div className="text-caption font-semibold text-faint">Recent work</div>
+      <div className="text-caption font-semibold text-faint">Helper runs</div>
+      <p className="mt-0.5 text-caption text-muted">
+        Temporary helpers this agent’s threads started for a single step. Each ends when its step does.
+      </p>
       {workers.length === 0 ? (
         <p className="mt-1 text-caption text-muted">
-          {work.isLoading ? 'Looking…' : 'No worker runs yet. They show here as threads hand work off.'}
+          {work.isLoading ? 'Looking…' : 'None yet.'}
         </p>
       ) : (
         <ul className="mt-1.5 flex flex-col gap-1.5">

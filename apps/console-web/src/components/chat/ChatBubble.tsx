@@ -110,12 +110,15 @@ function DraftFrame({ draft, children }: { draft: ChatMessage['answerDraft']; ch
 
 /** Who is speaking, and when. The avatar lives here now rather than in a
  *  gutter beside every reply, so the answer can use the full column. */
-function TurnHeader({ at, quiet, speaker }: { at?: number; quiet?: boolean; speaker?: string }) {
+function TurnHeader({ at, quiet, speaker, project }: { at?: number; quiet?: boolean; speaker?: string; project?: string }) {
   const time = at ? new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
   return (
     <div className={cn('flex items-center gap-2 text-small', quiet && 'opacity-70')}>
       <DogMark size={20} className="rounded-[5px]" />
       <span className="font-semibold text-fg">{speaker || 'Clem'}</span>
+      {/* The project the reply was written in; it stays with the reply
+          after the conversation moves on. */}
+      {project && <span className="min-w-0 truncate text-caption text-muted">in {project}</span>}
       {time && <time className="font-mono text-caption text-faint" dateTime={new Date(at!).toISOString()}>{time}</time>}
     </div>
   );
@@ -186,12 +189,19 @@ export function ChatBubble({
   traceHref,
   onAnswer,
   speaker,
+  project,
+  ownedTaskIds,
   sessionId, executionBusy, onExecutePlan, onPreparePlan, onRevisePlan,
 }: {
   message: ChatMessage;
   sessionId?: string;
+  /** The tasks this conversation delegated. Each has its own card under the
+   *  thread (ConversationTasks), so the live strip over one is not drawn. */
+  ownedTaskIds?: ReadonlySet<string>;
   /** Who is answering, when the thread works inside an agent. Clem otherwise. */
   speaker?: string;
+  /** The project this reply worked in, by name. Absent when it worked in none. */
+  project?: string;
   executionBusy?: boolean;
   onExecutePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
   onPreparePlan?: (ref: PlanRevisionRef) => Promise<void> | void;
@@ -332,6 +342,8 @@ export function ChatBubble({
   }
 
   if (message.delegated) {
+    // A task with an owner is shown by its own card, which names that owner.
+    if (message.delegated.taskId && ownedTaskIds?.has(message.delegated.taskId)) return null;
     return <DelegatedWorkCard message={message} delegated={message.delegated} />;
   }
 
@@ -380,8 +392,8 @@ export function ChatBubble({
     || hasReplyText;
   const answerable = message.status === 'awaiting-reply' && Boolean(onAnswer) && (message.options?.length ?? 0) > 0;
   return (
-    <article className="group/turn flex min-w-0 flex-col gap-2.5" aria-label={speaker || 'Clem'}>
-      <TurnHeader at={message.startedAt ?? message.sentAt} speaker={speaker} />
+    <article className="group/turn flex min-w-0 flex-col gap-2.5" aria-label={project ? `${speaker || 'Clem'}, in ${project}` : speaker || 'Clem'}>
+      <TurnHeader at={message.startedAt ?? message.sentAt} speaker={speaker} project={project} />
       {/* The work rides ABOVE the answer: while the turn runs it is the whole
           story (steps, helpers, the live line); once the answer lands it folds
           to one line you can reopen. */}

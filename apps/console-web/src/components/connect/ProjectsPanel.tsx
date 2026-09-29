@@ -39,8 +39,8 @@ export function ProjectsPanel() {
       <div className="mb-3 flex items-center gap-2.5">
         <FolderGit2 className="h-5 w-5 text-primary" aria-hidden />
         <div className="flex-1">
-          <h3 className="text-h3 text-fg">Projects & folders</h3>
-          <p className="text-small text-muted">Folders Clementine can read and work in on your machine</p>
+          <h3 className="text-h3 text-fg">Code folders</h3>
+          <p className="text-small text-muted">Folders on your machine Clementine can read and work in</p>
         </div>
       </div>
 
@@ -91,7 +91,7 @@ export function ProjectsPanel() {
 
           {found.length > 0 && (
             <>
-              <p className="mb-2 text-label text-faint">Detected projects</p>
+              <p className="mb-2 text-label text-faint">Code found in them</p>
               <div className="grid gap-2 sm:grid-cols-2">
                 {found.map((p) => (
                   <Card key={p.path} className="p-3.5">
@@ -129,7 +129,7 @@ export function ProjectsPanel() {
           )}
 
           {dirs.length === 0 && found.length === 0 && (
-            <Card className="p-4 text-body text-muted">No folders added yet. Add one above to let Clementine work with your local projects.</Card>
+            <Card className="p-4 text-body text-muted">No folders added yet. Add one above to let Clementine work with the code on your machine.</Card>
           )}
         </>
       )}
