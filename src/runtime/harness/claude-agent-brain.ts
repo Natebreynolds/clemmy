@@ -12,6 +12,7 @@ import { resolveHotSet } from '../../agents/tool-catalog.js';
 import {
   composeSession,
   composeSessionFromStore,
+  sessionMountContext,
   durableSessionKind,
   pinCompositionHotTools,
   pinCompositionTools,
@@ -1019,6 +1020,15 @@ function renderStableMemoryFrozen(request: AssistantRequest): string {
   return fresh;
 }
 
+function mountedIdentityContext(sessionId: string | undefined): string {
+  if (!sessionId?.trim()) return '';
+  try {
+    return sessionMountContext(composeSessionFromStore(sessionId));
+  } catch {
+    return '';
+  }
+}
+
 export function renderClaudeAgentBrainSystemAppend(
   surface: ClaudeAgentBrainSurface,
   request: AssistantRequest,
@@ -1076,6 +1086,9 @@ export function renderClaudeAgentBrainSystemAppend(
     // Session composition (workspace contract, saved-bundle notes): identity
     // mount, not a job type. Chat mounts nothing extra here.
     compositionPrimers,
+    // Who the work runs as and the project it runs in, read from the stored
+    // session the way every other lane reads it. Empty for an unattached turn.
+    mountedIdentityContext(request.sessionId),
     '',
     frameTrustedMemory(persistentContext),
     '',

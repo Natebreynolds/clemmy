@@ -23,6 +23,8 @@ import {
 } from '../../spaces/workspace-context.js';
 
 import { resolveAgentBinding, type AgentBinding } from '../../agents/agent-binding.js';
+import { resolveProjectBinding, type ProjectBinding } from '../../projects/project-binding.js';
+import { sessionProjectState } from '../../projects/session-project-state.js';
 
 export const WORKSPACE_CONTEXT_PRIMER_PREFIX = '[workspace-context]';
 
@@ -56,6 +58,8 @@ export interface SessionMount {
   toolAllowlist: readonly string[] | null;
   /** The saved agent this session works in, when it was opened in one. */
   agent: AgentBinding | null;
+  /** The project this session works in, when it has one. */
+  project: ProjectBinding | null;
 }
 
 /** Tools an agent's pinned workflows need first-class to be run by name. */
@@ -70,6 +74,25 @@ function agentFromMetadata(metadata: Record<string, unknown> | null | undefined)
   } catch {
     return null;
   }
+}
+
+function projectFromMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  agentId: string | null,
+): ProjectBinding | null {
+  const { projectId } = sessionProjectState(metadata);
+  if (!projectId) return null;
+  try {
+    return resolveProjectBinding(projectId, { agentId });
+  } catch {
+    return null;
+  }
+}
+
+/** A task the host delegated carries the agent and project it was given when
+ * it was created. Nothing else that runs unattended takes either. */
+function isDelegatedTask(metadata: Record<string, unknown> | null | undefined): boolean {
+  return typeof metadata?.delegatedTaskId === 'string' && metadata.delegatedTaskId.trim() !== '';
 }
 
 export interface ComposeSessionInput {
@@ -182,17 +205,23 @@ export function composeSession(input: ComposeSessionInput): SessionMount {
       hotTools: WORKSPACE_DOCK_HOT_TOOLS,
       toolAllowlist,
       agent: null,
+      project: null,
     };
   }
 
   // A chat opened inside a saved agent: its standing context joins the
   // stable system prefix (see harnessInstructions), and the tools its pinned
-  // workflows and skills need stay first-class. Nothing widens.
-  const agent = kind === 'chat' ? agentFromMetadata(input.metadata) : null;
-  const agentTools = agent
+  // workflows and skills need stay first-class. Nothing widens. A task the
+  // host delegated to an agent mounts it the same way.
+  const takesIdentity = kind === 'chat' || (kind === 'execution' && isDelegatedTask(input.metadata));
+  const agent = takesIdentity ? agentFromMetadata(input.metadata) : null;
+  const project = takesIdentity ? projectFromMetadata(input.metadata, agent?.agent.id ?? null) : null;
+  const agentTools = agent || project
     ? [
-        ...(agent.agent.workflows.length > 0 ? AGENT_WORKFLOW_TOOLS : []),
-        ...(agent.pinnedSkills.length > 0 || agent.missingSkills.length > 0 ? AGENT_SKILL_TOOLS : []),
+        ...(agent && agent.agent.workflows.length > 0 ? AGENT_WORKFLOW_TOOLS : []),
+        ...((agent && (agent.pinnedSkills.length > 0 || agent.missingSkills.length > 0))
+          || (project && (project.pinnedSkills.length > 0 || project.missingSkills.length > 0))
+          ? AGENT_SKILL_TOOLS : []),
       ]
     : [];
 
@@ -208,7 +237,17 @@ export function composeSession(input: ComposeSessionInput): SessionMount {
     hotTools: agentTools,
     toolAllowlist,
     agent,
+    project,
   };
+}
+
+/**
+ * The standing context a mount adds to the stable system prefix: who the
+ * work runs as, then the project it runs in. Empty for an unattached turn,
+ * so its prefix is byte-for-byte what it was.
+ */
+export function sessionMountContext(mount: Pick<SessionMount, 'agent' | 'project'>): string {
+  return [mount.agent?.context ?? '', mount.project?.context ?? ''].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -223,6 +262,28 @@ export function sessionAgentFields(sessionId: string | null | undefined): { agen
     if (!agentId) return {};
     const agentName = typeof metadata?.agentName === 'string' ? metadata.agentName.trim().slice(0, 64) : '';
     return { agentId, ...(agentName ? { agentName } : {}) };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The project a session works in, as bounded event fields, so a route marker
+ * can say which project the turn worked in and which rendering of it.
+ */
+export function sessionProjectFields(sessionId: string | null | undefined): {
+  projectId?: string; projectName?: string; projectRevision?: string;
+} {
+  if (!sessionId) return {};
+  try {
+    const row = getSession(sessionId);
+    const mount = composeSession({ sessionId, sessionKind: row?.kind, metadata: row?.metadata });
+    if (!mount.project) return {};
+    return {
+      projectId: mount.project.project.id,
+      projectName: mount.project.project.name.slice(0, 80),
+      projectRevision: mount.project.revision,
+    };
   } catch {
     return {};
   }
@@ -262,9 +323,11 @@ const AGENT_REVIEW_MAX_CHARS = 6_000;
 export function sessionAgentReviewContext(sessionId: string | null | undefined): string {
   if (!sessionId) return '';
   try {
-    const agentId = getSession(sessionId)?.metadata?.agentId;
+    const metadata = getSession(sessionId)?.metadata;
+    const agentId = metadata?.agentId;
     const binding = typeof agentId === 'string' ? resolveAgentBinding(agentId) : null;
-    if (!binding) return '';
+    const project = projectReviewContext(metadata, binding?.agent.id ?? null);
+    if (!binding) return project;
     const { agent } = binding;
     const instructions = agent.instructions.length > AGENT_REVIEW_MAX_CHARS
       ? `${agent.instructions.slice(0, AGENT_REVIEW_MAX_CHARS)}\n[instructions cut here for length]`
@@ -274,10 +337,22 @@ export function sessionAgentReviewContext(sessionId: string | null | undefined):
       agent.handles ? `Handles: ${agent.handles}` : '',
       instructions ? `Standing instructions:\n${instructions}` : '',
       binding.pinnedSkills.length > 0 ? `Pinned skills: ${binding.pinnedSkills.join(', ')}` : '',
+      project,
     ].filter(Boolean).join('\n');
   } catch {
     return '';
   }
+}
+
+/** What a reviewer needs to judge work done inside a project: what the
+ * project is for, and the part the answering agent has in it. */
+function projectReviewContext(metadata: Record<string, unknown> | null | undefined, agentId: string | null): string {
+  const project = projectFromMetadata(metadata, agentId);
+  if (!project) return '';
+  const context = project.context.length > AGENT_REVIEW_MAX_CHARS
+    ? `${project.context.slice(0, AGENT_REVIEW_MAX_CHARS)}\n[project context cut here for length]`
+    : project.context;
+  return `Project context:\n${context}`;
 }
 
 /**
