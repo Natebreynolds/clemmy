@@ -100,6 +100,16 @@ export async function listConnectedApps(): Promise<{ apps: unknown }> {
   return api(`${PROJECTS}-connected-apps`);
 }
 
+/** The local projects on this Mac, for linking one to a project. Slow the first time. */
+export async function listLocalProjects(): Promise<{ localProjects: unknown }> {
+  return api(`${PROJECTS}-local-projects`);
+}
+
+/** Link one local project, by the path the roster gave for it. */
+export async function linkLocalProject(projectId: string, path: string): Promise<{ overview: ProjectOverview }> {
+  return post(`${PROJECTS}/${id(projectId)}/resources`, { kind: 'folder', ref: path });
+}
+
 /** The accounts connected right now for one app, for the owner to choose from. */
 export async function listAccountChoices(projectId: string, toolkit: string): Promise<{ toolkit: string; accounts: ProjectAccountChoice[] }> {
   return api(`${PROJECTS}/${id(projectId)}/account-choices?toolkit=${id(toolkit)}`);

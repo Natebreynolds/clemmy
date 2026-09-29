@@ -4950,10 +4950,23 @@ textarea.cz-input { resize: vertical; }
   -webkit-box-orient: vertical;
 }
 .project-check.is-verified { color: var(--accent-2); }
+/* Local projects: the folder's name first; where it lives second and quieter. */
+.project-hint { margin: 0 2px var(--sp-2); font-size: var(--t-xs); color: var(--fg-3); line-height: 1.45; }
+.project-path { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.project-line-note { font-size: var(--t-xs); color: var(--fg-3); line-height: 1.45; }
+.project-line-note.is-gone { color: var(--accent-warn); }
+.project-line-clamp { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.pick-top { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.pick-top .agent-name { min-width: 0; overflow-wrap: anywhere; }
+.pick-top .chip { flex: 0 0 auto; }
+.agent-pick-list button.is-linked { opacity: 0.6; }
 .project-group + .project-group { margin-top: var(--sp-2); }
 .project-resource { flex-wrap: wrap; }
 .project-resource-remove { flex: 0 0 auto; padding: 8px 0 8px 12px; color: var(--fg-2); }
-.project-resource-confirm { display: flex; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+/* Remove stays at the row's right edge however much the row has to say; only
+   the two-button confirmation takes a line of its own. */
+.project-resource .project-line-text { flex: 1 1 0; }
+.project-resource-confirm { display: flex; gap: 6px; flex: 1 0 100%; justify-content: flex-end; }
 .project-form { display: grid; gap: var(--sp-3); }
 .project-sheet-note { margin: 0 4px var(--sp-2); font-size: var(--t-sm); color: var(--fg-2); line-height: 1.5; }
 .project-confirm {

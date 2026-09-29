@@ -8,15 +8,27 @@
  * one that is already bound is asked first.
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
-import type { ProjectAccountChoice, ProjectAssignmentView, ProjectConnectedApp, ProjectOverview } from '@clem/chat-engine';
+import {
+  middleTruncatePath,
+  projectLocalProjectChoices,
+  type ProjectAccountChoice,
+  type ProjectAssignmentView,
+  type ProjectConnectedApp,
+  type ProjectLocalProject,
+  type ProjectOverview,
+  type ProjectResourceView,
+} from '@clem/chat-engine';
 import { listAgents, type MobileAgent } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
 import {
   bindProjectAccount,
+  linkLocalProject,
+  listLocalProjects,
   listConnectedApps,
   removeProjectAgent,
   saveProjectAgent,
 } from '../lib/project-api';
+import { PHONE_PATH_CHARS, localProjectLinkStep, readLocalProjects } from '../lib/local-projects';
 import { assignableAgents, bindableApps } from '../lib/project-detail';
 import { accountBindStep, refusalWords } from '../lib/project-words';
 import { Sheet } from './Sheet';
@@ -413,6 +425,120 @@ export function AccountBinderSheet({ open, projectId, onClose, onSaved }: Binder
         </div>
       )}
       {failure ? <p class="agent-failure" role="alert">{failure}</p> : null}
+    </Sheet>
+  );
+}
+
+// ─── linking a local project ─
+
+interface LocalProjectProps {
+  open: boolean;
+  projectId: string;
+  /** What the project uses now, so a linked local project is not offered again. */
+  resources: readonly ProjectResourceView[];
+  onClose: () => void;
+  onSaved: (overview: ProjectOverview, name: string) => void;
+}
+
+/**
+ * The Mac's own roster of local projects. A folder that is not on it is never
+ * linked, so the sheet offers only what the Mac listed, and a refusal is
+ * answered with the list the Mac sent back.
+ */
+export function LocalProjectSheet({ open, projectId, resources, onClose, onSaved }: LocalProjectProps) {
+  const [roster, setRoster] = useState<ProjectLocalProject[] | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  const lock = useRef(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setRoster(null);
+    setNote(null);
+    setFailure(null);
+    setBusy(null);
+    listLocalProjects()
+      .then((result) => { if (!cancelled) setRoster(readLocalProjects(result.localProjects)); })
+      .catch((err) => {
+        if (cancelled) return;
+        setRoster([]);
+        setFailure(refusalWords(err, 'Could not read the local projects on your Mac. Try again.'));
+      });
+    return () => { cancelled = true; };
+  }, [open]);
+
+  const link = async (localProject: ProjectLocalProject) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy(localProject.path);
+    setNote(null);
+    setFailure(null);
+    haptic('light');
+    try {
+      const { overview } = await linkLocalProject(projectId, localProject.path);
+      haptic('success');
+      onSaved(overview, localProject.name);
+    } catch (err) {
+      const next = localProjectLinkStep(err);
+      if (next.step === 'failed') {
+        haptic('error');
+        setFailure(refusalWords(err, `${localProject.name} was not linked. Try again.`));
+      } else {
+        // Nothing was linked. The Mac said what can be chosen; that is the list now.
+        setNote(next.text);
+        if (next.localProjects.length > 0) setRoster(next.localProjects);
+      }
+    } finally {
+      lock.current = false;
+      setBusy(null);
+    }
+  };
+
+  const choices = roster ? projectLocalProjectChoices(roster, resources) : [];
+
+  return (
+    <Sheet open={open} onClose={onClose} title="Link a local project">
+      {roster === null ? (
+        <div role="status" aria-live="polite">
+          <p class="project-sheet-note">Looking through the code folders on your Mac. This can take a few seconds the first time.</p>
+          <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div>
+        </div>
+      ) : (
+        <>
+          {note ? <p class="project-sheet-note" role="status">{note}</p> : null}
+          {failure ? <p class="agent-failure" role="alert">{failure}</p> : null}
+          {choices.length === 0 && !failure ? (
+            <p class="project-sheet-note">
+              No local projects are on your Mac's list yet. Add a code folder in Connect on your Mac, then link it here.
+            </p>
+          ) : (
+            <ul class="agent-pick-list">
+              {choices.map(({ localProject, linked }) => (
+                <li key={localProject.path}>
+                  <button
+                    type="button"
+                    class={linked ? 'is-linked' : undefined}
+                    disabled={linked || busy !== null}
+                    aria-label={linked ? `${localProject.name}, already linked` : `Link ${localProject.name}`}
+                    onClick={() => void link(localProject)}
+                  >
+                    <span class="pick-top">
+                      <span class="agent-name">{localProject.name}</span>
+                      {linked ? <span class="chip chip-project">Linked</span> : null}
+                    </span>
+                    <span class="agent-desc project-path" title={localProject.path}>
+                      {busy === localProject.path ? 'Linking…' : middleTruncatePath(localProject.path, PHONE_PATH_CHARS)}
+                    </span>
+                    {!linked && !localProject.git ? <span class="agent-desc">Coding work cannot run here yet.</span> : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
     </Sheet>
   );
 }

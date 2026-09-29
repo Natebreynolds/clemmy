@@ -10,7 +10,14 @@
 import { useCallback, useRef, useState } from 'preact/hooks';
 import {
   delegatedTaskFollowsLine,
+  PROJECT_LOCAL_PROJECTS_HINT,
   groupProjectResources,
+  middleTruncatePath,
+  projectCodingRunPhase,
+  projectCodingRunPlace,
+  projectLinkedLocalProject,
+  projectLocalProjectGitLine,
+  projectLocalProjectMissingLine,
   projectDecisionConsequence,
   projectResourceApp,
   projectDecisionSource,
@@ -26,7 +33,7 @@ import { listApprovals, type ApprovalRow } from '../lib/api';
 import { Decisions, relativeTime } from '../components/Approvals';
 import { ChatBackButton } from '../components/ChatBackButton';
 import { DelegatedTaskCard, DelegatedTaskList } from '../components/DelegatedTaskCard';
-import { AccountBinderSheet, AssignAgentSheet, AssignmentSheet } from '../components/ProjectSheets';
+import { AccountBinderSheet, AssignAgentSheet, AssignmentSheet, LocalProjectSheet } from '../components/ProjectSheets';
 import { ScreenNotice, type ScreenNote } from '../components/ScreenNotice';
 import { haptic } from '../lib/native-bridge';
 import {
@@ -37,6 +44,7 @@ import {
   removeProjectResource,
   restoreProject,
 } from '../lib/project-api';
+import { PHONE_PATH_CHARS, readCodingRuns } from '../lib/local-projects';
 import { layoutProjectWork } from '../lib/project-detail';
 import {
   inWords,
@@ -103,6 +111,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
   const [assignment, setAssignment] = useState<ProjectAssignmentView | null>(null);
   const [assigning, setAssigning] = useState(false);
   const [binding, setBinding] = useState(false);
+  const [linking, setLinking] = useState(false);
   const [endedOpen, setEndedOpen] = useState(false);
 
   /** A decision settled here settles it everywhere: read the project and the count again. */
@@ -124,6 +133,11 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
   const follows = (task: DelegatedTask) => delegatedTaskFollowsLine(task, overview?.tasks ?? []);
   const listedTasks = new Set((overview?.tasks ?? []).map((task) => task.taskId));
   const resources = overview ? groupProjectResources(overview.resources) : [];
+  // Local projects are always drawn, first, even with none linked: it is
+  // where the owner links one. Every other group is drawn only when it has rows.
+  const localProjects = resources.find((group) => group.kind === 'folder')?.items ?? [];
+  const otherResources = resources.filter((group) => group.kind !== 'folder');
+  const codingRuns = readCodingRuns(overview);
 
   return (
     <div class="workflow-detail project-detail">
@@ -232,7 +246,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
             <DelegatedTaskList
               tasks={layout.current}
               known={overview.tasks}
-              empty={layout.questions.length > 0 ? undefined : 'No work is running in this project.'}
+              empty={layout.questions.length > 0 || codingRuns.length > 0 ? undefined : 'No work is running in this project.'}
               hideProject
               onChanged={() => void refresh()}
               onOpenRun={onOpenRun}
@@ -252,6 +266,40 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
                     {endedOpen ? 'Show fewer' : `Show ${layout.ended.length - ENDED_SHOWN} more`}
                   </button>
                 ) : null}
+              </>
+            ) : null}
+            {/* Coding work is followed and stopped where it already is: here it
+                is a list that leads back to the conversation it came from. */}
+            {codingRuns.length > 0 ? (
+              <>
+                <h3 class="project-sub">Coding work</h3>
+                <div class="home-card">
+                  {codingRuns.map((run) => {
+                    const phase = projectCodingRunPhase(run.phase);
+                    const body = (
+                      <>
+                        <span class="project-line-text">
+                          <span class="project-line-title project-line-clamp">{run.objective}</span>
+                          <span class="project-line-sub">
+                            {[projectCodingRunPlace(run), phase.label, relativeTime(run.updatedAt)].filter(Boolean).join(' · ')}
+                          </span>
+                        </span>
+                        {run.originSessionId ? <Chevron /> : null}
+                      </>
+                    );
+                    return run.originSessionId ? (
+                      <button
+                        key={run.runId}
+                        type="button"
+                        class="home-row home-row-tap project-line"
+                        aria-label={`${run.objective}. Open the conversation it came from`}
+                        onClick={() => { haptic('light'); onOpenChat({ sessionId: run.originSessionId! }); }}
+                      >
+                        {body}
+                      </button>
+                    ) : <div key={run.runId} class="home-row project-line">{body}</div>;
+                  })}
+                </div>
               </>
             ) : null}
           </section>
@@ -290,9 +338,25 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
 
           <section aria-labelledby="project-resources">
             <h2 id="project-resources" class="section-head">Accounts and resources</h2>
-            {resources.length === 0 ? (
-              <p class="section-empty">Nothing is attached. Add the account this project's work should use.</p>
-            ) : resources.map((group) => (
+            <div class="project-group">
+              <h3 class="project-sub">Local projects</h3>
+              <p class="project-hint">{PROJECT_LOCAL_PROJECTS_HINT}</p>
+              {localProjects.length > 0 ? (
+                <div class="home-card">
+                  {localProjects.map((resource) => (
+                    <ResourceRow
+                      key={resource.id}
+                      resource={resource}
+                      onRemoved={(next) => { setNote({ tone: 'success', text: `${projectLinkedLocalProject(resource)?.name ?? 'Local project'} is no longer linked to this project.` }); settle(next); }}
+                    />
+                  ))}
+                </div>
+              ) : null}
+              {!archived ? (
+                <button type="button" class="project-add" onClick={() => { haptic('light'); setLinking(true); }}>Link a local project</button>
+              ) : localProjects.length === 0 ? <p class="section-empty">No local project is linked.</p> : null}
+            </div>
+            {otherResources.map((group) => (
               <div key={group.kind} class="project-group">
                 <h3 class="project-sub">{group.label}</h3>
                 <div class="home-card">
@@ -371,6 +435,13 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
             assigned={overview?.agents ?? []}
             onClose={() => setAssigning(false)}
             onSaved={(next) => { setAssigning(false); settle(next); }}
+          />
+          <LocalProjectSheet
+            open={linking}
+            projectId={project.id}
+            resources={overview?.resources ?? []}
+            onClose={() => setLinking(false)}
+            onSaved={(next, name) => { setLinking(false); setNote({ tone: 'success', text: `${name} linked to this project.` }); settle(next); }}
           />
           <AccountBinderSheet
             open={binding}
@@ -513,7 +584,11 @@ function ResourceRow({ resource, onRemoved }: {
   const [failure, setFailure] = useState<string | null>(null);
   const lock = useRef(false);
   const checked = projectResourceVerification(resource);
-  const name = projectResourceName(resource);
+  // A local project is named and described as the folder is right now.
+  const local = projectLinkedLocalProject(resource);
+  const missing = local ? projectLocalProjectMissingLine(local) : null;
+  const noCoding = local ? projectLocalProjectGitLine(local) : null;
+  const name = local?.name ?? projectResourceName(resource);
   // The app as a person writes it, in the words the desktop uses.
   const app = projectResourceApp(resource) || null;
 
@@ -539,16 +614,23 @@ function ResourceRow({ resource, onRemoved }: {
     <div class="home-row project-line project-resource">
       <span class="project-line-text">
         <span class="project-line-title">{name}</span>
-        <span class="project-line-sub">
-          {app}
-          {checked ? (
-            <span class={`project-check${checked.verified ? ' is-verified' : ''}`}>
-              {app ? ' · ' : ''}
-              {checked.verified ? `Verified ${relativeTime(resource.verifiedAt ?? '')}` : 'Not verified'}
-            </span>
-          ) : null}
-          {!checked && resource.ref && resource.ref !== name ? resource.ref : null}
-        </span>
+        {local ? (
+          <span class="project-line-sub project-path" title={local.path}>{middleTruncatePath(local.path, PHONE_PATH_CHARS)}</span>
+        ) : null}
+        {missing ? <span class="project-line-note is-gone" role="note">{missing}</span> : null}
+        {noCoding ? <span class="project-line-note">{noCoding}</span> : null}
+        {local ? null : (
+          <span class="project-line-sub">
+            {app}
+            {checked ? (
+              <span class={`project-check${checked.verified ? ' is-verified' : ''}`}>
+                {app ? ' · ' : ''}
+                {checked.verified ? `Verified ${relativeTime(resource.verifiedAt ?? '')}` : 'Not verified'}
+              </span>
+            ) : null}
+            {!checked && resource.ref && resource.ref !== name ? resource.ref : null}
+          </span>
+        )}
         {failure ? <span class="inbox-inline-error" role="alert">{failure}</span> : null}
       </span>
       {confirming ? (
