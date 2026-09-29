@@ -478,6 +478,41 @@ function compactJsonValue(
   return Object.keys(compact).length > 0 ? compact : OMITTED_JSON_VALUE;
 }
 
+const MAX_COVERAGE_FIELD_NAMES = 12;
+
+/** What this view holds of the result's main list: how many records the
+ * source returned, how many are shown, and which fields every shown record
+ * carries. A reader deciding whether something is absent from the list, or
+ * true of all of it, needs the denominator and the fields it can rely on;
+ * omission counts summed over every nested array say neither. Null when the
+ * result has no main list or the view shows all of it. */
+function projectedRecordCoverage(
+  source: unknown,
+  projected: unknown,
+): { path: string; total: number; shown: number; fieldsInEveryShownRecord: string[] } | null {
+  const dominant = resolveDominantArray(source);
+  if (!dominant) return null;
+  let shownRows: unknown = projected;
+  for (const key of dominant.path ? dominant.path.split('.') : []) {
+    shownRows = shownRows && typeof shownRows === 'object' && !Array.isArray(shownRows)
+      ? (shownRows as Record<string, unknown>)[key] : undefined;
+  }
+  const rows = Array.isArray(shownRows) ? shownRows : [];
+  let shared: string[] | null = null;
+  for (const row of rows) {
+    const keys = row && typeof row === 'object' && !Array.isArray(row) ? Object.keys(row) : [];
+    shared = shared === null ? keys : shared.filter((key) => keys.includes(key));
+  }
+  const sourceFields = new Set<string>();
+  for (const row of dominant.rows) {
+    if (row && typeof row === 'object' && !Array.isArray(row)) for (const key of Object.keys(row)) sourceFields.add(key);
+  }
+  const fields = shared ?? [];
+  if (rows.length === dominant.rows.length && sourceFields.size === fields.length) return null;
+  return { path: dominant.path, total: dominant.rows.length, shown: rows.length,
+    fieldsInEveryShownRecord: fields.slice(0, MAX_COVERAGE_FIELD_NAMES) };
+}
+
 /**
  * Build a bounded, parseable JSON projection for an oversized JSON object.
  * Sibling objects/arrays receive fair budgets, so one early huge scrape cannot
@@ -533,8 +568,10 @@ export function compactStructuredJsonToolOutput(
       const value = compactJsonValue(parsed, payloadBudget, stats);
       const projected = value === OMITTED_JSON_VALUE ? {} : value;
       if (!projected || typeof projected !== 'object' || Array.isArray(projected)) break;
+      const records = metadataBase === fullMetadata ? projectedRecordCoverage(parsed, projected) : null;
       const metadata = metadataBase === fullMetadata
-        ? { ...metadataBase, truncated: stats.clippedStrings > 0 || stats.omittedArrayItems > 0 || stats.omittedObjectKeys > 0 || stats.omittedValues > 0, projection: stats }
+        ? { ...metadataBase, truncated: stats.clippedStrings > 0 || stats.omittedArrayItems > 0 || stats.omittedObjectKeys > 0 || stats.omittedValues > 0, projection: stats,
+          ...(records ? { records } : {}) }
         : metadataBase;
       const output = JSON.stringify({
         ...(projected as Record<string, unknown>),
