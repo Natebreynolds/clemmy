@@ -10,6 +10,8 @@ import {
   projectLocalProjectGitLine, projectLocalProjectMissingLine, projectLocalProjectRefusal, PROJECT_LOCAL_PROJECTS_HINT,
   projectLocalProjectCommands, projectLocalProjectToolServers,
   PROJECT_LOCAL_COMMANDS_HINT, PROJECT_LOCAL_COMMANDS_LABEL, PROJECT_LOCAL_TOOL_SERVERS_LABEL,
+  projectPages, projectPageTitle, projectPagePlace, projectPageNextOffset, projectPageRefusal,
+  PROJECT_PAGES_LABEL, PROJECT_PAGE_FRAME_SANDBOX, PROJECT_PAGE_MOST_PARTS,
   projectDecisionIsFormal, projectDecisionOptions, projectLabelsBySession, projectResourceApp,
   projectResourceKindLabel, projectResourceName, projectResourceVerification, projectWorkLine, sessionProjectLabelText,
   type MemoryScope, type ProjectSummary,
@@ -194,6 +196,36 @@ test('a linked local project says which commands it offers and which of its tool
   assert.equal(PROJECT_LOCAL_COMMANDS_LABEL, 'Commands it offers');
   assert.equal(PROJECT_LOCAL_TOOL_SERVERS_LABEL, 'Tools it expects');
   assert.equal(PROJECT_LOCAL_COMMANDS_HINT, 'Ask for one by name in a conversation in this project.');
+});
+
+test('a page made in a project is named by its folder when its file is only an index', () => {
+  const pages = projectPages({ pages: [
+    { id: 'pg_1', name: 'index.html', folder: 'harbor-brief', relativePath: 'harbor-brief/index.html', localProject: { name: 'audits', path: '/srv/o/audits' }, madeAt: '2026-09-29T10:00:00.000Z', sessionId: 'sess-1' },
+    { id: 'pg_2', name: 'report.html', folder: 'out', relativePath: 'out/report.html', localProject: { path: '/srv/o/site' }, madeAt: '', sessionId: '' },
+    { id: 'pg_1', name: 'again.html', folder: 'x', relativePath: 'x/again.html', localProject: {} },
+    { name: 'no-id.html' }, null, 'text',
+  ] });
+  assert.deepEqual(pages.map((page) => [page.id, projectPageTitle(page), projectPagePlace(page), page.sessionId]), [
+    ['pg_1', 'harbor-brief', 'In audits \u00b7 harbor-brief/index.html', 'sess-1'],
+    ['pg_2', 'report.html', 'In site \u00b7 out/report.html', null],
+  ]);
+  assert.deepEqual(projectPages({}), []);
+  assert.deepEqual(projectPages(null), []);
+  assert.equal(projectPageTitle({ name: 'INDEX.HTM', folder: '' }), 'INDEX.HTM');
+  assert.equal(PROJECT_PAGES_LABEL, 'Pages made here');
+  assert.equal(PROJECT_PAGE_FRAME_SANDBOX, 'allow-scripts', 'a framed page is never given the app\u2019s origin');
+});
+
+test('a rendered page is asked for one part after another until it ends', () => {
+  assert.equal(projectPageNextOffset([]), 0);
+  assert.equal(projectPageNextOffset([{ offsetY: 0, height: 1600, end: false }]), 1600);
+  assert.equal(projectPageNextOffset([{ offsetY: 0, height: 1600, end: false }, { offsetY: 1600, height: 1600, end: true }]), null);
+  const many = Array.from({ length: PROJECT_PAGE_MOST_PARTS }, (_unused, index) => ({ offsetY: index * 1600, height: 1600, end: false }));
+  assert.equal(projectPageNextOffset(many), null, 'a page that never ends is not asked for without limit');
+  assert.match(projectPageRefusal('page_not_found'), /no longer where it was written/);
+  assert.match(projectPageRefusal('PAGE_TOO_LARGE'), /Open it in your browser/);
+  assert.match(projectPageRefusal('PAGE_NOT_RENDERED'), /Chrome, Edge, Brave or Chromium/);
+  assert.equal(projectPageRefusal(undefined), 'The page could not be shown. Try again.');
 });
 
 test('a path is cut in the middle, keeping where it starts and the folder it ends in', () => {

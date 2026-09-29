@@ -87,6 +87,30 @@ export interface ProjectLocalToolServer {
   connected: boolean;
 }
 
+/** A page made in a project: an HTML file written into a linked local project. */
+export interface ProjectPageView {
+  id: string;
+  name: string;
+  /** The folder the file lies in. */
+  folder: string;
+  /** Where it is inside the local project. */
+  relativePath: string;
+  localProject: { name: string; path: string };
+  madeAt: string;
+  sessionId: string | null;
+}
+
+/** One part of a page, rendered on the Mac. */
+export interface ProjectPageImage {
+  image: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  offsetY: number;
+  /** The part shows nothing: the page ended above it. */
+  end: boolean;
+}
+
 export type ProjectCodingRunPhase = 'waiting_to_start' | 'working' | 'handed_to_you' | 'finished';
 
 /** One coding run started from a conversation of the project. */
@@ -159,6 +183,9 @@ export interface ProjectOverview {
   /** Coding runs started from the project's conversations, newest first.
    *  Absent from a service that predates them. */
   codingRuns?: ProjectCodingRunView[];
+  /** Pages that work in the project wrote into its linked local projects,
+   *  newest first. Absent from a service that predates them. */
+  pages?: ProjectPageView[];
   conversations: ProjectConversationView[];
   decisions: ProjectDecisionView[];
 }
@@ -339,6 +366,79 @@ export function groupProjectResources<T extends Pick<ProjectResourceView, 'kind'
       items: resources.filter((resource) => resource.kind === kind),
     }))
     .filter((group) => group.items.length > 0);
+}
+
+// ─── Pages made in a project ───
+
+export const PROJECT_PAGES_LABEL = 'Pages made here';
+export const PROJECT_PAGES_HINT = 'Pages Clem wrote into this project\u2019s local projects. Looking at one changes nothing.';
+export const PROJECT_PAGES_EMPTY = 'No page has been made in this project yet.';
+/** What the desktop's frame allows a page: its scripts, and nothing of the app. */
+export const PROJECT_PAGE_FRAME_SANDBOX = 'allow-scripts';
+export const PROJECT_PAGE_FRAME_NOTE = 'Shown in a sandbox: the page cannot reach Clem, your accounts or your files.';
+export const PROJECT_PAGE_RENDERED_NOTE = 'Rendered on your Mac at this width. Nothing on the page runs here.';
+/** How tall one rendered part is, and how many parts a reader asks for at most. */
+export const PROJECT_PAGE_PART_HEIGHT = 1600;
+export const PROJECT_PAGE_MOST_PARTS = 12;
+
+const text = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
+
+/** The pages of an overview as this build can read them; anything else is left out. */
+export function projectPages(overview: { pages?: unknown } | null | undefined): ProjectPageView[] {
+  const value = overview?.pages;
+  if (!Array.isArray(value)) return [];
+  const pages: ProjectPageView[] = [];
+  for (const row of value) {
+    if (!row || typeof row !== 'object') continue;
+    const raw = row as Record<string, unknown>;
+    const id = text(raw.id);
+    const relativePath = text(raw.relativePath);
+    if (!id || pages.some((page) => page.id === id)) continue;
+    const local = (raw.localProject && typeof raw.localProject === 'object' ? raw.localProject : {}) as Record<string, unknown>;
+    const name = text(raw.name) || pathLeaf(relativePath) || 'Page';
+    pages.push({
+      id, name,
+      folder: text(raw.folder),
+      relativePath,
+      localProject: { name: text(local.name) || pathLeaf(text(local.path)) || 'a local project', path: text(local.path) },
+      madeAt: text(raw.madeAt),
+      sessionId: text(raw.sessionId) || null,
+    });
+  }
+  return pages;
+}
+
+/** What a page is called: its folder when the file is only an index, else its file name. */
+export function projectPageTitle(page: Pick<ProjectPageView, 'name' | 'folder'>): string {
+  const name = page.name.trim();
+  const folder = page.folder.trim();
+  return /^index\.html?$/i.test(name) && folder ? folder : name || folder || 'Page';
+}
+
+/** Where a page is: the local project, then the path inside it. */
+export function projectPagePlace(page: Pick<ProjectPageView, 'localProject' | 'relativePath'>): string {
+  const project = page.localProject?.name?.trim() || 'a local project';
+  return page.relativePath ? `In ${project} \u00b7 ${page.relativePath}` : `In ${project}`;
+}
+
+/** Where the next part of a rendered page starts, or null when there is no more to ask for. */
+export function projectPageNextOffset(parts: ReadonlyArray<Pick<ProjectPageImage, 'offsetY' | 'height' | 'end'>>): number | null {
+  if (parts.length === 0) return 0;
+  const last = parts[parts.length - 1]!;
+  if (last.end || parts.length >= PROJECT_PAGE_MOST_PARTS) return null;
+  return last.offsetY + last.height;
+}
+
+/** Said in place of a page that could not be shown. */
+export function projectPageRefusal(code: string | null | undefined): string {
+  switch ((code ?? '').toUpperCase()) {
+    case 'PAGE_NOT_FOUND': return 'That page is no longer where it was written, or its folder is no longer linked to this project.';
+    case 'PAGE_TOO_LARGE': return 'That page is too large to show here. Open it in your browser on your Mac.';
+    case 'PAGE_NOT_RENDERED': return 'Your Mac could not render the page. It needs Chrome, Edge, Brave or Chromium installed.';
+    case 'THIS_MACHINE_ONLY': return 'That can only be done on your Mac.';
+    case 'NOT_SUPPORTED_HERE': return 'Opening a page in the browser works on a Mac only.';
+    default: return 'The page could not be shown. Try again.';
+  }
 }
 
 // ─── Local projects and coding work ───
