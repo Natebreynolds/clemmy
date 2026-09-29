@@ -13,12 +13,14 @@ process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 mkdirSync(path.join(HOME, 'state'), { recursive: true });
 
 const {
-  deriveResolvedReferences, learnResolvedReferencesForAcceptedTask, resolvedReferenceContent, resolvedReferenceLead,
+  deriveResolvedReferences, learnResolvedReferencesForAcceptedTask, resolvedReferenceContent, resolvedReferenceGrade,
+  resolvedReferenceLead,
 } = await import('./resolved-reference-learning.js');
 const { createSession, appendEvent, closeEventLog } = await import('./eventlog.js');
 const { listActiveFacts, findActiveFactsByContentPrefix } = await import('../../memory/facts.js');
 type SettledCall = Parameters<typeof deriveResolvedReferences>[0]['calls'][number];
-type ConfirmName = Parameters<typeof deriveResolvedReferences>[0]['confirmName'];
+type ReadName = Parameters<typeof deriveResolvedReferences>[0]['readName'];
+type PassedOver = NonNullable<Parameters<typeof deriveResolvedReferences>[0]['passedOver']>;
 
 after(() => {
   closeEventLog();
@@ -27,12 +29,18 @@ after(() => {
 
 /** A naming check that picks the person-like or place-like name a record
  * offers, the way the router does, and records what it was asked. */
-function confirming(pick: (candidates: string[]) => string | null, asked: Array<{ value: string; candidates: string[] }> = []): ConfirmName {
+function confirming(
+  pick: (candidates: string[]) => string | null,
+  asked: Array<{ value: string; candidates: string[] }> = [],
+  confidence = 0.93,
+): ReadName {
   return async (question) => {
     asked.push({ value: question.value, candidates: question.candidates });
-    return pick(question.candidates);
+    return { name: pick(question.candidates), confidence };
   };
 }
+/** The same check, leaning to the name without being sure of it. */
+const leaning = (pick: (candidates: string[]) => string | null, confidence = 0.72): ReadName => confirming(pick, [], confidence);
 const first = (...names: string[]) => (candidates: string[]) => names.find((name) => candidates.includes(name)) ?? null;
 
 // Three different kinds of thing, none of them known to the code: a person
@@ -52,7 +60,7 @@ test('what a request named is kept with the exact value an accepted call used, w
     args: { board: 'brd_7f3a91', assignee: { contact: 'dana.whitlock@harborline.example' }, title: 'Pier inspection', due: '2026-10-06' },
     result: { id: 'card_991', board: 'brd_7f3a91' } };
   const resolved = await deriveResolvedReferences({ request, calls: [directory, boards, write],
-    confirmName: confirming(first('Dana Whitlock', 'Quarterly Roadmap'), asked) });
+    readName: confirming(first('Dana Whitlock', 'Quarterly Roadmap'), asked) });
   assert.deepEqual(resolved.map((row) => [row.named, row.value, row.operation, row.argument, row.effect, row.foundIn.tool]), [
     ['Quarterly Roadmap', 'brd_7f3a91', 'boardscope__create_card', 'board', 'change', 'boardscope__list_boards'],
     ['Dana Whitlock', 'dana.whitlock@harborline.example', 'boardscope__create_card', 'assignee.contact', 'change', 'peoplescope__find'],
@@ -64,7 +72,7 @@ test('what a request named is kept with the exact value an accepted call used, w
 test('a value the request stated was given, not resolved', async () => {
   const write: SettledCall = { tool: 'boardscope__create_card', callId: 'w', mutating: true, args: { board: 'brd_7f3a91' }, result: {} };
   const resolved = await deriveResolvedReferences({ request: 'Add a card to board brd_7f3a91 (Quarterly Roadmap).',
-    calls: [boards, write], confirmName: confirming(first('Quarterly Roadmap')) });
+    calls: [boards, write], readName: confirming(first('Quarterly Roadmap')) });
   assert.deepEqual(resolved, []);
 });
 
@@ -73,17 +81,17 @@ test('sharing a record is not naming: a title beside an owner is kept only if th
   // an owner id the call used. The title is not that owner's name.
   const write: SettledCall = { tool: 'peoplescope__notify', callId: 'w', mutating: true, args: { user: 'U0OTHER2' }, result: { ok: true } };
   const request = 'Tell whoever owns the Quarterly Roadmap that the draft is ready.';
-  const unsure = await deriveResolvedReferences({ request, calls: [boards, write], confirmName: confirming(() => null) });
+  const unsure = await deriveResolvedReferences({ request, calls: [boards, write], readName: confirming(() => null) });
   assert.deepEqual(unsure, [], 'without a sure name nothing is kept');
   const other = await deriveResolvedReferences({ request, calls: [boards, directory, write],
-    confirmName: confirming(first('Rafi Okonkwo')) });
+    readName: confirming(first('Rafi Okonkwo')) });
   assert.deepEqual(other, [], 'the name the check is sure of was never used by the request');
 });
 
 test('when the naming check cannot be reached nothing is learned', async () => {
   const write: SettledCall = { tool: 'boardscope__create_card', callId: 'w', mutating: true, args: { board: 'brd_7f3a91' }, result: {} };
   const resolved = await deriveResolvedReferences({ request: 'Add a card to the Quarterly Roadmap.', calls: [boards, write],
-    confirmName: async () => { throw new Error('router unavailable'); } });
+    readName: async () => { throw new Error('router unavailable'); } });
   assert.deepEqual(resolved, []);
 });
 
@@ -91,7 +99,7 @@ test('a value is asked about once however many calls used it, and a read is kept
   const asked: Array<{ value: string; candidates: string[] }> = [];
   const read = (id: string): SettledCall => ({ tool: 'boardscope__list_cards', callId: id, mutating: false, args: { board: 'brd_7f3a91', page: '2' }, result: { cards: [] } });
   const resolved = await deriveResolvedReferences({ request: 'What is on the Quarterly Roadmap?', calls: [boards, read('r1'), read('r2')],
-    confirmName: confirming(first('Quarterly Roadmap'), asked) });
+    readName: confirming(first('Quarterly Roadmap'), asked) });
   assert.equal(asked.length, 1);
   assert.deepEqual(resolved.map((row) => [row.argument, row.effect]), [['board', 'read']], 'the same argument of the same operation is one resolution');
 });
@@ -103,7 +111,7 @@ test('an argument that holds a document as text is read as that document, and a 
     args: { arguments: JSON.stringify({ destination: [{ folder: 'fld_heron_22' }], auth: 'sk-live-0123456789abcdef0123456789abcdef' }) }, result: {} };
   const asked: Array<{ value: string; candidates: string[] }> = [];
   const resolved = await deriveResolvedReferences({ request: 'File this under the heron archive.', calls: [vault, write],
-    confirmName: confirming(first('Heron Archive'), asked) });
+    readName: confirming(first('Heron Archive'), asked) });
   assert.deepEqual(resolved.map((row) => [row.named, row.value, row.argument]), [['Heron Archive', 'fld_heron_22', 'arguments.destination[].folder']]);
   assert.ok(!asked.some((question) => question.value.startsWith('sk-')), 'a secret is not even asked about');
 });
@@ -112,14 +120,15 @@ test('a name inside another word is not the name', async () => {
   const places: SettledCall = { tool: 'mapscope__find', callId: 'r', mutating: false, args: {}, result: { places: [{ label: 'Art', ref: 'plc_art_1' }] } };
   const write: SettledCall = { tool: 'mapscope__pin', callId: 'w', mutating: true, args: { place: 'plc_art_1' }, result: {} };
   const resolved = await deriveResolvedReferences({ request: 'Pin the start of the party route.', calls: [places, write],
-    confirmName: confirming(first('Art')) });
+    readName: confirming(first('Art')) });
   assert.deepEqual(resolved, [], '"Art" appears only inside "start" and "party"');
 });
 
 test('a later resolution of the same name and argument replaces the earlier one and keeps it in history', async () => {
   const lead = resolvedReferenceLead({ named: 'Dana Whitlock', operation: 'boardscope__create_card', argument: 'assignee.contact' });
   const base = { named: 'Dana Whitlock', operation: 'boardscope__create_card', argument: 'assignee.contact',
-    effect: 'change' as const, callId: 'w', foundIn: { tool: 'peoplescope__find', callId: 'r' } };
+    effect: 'change' as const, callId: 'w', foundIn: { tool: 'peoplescope__find', callId: 'r' },
+    grade: 'confirmed' as const, basis: { namingConfidence: 0.93, confirmedBy: 'naming_check' as const } };
   const { rememberFact, supersedeFact } = await import('../../memory/facts.js');
   const earlier = rememberFact({ kind: 'reference', content: resolvedReferenceContent({ ...base, value: 'dana@oldfirm.example' }) });
   assert.deepEqual(findActiveFactsByContentPrefix('reference', lead).map((fact) => fact.id), [earlier.id]);
@@ -138,8 +147,8 @@ test('a finished request with nothing on a receipt teaches no resolution', async
     data: { text: 'Add a card to the Quarterly Roadmap for Dana Whitlock.' } });
   const before = listActiveFacts({ limit: 50, kind: 'reference' }).length;
   const kept = await learnResolvedReferencesForAcceptedTask({ sessionId: session.id, sourceUserSeq: source.seq },
-    { confirmName: confirming(first('Dana Whitlock')) });
-  assert.deepEqual(kept, { learned: 0, superseded: 0, references: [] });
+    { readName: confirming(first('Dana Whitlock')) });
+  assert.deepEqual(kept, { learned: 0, superseded: 0, held: 0, references: [], passedOver: [] });
   assert.equal(listActiveFacts({ limit: 50, kind: 'reference' }).length, before);
 });
 
@@ -178,12 +187,12 @@ test('resolutions are read from the settled calls of the request itself and kept
     'the arguments are the ones the call was admitted with');
 
   const kept = await learnResolvedReferencesForAcceptedTask({ sessionId: session.id, sourceUserSeq: source.seq },
-    { confirmName: confirming(first('Dana Whitlock', 'Quarterly Roadmap')) });
+    { readName: confirming(first('Dana Whitlock', 'Quarterly Roadmap')) });
   assert.equal(kept.learned, 2);
   assert.equal(kept.superseded, 0, 'the value is the one already on file: nothing is replaced');
   const facts = listActiveFacts({ limit: 50, kind: 'reference' }).map((fact) => fact.content);
   assert.ok(facts.some((content) => content.startsWith('When a request names "Quarterly Roadmap", boardscope__create_card takes board = brd_7f3a91 ')), facts.join('\n'));
-  assert.ok(facts.some((content) => /names "Dana Whitlock", boardscope__create_card takes assignee\.contact = dana\.whitlock@harborline\.example \(used in a change the provider accepted; found in a peoplescope__find result\)/.test(content)), facts.join('\n'));
+  assert.ok(facts.some((content) => /names "Dana Whitlock", boardscope__create_card takes assignee\.contact = dana\.whitlock@harborline\.example \(confirmed: the name was checked against the record it came from; used in a change the provider accepted; found in a peoplescope__find result\)/.test(content)), facts.join('\n'));
   const person = findActiveFactsByContentPrefix('reference', 'When a request names "Dana Whitlock", boardscope__create_card takes assignee.contact = ')[0]!;
   assert.equal(person.derivedFrom?.callId, 'w-card', 'the memory points at the accepted call');
   assert.equal(person.derivedFrom?.sessionId, session.id);
@@ -191,7 +200,7 @@ test('resolutions are read from the settled calls of the request itself and kept
 
   // Learned again from the same request: one memory, not two.
   await learnResolvedReferencesForAcceptedTask({ sessionId: session.id, sourceUserSeq: source.seq },
-    { confirmName: confirming(first('Dana Whitlock', 'Quarterly Roadmap')) });
+    { readName: confirming(first('Dana Whitlock', 'Quarterly Roadmap')) });
   assert.equal(findActiveFactsByContentPrefix('reference', 'When a request names "Dana Whitlock", boardscope__create_card takes assignee.contact = ').length, 1);
 });
 
@@ -205,12 +214,126 @@ test('records returned as a document held in text are read as records; prose is 
   const open = (id: string): SettledCall => ({ tool: 'read_file', callId: id, mutating: false, args: { path: '/fixtures/ledger-7f3a.json' }, result: '{"entries":[]}' });
   const request = 'Using the index at /fixtures/index.json, open the Harbor Ledger and count its entries.';
   for (const source of [asText, asResponse]) {
-    const resolved = await deriveResolvedReferences({ request, calls: [source, open('r-open')], confirmName: confirming(first('Harbor Ledger')) });
+    const resolved = await deriveResolvedReferences({ request, calls: [source, open('r-open')], readName: confirming(first('Harbor Ledger')) });
     assert.deepEqual(resolved.map((row) => [row.named, row.value, row.argument, row.foundIn.callId]),
       [['Harbor Ledger', '/fixtures/ledger-7f3a.json', 'path', source.callId]], source.tool);
   }
   const asked: Array<{ value: string; candidates: string[] }> = [];
-  assert.deepEqual(await deriveResolvedReferences({ request, calls: [asProse, open('r-open')], confirmName: confirming(first('Harbor Ledger'), asked) }), [],
+  assert.deepEqual(await deriveResolvedReferences({ request, calls: [asProse, open('r-open')], readName: confirming(first('Harbor Ledger'), asked) }), [],
     'a value found inside a sentence has no record to name it');
   assert.deepEqual(asked, []);
+});
+
+// Live 2026-09-29: the naming check leaned to the right name at 0.72 against
+// a bar of 0.80, and everything the work had resolved was thrown away.
+test('a check that leans to the name keeps the resolution as a lead, worded as one; under a lean nothing is kept', async () => {
+  const request = 'Add a card to the Quarterly Roadmap.';
+  const write: SettledCall = { tool: 'boardscope__create_card', callId: 'w', mutating: true, args: { board: 'brd_7f3a91' }, result: {} };
+  const passedOver: PassedOver = [];
+  const lead = await deriveResolvedReferences({ request, calls: [boards, write], readName: leaning(first('Quarterly Roadmap')), passedOver });
+  assert.deepEqual(lead.map((row) => [row.named, row.value, row.grade, row.basis]),
+    [['Quarterly Roadmap', 'brd_7f3a91', 'provisional', { namingConfidence: 0.72 }]]);
+  assert.deepEqual(passedOver, []);
+  const content = resolvedReferenceContent(lead[0]!);
+  assert.match(content, /^When a request names "Quarterly Roadmap", boardscope__create_card takes board = brd_7f3a91 \(not confirmed: /);
+  assert.match(content, /Look it up again before using it\.$/);
+  assert.doesNotMatch(content, /\(confirmed/);
+  assert.equal(resolvedReferenceGrade(content), 'provisional');
+
+  const sure = await deriveResolvedReferences({ request, calls: [boards, write], readName: confirming(first('Quarterly Roadmap'), [], 0.8) });
+  assert.deepEqual(sure.map((row) => [row.grade, row.basis.confirmedBy]), [['confirmed', 'naming_check']], 'the bar itself is sure');
+  assert.equal(resolvedReferenceGrade(resolvedReferenceContent(sure[0]!)), 'confirmed');
+
+  const under = await deriveResolvedReferences({ request, calls: [boards, write], readName: leaning(first('Quarterly Roadmap'), 0.49), passedOver });
+  assert.deepEqual(under, []);
+  assert.deepEqual(passedOver, [{ operation: 'boardscope__create_card', argument: 'board', reason: 'naming_unsure', namingConfidence: 0.49 }],
+    'what was not kept is recorded with its reason and never its value');
+});
+
+test('an approval confirms a name only beside a check that leans to it', async () => {
+  const request = 'Tell Dana Whitlock the draft is ready.';
+  const write: SettledCall = { tool: 'peoplescope__notify', callId: 'w-notify', mutating: true,
+    args: { to: 'dana.whitlock@harborline.example', text: 'The draft is ready.' }, result: { ok: true } };
+  const seen: Array<{ callId: string; value: string }> = [];
+  const approved = (input: { call: SettledCall; value: string }) => {
+    seen.push({ callId: input.call.callId, value: input.value });
+    return { approvalId: 'apr-fixture' };
+  };
+  const confirmed = await deriveResolvedReferences({ request, calls: [directory, write],
+    readName: leaning(first('Dana Whitlock')), ownerApproved: approved });
+  assert.deepEqual(confirmed.map((row) => [row.grade, row.basis]), [['confirmed',
+    { namingConfidence: 0.72, confirmedBy: 'owner_approval', approvalId: 'apr-fixture' }]]);
+  assert.deepEqual(seen, [{ callId: 'w-notify', value: 'dana.whitlock@harborline.example' }]);
+  assert.match(resolvedReferenceContent(confirmed[0]!), /\(confirmed: the owner approved the call that used it; /);
+
+  // Approved, but the check does not lean to any name: the owner approved a
+  // call, not a sentence about what its value is called.
+  seen.length = 0;
+  const passedOver: PassedOver = [];
+  assert.deepEqual(await deriveResolvedReferences({ request, calls: [directory, write],
+    readName: leaning(first('Dana Whitlock'), 0.3), ownerApproved: approved, passedOver }), []);
+  assert.deepEqual(seen, [], 'an approval is not even looked for');
+  assert.deepEqual(passedOver.map((row) => row.reason), ['naming_unsure']);
+
+  // A sure check needs no approval, and one that cannot be read changes nothing.
+  assert.deepEqual((await deriveResolvedReferences({ request, calls: [directory, write],
+    readName: confirming(first('Dana Whitlock')), ownerApproved: approved })).map((row) => row.basis.confirmedBy), ['naming_check']);
+  assert.deepEqual((await deriveResolvedReferences({ request, calls: [directory, write],
+    readName: leaning(first('Dana Whitlock')), ownerApproved: () => { throw new Error('ledger unreadable'); } })).map((row) => row.grade), ['provisional']);
+});
+
+test('a lead never replaces a confirmed resolution, and a confirmed one replaces a lead', async () => {
+  const shadow = await import('../graph/turn-graph-shadow.js');
+  const dispatch = await import('./dispatch-ledger.js');
+  const identities = await import('./attempt-identity.js');
+  const outcomes = await import('./attempt-outcome.js');
+  const store = await import('./logical-call-settlement-store.js');
+  const places: SettledCall = { tool: 'mapscope__find', callId: 'r', mutating: false, args: {},
+    result: { places: [{ label: 'Gull Wharf', ref: 'plc_gull_1' }, { label: 'Gull Wharf', ref: 'plc_gull_2' }] } };
+  const run = async (id: string, ref: string, readName: ReadName) => {
+    const session = createSession({ id, kind: 'chat' });
+    const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Pin Gull Wharf on the route.' } });
+    assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 } }));
+    const task = { sessionId: session.id, sourceUserSeq: source.seq, acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq) };
+    const settle = (callId: string, tool: string, mutating: boolean, args: Record<string, unknown>, payload: unknown) => {
+      const started = dispatch.beginPhysicalDispatch({ identity: { ...task, logicalToolCallId: callId, physicalDispatchId: `${callId}:1`, ordinal: 0 }, tool, args });
+      assert.equal(started.status, 'inserted', JSON.stringify(started));
+      if (started.status !== 'inserted') return;
+      assert.equal(dispatch.settlePhysicalDispatch({ identity: started.identity, tool, outcome: 'returned' }).status, 'inserted');
+      assert.equal(store.commitLogicalCallSettlement({
+        identity: { ...task, logicalToolCallId: callId }, contract: { toolName: tool, args },
+        execution: { kind: 'provider_execution' }, result: { payload },
+        outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+        recovery: { businessCall: true, mutating }, observer: { lane: 'byo', turn: 1 },
+      }).status, 'committed');
+    };
+    settle('r-places', places.tool, false, {}, places.result);
+    settle('w-pin', 'mapscope__pin', true, { place: ref }, { ok: true });
+    return learnResolvedReferencesForAcceptedTask({ sessionId: session.id, sourceUserSeq: source.seq }, { readName });
+  };
+  const lead = 'When a request names "Gull Wharf", mapscope__pin takes place = ';
+  const current = () => findActiveFactsByContentPrefix('reference', lead).map((fact) => fact.content);
+
+  const first1 = await run('graded-1', 'plc_gull_1', leaning(first('Gull Wharf')));
+  assert.deepEqual(first1.references.map((row) => [row.grade, row.outcome]), [['provisional', 'kept']]);
+  assert.equal(current().length, 1);
+  assert.match(current()[0]!, /plc_gull_1 \(not confirmed: /);
+  assert.equal(findActiveFactsByContentPrefix('reference', lead)[0]!.trustLevel, 0.5, 'a lead is trusted as a lead');
+
+  const second = await run('graded-2', 'plc_gull_1', confirming(first('Gull Wharf')));
+  assert.deepEqual(second.references.map((row) => [row.grade, row.outcome]), [['confirmed', 'replaced_earlier']]);
+  assert.equal(current().length, 1, 'one current resolution for one name and argument');
+  assert.match(current()[0]!, /plc_gull_1 \(confirmed: /);
+  assert.equal(findActiveFactsByContentPrefix('reference', lead)[0]!.trustLevel, 0.8);
+
+  const third = await run('graded-3', 'plc_gull_2', leaning(first('Gull Wharf')));
+  assert.deepEqual(third.references.map((row) => [row.grade, row.outcome]), [['provisional', 'held']]);
+  assert.deepEqual([third.learned, third.held], [0, 1]);
+  assert.equal(current().length, 1);
+  assert.match(current()[0]!, /plc_gull_1 \(confirmed: /, 'the confirmed value stands');
+
+  const fourth = await run('graded-4', 'plc_gull_2', confirming(first('Gull Wharf')));
+  assert.deepEqual(fourth.references.map((row) => [row.grade, row.outcome]), [['confirmed', 'replaced_earlier']]);
+  assert.match(current()[0]!, /plc_gull_2 \(confirmed: /, 'a confirmed correction replaces it');
 });

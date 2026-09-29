@@ -12,14 +12,23 @@
  *  - the request did not state the value, so it was found, not given;
  *  - a settled result of the same request holds a record with that exact
  *    value in one of its fields;
- *  - of the strings that record carries, the one that names the value the way
- *    its owner would is decided by the same typed check an approval card uses
- *    to name an identifier, and it must be sure;
+ *  - of the strings that record carries, a typed check picks the one the
+ *    request's words called it;
  *  - the request used that name.
  *
  * A record also carries strings that are not the value's name (a title beside
  * an owner, a subject beside a recipient). Sharing a record is not naming, so
  * that one judgement is a model's, and without it nothing is kept.
+ *
+ * What is kept carries a grade and what the grade rests on. Learning is not
+ * all or nothing: live 2026-09-29 the check leaned to the right name at 0.72
+ * against a bar of 0.80, and the whole resolution was thrown away.
+ *  - confirmed: the check was sure, or it leaned to the name and the owner
+ *    approved the call that used the value;
+ *  - provisional: the check leaned to the name and nothing else spoke for it.
+ *    It is kept as a lead to look up again, worded as one, and it never
+ *    replaces a confirmed resolution;
+ *  - under a lean, or with no answer, nothing is kept.
  *
  * Nothing here knows what kind of thing was named. It reads no provider,
  * operation or field name. A value that is a date, a number or a secret is
@@ -31,7 +40,7 @@ import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispa
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { labelCandidatesFor } from './approval-preview-labels.js';
-import { labelIdentifierWithJev } from '../jev/control-plane.js';
+import { nameResolvedValueWithJev, RESOLUTION_NAME_LEAN, RESOLUTION_NAME_SURE } from '../jev/control-plane.js';
 import { judgeEvidenceJsonValue } from './judge-evidence-tools.js';
 import { scanSecrets } from './guardrails.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
@@ -46,7 +55,21 @@ export interface SettledCall {
   result: unknown;
 }
 
+export type ResolutionGrade = 'confirmed' | 'provisional';
+
+/** What a grade rests on. */
+export interface ResolutionBasis {
+  /** How sure the naming check was of the name, 0 to 1. */
+  namingConfidence: number;
+  /** Absent on a provisional resolution: nothing confirmed it. */
+  confirmedBy?: 'naming_check' | 'owner_approval';
+  /** The approval the owner gave, when that is what confirmed it. */
+  approvalId?: string;
+}
+
 export interface ResolvedReference {
+  grade: ResolutionGrade;
+  basis: ResolutionBasis;
   /** The name the request used, in the form the record itself carries. */
   named: string;
   /** The exact value the accepted call used. */
@@ -136,16 +159,45 @@ function namedInRequest(request: string, candidate: string): boolean {
   return new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(name).replace(/ /g, '\\s+')}(?![\\p{L}\\p{N}])`, 'iu').test(request);
 }
 
-/** Which of a record's strings names the value, or null when not sure. */
-export type ConfirmName = (question: {
+/** Which of a record's strings the request's words called the value, and how
+ * sure the reading is. No bar is applied by the reader. */
+export type ReadName = (question: {
   operation: string; field: string; value: string; candidates: string[];
-}) => Promise<string | null | undefined>;
+}) => Promise<{ name: string | null; confidence?: number } | null | undefined>;
 
-/** Resolutions a finished request's settled calls prove. */
+/** Whether the owner approved the call that used this value, having been
+ * shown it. Null when no such approval is on record. */
+export type OwnerApproved = (input: { call: SettledCall; value: string }) => { approvalId: string } | null;
+
+/** A value that was considered and not kept, and why. Never the value. */
+export interface PassedOverResolution {
+  operation: string;
+  argument: string;
+  reason: 'naming_unavailable' | 'naming_none' | 'naming_unsure' | 'name_not_in_request';
+  namingConfidence?: number;
+}
+
+function graded(confidence: number, approved: { approvalId: string } | null): Pick<ResolvedReference, 'grade' | 'basis'> | null {
+  if (confidence >= RESOLUTION_NAME_SURE) {
+    return { grade: 'confirmed', basis: { namingConfidence: confidence, confirmedBy: 'naming_check' } };
+  }
+  if (confidence < RESOLUTION_NAME_LEAN) return null;
+  // An approval alone confirms nothing about a name: the owner approved a
+  // call, not a sentence about what its value is called. It counts only
+  // beside a check that already leans to the same name.
+  return approved
+    ? { grade: 'confirmed', basis: { namingConfidence: confidence, confirmedBy: 'owner_approval', approvalId: approved.approvalId } }
+    : { grade: 'provisional', basis: { namingConfidence: confidence } };
+}
+
+/** Resolutions a finished request's settled calls prove, each with its grade. */
 export async function deriveResolvedReferences(input: {
   request: string;
   calls: readonly SettledCall[];
-  confirmName: ConfirmName;
+  readName: ReadName;
+  ownerApproved?: OwnerApproved;
+  /** Filled with what was considered and not kept. */
+  passedOver?: PassedOverResolution[];
 }): Promise<ResolvedReference[]> {
   const request = input.request.replace(/\s+/g, ' ').trim();
   if (!request) return [];
@@ -153,7 +205,10 @@ export async function deriveResolvedReferences(input: {
   const resolved: ResolvedReference[] = [];
   const seen = new Set<string>();
   // The same value is asked about once, whichever calls used it.
-  const confirmed = new Map<string, Promise<string | null>>();
+  const readings = new Map<string, Promise<{ name: string | null; confidence: number } | null>>();
+  const pass = (call: SettledCall, argument: string, reason: PassedOverResolution['reason'], namingConfidence?: number): void => {
+    input.passedOver?.push({ operation: call.tool, argument, reason, ...(namingConfidence === undefined ? {} : { namingConfidence }) });
+  };
   for (const call of input.calls) {
     for (const leaf of argumentLeaves(call.args)) {
       if (resolved.length >= MAX_RESOLUTIONS) return resolved;
@@ -176,15 +231,26 @@ export async function deriveResolvedReferences(input: {
       }
       // Nothing the request said is among them: no question worth asking.
       if (!candidates.some((candidate) => namedInRequest(request, candidate))) continue;
-      const asked = confirmed.get(leaf.value) ?? Promise.resolve()
-        .then(() => input.confirmName({ operation: call.tool, field: leaf.path, value: leaf.value, candidates: candidates.slice(0, 20) }))
-        .then((answer) => answer ?? null).catch(() => null);
-      confirmed.set(leaf.value, asked);
-      const name = await asked;
+      const asked = readings.get(leaf.value) ?? Promise.resolve()
+        .then(() => input.readName({ operation: call.tool, field: leaf.path, value: leaf.value, candidates: candidates.slice(0, 20) }))
+        .then((answer) => (answer ? { name: answer.name, confidence: Number.isFinite(answer.confidence) ? Number(answer.confidence) : 0 } : null))
+        .catch(() => null);
+      readings.set(leaf.value, asked);
+      const reading = await asked;
+      if (!reading) { pass(call, leaf.path, 'naming_unavailable'); continue; }
+      const name = reading.name;
       const source = name ? foundIn.get(name) : undefined;
-      if (!name || !source || !namedInRequest(request, name)) continue;
+      if (!name || !source) { pass(call, leaf.path, 'naming_none', reading.confidence); continue; }
+      if (!namedInRequest(request, name)) { pass(call, leaf.path, 'name_not_in_request', reading.confidence); continue; }
+      let approved: { approvalId: string } | null = null;
+      if (reading.confidence >= RESOLUTION_NAME_LEAN && reading.confidence < RESOLUTION_NAME_SURE) {
+        try { approved = input.ownerApproved?.({ call, value: leaf.value }) ?? null; } catch { approved = null; }
+      }
+      const grade = graded(reading.confidence, approved);
+      if (!grade) { pass(call, leaf.path, 'naming_unsure', reading.confidence); continue; }
       seen.add(key);
       resolved.push({
+        ...grade,
         // The record's own form: a request may write a name in any case.
         named: name.trim().replace(/\s+/g, ' '), value: leaf.value, operation: call.tool, argument: leaf.path,
         effect: call.mutating ? 'change' : 'read', callId: call.callId, foundIn: source,
@@ -253,55 +319,93 @@ export function resolvedReferenceLead(reference: Pick<ResolvedReference, 'named'
   return `When a request names "${reference.named}", ${reference.operation} takes ${reference.argument} = `;
 }
 
+const PROVISIONAL_MARK = ' (not confirmed: ';
+
 export function resolvedReferenceContent(reference: ResolvedReference): string {
-  return `${resolvedReferenceLead(reference)}${reference.value} `
-    + `(${reference.effect === 'change' ? 'used in a change the provider accepted' : 'used in a read the provider answered'}; `
-    + `found in a ${reference.foundIn.tool} result). Check it still holds before relying on it for something that cannot be undone.`;
+  const used = reference.effect === 'change' ? 'used in a change the provider accepted' : 'used in a read the provider answered';
+  const found = `found in a ${reference.foundIn.tool} result`;
+  if (reference.grade === 'provisional') {
+    return `${resolvedReferenceLead(reference)}${reference.value}${PROVISIONAL_MARK}${used} once and ${found}, `
+      + 'but that this is what the name refers to was not certain). Look it up again before using it.';
+  }
+  const by = reference.basis.confirmedBy === 'owner_approval'
+    ? 'the owner approved the call that used it'
+    : 'the name was checked against the record it came from';
+  return `${resolvedReferenceLead(reference)}${reference.value} (confirmed: ${by}; ${used}; ${found}). `
+    + 'Check it still holds before relying on it for something that cannot be undone.';
+}
+
+/** The grade a kept resolution was written with. One written before grades
+ * existed was kept only on a sure naming check. */
+export function resolvedReferenceGrade(content: string): ResolutionGrade {
+  return content.includes(PROVISIONAL_MARK) ? 'provisional' : 'confirmed';
+}
+
+export interface LearnedResolution extends ResolvedReference {
+  /** What happened to it in memory. `held`: a confirmed resolution for the
+   * same name and argument stands, and a lead does not replace it. */
+  outcome: 'kept' | 'replaced_earlier' | 'held';
 }
 
 /**
  * Keep what one finished, verified request resolved. Called only after the
  * same request's strategy was admitted as learned, so it inherits that
  * authority and adds none. A value that replaces an earlier one for the same
- * name and argument supersedes it; the earlier one stays in history.
+ * name and argument supersedes it; the earlier one stays in history. A
+ * provisional resolution confirmed later is replaced by the confirmed one.
  */
 export async function learnResolvedReferencesForAcceptedTask(input: {
   sessionId: string;
   sourceUserSeq: number;
   occurredAt?: string;
-}, dependencies: { confirmName?: ConfirmName } = {}): Promise<{ learned: number; superseded: number; references: ResolvedReference[] }> {
+}, dependencies: { readName?: ReadName; ownerApproved?: OwnerApproved } = {}): Promise<{
+  learned: number; superseded: number; held: number;
+  references: LearnedResolution[]; passedOver: PassedOverResolution[];
+}> {
   const request = acceptedRequestText(input.sessionId, input.sourceUserSeq);
-  if (!request) return { learned: 0, superseded: 0, references: [] };
-  const references = await deriveResolvedReferences({
-    request, calls: settledCallsForSource(input),
-    // The check is given the request, as an approval card's check is given
-    // what the owner asked: which string is the name is clearest beside the
-    // words that used it. Its bar for being sure is unchanged.
-    confirmName: dependencies.confirmName
-      ?? ((question) => labelIdentifierWithJev({ ...question, ownerAsked: request }, { sessionId: input.sessionId })),
+  if (!request) return { learned: 0, superseded: 0, held: 0, references: [], passedOver: [] };
+  const passedOver: PassedOverResolution[] = [];
+  const derived = await deriveResolvedReferences({
+    request, calls: settledCallsForSource(input), passedOver,
+    readName: dependencies.readName
+      ?? ((question) => nameResolvedValueWithJev({ ...question, request }, { sessionId: input.sessionId })
+        .then((reading) => (reading.failedOpen ? null : reading))),
+    ...(dependencies.ownerApproved ? { ownerApproved: dependencies.ownerApproved } : {}),
   });
   let learned = 0;
   let superseded = 0;
-  for (const reference of references) {
+  let held = 0;
+  const references: LearnedResolution[] = [];
+  for (const reference of derived) {
     try {
       const content = resolvedReferenceContent(reference);
       const memory = {
         content,
         sessionId: input.sessionId,
         derivedFrom: { sessionId: input.sessionId, callId: reference.callId, tool: reference.operation },
-        // Both ends are on receipts, but the world can change after them.
-        trustLevel: 0.8,
+        // Both ends are on receipts, but the world can change after them. A
+        // lead is trusted as a lead.
+        trustLevel: reference.grade === 'confirmed' ? 0.8 : 0.5,
         ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
       };
-      const earlier = findActiveFactsByContentPrefix('reference', resolvedReferenceLead(reference))
-        .filter((fact) => fact.content !== content);
+      const standing = findActiveFactsByContentPrefix('reference', resolvedReferenceLead(reference));
+      if (reference.grade === 'provisional'
+        && standing.some((fact) => resolvedReferenceGrade(fact.content) === 'confirmed')) {
+        held += 1;
+        references.push({ ...reference, outcome: 'held' });
+        continue;
+      }
+      const earlier = standing.filter((fact) => fact.content !== content);
+      let replaced = 0;
       if (earlier.length > 0) {
-        for (const fact of earlier) if (supersedeFact(fact.id, memory)) superseded += 1;
+        for (const fact of earlier) if (supersedeFact(fact.id, memory)) replaced += 1;
       } else {
         rememberFact({ kind: 'reference', ...memory });
       }
+      superseded += replaced;
       learned += 1;
+      references.push({ ...reference, outcome: replaced > 0 ? 'replaced_earlier' : 'kept' });
     } catch { /* memory stays additive */ }
   }
-  return { learned, superseded, references };
+  return { learned, superseded, held, references, passedOver };
 }
