@@ -31,10 +31,11 @@ The defect is therefore unauditable and unenforced evidence, not a wrong outcome
 2. **Evidence rows carry coverage facts.** Read rows on the verdict record the retained result's record count,
    whether the source reported nothing further for that request, and whether a write by the same request settled
    after the read.
-3. **A verdict names what it needs the whole of.** After a DONE line the reviewer adds `NEEDS ALL OF: <refs>`, naming
-   each result where something must be absent from it or true of every record in it, or `NEEDS ALL OF: none` when
-   the verdict rests only on what it was shown, including a result's stated record count. The review prompt lists, from the host record, the results the
-   reviewer holds only in part.
+3. **A verdict names what it needs the whole of.** The review evidence lists, from the host record, the results
+   the reviewer holds only in part. Only then is the reviewer asked, after a DONE line, for `NEEDS ALL OF: <refs>`
+   naming each result where something must be absent from it or true of every record in it, or `NEEDS ALL OF: none`
+   when the verdict rests only on what it was shown, including a result's stated record count. A review shown
+   everything is asked for nothing more, and the reviewer's stable instructions do not change per review.
 4. **The host compares the two.** A result shown in part supports such a verdict only when the rest was opened, every
    record was paged, or a criterion was queried against every record, and the source reported nothing further. A
    record count, a successful outcome or a matching schema is not an inspection.
@@ -64,7 +65,7 @@ receipts and is unchanged. No new execution layer, no provider or model name in 
 ## Verification before installation
 
 - `tsc --noEmit` clean.
-- New pins: 17 coverage checks, 11 reviewer-flow checks driving the real judge runner with a scripted model that
+- New pins: 19 coverage checks, 11 reviewer-flow checks driving the real judge runner with a scripted model that
   makes real lookups, 2 host evidence checks over real settlements, 4 lookup-recording checks, 1 restatement check,
   2 bounded-view checks, 2 label checks.
 - Baseline falsification: the 11 reviewer-flow pins run against `8d4a03956` fail 9 of 11; the two that pass pin

@@ -250,7 +250,7 @@ export function assessReviewCoverage(input: {
 function describeRow(row: EvidenceCoverageRow): string {
   const size = typeof row.shownByteCount === 'number' && typeof row.rawByteCount === 'number'
     ? `${row.shownByteCount} of ${row.rawByteCount} bytes shown` : 'shown in part';
-  const records = typeof row.recordCount === 'number' ? `; ${row.recordCount} records` : '';
+  const records = typeof row.recordCount === 'number' && row.recordCount > 0 ? `; ${row.recordCount} records` : '';
   const inspected = row.inspection === 'unopened' ? 'nothing else opened'
     : row.inspection === 'partial' ? `${row.lookups} lookup(s), not covering the rest`
       : row.inspection === 'queried' ? 'every record checked against a criterion'
@@ -269,6 +269,9 @@ export function reviewCoverageLedger(results: readonly ReviewedEvidenceRow[]): s
     'RESULTS YOU HAVE ONLY IN PART (host record):',
     ...open.map((row) => `- ${describeRow(row)}`),
     'A count of records, a successful outcome or a matching schema says nothing about what those records contain.',
+    // Asked for only here, where a result is held in part: a review that was
+    // shown everything has nothing to declare.
+    'After a DONE verdict line add one more line naming, by ref, each of these results your verdict needs the whole of, because something must be absent from it or true of every record in it: "NEEDS ALL OF: <ref>, <ref>". When the verdict rests only on what you were shown, including a result\'s stated record count, write "NEEDS ALL OF: none".',
   ].join('\n');
 }
 
@@ -298,7 +301,7 @@ export function reviewCoverageFinding(assessment: ReviewCoverageAssessment): str
   return assessment.unsupported.map((row, index) => {
     const limit = row.moreAtSource
       ? 'the source reported more results than the call returned, or did not say it was complete'
-      : typeof row.recordCount === 'number'
+      : typeof row.recordCount === 'number' && row.recordCount > 0
         ? `it holds ${row.recordCount} records and only part of it was read`
         : 'only part of it was read';
     return `(${index + 1}) The review needs the whole of ${row.toolName} [${row.ref}], but ${limit}. `

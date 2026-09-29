@@ -123,6 +123,8 @@ test('the reviewer is told before it rules which results it holds only in part',
   assert.match(promptOf(requests[0]!), /RESULTS YOU HAVE ONLY IN PART/);
   assert.match(promptOf(requests[0]!), /call_list \(provider_list_records\): 3600 of 51000 bytes shown; 94 records; nothing else opened/);
   assert.match(promptOf(requests[0]!), /read before a write by this request/);
+  assert.match(promptOf(requests[0]!), /NEEDS ALL OF: none/, 'the line is asked for with the results it concerns');
+  assert.doesNotMatch(String(requests[0]!.systemInstructions ?? ''), /NEEDS ALL OF/, 'stable instructions are unchanged by a review');
   assert.equal(verdict.evidenceCoverage?.status, 'sufficient');
   assert.deepEqual(verdict.evidenceCoverage?.needsAllOf, ['call_write']);
   assert.deepEqual(verdict.evidenceCoverage?.open.map((row) => row.ref), ['call_list'],
@@ -230,6 +232,7 @@ test('with every result shown whole there is no ledger, no extra line required a
   assert.equal(verdict.done, true);
   assert.equal(requests.length, 1);
   assert.doesNotMatch(promptOf(requests[0]!), /RESULTS YOU HAVE ONLY IN PART/);
+  assert.doesNotMatch(JSON.stringify(requests[0]), /NEEDS ALL OF/, 'a review shown everything is asked for nothing more');
   assert.equal(verdict.evidenceCoverage?.status, 'sufficient');
 });
 

@@ -66,7 +66,6 @@ export function judgeEvidenceGuidance(source: JudgeEvidenceSource, budget = JUDG
     'Use them when your verdict depends on content you were not shown: the rest of a bounded view, every record of a list, a field a claim rests on. Do not re-open content already shown in full, and do not look up what your verdict does not depend on.',
     'A result shown in part supports a statement that something is absent from it, is true of all of it, or that so many of its records match something only after you queried every record for it or opened the rest. How many records it holds, or that the call succeeded, is not that check.',
     `You have at most ${budget} lookups. Then reply in the required format.`,
-    'After a DONE verdict line add one more line naming, by ref, each result your verdict needs the whole of, because something must be absent from it or true of every record in it: "NEEDS ALL OF: <ref>, <ref>". When the verdict rests only on what you were shown, including a result\'s stated record count, write "NEEDS ALL OF: none".',
   ].join('\n');
 }
 

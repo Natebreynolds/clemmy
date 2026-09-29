@@ -165,3 +165,16 @@ test('a verdict resting on the shown part of a large result needs none of the re
   assert.deepEqual(assessed.open.map((entry) => entry.ref), ['call_list']);
   assert.deepEqual(assessed.unsupported, []);
 });
+
+test('a result that is not a list is described by what was shown of it, never as zero records', () => {
+  const text = boundedList({ logicalToolCallId: 'call_text', resultHandleId: 'rh_text', toolName: 'read_file', recordCount: 0 });
+  const ledger = reviewCoverageLedger([text])!;
+  assert.match(ledger, /call_text \(read_file\): 3687 of 351835 bytes shown; nothing else opened/);
+  assert.doesNotMatch(ledger, /0 records/);
+  assert.match(reviewCoverageFinding(assessReviewCoverage({ results: [text], needsAllOf: ['call_text'] })), /but only part of it was read/);
+});
+
+test('the line naming what a verdict needs is asked for only where a result is held in part', () => {
+  assert.match(reviewCoverageLedger([boundedList()])!, /NEEDS ALL OF: <ref>, <ref>/);
+  assert.equal(reviewCoverageLedger([writeReceipt]), undefined);
+});
