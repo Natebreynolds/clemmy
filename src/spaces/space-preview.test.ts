@@ -94,6 +94,52 @@ test('the preview host frames the view like the desktop and answers the bridge f
   assert.match(lower, /top:-900px;height:calc\(100% \+ 900px\)/, 'a lower part of the page is shown by shifting a taller frame');
 });
 
+test('a local page is framed where it lies, at the requested width, and cannot leave its frame', () => {
+  const page = preview.localPageHostPage({ fileUrl: 'file:///srv/work/a%20brief/index.html?x=1&y=2', width: 390, offsetY: 0 });
+  assert.match(page, /<iframe sandbox="allow-scripts allow-same-origin" src="file:\/\/\/srv\/work\/a%20brief\/index\.html\?x=1&amp;y=2"><\/iframe>/);
+  assert.ok(!/allow-(?:forms|popups|top-navigation|modals|downloads)/.test(page), 'the page cannot submit, open windows or navigate the preview away');
+  assert.match(page, /iframe\{border:0;width:390px;height:100%;/, 'the page lays out at the requested width');
+  const lower = preview.localPageHostPage({ fileUrl: 'file:///srv/work/index.html', width: 1440, offsetY: 900 });
+  assert.match(lower, /top:-900px;height:calc\(100% \+ 900px\)/, 'a lower part of the page is shown by shifting a taller frame');
+  const hostile = preview.localPageHostPage({ fileUrl: 'file:///srv/"><script>alert(1)</script>', width: 1440, offsetY: 0 });
+  assert.ok(!hostile.includes('<script>alert(1)'), 'a file name cannot close the frame tag');
+});
+
+test('a local page preview returns the image, clamps its size, and leaves nothing behind', async () => {
+  const pageDir = mkdtempSync(path.join(HOME, 'page-'));
+  const file = path.join(pageDir, 'index.html');
+  writeFileSync(file, '<!doctype html><html><body><h1>Brief</h1></body></html>', 'utf8');
+  const temporary = () => readdirSync(os.tmpdir()).filter((name) => name.startsWith('clem-page-preview-'));
+  const before = new Set(temporary());
+  const result = await preview.renderLocalPagePreview({ file, width: 5000, height: 100, offsetY: 30_000 }, { browser: lingering, timeoutMs: 10_000 });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (!result.ok) return;
+  assert.ok(result.png.equals(PNG), 'the screenshot bytes come back');
+  assert.deepEqual([result.width, result.height, result.offsetY], [2000, 480, 20_000]);
+  assert.deepEqual(temporary().filter((name) => !before.has(name)), [], 'its temporary files were removed');
+  assert.equal(existsSync(file), true, 'the page itself is untouched');
+  const none = await preview.renderLocalPagePreview({ file }, { browser: null });
+  assert.equal(none.ok, false);
+  if (!none.ok) assert.match(none.reason, /no Chromium-family browser/);
+  const slow = await preview.renderLocalPagePreview({ file }, { browser: silent, timeoutMs: 1_200 });
+  assert.equal(slow.ok, false);
+  if (!slow.ok) assert.match(slow.reason, /did not produce a preview in time/);
+});
+
+test('a real installed browser renders a local page with what lies beside it', { skip: process.env.CLEMMY_TEST_REAL_BROWSER !== '1' }, async () => {
+  const browser = preview.findPreviewBrowser();
+  assert.ok(browser, 'CLEMMY_TEST_REAL_BROWSER=1 needs an installed Chromium-family browser');
+  const pageDir = mkdtempSync(path.join(HOME, 'real-page-'));
+  writeFileSync(path.join(pageDir, 'page.css'), 'html,body{margin:0;height:100%;background:#ff0000}@media (max-width:390px){html,body{background:#00ff00}}', 'utf8');
+  writeFileSync(path.join(pageDir, 'index.html'), '<!doctype html><html><head><link rel="stylesheet" href="page.css"></head><body><script>try{localStorage.setItem("k","v")}catch(e){document.documentElement.style.background="#0000ff"}</script></body></html>', 'utf8');
+  const result = await preview.renderLocalPagePreview({ file: path.join(pageDir, 'index.html'), width: 390, height: 600 }, { browser });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (!result.ok) return;
+  assert.equal(result.png.readUInt32BE(16), 390, 'the image is phone width');
+  const pixel = await firstPixel(result.png);
+  assert.deepEqual(pixel, [0, 255, 0], `the page loaded its own stylesheet and saw a 390-pixel viewport (first pixel ${pixel.join(',')})`);
+});
+
 test('a real installed browser renders a Workspace document', { skip: process.env.CLEMMY_TEST_REAL_BROWSER !== '1' }, async () => {
   const browser = preview.findPreviewBrowser();
   assert.ok(browser, 'CLEMMY_TEST_REAL_BROWSER=1 needs an installed Chromium-family browser');

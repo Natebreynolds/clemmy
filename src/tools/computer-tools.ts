@@ -366,7 +366,7 @@ function isInside(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function resolveAllowedPath(input: string): string {
+export function resolveAllowedPath(input: string): string {
   const resolved = path.resolve(expandHome(input));
   // YOLO mode lets the agent act anywhere the user can. The hard
   // command denylist (assertCommandAllowed) still applies on

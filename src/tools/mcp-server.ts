@@ -1,5 +1,6 @@
 import '../runtime/harness/memory-scope-binding.js';
 import { registerAttachmentTools } from './attachment-tools.js';
+import { registerPagePreviewTools } from './page-preview-tools.js';
 import {
   TOOL_REGISTRY,
   isRegisteredActionControl,
@@ -527,6 +528,7 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
 
   registerMemoryTools(server);
   registerAttachmentTools(server);
+  registerPagePreviewTools(server);
   registerFocusTools(server);
   registerVaultTools(server);
   registerPlanTools(server);

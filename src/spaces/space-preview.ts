@@ -9,11 +9,16 @@
  * the desktop does, using the stored dataset. Actions, notes, and compose never
  * run from a preview. A Chromium-family browser installed on this machine takes
  * the screenshot headlessly; when none is available the preview says so.
+ *
+ * The same browser shows a local page (renderLocalPagePreview): an HTML file
+ * the work produced, framed at the requested width, so it can be looked at
+ * before anyone is told it is done.
  */
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { getRuntimeEnv } from '../config.js';
 
 export const SPACE_PREVIEW_DEFAULT_WIDTH = 1440;
@@ -142,6 +147,53 @@ function stopProcessTree(child: ReturnType<typeof spawn>): void {
   }
 }
 
+/** Screenshot the index.html of one prepared directory headlessly. The
+ *  directory is the caller's to create and to remove. */
+async function captureHostPage(
+  input: { dir: string; browser: string; width: number; height: number },
+  dependencies: SpacePreviewDependencies,
+): Promise<{ ok: true; png: Buffer } | { ok: false; reason: string }> {
+  const shot = path.join(input.dir, 'preview.png');
+  let child: ReturnType<typeof spawn> | null = null;
+  try {
+    const args = [
+      '--headless=new',
+      '--disable-gpu',
+      '--hide-scrollbars',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-extensions',
+      '--disable-background-networking',
+      `--user-data-dir=${path.join(input.dir, 'profile')}`,
+      `--window-size=${input.width},${input.height}`,
+      '--virtual-time-budget=6000',
+      `--screenshot=${shot}`,
+      `file://${path.join(input.dir, 'index.html')}`,
+    ];
+    child = (dependencies.spawnBrowser ?? spawn)(input.browser, args, {
+      stdio: 'ignore',
+      detached: process.platform !== 'win32',
+    });
+    const spawned = child;
+    const exited = new Promise<void>((resolve) => { spawned.once('exit', () => resolve()); spawned.once('error', () => resolve()); });
+    const deadlineAt = Date.now() + (dependencies.timeoutMs ?? PREVIEW_TIMEOUT_MS);
+    const settled = await Promise.race([
+      waitForStableFile(shot, deadlineAt),
+      exited.then(() => waitForStableFile(shot, Math.min(deadlineAt, Date.now() + 1_000))),
+    ]);
+    if (!settled) return { ok: false, reason: 'the browser did not produce a preview in time' };
+    return { ok: true, png: readFileSync(shot) };
+  } finally {
+    if (child) stopProcessTree(child);
+  }
+}
+
+const NO_BROWSER = 'no Chromium-family browser (Chrome, Chromium, Edge, or Brave) is installed on this machine to render the preview';
+
+function previewSide(value: number | undefined, smallest: number, fallback: number): number {
+  return Math.round(Math.min(SPACE_PREVIEW_MAX_SIDE, Math.max(smallest, value ?? fallback)));
+}
+
 /** Screenshot one composed Workspace document headlessly. */
 export async function renderWorkspacePreview(
   input: {
@@ -157,57 +209,75 @@ export async function renderWorkspacePreview(
   dependencies: SpacePreviewDependencies = {},
 ): Promise<SpacePreviewResult> {
   const browser = dependencies.browser === undefined ? findPreviewBrowser() : dependencies.browser;
-  if (!browser) {
-    return {
-      ok: false,
-      reason: 'no Chromium-family browser (Chrome, Chromium, Edge, or Brave) is installed on this machine to render the preview',
-    };
-  }
+  if (!browser) return { ok: false, reason: NO_BROWSER };
   const theme: SpacePreviewTheme = input.theme === 'dark' ? 'dark' : 'light';
-  const width = Math.round(Math.min(SPACE_PREVIEW_MAX_SIDE, Math.max(360, input.width ?? SPACE_PREVIEW_DEFAULT_WIDTH)));
-  const height = Math.round(Math.min(SPACE_PREVIEW_MAX_SIDE, Math.max(480, input.height ?? SPACE_PREVIEW_DEFAULT_HEIGHT)));
+  const width = previewSide(input.width, 360, SPACE_PREVIEW_DEFAULT_WIDTH);
+  const height = previewSide(input.height, 480, SPACE_PREVIEW_DEFAULT_HEIGHT);
   const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-space-preview-'));
-  const shot = path.join(dir, 'preview.png');
-  let child: ReturnType<typeof spawn> | null = null;
   try {
     writeFileSync(path.join(dir, 'view.html'), input.servedViewHtml, 'utf8');
     writeFileSync(path.join(dir, 'index.html'), previewHostPage({
       slug: input.slug, dataset: input.dataset, viewFile: 'view.html', theme, width,
       offsetY: Math.min(20_000, Math.max(0, Math.round(input.offsetY ?? 0))),
     }), 'utf8');
-    const args = [
-      '--headless=new',
-      '--disable-gpu',
-      '--hide-scrollbars',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-extensions',
-      '--disable-background-networking',
-      `--user-data-dir=${path.join(dir, 'profile')}`,
-      `--window-size=${width},${height}`,
-      '--virtual-time-budget=6000',
-      `--screenshot=${shot}`,
-      `file://${path.join(dir, 'index.html')}`,
-    ];
-    child = (dependencies.spawnBrowser ?? spawn)(browser, args, {
-      stdio: 'ignore',
-      detached: process.platform !== 'win32',
-    });
-    const spawned = child;
-    const exited = new Promise<void>((resolve) => { spawned.once('exit', () => resolve()); spawned.once('error', () => resolve()); });
-    const deadlineAt = Date.now() + (dependencies.timeoutMs ?? PREVIEW_TIMEOUT_MS);
-    const settled = await Promise.race([
-      waitForStableFile(shot, deadlineAt),
-      exited.then(() => waitForStableFile(shot, Math.min(deadlineAt, Date.now() + 1_000))),
-    ]);
-    if (!settled) {
-      return { ok: false, reason: 'the browser did not produce a preview in time' };
-    }
-    return { ok: true, png: readFileSync(shot), width, height, theme };
+    const captured = await captureHostPage({ dir, browser, width, height }, dependencies);
+    if (!captured.ok) return captured;
+    return { ok: true, png: captured.png, width, height, theme };
   } catch (error) {
     return { ok: false, reason: `the preview could not be rendered: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
-    if (child) stopProcessTree(child);
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+function attribute(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+export type LocalPagePreviewResult =
+  | { ok: true; png: Buffer; width: number; height: number; offsetY: number }
+  | { ok: false; reason: string };
+
+/** The local parent page of a local HTML file. The file is framed where it
+ *  lies, so what it links to beside itself loads as it does when opened. Its
+ *  scripts run; it cannot open windows, submit forms or leave the frame. */
+export function localPageHostPage(input: { fileUrl: string; width: number; offsetY: number }): string {
+  const frameBox = input.offsetY > 0
+    ? `position:absolute;left:0;top:-${input.offsetY}px;height:calc(100% + ${input.offsetY}px)`
+    : 'height:100%';
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Page preview</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#fff}iframe{border:0;width:${input.width}px;${frameBox};display:block}</style></head>
+<body><iframe sandbox="allow-scripts allow-same-origin" src="${attribute(input.fileUrl)}"></iframe></body></html>`;
+}
+
+/** Screenshot one local HTML file headlessly, as a browser opening it shows it. */
+export async function renderLocalPagePreview(
+  input: {
+    /** Absolute path of an HTML file the caller has already admitted. */
+    file: string;
+    width?: number;
+    height?: number;
+    /** Pixels from the top of the page to start the screenshot at. */
+    offsetY?: number;
+  },
+  dependencies: SpacePreviewDependencies = {},
+): Promise<LocalPagePreviewResult> {
+  const browser = dependencies.browser === undefined ? findPreviewBrowser() : dependencies.browser;
+  if (!browser) return { ok: false, reason: NO_BROWSER };
+  const width = previewSide(input.width, 360, SPACE_PREVIEW_DEFAULT_WIDTH);
+  const height = previewSide(input.height, 480, SPACE_PREVIEW_DEFAULT_HEIGHT);
+  const offsetY = Math.min(20_000, Math.max(0, Math.round(input.offsetY ?? 0)));
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-page-preview-'));
+  try {
+    writeFileSync(path.join(dir, 'index.html'), localPageHostPage({
+      fileUrl: pathToFileURL(input.file).href, width, offsetY,
+    }), 'utf8');
+    const captured = await captureHostPage({ dir, browser, width, height }, dependencies);
+    if (!captured.ok) return captured;
+    return { ok: true, png: captured.png, width, height, offsetY };
+  } catch (error) {
+    return { ok: false, reason: `the preview could not be rendered: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 }
