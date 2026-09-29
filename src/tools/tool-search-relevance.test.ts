@@ -127,6 +127,26 @@ test('looking at a Workspace finds the preview, and authoring queries still find
   }
 });
 
+test('looking at a local page finds the page preview with a reference a turn can use', async () => {
+  for (const query of ['screenshot of the local html page I wrote', 'render my html file and look at it', 'preview the html page at phone width']) {
+    const body = await search(query);
+    assert.equal(body.results[0].name, 'page_preview', `${query}: ${body.results.map((row: { name: string }) => row.name).join(', ')}`);
+    assert.equal(body.results[0].capabilityRef, 'cap:local:page_preview:read');
+    assert.equal(body.results[0].planningRefStatus, undefined, 'a row with a reference carries no refusal status');
+  }
+  // The words of the live turn that went looking for a browser (2026-09-29):
+  // the browser tool still leads and still has no door, so the preview must be
+  // on the same page with one.
+  const live = await search('browser screenshot page render open url playwright');
+  const rows = live.results as Array<{ name: string; capabilityRef?: string; planningRefStatus?: string }>;
+  assert.equal(rows.find((row) => row.name === 'browser_harness_run')?.planningRefStatus, 'unsupported_unmaterialized');
+  assert.equal(rows.find((row) => row.name === 'page_preview')?.capabilityRef, 'cap:local:page_preview:read');
+  assert.ok(live.schemas.page_preview, 'the page carries the preview\'s argument schema');
+  // A Workspace is still looked at with its own preview.
+  const workspace = await search('preview my workspace screenshot');
+  assert.equal(workspace.results[0].name, 'space_preview');
+});
+
 test('connection metadata is discoverable from an instance URL question without a shell command', async () => {
   const body = await search('salesforce sf cli org display instance url', [
     {name:'OUTLOOK_LIST_EVENT_INSTANCES',summary:'List recurring event instances in Outlook calendar.',carrier:'work_call',score:1},
