@@ -274,8 +274,11 @@ export async function learnResolvedReferencesForAcceptedTask(input: {
   if (!request) return { learned: 0, superseded: 0, references: [] };
   const references = await deriveResolvedReferences({
     request, calls: settledCallsForSource(input),
+    // The check is given the request, as an approval card's check is given
+    // what the owner asked: which string is the name is clearest beside the
+    // words that used it. Its bar for being sure is unchanged.
     confirmName: dependencies.confirmName
-      ?? ((question) => labelIdentifierWithJev(question, { sessionId: input.sessionId })),
+      ?? ((question) => labelIdentifierWithJev({ ...question, ownerAsked: request }, { sessionId: input.sessionId })),
   });
   let learned = 0;
   let superseded = 0;
