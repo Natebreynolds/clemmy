@@ -194,3 +194,23 @@ test('resolutions are read from the settled calls of the request itself and kept
     { confirmName: confirming(first('Dana Whitlock', 'Quarterly Roadmap')) });
   assert.equal(findActiveFactsByContentPrefix('reference', 'When a request names "Dana Whitlock", boardscope__create_card takes assignee.contact = ').length, 1);
 });
+
+test('records returned as a document held in text are read as records; prose is not', async () => {
+  const index = { entries: [{ name: 'Harbor Ledger', file: '/fixtures/ledger-7f3a.json' }, { name: 'Pier Log', file: '/fixtures/pier-19c2.json' }] };
+  const asText: SettledCall = { tool: 'read_file', callId: 'r-text', mutating: false, args: { path: '/fixtures/index.json' }, result: JSON.stringify(index) };
+  const asResponse: SettledCall = { tool: 'filescope__read', callId: 'r-mcp', mutating: false, args: { path: '/fixtures/index.json' },
+    result: { content: [{ type: 'text', text: JSON.stringify(index) }] } };
+  const asProse: SettledCall = { tool: 'notescope__search', callId: 'r-prose', mutating: false, args: { q: 'ledger' },
+    result: 'Earlier you opened the Harbor Ledger at /fixtures/ledger-7f3a.json and summarised it.' };
+  const open = (id: string): SettledCall => ({ tool: 'read_file', callId: id, mutating: false, args: { path: '/fixtures/ledger-7f3a.json' }, result: '{"entries":[]}' });
+  const request = 'Using the index at /fixtures/index.json, open the Harbor Ledger and count its entries.';
+  for (const source of [asText, asResponse]) {
+    const resolved = await deriveResolvedReferences({ request, calls: [source, open('r-open')], confirmName: confirming(first('Harbor Ledger')) });
+    assert.deepEqual(resolved.map((row) => [row.named, row.value, row.argument, row.foundIn.callId]),
+      [['Harbor Ledger', '/fixtures/ledger-7f3a.json', 'path', source.callId]], source.tool);
+  }
+  const asked: Array<{ value: string; candidates: string[] }> = [];
+  assert.deepEqual(await deriveResolvedReferences({ request, calls: [asProse, open('r-open')], confirmName: confirming(first('Harbor Ledger'), asked) }), [],
+    'a value found inside a sentence has no record to name it');
+  assert.deepEqual(asked, []);
+});

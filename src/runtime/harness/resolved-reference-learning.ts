@@ -32,6 +32,7 @@ import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { labelCandidatesFor } from './approval-preview-labels.js';
 import { labelIdentifierWithJev } from '../jev/control-plane.js';
+import { judgeEvidenceJsonValue } from './judge-evidence-tools.js';
 import { scanSecrets } from './guardrails.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { findActiveFactsByContentPrefix, rememberFact, supersedeFact } from '../../memory/facts.js';
@@ -112,6 +113,18 @@ function argumentLeaves(args: unknown): Array<{ path: string; value: string }> {
   return leaves;
 }
 
+/** A result as its records. Many operations return their records as a JSON
+ * document held in text, bare or inside a single-text response; it is read as
+ * that document, the way a reviewer's evidence tools read it. Text that is
+ * not a document stays text and carries no record. */
+function recordsOf(result: unknown): unknown {
+  try {
+    return judgeEvidenceJsonValue({ text: typeof result === 'string' ? result : '', value: result });
+  } catch {
+    return result;
+  }
+}
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -154,7 +167,7 @@ export async function deriveResolvedReferences(input: {
       const candidates: string[] = [];
       const foundIn = new Map<string, { tool: string; callId: string }>();
       for (const source of input.calls) {
-        for (const candidate of labelCandidatesFor([source.result], leaf.value)) {
+        for (const candidate of labelCandidatesFor([recordsOf(source.result)], leaf.value)) {
           if (!foundIn.has(candidate)) {
             foundIn.set(candidate, { tool: source.tool, callId: source.callId });
             candidates.push(candidate);
