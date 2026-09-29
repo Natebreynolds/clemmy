@@ -15,8 +15,13 @@ import { renderSkillReference, type SessionSkill } from './skill-execution.js';
 import { effectiveContextWindow } from './model-window-observations.js';
 import { INSTRUCTION_CACHE_DELIM, resolveModelCapability } from './model-wire-registry.js';
 import {
-  JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceReferences, judgeEvidenceTools, type JudgeEvidenceSource,
+  JUDGE_EVIDENCE_LOOKUP_BUDGET, judgeEvidenceGuidance, judgeEvidenceReferences, judgeEvidenceTools,
+  type JudgeEvidenceLookup, type JudgeEvidenceLookupObserver, type JudgeEvidenceSource,
 } from './judge-evidence-tools.js';
+import {
+  assessReviewCoverage, parseRestsOn, reviewCoverageFinding, reviewCoverageFollowUp, reviewCoverageLedger,
+  type EvidenceCoverageRow, type ReviewCoverageStatus,
+} from './review-evidence-coverage.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 
 /**
@@ -143,6 +148,12 @@ export interface ObjectiveJudgeVerdict {
   /** Not done, and another attempt by the assistant cannot change that; the
    * reason is written for the owner. The caller does not re-run the work. */
   blocked?: boolean;
+  /** What the deciding review inspected of the results it was shown in part,
+   * against what its verdict said it rests on. Host record, not reviewer prose. */
+  evidenceCoverage?: ReviewEvidenceCoverageRecord;
+  /** The reviewer's output had no verdict line and it was asked for one; the
+   * start of what it first wrote, kept so the cause can be read afterwards. */
+  verdictRestatedFrom?: string;
   /** Typed Jev (or similar) prefilter produced this verdict. */
   fast?: boolean;
   /** Jev ran even when the Settings judge remained authoritative. */
@@ -156,6 +167,26 @@ export interface ObjectiveJudgeVerdict {
       /** Whether the configured reviewer was started (false = the hedge saved it). */
     reviewerStarted?: boolean;
 };
+}
+
+/** Bounded so a durable verdict stays small however long a review ran. */
+const COVERAGE_RECORD_MAX_ROWS = 16;
+const COVERAGE_RECORD_MAX_LOOKUPS = 2 * JUDGE_EVIDENCE_LOOKUP_BUDGET;
+
+export interface ReviewEvidenceCoverageRecord {
+  status: ReviewCoverageStatus;
+  /** Refs the verdict named; null when it named none and did not say "none". */
+  restsOn: string[] | null;
+  /** Every lookup the deciding review made, in order. */
+  lookups: JudgeEvidenceLookup[];
+  /** Results that were never inspected in full, whatever they were used for. */
+  open: EvidenceCoverageRow[];
+  /** Named by the verdict and not inspected in full. */
+  unsupported: EvidenceCoverageRow[];
+  /** The reviewer was asked once more to inspect what its verdict rests on. */
+  followUp?: 'answered' | 'unanswered';
+  /** The accepted verdict was returned for correction on this record. */
+  returnedForCorrection?: boolean;
 }
 
 export interface ObjectiveJudgeGateInput {
@@ -566,6 +597,14 @@ export interface CompletionEvidenceRow {
   sourceLogicalToolCallId?: string;
   sourceResultHandleId?: string;
   sourcePhysicalDispatchId?: string;
+  /** What the review was shown of the retained result, and what it holds. */
+  rawByteCount?: number;
+  shownByteCount?: number;
+  recordCount?: number;
+  /** The source reported nothing further to fetch for this request. */
+  sourceExhausted?: boolean;
+  /** A write by the same request settled after this read. */
+  precedesWrite?: boolean;
 }
 
 function isSucceededReceipt(row: CompletionEvidenceRow): boolean {
@@ -829,6 +868,13 @@ export function clipForJudge(text: string, max = JUDGE_RESPONSE_MAX_CHARS): { te
   return { text: windowed, truncated: true };
 }
 
+/** Coverage is checked where the reviewer can open what it was not shown and
+ * the candidate is finished work. A plan is reviewed before anything runs. */
+function coverageReviewed(skillContext?: SkillExecutionContext): boolean {
+  return Boolean(skillContext?.fullSourceEvidence && skillContext.evidence
+    && skillContext.verifiedReadResults && !skillContext.reviewsPlan);
+}
+
 export function buildObjectiveJudgePrompt(
   objective: string,
   assistantResponse: string,
@@ -862,6 +908,10 @@ export function buildObjectiveJudgePrompt(
         : `Tool calls made this session (evidence the work actually ran — corroborates the reply, but the response must still contain the artifact/URL the objective named): ${toolSummary}`,
     );
   }
+  // Which results the review holds only in part is a host fact the reviewer
+  // should have before it rules, not something to infer from each block.
+  const ledger = coverageReviewed(skillContext) ? reviewCoverageLedger(skillContext!.verifiedReadResults ?? []) : undefined;
+  if (ledger) parts.push('', ledger);
   if (skillContext && skillContext.skills.length > 0) {
     parts.push(
       '',
@@ -929,6 +979,19 @@ function quotaRefusalWords(error: unknown): string | null {
   return redactSensitiveText(providerCapacityErrorText(error)).replace(/\s+/g, ' ').trim().slice(0, 200);
 }
 
+/** Host observation of one reviewer attempt. Observers never change what the
+ * reviewer receives or what the attempt returns. */
+export interface JudgeAttemptObservers {
+  lookup?: JudgeEvidenceLookupObserver;
+  /** The reviewer's output carried no verdict line and it was asked to state
+   * one; `head` is the start of what it had written. */
+  restated?: (head: string) => void;
+}
+
+/** A reviewer restating its own verdict decides nothing new, so it is asked
+ * at the lowest depth its wire accepts. */
+const VERDICT_RESTATEMENT_EFFORT: JudgeReviewEffort = 'low';
+
 /** The same attempt used by the primary and hedge, exported for a provider-
  * free test of the actual assembled SDK request. This does not add a judge. */
 export async function runRoutedJudgeAttempt<T>(
@@ -941,6 +1004,7 @@ export async function runRoutedJudgeAttempt<T>(
   signal?: AbortSignal,
   effort?: JudgeReviewEffort,
   onResponder?: (modelId: string) => void,
+  observe?: JudgeAttemptObservers,
 ): Promise<T> {
   // Keep per-review handles out of tool schemas and stable instructions.
   // Supply them once with the evidence whose handles they identify.
@@ -969,7 +1033,7 @@ export async function runRoutedJudgeAttempt<T>(
   const agent = evidence
     ? buildJudgeAgent(routing,
       routing.judgeFamily === 'claude' ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : reviewInstructions,
-      judgeEvidenceTools(evidence), reviewEffort)
+      judgeEvidenceTools(evidence, JUDGE_EVIDENCE_LOOKUP_BUDGET, observe?.lookup), reviewEffort)
     : buildJudgeAgent(routing, instructions, [], reviewEffort);
   const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
@@ -997,8 +1061,12 @@ export async function runRoutedJudgeAttempt<T>(
     const prior = redactSensitiveText(String(result.finalOutput ?? '')).trim();
     const head = prior.replace(/\s+/g, ' ').slice(0, 600);
     if (prior) {
+      try { observe?.restated?.(head.slice(0, 240)); } catch { /* observation only */ }
       try {
-        const repairAgent = buildJudgeAgent(routing, instructions, [], reviewEffort);
+        // The review is already written. Live 2026-09-28 (source 325147): a
+        // restatement run at the review's own depth took 56.7 s and 4,123
+        // output tokens to produce one line.
+        const repairAgent = buildJudgeAgent(routing, instructions, [], VERDICT_RESTATEMENT_EFFORT);
         const repairPrompt = [
             'You already reviewed a response and wrote the review below, but it did not contain the required verdict line.',
             'Do not review again. From your own review, state the verdict now.',
@@ -1044,6 +1112,9 @@ interface CompletionJudgeRun {
   routing?: BoundaryJudgeRouting;
   unavailableReason?: string;
   invalidDetail?: string;
+  evidenceCoverage?: ReviewEvidenceCoverageRecord;
+  /** The verdict line was asked for separately; the start of the first output. */
+  verdictRestatedFrom?: string;
 }
 
 /**
@@ -1072,7 +1143,12 @@ export async function runHedgedJudge<T>(
     quotaAwareRoute?: boolean;
     effort?: JudgeReviewEffort;
   } = {},
-): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string }> {
+): Promise<{ value: T | null; failure: 'timeout' | 'invalid' | 'error' | null; routing?: BoundaryJudgeRouting; unavailableReason?: string; invalidDetail?: string;
+  /** Evidence lookups made by the attempt whose verdict was returned. */
+  lookups?: JudgeEvidenceLookup[];
+  /** Set when that attempt's verdict line had to be asked for separately:
+   *  the start of what the reviewer first wrote. */
+  restatedFrom?: string }> {
   const startedAt = Date.now();
   let routing: BoundaryJudgeRouting | undefined;
   try {
@@ -1096,8 +1172,15 @@ export async function runHedgedJudge<T>(
     // session/source attribution is preserved.
     const callerSignal = (await import('./brackets.js')).harnessRunContextStorage.getStore()?.callerCancelSignal;
     const observedRoutes = new Map<BoundaryJudgeRouting, BoundaryJudgeRouting>();
+    // Lookups belong to the attempt that made them: a hedge that lost the race
+    // inspected nothing on behalf of the verdict that won.
+    const attemptLookups = new Map<BoundaryJudgeRouting, JudgeEvidenceLookup[]>();
+    const attemptRestated = new Map<BoundaryJudgeRouting, string>();
     const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (deadlineSignal?: AbortSignal): Promise<T> => {
       const signals = [signal, deadlineSignal, callerSignal].filter((value): value is AbortSignal => Boolean(value));
+      const lookups: JudgeEvidenceLookup[] = [];
+      attemptLookups.set(r, lookups);
+      attemptRestated.delete(r);
       return runRoutedJudgeAttempt<T>(r, instructions, prompt, parse, opts.requireCompletePrompt === true,
         opts.evidence, signals.length ? AbortSignal.any(signals) : undefined, opts.effort, (modelId) => {
           observedRoutes.set(r, modelId === r.modelId ? r : { ...r, modelId,
@@ -1105,7 +1188,7 @@ export async function runHedgedJudge<T>(
             substituteForExactPin: true,
             substituteReason: r.substituteReason ?? 'provider_reported_model',
           });
-        });
+        }, { lookup: (lookup) => { lookups.push(lookup); }, restated: (head) => { attemptRestated.set(r, head); } });
     };
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -1184,7 +1267,8 @@ export async function runHedgedJudge<T>(
     const winner = observedRoutes.get(winningRoute) ?? winningRoute;
     if (raced.value !== null) {
       recordCompletionJudgeMetric(isPass(raced.value) ? 'passed' : 'blocked', startedAt, winner, lane);
-      return { value: raced.value, failure: null, routing: winner };
+      return { value: raced.value, failure: null, routing: winner, lookups: [...(attemptLookups.get(winningRoute) ?? [])],
+        ...(attemptRestated.has(winningRoute) ? { restatedFrom: attemptRestated.get(winningRoute)! } : {}) };
     }
     const failure =
       raced.errors.length === 0
@@ -1240,6 +1324,21 @@ function startCompletionJudge(
   });
 }
 
+function coverageRecord(
+  assessment: ReturnType<typeof assessReviewCoverage>,
+  lookups: readonly JudgeEvidenceLookup[],
+  followUp: ReviewEvidenceCoverageRecord['followUp'],
+): ReviewEvidenceCoverageRecord {
+  return {
+    status: assessment.status,
+    restsOn: assessment.restsOn ? assessment.restsOn.slice(0, COVERAGE_RECORD_MAX_ROWS) : null,
+    lookups: lookups.slice(0, COVERAGE_RECORD_MAX_LOOKUPS),
+    open: assessment.open.slice(0, COVERAGE_RECORD_MAX_ROWS),
+    unsupported: assessment.unsupported.slice(0, COVERAGE_RECORD_MAX_ROWS),
+    ...(followUp ? { followUp } : {}),
+  };
+}
+
 async function runCompletionJudge(
   objective: string,
   assistantResponse: string,
@@ -1247,12 +1346,21 @@ async function runCompletionJudge(
   judge: { lane?: JudgeMetricLane; timeoutMs?: number } = {},
 ): Promise<CompletionJudgeRun> {
   const prompt = buildObjectiveJudgePrompt(objective, assistantResponse, skillContext);
-  const review = async (depth: ReviewDepthRequest): Promise<CompletionJudgeRun> => {
+  const checksCoverage = coverageReviewed(skillContext);
+  const results = skillContext?.verifiedReadResults ?? [];
+  // What the verdict rests on is read from the same output the verdict line
+  // is, so the two can never come from different answers.
+  type Parsed = NonNullable<ReturnType<typeof parseCompletionVerdict>> & { restsOn?: string[] | null };
+  const parse = (output: unknown): Parsed | null => {
+    const verdict = parseCompletionVerdict(output);
+    return verdict && checksCoverage ? { ...verdict, restsOn: parseRestsOn(output) } : verdict;
+  };
+  const hedged = (reviewPrompt: string, depth: ReviewDepthRequest) => {
     const timeoutMs = judge.timeoutMs ?? depth.timeoutMs;
-    const run = await runHedgedJudge(
+    return runHedgedJudge(
       JUDGE_SYSTEM_PROMPT,
-      prompt,
-      parseCompletionVerdict,
+      reviewPrompt,
+      parse,
       (v) => v.done,
       judge.lane ?? 'completion',
       { ...(timeoutMs ? { timeoutMs } : {}),
@@ -1263,9 +1371,49 @@ async function runCompletionJudge(
         ...(depth.effort ? { effort: depth.effort } : {}),
         quotaAwareRoute: true },
     );
-    return { verdict: run.value, failure: run.failure, routing: run.routing,
-      ...(run.unavailableReason ? { unavailableReason: run.unavailableReason } : {}),
-      ...(run.invalidDetail ? { invalidDetail: run.invalidDetail } : {}) };
+  };
+  const plain = ({ restsOn: _restsOn, ...verdict }: Parsed): NonNullable<CompletionJudgeRun['verdict']> => verdict;
+  const review = async (depth: ReviewDepthRequest): Promise<CompletionJudgeRun> => {
+    const first = await hedged(prompt, depth);
+    const run: CompletionJudgeRun = { verdict: first.value ? plain(first.value) : null, failure: first.failure, routing: first.routing,
+      ...(first.restatedFrom ? { verdictRestatedFrom: first.restatedFrom } : {}),
+      ...(first.unavailableReason ? { unavailableReason: first.unavailableReason } : {}),
+      ...(first.invalidDetail ? { invalidDetail: first.invalidDetail } : {}) };
+    // Coverage qualifies an acceptance. A verdict that already sends the work
+    // back, waits on the owner or is blocked claims nothing to qualify.
+    const accepts = (value: Parsed | null): value is Parsed => Boolean(value?.done && !value.awaitingUser && !value.blocked);
+    if (!checksCoverage || !accepts(first.value)) return run;
+    const lookups = [...(first.lookups ?? [])];
+    let assessment = assessReviewCoverage({ results, lookups, restsOn: first.value.restsOn ?? null });
+    let followUp: ReviewEvidenceCoverageRecord['followUp'];
+    if (assessment.status !== 'sufficient') {
+      // ONE follow-up, in the reviewer's own lane: it names the exact results
+      // and what was read of them, and the reviewer inspects or corrects. The
+      // evidence prompt is resent unchanged ahead of it, so a provider that
+      // caches a prefix reads it from cache.
+      const second = await hedged([
+        prompt, '', `Your verdict on the above: DONE: ${first.value.reason}`, '', reviewCoverageFollowUp(assessment),
+      ].join('\n'), depth);
+      followUp = second.value ? 'answered' : 'unanswered';
+      if (second.value) {
+        lookups.push(...(second.lookups ?? []));
+        run.verdict = plain(second.value);
+        if (second.restatedFrom) run.verdictRestatedFrom = second.restatedFrom;
+        if (second.routing) run.routing = second.routing;
+        if (!accepts(second.value)) {
+          return { ...run, evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
+        }
+        assessment = assessReviewCoverage({ results, lookups, restsOn: second.value.restsOn ?? null });
+      }
+    }
+    // Asked, and the accepted verdict still rests on a result nobody read in
+    // full: the acceptance does not stand. The assistant can read every record
+    // or say what it checked; both are one revision away.
+    if (assessment.status === 'insufficient') {
+      run.verdict = { done: false, repairScope: 'claims', reason: reviewCoverageFinding(assessment).slice(0, VERDICT_REASON_MAX_CHARS) };
+      return { ...run, evidenceCoverage: { ...coverageRecord(assessment, lookups, followUp), returnedForCorrection: true } };
+    }
+    return { ...run, evidenceCoverage: coverageRecord(assessment, lookups, followUp) };
   };
   return skillContext?.reviewStakes ? reviewAtStakes(skillContext.reviewStakes, review, {
     readEvidenceComplete: assessCompletionEvidenceCoverage({
@@ -1672,6 +1820,8 @@ export async function judgeObjectiveComplete(
     ...(run.verdict.blocked ? { blocked: true } : {}),
     ...(run.reviewDepth ? { reviewDepth: run.reviewDepth } : {}),
     ...(run.reviewConfirmation ? { reviewConfirmation: run.reviewConfirmation } : {}),
+    ...(run.evidenceCoverage ? { evidenceCoverage: run.evidenceCoverage } : {}),
+    ...(run.verdictRestatedFrom ? { verdictRestatedFrom: run.verdictRestatedFrom } : {}),
   };
 }
 

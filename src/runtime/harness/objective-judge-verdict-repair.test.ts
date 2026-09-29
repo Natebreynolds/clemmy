@@ -100,3 +100,15 @@ test('the judge reports the provider response model, including a verdict repair,
   assert.equal(verdict.done, true);
   assert.deepEqual(responders, ['served-review-version', 'served-verdict-version']);
 });
+
+test('a restated verdict is asked for at low depth and the first output is reported to the host', async () => {
+  const { model, requests } = scripted([LONG_REVIEW, 'DONE: all three drafts present']);
+  const restated: string[] = [];
+  const verdict = await runRoutedJudgeAttempt(route(model), 'Audit.', 'Objective: three drafts.', parseCompletionVerdict,
+    false, undefined, undefined, 'high', undefined, { restated: (head) => restated.push(head) });
+  assert.equal(verdict.done, true);
+  assert.equal(requests[0]!.modelSettings.reasoning?.effort, 'high', 'the review itself keeps its requested depth');
+  assert.equal(requests[1]!.modelSettings.reasoning?.effort, 'low', 'restating a verdict already reached decides nothing new');
+  assert.equal(restated.length, 1);
+  assert.match(restated[0]!, /^Reviewing the three drafts/);
+});

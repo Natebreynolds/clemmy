@@ -1627,3 +1627,74 @@ test('lookup-backed completion bounds bulk retained pages without losing exact s
   const unrelated = sourceEvidenceLookup(other);
   assert.equal(unrelated.resolve(evidence.results[0]!.resultHandleId!), undefined);
 });
+
+test('a bounded list read carries its denominator, its source completeness and its order against the write', async () => {
+  const { assessReviewCoverage, reviewCoverageLedger } = await import('./review-evidence-coverage.js');
+  const { judgeEvidenceTools } = await import('./judge-evidence-tools.js');
+  const identity = accepted('Add the autumn events to the calendar unless they are already there.');
+  // The match is past the prefix a bounded view keeps; the body is large enough
+  // that the review receives the list as a preview.
+  const listed = { data: { value: Array.from({ length: 94 }, (_, index) => ({
+    id: `event-${index}`, subject: index === 71 ? 'Autumn Picture Day' : `Standing meeting ${index % 7}`,
+    start: { dateTime: `2026-10-${String((index % 28) + 1).padStart(2, '0')}T09:00:00` }, body: 'agenda '.repeat(300),
+  })) } };
+  retainedRead(identity, 'calendar_list_events', listed, false, false, false, { id: 'list-month', args: { month: '2026-10' } });
+  retainedRead(identity, 'calendar_create_event', { id: 'created-1', subject: 'Autumn Picture Day' }, true, false, false,
+    { id: 'create-1', args: { subject: 'Autumn Picture Day' } });
+  retainedRead(identity, 'calendar_get_event', { id: 'created-1', subject: 'Autumn Picture Day', start: '2026-10-20' }, false, false, false,
+    { id: 'readback-1', args: { id: 'created-1' } });
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
+  const list = evidence.results.find((row) => row.logicalToolCallId === 'list-month')!;
+  const write = evidence.results.find((row) => row.logicalToolCallId === 'create-1')!;
+  const readback = evidence.results.find((row) => row.logicalToolCallId === 'readback-1')!;
+  assert.equal(list.contentComplete, false);
+  assert.equal(list.recordCount, 94);
+  assert.equal(list.sourceExhausted, true, 'a host execution holds everything the function returned');
+  assert.equal(list.precedesWrite, true, 'this read shows the state before the write');
+  assert.equal(readback.precedesWrite, undefined, 'a read after the write can verify it');
+  assert.equal(readback.contentComplete, true);
+  assert.equal(write.recordCount, undefined, 'a write receipt is one operation, not a list to cover');
+  assert.equal(write.precedesWrite, undefined);
+  assert.doesNotMatch(evidence.summary, /Autumn Picture Day[^]*Standing meeting 1"[^]*event-71/, 'the late record is outside the preview');
+
+  const ledger = reviewCoverageLedger(evidence.results)!;
+  assert.match(ledger, /list-month \(calendar_list_events\): \d+ of \d+ bytes shown; 94 records; nothing else opened; read before a write by this request/);
+  assert.doesNotMatch(ledger, /create-1|readback-1/);
+  assert.equal(assessReviewCoverage({ results: evidence.results, restsOn: ['list-month'] }).status, 'insufficient');
+
+  // The reviewer's own tools, over the same source-scoped lookup the host
+  // gives a review, settle it: one exhaustive query finds the late record.
+  const lookups: Array<Parameters<NonNullable<Parameters<typeof judgeEvidenceTools>[2]>>[0]> = [];
+  const tools = judgeEvidenceTools(sourceEvidenceLookup(identity), 4, (lookup) => lookups.push(lookup)) as unknown as
+    Array<{ name: string; invoke: (context: unknown, input: string) => Promise<unknown> }>;
+  const query = tools.find((entry) => entry.name === 'query_evidence')!;
+  const found = String(await query.invoke({ context: {} }, JSON.stringify({
+    ref: 'list-month', where_field: 'subject', contains: 'picture day', fields: ['subject', 'start.dateTime'] })));
+  assert.match(found, /1 of 94 records at data\.value match; showing 1 from offset 0 \(end\)/);
+  assert.match(found, /"sourceIndex": 71/);
+  const covered = assessReviewCoverage({ results: evidence.results, lookups, restsOn: ['list-month'] });
+  assert.equal(covered.status, 'sufficient');
+  assert.equal(covered.rows.find((row) => row.ref === 'list-month')?.inspection, 'queried');
+});
+
+test('a page that names a next page is not the whole answer, however completely it is shown', async () => {
+  const { assessReviewCoverage } = await import('./review-evidence-coverage.js');
+  const identity = accepted('Is there already an autumn event on the calendar?');
+  retainedRead(identity, 'calendar_list_events', { value: [{ id: 'event-1', subject: 'Standing meeting' }], next_page_token: 'page-2-cursor' },
+    false, false, false, { id: 'first-page', args: { month: '2026-10' } });
+  retainedRead(identity, 'calendar_list_events', { value: [], next_page_token: null },
+    false, false, false, { id: 'empty-complete', args: { month: '2026-11' } });
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence({ ...identity, lookupBacked: true });
+  const page = evidence.results.find((row) => row.logicalToolCallId === 'first-page')!;
+  const empty = evidence.results.find((row) => row.logicalToolCallId === 'empty-complete')!;
+  assert.equal(page.contentComplete, true, 'the page itself is shown whole');
+  assert.equal(page.sourceExhausted, false, 'the source said there is more');
+  assert.equal(empty.sourceExhausted, true);
+  assert.equal(empty.recordCount, 0);
+  const assessed = assessReviewCoverage({ results: evidence.results, restsOn: ['first-page', 'empty-complete'] });
+  assert.deepEqual(assessed.unsupported.map((row) => row.ref), ['first-page']);
+  assert.equal(assessed.rows.find((row) => row.ref === 'empty-complete')?.exhaustive, true,
+    'an empty result from a source with nothing further is evidence of an empty result');
+});

@@ -27,6 +27,32 @@ export interface JudgeEvidenceSource {
   resolve(ref: string): JudgeEvidenceEntry | undefined;
 }
 
+/** What one reviewer lookup actually returned, recorded by the host. A verdict
+ * that rests on a bounded result is only as strong as the part of it the
+ * reviewer opened; without this record that part cannot be known afterwards. */
+export interface JudgeEvidenceLookup {
+  tool: 'open_evidence' | 'query_evidence';
+  ref: string;
+  /** Why nothing was returned, when nothing was. */
+  refused?: 'budget' | 'unknown_ref' | 'no_records';
+  /** open_evidence: the character range returned, and the result's length. */
+  charStart?: number;
+  charEnd?: number;
+  charTotal?: number;
+  /** query_evidence: the list queried and how much of it was returned. */
+  recordPath?: string;
+  recordsTotal?: number;
+  recordsMatched?: number;
+  recordsReturned?: number;
+  offset?: number;
+  /** The query kept only records matching a criterion. Its match count is
+   * true of every record; the records outside it were not returned. */
+  filter?: { field: string; mode: 'equals' | 'contains' };
+  fields?: string[];
+}
+
+export type JudgeEvidenceLookupObserver = (lookup: JudgeEvidenceLookup) => void;
+
 export const JUDGE_EVIDENCE_LOOKUP_BUDGET = 4;
 const MAX_CHARS_PER_LOOKUP = 12_000;
 const MAX_RECORDS_PER_QUERY = 100;
@@ -38,7 +64,9 @@ export function judgeEvidenceGuidance(source: JudgeEvidenceSource, budget = JUDG
     '',
     `EVIDENCE TOOLS: open_evidence reads a retained result as text and query_evidence filters the records of a retained JSON result and returns their true count. A ref is one of the ${source.refKind}.`,
     'Use them when your verdict depends on content you were not shown: the rest of a bounded view, every record of a list, a field a claim rests on. Do not re-open content already shown in full, and do not look up what your verdict does not depend on.',
+    'A result shown in part supports a statement that something is absent from it, is true of all of it, or counts what it holds only after you queried every record for it or opened the rest. How many records it holds, or that the call succeeded, is not that check.',
     `You have at most ${budget} lookups. Then reply in the required format.`,
+    'After a DONE verdict line add one more line naming the results that verdict rests on, by ref: "RESTS ON: <ref>, <ref>", or "RESTS ON: none".',
   ].join('\n');
 }
 
@@ -165,24 +193,41 @@ function project(record: unknown, fields: readonly string[] | undefined): unknow
   return Object.fromEntries(fields.map((field) => [field, at(record, field)]));
 }
 
-function clip(text: string): string {
-  return text.length <= MAX_CHARS_PER_LOOKUP
-    ? text
-    : `${text.slice(0, MAX_CHARS_PER_LOOKUP)}\n…[clipped at ${MAX_CHARS_PER_LOOKUP} of ${text.length} chars; narrow the query or page with offset]`;
+/** Whole records that fit one lookup. A page cut mid-record would report more
+ * records than the reviewer could read; the first record is always returned,
+ * clipped if it alone is over the limit, so a lookup never returns nothing. */
+function wholeRecordsWithin<T>(page: readonly T[], maxChars: number): { shown: T[]; firstClipped: boolean } {
+  const shown: T[] = [];
+  let used = 2;
+  for (const entry of page) {
+    const cost = JSON.stringify(entry, null, 1).length + 2;
+    if (shown.length > 0 && used + cost > maxChars) break;
+    shown.push(entry);
+    used += cost;
+    if (used > maxChars) return { shown, firstClipped: true };
+  }
+  return { shown, firstClipped: false };
 }
 
 /** Fresh tools with their own lookup budget; build one set per review attempt. */
 export function judgeEvidenceTools(
   source: JudgeEvidenceSource,
   budget = JUDGE_EVIDENCE_LOOKUP_BUDGET,
+  onLookup?: JudgeEvidenceLookupObserver,
 ): Tool[] {
   let used = 0;
-  const lookup = (ref: string): JudgeEvidenceEntry | string => {
+  const record = (lookup: JudgeEvidenceLookup): void => {
+    // Recording is observation: it never changes what the reviewer receives.
+    try { onLookup?.(lookup); } catch { /* the lookup result stands */ }
+  };
+  const lookup = (tool: JudgeEvidenceLookup['tool'], ref: string): JudgeEvidenceEntry | string => {
     if (used >= budget) {
+      record({ tool, ref: ref.trim(), refused: 'budget' });
       return `Lookup budget spent (${budget}). Rule from the evidence you have, and say what you could not check.`;
     }
     used += 1;
     const entry = source.resolve(ref.trim());
+    if (!entry) record({ tool, ref: ref.trim(), refused: 'unknown_ref' });
     return entry ?? `No retained result for ref ${JSON.stringify(ref)}. ${judgeEvidenceReferences(source)}`;
   };
   return [
@@ -193,10 +238,11 @@ export function judgeEvidenceTools(
       strict: false,
       execute: async (raw) => {
         const input = openInput.parse(raw);
-        const entry = lookup(input.ref);
+        const entry = lookup('open_evidence', input.ref);
         if (typeof entry === 'string') return entry;
         const offset = Math.min(input.offset ?? 0, entry.text.length);
         const end = Math.min(entry.text.length, offset + (input.max_chars ?? MAX_CHARS_PER_LOOKUP));
+        record({ tool: 'open_evidence', ref: input.ref.trim(), charStart: offset, charEnd: end, charTotal: entry.text.length });
         return `${input.ref}: characters ${offset}–${end} of ${entry.text.length}${end < entry.text.length ? ` (continue with offset ${end})` : ' (end)'}\n\n${entry.text.slice(offset, end)}`;
       },
     }),
@@ -207,11 +253,16 @@ export function judgeEvidenceTools(
       strict: false,
       execute: async (raw) => {
         const input = queryInput.parse(raw);
-        const entry = lookup(input.ref);
+        const ref = input.ref.trim();
+        const entry = lookup('query_evidence', input.ref);
         if (typeof entry === 'string') return entry;
         const records = recordsOf(judgeEvidenceJsonValue(entry), input.path ?? entry.recordPath);
-        if (typeof records === 'string') return records;
+        if (typeof records === 'string') {
+          record({ tool: 'query_evidence', ref, refused: 'no_records' });
+          return records;
+        }
         let rows = records.rows.map((record, sourceIndex) => ({ record, sourceIndex }));
+        const filtered = Boolean(input.where_field && (input.equals !== undefined || input.contains !== undefined));
         if (input.where_field && (input.equals !== undefined || input.contains !== undefined)) {
           const needle = input.contains?.toLowerCase();
           rows = rows.filter((row) => {
@@ -224,7 +275,21 @@ export function judgeEvidenceTools(
         }
         const offset = input.offset ?? 0;
         const page = rows.slice(offset, offset + (input.limit ?? 50)).map(({ record, sourceIndex }) => ({ sourceIndex, record: project(record, input.fields) }));
-        return clip(`${input.ref}: ${rows.length} of ${records.rows.length} records at ${records.from} match; showing ${page.length} from offset ${offset}.\n\n${JSON.stringify(page, null, 1)}`);
+        const header = (shown: number): string => `${input.ref}: ${rows.length} of ${records.rows.length} records at ${records.from} match; showing ${shown} from offset ${offset}`;
+        // The count reported is the count returned: a page is cut between
+        // records, never inside one, and says where the next one starts.
+        const fit = wholeRecordsWithin(page, MAX_CHARS_PER_LOOKUP - 240);
+        const next = offset + fit.shown.length;
+        const body = JSON.stringify(fit.shown, null, 1);
+        const complete = !fit.firstClipped;
+        record({ tool: 'query_evidence', ref, recordPath: records.from, recordsTotal: records.rows.length,
+          recordsMatched: rows.length, recordsReturned: complete ? fit.shown.length : 0, offset,
+          ...(filtered ? { filter: { field: input.where_field!, mode: input.equals !== undefined ? 'equals' as const : 'contains' as const } } : {}),
+          ...(input.fields?.length ? { fields: [...input.fields] } : {}) });
+        if (!complete) {
+          return `${header(1)}, clipped inside the record at ${MAX_CHARS_PER_LOOKUP} characters (it is not whole; choose fields to read it).\n\n${body.slice(0, MAX_CHARS_PER_LOOKUP)}`;
+        }
+        return `${header(fit.shown.length)}${next < rows.length ? ` (continue with offset ${next})` : ' (end)'}.\n\n${body}`;
       },
     }),
   ];

@@ -1656,6 +1656,10 @@ export function commitTurnOutcome(
       ? { requestedJudgeModelId: publishedVerdict.requestedJudgeModelId } : {}),
     ...(publishedVerdict.substituteReason ? { substituteReason: publishedVerdict.substituteReason } : {}),
     ...(publishedVerdict.settledEvidenceAvailable === false ? { settledEvidenceAvailable: false } : {}),
+    // Reviewed, with a result the review held only in part left uninspected.
+    // Sufficient coverage is the unqualified case and is not repeated here.
+    ...(publishedVerdict.evidenceCoverage && publishedVerdict.evidenceCoverage !== 'sufficient'
+      ? { evidenceCoverage: publishedVerdict.evidenceCoverage } : {}),
     ...(publishedVerdict.judgeModelId ? { judgeModelId: publishedVerdict.judgeModelId } : {}),
     ...(publishedVerdict.judgeProvider ? { judgeProvider: publishedVerdict.judgeProvider } : {}),
     ...(publishedVerdict.judgeProviderId ? { judgeProviderId: publishedVerdict.judgeProviderId } : {}),

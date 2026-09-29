@@ -131,3 +131,55 @@ test('an authenticated empty record path wins over a larger carrier metadata arr
   assert.match(found, /0 of 0 records at result\.stdout\.result\.records match/);
   assert.doesNotMatch(found, /result\.argv match/);
 });
+
+test('a page is cut between records and reports only what it returned', async () => {
+  const wide = { rows: Array.from({ length: 40 }, (_, index) => ({ index, text: `record ${index} ` + 'x'.repeat(900) })) };
+  const seen: unknown[] = [];
+  const built = judgeEvidenceTools({ refKind: 'refs', refs: () => ['wide'],
+    resolve: (ref: string) => (ref === 'wide' ? { text: JSON.stringify(wide), value: wide } : undefined) },
+  undefined, (lookup) => seen.push(lookup)) as unknown as Invokable[];
+  const query = built.find((entry) => entry.name === 'query_evidence')!;
+  const first = String(await query.invoke({ context: {} }, JSON.stringify({ ref: 'wide' })));
+  const shown = Number(/showing (\d+) from offset 0/.exec(first)![1]);
+  assert.ok(shown > 0 && shown < 40, 'forty wide records do not fit one lookup');
+  assert.match(first, new RegExp(`\\(continue with offset ${shown}\\)`));
+  assert.doesNotMatch(first, /clipped/);
+  const page = JSON.parse(first.slice(first.indexOf('\n\n') + 2)) as Array<{ sourceIndex: number }>;
+  assert.equal(page.length, shown, 'every record reported as shown is whole');
+  assert.equal(page.at(-1)!.sourceIndex, shown - 1);
+  assert.deepEqual(seen, [{ tool: 'query_evidence', ref: 'wide', recordPath: 'rows', recordsTotal: 40,
+    recordsMatched: 40, recordsReturned: shown, offset: 0 }]);
+});
+
+test('a single record over the limit is returned clipped and recorded as no whole record', async () => {
+  const huge = { rows: [{ id: 1, text: 'y'.repeat(30_000) }] };
+  const seen: Array<Record<string, unknown>> = [];
+  const built = judgeEvidenceTools({ refKind: 'refs', refs: () => ['huge'],
+    resolve: (ref: string) => (ref === 'huge' ? { text: JSON.stringify(huge), value: huge } : undefined) },
+  undefined, (lookup) => seen.push(lookup as never)) as unknown as Invokable[];
+  const query = built.find((entry) => entry.name === 'query_evidence')!;
+  const result = String(await query.invoke({ context: {} }, JSON.stringify({ ref: 'huge' })));
+  assert.match(result, /clipped inside the record/);
+  assert.equal(seen[0]!.recordsReturned, 0);
+});
+
+test('every lookup is recorded with what it returned, including the ones refused', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const built = judgeEvidenceTools(source, 2, (lookup) => seen.push(lookup as never)) as unknown as Invokable[];
+  const call = (name: string, args: Record<string, unknown>) =>
+    built.find((entry) => entry.name === name)!.invoke({ context: {} }, JSON.stringify(args));
+  await call('open_evidence', { ref: 'report', offset: 100, max_chars: 1_000 });
+  await call('query_evidence', { ref: 'someone_elses_session' });
+  await call('query_evidence', { ref: 'triage', where_field: 'bucket', equals: 'respond' });
+  assert.deepEqual(seen, [
+    { tool: 'open_evidence', ref: 'report', charStart: 100, charEnd: 1_100, charTotal: report.length },
+    { tool: 'query_evidence', ref: 'someone_elses_session', refused: 'unknown_ref' },
+    { tool: 'query_evidence', ref: 'triage', refused: 'budget' },
+  ]);
+});
+
+test('an observer that throws never changes what the reviewer receives', async () => {
+  const built = judgeEvidenceTools(source, undefined, () => { throw new Error('observer failure'); }) as unknown as Invokable[];
+  const query = built.find((entry) => entry.name === 'query_evidence')!;
+  assert.match(String(await query.invoke({ context: {} }, JSON.stringify({ ref: 'triage' }))), /4 of 4 records at emails match/);
+});

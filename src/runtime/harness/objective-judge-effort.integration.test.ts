@@ -105,7 +105,9 @@ for (const repair of [false, true]) {
         false, undefined, undefined, 'medium');
       assert.equal(v.done, true);
       assert.equal(bodies.length, repair ? 2 : 1);
-      for (const body of bodies) assert.equal(body.reasoning_effort, 'medium');
+      assert.equal(bodies[0]!.reasoning_effort, 'medium');
+      // Restating a verdict already reached decides nothing new.
+      if (repair) assert.equal(bodies[1]!.reasoning_effort, 'low');
     } finally { mock.restoreAll(); resetByoModelCache(); }
   });
 }

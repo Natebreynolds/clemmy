@@ -3,7 +3,7 @@ import { openEventLog } from './eventlog.js';
 import { isToolMediaImageBlock } from './tool-media-content.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
-import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { redeemSuccessfulSettlementResultForHost, redeemedReadIsExhausted } from './result-handle.js';
 import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { discoveryNavigation } from './discovered-tool-context.js';
@@ -79,6 +79,14 @@ export interface CompletionReadEvidence {
     /** The shown content is the bounded view the answerer received, not the
      * whole retained result. */
     viewBounded?: boolean;
+    /** Records in the retained result's main list. A count, never content. */
+    recordCount?: number;
+    /** The source reported nothing further to fetch for this exact request.
+     * False when it handed back a continuation or never said it was complete. */
+    sourceExhausted?: boolean;
+    /** A write by the same accepted source settled after this read, so the
+     * read shows the state before that write and cannot verify it. */
+    precedesWrite?: boolean;
     presentation?: 'raw_json' | 'decoded_text' | 'media_described';
     contentDisposition?: 'prior_review_window' | 'duplicate_content' | 'discovery_navigation' | 'superseded_read';
     /** Projection → source result. Set on retained_projection rows. */
@@ -510,6 +518,13 @@ export function sourceSettledReadEvidence(input: {
     const results: CompletionReadEvidence['results'] = [];
     const blocks: string[] = [];
     const incremental = input.afterSettlementIndex !== undefined;
+    // Order against this source's own writes, whether or not their receipts
+    // are part of this evidence scope.
+    const lastWriteIndex = (openEventLog().prepare(`
+      SELECT MAX(rowid) AS settlementIndex FROM logical_call_settlements
+       WHERE session_id = ? AND source_user_seq = ? AND mutating = 1
+         AND outcome_kind IN ('succeeded', 'empty_result')
+    `).get(input.sessionId, input.sourceUserSeq) as { settlementIndex: number | null } | undefined)?.settlementIndex ?? 0;
     // A control-role write that committed a durable definition (workflow or
     // Space) is marked on its tool_returned row by the tool edge. That commit
     // is the outcome of an authoring request, so the review sees it as one.
@@ -685,10 +700,18 @@ export function sourceSettledReadEvidence(input: {
             ? Math.min(PROMPT_INLINE_RECALLABLE_RESULT_CHARS, presentationBudgetFor(budgetInput))
             : answererViewBudgetFor(budgetInput));
       const bytes = Buffer.from(view.text, 'utf8');
+      const precedesWrite = !row.mutating && row.settlementIndex < lastWriteIndex;
       results.push({ ...base, ...projectedSource, status: 'verified', resultHandleId: value.resultHandleId,
         physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,
         rawByteCount: value.rawByteCount, shownByteCount: bytes.byteLength, contentComplete: !view.bounded,
-        ...(view.bounded ? { viewBounded: true } : {}), presentation: shown.format });
+        ...(view.bounded ? { viewBounded: true } : {}), presentation: shown.format,
+        // Coverage facts: what the result holds and whether its source had
+        // more. Writes are receipts of one operation and carry neither.
+        ...(row.mutating ? {} : {
+          recordCount: value.handle.recordCount,
+          sourceExhausted: redeemedReadIsExhausted(value),
+          ...(precedesWrite ? { precedesWrite: true } : {}),
+        }) });
       blocks.push([
         `${label}: authenticated ${evidenceKind}; handle=${value.resultHandleId}; dispatch=${value.physicalDispatchId}; sha256=${value.rawPayloadSha256}.`,
         view.bounded

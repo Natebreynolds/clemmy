@@ -4339,6 +4339,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ...(verdict.failedOpen && verdict.reviewFailure ? { reviewFailure: verdict.reviewFailure } : {}),
           ...(verdict.reviewDepth ? { reviewDepth: verdict.reviewDepth } : {}),
           ...(verdict.reviewConfirmation ? { reviewConfirmation: verdict.reviewConfirmation } : {}),
+          // What the review inspected of the results it held only in part, and
+          // what its verdict said it rests on. The verdict is auditable against
+          // this record; a reviewer's prose about what it read is not.
+          ...(verdict.evidenceCoverage ? { evidenceCoverage: verdict.evidenceCoverage } : {}),
+          ...(verdict.verdictRestatedFrom ? { verdictRestatedFrom: verdict.verdictRestatedFrom } : {}),
           ...(verdict.selfJudge ? { selfJudge: true } : {}),
           // Requested-vs-actual judge identity on the durable event, so a
           // substitute is never read back as the pinned model's judgment. A
@@ -11360,6 +11365,9 @@ export function completionVerdictForAcceptedSource(input: {
   requestedJudgeModelId?: string;
   substituteReason?: string;
   settledEvidenceAvailable?: boolean;
+  /** The accepted review left results it held only in part uninspected:
+   *  'unattested' when the verdict never said what it rests on. */
+  evidenceCoverage?: 'sufficient' | 'unattested' | 'insufficient';
   /** Eligible settled effects for this source. Artifact coverage is REQUIRED
    *  only when this is > 0 — an ordinary artifact-free answer must not be made
    *  to look unverified for having produced no artifact. */
@@ -11397,6 +11405,11 @@ export function completionVerdictForAcceptedSource(input: {
           ? { requestedJudgeModelId: data.requestedJudgeModelId } : {}),
         ...(typeof data.substituteReason === 'string' ? { substituteReason: data.substituteReason } : {}),
         ...(data.settledEvidenceAvailable === false ? { settledEvidenceAvailable: false } : {}),
+        ...((): { evidenceCoverage?: 'sufficient' | 'unattested' | 'insufficient' } => {
+          const status = (data.evidenceCoverage as { status?: unknown } | undefined)?.status;
+          return status === 'sufficient' || status === 'unattested' || status === 'insufficient'
+            ? { evidenceCoverage: status } : {};
+        })(),
         ...(typeof data.settledEffectCount === 'number'
           ? { settledEffectCount: data.settledEffectCount } : {}),
         ...(typeof data.judgeModelId === 'string' ? { judgeModelId: data.judgeModelId } : {}),
