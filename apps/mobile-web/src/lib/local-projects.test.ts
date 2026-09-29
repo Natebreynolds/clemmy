@@ -20,12 +20,12 @@ import {
 import { PHONE_PATH_CHARS, localProjectLinkStep, readCodingRuns, readLocalProjects } from './local-projects';
 
 const roster = [
-  { name: 'fixture-site', path: '/Users/fixture/code/fixture-site', type: 'node', description: 'The marketing site', git: true },
-  { name: 'fixture-api', path: '/Users/fixture/code/fixture-api', type: 'node', description: '', git: false },
+  { name: 'fixture-site', path: '/srv/fixture/code/fixture-site', type: 'node', description: 'The marketing site', git: true },
+  { name: 'fixture-api', path: '/srv/fixture/code/fixture-api', type: 'node', description: '', git: false },
 ];
 
 test('the roster is read once per folder, and only an explicit yes allows coding work', () => {
-  const read = readLocalProjects([...roster, roster[0], { name: 'no path' }, null, { path: '/Users/fixture/code/unnamed', git: 'yes' }]);
+  const read = readLocalProjects([...roster, roster[0], { name: 'no path' }, null, { path: '/srv/fixture/code/unnamed', git: 'yes' }]);
   assert.deepEqual(read.map((row) => row.name), ['fixture-site', 'fixture-api', 'unnamed']);
   assert.equal(read[2]!.git, false);
   assert.deepEqual(readLocalProjects(undefined), []);
@@ -34,8 +34,8 @@ test('the roster is read once per folder, and only an explicit yes allows coding
 
 test('a linked local project is marked in the picker, so it is not offered again', () => {
   const choices = projectLocalProjectChoices(readLocalProjects(roster), [
-    { kind: 'folder', ref: '/Users/fixture/code/fixture-site' },
-    { kind: 'link', ref: '/Users/fixture/code/fixture-api' },
+    { kind: 'folder', ref: '/srv/fixture/code/fixture-site' },
+    { kind: 'link', ref: '/srv/fixture/code/fixture-api' },
   ]);
   assert.deepEqual(choices.map((row) => [row.localProject.name, row.linked]), [['fixture-api', false], ['fixture-site', true]]);
 });
@@ -64,10 +64,10 @@ test('a folder that is gone says so, and one that cannot take coding work says t
 });
 
 test('a path fits a phone row and keeps both its start and the folder it ends in', () => {
-  const path = '/Users/fixture/Documents/clients/northwind/2026/websites/fixture-marketing-site';
+  const path = '/srv/fixture/Documents/clients/northwind/2026/websites/fixture-marketing-site';
   const short = middleTruncatePath(path, PHONE_PATH_CHARS);
   assert.ok(short.length <= PHONE_PATH_CHARS, short);
-  assert.match(short, /^\/Users\/fix/);
+  assert.match(short, /^\/srv\/fix/);
   assert.match(short, /marketing-site$/);
   assert.equal(middleTruncatePath('/opt/work/site', PHONE_PATH_CHARS), '/opt/work/site');
 });
@@ -77,7 +77,7 @@ test('a refused link is said in plain words, with what can be chosen', () => {
   const choose = localProjectLinkStep(refused('LOCAL_PROJECT_CHOICE_REQUIRED', { named: 'site', localProjects: roster }));
   assert.equal(choose.step, 'choose');
   assert.deepEqual(choose.step === 'choose' ? choose.localProjects.map((row) => row.name) : [], ['fixture-site', 'fixture-api']);
-  const gone = localProjectLinkStep(refused('LOCAL_PROJECT_NOT_FOUND', { named: '/Users/fixture/code/old', localProjects: [] }));
+  const gone = localProjectLinkStep(refused('LOCAL_PROJECT_NOT_FOUND', { named: '/srv/fixture/code/old', localProjects: [] }));
   assert.equal(gone.step, 'not_found');
   const words = [choose, gone].map((step) => ('text' in step ? step.text : ''));
   for (const said of words) {
@@ -92,9 +92,9 @@ test('a refused link is said in plain words, with what can be chosen', () => {
 
 test('a coding run is its objective, where it works and where it stands', () => {
   const runs = readCodingRuns({ codingRuns: [
-    { runId: 'code-1', objective: 'Add a pricing page', localProject: { name: 'fixture-site', path: '/Users/fixture/code/fixture-site', linked: true }, branch: 'clem/pricing', phase: 'handed_to_you', originSessionId: 'sess-1', createdAt: '2026-09-29T09:00:00Z', updatedAt: '2026-09-29T10:00:00Z' },
+    { runId: 'code-1', objective: 'Add a pricing page', localProject: { name: 'fixture-site', path: '/srv/fixture/code/fixture-site', linked: true }, branch: 'clem/pricing', phase: 'handed_to_you', originSessionId: 'sess-1', createdAt: '2026-09-29T09:00:00Z', updatedAt: '2026-09-29T10:00:00Z' },
     { runId: 'code-1', objective: 'Repeated' },
-    { runId: 'code-2', objective: '', localProject: { path: '/Users/fixture/code/fixture-api', linked: false }, phase: 'some_new_phase', originSessionId: null },
+    { runId: 'code-2', objective: '', localProject: { path: '/srv/fixture/code/fixture-api', linked: false }, phase: 'some_new_phase', originSessionId: null },
     { objective: 'no id' },
   ] });
   assert.deepEqual(runs.map((run) => run.runId), ['code-1', 'code-2']);

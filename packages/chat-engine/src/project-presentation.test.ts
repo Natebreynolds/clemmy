@@ -146,29 +146,29 @@ test('local projects are their own group, first, and say what they are for', () 
 });
 
 test('a linked local project says when its folder is gone, and when coding work cannot run in it', () => {
-  const here = projectLinkedLocalProject({ kind: 'folder', label: 'clem', ref: '/Users/o/code/clem', localProject: { name: 'clem', path: '/Users/o/code/clem', present: true, git: true } });
-  assert.deepEqual(here, { name: 'clem', path: '/Users/o/code/clem', present: true, git: true, known: true });
+  const here = projectLinkedLocalProject({ kind: 'folder', label: 'clem', ref: '/srv/o/code/clem', localProject: { name: 'clem', path: '/srv/o/code/clem', present: true, git: true } });
+  assert.deepEqual(here, { name: 'clem', path: '/srv/o/code/clem', present: true, git: true, known: true });
   assert.equal(projectLocalProjectMissingLine(here!), null);
   assert.equal(projectLocalProjectGitLine(here!), null);
 
-  const gone = { name: 'old', path: '/Users/o/code/old', present: false, git: false };
+  const gone = { name: 'old', path: '/srv/o/code/old', present: false, git: false };
   assert.match(projectLocalProjectMissingLine(gone)!, /no longer on this Mac/);
   assert.equal(projectLocalProjectGitLine(gone), null, 'a folder that is gone gets one line, not two');
 
-  const plain = { name: 'notes', path: '/Users/o/notes', present: true, git: false };
+  const plain = { name: 'notes', path: '/srv/o/notes', present: true, git: false };
   assert.equal(projectLocalProjectMissingLine(plain), null);
   assert.equal(projectLocalProjectGitLine(plain), 'Coding work cannot run here yet: this folder is not a git repository.');
 
-  const older = projectLinkedLocalProject({ kind: 'folder', label: '', ref: '/Users/o/code/app', localProject: null });
+  const older = projectLinkedLocalProject({ kind: 'folder', label: '', ref: '/srv/o/code/app', localProject: null });
   assert.deepEqual([older?.name, older?.known], ['app', false], 'nothing is claimed about a folder the server did not describe');
   assert.equal(projectLinkedLocalProject({ kind: 'link', label: 'x', ref: 'https://example.test' }), null);
 });
 
 test('a path is cut in the middle, keeping where it starts and the folder it ends in', () => {
-  assert.equal(middleTruncatePath('/Users/o/code/app'), '/Users/o/code/app');
-  const cut = middleTruncatePath('/Users/owner/Documents/clients/acme/projects/2026/spring-launch-site', 40);
+  assert.equal(middleTruncatePath('/srv/o/code/app'), '/srv/o/code/app');
+  const cut = middleTruncatePath('/srv/owner/Documents/clients/acme/projects/2026/spring-launch-site', 40);
   assert.equal(cut.length, 40);
-  assert.ok(cut.startsWith('/Users/owner/'));
+  assert.ok(cut.startsWith('/srv/owner/'));
   assert.ok(cut.endsWith('spring-launch-site'));
   assert.ok(cut.includes('…'));
 });

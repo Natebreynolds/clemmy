@@ -82,8 +82,8 @@ test('a task opens on its run, a conversation in Chat, and the keys stay clear o
 
 test('linking a local project: a refusal hands back the folders to choose from', () => {
   const roster = [
-    { name: 'app', path: '/Users/o/code/app', type: 'node', description: '', git: true },
-    { name: 'notes', path: '/Users/o/notes', git: false },
+    { name: 'app', path: '/srv/o/code/app', type: 'node', description: '', git: true },
+    { name: 'notes', path: '/srv/o/notes', git: false },
     { name: 'no path' },
   ];
   assert.deepEqual(
@@ -91,8 +91,8 @@ test('linking a local project: a refusal hands back the folders to choose from',
     {
       kind: 'choose', named: 'app',
       localProjects: [
-        { name: 'app', path: '/Users/o/code/app', type: 'node', description: '', git: true },
-        { name: 'notes', path: '/Users/o/notes', type: '', description: '', git: false },
+        { name: 'app', path: '/srv/o/code/app', type: 'node', description: '', git: true },
+        { name: 'notes', path: '/srv/o/notes', type: '', description: '', git: false },
       ],
     },
   );
