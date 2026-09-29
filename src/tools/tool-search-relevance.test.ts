@@ -147,6 +147,44 @@ test('looking at a local page finds the page preview with a reference a turn can
   assert.equal(workspace.results[0].name, 'space_preview');
 });
 
+test('the shell is disclosed as callable now for reads and computation, with the carrier and the call that take it', async () => {
+  const { TOOL_REGISTRY, isEffectDecidedPerCall } = await import('./tool-registry.js');
+  const { classifyRuntimeToolEffect } = await import('../runtime/harness/tool-effect.js');
+  const { PER_CALL_EFFECT_DISPATCH_NOTE } = await import('./tool-search-tool.js');
+  // The words of the two live turns that were sent away from the shell.
+  for (const query of ['run shell command bash execute local script', 'run_shell_command']) {
+    const body = await search(query);
+    const row = (body.results as Array<Record<string, any>>).find((candidate) => candidate.name === 'run_shell_command');
+    assert.ok(row, `${query}: ${body.results.map((candidate: { name: string }) => candidate.name).join(', ')}`);
+    assert.equal(row.planningRefStatus, 'dispatch_now');
+    assert.equal(row.dispatchScope, 'reads_and_computation');
+    assert.equal(row.dispatchNote, PER_CALL_EFFECT_DISPATCH_NOTE);
+    assert.equal(row.carrier, 'work_call');
+    assert.equal(row.capabilityRef, undefined, 'no capability is claimed for it');
+    assert.deepEqual(row.example, {
+      tool: 'work_call',
+      args: { requirement_id: 'run_shell_command', name: 'run_shell_command', args_json: '{"<argument>":"<value>"}' },
+    });
+    assert.match(body.hint, /run_shell_command/);
+    assert.match(body.hint, /through work_call for a call that only reads or computes/);
+    assert.doesNotMatch(body.hint, /call_tool\(name, args_json\): [^.]*run_shell_command/, 'the shell is never said to go through call_tool');
+  }
+  // A write with no declaration and no per-call effect still has no door.
+  const browser = await search('browser_harness_run');
+  assert.equal(browser.results[0].planningRefStatus, 'unsupported_unmaterialized');
+  assert.equal(browser.results[0].example, undefined);
+
+  // The declaration is a statement about the effect classifier, so it is held to it.
+  const declared = TOOL_REGISTRY.filter((row) => row.effectDecidedPerCall === true).map((row) => row.name);
+  assert.deepEqual(declared, ['run_shell_command']);
+  assert.equal(isEffectDecidedPerCall('run_shell_command'), true);
+  assert.equal(isEffectDecidedPerCall('write_file'), false);
+  assert.equal(isEffectDecidedPerCall('not_a_tool'), false);
+  assert.equal(classifyRuntimeToolEffect('run_shell_command', { command: 'ls -lt /srv/work | head -20' }).effect, 'compute');
+  assert.equal(classifyRuntimeToolEffect('run_shell_command', { command: 'cp /srv/work/a.css /srv/work/out/a.css' }).effect, 'local_write');
+  assert.equal(classifyRuntimeToolEffect('run_shell_command', { command: 'curl -X POST https://example.com/hook -d x=1' }).effect, 'external_write');
+});
+
 test('connection metadata is discoverable from an instance URL question without a shell command', async () => {
   const body = await search('salesforce sf cli org display instance url', [
     {name:'OUTLOOK_LIST_EVENT_INSTANCES',summary:'List recurring event instances in Outlook calendar.',carrier:'work_call',score:1},

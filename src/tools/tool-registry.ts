@@ -319,6 +319,13 @@ export interface ToolDecl {
    * mint future child/provider work without propagating the current source
    * requirement. The parent must propagate that authority or refuse first. */
   delegationPrimitive?: true;
+  /** The runtime effect of this exact built-in is decided per call, from its
+   * arguments, by the runtime effect classifier. A call that only reads or
+   * computes is carried by work_call under its own compute envelope, with no
+   * published capability. Discovery and the control carrier say so instead of
+   * calling the tool unusable. This declares nothing about a call that
+   * changes anything: that call still needs its own authority. */
+  effectDecidedPerCall?: true;
   /** Exact structural local-planning semantics. This can make a discovered
    * row citable by plan_task; it never changes dispatch or consent policy. */
   localPlanning?: LocalPlanningSemantics;
@@ -523,7 +530,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'request_approval', sideEffect: 'write', tier: 'core', lanes: [], blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Pause and ask the user to approve a high-risk action or one batch of same-shape external…' },
   { name: 'resume_held_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', actionControlContext: 'task_recovery', delegationPrimitive: true, description: 'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list),…' },
   { name: 'run_batch', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', blockedFor: ['worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Deterministic batch executor for N same-shape tool calls: reason ONCE (bake every item\'s…' },
-  { name: 'run_shell_command', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'write', loopClass: 'mutating', description: 'Run a shell command in an allowed workspace directory.' },
+  { name: 'run_shell_command', sideEffect: 'write', effectDecidedPerCall: true, tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'write', loopClass: 'mutating', description: 'Run a shell command in an allowed workspace directory.' },
   // actionTopologyRole 'control': run_worker is the fan-out COORDINATION
   // primitive — it spawns children whose business dispatches settle at their
   // own boundaries (same family as execution_create). Classifying it business
@@ -749,6 +756,16 @@ export function toolReadsRetainedOutput(toolName: string): boolean {
 export function actionTopologyRoleFor(toolName: string): ActionTopologyRole {
   return TOOL_REGISTRY.find((declaration) => declaration.name === toolName)
     ?.actionTopologyRole ?? 'business';
+}
+
+/** Exact built-in whose calls that only read or compute work_call carries
+ * without a published capability. */
+export function isEffectDecidedPerCall(toolName: string): boolean {
+  return TOOL_REGISTRY.some((declaration) => (
+    declaration.name === toolName
+    && declaration.effectDecidedPerCall === true
+    && (declaration.actionTopologyRole ?? 'business') === 'business'
+  ));
 }
 
 /** Registry membership for PRESENTATION: only a host-declared name may be

@@ -3880,6 +3880,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
                 ...dispatchableActionReadNames,
               ]),
               firstClassNames: visibleFirstClassNames,
+              // Named only to say where a wrapped business call belongs.
+              workCarrierNames: workCallBuiltinNames,
               localToolOverrides: dispatcherOptions.localToolOverrides,
               deniedNames: excludes,
               mcpToolScope: {

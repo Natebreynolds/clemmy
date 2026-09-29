@@ -23,6 +23,7 @@ import { SourceAccountNominationSchema, type SourceAccountNomination } from './s
 import { hostStructuralPlanningControlLookup } from './structural-control-lookup.js';
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
+import { isEffectDecidedPerCall } from './tool-registry.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
@@ -384,10 +385,30 @@ export type ToolSearchCandidateSourceKind =
  * fill. Live 2026-09-01: an abstract hint ("inner name/args_json of
  * work_call") plus a structured `invocation` object was not enough for GLM 5.3,
  * which put the action arguments where tool_slug belongs. */
+/** Each callable name, said with the carrier that takes it. A row carried by
+ * work_call was never invocable through call_tool. */
+function sayCallableNow(names: readonly string[], carriedByWorkCall: (name: string) => boolean): string {
+  const carried = names.filter(carriedByWorkCall);
+  const direct = names.filter((name) => !carried.includes(name));
+  return [
+    ...(direct.length > 0
+      ? [`${direct.length === 1 ? 'this one is' : 'these are'} directly invocable on this turn with call_tool(name, args_json): ${direct.join(', ')}.`]
+      : []),
+    ...(carried.length > 0
+      ? [`${carried.length === 1 ? 'this one runs' : 'these run'} now through work_call for a call that only reads or computes, following the example on ${carried.length === 1 ? 'its' : 'each'} row: ${carried.join(', ')}.`]
+      : []),
+  ].join(' And ');
+}
+
+/** Said on the row of a built-in whose effect is decided per call. */
+export const PER_CALL_EFFECT_DISPATCH_NOTE = 'A call that only reads or computes runs now: invoke it as the inner name and args_json of work_call, with the tool\'s own name as requirement_id. A call that changes files, or that leaves this machine, is a different effect and is not carried by this example.';
+
 export function renderCarrierInvocationExample(
   carrier: string,
   invocation: { name: string; fixedArgs?: Record<string, unknown>; payloadField?: string | null },
   capabilityRef?: string,
+  /** A read or compute label for a work_call that has no capability ref. */
+  requirementLabel?: string,
 ): {
   tool: string;
   args: {
@@ -420,6 +441,9 @@ export function renderCarrierInvocationExample(
         ...base,
       },
     };
+  }
+  if (carrier === 'work_call' && requirementLabel) {
+    return { tool: carrier, args: { requirement_id: requirementLabel, ...base } };
   }
   return { tool: carrier, args: base };
 }
@@ -1645,6 +1669,21 @@ export function registerToolSearchTool(
         if (carrier === 'call_tool') {
           return { planningRefStatus: 'dispatch_now' as const, ...reason };
         }
+        // A work_call row with no ref has no door, EXCEPT a built-in whose
+        // effect is decided per call: work_call carries its reads and
+        // computation now, under their own compute envelope. Stamping that row
+        // unusable sent the model away from a tool it could call. Live
+        // 2026-09-29, twice: a turn searched for the shell, read this status,
+        // wrapped the shell in call_tool, was refused, and listed a folder by
+        // fetching web pages instead.
+        if (carrier === 'work_call' && isEffectDecidedPerCall(name)) {
+          return {
+            planningRefStatus: 'dispatch_now' as const,
+            dispatchScope: 'reads_and_computation' as const,
+            dispatchNote: PER_CALL_EFFECT_DISPATCH_NOTE,
+            ...reason,
+          };
+        }
         return { planningRefStatus: 'unsupported_unmaterialized' as const, ...reason };
       };
 
@@ -1935,7 +1974,7 @@ export function registerToolSearchTool(
               return status.planningRefStatus === 'dispatch_now';
             });
           if (callableNow.length > 0) {
-            return `None of these can be CITED in plan_task, but ${callableNow.length === 1 ? 'this one is' : 'these are'} directly invocable on this turn with call_tool(name, args_json): ${callableNow.join(', ')}. Each result carries its schema. Call what you need instead of re-searching; only refine discovery if none of them does the job.`;
+            return `None of these can be CITED in plan_task, but ${sayCallableNow(callableNow, (name) => localPlanningRowStatus(name).dispatchScope !== undefined)} Each result carries its schema. Call what you need instead of re-searching; only refine discovery if none of them does the job.`;
           }
           return 'No returned candidate was materialized into an exact host capabilityRef. Do not cite these results in plan_task; refine discovery, choose another live result, or ask the user only for a genuinely missing connection/account/target choice.';
         }
@@ -1971,9 +2010,11 @@ export function registerToolSearchTool(
         const effect = ((candidate?.capabilityVariants?.length ?? 0) <= 1
           ? publishedEffect(r.name, planningRefs[r.name]) : undefined)
           ?? (localEffects.size === 1 ? [...localEffects][0] : undefined);
+        const carriedPerCall = Boolean(opts.discloseForPlanning) && !planningRefs[r.name] && !planningBlockers[r.name]
+          && localPlanningRowStatus(r.name).dispatchScope === 'reads_and_computation';
         const invocation = 'invocation' in r && r.invocation
           ? r.invocation
-          : localDefinitions?.length
+          : localDefinitions?.length || carriedPerCall
             ? { name: r.name, payloadField: null }
             : undefined;
         return ({
@@ -2049,6 +2090,7 @@ export function registerToolSearchTool(
                   && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) <= 1
                   ? planningRefs[r.name]
                   : undefined,
+                carriedPerCall ? r.name : undefined,
               ) }
             : {}),
         });

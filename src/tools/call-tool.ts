@@ -56,7 +56,7 @@ import {
   dispatchBatchItemTool,
   isMcpNamespacedTool,
 } from './inner-dispatch.js';
-import { deriveOrchestratorDiscoveryNames, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool, registeredToolSideEffect } from './tool-registry.js';
+import { deriveOrchestratorDiscoveryNames, isEffectDecidedPerCall, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool, registeredToolSideEffect } from './tool-registry.js';
 import { recordToolHit } from '../agents/tool-hotset.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
 import { provenComposioSlugForTurn } from '../runtime/harness/capability-resolution.js';
@@ -755,6 +755,11 @@ export interface BuildCallToolOptions {
   /** Exact built-in names advertised as deferred on this turn. Omit for the
    * legacy full orchestrator surface (tests and non-scoped callers). */
   reachableBuiltinNames?: ReadonlySet<string>;
+  /** Exact built-ins the sibling work_call carries on this turn. This carrier
+   * never dispatches them; it names work_call in the refusal, so a wrapped
+   * call is sent to the carrier that takes it instead of being called
+   * unreachable. Omitted means no sibling carrier is known. */
+  workCarrierNames?: ReadonlySet<string>;
   /** First-class built-ins on this turn's surface — directly callable, so NOT
    * in the deferred set above. Admitted so a model that wraps a first-class tool
    * in call_tool (a common confusion) gets a transparent dispatch instead of a
@@ -848,6 +853,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     reason: 'call_tool default built-in reachability',
   });
   const reachableBuiltinNames = options.reachableBuiltinNames ?? new Set(defaultSurface.firstClass);
+  const workCarrierNames = options.workCarrierNames ?? new Set<string>();
   const firstClassNames = options.firstClassNames ?? new Set<string>();
   const deniedNames = options.deniedNames ?? new Set<string>();
   const sourceStrategyBinding = validatedTurnSourceStrategyBinding(options.sourceStrategyBinding);
@@ -1209,7 +1215,16 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
             // established the opposite, so that advice fired exactly when it
             // was false: a turn told to call directly a built-in that is not on
             // its surface cannot, and dies at the no-progress floor.
-            detail: isRegistryDeclaredTool(target)
+            detail: isEffectDecidedPerCall(target) && workCarrierNames.has(target)
+              // It must be TRUE here too. This branch told a turn that "neither
+              // this carrier nor a direct call can invoke it here" about a
+              // built-in that work_call carries on the same turn, so the turn
+              // gave up on a tool it could call. Live 2026-09-29, twice.
+              ? `"${requestedTarget}" is not carried by this carrier: work_call carries it on this turn.`
+                + ` Call work_call DIRECTLY as its own tool call, with name "${target}", args_json holding its arguments,`
+                + ` and "${target}" as requirement_id. A call that only reads or computes runs at once.`
+                + ' A call that changes files or leaves this machine is a different effect and answers for itself there.'
+              : isRegistryDeclaredTool(target)
               ? `"${requestedTarget}" is a Clementine built-in, but it is NOT on this turn's surface:`
                 + ' this turn\'s tool policy does not reach it, so neither this carrier nor a direct call can invoke it here.'
                 + ' Call tool_search DIRECTLY as its own tool call (never wrapped in this carrier) to disclose the exact operation for this step,'

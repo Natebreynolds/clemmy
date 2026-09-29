@@ -892,6 +892,38 @@ test('call_tool freezes strict host materialization as the one effective logical
   }
 });
 
+test('a wrapped built-in that work_call carries is sent to work_call, never called unreachable', async () => {
+  const controls = buildCallTool({
+    reachableBuiltinNames: new Set(['space_preview']),
+    firstClassNames: new Set(['tool_search']),
+    workCarrierNames: new Set(['run_shell_command', 'write_file']),
+  }) as unknown as ToolLike;
+  const wrapped = JSON.parse(String(await invokeCallToolFixture(
+    controls, 'sess-carried-by-work', JSON.stringify({ name: 'run_shell_command', args_json: JSON.stringify({ command: 'ls -lt' }) }), 'call-carried-by-work',
+  ))) as { error: string; detail: string };
+  assert.equal(wrapped.error, 'not_reachable', 'this carrier still does not dispatch it');
+  assert.match(wrapped.detail, /work_call carries it on this turn/);
+  assert.match(wrapped.detail, /Call work_call DIRECTLY as its own tool call, with name "run_shell_command"/);
+  assert.match(wrapped.detail, /"run_shell_command" as requirement_id/);
+  assert.doesNotMatch(wrapped.detail, /neither this carrier nor a direct call can invoke it/, 'the refusal never says a callable tool cannot be called');
+
+  // A built-in work_call carries only with a published capability keeps the
+  // advice that publishes it.
+  const write = JSON.parse(String(await invokeCallToolFixture(
+    controls, 'sess-carried-by-work', JSON.stringify({ name: 'write_file', args_json: JSON.stringify({ path: '/srv/x.txt', content: 'x' }) }), 'call-write-by-work',
+  ))) as { error: string; detail: string };
+  assert.equal(write.error, 'not_reachable');
+  assert.match(write.detail, /Call tool_search DIRECTLY/);
+
+  // With no sibling carrier named, nothing is promised.
+  const alone = buildCallTool({ reachableBuiltinNames: new Set(['space_preview']) }) as unknown as ToolLike;
+  const refused = JSON.parse(String(await invokeCallToolFixture(
+    alone, 'sess-carried-by-work', JSON.stringify({ name: 'run_shell_command', args_json: JSON.stringify({ command: 'ls -lt' }) }), 'call-no-sibling',
+  ))) as { error: string; detail: string };
+  assert.equal(refused.error, 'not_reachable');
+  assert.doesNotMatch(refused.detail, /work_call carries it/);
+});
+
 test('call_tool materializes omitted nullable computer-tool defaults before strict dispatch', async () => {
   _resetCallToolSchemaCacheForTest();
   const out = String(await invokeCallTool(
