@@ -25,7 +25,7 @@ import { MODELS } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { deriveTitle } from '../memory/derive-title.js';
-import { createBackgroundTask, listBackgroundTasks, requestBackgroundDrain, type BackgroundReportBackTarget, type BackgroundTaskRecord } from './background-tasks.js';
+import { createBackgroundTask, listBackgroundTasks, requestBackgroundDrain, type BackgroundReportBackTarget, type BackgroundTaskDelegation, type BackgroundTaskRecord } from './background-tasks.js';
 import {
   clearKill,
   getActiveRunAttempt,
@@ -350,6 +350,8 @@ export interface EnqueueDurableChatTaskInput {
   source?: BackgroundTaskRecord['source'];
   /** Soft wall-clock budget; defaults to the proactivity policy's long-task minutes. */
   maxMinutes?: number;
+  /** Who the task is delegated to and the project it works in. */
+  delegation?: BackgroundTaskDelegation;
 }
 
 /**
@@ -403,7 +405,11 @@ export function enqueueDurableChatTask(input: EnqueueDurableChatTaskInput): Back
     // followed by an immediate error, with a healthy brain sitting right there.
     // resolveRoleModel is the same resolver the settings surface reports, so
     // backgrounding never silently changes which brain is doing the work.
+    // A task delegated to a saved agent is one bounded piece of work: it
+    // runs on the model its caller resolved for it (the agent's own, or the
+    // helper role), never silently on the brain the owner is talking to.
     model: input.model ?? resolveRoleModel('brain').modelId,
+    ...(input.delegation ? { delegation: input.delegation } : {}),
     maxMinutes: input.maxMinutes ?? loadProactivityPolicy().defaultLongTaskMinutes,
     source: input.source ?? 'gateway',
   });

@@ -271,6 +271,8 @@ export interface BackgroundTaskRecord {
     logicalTaskId?: string;
   };
   runSessionId: string;
+  /** Set when the task was delegated to a saved agent, a project, or both. */
+  delegation?: BackgroundTaskDelegation;
   /** User-visible, monotonic task contract. The original prompt is v1; later
    * revisions are appended instead of rewriting history. A run that finishes
    * against an older version is superseded and re-queued on the same session. */
@@ -393,6 +395,28 @@ export interface BackgroundTaskRecord {
   archiveReason?: string;
 }
 
+/**
+ * Who a task was delegated to and which project it works in. Frozen when the
+ * task is created: a later change to the conversation's agent or project does
+ * not move work that is already owned. It names who does the work and what
+ * they know; it grants nothing the task would not otherwise have.
+ */
+export interface BackgroundTaskDelegation {
+  agentId: string | null;
+  agentName: string | null;
+  /** When the agent record delegated to was created: an id is a name's slug,
+   * and a different agent saved later under it is not this one. */
+  agentCreatedAt: string | null;
+  projectId: string | null;
+  projectName: string | null;
+  /** Where the owner asked for the result to be put, in their words. */
+  artifactDestination?: string;
+  /** Who chose the agent: the owner by name, Clem, or the router. */
+  assignedBy: 'owner' | 'clem' | 'router';
+  /** The accepted request that asked for the work. */
+  originSourceUserSeq?: number;
+}
+
 export interface BackgroundTaskContractRevision {
   version: number;
   instruction: string;
@@ -422,6 +446,7 @@ export interface CreateBackgroundTaskInput {
    */
   originSessionId?: string;
   foregroundHandoff?: BackgroundTaskRecord['foregroundHandoff'];
+  delegation?: BackgroundTaskDelegation;
   /** A task id RESERVED from durable identity before this task existed. Callers
    *  that can derive their id (a foreground handoff derives it from the accepted
    *  attempt) pass it so concurrent materializations converge on one task. */
@@ -602,12 +627,119 @@ type BackgroundTaskOperationalType =
   | 'background_task_parked'
   | 'background_self_resume_check';
 
+/** What the run session of a delegated task carries so that every lane mounts
+ * the agent and the project the task was given. */
+function delegatedSessionMetadata(task: BackgroundTaskRecord): Record<string, string | string[]> | null {
+  const delegation = task.delegation;
+  if (!delegation || (!delegation.agentId && !delegation.projectId)) return null;
+  return {
+    delegatedTaskId: task.id,
+    ...(delegation.agentId ? { agentId: delegation.agentId, agentIds: [delegation.agentId] } : {}),
+    ...(delegation.agentId && delegation.agentName ? { agentName: delegation.agentName } : {}),
+    ...(delegation.projectId ? { projectId: delegation.projectId, projectIds: [delegation.projectId] } : {}),
+    ...(delegation.projectId && delegation.projectName ? { projectName: delegation.projectName } : {}),
+    ...(task.originSessionId ? { delegatedFromSessionId: task.originSessionId } : {}),
+  };
+}
+
+/**
+ * Make sure the run session of a delegated task exists and carries who the
+ * task was delegated to. The identity written is the one frozen on the task,
+ * whatever the conversation that started it points at now.
+ */
+function ensureDelegatedRunSession(task: BackgroundTaskRecord): void {
+  const metadata = delegatedSessionMetadata(task);
+  if (!metadata) return;
+  try {
+    if (!getHarnessSessionRow(task.runSessionId)) {
+      createHarnessSession({
+        id: task.runSessionId,
+        kind: 'execution',
+        title: task.title,
+        ...(task.channel ? { channel: task.channel } : {}),
+        ...(task.userId ? { userId: task.userId } : {}),
+        metadata: { source: 'bridge:background', ...metadata },
+      });
+      return;
+    }
+    // Touch only these keys: a run may be writing its own bookkeeping.
+    const assignments = Object.entries(metadata);
+    const sets = assignments.map(([key, value]) => `'$.${key}', ${Array.isArray(value) ? 'json(?)' : '?'}`).join(', ');
+    openEventLog().prepare(
+      `UPDATE sessions SET metadata_json = json_set(COALESCE(metadata_json, '{}'), ${sets}) WHERE id = ?`,
+    ).run(...assignments.map(([, value]) => (Array.isArray(value) ? JSON.stringify(value) : value)), task.runSessionId);
+  } catch { /* the task record keeps the delegation; the next start retries */ }
+}
+
+export type DelegatedTaskPhase =
+  | 'dispatched' | 'started' | 'revised' | 'needs_you' | 'parked' | 'finished' | 'stopped' | 'failed';
+
+/**
+ * Say in the conversation that delegated it what state a delegated task is
+ * in: who owns it, which project, which version of the request it is working
+ * to. Written at real transitions of the task record and nowhere else, so the
+ * conversation never shows progress that did not happen.
+ */
+function publishDelegatedTaskState(
+  task: BackgroundTaskRecord,
+  phase: DelegatedTaskPhase,
+  detail: { instruction?: string; evidencePolicy?: string; reason?: string } = {},
+): void {
+  const delegation = task.delegation;
+  if (!delegation || !task.originSessionId || task.internal) return;
+  try {
+    if (!getHarnessSessionRow(task.originSessionId)) return;
+    appendEvent({
+      sessionId: task.originSessionId,
+      turn: 0,
+      role: 'system',
+      type: 'delegated_task_state',
+      data: {
+        taskId: task.id,
+        title: task.title,
+        phase,
+        status: task.status,
+        contractVersion: task.contractVersion ?? 1,
+        ...(delegation.agentId ? { agentId: delegation.agentId } : {}),
+        ...(delegation.agentName ? { agentName: delegation.agentName } : {}),
+        ...(delegation.projectId ? { projectId: delegation.projectId } : {}),
+        ...(delegation.projectName ? { projectName: delegation.projectName } : {}),
+        ...(typeof delegation.originSourceUserSeq === 'number' ? { sourceUserSeq: delegation.originSourceUserSeq } : {}),
+        ...(detail.instruction ? { instruction: clean(detail.instruction, 400) } : {}),
+        ...(detail.evidencePolicy ? { evidencePolicy: detail.evidencePolicy } : {}),
+        ...(detail.reason ? { reason: clean(detail.reason, 400) } : {}),
+        ...(phase === 'needs_you' && task.pendingQuestion ? { question: clean(task.pendingQuestion, 400) } : {}),
+        ...(phase === 'needs_you' && task.pendingApprovalId ? { approvalId: task.pendingApprovalId } : {}),
+      },
+    });
+  } catch { /* the task record is the authority; the projection is best-effort */ }
+}
+
+function delegatedPhaseFor(type: BackgroundTaskOperationalType, task: BackgroundTaskRecord): DelegatedTaskPhase | null {
+  if (type === 'background_task_created') return 'dispatched';
+  if (type === 'background_task_started') return 'started';
+  if (type === 'background_task_parked') {
+    return task.status === 'awaiting_input' || task.status === 'awaiting_approval' ? 'needs_you' : 'parked';
+  }
+  if (type === 'background_task_finished') {
+    if (task.status === 'done') return 'finished';
+    return task.status === 'aborted' ? 'stopped' : 'failed';
+  }
+  return null;
+}
+
 function emitBackgroundTaskOperational(
   type: BackgroundTaskOperationalType,
   task: BackgroundTaskRecord,
   payload: Record<string, unknown> = {},
   severity: OperationalEventSeverity = 'info',
 ): void {
+  const phase = delegatedPhaseFor(type, task);
+  if (phase) {
+    publishDelegatedTaskState(task, phase, {
+      reason: typeof payload.reason === 'string' ? payload.reason : task.error ?? task.cancellationReason,
+    });
+  }
   try {
     recordOperationalEvent({
       source: 'harness',
@@ -1325,6 +1457,7 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
       + 'Lead with whatever matters most for THIS outcome — if you were blocked, that is the blocker, not the parts that went well.',
     '',
     `Task ID: ${task.id}`,
+    renderDelegationBlock(task),
     renderTaskContractBlock(task),
     task.originSessionId ? `Origin session: ${task.originSessionId}` : '',
     `Soft max runtime: ${task.maxMinutes} minutes`,
@@ -1337,6 +1470,22 @@ function buildWorkerPrompt(task: BackgroundTaskRecord): string {
       : '',
     'Original request:',
     task.prompt,
+  ].filter(Boolean).join('\n');
+}
+
+/** Empty for a task nobody delegated, so its prompt is what it always was. */
+function renderDelegationBlock(task: BackgroundTaskRecord): string {
+  const delegation = task.delegation;
+  if (!delegation || (!delegation.agentId && !delegation.projectId)) return '';
+  return [
+    '## Delegated Task',
+    delegation.agentName
+      ? `Clem delegated this task to you, ${delegation.agentName}. Your standing instructions are above; this task is one bounded piece of work, not a conversation.`
+      : 'Clem delegated this task.',
+    delegation.projectName ? `It belongs to the project ${delegation.projectName}, whose context is above.` : '',
+    delegation.artifactDestination ? `Put the result here: ${delegation.artifactDestination}` : '',
+    'Report what you did and what you found with its evidence. Clem checks the result before it is reported as done: '
+      + 'saying it is finished does not make it so. If the owner corrects the task while you work, the correction arrives as a contract revision below and overrides what it conflicts with.',
   ].filter(Boolean).join('\n');
 }
 
@@ -1491,6 +1640,9 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
       originSessionId: input.originSessionId,
       foregroundHandoff: input.foregroundHandoff,
       runSessionId: `background:${id}`,
+      ...(input.delegation && (input.delegation.agentId || input.delegation.projectId)
+        ? { delegation: input.delegation }
+        : {}),
       contractVersion: 1,
       contractRevisions: [],
       userId: input.userId,
@@ -1556,7 +1708,10 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
     silent: true,
     metadata: taskNotificationMetadata(task),
   });
-  if (created) emitBackgroundTaskOperational('background_task_created', task, { runSessionId: task.runSessionId });
+  if (created) {
+    ensureDelegatedRunSession(task);
+    emitBackgroundTaskOperational('background_task_created', task, { runSessionId: task.runSessionId });
+  }
   return task;
 }
 
@@ -1976,8 +2131,10 @@ export function reviseBackgroundTaskContract(
     } catch { /* task revision remains canonical if approval cleanup fails */ }
   }
 
+  publishDelegatedTaskState(updated, 'revised', { instruction, evidencePolicy });
   // Pre-register a pending task's trace so the revision is visible immediately.
   try {
+    ensureDelegatedRunSession(updated);
     if (!getHarnessSessionRow(updated.runSessionId)) {
       createHarnessSession({
         id: updated.runSessionId,
@@ -2225,6 +2382,7 @@ export function markBackgroundTaskRunning(id: string): BackgroundTaskRecord | nu
     // run. summarizeFanoutCoverage counts only worker_results AFTER the latest
     // boundary, so a prior run's (or continue's) failures don't leak into THIS run's
     // authoritative coverage gate and permanently block a re-completed task.
+    if (updated) ensureDelegatedRunSession(updated);
     appendEvent({ sessionId: runSessionId, turn: 0, role: 'system', type: 'fanout_run_boundary', data: { taskId: id } });
     // Stage 3: a new run boundary also resets the in-process fan-out reduce
     // window, so a prior run's digest-mode state never leaks into this run.

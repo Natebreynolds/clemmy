@@ -651,9 +651,58 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       return foldCodingRunActivity(prev, d, now);
     case 'coding_run_settled':
       return foldCodingRunSettled(prev, d, now);
+    case 'delegated_task_state':
+      return foldDelegatedTaskState(prev, d, now);
     default:
       return prev;
   }
+}
+
+// ─── Delegated tasks ────────────────────────────────────────────────────
+// One row per task Clem delegated, in the chat that delegated it: who owns it
+// and what it is for as the label, the last real change of state as the
+// detail. The row moves only when the task record did.
+
+export function delegatedTaskRowId(taskId: unknown): string | null {
+  return typeof taskId === 'string' && taskId ? `delegated-${taskId}` : null;
+}
+
+function delegatedTaskLabel(d: Record<string, unknown>): string {
+  const owner = typeof d.agentName === 'string' && d.agentName.trim() ? d.agentName.trim() : 'Clem';
+  const title = firstLine(d.title, 100);
+  return title ? `${owner} · ${title}` : owner;
+}
+
+function foldDelegatedTaskState(prev: ActivityItem[], d: Record<string, unknown>, now: () => number): ActivityItem[] {
+  const id = delegatedTaskRowId(d.taskId);
+  if (!id) return prev;
+  const version = typeof d.contractVersion === 'number' && d.contractVersion > 1 ? ` (request v${d.contractVersion})` : '';
+  let status: ActivityItem['status'] = 'running';
+  let tone: ActivityItem['tone'] = 'live';
+  let detail = '';
+  switch (d.phase) {
+    case 'dispatched': detail = 'Handed over, waiting to start'; tone = 'muted'; break;
+    case 'started': detail = `Working${version}`; break;
+    case 'revised': detail = `Your correction was added${version}: ${firstLine(d.instruction, 110)}`; tone = 'warning'; break;
+    case 'needs_you': detail = firstLine(d.question, 120) || 'Waiting on your decision'; tone = 'warning'; break;
+    case 'parked': detail = firstLine(d.reason, 120) || 'Paused'; tone = 'warning'; break;
+    case 'finished': detail = `Finished${version}`; status = 'done'; tone = 'success'; break;
+    case 'stopped': detail = 'Stopped'; status = 'interrupted'; tone = 'warning'; break;
+    case 'failed': detail = firstLine(d.reason, 120) || 'Did not finish'; status = 'failed'; tone = 'danger'; break;
+    default: return prev;
+  }
+  const settled = status !== 'running';
+  const existing = prev.find((row) => row.id === id);
+  if (!existing) {
+    return [...prev, {
+      id, kind: 'agent', label: delegatedTaskLabel(d), detail, status, tone,
+      ...(settled ? { finishedAt: now() } : { startedAt: now() }),
+    }];
+  }
+  return prev.map((row) => (row.id === id
+    ? { ...row, label: delegatedTaskLabel(d), detail, status, tone,
+        ...(settled ? { finishedAt: now() } : { finishedAt: undefined, startedAt: row.startedAt ?? now() }) }
+    : row));
 }
 
 // ─── Delegated coding agents ────────────────────────────────────────────

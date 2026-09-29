@@ -667,6 +667,10 @@ export const EVENT_TYPES = [
   // adjudication or write accounting.
   'coding_run_activity',
   'coding_run_settled',
+  // The state of a task Clem delegated to a saved agent or into a project,
+  // written on the conversation that delegated it at each real transition of
+  // the task record: who owns it, which version of the request it works to.
+  'delegated_task_state',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

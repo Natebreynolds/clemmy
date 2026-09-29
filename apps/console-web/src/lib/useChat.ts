@@ -533,6 +533,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
   if (ev.type === 'turn_started' || ev.type === 'turn_model_routed'
     || ev.type === 'work_manifest_declared' || ev.type === 'work_item_checkpoint'
     || ev.type === 'coding_run_activity' || ev.type === 'coding_run_settled'
+    || ev.type === 'delegated_task_state'
     || ev.type === 'worker_model_offer' || ev.type === 'worker_model_offer_resolved'
     || ev.type === 'workflow_saved'
     || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {

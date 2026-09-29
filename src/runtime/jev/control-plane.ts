@@ -602,6 +602,67 @@ export async function labelIdentifierWithJev(
   return label;
 }
 
+/** Work is handed to an agent on the router's word only when it is sure:
+ *  an agent that does not fit does the work worse than no agent at all. */
+export const AGENT_SELECT_SURE = 0.8;
+const AGENT_SELECT_TIMEOUT_MS = 1_500;
+const AGENT_SELECT_MAX_CANDIDATES = 12;
+
+export interface AgentSelectCandidate {
+  id: string;
+  name: string;
+  /** What the agent handles, and what it answers for where the work belongs. */
+  handles: string;
+}
+
+export interface AgentSelection<T extends AgentSelectCandidate> {
+  /** The agent chosen, only when the router was sure. */
+  agent: T | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+/**
+ * A task is about to be delegated and nobody named who should do it. The
+ * host lists the agents assigned where the work belongs; Jev picks the one
+ * whose stated responsibility covers the task, or none. A name the owner or
+ * Clem gave is never put to this question.
+ */
+export async function selectAgentForTaskWithJev<T extends AgentSelectCandidate>(
+  objective: string,
+  candidates: readonly T[],
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<AgentSelection<T>> {
+  const listed = candidates.filter((candidate) => candidate.id && candidate.name).slice(0, AGENT_SELECT_MAX_CANDIDATES);
+  if (listed.length === 0 || !objective.trim()) return { agent: null, failedOpen: false };
+  const criteria: Record<string, string | null> = {};
+  listed.forEach((candidate, index) => {
+    criteria[`c${index}`] = clipMiddle(`${candidate.name}: ${candidate.handles || 'no stated responsibility'}`, 400).text;
+  });
+  criteria.none = 'None of these is responsible for this kind of work.';
+  const result = await evaluateSystemOne({
+    state: { task: clipMiddle(objective.trim(), 1_200).text },
+    questions: {
+      agent: {
+        type: 'choice',
+        instructions: 'A task is about to be handed to one of these agents. Each choice is an agent and what it is responsible for. Which one is responsible for this task? Choose none when the task is outside what every one of them is responsible for.',
+        criteria,
+      },
+    },
+    timeoutMs: Math.min(AGENT_SELECT_TIMEOUT_MS, opts.timeoutMs ?? AGENT_SELECT_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-agent-select',
+  });
+  if (!result.ok) return { agent: null, failedOpen: true };
+  const answer = result.answers.agent as ChoiceAnswer | undefined;
+  const index = answer && /^c\d+$/.test(answer.choice) ? Number(answer.choice.slice(1)) : -1;
+  const agent = answer && answer.confidence >= AGENT_SELECT_SURE ? listed[index] ?? null : null;
+  noteJevDecisionOutcome(result.decisionId, agent ? 'selected' : 'none', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { agent, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 /** Name the operation this request needs first, from a host-prepared list,
  *  or none. */
 export async function routeOperationWithJev<T extends RoutableOperation>(

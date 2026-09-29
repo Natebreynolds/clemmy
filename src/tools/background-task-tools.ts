@@ -32,6 +32,7 @@ import {
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { publicConversationPreambleData } from '../runtime/harness/public-presentation.js';
 import { textResult } from './shared.js';
+import { resolveTaskDelegation } from '../projects/task-delegation.js';
 
 /** Split an agreed plan (markdown bullets / numbered lines) into discrete next
  *  actions for the goal contract's step list. Best-effort + bounded. */
@@ -295,6 +296,9 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       success_criteria: z.array(z.string()).nullable().describe('Concrete done-checks; the run is complete only when all hold.'),
       context_refs: z.array(z.string()).nullable().describe('File paths, resource ids, or tool-call ids the worker should load first before producing artifacts.'),
       max_minutes: z.number().int().min(1).max(240).nullable().describe('Soft wall-clock budget; defaults to the policy long-task minutes.'),
+      agent: z.string().nullable().optional().describe('Saved agent to delegate this task to (its name). The task then runs as that agent, with its standing instructions and skills, and reports back here. Null or omitted: the agent this conversation is already in, otherwise the one assigned to the project that is responsible for this kind of work, otherwise none.'),
+      project: z.string().nullable().optional().describe('Project the task belongs to (its name or id). Null or omitted: the project this conversation is in, if any. The task works with that project\'s context, accounts and learning, and nothing from any other project.'),
+      artifact_destination: z.string().nullable().optional().describe('Where the owner asked for the result to be put, in their words (a folder, a document, "a draft here in chat"). Null when they did not say.'),
       manifest: z.object({
         items: z.array(z.string().min(1)).min(1).max(2000)
           .describe('CANONICAL item identities (real ids/names you enumerated — never "item 1..N" placeholders). Every item is durably tracked and settled individually.'),
@@ -315,7 +319,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         + 'The runtime windows items across durable workers, settles each item exactly once (a restart resumes, never redoes), '
         + 'and runs the reducer once when every item has settled. Omit for ordinary single-objective tasks.'),
     },
-    async ({ objective, handoff_note, plan, success_criteria, context_refs, max_minutes, manifest }) => {
+    async ({ objective, handoff_note, plan, success_criteria, context_refs, max_minutes, manifest, agent, project, artifact_destination }) => {
       const sessionId = getToolOutputContext()?.sessionId;
       if (!sessionId) {
         return textResult('I can only dispatch a background task from a live chat session (no session context here) — run the task directly instead.');
@@ -437,6 +441,24 @@ export function registerBackgroundTaskTools(server: McpServer): void {
           : '',
       ].filter(Boolean).join('\n');
 
+      // Who does the work and in which project is decided once, before any
+      // task exists. A name that is not saved, or an agent that is not
+      // assigned to the project, starts nothing.
+      const runContextForDelegation = harnessRunContextStorage.getStore();
+      const delegated = await resolveTaskDelegation({
+        sessionId,
+        objective,
+        agent: agent ?? null,
+        project: project ?? null,
+        artifactDestination: artifact_destination ?? null,
+        ...(runContextForDelegation?.sessionId === sessionId && typeof runContextForDelegation.sourceUserSeq === 'number'
+          ? { sourceUserSeq: runContextForDelegation.sourceUserSeq }
+          : {}),
+      });
+      if (delegated.kind === 'refuse') {
+        return textResult(JSON.stringify({ ok: false, code: 'delegation_refused', detail: delegated.reason }));
+      }
+
       const originRoute = backgroundRouteForOriginSession(sessionId);
       const task = enqueueDurableChatTask({
         message: objective,
@@ -446,6 +468,9 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         channel: originRoute.channel,
         source: originRoute.source,
         maxMinutes: max_minutes ?? undefined,
+        ...(delegated.kind === 'bound'
+          ? { delegation: delegated.delegation, ...(delegated.model ? { model: delegated.model } : {}) }
+          : {}),
         // Rich contract rides through enqueue's goal-bind-at-creation (the
         // single mechanism every entry path now shares).
         goal: {
@@ -464,8 +489,15 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         note: goal ? 'Bound to its durable goal contract.' : undefined,
       });
 
+      const owner = delegated.kind === 'bound'
+        ? [
+            delegated.delegation.agentName ? ` to ${delegated.delegation.agentName}` : '',
+            delegated.delegation.assignedBy === 'router' ? ' (chosen because it is the agent assigned to this kind of work)' : '',
+            delegated.delegation.projectName ? ` in the project ${delegated.delegation.projectName}` : '',
+          ].join('')
+        : '';
       return textResult(
-        `Dispatched "${task.title}" to the background (task ${task.id})`
+        `Dispatched "${task.title}"${owner} to the background (task ${task.id})`
         + (goal ? ' with a goal contract — it will keep working until the success criteria are met, not just run once' : '')
         + `. It's running in the daemon now and will report its result back HERE automatically when it finishes — or pause and ask you here if it needs a decision. `
         + `Tell the user it's on it and that you'll report back; do NOT wait, poll, or do the work yourself this turn — you're free to take their next request right now. It's also watchable on the Tasks board.`,

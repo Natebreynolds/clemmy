@@ -8,6 +8,7 @@ const {
 const {
   classifyOpenQuestionReplyWithJev,
   labelIdentifierWithJev,
+  selectAgentForTaskWithJev,
   classifyApprovalReplyWithJev,
   nominateReadCapabilitiesWithJev,
   prepareSharedEvidenceDecisionsWithJev,
@@ -655,6 +656,42 @@ test('labelIdentifierWithJev names an id only when Jev is sure, and never offers
   assert.equal(posted.length, 3);
   _setTypesafeKeyForTests(null);
   assert.equal(await labelIdentifierWithJev(input), null, 'no Jev, no name');
+});
+
+
+test('selectAgentForTaskWithJev hands a task to an agent only when Jev is sure it is responsible', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Record<string, any>[] = [];
+  let choice = 'c1';
+  let confidence = 0.91;
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      agent: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } },
+    }, usage: { input_tokens: 60, output_tokens: 2 } }) };
+  });
+  const candidates = [
+    { id: 'hiring-desk', name: 'Hiring Desk', handles: 'Summarise applicants.' },
+    { id: 'sales-assistant', name: 'Sales Assistant', handles: 'Prepare the weekly briefing.' },
+  ];
+  const picked = await selectAgentForTaskWithJev('Draft this week\'s sales briefing.', candidates);
+  assert.deepEqual(picked, { agent: candidates[1], confidence: 0.91, failedOpen: false });
+  const body = posted[0]!;
+  assert.deepEqual(Object.keys(body.questions), ['agent']);
+  assert.deepEqual(body.questions.agent.criteria, {
+    c0: 'Hiring Desk: Summarise applicants.', c1: 'Sales Assistant: Prepare the weekly briefing.',
+    none: 'None of these is responsible for this kind of work.',
+  });
+  confidence = 0.79;
+  assert.deepEqual(await selectAgentForTaskWithJev('Draft the briefing.', candidates), { agent: null, confidence: 0.79, failedOpen: false });
+  choice = 'none'; confidence = 0.97;
+  assert.deepEqual(await selectAgentForTaskWithJev('Book a flight.', candidates), { agent: null, confidence: 0.97, failedOpen: false });
+  choice = 'c9';
+  assert.equal((await selectAgentForTaskWithJev('x', candidates)).agent, null, 'a choice outside the list is no choice');
+  assert.deepEqual(await selectAgentForTaskWithJev('x', []), { agent: null, failedOpen: false }, 'nobody to choose from asks nothing');
+  assert.equal(posted.length, 4);
+  _setTypesafeKeyForTests(null);
+  assert.deepEqual(await selectAgentForTaskWithJev('x', candidates), { agent: null, failedOpen: true });
 });
 
 

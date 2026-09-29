@@ -716,6 +716,34 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
 
 const PUBLIC_TOOL_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/;
 
+const DELEGATED_TASK_PHASES: ReadonlySet<string> = new Set([
+  'dispatched', 'started', 'revised', 'needs_you', 'parked', 'finished', 'stopped', 'failed',
+]);
+
+/**
+ * The state of a delegated task on the conversation that delegated it. Ids
+ * and enums pass as they are; every piece of text is bounded again here. A
+ * phase this surface does not know stays private.
+ */
+function publicDelegatedTaskState(data: Record<string, unknown>): Record<string, unknown> | null {
+  const phase = typeof data.phase === 'string' ? data.phase : '';
+  if (!DELEGATED_TASK_PHASES.has(phase) || typeof data.taskId !== 'string' || !data.taskId) return null;
+  const text = (key: string, max: number) => {
+    const value = shortString(data[key], max);
+    return value ? { [key]: value } : {};
+  };
+  return {
+    ...selected(data, ['taskId', 'phase', 'status', 'contractVersion', 'agentId', 'projectId',
+      'sourceUserSeq', 'evidencePolicy', 'approvalId']),
+    ...text('title', 200),
+    ...text('agentName', 64),
+    ...text('projectName', 80),
+    ...text('instruction', 400),
+    ...text('reason', 400),
+    ...text('question', 400),
+  };
+}
+
 /**
  * A delegated coding agent's live activity. Text was redacted when the
  * executor wrote it; this bounds it again and admits only the fields each
@@ -1142,6 +1170,8 @@ function projectData(event: EventRow): Record<string, unknown> | null {
           'commitCount', 'filesChanged', 'insertions', 'deletions', 'testExitCode', 'verdict']),
         ...(shortString(data.reason, 600) ? { reason: shortString(data.reason, 600) } : {}),
       };
+    case 'delegated_task_state':
+      return publicDelegatedTaskState(data);
     case 'batch_started':
     case 'batch_progress':
     case 'batch_completed':

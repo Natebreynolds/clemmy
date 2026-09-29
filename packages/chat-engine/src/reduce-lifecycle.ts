@@ -125,6 +125,7 @@ export const ACTIVITY_FOLD_EVENTS: ReadonlySet<string> = new Set([
   'plan_drafted', 'plan_revision_published', 'memory_signals_captured', 'handoff',
   'run_completed', 'run_paused', 'run_resumed',
   'coding_run_activity', 'coding_run_settled',
+  'delegated_task_state',
 ]);
 
 /** The detail line under a lifecycle row: the step's own title where it has
