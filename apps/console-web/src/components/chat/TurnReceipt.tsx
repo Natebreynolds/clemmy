@@ -8,11 +8,11 @@
  * unchecked answer must not borrow a pass. A card for work outside Clem
  * appears only for writes the provider confirmed.
  */
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertCircle, Check, CheckCircle2, Copy, FileText, Lock, Mail, PenLine, Repeat, Send, Sparkles, Workflow } from 'lucide-react';
 import {
-  outsideWorkCards, turnByline, turnModelOffer, turnReview, workflowCardLevels, workflowCards,
+  outsideWorkCards, projectPagePlace, projectPageTitle, turnByline, turnModelOffer, turnReview, workflowCardLevels, workflowCards,
   type ModelRuleOffer, type OutsideWorkCard, type WorkflowCardData,
 } from '@clem/chat-engine';
 import { cn } from '@/lib/cn';
@@ -20,17 +20,51 @@ import { answerModelRuleOffer } from '@/lib/chat';
 import type { ActivityItem } from '@/lib/useChat';
 import type { TerminalFacts } from '@clem/chat-engine';
 import { openFile, resolveDeliverablePath } from '@/lib/files';
+import { findSessionPage, isPageName, pageViewerPath, type ProjectPageView } from '@/lib/projects';
 import { TurnEvidenceLine } from '@/components/chat/TurnEvidenceLine';
 
 /** A file she saved this turn, as something you can open. The harness names
  *  the latest file by basename; the path is resolved on demand and the button
  *  disappears when no single file matches. */
-function DeliverableCard({ row }: { row: ActivityItem }) {
+function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: string }) {
   const file = row.deliverable;
   const [state, setState] = useState<'idle' | 'working' | 'unavailable'>('idle');
   const [problem, setProblem] = useState('');
+  // A page written into a linked local project lies outside Clem's own
+  // files, where Open cannot reach. It is looked at in the project's viewer.
+  const [page, setPage] = useState<{ projectId: string; page: ProjectPageView } | null>(null);
+  const name = file?.name ?? '';
+  const folder = file?.dir ?? '';
+  useEffect(() => {
+    let current = true;
+    setPage(null);
+    if (!sessionId || !isPageName(name)) return undefined;
+    void findSessionPage(sessionId, name, folder).then((found) => { if (current) setPage(found); });
+    return () => { current = false; };
+  }, [sessionId, name, folder]);
   if (!file) return null;
   const count = row.count ?? 1;
+  if (page) {
+    const title = projectPageTitle(page.page);
+    return (
+      <div className="flex min-w-0 items-center gap-3 rounded-md border border-border bg-surface px-3 py-2.5">
+        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-sm bg-success-tint text-success">
+          <FileText className="h-[18px] w-[18px]" aria-hidden />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col leading-tight">
+          <span className="truncate text-small font-semibold text-fg" title={title}>{title}</span>
+          <span className="truncate text-caption text-faint" title={projectPagePlace(page.page)}>{projectPagePlace(page.page)}</span>
+        </span>
+        <Link
+          to={pageViewerPath(page.projectId, page.page.id)}
+          aria-label={`View the page ${title}`}
+          className="shrink-0 rounded-sm border border-border-strong px-3 py-1 text-caption font-semibold text-fg transition-colors hover:bg-subtle active:scale-press"
+        >
+          View
+        </Link>
+      </div>
+    );
+  }
   const open = () => {
     setState('working');
     setProblem('');
@@ -270,7 +304,7 @@ export function TurnReceipt({
   const offer = turnModelOffer(activity);
   return (
     <>
-      <OutsideWorkCards activity={activity}>{saved ? <DeliverableCard row={saved} /> : null}</OutsideWorkCards>
+      <OutsideWorkCards activity={activity}>{saved ? <DeliverableCard row={saved} sessionId={sessionId} /> : null}</OutsideWorkCards>
       {offer && sessionId && <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} />}
       <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
         {review === 'checked' && (

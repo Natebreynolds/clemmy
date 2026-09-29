@@ -27,7 +27,7 @@ import {
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
 import { chooseLocalProject, localProjects } from './local-projects.js';
-import { localPageContentPolicy, pageImageIsBlank, pageOfProject, pagesMadeInProject, readPageDocument } from './local-pages.js';
+import { localPageContentPolicy, pageImageIsBlank, pageMadeBySession, pageOfProject, pagesMadeInProject, readPageDocument } from './local-pages.js';
 import { moveFact } from './memory-scope-views.js';
 
 type Handler = (req: Request, res: Response) => void | Promise<void>;
@@ -364,6 +364,14 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
       return;
     }
     res.json({ sessionId, projectId: result.projectId, projectName: result.projectName, changed: result.changed });
+  });
+
+  // The page behind a saved-file card: the card knows the file's name and
+  // folder, never its path.
+  add('get', `${mount.sessions}/:sessionId/page`, (req, res) => {
+    const found = pageMadeBySession(param(req, 'sessionId'), String(req.query.name ?? ''), String(req.query.folder ?? ''));
+    if (!found) { refuse(res, 'page_not_found'); return; }
+    res.json(found);
   });
 
   add('get', `${mount.sessions}/:sessionId/delegated-tasks`, (req, res) => {

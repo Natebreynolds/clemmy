@@ -13,9 +13,9 @@
  */
 import type {
   AgentAssignments, DelegatedTask, DelegatedTaskCorrection, ProjectAccountChoice, ProjectConnectedApp, ProjectLocalProject,
-  ProjectOverview, ProjectResourceKind, ProjectSummary, SessionProjectLabel,
+  ProjectOverview, ProjectPageView, ProjectResourceKind, ProjectSummary, SessionProjectLabel,
 } from '@clem/chat-engine';
-import { projectPageRefusal } from '@clem/chat-engine';
+import { projectPageRefusal, projectPages } from '@clem/chat-engine';
 import { apiGet, apiPost, withToken, type ApiError } from './api';
 import { unifiedChatSessionId } from './last-session';
 
@@ -341,6 +341,30 @@ export function pageRefusalText(error: unknown, fallback: string): string {
   const code = apiErrorCode(error);
   const words = code ? projectPageRefusal(code) : '';
   return words && words !== projectPageRefusal(null) ? words : refusalText(error, fallback);
+}
+
+/** Whether a saved file's name says it is a page. */
+export function isPageName(name: string | null | undefined): boolean {
+  return /\.html?$/i.test((name ?? '').trim());
+}
+
+/**
+ * The page behind a saved-file card, found by the conversation that wrote it
+ * and the name the card shows. Null when there is none, or when more than one
+ * page answers to the name: a card never opens the wrong page.
+ */
+export async function findSessionPage(sessionId: string, name: string, folder: string): Promise<{ projectId: string; page: ProjectPageView } | null> {
+  if (!sessionId || !isPageName(name)) return null;
+  try {
+    const found = await apiGet<{ projectId?: unknown; page?: unknown }>(
+      `/api/console/sessions/${id(sessionId)}/page?name=${encodeURIComponent(name)}&folder=${encodeURIComponent(folder)}`,
+    );
+    const page = projectPages({ pages: [found.page] })[0];
+    return typeof found.projectId === 'string' && found.projectId && page ? { projectId: found.projectId, page } : null;
+  } catch {
+    // No page, or no answer: the card keeps what it could already do.
+    return null;
+  }
 }
 
 // ─── A conversation's project ───

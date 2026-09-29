@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { projectPageRefusal } from '@clem/chat-engine';
 import {
   accountBindingFromRefusal, apiErrorCode, conversationPath, goalsFromText, goalsToText, localProjectLinkFromRefusal,
-  checkPageDocument, pageDocumentUrl, pageRefusalText, pageViewerPath, projectKeys, refusalText,
+  checkPageDocument, findSessionPage, isPageName, pageDocumentUrl, pageRefusalText, pageViewerPath, projectKeys, refusalText,
   taskFromRefusal, taskRunPath,
 } from './projects.js';
 
@@ -175,6 +175,40 @@ test('asking for a page before framing it answers with a value, and a refusal ke
     const unreachable = await checkPageDocument('prj_1', 'pg_1').then(() => null, (error: unknown) => error) as { status?: number; message?: string } | null;
     assert.equal(unreachable?.status, 0);
     assert.match(unreachable?.message ?? '', /restarting or unavailable/);
+  } finally {
+    globalThis.fetch = real;
+    if (hadWindow) scope.window = realWindow; else delete scope.window;
+  }
+});
+
+test('a saved-file card looks for its page only when the file is a page, and keeps quiet when there is none', async () => {
+  assert.deepEqual(['index.html', 'Report.HTM', ' page.html '].map(isPageName), [true, true, true]);
+  assert.deepEqual(['data.json', 'notes.html.bak', '', null, undefined].map(isPageName), [false, false, false, false, false]);
+  const asked: string[] = [];
+  const real = globalThis.fetch;
+  const scope = globalThis as unknown as { window?: unknown };
+  const hadWindow = 'window' in scope;
+  const realWindow = scope.window;
+  scope.window = { __CLEM_BOOTSTRAP__: { token: 'fixture-token' } };
+  try {
+    globalThis.fetch = (async (input: unknown) => {
+      asked.push(String(input));
+      return new Response(JSON.stringify({ projectId: 'prj_1', page: {
+        id: 'pg_1', name: 'index.html', folder: 'harbor brief', relativePath: 'harbor brief/index.html',
+        localProject: { name: 'audits', path: '/srv/o/audits' }, madeAt: '2026-09-29T10:00:00.000Z', sessionId: 'sess-1',
+      } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    const found = await findSessionPage('sess-1', 'index.html', 'harbor brief');
+    assert.deepEqual([found?.projectId, found?.page.id, found?.page.folder], ['prj_1', 'pg_1', 'harbor brief']);
+    assert.match(asked[0]!, /\/api\/console\/sessions\/sess-1\/page\?name=index\.html&folder=harbor%20brief/);
+    assert.equal(await findSessionPage('sess-1', 'data.json', 'x'), null, 'a file that is not a page asks nothing');
+    assert.equal(await findSessionPage('', 'index.html', 'x'), null);
+    assert.equal(asked.length, 1);
+
+    globalThis.fetch = (async () => new Response(JSON.stringify({ error: 'PAGE_NOT_FOUND' }), { status: 404, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+    assert.equal(await findSessionPage('sess-1', 'index.html', 'gone'), null);
+    globalThis.fetch = (async () => new Response(JSON.stringify({ projectId: 'prj_1', page: { name: 'no id' } }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+    assert.equal(await findSessionPage('sess-1', 'index.html', 'odd'), null, 'an answer this build cannot read is no page');
   } finally {
     globalThis.fetch = real;
     if (hadWindow) scope.window = realWindow; else delete scope.window;

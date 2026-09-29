@@ -19,7 +19,7 @@ import path from 'node:path';
 import { inflateSync } from 'node:zlib';
 import { listFileDeliverablesUnder } from '../memory/deliverable-index.js';
 import { isSensitivePath } from '../runtime/security.js';
-import { getProject, listResources } from './project-record.js';
+import { getProject, listProjects, listResources } from './project-record.js';
 
 const PAGE_EXTENSIONS = new Set(['.html', '.htm']);
 const MOST_PAGES = 50;
@@ -111,6 +111,41 @@ function found(projectId: string): FoundPage[] {
 /** The pages made in a project, newest first. */
 export function pagesMadeInProject(projectId: string): ProjectPageView[] {
   try { return found(projectId).map((page) => page.view); } catch { return []; }
+}
+
+/**
+ * The page a conversation or task wrote, by the name its saved-file card
+ * shows: the file's name and the folder it lies in. Found only among pages
+ * the record says THAT session wrote, in a project that is still active and
+ * still links the folder. More than one match is no match: a card never opens
+ * the wrong page.
+ */
+export function pageMadeBySession(
+  sessionId: string | null | undefined,
+  name: string | null | undefined,
+  folder?: string | null,
+): { projectId: string; page: ProjectPageView } | null {
+  const session = String(sessionId ?? '').trim();
+  const wanted = String(name ?? '').trim();
+  const within = String(folder ?? '').trim();
+  if (!session || !wanted) return null;
+  const matches: Array<{ projectId: string; page: ProjectPageView }> = [];
+  const seen = new Set<string>();
+  try {
+    for (const project of listProjects({ includeArchived: false }).slice(0, 100)) {
+      for (const page of pagesMadeInProject(project.id)) {
+        if (page.sessionId !== session || page.name !== wanted || (within && page.folder !== within)) continue;
+        // Two projects may link the same folder: the page is one page.
+        const key = `${page.localProject.path}\n${page.relativePath}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        matches.push({ projectId: project.id, page });
+      }
+    }
+  } catch {
+    return null;
+  }
+  return matches.length === 1 ? matches[0]! : null;
 }
 
 export type ProjectPageRead =

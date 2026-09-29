@@ -183,6 +183,33 @@ test('a page is found again each time it is read', () => {
   assert.deepEqual(pages.pageOfProject(id, page.id), { ok: false, reason: 'not_found' });
 });
 
+test('a saved-file card finds its page by the session that wrote it, and never the wrong one', async () => {
+  const id = project('Pages By Session');
+  link(id, path.join(WORK, 'by-session'));
+  made(write('by-session/one-brief/index.html'), '2026-09-29T15:00:00.000Z', 'sess-writer');
+  made(write('by-session/two-brief/index.html'), '2026-09-29T15:01:00.000Z', 'sess-writer');
+  made(write('by-session/other-brief/index.html'), '2026-09-29T15:02:00.000Z', 'sess-other');
+  const one = pages.pageMadeBySession('sess-writer', 'index.html', 'one-brief');
+  assert.deepEqual([one?.projectId, one?.page.relativePath], [id, 'one-brief/index.html']);
+  assert.equal(pages.pageMadeBySession('sess-writer', 'index.html'), null, 'two pages of one name are no match without the folder');
+  assert.equal(pages.pageMadeBySession('sess-writer', 'index.html', 'other-brief'), null, 'another session\u2019s page is not this card\u2019s page');
+  assert.equal(pages.pageMadeBySession('sess-nobody', 'index.html', 'one-brief'), null);
+  assert.equal(pages.pageMadeBySession('', 'index.html', 'one-brief'), null);
+  assert.equal(pages.pageMadeBySession('sess-writer', '', 'one-brief'), null);
+  // A second project linking the same folder shows the same page, once.
+  const second = project('Pages By Session Again');
+  link(second, path.join(WORK, 'by-session'));
+  assert.equal(pages.pageMadeBySession('sess-writer', 'index.html', 'one-brief')?.page.relativePath, 'one-brief/index.html');
+
+  const desktop = surface('console');
+  const phone = surface('phone');
+  const answer = await desktop('get', '/s/sess-writer/page?name=index.html&folder=two-brief');
+  assert.deepEqual([answer.status, answer.body.page.folder], [200, 'two-brief']);
+  assert.deepEqual((await phone('get', '/s/sess-writer/page?name=index.html&folder=two-brief')).body, answer.body);
+  const none = await desktop('get', '/s/sess-writer/page?name=index.html&folder=missing');
+  assert.deepEqual([none.status, none.body.error], [404, 'PAGE_NOT_FOUND']);
+});
+
 test('a framed page has no origin and can call nothing', () => {
   const policy = pages.localPageContentPolicy();
   const directive = (name: string) => policy.split('; ').find((part) => part.startsWith(`${name} `) || part === name) ?? '';
