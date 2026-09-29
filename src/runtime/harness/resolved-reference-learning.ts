@@ -45,6 +45,7 @@ import { judgeEvidenceJsonValue } from './judge-evidence-tools.js';
 import { scanSecrets } from './guardrails.js';
 import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
 import { findActiveFactsByContentPrefix, rememberFact, supersedeFact } from '../../memory/facts.js';
+import { personApprovalForCall } from './approved-call-evidence.js';
 
 export interface SettledCall {
   tool: string;
@@ -370,7 +371,8 @@ export async function learnResolvedReferencesForAcceptedTask(input: {
     readName: dependencies.readName
       ?? ((question) => nameResolvedValueWithJev({ ...question, request }, { sessionId: input.sessionId })
         .then((reading) => (reading.failedOpen ? null : reading))),
-    ...(dependencies.ownerApproved ? { ownerApproved: dependencies.ownerApproved } : {}),
+    ownerApproved: dependencies.ownerApproved
+      ?? (({ call, value }) => personApprovalForCall({ ...input, callId: call.callId, value })),
   });
   let learned = 0;
   let superseded = 0;
