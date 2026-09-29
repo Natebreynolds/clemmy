@@ -175,6 +175,26 @@ function currentOperationCandidates(
   });
 }
 
+/** Of the current candidates for one operation, the one whose manifest was
+ * issued last; the manifest id settles a tie so the answer never depends on
+ * the order they were registered in. */
+function lastIssuedCandidate(
+  factory: HostCapabilityCatalogFactory,
+  operationId: string,
+): CanonicalCatalogIdentityV1 | undefined {
+  const dated = factory.snapshot().flatMap((entry) => {
+    if (!entry.manifest || !currentCapabilityManifest(entry.manifest)) return [];
+    const identity = canonicalCatalogIdentityOf(entry);
+    if (identity?.operationId !== operationId) return [];
+    const issuedAt = Date.parse(String(entry.manifest.provenance?.issuedAt ?? ''));
+    return [{ identity, issuedAt: Number.isFinite(issuedAt) ? issuedAt : 0 }];
+  });
+  dated.sort((left, right) => (
+    right.issuedAt - left.issuedAt || right.identity.manifestId.localeCompare(left.identity.manifestId)
+  ));
+  return dated[0]?.identity;
+}
+
 /**
  * Re-materialize only the exact durable manifests for one saved operation.
  *
@@ -448,13 +468,22 @@ export function compileLiveCatalogWorkflowCallPlan(input: {
       };
     }
   } else if (accountChoiceSet.total > 1) {
-    return {
-      ok: false,
-      recoverable: true,
-      reason: 'ambiguous-account',
-      message: `${accountChoiceSet.total} accounts are registered for "${input.operationId}"; choose the exact account before this workflow can dispatch.`,
-      accountChoiceSet,
-    };
+    // Several current capabilities for ONE account are that account seen more
+    // than once: each time a conversation discloses the operation it is
+    // registered again. There is nothing for the owner to choose between, so
+    // the one issued last is used. A choice is asked for only when the
+    // accounts themselves differ.
+    const accounts = new Set(candidates.map((candidate) => candidate.account));
+    if (accounts.size > 1) {
+      return {
+        ok: false,
+        recoverable: true,
+        reason: 'ambiguous-account',
+        message: `${accounts.size} accounts are registered for "${input.operationId}"; choose the exact account before this workflow can dispatch.`,
+        accountChoiceSet,
+      };
+    }
+    identity = lastIssuedCandidate(factory, input.operationId) ?? candidates[candidates.length - 1];
   } else {
     identity = candidates[0];
   }

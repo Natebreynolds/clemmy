@@ -284,6 +284,47 @@ test('revalidation preserves the existing multiple-account ambiguity refusal', (
   assert.equal(selectedB.plan.binding.accountId, 'account-b');
 });
 
+test('one account registered more than once is one account: nothing is asked and the last issued is used', () => {
+  const operationId = 'GENERIC_REPEATED_QUERY';
+  // The same operation for the same account, disclosed three times.
+  const manifests = ['2026-08-27T00:00:00.000Z', '2026-08-29T00:00:00.000Z', '2026-08-28T00:00:00.000Z'].map((issuedAt, index) => ({
+    ...manifestFor({ operationId, manifestId: `cap:generic-repeated-query:seen-${index}`, accountId: 'host-account' }),
+    provenance: { issuer: 'workflow-catalog-handoff-test', issuedAt, trusted: true },
+  }));
+  const store = manifestStores.createCapabilityManifestStore(manifests);
+  manifestStores.installCapabilityManifestStore(store);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  for (const manifest of manifests) {
+    const observe = () => ({
+      definitionFingerprint: manifest.definitionFingerprint,
+      providerVersion: manifest.providerVersion,
+      operationVersion: manifest.operationVersion,
+      accountId: manifest.accountId,
+      observedAt: Date.now(),
+    });
+    assert.equal(ports.registerFixtureCapabilityPort(
+      ports.productionPortIdentityFromManifest(manifest),
+      { observe, invoke: async () => ({ data: { value: [] } }) },
+    ).ok, true);
+  }
+  adapters.installProductionCapabilityAdapter(adapters.createProductionCapabilityAdapter({ factory, store }));
+
+  const result = compiler.compileLiveCatalogWorkflowCallPlan({
+    ownerId: 'scheduled-workflow',
+    nodeId: 'read_records',
+    operationId,
+    args: { scope: 'newest' },
+    expectedEffect: 'read',
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (!result.ok) assert.fail(result.message);
+  assert.equal(factory.snapshot().length, 3, 'all three were current candidates');
+  assert.equal(result.identity.account, 'host-account');
+  assert.equal(result.identity.capabilityId, 'cap:generic-repeated-query:seen-1', 'the one issued last, whatever order they were registered in');
+  assert.equal(result.plan.binding.accountId, 'host-account');
+});
+
 for (const effect of ['read', 'external_write'] as const) {
   test(`a prepared ${effect} catalog does not confuse read creation tests with write grants`, async (t) => {
     let modelEntries = 0;
