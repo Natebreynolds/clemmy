@@ -8,6 +8,7 @@
  */
 import type { ActivityItem } from './types.js';
 import { MODEL_PHASE_ACTIVITY_ID } from './reduce-activity.js';
+import { threadChanges } from './thread-marks.js';
 
 export interface AgentAttributed {
   role: 'user' | 'assistant';
@@ -42,25 +43,9 @@ export function agentThreadMarks(
   messages: readonly AgentAttributed[],
   fallback: string | null = null,
 ): AgentThreadMark[] {
-  const known = messages.map(messageAgent);
-  const firstKnown = known.find((agent) => agent !== undefined);
-  let current: string | null = firstKnown === undefined ? fallback : firstKnown;
-  const marks: AgentThreadMark[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    const agent = known[i];
-    if (agent !== undefined && agent !== current) {
-      // The reply names the change but the question before it did not: the
-      // line belongs above that question.
-      const at = messages[i].role === 'assistant' && i > 0 && messages[i - 1].role === 'user' && known[i - 1] === undefined
-        ? i - 1
-        : i;
-      // null is a speaker (Clem), so keep an existing mark's speaker as is.
-      marks[at] = { speaker: marks[at] ? marks[at].speaker : agent, switchedTo: { name: agent } };
-      current = agent;
-    }
-    marks[i] = { ...marks[i], speaker: current };
-  }
-  return marks;
+  // null is a speaker (Clem), so "does not say" is undefined and nothing else.
+  return threadChanges<string | null>(messages.map((message) => message.role), messages.map(messageAgent), fallback)
+    .map((mark) => ({ speaker: mark.value, ...(mark.changed ? { switchedTo: { name: mark.changed.to } } : {}) }));
 }
 
 /** The words on the line where a conversation moved to another agent. */

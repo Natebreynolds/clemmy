@@ -82,10 +82,12 @@ function upsertModelPhase(
   detail?: string,
   modelName?: string,
   agentName?: string,
+  projectName?: string,
 ): ActivityItem[] {
   const prior = prev.find((row) => row.id === MODEL_PHASE_ACTIVITY_ID);
   const name = modelName || prior?.modelName;
   const agent = agentName || prior?.agentName;
+  const project = projectName || prior?.projectName;
   const row: ActivityItem = {
     id: MODEL_PHASE_ACTIVITY_ID,
     kind: 'event',
@@ -97,6 +99,7 @@ function upsertModelPhase(
     ...(detail ? { detail: detail.slice(0, 64) } : prior?.detail ? { detail: prior.detail } : {}),
     ...(name ? { modelName: name } : {}),
     ...(agent ? { agentName: agent } : {}),
+    ...(project ? { projectName: project } : {}),
   };
   // Re-append instead of replacing in place: the final running row is the
   // current phase, so a rescue route or heartbeat cannot sit behind an older
@@ -151,7 +154,8 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
           : `Switching to ${identity || 'a backup brain'}…`
         : `Thinking with ${identity || 'your selected brain'}…`;
       const agentName = typeof d.agentName === 'string' ? d.agentName.trim().slice(0, 64) : '';
-      return upsertModelPhase(prev, label, now, identity || undefined, routedModelName(d) || undefined, agentName || undefined);
+      const projectName = typeof d.projectName === 'string' ? d.projectName.trim().slice(0, 80) : '';
+      return upsertModelPhase(prev, label, now, identity || undefined, routedModelName(d) || undefined, agentName || undefined, projectName || undefined);
     }
     // The compiled graph is internal topology. Pinning "Planned: plan · N
     // steps" is generic noise, not work.

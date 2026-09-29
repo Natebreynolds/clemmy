@@ -156,6 +156,8 @@ export interface ActivityItem {
   modelName?: string;
   /** The model-phase row: the saved agent this turn ran as, by its name. */
   agentName?: string;
+  /** The model-phase row: the project this turn worked in, by its name. */
+  projectName?: string;
   /** kind 'agent' rows: the kind of work the brain handed this helper, in
    *  the brain's own words, when it named one. */
   helperFor?: string;
