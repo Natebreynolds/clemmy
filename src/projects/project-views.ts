@@ -165,8 +165,10 @@ function assignmentView(row: ProjectAssignment): AssignmentView {
   const same = Boolean(agent) && !(row.agentCreatedAt && agent!.createdAt && row.agentCreatedAt !== agent!.createdAt);
   return {
     agentId: row.agentId,
-    agentName: agent?.name ?? row.agentId,
-    handles: agent?.handles ?? '',
+    // The agent as it is now when it is still the one assigned; otherwise
+    // the name the assignment was made with, never another agent's.
+    agentName: (same ? agent!.name : row.agentName) || row.agentId,
+    handles: same ? agent!.handles ?? '' : '',
     available: same,
     responsibility: row.responsibility,
     context: row.context,
@@ -214,6 +216,8 @@ export function conversationsForProject(projectId: string, limit = 20): ProjectC
 
 export interface ProjectDecisionView {
   kind: 'question' | 'approval';
+  /** For a question: the answers it offered, when it offered any. */
+  options: string[];
   /** For an approval: whether it is decided on a card. One that was asked in
    * the conversation's own words is answered there, never from a card. */
   formal: boolean;
@@ -240,6 +244,7 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
     sessions.set(task.runSessionId, { taskId: task.id, owner, title: task.title });
     if (task.status === 'awaiting_input' && task.pendingQuestionId && task.pendingQuestion) {
       decisions.push({ kind: 'question', taskId: task.id, sessionId: task.originSessionId ?? task.runSessionId,
+        options: (task.pendingQuestionOptions ?? []).slice(0, 8),
         formal: true, approvalId: null, questionId: task.pendingQuestionId, title: task.title,
         detail: task.pendingQuestion.slice(0, 600), owner, askedAt: task.updatedAt });
     }
@@ -256,9 +261,9 @@ export function decisionsForProject(projectId: string, limit = 12): ProjectDecis
       // one asked in the conversation's own words, only the question.
       const shown = approvalRegistry.projectPendingApprovalUserDependency(approval);
       decisions.push(shown.kind === 'approval'
-        ? { kind: 'approval', formal: true, taskId: from.taskId, sessionId: approval.sessionId, approvalId: shown.approvalId,
+        ? { kind: 'approval', options: [], formal: true, taskId: from.taskId, sessionId: approval.sessionId, approvalId: shown.approvalId,
           questionId: null, title: from.title, detail: approval.subject.slice(0, 600), owner: from.owner, askedAt: approval.requestedAt }
-        : { kind: 'approval', formal: false, taskId: from.taskId, sessionId: approval.sessionId, approvalId: null,
+        : { kind: 'approval', options: [], formal: false, taskId: from.taskId, sessionId: approval.sessionId, approvalId: null,
           questionId: null, title: from.title, detail: shown.question.slice(0, 600), owner: from.owner, askedAt: approval.requestedAt });
     }
   } catch { /* the registry is read elsewhere too; a project view never fails on it */ }

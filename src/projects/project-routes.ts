@@ -150,6 +150,7 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
     const saved = saveAssignment(param(req, 'id'), {
       agentId: agent.id,
       agentCreatedAt: agent.createdAt,
+      agentName: agent.name,
       ...(typeof input.responsibility === 'string' ? { responsibility: input.responsibility } : {}),
       ...(typeof input.context === 'string' ? { context: input.context } : {}),
       ...(Array.isArray(input.skills) ? { skills: strings(input.skills) } : {}),

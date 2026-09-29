@@ -84,6 +84,9 @@ export interface ProjectAssignment {
   /** When the agent record assigned was created. An agent id is a name's
    * slug; a different agent later saved under the same name is not this one. */
   agentCreatedAt: string | null;
+  /** The agent's name when it was assigned or last seen, so an assignment
+   * whose agent is gone can still say who it was. */
+  agentName: string;
   /** What this agent answers for in this project. */
   responsibility: string;
   /** Context that applies to this agent in this project and nowhere else. */
@@ -106,6 +109,7 @@ export interface ProjectAssignment {
 export interface AssignmentDraft {
   agentId: string;
   agentCreatedAt?: string | null;
+  agentName?: string;
   responsibility?: string;
   context?: string;
   skills?: readonly string[];
@@ -224,6 +228,7 @@ function migrate(conn: Database.Database): void {
           project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
           agent_id         TEXT NOT NULL,
           agent_created_at TEXT,
+          agent_name       TEXT NOT NULL DEFAULT '',
           responsibility   TEXT NOT NULL DEFAULT '',
           context          TEXT NOT NULL DEFAULT '',
           skills_json      TEXT NOT NULL DEFAULT '[]',
@@ -347,14 +352,15 @@ function toProject(row: RawProject): ProjectRecord {
 }
 
 interface RawAssignment {
-  project_id: string; agent_id: string; agent_created_at: string | null; responsibility: string; context: string;
+  project_id: string; agent_id: string; agent_created_at: string | null; agent_name: string;
+  responsibility: string; context: string;
   skills_json: string; share_methods: number; state: 'active' | 'removed'; revision: number;
   assigned_at: string; updated_at: string;
 }
 
 function toAssignment(row: RawAssignment): ProjectAssignment {
   return {
-    projectId: row.project_id, agentId: row.agent_id, agentCreatedAt: row.agent_created_at,
+    projectId: row.project_id, agentId: row.agent_id, agentCreatedAt: row.agent_created_at, agentName: row.agent_name,
     responsibility: row.responsibility, context: row.context, skills: parseList(row.skills_json),
     shareMethods: row.share_methods === 1, state: row.state, revision: row.revision,
     assignedAt: row.assigned_at, updatedAt: row.updated_at,
@@ -525,6 +531,7 @@ export function saveAssignment(projectId: string, draft: AssignmentDraft): SaveA
     const sameAgent = existing && existing.state === 'active'
       && (existing.agent_created_at ?? null) === agentCreatedAt;
     const base = sameAgent ? toAssignment(existing) : null;
+    const agentName = draft.agentName === undefined ? base?.agentName ?? '' : cleanLine(draft.agentName, 120);
     const next = {
       responsibility: draft.responsibility === undefined
         ? base?.responsibility ?? '' : clean(draft.responsibility, MAX_ASSIGNMENT_RESPONSIBILITY_CHARS),
@@ -532,24 +539,24 @@ export function saveAssignment(projectId: string, draft: AssignmentDraft): SaveA
       skills: draft.skills === undefined ? base?.skills ?? [] : boundedList(draft.skills, MAX_ASSIGNMENT_SKILLS, 120),
       shareMethods: draft.shareMethods === undefined ? base?.shareMethods ?? false : draft.shareMethods === true,
     };
-    if (base && next.responsibility === base.responsibility && next.context === base.context
+    if (base && agentName === base.agentName && next.responsibility === base.responsibility && next.context === base.context
       && next.shareMethods === base.shareMethods && JSON.stringify(next.skills) === JSON.stringify(base.skills)) {
       return { ok: true, assignment: base, created: false };
     }
     if (existing) {
       conn.prepare(`
-        UPDATE project_agents SET agent_created_at = ?, responsibility = ?, context = ?, skills_json = ?,
+        UPDATE project_agents SET agent_created_at = ?, agent_name = ?, responsibility = ?, context = ?, skills_json = ?,
           share_methods = ?, state = 'active', revision = revision + 1,
           assigned_at = CASE WHEN ? THEN assigned_at ELSE ? END, updated_at = ?
         WHERE project_id = ? AND agent_id = ?
-      `).run(agentCreatedAt, next.responsibility, next.context, JSON.stringify(next.skills),
+      `).run(agentCreatedAt, agentName, next.responsibility, next.context, JSON.stringify(next.skills),
         next.shareMethods ? 1 : 0, sameAgent ? 1 : 0, at, at, projectId, agentId);
     } else {
       conn.prepare(`
-        INSERT INTO project_agents (project_id, agent_id, agent_created_at, responsibility, context, skills_json,
+        INSERT INTO project_agents (project_id, agent_id, agent_created_at, agent_name, responsibility, context, skills_json,
           share_methods, state, revision, assigned_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)
-      `).run(projectId, agentId, agentCreatedAt, next.responsibility, next.context, JSON.stringify(next.skills),
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)
+      `).run(projectId, agentId, agentCreatedAt, agentName, next.responsibility, next.context, JSON.stringify(next.skills),
         next.shareMethods ? 1 : 0, at, at);
     }
     conn.prepare('UPDATE projects SET updated_at = ? WHERE id = ?').run(at, projectId);

@@ -136,8 +136,8 @@ test('a project made on the desktop is the same project on the phone, with the s
   // It asks; the project shows one decision; answered on the phone, settled on the desktop.
   tasks.markBackgroundTaskAwaitingInput(task.id, 'q-region', 'Which region should the briefing cover?', { options: ['East', 'West'] });
   const waiting = (await desktop('get', `/api/console/project-records/${id}`)).body.overview;
-  assert.deepEqual(waiting.decisions.map((row: any) => [row.kind, row.taskId, row.detail, row.owner]),
-    [['question', task.id, 'Which region should the briefing cover?', 'Route Analyst']]);
+  assert.deepEqual(waiting.decisions.map((row: any) => [row.kind, row.taskId, row.detail, row.owner, row.options]),
+    [['question', task.id, 'Which region should the briefing cover?', 'Route Analyst', ['East', 'West']]]);
   assert.equal((await phone('get', '/api/project-records')).body.projects.find((row: any) => row.id === id).needsYou, 1);
   assert.equal((await desktop('post', `/api/console/delegated-tasks/${task.id}/answer`, { answer: ' ' })).status, 400);
   const answered = await phone('post', `/api/delegated-tasks/${task.id}/answer`, { answer: 'East' });
@@ -184,6 +184,18 @@ test('a project made on the desktop is the same project on the phone, with the s
   const other = createSession({ id: 'route-chat-2', kind: 'chat' });
   assert.deepEqual((await phone('post', `/api/chat/sessions/${other.id}/project`, { projectId: id })).body, { error: 'PROJECT_ARCHIVED' });
   void getSession;
+});
+
+test('an assignment whose agent is gone still says who it was, and says it is unavailable', async () => {
+  const { deleteAgentRecord } = await import('../agents/agent-record.js');
+  const temp = createAgentRecord({ name: 'Departing Clerk', handles: 'Filing.', createdFrom: 'console' });
+  if (!temp.ok) throw new Error('fixture agent');
+  const made = await desktop('post', '/api/console/project-records', { name: 'Route Archive Room' });
+  const id = made.body.overview.project.id as string;
+  assert.equal((await desktop('post', `/api/console/project-records/${id}/agents/${temp.agent.id}`, { responsibility: 'Files the records.' })).status, 200);
+  assert.equal(deleteAgentRecord(temp.agent.id), true);
+  assert.deepEqual((await phone('get', `/api/project-records/${id}`)).body.overview.agents.map((row: any) => [row.agentName, row.available, row.responsibility]),
+    [['Departing Clerk', false, 'Files the records.']]);
 });
 
 test('a task nobody delegated is not a delegated task on any surface', async () => {

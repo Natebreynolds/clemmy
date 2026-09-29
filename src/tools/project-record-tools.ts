@@ -196,7 +196,7 @@ export function registerProjectRecordTools(server: McpServer): void {
         }
         const missing = (entry.skills ?? []).filter((skill) => !loadSkill(skill));
         const saved = saveAssignment(record.id, {
-          agentId: agent.id, agentCreatedAt: agent.createdAt,
+          agentId: agent.id, agentCreatedAt: agent.createdAt, agentName: agent.name,
           ...(typeof entry.responsibility === 'string' ? { responsibility: entry.responsibility } : {}),
           ...(typeof entry.context === 'string' ? { context: entry.context } : {}),
           ...(Array.isArray(entry.skills) ? { skills: entry.skills.filter((skill) => !missing.includes(skill)) } : {}),
