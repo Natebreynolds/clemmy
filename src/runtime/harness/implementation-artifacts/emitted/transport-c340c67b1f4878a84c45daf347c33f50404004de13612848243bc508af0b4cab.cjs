@@ -37,7 +37,8 @@ __export(transport_entry_exports, {
   prepareAttestedComposioDispatch: () => prepareAttestedComposioDispatch,
   reconcileAttestedTransport: () => reconcileAttestedTransport,
   refreshAttestedTransportObservation: () => refreshAttestedTransportObservation,
-  registerIsolatedObservation: () => registerIsolatedObservation
+  registerIsolatedObservation: () => registerIsolatedObservation,
+  resolveConnectedAccount: () => resolveConnectedAccount
 });
 module.exports = __toCommonJS(transport_entry_exports);
 var import_node_module = require("node:module");
@@ -350,11 +351,45 @@ function fingerprintComposioProviderDefinition(input) {
   }), "utf8").digest("hex");
 }
 
+// src/spaces/workspace-script-contract.ts
+var import_zod = require("zod");
+var digest = import_zod.z.string().regex(/^[a-f0-9]{64}$/);
+var WORKSPACE_SCRIPT_PARAMETERS = {
+  slug: import_zod.z.string().regex(/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/),
+  source_id: import_zod.z.string().min(1).max(256),
+  source_digest: digest,
+  script_sha256: digest,
+  occurrence_id: import_zod.z.string().min(1).max(128),
+  cause: import_zod.z.enum(["manual", "scheduled"])
+};
+var workspaceScriptArguments = import_zod.z.strictObject(WORKSPACE_SCRIPT_PARAMETERS);
+
+// src/tools/local-file-read-contract.ts
+var import_zod2 = require("zod");
+var READ_FILE_PARAMS = {
+  path: import_zod2.z.string().min(1),
+  max_chars: import_zod2.z.number().int().min(1).nullable()
+};
+
 // src/runtime/harness/reviewed-local-tool-transport.ts
-var import_zod4 = require("zod");
+var import_zod7 = require("zod");
+
+// src/tools/local-file-write-contract.ts
+var import_zod3 = require("zod");
+var WRITE_FILE_PARAMS = {
+  path: import_zod3.z.string().min(1),
+  content: import_zod3.z.string(),
+  mode: import_zod3.z.enum(["create", "append", "overwrite"]).nullable(),
+  // Chunked-by-construction: append:true appends (creating if absent) — the
+  // continuation call for a large file. append:false starts the file fresh
+  // (overwrite). Omitted/null → fall back to `mode` (backward compatible — a
+  // caller that never sends `append` behaves exactly as before, so it is OPTIONAL,
+  // unlike the always-present `mode`).
+  append: import_zod3.z.boolean().nullable().optional()
+};
 
 // src/runtime/schema-normalizer.ts
-var import_zod = require("zod");
+var import_zod4 = require("zod");
 function withDescription(source, target) {
   return source.description ? target.describe(source.description) : target;
 }
@@ -382,25 +417,25 @@ function normalizeZodForDeferredJson(schema) {
           normalizeZodForDeferredJson(value)
         ])
       );
-      return withDescription(schema, import_zod.z.strictObject(normalizedShape));
+      return withDescription(schema, import_zod4.z.strictObject(normalizedShape));
     }
     case "array":
-      return withDescription(schema, import_zod.z.array(normalizeZodForDeferredJson(def.element)));
+      return withDescription(schema, import_zod4.z.array(normalizeZodForDeferredJson(def.element)));
     case "record": {
-      const keyType = def.keyType ?? import_zod.z.string();
-      const valueType = def.valueType ? normalizeZodForDeferredJson(def.valueType) : import_zod.z.json();
-      return withDescription(schema, import_zod.z.record(keyType, valueType));
+      const keyType = def.keyType ?? import_zod4.z.string();
+      const valueType = def.valueType ? normalizeZodForDeferredJson(def.valueType) : import_zod4.z.json();
+      return withDescription(schema, import_zod4.z.record(keyType, valueType));
     }
     case "any":
     case "unknown":
-      return withDescription(schema, import_zod.z.json());
+      return withDescription(schema, import_zod4.z.json());
     case "union": {
       const options = Array.isArray(def.options) ? def.options.map((item) => normalizeZodForDeferredJson(item)) : [];
-      if (options.length === 0) return withDescription(schema, import_zod.z.string());
+      if (options.length === 0) return withDescription(schema, import_zod4.z.string());
       if (options.length === 1) return withDescription(schema, options[0]);
       return withDescription(
         schema,
-        import_zod.z.union(options)
+        import_zod4.z.union(options)
       );
     }
     default:
@@ -425,6 +460,12 @@ function jsonSchemaAllowsNull(schemaValue) {
   }
   return false;
 }
+var ADVERTISED_FORMAT_EQUIVALENT_PATTERNS = new Map(
+  [import_zod4.z.string().datetime({ offset: true }), import_zod4.z.string().date()].flatMap((schema) => {
+    const advertised = import_zod4.z.toJSONSchema(schema);
+    return typeof advertised.format === "string" && typeof advertised.pattern === "string" ? [[advertised.format, advertised.pattern]] : [];
+  })
+);
 function relaxJsonSchemaForDeferred(schemaValue) {
   if (Array.isArray(schemaValue)) return schemaValue.map(relaxJsonSchemaForDeferred);
   if (!schemaValue || typeof schemaValue !== "object") return schemaValue;
@@ -983,6 +1024,24 @@ function currentCapabilityManifest(manifest) {
 }
 
 // src/tools/tool-registry.ts
+function cliSetupSemantics(action) {
+  return {
+    consequence: "runtime_configuration",
+    reversibility: "irreversible",
+    destructive: false,
+    purpose: `cli_${action}`,
+    inputKind: "cli_configuration_request",
+    outputKind: "cli_job_receipt",
+    deliverableKind: "cli_configuration",
+    destinationPosture: "named_existing",
+    advisoryRoles: ["configure", "repair"],
+    safeMode: {
+      id: action,
+      requiredEquals: { action },
+      absentOrNull: action === "auth" ? ["command", "saveAs", "jobId", "repairId", "values"] : action === "repair" ? ["command", "saveAs", "jobId"] : ["jobId", "repairId", "values"]
+    }
+  };
+}
 var TOOL_REGISTRY = [
   { name: "agent_propose", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", description: "Draft a reusable team-agent proposal for user review." },
   { name: "agent_run_get", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", actionControlContext: "task_recovery", description: "Fetch the full event timeline of a single autonomy cycle by runId." },
@@ -993,13 +1052,13 @@ var TOOL_REGISTRY = [
   { name: "automation_opportunity_get", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Read one inert automation opportunity proposal by its exact ID." },
   { name: "automation_opportunity_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "List inert automation opportunity proposals for review." },
   { name: "automation_opportunity_propose", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Persist an inert, reviewable automation opportunity without granting execution authority." },
-  { name: "automation_opportunity_revise", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Revise an inert automation opportunity without granting execution authority." },
-  { name: "automation_opportunity_review_request", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Stage an exact proposal CAS and formal human decision card without granting execution authority." },
+  { name: "automation_opportunity_revise", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Revise an inert automation opportunity without granting execution authority." },
+  { name: "automation_opportunity_review_request", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Stage an exact proposal CAS and formal human decision card without granting execution authority." },
   { name: "automation_read_pilot_acquisition_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", blockedFor: ["workflow-step", "worker"], loopClass: "idempotent", actionTopologyRole: "control", description: "List exact host-issued live read acquisition references without granting authority." },
-  { name: "automation_read_pilot_request", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Create an exact one-read pilot projection and its formal approval card." },
-  { name: "automation_read_pilot_workspace_create_request", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Stage an exact local Workspace manifest and formal human creation card without granting workflow authority." },
+  { name: "automation_read_pilot_request", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Create an exact one-read pilot projection and its formal approval card." },
+  { name: "automation_read_pilot_workspace_create_request", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Stage an exact local Workspace manifest and formal human creation card without granting workflow authority." },
   { name: "automation_read_pilot_workspace_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", blockedFor: ["workflow-step", "worker"], loopClass: "idempotent", actionTopologyRole: "control", description: "List exact current Workspace revisions without selecting or binding one." },
-  { name: "automation_recurrence_request", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Stage a disabled interval preview and formal recurrence-consent card from one exact clean pilot." },
+  { name: "automation_recurrence_request", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Stage a disabled interval preview and formal recurrence-consent card from one exact clean pilot." },
   // The background-task family is control-plane (task-lifecycle coordination,
   // same family as run_worker/execution_create) — the default business role
   // made a plain status read on an act-authority turn a turn-killing 500
@@ -1016,10 +1075,20 @@ var TOOL_REGISTRY = [
   // sideEffect 'write' = documented default-ask, but needsApproval is FALSE: the
   // runtime gate keys on the INNER tool (dispatchBatchItemTool), not call_tool.
   { name: "call_tool", sideEffect: "write", tier: "core", lanes: [], needsApproval: false, description: "Invoke a catalog-only built-in tool by name with a JSON args string; effects and gates key on the inner tool." },
-  { name: "check_in", sideEffect: "read", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", blockedFor: ["worker"], actionTopologyRole: "control", description: "Tell the user what you found or what you are doing, mid-task, without stopping. Lands in the conversation so they can read it whenever they come back." },
+  { name: "check_in", sideEffect: "read", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", blockedFor: ["worker"], actionTopologyRole: "control", desk: { rung: "full", promotedBy: ["long_work", "delegation"], purpose: "post a progress note without stopping" }, description: "Tell the user what you found or what you are doing, mid-task, without stopping. Lands in the conversation so they can read it whenever they come back." },
   { name: "check_capability", sideEffect: "read", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", delegationPrimitive: true, description: "Check whether a CLI / binary is available on this machine." },
-  { name: "cli_setup", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], loopClass: "mutating", blockedFor: ["workflow-step", "worker"], delegationPrimitive: true, description: "Install or re-authenticate a local CLI via the approved runners: status | install | auth | job_status. Ask the user before install/auth." },
-  { name: "project_run", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], loopClass: "mutating", blockedFor: ["workflow-step", "worker"], delegationPrimitive: true, description: "Inspect or stop historical Claude Code / Codex guest runs: status | runs | kill. start is unavailable until a durable delegated-execution root owns the child effects and receipt." },
+  { name: "cli_inspect", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", loopClass: "idempotent", description: "Inspect connected CLI health, signed-in account and its public connection origin (instance URL / hostname), declared repairs, or a managed CLI job. Read-only; never starts login, installation, or repair." },
+  { name: "cli_setup", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], loopClass: "mutating", blockedFor: ["workflow-step", "worker"], delegationPrimitive: true, localPlanning: cliSetupSemantics("auth"), localPlanningVariants: [cliSetupSemantics("install"), cliSetupSemantics("repair")], description: "Install, re-authenticate, or REPAIR a local CLI via the approved runners: status | install | auth | repairs | repair | job_status. Repairs fix a tool's own configuration \u2014 for example a CLI that is signed in but has no default org, account, project or app selected, so every command fails. Ask the user before install/auth; run a declared repair once they agree." },
+  { name: "project_get", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Read one project: purpose, goals, context, assigned agents, bound accounts and resources, delegated tasks." },
+  { name: "project_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "List the owner's projects (ongoing bodies of work, not code folders) and who is assigned to each." },
+  { name: "project_run", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], loopClass: "mutating", blockedFor: ["workflow-step", "worker"], delegationPrimitive: true, description: "Inspect or stop coding runs in the user's local projects: status | runs | kill. New runs start with dispatch_coding_task." },
+  // A project is the host's own record of how the owner's work is organised:
+  // it grants no authority and crosses no boundary, like a focus or a memory.
+  // Handing the owner's correction to the task that owns the work writes the
+  // host's own task record. What the task then does passes every gate a task
+  // passes.
+  { name: "delegated_task_correct", sideEffect: "read", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Give the owner's change or correction to a delegated task; its own agent applies it." },
+  { name: "project_save", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", description: "Create or change a project: purpose, goals, context, the agents assigned to it, and the accounts and resources it uses." },
   { name: "check_delegation", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Check a delegated task by ID or list delegations for an agent." },
   { name: "composio_execute_tool", sideEffect: "send", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", loopClass: "mutating", description: "Execute any Composio action by exact slug (Outlook list-mail, Gmail search, Drive search,\u2026" },
   { name: "composio_list_tools", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "agentic", loopClass: "idempotent", cacheSafeRead: true, actionTopologyRole: "control", description: "List available Composio tools for one connected toolkit slug, such as gmail, slack, notio\u2026" },
@@ -1036,6 +1105,7 @@ var TOOL_REGISTRY = [
   { name: "desktop_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator"], actionTopologyRole: "control", description: "Read-only status for the locally installed Clementine desktop app, including installed bu\u2026" },
   { name: "discover_work", sideEffect: "read", tier: "discoverable", lanes: ["cli"], loopClass: "idempotent", actionTopologyRole: "control", description: "Scan handoffs, plans, goals, tasks, and inbox items to find prioritized work that should\u2026" },
   { name: "dispatch_background_task", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", delegationPrimitive: true, description: "Hand an AGREED, multi-step task to the reliable background runner (fire-and-forget)." },
+  { name: "dispatch_coding_task", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Hand an AGREED coding task to Claude Code working in its own worktree and branch of a local git project; Clem verifies the work and reports back." },
   { name: "draft_plan", sideEffect: "read", tier: "core", lanes: [], actionTopologyRole: "control", description: "Draft a structured plan for multi-step work before executing it." },
   { name: "execution_complete", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "full-extra", loopClass: "mutating", actionTopologyRole: "control", actionControlContext: "alternate_action_owner", description: "Mark a tracked execution complete after its criteria are verified. Args: id, summary." },
   // Creating an execution lane MINTS DURABLE MUTATION AUTHORITY: it is the
@@ -1070,28 +1140,41 @@ var TOOL_REGISTRY = [
   { name: "goal_stale", sideEffect: "write", tier: "core", lanes: [], actionTopologyRole: "control", description: "Detect or mark long-running goals that have gone stale (not updated in a while)." },
   { name: "goal_upsert", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Create a persistent goal when no id matches, or update the existing goal when one does \u2014 the single durable-goal write tool." },
   { name: "harness_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Inspect Clementine harness-internal capability health." },
+  { name: "http_read", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Bounded public HTTP(S) GET for documentation, pricing and JSON schemas; no shell, credentials or writes." },
   { name: "hold_task_for_later", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", delegationPrimitive: true, description: 'HOLD an agreed multi-step task for later instead of running it now \u2014 the "or you can ask\u2026' },
-  { name: "list_files", sideEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["write_file", "artifact_bundle_save", "replace_file", "run_shell_command"], description: "List files in an allowed workspace directory." },
+  { name: "list_files", sideEffect: "read", readReuse: "settled_within_source", readRevision: "local_path", resourceIdentityArgument: "directory", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["write_file", "artifact_bundle_save", "replace_file", "run_shell_command"], description: "List files in an allowed workspace directory." },
   { name: "list_pending_check_ins", sideEffect: "read", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "List open check-ins waiting for a user answer." },
   { name: "local_cli_list", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "read", actionTopologyRole: "control", delegationPrimitive: true, description: "List CLIs installed on the local machine and detected on $PATH." },
   { name: "local_cli_probe", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "read", actionTopologyRole: "control", delegationPrimitive: true, description: "Probe a specific local CLI by running `<command> --version` and `<command> --help`." },
   { name: "mcp_add", sideEffect: "admin", tier: "discoverable", lanes: ["orchestrator", "cli"], localPlanning: { consequence: "runtime_configuration", reversibility: "unknown", destructive: false, purpose: "configure_runtime", inputKind: "configuration", outputKind: "configuration", deliverableKind: "runtime_configuration", destinationPosture: "create_new", advisoryRoles: ["admin"] }, description: "Create a NEW external MCP server configuration." },
+  // A heartbeat's contract is the owner's own configuration: reversible, local,
+  // and exactly what they just said. It is a write so the boundary records it,
+  // never a send.
+  { name: "heartbeat_refine", sideEffect: "write", readOnlyWhen: { field: "action", values: ["status"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], actionTopologyRole: "control", localPlanning: { consequence: "runtime_configuration", reversibility: "reversible", destructive: false, purpose: "configure_runtime", inputKind: "configuration", outputKind: "configuration", deliverableKind: "runtime_configuration", destinationPosture: "named_existing", advisoryRoles: ["admin"] }, description: "Change one of the owner's heartbeats (work review, calendar watch, workflow suggestions) the way the owner asked: add or remove a rule in their words, change cadence, on/off, or whether items reach the phone." },
   { name: "mcp_configure", sideEffect: "admin", tier: "discoverable", lanes: ["orchestrator", "cli"], localPlanning: { consequence: "runtime_configuration", reversibility: "unknown", destructive: false, purpose: "configure_runtime", inputKind: "configuration", outputKind: "configuration", deliverableKind: "runtime_configuration", destinationPosture: "named_existing", advisoryRoles: ["admin"] }, description: "Edit an EXISTING external MCP server's NON-SECRET fields (description/command/args/url/he\u2026" },
   { name: "mcp_list_tools", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Search one configured external MCP server for exact callable names and the best match's real input schema." },
   { name: "mcp_reconnect", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Recover an external MCP server that is degraded/unavailable (stuck in the connection back\u2026" },
   { name: "mcp_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Inspect configured external MCP servers available to Clementine." },
-  { name: "memory_embed_backfill", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Compute embeddings for vault chunks and/or durable facts using the active embedding provi\u2026" },
+  // 'orchestrator' because a cli-only lane made this unreachable from chat and
+  // the owner cannot see lanes. Asked live to run it, Clem spent 301s and 70
+  // tool calls trying to do it by hand (list_files, read_file, local_cli_probe)
+  // and never reached a terminal — an absent capability does not refuse, it
+  // flails. It is a safer write than its cli+orchestrator siblings beside it:
+  // memory_forget soft-deletes a fact, memory_pin changes standing context,
+  // while this only recomputes embeddings that the maintenance tick already
+  // recomputes on its own schedule.
+  { name: "memory_embed_backfill", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Compute embeddings for vault chunks and/or durable facts using the active embedding provi\u2026" },
   { name: "memory_forget", sideEffect: "write", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "cli"], loopClass: "mutating", actionTopologyRole: "control", description: "Soft-delete a fact by id (sets active=0)." },
   { name: "memory_import", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Import ANOTHER agent's memory files (Claude Code memories, OpenClaw/Fermis stores, bare m\u2026" },
   { name: "memory_list_facts", sideEffect: "read", projectEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "List or query durable facts as filterable JSON. Pass query for targeted lookup." },
   { name: "memory_pin", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Pin a fact as a STANDING INSTRUCTION (always injected into context, exempt from the recen\u2026" },
   { name: "memory_read", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Read a durable memory reference (fact:<id> or policy:<id>), a key memory file, or a vault-relative markdown path." },
   { name: "memory_recall", sideEffect: "read", projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Recall vault chunks." },
-  { name: "memory_recall_all", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Recall distilled memory \u2014 facts, notes, entities, resources, episode summaries, policies and proven tools \u2014 through one evidence-backed pipeline. This is NOT a transcript store: it does not hold what was literally said in an earlier conversation. To find or quote a prior conversation, use session_search instead." },
+  { name: "memory_recall_all", sideEffect: "read", readReuse: "settled_within_source", readRevision: "memory_store", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Recall distilled memory \u2014 facts, notes, entities, resources, episode summaries, policies and proven tools \u2014 through one evidence-backed pipeline. This is NOT a transcript store: it does not hold what was literally said in an earlier conversation. To find or quote a prior conversation, use session_search instead." },
   { name: "memory_remember", sideEffect: "write", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "mutating", actionTopologyRole: "control", description: "Record a durable fact in long-term memory." },
   { name: "memory_restore", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Restore (reactivate) a soft-deleted fact by id \u2014 the inverse of memory_forget." },
   { name: "memory_review_instructions", sideEffect: "read", tier: "core", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Before a batch/irreversible external write, review the standing instructions in play." },
-  { name: "memory_search", sideEffect: "read", projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Search the local Clementine vault for relevant notes and memories." },
+  { name: "memory_search", sideEffect: "read", readReuse: "settled_within_source", readRevision: "memory_store", projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Search the local Clementine vault for relevant notes and memories." },
   { name: "memory_search_facts", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", actionTopologyRole: "control", description: "Semantically search durable FACTS (your long-term memory of the user, projects, standing\u2026" },
   { name: "memory_self_heal", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Inspect or run the audited long-term-memory self-heal loop." },
   { name: "note_create", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Create a new note in the vault." },
@@ -1113,12 +1196,27 @@ var TOOL_REGISTRY = [
   { name: "plan_task", sideEffect: "write", runtimeEffect: "host_only", hostControlFrame: "sole", hostModelFrameClass: "fresh_plan_barrier", tier: "core", lanes: [], needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Admit and freeze one primary-model action plan for the exact accepted request." },
   { name: "ping", sideEffect: "read", tier: "discoverable", lanes: ["sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Basic health-check tool for the local Clementine tool runtime." },
   { name: "propose_check_in_template", sideEffect: "read", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Propose a NEW autonomous check-in template the user can approve." },
-  { name: "read_file", sideEffect: "read", localPlanningRead: true, tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["write_file", "artifact_bundle_save", "replace_file", "run_shell_command"], description: "Read a file from an allowed workspace path." },
-  { name: "recall_tool_result", sideEffect: "read", readsRetainedOutput: true, projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Retrieve the full verbatim output of a prior tool call by its call_id." },
+  { name: "meeting_search", sideEffect: "read", localPlanningRead: true, hostReadOnlyExecution: "pure_local", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Find recent meeting notes or transcripts captured locally by Clementine through Recall.ai or local recording; search saved meetings by title, participant, transcript words or time without external connections." },
+  { name: "meeting_read", sideEffect: "read", localPlanningRead: true, hostReadOnlyExecution: "pure_local", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Read a saved meeting transcript and analysis directly from Clementine by meeting id; paginated complete conversation with timestamps and speakers, even if analysis is absent." },
+  { name: "meeting_analysis_save", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "agentic", needsApproval: false, loopClass: "mutating", actionTopologyRole: "control", description: "Persist structured analysis for an existing finalized meeting through the host-owned meeting store; no arbitrary path or external effects." },
+  { name: "page_preview", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Render a local HTML page as a browser shows it and return a screenshot, so the page can be checked visually." },
+  { name: "read_file", sideEffect: "read", readReuse: "settled_within_source", readRevision: "local_path", resourceIdentityArgument: "path", localPlanningRead: true, localExecution: { version: 1, adapter: "local_file_read_v1", idempotency: "read_only", reconciliation: "none" }, tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["write_file", "artifact_bundle_save", "replace_file", "run_shell_command"], description: "Read a file from an allowed workspace path." },
+  { name: "recall_tool_result", sideEffect: "read", readsRetainedOutput: true, projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", desk: { rung: "readers", promotedBy: ["retained_output", "delegation"], purpose: "reread a saved tool result by call_id" }, description: "Retrieve the full verbatim output of a prior tool call by its call_id." },
   { name: "request_approval", sideEffect: "write", tier: "core", lanes: [], blockedFor: ["worker"], loopClass: "mutating", actionTopologyRole: "control", description: "Pause and ask the user to approve a high-risk action or one batch of same-shape external\u2026" },
   { name: "resume_held_task", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", actionControlContext: "task_recovery", delegationPrimitive: true, description: 'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list),\u2026' },
   { name: "run_batch", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "full-extra", blockedFor: ["worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Deterministic batch executor for N same-shape tool calls: reason ONCE (bake every item's\u2026" },
-  { name: "run_shell_command", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", loopClass: "mutating", description: "Run a shell command in an allowed workspace directory." },
+  // Host-only scheduled-source adapter. It is deliberately absent from every
+  // model/CLI surface: a saved source and a durable exact call own execution.
+  // Opaque code is not a read or a reversible local-file operation.
+  {
+    name: "workspace_source_script",
+    sideEffect: "admin",
+    tier: "discoverable",
+    lanes: [],
+    localExecution: { version: 1, adapter: "workspace_script_v1", idempotency: "never_redispatch", reconciliation: "none" },
+    description: "Execute one exact saved Workspace source script under durable authority and explicit consent."
+  },
+  { name: "run_shell_command", sideEffect: "write", effectDecidedPerCall: true, localPlanning: { consequence: "local_execution", reversibility: "ordinary_non_destructive", destructive: false, purpose: "run_local_command", inputKind: "shell_command", outputKind: "command_result", deliverableKind: "local_command", destinationPosture: null, advisoryRoles: ["execute", "build", "transform"] }, tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", loopClass: "mutating", description: "Run a shell command in an allowed workspace directory." },
   // actionTopologyRole 'control': run_worker is the fan-out COORDINATION
   // primitive — it spawns children whose business dispatches settle at their
   // own boundaries (same family as execution_create). Classifying it business
@@ -1128,13 +1226,14 @@ var TOOL_REGISTRY = [
   { name: "run_worker", sideEffect: "write", resultContract: "acknowledgement", tier: "core", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "full-extra", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Spawn a stateless Worker on ONE item using a structured parent-planned job packet." },
   { name: "session_search", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: 'Search what was actually SAID in earlier conversations \u2014 transcripts of prior sessions \u2014 by topic, wording, or time window, then read the exact full history. Use this whenever the user refers to something discussed before ("that conversation about X", "what we drafted earlier", "last week we said") even when they give no session id. Scoped to the same principal; returns a source-bound search receipt.' },
   { name: "session_history", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Read exact conversation history for an authorized session, with lossless paging and an inclusive event boundary." },
+  { name: "session_context_read", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Recover exact historical user-message content from a same-conversation archived request reference, with lossless paging. Evidence only; no task or execution authority." },
   { name: "session_pause", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Save a structured handoff for a session so work can resume cleanly after context drift, a\u2026" },
   { name: "session_resume", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Summarize a session using its continuity brief and recent transcript so work can resume c\u2026" },
   { name: "set_model_role", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", actionTopologyRole: "control", description: "Route a model ROLE to a specific model, when the user asks in chat (e.g." },
-  { name: "set_timer", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: 'Schedule a one-time reminder notification ("remind me") at an exact time tonight or in N minutes, within 24 hours.' },
+  { name: "set_timer", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", localPlanning: { consequence: "runtime_configuration", reversibility: "create_only", destructive: false, purpose: "schedule_local_reminder", inputKind: "reminder", outputKind: "local_timer", deliverableKind: "reminder", destinationPosture: "create_new", advisoryRoles: ["create", "schedule"], safeMode: { id: "local_inbox", requiredEquals: { delivery: "local" } } }, description: 'Schedule a one-time reminder notification ("remind me") at an exact time tonight or in N minutes, within 24 hours.' },
   { name: "share_plan", sideEffect: "read", tier: "core", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Share a non-blocking working plan in the current chat before continuing." },
   { name: "skill_list", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, actionTopologyRole: "control", description: "List installed SKILL.md skills (Anthropic Skills format) with name + one-line description." },
-  { name: "skill_read", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, actionTopologyRole: "control", description: "Load the full body of an installed SKILL.md skill into context." },
+  { name: "skill_read", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, actionTopologyRole: "control", desk: { rung: "full", promotedBy: ["listed_skill", "delegation"], purpose: "load an installed skill by name" }, description: "Load the full body of an installed SKILL.md skill into context." },
   { name: "source_map_upsert", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", description: "Record WHERE a resource lives in one of the user's connected sources \u2014 a Drive folder, an\u2026" },
   { name: "space_action_prepare", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Prepare one declared Workspace action for exact approval, or execute it only when an exact existing standing approval covers the current action, arguments, and runner bytes." },
   { name: "space_diff", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", loopClass: "idempotent", actionTopologyRole: "control", description: "Compare two retained successful observations for one Workspace data source, defaulting to current versus prior." },
@@ -1142,9 +1241,10 @@ var TOOL_REGISTRY = [
   { name: "space_edit_view", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", localPlanning: { consequence: "workspace_definition", reversibility: "reversible", destructive: false, purpose: "author_workspace", inputKind: "workspace_patch", outputKind: "workspace_revision", deliverableKind: "workspace", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Edit only the requested parts of an existing Workspace HTML view; preserve other content. Stored data and phone content stay unchanged." },
   { name: "home_get", sideEffect: "read", localPlanningRead: true, hostReadOnlyExecution: "pure_local", projectEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", loopClass: "idempotent", description: "Read the owner\u2019s Home tiles and current placement revision; no refresh or execution." },
   { name: "home_update", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", needsApproval: false, loopClass: "mutating", localPlanning: { consequence: "runtime_configuration", reversibility: "reversible", destructive: false, purpose: "arrange_home", inputKind: "home_placement", outputKind: "home_revision", deliverableKind: "home", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Pin, resize, reorder or remove a Space tile on Home. Preserve the Space and unrelated placements; commit a versioned Home receipt." },
-  { name: "space_get", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read a Workspace: its manifest (title, status, data sources, re-engage contract), a snaps\u2026" },
+  { name: "space_get", sideEffect: "read", readReuse: "settled_within_source", readRevision: "workspace_files", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read a Workspace: its manifest (title, status, data sources, re-engage contract), a snaps\u2026" },
   { name: "space_get_runner", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read the SOURCE of a Workspace data/action RUNNER (the .mjs/.py/.sh script under data/ th\u2026" },
   { name: "space_get_view", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read the CURRENT view HTML of a Workspace, line-numbered \u2014 this is the EXACT text you nee\u2026" },
+  { name: "space_preview", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Render a Workspace exactly as the desktop shows it and return a screenshot, so the view can be checked visually." },
   { name: "space_history", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", loopClass: "idempotent", actionTopologyRole: "control", description: "List bounded, metadata-only observation history for a Workspace without loading raw retained datasets." },
   { name: "space_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "List the user's Workspaces (persistent interactive surfaces you built)." },
   { name: "space_publish", sideEffect: "send", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", description: "Export a Workspace as a STATIC, share-ready snapshot \u2014 the shareable counterpart to the l\u2026" },
@@ -1167,7 +1267,7 @@ var TOOL_REGISTRY = [
   { name: "tool_choice_invalidate", sideEffect: "write", tier: "core", lanes: ["orchestrator", "cli"], loopClass: "mutating", actionTopologyRole: "control", description: "Mark the currently-recorded tool choice for an intent as broken." },
   { name: "tool_choice_recall", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Look up the previously-recorded tool choice for an intent (per-machine memory)." },
   { name: "tool_choice_remember", sideEffect: "write", tier: "core", lanes: ["orchestrator", "cli"], loopClass: "mutating", actionTopologyRole: "control", description: "Save the tool that worked for an intent so future runs skip discovery." },
-  { name: "tool_output_query", sideEffect: "read", readsRetainedOutput: true, projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch"], sdkLayer: "read-only", innerDispatch: "read", actionTopologyRole: "control", description: "Query a slice of a large prior tool output by its call_id, without loading the whole payl\u2026" },
+  { name: "tool_output_query", sideEffect: "read", readsRetainedOutput: true, projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch"], sdkLayer: "read-only", innerDispatch: "read", actionTopologyRole: "control", desk: { rung: "readers", promotedBy: ["retained_output", "delegation"], purpose: "query a slice of a large saved tool result" }, description: "Query a slice of a large prior tool output by its call_id, without loading the whole payl\u2026" },
   { name: "tool_search", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Search the full built-in tool catalog by intent and get matching names, summaries, and sc\u2026" },
   { name: "update_agent", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Update an existing team agent." },
   { name: "user_profile_read", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Read the user's current profile (name, role, timezone, working hours, communication prefe\u2026" },
@@ -1177,13 +1277,13 @@ var TOOL_REGISTRY = [
   { name: "workflow_delete", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", localPlanning: { consequence: "workflow_definition", reversibility: "irreversible", destructive: true, purpose: "delete_workflow", inputKind: "workflow_reference", outputKind: "deletion_receipt", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["delete", "destination"] }, description: "Permanently delete a workflow definition file." },
   { name: "workflow_edit_step", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "author_workflow", inputKind: "workflow_patch", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Make a TARGETED, reversible edit to ONE step's prompt in an existing workflow \u2014 the FAST,\u2026" },
   { name: "workflow_from_session", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, description: "Turn what you JUST did in this chat into a reusable, repeatable workflow." },
-  { name: "workflow_get", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "Fetch the full definition of a single workflow by name." },
+  { name: "workflow_get", sideEffect: "read", readReuse: "settled_within_source", readRevision: "workflow_files", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "Fetch the full definition of a single workflow by name." },
   { name: "workflow_import_framework", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Import workflow framework packages from a local folder or GitHub repo." },
   { name: "workflow_import_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Check a workflow framework import job." },
   { name: "workflow_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "List all workflows with description, steps, and trigger metadata." },
   { name: "workflow_rerun_failed_items", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Re-run only the failed forEach items from a prior workflow run." },
   { name: "workflow_run", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "dispatch_named_workflow", inputKind: "workflow_identity", outputKind: "workflow_run", deliverableKind: "workflow", destinationPosture: "create_new", advisoryRoles: ["control", "destination"] }, description: "Dispatch a workflow to run in the BACKGROUND (fire-and-forget) \u2014 it runs in the daemon an\u2026" },
-  { name: "workflow_run_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "Check workflow runs." },
+  { name: "workflow_run_status", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "Check workflow runs." },
   { name: "workflow_schedule", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "schedule_workflow", inputKind: "workflow_definition", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "create_new", destinationPostures: ["create_new", "named_existing"], advisoryRoles: ["author", "destination"] }, description: "Schedule work once at an absolute run_at timestamp or repeatedly with cron." },
   { name: "workflow_set_enabled", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "toggle_workflow", inputKind: "workflow_reference", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Approve or disable a workflow." },
   // Data-operation primitive (2026-07-21 capability audit #1): deterministic
@@ -1204,7 +1304,7 @@ var TOOL_REGISTRY = [
   // Defaulting to 'business' routed it through work_call on action surfaces
   // (live 2026-08-18: a program-carried file_query → work_binding_required
   // while the model was just trying to read its own search result).
-  { name: "file_query", sideEffect: "read", readsRetainedOutput: true, tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "workflow-step", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Query a big document or prior tool output for relevant passages (heading-aware chunks, deterministic ranking) instead of reading a byte-clipped preview." },
+  { name: "file_query", sideEffect: "read", readsRetainedOutput: true, tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "workflow-step", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", desk: { rung: "readers", promotedBy: ["retained_output", "delegation"], purpose: "find passages in a big document or saved result" }, description: "Query a big document or prior tool output for relevant passages (heading-aware chunks, deterministic ranking) instead of reading a byte-clipped preview." },
   // Structured extraction (2026-07-21 capability audit #3): schema-guided
   // NL→payload with deterministic validation. Uses a model internally (the
   // boundary-judge routing) but mutates nothing — read-class; the CREATE that
@@ -1226,12 +1326,13 @@ var TOOL_REGISTRY = [
   { name: "workspace_artifact_query", sideEffect: "read", projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Query exact rows, fields, and pages from a JSON/JSONL run-workspace artifact." },
   { name: "workspace_info", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Inspect a project directory and its notes, manifest, and structure. Use read_file for a known file." },
   { name: "workspace_list", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", description: "List local projects found in configured workspace directories." },
+  { name: "view_image", sideEffect: "read", localPlanningRead: true, hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Look at the actual pixels of a stored attachment image." },
   { name: "workspace_roots", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "List directories Clementine is allowed to inspect or operate in." },
-  { name: "write_file", sideEffect: "write", resourceIdentityArgument: "path", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", loopClass: "mutating", localPlanning: { consequence: "local_artifact", reversibility: "create_only", destructive: false, purpose: "create_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "create_new", advisoryRoles: ["author", "create", "destination"], safeMode: { id: "create", requiredEquals: { mode: "create" }, nullEquivalentToRequired: ["mode"], absentOrNull: ["append"] } }, localPlanningVariants: [{ consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "append_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "append", requiredEquals: {}, alternatives: [{ requiredEquals: { append: true }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "append" }, absentOrNull: ["append"] }] } }, { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "overwrite_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "overwrite", requiredEquals: {}, alternatives: [{ requiredEquals: { append: false }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "overwrite" }, absentOrNull: ["append"] }] } }], description: "Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path with recoverable prior bytes and a committed-file receipt." }
+  { name: "write_file", localExecution: { version: 1, adapter: "local_file_revision_v1", idempotency: "receipt_reconciled", reconciliation: "local_file_revision_v1", semantics: { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "write_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "create_new", destinationPostures: ["create_new", "named_existing"], advisoryRoles: ["author", "create", "update", "destination"] } }, sideEffect: "write", resourceIdentityArgument: "path", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", loopClass: "mutating", localPlanning: { consequence: "local_artifact", reversibility: "create_only", destructive: false, purpose: "create_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "create_new", advisoryRoles: ["author", "create", "destination"], safeMode: { id: "create", requiredEquals: { mode: "create" }, nullEquivalentToRequired: ["mode"], omittedEquivalentToRequired: ["mode"], absentOrNull: ["append"] } }, localPlanningVariants: [{ consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "append_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "append", requiredEquals: {}, alternatives: [{ requiredEquals: { append: true }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "append" }, absentOrNull: ["append"] }] } }, { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "overwrite_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "overwrite", requiredEquals: {}, alternatives: [{ requiredEquals: { append: false }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "overwrite" }, absentOrNull: ["append"] }] } }], description: "Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path with recoverable prior bytes and a committed-file receipt." }
 ];
 
 // src/tools/artifact-bundle-contract.ts
-var import_zod2 = require("zod");
+var import_zod5 = require("zod");
 
 // src/tools/artifact-bundle-core.ts
 var import_node_crypto4 = require("node:crypto");
@@ -1318,9 +1419,9 @@ function prepareBundle(input) {
   const revisionDigest = sha256(closedCanonicalJson({
     version: 1,
     bundleId,
-    files: files.map(({ path: filePath, sha256: digest, bytes }) => ({
+    files: files.map(({ path: filePath, sha256: digest2, bytes }) => ({
       path: filePath,
-      sha256: digest,
+      sha256: digest2,
       bytes
     }))
   }));
@@ -1332,9 +1433,9 @@ function manifestFor(bundle) {
     bundleId: bundle.bundleId,
     revisionDigest: bundle.revisionDigest,
     totalBytes: bundle.totalBytes,
-    files: bundle.files.map(({ path: filePath, sha256: digest, bytes }) => ({
+    files: bundle.files.map(({ path: filePath, sha256: digest2, bytes }) => ({
       path: filePath,
-      sha256: digest,
+      sha256: digest2,
       bytes
     }))
   };
@@ -1349,10 +1450,10 @@ function resultFor(bundle, directory, created) {
     handle: directory,
     directory,
     manifestPath: import_node_path4.default.join(directory, MANIFEST_NAME),
-    files: bundle.files.map(({ path: filePath, sha256: digest, bytes }) => ({
+    files: bundle.files.map(({ path: filePath, sha256: digest2, bytes }) => ({
       path: filePath,
       filePath: import_node_path4.default.join(directory, ...filePath.split("/")),
-      sha256: digest,
+      sha256: digest2,
       bytes
     })),
     totalBytes: bundle.totalBytes,
@@ -1559,14 +1660,14 @@ function saveArtifactBundle(input, options = {}) {
 }
 
 // src/tools/artifact-bundle-contract.ts
-var artifactBundleFileShape = import_zod2.z.object({
-  path: import_zod2.z.string().min(1).max(ARTIFACT_BUNDLE_LIMITS.maxPathBytes).describe('Safe relative POSIX path inside the bundle, for example "public/index.html". Absolute paths, backslashes, dot segments, and duplicates are refused.'),
-  content: import_zod2.z.string().describe(`Exact UTF-8 file content (maximum ${ARTIFACT_BUNDLE_LIMITS.maxFileBytes} bytes per file).`)
+var artifactBundleFileShape = import_zod5.z.object({
+  path: import_zod5.z.string().min(1).max(ARTIFACT_BUNDLE_LIMITS.maxPathBytes).describe('Safe relative POSIX path inside the bundle, for example "public/index.html". Absolute paths, backslashes, dot segments, and duplicates are refused.'),
+  content: import_zod5.z.string().describe(`Exact UTF-8 file content (maximum ${ARTIFACT_BUNDLE_LIMITS.maxFileBytes} bytes per file).`)
 }).strict();
 var ARTIFACT_BUNDLE_TOOL_PARAMETERS = {
-  bundle_id: import_zod2.z.string().min(1).max(80).describe('Stable lowercase artifact id, for example "sales-portal". The revision digest is derived from every file path and byte sequence.'),
-  mode: import_zod2.z.literal("content_addressed").describe("Required safety mode. Revisions are immutable and never overwrite a prior revision."),
-  files: import_zod2.z.array(artifactBundleFileShape).min(1).max(ARTIFACT_BUNDLE_LIMITS.maxFiles)
+  bundle_id: import_zod5.z.string().min(1).max(80).describe('Stable lowercase artifact id, for example "sales-portal". The revision digest is derived from every file path and byte sequence.'),
+  mode: import_zod5.z.literal("content_addressed").describe("Required safety mode. Revisions are immutable and never overwrite a prior revision."),
+  files: import_zod5.z.array(artifactBundleFileShape).min(1).max(ARTIFACT_BUNDLE_LIMITS.maxFiles)
 };
 function executeArtifactBundleSave(args) {
   return saveArtifactBundle({
@@ -1577,7 +1678,7 @@ function executeArtifactBundleSave(args) {
 
 // src/spaces/workspace-set-data-contract.ts
 var import_node_crypto5 = require("node:crypto");
-var import_zod3 = require("zod");
+var import_zod6 = require("zod");
 var WORKSPACE_SET_DATA_MAX_BYTES = 5 * 1024 * 1024;
 var WORKSPACE_SET_DATA_MAX_SOURCE_CHARS = 120;
 var WORKSPACE_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
@@ -1587,9 +1688,9 @@ var REFRESH_PREFIX = "workspace-set-data:v1";
 var MAX_JSON_NODES = 2e5;
 var MAX_JSON_DEPTH = 64;
 var WORKSPACE_SET_DATA_TOOL_PARAMETERS = {
-  slug: import_zod3.z.string().min(2).max(63).regex(WORKSPACE_SLUG_RE).describe("The existing active workspace slug."),
-  source_id: import_zod3.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_SOURCE_CHARS).describe("The canonical non-reserved source id to replace."),
-  data_json: import_zod3.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_BYTES).describe("A complete JSON object or array for this source id.")
+  slug: import_zod6.z.string().min(2).max(63).regex(WORKSPACE_SLUG_RE).describe("The existing active workspace slug."),
+  source_id: import_zod6.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_SOURCE_CHARS).describe("The canonical non-reserved source id to replace."),
+  data_json: import_zod6.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_BYTES).describe("A complete JSON object or array for this source id.")
 };
 var WorkspaceSetDataContractError = class extends Error {
   constructor(code, message) {
@@ -1643,7 +1744,7 @@ function canonicalWorkspaceJson(value) {
   return canonical;
 }
 function exactArguments(value) {
-  const parsed = import_zod3.z.strictObject(WORKSPACE_SET_DATA_TOOL_PARAMETERS).safeParse(value);
+  const parsed = import_zod6.z.strictObject(WORKSPACE_SET_DATA_TOOL_PARAMETERS).safeParse(value);
   if (!parsed.success) {
     const record3 = value && typeof value === "object" && !Array.isArray(value) ? value : {};
     if (typeof record3.slug === "string" && !WORKSPACE_SLUG_RE.test(record3.slug)) {
@@ -1737,7 +1838,13 @@ function exactDeclaration(name) {
 function validExecutionContract(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const contract = value;
-  return contract.version === 1 && contract.idempotency === "content_addressed" && (contract.adapter === "artifact_bundle_v1" && contract.reconciliation === "artifact_bundle_v1" || contract.adapter === "workspace_dataset_v1" && contract.reconciliation === "workspace_dataset_v1");
+  if (contract.version === 1 && contract.adapter === "workspace_script_v1") {
+    return contract.idempotency === "never_redispatch" && contract.reconciliation === "none";
+  }
+  if (contract.version === 1 && contract.adapter === "local_file_read_v1") {
+    return contract.idempotency === "read_only" && contract.reconciliation === "none";
+  }
+  return contract.version === 1 && (contract.idempotency === "content_addressed" || contract.adapter === "local_file_revision_v1" && contract.idempotency === "receipt_reconciled") && (contract.adapter === "artifact_bundle_v1" && contract.reconciliation === "artifact_bundle_v1" || contract.adapter === "workspace_dataset_v1" && contract.reconciliation === "workspace_dataset_v1" || contract.adapter === "local_file_revision_v1" && contract.reconciliation === "local_file_revision_v1" && contract.idempotency === "receipt_reconciled");
 }
 function safeToken(value) {
   const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._/-]+/g, "_");
@@ -1764,6 +1871,7 @@ function normalizedSemantics(semantics) {
     outputKind: semantics.outputKind.trim(),
     deliverableKind: semantics.deliverableKind.trim(),
     destinationPosture: semantics.destinationPosture,
+    ...semantics.destinationPostures ? { destinationPostures: [...semantics.destinationPostures] } : {},
     advisoryRoles: [...new Set(semantics.advisoryRoles.map((role) => role.trim()).filter(Boolean))],
     ...semantics.safeMode ? {
       safeMode: {
@@ -1798,9 +1906,118 @@ function structurallyCarriesSafeMode(schema, semantics) {
   }
   return true;
 }
+function deriveReviewedLocalReadDefinition(input) {
+  const row = input.declaration;
+  if (row.sideEffect !== "read" || row.localPlanningRead !== true || row.runtimeEffect === "host_only") return null;
+  const name = safeToken(row.name);
+  if (!name || name !== row.name) return null;
+  const capabilityRef = `cap:local:${name}:read`;
+  const schemaFingerprint = stableJsonDigest(input.schema);
+  const registrySemanticsFingerprint = stableJsonDigest({
+    version: 1,
+    name,
+    sideEffect: row.sideEffect,
+    localPlanningRead: true,
+    localExecution: row.localExecution,
+    runtimeEffect: row.runtimeEffect ?? null
+  });
+  const envelopeFingerprint = stableJsonDigest({
+    version: 1,
+    provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+    name,
+    carrier: "work_call",
+    schemaFingerprint,
+    registrySemanticsFingerprint
+  });
+  return {
+    version: 1,
+    provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+    name,
+    carrier: "work_call",
+    capabilityRef,
+    schemaFingerprint,
+    registrySemanticsFingerprint,
+    envelopeFingerprint,
+    consequence: "read",
+    reversibility: "read_only",
+    destructive: false,
+    accountIdentity: REVIEWED_LOCAL_ACCOUNT,
+    safeMode: null,
+    descriptor: {
+      id: capabilityRef,
+      effect: "read",
+      purpose: row.description ?? "Read local state.",
+      acceptedInputKinds: ["request", "evidence"],
+      producedOutputKinds: ["evidence"],
+      applicableDeliverableKinds: ["evidence"],
+      inputShape: "request",
+      outputShape: "evidence",
+      outputKind: "evidence",
+      deliverableKind: "evidence",
+      destinationPosture: null,
+      evidenceKinds: ["tool_result"],
+      handleRequired: false,
+      readbackRequired: false,
+      accountScope: REVIEWED_LOCAL_ACCOUNT,
+      manifestDigest: stableJsonDigest({ capabilityRef, envelopeFingerprint }),
+      advisoryRoles: ["source", "collection", "read"]
+    }
+  };
+}
+function deriveReviewedScriptDefinition(input) {
+  if (input.declaration.sideEffect !== "admin") return null;
+  const name = input.declaration.name;
+  const capabilityRef = `cap:local:${name}:opaque_execution`;
+  const schemaFingerprint = stableJsonDigest(input.schema);
+  const registrySemanticsFingerprint = stableJsonDigest({
+    version: 1,
+    name,
+    effect: "admin",
+    localExecution: input.declaration.localExecution
+  });
+  const envelopeFingerprint = stableJsonDigest({ schemaFingerprint, registrySemanticsFingerprint });
+  return {
+    version: 1,
+    provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
+    name,
+    carrier: "work_call",
+    capabilityRef,
+    schemaFingerprint,
+    registrySemanticsFingerprint,
+    envelopeFingerprint,
+    consequence: "local_execution",
+    reversibility: "unknown",
+    destructive: true,
+    accountIdentity: REVIEWED_LOCAL_ACCOUNT,
+    safeMode: null,
+    descriptor: {
+      id: capabilityRef,
+      effect: "admin",
+      purpose: "execute_saved_source_script",
+      acceptedInputKinds: ["saved_source_execution"],
+      producedOutputKinds: ["script_execution_receipt"],
+      applicableDeliverableKinds: ["source_data"],
+      inputShape: "saved_source_execution",
+      outputShape: "script_execution_receipt",
+      outputKind: "script_execution_receipt",
+      deliverableKind: "source_data",
+      destinationPosture: null,
+      evidenceKinds: ["process_result"],
+      handleRequired: false,
+      readbackRequired: false,
+      accountScope: REVIEWED_LOCAL_ACCOUNT,
+      manifestDigest: stableJsonDigest({ capabilityRef, envelopeFingerprint }),
+      advisoryRoles: ["execute"]
+    }
+  };
+}
 function deriveReviewedLocalDefinition(input) {
   const name = input.declaration.name.trim();
-  const semantics = input.declaration.localPlanning;
+  if (input.declaration.localExecution?.adapter === "workspace_script_v1") return deriveReviewedScriptDefinition(input);
+  if (input.declaration.localExecution?.adapter === "local_file_read_v1") {
+    return deriveReviewedLocalReadDefinition(input);
+  }
+  const semantics = input.declaration.localExecution?.semantics ?? input.declaration.localPlanning;
   if (!name || input.declaration.sideEffect !== "write" || input.declaration.runtimeEffect === "host_only" || !semantics || semantics.destructive || semantics.reversibility !== "reversible" && semantics.reversibility !== "create_only") return null;
   const normalized = normalizedSemantics(semantics);
   if (!structurallyCarriesSafeMode(input.schema, normalized)) return null;
@@ -1837,6 +2054,7 @@ function deriveReviewedLocalDefinition(input) {
     outputKind: normalized.outputKind,
     deliverableKind: normalized.deliverableKind,
     destinationPosture: normalized.destinationPosture,
+    ...normalized.destinationPostures ? { destinationPostures: normalized.destinationPostures } : {},
     evidenceKinds: ["local_commit_receipt"],
     handleRequired: normalized.destinationPosture !== null,
     readbackRequired: false,
@@ -1867,9 +2085,9 @@ function deriveReviewedLocalDefinition(input) {
   });
 }
 function currentReviewedLocalSchema(execution) {
-  const parametersShape = execution.adapter === "artifact_bundle_v1" ? ARTIFACT_BUNDLE_TOOL_PARAMETERS : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
-  const deferredParameters = import_zod4.z.strictObject(normalizeShapeForDeferredJson(parametersShape));
-  const parameters = import_zod4.z.toJSONSchema(deferredParameters);
+  const parametersShape = execution.adapter === "workspace_script_v1" ? WORKSPACE_SCRIPT_PARAMETERS : execution.adapter === "local_file_read_v1" ? READ_FILE_PARAMS : execution.adapter === "artifact_bundle_v1" ? ARTIFACT_BUNDLE_TOOL_PARAMETERS : execution.adapter === "local_file_revision_v1" ? WRITE_FILE_PARAMS : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
+  const deferredParameters = import_zod7.z.strictObject(normalizeShapeForDeferredJson(parametersShape));
+  const parameters = import_zod7.z.toJSONSchema(deferredParameters);
   const schema = relaxJsonSchemaForDeferred(parameters);
   return isRecord(schema) ? schema : null;
 }
@@ -1916,7 +2134,7 @@ function reviewedLocalCapabilityManifest(observed2) {
     providerVersion: REVIEWED_LOCAL_PROVIDER_VERSION,
     operationVersion: REVIEWED_LOCAL_OPERATION_VERSION,
     definitionFingerprint: observed2.definition.envelopeFingerprint,
-    effect: "local_write",
+    effect: descriptor.effect,
     ...descriptor.destinationPosture ? {
       destination: {
         family: observed2.definition.consequence,
@@ -1924,14 +2142,14 @@ function reviewedLocalCapabilityManifest(observed2) {
       }
     } : {},
     accountId: REVIEWED_LOCAL_ACCOUNT,
-    idempotency: { required: true, policy: "key_before_dispatch" },
-    reconciliation: { supported: true, policy: "exact_artifact" },
+    idempotency: descriptor.effect === "read" ? { required: false, policy: "none" } : { required: true, policy: "key_before_dispatch" },
+    reconciliation: observed2.execution.adapter === "workspace_script_v1" ? { supported: false, policy: "uncertain_if_absent" } : descriptor.effect === "read" ? { supported: false, policy: "none" } : { supported: true, policy: "exact_artifact" },
     outputContract: { kind: descriptor.outputKind ?? observed2.definition.consequence },
     purpose: descriptor.purpose,
     acceptedInputKinds: [...descriptor.acceptedInputKinds],
     producedOutputKinds: [...descriptor.producedOutputKinds],
     applicableDeliverableKinds: [...descriptor.applicableDeliverableKinds],
-    evidenceContract: { kinds: ["local_commit_receipt"], readbackRequired: false },
+    evidenceContract: { kinds: observed2.execution.adapter === "workspace_script_v1" ? ["process_result"] : descriptor.effect === "read" ? ["tool_result"] : ["local_commit_receipt"], readbackRequired: false },
     provenance: {
       issuer: "host:reviewed-local-registry",
       issuedAt: "1970-01-01T00:00:00.000Z",
@@ -1945,8 +2163,12 @@ function reviewedLocalCapabilityManifest(observed2) {
   });
 }
 function reviewedLocalToolArgumentsMatch(observed2, args) {
+  if (observed2.execution.adapter === "workspace_script_v1") return workspaceScriptArguments.safeParse(args).success;
+  if (observed2.execution.adapter === "local_file_read_v1") {
+    return import_zod7.z.strictObject(READ_FILE_PARAMS).safeParse({ ...args, max_chars: args.max_chars ?? null }).success;
+  }
   if (observed2.execution.adapter === "artifact_bundle_v1") {
-    const parsed = import_zod4.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
+    const parsed = import_zod7.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
     if (!parsed.success) return false;
   } else if (observed2.execution.adapter === "workspace_dataset_v1") {
     try {
@@ -1954,6 +2176,8 @@ function reviewedLocalToolArgumentsMatch(observed2, args) {
     } catch {
       return false;
     }
+  } else if (observed2.execution.adapter === "local_file_revision_v1") {
+    if (!import_zod7.z.strictObject(WRITE_FILE_PARAMS).safeParse(args).success) return false;
   } else {
     return false;
   }
@@ -1983,11 +2207,28 @@ function prepareReviewedLocalToolExecution(call) {
   if (!reviewedLocalToolArgumentsMatch(observed2, call.args)) {
     throw new Error("reviewed local execution arguments exceed the declared safe mode");
   }
+  if (observed2.execution.adapter === "workspace_script_v1") {
+    return { observed: observed2, adapter: observed2.execution.adapter, args: workspaceScriptArguments.parse(call.args) };
+  }
+  if (observed2.execution.adapter === "local_file_read_v1") {
+    return {
+      observed: observed2,
+      adapter: observed2.execution.adapter,
+      args: import_zod7.z.strictObject(READ_FILE_PARAMS).parse({ ...call.args, max_chars: call.args.max_chars ?? null })
+    };
+  }
   if (observed2.execution.adapter === "artifact_bundle_v1") {
     return {
       observed: observed2,
       adapter: observed2.execution.adapter,
-      args: import_zod4.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args)
+      args: import_zod7.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args)
+    };
+  }
+  if (observed2.execution.adapter === "local_file_revision_v1") {
+    return {
+      observed: observed2,
+      adapter: observed2.execution.adapter,
+      args: import_zod7.z.strictObject(WRITE_FILE_PARAMS).parse(call.args)
     };
   }
   return {
@@ -2743,17 +2984,17 @@ function observationKey(operationId, accountId) {
 }
 function resolveConnectedAccount(client, input) {
   const toolkit = input.operationId.split("_")[0]?.toLowerCase() ?? "";
-  if (!toolkit) return null;
+  const expected = input.accountId.trim();
+  if (!toolkit || !expected) return null;
   const matched = client.peekConnectedToolkits().filter((row) => {
     const slug = String(row.slug ?? "").toLowerCase();
-    return slug.includes(toolkit);
+    if (!slug.includes(toolkit)) return false;
+    const connectionId = String(row.connectionId ?? "").trim();
+    const accountEmail = String(row.accountEmail ?? "").trim();
+    return connectionId === expected || !connectionId && accountEmail === expected;
   });
   if (matched.length !== 1) return null;
-  const accountId = String(
-    matched[0].connectionId ?? matched[0].accountEmail ?? ""
-  ).trim();
-  if (!accountId || accountId !== input.accountId) return null;
-  return accountId;
+  return expected;
 }
 function observeAttestedTransport(input) {
   return observed.get(observationKey(input.operationId, input.accountId)) ?? null;
@@ -2866,9 +3107,9 @@ async function reconcileAttestedTransport(input) {
     return { exists: false };
   }
 }
-function createAttestedTransport(digest) {
+function createAttestedTransport(digest2) {
   return {
-    digest,
+    digest: digest2,
     execute: executeAttestedTransport,
     observe: observeAttestedTransport,
     refreshObservation: refreshAttestedTransportObservation,
@@ -2883,5 +3124,6 @@ function createAttestedTransport(digest) {
   prepareAttestedComposioDispatch,
   reconcileAttestedTransport,
   refreshAttestedTransportObservation,
-  registerIsolatedObservation
+  registerIsolatedObservation,
+  resolveConnectedAccount
 });

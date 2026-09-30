@@ -449,3 +449,120 @@ adapter. The five retired Space scripts are **still not executable** through
 that adapter; their durable source/occurrence binding, authority, once-only
 settlement and restart recovery remain the next implementation work. The
 wider connection-continuity ledger and release qualification remain open.
+
+## Saved-source execution carrier: exact one-occurrence admission
+
+Implemented after `09895a3c7` on `codex/connection-shell-integration`, alongside
+the unchanged `claude/two-modes` lane at `76c53a1ea`. This is a source candidate,
+not an installed fix and not permission to restore the old raw `runScript`.
+
+The new internal `workspace_source_script` operation has no model/CLI lanes.
+Its registry contract selects a host carrier through the existing emitted
+invoke port. It is classified as opaque `admin` execution, never a read or a
+reversible dataset write. Ordinary shell retains its existing separate path;
+it did not gain a workflow execution contract. The compiler accepts explicit
+host-authored admin preparation while still rejecting read/write/send
+escalation to admin.
+
+`workspace-script-authority.ts` prepares an exact shared v3 one-shot consent
+request and activates only its resolved, approved registry row. Arguments bind
+the Workspace, saved source ID, whole source declaration digest, entrypoint
+digest, manual/scheduled cause and durable occurrence. Neither activation nor
+reentry invents a fresh occurrence. Old runner trust does not satisfy this
+contract, and none of the owner's past decisions were modified. New admission
+requires the saved declaration and entrypoint still to match. Recovery uses
+the retained activation/plan/canonical arguments, without readmitting the work.
+
+The host carrier requires the module-minted call attestation and exact live
+dispatch lease. It rejects archive/status/declaration/content drift, ambiguous
+executor declarations and symlinked Workspace/data/entrypoint paths before
+launch. It reads and hashes one open file and runs a private sibling snapshot
+with the same extension and parent directory, using the shared guarded process
+substrate and scrubbed environment. The logical/physical kernel retains the
+result once. Reentry into a claimed/uncertain process never dispatches again.
+The script's stdout must be one JSON document; script-authored receipt or
+authority fields remain nested data and cannot become host evidence. The
+host receipt proves entrypoint exit and output, not arbitrary downstream
+business correctness or a committed dataset.
+
+Two framework defects were exposed by driving this carrier through the real
+shared kernel and fixed there:
+
+- The kernel checked AbortSignal before admission but did not carry it to an
+  already-running tool. It now passes it through the existing tool-abort
+  context. The script combines it with its authority/lease cancellation fence,
+  so Stop reaches the owned process group. A caller that merely observes an
+  already-claimed occurrence cannot abort the winning call.
+- A known refusal before process launch became `uncertain_write`. A small
+  host-only WeakSet now distinguishes a host-proven no-dispatch error from
+  provider text, error names or serialized lookalikes. The kernel preserves
+  the exact refusal as zero-body. Started processes that fail, time out, stop
+  or return malformed output remain uncertain and cannot silently retry.
+  Preparation/network failure behavior outside this host proof is unchanged.
+
+Verification on this source candidate, with no paid models or live providers:
+
+- `/tmp/clem-workspace-script-final.txt`: **82/82** across the new script tests,
+  existing shared read kernel, reviewed local tools/storage/capability,
+  registry classification, effect-direction checks and existing local v3
+  workflow integration.
+- `/tmp/clem-workspace-script-terminal.txt`: **2/2** additional checks for
+  physical lease revocation without an AbortSignal and malformed JSON after
+  successful process exit. The first draft of the revocation test called the
+  terminal closer mid-I/O; that correctly returned `not_ready`. The test now
+  revokes the exact physical lease through the existing recovery fence rather
+  than mistaking a refused terminal close for cancellation.
+- `/tmp/clem-workspace-script-red.txt`: **4/4 expected failures** with the
+  kernel temporarily restored to `09895a3c7`: three drift refusals were
+  mislabeled uncertain, and Stop did not reach the child. Candidate bytes were
+  restored exactly in finally and verified by SHA-256.
+- `/tmp/clem-workspace-script-tsc-final.txt`: TypeScript passed.
+- `/tmp/clem-workspace-script-artifacts-verified.txt`: emitted component
+  artifacts verified current; manifest digest
+  `399bb957ca9670dbc9427ba1e4bde692d9650dc3e4b0709fefeb717e9fb09610`.
+- The script checks include pending/declined consent, wrong occurrence/cause,
+  source/entrypoint/archive drift, symlink refusal, concurrency, Stop, timeout,
+  started-process failure, untrusted output and one retained physical result.
+- Two fresh-process checks remove isolated-transport markers but retain an
+  explicit disposable home. They verify the emitted **production** invoke and
+  transport digests, one logical/physical/settlement row, completed replay even
+  after deleting the original script, and uncertain reentry without a second
+  marker write. These are production-carrier fixture checks, not installed-app
+  or live-home acceptance.
+- Canonical argument order is significant in the existing v3 seal. Re-parsing
+  the call with Zod before hashing silently reordered keys and correctly
+  refused the binding. Activation now forwards the compiler's canonical object
+  verbatim; schema validation does not replace those sealed bytes.
+- Harness component artifacts were regenerated for these checks. The desktop
+  app was not built, signed, installed, restarted or hotpatched. No full suite
+  or journey run was performed. The broad live-home sentinel still reports
+  NOT PERFORMED while the active daemon owns/writes that home.
+
+Still owed before enabling scheduled scripts:
+
+1. Wire a saved-source consent scope that explicitly covers its schedule and
+   code revision, with revocation and prior-denial preservation. The current
+   exact one-shot adapter is a prerequisite; do not create a fresh approval at
+   every tick or turn old trust into new authority by inference.
+2. Persist source-owned occurrence and activation/plan/argument recovery
+   material before launch. Reopen that exact material after restart. An
+   uncertain older occurrence must block automatic later ticks for that source
+   until resolved; changing the occurrence ID is not recovery.
+3. Connect scheduler/manual refresh and approval resolution to this adapter,
+   preserving the existing refresh serialization and dataset observation
+   transaction. Publish data only from a successful host result. Do not put
+   untrusted script receipt fields on the approval/effect surface.
+4. Exercise interruption between process return, kernel settlement and source
+   observation commit. Test repeated scheduled occurrences, schedule/code
+   edits, refusal/revocation, and cross-process restart of each gap.
+5. Coordinate the combined build/hotpatch, verify served identity, then run
+   named controlled installed-app/live-home acceptance before claiming the
+   retired source failures are fixed. Personal source manifests remain intact.
+
+Limits: this is process ownership, not OS confinement. Entrypoint bytes are
+frozen; imported helpers, executables, account credentials and network state
+remain live. Consent must disclose that scope. Hidden sibling filenames may
+differ from code that assumes its original basename, though relative imports
+and the parent directory are preserved. Windows process/path behavior is not
+certified by the macOS checks. No performance or token improvement is claimed
+from deterministic fixtures alone.

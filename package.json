@@ -32,6 +32,7 @@
     "dist",
     "!dist/**/*.test.js",
     "!dist/execution/reviewed-local-workflow-v3-process.fixture.js",
+    "!dist/spaces/workspace-script-process.fixture.js",
     "!dist/journeys/*.fixture.js",
     "!dist/journeys/*.fixture-support.js",
     "!dist/runtime/harness/current-capability-manifest.fixture.js",

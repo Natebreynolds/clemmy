@@ -93,10 +93,24 @@ const localFileReadStorage: HostLocalWriteStorageAdapter = Object.freeze({
   async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
 });
 
+const workspaceScriptStorage: HostLocalWriteStorageAdapter = Object.freeze({
+  async execute(call: AttestedTransportCall): Promise<unknown> {
+    const prepared = prepareReviewedLocalToolExecution(call);
+    if (prepared.adapter !== 'workspace_script_v1') throw new Error('Not a saved source script');
+    const carrier = await import('../../spaces/workspace-script-carrier.js');
+    // Validation parses values but must not reorder the sealed call object.
+    return carrier.executeReviewedWorkspaceScript(call.args as typeof prepared.args);
+  },
+  // Without a committed kernel receipt, a script may already have caused
+  // effects. Never probe its output or rerun it to manufacture reconciliation.
+  async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
+});
+
 export const reviewedLocalStorageCarrier: HostLocalWriteCarrier = Object.freeze({
   select(input: { operationId: string; accountId: string }) {
     if (input.accountId !== REVIEWED_LOCAL_ACCOUNT) return null;
     const observed = observeReviewedLocalTool(input.operationId);
+    if (observed?.execution.adapter === 'workspace_script_v1') return workspaceScriptStorage;
     if (observed?.execution.adapter === 'local_file_read_v1') return localFileReadStorage;
     if (observed?.execution.adapter === 'local_file_revision_v1') return localFileStorage;
     if (observed?.execution.adapter !== 'workspace_dataset_v1') return null;

@@ -1389,7 +1389,7 @@ function invokeForSealedManifest(manifest) {
       if (!compiled) throw new Error("native MCP invoke requires canonical object arguments");
       return executeSealed(sealed.operationId, compiled, accountId, expectedTransport());
     }
-    if (sealed.providerKind === "local_registry" && sealed.effect === "local_write") {
+    if (sealed.providerKind === "local_registry" && (sealed.effect === "local_write" || sealed.effect === "read" || sealed.effect === "admin")) {
       const compiled = authority?.canonicalArgs ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
       if (!compiled) throw new Error("reviewed local invoke requires canonical object arguments");
       const hostStorage = peekHostLocalWriteCarrier()?.select({

@@ -231,8 +231,8 @@ export interface LocalPlanningSemantics {
  */
 export interface ReviewedLocalExecutionContractV1 {
   version: 1;
-  adapter: 'artifact_bundle_v1' | 'workspace_dataset_v1' | 'local_file_revision_v1' | 'local_file_read_v1';
-  idempotency: 'content_addressed' | 'receipt_reconciled' | 'read_only';
+  adapter: 'artifact_bundle_v1' | 'workspace_dataset_v1' | 'local_file_revision_v1' | 'local_file_read_v1' | 'workspace_script_v1';
+  idempotency: 'content_addressed' | 'receipt_reconciled' | 'read_only' | 'never_redispatch';
   reconciliation: 'artifact_bundle_v1' | 'workspace_dataset_v1' | 'local_file_revision_v1' | 'none';
   /** Workflow execution freezes exact arguments before crossing. Its adapter
    * may cover multiple separately published planning modes. */
@@ -536,6 +536,12 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'request_approval', sideEffect: 'write', tier: 'core', lanes: [], blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Pause and ask the user to approve a high-risk action or one batch of same-shape external…' },
   { name: 'resume_held_task', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', actionControlContext: 'task_recovery', delegationPrimitive: true, description: 'Resume a task the user previously asked you to HOLD (see your Current Focus "Held" list),…' },
   { name: 'run_batch', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'full-extra', blockedFor: ['worker'], actionTopologyRole: 'control', delegationPrimitive: true, description: 'Deterministic batch executor for N same-shape tool calls: reason ONCE (bake every item\'s…' },
+  // Host-only scheduled-source adapter. It is deliberately absent from every
+  // model/CLI surface: a saved source and a durable exact call own execution.
+  // Opaque code is not a read or a reversible local-file operation.
+  { name: 'workspace_source_script', sideEffect: 'admin', tier: 'discoverable', lanes: [],
+    localExecution: { version: 1, adapter: 'workspace_script_v1', idempotency: 'never_redispatch', reconciliation: 'none' },
+    description: 'Execute one exact saved Workspace source script under durable authority and explicit consent.' },
   { name: 'run_shell_command', sideEffect: 'write', effectDecidedPerCall: true, localPlanning: { consequence: 'local_execution', reversibility: 'ordinary_non_destructive', destructive: false, purpose: 'run_local_command', inputKind: 'shell_command', outputKind: 'command_result', deliverableKind: 'local_command', destinationPosture: null, advisoryRoles: ['execute', 'build', 'transform'] }, tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'agentic', innerDispatch: 'write', loopClass: 'mutating', description: 'Run a shell command in an allowed workspace directory.' },
   // actionTopologyRole 'control': run_worker is the fan-out COORDINATION
   // primitive — it spawns children whose business dispatches settle at their

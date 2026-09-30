@@ -1,3 +1,4 @@
+import { WORKSPACE_SCRIPT_PARAMETERS, workspaceScriptArguments, type WorkspaceScriptArguments } from '../../spaces/workspace-script-contract.js';
 import { READ_FILE_PARAMS } from '../../tools/local-file-read-contract.js';
 /**
  * Transport-only crossing for explicitly reviewed Clementine-local tools.
@@ -77,6 +78,9 @@ function exactDeclaration(name: string): ToolDecl | null {
 function validExecutionContract(value: unknown): value is ReviewedLocalExecutionContractV1 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const contract = value as Partial<ReviewedLocalExecutionContractV1>;
+  if (contract.version === 1 && contract.adapter === 'workspace_script_v1') {
+    return contract.idempotency === 'never_redispatch' && contract.reconciliation === 'none';
+  }
   if (contract.version === 1 && contract.adapter === 'local_file_read_v1') {
     return contract.idempotency === 'read_only' && contract.reconciliation === 'none';
   }
@@ -220,11 +224,44 @@ function deriveReviewedLocalReadDefinition(input: {
   };
 }
 
+/** Opaque scripts carry the maximum effect and require exact consent. The
+ * adapter promises an execution receipt, never reversibility or pure reads. */
+function deriveReviewedScriptDefinition(input: {
+  declaration: ToolDecl; schema: Record<string, unknown>;
+}): AuthorizedLocalPlanningDefinitionV1 | null {
+  if (input.declaration.sideEffect !== 'admin') return null;
+  const name = input.declaration.name;
+  const capabilityRef = `cap:local:${name}:opaque_execution`;
+  const schemaFingerprint = stableJsonDigest(input.schema);
+  const registrySemanticsFingerprint = stableJsonDigest({
+    version: 1, name, effect: 'admin', localExecution: input.declaration.localExecution,
+  });
+  const envelopeFingerprint = stableJsonDigest({ schemaFingerprint, registrySemanticsFingerprint });
+  return {
+    version: 1, provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, name,
+    carrier: 'work_call', capabilityRef, schemaFingerprint, registrySemanticsFingerprint,
+    envelopeFingerprint, consequence: 'local_execution', reversibility: 'unknown',
+    destructive: true, accountIdentity: REVIEWED_LOCAL_ACCOUNT, safeMode: null,
+    descriptor: {
+      id: capabilityRef, effect: 'admin', purpose: 'execute_saved_source_script',
+      acceptedInputKinds: ['saved_source_execution'], producedOutputKinds: ['script_execution_receipt'],
+      applicableDeliverableKinds: ['source_data'], inputShape: 'saved_source_execution',
+      outputShape: 'script_execution_receipt', outputKind: 'script_execution_receipt',
+      deliverableKind: 'source_data', destinationPosture: null,
+      evidenceKinds: ['process_result'], handleRequired: false, readbackRequired: false,
+      accountScope: REVIEWED_LOCAL_ACCOUNT,
+      manifestDigest: stableJsonDigest({ capabilityRef, envelopeFingerprint }),
+      advisoryRoles: ['execute'],
+    },
+  };
+}
+
 function deriveReviewedLocalDefinition(input: {
   declaration: ToolDecl;
   schema: Record<string, unknown>;
 }): AuthorizedLocalPlanningDefinitionV1 | null {
   const name = input.declaration.name.trim();
+  if (input.declaration.localExecution?.adapter === 'workspace_script_v1') return deriveReviewedScriptDefinition(input);
   if (input.declaration.localExecution?.adapter === 'local_file_read_v1') {
     return deriveReviewedLocalReadDefinition(input);
   }
@@ -309,7 +346,8 @@ function currentReviewedLocalSchema(
   // work_call is the physical carrier for reviewed local mutations. Match its
   // current strict deferred schema bytes (Zod's 2020-12 projection), not the
   // separate first-class provider projection used by direct model calling.
-  const parametersShape = execution.adapter === 'local_file_read_v1' ? READ_FILE_PARAMS
+  const parametersShape = execution.adapter === 'workspace_script_v1' ? WORKSPACE_SCRIPT_PARAMETERS
+    : execution.adapter === 'local_file_read_v1' ? READ_FILE_PARAMS
     : execution.adapter === 'artifact_bundle_v1'
     ? ARTIFACT_BUNDLE_TOOL_PARAMETERS
     : execution.adapter === 'local_file_revision_v1' ? WRITE_FILE_PARAMS
@@ -386,14 +424,17 @@ export function reviewedLocalCapabilityManifest(
     accountId: REVIEWED_LOCAL_ACCOUNT,
     idempotency: descriptor.effect === 'read'
       ? { required: false, policy: 'none' } : { required: true, policy: 'key_before_dispatch' },
-    reconciliation: descriptor.effect === 'read'
-      ? { supported: false, policy: 'none' } : { supported: true, policy: 'exact_artifact' },
+    reconciliation: observed.execution.adapter === 'workspace_script_v1'
+      ? { supported: false, policy: 'uncertain_if_absent' }
+      : descriptor.effect === 'read'
+        ? { supported: false, policy: 'none' } : { supported: true, policy: 'exact_artifact' },
     outputContract: { kind: descriptor.outputKind ?? observed.definition.consequence },
     purpose: descriptor.purpose,
     acceptedInputKinds: [...descriptor.acceptedInputKinds],
     producedOutputKinds: [...descriptor.producedOutputKinds],
     applicableDeliverableKinds: [...descriptor.applicableDeliverableKinds],
-    evidenceContract: { kinds: descriptor.effect === 'read' ? ['tool_result'] : ['local_commit_receipt'], readbackRequired: false },
+    evidenceContract: { kinds: observed.execution.adapter === 'workspace_script_v1'
+      ? ['process_result'] : descriptor.effect === 'read' ? ['tool_result'] : ['local_commit_receipt'], readbackRequired: false },
     provenance: {
       issuer: 'host:reviewed-local-registry',
       issuedAt: '1970-01-01T00:00:00.000Z',
@@ -411,6 +452,7 @@ export function reviewedLocalToolArgumentsMatch(
   observed: ReviewedLocalToolObservation,
   args: Record<string, unknown>,
 ): boolean {
+  if (observed.execution.adapter === 'workspace_script_v1') return workspaceScriptArguments.safeParse(args).success;
   if (observed.execution.adapter === 'local_file_read_v1') {
     return z.strictObject(READ_FILE_PARAMS).safeParse({ ...args, max_chars: args.max_chars ?? null }).success;
   }
@@ -441,6 +483,7 @@ export function reviewedLocalToolArgumentsMatch(
 }
 
 export type PreparedReviewedLocalToolExecution =
+  | { observed: ReviewedLocalToolObservation; adapter: 'workspace_script_v1'; args: WorkspaceScriptArguments }
   | { observed: ReviewedLocalToolObservation; adapter: 'local_file_read_v1';
       args: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>> }
   | {
@@ -508,6 +551,9 @@ export function prepareReviewedLocalToolExecution(
   }
   if (!reviewedLocalToolArgumentsMatch(observed, call.args)) {
     throw new Error('reviewed local execution arguments exceed the declared safe mode');
+  }
+  if (observed.execution.adapter === 'workspace_script_v1') {
+    return { observed, adapter: observed.execution.adapter, args: workspaceScriptArguments.parse(call.args) };
   }
   if (observed.execution.adapter === 'local_file_read_v1') {
     return { observed, adapter: observed.execution.adapter,

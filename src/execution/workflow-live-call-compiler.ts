@@ -51,7 +51,7 @@ const PLAN_EFFECTS = new Set<WorkflowNodeInvocationEffectV1>([
   'read', 'compute', 'host_only', 'local_write', 'external_write', 'admin',
 ]);
 
-export type LiveCallExpectedEffect = 'read' | 'write' | 'send';
+export type LiveCallExpectedEffect = 'read' | 'write' | 'send' | 'admin';
 
 /**
  * The only account identity a blocked workflow may offer to a human. Labels,
@@ -160,7 +160,7 @@ export function liveCallEffectEscalates(
   live: 'read' | 'write' | 'admin',
 ): boolean {
   const liveRank = live === 'read' ? 0 : live === 'write' ? 1 : 2;
-  const authoredRank = authored === 'read' ? 0 : 1;
+  const authoredRank = authored === 'read' ? 0 : authored === 'admin' ? 2 : 1;
   return liveRank > authoredRank;
 }
 

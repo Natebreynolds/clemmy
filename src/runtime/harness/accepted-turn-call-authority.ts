@@ -492,6 +492,13 @@ export interface WorkflowV3CallAttestationProof {
 const workflowV3Proofs = new WeakMap<object, Readonly<WorkflowV3CallAttestation>>();
 const workflowV3CallAttestationStorage = new AsyncLocalStorage<Readonly<WorkflowV3CallAttestation>>();
 
+/** Host carrier reads its module-minted exact-call owner; serialized lookalikes
+ * cannot install this scope or authorize a process. */
+export function currentWorkflowV3CallAttestation(): Readonly<WorkflowV3CallAttestation> | undefined {
+  return workflowV3CallAttestationStorage.getStore();
+}
+
+
 type HarnessDb = ReturnType<typeof openEventLog>;
 
 interface WorkflowV3BindingSqlAdmission {

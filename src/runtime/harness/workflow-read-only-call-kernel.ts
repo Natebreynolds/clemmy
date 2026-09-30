@@ -13,8 +13,10 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { withFileLock } from '../atomic-json.js';
+import { runWithToolAbortSignal } from '../tool-abort-context.js';
 import { observeReviewedLocalTool, reviewedLocalToolArgumentsMatch } from './reviewed-local-tool-transport.js';
 import { isKnownLocalFileCreateConflict } from './local-file-create-conflict.js';
+import { isHostPreDispatchRefusal } from './host-pre-dispatch-refusal.js';
 import { liveReadCompletenessEvidencePaths } from './reviewed-cli-read-config.js';
 
 import {
@@ -996,6 +998,8 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
         error: unknown,
         businessCall: boolean,
       ): ExecuteWorkflowCallKernelResult => {
+        const hostRefused = isHostPreDispatchRefusal(error);
+        const provenNoDispatch = !businessCall || hostRefused;
         const physical = settlePhysicalDispatch({
           identity: crossing,
           tool: minted.toolName,
@@ -1017,12 +1021,13 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
               execution: { kind: 'provider_execution' },
               outcome: classifyAttemptOutcome({
                 executionFailed: true,
-                ...(businessCall && port.mutating
+                ...(hostRefused ? { preDispatch: true, policyRefused: true } : {}),
+                ...(!provenNoDispatch && port.mutating
                   ? { mutating: true, acknowledged: isKnownLocalFileCreateConflict(error, exactPort.capability.providerKind) }
                   : {}),
               }),
               recovery: {
-                businessCall,
+                businessCall: !provenNoDispatch,
                 mutating: port.mutating,
                 requirementId: parsed.plan.requirementId,
               },
@@ -1060,7 +1065,7 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
           : {
               status: 'failed',
               reason,
-              zeroBody: !businessCall,
+              zeroBody: provenNoDispatch,
               activationId: input.activationId,
             };
       };
@@ -1240,7 +1245,7 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
 
       let result: unknown = recoveredFileResult;
       try {
-        const invokeBusiness = () => exactPort.invoke({
+        const invokePort = () => exactPort.invoke({
             nodeId: workflow.nodeId,
             role: parsed.plan.requirementId,
             payload: structuredClone(input.args),
@@ -1267,6 +1272,12 @@ async function executeWorkflowCallKernel<Proof extends object>(input: {
               invoke: exactPort.invoke,
             },
           });
+        // Admission cancellation alone does not stop an already-started tool.
+        // Carry the exact owner's signal to host/network carriers that support
+        // cancellation; settlement still owns any effects already performed.
+        const invokeBusiness = () => input.signal
+          ? runWithToolAbortSignal(input.signal, invokePort)
+          : invokePort();
         if (recoveredFileResult !== undefined) {
           // Receipt-only reconciliation: the business port is never re-entered.
         } else if (exactPort.invokeWithPreparation) {

@@ -76,6 +76,8 @@ export interface ClassifyOptions {
  * split it into a read+confirm pair.
  */
 const ALWAYS_ADMIN = new Set<string>([
+  // Internal saved-code execution has opaque effects; a digest is not a read proof.
+  'workspace_source_script',
   'create_tool',
   'delete_agent',
   'credentials_set',
