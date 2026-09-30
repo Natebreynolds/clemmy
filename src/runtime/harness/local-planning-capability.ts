@@ -227,7 +227,7 @@ function structurallyCarriesSafeMode(
   semantics: LocalPlanningSemantics,
 ): boolean {
   const safeMode = semantics.safeMode;
-  if (!safeMode) return semantics.reversibility === 'reversible' && !semantics.destructive;
+  if (!safeMode) return cardFreeWithoutSafeMode(semantics.reversibility) && !semantics.destructive;
   if (!safeToken(safeMode.id)) return false;
   const properties = isRecord(schema.properties) ? schema.properties : null;
   if (!properties) return false;
@@ -268,6 +268,18 @@ function structurallyCarriesSafeMode(
   });
 }
 
+/** What a single declaration with no safe mode may be: work that can be
+ * undone, or ordinary local work. Never irreversible, never unknown. */
+function cardFreeWithoutSafeMode(reversibility: LocalPlanningSemantics['reversibility']): boolean {
+  return reversibility === 'reversible' || reversibility === 'ordinary_non_destructive';
+}
+
+/** The variant a declaration with no safe mode is named by. It says what the
+ * declaration is: ordinary local work is never named reversible. */
+function unnamedVariantToken(reversibility: LocalPlanningSemantics['reversibility'] | 'read_only'): string {
+  return reversibility === 'ordinary_non_destructive' ? 'ordinary' : 'reversible';
+}
+
 function declaredMutationSemantics(declaration: ToolDecl): readonly LocalPlanningSemantics[] {
   return [
     ...(declaration.localPlanning ? [declaration.localPlanning] : []),
@@ -289,7 +301,9 @@ function declarationCanEnterLocalPlanningMutation(declaration: ToolDecl): boolea
   const semantics = declaredMutationSemantics(declaration);
   const legacySafe = semantics.length === 1
     && semantics[0]!.destructive === false
-    && (semantics[0]!.reversibility === 'reversible' || semantics[0]!.reversibility === 'create_only');
+    && (semantics[0]!.reversibility === 'reversible'
+      || semantics[0]!.reversibility === 'create_only'
+      || semantics[0]!.reversibility === 'ordinary_non_destructive');
   const exactVariants = semantics.length > 1
     && explicitVariantSemanticsAreClosed(declaration)
     && semantics.every((variant) => variant.reversibility !== 'unknown' && variant.safeMode !== undefined);
@@ -558,6 +572,7 @@ function deriveLocalPlanningDefinitionForSemantics(input: {
         !input.allowHighRiskVariant
         && semantics!.reversibility !== 'reversible'
         && semantics!.reversibility !== 'create_only'
+        && semantics!.reversibility !== 'ordinary_non_destructive'
       )
     )
   ) {
@@ -572,7 +587,7 @@ function deriveLocalPlanningDefinitionForSemantics(input: {
     return { ok: false, reason: 'safe_mode_not_structural' };
   }
 
-  const variant = safeToken(readOnly ? 'read' : normalized!.safeMode?.id ?? 'reversible');
+  const variant = safeToken(readOnly ? 'read' : normalized!.safeMode?.id ?? unnamedVariantToken(normalized!.reversibility));
   const nameToken = safeToken(name);
   if (!variant || !nameToken) return { ok: false, reason: 'not_exact_registry_row' };
   const capabilityRef = `cap:local:${nameToken}:${variant}`;
@@ -835,7 +850,7 @@ export async function issueAuthorizedLocalPlanningDisclosureCandidate(input: {
     schema: observed.schema,
     sourceKind: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
     capabilityVariants: Object.freeze(observed.definitions.map((definition) => Object.freeze({
-      variantId: definition.safeMode?.id ?? 'reversible',
+      variantId: definition.safeMode?.id ?? unnamedVariantToken(definition.reversibility),
       capabilityRef: definition.capabilityRef,
       reversibility: definition.reversibility,
       destructive: definition.destructive,
@@ -911,7 +926,7 @@ export async function revalidateLocalPlanningDefinition(
           || prior.safeMode !== null
           || prior.descriptor.destinationPosture !== null
         : prior.descriptor.effect !== 'local_write'
-          || !['reversible', 'create_only', 'irreversible'].includes(prior.reversibility)
+          || !['reversible', 'create_only', 'irreversible', 'ordinary_non_destructive'].includes(prior.reversibility)
           || (prior.reversibility === 'irreversible' && prior.safeMode === null)
     )
   ) return { ok: false, reason: 'invalid_local_planning_definition' };
@@ -964,7 +979,7 @@ function minimallyValidDurableDefinition(
           && value.safeMode === null
           && value.descriptor.destinationPosture === null
         : value.descriptor.effect === 'local_write'
-          && ['reversible', 'create_only', 'irreversible'].includes(String(value.reversibility))
+          && ['reversible', 'create_only', 'irreversible', 'ordinary_non_destructive'].includes(String(value.reversibility))
           && (value.reversibility !== 'irreversible' || isRecord(value.safeMode))
     )
     && typeof value.destructive === 'boolean'

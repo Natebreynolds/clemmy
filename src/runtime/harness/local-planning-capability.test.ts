@@ -403,10 +403,25 @@ test('reviewed project reads enter local planning generically without widening a
     assert.deepEqual(wrongCarrier, { ok: false, reason: 'carrier_mismatch' });
   }
 
-  for (const name of ['run_shell_command', 'list_files'] as const) {
+  for (const name of ['list_files'] as const) {
     assert.equal(local.isRegistryDeclaredLocalPlanningCapability(name), false, name);
     const refused = await local.observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
     assert.equal(refused.ok, false, name);
+  }
+
+  // The shell is ordinary local work: one definition, named for what it is,
+  // never called reversible. Its own guards still run inside the tool.
+  assert.equal(local.isRegistryDeclaredLocalPlanningMutation('run_shell_command'), true);
+  const shell = await local.observeCurrentLocalPlanningDefinition({ name: 'run_shell_command', carrier: 'work_call' });
+  assert.equal(shell.ok, true, shell.ok ? '' : shell.reason);
+  if (shell.ok) {
+    assert.equal(shell.definition.capabilityRef, 'cap:local:run_shell_command:ordinary');
+    assert.equal(shell.definition.descriptor.effect, 'local_write');
+    assert.equal(shell.definition.consequence, 'local_execution');
+    assert.equal(shell.definition.reversibility, 'ordinary_non_destructive');
+    assert.equal(shell.definition.destructive, false);
+    assert.equal(shell.definition.safeMode, null);
+    assert.equal(shell.definition.descriptor.destinationPosture, null);
   }
 
   assert.equal(local.isRegistryDeclaredLocalPlanningCapability('git_status'), true,

@@ -1531,9 +1531,9 @@ function replayedLocalPlanningDefinition(value: unknown): AuthorizedLocalPlannin
       && safeMode === null
       && descriptor.destinationPosture === null
     : descriptor.effect === 'local_write'
-      && ['local_artifact', 'workspace_definition', 'workflow_definition', 'runtime_configuration']
+      && ['local_artifact', 'workspace_definition', 'workflow_definition', 'runtime_configuration', 'local_execution']
         .includes(String(row.consequence))
-      && ['reversible', 'create_only', 'irreversible'].includes(String(row.reversibility))
+      && ['reversible', 'create_only', 'irreversible', 'ordinary_non_destructive'].includes(String(row.reversibility))
       && (row.reversibility !== 'irreversible' || (safeMode !== null && typeof safeMode === 'object'));
   if (!localShape) return null;
   return {

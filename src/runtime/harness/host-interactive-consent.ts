@@ -718,9 +718,13 @@ function localRisk(definition: AuthorizedLocalPlanningDefinitionV1, args: unknow
   }
   const posture = definition.descriptor.destinationPosture;
   return {
+    // Ordinary local work is named as what it is. It proceeds as ordinary
+    // accepted work, never as work that can be undone.
     reversibility: definition.reversibility === 'irreversible'
       ? 'irreversible'
-      : 'reversible',
+      : definition.reversibility === 'ordinary_non_destructive'
+        ? 'ordinary_non_destructive'
+        : 'reversible',
     consequence: posture === 'create_new'
       ? 'create'
       : posture === 'named_existing'
