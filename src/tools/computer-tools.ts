@@ -1502,6 +1502,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     name: 'read_file',
     description: [
       'Read a file from an allowed workspace path.',
+      'An .html file read here is its source. To see how a page LOOKS, as a browser shows it, use page_preview instead.',
       'The complete content is retained for recall_tool_result and tool_output_query. max_chars controls only the visible preview, never how much of the file is retained; null uses the normal result preview.',
       'UTF-8 text is returned as-is; PDF, Office and EPub documents, images (OCR) and audio (transcript) are extracted to Markdown.',
     ].join('\n'),
