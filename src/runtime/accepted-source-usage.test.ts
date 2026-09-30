@@ -3,6 +3,7 @@ import { after, test } from 'node:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import Database from 'better-sqlite3';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-source-usage-'));
 process.env.CLEMENTINE_HOME = home;
@@ -108,13 +109,48 @@ test('deleting the owning session removes only its usage projection', () => {
 test('rehearsing the new migration preserves reported usage and accepted-source references', async () => {
   const owner = source('usage-migration');
   record(owner);
-  const db = log.openEventLog();
-  const before = db.prepare('SELECT * FROM accepted_source_usage_v1 ORDER BY session_id, source_user_seq, role').all();
-  db.prepare('DELETE FROM schema_version WHERE version = 84').run();
-  const { applyHarnessMigrations } = await import('./harness/eventlog-schema.js');
-  applyHarnessMigrations(db);
-  assert.deepEqual(db.prepare('SELECT * FROM accepted_source_usage_v1 ORDER BY session_id, source_user_seq, role').all(), before);
-  assert.deepEqual(db.pragma('foreign_key_check'), []);
+  const recorded = log.openEventLog();
+  const { applyHarnessMigrations, applyHarnessMigrationsThroughVersionForTests } = await import('./harness/eventlog-schema.js');
+  const { HARNESS_SCHEMA_VERSION } = await import('./harness/schema-version.js');
+  // Rehearse a real forward chain in a separate database. Deleting only the
+  // v84 marker from the latest database leaves a hole beneath later versions;
+  // MAX(version) then skips v84 and contaminates every following reader test.
+  const db = new Database(':memory:');
+  db.pragma('foreign_keys = ON');
+  try {
+    applyHarnessMigrationsThroughVersionForTests(db, 83);
+    assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'accepted_source_usage_v1'").get(), undefined);
+    const preceding = db.prepare('SELECT * FROM schema_version ORDER BY version').all();
+    applyHarnessMigrationsThroughVersionForTests(db, 84);
+    assert.deepEqual(db.prepare('SELECT * FROM schema_version WHERE version <= 83 ORDER BY version').all(), preceding);
+    assert.deepEqual(db.prepare('SELECT * FROM accepted_source_usage_v1').all(), [], 'migration does not invent usage');
+
+    // Seed the historical schema with actual source/usage-writer rows, including
+    // its foreign-key owners, rather than guessed billing totals.
+    const retained = [
+      ['sessions', 'id', owner.sessionId],
+      ['events', 'seq', owner.sourceUserSeq],
+      ['accepted_source_usage_v1', 'source_user_seq', owner.sourceUserSeq],
+    ] as const;
+    for (const [table, key, value] of retained) {
+      const row = recorded.prepare(`SELECT * FROM ${table} WHERE ${key} = ?`).get(value) as Record<string, unknown>;
+      assert.ok(row);
+      const columns = Object.keys(row);
+      db.prepare(`INSERT INTO ${table} (${columns.map(column => `"${column}"`).join(', ')})
+        VALUES (${columns.map(() => '?').join(', ')})`).run(...Object.values(row));
+    }
+    const before = new Map(retained.map(([table]) => [table, db.prepare(`SELECT * FROM ${table}`).all()]));
+    const migrationHistory = db.prepare('SELECT * FROM schema_version ORDER BY version').all();
+    for (let boot = 0; boot < 2; boot += 1) {
+      applyHarnessMigrations(db);
+      assert.deepEqual(db.prepare('SELECT * FROM schema_version WHERE version <= 84 ORDER BY version').all(), migrationHistory);
+      assert.deepEqual(db.prepare('SELECT version FROM schema_version ORDER BY version').all(),
+        Array.from({ length: HARNESS_SCHEMA_VERSION }, (_, index) => ({ version: index + 1 })));
+      for (const [table] of retained) assert.deepEqual(db.prepare(`SELECT * FROM ${table}`).all(), before.get(table));
+      assert.deepEqual(db.pragma('foreign_key_check'), []);
+      assert.equal(db.pragma('quick_check', { simple: true }), 'ok');
+    }
+  } finally { db.close(); }
   assert.equal(readAcceptedSourceUsage(owner)!.totals.calls, 1);
 });
 
