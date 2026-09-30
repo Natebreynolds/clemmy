@@ -4,7 +4,7 @@
 
 This is the first implementation slice of the owner's request to make setup feel native and let Clem carry a task through missing capabilities. UI and harness work belong together: a connection form without durable continuation would merely move the manual setup problem into chat.
 
-Base: `4e2efe15bc348549e195e6660a305c011bff8cf1`. Implementation branch: `codex/contextual-connection-ui`; worktree: `/Users/nathan.reynolds/.codex/worktrees/connection-continuity/clementine-next`. The other agent's shell lane was last checked at `c76c4561a`, branch `claude/shell-anywhere`; it was not modified. Main and the owner's uncommitted documents were not changed.
+Base: `4e2efe15bc348549e195e6660a305c011bff8cf1`. Implementation branch: `codex/contextual-connection-ui`; worktree: `/Users/nathan.reynolds/.codex/worktrees/connection-continuity/clementine-next`. The other agent's shell lane was last checked clean at `5fc52bf4b`, branch `claude/shell-anywhere`; it was not modified. Its navigation/settings/consent work remains owned by that lane. Main and the owner's uncommitted documents were not changed.
 
 Source and UI builds are qualified separately from installation. This slice has **not been merged, hotpatched, tagged, or accepted in the installed app/live home**. The broader improvement goal remains open.
 
@@ -320,6 +320,78 @@ The isolation runner explicitly could not prove its live-home sentinel because e
 - A receipt is not source acceptance. Mobile acknowledgement must not leave a stale rejected continuation waiting forever for an SSE source that was never created.
 
 ## UI woven into the next slices
+
+### Verified account identity in the setup card — September 30
+
+Both desktop and mobile now show which account the setup check verified. The
+strict provider verifier can return a small display projection from the same
+snapshot it already fetched. It returns only the selected connection's ID,
+toolkit and label internally; the task setup response exposes only the label,
+after rechecking the original task and account binding. Provider state, tokens
+and dispatch entity are excluded. A missing name stays unknown; no account
+name is guessed from another connection. The UI clears the previous label and
+success message when checking again, and a failed recheck cannot keep showing
+the account as verified. This adds no model call or extra provider request.
+
+This is display context, not an account-routing grant. Existing non-setup
+verifiers retain their previous result shape. Existing callable attestation,
+approval requirements, task ownership and the reviewed-Execute pause remain
+unchanged. A verified account does not imply a resumed or completed task.
+
+Verification: **29/29** focused tests across strict provider account display,
+connection setup/retirement/races, and mobile continuation passed. Runtime
+TypeScript and both frontend production builds passed; the existing console
+large-chunk warning remains. The design detector returned no findings.
+Controlled browser fixtures rendered the actual components and styles: both
+surfaces cleared the old confirmation after a failed recheck; ordinary setup
+issued one continuation each; reviewed Execute issued zero. Missing account
+names rendered explicitly. At a 390px mobile viewport, a long account address
+wrapped inside a 358px card with document width 390px. Fixtures intercepted
+all fetches, dev proxies pointed at a non-daemon port, and temporary files,
+tabs and servers were removed afterward; the viewport override was reset.
+
+Logs: `/tmp/clem-connection-account-{tests,tsc,console,mobile}.txt` and
+`/tmp/clem-connection-account-detect.json`. These are transient; this section
+retains their results. The runner's live-home sentinel was **NOT PERFORMED**
+while daemon 35630 owned the changing live stores. No paid-model test,
+provider connection, hotpatch or installed-app acceptance occurred. This
+increment is not proof of reviewed Execute resumption, general latency or
+token savings, or release readiness.
+
+### Direction for the remaining UI work
+
+The user explicitly wants UI refinement woven into this capability work.
+Preserve the existing visual identity and put the next useful action beside
+the task that needs it. Desktop and mobile should agree on the task, selected
+account, permission, next step and result. The priorities below are planned
+work, not claims that the whole experience has shipped.
+
+- **Setup in the conversation:** explain the missing capability, connect with
+  provider-native forms, verify the exact account, and return to the retained
+  task. Complete safe reviewed-Execute activation before enabling its resume
+  button; never ask the person to restate the task to conceal lost continuity.
+- **One clear decision:** readable recipient/resource and account names,
+  exact proposed effect, and costs where a purchase or recurring charge is
+  involved. Progressive disclosure holds technical evidence. A provisioning
+  action and permission to send messages/calls are distinct scoped decisions;
+  do not turn connecting an app into blanket ongoing authority.
+- **Purposeful progress:** show what is running, what needs the user, and what
+  actually completed from durable task/receipt state. Put background detail
+  in the work view and link back to its conversation, without covering Home
+  in redundant cards or equating connection with successful work.
+- **Projects and agents:** make the objective, assigned agent, current work
+  and retained conversation easy to find. Open or steer the existing child
+  execution instead of accidentally creating another.
+- **Proactive follow-up:** a check-in explains why now, what changed, and what
+  Clem proposes, with a dismiss/defer action and links to the supporting
+  memory/task. Background memory maintenance should be visible without
+  turning each internal bookkeeping step into a notification.
+- **Mobile continuity:** the same task and decision survive sign-in, reload,
+  desktop/phone handoff and a lost response. Connection health distinguishes
+  outbound tool access from inbound event delivery; a green connection badge
+  alone must not imply that future calls/messages can reach Clem.
+
+### Paired harness and UI acceptance
 
 | Harness work | Corresponding user experience | Acceptance evidence |
 | --- | --- | --- |

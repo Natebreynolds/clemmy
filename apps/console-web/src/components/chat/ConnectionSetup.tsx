@@ -24,6 +24,7 @@ export function ConnectionSetup({ sessionId, options, revision, onContinue, fall
   const [url, setUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState<'connect' | 'check' | null>(null);
   const [verified, setVerified] = useState(false);
+  const [accountLabel, setAccountLabel] = useState<string | null>(null);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
   const identity = JSON.stringify([sessionId, options]);
@@ -37,9 +38,9 @@ export function ConnectionSetup({ sessionId, options, revision, onContinue, fall
     if (!pending || checking.current || continuing.current) return;
     const ownGeneration = generation.current;
     checking.current = true;
-    setBusy('check'); setError('');
+    setBusy('check'); setError(''); setNote(''); setVerified(false); setAccountLabel(null);
     try {
-      const result = await api<{ request: ConnectionRequest | null; ready: boolean; connectionVerified?: true }>(
+      const result = await api<{ request: ConnectionRequest | null; ready: boolean; connectionVerified?: true; verifiedAccount?: { label: string | null } }>(
         `/api/connection-requests/${encodeURIComponent(pending.requestId)}/verify`,
         { method: 'POST', cache: 'no-store', body: JSON.stringify({ sessionId }) },
       );
@@ -52,6 +53,7 @@ export function ConnectionSetup({ sessionId, options, revision, onContinue, fall
       }
       setRequest(fresh);
       setVerified(result.ready || Boolean(result.connectionVerified));
+      setAccountLabel(result.ready || result.connectionVerified ? result.verifiedAccount?.label ?? null : null);
       if (result.ready || result.connectionVerified) { setForm(null); setUrl(null); }
       if (result.ready) {
         continuing.current = true;
@@ -64,7 +66,7 @@ export function ConnectionSetup({ sessionId, options, revision, onContinue, fall
         : 'Sign-in is not finished yet. Your request is saved here.');
     } catch (err) {
       if (ownGeneration === generation.current) {
-        setVerified(false); setNote('');
+        setVerified(false); setAccountLabel(null); setNote('');
         setError(err instanceof Error ? err.message : 'Could not check this connection. Try again.');
       }
     } finally {
@@ -74,7 +76,7 @@ export function ConnectionSetup({ sessionId, options, revision, onContinue, fall
 
   useEffect(() => {
     const ownGeneration = ++generation.current;
-    setRequest(null); setForm(null); setUrl(null); setNote(''); setError(''); setBusy(null); setVerified(false);
+    setRequest(null); setForm(null); setUrl(null); setNote(''); setError(''); setBusy(null); setVerified(false); setAccountLabel(null);
     checking.current = false; continuing.current = false;
     void api<{ request: ConnectionRequest | null }>(`/api/connection-requests?sessionId=${encodeURIComponent(sessionId)}`, { cache: 'no-store' })
       .then(({ request: found }) => {
@@ -118,7 +120,7 @@ export function ConnectionSetup({ sessionId, options, revision, onContinue, fall
   async function connect() {
     if (busy || checking.current || continuing.current) return;
     const ownGeneration = generation.current;
-    setBusy('connect'); setError(''); setVerified(false); setNote('');
+    setBusy('connect'); setError(''); setVerified(false); setAccountLabel(null); setNote('');
     try {
       const result = await authorizeComposio(request!.toolkit, undefined, context);
       if (ownGeneration === generation.current) await authorized(result);
@@ -134,7 +136,10 @@ export function ConnectionSetup({ sessionId, options, revision, onContinue, fall
       }} /> : <>
       <div className="flex items-start gap-3">
         <Plug className="mt-0.5 h-5 w-5 shrink-0 text-primary" aria-hidden />
-        <div><p className="text-small font-medium text-fg">{verified ? `${name} connected` : `Connect ${name} to continue`}</p>
+        <div className="min-w-0"><p className="text-small font-medium text-fg">{busy === 'check' ? `Checking ${name}` : verified ? `${name} connected` : `Connect ${name} to continue`}</p>
+          {verified && <p className="mt-1 break-words text-small text-fg">{accountLabel
+            ? <>Verified account: <span className="font-medium">{accountLabel}</span></>
+            : 'The provider did not return an account name.'}</p>}
           {!verified && <p className="mt-1 text-small text-muted">{request.continuationBlocker
             ? 'Connect this app to resolve the missing connection. Your reviewed execution stays paused.'
             : 'Your request stays here. Clem will continue once this account is verified.'}</p>}</div>

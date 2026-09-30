@@ -163,14 +163,20 @@ export async function verifyConnectionSetup(
   if (!attempt) return { request, ready: false };
   // This verifier refreshes the provider snapshot without last-good fallback.
   // A stale account list or a different connected mailbox cannot resume work.
-  const result = await verify([{ identifier: request.capability, connectionId: attempt.connection_id }]);
+  const result = await verify([{ identifier: request.capability, connectionId: attempt.connection_id }], { includeAccountDisplay: true });
   const current = readConnectionSetup(context.sessionId, context.connectionRequestId);
   const stillBound = openEventLog().prepare(`SELECT connection_id, updated_at FROM connection_setup_attempts
     WHERE request_id = ? AND session_id = ?`).get(request.requestId, request.sessionId) as { connection_id: string; updated_at: string } | undefined;
   const verificationBinding = setupBinding(request.requestId, attempt);
   const connectionVerified = Boolean(result.ok && current && stillBound && setupBinding(request.requestId, stillBound) === verificationBinding);
+  const account = result.ok ? result.accounts?.find((item) => item.connectionId === attempt.connection_id
+    && item.toolkit.toLowerCase() === request.toolkit.toLowerCase()) : undefined;
   return { request: current, ready: Boolean(connectionVerified && current && !current.continuationBlocker),
-    ...(connectionVerified ? { connectionVerified: true as const, verificationBinding } : {}) };
+    ...(connectionVerified ? { connectionVerified: true as const, verificationBinding,
+      // UI context only: never a browser-supplied account selection, never a
+      // durable routing grant, and never a second provider/model request.
+      verifiedAccount: { label: account?.label ?? null },
+    } : {}) };
   // Do NOT satisfy dependency_requests here. The existing continuation spine
   // must still discover and attest the exact account-bound callable capability.
 }

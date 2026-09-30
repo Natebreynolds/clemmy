@@ -1342,8 +1342,16 @@ export async function listUsableConnectedToolkits(
   );
 }
 
+/** Display-only identity from the exact snapshot used for verification. Never
+ * expose provider state, credentials, or the dispatch entity in a setup card. */
+export interface VerifiedComposioAccountDisplay {
+  connectionId: string;
+  toolkit: string;
+  label: string | null;
+}
+
 export type SelectedComposioConnectionRevalidation =
-  | { ok: true }
+  | { ok: true; accounts?: VerifiedComposioAccountDisplay[] }
   | {
       ok: false;
       identifier: string;
@@ -1357,6 +1365,7 @@ export type SelectedComposioConnectionRevalidation =
  */
 export async function revalidateSelectedComposioConnections(
   selections: readonly { identifier: string; connectionId: string }[],
+  options: { includeAccountDisplay?: boolean } = {},
 ): Promise<SelectedComposioConnectionRevalidation> {
   if (selections.length === 0) return { ok: true };
   const fresh = await refreshConnectedToolkits();
@@ -1364,6 +1373,7 @@ export async function revalidateSelectedComposioConnections(
     fresh,
     readComposioConnectionSuppressionState(),
   );
+  const accounts: VerifiedComposioAccountDisplay[] = [];
   for (const selection of selections) {
     const identifier = selection.identifier.trim();
     const connectionId = selection.connectionId.trim();
@@ -1383,8 +1393,13 @@ export async function revalidateSelectedComposioConnections(
     ) {
       return { ok: false, identifier, reason: 'inactive_or_suppressed' };
     }
+    if (options.includeAccountDisplay) accounts.push({
+      connectionId: current.connectionId,
+      toolkit: current.slug,
+      label: current.accountEmail?.trim() || current.accountName?.trim() || current.accountLabel?.trim() || null,
+    });
   }
-  return { ok: true };
+  return { ok: true, ...(options.includeAccountDisplay ? { accounts } : {}) };
 }
 
 export async function listSuppressedConnectedToolkits(): Promise<Array<ConnectedToolkit & { suppression: ComposioConnectionSuppression }>> {

@@ -296,6 +296,30 @@ test('provider rejection cannot be converted into ready or satisfy the dependenc
   assert.equal(dependencyStatus(dependency.requestId), 'open');
 });
 
+test('the setup receipt exposes only the exact verified account label, without persisting it in chat', async () => {
+  const { context, dependency } = parkedTask('setup-account-display');
+  setup.recordConnectionSetupResult(context, { connectionId: 'ca_display_fixture' });
+  const account = { connectionId: 'ca_display_fixture', toolkit: subject.toolkit, label: 'work@example.test' };
+  const result = await setup.verifyConnectionSetup(context, async (_selections, options) => {
+    assert.equal(options?.includeAccountDisplay, true);
+    return { ok: true, accounts: [
+      { connectionId: 'ca_other_fixture', toolkit: subject.toolkit, label: 'other@example.test' },
+      { ...account, ownerUserId: 'private-dispatch-entity', state: { access_token: 'fixture-secret' } },
+    ] };
+  });
+  assert.equal(result.ready, true);
+  assert.deepEqual(result.verifiedAccount, { label: 'work@example.test' });
+  assert.equal(dependencyStatus(dependency.requestId), 'open', 'display metadata grants no callable authority');
+  const events = JSON.stringify(eventlog.listEvents(context.sessionId));
+  assert.equal(events.includes('work@example.test'), false);
+  assert.equal(JSON.stringify(result).includes('fixture-secret'), false);
+  assert.equal(JSON.stringify(result).includes('private-dispatch-entity'), false);
+  for (const changed of [{ ...account, connectionId: 'ca_other_fixture' }, { ...account, toolkit: 'other_app' }]) {
+    const unmatched = await setup.verifyConnectionSetup(context, async () => ({ ok: true, accounts: [changed] }));
+    assert.deepEqual(unmatched.verifiedAccount, { label: null }, 'never guess a label from a different account/toolkit');
+  }
+});
+
 test('a newer source arriving during provider verification prevents old readiness', async () => {
   const { context, dependency } = parkedTask('setup-new-source-race');
   setup.recordConnectionSetupResult(context, { connectionId: 'ca_source_race_fixture' });
@@ -303,10 +327,11 @@ test('a newer source arriving during provider verification prevents old readines
   const pending = setup.verifyConnectionSetup(context, delayed.verify);
   await delayed.started;
   newerSource(context.sessionId);
-  delayed.release({ ok: true });
+  delayed.release({ ok: true, accounts: [{ connectionId: 'ca_source_race_fixture', toolkit: subject.toolkit, label: 'stale@example.test' }] });
   const result = await pending;
   assert.equal(result.ready, false);
   assert.equal(result.request, null);
+  assert.equal(result.verifiedAccount, undefined, 'retired task must not receive an account receipt');
   assert.equal(dependencyStatus(dependency.requestId), 'open');
 });
 
@@ -317,10 +342,11 @@ test('an account replacement during verification cannot inherit the first accoun
   const pending = setup.verifyConnectionSetup(context, delayed.verify);
   await delayed.started;
   setup.recordConnectionSetupResult(context, { connectionId: 'ca_replacement_fixture' });
-  delayed.release({ ok: true });
+  delayed.release({ ok: true, accounts: [{ connectionId: 'ca_first_fixture', toolkit: subject.toolkit, label: 'stale@example.test' }] });
   const staleResult = await pending;
   assert.deepEqual(delayed.selections, [{ identifier: subject.capability, connectionId: 'ca_first_fixture' }]);
   assert.equal(staleResult.ready, false);
+  assert.equal(staleResult.verifiedAccount, undefined, 'replaced account must not receive a stale display receipt');
   const replacement = await setup.verifyConnectionSetup(context, async (selections) => {
     assert.deepEqual(selections, [{ identifier: subject.capability, connectionId: 'ca_replacement_fixture' }]);
     return { ok: true };

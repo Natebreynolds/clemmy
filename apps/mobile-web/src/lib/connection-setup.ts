@@ -39,7 +39,12 @@ export type ConnectionAuthorization = ConnectionForm
   | { kind: 'no_auth'; name: string }
   | { kind?: 'authorization'; url?: string; redirectUrl?: string | null };
 
-export interface ConnectionVerification { request: ConnectionRequest | null; ready: boolean; connectionVerified?: true }
+export interface ConnectionVerification {
+  request: ConnectionRequest | null;
+  ready: boolean;
+  connectionVerified?: true;
+  verifiedAccount?: { label: string | null };
+}
 export type ConnectionContinuation = (text: string, resume: {
   connectionRequestId: string;
   clientRequestId: string;

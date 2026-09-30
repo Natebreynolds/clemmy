@@ -30,6 +30,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [verifiedConnection, setVerifiedConnection] = useState(false);
+  const [accountLabel, setAccountLabel] = useState<string | null>(null);
   const alive = useRef(true);
   const pending = useRef<ConnectionRequest | null>(null);
   const inFlight = useRef(false);
@@ -44,6 +45,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
       setSignInUrl(null);
       setMessage('');
       setVerifiedConnection(false);
+      setAccountLabel(null);
     }
     pending.current = next;
     setRequest(next);
@@ -52,11 +54,15 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
 
   async function verify(current: ConnectionRequest) {
     setBusy('check');
+    setMessage('');
+    setVerifiedConnection(false);
+    setAccountLabel(null);
     const result = await connectionSetupApi.verify(current);
     if (!alive.current || pending.current?.requestId !== current.requestId) return;
     const verified = adopt(result.request);
     if (!verified || verified.requestId !== current.requestId) return;
     setVerifiedConnection(result.ready || Boolean(result.connectionVerified));
+    setAccountLabel(result.ready || result.connectionVerified ? result.verifiedAccount?.label ?? null : null);
     if (result.ready || result.connectionVerified) { setForm(null); setSignInUrl(null); }
     if (continued.current.has(current.clientRequestId)) return;
     // Reserve the stable host key before handing control to Chat. A failed
@@ -123,7 +129,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
       if (work === 'check') {
         await verify(current);
       } else if (work === 'connect') {
-        setVerifiedConnection(false); setMessage('');
+        setVerifiedConnection(false); setAccountLabel(null); setMessage('');
         await authorized(current, await connectionSetupApi.authorize(current));
       } else if (form && values) {
         const result = await connectionSetupApi.submit(current, form, values);
@@ -139,6 +145,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
     } catch (err) {
       if (alive.current) {
         setVerifiedConnection(false);
+        setAccountLabel(null);
         setMessage('');
         setError(err instanceof Error ? err.message : 'Could not check this connection. Try again.');
       }
@@ -174,7 +181,10 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
   return (
     <section class="card stack" aria-label={`Connect ${name} for this task`} style={{ overflowWrap: 'anywhere' }}>
       <div>
-        <h3 class="card-title">{verifiedConnection ? `${name} connected` : `Connect ${name}`}</h3>
+        <h3 class="card-title">{busy === 'check' ? `Checking ${name}` : verifiedConnection ? `${name} connected` : `Connect ${name}`}</h3>
+        {verifiedConnection && <p class="card-note">{accountLabel
+          ? <>Verified account: <strong>{accountLabel}</strong></>
+          : 'The provider did not return an account name.'}</p>}
         {!verifiedConnection && <p class="card-note">{request.continuationBlocker
           ? 'Connect this app to resolve the missing connection. Your reviewed execution stays paused.'
           : 'Your task is waiting for this app. Once the connection is verified, Clem can continue where she left off.'}</p>}
