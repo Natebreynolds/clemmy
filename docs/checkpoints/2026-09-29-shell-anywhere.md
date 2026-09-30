@@ -30,6 +30,19 @@ folder rule. `shell-off-machine-card.integration.test.ts` proves a `cat
 - The local lane of `dispatchInnerLocalTool` ignored the approval's
   accepted source, so a local tool's attempt could not settle after a card.
 
+## Installed and live-proven (2026-09-30 01:29 PT)
+
+Tip `ffed74631` hotpatched over `4e2efe15b` (via `c826d4b9c`) and driven
+through the installed app: a local `mkdir`+`cp` ran with no card; a `curl
+POST` was refused into the door, queued once, opened one card whose preview
+was the exact command, and approving it from the desktop route ran the
+command exactly once (the endpoint received it) and settled the
+conversation with the result. Two more defects fell out of the first live
+attempt and are fixed on the tip: the desktop approve route executed inline
+and raced the resume (`c76c4561a`); the resume's synthetic "Approve apr-…"
+source was read by the semantic model as conversation and refused as "not
+an action turn" (`ffed74631`).
+
 ## Still open
 
 - A host consent card for a graphless LOCAL call (a sensitive-path
