@@ -119,13 +119,94 @@ do not constitute a full-suite or production qualification. Logs:
 review found no further concrete issue. At the ownership recheck the shell
 agent's separate branch was clean at `c826d4b9c`; this task did not alter it.
 
-**Still owed before enabling reviewed Execute continuation:** durable original
+**Still owed at this earlier checkpoint before enabling reviewed Execute continuation:** durable original
 agent/project/memory identity, a distinct connection activation and delivery
 owner, cancellation and executor leases, retained token-budget semantics,
 fresh capability satisfaction, and proof that settled writes are not replayed.
 The UI/service Execute blocker remains. The UI truthfully says connected but
 paused; building the context alone must never flip it to working or completed.
 No change from this slice is installed, merged to main or tagged.
+
+### Consumed host progress at a connection pause — September 30
+
+This slice retains and inspects progress; it does **not** enable automatic
+reviewed Execute continuation. The desktop/mobile connected-but-paused state
+continues to describe the actual runtime behavior.
+
+The actual host's completion/ASK and review-needs-input exits now bind one
+private compact record to the agent and exact accepted source. It records the
+next host step (including the consumed ASK frame), no-progress state/cursor,
+completion-review count and feedback, effective activation model/tool limits,
+tool calls spent, elapsed activation time, one-shot continuation allowances,
+remaining model-stall retries, and watcher checks/injections/delivered-steers.
+An unfinished watcher is recorded as unfinished, never as an on-track verdict.
+The record is cleared on host entry and copied at binding/read so a reused
+agent or later caller mutation cannot replenish a saved task's allowances.
+Optional capture failure keeps the existing public pause intact.
+
+The immutable source connection checkpoint now carries this compact record
+beside the existing batch token. It stores no second full conversation. The
+new read-only batch inspector validates exact finalized history and durable
+result receipts. A later descendant cannot use an older connection's budget
+snapshot, even though the ordinary restart token intentionally allows that
+descendant. The recovery inspection uses the existing host parser: it rejects
+an out-of-range no-progress cursor and a review from a different source instead
+of clamping the cursor or dropping the review. Missing legacy progress is not
+replaced with fresh default counters.
+
+The actual host fixture revealed an additional activation requirement:
+`eventlog.ts::hostTurnCallAuthorityTerminalTarget` closes an ordinary input
+pause as `host_needs_input`. Both ASK and structured connection pauses retain
+good progress but finish with a **closed** host root. The new inspector reports
+that state; it does not reopen it. Existing admission/restart paths still
+require open authority, and the regression pin proves that inspection does
+not make a closed source executable. Do not solve continuation by weakening
+that check, rewriting a terminal, making a second plan claim, or treating a
+successful sign-in as consent for a new task. A distinct durable connection
+pause/activation owner must govern the same original execution, cancellation,
+account/schema revalidation, leases and delivery.
+
+Budget boundary also confirmed: production fresh host execution bypasses the
+legacy `runConversationCore`'s outer token-window/step/clock locals. The approval
+continuation core, in contrast, self-baselines a new consented token window and
+resets its outer clock/counters. This host record must not be presented as proof
+of those missing outer counters, nor may a connection control inherit the
+approval lane's budget renewal. Retain the actual outer state where it exists;
+preserve durable accepted-source usage accounting. Check remaining allowance
+before the first resumed model request. No new token-budget behavior is enabled
+in this slice.
+
+Validation uses recording/injected models and temporary homes, with no paid
+model calls:
+
+- **50/50** batch/checkpoint/schema/actual-host-pause checks passed; captures
+  spent review/no-progress state, consumed ASK step, exact canonical prefix,
+  database reopen, stale descendants and invalid/missing progress.
+- **349/349** host runner, no-progress governor and recovery-activation checks
+  passed. These include existing approval, Plan and host recovery behavior.
+- Runtime `tsc --noEmit` passed. The bounded independent read-only review found
+  no further concrete issue in retention/inspection or authority preservation.
+
+Transient logs: `/tmp/clem-connection-progress-qualified.txt`,
+`/tmp/clem-connection-progress-host-regressions.txt`,
+`/tmp/clem-connection-progress-qualified-tsc.txt`. The first new fixture was red
+because it incorrectly expected an open root after the real needs-input
+terminal. Investigation established the root-lifecycle requirement above; the
+test now explicitly requires read-only inspection and continued refusal by the
+execution restart API. No execution boundary was relaxed to make it pass.
+The runner's live-home sentinel was **NOT PERFORMED** with daemon 35630 active;
+this is neither live acceptance nor an isolation proof. No benchmark win is
+claimed.
+
+Ownership recheck: the other shell agent advanced independently to
+`e9d5b0294` (`claude/shell-anywhere`) and is editing consent policy, plan scope
+and console settings/navigation. Its checkpoint reports an installed shell
+slice; this task has not independently verified the served fingerprint.
+The old localhost:8768 build-info address refused a read-only connection, so
+it cannot establish current installed identity. No restart/hotpatch was
+attempted. Preserve that agent's ongoing changes during integration, especially
+the separate `console-routes.ts` modifications. Our series remains in its own
+worktree, unmerged, uninstalled and untagged.
 
 ### Original task identity across setup and approval recovery — September 30
 

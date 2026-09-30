@@ -37,6 +37,9 @@ const mcpAuthority = await import('../mcp-tool-authority.js');
 const sessionContext = await import('./source-session-context.js');
 const sessionContextScope = await import('./source-session-context-scope.js');
 const { rebuildSourceConnectionAgent } = await import('./connection-agent-rebuild.js');
+const hostProgress = await import('./host-connection-progress.js');
+const { readSourceConnectionHostRecovery } = await import('./connection-host-recovery.js');
+const noProgress = await import('./no-progress-governor.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -366,6 +369,98 @@ for (const shape of ['ask', 'decision'] as const) test(`connection pause after f
   assert.equal(retained?.agent?.modelId, replacement.model, 'original model must not replace the actual fallback at pause');
   assert.equal(retained.agent.mcpToolScope, null);
   assert.equal(retained.agent.rebuildContext.acceptedRoute, 'retrieve');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+function recordedHostProgress(task: Fixture, batch: import('./accepted-model-batch-checkpoint.js').AcceptedModelBatchCheckpoint): import('./host-connection-progress.js').HostConnectionProgress {
+  const initial = noProgress.initializeNoProgressGovernor({
+    taskKey: batch.acceptedTaskId, authority: { operation: [], account: [], target: [], evidence: [], effect: [] },
+  });
+  const spent = noProgress.observeNoProgress(initial, {
+    taskKey: initial.taskKey, attemptClass: 'dependency_lookup', authority: initial.authority,
+  }).state;
+  return {
+    version: 1,
+    batch: { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, acceptedTaskId: batch.acceptedTaskId,
+      authorityDigest: batch.authorityDigest, batchOrdinal: batch.batchOrdinal, batchId: batch.batchId },
+    recovery: { turnEngine: 'host_v1', stepIndex: 3, objectiveJudgeContinuations: 1,
+      noProgressCheckpoint: { state: spent, historyCursor: batch.history.length, recoveryOnly: true, recoveryDirectiveWritten: true },
+      completionReviewFeedback: { version: 1, sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+        objective: 'Inspect the original account', objectiveDigest: digest('Inspect the original account'),
+        reply: 'Draft before the connection pause', replyDigest: digest('Draft before the connection pause'), reason: 'Read the missing evidence.' } },
+    activation: { maxTurns: 3, toolCalls: { used: 2, limit: 4 }, elapsedMs: 3210, judgeCompletion: true },
+    continuations: { acceptedReadPlanUsed: true, acceptedUniqueWorkflowUsed: false, workflowStepResultUsed: 1,
+      continueMarkerUsed: 1, planFinalPublishSpent: false, modelStallRetriesRemaining: 0, judgedBusinessCallsAtLastVerdict: 2 },
+    watcher: { checksUsed: 2, injectionsUsed: 1, deliveredSteers: 1, unresolvedDrift: true,
+      lastCheckedAt: 2, lastFailureSeq: 7, checkInFlight: true },
+  };
+}
+
+test('connection progress survives reopen with spent judge, retry and step allowances and original evidence', async () => {
+  const task = fixture('Inspect the controlled account after connection.', 'execute');
+  const batch = await settledConnectionBatch(task);
+  const agent = connectionAgent(task);
+  const progress = recordedHostProgress(task, batch);
+  hostProgress.bindHostConnectionProgress(agent, progress);
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent })!;
+  const identity = { sessionId: task.sessionId, requestId: pause.requestId };
+  // Neither mutation of the caller-owned object nor reuse/clear of the agent
+  // may replenish an already-persisted request's counters.
+  progress.recovery.objectiveJudgeContinuations = 0;
+  hostProgress.clearHostConnectionProgress(agent);
+  eventlog.closeEventLog();
+  const reopened = readSourceConnectionHostRecovery(identity);
+  assert.equal(reopened.hostState.objectiveJudgeContinuations, 1);
+  assert.equal(reopened.hostState.stepIndex, reopened.progress.activation.maxTurns, 'an exhausted budget must remain exhausted');
+  assert.equal(reopened.hostState.noProgressCheckpoint?.state.retriesRemaining, noProgress.NO_PROGRESS_RETRY_BUDGET - 1);
+  assert.equal(reopened.hostState.noProgressCheckpoint?.historyCursor, batch.history.length);
+  assert.deepEqual(reopened.hostState.history, batch.history);
+  assert.equal(reopened.progress.continuations.modelStallRetriesRemaining, 0);
+  assert.equal(reopened.progress.watcher.checkInFlight, true, 'unfinished review must not become a passed review');
+  assert.equal(reopened.progress.activation.elapsedMs, 3210);
+  assert.equal(reopened.hostState.completionReviewFeedback?.sourceUserSeq, task.sourceUserSeq);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['approval_requested'] }).length, 0);
+  assert.equal(physicalRows(task, 'call:connection-search').length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const corruption of ['cursor', 'feedback-source', 'missing-progress'] as const) {
+  test(`connection restore refuses ${corruption} instead of inventing fresh progress`, async () => {
+    const task = fixture('Inspect the controlled account after connection.', 'execute');
+    const batch = await settledConnectionBatch(task);
+    const agent = connectionAgent(task);
+    const progress = recordedHostProgress(task, batch);
+    if (corruption === 'cursor') progress.recovery.noProgressCheckpoint!.historyCursor = batch.history.length + 1;
+    if (corruption === 'feedback-source') progress.recovery.completionReviewFeedback!.sourceUserSeq += 1;
+    if (corruption !== 'missing-progress') hostProgress.bindHostConnectionProgress(agent, progress);
+    const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent })!;
+    assert.throws(() => readSourceConnectionHostRecovery({ sessionId: task.sessionId, requestId: pause.requestId }),
+      corruption === 'cursor' ? /invalid no-progress checkpoint/ : corruption === 'feedback-source'
+        ? /review belongs to another/ : /no retained host progress/);
+    assert.equal(physicalRows(task, 'call:connection-search').length, 1);
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+test('an advanced canonical chain cannot borrow an older connection budget snapshot', async () => {
+  const task = fixture('Inspect the controlled account after connection.', 'execute');
+  const batch = await settledConnectionBatch(task);
+  const agent = connectionAgent(task);
+  hostProgress.bindHostConnectionProgress(agent, recordedHostProgress(task, batch));
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent })!;
+  const extra = { callId: 'call:after-pause-inspection', toolName: 'tool_search', args: { query: 'extra inspection' } };
+  const admitted = checkpoints.admitAcceptedModelBatch({ ...task, preHistory: batch.history,
+    previousResponseId: batch.lastResponseId, frameHistory: openFrame(extra), providerResponseId: 'response:after-pause' });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  await runCall({ task, ...extra, effect: 'read', boundary: 'host_owned_local', localEnvelope: true,
+    invoke: async () => ({ ok: true, rows: [] }) });
+  const result = exactSettledResult({ task, callId: extra.callId, history: [...batch.history, ...openFrame(extra)] });
+  recordLogicalResult(admitted.admission, result);
+  assert.ok(['committed', 'existing'].includes(checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [result] }).status));
+  const retained = connectionCheckpoints.readSourceConnectionCheckpoint({ sessionId: task.sessionId, requestId: pause.requestId })!;
+  assert.equal(checkpoints.recoverAcceptedModelBatchFromToken(retained.restartToken).status, 'ready', 'ordinary restart still accepts a proven descendant');
+  assert.throws(() => readSourceConnectionHostRecovery({ sessionId: task.sessionId, requestId: pause.requestId }), /advanced beyond retained progress/);
   leases.revokeDispatchLease(task.parentLease);
 });
 

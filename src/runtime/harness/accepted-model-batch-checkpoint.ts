@@ -358,12 +358,19 @@ function exactOpenHostRoot(input: {
   sessionId: string;
   sourceUserSeq: number;
 }): RootRow | null {
+  const root = exactHostRootForInspection(input);
+  return root?.state === 'open' ? root : null;
+}
+
+/** Inspection does not reactivate a terminalized source. All admission and
+ * restart entry points continue to require exactOpenHostRoot. */
+function exactHostRootForInspection(input: { sessionId: string; sourceUserSeq: number }): RootRow | null {
   const verified = acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq);
   if (
     verified.status !== 'ok'
     || (verified.authority.authorityKind !== 'host_v1'
       && verified.authority.authorityKind !== 'host_v1_read_only')
-    || verified.authority.state !== 'open'
+    || verified.authority.state === 'conflict'
   ) return null;
   return {
     accepted_task_id: verified.authority.identity.acceptedTaskId,
@@ -1588,6 +1595,41 @@ export function recoverAcceptedModelBatchFromToken(
     return { status: 'conflict', reason: 'accepted model-batch restart token no longer names this exact chain' };
   }
   return recovered;
+}
+
+/** Read-only inspection of the already-finalized EXACT retained batch. Unlike
+ * recovery, this can inspect a closed source, but it never finalizes a batch,
+ * reopens authority, or returns a restart-ready grant. Later descendants are
+ * refused: an old connection's counters cannot account for their work. */
+export function inspectRetainedModelBatchFromToken(token: AcceptedModelBatchRestartToken):
+  | { status: 'inspected'; checkpoint: AcceptedModelBatchCheckpoint; rootState: 'open' | 'closed' }
+  | { status: 'conflict' | 'unavailable'; reason: string } {
+  if (!isAcceptedModelBatchRestartToken(token)) return { status: 'conflict', reason: 'invalid retained batch token' };
+  try {
+    const db = openEventLog();
+    const root = exactHostRootForInspection(token);
+    if (!root || root.accepted_task_id !== token.acceptedTaskId || root.authority_digest !== token.authorityDigest) {
+      return { status: 'conflict', reason: 'retained batch has no exact inspectable host root' };
+    }
+    const latest = latestAdmissionRow(db, token.sessionId, token.sourceUserSeq);
+    if (!latest || latest.batch_ordinal !== token.resumeFromBatchOrdinal || latest.batch_id !== token.resumeFromBatchId) {
+      return { status: 'conflict', reason: 'execution advanced beyond retained progress' };
+    }
+    const row = checkpointRowFor(db, { ...token, batchOrdinal: token.resumeFromBatchOrdinal });
+    if (!row || !exactCheckpointStillReopens({ db, root, row })) {
+      return { status: 'conflict', reason: 'retained batch lost its exact finalized checkpoint' };
+    }
+    const checkpoint = checkpointFromRow(row);
+    const verified = validateCheckpointEvidence(db, latest, checkpoint);
+    if (!verified || verified.disposition !== 'ready' || checkpoint.disposition !== 'ready'
+      || checkpoint.historyDigest !== token.resumeFromHistoryDigest
+      || acceptedModelBatchHistoryDigest(verified.history) !== token.resumeFromHistoryDigest) {
+      return { status: 'conflict', reason: 'retained batch evidence is unavailable or inconsistent' };
+    }
+    return { status: 'inspected', checkpoint, rootState: root.state as 'open' | 'closed' };
+  } catch (error) {
+    return { status: 'unavailable', reason: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 /** Exact JSON-byte digest for tests and cross-process crash assertions. */

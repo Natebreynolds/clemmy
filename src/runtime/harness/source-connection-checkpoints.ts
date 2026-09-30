@@ -16,6 +16,7 @@ import { boundAgentMcpToolScope } from '../mcp-tool-authority.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import { sealAdmissionEnvelope, type AdmissionEnvelope, type CapabilityBindingRevision } from '../graph/admission-envelope.js';
 import { boundAgentSourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
+import { assertHostConnectionProgress, boundHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 
 /** Same construction records retained at workflow handoff. Historical tool
  * definitions and scope are context for rebuilding, never current authority. */
@@ -42,6 +43,9 @@ export interface SourceConnectionCheckpoint {
   /** Absent on older/custom builders: retain progress, but do not infer an
    * unrestricted replacement agent when activating a connection resume. */
   agent?: ConnectionAgentCheckpoint;
+  /** Exact consumed host allowances. Older/custom runners lack this proof;
+   * never replace the missing state with fresh default counters at resume. */
+  hostProgress?: HostConnectionProgress;
 }
 
 type CaptureResult =
@@ -135,6 +139,16 @@ export function readSourceConnectionCheckpoint(input: { sessionId: string; reque
     throw new Error('The retained connection checkpoint is inconsistent.');
   }
   if (value.agent !== undefined) assertRetainedAgent(value.agent, input.sessionId);
+  if (value.hostProgress !== undefined) {
+    assertHostConnectionProgress(value.hostProgress);
+    const batch = value.hostProgress.batch;
+    const token = value.restartToken;
+    if (batch.sessionId !== value.sessionId || batch.sourceUserSeq !== value.sourceUserSeq
+      || batch.acceptedTaskId !== token.acceptedTaskId || batch.authorityDigest !== token.authorityDigest
+      || batch.batchOrdinal !== token.resumeFromBatchOrdinal || batch.batchId !== token.resumeFromBatchId) {
+      throw new Error('The retained host progress belongs to another model batch.');
+    }
+  }
   const dependency = dependencyIdentity(input);
   const selected = acceptedPlanExecution(input.sessionId, value.sourceUserSeq);
   if (!dependency || dependency.source_user_seq !== value.sourceUserSeq
@@ -162,6 +176,15 @@ export function captureSourceConnectionCheckpoint(input: { sessionId: string; re
     const restart = prepareAcceptedModelBatchRestart({ sessionId: input.sessionId, sourceUserSeq: dependency.source_user_seq });
     if (restart.status !== 'ready') return { status: 'unavailable', reason: restart.status };
     const agent = captureAgent(input.agent, input.sessionId);
+    const hostProgress = boundHostConnectionProgress(input.agent, {
+      sessionId: input.sessionId, sourceUserSeq: dependency.source_user_seq,
+    });
+    if (hostProgress && (hostProgress.batch.batchId !== restart.checkpoint.batchId
+      || hostProgress.batch.batchOrdinal !== restart.checkpoint.batchOrdinal
+      || hostProgress.batch.acceptedTaskId !== restart.checkpoint.acceptedTaskId
+      || hostProgress.batch.authorityDigest !== restart.checkpoint.authorityDigest)) {
+      return { status: 'unavailable', reason: 'host_progress_batch_changed' };
+    }
     if (agent) assertRetainedAgent(agent, input.sessionId);
     if (agent?.sessionContext && (agent.sessionContext.sessionId !== input.sessionId
       || agent.sessionContext.sourceUserSeq !== dependency.source_user_seq)) {
@@ -174,6 +197,7 @@ export function captureSourceConnectionCheckpoint(input: { sessionId: string; re
       executionClaimId: selected.claim.claimId, executionClaimDigest: selected.claim.digest,
       executionRunId: selected.claim.executionRunId, restartToken: restart.token,
       ...(agent ? { agent } : {}),
+      ...(hostProgress ? { hostProgress } : {}),
     };
     const json = JSON.stringify(checkpoint);
     store().prepare('INSERT INTO source_connection_checkpoints_v1 VALUES (?, ?, ?, ?, ?)')

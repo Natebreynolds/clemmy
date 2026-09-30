@@ -1,4 +1,5 @@
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
+import { bindHostConnectionProgress, clearHostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { responseFormatRepairPacket } from './response-format-repair.js';
 import { verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
@@ -2857,6 +2858,8 @@ function priorZeroCrossingRefusalCounts(
  * every exit (success, approval pause, typed stop, cancellation, or error).
  */
 const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
+  clearHostConnectionProgress(agent);
+  const connectionActivationStartedAt = Date.now();
   const emitter = runner as unknown as EmitterLike;
   const contextValue = (opts as { context?: unknown }).context ?? {};
   const runContext = new RunContext(contextValue as never);
@@ -3893,6 +3896,52 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   let lastResponseId: string | undefined = resumedResponseId ?? hostPreviousResponseId;
   let latestAcceptedModelBatchRef = resumedAcceptedModelBatchRef;
   let currentHostStepIndex = resumedRecoveryState?.stepIndex ?? 0;
+  let remainingModelStallRetries = modelStreamStallRetries();
+  const retainConnectionProgress = (): void => {
+    try {
+      // Only reviewed execution needs this private resume prerequisite. Normal
+      // answers acquire no durable record or extra model/context work.
+      if (!hostProduction || !latestAcceptedModelBatchRef || conversationalCheckInSurface()) return;
+      const identity = exactHostIdentity();
+      if (!acceptedPlanExecution(identity.sessionId, identity.sourceUserSeq)) return;
+      const counter = harnessRunContextStorage.getStore()!.counter;
+      bindHostConnectionProgress(agent, {
+        version: 1,
+        batch: latestAcceptedModelBatchRef,
+        recovery: {
+          turnEngine: hostTurnEngine ?? 'host_v1', stepIndex: currentHostStepIndex + 1,
+          noProgressCheckpoint: currentNoProgressCheckpoint(), objectiveJudgeContinuations,
+          completionReviewFeedback,
+        },
+        activation: {
+          maxTurns, toolCalls: { used: counter.currentCount, limit: counter.limit },
+          elapsedMs: Math.max(0, Date.now() - connectionActivationStartedAt),
+          judgeCompletion: (opts as { hostJudgeCompletion?: unknown }).hostJudgeCompletion === true,
+        },
+        continuations: {
+          acceptedReadPlanUsed: acceptedReadPlanContinuationUsed,
+          acceptedUniqueWorkflowUsed: acceptedUniqueWorkflowContinuationUsed,
+          workflowStepResultUsed: workflowStepResultContinuationsUsed,
+          continueMarkerUsed: continueMarkerContinuationsUsed,
+          planFinalPublishSpent: planFinalPublishStepSpent,
+          modelStallRetriesRemaining: remainingModelStallRetries,
+          ...(judgedBusinessCallsAtLastVerdict !== undefined ? { judgedBusinessCallsAtLastVerdict } : {}),
+        },
+        watcher: {
+          checksUsed: hostWatcherChecksUsed, injectionsUsed: hostWatcherInjectionsUsed,
+          deliveredSteers: hostWatcherDeliveredSteers, unresolvedDrift: hostWatcherUnresolvedDrift,
+          lastCheckedAt: hostWatcherLastCheckedAt, lastFailureSeq: hostWatcherLastFailureSeq,
+          checkInFlight: hostWatcherCheckInFlight,
+        },
+      });
+    } catch (error) {
+      clearHostConnectionProgress(agent);
+      // Optional recovery retention cannot turn a valid public pause into a
+      // failed turn. Missing proof keeps automatic Execute continuation off.
+      hostTurnLogger.warn({ error: error instanceof Error ? error.message : 'unknown' },
+        'connection progress could not be retained');
+    }
+  };
   const propagateToolCallsLimit = (error: ToolCallsLimitExceeded): never => {
     hostToolCallsLimitCheckpoints.set(error, {
       history: [...history],
@@ -4712,6 +4761,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (pending) return blockedOutcome(guarded, 'local_work_incomplete');
     }
     emit('agent_end', runContext, agent, guarded);
+    retainConnectionProgress();
     return {
       history,
       lastResponseId,
@@ -8857,7 +8907,6 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       return undefined;
     }
   })();
-  let remainingModelStallRetries = modelStreamStallRetries();
   let committedVerificationRecoveryChecked = false;
   /** Why the host is taking another step after a shown draft, so the viewer
    *  can say so instead of the draft silently disappearing. */
@@ -9874,6 +9923,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         if (judged === 'awaiting_user_input') {
           history.push(...admission.frame.history);
           if (step.responseId !== undefined) lastResponseId = step.responseId;
+          retainConnectionProgress();
           return { history, lastResponseId, finalOutput: await runOutputGuardrails(admission.frame.text),
             terminal: { status: 'awaiting_user_input', reason: 'completion_review_needs_input' } };
         }
