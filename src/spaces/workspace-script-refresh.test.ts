@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-script-refresh-'));
 process.env.CLEMENTINE_HOME = home;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
@@ -12,12 +13,14 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 const store = await import('./store.js');
 const runner = await import('./runner.js');
 const refresh = await import('./workspace-script-refresh.js');
+const reports = await import('./workspace-script-reports.js');
 const journal = await import('./workspace-script-occurrence.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
 const consent = await import('../runtime/harness/saved-source-consent.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const datasets = await import('./workspace-db.js');
 const data = await import('./data-store.js');
+const schema = await import('../runtime/harness/eventlog-schema.js');
 const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
 test.after(async () => {
   journal.setWorkspaceScriptOccurrenceFaultForTests(null);
@@ -48,6 +51,99 @@ async function approve(id: string) {
   await refresh.recoverSavedScriptRefreshes();
 }
 function observations(slug: string) { return datasets.listWorkspaceDatasetObservations(slug, { sourceKey: 'rows', status: 'ok' }); }
+function doneReports(slug: string) {
+  return eventlog.listEvents(`workspace-script:${slug}`, { types: ['user_input_received'] })
+    .filter(event => event.data.source === 'outcome' && event.data.status === 'done');
+}
+function outbox(slug: string) {
+  return eventlog.openEventLog().prepare('SELECT * FROM workspace_script_reports_v1 WHERE workspace_id = ? ORDER BY rowid')
+    .all(slug) as Array<{ acknowledged_at: string | null; observation_id: string; attempts: number }>;
+}
+
+test('v86 upgrade preserves published and unfinished execution owners without fabricating execution or consent', () => {
+  const db = new Database(':memory:');
+  try {
+    schema.applyHarnessMigrationsThroughVersionForTests(db, 86);
+    for (const [source, observation] of [['pending', null], ['saved', 'retained-observation']]) {
+      db.prepare(`INSERT INTO workspace_script_occurrences_v1
+        (workspace_id, source_id, occurrence_id, session_id, logical_call_id, preparation_json, observation_id, created_at)
+        VALUES ('migration-fixture', ?, 'tick', 'retained-owner', ?, '{}', ?, '2026-09-30T00:00:00Z')`)
+        .run(source, `call:${source}`, observation);
+    }
+    const before = db.prepare('SELECT * FROM workspace_script_occurrences_v1 ORDER BY source_id').all();
+    schema.applyHarnessMigrations(db); schema.applyHarnessMigrations(db);
+    assert.deepEqual(db.prepare('SELECT * FROM workspace_script_occurrences_v1 ORDER BY source_id').all(), before);
+    for (const table of ['workspace_script_reports_v1', 'saved_source_script_grants_v1', 'physical_dispatches']) {
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n, 0);
+    }
+    assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'events_outcome_delivery_id_v1'").get());
+    assert.deepEqual(db.pragma('foreign_key_check'), []);
+  } finally { db.close(); }
+});
+
+test('published data survives failed report delivery; retry reports once without another execution', async () => {
+  const item = fixture('refresh-report-failure'); const id = await request(item);
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TRIGGER fixture_report_write_failure BEFORE INSERT ON events
+    WHEN NEW.session_id = 'workspace-script:refresh-report-failure'
+      AND json_extract(NEW.data_json, '$.outcomeDeliveryId') IS NOT NULL
+    BEGIN SELECT RAISE(FAIL, 'fixture report write failed'); END`);
+  try {
+    await approve(id);
+    assert.equal(journal.listUnpublishedWorkspaceScriptOccurrences(item.slug).length, 0);
+    assert.equal(observations(item.slug).length, 1);
+    assert.equal(outbox(item.slug).length, 1); assert.equal(outbox(item.slug)[0].acknowledged_at, null);
+    assert.equal(doneReports(item.slug).length, 0); assert.equal(crossings(item), 'x');
+    const replay = await runner.refreshSpaceData(item.slug, 'rows', { cause: 'scheduled', refreshId: 'first-tick' });
+    assert.equal(replay[0].ok, true, 'report failure must not misreport the saved data as failed');
+  } finally { db.exec('DROP TRIGGER fixture_report_write_failure'); }
+  reports.drainWorkspaceScriptReports(); reports.drainWorkspaceScriptReports();
+  assert.ok(outbox(item.slug)[0].acknowledged_at); assert.equal(doneReports(item.slug).length, 1);
+  assert.equal(crossings(item), 'x'); assert.equal(observations(item.slug).length, 1);
+});
+
+test('a failed report-intent commit leaves publication recoverable and never repeats the process', async () => {
+  const item = fixture('refresh-report-intent'); const id = await request(item);
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TRIGGER fixture_report_intent_failure BEFORE INSERT ON workspace_script_reports_v1
+    WHEN NEW.workspace_id = 'refresh-report-intent' BEGIN SELECT RAISE(FAIL, 'fixture report intent failed'); END`);
+  try {
+    await approve(id);
+    assert.equal(observations(item.slug).length, 1); assert.equal(crossings(item), 'x');
+    assert.equal(journal.listUnpublishedWorkspaceScriptOccurrences(item.slug).length, 1);
+    assert.equal(outbox(item.slug).length, 0);
+  } finally { db.exec('DROP TRIGGER fixture_report_intent_failure'); }
+  rmSync(item.script);
+  await refresh.recoverSavedScriptRefreshes();
+  assert.equal(journal.listUnpublishedWorkspaceScriptOccurrences(item.slug).length, 0);
+  assert.equal(doneReports(item.slug).length, 1); assert.equal(crossings(item), 'x');
+});
+
+test('report acknowledgement recovery does not replay an older report after many later messages', async () => {
+  const item = fixture('refresh-report-ack'); const id = await request(item);
+  const db = eventlog.openEventLog();
+  db.exec(`CREATE TRIGGER fixture_report_ack_failure BEFORE UPDATE OF acknowledged_at ON workspace_script_reports_v1
+    WHEN NEW.workspace_id = 'refresh-report-ack' BEGIN SELECT RAISE(FAIL, 'fixture report ack failed'); END`);
+  try { await approve(id); } finally { db.exec('DROP TRIGGER fixture_report_ack_failure'); }
+  assert.equal(doneReports(item.slug).length, 1); assert.equal(outbox(item.slug)[0].acknowledged_at, null);
+  for (let n = 0; n < 205; n++) eventlog.appendEvent({ sessionId: `workspace-script:${item.slug}`, turn: n + 1,
+    role: 'user', type: 'user_input_received', data: { text: `Subsequent activity ${n}` } });
+  rmSync(item.script);
+  await refresh.recoverSavedScriptRefreshes();
+  assert.ok(outbox(item.slug)[0].acknowledged_at); assert.equal(doneReports(item.slug).length, 1);
+  assert.equal(crossings(item), 'x'); assert.equal(observations(item.slug).length, 1);
+});
+
+test('upgrade recovery adopts an old committed completion notice without duplicate delivery', async () => {
+  const item = fixture('refresh-report-upgrade'); const id = await request(item); await approve(id);
+  const db = eventlog.openEventLog();
+  db.prepare('DELETE FROM workspace_script_reports_v1 WHERE workspace_id = ?').run(item.slug);
+  db.prepare(`UPDATE events SET data_json = json_remove(data_json, '$.outcomeDeliveryId') WHERE session_id = ?`)
+    .run(`workspace-script:${item.slug}`);
+  reports.recoverPublishedWorkspaceScriptReports(); reports.drainWorkspaceScriptReports();
+  assert.ok(outbox(item.slug)[0].acknowledged_at); assert.equal(doneReports(item.slug).length, 1);
+  assert.equal(crossings(item), 'x');
+});
 
 test('public refresh coalesces pending clicks, resumes from its approval and reuses one scope for later ticks', async () => {
   const item = fixture('refresh-one-card');
@@ -196,7 +292,7 @@ test('automatic retry can recover an addressed run but cannot manufacture a new 
   assert.equal(observations(item.slug).length, 1);
 });
 
-for (const mode of ['approved-offline', 'publication-gap']) test(`cold production refresh recovers ${mode} exactly once`, () => {
+for (const mode of ['approved-offline', 'publication-gap', 'report-gap', 'report-ack-gap']) test(`cold production refresh recovers ${mode} exactly once`, () => {
   const processHome = mkdtempSync(path.join(os.tmpdir(), 'clem-script-refresh-process-'));
   try {
     const run = (phase: string) => {
@@ -212,8 +308,13 @@ for (const mode of ['approved-offline', 'publication-gap']) test(`cold productio
     };
     const first = run('first'); const second = run('second'); const third = run('third');
     assert.equal(first.crossings, mode === 'approved-offline' ? '' : 'x');
+    if (mode === 'report-gap' || mode === 'report-ack-gap') {
+      assert.equal(first.unpublished, 0); assert.equal(first.pendingReports, 1);
+      assert.equal(first.reports, mode === 'report-gap' ? 0 : 1);
+    }
     assert.equal(second.crossings, 'x'); assert.equal(second.observations, 1); assert.equal(second.reports, 1);
     assert.equal(second.approvals, 1);
+    assert.equal(second.pendingReports, 0);
     assert.deepEqual(second.counts, { logical_tool_calls: 1, physical_dispatches: 1, logical_call_settlements: 1 });
     assert.deepEqual(third, second);
   } finally { rmSync(processHome, { recursive: true, force: true }); }

@@ -4,7 +4,8 @@ import path from 'node:path';
 const [phase, mode] = process.argv.slice(2);
 const home = process.env.CLEMENTINE_HOME;
 if (!home || !path.basename(home).startsWith('clem-script-refresh-process-')
-  || !['first', 'second', 'third'].includes(phase!) || !['approved-offline', 'publication-gap'].includes(mode!)) {
+  || !['first', 'second', 'third'].includes(phase!)
+  || !['approved-offline', 'publication-gap', 'report-gap', 'report-ack-gap'].includes(mode!)) {
   throw new Error('Refresh process fixture requires its explicit disposable home and phase.');
 }
 const store = await import('./store.js');
@@ -29,15 +30,22 @@ if (phase === 'first') {
     eventlog.openEventLog().prepare(`UPDATE pending_approvals SET status = 'resolved', resolution = 'approved',
       resolver = 'fixture-owner', resolved_at = ? WHERE approval_id = ?`).run(new Date().toISOString(), approvalId);
   } else {
-    eventlog.openEventLog().exec(`CREATE TRIGGER fixture_publication_gap BEFORE UPDATE OF observation_id
+    if (mode === 'publication-gap') eventlog.openEventLog().exec(`CREATE TRIGGER fixture_publication_gap BEFORE UPDATE OF observation_id
       ON workspace_script_occurrences_v1 BEGIN SELECT RAISE(FAIL, 'fixture publication gap'); END`);
+    if (mode === 'report-gap') eventlog.openEventLog().exec(`CREATE TRIGGER fixture_report_gap BEFORE INSERT ON events
+      WHEN json_extract(NEW.data_json, '$.outcomeDeliveryId') IS NOT NULL
+      BEGIN SELECT RAISE(FAIL, 'fixture report gap'); END`);
+    if (mode === 'report-ack-gap') eventlog.openEventLog().exec(`CREATE TRIGGER fixture_report_ack_gap
+      BEFORE UPDATE OF acknowledged_at ON workspace_script_reports_v1
+      BEGIN SELECT RAISE(FAIL, 'fixture report ack gap'); END`);
     approvals.resolve(approvalId, 'approved', 'fixture-owner');
     await recovery.recoverSavedScriptRefreshes();
     if (!existsSync(marker)) throw new Error('Production process did not execute before publication gap');
     unlinkSync(path.join(dir, 'refresh.mjs'));
   }
 } else {
-  eventlog.openEventLog().exec('DROP TRIGGER IF EXISTS fixture_publication_gap');
+  eventlog.openEventLog().exec(`DROP TRIGGER IF EXISTS fixture_publication_gap;
+    DROP TRIGGER IF EXISTS fixture_report_gap; DROP TRIGGER IF EXISTS fixture_report_ack_gap;`);
   await recovery.recoverSavedScriptRefreshes();
 }
 const counts = Object.fromEntries(['logical_tool_calls', 'physical_dispatches', 'logical_call_settlements'].map(table => [table,
@@ -46,6 +54,8 @@ process.stdout.write(`SCRIPT_REFRESH_PROCESS_RESULT ${JSON.stringify({ counts,
   crossings: existsSync(marker) ? readFileSync(marker, 'utf8') : '',
   approvals: approvals.listPending({ sessionId, status: 'any' }).length,
   observations: datasets.listWorkspaceDatasetObservations(slug, { sourceKey: 'rows', status: 'ok' }).length,
+  unpublished: (eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM workspace_script_occurrences_v1 WHERE observation_id IS NULL').get() as { n: number }).n,
+  pendingReports: (eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM workspace_script_reports_v1 WHERE acknowledged_at IS NULL').get() as { n: number }).n,
   reports: eventlog.listEvents(sessionId, { types: ['user_input_received'] }).filter(event => event.data.source === 'outcome' && event.data.status === 'done').length,
 })}\n`);
 eventlog.closeEventLog(); datasets.closeWorkspaceDb();

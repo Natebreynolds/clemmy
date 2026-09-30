@@ -19,6 +19,7 @@ import { bootstrapWorkspaceObservationHistory, commitWorkspaceObservationBatch,
   getWorkspaceDatasetObservationByRefreshId, healWorkspaceDataProjection,
   indexWorkspaceRecord, type CommitWorkspaceObservationBatchResult } from './workspace-db.js';
 import { finalizeWorkspaceObservationCommit } from './workspace-observation-finalize.js';
+import { retainWorkspaceScriptReport } from './workspace-script-reports.js';
 
 export interface WorkspaceScriptOccurrenceKey {
   slug: string;
@@ -286,8 +287,12 @@ export async function executeWorkspaceScriptOccurrence(
   // Finalization is idempotent and has its own durable memory-recovery path.
   await finalizeWorkspaceObservationCommit(key.slug, committed);
   const observation = committed.observations[0]!;
-  db.prepare(`UPDATE ${table} SET observation_id = ? WHERE workspace_id = ? AND source_id = ?
-    AND occurrence_id = ? AND observation_id IS NULL`).run(observation.id, ...keyArgs(key));
+  db.transaction(() => {
+    db.prepare(`UPDATE ${table} SET observation_id = ? WHERE workspace_id = ? AND source_id = ?
+      AND occurrence_id = ? AND observation_id IS NULL`).run(observation.id, ...keyArgs(key));
+    retainWorkspaceScriptReport(db, { ...key, observationId: observation.id, sessionId: row!.session_id,
+      title: spaceStore.get(key.slug)?.title ?? key.slug });
+  }).immediate();
   return { status: 'published', observationId: observation.id, replayed: result.status === 'replayed',
     changed: observation.changed, bytes: committed.projection.bytes };
 }

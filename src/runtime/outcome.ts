@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SessionStore } from '../memory/session-store.js';
 import { HarnessSession } from './harness/session.js';
-import { appendEvent, getSession as getHarnessSession, listEvents, type EventRow } from './harness/eventlog.js';
+import { appendEvent, getSession as getHarnessSession, listEvents, openEventLog, type EventRow } from './harness/eventlog.js';
 import { appendGoalLedgerForSession } from '../agents/plan-proposals.js';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import pino from 'pino';
@@ -92,6 +92,9 @@ export interface DeliverContext {
   sourceLabel: string;
   /** The run/task id. */
   sourceId: string;
+  /** Optional durable outbox identity. Exact payload/session matching and a
+   * database uniqueness constraint protect acknowledgement-gap recovery. */
+  deliveryId?: string;
   /** Human title (workflow name, task title). */
   title?: string;
   /** How the agent fetches the full result, e.g. `background_task_status('id')`. */
@@ -265,6 +268,22 @@ function harnessEventLogHasOutcome(sessionId: string, outcome: Outcome, ctx: Del
   } catch {
     return false;
   }
+}
+
+function hasExactOutcomeDelivery(sessionId: string, outcome: Outcome, ctx: DeliverContext, text: string): boolean {
+  const row = openEventLog().prepare(`SELECT session_id, data_json FROM events
+    WHERE type = 'user_input_received' AND json_valid(data_json)
+      AND json_type(data_json, '$.outcomeDeliveryId') = 'text'
+      AND json_extract(data_json, '$.outcomeDeliveryId') = ?`).get(ctx.deliveryId) as
+      { session_id: string; data_json: string } | undefined;
+  if (!row) return false;
+  const data = JSON.parse(row.data_json);
+  if (row.session_id !== sessionId || data.synthetic !== true || data.source !== 'outcome'
+    || data.sourceLabel !== ctx.sourceLabel || data.sourceId !== ctx.sourceId
+    || data.status !== outcome.status || data.deliveryPhase !== 'passive' || data.text !== text) {
+    throw new Error('Outcome delivery identity conflicts with its retained destination or content.');
+  }
+  return true;
 }
 
 function appendGoalEvidence(sessionId: string, outcome: Outcome, ctx: DeliverContext): void {
@@ -549,10 +568,11 @@ export function deliverOutcomeWithAcknowledgement(
     // that loses the original harness transcript on reopen.
     const harnessRow = getHarnessSession(sessionId);
     if (harnessRow) {
-      if (harnessEventLogHasOutcome(sessionId, outcome, ctx, text)) {
+      if (ctx.deliveryId ? hasExactOutcomeDelivery(sessionId, outcome, ctx, text)
+        : harnessEventLogHasOutcome(sessionId, outcome, ctx, text)) {
         return { acknowledged: true, written: false, disposition: 'already_delivered' };
       }
-      appendEvent({
+      try { appendEvent({
         sessionId,
         turn: 0,
         role: 'user',
@@ -565,12 +585,20 @@ export function deliverOutcomeWithAcknowledgement(
           sourceId: ctx.sourceId,
           status: outcome.status,
           deliveryPhase: 'passive',
+          ...(ctx.deliveryId ? { outcomeDeliveryId: ctx.deliveryId } : {}),
           ...(outcome.evidence ? { evidence: outcome.evidence } : {}),
           ...(outcome.blocker ? { blocker: outcome.blocker } : {}),
           ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}),
           ...(outcome.resumable !== undefined ? { resumable: outcome.resumable } : {}),
         },
-      });
+      }); } catch (error) {
+        // Another process may have committed this exact delivery after our
+        // lookup. Only its verified row counts as an acknowledgement.
+        if (ctx.deliveryId && hasExactOutcomeDelivery(sessionId, outcome, ctx, text)) {
+          return { acknowledged: true, written: false, disposition: 'already_delivered' };
+        }
+        throw error;
+      }
       try {
         const hs = HarnessSession.load(sessionId);
         if (hs) hs.injectSyntheticUserTurn(idPrefix, text);
@@ -581,6 +609,9 @@ export function deliverOutcomeWithAcknowledgement(
       return { acknowledged: true, written: true, disposition: 'delivered' };
     }
 
+    // A durable outbox must not create a legacy ghost after its canonical
+    // conversation disappears. Keep its report pending for owner recovery.
+    if (ctx.deliveryId) throw new Error('Outcome delivery destination is not retained.');
     const store = new SessionStore();
     if (sessionStoreHasOutcome(store, sessionId, outcome, ctx, text)) {
       return { acknowledged: true, written: false, disposition: 'already_delivered' };

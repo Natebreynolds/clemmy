@@ -15,6 +15,7 @@ import { activateWorkspaceScriptOccurrenceWithGrant, executeWorkspaceScriptOccur
   reserveWorkspaceScriptOccurrence, type WorkspaceScriptOccurrenceKey,
   type WorkspaceScriptOccurrenceView } from './workspace-script-occurrence.js';
 import { historicalRunnerDenial } from './space-data-runner-trust.js';
+import { drainWorkspaceScriptReports, recoverPublishedWorkspaceScriptReports } from './workspace-script-reports.js';
 import { spaceStore, type SpaceDataSource } from './store.js';
 import type { RefreshResult, RunSourceErr } from './runner.js';
 
@@ -109,6 +110,8 @@ export async function refreshWorkspaceScriptSource(
     }
     const result = await executeWorkspaceScriptOccurrence(view.key, opts.signal);
     if (result.status === 'held') return held(`This saved refresh is held: ${result.reason} Later ticks will not start a replacement.`, 'script_held');
+    // Delivery failure cannot change a proven publication into a failed run.
+    try { drainWorkspaceScriptReports(); } catch { /* durable boot/timer retry */ }
     return { ok: true, observationId: result.observationId, changed: result.changed,
       write: { ok: true, bytes: result.bytes } };
   } catch (error) {
@@ -132,10 +135,9 @@ function resume(key: WorkspaceScriptOccurrenceKey): Promise<RefreshResult[]> {
   const work = Promise.resolve().then(() => handler(key)).then(results => {
     const view = readWorkspaceScriptOccurrence(key);
     const result = results.find(result => result.sourceId === key.sourceId);
-    if (view && result) deliverOutcome({ status: result.ok ? 'done' : 'needs_input',
-      summary: result.ok ? `“${spaceStore.get(key.slug)?.title ?? key.slug}” refreshed ${key.sourceId} and saved its data.`
-        : `“${spaceStore.get(key.slug)?.title ?? key.slug}” has not refreshed ${key.sourceId}. ${result.error ?? 'Review its source status.'}`,
-      evidence: { work: [{ label: `Refresh ${key.sourceId}`, completed: result.ok ? 1 : 0, total: 1 }] },
+    if (view && result && !result.ok) deliverOutcome({ status: 'needs_input',
+      summary: `“${spaceStore.get(key.slug)?.title ?? key.slug}” has not refreshed ${key.sourceId}. ${result.error ?? 'Review its source status.'}`,
+      evidence: { work: [{ label: `Refresh ${key.sourceId}`, completed: 0, total: 1 }] },
     }, { originSessionId: view.sessionId, sourceLabel: 'workspace script refresh', sourceId: id,
       title: spaceStore.get(key.slug)?.title ?? key.slug, proactiveTurn: true });
     return results;
@@ -165,6 +167,8 @@ onApprovalResolved(onDecision);
 /** Recover approved-but-not-armed and armed-but-not-published gaps, without
  * consuming a new card, inventing a tick, or starting a chat/model turn. */
 export async function recoverSavedScriptRefreshes(): Promise<number> {
+  recoverPublishedWorkspaceScriptReports();
+  drainWorkspaceScriptReports();
   if (!recoveryHandler) return 0;
   const work: Promise<unknown>[] = [];
   for (const key of listUnpublishedWorkspaceScriptOccurrences()) {

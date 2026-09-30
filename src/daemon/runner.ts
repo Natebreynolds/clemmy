@@ -3098,6 +3098,8 @@ export async function startDaemon(
   // (outcome.ts owns the queue + idle gate; entry removal is at-most-once).
   const drainDeferredProactiveReports = () => {
     withDaemonRuntimePhase('daemon.timer.deferred_proactive_reports', {}, async () => {
+      const { drainWorkspaceScriptReports } = await import('../spaces/workspace-script-reports.js');
+      drainWorkspaceScriptReports();
       const { processDeferredProactiveReports } = await import('../runtime/outcome.js');
       await processDeferredProactiveReports();
     }).catch((err) => {

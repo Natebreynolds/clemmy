@@ -827,3 +827,80 @@ Still owed before the combined hotpatch and tag qualification:
    restart/cancel/no-replay, model/tool routing and long-task checks, followed
    by matched total-token and wall-time measurements. No live improvement or
    release readiness is established by this source slice.
+
+## Saved refresh report recovery now survives publication and acknowledgement gaps
+
+This slice closes the remaining publication-marker → completion-report gap.
+Schema 87 adds `workspace_script_reports_v1`. Recording the occurrence's
+`observation_id` and its report intent shares one event-log transaction. If
+retaining the intent fails, the marker rolls back; ordinary recovery adopts the
+already saved observation without executing the script again. Report delivery
+itself is downstream and cannot change a successful data-save result into a
+failed script.
+
+The new outbox uses the existing Outcome mechanism, with an opt-in durable
+`deliveryId`. Outcome verifies the exact destination, source, status and rendered
+content for that identity. An indexed database uniqueness constraint prevents a
+second passive event with the same identity; an insert race can acknowledge only
+an exact existing event. This check does not rely on the last 200 messages.
+Conflicting content or destination is not acknowledged. If the canonical session
+is missing, the report stays pending instead of creating a legacy ghost session.
+Existing callers without a durable delivery identity retain their previous API.
+
+Boot recovers both unfinished execution and published-but-unreported occurrences.
+The existing deferred-report timer drains pending reports every 20 seconds, with
+no new model or script turn. Newer pending records can progress past records with
+repeated delivery failures. Previously delivered, typed completion reports are
+adopted during upgrade recovery rather than sent again. Acknowledged outbox rows
+remain separate from execution and observation history. The report proves saved
+source data, not arbitrary downstream business effects performed by a script.
+
+Verification:
+
+- `/tmp/clem-script-reports-tests.txt`: initial focused Outcome and public-refresh
+  checks, **43/43**. The migration-specific check was added afterward and is
+  included in the expanded run below.
+- `/tmp/clem-script-reports-qualification.txt`: **220/220**, serial, covering the
+  shared Outcome API, public script refresh, occurrence and scope-consent
+  recovery, event-log migration/retention, schema readiness, existing workflow
+  and coding-task report-backs, and daemon boot guards. These counts overlap.
+- New SQL fault seams exercise failure while retaining report intent, while
+  appending the actual report, and after delivery but before acknowledgement.
+  A successful data-save replay remains successful while reporting is down.
+  More than 200 intervening messages do not duplicate an old report. Changed
+  payload or destination cannot borrow another report's acknowledgement.
+- Two additional cold production-caller cases each use three fresh processes
+  in explicitly disposable homes: publication is already marked complete while
+  report delivery fails, and a report commits while its acknowledgement fails.
+  Recovery retains exactly one process crossing, one observation, one completion
+  report and one approval; a further restart changes none. The script is removed
+  before recovery, so reporting cannot depend on rerunning/re-preparing it.
+- The v86 upgrade check preserves both unfinished and published source owners,
+  fabricates no scope grant or physical execution, and permits migration replay.
+- `/tmp/clem-script-reports-typecheck-final.txt`: TypeScript passed.
+- `/tmp/clem-script-reports-red.txt`: **2/2 expected semantic failures** after
+  separately removing atomic report-intent retention and exact delivery-content
+  matching. The intended assertions failed (unfinished owner lost; mismatched
+  report incorrectly acknowledged). Original source bytes were restored in
+  `finally` and SHA-256 verified after each mutation.
+- `/tmp/clem-script-reports-artifacts-verified.txt`: emitted harness component
+  artifacts verified source-current. This is not a desktop/application build.
+- The runner's broad live-home isolation sentinel remains **NOT PERFORMED** while
+  live daemon 72427 owns the home. The expanded run observed `secretsMeta` change
+  while that daemon was running; this is not an isolation-proof pass. Controlled
+  disposable process checks are not installed-app/live-home acceptance.
+
+No app install/restart, provider/model call, personal source edit, credential
+change, merge to main, push or tag was performed. The other agent's worktree
+remained clean at `76c53a1ea`. The candidate expects schema 87; the installed
+runtime last served `019e8d9d5` with schema 82. A new full app build and served
+fingerprint check are still owed. The excluded model-ledger draft still using
+migration 85 must be renumbered after the accepted chain (now after 87) if resumed.
+
+The next bounded implementation is owner-visible source control: stopping and
+revoking a saved source, explicitly reviewing a prior denial or changed source,
+and resolving a stopped uncertain attempt without forging completion or replaying
+its effects. A changed source must not silently undo an earlier stop. Controls
+must address an exact retained state, work on desktop and mobile, preserve old
+receipts, and distinguish reviewing new permission from granting it. Finish their
+presentation and live acceptance before treating this candidate as hotpatch-ready.

@@ -723,7 +723,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 562979
+          "bytes": 564077
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
@@ -2825,14 +2825,17 @@
         "src/spaces/workspace-script-authority.ts": {
           "bytes": 5525
         },
+        "src/spaces/workspace-script-reports.ts": {
+          "bytes": 6153
+        },
         "src/spaces/workspace-script-occurrence.ts": {
-          "bytes": 19189
+          "bytes": 19479
         },
         "src/spaces/space-data-runner-trust.ts": {
           "bytes": 27729
         },
         "src/spaces/workspace-script-refresh.ts": {
-          "bytes": 11435
+          "bytes": 11645
         },
         "src/spaces/runner.ts": {
           "bytes": 34766
@@ -3033,7 +3036,7 @@
           "bytes": 89918
         },
         "src/runtime/outcome.ts": {
-          "bytes": 28861
+          "bytes": 30770
         },
         "src/runtime/harness/accepted-source-readback.ts": {
           "bytes": 12038
@@ -4080,7 +4083,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 562979
+          "bytes": 564077
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
@@ -6182,14 +6185,17 @@
         "src/spaces/workspace-script-authority.ts": {
           "bytes": 5525
         },
+        "src/spaces/workspace-script-reports.ts": {
+          "bytes": 6153
+        },
         "src/spaces/workspace-script-occurrence.ts": {
-          "bytes": 19189
+          "bytes": 19479
         },
         "src/spaces/space-data-runner-trust.ts": {
           "bytes": 27729
         },
         "src/spaces/workspace-script-refresh.ts": {
-          "bytes": 11435
+          "bytes": 11645
         },
         "src/spaces/runner.ts": {
           "bytes": 34766
@@ -6390,7 +6396,7 @@
           "bytes": 89918
         },
         "src/runtime/outcome.ts": {
-          "bytes": 28861
+          "bytes": 30770
         },
         "src/runtime/harness/accepted-source-readback.ts": {
           "bytes": 12038

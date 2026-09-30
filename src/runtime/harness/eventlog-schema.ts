@@ -11321,6 +11321,31 @@ const MIGRATIONS: EventLogMigration[] = [
       receipt_json TEXT NOT NULL
     );`,
   },
+  {
+    // Publication and its report intent commit together. Reporting never owns
+    // execution authority, and session retention cannot erase an undelivered result.
+    version: 87,
+    sql: `CREATE TABLE IF NOT EXISTS workspace_script_reports_v1 (
+      delivery_id TEXT NOT NULL UNIQUE,
+      workspace_id TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      occurrence_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      observation_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      acknowledged_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      PRIMARY KEY(workspace_id, source_id, occurrence_id)
+    );
+    CREATE INDEX IF NOT EXISTS workspace_script_reports_pending_v1
+      ON workspace_script_reports_v1(created_at) WHERE acknowledged_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS events_outcome_delivery_id_v1
+      ON events(json_extract(data_json, '$.outcomeDeliveryId'))
+      WHERE type = 'user_input_received' AND json_valid(data_json)
+        AND json_type(data_json, '$.outcomeDeliveryId') = 'text';`,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

@@ -42,6 +42,33 @@ const ctx = (over = {}) => ({
   ...over,
 });
 
+test('durable delivery stays exactly once beyond the recent-history window and refuses changed content or destination', () => {
+  const sessionId = 'outbox-long-history';
+  createSession({ id: sessionId, kind: 'workflow' });
+  const context = ctx({ originSessionId: sessionId, sourceId: 'saved-refresh', deliveryId: 'outbox-long-history:1' });
+  const outcome = { status: 'done' as const, summary: 'Saved exactly one dataset.' };
+  assert.equal(deliverOutcomeWithAcknowledgement(outcome, context).written, true);
+  for (let n = 0; n < 205; n++) appendEvent({ sessionId, turn: n + 1, role: 'user', type: 'user_input_received',
+    data: { text: `Later event ${n}` } });
+  assert.deepEqual(deliverOutcomeWithAcknowledgement(outcome, context),
+    { acknowledged: true, written: false, disposition: 'already_delivered' });
+  assert.equal(deliverOutcomeWithAcknowledgement({ ...outcome, summary: 'Different result.' }, context).acknowledged, false);
+  createSession({ id: 'outbox-wrong-destination', kind: 'workflow' });
+  assert.equal(deliverOutcomeWithAcknowledgement(outcome, { ...context, originSessionId: 'outbox-wrong-destination' }).acknowledged, false);
+  const events = listEvents(sessionId).filter(e => e.data.outcomeDeliveryId === context.deliveryId);
+  assert.equal(events.length, 1);
+  assert.throws(() => appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: events[0].data }), /UNIQUE/);
+  assert.equal(listEvents('outbox-wrong-destination').length, 0);
+});
+
+test('durable delivery with a missing canonical destination stays pending instead of creating a legacy ghost', () => {
+  const sessionId = 'outbox-missing-session';
+  assert.deepEqual(deliverOutcomeWithAcknowledgement({ status: 'done', summary: 'Saved.' },
+    ctx({ originSessionId: sessionId, deliveryId: 'missing-destination:1' })),
+  { acknowledged: false, written: false, disposition: 'failed' });
+  assert.equal(new SessionStore().get(sessionId).turns.length, 0);
+});
+
 test('renderOutcomeText: head word + prefix + guidance per status', () => {
   const done = renderOutcomeText({ status: 'done', detail: 'all set' }, ctx());
   assert.ok(done.startsWith('[background task bg-1 completed] My Task'), 'done → completed] head');
