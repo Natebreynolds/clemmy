@@ -23,6 +23,7 @@ Object.assign(process.env, {
   CLEMMY_UNIFIED_TURN_PRIMER: 'off',
   CLEMMY_DEBATE_MODE: 'off',
   CLEMMY_WATCHER_JUDGE: 'off',
+  COMPOSIO_BACKEND: 'sdk',
 });
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
 writeFileSync(path.join(fixtureHome, 'state', 'machine-id'), 'connection-closure-fixture\n');
@@ -66,6 +67,7 @@ const { spaceStore } = await import('../../spaces/store.js');
 const { closeWorkspaceDb } = await import('../../spaces/workspace-db.js');
 const { closeMemoryDb } = await import('../../memory/db.js');
 const writeCapabilities = await import('../../memory/verified-write-capability-store.js');
+const { installConnectionProviderFixture } = await import('./connection-provider.fixture.js');
 
 after(() => {
   globalThis.fetch = originalFetch;
@@ -100,7 +102,10 @@ function recordMissingConnection(identity: { sessionId: string; sourceUserSeq: n
       accounting: 'top_level', topologyRole: 'control', result: output } });
 }
 
-for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile', 'prefer-home', 'prefer-mobile', 'gateway-mobile', 'account-changed-before-model', 'stopped-before-model'] as const) test(`connection execution: ${scenario}`, async t => {
+for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile', 'prefer-home', 'prefer-mobile',
+  'gateway-mobile', 'account-changed-before-model', 'stopped-before-model', 'account-inactive', 'schema-changed',
+  'account-changed-during-check', 'stopped-during-check', 'callable-revoked-during-check', 'unreviewed-capability',
+  'different-reviewed-account', 'definition-relabeled'] as const) test(`connection execution: ${scenario}`, async t => {
   const useExecutor = scenario !== 'publication';
   let configured = 0;
   _setBridgeImplsForTests({ configure: async () => { configured += 1; return { ok: true }; } });
@@ -108,6 +113,8 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   log.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
+  const provider = useExecutor && scenario !== 'unreviewed-capability' ? await installConnectionProviderFixture() : null;
+  if (provider) t.after(() => provider.dispose());
   const slug = `connection-board-${scenario}`;
   spaceStore.save({ id: slug, title: 'Controlled closure board',
     initialData: { rows: [{ account: 'Southgate', status: 'Ready', note: 'Parts arrived' }] },
@@ -121,11 +128,16 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const planning = await semantic.primePrimaryModelPlanningCatalog(planIdentity);
   assert.ok(planning.ok, JSON.stringify(planning));
   if (!planning.ok) throw new Error(planning.reason);
+  if (provider) await semantic.disclosePrimaryModelPlanningCapabilities({ authority: planning.planning.authority,
+    candidates: [{ name: provider.operation, carrier: 'work_call', sourceKind: 'authorized_composio', schema: provider.schema }] });
   const capabilityRef = 'cap:local:space_get:read';
   const preparedOutline = await publisher.preparePlanOutline({ ...planIdentity, planning: planning.planning, ready: true,
     raw: { steps: [{ id: 'verify_board', action: 'Read the saved controlled board.', effect: 'read', capabilityRef,
       staticArguments: { slug }, dynamicBindings: [], dependsOn: [], subagentRole: null,
-      verification: 'Report the returned board status without changing its content.' }],
+      verification: 'Report the returned board status without changing its content.' },
+      ...(provider ? [{ id: 'verify_crm', action: 'Read the connected CRM board status.', effect: 'read',
+        capabilityRef: provider.capability, staticArguments: { recordId: 'fixture-board' }, dynamicBindings: [],
+        dependsOn: ['verify_board'], subagentRole: null, verification: 'Confirm the returned CRM board status.' }] : [])],
     successCriteria: ['Report Southgate’s current status from the saved board.'], subagents: [] } });
   assert.deepEqual(preparedOutline.preparationIssues, []);
   // A reviewed tracked point read is supported by plan_task. The ordinary
@@ -134,8 +146,11 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const executionDraft = {
     criteria: ['Read and report the saved board without changing any content.'], cardinality: null, destination: null,
     topology: { version: 1, operations: [{ id: 'verify_board', effect: 'read', coverage: 'single',
-      dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } }], universes: [] },
-    bindings: [{ operationId: 'verify_board', role: 'source', capabilityRef, evidence: ['tool_result'] }],
+      dependsOn: [], dataFrom: [], cardinality: { kind: 'once' } },
+      ...(provider ? [{ id: 'verify_crm', effect: 'read', coverage: 'single', dependsOn: ['verify_board'],
+        dataFrom: [], cardinality: { kind: 'once' } }] : [])], universes: [] },
+    bindings: [{ operationId: 'verify_board', role: 'source', capabilityRef, evidence: ['tool_result'] },
+      ...(provider ? [{ operationId: 'verify_crm', role: 'source', capabilityRef: provider.capability, evidence: ['tool_result'] }] : [])],
     deliverables: [{ id: 'board_evidence', kind: 'evidence' }], evidenceRequirements: ['tool_result'],
   };
   const artifact = plans.publishPlanRevision({ ...planIdentity, principalId: 'fixture-owner', fullText: objective,
@@ -158,6 +173,10 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
       universe_selector: null, seal_amendment: null,
       name: 'space_get', args_json: JSON.stringify({ slug }) })],
     [message('ASK: Connect the controlled fixture CRM to continue.')],
+    ...(provider ? [[toolCall('controlled-selected-crm-read', 'work_call', { requirement_id: 'verify_crm',
+      universe_item_id: null, universe_selector: null, seal_amendment: null,
+      name: 'composio_execute_tool', args_json: JSON.stringify({ tool_slug: provider.operation,
+        arguments: { recordId: 'fixture-board' } }) })]] : []),
     [message('Southgate is Ready; its note is Parts arrived. The saved board was not changed.')],
   ];
   let modelCalls = 0;
@@ -166,7 +185,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     async getResponse() {
       if (modelCalls === 3) await beforeFinalResponse?.();
       const output = frames[modelCalls++];
-      assert.ok(output, 'the recording model must not run beyond its four scripted frames');
+      assert.ok(output, 'the recording model must not run beyond its scripted frames');
       return { responseId: `controlled-closure-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output } as never;
     },
     async *getStreamedResponse(request) {
@@ -190,7 +209,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     if (!primed.ok) throw new Error(primed.reason);
     await reviewed.revalidateReviewedPlanPreparation(primed.planning);
     return buildOrchestratorAgent({ userInput: executeInput, ...identity, hostFreshPlanning: primed.planning,
-      allowedToolNames: ['space_get'], allowToolJit: true, model: modelId,
+      allowedToolNames: ['space_get', ...(provider ? ['composio_execute_tool'] : [])], allowToolJit: true, model: modelId,
       mcpToolScope: { authority: 'none', reason: 'Controlled native read has no external tool authority',
         allowedServerSlugs: [], toolPatterns: [], maxTools: 0 } });
   });
@@ -225,20 +244,22 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   assert.deepEqual(operation, [{ operation_id: 'verify_board', resolved_tool: 'space_get', logical_tool_call_id: readCallId }]);
   const reply = 'Southgate is Ready; its note is Parts arrived. The saved board was not changed.';
   const prepared = preparation.prepareAcceptedTaskTerminal({ ...identity, proposedReply: reply });
-  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.equal(prepared.status === 'ready', !provider, JSON.stringify(prepared));
   const taskBefore = log.openEventLog().prepare(`SELECT state, manifest_id, work_contract_id, terminal_event_id
     FROM accepted_task_authority WHERE session_id = ? AND source_user_seq = ?`).get(session.id, source.seq) as Record<string, unknown>;
-  assert.equal(taskBefore.state, 'manifested_verifying');
-  assert.ok(taskBefore.manifest_id && taskBefore.work_contract_id);
+  assert.equal(taskBefore.state, provider ? 'armed' : 'manifested_verifying', JSON.stringify(taskBefore));
+  assert.ok(taskBefore.work_contract_id);
+  assert.equal(Boolean(taskBefore.manifest_id), !provider);
   assert.equal(taskBefore.terminal_event_id, null);
-  const manifestState = loadManifestState(session.id, source.seq);
-  assert.equal(manifestState.status, 'ok');
-  if (manifestState.status !== 'ok') throw new Error('The actual planned read did not produce its manifest.');
-  const proveOriginal = () => log.openEventLog().transaction(() => verifyAcceptedTaskTerminalProofInTransaction({
-    db: log.openEventLog(), ...identity, acceptedTaskId: acceptedTaskIdFor(session.id, source.seq),
-    manifest: manifestState.manifest,
-  }))();
-  assert.deepEqual(proveOriginal(), { ok: true });
+  const proveOriginal = () => {
+    const manifestState = loadManifestState(session.id, source.seq);
+    if (manifestState.status !== 'ok') return { ok: false, reason: manifestState.status };
+    return log.openEventLog().transaction(() => verifyAcceptedTaskTerminalProofInTransaction({
+      db: log.openEventLog(), ...identity, acceptedTaskId: acceptedTaskIdFor(session.id, source.seq),
+      manifest: manifestState.manifest,
+    }))();
+  };
+  assert.equal(proveOriginal().ok, !provider, 'the pending provider read cannot count as complete');
   const canonical = batchCheckpoints.prepareAcceptedModelBatchRestart(identity);
   assert.equal(canonical.status, 'ready');
   const progress = hostProgress.boundHostConnectionProgress(agent, identity);
@@ -293,11 +314,12 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   assert.deepEqual(hostAuthority.acceptedTurnCallAuthorityFor(session.id, source.seq), rootBefore);
   log.updateSession(session.id, { status: 'active' });
   const context = { sessionId: session.id, connectionRequestId: dependency.requestId };
-  connectionSetup.recordConnectionSetupResult(context, { connectionId: 'fixture-server-returned-account' });
+  const connectedAccount = scenario === 'different-reviewed-account' ? 'fixture-another-account' : 'fixture-server-returned-account';
+  connectionSetup.recordConnectionSetupResult(context, { connectionId: connectedAccount });
   let checks = 0;
   const verified = await connectionSetup.verifyConnectionSetup(context, async selected => {
     checks += 1;
-    assert.deepEqual(selected, [{ identifier: 'FIXTURECRM_READ', connectionId: 'fixture-server-returned-account' }]);
+    assert.deepEqual(selected, [{ identifier: 'FIXTURECRM_READ', connectionId: connectedAccount }]);
     return { ok: true };
   });
   assert.ok(verified.connectionVerified && verified.verificationBinding);
@@ -336,7 +358,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     assert.equal(response.text, reply, JSON.stringify(response));
     assert.equal(response.terminal?.status, 'done');
     assert.ok(gatewayAccepted);
-    assert.equal(modelCalls, 4);
+    assert.equal(modelCalls, 5);
   }
   const leaseOwner = scenario === 'gateway-mobile' ? `connection-gateway:${process.pid}` : 'fixture-closure-desktop';
   const lease = scenario === 'gateway-mobile'
@@ -352,7 +374,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   assert.equal(active.kind, 'activated');
   assert.equal(active.activation.executionSourceUserSeq, source.seq);
   assert.notEqual(active.source.seq, source.seq);
-  if (scenario !== 'gateway-mobile') assert.deepEqual(proveOriginal(), { ok: true }, 'control acceptance cannot replace the original completion evidence');
+  if (scenario !== 'gateway-mobile') assert.equal(proveOriginal().ok, !provider, 'control acceptance cannot replace the original completion evidence');
   const deliveryIdentity = { sessionId: session.id, sourceUserSeq: active.source.seq, turn: active.source.turn };
   const finalOutcome: TurnOutcome = { version: 2, id: turnOutcomeId(deliveryIdentity), identity: deliveryIdentity,
     status: 'done', resumable: false, presentation: { kind: 'answer', text: reply } };
@@ -375,13 +397,49 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
         async () => { throw new Error('The legacy bridge responder must not run.'); }, { connectionExecutionLeaseOwner: leaseOwner })
     : respondViaHarness(scenario === 'bridge-mobile' ? 'webhook' : 'home', bridgeRequest,
         { connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1', modelOverride: 'fixture-wrong-caller-override' });
+  if (['account-inactive', 'schema-changed', 'account-changed-during-check', 'stopped-during-check',
+    'callable-revoked-during-check', 'unreviewed-capability', 'different-reviewed-account', 'definition-relabeled'].includes(scenario)) {
+    const beforeChecks = provider ? { ...provider.counts } : null;
+    if (scenario === 'account-inactive') provider!.setActive(false);
+    if (scenario === 'schema-changed') provider!.setSchema({ ...provider!.schema,
+      properties: { ...provider!.schema.properties, extra: { type: 'string' } } });
+    if (scenario === 'definition-relabeled') provider!.setVersion('2');
+    if (scenario === 'account-changed-during-check') provider!.beforeSchema(() => {
+      connectionSetup.recordConnectionSetupResult(context, { connectionId: 'fixture-different-account' });
+    });
+    if (scenario === 'stopped-during-check') provider!.beforeSchema(() => {
+      log.requestKill(session.id, 'Owner stopped the task during verification', originalAttempt);
+    });
+    if (scenario === 'callable-revoked-during-check') provider!.beforeSchema(() => {
+      catalogs.peekHostCapabilityCatalogFactory()!.forget(provider!.capability);
+    });
+    await assert.rejects(runConversation(resumeOptions), /connected operation|account changed|was stopped|operation changed|outside the reviewed plan|differs from the reviewed account/);
+    assert.equal(modelCalls, 3, 'a metadata refusal cannot spend another model frame');
+    assert.equal(provider?.counts.businessCalls ?? 0, 0, 'verification cannot execute a business operation');
+    assert.deepEqual(readRows(), readBefore);
+    assert.equal(log.openEventLog().prepare('SELECT status FROM dependency_requests WHERE request_id = ?')
+      .get(dependency.requestId)?.status, 'open');
+    assert.equal(log.listEvents(session.id, { types: ['connection_request_satisfied'] }).length, 0);
+    if (provider && beforeChecks && scenario !== 'different-reviewed-account') {
+      assert.ok(provider.counts.accountChecks > beforeChecks.accountChecks, 'a cached account must not satisfy the check');
+      if (scenario !== 'account-inactive') assert.ok(provider.counts.schemaChecks > beforeChecks.schemaChecks,
+        'the exact definition must be refreshed without model discovery');
+    }
+    if (scenario === 'different-reviewed-account') assert.deepEqual(provider!.counts, beforeChecks,
+      'a different account must be refused before provider metadata or business work');
+    return;
+  }
   if (scenario === 'account-changed-before-model' || scenario === 'stopped-before-model') {
     let invalidated = false;
     beforeResumeModel = () => {
       beforeResumeModel = undefined;
       invalidated = true;
       if (scenario === 'account-changed-before-model') {
-        connectionSetup.recordConnectionSetupResult(context, { connectionId: 'fixture-different-account' });
+        // The request is now satisfied, so a late provider setup callback is
+        // correctly ignored. Inject persistent account drift directly to
+        // exercise the final ownership guard independently of that filter.
+        log.openEventLog().prepare('UPDATE connection_setup_attempts SET connection_id = ? WHERE request_id = ?')
+          .run('fixture-different-account', dependency.requestId);
       } else {
         log.requestKill(session.id, 'Owner stopped the original task before dispatch', originalAttempt);
       }
@@ -455,7 +513,12 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   else assert.equal(publishFinal().inserted, false);
   assert.deepEqual(readRows(), readBefore, 'closure and both exact replays must never repeat the completed local read');
   assert.deepEqual(spaceStore.snapshot(slug), beforeSpace);
-  assert.equal(modelCalls, useExecutor ? 4 : 3);
+  assert.equal(modelCalls, useExecutor ? 5 : 3);
+  if (provider) {
+    assert.equal(provider.counts.businessCalls, 1, 'only the pending provider read executes after connection');
+    assert.equal(log.listEvents(session.id, { types: ['connection_request_satisfied'] })
+      .filter(event => event.data.kind === 'reviewed_execution_callable').length, 1);
+  }
   assert.equal(configured, scenario.startsWith('prefer-') || scenario === 'gateway-mobile' ? 1 : 0,
     'a completed replay must not configure or re-enter the runtime');
   assert.equal(checks, 1);
@@ -471,5 +534,5 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   }
   assert.equal(closure.readConnectionExecutionClosure(log.openEventLog(), {
     sessionId: session.id, executionSourceUserSeq: source.seq }), null);
-  assert.equal(modelCalls, useExecutor ? 4 : 3);
+  assert.equal(modelCalls, useExecutor ? 5 : 3);
 });

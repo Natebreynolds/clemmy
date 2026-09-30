@@ -180,6 +180,32 @@ test('host reason survives retained-work rendering before effect-truth correctio
   assert.equal(terminal.data.blockedReason, 'host_control_failure_no_external_effect');
 });
 
+test('a resumed approval preserves the original unresolved external effect in its delivery', async () => {
+  const source = acceptedSource('sess-effect-truth-resumed-write');
+  const approvals = await import('./approval-registry.js');
+  const card = approvals.register({ sessionId: source.sessionId, subject: 'Fixture write',
+    tool: 'fixture_write', args: { value: 'one' } });
+  approvals.resolve(card.approvalId, 'approved', 'fixture-owner');
+  const control = appendEvent({ sessionId: source.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Approved.', approvalId: card.approvalId, decision: 'approve' } });
+  appendEvent({ sessionId: source.sessionId, turn: 2, role: 'system', type: 'run_resumed', data: {
+    reviewContinuationVersion: 1, deliverySourceUserSeq: control.seq, executionSourceUserSeq: source.sourceUserSeq,
+    approvalId: card.approvalId, decision: 'approve',
+  } });
+  const started = dispatch.beginPhysicalDispatch({ identity: {
+    sessionId: source.sessionId, sourceUserSeq: source.sourceUserSeq, acceptedTaskId: source.acceptedTaskId,
+    logicalToolCallId: 'logical:resumed-write', physicalDispatchId: 'dispatch:provider:resumed-write', ordinal: 1,
+  }, tool: 'fixture_write', args: { value: 'one' }, relation: 'primary' });
+  assert.equal(started.status, 'inserted');
+  if (started.status !== 'inserted') throw new Error('Fixture crossing not admitted.');
+  assert.equal(dispatch.settlePhysicalDispatch({ identity: started.identity, tool: 'fixture_write', outcome: 'unknown' }).status, 'inserted');
+  const result = commitTurnOutcome(uncertainBlockedOutcome({ ...source, sourceUserSeq: control.seq, turn: 2 }),
+    { metadata: { blockedReason: 'tool_effect_uncertain' } });
+  assert.equal(result.presentation.identity.sourceUserSeq, control.seq, 'the new control still owns delivery');
+  assert.match(result.presentation.text, /reconcil/i, 'the control must not hide its original unresolved write');
+  assert.equal(result.event.data.blockedReason, 'tool_effect_uncertain');
+});
+
 
 test('an exact stopped attempt publishes cancelled rather than a host failure', () => {
   const source = acceptedSource('sess-effect-truth-exact-stop');

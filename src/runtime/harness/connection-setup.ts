@@ -78,12 +78,19 @@ export function assertConnectionContinuationCurrent(context: ConnectionSetupCont
  * after fresh tool attestation has satisfied the original dependency. This
  * comparison is not a new provider check or a callable capability grant. */
 export function assertConnectionContinuationAccount(context: ConnectionSetupContext, binding: string): void {
+  readConnectionContinuationAccount(context, binding);
+}
+
+/** Server-owned selection only. This id is context for fresh provider proof,
+ * not a callable grant and never a replacement supplied by the browser. */
+export function readConnectionContinuationAccount(context: ConnectionSetupContext, binding: string): string {
   ensureSetupTable();
   const account = openEventLog().prepare('SELECT connection_id, updated_at FROM connection_setup_attempts WHERE request_id = ? AND session_id = ?')
     .get(context.connectionRequestId, context.sessionId) as { connection_id: string; updated_at: string } | undefined;
   if (!account || setupBinding(context.connectionRequestId, account) !== binding) {
     throw new Error('The account changed while connecting. Check the connection again.');
   }
+  return account.connection_id;
 }
 
 export function withConnectionContinuationAdmission<T>(context: ConnectionSetupContext,

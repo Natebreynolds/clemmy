@@ -971,3 +971,83 @@ qualifying it in the installed app is a separate remaining step.
 The UI state contract above is paired with this work. Broader projects/agents,
 inbound event health and purposeful proactive check-ins remain planned slices;
 this routing change does not claim to ship them.
+
+## Fresh callable preparation and original-task delivery evidence — September 30
+
+Verified: production retained-agent preparation now verifies the exact missing
+Composio operation against the reviewed binding and the account selected by the
+server's setup receipt. It uses the existing forced account snapshot and exact
+definition refresh. A cached callable registration or successful sign-in alone
+does not satisfy the dependency. It checks the current callable identity again
+after those awaits and rechecks execution ownership throughout preparation.
+Only then does one atomic dependency update record a connection-satisfied event.
+The event is evidence of preparation, not an approval or business-effect receipt.
+
+The operation must belong to the retained reviewed plan. A different connected
+account, changed input/output contract, changed definition/version, unavailable
+account, lost owner or revoked callable cannot silently replace it. Revalidation
+adds no model discovery frame and executes no business operation. Subsequent
+calls still pass the ordinary dispatch, account, effect and consent boundaries.
+
+The stronger integration test uncovered a second framework defect. Completion
+assessment used the new delivery control's empty work history, while terminal
+closure correctly required the original task's completed contract. A local-only
+completion fixture had masked that by preparing all original evidence before
+the pause. Delivery assessment now uses the same validated original source as
+closure and review. Partial-effect copy, retained results, evidence references,
+pending-read checks and external-uncertainty reporting follow that source too;
+the new control still owns the public terminal. A resumed approval with an
+unresolved original write retains its reconciliation warning.
+
+Evidence:
+
+- **17/17** connection integration cases passed:
+  `/tmp/clem-connection-callable-accepted.txt`. The successful cases now have a
+  genuinely pending provider read in the immutable reviewed plan. They execute
+  the native board read once, pause, prepare the exact account/tool, execute the
+  pending CRM read once through the actual attested carrier with a recording
+  provider, and publish/reopen/replay without repeating either read. Exactly
+  five recording frames are used: three before setup and two after (the pending
+  read and final answer). There is no added discovery frame. This is a stronger
+  workload than the previous four-frame local-only fixture, not a latency A/B.
+- The cases also cover inactive account, changed schema, selected-account
+  mismatch, account/Stop/callable changes during refresh, operation outside the
+  reviewed plan, provider version relabel, and final account/Stop invalidation
+  before model dispatch. Preparation refusals leave the dependency open, with
+  no resumed model frame, no provider business call and no satisfied receipt.
+- **207/207** across eight regression files passed in
+  `/tmp/clem-connection-callable-regression.txt`: delivery, effect truth, partial
+  work, terminal states, retained-work projection, accepted batches/checkpoints,
+  connection setup and selected provider-definition revalidation.
+- `/tmp/clem-connection-callable-final.txt` passed **21/21** before adding the
+  final two account/version cases: 15 connection cases plus six effect-truth
+  cases, including the new resumed-approval pin. Five effect-truth cases overlap
+  the 207 count; do not add these logs as independent coverage totals.
+- Red evidence: `/tmp/clem-connection-callable-integration-2.txt` captures the
+  unprepared original-task closure failure. Temporarily removing only the new
+  callable check made the inactive-account and schema-change pins fail with
+  “Missing expected rejection” in `/tmp/clem-connection-callable-red.txt`.
+  Candidate source was restored immediately afterward.
+- Final runtime TypeScript and `git diff --check` passed. TypeScript output:
+  `/tmp/clem-connection-callable-final-tsc.txt`.
+
+Not performed: live provider/model requests, live-home acceptance, browser or
+physical-phone interaction, build, hotpatch, merge or tag. The isolated runner's
+live-home sentinel remains **NOT PERFORMED** while daemon 72427 owns those
+stores. Test homes and provider/model recordings are isolated; no business
+account or real credential is used. No measured speed or token saving is
+claimed. Other-agent `claude/two-modes` remains clean at `76c53a1ea` when checked.
+
+Still owed before exposing reviewed Execute Continue: typed transient-connection
+refusal/retry and changed-plan guidance at the public route (the internal
+preparation currently refuses by throwing); held-lease renewal and boot
+adoption; full-source outer budgets; workflow finalization; subsequent setup
+and approval pauses; completed-write/no-replay and cross-device acceptance.
+In particular, a temporary metadata failure must not be turned into a generic
+failed terminal that closes the original task and prevents its safe retry.
+Keep `EXECUTION_CONTINUATION_BLOCKER` active until those lifecycle paths are
+implemented and the combined installed app/live-home candidate is qualified.
+
+The UI must show which requirement remains, keep the task and completed work
+visible, and offer the correct connection retry or reviewed-plan change. It
+must not promise completion just because this new metadata check succeeded.

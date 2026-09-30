@@ -1,7 +1,8 @@
 /** Rebuild and check the retained model, tool surface and execution route.
  * The retained executor uses this after durable activation and lease checks;
- * browser admission, fresh callable attestation and per-call consent remain
- * separate requirements. Original agent/project/memory identity
+ * production preparation freshly verifies the missing provider operation.
+ * Browser admission and per-call consent remain separate requirements.
+ * Original agent/project/memory identity
  * is revalidated here before any retrieval or construction. */
 import { isDeepStrictEqual } from 'node:util';
 import type { Agent } from '@openai/agents';
@@ -46,7 +47,10 @@ export async function rebuildSourceConnectionAgent(
   if (!userInput) throw new Error('The paused execution has no original reviewed request.');
   const runtime = ports ?? {
     prime: (await import('../semantic-boundary/admit-and-compile-accepted-source.js')).primePrimaryModelPlanningCatalog,
-    revalidate: (await import('./reviewed-plan-runtime.js')).revalidateReviewedPlanPreparation,
+    revalidate: async planning => {
+      await (await import('./reviewed-plan-runtime.js')).revalidateReviewedPlanPreparation(planning);
+      await (await import('./connection-callable-preparation.js')).prepareConnectionExecutionCapability(input);
+    },
     build: (await import('../../agents/orchestrator.js')).buildOrchestratorAgent,
   };
   input.assertOwned();

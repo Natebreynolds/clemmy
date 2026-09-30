@@ -308,6 +308,10 @@ export function assessAcceptedSourceDelivery(input: {
   proposedReply: string;
   deliveryConcern?: DeliveryGap | null;
 }): AcceptedSourceDeliveryAssessment {
+  // A setup/approval control owns delivery, while its validated original
+  // source owns the work contract and settlements. Assess that same source
+  // used by the terminal closure and completion-review proof below.
+  input = { ...input, ...completionEvidenceSource(input) };
   const settlementAudit = auditAcceptedSourceSettlementTruth({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
@@ -472,8 +476,7 @@ function withDurablePartialEvidence(
   let durablePartial: NonNullable<TurnOutcome['evidenceRefs']> = [];
   try {
     durablePartial = workEvidenceForAcceptedSource({
-      sessionId: outcome.identity.sessionId,
-      sourceUserSeq: outcome.identity.sourceUserSeq,
+      ...completionEvidenceSource(outcome.identity),
     }).map((ref) => ({ kind: publicEvidenceKind(ref.kind), id: ref.ref }));
   } catch { /* absence/unreadability cannot manufacture presentation evidence */ }
   return [...(outcome.evidenceRefs ?? []), ...durablePartial]
@@ -501,8 +504,7 @@ function withExactMutationPartialTruth(
   outcome: Extract<TurnOutcome, { status: 'done' }>,
 ): Extract<TurnOutcome, { status: 'done' }> {
   const text = exactPartialMutationPresentation({
-    sessionId: outcome.identity.sessionId,
-    sourceUserSeq: outcome.identity.sourceUserSeq,
+    ...completionEvidenceSource(outcome.identity),
   });
   return text
     ? { ...outcome, presentation: { kind: 'answer', text } }
@@ -898,7 +900,7 @@ export const HOST_LOCAL_FAILURE_BLOCKED_TEXT =
  * upgraded on proof, never on a query failure.
  */
 function acceptedSourceHasZeroExternalEffectSurface(
-  identity: TurnIdentity,
+  identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>,
 ): boolean {
   try {
     const row = openEventLog().prepare(`
@@ -939,11 +941,11 @@ function reviewFindingForOwner(reason: string, max = 900): string {
 }
 
 function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
+  const workIdentity = completionEvidenceSource(outcome.identity);
   switch (outcome.status) {
     case 'needs_input': {
       const text = renderFailureWithRetainedWork({
-        sessionId: outcome.identity.sessionId,
-        sourceUserSeq: outcome.identity.sourceUserSeq,
+        ...workIdentity,
         fallbackText: outcome.presentation.text,
       });
       if (text === outcome.presentation.text) return outcome;
@@ -969,8 +971,7 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
     }
     case 'blocked': {
       const text = renderFailureWithRetainedWork({
-        sessionId: outcome.identity.sessionId,
-        sourceUserSeq: outcome.identity.sourceUserSeq,
+        ...workIdentity,
         fallbackText: outcome.presentation.text,
       });
       return text === outcome.presentation.text
@@ -979,8 +980,7 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
     }
     case 'uncertain': {
       const text = renderFailureWithRetainedWork({
-        sessionId: outcome.identity.sessionId,
-        sourceUserSeq: outcome.identity.sourceUserSeq,
+        ...workIdentity,
         fallbackText: outcome.presentation.text,
       });
       return text === outcome.presentation.text
@@ -989,8 +989,7 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
     }
     case 'cancelled': {
       const text = renderFailureWithRetainedWork({
-        sessionId: outcome.identity.sessionId,
-        sourceUserSeq: outcome.identity.sourceUserSeq,
+        ...workIdentity,
         fallbackText: outcome.presentation.text,
       });
       return text === outcome.presentation.text
@@ -999,8 +998,7 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
     }
     case 'failed': {
       const text = renderFailureWithRetainedWork({
-        sessionId: outcome.identity.sessionId,
-        sourceUserSeq: outcome.identity.sourceUserSeq,
+        ...workIdentity,
         fallbackText: outcome.presentation.text,
       });
       return text === outcome.presentation.text
@@ -1097,8 +1095,7 @@ export function commitTurnOutcome(
       // This is the source-91257 floor: plan_task succeeded, the model stopped,
       // and a truthful-sounding explanation was otherwise stamped success.
       const acceptedReadPlanStillPending = pendingAcceptedReadPlan({
-        sessionId: requested.identity.sessionId,
-        sourceUserSeq: requested.identity.sourceUserSeq,
+        ...completionEvidenceSource(requested.identity),
       }) !== null;
       const mustHold = assessment.localWorkIncomplete || acceptedReadPlanStillPending
         || (options.terminalJudgeDisposition === 'deliver'
@@ -1137,7 +1134,7 @@ export function commitTurnOutcome(
     // reason survives that rendering; presentation bytes are not identity.
     && (effectiveOptions.metadata?.blockedReason === 'tool_effect_uncertain'
       || effectiveOutcome.presentation.text === HOST_TOOL_UNCERTAIN_BLOCKED_TEXT)
-    && acceptedSourceHasZeroExternalEffectSurface(effectiveOutcome.identity)
+    && acceptedSourceHasZeroExternalEffectSurface(completionEvidenceSource(effectiveOutcome.identity))
   ) {
     const attempt = getRunAttemptBySourceUserSeq(
       effectiveOutcome.identity.sessionId, effectiveOutcome.identity.sourceUserSeq,
