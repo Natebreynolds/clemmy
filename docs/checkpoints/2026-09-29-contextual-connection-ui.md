@@ -4,7 +4,7 @@
 
 This is the first implementation slice of the owner's request to make setup feel native and let Clem carry a task through missing capabilities. UI and harness work belong together: a connection form without durable continuation would merely move the manual setup problem into chat.
 
-Base: `4e2efe15bc348549e195e6660a305c011bff8cf1`. Implementation branch: `codex/contextual-connection-ui`; worktree: `/Users/nathan.reynolds/.codex/worktrees/connection-continuity/clementine-next`. The other agent's shell lane was last checked clean at `5fc52bf4b`, branch `claude/shell-anywhere`; it was not modified. Its navigation/settings/consent work remains owned by that lane. Main and the owner's uncommitted documents were not changed.
+Base: `4e2efe15bc348549e195e6660a305c011bff8cf1`. Implementation branch: `codex/contextual-connection-ui`; worktree: `~/.codex/worktrees/connection-continuity/clementine-next`. The other agent's shell lane was last checked clean at `5fc52bf4b`, branch `claude/shell-anywhere`; it was not modified. Its navigation/settings/consent work remains owned by that lane. Main and the owner's uncommitted documents were not changed.
 
 Source and UI builds are qualified separately from installation. This slice has **not been merged, hotpatched, tagged, or accepted in the installed app/live home**. The broader improvement goal remains open.
 

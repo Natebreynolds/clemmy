@@ -331,7 +331,7 @@ connection/budget lifecycle work and installed/live qualification remain owed.
 A separate integration checkout now combines committed source from
 `codex/contextual-connection-ui` at `8460a88a5` and `claude/two-modes`
 at `76c53a1ea`. Its branch is `codex/connection-shell-integration` at
-`/Users/nathan.reynolds/.codex/worktrees/connection-shell-integration/clementine-next`.
+`~/.codex/worktrees/connection-shell-integration/clementine-next`.
 The other agent's worktree remained clean at the same revision after checks.
 Main, the installed app, credentials and personal Space declarations were not
 changed. The three-file model invocation ledger/schema-85 draft remains only
