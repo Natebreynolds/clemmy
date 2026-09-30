@@ -9,15 +9,43 @@ exercises the installed product against the same disposable migrated home. The
 only model endpoint is a loopback fixture server. Every path remains below the
 operating system's temporary directory.
 
-## Current candidate: harness schema v82
+## Current candidate: harness schema v88
 
-The current target adds the nullable `pending_approvals.reminded_at` column.
-Existing rows retain their approval state and begin without a reminder stamp;
-the migration does not send notifications, approve work, or replay effects.
-A second open leaves the column and its contents intact. The rehearsal must
-reach the exported current schema version and compare both migrated boots;
-this document is the maintained target contract, while published release notes
-remain historical records.
+Target reviewed: 2026-09-30. The migration authority is
+`src/runtime/harness/eventlog-schema.ts`; retained-proof migration details live
+in `src/runtime/harness/retained-session-proof-schema.ts`.
+
+The current target retains the v82 nullable `pending_approvals.reminded_at`
+column and adds the following migrations. Existing approvals retain their
+decisions; migrating storage does not send notifications, approve new work,
+execute saved scripts, or replay completed effects.
+
+| Schema | Storage change | Preservation contract |
+|---|---|---|
+| 83 | Rebuild existing reviewed-plan revision, claim and observer tables, plus source-session context and connection-checkpoint tables when present, with session-owned retention constraints. | Copy original columns unchanged. Cross-session proof references remain restrictive; generated references do not create new claims. Missing parents or integrity failures abort the migration transaction. Absent optional tables are not evidence of migrated rows. |
+| 84 | Add `accepted_source_usage_v1`, indexed by accepted session, source and role. | Start with an empty usage projection; do not fabricate historical model calls or assign session-wide totals to a task. |
+| 85 | Add `workspace_script_occurrences_v1` and its one-unpublished-occurrence barrier per saved source. | Start empty. An occurrence records durable ownership across execution and dataset publication; it is not execution permission. |
+| 86 | Add `saved_source_script_grants_v1` and `workflow_v3_saved_source_consent_v1`. | Start empty. Existing declarations or historical approvals do not become new grants merely because the tables exist. |
+| 87 | Add `workspace_script_reports_v1`, its pending-report index and a unique event index for textual `outcomeDeliveryId` values. | Start with no synthesized reports. Existing events remain intact; conflicting indexed delivery identifiers must fail migration rather than be silently deleted or rewritten. Report delivery must not replay script execution. |
+| 88 | Add `workspace_source_controls_v1` and idempotent `workspace_source_control_receipts_v1`; add nullable `resolution_json` to script occurrences and narrow the unpublished barrier to unresolved occurrences. | Preserve occurrence rows and observations. Existing unresolved occurrences still hold their barrier. A stop or owner resolution is not a fresh execution grant. |
+
+A second open must preserve the resulting schema and rows. The rehearsal must
+reach the exported current schema version and compare both migrated boots.
+Schema creation is not proof of installed workflow execution, approval recovery,
+source controls, or complete token attribution; those require their own focused
+pins and controlled installed-app/live-home acceptance. This document is the
+maintained target contract, while published release notes remain historical
+records.
+
+Before replacing a live installation, retain a quiescent pre-migration snapshot
+including any WAL and validate that snapshot. Migration 83 checks the proof
+graph and store integrity, and migration 87 indexes existing events, so a large
+home can need substantially longer than a small fixture. The September 30
+candidate uses the existing authenticated cutover-hold migration process before
+normal desktop startup. Verify that process's exact candidate, source fingerprint
+and schema receipt, then independently verify the normal served runtime. A
+successful clone rehearsal is migration evidence, not live acceptance. Do not
+automatically launch an older binary against an already migrated home.
 
 ## Exact release provenance
 
@@ -38,7 +66,7 @@ v3.14 graph; any installed dependency drift refuses exact-tag execution.
 
 | Store | v3.14.0 | Current target | Upgrade behavior | Rehearsed |
 |---|---:|---:|---|---|
-| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 82) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
+| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 88) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
 | `state/memory.db` | migration 32 | exported `MEMORY_SCHEMA_VERSION` | numbered migrations 33 through current; opening an old DB must first make an immutable pre-migration backup | Yes, including backup existence and second-open idempotence |
 | `state/workspaces.db` | `PRAGMA user_version=3` | 5 | v4 adds workflow binding/run projection/partition tables; v5 adds the canonical-entity projection head; Space remains a read model | Yes, with a v3 Space and dataset observation |
 | `state/workflow-triggers.db` | schema contract 4 | 4 | additive shape validation; no release-boundary version change | Yes, with exact cron and event triggers compiled by v3.14 |
