@@ -549,6 +549,10 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     || ev.type === 'delegated_task_state'
     || ev.type === 'worker_model_offer' || ev.type === 'worker_model_offer_resolved'
     || ev.type === 'workflow_saved'
+    // The saved-file row carries the file's name for the card that opens it.
+    // This surface's own copy of the fold never set it, so the card never
+    // drew on the desktop (found live 2026-09-29).
+    || ev.type === 'deliverable_saved'
     || (ev.type === 'heartbeat' && ev.data?.kind !== 'watcher_steer')) {
     return reduceSharedActivity(prev, sharedEvent(ev));
   }
@@ -671,36 +675,6 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
             batch: a.batch ? { ...a.batch, done: typeof d.succeeded === 'number' ? (d.succeeded as number) + failed : a.batch.done, failed } : a.batch,
           }
         : a));
-    }
-    case 'deliverable_saved': {
-      // Files landing, live (the drafting-emails scenario): ONE rolling row
-      // that keeps counting — "Saved 3 files · latest client-brief.md" — so
-      // results visibly accumulate instead of vanishing into a folder.
-      const name = typeof d.name === 'string' ? d.name : '';
-      if (!name) return prev;
-      const dir = typeof d.dir === 'string' && d.dir ? d.dir : '';
-      const existing = prev.find((a) => a.id === 'deliverables');
-      const count = (existing?.count ?? 0) + 1;
-      const label = count === 1
-        ? `Saved ${name}${dir ? ` in ${dir}` : ''}`
-        : `Saved ${count} files · latest ${name}`;
-      const excerpt = typeof d.excerpt === 'string' && d.excerpt.trim() ? d.excerpt : undefined;
-      const row: ActivityItem = {
-        id: 'deliverables',
-        kind: 'event',
-        variant: 'write',
-        tone: 'success',
-        label,
-        ...(dir && count > 1 ? { detail: `in ${dir}` } : {}),
-        status: 'done',
-        count,
-        // The latest file's opening rides along, so the peek pane always
-        // shows what was JUST produced.
-        ...(excerpt ? { excerpt } : (existing?.excerpt ? { excerpt: existing.excerpt } : {})),
-      };
-      return existing
-        ? prev.map((a) => (a.id === 'deliverables' ? row : a))
-        : [...prev, row];
     }
     case 'capability_resolution': {
       // Inventory, not work. The previous turn's Outlook pin showing up on a

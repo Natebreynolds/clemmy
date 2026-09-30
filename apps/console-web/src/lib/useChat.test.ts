@@ -1204,3 +1204,17 @@ test('a cancelled or superseded reopen never attaches a stale source', async () 
   });
   assert.equal(result, null);
 });
+
+test('a saved file folds into one rolling row that names the latest file, so the card can open it', () => {
+  const saved = (name: string, dir: string, seq: number) => ({ seq, type: 'deliverable_saved', data: { name, dir, bytes: 10, excerpt: '<!doctype html>' } } as unknown as HarnessEvent);
+  const one = reduceActivity([], saved('index.html', 'harbor-brief', 1));
+  assert.equal(one.length, 1);
+  assert.deepEqual(one[0]!.deliverable, { name: 'index.html', dir: 'harbor-brief' }, 'the card is given the file it opens');
+  assert.equal(one[0]!.label, 'Saved index.html in harbor-brief');
+  assert.equal(one[0]!.excerpt, '<!doctype html>');
+  const two = reduceActivity(one, saved('notes.md', 'harbor-brief', 2));
+  assert.equal(two.length, 1, 'one rolling row');
+  assert.deepEqual(two[0]!.deliverable, { name: 'notes.md', dir: 'harbor-brief' }, 'the latest file rides along');
+  assert.equal(two[0]!.count, 2);
+  assert.equal(reduceActivity([], { seq: 3, type: 'deliverable_saved', data: {} } as unknown as HarnessEvent).length, 0, 'a save with no name is no row');
+});
