@@ -142,7 +142,15 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         ) : section === 'accounts' ? (
           <UsageCard />
         ) : section === 'connections' ? (
-          <ConnectionsPage rows={connections.data?.connections} loading={connections.loading} />
+          <ConnectionsPage
+            rows={connections.data?.connections}
+            loading={connections.loading}
+            error={connections.error}
+            offline={connections.offline}
+            stale={connections.stale}
+            refreshing={connections.refreshing}
+            onRetry={() => void connections.refresh()}
+          />
         ) : (
           <DevicesPage
             rows={devices.data?.devices}
@@ -211,7 +219,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 7V3M15 7V3" /><path d="M6 7h12v4a6 6 0 0 1-12 0z" /><path d="M12 17v4" /></svg>}
           title="Connections"
-          note={connectionsSummary(connections.data?.connections)}
+          note={connections.error || connections.offline ? 'Status unavailable · open to retry' : connectionsSummary(connections.data?.connections)}
           onOpen={() => openSection('connections')}
         />
       </IndexGroup>
@@ -731,25 +739,28 @@ function CodexRescueRow({ settings, onChanged }: {
  * tools on the Mac. A row says what is true in plain words; fixing anything
  * happens on the Mac, in Connect.
  */
-function ConnectionsPage({ rows, loading }: {
+export function ConnectionsPage({ rows, loading, error, offline, stale, refreshing, onRetry }: {
   rows?: Array<{ id: string; name: string; kind: string; state: 'ok' | 'warn' | 'err'; cause: string | null }>;
   loading: boolean;
+  error: string | null;
+  offline: boolean;
+  stale: boolean;
+  refreshing: boolean;
+  onRetry: () => void;
 }) {
   if (loading && !rows) {
-    return <section class="card settings-card"><div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div></section>;
+    return <section class="card settings-card" role="status" aria-label="Loading connections" aria-busy="true"><div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div></section>;
   }
-  if (!rows || rows.length === 0) {
-    return <section class="card settings-card"><p class="card-note">Nothing connected yet. Connect apps on your Mac and they show up here.</p></section>;
-  }
-  const { apps, tools } = groupConnections(rows);
-  const list = (items: typeof rows) => (
+  const unavailable = Boolean(error || offline || stale || !rows);
+  const { apps, tools } = groupConnections(rows ?? []);
+  const list = (items: NonNullable<typeof rows>) => (
     <ul class="settings-list">
       {items.map((row) => (
         <li key={row.id} class="settings-list-row">
-          <span class={`health-dot ${row.state}`} aria-hidden="true" />
+          {!unavailable && <span class={`health-dot ${row.state}`} aria-hidden="true" />}
           <span class="settings-row-main">
             <span class="settings-row-label truncate">{row.name}</span>
-            <span class="settings-row-note">{connectionStateWords(row)}</span>
+            <span class="settings-row-note">{unavailable ? `Last checked: ${connectionStateWords(row)}` : connectionStateWords(row)}</span>
           </span>
         </li>
       ))}
@@ -757,6 +768,15 @@ function ConnectionsPage({ rows, loading }: {
   );
   return (
     <Fragment>
+      <ScreenNotice
+        error={unavailable ? 'Connection status is unavailable.' : null}
+        offline={offline}
+        onRetry={onRetry}
+        hasData={Boolean(rows?.length)}
+      />
+      {refreshing && <p class="card-note" role="status">Checking connections…</p>}
+      {unavailable && Boolean(rows?.length) && <p class="card-note">Showing last known connections. Their current status has not been verified.</p>}
+      {!unavailable && rows?.length === 0 && <section class="card settings-card"><p class="card-note">Nothing connected yet. Connect apps on your Mac and they show up here.</p></section>}
       {apps.length ? (
         <section class="settings-group" aria-label="Apps">
           <h2 class="settings-group-label">Apps</h2>
@@ -769,7 +789,7 @@ function ConnectionsPage({ rows, loading }: {
           <div class="card settings-card">{list(tools)}</div>
         </section>
       ) : null}
-      <p class="settings-foot">Connect or fix anything here on your Mac, in Connect.</p>
+      {Boolean(rows?.length) && <p class="settings-foot">Connect or fix anything here on your Mac, in Connect.</p>}
     </Fragment>
   );
 }

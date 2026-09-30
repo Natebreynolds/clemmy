@@ -12,10 +12,10 @@ const eventlog = await import('./eventlog.js');
 const dependencies = await import('./dependency-request.js');
 const continuity = await import('../../memory/task-continuity.js');
 
-const CONNECTION_QUESTION = 'Firecrawl isn’t connected, so I can’t use FIRECRAWL_SEARCH for this task yet. [Open Connections](/m/?tab=settings&toolkit=firecrawl&capability=FIRECRAWL_SEARCH) on this Mac and connect Firecrawl, then choose how you want me to continue:';
+const CONNECTION_QUESTION = 'Firecrawl needs to be connected before I can continue this task. Connect it in Clementine, or pause to change the request.';
 const CONNECTION_OPTIONS = [
   'I’ve connected Firecrawl — continue this same task',
-  'Pause so I can change the research scope',
+  'Pause so I can change this request',
 ];
 const CONNECTION_SUBJECT = {
   kind: 'exact_capability_connection' as const,

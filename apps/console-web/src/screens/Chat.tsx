@@ -254,7 +254,7 @@ export function Chat() {
               onBackground={chat.background}
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.
-              onAnswer={index === chat.messages.length - 1 ? (text) => send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
+              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />
             </Fragment>

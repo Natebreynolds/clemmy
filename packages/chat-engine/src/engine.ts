@@ -44,6 +44,7 @@ export interface ChatApi {
     message: string;
     sessionId: string | null;
     idempotencyKey: string;
+    connectionRequestId?: string;
     steerOnly?: boolean;
     taskMode?: TaskMode;
     /** Saved agent a NEW conversation opens inside. The server binds it at
@@ -269,8 +270,9 @@ export class ChatEngine {
     this.emit();
   }
 
-  async send(text: string, selectedMode?: TaskMode, options: { attachments?: ChatAttachment[] } = {}): Promise<void> {
-    const taskMode = snapshotTaskMode(selectedMode);
+  async send(text: string, selectedMode?: TaskMode, options: { attachments?: ChatAttachment[]; connectionResume?: { connectionRequestId: string; clientRequestId: string } } = {}): Promise<void> {
+    if (options.connectionResume && this.busy) throw new Error('Another turn is running. Check the connection again when it finishes.');
+    const taskMode = snapshotTaskMode(options.connectionResume ? undefined : selectedMode);
     if (this.busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, this.snapshot().activeTaskMode))) {
       throw new Error('Wait for the current turn to finish before changing modes or executing a plan.');
     }
@@ -319,7 +321,7 @@ export class ChatEngine {
       this.emit();
       return;
     }
-    const idempotencyKey = this.newKey();
+    const idempotencyKey = options.connectionResume?.clientRequestId ?? this.newKey();
     const userMessage: ChatMessage = {
       id: nextLocalId(),
       role: 'user',
@@ -329,6 +331,7 @@ export class ChatEngine {
       ...(taskMode ? { taskMode } : {}),
       requestSessionId: this.sessionId,
       idempotencyKey,
+      ...(options.connectionResume ? { connectionRequestId: options.connectionResume.connectionRequestId } : {}),
     };
     const assistant: ChatMessage = {
       id: nextLocalId(),
@@ -390,6 +393,7 @@ export class ChatEngine {
     for (let attempt = 0; ; attempt += 1) {
       try {
         const result = await this.api.send({ message, sessionId: userMessage.requestSessionId !== undefined ? userMessage.requestSessionId : this.sessionId, idempotencyKey,
+          ...(userMessage.connectionRequestId ? { connectionRequestId: userMessage.connectionRequestId } : {}),
           ...(userMessage.taskMode ? { taskMode: userMessage.taskMode } : {}),
           ...(userMessage.steer ? { steerOnly: true } : {}),
           ...(userMessage.attachments?.length ? { attachments: userMessage.attachments.map((a) => a.id) } : {}),
@@ -430,6 +434,10 @@ export class ChatEngine {
         }
         this.busy = false;
         this.emit();
+        // Connection setup awaits this callback before declaring its task
+        // continued. Keep the retryable echo, but do not report acceptance
+        // through a fulfilled Promise when every delivery attempt failed.
+        if (userMessage.connectionRequestId) throw err;
         return;
       }
     }

@@ -1218,3 +1218,31 @@ test('a saved file folds into one rolling row that names the latest file, so the
   assert.equal(two[0]!.count, 2);
   assert.equal(reduceActivity([], { seq: 3, type: 'deliverable_saved', data: {} } as unknown as HarnessEvent).length, 0, 'a save with no name is no row');
 });
+
+
+test('connection continuation keeps its host identity and setup binding through transport retry', async () => {
+  const pending = retainPendingChatPost(null, {
+    input: 'Continue the connected task', sessionId: 'sess-setup', attachments: [], connectionRequestId: 'dep-setup',
+  }, () => 'connection-stable-fixture');
+  const replay = retainPendingChatPost(pending, {
+    input: pending.input, sessionId: pending.sessionId, attachments: [], connectionRequestId: 'dep-setup',
+  }, () => 'must-not-change');
+  assert.equal(replay, pending);
+  const changed = retainPendingChatPost(pending, {
+    input: pending.input, sessionId: pending.sessionId, attachments: [], connectionRequestId: 'dep-different',
+  }, () => 'connection-other-fixture');
+  assert.notEqual(changed, pending, 'two setup requests cannot alias because their visible answer matches');
+  const calls: unknown[][] = [];
+  await postPendingChatWithRetry(pending, {
+    retryDelaysMs: [0], wait: async () => {},
+    transport: async (...args) => {
+      calls.push(args);
+      if (calls.length === 1) throw Object.assign(new Error('response lost'), { status: 0 });
+      return { sessionId: 'sess-setup', streamUrl: '/events', status: 'started', mode: 'fresh' };
+    },
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0]?.[3], 'connection-stable-fixture');
+  assert.equal(calls[0]?.[7], 'dep-setup');
+  assert.deepEqual(calls[1], calls[0]);
+});

@@ -1,10 +1,12 @@
+import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
+import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
 import { patchUnifiedSession } from '../dashboard/sessions-api.js';
 import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
-import { prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
+import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobile-chat-execution.js';
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
@@ -243,6 +245,7 @@ export function classifyMobileTypedChatControl(message: string): MobileTypedChat
 }
 
 const mobileChatInFlight = new Map<string, Promise<GatewayResponse>>();
+const mobileConnectionAdmissions = new Map<string, ReturnType<typeof createMobileChatAdmission>>();
 
 function mobileChatDigest(deviceId: string, idempotencyKey: string): string {
   return createHash('sha256')
@@ -268,6 +271,7 @@ function mobileFreshSessionId(runId: string): string {
 /** Test-only process restart seam; durable receipts and terminals remain. */
 export function _clearMobileChatInFlightForTests(): void {
   mobileChatInFlight.clear();
+  mobileConnectionAdmissions.clear();
 }
 
 const MOBILE_APPROVAL_LEASE_OWNER = `mobile-approval:${process.pid}:${randomBytes(6).toString('hex')}`;
@@ -2887,6 +2891,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // hides /api/console/*, so approval actions cannot depend on desktop routes.
 
   registerCliSessionRoutes(router, requireMobileSession, '/api');
+  registerConnectionSetupRoutes(router, requireMobileSession, '/api', { requireContext: true });
 
   router.get('/api/approvals', requireMobileSession, (_req, res) => {
     try {
@@ -3995,7 +4000,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
     const scope = `chat:${ctx.record.deviceId}`;
     const digest = mobileChatDigest(ctx.record.deviceId, idempotencyKey);
-    const requestId = `mobile:${digest}`;
+    let requestId = `mobile:${digest}`;
     const runId = `run-mobile-${digest}`;
     const requestedSessionId = typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()
       ? req.body.sessionId.trim()
@@ -4010,7 +4015,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const requestedProjectId = typeof req.body?.projectId === 'string' ? req.body.projectId.trim() : '';
     const requestedProject = requestedProjectId ? getProjectRecord(requestedProjectId) : null;
     if (requestedProjectId && (!requestedProject || requestedProject.status !== 'active')) { res.status(400).json({ error: 'PROJECT_NOT_FOUND' }); return; }
-    const inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode, requestedAgent?.agent.id, requestedProject?.id);
+    let inputHash = mobileChatPayloadHash(message, requestedSessionId, taskMode, requestedAgent?.agent.id, requestedProject?.id);
+    let connectionContext: { sessionId: string; connectionRequestId: string } | undefined;
+    let connectionVerification: ConnectionContinuationVerification | undefined;
+    if (req.body?.connectionRequestId !== undefined) {
+      if (typeof req.body.connectionRequestId !== 'string' || !requestedSessionId || attachmentIds.length || req.body.steerOnly === true || taskMode) {
+        res.status(400).json({ error: 'INVALID_CONNECTION_CONTINUATION' }); return;
+      }
+      connectionContext = { sessionId: requestedSessionId, connectionRequestId: req.body.connectionRequestId };
+      try {
+        const identity = connectionContinuationIdentity(connectionContext, message, idempotencyKey);
+        requestId = identity.requestId;
+        inputHash = identity.inputHash;
+      } catch { res.status(400).json({ error: 'INVALID_CONNECTION_CONTINUATION_IDENTITY' }); return; }
+    }
     if (taskMode?.kind === 'execute' && !requestedSessionId) {
       res.status(400).json({ error: 'PLAN_CONVERSATION_REQUIRED' });
       return;
@@ -4066,6 +4084,20 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // The receipt has a session FK, so create the deterministic session first
       // only on a genuinely new key. Replays recover its original durable id.
       const priorReceipt = getHarnessChatRequestReceipt(requestId);
+      if (connectionContext) taskMode = connectionContinuationTaskMode(connectionContext);
+      const connectionNeedsAdmission = connectionContext && (!priorReceipt
+        || !getLatestRunAttemptByRunId(priorReceipt.sessionId, priorReceipt.runId)?.sourceUserSeq);
+      if (connectionContext && connectionNeedsAdmission) {
+        try {
+          const checked = await verifyConnectionSetup(connectionContext);
+          if (!checked.ready || !checked.request || !checked.verificationBinding || checked.request.continueLabel !== message) {
+            res.status(409).json({ error: 'This connection is not ready for the current task. Check again from the conversation.' }); return;
+          }
+          connectionVerification = { sourceUserSeq: checked.request.sourceUserSeq, binding: checked.verificationBinding };
+          taskMode = connectionContinuationTaskMode(connectionContext);
+        } catch { res.status(503).json({ error: 'Could not verify the connected account. Your task is still paused.' }); return; }
+      }
+
       const typedControl = !taskMode || taskMode.kind === 'normal' ? classifyMobileTypedChatControl(message) : null;
       if (typedControl?.kind === 'formal_approval') {
         await resolveMobileApproval(res, typedControl.approvalId, typedControl.decision, {
@@ -4075,7 +4107,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       }
       // A written reply to the waiting card (parity with the desktop dock):
       // a sure change or decline, read by Jev, answers the card itself.
-      if (!typedControl && requestedSessionId && (!taskMode || taskMode.kind === 'normal')
+      if (!connectionContext && !typedControl && requestedSessionId && (!taskMode || taskMode.kind === 'normal')
         && HarnessSession.load(requestedSessionId)?.loadInterruptState()) {
         const routed = await routeReplyToPendingApproval({ sessionId: requestedSessionId, text: message, parsed: null })
           .catch(() => null);
@@ -4132,6 +4164,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             && Date.parse(latestAttempt.leaseExpiresAt) > Date.now(),
           );
           if (leaseLive) {
+            if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
             if (taskMode && taskMode.kind !== 'normal') {
               res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
               return;
@@ -4220,6 +4253,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
               inputHash,
               sinceSeq: priorReceipt.sinceSeq,
             });
+          } else if (connectionContext) {
+            requestClaim = claimHarnessChatRequest({ requestId, sessionId: connectionContext.sessionId,
+              runId, inputHash, sinceSeq: harnessLatestEventSeq(connectionContext.sessionId) });
+            selectedSessionId = connectionContext.sessionId;
           } else {
             const selectedClaim = claimSessionForAcceptedSource({
               kind: 'ordinary',
@@ -4239,7 +4276,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           }
           return requestClaim;
         };
-        requestClaim = executeIngress
+        requestClaim = connectionContext && connectionNeedsAdmission
+          ? withConnectionContinuationAdmission(connectionContext, connectionVerification, claimOrdinaryRequest)
+          : executeIngress
           ? claimPlanExecutionIngress(executeIngress, claimOrdinaryRequest)
           : claimOrdinaryRequest();
         if (executeIngress && rejoinPlanExecution(requestClaim.receipt)) return;
@@ -4296,6 +4335,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const executionKey = executeIngress ? requestClaim.receipt.runId : requestId;
       let execution = mobileChatInFlight.get(executionKey);
       if (!execution) {
+        const admission = connectionContext ? createMobileChatAdmission() : undefined;
+        if (admission) mobileConnectionAdmissions.set(executionKey, admission);
         const started = prepareAndDispatchMobileChat({
           requestId: requestClaim.receipt.requestId,
           prepare: async () => {
@@ -4311,6 +4352,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             if (executeIngress) assertReviewedPlanExecuteSessionIdle(sessionId, requestClaim.receipt.runId);
             return new ClementineGateway(deps.assistant!).handleMessage({
             ...taskModeFields(taskMode),
+            ...(connectionContext ? { connectionContinuation: connectionContext, connectionContinuationVerification: connectionVerification } : {}),
+            ...(admission ? { onAcceptedTurn: admission.accepted } : {}),
             message: executionMessage,
             // The bubble shows what was typed (or "Attached: …"); the fold is for the model.
             ...(ingestedAttachments.length ? { visibleMessage: message } : {}),
@@ -4329,8 +4372,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             });
           },
         });
+        admission?.observe(started);
         execution = started.finally(() => {
-          if (mobileChatInFlight.get(executionKey) === execution) mobileChatInFlight.delete(executionKey);
+          if (mobileChatInFlight.get(executionKey) === execution) {
+            mobileChatInFlight.delete(executionKey);
+            mobileConnectionAdmissions.delete(executionKey);
+          }
         });
         mobileChatInFlight.set(executionKey, execution);
       }
@@ -4341,6 +4388,11 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // key get the same acknowledgement (and the same run).
       if (req.body?.async === true) {
         execution.catch((err) => console.error('mobile chat async run failed:', err));
+        // A setup receipt can become stale during asynchronous preparation.
+        // Acknowledge only after source acceptance or an existing-owner rejoin,
+        // so a rejected continuation cannot leave the phone awaiting an SSE
+        // source that was deliberately never created.
+        if (connectionContext) await (mobileConnectionAdmissions.get(executionKey)?.wait ?? execution);
         res.status(202).json({
           accepted: true,
           sessionId,
@@ -5535,7 +5587,10 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         // it replaced. Deriving it here also binds the tombstone to THIS
         // device: the id can no longer be an arbitrary caller-supplied string,
         // so a mobile caller cannot write a latch outside its own namespace.
-        const requestId = `mobile:${mobileChatDigest(ctx.record.deviceId, clientRequestId)}`;
+        // Contextual setup has one shared host key, admitted only when its
+        // durable receipt or current setup proves this exact session.
+        const requestId = connectionContinuationCancellationId(sessionId, clientRequestId)
+          ?? `mobile:${mobileChatDigest(ctx.record.deviceId, clientRequestId)}`;
         const receipt = getHarnessChatRequestReceipt(requestId);
         // A receipt for another session would let one phone stop another
         // session's turn by guessing a key, so the attempt stop stays

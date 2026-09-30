@@ -75,6 +75,7 @@ export async function postChat(
   agentId?: string,
   /** The project a NEW session starts in, the same way. */
   projectId?: string,
+  connectionRequestId?: string,
 ): Promise<ChatPostResult> {
   const result = await apiPost<ChatPostResult>('/api/harness/chat', {
     input,
@@ -84,6 +85,7 @@ export async function postChat(
     ...(taskMode ? { taskMode } : {}),
     ...(agentId ? { agentId } : {}),
     ...(projectId ? { projectId } : {}),
+    ...(connectionRequestId ? { connectionRequestId } : {}),
   });
   if (!result || typeof result.sessionId !== 'string' || !result.sessionId) {
     throw Object.assign(new TypeError('chat acknowledgement was incomplete'), { status: 0 });

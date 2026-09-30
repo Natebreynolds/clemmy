@@ -292,6 +292,7 @@ export interface ChatMessage {
   pendingError?: string;
   /** Client idempotency key for retrying a failed send verbatim. */
   idempotencyKey?: string;
+  connectionRequestId?: string;
   /** Mid-run steer: text delivered into the live turn, not a new attempt. */
   steer?: 'pending' | 'delivered' | 'failed';
   /** Present only while this assistant bubble represents exact, source-bound

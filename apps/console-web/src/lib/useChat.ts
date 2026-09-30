@@ -356,6 +356,7 @@ export interface PendingChatPost {
   /** The project a brand-new session should start in; part of the request
    *  identity the same way. */
   projectId?: string;
+  connectionRequestId?: string;
 }
 
 export class ChatPostCancelledError extends Error {
@@ -380,7 +381,7 @@ function throwIfChatPostCancelled(signal?: AbortSignal): void {
  * second model/tool run. */
 export function retainPendingChatPost(
   previous: PendingChatPost | null,
-  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode; agentId?: string; projectId?: string },
+  payload: { input: string; sessionId: string | null; attachments: string[]; taskMode?: TaskMode; agentId?: string; projectId?: string; connectionRequestId?: string },
   createId: () => string = createChatClientRequestId,
 ): PendingChatPost {
   const taskMode = snapshotTaskMode(payload.taskMode);
@@ -393,6 +394,7 @@ export function retainPendingChatPost(
     // Only a request that names a project adds to the identity, so every
     // other request keeps the fingerprint it always had.
     ...(projectId ? [{ projectId }] : []),
+    ...(payload.connectionRequestId ? [{ connectionRequestId: payload.connectionRequestId }] : []),
   ]);
   if (previous?.fingerprint === fingerprint) return previous;
   return {
@@ -404,6 +406,7 @@ export function retainPendingChatPost(
     ...(taskMode ? { taskMode } : {}),
     ...(agentId ? { agentId } : {}),
     ...(projectId ? { projectId } : {}),
+    ...(payload.connectionRequestId ? { connectionRequestId: payload.connectionRequestId } : {}),
   };
 }
 
@@ -483,7 +486,9 @@ export async function postPendingChatWithRetry(
         pending.taskMode,
         // Only a request that names an agent carries the extra argument, so a
         // plain request keeps the exact transport call it always made.
-        ...(pending.projectId ? [pending.agentId, pending.projectId] : pending.agentId ? [pending.agentId] : []),
+        ...(pending.connectionRequestId
+          ? [pending.agentId, pending.projectId, pending.connectionRequestId]
+          : pending.projectId ? [pending.agentId, pending.projectId] : pending.agentId ? [pending.agentId] : []),
       );
       if (options.signal?.aborted) {
         try {
@@ -1631,8 +1636,9 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null }, retryRequest?: PendingChatPost) => {
-    const taskMode = snapshotTaskMode(input.taskMode);
+  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string } }, retryRequest?: PendingChatPost) => {
+    if (busy && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
+    const taskMode = snapshotTaskMode(input.connectionResume ? undefined : input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
     if (busy && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
       throw new Error('Wait for the current turn to finish before changing modes or executing a plan.');
@@ -1647,7 +1653,7 @@ export function useChat(options?: UseChatOptions) {
     // The same for the project a new session opens in (lib/conversation-project).
     const projectId = sessionIdRef.current ? undefined : (input.projectId || undefined);
     if (!busy && pendingPostRef.current && !retryRequest) {
-      const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode, agentId, projectId });
+      const candidate = retainPendingChatPost(pendingPostRef.current, { input: text, attachments: attachmentIds, sessionId: sessionIdRef.current, taskMode, agentId, projectId, connectionRequestId: input.connectionResume?.connectionRequestId });
       if (candidate !== pendingPostRef.current) throw new Error('Retry or cancel the unconfirmed request before sending a different one.');
     }
     if (busy) {
@@ -1707,7 +1713,8 @@ export function useChat(options?: UseChatOptions) {
         ...(taskMode ? { taskMode } : {}),
         ...(agentId ? { agentId } : {}),
         ...(projectId ? { projectId } : {}),
-      });
+        ...(input.connectionResume ? { connectionRequestId: input.connectionResume.connectionRequestId } : {}),
+      }, input.connectionResume ? () => input.connectionResume!.clientRequestId : undefined);
       retainPending(pending);
       const body = await postPendingChatWithRetry(pending, {
         signal: postAbort.signal,
@@ -1776,6 +1783,7 @@ export function useChat(options?: UseChatOptions) {
       const msg = (e.message || '').trim();
       const text = !msg || looksRawError(msg) ? GENERIC_TURN_ERROR : `Couldn't send: ${msg}`;
       patch(assistantId, { text, status: 'failed', progress: undefined });
+      if (input.connectionResume || retryRequest?.connectionRequestId) throw err;
     } finally {
       // A stopped POST can finish after the user has already started another
       // turn. Never let the stale promise clear the newer turn's controller,

@@ -1,3 +1,5 @@
+import { ConnectionSetup } from '../components/ConnectionSetup';
+import type { ConnectionContinuation } from '../lib/connection-setup';
 import { ApprovalReview } from '../components/ApprovalReview';
 import { CliSessions } from '../components/CliSessions';
 /**
@@ -192,7 +194,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     agentId: boundAgentId,
     pendingStore: createPendingMessageStore(localStorage, `clem.pending.mobile:${initialSessionId ?? 'new'}`),
     api: {
-      send: async ({ message, sessionId, idempotencyKey, steerOnly, taskMode, agentId, attachments }) => {
+      send: async ({ message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, agentId, attachments }) => {
         // Only the message that creates the conversation names its project.
         let projectId: string | null = null;
         if (!sessionId) {
@@ -202,7 +204,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           projectId = openedInProject.current.get(idempotencyKey) ?? null;
         }
         const result = await sendChatMessageAsync({
-          message, sessionId, idempotencyKey, steerOnly, taskMode, agentId, attachments,
+          message, sessionId, idempotencyKey, connectionRequestId, steerOnly, taskMode, agentId, attachments,
           ...(projectId ? { projectId } : {}),
         });
         if (!sessionId) sessionProjectId.current = projectId;
@@ -641,10 +643,11 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
             approvalActing={approvalActing}
             approvalDecided={Boolean(message.approval?.resolution) || chatApprovalDecided(messages, message.approval?.approvalId)}
             onApprovalAction={actOnApproval}
-            onRetry={(id) => void engine.retry(id)}
+            onRetry={(id) => { void engine.retry(id).catch(error => setError(error instanceof Error ? error.message : 'Could not retry.')); }}
             onDiscard={(id) => engine.discard(id)}
             // Suggested answers stay tappable only while the question is the
             // newest message; once anything follows it, they are a record.
+            onConnectionContinue={index === messages.length - 1 ? (text, connectionResume) => engine.send(text, undefined, { connectionResume }) : undefined}
             onAnswer={index === messages.length - 1 ? (text) => {
               haptic('light');
               void sendMessage(text, busy ? snapshot?.activeTaskMode : { version: 1, kind: composerMode })
@@ -719,7 +722,7 @@ function approvalFieldLabel(name: string): string {
 function MessageRow({
   message, speaker, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
   approvalActing, approvalDecided, onApprovalAction,
-  onDelegatedStateChange, onDelegatedChanged, onAnswer,
+  onDelegatedStateChange, onDelegatedChanged, onAnswer, onConnectionContinue,
 }: {
   message: ChatMessage;
   /** Who wrote this reply, drawn above it. Absent in a thread only Clem answered. */
@@ -744,6 +747,7 @@ function MessageRow({
   /** Send a suggested answer as the reply, exactly as if it were typed.
    *  Absent once the question is no longer the newest message. */
   onAnswer?: (text: string) => void;
+  onConnectionContinue?: ConnectionContinuation;
 }) {
   if (message.role === 'user') {
     return (
@@ -908,7 +912,11 @@ function MessageRow({
           local to open to, so here it stays an honest count rather than a
           button that does nothing. */}
       {message.status === 'awaiting-reply' && message.options?.length && onAnswer ? (
-        <AnswerChoices options={message.options} onAnswer={onAnswer} />
+        sessionId && onConnectionContinue ? <ConnectionSetup sessionId={sessionId} options={message.options}
+          revision={JSON.stringify(message.terminal)} onContinue={onConnectionContinue}
+          fallback={<AnswerChoices options={message.options} onAnswer={onAnswer} />}
+          renderOtherAnswers={(options) => options.length ? <AnswerChoices options={options} onAnswer={onAnswer} /> : null} />
+        : <AnswerChoices options={message.options} onAnswer={onAnswer} />
       ) : null}
       {thinking ? <OutsideWork activity={message.activity} /> : <TurnReceipt message={message} sessionId={sessionId} />}
       {message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput ? (

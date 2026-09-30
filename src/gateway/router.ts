@@ -1,3 +1,4 @@
+import { connectionContinuationAudience, connectionContinuationTaskMode, withConnectionContinuationAdmission, type ConnectionSetupContext, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { parseTaskMode, taskModeDigest, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
 import { withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import pino from 'pino';
@@ -44,6 +45,8 @@ import {
 } from '../runtime/harness/accepted-source-outcome.js';
 import {
   beginRunAttempt,
+  claimRunAttemptLease,
+  renewRunAttemptLease,
   createSession as createHarnessSession,
   finishRunAttempt,
   getLatestRunAttemptByRunId,
@@ -84,6 +87,9 @@ import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 const logger = pino({ name: 'clementine-next.gateway' });
 
 export interface GatewayRequest {
+  /** Server-only, receipt-bound continuation from contextual app setup. */
+  connectionContinuation?: ConnectionSetupContext;
+  connectionContinuationVerification?: ConnectionContinuationVerification;
   taskMode?: TaskMode;
   /** Server-only attribution after authenticated owner Plan control. */
   reviewedPlanOwnerControl?: ReviewedPlanOwnerControlV1;
@@ -395,7 +401,9 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
 
   const admit = (): AcceptedGatewayTurn => {
     const attempt = beginRunAttempt(request.sessionId, { runId });
-    const audience = gatewayAudienceIdentity(request);
+    const audience = request.connectionContinuation
+      ? connectionContinuationAudience(request.connectionContinuation, runId, request.message)
+      : gatewayAudienceIdentity(request);
     const source = recordRunAttemptUserInput(attempt, {
       turn: 1,
       role: 'user',
@@ -1159,6 +1167,37 @@ export class ClementineGateway {
   }
 
   async handleMessage(request: GatewayRequest): Promise<GatewayResponse> {
+    const context = request.connectionContinuation;
+    if (!context) return this.handleAcceptedMessage(request);
+    if (context.sessionId !== request.sessionId || !request.runId) throw new Error('Invalid connection continuation target.');
+    const runId = request.runId;
+    // Validate its server-owned receipt before acquiring an execution lease.
+    connectionContinuationAudience(context, runId, request.message);
+    const taskMode = connectionContinuationTaskMode(context);
+    if (taskMode?.kind === 'execute') throw new Error('Continue this connection from its reviewed plan execution.');
+    request = { ...request, taskMode };
+    const prior = getLatestRunAttemptByRunId(request.sessionId, runId);
+    const source = prior?.sourceUserSeq ? listHarnessEvents(request.sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === prior.sourceUserSeq) : undefined;
+    if (source && acceptedSourceOutcome(source)) return this.handleAcceptedMessage(request);
+    if (prior && !prior.finishedAt && prior.leaseExpiresAt && Date.parse(prior.leaseExpiresAt) > Date.now()) {
+      return { sessionId: request.sessionId, runId, text: 'Your original request is already running.' };
+    }
+    // Desktop and phone share this existing lease owner primitive. Two setup
+    // cards may rejoin the same receipt; only one may enter a physical executor.
+    const ownerId = `connection-gateway:${process.pid}`;
+    const acquire = () => claimRunAttemptLease({ sessionId: request.sessionId, runId, ownerId, leaseMs: 90_000 });
+    const claim = source ? acquire()
+      : withConnectionContinuationAdmission(context, request.connectionContinuationVerification, acquire);
+    if (!claim.claimed || !claim.attempt) return { sessionId: request.sessionId, runId: request.runId, text: 'Your original request is already running.' };
+    const attempt = claim.attempt;
+    const renew = setInterval(() => { renewRunAttemptLease(attempt, ownerId, 90_000); }, 30_000);
+    renew.unref();
+    try { return await this.handleAcceptedMessage(request); }
+    finally { clearInterval(renew); }
+  }
+
+  private async handleAcceptedMessage(request: GatewayRequest): Promise<GatewayResponse> {
     request = { ...request, taskMode: parseTaskMode(request.taskMode) };
     const run = startRun({
       id: request.runId,
@@ -1246,7 +1285,7 @@ export class ClementineGateway {
     }
 
     try {
-      const command = !request.taskMode || request.taskMode.kind === 'normal' ? parseCommand(request.message) : null;
+      const command = !request.connectionContinuation && (!request.taskMode || request.taskMode.kind === 'normal') ? parseCommand(request.message) : null;
       if (command) {
         const response = this.handleCommand(command, request);
         const committed = commitGatewayTerminal({
@@ -1264,7 +1303,7 @@ export class ClementineGateway {
         return { ...response, text: committed.presentation.text, runId: run.id };
       }
 
-      const parkedBackground = !request.taskMode || request.taskMode.kind === 'normal' ? routeParkedBackgroundReply(request) : null;
+      const parkedBackground = !request.connectionContinuation && (!request.taskMode || request.taskMode.kind === 'normal') ? routeParkedBackgroundReply(request) : null;
       if (parkedBackground) {
         const { response } = parkedBackground;
         addRunEvent(run.id, {
@@ -1294,7 +1333,7 @@ export class ClementineGateway {
       const effectiveMessage = !request.taskMode || request.taskMode.kind === 'normal'
         ? rewriteBareContinueForHarness(request.sessionId, request.message) : request.message;
 
-      if ((!request.taskMode || request.taskMode.kind === 'normal') && shouldPromoteToDurable(request.message)) {
+      if (!request.connectionContinuation && (!request.taskMode || request.taskMode.kind === 'normal') && shouldPromoteToDurable(request.message)) {
         addRunEvent(run.id, {
           type: 'queued_background',
           status: 'queued',

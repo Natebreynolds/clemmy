@@ -231,18 +231,19 @@ export const revokeComposioCliDefaultAccount = (slug: string) =>
   apiPost<{ ok: true; revoked: boolean }>(
     `/api/composio/cli-default-accounts/${encodeURIComponent(slug)}/revoke`,
   );
-export const authorizeComposio = (slug: string, details?: Record<string, string>) =>
+export interface ConnectionSetupContext { connectionRequestId: string; sessionId: string }
+export const authorizeComposio = (slug: string, details?: Record<string, string>, context?: ConnectionSetupContext) =>
   apiPost<ComposioConnectResult>(
     `/api/composio/toolkits/${encodeURIComponent(slug)}/authorize`,
-    details ? { details } : undefined,
+    { ...(details ? { details } : {}), ...context },
   );
 /** Create the setup from the person's own developer app, then start sign-in. */
-export const setupComposioOAuthApp = (slug: string, body: { credentials: Record<string, string>; details?: Record<string, string>; authScheme?: string }) =>
-  apiPost<ComposioConnectResult>(`/api/composio/toolkits/${encodeURIComponent(slug)}/oauth-app`, body);
-export const setupComposioCredentials = (slug: string, credentials: Record<string, string>, authScheme?: string) =>
+export const setupComposioOAuthApp = (slug: string, body: { credentials: Record<string, string>; details?: Record<string, string>; authScheme?: string }, context?: ConnectionSetupContext) =>
+  apiPost<ComposioConnectResult>(`/api/composio/toolkits/${encodeURIComponent(slug)}/oauth-app`, { ...body, ...context });
+export const setupComposioCredentials = (slug: string, credentials: Record<string, string>, authScheme?: string, context?: ConnectionSetupContext) =>
   apiPost<{ ok: true; authConfigId: string; connectionId: string }>(
     `/api/composio/toolkits/${encodeURIComponent(slug)}/setup-credentials`,
-    { credentials, ...(authScheme ? { authScheme } : {}) },
+    { credentials, ...(authScheme ? { authScheme } : {}), ...context },
   );
 // Reset the daemon's cached Composio client so the next status/toolkits read is fresh.
 export const refreshComposio = () => apiPost<{ ok: boolean }>('/api/composio/refresh');

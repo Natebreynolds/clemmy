@@ -11,6 +11,8 @@ import {
   getEvent,
   getToolOutput,
   getToolOutputForInvocation,
+  getRunAttemptBySourceUserSeq,
+  isKillRequested,
   listEvents,
   openEventLog,
 } from './eventlog.js';
@@ -377,6 +379,48 @@ interface ToolSearchUnavailableProjection {
   dependencySubject?: unknown;
 }
 
+/** The latest accepted request owns its connection UI. An old open dependency
+ * must never wake a task after the person moved on or answered its question. */
+export function currentConnectionDependency(sessionId: string, requestId?: string): {
+  requestId: string;
+  sessionId: string;
+  sourceUserSeq: number;
+  toolkit: string;
+  capability: string;
+  continueLabel: string;
+} | null {
+  ensureTable();
+  const db = openEventLog();
+  const source = db.prepare(`SELECT seq FROM events WHERE session_id = ?
+    AND type = 'user_input_received' AND role = 'user'
+    AND (json_type(data_json, '$.synthetic') IS NULL OR json_type(data_json, '$.synthetic') = 'false')
+    ORDER BY seq DESC LIMIT 1`).get(sessionId) as { seq: number } | undefined;
+  if (!source) return null;
+  const attempt = getRunAttemptBySourceUserSeq(sessionId, source.seq);
+  if (attempt && (['cancelled', 'failed', 'superseded'].includes(attempt.status)
+    || isKillRequested(sessionId, attempt))) return null;
+  const rows = db.prepare(`SELECT request_id, session_id, source_user_seq,
+    subject_toolkit, subject_capability, continue_option_label
+    FROM dependency_requests WHERE session_id = ? AND source_user_seq = ?
+    AND kind = 'connection_missing' AND status = 'open'
+    AND subject_kind = 'exact_capability_connection' AND subject_provider = 'authorized_composio'`
+  ).all(sessionId, source.seq) as Array<{
+    request_id: string; session_id: string; source_user_seq: number;
+    subject_toolkit: string; subject_capability: string; continue_option_label: string;
+  }>;
+  if (rows.length !== 1) return null;
+  const row = rows[0]!;
+  if ((requestId && row.request_id !== requestId)
+    || !/^[a-z0-9][a-z0-9_]{0,79}$/.test(row.subject_toolkit ?? '')
+    || !row.subject_capability?.startsWith(`${row.subject_toolkit.toUpperCase()}_`)
+    || !row.continue_option_label) return null;
+  return {
+    requestId: row.request_id, sessionId: row.session_id, sourceUserSeq: row.source_user_seq,
+    toolkit: row.subject_toolkit, capability: row.subject_capability,
+    continueLabel: row.continue_option_label,
+  };
+}
+
 interface ToolSearchResultProjection {
   name?: unknown;
   capabilityRef?: unknown;
@@ -421,13 +465,11 @@ function connectionPresentationForSubject(
 ): ConnectionDependencyPresentation {
   if (subject.kind === 'exact_capability_connection') {
     const label = toolkitDisplayName(subject.toolkit);
-    const question = `${label} isn’t connected, so I can’t use ${subject.capability} for this task yet. `
-      + `[Open Connections](/m/?tab=settings&toolkit=${encodeURIComponent(subject.toolkit)}`
-      + `&capability=${encodeURIComponent(subject.capability)}) on this Mac and connect ${label}, `
-      + 'then choose how you want me to continue:';
+    const question = `${label} needs to be connected before I can continue this task. `
+      + 'Connect it in Clementine, or pause to change the request.';
     const options = [
       `I’ve connected ${label} — continue this same task`,
-      'Pause so I can change the research scope',
+      'Pause so I can change this request',
     ] as const;
     return {
       question,
@@ -439,12 +481,11 @@ function connectionPresentationForSubject(
       },
     };
   }
-  const question = 'A connected research provider isn’t available for this task yet. '
-    + '[Open Connections](/m/?tab=settings) on this Mac and connect a suitable provider, '
-    + 'then choose how you want me to continue:';
+  const question = 'A required provider isn’t available for this task yet. '
+    + 'Connect a suitable provider in Clementine, then choose how to continue.';
   const options = [
     'I’ve connected a provider — continue this same task',
-    'Pause so I can change the research scope',
+    'Pause so I can change this request',
   ] as const;
   return {
     question,

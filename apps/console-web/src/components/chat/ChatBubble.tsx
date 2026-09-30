@@ -1,3 +1,4 @@
+import { ConnectionSetup, type ConnectionResume } from './ConnectionSetup';
 import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
@@ -220,7 +221,7 @@ export function ChatBubble({
   traceHref?: string;
   /** Send a suggested answer as the reply. Absent on a read-only transcript,
    *  where a question is a record and its choices are not buttons. */
-  onAnswer?: (text: string) => Promise<void> | void;
+  onAnswer?: (text: string, resume?: ConnectionResume) => Promise<void> | void;
 }) {
   const isUser = message.role === 'user';
   // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
@@ -558,7 +559,11 @@ export function ChatBubble({
         </>
       )}
 
-      {answerable && <AnswerChoices options={message.options!} onAnswer={onAnswer!} />}
+      {answerable && (sessionId ? <ConnectionSetup sessionId={sessionId} options={message.options!}
+        revision={JSON.stringify(message.terminal)} onContinue={onAnswer!}
+        fallback={<AnswerChoices options={message.options!} onAnswer={onAnswer!} />}
+        renderOtherAnswers={(options) => options.length ? <AnswerChoices options={options} onAnswer={onAnswer!} /> : null} />
+        : <AnswerChoices options={message.options!} onAnswer={onAnswer!} />)}
 
         {/* The backend's TYPED terminal decides the pill. The legacy MessageStatus
             collapses blocked/cancelled/uncertain into "failed"/"stopped" and cannot

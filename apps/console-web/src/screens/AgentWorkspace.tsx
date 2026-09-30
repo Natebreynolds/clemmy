@@ -377,7 +377,7 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
               onApprove={() => resolveDecision(m, 'approve')}
               onReject={() => resolveDecision(m, 'reject')}
               onBackground={chat.background}
-              onAnswer={index === chat.messages.length - 1 ? (text) => send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
+              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
               traceHref={traceHref}
             />
             </Fragment>

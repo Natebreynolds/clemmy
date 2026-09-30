@@ -15,6 +15,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
 import { getBuildInfo } from '../runtime/build-info.js';
+import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationTaskMode, connectionContinuationAudience, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
 import * as childProcess from 'node:child_process';
 import matter from 'gray-matter';
@@ -16650,7 +16651,7 @@ export function registerConsoleRoutes(
     let taskMode: TaskMode | undefined;
     try { taskMode = parseTaskMode(body.taskMode); } catch { res.status(400).json({ error: 'INVALID_TASK_MODE' }); return; }
     if (taskMode && body.steerOnly === true) { res.status(409).json({ error: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' }); return; }
-    const explicitTaskMode = taskMode !== undefined && taskMode.kind !== 'normal';
+    let explicitTaskMode = taskMode !== undefined && taskMode.kind !== 'normal';
     const input = typeof body.input === 'string' ? body.input.trim() : '';
     const attachmentIds: string[] = Array.isArray(body.attachments)
       ? body.attachments.filter((a: unknown): a is string => typeof a === 'string').slice(0, 10)
@@ -16681,14 +16682,47 @@ export function registerConsoleRoutes(
       });
       return;
     }
-    const payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode, requestedAgent?.agent.id, requestedProject?.id);
+    const requestedSessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+    let connectionContext: { sessionId: string; connectionRequestId: string } | undefined;
+    let connectionVerification: ConnectionContinuationVerification | undefined;
+    let payloadHash = harnessChatPayloadHash(input, attachmentIds, taskMode, requestedAgent?.agent.id, requestedProject?.id);
+    if (body.connectionRequestId !== undefined) {
+      if (typeof body.connectionRequestId !== 'string' || attachmentIds.length || body.steerOnly === true || taskMode) {
+        res.status(400).json({ error: 'Invalid connection continuation.' }); return;
+      }
+      connectionContext = { sessionId: requestedSessionId, connectionRequestId: body.connectionRequestId };
+      try { payloadHash = connectionContinuationIdentity(connectionContext, input, requestIdentity.requestId).inputHash; }
+      catch { res.status(400).json({ error: 'Invalid connection continuation identity.' }); return; }
+    }
     const priorReceipt = getHarnessChatRequestReceipt(requestIdentity.requestId);
     if (priorReceipt && priorReceipt.inputHash !== payloadHash) {
       res.status(409).json({ error: 'client request id is already bound to different input' });
       return;
     }
 
-    const requestedSessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+    if (connectionContext) {
+      try {
+        taskMode = connectionContinuationTaskMode(connectionContext);
+        explicitTaskMode = taskMode !== undefined && taskMode.kind !== 'normal';
+      } catch {
+        res.status(409).json({ error: 'The original connection request is no longer available.' }); return;
+      }
+    }
+    const connectionNeedsAdmission = connectionContext && (!priorReceipt
+      || !getLatestHarnessRunAttemptByRunId(priorReceipt.sessionId, priorReceipt.runId)?.sourceUserSeq);
+    if (connectionContext && connectionNeedsAdmission) {
+      try {
+        const checked = await verifyConnectionSetup(connectionContext);
+        if (!checked.ready || !checked.request || !checked.verificationBinding || checked.request.continueLabel !== input) {
+          res.status(409).json({ error: 'This connection is not ready for the current task. Return to the conversation and check again.' }); return;
+        }
+        connectionVerification = { sourceUserSeq: checked.request.sourceUserSeq, binding: checked.verificationBinding };
+        taskMode = connectionContinuationTaskMode(connectionContext);
+        explicitTaskMode = taskMode !== undefined && taskMode.kind !== 'normal';
+      } catch {
+        res.status(503).json({ error: 'Couldn’t verify the connected account. Your task is still paused.' }); return;
+      }
+    }
     const parsedHarnessCommand = explicitTaskMode ? null : parseHarnessCommand(input);
     if (
       (parsedHarnessCommand === 'cancel' || parsedHarnessCommand === 'new')
@@ -16825,7 +16859,7 @@ export function registerConsoleRoutes(
     } else if (command === 'new') {
       proposedEarlyRoute = { kind: 'new' };
     }
-    if (!explicitTaskMode && !proposedEarlyRoute && requestedSessionId && input && command !== 'sessions') {
+    if (!connectionContext && !explicitTaskMode && !proposedEarlyRoute && requestedSessionId && input && command !== 'sessions') {
       const parkedTask = findSoleAwaitingInputTaskForOrigin(requestedSessionId);
       if (parkedTask?.pendingQuestionId) {
         const replyDecision = classifyBackgroundInputReply({
@@ -16885,7 +16919,7 @@ export function registerConsoleRoutes(
     // call and carries the owner's words into one fresh call and a new card.
     let intent = parsedIntent;
     let approvalChangeRequest: string | undefined;
-    if (isPausedOnApproval && !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 && input.trim()) {
+    if (!connectionContext && isPausedOnApproval && !explicitTaskMode && !proposedEarlyRoute && attachmentIds.length === 0 && input.trim()) {
       const routed = await routeReplyToPendingApproval({ sessionId, text: input, parsed: parsedIntent })
         .catch(() => null);
       if (routed) {
@@ -16931,6 +16965,7 @@ export function registerConsoleRoutes(
         } catch { steerReason = null; }
         const leaseLive = steerReason === 'lease_live';
         if (steerReason) {
+          if (connectionContext) { res.status(409).json({ error: 'This turn is still finishing. Check the connection again shortly.' }); return; }
           if (explicitTaskMode) {
             res.status(409).json({ error: 'Finish or stop the active turn before changing its mode.', code: 'TASK_MODE_CANNOT_CHANGE_ACTIVE_TURN' });
             return;
@@ -17108,6 +17143,11 @@ export function registerConsoleRoutes(
             inputHash: payloadHash,
             sinceSeq: priorReceipt.sinceSeq,
           });
+        } else if (connectionContext) {
+          // Setup is already bound to this owner's exact parked task; do not
+          // fork it just because the answer arrived from another device.
+          requestClaim = claimHarnessChatRequest({ requestId: requestIdentity.requestId,
+            sessionId: connectionContext.sessionId, runId: proposedRunId, inputHash: payloadHash, sinceSeq });
         } else if (!proposedEarlyRoute && !intent) {
           const lineage = resolveAcceptedSourceIngressLineage({
             sessionId,
@@ -17159,7 +17199,9 @@ export function registerConsoleRoutes(
         }
         return requestClaim;
       };
-      requestClaim = executeIngress
+      requestClaim = connectionContext && connectionNeedsAdmission
+        ? withConnectionContinuationAdmission(connectionContext, connectionVerification, claimOrdinaryRequest)
+        : executeIngress
         ? claimPlanExecutionIngress(executeIngress, claimOrdinaryRequest)
         : claimOrdinaryRequest();
       sessionId = requestClaim.receipt.sessionId;
@@ -17204,7 +17246,10 @@ export function registerConsoleRoutes(
     };
     let executionClaim: ReturnType<typeof claimRunAttemptLease>;
     try {
-      executionClaim = executeIngress
+      const connectionUnaccepted = connectionContext && !getLatestHarnessRunAttemptByRunId(sessionId, requestRunId)?.sourceUserSeq;
+      executionClaim = connectionContext && connectionUnaccepted
+        ? withConnectionContinuationAdmission(connectionContext, connectionVerification, claimAttempt)
+        : executeIngress
         ? withReviewedPlanExecuteAdmission(sessionId, requestRunId, claimAttempt) : claimAttempt();
     } catch (error) {
       res.status(409).json({ error: error instanceof Error ? error.message : 'Plan execution could not acquire the conversation.', code: 'PLAN_EXECUTE_CONFLICT' });
@@ -17269,6 +17314,7 @@ export function registerConsoleRoutes(
           data: {
             text: turnInput,
             ...taskModeFields(taskMode),
+            ...(connectionContext ? connectionContinuationAudience(connectionContext, requestRunId, input) : {}),
             displayText: input || (attachmentIds.length ? 'Attached file' : ''),
             ...(reviewedPlanOwnerControl ? { reviewedPlanOwnerControl, userId: reviewedPlanOwnerControl.conversationPrincipalId } : {}),
             requestId: requestClaim.receipt.requestId,

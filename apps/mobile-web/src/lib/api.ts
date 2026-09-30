@@ -1062,6 +1062,7 @@ export async function sendChatMessageAsync(
     message: string;
     sessionId?: string | null;
     idempotencyKey: string;
+    connectionRequestId?: string;
     steerOnly?: boolean;
     taskMode?: TaskMode;
     /** Binds a NEW conversation to this saved agent; ignored once it exists. */
@@ -1077,6 +1078,7 @@ export async function sendChatMessageAsync(
     headers: { 'idempotency-key': input.idempotencyKey },
     body: JSON.stringify({
       message: input.message,
+      ...(input.connectionRequestId ? { connectionRequestId: input.connectionRequestId } : {}),
       ...(input.taskMode ? { taskMode: input.taskMode } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(input.agentId ? { agentId: input.agentId } : {}),

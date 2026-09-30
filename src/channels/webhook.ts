@@ -1,4 +1,5 @@
 import express from 'express';
+import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
 import pino from 'pino';
 import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -1556,6 +1557,8 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     }
   });
 
+  registerConnectionSetupRoutes(app, requireAuth, '/api', { includeLegacyCredentialAlias: true });
+
   app.get('/api/composio/status', requireAuth, async (_req, res) => {
     res.json(await getComposioRuntimeStatus());
   });
@@ -1652,68 +1655,6 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     }
   });
 
-  // A connect failure reaches the person in plain words on the card they
-  // clicked, and the log keeps the cause so a failed app is findable later.
-  const connectFailed = (res: express.Response, slug: string, step: string, error: unknown) => {
-    logger.warn({ toolkit: slug, step, err: error instanceof Error ? error.message : String(error) }, 'Composio app connect failed');
-    res.status(500).json({ error: plainConnectError(displayNameFor(slug), error), toolkit: slug });
-  };
-
-  const stringRecord = (value: unknown): Record<string, string> | undefined => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) if (typeof v === 'string') out[k] = v;
-    return out;
-  };
-
-  app.post('/api/composio/toolkits/:slug/authorize', requireAuth, async (req, res) => {
-    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
-    try {
-      const authorized = await prepareInAppToolkitConnection(slug, undefined, stringRecord(req.body?.details));
-      bustComposioDashboardCaches();
-      res.json(authorized);
-    } catch (error) {
-      connectFailed(res, slug, 'authorize', error);
-    }
-  });
-
-  // The person's own developer app: validate its fields against the
-  // toolkit's live record, create the project's sign-in setup from them, then
-  // start the sign-in. The client secret goes to Composio only.
-  app.post('/api/composio/toolkits/:slug/oauth-app', requireAuth, async (req, res) => {
-    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
-    try {
-      const detail = await getToolkitDetail(slug);
-      if (!detail) {
-        res.status(404).json({ error: 'Composio has no record of this app, or your Composio key is missing.' });
-        return;
-      }
-      const wanted = typeof req.body?.authScheme === 'string' ? req.body.authScheme.toUpperCase() : '';
-      const mode = detail.modes.find((m) => m.mode === wanted && isRedirectableToolkitAuthScheme(m.mode))
-        ?? detail.modes.find((m) => isRedirectableToolkitAuthScheme(m.mode));
-      if (!mode) {
-        res.status(400).json({ error: `${detail.name} has no sign-in that uses a developer app.` });
-        return;
-      }
-      const app = oauthAppSetupFor(detail, mode.mode);
-      const creationFields = app.fields.filter((f) => !/redirect/i.test(f.name));
-      const { credentials, missing } = selectToolkitCredentialValues(
-        { ...setupMetaForMode(detail, mode.mode), fields: creationFields },
-        stringRecord(req.body?.credentials) ?? {},
-      );
-      if (missing.length > 0) {
-        res.status(400).json({ error: `Missing ${missing.join(', ')}.` });
-        return;
-      }
-      await setupCustomOAuthToolkit(slug, mode.mode, credentials, app.callbackUrl);
-      const authorized = await prepareInAppToolkitConnection(slug, undefined, stringRecord(req.body?.details));
-      bustComposioDashboardCaches();
-      res.json(authorized);
-    } catch (error) {
-      connectFailed(res, slug, 'oauth-app', error);
-    }
-  });
-
   app.post('/api/composio/toolkits/:slug/disconnect', requireAuth, async (req, res) => {
     const connectionId = typeof req.body.connectionId === 'string'
       ? req.body.connectionId
@@ -1781,54 +1722,6 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
       res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
     }
   });
-
-  // Clementine-native credential setup for API_KEY / BASIC / BEARER and other
-  // non-redirect schemes. The field allow-list and scheme come from Composio's
-  // live toolkit metadata; the browser cannot inject arbitrary connection
-  // state. Secrets go straight to Composio and are never persisted locally.
-  const setupToolkitCredentials: express.RequestHandler = async (req, res) => {
-    const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
-    if (!slug) {
-      res.status(400).json({ error: 'slug required' });
-      return;
-    }
-    try {
-      const detail = await getToolkitDetail(slug);
-      if (!detail) {
-        res.status(404).json({ error: 'toolkit not found or Composio not configured' });
-        return;
-      }
-      // The key-style scheme the form was built for; a redirect scheme is
-      // never accepted here, and a toolkit with several key schemes gets the
-      // one the form named.
-      const mode = credentialModeFor(detail, typeof req.body?.authScheme === 'string' ? req.body.authScheme : undefined);
-      if (!mode) {
-        res.status(400).json({ error: `${detail.name} signs in through its own page, not with a key; use Connect instead.` });
-        return;
-      }
-      const setup = setupMetaForMode(detail, mode);
-      const submitted = req.body?.credentials && typeof req.body.credentials === 'object' && !Array.isArray(req.body.credentials)
-        ? req.body.credentials as Record<string, unknown>
-        : {};
-      // Back-compat for the original API-key-only route/body.
-      if (typeof req.body?.apiKey === 'string') submitted.generic_api_key = req.body.apiKey;
-      if (typeof req.body?.baseUrl === 'string') submitted.base_url = req.body.baseUrl;
-
-      const { credentials, missing } = selectToolkitCredentialValues(setup, submitted);
-      if (missing.length > 0) {
-        res.status(400).json({ error: `Missing required credential field${missing.length === 1 ? '' : 's'}: ${missing.join(', ')}` });
-        return;
-      }
-
-      const result = await setupCredentialToolkit(slug, setup.authScheme, credentials);
-      bustComposioDashboardCaches();
-      res.json(result);
-    } catch (error) {
-      connectFailed(res, slug, 'credentials', error);
-    }
-  };
-  app.post('/api/composio/toolkits/:slug/setup-credentials', requireAuth, setupToolkitCredentials);
-  app.post('/api/composio/toolkits/:slug/setup-api-key', requireAuth, setupToolkitCredentials);
 
   // OAuth2 auto-setup. Creates a `use_composio_managed_auth` config
   // for OAUTH2 toolkits where Composio offers managed credentials
