@@ -35,6 +35,9 @@ const approvalRegistry = await import('../runtime/harness/approval-registry.js')
 const { createSession, listEvents, openEventLog } = await import('../runtime/harness/eventlog.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const { listSendTrustGrants } = await import('../agents/plan-scope.js');
+const { startChatApprovalResume, _resetChatApprovalResumeForTest } = await import('../runtime/harness/chat-approval-resume.js');
+const { _setApprovedCallDispatchForTests } = await import('../execution/pending-action-executor.js');
+const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
 
 test.after(() => { try { rmSync(TMP_HOME, { recursive: true, force: true }); } catch { /* best effort */ } });
 
@@ -103,6 +106,58 @@ function linkedRunBatch(subject: string, opts: {
   });
   return { record, card };
 }
+
+test('approve-execute on a card the resume owns reports the resume\'s one execution, never a second inline run', async () => {
+  // Live 2026-09-30: the desktop button resolved the card, the registry hook
+  // started the resume, and the route also executed inline under the original
+  // turn's authority. The inline run claimed first, was refused for lacking a
+  // live attestation, and the real resume then found a failed record. The
+  // command never ran.
+  _resetChatApprovalResumeForTest();
+  startChatApprovalResume(async () => { throw new Error('a linked card never resumes the model'); });
+  const dispatched: Array<{ tool: string; payload: unknown }> = [];
+  _setApprovedCallDispatchForTests(async (tool, payload) => {
+    dispatched.push({ tool, payload });
+    return 'HTTP/1.1 200 OK\nok';
+  });
+  const sessionId = createSession({ kind: 'chat', channel: 'desktop' }).id;
+  const record = queuePendingAction({
+    title: 'POST x=1 to the hook',
+    summary: 'One curl POST to a local endpoint.',
+    kind: 'shell_command',
+    toolName: 'run_shell_command',
+    payload: { command: "curl -sS -X POST -d 'x=1' http://127.0.0.1:1/hook", cwd: '/tmp' },
+    sessionId,
+  });
+  const card = approvalRegistry.register({
+    sessionId,
+    subject: record.title,
+    tool: 'request_approval',
+    args: { pendingActionId: record.id, pendingAction: pendingActionApprovalView(record) },
+  });
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approvalId: card.approvalId }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json() as { ok: boolean; status: string; resultSummary: string };
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.status, 'executed');
+    assert.match(body.resultSummary, /Executed the approved run_shell_command call/);
+    assert.equal(dispatched.length, 1, 'the stored payload ran exactly once');
+    assert.deepEqual(dispatched[0].payload, record.payload);
+    assert.equal(getPendingAction(record.id)?.status, 'executed');
+    // The resume settled its own accepted source with what landed.
+    const settled = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+    assert.ok(settled, 'the approval source settled');
+    assert.match(JSON.stringify(settled!.data), /Executed the approved run_shell_command call/);
+  } finally {
+    _setApprovedCallDispatchForTests(null);
+    _resetChatApprovalResumeForTest();
+    await h.close();
+  }
+});
 
 test('approve-execute resolves the human card and defers a run_batch plan (skipped, never dispatched)', async () => {
   // A run_batch record never reaches the real dispatcher — it defers to the

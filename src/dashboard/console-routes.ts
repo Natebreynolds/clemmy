@@ -506,6 +506,7 @@ import {
   type PendingActionApprovalPreflight,
 } from '../runtime/harness/pending-action-approval.js';
 import { executeApprovedPendingActionCall } from '../execution/pending-action-executor.js';
+import { approvalResumeInFlight } from '../runtime/harness/chat-approval-resume.js';
 import {
   listOperationalEvents,
   isOperationalEventType,
@@ -13628,7 +13629,24 @@ export function registerConsoleRoutes(
       const trustGrant = alwaysAllow && validatedHumanApproval
         ? grantSendTrustFromApprovedAction(record.toolName, record.payload, `always-allow from card: ${record.title}`.slice(0, 120))
         : null;
-      const exec = await executeApprovedPendingActionCall(id, { sessionId: record.sessionId ?? undefined });
+      // Resolving the card started the approval resume, which runs the stored
+      // action under its own accepted source and settles the conversation
+      // with what landed. Await that one execution instead of racing it with
+      // an inline dispatch here: an inline run has no turn of its own, so the
+      // local lane refused it for lacking a live attestation and, having
+      // claimed first, left the real resume to find a failed record.
+      const resumeFlight = approvalId ? approvalResumeInFlight(approvalId) : null;
+      const exec = resumeFlight
+        ? await resumeFlight.then(() => {
+            const settled = getPendingAction(id);
+            return {
+              ok: settled?.status === 'executed',
+              status: settled?.status === 'executed' ? 'executed' as const : settled?.status === 'failed' ? 'failed' as const : 'skipped' as const,
+              resultSummary: settled?.resultSummary ?? `Pending action ${id} is ${settled?.status ?? 'missing'}.`,
+              record: settled,
+            };
+          })
+        : await executeApprovedPendingActionCall(id, { sessionId: record.sessionId ?? undefined });
       const out = exec.record ?? getPendingAction(id);
       res.json({
         ok: exec.ok,

@@ -820,6 +820,25 @@ export async function handleResolvedApprovalForChatResume(
 let started = false;
 let listenerRegistered = false;
 let registeredDispatch: ChatApprovalResumeDispatch | null = null;
+/** The resume in flight for each resolved card, so a surface that resolved
+ * the card (a desktop button) can await the one execution instead of racing
+ * it with its own. */
+const resumeFlights = new Map<string, Promise<boolean>>();
+
+function trackResumeFlight(approvalId: string, flight: Promise<boolean>): Promise<boolean> {
+  resumeFlights.set(approvalId, flight);
+  void flight.finally(() => {
+    if (resumeFlights.get(approvalId) === flight) resumeFlights.delete(approvalId);
+  });
+  return flight;
+}
+
+/** The resume that the registry's resolution hook started for this card, or
+ * null when none is in flight. */
+export function approvalResumeInFlight(approvalId: string): Promise<boolean> | null {
+  return resumeFlights.get(approvalId) ?? null;
+}
+
 const dispatchResolvedApproval = (row: approvalRegistry.PendingApprovalRow): void => {
   const dispatch = registeredDispatch;
   // Conversational consent has a live ingress owner. Let that owner atomically
@@ -829,7 +848,7 @@ const dispatchResolvedApproval = (row: approvalRegistry.PendingApprovalRow): voi
   if (row.presentation) {
     settleConversationalApprovalDecisionInBackground(row, 'approval-resolution-listener');
   } else if (dispatch) {
-    void handleResolvedApprovalForChatResume(row, dispatch);
+    void trackResumeFlight(row.approvalId, handleResolvedApprovalForChatResume(row, dispatch));
   }
 };
 
