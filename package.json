@@ -35,6 +35,7 @@
     "!dist/spaces/workspace-script-process.fixture.js",
     "!dist/spaces/workspace-script-occurrence-process.fixture.js",
     "!dist/spaces/workspace-script-consent-process.fixture.js",
+    "!dist/spaces/workspace-script-refresh-process.fixture.js",
     "!dist/journeys/*.fixture.js",
     "!dist/journeys/*.fixture-support.js",
     "!dist/runtime/harness/current-capability-manifest.fixture.js",

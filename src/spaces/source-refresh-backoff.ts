@@ -31,6 +31,7 @@ export type SourceStreakCode = SpaceSourceFailureCode | 'unclassified';
 
 const STREAK_CODES: ReadonlySet<string> = new Set<SourceStreakCode>([
   'local_runner',
+  'script_held',
   'local_command',
   'not_approved',
   'definition',
@@ -270,9 +271,15 @@ function plainReason(code: SourceStreakCode, declared: { read: string; through: 
   switch (code) {
     case 'local_runner':
       return {
-        why: `It runs a local script${read ? ` (${read})` : ''}, and Space refreshes never start local scripts.`,
-        fix: 'Ask Clem to rebuild this source on a connected app or a reviewed read, or remove it from the Space.',
+        why: `The old raw script path${read ? ` (${read})` : ''} has no saved execution authority.`,
+        fix: 'Refresh the saved source through its Workspace to review the current script permission.',
         detail: false,
+      };
+    case 'script_held':
+      return {
+        why: `The saved script refresh${read ? ` (${read})` : ''} is held.`,
+        fix: 'Review this source’s saved refresh and its execution evidence before retrying; later ticks will not start a replacement.',
+        detail: true,
       };
     case 'local_command':
       return {

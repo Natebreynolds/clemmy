@@ -66,6 +66,16 @@ export function readSavedSourceScriptGrant(grantId: string, db = openEventLog())
   } catch { return null; }
 }
 
+/** The grant outlives registry/session retention. A revoked latest grant is
+ * returned too, so ordinary refreshes cannot silently ask for it again. */
+export function findSavedSourceScriptGrant(scope: SavedSourceScriptScope): SavedSourceScriptGrant | null {
+  const row = openEventLog().prepare(`SELECT grant_id FROM saved_source_script_grants_v1
+    WHERE scope_json = ? ORDER BY rowid DESC LIMIT 1`).get(
+    closedCanonicalJson(savedSourceScriptScope.parse(scope)),
+  ) as { grant_id: string } | undefined;
+  return row ? readSavedSourceScriptGrant(row.grant_id) : null;
+}
+
 /** Transfer one approved scope card into an immutable grant in the same DB
  * transaction as its consume CAS. Reentry cannot revive a revoked grant. */
 export function recordApprovedSavedSourceScriptGrant(approvalId: string): SavedSourceScriptGrant {

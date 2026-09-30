@@ -2819,11 +2819,23 @@
         "src/spaces/space-action-v3-authority.ts": {
           "bytes": 16201
         },
+        "src/spaces/workspace-script-carrier.ts": {
+          "bytes": 10237
+        },
+        "src/spaces/workspace-script-authority.ts": {
+          "bytes": 5525
+        },
+        "src/spaces/workspace-script-occurrence.ts": {
+          "bytes": 19189
+        },
         "src/spaces/space-data-runner-trust.ts": {
-          "bytes": 26633
+          "bytes": 27729
+        },
+        "src/spaces/workspace-script-refresh.ts": {
+          "bytes": 11435
         },
         "src/spaces/runner.ts": {
-          "bytes": 33579
+          "bytes": 34766
         },
         "src/spaces/space-action-canonical-consent.ts": {
           "bytes": 3417
@@ -3200,9 +3212,6 @@
         "src/runtime/harness/local-file-workflow-carrier.ts": {
           "bytes": 3581
         },
-        "src/spaces/workspace-script-carrier.ts": {
-          "bytes": 10237
-        },
         "src/runtime/harness/reviewed-local-storage-carrier.ts": {
           "bytes": 6254
         },
@@ -3216,7 +3225,7 @@
           "bytes": 35502
         },
         "src/runtime/harness/saved-source-consent.ts": {
-          "bytes": 12215
+          "bytes": 12794
         },
         "src/runtime/harness/historical-terminal-call-authority-proof.ts": {
           "bytes": 14436
@@ -6167,11 +6176,23 @@
         "src/spaces/space-action-v3-authority.ts": {
           "bytes": 16201
         },
+        "src/spaces/workspace-script-carrier.ts": {
+          "bytes": 10237
+        },
+        "src/spaces/workspace-script-authority.ts": {
+          "bytes": 5525
+        },
+        "src/spaces/workspace-script-occurrence.ts": {
+          "bytes": 19189
+        },
         "src/spaces/space-data-runner-trust.ts": {
-          "bytes": 26633
+          "bytes": 27729
+        },
+        "src/spaces/workspace-script-refresh.ts": {
+          "bytes": 11435
         },
         "src/spaces/runner.ts": {
-          "bytes": 33579
+          "bytes": 34766
         },
         "src/spaces/space-action-canonical-consent.ts": {
           "bytes": 3417
@@ -6548,9 +6569,6 @@
         "src/runtime/harness/local-file-workflow-carrier.ts": {
           "bytes": 3581
         },
-        "src/spaces/workspace-script-carrier.ts": {
-          "bytes": 10237
-        },
         "src/runtime/harness/reviewed-local-storage-carrier.ts": {
           "bytes": 6254
         },
@@ -6564,7 +6582,7 @@
           "bytes": 35502
         },
         "src/runtime/harness/saved-source-consent.ts": {
-          "bytes": 12215
+          "bytes": 12794
         },
         "src/runtime/harness/historical-terminal-call-authority-proof.ts": {
           "bytes": 14436

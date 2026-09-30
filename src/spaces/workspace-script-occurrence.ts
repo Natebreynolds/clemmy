@@ -25,6 +25,15 @@ export interface WorkspaceScriptOccurrenceKey {
   sourceId: string;
   occurrenceId: string;
 }
+export interface WorkspaceScriptOccurrenceView {
+  key: WorkspaceScriptOccurrenceKey;
+  sessionId: string;
+  args: Prepared['args'];
+  source: SpaceDataSource;
+  approvalId: string | null;
+  activationId: string | null;
+  published: boolean;
+}
 type Prepared = ReturnType<typeof prepareWorkspaceScriptCall>;
 interface Preparation {
   args: Prepared['args'];
@@ -46,6 +55,25 @@ const keyArgs = (key: WorkspaceScriptOccurrenceKey) => [key.slug, key.sourceId, 
 function rowFor(key: WorkspaceScriptOccurrenceKey): OccurrenceRow | undefined {
   return openEventLog().prepare(`SELECT * FROM ${table}
     WHERE workspace_id = ? AND source_id = ? AND occurrence_id = ?`).get(...keyArgs(key)) as OccurrenceRow | undefined;
+}
+
+/** Retained ownership, including the arm/address crash gap. Callers must use
+ * this occurrence instead of creating a replacement when recovering work. */
+export function readWorkspaceScriptOccurrence(key: WorkspaceScriptOccurrenceKey): WorkspaceScriptOccurrenceView | null {
+  const row = rowFor(key);
+  if (!row) return null;
+  const saved = JSON.parse(row.preparation_json) as Preparation;
+  return { key, sessionId: row.session_id, args: saved.args, source: saved.source,
+    approvalId: row.approval_id, activationId: recoverActivation(row), published: row.observation_id !== null };
+}
+
+export function listUnpublishedWorkspaceScriptOccurrences(slug?: string, sourceId?: string): WorkspaceScriptOccurrenceKey[] {
+  const rows = openEventLog().prepare(`SELECT workspace_id, source_id, occurrence_id FROM ${table}
+    WHERE observation_id IS NULL ${slug === undefined ? '' : 'AND workspace_id = ?'}
+    ${sourceId === undefined ? '' : 'AND source_id = ?'} ORDER BY rowid`).all(
+    ...(slug === undefined ? [] : [slug]), ...(sourceId === undefined ? [] : [sourceId]),
+  ) as Pick<OccurrenceRow, 'workspace_id' | 'source_id' | 'occurrence_id'>[];
+  return rows.map(row => ({ slug: row.workspace_id, sourceId: row.source_id, occurrenceId: row.occurrence_id }));
 }
 
 export type ReserveWorkspaceScriptOccurrenceResult =
@@ -147,7 +175,7 @@ export function activateWorkspaceScriptOccurrence(key: WorkspaceScriptOccurrence
 }
 
 export type ExecuteWorkspaceScriptOccurrenceResult =
-  | { status: 'published'; observationId: string; replayed: boolean }
+  | { status: 'published'; observationId: string; replayed: boolean; changed: boolean | null; bytes: number }
   | { status: 'held'; reason: string };
 
 /** Subsequent occurrences use the explicit scope grant, not a fabricated
@@ -260,5 +288,6 @@ export async function executeWorkspaceScriptOccurrence(
   const observation = committed.observations[0]!;
   db.prepare(`UPDATE ${table} SET observation_id = ? WHERE workspace_id = ? AND source_id = ?
     AND occurrence_id = ? AND observation_id IS NULL`).run(observation.id, ...keyArgs(key));
-  return { status: 'published', observationId: observation.id, replayed: result.status === 'replayed' };
+  return { status: 'published', observationId: observation.id, replayed: result.status === 'replayed',
+    changed: observation.changed, bytes: committed.projection.bytes };
 }

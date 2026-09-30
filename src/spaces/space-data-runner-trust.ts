@@ -236,6 +236,17 @@ function ensureSpaceSession(rec: SpaceRecord): string {
   return sessionId;
 }
 
+/** A retired trust approval never authorizes the new carrier. Retire an exact
+ * obsolete pending card before its replacement; preserve a person's prior no. */
+export function historicalRunnerDenial(slug: string, source: SpaceDataSource): PendingApprovalRow | null {
+  const snapshot = runnerSnapshot(slug, source);
+  if (!snapshot.ok) return null;
+  const { row: decision } = historicalTrustDecision({ sessionId: `space-${snapshot.rec.id}`,
+    tool: SPACE_DATA_RUNNER_TRUST_TOOL, trustKey: snapshot.trustKey, sourceId: source.id,
+    executionLabel: `The historical runner “data/${source.runner}”` });
+  return decision?.resolution === 'rejected' || decision?.resolution === 'cancelled_by_user' ? decision : null;
+}
+
 function terminalApprovalResolution(
   row: PendingApprovalRow,
 ): WorkspaceApprovalTerminalResolution | null {
@@ -416,14 +427,17 @@ function resumeApprovedSourceRefresh(
   }).then((results) => {
     const succeeded = results.length > 0 && results.every((result) => result.ok);
     const failures = results.filter((result) => !result.ok);
+    const pendingIds = [...new Set(failures.flatMap(result => result.pendingApprovalId ? [result.pendingApprovalId] : []))];
     const missingExecutor = failures.some(result => result.failureCode === 'local_runner' || result.failureCode === 'local_command');
-    const nextAction = missingExecutor
+    const nextAction = pendingIds.length
+      ? `Review the saved-source permission ${pendingIds.join(', ')}. The historical trust decision does not authorize the new execution scope.`
+      : missingExecutor
       ? 'Open the Workspace activity log for technical details. The source needs a supported executor before another refresh can work.'
       : 'Open the Workspace activity log for technical details, then retry the refresh.';
     const reply = succeeded
       ? `Approved ${row.approvalId}. “${rec.title}” refreshed ${sourceId} successfully.`
       : `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId} (${failures.length} failed step${failures.length === 1 ? '' : 's'}). ${nextAction}`;
-    if (!succeeded) {
+    if (failures.some(result => !result.pendingApprovalId)) {
       recordOperationalEvent({
         source: 'workspace',
         type: 'workspace_data_refresh_failed',
@@ -440,7 +454,7 @@ function resumeApprovedSourceRefresh(
     }
     deliverOutcome(
       {
-        status: succeeded ? 'done' : 'failed',
+        status: succeeded ? 'done' : pendingIds.length ? 'needs_input' : 'failed',
         summary: reply,
         evidence: {
           work: [{

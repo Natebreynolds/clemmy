@@ -312,6 +312,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
     'reconcileTerminalRunAttemptDispatchLeasesAtBoot',
   );
   const runnerTrustRecovery = callsNamed(startDaemon, 'recoverResolvedRunnerTrustApprovals');
+  const savedScriptRecovery = callsNamed(startDaemon, 'recoverSavedScriptRefreshes');
   const approvalDrain = callsNamed(startDaemon, 'startChatApprovalResume');
   const closedDispatchRecovery = callsNamed(startDaemon, 'reconcileClosedWorkflowDispatchBatches')
     .filter((call) => nearestContainingFunction(call) === startDaemon);
@@ -329,6 +330,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
     ['orphan fencing', orphanFence],
     ['terminal-attempt dispatch quarantine', dispatchLeaseQuarantine],
     ['runner-trust approval recovery', runnerTrustRecovery],
+    ['saved script refresh recovery', savedScriptRecovery],
     ['approval drain', approvalDrain],
     ['closed workflow dispatch recovery', closedDispatchRecovery],
     ['activated workflow dispatch recovery', activatedDispatchRecovery],
@@ -355,6 +357,7 @@ test('daemon readiness hook is awaited once after recovery and workflow-lane reg
     orphanFence[0],
     dispatchLeaseQuarantine[0],
     runnerTrustRecovery[0],
+    savedScriptRecovery[0],
     approvalDrain[0],
     closedDispatchRecovery[0],
     activatedDispatchRecovery[0],

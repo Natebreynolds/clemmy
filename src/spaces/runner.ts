@@ -1,10 +1,10 @@
 /**
- * Workspace data-source executor. Composio declarations may execute only by
- * redeeming the shared durable call kernel; local runner and CLI declarations
- * remain zero-process until they are compiled into that same kernel. Legacy
- * trust decisions are retained as migration metadata, never call authority.
+ * Workspace data-source executor. Provider reads, reviewed CLI reads and saved
+ * scripts use the shared durable call kernel. Saved scripts additionally own
+ * explicit recurring consent and a retained occurrence through publication.
+ * Retired raw APIs remain zero-body; old trust is not execution authority.
  *
- * Used by the on-demand /refresh route and (later) the scheduled daily poll —
+ * Used by the on-demand /refresh route and the scheduled poll —
  * one execution path for both. Fail-safe: a source error is captured into
  * data.json under _meta so the view can show "couldn't refresh" without the
  * whole Workspace breaking.
@@ -22,6 +22,8 @@ import {
   type WorkspaceObservationCommitItem,
 } from './workspace-db.js';
 import { finalizeWorkspaceObservationCommit } from './workspace-observation-finalize.js';
+import { refreshWorkspaceScriptSource, registerSavedScriptRefreshHandler } from './workspace-script-refresh.js';
+import type { WorkspaceScriptOccurrenceKey } from './workspace-script-occurrence.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
   workspaceActionRequiresApproval,
@@ -49,8 +51,10 @@ export interface RunSourceOk { ok: true; data: unknown }
  * error text, so "the same failure again" is a fact, not a comparison.
  */
 export type SpaceSourceFailureCode =
-  /** A declared local script; Space refreshes never start local processes. */
+  /** A retired raw script entrypoint with no shared execution authority. */
   | 'local_runner'
+  /** A supported saved script is held at preparation, execution or publication. */
+  | 'script_held'
   /** A declared command line that is not, or cannot be carried by, a reviewed read. */
   | 'local_command'
   /** The decision to run this source's script or command was declined or ended. */
@@ -71,7 +75,7 @@ export interface RunSourceErr {
   error: string;
   /** Nominal executor proof; never inferred from runner-controlled output. */
   provenNoDispatch?: true;
-  /** Exact legacy migration decision; never shared-kernel call authority. */
+  /** Exact pending decision; never shared-kernel call authority by itself. */
   pendingApprovalId?: string;
   code?: SpaceSourceFailureCode;
 }
@@ -531,12 +535,13 @@ export interface RefreshSpaceOptions {
   refreshId?: string;
   /** Optional durable batch identity for diagnostics. */
   batchId?: string;
+  /** Internal retained address for approval/restart recovery, never consent. */
+  scriptOccurrence?: WorkspaceScriptOccurrenceKey;
+  signal?: AbortSignal;
   /**
-   * Exact shared-kernel authority per declared source. Ordinary dashboard,
-   * scheduler, creation-smoke, and retry callers provide no entries and thus
-   * cannot reach Composio until a production compiler/activation adapter is
-   * wired. Local runner and CLI declarations remain zero-body as well; their
-   * legacy trust records are not shared-kernel authority.
+   * Optional already-prepared authority per source. Otherwise the production
+   * refresh owner prepares the provider/reviewed-CLI read from its declaration.
+   * Scripts use their own occurrence and consent through that same kernel.
    */
   composioAuthorityBySourceId?: Readonly<Record<string, SpaceSharedDurableComposioAuthority>>;
 }
@@ -552,6 +557,11 @@ registerRunnerTrustRefreshHandler(async ({ spaceSlug, sourceId, approvalId }) =>
     batchId: `runner-trust:${approvalId}`,
   })
 ));
+
+registerSavedScriptRefreshHandler(key => refreshSpaceData(key.slug, key.sourceId, {
+  cause: 'retry', scriptOccurrence: key,
+  refreshId: `saved-script-recovery:${key.occurrenceId}`,
+}));
 
 async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: RefreshSpaceOptions = {}): Promise<RefreshResult[]> {
   const rec = spaceStore.get(slug);
@@ -594,13 +604,24 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
   }
 
   const results: RefreshResult[] = [];
-  const observations: WorkspaceObservationCommitItem[] = [];
+  const observations: (WorkspaceObservationCommitItem | null)[] = [];
   const cause = opts.cause ?? 'manual';
   const batchId = opts.batchId ?? randomUUID();
 
   // Phase A observability: the workspace data-refresh lifecycle on the operator view.
   recordOperationalEvent({ source: 'workspace', type: 'workspace_data_refresh_started', workspaceId: slug, actor: 'space-runner', payload: { sourceCount: sources.length, sourceId } });
   for (const source of sources) {
+    const scriptRun = source.runner?.trim() ? await refreshWorkspaceScriptSource(slug, source, {
+      cause, refreshId: opts.refreshId, occurrence: opts.scriptOccurrence, signal: opts.signal,
+    }) : null;
+    if (scriptRun?.ok) {
+      // The source-owned coordinator has already transformed, committed and
+      // finalized this exact observation, including restart recovery.
+      results.push({ ...scriptRun, sourceId: source.id });
+      observations.push(null);
+      appendAudit(slug, { method: 'REFRESH', path: `/refresh/${source.id}`, outcome: 'ok' });
+      continue;
+    }
     const authorityMap = opts.composioAuthorityBySourceId;
     let composioAuthority = authorityMap && Object.prototype.hasOwnProperty.call(authorityMap, source.id)
       ? authorityMap[source.id]
@@ -640,7 +661,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
     // A preparation failure is not evidence that a read is a write. Return
     // its actual cause without running a second gate that obscures it.
     const refusedProviderRead = Boolean(mintRefusal && source.composioSlug && !source.runner && !source.cliArgv?.length);
-    const run: RunSourceResult = refusedProviderRead
+    const run: RunSourceResult = scriptRun ?? (refusedProviderRead
       ? {
         ok: false,
         error: `Data source "${source.id}" could not refresh. ${mintRefusal}`,
@@ -650,7 +671,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
       : await runSpaceDataSource(slug, source, {
         composioAuthority,
         requestFreshTrustApproval: cause === 'manual',
-      });
+      }));
     if (!run.ok && mintRefusal && !refusedProviderRead) {
       run.error = `${run.error} Durable read authority could not be minted: ${mintRefusal}`;
     }
@@ -672,7 +693,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
         ...(source.schedule ? { schedule: source.schedule } : {}),
       }
       : {
-        adapter: 'legacy_runner',
+        adapter: source.runner?.trim() ? 'workspace_script' : 'legacy_runner',
         ...(source.runner ? { runner: source.runner } : {}),
         ...(source.schedule ? { schedule: source.schedule } : {}),
       };
@@ -714,6 +735,7 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
   // must not roll back valid observations from the same refresh fan-out.
   // batchId still correlates the independent commits for diagnostics.
   for (const [index, observation] of observations.entries()) {
+    if (!observation) continue;
     const result = results[index]!;
     let committed: CommitWorkspaceObservationBatchResult | null = null;
     let persistenceError = '';

@@ -67,8 +67,9 @@ test('smoke: an approved local source is a contained failure before its rows exe
   writeRunner(slug, source.runner, `process.stdout.write(JSON.stringify({rows:[{a:1}]}));`);
   await approveInstalledRunnerFixture(slug, source);
   const res = await smoke.runSpaceCreationSmoke(slug);
-  assert.equal(res.failed.length, 1);
-  assert.match(res.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.equal(res.failed.length, 0);
+  assert.equal(res.awaitingApproval.length, 1);
+  assert.equal(approvals.get(res.awaitingApproval[0].approvalId)?.tool, 'workspace_source_script_consent');
   assert.equal(res.empty.length, 0);
 });
 
@@ -77,9 +78,9 @@ test('smoke: an installed legacy runner reports unavailable execution without a 
   store.spaceStore.save({ id: slug, title: 'Fail', dataSources: [{ id: 'pull', runner: 'bad.mjs' }] });
   writeRunner(slug, 'bad.mjs', 'process.exit(3)');
   const res = await smoke.runSpaceCreationSmoke(slug);
-  assert.equal(res.failed.length, 1);
-  assert.match(res.failed[0]?.error ?? '', /supported executor/);
-  assert.equal(res.awaitingApproval.length, 0);
+  assert.equal(res.failed.length, 0);
+  assert.equal(res.awaitingApproval.length, 1);
+  assert.equal(approvals.get(res.awaitingApproval[0].approvalId)?.tool, 'workspace_source_script_consent');
 });
 
 test('smoke: contained local source cannot be classified from fabricated empty output', async () => {
@@ -89,8 +90,9 @@ test('smoke: contained local source cannot be classified from fabricated empty o
   writeRunner(slug, source.runner, `process.stdout.write(JSON.stringify({rows:[]}));`);
   await approveInstalledRunnerFixture(slug, source);
   const res = await smoke.runSpaceCreationSmoke(slug);
-  assert.equal(res.failed.length, 1);
-  assert.match(res.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.equal(res.failed.length, 0);
+  assert.equal(res.awaitingApproval.length, 1);
+  assert.equal(approvals.get(res.awaitingApproval[0].approvalId)?.tool, 'workspace_source_script_consent');
   assert.deepEqual(res.empty, []);
 });
 
@@ -106,10 +108,12 @@ test('smoke: allowEmpty cannot waive local execution authority', async () => {
   await approveInstalledRunnerFixture(slug, source);
   const first = await smoke.runSpaceCreationSmoke(slug);
   const second = await smoke.runSpaceCreationSmoke(slug);
-  assert.equal(first.failed.length, 1);
-  assert.match(first.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.equal(first.failed.length, 0);
+  assert.equal(first.awaitingApproval.length, 1);
   assert.deepEqual(first.empty, []);
-  assert.equal(second.failed.length, 1);
-  assert.match(second.failed[0]?.error ?? '', /no shared durable call authority/i);
+  assert.equal(second.failed.length, 0);
+  assert.equal(second.awaitingApproval.length, 1);
   assert.deepEqual(second.empty, []);
+  assert.equal(second.awaitingApproval[0].approvalId, first.awaitingApproval[0].approvalId);
+  assert.equal(approvals.get(second.awaitingApproval[0].approvalId)?.status, 'pending');
 });

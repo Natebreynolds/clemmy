@@ -52,7 +52,8 @@ test('a due approved local source is contained and still dedupes within the minu
     const now = new Date('2026-06-08T08:00:00.000Z');
     const first = await sched.processSpaceSchedules(now);
     assert.equal(first.fired, 0);
-    assert.equal(first.errors, 1);
+    assert.equal(first.errors, 0);
+    assert.equal(first.awaitingApproval, 1);
     assert.equal(Object.hasOwn(data.readData(slug) as object, 'pull'), false);
 
     // Same minute again → no double fire (dedup).
@@ -95,7 +96,8 @@ process.stdout.write(JSON.stringify({dispatches}));`);
     const wake = new Date('2026-06-09T11:01:00.000Z');
     const first = await sched.processSpaceSchedules(wake);
     assert.equal(first.fired, 0);
-    assert.equal(first.errors, 1, 'the collapsed latest occurrence reports one contained failure');
+    assert.equal(first.errors, 0);
+    assert.equal(first.awaitingApproval, 1, 'the collapsed latest occurrence waits for one executable scope approval');
     assert.equal(
       (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/dispatch-count.txt')),
       false,
@@ -117,6 +119,13 @@ process.stdout.write(JSON.stringify({dispatches}));`);
       false,
       'same-minute reevaluation remains zero-process',
     );
+    const scope = approvals.listPending({ sessionId: `workspace-script:${slug}`, status: 'pending' });
+    assert.equal(scope.length, 1);
+    approvals.resolve(scope[0].approvalId, 'approved', 'scheduler-fixture-owner');
+    await (await import('./workspace-script-refresh.js')).recoverSavedScriptRefreshes();
+    assert.equal(readFileSync(store.resolveInSpace(slug, 'data/dispatch-count.txt'), 'utf8'), '1');
+    assert.equal((await sched.processSpaceSchedules(wake)).fired, 0);
+    assert.equal(readFileSync(store.resolveInSpace(slug, 'data/dispatch-count.txt'), 'utf8'), '1');
   } finally {
     store.spaceStore.archive(slug);
   }
@@ -160,8 +169,9 @@ process.stdout.write('{}');`,
 
   const res = await sched.processSpaceSchedules(new Date('2026-06-08T10:00:00.000Z'));
   assert.equal(res.fired, 0);
-  assert.equal(res.errors, 1);
-  assert.equal(res.awaitingApproval, 0);
+  assert.equal(res.errors, 0);
+  assert.equal(res.awaitingApproval, 1);
+  assert.equal(approvals.listPending({ sessionId: `workspace-script:${slug}`, status: 'pending' }).length, 1);
   assert.equal(
     approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
     0,

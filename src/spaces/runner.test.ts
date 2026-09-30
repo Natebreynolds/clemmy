@@ -410,7 +410,9 @@ process.stdout.write('{}');`,
     assert.ok(note);
     assert.equal(note.meta?.status, resolution);
     if (resolution === 'approved') {
-      assert.equal((current._meta?.pull as { ok?: boolean } | undefined)?.ok, false);
+      assert.equal(current._meta?.pull?.status, 'awaiting_approval');
+      assert.notEqual(current._meta?.pull?.approvalId, approvalId);
+      assert.equal(approvalRegistry.get(current._meta!.pull!.approvalId!)?.tool, 'workspace_source_script_consent');
       assert.equal(approvalRegistry.get(approvalId)?.consumedAt !== null, true);
       assert.match(note.text, /refresh.*resum/i);
       const outcome = eventlog.listEvents(`space-${slug}`, {
@@ -422,7 +424,7 @@ process.stdout.write('{}');`,
         && event.data.sourceId === `${approvalId}:${source.id}`
       ));
       assert.ok(outcome, 'Workspace refresh reports through the unified async Outcome edge');
-      assert.equal(outcome.data.status, 'failed');
+      assert.equal(outcome.data.status, 'needs_input');
       assert.match(String(outcome.data.text ?? ''), /could not refresh|activity log/i);
       assert.equal(
         eventlog.listEvents(`space-${slug}`, { types: ['conversation_completed'] })
@@ -483,9 +485,10 @@ test('contained approved refresh reports a safe async Outcome without entering r
   }
 
   assert.ok(outcome);
-  assert.equal(outcome.data.status, 'failed');
-  assert.match(String(outcome.data.text ?? ''), /activity log for technical details/i);
-  assert.match(String(outcome.data.text ?? ''), /needs a supported executor/i);
+  assert.equal(outcome.data.status, 'needs_input');
+  assert.match(String(outcome.data.text ?? ''), /Review the saved-source permission/i);
+  assert.match(String(outcome.data.text ?? ''), /Review the saved-source permission/i);
+  assert.match(String(outcome.data.text ?? ''), /historical trust decision does not authorize/i);
   assert.doesNotMatch(String(outcome.data.text ?? ''), /then (?:try again|retry)/i);
   assert.doesNotMatch(String(outcome.data.text ?? ''), /provider-secret-diagnostic/);
   assert.equal(
@@ -650,13 +653,13 @@ test('concurrent same-space local refreshes both remain contained without projec
 
     assert.equal(alpha[0].ok, false);
     assert.equal(beta[0].ok, false);
-    assert.match(alpha[0].error ?? '', /no shared durable call authority/i);
-    assert.match(beta[0].error ?? '', /no shared durable call authority/i);
+    assert.match(alpha[0].error ?? '', /Review approval .*Nothing has executed/i);
+    assert.match(beta[0].error ?? '', /Review approval .*Nothing has executed/i);
     const data = dataStore.readData(slug) as Record<string, unknown>;
     assert.equal(Object.hasOwn(data, 'alpha'), false);
     assert.equal(Object.hasOwn(data, 'beta'), false);
-    assert.equal((data._meta as Record<string, { ok?: boolean }>).alpha.ok, false);
-    assert.equal((data._meta as Record<string, { ok?: boolean }>).beta.ok, false);
+    assert.equal((data._meta as Record<string, { status?: string }>).alpha.status, 'awaiting_approval');
+    assert.equal((data._meta as Record<string, { status?: string }>).beta.status, 'awaiting_approval');
   } finally {
     runner._resetSpaceRefreshQueuesForTest();
   }
@@ -664,8 +667,8 @@ test('concurrent same-space local refreshes both remain contained without projec
 
 test('contained sibling sources persist bounded error observations and retry without duplicates', async () => {
   const slug = 'refresh-partial-batch';
-  const smallSource = { id: 'small', runner: 'small.mjs' };
-  const oversizedSource = { id: 'oversized', runner: 'oversized.mjs' };
+  const smallSource = { id: 'small', runner: 'small.mjs', schedule: '* * * * *' };
+  const oversizedSource = { id: 'oversized', runner: 'oversized.mjs', schedule: '* * * * *' };
   store.spaceStore.save({
     id: slug,
     title: 'Refresh Partial Batch',
@@ -685,10 +688,10 @@ test('contained sibling sources persist bounded error observations and retry wit
       assert.equal(results.length, 2);
       assert.equal(results[0]?.sourceId, 'small');
       assert.equal(results[0]?.ok, false);
-      assert.match(results[0]?.error ?? '', /no shared durable call authority/i);
+      assert.match(results[0]?.error ?? '', /Review approval .*Nothing has executed/i);
       assert.equal(results[1]?.sourceId, 'oversized');
       assert.equal(results[1]?.ok, false);
-      assert.match(results[1]?.error ?? '', /no shared durable call authority/i);
+      assert.match(results[1]?.error ?? '', /Review approval .*Nothing has executed/i);
       assert.equal(
         results.every((result) => result.write?.ok === true),
         true,
@@ -700,12 +703,12 @@ test('contained sibling sources persist bounded error observations and retry wit
     assert.equal(Object.hasOwn(data, 'small'), false);
     assert.equal(Object.hasOwn(data, 'oversized'), false);
     assert.equal(
-      (data._meta as Record<string, { ok?: boolean | null }>).small.ok,
-      false,
+      (data._meta as Record<string, { status?: string }>).small.status,
+      'awaiting_approval',
     );
     assert.equal(
-      (data._meta as Record<string, { ok?: boolean | null }>).oversized.ok,
-      false,
+      (data._meta as Record<string, { status?: string }>).oversized.status,
+      'awaiting_approval',
     );
     assert.equal(
       workspaceDb.listWorkspaceDatasetObservations(slug, {
@@ -720,7 +723,7 @@ test('contained sibling sources persist bounded error observations and retry wit
       limit: 10,
     });
     assert.equal(oversized.length, 1, 'contained sibling retry reuses its error observation');
-    assert.equal(oversized[0]?.status, 'error');
+    assert.equal(oversized[0]?.status, 'awaiting_approval');
   } finally {
     runner._resetSpaceRefreshQueuesForTest();
   }
@@ -749,7 +752,7 @@ test('contained refresh preserves a 2.7.5 baseline and dedupes its error observa
       batchId: 'manual-batch-1',
     });
     assert.equal(first[0]?.ok, false);
-    assert.match(first[0]?.error ?? '', /no shared durable call authority/i);
+    assert.match(first[0]?.error ?? '', /Review approval .*Nothing has executed/i);
     assert.match(first[0]?.observationId ?? '', /^[a-f0-9-]{36}$/i);
 
     const afterFirst = workspaceDb.listWorkspaceDatasetObservations(slug, {
@@ -758,7 +761,7 @@ test('contained refresh preserves a 2.7.5 baseline and dedupes its error observa
     });
     assert.equal(afterFirst.length, 2);
     assert.equal(afterFirst[0]?.cause, 'manual');
-    assert.equal(afterFirst[0]?.status, 'error');
+    assert.equal(afterFirst[0]?.status, 'awaiting_approval');
     assert.equal(afterFirst[1]?.cause, 'legacy_import');
     assert.equal(afterFirst[0]?.previousObservationId, afterFirst[1]?.id);
     assert.deepEqual(
@@ -785,8 +788,8 @@ test('contained refresh preserves a 2.7.5 baseline and dedupes its error observa
         sourceKey: 'campaigns',
         limit: 10,
       }).length,
-      3,
-      'same refresh identity reuses its observation after restart/retry',
+      2,
+      'all clicks awaiting one scope approval reuse its observation after restart/retry',
     );
   } finally {
     runner._resetSpaceRefreshQueuesForTest();
@@ -808,7 +811,7 @@ test('refreshSpaceData does not advance lastRefreshedAt when every source fails'
   assert.equal(res[0].ok, false);
   assert.equal(store.spaceStore.get(slug)?.lastRefreshedAt, oldSuccess);
   const data = dataStore.readData(slug) as Record<string, unknown>;
-  assert.equal(((data._meta as Record<string, { ok?: boolean }>).bad).ok, false);
+  assert.equal(((data._meta as Record<string, { status?: string }>).bad).status, 'awaiting_approval');
   runner._resetSpaceRefreshQueuesForTest();
 });
 

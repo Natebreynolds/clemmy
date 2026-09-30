@@ -106,6 +106,7 @@ import { processGoalResumptions } from '../execution/goal-resume.js';
 import { processOrphanedToolReports } from '../execution/orphan-tool-reports.js';
 import { processSpaceSchedules, retryPausedSpaces } from '../spaces/scheduler.js';
 import { recoverResolvedRunnerTrustApprovals } from '../spaces/space-data-runner-trust.js';
+import { recoverSavedScriptRefreshes } from '../spaces/workspace-script-refresh.js';
 import { maybeOfferStarterWorkspace } from '../spaces/starter-recipes.js';
 import { initializeWorkspaceTemporalStorage } from '../spaces/workspace-temporal-init.js';
 import { listUsableConnectedToolkits } from '../integrations/composio/client.js';
@@ -2447,6 +2448,9 @@ export async function startDaemon(
   // callback can never race schema migration or bypass foreground ownership.
   try {
     const recoveredRunnerTrustApprovals = recoverResolvedRunnerTrustApprovals();
+    void recoverSavedScriptRefreshes().catch(err => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Saved script refresh boot recovery failed');
+    });
     if (recoveredRunnerTrustApprovals > 0) {
       logger.info(
         { recoveredRunnerTrustApprovals },

@@ -1,3 +1,4 @@
+import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
 import { activateConnectionExecution } from '../runtime/harness/connection-execution-activation.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
@@ -3597,7 +3598,8 @@ function tryCommitLiveApprovalControl(input: {
       const selection = selectAddressedApproval(actionable, intent.approvalId);
       if (selection.kind === 'none') return null;
       const row = selection.kind === 'selected' ? selection.row : null;
-      const standalone = row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+      const standalone = row?.tool === SAVED_SOURCE_SCRIPT_CONSENT_TOOL
+        || row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
         || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL || row?.tool === SPACE_ACTION_APPROVAL_TOOL;
       if (row && !standalone) {
         const linked = pendingActionApprovalViewFromArgs(row.args);
@@ -3627,11 +3629,11 @@ function tryCommitLiveApprovalControl(input: {
             const result = resolveDecision(selection.row.approvalId,
               intent.decision === 'approve' ? 'approved' : 'rejected', 'chat-dock-user');
             const approvedRunner = result.ok && intent.decision === 'approve'
-              && (row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
+              && (row?.tool === SAVED_SOURCE_SCRIPT_CONSENT_TOOL || row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
             text = !result.ok
               ? 'That approval was no longer pending. Nothing else was approved or rejected.'
               : approvedRunner
-                ? `Approved ${row!.approvalId}. Refreshing the blocked Workspace data source now; I’ll report its real outcome here.`
+                ? `Approved ${row!.approvalId}. The Workspace refresh will resume through its saved execution; its result will report whether the data was saved.`
                 : `${intent.decision === 'approve' ? 'Approved' : 'Rejected'} ${row!.approvalId} — continuing.`;
             if (standalone) reason = approvedRunner ? 'workspace_runner_approval_refresh_started' : 'workspace_approval_resolved';
           }
@@ -17127,7 +17129,8 @@ export function registerConsoleRoutes(
       desc: true,
       limit: 80,
     }).some((event) => event.data.approvalId === acceptedApprovalRow.approvalId);
-    const acceptedApprovalIsStandaloneWorkspace = acceptedApprovalRow?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+    const acceptedApprovalIsStandaloneWorkspace = acceptedApprovalRow?.tool === SAVED_SOURCE_SCRIPT_CONSENT_TOOL
+      || acceptedApprovalRow?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
       || acceptedApprovalRow?.tool === SPACE_CLI_SOURCE_TRUST_TOOL
       || acceptedApprovalRow?.tool === SPACE_ACTION_APPROVAL_TOOL;
     const acceptedApprovalHasLinkedPendingAction = (() => {
@@ -17925,7 +17928,8 @@ export function registerConsoleRoutes(
             }).some((event) => event.data.approvalId === row.approvalId)
             || (!!linkedPendingAction?.id && linkedPendingAction.approvalId === row.approvalId)
           );
-          const standaloneWorkspaceApproval = row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
+          const standaloneWorkspaceApproval = row?.tool === SAVED_SOURCE_SCRIPT_CONSENT_TOOL
+            || row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL
             || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL
             || row?.tool === SPACE_ACTION_APPROVAL_TOOL;
           const resolved = !!row
@@ -17935,11 +17939,11 @@ export function registerConsoleRoutes(
           if (standaloneWorkspaceApproval) {
             const approvedRunner = resolved
               && resolution === 'approved'
-              && (row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
+              && (row?.tool === SAVED_SOURCE_SCRIPT_CONSENT_TOOL || row?.tool === SPACE_DATA_RUNNER_TRUST_TOOL || row?.tool === SPACE_CLI_SOURCE_TRUST_TOOL);
             const reply = !resolved
               ? 'That approval was no longer pending. Nothing else was approved or rejected.'
               : approvedRunner
-                ? `Approved ${addressedApprovalId}. Refreshing the blocked Workspace data source now; I’ll report its real outcome here.`
+                ? `Approved ${addressedApprovalId}. The Workspace refresh will resume through its saved execution; its result will report whether the data was saved.`
                 : resolution === 'approved'
                   ? `Approved ${addressedApprovalId}. The exact Workspace action is now authorized and its runtime is executing it.`
                   : `Rejected ${addressedApprovalId}. The Workspace runner or action remains blocked and was not executed.`;

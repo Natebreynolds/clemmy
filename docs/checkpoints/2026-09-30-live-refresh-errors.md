@@ -729,3 +729,101 @@ The uncommitted model-ledger draft on `connection-continuity` still calls its
 separate migration 85. It remains excluded. If resumed, renumber it after the
 accepted 85/86 chain and test the combined upgrade; do not overwrite either
 committed source-ownership migration.
+
+## Production refresh, scope approval and restart callers connected
+
+This follow-on connects `refreshSpaceData` to `workspace-script-refresh.ts`.
+Manual refresh, scheduled refresh and creation smoke now reach the saved-script
+occurrence owner. The retired `runScript` / unowned single-source APIs remain
+zero-body. A supported saved source first receives one explicit recurring
+scope card; approving it resumes the retained occurrence through the existing
+Space queue, v3 kernel, process carrier and dataset transaction. Later matching
+manual/scheduled occurrences reuse the grant without fabricating more cards.
+
+Success already contains a committed observation. The outer refresh skips its
+ordinary transform/write/finalizer for that result, preserving mixed-batch
+alignment and avoiding duplicate publication. Replayed results retain their
+observation ID, change state and saved-byte receipt. An unfinished occurrence
+wins over a newer tick. A caller's stable refresh ID cannot change its cause.
+Automatic `retry` can recover an existing/addressed occurrence; it cannot
+invent a new manual run after the old one completed or before an owner exists.
+
+Approval listeners register without reading the database. Daemon boot starts
+recovery after the existing event-log migration/ownership fence. Desktop
+approval control recognizes the scope tool as standalone work and completes
+the exact control turn without launching another brain or competing executor.
+The existing async Outcome surface reports the actual data-save result. Mobile
+uses the shared approval registry; physical-device acceptance is still owed.
+
+The caller preserves rejected/revoked decisions and reuses pending cards.
+Exact obsolete pending legacy cards are retired before the executable scope
+card appears; historical approval never becomes new execution authority.
+Saved grants remain usable after approval registry retention. Unsupported
+scheduled requests without a saved schedule do not get a futile card.
+
+Failures of the supported carrier now use `script_held`, distinct from the
+retired raw `local_runner` path. Scheduler notices no longer say that all
+scripts are prohibited when a saved script is actually held. Legacy approval
+handoffs awaiting the new scope report `needs_input`, not a failed execution,
+and do not create an extra failed-refresh operational notice.
+
+Verification and attribution:
+
+- Initial caller/routing set: `/tmp/clem-script-refresh-tests.txt`, **83/83**.
+- Expanded parallel set: `/tmp/clem-script-refresh-qualification.txt`,
+  **264/277 passed**. Ten assertions still pinned permanent script unavailability;
+  they were updated to assert pending consent rather than failed execution,
+  retaining no-process-before-consent, baseline preservation, deduplication and
+  last-success timestamp checks. Backoff tests now approve a real script that
+  exits unsuccessfully, then prove one physical execution across later ticks,
+  grouped notices and notification recovery. These were not skipped.
+- That parallel run also failed `desktop qualified approval steers the live
+  owner without authorizing its pending call` with `SQLITE_IOERR_SHMOPEN`,
+  `production process restart recovers after_observation without duplicating
+  execution` with `SQLITE_FULL`, and `mixed refresh batches keep result
+  alignment and do not publish a script result twice` with a 10-second
+  Workspace file-lock timeout. Disk availability after the run was 9.3 GiB
+  (98% data-volume usage). Do not call these pre-existing or claim that the
+  parallel run qualified the candidate; no HEAD/tag attribution was performed.
+- All six affected suites rerun serially:
+  `/tmp/clem-script-refresh-serial.txt`, **84/84**, including the three named
+  failures above. The storage/lock failures did not recur on that run.
+- After adding the retry-ownership fence, final affected refresh, runner,
+  scheduler, backoff, creation-smoke and daemon-boot checks:
+  `/tmp/clem-script-refresh-final.txt`, **86/86**. Counts overlap; do not add
+  them into a fictional number of distinct tests.
+- The new public-caller suite includes two production-transport fixtures,
+  each across three fresh processes: approval persisted while offline and a
+  SQLite publication-gap fault after the script completed. Recovery preserves
+  one process crossing, one observation, one completion report and one card;
+  a further restart adds none. No test transport or model provider is used.
+- `/tmp/clem-script-refresh-red.txt`: removing the prior-decision fence makes
+  the decline test fail because a replacement approval is offered. Original
+  source bytes were restored and hash-verified before subsequent checks.
+- `/tmp/clem-script-refresh-typecheck.txt`: TypeScript passed.
+  `/tmp/clem-script-refresh-artifacts-verified.txt`: component artifacts are
+  source-current. This is not an application build.
+- The live-home isolation sentinel is **NOT PERFORMED** while daemon 72427
+  writes that home. These disposable fixtures are not installed acceptance.
+  No model calls, external sends, personal source changes, credential edits,
+  application install/restart, main update, push or tag occurred.
+
+Still owed before the combined hotpatch and tag qualification:
+
+1. Finish owner-visible source controls for revocation, explicitly reconsidering
+   a denial, changed-but-unstarted sources, and resolving uncertain effects.
+   Never clear a held occurrence automatically just to get the next tick green.
+   Reconsideration must address the exact state, preserve old receipts and
+   preserve no-replay; it is not permission to execute another run by itself.
+2. Complete/review card presentation and report-back recovery, including the
+   gap after publication is marked complete but before its report is delivered.
+   A source success in the ledger must remain distinct from delivery success.
+   Check the readable controls on both desktop and mobile.
+3. Recheck combined ownership, run remaining release gates on a suitably idle
+   machine with sufficient storage, build once from the final reviewed source,
+   then coordinate the Terminal/signing hotpatch. Verify actual served identity
+   and migration to schema 86 before controlled installed-app/live-home tests.
+4. Run the agreed workflow author/update/enable/execute, approval/correction,
+   restart/cancel/no-replay, model/tool routing and long-task checks, followed
+   by matched total-token and wall-time measurements. No live improvement or
+   release readiness is established by this source slice.

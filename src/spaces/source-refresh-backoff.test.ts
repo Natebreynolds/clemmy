@@ -32,7 +32,7 @@ const notifications = await import('../runtime/notifications.js');
 const intent = await import('../runtime/notification-intent.js');
 const store = await import('./store.js');
 const runner = await import('./runner.js');
-const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
+const recovery = await import('./workspace-script-refresh.js');
 const sched = await import('./scheduler.js');
 const backoff = await import('./source-refresh-backoff.js');
 const workspaceDb = await import('./workspace-db.js');
@@ -145,13 +145,12 @@ function installSwitchableRead(operationId: string): {
 async function approveLocalRunner(slug: string, source: Parameters<typeof runner.runSpaceDataSource>[1]): Promise<void> {
   const dir = store.resolveInSpace(slug, 'data');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, source.runner!), 'process.stdout.write("{}");', 'utf-8');
-  const card = seedLegacySpaceTrustApproval(slug, source);
-  eventlog.openEventLog().prepare(`
-    UPDATE pending_approvals
-       SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
-     WHERE approval_id = ? AND status = 'pending'
-  `).run('backoff-fixture', new Date().toISOString(), card.approvalId);
+  writeFileSync(path.join(dir, source.runner!), `import { appendFileSync } from 'node:fs'; appendFileSync('${source.id}-crossings.txt', 'x'); process.exit(7);`, 'utf-8');
+  const result = await runner.refreshSpaceData(slug, source.id);
+  assert.ok(result[0].pendingApprovalId, JSON.stringify(result));
+  approvals.resolve(result[0].pendingApprovalId, 'approved', 'backoff-fixture');
+  await recovery.recoverSavedScriptRefreshes();
+  assert.equal(readFileSync(path.join(dir, `${source.id}-crossings.txt`), 'utf8'), 'x');
 }
 
 function noticesFor(slug: string): ReturnType<typeof notifications.loadNotifications> {
@@ -278,10 +277,10 @@ test('a local-script source that fails the same way every hour tells once, then 
     assert.equal(extra.length, 0);
     assert.match(notice.title, /"pipeline" in FRAMEWORK-TEST Pipeline Board isn't refreshing/);
     assert.match(notice.body, /failed its last 3 scheduled refreshes the same way/);
-    assert.match(notice.body, /Why: It runs a local script \(refresh\.mjs\)/);
-    assert.match(notice.body, /What would fix it: Ask Clem to rebuild this source/);
+    assert.match(notice.body, /Why: The saved script refresh \(refresh\.mjs\) is held/);
+    assert.match(notice.body, /What would fix it: Review this source’s saved refresh/);
     assert.doesNotMatch(notice.body, /shared durable call authority|kernel/i, 'plain words, not the engine refusal');
-    assert.equal(notice.metadata?.failureCode, 'local_runner');
+    assert.equal(notice.metadata?.failureCode, 'script_held');
     assert.equal(notice.silent, undefined, 'the notice is delivered like any finished report');
     assert.equal(intent.classifyNotification(notice), 'finished', 'told once, never a badge');
     assert.equal(intent.isAwaitingUser(notice), false);
@@ -301,11 +300,12 @@ test('a local-script source that fails the same way every hour tells once, then 
     const ninth = await sched.processSpaceSchedules(hour(base, 8));
     assert.equal(ninth.errors, 1);
     assert.equal(noticesFor(slug).length, 1, 'the same failure is never told twice');
+    assert.equal(readFileSync(store.resolveInSpace(slug, 'data/pipeline-crossings.txt'), 'utf8'), 'x', 'uncertain script effects are never replayed');
     assert.equal(
       workspaceDb.listWorkspaceDatasetObservations(slug, { sourceKey: 'pipeline', limit: 500 })
         .filter((row) => row.cause === 'scheduled').length,
       5,
-      'nine scheduled hours cost five refreshes',
+      'nine scheduled hours cost five retained-result checks',
     );
   } finally {
     store.spaceStore.archive(slug);
@@ -433,20 +433,20 @@ test('the failing-source notice routes exactly like a workflow outcome', async (
   });
 });
 
-function saveFailingSources(slug: string, ids: string[]) {
+async function saveFailingSources(slug: string, ids: string[]) {
   const sources = ids.map(id => ({ id, runner: `${id}.mjs`, schedule: '0 * * * *' }));
   store.spaceStore.save({ id: slug, title: `FRAMEWORK-TEST ${slug}`, dataSources: sources });
   const dir = store.resolveInSpace(slug, 'data');
   mkdirSync(dir, { recursive: true });
-  for (const source of sources) writeFileSync(path.join(dir, source.runner), 'process.stdout.write("{}");');
+  for (const source of sources) await approveLocalRunner(slug, source);
   return sources;
 }
 
 test('simultaneous failures form one report per Space, preserve every source, and concurrent ticks do not repeat it', async () => {
   const a = 'framework-group-a';
   const b = 'framework-group-b';
-  const first = saveFailingSources(a, ['pipeline', 'transcripts']);
-  saveFailingSources(b, ['contacts']);
+  const first = await saveFailingSources(a, ['pipeline', 'transcripts']);
+  await saveFailingSources(b, ['contacts']);
   const base = '2026-06-23T08:00:00.000Z';
   try {
     await sched.processSpaceSchedules(hour(base, 0));
@@ -467,8 +467,9 @@ test('simultaneous failures form one report per Space, preserve every source, an
     assert.equal((group.body?.match(/What would fix it:/g) ?? []).length, 2);
     assert.equal(noticesFor(b).length, 1, 'unrelated Spaces remain independently actionable');
     for (const source of first) {
-      assert.deepEqual(persistedStreak(`${a}:${source.id}`)?.told, ['local_runner']);
-      assert.equal(observationCount(a, source.id), 3);
+      assert.deepEqual(persistedStreak(`${a}:${source.id}`)?.told, ['script_held']);
+      assert.equal(workspaceDb.listWorkspaceDatasetObservations(a, { sourceKey: source.id, limit: 50 }).filter(row => row.cause === 'scheduled').length, 3);
+      assert.equal(readFileSync(store.resolveInSpace(a, `data/${source.id}-crossings.txt`), 'utf8'), 'x');
     }
     const next = await sched.processSpaceSchedules(hour(base, 3));
     assert.equal(next.heldBack, 3, 'grouping does not change per-source backoff');
@@ -484,7 +485,7 @@ test('simultaneous failures form one report per Space, preserve every source, an
 
 test('a partial notification write retains a durable group and retries it without rerunning held sources', async () => {
   const slug = 'framework-group-delivery-recovery';
-  const sources = saveFailingSources(slug, ['rows', 'activity']);
+  const sources = await saveFailingSources(slug, ['rows', 'activity']);
   const base = '2026-06-24T08:00:00.000Z';
   try {
     await sched.processSpaceSchedules(hour(base, 0));
