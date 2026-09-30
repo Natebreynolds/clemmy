@@ -105,3 +105,20 @@ test('page_preview says so when no browser can render', async () => {
     process.env.CLEMMY_PREVIEW_BROWSER = browser;
   }
 });
+
+test('reading a page\'s source says where its picture is, and reading anything else does not', async () => {
+  const { executeLocalFileRead, PAGE_SOURCE_NOTE } = await import('./computer-tools.js');
+  const page = path.join(dir, 'brief', 'index.html');
+  const notes = path.join(dir, 'notes.txt');
+  writeFileSync(page, '<!doctype html><title>t</title>', 'utf8');
+  writeFileSync(notes, 'plain', 'utf8');
+  const read = String(await executeLocalFileRead({ path: page, max_chars: null } as never, undefined, undefined));
+  assert.ok(read.includes(PAGE_SOURCE_NOTE), read.slice(0, 160));
+  assert.match(read, /<!doctype html>/);
+  assert.match(PAGE_SOURCE_NOTE, /page_preview/);
+  // A workflow that consumes the bytes as data is handed the file and nothing else.
+  const data = String(await executeLocalFileRead({ path: page, max_chars: null } as never, undefined, undefined, { completeOutput: true }));
+  assert.equal(data, '<!doctype html><title>t</title>');
+  const plain = String(await executeLocalFileRead({ path: notes, max_chars: null } as never, undefined, undefined, { completeOutput: true }));
+  assert.equal(plain, 'plain');
+});

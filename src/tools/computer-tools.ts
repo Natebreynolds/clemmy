@@ -1443,14 +1443,22 @@ export async function executeLocalFileRead(
       input.max_chars ?? undefined,
     );
   }
+  const text = readFileSync(filePath, 'utf-8');
   return formatToolOutput(
     'read_file',
     runContext,
     details,
-    readFileSync(filePath, 'utf-8'),
+    // A page read here is its source. Asked to look at a rendered page, a turn
+    // read the source and answered from it (live 2026-09-29); the result says
+    // where the picture is, only when a page was read, and never to a workflow
+    // that consumes the bytes as data.
+    isHtmlSource && !options?.completeOutput ? `${PAGE_SOURCE_NOTE}\n\n${text}` : text,
     input.max_chars ?? undefined,
   );
 }
+
+/** Said at the top of an .html file's source. */
+export const PAGE_SOURCE_NOTE = '[This is the page\'s source. To see how it LOOKS, as a browser shows it, use page_preview.]';
 
 /** The SDK surface carries nominal completion alongside its unchanged text.
  * Workflow callers still consume executeLocalFileRead's complete raw output. */
@@ -1502,7 +1510,6 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
     name: 'read_file',
     description: [
       'Read a file from an allowed workspace path.',
-      'An .html file read here is its source. To see how a page LOOKS, as a browser shows it, use page_preview instead.',
       'The complete content is retained for recall_tool_result and tool_output_query. max_chars controls only the visible preview, never how much of the file is retained; null uses the normal result preview.',
       'UTF-8 text is returned as-is; PDF, Office and EPub documents, images (OCR) and audio (transcript) are extracted to Markdown.',
     ].join('\n'),
