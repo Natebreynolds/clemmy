@@ -15,6 +15,7 @@ import { boundAgentRebuildContext, type AgentRebuildContext } from '../../agents
 import { boundAgentMcpToolScope } from '../mcp-tool-authority.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import { sealAdmissionEnvelope, type AdmissionEnvelope, type CapabilityBindingRevision } from '../graph/admission-envelope.js';
+import { boundAgentSourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 
 /** Same construction records retained at workflow handoff. Historical tool
  * definitions and scope are context for rebuilding, never current authority. */
@@ -24,6 +25,7 @@ export interface ConnectionAgentCheckpoint {
   rebuildContext: AgentRebuildContext;
   mcpToolScope: McpToolScope | null;
   modelId?: string;
+  sessionContext?: SourceSessionContextRef;
 }
 
 export interface SourceConnectionCheckpoint {
@@ -58,11 +60,13 @@ function captureAgent(agent: object | undefined, sessionId: string): ConnectionA
   if (envelope.attemptId !== sessionId) throw new Error('The connection agent belongs to another session.');
   const bindingRevision = boundAgentCapabilityRevision(agent);
   const model = (agent as { model?: unknown }).model;
+  const sessionContext = boundAgentSourceSessionContext(agent);
   // Never serialize an SDK agent, provider object, authentication or tool
   // closures. An opaque custom model cannot supply a replayable model id.
   return JSON.parse(JSON.stringify({ envelope, rebuildContext, mcpToolScope: mcp.scope,
     ...(bindingRevision ? { bindingRevision } : {}),
     ...(typeof model === 'string' && model.trim() ? { modelId: model } : {}),
+    ...(sessionContext ? { sessionContext } : {}),
   })) as ConnectionAgentCheckpoint;
 }
 
@@ -159,6 +163,10 @@ export function captureSourceConnectionCheckpoint(input: { sessionId: string; re
     if (restart.status !== 'ready') return { status: 'unavailable', reason: restart.status };
     const agent = captureAgent(input.agent, input.sessionId);
     if (agent) assertRetainedAgent(agent, input.sessionId);
+    if (agent?.sessionContext && (agent.sessionContext.sessionId !== input.sessionId
+      || agent.sessionContext.sourceUserSeq !== dependency.source_user_seq)) {
+      throw new Error('The paused agent belongs to another accepted task.');
+    }
     const checkpoint: SourceConnectionCheckpoint = {
       version: 1, sessionId: input.sessionId, requestId: input.requestId, sourceUserSeq: dependency.source_user_seq,
       dependencyDigest: digest(JSON.stringify(dependency)),

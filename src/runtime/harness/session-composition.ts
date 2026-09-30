@@ -25,6 +25,7 @@ import {
 import { resolveAgentBinding, type AgentBinding } from '../../agents/agent-binding.js';
 import { resolveProjectBinding, type ProjectBinding } from '../../projects/project-binding.js';
 import { sessionProjectState } from '../../projects/session-project-state.js';
+import { currentSourceSessionContext } from './source-session-context-scope.js';
 
 export const WORKSPACE_CONTEXT_PRIMER_PREFIX = '[workspace-context]';
 
@@ -276,6 +277,9 @@ export function sessionMountContext(mount: Pick<SessionMount, 'agent' | 'project
 export function sessionAgentFields(sessionId: string | null | undefined): { agentId?: string; agentName?: string } {
   if (!sessionId) return {};
   try {
+    const accepted = currentSourceSessionContext(sessionId);
+    if (accepted) return accepted.mount.agent
+      ? { agentId: accepted.mount.agent.agent.id, agentName: accepted.mount.agent.agent.name.slice(0, 64) } : {};
     const metadata = getSession(sessionId)?.metadata;
     const agentId = typeof metadata?.agentId === 'string' ? metadata.agentId.trim() : '';
     if (!agentId) return {};
@@ -295,8 +299,7 @@ export function sessionProjectFields(sessionId: string | null | undefined): {
 } {
   if (!sessionId) return {};
   try {
-    const row = getSession(sessionId);
-    const mount = composeSession({ sessionId, sessionKind: row?.kind, metadata: row?.metadata });
+    const mount = composeSessionFromStore(sessionId);
     if (!mount.project) return {};
     return {
       projectId: mount.project.project.id,
@@ -313,6 +316,8 @@ export function composeSessionFromStore(
   sessionId: string,
   extra?: { toolAllowlist?: readonly string[] | null },
 ): SessionMount {
+  const accepted = currentSourceSessionContext(sessionId);
+  if (accepted) return { ...accepted.mount, toolAllowlist: freezeNames(extra?.toolAllowlist) };
   let sessionKind: SessionKind | undefined;
   let metadata: Record<string, unknown> | undefined;
   try {
@@ -342,10 +347,11 @@ const AGENT_REVIEW_MAX_CHARS = 6_000;
 export function sessionAgentReviewContext(sessionId: string | null | undefined): string {
   if (!sessionId) return '';
   try {
+    const accepted = currentSourceSessionContext(sessionId);
     const metadata = getSession(sessionId)?.metadata;
     const agentId = metadata?.agentId;
-    const binding = typeof agentId === 'string' ? resolveAgentBinding(agentId) : null;
-    const project = projectReviewContext(metadata, binding?.agent.id ?? null);
+    const binding = accepted ? accepted.mount.agent : typeof agentId === 'string' ? resolveAgentBinding(agentId) : null;
+    const project = accepted ? renderProjectReviewContext(accepted.mount.project) : projectReviewContext(metadata, binding?.agent.id ?? null);
     if (!binding) return project;
     const { agent } = binding;
     const instructions = agent.instructions.length > AGENT_REVIEW_MAX_CHARS
@@ -366,7 +372,10 @@ export function sessionAgentReviewContext(sessionId: string | null | undefined):
 /** What a reviewer needs to judge work done inside a project: what the
  * project is for, and the part the answering agent has in it. */
 function projectReviewContext(metadata: Record<string, unknown> | null | undefined, agentId: string | null): string {
-  const project = projectFromMetadata(metadata, agentId);
+  return renderProjectReviewContext(projectFromMetadata(metadata, agentId));
+}
+
+function renderProjectReviewContext(project: ProjectBinding | null): string {
   if (!project) return '';
   const context = project.context.length > AGENT_REVIEW_MAX_CHARS
     ? `${project.context.slice(0, AGENT_REVIEW_MAX_CHARS)}\n[project context cut here for length]`

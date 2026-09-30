@@ -1,7 +1,8 @@
 /** Rebuild and check the retained model, tool surface and execution route.
  * This is an unwired prerequisite, not a complete execution restore. Durable
- * agent/project/memory identity, connection activation, leases, cancellation,
- * delivery ownership and per-call consent remain separate requirements. */
+ * connection activation, leases, cancellation, delivery ownership and per-call
+ * consent remain separate requirements. Original agent/project/memory identity
+ * is revalidated here before any retrieval or construction. */
 import { isDeepStrictEqual } from 'node:util';
 import type { Agent } from '@openai/agents';
 import type { BuildOrchestratorAgentOptions } from '../../agents/orchestrator.js';
@@ -11,6 +12,8 @@ import { boundAgentMcpToolScope } from '../mcp-tool-authority.js';
 import { mcpToolScopeAuthority } from '../mcp-tool-scope.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { readSourceConnectionCheckpoint } from './source-connection-checkpoints.js';
+import { readSourceSessionContext } from './source-session-context.js';
+import { withSourceSessionContext, boundAgentSourceSessionContext } from './source-session-context-scope.js';
 import type { primePrimaryModelPlanningCatalog } from '../semantic-boundary/admit-and-compile-accepted-source.js';
 import type { revalidateReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 
@@ -32,6 +35,13 @@ export async function rebuildSourceConnectionAgent(
     throw new Error('The paused execution has no retained tool context and replayable model identity.');
   }
   const context = checkpoint.agent;
+  const ref = context.sessionContext;
+  if (!ref || ref.sessionId !== input.sessionId || ref.sourceUserSeq !== checkpoint.sourceUserSeq) {
+    throw new Error('The paused execution has no retained task composition identity.');
+  }
+  const sessionContext = readSourceSessionContext(ref, ref.digest);
+  if (!sessionContext) throw new Error('The original task composition could not be restored.');
+  return withSourceSessionContext(sessionContext, async () => {
   const userInput = acceptedPlanExecutionText(input.sessionId, checkpoint.sourceUserSeq);
   if (!userInput) throw new Error('The paused execution has no original reviewed request.');
   const runtime = ports ?? {
@@ -74,5 +84,9 @@ export async function rebuildSourceConnectionAgent(
   if (!rebuiltContext || !isDeepStrictEqual(rebuiltContext, context.rebuildContext)) {
     throw new Error('The rebuilt execution changed its retained construction context or accepted route.');
   }
+  if (!isDeepStrictEqual(boundAgentSourceSessionContext(agent), ref)) {
+    throw new Error('The rebuilt agent did not preserve its original task composition.');
+  }
   return agent;
+  });
 }

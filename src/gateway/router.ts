@@ -1,3 +1,4 @@
+import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
 import { connectionContinuationAudience, connectionContinuationTaskMode, withConnectionContinuationAdmission, type ConnectionSetupContext, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { parseTaskMode, taskModeDigest, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
 import { withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
@@ -420,6 +421,12 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
         source: `gateway:${request.source ?? 'gateway'}`,
       },
     }, { armRunInFlight: true });
+    try {
+      captureFreshSourceSessionContext({ sessionId: source.sessionId, sourceUserSeq: source.seq });
+    } catch (error) {
+      settleGatewayAttempt(attempt, 'failed');
+      throw error;
+    }
     return { source, attempt, replayedSource: false };
   };
   return request.reviewedPlanOwnerControl

@@ -1,7 +1,7 @@
 /** Atomic direct-bridge admission, including callers without a chat run ID. */
 import { createHash } from 'node:crypto';
 import { resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
-import { beginRunAttempt, getSession, listEvents, openEventLog, recordRunAttemptUserInput } from './eventlog.js';
+import { beginRunAttempt, getSession, getRunAttemptSourceUserEvent, listEvents, openEventLog, recordRunAttemptUserInput } from './eventlog.js';
 import { claimPlanExecution, getLatestPlanRevision, getPlanExecutionClaim, getPlanRevision, PlanArtifactError } from './plan-artifacts.js';
 import { parseTaskMode, taskModeDigest, type TaskMode } from './task-mode.js';
 
@@ -43,12 +43,13 @@ export function admitPlanExecutionBridgeSource(input: {
     const derivedRunId = `run-plan-source-${createHash('sha256').update(JSON.stringify({ version: 1, sessionId: session.id, sourceUserSeq: input.sourceUserSeq ?? null, ref: scope.ref })).digest('hex').slice(0, 40)}`;
     const runId = prior?.executionRunId ?? input.runId ?? derivedRunId;
     const attempt = beginRunAttempt(session.id, { runId });
+    const newlyAccepted = input.sourceUserSeq === undefined && getRunAttemptSourceUserEvent(attempt) === null;
     const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
       text: input.displayText, taskMode: input.mode, runId, attemptId: attempt.attemptId,
       ...(input.modelDirectiveApplied ? { modelDirectiveApplied: true } : {}), source: `bridge:${input.surface}`,
     } }, { existingEventSeq: input.sourceUserSeq, armRunInFlight: true });
     const selected = claimPlanExecution({ ...scope, sourceUserSeq: source.seq, executeRef: scope.ref });
     if (selected.joinedExistingSource || selected.claim.executionRunId !== attempt.runId) throw new PlanArtifactError('conflict', 'Execute admission lost its exact source/run ownership.');
-    return { kind: 'accepted' as const, attempt, source, claim: selected.claim };
+    return { kind: 'accepted' as const, attempt, source, newlyAccepted, claim: selected.claim };
   }).immediate();
 }

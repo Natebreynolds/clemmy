@@ -1,3 +1,4 @@
+import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
@@ -404,6 +405,7 @@ import {
   getSession as getHarnessSession,
   interruptForeignRunAttemptLeases,
   recordRunAttemptUserInput,
+  getRunAttemptSourceUserEvent,
   renewRunAttemptLease,
   requestHarnessChatCancellation,
   requestKill as requestHarnessKill,
@@ -17308,6 +17310,7 @@ export function registerConsoleRoutes(
     let requestAcceptedUserEvent: HarnessEventRow | undefined;
     if (shouldSchedule && requestAttempt) {
       try {
+        const newlyAccepted = !acceptedApprovalId && getRunAttemptSourceUserEvent(requestAttempt) === null;
         const acceptedUserEvent = recordRunAttemptUserInput(requestAttempt, {
           turn: 1,
           role: 'user',
@@ -17331,6 +17334,7 @@ export function registerConsoleRoutes(
               : {}),
           },
         }, { armRunInFlight: !acceptedApprovalDefersMarkerOwnership });
+        if (newlyAccepted) captureFreshSourceSessionContext({ sessionId, sourceUserSeq: acceptedUserEvent.seq });
         requestAcceptedUserEvent = acceptedUserEvent;
         markPreparation('source_recorded');
       } catch (err) {

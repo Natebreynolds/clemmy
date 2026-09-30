@@ -34,6 +34,8 @@ const sessionStore = await import('./session.js');
 const agentEnvelopes = await import('../../agents/capability-envelope.js');
 const agentRebuild = await import('../../agents/agent-rebuild-context.js');
 const mcpAuthority = await import('../mcp-tool-authority.js');
+const sessionContext = await import('./source-session-context.js');
+const sessionContextScope = await import('./source-session-context-scope.js');
 const { rebuildSourceConnectionAgent } = await import('./connection-agent-rebuild.js');
 
 test.after(() => {
@@ -108,6 +110,8 @@ function connectionAgent(task: Fixture, mcpToolScope: import('../mcp-tool-scope.
   agentEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
   agentRebuild.bindAgentRebuildContext(agent, { excludeToolNames: ['run_shell_command'], allowToolJit: true, acceptedRoute });
   mcpAuthority.bindAgentMcpToolScope(agent, mcpToolScope);
+  sessionContextScope.withSourceSessionContext(sessionContext.captureFreshSourceSessionContext(task)!, () =>
+    sessionContextScope.bindAgentSourceSessionContext(agent, task.sessionId));
   return agent;
 }
 

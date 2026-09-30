@@ -1,3 +1,4 @@
+import { withAcceptedSourceSessionContext } from './source-session-context.js';
 import { parseTaskMode } from './task-mode.js';
 import { creditDelegatedExpectedWork, delegableExpectedWorkForItem, delegateExpectedWorkToChild, type DelegableExpectedWork } from './expected-work-delegation.js';
 import { discoveryGovernor } from './discovery-governor.js';
@@ -116,7 +117,7 @@ export async function runPacketWorkerWithHost(input: {
       role: input.input.intent, childSessionId: session.id, childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId } });
   let completed = false;
   try {
-    return await withHarnessRunContext({
+    return await withAcceptedSourceSessionContext({ sessionId: session.id, sourceUserSeq: childSource.seq }, () => withHarnessRunContext({
       // The child's own accepted turn: plan_task (a delegated child plans its
       // item itself) requires the exact turn in the run context.
       sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1, runAttemptId: attempt.attemptId,
@@ -237,7 +238,7 @@ export async function runPacketWorkerWithHost(input: {
       const text = normalizeWorkerOutput(outcome.finalOutput);
       completed = !/^\s*(?:ERROR|PARTIAL):/i.test(text);
       return text;
-    });
+    }), { newlyAccepted: true });
   } catch (error) {
     // A child failure is an item result, never an exception that can poison
     // the parent's still-open coordinator call or force checkpoint re-entry.

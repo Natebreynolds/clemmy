@@ -1370,23 +1370,49 @@ async function approvedCheckpointFixture(stopTarget?: 'control' | 'business') {
   const { runConversation, runConversationFromResume } = await import('./loop.js');
   const { HarnessSession } = await import('./session.js');
   const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+  const { captureFreshSourceSessionContext, readSourceSessionContext } = await import('./source-session-context.js');
+  if (!saved) captureFreshSourceSessionContext({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq });
+  else assert.ok(readSourceSessionContext({ sessionId: fixture.session.id, sourceUserSeq: saved.sourceUserSeq }));
   const agent = await fixture.useProductionAgent();
   if (saved) {
     const original = fixture.model.getResponse.bind(fixture.model);
     fixture.model.getResponse = async (request: any) => ({ ...await original(request),
       output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The approved action completed once.' }] }],
     });
-    const continueSaved = () => runConversation({ sessionId: fixture.session.id, sourceUserSeq: saved.acceptingSeq,
-      input: `Approve ${saved.approvalId}.`, reuseRecordedUserInput: true, turnEngine: 'host_v1',
-      makeRunner: () => fixture.runner as never, judgeFn: async () => ({ done: true, reason: 'fixture exact settled result' }),
-      buildAgent: identity => buildOrchestratorAgentForApprovalResume({ ...identity,
-        acceptedRoute: identity.route ?? 'act', model: fixture.model as never, allowToolJit: true }),
-    });
+    // Drive the public bridge after process exit, not just the loop. The
+    // bridge sees the approval answer while the executor restores the source
+    // that owned the write. Both must use one original composition scope.
+    const { respondPreferHarness, _setBridgeImplsForTests } = await import('./respond-bridge.js');
+    const { currentSourceSessionContext } = await import('./source-session-context-scope.js');
+    const continueSaved = async () => {
+      let outcome: Awaited<ReturnType<typeof runConversation>> | undefined;
+      _setBridgeImplsForTests({
+        configure: async () => ({ ok: true }),
+        buildAgent: async options => buildOrchestratorAgentForApprovalResume({ ...options,
+          model: fixture.model as never, allowToolJit: true }),
+        runConversation: async options => {
+          if (phase === 'recover') assert.equal(currentSourceSessionContext(fixture.session.id)?.sourceUserSeq, saved.sourceUserSeq);
+          outcome = await runConversation({ ...options, makeRunner: () => fixture.runner as never,
+            judgeFn: async () => ({ done: true, reason: 'fixture exact settled result' }) });
+          return outcome;
+        },
+      });
+      try {
+        const control = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).find(event => event.seq === saved.acceptingSeq)!;
+        const response = await respondPreferHarness('webhook', { sessionId: fixture.session.id,
+          sourceUserSeq: saved.acceptingSeq, message: String(control.data.text),
+          displayMessage: String(control.data.displayText ?? control.data.text) }, async () => { throw new Error('legacy responder cannot run'); });
+        if (phase === 'recover') assert.ok(outcome, JSON.stringify(response));
+        else assert.equal(outcome, undefined, 'a completed transport replay does not re-enter the executor');
+        assert.equal(response.stoppedReason, 'success', JSON.stringify(response));
+        return response;
+      } finally { _setBridgeImplsForTests({}); }
+    };
     if (phase === 'recover') {
       const { recoverInterruptedChatRuns } = await import('./restart-recovery.js');
-      let settle!: (value: Awaited<ReturnType<typeof runConversation>>) => void;
+      let settle!: (value: Awaited<ReturnType<typeof continueSaved>>) => void;
       let reject!: (reason: unknown) => void;
-      const finished = new Promise<Awaited<ReturnType<typeof runConversation>>>((resolve, fail) => { settle = resolve; reject = fail; });
+      const finished = new Promise<Awaited<ReturnType<typeof continueSaved>>>((resolve, fail) => { settle = resolve; reject = fail; });
       let dispatches = 0;
       const summary = recoverInterruptedChatRuns(Date.now, async dispatch => {
         assert.equal(dispatch.sourceUserSeq, saved.acceptingSeq, 'boot dispatch owns the approval answer');
@@ -1398,14 +1424,14 @@ async function approvedCheckpointFixture(stopTarget?: 'control' | 'business') {
       const result = await Promise.race([finished, new Promise<never>((_, fail) => {
         timeout = setTimeout(() => fail(new Error('approved checkpoint boot recovery timed out')), 15_000);
       })]).finally(() => { if (timeout) clearTimeout(timeout); });
-      assert.equal(result.status, 'completed', JSON.stringify(result));
+      assert.equal(result.stoppedReason, 'success', JSON.stringify(result));
       assert.equal(dispatches, 1);
       assert.equal(fixture.counts().modelCalls, 1);
       const frame = fixture.modelInputs[0] as Array<{ type?: string; callId?: string }>;
       assert.equal(frame.filter(item => item.type === 'function_call_result' && item.callId === 'exact-draft').length, 1);
     } else {
       const result = await continueSaved();
-      assert.equal(result.status, 'completed', JSON.stringify(result));
+      assert.equal(result.stoppedReason, 'success', JSON.stringify(result));
       assert.equal(fixture.counts().modelCalls, 0, 'a second process reopening the completed source performs no model work');
     }
     assert.equal(fixture.counts().providerCalls, 0, 'a fresh process must never cross the settled provider again');
@@ -1450,6 +1476,12 @@ async function approvedCheckpointFixture(stopTarget?: 'control' | 'business') {
   assert.notEqual(accepting.seq, fixture.source.seq);
   assert.ok(HarnessSession.load(fixture.session.id)?.loadRecoveryState(), JSON.stringify(eventlog.listEvents(fixture.session.id, { types: ['restart_recovery_decision'] }).map(event => event.data)));
   if (phase === 'prepare') {
+    // Production transport owns a durable attempt for the approval answer.
+    // The direct loop fixture above has no transport, so supply that receipt
+    // before exercising the public bridge's exact-identity restart check.
+    const deliveryAttempt = eventlog.beginRunAttempt(fixture.session.id, { runId: 'fixture-approved-control' });
+    eventlog.recordRunAttemptUserInput(deliveryAttempt, { turn: accepting.turn, role: 'user', data: accepting.data },
+      { existingEventSeq: accepting.seq, armRunInFlight: true });
     writeFileSync(handoffPath, JSON.stringify({ sourceUserSeq: fixture.source.seq,
       acceptingSeq: accepting.seq, approvalId: approval.approvalId, ...fixture.counts() }));
     // Simulate a process death while the storage fault is still present. The

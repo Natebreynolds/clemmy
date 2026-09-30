@@ -1,4 +1,6 @@
 import './memory-scope-binding.js';
+import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, readSourceSessionContext } from './source-session-context.js';
+import { currentSourceSessionContext, withSourceSessionContext } from './source-session-context-scope.js';
 import { readApprovalRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
 import { parkObservedConnectionWithCheckpoint } from './source-connection-checkpoints.js';
 import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
@@ -22,7 +24,7 @@ import { randomUUID } from 'node:crypto';
 import { HarnessSession } from './session.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
 import { composeRunProgressLine } from './run-progress.js';
-import { applySessionMountPrimers, composeSession, sessionAgentReviewContext } from './session-composition.js';
+import { applySessionMountPrimers, composeSessionFromStore, sessionAgentReviewContext } from './session-composition.js';
 import {
   clearRunInFlightAfterTerminal,
   releaseRunInFlightAfterWorkflowTransfer,
@@ -6161,16 +6163,20 @@ export async function runConversation(
         if (replay) return replay;
       }
       const sourceUserSeq = acceptFreshConversationInput(options);
+      // Capture synchronously beside acceptance. Deferring this to the owned
+      // promise lets a selection change in the intervening microtask rewrite
+      // what the newly accepted request began with.
+      if (!replaySource) captureFreshSourceSessionContext({ sessionId: options.sessionId, sourceUserSeq });
       const acceptedOptions = { ...options, sourceUserSeq };
       const key = `${options.sessionId}:${sourceUserSeq}`;
       const prior = activeHostConversations.get(key);
       if (prior) return prior;
       // Install the promise before any async activation work can yield/re-enter.
-      const owned = Promise.resolve().then(async () => {
+      const owned = Promise.resolve().then(() => withAcceptedSourceSessionContext({ sessionId: options.sessionId, sourceUserSeq }, async () => {
         const outcome = await runConversationWithinRuntimeConfig(acceptedOptions);
         if (!checkpointContinuationIsReady(outcome, acceptedOptions)) return outcome;
         return runConversationWithinRuntimeConfig(acceptedOptions);
-      });
+      }));
       activeHostConversations.set(key, owned);
       try { return await owned; }
       finally {
@@ -10555,15 +10561,17 @@ export function goalObjectiveString(goal: PlanProposal): string | undefined {
 }
 
 export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
+  const context = options.sourceUserSeq && !currentSourceSessionContext(options.sessionId)
+    ? readSourceSessionContext({ sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq }) : null;
+  return context ? withSourceSessionContext(context, () => runTurnWithSessionContext(options)) : runTurnWithSessionContext(options);
+}
+
+async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTurnResult> {
   const row = getSession(options.sessionId);
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
   const session = HarnessSession.load(options.sessionId);
   if (!session) throw new Error(`unable to load session: ${options.sessionId}`);
-  applySessionMountPrimers(options.sessionId, composeSession({
-    sessionId: options.sessionId,
-    sessionKind: row.kind,
-    metadata: row.metadata,
-  }));
+  applySessionMountPrimers(options.sessionId, composeSessionFromStore(options.sessionId));
   // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
   const turnStartedAtIso = new Date().toISOString();
 
@@ -12630,11 +12638,7 @@ export async function resumePendingApproval(
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
   const session = HarnessSession.load(options.sessionId);
   if (!session) throw new Error(`unable to load session: ${options.sessionId}`);
-  applySessionMountPrimers(options.sessionId, composeSession({
-    sessionId: options.sessionId,
-    sessionKind: row.kind,
-    metadata: row.metadata,
-  }));
+  applySessionMountPrimers(options.sessionId, composeSessionFromStore(options.sessionId));
   // Anchor for the post-turn recall-run sweep (cross-process credit recovery).
   const turnStartedAtIso = new Date().toISOString();
 
@@ -13511,6 +13515,7 @@ async function runConversationFromResumeOwned(opts: {
   );
   const resumeHostOwns = opts.runRunner === undefined && isHostTurnEngine(resumeTurnEngine);
   let resumePlanning: HostFreshPlanningContextV1 | undefined;
+  let needsResumePlanning = Boolean(checkpointContinuation && opts.buildAgent);
   if (resumeHostOwns) {
     // The approval click is an audit event, not a new business objective. Restore
     // the parked source BEFORE constructing tools; doing this only inside
@@ -13528,11 +13533,7 @@ async function runConversationFromResumeOwned(opts: {
         const originalSource = pausedHostApprovalSource(pausedState, opts.sessionId);
         if (originalSource) {
           resumeAgentSourceUserSeq = originalSource;
-          if (opts.buildAgent) {
-            const primed = await primePrimaryModelPlanningCatalog({ sessionId: opts.sessionId, sourceUserSeq: originalSource });
-            if (!primed.ok) throw new Error(primed.reason);
-            resumePlanning = primed.planning;
-          }
+          needsResumePlanning = Boolean(opts.buildAgent);
         }
       } catch (error) {
         return { sessionId: opts.sessionId, status: 'blocked', steps: 0, lastTurn: 0,
@@ -13540,7 +13541,9 @@ async function runConversationFromResumeOwned(opts: {
       }
     }
   }
-  if (checkpointContinuation && opts.buildAgent) {
+  const retainedComposition = readSourceSessionContext({ sessionId: opts.sessionId, sourceUserSeq: resumeAgentSourceUserSeq });
+  const continueWithComposition = async (): Promise<RunConversationResult> => {
+  if (needsResumePlanning) {
     const primed = await primePrimaryModelPlanningCatalog({ sessionId: opts.sessionId, sourceUserSeq: resumeAgentSourceUserSeq });
     if (!primed.ok) throw new Error(primed.reason);
     resumePlanning = primed.planning;
@@ -13796,6 +13799,9 @@ async function runConversationFromResumeOwned(opts: {
   }
     },
   ));
+  };
+  return retainedComposition
+    ? withSourceSessionContext(retainedComposition, continueWithComposition) : continueWithComposition();
 }
 
 async function runConversationFromResumeCore(opts: {

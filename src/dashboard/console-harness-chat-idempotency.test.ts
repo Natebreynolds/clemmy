@@ -28,6 +28,8 @@ writeFileSync(path.join(TMP_HOME, 'state', 'claude-auth.json'), JSON.stringify({
   scopes: ['user:inference'],
 }), 'utf-8');
 
+const contexts = await import('../runtime/harness/source-session-context.js');
+const contextScope = await import('../runtime/harness/source-session-context-scope.js');
 const { registerConsoleRoutes } = await import('./console-routes.js');
 const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
 const { resetHarnessRuntimeConfig } = await import('../runtime/harness/codex-client.js');
@@ -286,6 +288,7 @@ test('desktop chat replay reuses the pre-202 session/run and schedules the brain
     configure: (async () => ({ ok: true })) as never,
     runConversation: (async (request: { sessionId: string }) => {
       capturedRunIds.push(getActiveRunAttempt(request.sessionId)?.runId ?? '');
+      assert.ok(contextScope.currentSourceSessionContext(request.sessionId), 'bridge restores the desktop-accepted context');
       enterBrain();
       await brainReleased;
       return {
@@ -338,6 +341,8 @@ test('desktop chat replay reuses the pre-202 session/run and schedules the brain
     const acceptedInputs = listEvents(first.sessionId, { types: ['user_input_received'] });
     assert.equal(acceptedInputs.length, 1, 'the accepted turn is durable before any early-return branch or brain work');
     assert.equal(acceptedInputs[0].data.runId, first.runId);
+    const acceptedContext = contexts.readSourceSessionContext({ sessionId: first.sessionId, sourceUserSeq: acceptedInputs[0].seq });
+    assert.ok(acceptedContext, 'desktop persists original composition before its 202');
     assert.equal(acceptedInputs[0].data.attemptId, activeAttempt?.attemptId);
     assert.equal(
       getLatestRunAttemptByRunId(first.sessionId, first.runId)?.sourceUserSeq,
@@ -354,6 +359,8 @@ test('desktop chat replay reuses the pre-202 session/run and schedules the brain
     assert.equal(replayResponse.status, 202);
     const replay = await replayResponse.json() as typeof first;
     assert.equal(replay.sessionId, first.sessionId, 'lost first response can recover the server-created session');
+    assert.equal(contexts.readSourceSessionContext({ sessionId: first.sessionId, sourceUserSeq: acceptedInputs[0].seq })?.digest,
+      acceptedContext.digest, 'transport retry reuses original composition');
     assert.equal(replay.runId, first.runId);
     assert.equal(replay.attemptId, first.attemptId);
     assert.equal(replay.cancelEndpoint, first.cancelEndpoint);

@@ -1422,3 +1422,18 @@ for (const damage of ['ordinary', 'wrong-source', 'missing-group', 'corrupt-grou
     assert.equal(getRunAttemptBySourceUserSeq(session.id, source.seq)?.status, 'interrupted');
   });
 }
+
+test('gateway acceptance retains the original composition before the bridge runs', async () => {
+  const contexts = await import('../runtime/harness/source-session-context.js');
+  const scope = await import('../runtime/harness/source-session-context-scope.js');
+  const session = createSession({ kind: 'chat', channel: 'mobile' });
+  const { gateway } = hostGatewayForTest(async options => {
+    const source = acceptedHostSource(options);
+    const saved = contexts.readSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq });
+    assert.ok(saved, 'gateway persisted context for its newly accepted input');
+    assert.equal(scope.currentSourceSessionContext(session.id)?.digest, saved.digest, 'bridge reopens that same context');
+    return completedHostAnswer(options, 'Original context retained.');
+  });
+  const response = await gateway.handleMessage({ message: 'Give a controlled reply.', sessionId: session.id, source: 'mobile', channel: 'mobile' });
+  assert.equal(response.text, 'Original context retained.');
+});

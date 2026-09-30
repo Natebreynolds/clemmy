@@ -1,3 +1,4 @@
+import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
 /**
  * Discord ↔ 0.3 harness bridge.
  *
@@ -41,6 +42,7 @@ import {
   listEvents as listHarnessEvents,
   listSessions as listHarnessSessions,
   recordRunAttemptUserInput,
+  getRunAttemptSourceUserEvent,
   requestKill,
   updateSession as updateHarnessSession,
   type EventRow,
@@ -283,7 +285,8 @@ function recordActiveChannelUserInput(
   progressPresentation: ProgressPresentation = progressPresentationForPrompt(displayText),
 ): EventRow {
   const replyAuthority = exactChannelReplyAuthority(attempt.channel, attempt.channelId);
-  return recordRunAttemptUserInput(attempt, {
+  const newlyAccepted = getRunAttemptSourceUserEvent(attempt) === null;
+  const source = recordRunAttemptUserInput(attempt, {
     turn: 1,
     role: 'user',
     data: {
@@ -297,6 +300,8 @@ function recordActiveChannelUserInput(
       ...replyAuthority,
     },
   }, { armRunInFlight: true });
+  if (newlyAccepted) captureFreshSourceSessionContext({ sessionId: source.sessionId, sourceUserSeq: source.seq });
+  return source;
 }
 
 /**

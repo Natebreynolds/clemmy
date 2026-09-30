@@ -21,6 +21,7 @@ globalThis.fetch = async () => { throw new Error('Network is forbidden in connec
 
 const log = await import('./eventlog.js');
 const plans = await import('./plan-artifacts.js');
+const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
 const { runConversation } = await import('./loop.js');
 const { wrapToolForHarness } = await import('./brackets.js');
 const envelopes = await import('../../agents/capability-envelope.js');
@@ -28,6 +29,12 @@ const { bindAgentRebuildContext } = await import('../../agents/agent-rebuild-con
 const { bindAgentMcpToolScope } = await import('../mcp-tool-authority.js');
 const { readSourceConnectionCheckpoint } = await import('./source-connection-checkpoints.js');
 const { currentConnectionDependency } = await import('./dependency-request.js');
+const { bindAgentSourceSessionContext } = await import('./source-session-context-scope.js');
+const { createAgentRecord } = await import('../../agents/agent-record.js');
+const { setSessionAgent } = await import('../../agents/session-agent.js');
+const { composeSessionFromStore, sessionAgentReviewContext } = await import('./session-composition.js');
+const { defaultFactWriteScope } = await import('../../memory/facts.js');
+const { agentScopeKey } = await import('../../memory/memory-scope.js');
 const { closeMemoryDb } = await import('../../memory/db.js');
 
 after(() => {
@@ -39,6 +46,11 @@ after(() => {
 
 for (const answerShape of ['ask', 'decision'] as const) test(`real ${answerShape} pause retains original agent construction context`, async () => {
   const session = log.createSession({ id: `connection-pause-${answerShape}`, kind: 'chat' });
+  const chosen = createAgentRecord({ name: `Original ${answerShape} specialist`, instructions: `ORIGINAL_${answerShape}`, createdFrom: 'console' });
+  const nextAgent = createAgentRecord({ name: `Later ${answerShape} specialist`, instructions: `LATER_${answerShape}`, createdFrom: 'console' });
+  assert.ok(chosen.ok && nextAgent.ok);
+  if (!chosen.ok || !nextAgent.ok) throw new Error('fixture agent creation');
+  setSessionAgent(session.id, chosen.agent.id, { by: 'owner' });
   const prep = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Plan the controlled account inspection.', taskMode: { version: 1, kind: 'plan' } } });
   const artifact = plans.publishPlanRevision({ sessionId: session.id, principalId: session.id,
@@ -49,6 +61,8 @@ for (const answerShape of ['ask', 'decision'] as const) test(`real ${answerShape
   const source = log.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
     data: { text: 'Execute this reviewed account inspection.', taskMode: { version: 1, kind: 'execute', executeRef } } });
   plans.claimPlanExecution({ sessionId: session.id, principalId: session.id, sourceUserSeq: source.seq, executeRef });
+  // This fixture accepts its Execute before calling the loop, like the gateway.
+  captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq });
   let searches = 0;
   const search = wrapToolForHarness({ type: 'function', name: 'tool_search',
     description: 'Read controlled connection metadata.', parameters: { type: 'object', properties: {}, additionalProperties: false },
@@ -67,6 +81,11 @@ for (const answerShape of ['ask', 'decision'] as const) test(`real ${answerShape
   const model = {
     async getResponse() {
       calls += 1;
+      if (calls === 1) setSessionAgent(session.id, nextAgent.agent.id, { by: 'owner' });
+      assert.equal(composeSessionFromStore(session.id).agent?.agent.id, chosen.agent.id, 'an in-flight selection change must not retarget the accepted turn');
+      assert.match(sessionAgentReviewContext(session.id), new RegExp(`ORIGINAL_${answerShape}`));
+      assert.doesNotMatch(sessionAgentReviewContext(session.id), new RegExp(`LATER_${answerShape}`));
+      assert.equal(defaultFactWriteScope('project', session.id).agentKey, agentScopeKey(chosen.agent));
       assert.ok(calls <= 2, 'setup must not spend another brain turn on a known missing connection');
       const text = answerShape === 'ask' ? 'ASK: Connect the fixture CRM to continue.'
         : JSON.stringify({ summary: 'Connect the fixture CRM to continue.', reply: 'Connect the fixture CRM to continue.',
@@ -95,16 +114,21 @@ for (const answerShape of ['ask', 'decision'] as const) test(`real ${answerShape
   bindAgentRebuildContext(agent, { allowToolJit: true, excludeToolNames: ['run_shell_command'] });
 
   const result = await runConversation({ sessionId: session.id, sourceUserSeq: source.seq, input: String(source.data.text),
-    reuseRecordedUserInput: true, agent: agent as never, turnEngine: 'host_v1', judgeCompletion: false,
+    reuseRecordedUserInput: true, buildAgent: async () => {
+      bindAgentSourceSessionContext(agent, session.id);
+      return agent as never;
+    }, turnEngine: 'host_v1', judgeCompletion: false,
     suppressMemoryCapture: true, maxTurns: 3, maxSteps: 2,
     makeRunner: () => new EventEmitter() as never });
   assert.equal(result.status, 'awaiting_user_input', JSON.stringify(result));
   assert.equal(calls, 2);
   assert.equal(searches, 1);
+  assert.equal(composeSessionFromStore(session.id).agent?.agent.id, nextAgent.agent.id, 'the user selection remains in place for the next task');
   const dependency = currentConnectionDependency(session.id);
   assert.ok(dependency, 'the actual public pause must park the typed connection');
   const retained = readSourceConnectionCheckpoint({ sessionId: session.id, requestId: dependency.requestId });
   assert.ok(retained?.agent, 'the loop must pass its actual agent to checkpoint capture');
+  assert.equal(retained.agent.sessionContext?.sourceUserSeq, source.seq, 'construction must retain the original accepted identity');
   assert.deepEqual(retained.agent.mcpToolScope, scope);
   assert.deepEqual(retained.agent.rebuildContext, { allowToolJit: true, excludeToolNames: ['run_shell_command'] });
   assert.equal(retained.agent.envelope.envelopeDigest, sealed.envelope.envelopeDigest);

@@ -37,6 +37,7 @@ import {
 import { harnessInstructions } from './harness-context.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { bindAgentRebuildContext } from './agent-rebuild-context.js';
+import { bindAgentSourceSessionContext } from '../runtime/harness/source-session-context-scope.js';
 import { enabledExternalServerNames } from '../runtime/mcp-servers.js';
 import { batchShapeDirective } from '../tools/batch-shape-directive.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
@@ -4371,6 +4372,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   });
   bindAgentMcpToolScope(agent, mcpToolScope);
   bindAgentRebuildContext(agent, options);
+  bindAgentSourceSessionContext(agent, options.sessionId ?? '');
   // A desk-governed turn keeps the session's wire order, so the tools block
   // only changes when the session climbs a rung.
   if (turnDesk && turnDesk.fallbackReason === null) bindSessionWireOrder(agent);

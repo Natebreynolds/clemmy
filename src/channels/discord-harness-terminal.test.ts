@@ -30,6 +30,7 @@ const {
   createSession,
   listEvents,
 } = await import('../runtime/harness/eventlog.js');
+const contexts = await import('../runtime/harness/source-session-context.js');
 const { projectHarnessEventForPublic } = await import('../runtime/harness/public-presentation.js');
 const { _setLocalProviderForTest } = await import('../memory/embeddings.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
@@ -1017,4 +1018,18 @@ test('model-runtime-unavailable resume has an accepted source and failed termina
   assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'pending');
   assert.equal(listEvents(session.id, { types: ['tool_called', 'run_completed'] }).length, 0);
   assert.match(delivery.initial[0], /model|connect|settings/i);
+});
+
+for (const channel of ['discord', 'slack'] as const) test(`${channel} source admission retains original context before bridge construction`, () => {
+  const session = createSession({ kind: 'chat', channel });
+  const active = __test__.registerActiveChannelRunForTest({ channel, channelId: channel === 'slack' ? 'C0CONTEXT' : 'context-discord',
+    userId: 'fixture-owner', guildId: null, sessionId: session.id });
+  try {
+    const accepted = __test__.recordActiveChannelUserInputForTest(active, 'Inspect the controlled task.', 'Inspect the controlled task.');
+    const context = contexts.readSourceSessionContext({ sessionId: session.id, sourceUserSeq: accepted.seq });
+    assert.ok(context);
+    const again = __test__.recordActiveChannelUserInputForTest(active, 'Inspect the controlled task.', 'Inspect the controlled task.');
+    assert.equal(again.seq, accepted.seq);
+    assert.equal(contexts.readSourceSessionContext({ sessionId: session.id, sourceUserSeq: again.seq })?.digest, context.digest);
+  } finally { __test__.unregisterActiveChannelRunForTest(active); }
 });

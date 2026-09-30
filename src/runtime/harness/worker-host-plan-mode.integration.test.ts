@@ -19,6 +19,15 @@ process.env.CLEMMY_WATCHER_JUDGE = 'off';
 mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TEST_HOME, 'state', 'machine-id'), 'worker-plan-mode-fixture\n');
 
+const contexts = await import('./source-session-context.js');
+const contextScope = await import('./source-session-context-scope.js');
+const memory = await import('../../memory/memory-scope.js');
+const { defaultFactWriteScope } = await import('../../memory/facts.js');
+const { closeMemoryDb } = await import('../../memory/db.js');
+const agents = await import('../../agents/agent-record.js');
+const projects = await import('../../projects/project-record.js');
+const { setSessionAgent } = await import('../../agents/session-agent.js');
+const { setSessionProject } = await import('../../projects/session-project.js');
 const eventlog = await import('./eventlog.js');
 const brackets = await import('./brackets.js');
 const envelopes = await import('../../agents/capability-envelope.js');
@@ -34,6 +43,7 @@ const priorCatalog = catalogs.peekHostCapabilityCatalogFactory();
 after(() => {
   catalogs.installHostCapabilityCatalogFactory(priorCatalog);
   eventlog.closeEventLog();
+  closeMemoryDb(); projects._closeProjectStoreForTests();
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
@@ -58,6 +68,23 @@ for (const parentKind of ['plan', 'execute'] as const) test(`a real delegated ${
     source = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Execute the reviewed investigation.', taskMode: { version: 1, kind: 'execute', executeRef: ref } } });
     plans.claimPlanExecution({ sessionId: session.id, sourceUserSeq: source.seq, principalId: 'fixture-owner', executeRef: ref });
   }
+  const agentRecord = agents.createAgentRecord({ name: `Worker parent ${parentKind}`, instructions: 'Controlled parent craft.', createdFrom: 'console' });
+  const project = projects.createProject({ name: `Worker project ${parentKind}`, context: 'Controlled project.' });
+  assert.ok(agentRecord.ok && project.ok);
+  if (!agentRecord.ok || !project.ok) throw new Error('parent context fixtures');
+  setSessionAgent(session.id, agentRecord.agent.id, { by: 'owner' });
+  setSessionProject(session.id, project.project.id, { by: 'owner' });
+  const parentContext = contexts.captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.ok(parentContext);
+  // No parent ALS survives. A worker must recover the accepted scope even if
+  // the owner's next task moves back to Clem and out of this project.
+  setSessionAgent(session.id, null, { by: 'owner' });
+  setSessionProject(session.id, null, { by: 'owner' });
+  const assertWorkerScope = (id: string) => {
+    assert.ok(contextScope.currentSourceSessionContext(id), 'the real worker entry installed its own source context');
+    assert.deepEqual(memory.scopeOfSession(id), parentContext.memoryScope);
+    assert.equal(defaultFactWriteScope('project', id).agentKey, memory.agentScopeKey(agentRecord.agent));
+  };
   const packet = {
     objective: 'Investigate the proposed local artifact.', item: 'local-artifact', resolvedTools: 'read_file, write_file',
     externalMcpToolNames: null, context: `Read ${sourcePath}. Proposed destination ${targetPath}.`,
@@ -76,6 +103,7 @@ for (const parentKind of ['plan', 'execute'] as const) test(`a real delegated ${
       buildAgent: async (child) => {
         childId = child.sessionId;
         childSourceSeq = child.sourceUserSeq;
+        assertWorkerScope(childId);
         assert.notEqual(childId, session.id);
         assert.deepEqual(acceptedTaskMode(childId, childSourceSeq), { version: 1, kind: 'plan' });
         // A worker child owns a discovery task from the moment it is accepted
@@ -88,6 +116,7 @@ for (const parentKind of ['plan', 'execute'] as const) test(`a real delegated ${
         assert.equal(tools.length, 2);
         const model = {
           async getResponse(request: unknown) {
+            assertWorkerScope(childId);
             observedRequests.push(JSON.stringify(request));
             modelCalls += 1;
             const output = modelCalls === 1
@@ -123,6 +152,9 @@ for (const parentKind of ['plan', 'execute'] as const) test(`a real delegated ${
   assert.equal(eventlog.listEvents(childId, { types: ['approval_requested'] }).length, 0);
   eventlog.closeEventLog();
   assert.deepEqual(acceptedTaskMode(childId, childSourceSeq), { version: 1, kind: 'plan' }, 'restart reopens the exact inherited ceiling');
+  const restoredContext = contexts.readSourceSessionContext({ sessionId: childId, sourceUserSeq: childSourceSeq });
+  assert.ok(restoredContext);
+  assert.deepEqual(restoredContext.memoryScope, parentContext.memoryScope);
   const childSource = eventlog.listEvents(childId, { types: ['user_input_received'] })[0]!;
   assert.equal(childSource.parentEventId, source.id);
   assert.equal((childSource.data.delegatedWorker as Record<string, unknown>).parentSourceUserSeq, source.seq);

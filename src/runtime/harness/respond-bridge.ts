@@ -1,4 +1,5 @@
 import './memory-scope-binding.js';
+import { withAcceptedSourceSessionContext } from './source-session-context.js';
 import { admitPlanExecutionBridgeSource } from './plan-execution-bridge.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { getPlanRevision, type PlanArtifactV1 } from './plan-artifacts.js';
@@ -86,6 +87,7 @@ import {
   getLatestRunAttempt,
   getLatestRunAttemptByRunId,
   getRunAttemptBySourceUserSeq,
+  getRunAttemptSourceUserEvent,
   getSession,
   isKillRequested,
   listEvents,
@@ -1491,6 +1493,8 @@ export async function respondViaHarness(
       raw: { reviewedPlanExecutionJoined: true, planExecutionRunId: reviewedAdmission.claim.executionRunId, planExecutionSessionId: reviewedAdmission.claim.sessionId, planExecutionSourceUserSeq: reviewedAdmission.claim.sourceUserSeq } };
   }
   const requestAttempt = reviewedAdmission?.attempt ?? beginRunAttempt(sessionId, { runId: request.runId });
+  const newlyAcceptedSource = reviewedAdmission?.newlyAccepted
+    ?? (acceptedSourceUserSeq === undefined && getRunAttemptSourceUserEvent(requestAttempt) === null);
   const sourceUserEvent = reviewedAdmission?.source ?? recordRunAttemptUserInput(requestAttempt, {
     turn: 1,
     role: 'user',
@@ -1504,6 +1508,24 @@ export async function respondViaHarness(
     },
   }, { existingEventSeq: acceptedSourceUserSeq, armRunInFlight: true });
   markPreparation('accepted_source_ready');
+  let cancelledByCaller = false;
+  let cancelPoll: ReturnType<typeof setInterval> | undefined;
+  let detachProgressRelay: () => void = () => {};
+  let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'failed';
+  let preserveRequestAttemptOwnership = false;
+  try {
+  return await withAcceptedSourceSessionContext({ sessionId, sourceUserSeq: sourceUserEvent.seq }, async execution => {
+  const resumesApprovalCheckpoint = execution.sourceUserSeq !== sourceUserEvent.seq;
+  if (resumesApprovalCheckpoint) {
+    // The validated approval control owns delivery, not a new business query.
+    // Let the loop reopen its exact checkpoint/consent receipts. Do not run
+    // fresh clarification, source-selection or discovery over "Approved".
+    const original = listEvents(sessionId, { types: ['user_input_received'], sinceSeq: execution.sourceUserSeq - 1, limit: 1 })
+      .find(event => event.seq === execution.sourceUserSeq);
+    if (!original) throw new Error('The approved execution source is unavailable.');
+    request = { ...request, message: String(original.data.text ?? ''), semanticTaskInput: undefined,
+      taskContinuation: undefined, taskContinuationResolved: true, turnCandidates: undefined };
+  }
   const durableTaskMode = parseTaskMode(sourceUserEvent.data.taskMode);
   if (request.taskMode && taskModeDigest(request.taskMode) !== taskModeDigest(durableTaskMode)) throw new Error('accepted task mode mismatch');
   request = { ...request, taskMode: durableTaskMode };
@@ -1520,7 +1542,7 @@ export async function respondViaHarness(
   // Caller-supplied semantic context is stripped when no valid packet exists.
   const hostOwnsTurn = Boolean(opts.turnEngine && isHostTurnEngine(opts.turnEngine));
   const callerSourceStrategyBinding = request.turnCandidates?.sourceStrategyBinding;
-  if (hostOwnsTurn) {
+  if (hostOwnsTurn && !resumesApprovalCheckpoint) {
     await prepareCheckedHostClarificationAnswer({
       sessionId: request.sessionId,
       sourceUserSeq: sourceUserEvent.seq,
@@ -1535,11 +1557,11 @@ export async function respondViaHarness(
     });
   }
   markPreparation('clarification_checked');
-  const typedClassification = semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
+  const typedClassification = !resumesApprovalCheckpoint && semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
     ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
     : undefined;
   const requestBeforeContinuity = request;
-  request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
+  if (!resumesApprovalCheckpoint) request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
     ...(hostOwnsTurn ? { continuationOnly: true, resolveCandidates: false } : {}),
     typedClassification,
   });
@@ -1557,7 +1579,7 @@ export async function respondViaHarness(
     )
     ? request.semanticTaskInput
     : undefined;
-  if (hostOwnsTurn) {
+  if (hostOwnsTurn && !resumesApprovalCheckpoint) {
     const materialSource = inspectDurableMaterialSourceContinuation({
       sessionId,
       sourceUserSeq: sourceUserEvent.seq,
@@ -1693,7 +1715,7 @@ export async function respondViaHarness(
   // fallover rebuild. A retrieval failure remains advisory-only: existing
   // caller/continuation candidates survive, while no candidate ever grants
   // dispatch authority.
-  const resolveFreshHostCandidates = hostOwnsTurn
+  const resolveFreshHostCandidates = hostOwnsTurn && !resumesApprovalCheckpoint
     && request.taskContinuation === undefined
     && !(typedClassification && 'keepOpen' in typedClassification);
   if (resolveFreshHostCandidates && request.turnCandidates?.sourceStrategyBinding) {
@@ -1738,7 +1760,7 @@ export async function respondViaHarness(
     }
     return acceptedTurnCandidatesPromise;
   };
-  if (!opts.turnEngine || !isHostTurnEngine(opts.turnEngine)) {
+  if (!resumesApprovalCheckpoint && (!opts.turnEngine || !isHostTurnEngine(opts.turnEngine))) {
     await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
   }
   markPreparation('graph_observed');
@@ -1746,8 +1768,6 @@ export async function respondViaHarness(
   // failures while building the agent/tool surface remain restart-recoverable.
   preserveCurrentKillAndClearStale(sessionId, requestAttempt);
 
-  let cancelledByCaller = false;
-  let cancelPoll: ReturnType<typeof setInterval> | undefined;
   if (request.shouldCancel) {
     const shouldCancel = request.shouldCancel;
     cancelPoll = setInterval(() => {
@@ -1763,10 +1783,7 @@ export async function respondViaHarness(
     }, CANCEL_POLL_MS);
   }
 
-  const detachProgressRelay = attachLegacyProgressRelay(request);
-  let requestAttemptStatus: 'completed' | 'cancelled' | 'failed' = 'failed';
-  let preserveRequestAttemptOwnership = false;
-  try {
+  detachProgressRelay = attachLegacyProgressRelay(request);
     const modelForRun = opts.modelOverride ?? (config.honorModel && request.model ? request.model : undefined);
     // A verified clarification continuation may carry a richer private query
     // for retrieval/tool ranking. The actual user turn remains request.message
@@ -2194,6 +2211,7 @@ export async function respondViaHarness(
       default:
         throw new Error(result.error || `harness run ${result.status}`);
     }
+  }, { newlyAccepted: newlyAcceptedSource });
   } catch (err) {
     if (err instanceof AgentRuntimeCancelledError) throw err;
     const signaledOwnership = err instanceof PendingWorkflowChatDispatchOwnershipError
@@ -2259,7 +2277,8 @@ export async function respondViaHarness(
     if (!preserveRequestAttemptOwnership) {
       try { finishRunAttempt(requestAttempt, requestAttemptStatus); } catch { /* attempt telemetry must not mask the response */ }
     }
-    if (requestAttemptStatus === 'cancelled') {
+    // Status is assigned inside the async composition scope above.
+    if ((requestAttemptStatus as 'completed' | 'cancelled' | 'failed') === 'cancelled') {
       try { clearKill(sessionId, requestAttempt); } catch { /* best effort */ }
     }
   }

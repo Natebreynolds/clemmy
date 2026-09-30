@@ -5170,3 +5170,56 @@ test('attachment-enriched accepted source replays by its durable display identit
   }
   assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
 });
+
+for (const entry of ['fresh', 'preaccepted', 'existing-attempt'] as const) {
+  test(`source composition: ${entry} bridge entry distinguishes capture from historical reopen`, async () => {
+    const contexts = await import('./source-session-context.js');
+    const scope = await import('./source-session-context-scope.js');
+    const session = createSession({ kind: 'chat' });
+    const runId = `context-${entry}`;
+    const prior = entry === 'existing-attempt'
+      ? recordRunAttemptUserInput(beginRunAttempt(session.id, { runId }), { turn: 1, role: 'user', data: { text: 'A controlled reply.' } })
+      : entry === 'preaccepted'
+        ? appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'A controlled reply.' } }) : null;
+    let called = false;
+    _setBridgeImplsForTests({ configure: okConfigure,
+      buildAgent: (async () => {
+        called = true;
+        const context = scope.currentSourceSessionContext(session.id);
+        if (entry === 'fresh') assert.ok(context);
+        else assert.equal(context, undefined, 'current selection is not historical evidence');
+        return FAKE_AGENT;
+      }) as never,
+      runConversation: fakeRun({ status: 'completed', lastDecision: { reply: 'Controlled reply.', done: true } }),
+    });
+    const response = await respondViaHarness('webhook', { sessionId: session.id, message: 'A controlled reply.', runId }, {
+      turnEngine: 'host_v1', ...(entry === 'preaccepted' ? { sourceUserSeq: prior!.seq } : {}),
+    });
+    assert.equal(called, true, JSON.stringify(response));
+    assert.notEqual(response.stoppedReason, 'error');
+    const source = listEvents(session.id, { types: ['user_input_received'] })[0]!;
+    assert.equal(Boolean(contexts.readSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq })), entry === 'fresh');
+  });
+}
+
+test('a source context restoration failure settles the bridge attempt and clears its spinner', async () => {
+  const contexts = await import('./source-session-context.js');
+  const agents = await import('../../agents/agent-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const session = createSession({ kind: 'chat' });
+  const agent = agents.createAgentRecord({ name: 'Bridge restoration fixture', instructions: 'Original craft.', createdFrom: 'console' });
+  assert.ok(agent.ok); if (!agent.ok) throw new Error('agent fixture');
+  setSessionAgent(session.id, agent.agent.id, { by: 'owner' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'A controlled reply.' } });
+  assert.ok(contexts.captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq }));
+  agents.updateAgentRecord(agent.agent.id, { instructions: 'Different craft.' });
+  let calls = 0;
+  _setBridgeImplsForTests({ runConversation: (async () => { calls += 1; throw new Error('must not execute'); }) as never });
+  const response = await respondViaHarness('webhook', { sessionId: session.id, message: 'A controlled reply.', sourceUserSeq: source.seq }, { turnEngine: 'host_v1' });
+  assert.equal(calls, 0);
+  assert.equal(response.stoppedReason, 'error');
+  assert.equal(getLatestRunAttempt(session.id)?.status, 'failed');
+  assert.equal(HarnessSession.load(session.id)?.runInFlightSince(), null);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+  assert.doesNotMatch(response.text, /Different craft|digest|composition|sqlite/i);
+});

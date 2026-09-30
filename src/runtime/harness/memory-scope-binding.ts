@@ -14,11 +14,14 @@ import { harnessRunContextStorage } from './brackets.js';
 import { getSession } from './eventlog.js';
 import { sessionTakesIdentity } from './session-composition.js';
 import { getToolOutputContext } from './tool-output-context.js';
+import { currentSourceSessionContext } from './source-session-context-scope.js';
 
 const CACHE_MS = 1_500;
 const cache = new Map<string, { at: number; key: string; scope: MemoryScope | null }>();
 
 function scopeFromRow(sessionId: string, depth: number): MemoryScope | null {
+  const accepted = currentSourceSessionContext(sessionId);
+  if (accepted) return { ...accepted.memoryScope };
   const row = getSession(sessionId);
   if (!row) return null;
   const metadata = row.metadata ?? {};
@@ -51,6 +54,8 @@ function requestOf(sessionId: string): string | null {
 }
 
 function scopeOfSession(sessionId: string): MemoryScope | null {
+  const accepted = currentSourceSessionContext(sessionId);
+  if (accepted) return { ...accepted.memoryScope };
   const request = requestOf(sessionId);
   if (request && pinned.has(request)) return pinned.get(request) ?? null;
   const scope = liveScopeOfSession(sessionId);

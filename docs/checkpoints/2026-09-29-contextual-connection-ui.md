@@ -4,7 +4,7 @@
 
 This is the first implementation slice of the owner's request to make setup feel native and let Clem carry a task through missing capabilities. UI and harness work belong together: a connection form without durable continuation would merely move the manual setup problem into chat.
 
-Base: `4e2efe15bc348549e195e6660a305c011bff8cf1`. Implementation branch: `codex/contextual-connection-ui`; worktree: `/Users/nathan.reynolds/.codex/worktrees/connection-continuity/clementine-next`. The other agent's shell lane was last checked at `8da123b87`, branch `claude/shell-anywhere`; it was not modified. Main and the owner's uncommitted documents were not changed.
+Base: `4e2efe15bc348549e195e6660a305c011bff8cf1`. Implementation branch: `codex/contextual-connection-ui`; worktree: `/Users/nathan.reynolds/.codex/worktrees/connection-continuity/clementine-next`. The other agent's shell lane was last checked at `c76c4561a`, branch `claude/shell-anywhere`; it was not modified. Main and the owner's uncommitted documents were not changed.
 
 Source and UI builds are qualified separately from installation. This slice has **not been merged, hotpatched, tagged, or accepted in the installed app/live home**. The broader improvement goal remains open.
 
@@ -126,6 +126,85 @@ fresh capability satisfaction, and proof that settled writes are not replayed.
 The UI/service Execute blocker remains. The UI truthfully says connected but
 paused; building the context alone must never flip it to working or completed.
 No change from this slice is installed, merged to main or tagged.
+
+### Original task identity across setup and approval recovery — September 30
+
+The source-context prerequisite is now implemented. Each newly accepted request
+retains a compact immutable descriptor: original agent ID and incarnation,
+project revision, workspace composition digest, memory scope and (for helper
+workers) the exact parent-source reference. It does not copy prompt bodies,
+transcripts, credentials, model objects or retrieved memories. Current facts
+within the same retained scope can still be retrieved; this is not a frozen
+snapshot of everything the user knew at acceptance.
+
+Capture happens at real fresh admissions: desktop, mobile's gateway, the shared
+Discord/Slack entry, direct bridge/loop turns and delegated workers. Reusing an
+attempt or supplying a historical source only reopens saved identity. Older
+sources and legacy agents without a creation identity are not given invented
+recovery proof; ordinary legacy behavior remains available. Workers without a
+validated parent record similarly cannot claim exact durable scope.
+
+Within an accepted request, source-local composition serves agent/project
+primers, reviewer context and memory read/learning scope. A later UI selection
+applies to the next request without retargeting the running one. Fresh scope is
+derived from the current resolved mount, never from a warmed process cache.
+Reopen rejects changed/deleted/replaced agents, altered skills, changed or
+archived projects and changed project assignments. The connection agent rebuild
+helper checks the private source reference before retrieval and construction.
+It remains unwired to automatic reviewed Execute continuation.
+
+The approval restart pin found a separate bridge defect: the approval control
+was being processed as a new source-selection answer, producing
+`material_source_authority_invalid` before the existing recovery could run.
+The bridge now recognizes only the already-validated approval checkpoint
+mapping, restores its original composition and business text, and leaves the
+loop to validate the canonical checkpoint, exact consent and settled results.
+The approval source still owns delivery. Original-context priming happens
+inside that scope. Capture/restoration failures run through the bridge's
+terminal/attempt cleanup instead of leaving a spinner armed.
+
+Evidence saved in this slice:
+
+- **152/152** entry/context/gateway/worker/bridge checks passed in
+  `/tmp/clem-source-context-entry-pins.txt` before the final transport additions.
+- **78/78** accepted-model-batch, recovery-owner, session-composition,
+  memory-scope, reviewed-plan admission and surface-parity checks passed in
+  `/tmp/clem-source-context-remaining-regressions.txt`.
+- **5/5** exact transport/restart pins passed in
+  `/tmp/clem-source-context-real-entries3.txt`: desktop accepts/replays one
+  source with its retained context; Discord and Slack capture it at admission;
+  an approved write survives a checkpoint storage fault, real process exit and
+  public-bridge recovery; the next process replays the terminal without a model
+  call or a second provider crossing. Only injected recording models/providers
+  run. The first bridge pin failed on the source-selection defect above before
+  its fix. Later fixture corrections supplied the production approval attempt,
+  separate display text and valid Slack channel identity; these were test setup
+  corrections, not product defects.
+- The final boundary regression run passed **154/154** across the bridge,
+  source-context, desktop HTTP admission/idempotency and Discord/Slack terminal
+  suites, in `/tmp/clem-source-context-final-boundaries.txt`. Runtime TypeScript
+  passed in `/tmp/clem-source-context-final-qualified-tsc.txt`. These counts
+  overlap and must not be added as unique tests.
+
+All paths use temporary fixture homes. The runner's live-home isolation
+sentinel remained **NOT PERFORMED** while the live daemon was active (last reported PIDs
+18798 and 75509); no stronger isolation or production acceptance claim is made. No paid
+model calls, account changes, install, hotpatch, merge or tag were performed by
+this task. A read-only review found no further concrete issue after the fresh
+transport admissions were included.
+
+The shell agent independently reached `c76c4561a`, including a desktop
+approve-button/resume race fix. Our four-line desktop admission change and that
+agent's approval-route changes must both survive integration. Their lane was
+not edited. Do not install an older combined build over their newer work.
+
+**Still owed:** a distinct connection activation/delivery owner, one executor
+lease and cancellation path, retained model/tool/token/elapsed budgets, current
+capability satisfaction, and integrated no-replay evidence for connection
+resumption itself. Then combine source revisions, build, coordinate hotpatch,
+and run the controlled installed-app/live-home acceptance matrix. Setup adds no
+model prompt or model call; no measured live speed/token improvement is claimed.
+The UI continues to show reviewed Execute as connected but paused.
 
 ## Verification and evidence
 
