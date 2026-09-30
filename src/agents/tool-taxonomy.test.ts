@@ -377,14 +377,14 @@ test('decideToolApproval: yolo scope auto-approves reversible writes/executes; a
   assert.equal(send.needsApproval, true, 'irreversible send cards even under YOLO');
 });
 
-test('decideToolApproval: workspace scope auto-approves writes inside workspace only', () => {
+test('decideToolApproval: the retired workspace scope reads as Ask', () => {
   setScope('workspace');
   const inside = decideToolApproval({
     toolName: 'write_file',
     insideWorkspaceHint: true,
   });
   assert.equal(inside.needsApproval, false);
-  assert.equal(inside.reason, 'workspace-policy');
+  assert.equal(inside.reason, 'local-workspace-write');
 
   const outside = decideToolApproval({
     toolName: 'write_file',

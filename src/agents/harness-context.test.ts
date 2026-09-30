@@ -209,10 +209,13 @@ test('Autonomy section: YOLO auto-runs reversible work but preserves one irrever
   }
 });
 
-test('Autonomy section: legacy "balanced" renders the Supervised line (== strict; two-posture model)', () => {
+test('Autonomy section: legacy "balanced" reads as Ask mode, which still never asks for local work', () => {
   saveProactivityPolicy({ autoApproveScope: 'balanced' });
   const context = renderHarnessMemoryContext();
-  assert.match(context, /Supervised/);
+  assert.match(context, /ASK MODE/);
+  assert.match(context, /local work \(files, the shell, reads\) and anything non-disruptive runs without asking/);
+  assert.match(context, /approval teaches that kind of change/);
+  assert.match(context, /let the card own the pause/);
 });
 
 test('stable context carries compact skill discovery while the volatile query gets only relevant skills', () => {

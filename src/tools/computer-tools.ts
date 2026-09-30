@@ -25,7 +25,6 @@ import {
 } from './shared.js';
 import { HostLocalReadSuccessResult, InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
 import { LocalFileCreateConflict } from '../runtime/harness/local-file-create-conflict.js';
-import { loadProactivityPolicy } from '../agents/proactivity-policy.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../runtime/spawn-env.js';
@@ -368,31 +367,10 @@ function isInside(parent: string, child: string): boolean {
 
 export function resolveAllowedPath(input: string): string {
   const resolved = path.resolve(expandHome(input));
-  // YOLO mode lets the agent act anywhere the user can. The hard
-  // command denylist (assertCommandAllowed) still applies on
-  // run_shell_command, so destructive ops like `rm -rf /` remain
-  // blocked even here.
-  const policy = loadProactivityPolicy();
-  if (policy.autoApproveScope === 'yolo') return resolved;
-
-  const roots = workspaceRoots();
-  if (!roots.some((root) => isInside(root, resolved))) {
-    // List the valid roots IN the error so the agent self-corrects on
-    // the first retry instead of guessing again. Before this change,
-    // a bad cwd ("/Users/example", "/Users/Shared", invented from
-    // preferredName) would loop 7-8 times against the same wrong path
-    // before the agent finally thought to call workspace_roots.
-    // Architectural fix beats a prompt nudge: the failing tool tells
-    // the agent the answer instead of relying on the model to remember.
-    const rootsList = roots.map((r) => `  - ${r}`).join('\n');
-    throw new Error(
-      `Path is outside allowed workspace roots: ${resolved}.\n`
-      + `Allowed roots:\n${rootsList}\n`
-      + `Pick one of these as cwd, or omit cwd to use the safe default (~/.clementine-next). `
-      + `If you genuinely need to act outside these roots, switch to YOLO mode in Settings → Proactivity Policy, `
-      + `or add the dir to WORKSPACE_DIRS in ~/.clementine-next/.env.`,
-    );
-  }
+  // Local work is the same in both modes (2026-09-30): the agent may act
+  // anywhere the owner can. The mode is about changes in connected apps,
+  // not about paths. The guards inside the tool (the hard command denylist,
+  // credential refusal, Clem's own stores) still apply everywhere.
   return resolved;
 }
 
@@ -1343,10 +1321,6 @@ export const RUN_SHELL_COMMAND_PARAMS = {
 export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WRITE_FILE_PARAMS>>, options?: { preserveCreateConflict: boolean; operationKey?: string; recoveryOnly?: boolean }): Promise<string> {
   const filePath = resolveAllowedPath(input.path);
   const canonicalTarget = canonicalLocalFileTarget(filePath);
-  if (loadProactivityPolicy().autoApproveScope !== 'yolo'
-    && !workspaceRoots().some(root => isInside(path.dirname(canonicalLocalFileTarget(path.join(root, '.clem-path-check'))), canonicalTarget))) {
-    throw new Error(`Path is outside allowed workspace roots: ${canonicalTarget}.`);
-  }
   if (isProtectedInstalledSkillSourcePath(filePath) || isProtectedInstalledSkillSourcePath(canonicalTarget)) {
     return [
       `Refused to write ${filePath}: installed skill source files are read-only during skill runs.`,

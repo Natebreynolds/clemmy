@@ -11,7 +11,6 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
 import { getUsage, getTools, fmtNum } from '@/lib/advanced';
-import { BudgetsForm } from './advanced/BudgetsForm';
 import { AutonomyForm } from './advanced/AutonomyForm';
 import { DiagnosticsView } from './advanced/DiagnosticsView';
 import { EvolutionView } from './advanced/EvolutionView';
@@ -175,7 +174,6 @@ export function Advanced() {
       case 'diagnostics': return <DiagnosticsView />;
       case 'observability': return <ObservabilityView />;
       case 'traces': return <TraceLabView />;
-      case 'budgets': return <BudgetsForm />;
       case 'autonomy': return <AutonomyForm />;
       case 'evolution': return <EvolutionView />;
       case 'developer': return <DeveloperFlags />;

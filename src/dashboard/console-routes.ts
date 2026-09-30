@@ -329,8 +329,7 @@ import {
   closePlanScope, listActiveScopes, listAllScopes,
   grantStandingApproval, revokeStandingApproval, listStandingGrants,
   grantSendTrust, revokeSendTrust, listSendTrustGrants, SEND_TRUST_MAX_RECIPIENTS,
-  grantSendTrustFromApprovedAction,
-} from '../agents/plan-scope.js';
+  grantSendTrustFromApprovedAction, listApprovedWriteKinds, forgetApprovedWriteKind } from '../agents/plan-scope.js';
 import {
   listTrustProposals,
   getTrustProposal,
@@ -441,7 +440,7 @@ import { clearRunInFlightAfterTerminal, releaseRunInFlightAfterWorkflowTransfer 
 import { acceptedSourceOutcome, workflowOwnedUnfinishedAttemptIds } from '../runtime/harness/accepted-source-outcome.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { routeOpenQuestionPlan } from '../runtime/harness/plan-continuity.js';
-import { getHarnessBudgetSnapshot, saveHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
+import { getHarnessBudgetSnapshot } from '../runtime/harness/budget-settings.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
@@ -9738,15 +9737,12 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Run limits are not the owner's to tune (2026-09-30): a run stops for a
+  // terminal outcome, a gate, a stop or zero progress, never for a ceiling.
+  // The values stay readable in the settings snapshot; nothing writes them.
   app.patch('/api/console/settings/runtime-budget', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
-      const settings = saveHarnessBudgetSettings(req.body ?? {});
-      clearAutonomyAgentCache();
-      res.json({ runtimeBudget: { ...getHarnessBudgetSnapshot(), settings } });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
+    res.status(410).json({ error: 'run limits are fixed; there is nothing to set' });
   });
 
   registerCliSessionRoutes(app, (req, res, next) => {
@@ -11109,6 +11105,26 @@ export function registerConsoleRoutes(
     const ok = revokeSendTrust(req.params.id);
     if (!ok) { res.status(404).json({ error: 'no live send-trust grant with that id' }); return; }
     res.json({ revoked: true });
+  });
+
+  // ─── Kinds of change approved once in Ask mode (2026-09-30) ──────
+  // What an approval taught: this operation on this account runs next time
+  // without a card. Visible here, and forgettable, because a learned grant the
+  // owner cannot see is a grant they cannot take back.
+  app.get('/api/console/approved-write-kinds', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ kinds: listApprovedWriteKinds() });
+  });
+
+  app.delete('/api/console/approved-write-kinds', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const operationId = typeof body.operationId === 'string' ? body.operationId.trim() : '';
+    const accountId = typeof body.accountId === 'string' && body.accountId.trim() ? body.accountId.trim() : null;
+    if (!operationId) { res.status(400).json({ error: 'operationId is required' }); return; }
+    const ok = forgetApprovedWriteKind(operationId, accountId);
+    if (!ok) { res.status(404).json({ error: 'no approved kind matches' }); return; }
+    res.json({ forgotten: true });
   });
 
   // ─── Trust-graduation proposals ──────────────────────────────────

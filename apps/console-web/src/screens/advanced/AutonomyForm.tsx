@@ -9,7 +9,7 @@ import { Switch } from '@/components/ui/Switch';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { getSettings, patchPolicy, type Policy } from '@/lib/settings';
-import { listSendTrust, addSendTrust, revokeSendTrust } from '@/lib/settings';
+import { listSendTrust, addSendTrust, revokeSendTrust, listApprovedWriteKinds, forgetApprovedWriteKind } from '@/lib/settings';
 import { getWatches, patchWatch, tickWatch, type WatchStatus } from '@/lib/settings';
 
 /**
@@ -18,6 +18,42 @@ import { getWatches, patchWatch, tickWatch, type WatchStatus } from '@/lib/setti
  * domain/address here; anything else (an out-of-scope cc, a mass-send, a new
  * channel) still asks. Managed here by the human so there's no self-grant path.
  */
+/** What Ask mode learned: each kind of connected-app change the owner
+ * approved once. Visible, and forgettable. */
+function ApprovedKindsPanel() {
+  const qc = useQueryClient();
+  const kinds = usePoll(['approved-write-kinds'], listApprovedWriteKinds, 0);
+  const rows = kinds.data?.kinds ?? [];
+  const forget = async (kind: { operationId: string; accountId: string | null }) => {
+    try { await forgetApprovedWriteKind(kind); } finally { void qc.invalidateQueries({ queryKey: ['approved-write-kinds'] }); }
+  };
+  return (
+    <div className="mt-5">
+      <h3 className="mb-1 text-h3 text-fg">Changes you've approved once</h3>
+      <p className="mb-3 text-caption text-muted">
+        In Ask mode, approving a change in a connected app teaches Clem that kind of change, so it runs next time without asking.
+        A kind unused for sixty days is forgotten on its own.
+      </p>
+      {rows.length === 0
+        ? <div className="text-caption text-faint">Nothing learned yet.</div>
+        : (
+          <div className="space-y-1.5">
+            {rows.map((k) => (
+              <div key={`${k.operationId}:${k.accountId ?? ''}`} className="flex items-center gap-3 rounded-md border border-border bg-subtle px-3 py-2">
+                <Check className="h-4 w-4 shrink-0 text-success" aria-hidden />
+                <span className="min-w-0 flex-1 truncate text-body text-fg">
+                  {k.operationId.toLowerCase().replace(/_/g, ' ')}
+                  {k.accountId ? <span className="text-muted"> · {k.accountId}</span> : null}
+                </span>
+                <button type="button" onClick={() => forget({ operationId: k.operationId, accountId: k.accountId })} className="shrink-0 text-caption text-danger hover:underline cursor-pointer">Forget</button>
+              </div>
+            ))}
+          </div>
+        )}
+    </div>
+  );
+}
+
 function SendTrustPanel() {
   const qc = useQueryClient();
   const grants = usePoll(['send-trust'], listSendTrust, 0);
@@ -214,31 +250,24 @@ export function AutonomyForm() {
           <ToggleRow label="Proactive work" desc="Let Clementine start helpful work without being asked." checked={!!form.enabled} onChange={(v) => set('enabled', v)} />
 
           <div className="grid gap-x-4 pt-4 sm:grid-cols-2">
-            <Field label="Mode">{(id) => (
+            <Field label="Working style">{(id) => (
               <Select id={id} value={form.mode ?? 'balanced'} onChange={(e) => set('mode', e.target.value as Policy['mode'])}>
                 <option value="watch">Watch — observe and notify</option>
                 <option value="balanced">Balanced</option>
                 <option value="hands_on">Hands-on — drive forward</option>
               </Select>
             )}</Field>
-            <Field label="Approvals" hint="Auto-approve: Clem plans, confirms once, then completes the task — including the sends that plan named and anyone you trust below. A send she didn't plan, a blast to many people, or an untrusted recipient still checks with you. Approve: she confirms before every change.">{(id) => (
+            <Field label="Mode" hint="Auto: anything that is not disruptive just runs — local files, the shell, reads, ordinary changes in your connected apps. Ask: Clem also checks with you before an ordinary change in a connected app, once; approving it teaches her that kind of change. In both modes a send, a delete or anything irreversible always asks on one card.">{(id) => (
               <Select
                 id={id}
-                value={form.autoApproveScope === 'strict' || form.autoApproveScope === 'balanced' ? 'strict'
-                  : form.autoApproveScope === 'workspace' ? 'workspace' : 'yolo'}
+                value={form.autoApproveScope === 'yolo' ? 'yolo' : 'strict'}
                 onChange={(e) => set('autoApproveScope', e.target.value as Policy['autoApproveScope'])}
               >
-                <option value="yolo">Auto-approve — approve the plan once, then Clem runs it (recommended)</option>
-                <option value="strict">Approve — check with me before each change</option>
-                {/* Legacy power-user scope: shown ONLY when it's the stored value,
-                    so it round-trips truthfully instead of silently reading as
-                    Auto-approve and getting rewritten to yolo on the next save. */}
-                {form.autoApproveScope === 'workspace' && (
-                  <option value="workspace">Workspace — auto-approve inside your workspace folders (legacy)</option>
-                )}
+                <option value="yolo">Auto — anything non-disruptive runs (recommended)</option>
+                <option value="strict">Ask — check with me before changing my connected apps</option>
               </Select>
             )}</Field>
-            <Field label="Proactive check-in (minutes)" hint="How often Clementine proactively checks in / starts helpful work on its own. (Separate from the run-loop heartbeat under Run limits.)">{(id) => <Input id={id} type="number" min={1} max={60} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', Number(e.target.value))} />}</Field>
+            <Field label="Proactive check-in (minutes)" hint="How often Clementine proactively checks in / starts helpful work on its own.">{(id) => <Input id={id} type="number" min={1} max={60} value={form.checkInMinutes ?? ''} onChange={(e) => set('checkInMinutes', Number(e.target.value))} />}</Field>
           </div>
 
           <h3 className="mb-1 mt-4 text-h3 text-fg">Quiet hours</h3>
@@ -250,6 +279,7 @@ export function AutonomyForm() {
             </div>
           )}
 
+          <ApprovedKindsPanel />
           <SendTrustPanel />
 
           <WatchesPanel />
