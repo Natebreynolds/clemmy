@@ -23,6 +23,7 @@ Object.assign(process.env, {
   CLEMMY_UNIFIED_TURN_PRIMER: 'off',
   CLEMMY_DEBATE_MODE: 'off',
   CLEMMY_WATCHER_JUDGE: 'off',
+  CLEMMY_RUN_TOKEN_BUDGET: 'on',
   COMPOSIO_BACKEND: 'sdk',
 });
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
@@ -45,6 +46,7 @@ const host = await import('./host-turn-runner.js');
 const hostAuthority = await import('./accepted-turn-call-authority.js');
 const hostProgress = await import('./host-connection-progress.js');
 const sourceBudgets = await import('./source-budget-policy.js');
+const { recordModelUsage } = await import('../usage-log.js');
 const batchCheckpoints = await import('./accepted-model-batch-checkpoint.js');
 const sourceContext = await import('./source-session-context.js');
 const { withSourceSessionContext } = await import('./source-session-context-scope.js');
@@ -115,7 +117,9 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   'lease-newer-request', 'lease-rollback', 'lease-live-renewal', 'lease-lost-during-check', 'lease-dispatch',
   'lease-expired-during-model', 'progress-model-pending', 'progress-result-landed', 'progress-exhausted',
   'progress-corrupt', 'progress-stale', 'progress-stopped', 'progress-provider-returned',
-  'progress-adoption'] as const) test(`connection execution: ${scenario}`, async t => {
+  'progress-adoption', 'budget-token-before-resume', 'budget-token-after-result',
+  'budget-time-after-result', 'budget-unknown-cost', 'budget-child-before-resume', 'budget-wait-excluded',
+  'budget-unrelated-turn'] as const) test(`connection execution: ${scenario}`, async t => {
   const useExecutor = scenario !== 'publication';
   let configured = 0;
   _setBridgeImplsForTests({ configure: async () => { configured += 1; return { ok: true }; } });
@@ -198,6 +202,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
       beforeModelResponse?.(modelCalls);
       const output = frames[modelCalls++];
       assert.ok(output, 'the recording model must not run beyond its scripted frames');
+      recordModelUsage({ ...identity, model: modelId, role: 'brain', cacheDialect: 'none', inputTokens: 1, outputTokens: 1 });
       return { responseId: `controlled-closure-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output } as never;
     },
     async *getStreamedResponse(request) {
@@ -228,12 +233,13 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const runner = new EventEmitter();
   Object.assign(runner, { run() { throw new Error('The legacy runner must not execute this fixture.'); } });
   const preparationStartedAt = Date.now() - 1200;
+  const originalMaxActiveMs = scenario === 'lease-live-renewal' ? 180_000 : 42_000;
   const outcome = await withSourceSessionContext(retainedContext, () => brackets.withHarnessRunContext({ ...identity,
     counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::source:${source.seq}` },
   () => host.hostRunRunner(runner as never, agent as never,
     [{ type: 'message', role: 'user', content: executeInput }] as never,
     { maxTurns: scenario === 'progress-exhausted' ? 5 : 6, hostTurnEngine: 'host_v1', hostJudgeCompletion: false,
-      maxWallClockMs: 42_000, maxRunTokens: 1234, hostActivationStartedAt: preparationStartedAt, context: identity } as never)));
+      maxWallClockMs: originalMaxActiveMs, maxRunTokens: 1234, hostActivationStartedAt: preparationStartedAt, context: identity } as never)));
   assert.equal(modelCalls, 3, JSON.stringify({ outcome,
     planResult: log.getToolOutput(session.id, 'controlled-reviewed-plan') }));
   assert.match(String(outcome.finalOutput), /Connect the controlled fixture CRM/);
@@ -279,7 +285,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const progress = hostProgress.boundHostConnectionProgress(agent, identity);
   assert.ok(progress?.activation.outerBudget, 'the connection pause must retain its original outer policy');
   const retainedBudget = sourceBudgets.readSourceBudgetPolicy(identity, progress.activation.outerBudget)!;
-  assert.equal(retainedBudget.policy.maxActiveMs, 42_000);
+  assert.equal(retainedBudget.policy.maxActiveMs, originalMaxActiveMs);
   assert.equal(retainedBudget.policy.maxUncachedTokens, 1234);
   assert.ok(progress.activation.elapsedMs >= 1200, 'active preparation belongs to the interval before the host starts');
   assert.ok(progress, 'the real host must retain consumed progress at its input pause');
@@ -291,6 +297,9 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const db = log.openEventLog();
   const checkpointRows = () => db.prepare('SELECT * FROM source_connection_checkpoints_v1 ORDER BY request_id').all();
   const checkpointBefore = checkpointRows();
+  // The meter already observed this source. Rehearsing an older table
+  // migration must not pretend the independent usage meter was installed now.
+  const meterInstalledAt = db.prepare('SELECT applied_at FROM schema_version WHERE version = 84').get()!.applied_at;
   db.pragma('foreign_keys = OFF');
   try {
     db.transaction(() => {
@@ -310,6 +319,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     })();
   } finally { db.pragma('foreign_keys = ON'); }
   applyHarnessMigrations(db);
+  db.prepare('UPDATE schema_version SET applied_at = ? WHERE version = 84').run(meterInstalledAt);
   assert.deepEqual(checkpointRows(), checkpointBefore);
   assert.deepEqual(db.pragma('foreign_key_check'), []);
   const pauseBinding = connectionPause.prepareConnectionExecutionPause({ ...identity, requestId: dependency.requestId });
@@ -333,6 +343,9 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   assert.deepEqual(hostAuthority.acceptedTurnCallAuthorityFor(session.id, source.seq), rootBefore);
   log.updateSession(session.id, { status: 'active' });
   const context = { sessionId: session.id, connectionRequestId: dependency.requestId };
+  if (scenario === 'budget-wait-excluded') {
+    t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+  }
   const connectedAccount = scenario === 'different-reviewed-account' ? 'fixture-another-account' : 'fixture-server-returned-account';
   connectionSetup.recordConnectionSetupResult(context, { connectionId: connectedAccount });
   let checks = 0;
@@ -348,11 +361,16 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const runId = 'fixture-connection-control';
   // Create the receipt at a historical clock so the final retention assertion
   // exercises real expiry without mutating an immutable acceptance timestamp.
+  const clockAfterConnection = Date.now();
+  if (scenario === 'budget-wait-excluded') t.mock.timers.reset();
   t.mock.timers.enable({ apis: ['Date'], now: new Date('2020-01-01T00:00:00.000Z') });
   try {
     log.claimHarnessChatRequest({ ...sharedReceipt, sessionId: session.id, runId,
       sinceSeq: log.listEvents(session.id).at(-1)!.seq });
-  } finally { t.mock.timers.reset(); }
+  } finally {
+    t.mock.timers.reset();
+    if (scenario === 'budget-wait-excluded') t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: clockAfterConnection });
+  }
   const gateway = new ClementineGateway({ respond: async () => { throw new Error('The legacy gateway responder must not run.'); } } as never);
   let gatewayAccepted: import('./eventlog.js').EventRow | undefined;
   const gatewayRequest = { sessionId: session.id, runId, userId: 'fixture-owner', channel: 'mobile', source: 'mobile' as const,
@@ -474,6 +492,54 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
         async () => { throw new Error('The legacy bridge responder must not run.'); }, { connectionExecutionLeaseOwner: leaseOwner })
     : respondViaHarness(scenario.endsWith('mobile') ? 'webhook' : 'home', bridgeRequest,
         { connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1', modelOverride: 'fixture-wrong-caller-override' });
+  if (['budget-token-before-resume', 'budget-token-after-result', 'budget-time-after-result', 'budget-unknown-cost',
+    'budget-child-before-resume'].includes(scenario)) {
+    let usageOwner = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq };
+    if (scenario === 'budget-child-before-resume') {
+      const child = log.createSession({ id: 'recording-budget-child', kind: 'agent' });
+      const childSource = log.appendEvent({ sessionId: child.id, turn: 1, role: 'user', type: 'user_input_received',
+        parentEventId: source.id, data: { text: 'recording child work',
+          delegatedWorker: { parentSessionId: identity.sessionId, parentSourceUserSeq: identity.sourceUserSeq } } });
+      log.appendEvent({ sessionId: identity.sessionId, turn: 1, role: 'system', type: 'worker_started', data: {
+        parentSessionId: identity.sessionId, parentSourceUserSeq: identity.sourceUserSeq,
+        childSessionId: child.id, childSourceUserSeq: childSource.seq } });
+      usageOwner = { sessionId: child.id, sourceUserSeq: childSource.seq };
+    }
+    const charge = () => recordModelUsage({ ...usageOwner, model: 'recording-reviewer', role: 'reviewer', cacheDialect: 'none',
+      inputTokens: scenario === 'budget-unknown-cost' ? 0 : 1234, outputTokens: 0,
+      ...(scenario === 'budget-unknown-cost' ? { ok: false } : {}) });
+    const afterResult = scenario.endsWith('after-result');
+    if (scenario === 'budget-time-after-result') {
+      t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+      provider!.afterBusiness(() => t.mock.timers.tick(43_000));
+    } else if (afterResult) provider!.afterBusiness(charge);
+    else charge();
+    log.closeEventLog();
+    const stopped = await runConversation(resumeOptions);
+    assert.equal(stopped.status, 'blocked', JSON.stringify(stopped));
+    assert.equal(stopped.blockedReason, scenario === 'budget-time-after-result' ? 'wall_clock'
+      : scenario === 'budget-unknown-cost' ? 'budget_usage_unavailable' : 'token_budget');
+    assert.equal(modelCalls, afterResult ? 4 : 3, 'the spent original budget cannot buy another model frame');
+    assert.equal(provider!.counts.businessCalls, afterResult ? 1 : 0);
+    assert.deepEqual(readRows(), readBefore, 'budget stop cannot replay the completed local read');
+    if (afterResult) {
+      const settlement = log.openEventLog().prepare(`SELECT outcome_kind FROM logical_call_settlements
+        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+        .get(session.id, source.seq, 'controlled-selected-crm-read');
+      assert.equal(settlement?.outcome_kind, 'succeeded', 'returned work must settle before any budget stop');
+    }
+    assert.deepEqual(sourceBudgets.readSourceBudgetPolicy(identity, progress.activation.outerBudget), retainedBudget);
+    const counts = { modelCalls, businessCalls: provider!.counts.businessCalls };
+    const replayedStop = await runConversation(resumeOptions);
+    assert.equal(replayedStop.status, 'blocked', 'replaying a budget stop cannot claim completion');
+    assert.deepEqual({ modelCalls, businessCalls: provider!.counts.businessCalls }, counts,
+      'a repeated control cannot reset or spend the closed task budget');
+    return;
+  }
+  if (scenario === 'budget-unrelated-turn') {
+    recordModelUsage({ sessionId: session.id, sourceUserSeq: planSource.seq, model: 'recording-other-turn',
+      role: 'brain', cacheDialect: 'none', inputTokens: 90_000, outputTokens: 0 });
+  }
   if (scenario.startsWith('progress-')) {
     const afterRead = ['progress-result-landed', 'progress-exhausted', 'progress-stale', 'progress-provider-returned'].includes(scenario);
     const losesResponse = !['progress-provider-returned', 'progress-adoption'].includes(scenario);

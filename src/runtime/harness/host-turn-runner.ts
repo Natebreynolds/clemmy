@@ -30,6 +30,7 @@ import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
 import { acceptedPlanExecution, acceptedPlanExecutionText } from './accepted-plan-execution.js';
 import { captureSourceBudgetPolicy, readSourceBudgetPolicy } from './source-budget-policy.js';
+import { assertSourceBudgetBeforeModel, SourceBudgetBoundaryError } from './source-budget-boundary.js';
 import { acceptedTaskMode, acceptedTaskModeIdentity, planModeCallRefusal, planModeReadOnlyRefusalText } from './accepted-task-mode.js';
 import { getPlanRevision } from './plan-artifacts.js';
 import { normalizeCallableArguments } from './callable-contract.js';
@@ -5055,6 +5056,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             ? {
                 beforeModelDispatch: (request: ModelRequest) => {
                   assertRecoveryActivationOwned();
+                  if (outerBudget) assertSourceBudgetBeforeModel(outerBudget.policy,
+                    (carriedProgress?.activation.elapsedMs ?? 0) + Math.max(0, Date.now() - connectionActivationStartedAt));
                   const identity = exactHostIdentity();
                   const provenance = recordModelRequestDispatchProvenance({
                     sessionId: identity.sessionId,
@@ -5203,7 +5206,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       });
       return written;
     } catch (error) {
-      if (error instanceof KillRequested || signal?.aborted) throw error;
+      if (error instanceof KillRequested || error instanceof SourceBudgetBoundaryError || signal?.aborted) throw error;
       journalHostGuide('host_final_writer', {
         phase: 'fell_back', modelId: writer.author.modelId, durationMs: Date.now() - startedAt,
         reason: String(error instanceof Error ? error.message : error).slice(0, 200),
@@ -9685,6 +9688,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     } catch (error) {
       // Whatever the failed response showed is not an answer.
       answerDraft?.retract();
+      if (error instanceof SourceBudgetBoundaryError) {
+        journalHostGuide('accepted_source_budget_reached', { reason: error.reason, ...error.evidence });
+        return blockedOutcome(error.message, error.reason);
+      }
       // This host admits a complete model frame before running any of its
       // tools. Even after partial text or arguments streamed, a rejected frame
       // has no tool effects to replay. Retry from the accepted history using

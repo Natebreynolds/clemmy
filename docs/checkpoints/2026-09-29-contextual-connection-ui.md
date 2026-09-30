@@ -1506,3 +1506,111 @@ No paid model/provider, credentials/settings mutation, build, hotpatch, merge
 or tag. The isolated live-home sentinel was **NOT PERFORMED** while daemon
 72427 wrote its normal stores; these pins do not replace installed acceptance.
 The other agent remains clean at `76c53a1ea` on `claude/two-modes`.
+
+### Observed budget checks at the host model boundary — 2026-09-30
+
+This increment applies the retained policy from `203c9f887` before the host
+dispatches another brain/writer request. It does **not** finish full-task
+budget enforcement or qualify public Execute Continue. The
+`EXECUTION_CONTINUATION_BLOCKER` remains active; no installed app changed.
+
+Implemented:
+
+- The host checks the original source's active-time limit using retained
+  elapsed time plus the current activation, including captured preparation.
+  Waiting for sign-in does not create a new allowance or consume active time.
+- Recorded uncached work is summed for the original exact accepted source and
+  nested host workers. Worker links require both the parent's exact tuple and
+  the child's matching accepted parent event/delegation. Duplicate worker
+  announcements count once. Another source in the same chat or worker session
+  cannot spend this request's allowance. All recorded roles count.
+- A reached configured limit stops the next host model request before
+  dispatch/provenance publication. A returned tool result still gets its
+  settlement. The stop preserves retained work and does not buy a model call
+  to explain the stop. A writer cannot hide the typed stop in its fallback.
+- Finite token policies hold when the available record explicitly reports an
+  unknown failed-call cost, a pre-meter baseline, an invalid child link or an
+  unavailable meter. Unlimited/disabled token settings do not read this meter.
+  Current caller settings still cannot replace the captured policy.
+- `usageEfficiencyForTurn` no longer accepts a turn number from a different
+  session. Exact accepted-source trace identity wins over legacy source text;
+  a legacy turn-only marker also needs the matching session. The new recording
+  fixtures exposed this separate reporting bug: their reused database sequence
+  numbers polluted diagnostic frame counts across sessions. This fix changes
+  attribution, not historical usage rows, provider billing or model behavior.
+
+Verification, with recording models and provider fixtures only:
+
+- `/tmp/clem-source-budget-boundary-final-2.txt`: **70/70** across policy,
+  indexed usage, boundary, ordinary source checkpoint and connection execution
+  tests. The execution file now has **46** scenarios, including seven new
+  budget cases: spent before resume, spent after a landed read, active time
+  spent after a read, unknown failed-call cost, child spend before resume,
+  seven days waiting for connection, and unrelated-turn spend.
+- `/tmp/clem-source-budget-boundary-host-compat.txt`: **337/337** existing host
+  checks, including approval/recovery/writer behavior. This ran the budget
+  boundary before the separate reporting-only predicate correction.
+- `/tmp/clem-source-budget-boundary-usage-final.txt`: **45/45** reporting,
+  writer/observer and whole-task report checks, including both new exact-source
+  efficiency cases.
+- `/tmp/clem-source-budget-boundary-replay-final.txt`: **7/7** budget scenarios
+  after strengthening the replay assertion: reopening a stopped control still
+  reports `blocked`, with no model/tool replay or false completion. These
+  overlap the 70-check run and must not be added as independent coverage.
+- Runtime TypeScript passed in
+  `/tmp/clem-source-budget-boundary-tsc-final-2.txt`.
+- Removing only the new host budget assertion made all five stop scenarios
+  fail: each incorrectly completed instead of stopping. Evidence:
+  `/tmp/clem-source-budget-boundary-red.txt`. Restoring the former efficiency
+  predicate made both new reporting checks fail (two frames instead of one,
+  and six instead of three): `/tmp/clem-source-budget-efficiency-red.txt`.
+  Both mutations restored the exact original bytes in `finally`.
+
+Fixture traps caught and corrected: replaying migration 83 had also reset
+the already-installed meter's timestamp, incorrectly classifying the source
+as pre-meter. The rehearsal now preserves the real original timestamp; the
+production unknown-baseline check was not weakened. The week-long wait fixture
+also collided with an existing temporary historical clock for receipt expiry;
+it now restores the intended clock around that receipt. The renewal scenario
+uses an explicit 180-second policy for its simulated 120-second active request,
+instead of testing successful execution against a contradictory 42-second cap.
+An obsolete combined check was terminated after discovering an incorrect
+usage-directory import in a new test; the test now uses `BASE_DIR/state/token-usage`.
+The final evidence above supersedes those partial/failed runs.
+
+Limits of this increment (do not describe it as a strict total-spend ceiling):
+
+1. Only recorded costs and observed elapsed time are known. A zero-row meter
+   does not certify zero spend. There is no durable reservation/settlement
+   ledger for every in-flight provider request; a lost request may still cost
+   money without a usage row. Aggregated unknown-cost counts cannot yet be
+   reconciled against a later report of that same physical call.
+2. The check gates the host's next brain/writer dispatch. It does not stop all
+   parallel worker/auxiliary dispatches against a shared root allowance, cap
+   the current request's unknown output cost, or aggregate the separate
+   background-task delegation lifecycle. A running batch can overshoot before
+   the next checked boundary. Known host-worker descendants are included when
+   their parent checks again.
+3. Crash gaps, preparation failures before a snapshot, and historical sources
+   with no captured policy still need their own durable evidence. No defaults
+   were invented for those sources. A late writer/reviewer or memory job is
+   not made fully accounted merely by having a role in the recorded meter.
+4. A configured-budget stop still needs a qualified owner action for changing
+   the original allowance or resolving uncertain usage. Repeated connection
+   controls must not silently start a new task or offer a futile automatic
+   retry. UI work must use the typed cause and saved task state, rather than
+   turning a budget hold back into a misleading connection card.
+
+Next: durable in-flight usage and interrupted active intervals; shared root
+budget admission for descendant/auxiliary requests; then owned Retry/Continue
+and reloadable desktop/mobile state. Show one saved task, verified account,
+retained results, and a precise next action. Keep incomplete usage in details,
+and distinguish waiting for sign-in, resuming, running, and a configured-limit
+stop. Actual physical-write recovery, device handoff, subsequent approvals,
+workflow completion and installed-app/live-home acceptance remain owed.
+
+No paid model/provider call, credentials/settings mutation, build, hotpatch,
+merge or tag. The isolated sentinel was **NOT PERFORMED** because live daemon
+72427 owned the home and wrote normal stores. No performance or live acceptance
+claim follows from these fixture times. The other agent was rechecked clean
+at `76c53a1ea`; their files were not changed.

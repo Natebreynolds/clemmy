@@ -1199,11 +1199,14 @@ export function usageEfficiencyForTurn(
 ): UsageEfficiency {
   const exact = `${sessionId}:${sourceUserSeq}`;
   return usageEfficiencyForEvents(
-    readUsageEventsForDate(date).filter((ev) => (
-      ev.source === exact
-      || ev.trace?.acceptedSource === exact
-      || ev.trace?.logicalTurnId === `turn:${sourceUserSeq}`
-    )),
+    readUsageEventsForDate(date).filter((ev) => {
+      // A sequence number alone is not an owner. Restored/imported logs can
+      // share it across sessions; exact trace identity also outranks legacy
+      // source text when those disagree.
+      if (ev.trace?.acceptedSource) return ev.trace.acceptedSource === exact;
+      return ev.source === exact
+        || (ev.source === sessionId && ev.trace?.logicalTurnId === `turn:${sourceUserSeq}`);
+    }),
   );
 }
 
