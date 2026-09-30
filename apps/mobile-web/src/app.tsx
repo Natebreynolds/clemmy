@@ -881,7 +881,7 @@ export function App() {
             />
           ) : tab === 'workflows' ? <Workflows />
             : tab === 'spaces' ? (
-              <Workspaces initialOpenId={workspaceId} onOpenChange={selectWorkspace} />
+              <Workspaces onOpenNeedsYou={() => navigateTo('inbox')} initialOpenId={workspaceId} onOpenChange={selectWorkspace} />
             )
             : tab === 'memory' ? <Memory />
             : tab === 'settings' ? (

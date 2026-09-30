@@ -1715,6 +1715,18 @@ export async function getWorkspace(id: string): Promise<WorkspaceDetail> {
   return api<WorkspaceDetail>(`/m/api/workspaces/${encodeURIComponent(id)}`);
 }
 
+export type { WorkspaceSourceControlRequest, WorkspaceSourceControlResponse, WorkspaceSourceControlView } from '../../../../src/shared/workspace-source-controls';
+export async function getWorkspaceSourceControls(id: string): Promise<{ sources: import('../../../../src/shared/workspace-source-controls').WorkspaceSourceControlView[] }> {
+  return api(`/m/api/workspaces/${encodeURIComponent(id)}/source-controls`);
+}
+export async function controlWorkspaceSource(id: string, sourceId: string,
+  command: import('../../../../src/shared/workspace-source-controls').WorkspaceSourceControlRequest,
+): Promise<import('../../../../src/shared/workspace-source-controls').WorkspaceSourceControlResponse> {
+  return api(`/m/api/workspaces/${encodeURIComponent(id)}/source-controls/${encodeURIComponent(sourceId)}`, {
+    method: 'POST', body: JSON.stringify(command),
+  });
+}
+
 /** Starts the runners; returns immediately (a refresh can take minutes). */
 /**
  * Refresh outcome: `done:false` means a long runner is still going (keep

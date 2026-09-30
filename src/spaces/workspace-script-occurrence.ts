@@ -34,6 +34,7 @@ export interface WorkspaceScriptOccurrenceView {
   approvalId: string | null;
   activationId: string | null;
   published: boolean;
+  resolved: boolean;
 }
 type Prepared = ReturnType<typeof prepareWorkspaceScriptCall>;
 interface Preparation {
@@ -47,6 +48,7 @@ interface OccurrenceRow {
   session_id: string; logical_call_id: string; preparation_json: string;
   approval_id: string | null; activation_id: string | null;
   observed_at: string | null; observation_id: string | null; created_at: string;
+  resolution_json: string | null;
 }
 const table = 'workspace_script_occurrences_v1';
 const digest = (value: unknown) => createHash('sha256').update(canonicalWorkspaceJson(value)).digest('hex');
@@ -65,12 +67,13 @@ export function readWorkspaceScriptOccurrence(key: WorkspaceScriptOccurrenceKey)
   if (!row) return null;
   const saved = JSON.parse(row.preparation_json) as Preparation;
   return { key, sessionId: row.session_id, args: saved.args, source: saved.source,
-    approvalId: row.approval_id, activationId: recoverActivation(row), published: row.observation_id !== null };
+    approvalId: row.approval_id, activationId: recoverActivation(row), published: row.observation_id !== null,
+    resolved: row.resolution_json !== null };
 }
 
 export function listUnpublishedWorkspaceScriptOccurrences(slug?: string, sourceId?: string): WorkspaceScriptOccurrenceKey[] {
   const rows = openEventLog().prepare(`SELECT workspace_id, source_id, occurrence_id FROM ${table}
-    WHERE observation_id IS NULL ${slug === undefined ? '' : 'AND workspace_id = ?'}
+    WHERE observation_id IS NULL AND resolution_json IS NULL ${slug === undefined ? '' : 'AND workspace_id = ?'}
     ${sourceId === undefined ? '' : 'AND source_id = ?'} ORDER BY rowid`).all(
     ...(slug === undefined ? [] : [slug]), ...(sourceId === undefined ? [] : [sourceId]),
   ) as Pick<OccurrenceRow, 'workspace_id' | 'source_id' | 'occurrence_id'>[];
@@ -97,7 +100,7 @@ export function reserveWorkspaceScriptOccurrence(
         sessionId: existing.session_id, consent: saved.consent, published: existing.observation_id !== null };
     }
     const pending = db.prepare(`SELECT occurrence_id FROM ${table}
-      WHERE workspace_id = ? AND source_id = ? AND observation_id IS NULL`).get(input.slug, input.sourceId) as { occurrence_id: string } | undefined;
+      WHERE workspace_id = ? AND source_id = ? AND observation_id IS NULL AND resolution_json IS NULL`).get(input.slug, input.sourceId) as { occurrence_id: string } | undefined;
     if (pending) return { status: 'blocked', occurrenceId: pending.occurrence_id,
       reason: 'This source has an unfinished occurrence. Recover that occurrence before admitting another run.' };
     const args = captureWorkspaceScriptArguments({ slug: input.slug, source_id: input.sourceId,
@@ -147,6 +150,7 @@ export function activateWorkspaceScriptOccurrence(key: WorkspaceScriptOccurrence
   const db = openEventLog();
   let row = rowFor(key);
   if (!row) throw new Error('Saved script occurrence was not reserved.');
+  if (row.resolution_json) throw new Error('Saved script occurrence was closed by its owner.');
   const saved = JSON.parse(row.preparation_json) as Preparation;
   const approval = getApproval(approvalId);
   if (!approval || approval.status !== 'resolved' || approval.resolution !== 'approved'
@@ -185,6 +189,7 @@ export function activateWorkspaceScriptOccurrenceWithGrant(key: WorkspaceScriptO
   const db = openEventLog();
   let row = rowFor(key);
   if (!row) throw new Error('Saved script occurrence was not reserved.');
+  if (row.resolution_json) throw new Error('Saved script occurrence was closed by its owner.');
   const grant = readSavedSourceScriptGrant(grantId);
   if (!grant) throw new Error('Saved script scope grant is missing.');
   if (row.approval_id && row.approval_id !== grant.approvalId) throw new Error('Saved script occurrence already owns a different approval.');
@@ -223,6 +228,7 @@ export async function executeWorkspaceScriptOccurrence(
 ): Promise<ExecuteWorkspaceScriptOccurrenceResult> {
   let row = rowFor(key);
   if (!row) return { status: 'held', reason: 'Saved script occurrence was not reserved.' };
+  if (row.resolution_json) return { status: 'held', reason: 'Saved script occurrence was closed by its owner.' };
   const saved = JSON.parse(row.preparation_json) as Preparation;
   const activationId = recoverActivation(row);
   if (!activationId) return { status: 'held', reason: 'Saved script occurrence has no approved activation.' };
@@ -233,6 +239,7 @@ export async function executeWorkspaceScriptOccurrence(
   const result = await executeActivatedWorkflowNodeCall({ activationId,
     invocationPlan: saved.plan, args: saved.args, signal });
   crash('after_kernel');
+  if (rowFor(key)?.resolution_json) return { status: 'held', reason: 'Saved script occurrence was closed by its owner.' };
   if (result.status !== 'completed' && result.status !== 'replayed') {
     // zeroBody describes THIS invocation, not necessarily a previous claimed
     // occurrence. Never free a source's barrier based on a retry's zeroBody.
@@ -288,6 +295,7 @@ export async function executeWorkspaceScriptOccurrence(
   await finalizeWorkspaceObservationCommit(key.slug, committed);
   const observation = committed.observations[0]!;
   db.transaction(() => {
+    if (rowFor(key)?.resolution_json) throw new Error('Saved script occurrence was closed before publication completed.');
     db.prepare(`UPDATE ${table} SET observation_id = ? WHERE workspace_id = ? AND source_id = ?
       AND occurrence_id = ? AND observation_id IS NULL`).run(observation.id, ...keyArgs(key));
     retainWorkspaceScriptReport(db, { ...key, observationId: observation.id, sessionId: row!.session_id,

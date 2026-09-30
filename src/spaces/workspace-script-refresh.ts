@@ -17,6 +17,7 @@ import { activateWorkspaceScriptOccurrenceWithGrant, executeWorkspaceScriptOccur
 import { historicalRunnerDenial } from './space-data-runner-trust.js';
 import { drainWorkspaceScriptReports, recoverPublishedWorkspaceScriptReports } from './workspace-script-reports.js';
 import { spaceStore, type SpaceDataSource } from './store.js';
+import { readSavedSourceControlState } from '../runtime/harness/saved-source-control-state.js';
 import type { RefreshResult, RunSourceErr } from './runner.js';
 
 export interface SavedScriptRefreshOptions {
@@ -32,7 +33,9 @@ export type SavedScriptRefreshResult = RunSourceErr | {
 const held = (error: string, code: RunSourceErr['code'] = 'not_approved'): RunSourceErr => ({ ok: false, error, code });
 
 function scopeFor(view: WorkspaceScriptOccurrenceView): SavedSourceScriptScope {
+  const control = readSavedSourceControlState(view.key.slug, view.key.sourceId);
   return savedSourceScriptScope.parse({ version: 1, workspaceId: view.key.slug, sourceId: view.key.sourceId,
+    ...(control.reviewId ? { reviewId: control.reviewId } : {}),
     sourceDigest: view.args.source_digest, scriptSha256: view.args.script_sha256, runner: view.source.runner,
     schedule: { cron: view.source.schedule?.trim() || null,
       timeZone: view.source.timezone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone },
@@ -63,6 +66,7 @@ export async function refreshWorkspaceScriptSource(
       if (unfinished) view = readWorkspaceScriptOccurrence(unfinished);
     }
     if (!view) {
+      if (readSavedSourceControlState(slug, source.id).stopped) return held('Permission for this source is stopped or revoked. Review its permission in Workspace details to start again.');
       if (opts.cause === 'retry') {
         return held('No saved refresh is available to retry. Request a new refresh to start another run.', 'definition');
       }
@@ -75,8 +79,10 @@ export async function refreshWorkspaceScriptSource(
       view = readWorkspaceScriptOccurrence(reserved.key);
     }
     if (!view) return held('Saved script occurrence could not be retained.', 'definition');
+    if (view.resolved) return held('This saved refresh was closed by its owner. Request a new refresh after reviewing permission.');
 
     if (!view.activationId) {
+      if (readSavedSourceControlState(slug, source.id).stopped) return held('Permission for this source is stopped or revoked. Review its permission in Workspace details to start again.');
       // Do not show an executable approval for stale/invalid source bytes.
       // Armed recovery intentionally does not re-prepare: the process may have
       // completed before a file edit or deletion, with its result retained.
@@ -92,7 +98,9 @@ export async function refreshWorkspaceScriptSource(
       }
       if (grant && !grant.active) return held('Permission for this saved source was revoked. Refresh does not restore it.');
       if (!grant) {
-        const priorNo = historicalRunnerDenial(slug, source);
+        // An explicit owner review supersedes the old refusal, but grants no
+        // execution: it still needs its own new-generation scope approval.
+        const priorNo = scope.reviewId ? null : historicalRunnerDenial(slug, source);
         if (priorNo) return held(`Earlier approval ${priorNo.approvalId} was declined. The new executor preserves that decision; this source has not run.`);
         if (decision.state === 'expired') {
           if (opts.cause !== undefined && opts.cause !== 'manual') return held(`Approval ${decision.row.approvalId} expired. Open this Workspace and request a refresh to review it again.`);

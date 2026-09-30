@@ -723,7 +723,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 564077
+          "bytes": 565277
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
@@ -2819,8 +2819,11 @@
         "src/spaces/space-action-v3-authority.ts": {
           "bytes": 16201
         },
+        "src/runtime/harness/saved-source-control-state.ts": {
+          "bytes": 2527
+        },
         "src/spaces/workspace-script-carrier.ts": {
-          "bytes": 10237
+          "bytes": 10442
         },
         "src/spaces/workspace-script-authority.ts": {
           "bytes": 5525
@@ -2829,13 +2832,13 @@
           "bytes": 6153
         },
         "src/spaces/workspace-script-occurrence.ts": {
-          "bytes": 19479
+          "bytes": 20186
         },
         "src/spaces/space-data-runner-trust.ts": {
           "bytes": 27729
         },
         "src/spaces/workspace-script-refresh.ts": {
-          "bytes": 11645
+          "bytes": 12576
         },
         "src/spaces/runner.ts": {
           "bytes": 34766
@@ -2867,6 +2870,12 @@
         "src/spaces/space-action-gate.ts": {
           "bytes": 22327
         },
+        "src/spaces/workspace-source-controls.ts": {
+          "bytes": 11981
+        },
+        "src/dashboard/workspace-source-control-routes.ts": {
+          "bytes": 1757
+        },
         "src/spaces/compose.ts": {
           "bytes": 3156
         },
@@ -2880,7 +2889,7 @@
           "bytes": 9560
         },
         "src/dashboard/space-routes.ts": {
-          "bytes": 58643
+          "bytes": 58932
         },
         "src/tools/space-tools.ts": {
           "bytes": 119664
@@ -3228,7 +3237,7 @@
           "bytes": 35502
         },
         "src/runtime/harness/saved-source-consent.ts": {
-          "bytes": 12794
+          "bytes": 13446
         },
         "src/runtime/harness/historical-terminal-call-authority-proof.ts": {
           "bytes": 14436
@@ -4083,7 +4092,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 564077
+          "bytes": 565277
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
@@ -6179,8 +6188,11 @@
         "src/spaces/space-action-v3-authority.ts": {
           "bytes": 16201
         },
+        "src/runtime/harness/saved-source-control-state.ts": {
+          "bytes": 2527
+        },
         "src/spaces/workspace-script-carrier.ts": {
-          "bytes": 10237
+          "bytes": 10442
         },
         "src/spaces/workspace-script-authority.ts": {
           "bytes": 5525
@@ -6189,13 +6201,13 @@
           "bytes": 6153
         },
         "src/spaces/workspace-script-occurrence.ts": {
-          "bytes": 19479
+          "bytes": 20186
         },
         "src/spaces/space-data-runner-trust.ts": {
           "bytes": 27729
         },
         "src/spaces/workspace-script-refresh.ts": {
-          "bytes": 11645
+          "bytes": 12576
         },
         "src/spaces/runner.ts": {
           "bytes": 34766
@@ -6227,6 +6239,12 @@
         "src/spaces/space-action-gate.ts": {
           "bytes": 22327
         },
+        "src/spaces/workspace-source-controls.ts": {
+          "bytes": 11981
+        },
+        "src/dashboard/workspace-source-control-routes.ts": {
+          "bytes": 1757
+        },
         "src/spaces/compose.ts": {
           "bytes": 3156
         },
@@ -6240,7 +6258,7 @@
           "bytes": 9560
         },
         "src/dashboard/space-routes.ts": {
-          "bytes": 58643
+          "bytes": 58932
         },
         "src/tools/space-tools.ts": {
           "bytes": 119664
@@ -6588,7 +6606,7 @@
           "bytes": 35502
         },
         "src/runtime/harness/saved-source-consent.ts": {
-          "bytes": 12794
+          "bytes": 13446
         },
         "src/runtime/harness/historical-terminal-call-authority-proof.ts": {
           "bytes": 14436

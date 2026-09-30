@@ -60,7 +60,8 @@ test('scope migration preserves existing unfinished source ownership', () => {
     db.prepare(`INSERT INTO workspace_script_occurrences_v1
       (workspace_id, source_id, occurrence_id, session_id, logical_call_id, preparation_json, created_at)
       VALUES ('saved-workspace', 'rows', 'pending-tick', 'retained-session', 'retained-call', '{}', '2026-09-30T00:00:00Z')`).run();
-    const before = db.prepare('SELECT * FROM workspace_script_occurrences_v1').all();
+    const before = db.prepare('SELECT * FROM workspace_script_occurrences_v1').all()
+      .map(row => ({ ...(row as Record<string, unknown>), resolution_json: null }));
     schema.applyHarnessMigrations(db);
     assert.deepEqual(db.prepare('SELECT * FROM workspace_script_occurrences_v1').all(), before);
     assert.equal((db.prepare('SELECT COUNT(*) AS n FROM saved_source_script_grants_v1').get() as { n: number }).n, 0);

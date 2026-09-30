@@ -8,12 +8,14 @@ import { approvalResolutionWithinLifetime, claimResumableApproval, get as getApp
 import { openEventLog } from './eventlog.js';
 import { canonicalArgumentDigestOf } from './resolved-call-authority.js';
 import type { WorkflowV3AutoConsentArmInput } from './accepted-turn-call-authority.js';
+import { readSavedSourceControlState, savedSourceReviewIsCurrent, stopSavedSource } from './saved-source-control-state.js';
 
 export const SAVED_SOURCE_SCRIPT_CONSENT_TOOL = 'workspace_source_script_consent';
 const sha = (value: unknown) => createHash('sha256').update(closedCanonicalJson(value)).digest('hex');
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 export const savedSourceScriptScope = z.strictObject({
   version: z.literal(1),
+  reviewId: z.string().uuid().optional(),
   workspaceId: z.string().regex(/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/),
   sourceId: z.string().min(1).max(256),
   sourceDigest: hash,
@@ -62,7 +64,8 @@ export function readSavedSourceScriptGrant(grantId: string, db = openEventLog())
     if (row.grant_id !== `saved-source:${row.approval_id}` || decision.approvalId !== row.approval_id
       || sha(decision) !== row.decision_digest || !validDecision(decision, scope)) return null;
     return { grantId: row.grant_id, approvalId: row.approval_id, scope,
-      decisionDigest: row.decision_digest, active: row.revoked_at === null };
+      decisionDigest: row.decision_digest, active: row.revoked_at === null
+        && savedSourceReviewIsCurrent(scope.workspaceId, scope.sourceId, scope.reviewId, db) };
   } catch { return null; }
 }
 
@@ -101,8 +104,16 @@ export function recordApprovedSavedSourceScriptGrant(approvalId: string): SavedS
 
 export function revokeSavedSourceScriptGrant(grantId: string, reason: string): boolean {
   if (!reason.trim()) throw new Error('Saved source revocation requires a reason.');
-  return openEventLog().prepare(`UPDATE saved_source_script_grants_v1 SET revoked_at = ?, revocation_reason = ?
-    WHERE grant_id = ? AND revoked_at IS NULL`).run(new Date().toISOString(), reason.trim().slice(0, 2000), grantId).changes === 1;
+  const db = openEventLog();
+  return db.transaction(() => {
+    const grant = readSavedSourceScriptGrant(grantId, db);
+    const changed = db.prepare(`UPDATE saved_source_script_grants_v1 SET revoked_at = ?, revocation_reason = ?
+      WHERE grant_id = ? AND revoked_at IS NULL`).run(new Date().toISOString(), reason.trim().slice(0, 2000), grantId).changes === 1;
+    if (changed && grant && readSavedSourceControlState(grant.scope.workspaceId, grant.scope.sourceId, db).reviewId === (grant.scope.reviewId ?? null)) {
+      stopSavedSource(grant.scope.workspaceId, grant.scope.sourceId, db);
+    }
+    return changed;
+  }).immediate();
 }
 
 /** Process-opaque token. Structural clones and serialized fields grant nothing. */

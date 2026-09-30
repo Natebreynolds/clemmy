@@ -11346,6 +11346,29 @@ const MIGRATIONS: EventLogMigration[] = [
       WHERE type = 'user_input_received' AND json_valid(data_json)
         AND json_type(data_json, '$.outcomeDeliveryId') = 'text';`,
   },
+  {
+    version: 88,
+    sql: `CREATE TABLE IF NOT EXISTS workspace_source_controls_v1 (
+      workspace_id TEXT NOT NULL, source_id TEXT NOT NULL,
+      revision INTEGER NOT NULL CHECK(revision > 0), review_id TEXT,
+      stopped INTEGER NOT NULL CHECK(stopped IN (0, 1)),
+      PRIMARY KEY(workspace_id, source_id)
+    );
+    CREATE TABLE IF NOT EXISTS workspace_source_control_receipts_v1 (
+      control_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, source_id TEXT NOT NULL,
+      request_json TEXT NOT NULL, resolution_json TEXT NOT NULL, created_at TEXT NOT NULL
+    );`,
+    backfill: db => {
+      const columns = db.prepare('PRAGMA table_info(workspace_script_occurrences_v1)').all() as Array<{ name: string }>;
+      if (!columns.some(column => column.name === 'resolution_json')) {
+        db.exec('ALTER TABLE workspace_script_occurrences_v1 ADD COLUMN resolution_json TEXT');
+      }
+      db.exec(`DROP INDEX IF EXISTS workspace_script_one_unpublished_source_v1;
+        CREATE UNIQUE INDEX workspace_script_one_unpublished_source_v1
+        ON workspace_script_occurrences_v1(workspace_id, source_id)
+        WHERE observation_id IS NULL AND resolution_json IS NULL;`);
+    },
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

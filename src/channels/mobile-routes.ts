@@ -1,6 +1,7 @@
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
+import { registerWorkspaceSourceControlRoutes } from '../dashboard/workspace-source-control-routes.js';
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
 import { patchUnifiedSession } from '../dashboard/sessions-api.js';
 import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
@@ -5136,6 +5137,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  registerWorkspaceSourceControlRoutes(router, '/api/workspaces', requireMobileSession);
   router.get('/api/workspaces', requireMobileSession, async (_req, res) => {
     try {
       const { spaceStore } = await import('../spaces/store.js');

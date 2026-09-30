@@ -28,12 +28,15 @@ import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { failedWorkspaceSources, workspaceNeedsSourceRepair } from '../lib/workspace-presentation';
 import { Chat } from './Chat';
+import { WorkspaceSourceControls } from '../components/WorkspaceSourceControls';
 
 export function Workspaces({
   initialOpenId = null,
+  onOpenNeedsYou,
   onOpenChange = () => undefined,
 }: {
   initialOpenId?: string | null;
+  onOpenNeedsYou: () => void;
   onOpenChange?: (id: string | null) => void;
 }) {
   const [openId, setOpenId] = useState<string | null>(initialOpenId);
@@ -49,7 +52,7 @@ export function Workspaces({
   const spaces = (data?.workspaces ?? []).filter((w) => w.status !== 'archived');
 
   if (openId) {
-    return <WorkspaceDetailView id={openId} onBack={() => { selectWorkspace(null); void refresh(); }} />;
+    return <WorkspaceDetailView key={openId} onOpenNeedsYou={onOpenNeedsYou} id={openId} onBack={() => { selectWorkspace(null); void refresh(); }} />;
   }
 
   if (loading && spaces.length === 0) {
@@ -160,7 +163,7 @@ const FIX_REFRESH_ASK = 'Connect this Space to the read-only sources it needs so
 const PHONE_LAYOUT_ASK = 'Improve this Space’s phone layout. Show two or three key numbers and useful rows, '
   + 'and keep them in sync with the underlying data. Preserve the desktop view and existing actions.';
 
-function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void }) {
+function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBack: () => void; onOpenNeedsYou: () => void }) {
   const [refreshing, setRefreshing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshNote, setRefreshNote] = useState<{ kind: 'ok' | 'approval' | 'failed'; text: string } | null>(null);
@@ -312,6 +315,7 @@ function WorkspaceDetailView({ id, onBack }: { id: string; onBack: () => void })
       {/* Diagnostics are for when you go looking, not for the first screenful:
           the headline numbers are why you opened this. */}
       {detail.issues.length > 0 ? <IssueDisclosure issues={detail.issues} /> : null}
+      <WorkspaceSourceControls workspaceId={id} onOpenApprovals={onOpenNeedsYou} />
 
       {projection.headline.length > 0 ? (
         <section class="home-section">

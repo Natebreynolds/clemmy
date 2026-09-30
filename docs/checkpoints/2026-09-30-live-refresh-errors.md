@@ -904,3 +904,108 @@ its effects. A changed source must not silently undo an earlier stop. Controls
 must address an exact retained state, work on desktop and mobile, preserve old
 receipts, and distinguish reviewing new permission from granting it. Finish their
 presentation and live acceptance before treating this candidate as hotpatch-ready.
+
+## Owner controls for saved sources — source implementation, not live acceptance
+
+Schema 88 adds durable source-wide stop/review state and exact control receipts.
+A stop survives runner/declaration edits and invalidates current recurring grants.
+The carrier checks that state before dispatch and while the child is running;
+existing process-tree cancellation supplies the stop. A new permission review is
+an explicit generation change, not approval. Old pending scope cards are closed,
+an unchanged command rejoins its own receipt, and another device cannot apply a
+stale displayed decision to newer source state.
+
+Unstarted occurrences can be replaced only after closing their old call authority.
+A stopped, settled run with uncertain effects can be explicitly closed after the
+owner confirms they checked its effects and supplies a note. Its original physical
+and logical settlements remain unchanged. Closing neither undoes effects nor
+replays the script. An actually unsettled physical dispatch cannot be cleared by
+this UI; crash cases without canonical settlement still need framework recovery.
+The migration preserves existing occurrence records with an empty resolution;
+it does not manufacture grants, successes, or execution. The unpublished-source
+barrier releases only for publication or a recorded explicit owner resolution.
+
+Desktop Workspace details/Health and the mobile Workspace permission disclosure
+now expose those same operations. Review opens an ordinary Needs-you approval;
+there is no client-side grant. Network retries retain the same command identity,
+stale decisions refresh status without automatic resubmission, and held-run
+closure requires both the effects confirmation and a note. Controls poll only
+while their panel is mounted. This adds no model turn or prompt context.
+
+New tests cover denial reconsideration, edits after stop/revocation, cross-device
+stale decisions, duplicate command replay, running-child cancellation, uncertain
+settlement preservation, armed-but-unstarted authority closure, and v87 upgrade.
+Production route registrations are exercised with desktop auth and an actual
+paired-device test session; unauthenticated and opaque iframe origins are denied.
+These use explicitly disposable homes, not the installed live home.
+
+UI inspection used the actual desktop/phone row components with labelled inert
+fixture actions. The held-run form remained disabled until both required fields
+were supplied; the phone emitted the expected resolve payload. At 390px width,
+scroll width was also 390px; phone action buttons measured 44px high. This is a
+component preview, not full-app navigation or physical-device acceptance. The
+preview files/servers were removed afterward. The design detector returned no
+findings. Backend typecheck and both frontend production builds passed before
+one final mobile error-color token correction; the final mobile rebuild also
+passed (`/tmp/clem-source-controls-mobile-build-final.txt`).
+
+The first 48-test run had 46 passes and two migration equality expectations that
+omitted the newly added null resolution column. Those assertions now preserve all
+old columns and explicitly require null resolution. A broader run then passed the
+three new production-route checks but timed out both existing fresh-process scope
+consent cases at their unchanged 30s child timeout while other builds were active.
+That loaded run was retired; it is not qualified or attributed as pre-existing.
+The fresh serial rerun is recorded separately below when complete.
+
+### Newly observed installed-runtime liveness issue
+
+At 17:50:04Z on September 30, the desktop supervisor killed installed daemon
+72427 after repeated HTTP liveness misses. The diagnostic listed six overlapping calendar-watch phase scopes (46–513s
+old), alongside other in-flight work. Both installed JavaScript and candidate
+source return the existing in-flight tick promise, so these scopes do not prove
+six independent calendar polls. Do not infer duplicate calls from this display. A replacement
+PID 6735 started at 17:50:05Z, bound port 8520 at approximately 17:51:37Z, and exited
+with SIGKILL at 17:51:41Z. The second kill's cause is not established by these logs.
+A fresh build-info request then received connection refused. No installation or
+manual app/daemon restart was performed by this task. These are the old installed
+bytes (last verified 019e8d9d5, schema 82), not proof of a regression from the
+uninstalled schema-88 candidate. Heavy validation was concurrent, so neither the
+machine load nor the overlapping timer work can yet be assigned sole causality.
+
+Do not tag on this evidence. First re-establish live runtime readiness and inspect
+the restart/liveness behavior under controlled load. The existing tag procedure
+still requires the exact reviewed source, full required gates, fresh combined
+build, coordinated Terminal/signing installation, served fingerprint and schema
+verification, and installed/live-home acceptance. Workflow author/update/enable/
+execute, approval correction, cancellation/restart/no-replay, exact provider/tool/
+account routing and long-task continuity remain required. Re-run matched owner
+workloads and count total task tokens and wall time only after correctness passes.
+No new efficiency number, full-suite pass, main merge, hotpatch or tag is claimed.
+
+### Source-control qualification result
+
+- `/tmp/clem-source-controls-qualification-serial.txt`: **51/51 passed**, exit 0,
+  153.7s wall for the recording/disposable fixtures. Both previously timed-out
+  cold-process scope tests passed without changing their 30s timeout (16.2s and
+  11.8s, each includes two fresh processes). No concurrent frontend/backend
+  build ran during this repeat. The earlier loaded run remains recorded above.
+- `/tmp/clem-source-controls-console-build.txt`: desktop production build passed.
+- `/tmp/clem-source-controls-mobile-build-final.txt`: final phone production build passed.
+- `/tmp/clem-source-controls-artifacts-verified.txt`: implementation artifacts are
+  source-current (manifest 399bb957ca9670dbc9427ba1e4bde692d9650dc3e4b0709fefeb717e9fb09610).
+- `/tmp/clem-source-controls-ui-detect.json`: no detector findings.
+- `git diff --check` passed. Shell agent remained clean at 76c53a1ea and that
+  commit is an ancestor of this combined integration branch. Main remains at
+  4e2efe15b; no source edits were made in that shared worktree.
+
+Still owed: full combined application build after the final source commit; live
+service readiness and installed acceptance, including real Needs-you card copy
+and navigation on both surfaces. Entrypoint capture checks the declaration and
+file, but full interpreter availability is still decided by the executor; do
+not claim that every unavailable interpreter is rejected before offering a card.
+Any follow-up to the excluded model-ledger draft must renumber its migration
+after the accepted chain, now schema 88. Its files were not changed.
+
+Final source typecheck, including the new route tests, passed at
+`/tmp/clem-source-controls-typecheck-complete.txt`. This still is not a daemon
+package build or installed acceptance.

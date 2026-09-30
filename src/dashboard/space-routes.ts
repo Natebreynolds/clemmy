@@ -13,6 +13,7 @@
  * Mirrors the inline auth + path-safety idioms in console-routes.ts.
  */
 import { withWorkspaceSnapshotRead } from '../spaces/workspace-snapshot.js';
+import { registerWorkspaceSourceControlRoutes } from './workspace-source-control-routes.js';
 import type { Express, Request, Response } from 'express';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -396,6 +397,10 @@ const PLACEHOLDER_VIEW = (title: string) => `<!doctype html><html><head><meta ch
 <p>This workspace is empty. Ask Clem to build it — she'll write the view and wire up its data.</p></div></body></html>`;
 
 export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): void {
+  registerWorkspaceSourceControlRoutes(app, '/api/console/spaces', (req, res, next) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    next();
+  });
   // Wire the gated-action resolve listener once, so an APPROVED one-click Space
   // action actually runs (a button click has no agent turn to resume). Idempotent.
   initSpaceActionApprovals();

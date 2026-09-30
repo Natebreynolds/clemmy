@@ -5190,3 +5190,19 @@ textarea.cz-input { resize: vertical; }
 .memory-scope-pick.active .memory-scope-pick-value { color: var(--accent-deep); }
 .memory-scope-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0 8px; margin: var(--sp-2) 0 0; font-size: var(--t-xs); color: var(--fg-3); }
 .memory-scope-save { width: 100%; }
+
+/* Source permission controls stay inside Workspace details, separate from its data. */
+.ws-source-controls { margin: var(--sp-4) 0; color: var(--fg-2); font-size: var(--t-sm); }
+.ws-source-controls summary { min-height: 44px; padding-block: var(--sp-3); color: var(--fg); font-weight: 600; cursor: pointer; }
+.ws-source-controls p { margin-block: var(--sp-2) var(--sp-3); line-height: 1.5; overflow-wrap: anywhere; }
+.ws-source-row { border-top: 1px solid var(--line); padding-block: var(--sp-4); }
+.ws-source-title { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--sp-2); }
+.ws-source-title h3 { margin: 0; color: var(--fg); font-size: var(--t-body); overflow-wrap: anywhere; min-width: 0; }
+.ws-source-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.ws-source-close { margin-top: var(--sp-4); }
+.ws-source-close label { display: block; color: var(--fg); line-height: 1.5; }
+.ws-source-close .ws-source-check { display: flex; gap: var(--sp-2); align-items: center; min-height: 44px; margin-bottom: var(--sp-3); }
+.ws-source-check input { flex-shrink: 0; accent-color: var(--accent-deep); }
+.ws-source-close textarea { display: block; box-sizing: border-box; width: 100%; min-height: 96px; padding: var(--sp-3); margin-block: var(--sp-2) var(--sp-3); border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--bg-2); color: var(--fg); font: inherit; resize: vertical; }
+.ws-source-error { color: var(--clem-danger); }
+.ws-source-controls button:disabled { opacity: 0.5; cursor: default; }

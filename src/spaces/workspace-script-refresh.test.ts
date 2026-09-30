@@ -70,7 +70,8 @@ test('v86 upgrade preserves published and unfinished execution owners without fa
         VALUES ('migration-fixture', ?, 'tick', 'retained-owner', ?, '{}', ?, '2026-09-30T00:00:00Z')`)
         .run(source, `call:${source}`, observation);
     }
-    const before = db.prepare('SELECT * FROM workspace_script_occurrences_v1 ORDER BY source_id').all();
+    const before = db.prepare('SELECT * FROM workspace_script_occurrences_v1 ORDER BY source_id').all()
+      .map(row => ({ ...(row as Record<string, unknown>), resolution_json: null }));
     schema.applyHarnessMigrations(db); schema.applyHarnessMigrations(db);
     assert.deepEqual(db.prepare('SELECT * FROM workspace_script_occurrences_v1 ORDER BY source_id').all(), before);
     for (const table of ['workspace_script_reports_v1', 'saved_source_script_grants_v1', 'physical_dispatches']) {

@@ -4,6 +4,15 @@
  * path /console/spaces/<id>/view (by the daemon, outside the SPA router).
  */
 import { apiGet, apiPost, apiPatch, apiDelete } from './api';
+import type { WorkspaceSourceControlRequest, WorkspaceSourceControlResponse, WorkspaceSourceControlView } from '../../../../src/shared/workspace-source-controls';
+export type { WorkspaceSourceControlRequest, WorkspaceSourceControlView };
+
+export function getWorkspaceSourceControls(id: string): Promise<{ sources: WorkspaceSourceControlView[] }> {
+  return apiGet(`/api/console/spaces/${encodeURIComponent(id)}/source-controls`);
+}
+export function controlWorkspaceSource(id: string, sourceId: string, command: WorkspaceSourceControlRequest): Promise<WorkspaceSourceControlResponse> {
+  return apiPost(`/api/console/spaces/${encodeURIComponent(id)}/source-controls/${encodeURIComponent(sourceId)}`, command);
+}
 import {
   refreshFailureForResults,
   type WorkspaceRefreshResult,

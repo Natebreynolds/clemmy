@@ -26,6 +26,7 @@ import {
 import { BuildStatusBanner } from '@/components/workspaces/BuildStatusBanner';
 import { CanonicalEntityCoveragePanel } from '@/components/workspaces/CanonicalEntityCoveragePanel';
 import { PurposePanel } from '@/components/workspaces/PurposePanel';
+import { SourceControlsPanel } from '@/components/workspaces/SourceControlsPanel';
 import { WorkspaceFrame } from '@/components/workspaces/WorkspaceFrame';
 import { describeSpaceShape, spaceBuildState } from '@/lib/space-build';
 import { getWorkflowsHome } from '@/lib/automate';
@@ -492,6 +493,7 @@ function WorkspaceViewForId({ id }: { id: string }) {
                 <div className="space-y-3">
                   <PurposePanel space={space} onSaved={() => { void detail.refetch(); }} />
                   <CanonicalEntityCoveragePanel workspaceId={id} />
+                  <SourceControlsPanel workspaceId={id} onOpenApprovals={() => navigate('/inbox')} />
                   {health ? (
                     <>
                       <div className="grid grid-cols-2 gap-2">
