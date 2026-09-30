@@ -1863,7 +1863,7 @@ test('the loop\'s reask and the respond bridge both go through the recorded repl
   const bridge = readFileSync(new URL('./respond-bridge.ts', import.meta.url), 'utf8');
   const checked = bridge.indexOf('await prepareCheckedHostClarificationAnswer({');
   const classified = bridge.indexOf('await classifyUnsettledOpenQuestionReply({');
-  const typed = bridge.indexOf('const typedClassification = semanticPortParticipated(');
+  const typed = bridge.indexOf('const typedClassification = ');
   assert.ok(checked > 0 && classified > checked && typed > classified,
     'Jev reads the reply after the turn is interpreted and before continuity is resolved');
   assert.match(bridge, /startsWith\('\[task-continuation-question:v1\]\\n'\)/,

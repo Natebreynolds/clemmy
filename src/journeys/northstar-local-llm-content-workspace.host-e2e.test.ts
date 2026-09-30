@@ -2725,10 +2725,12 @@ test('missing Firecrawl authority becomes one visible resumable connection gate 
     channel: 'mobile',
   });
   const workspaceIdsBefore = spaceStore.list().map((record) => record.id).sort();
-  const question = 'Firecrawl isn’t connected, so I can’t use FIRECRAWL_SEARCH for this task yet. [Open Connections](/m/?tab=settings&toolkit=firecrawl&capability=FIRECRAWL_SEARCH) on this Mac and connect Firecrawl, then choose how you want me to continue:';
+  // Setup happens inside the conversation now (2026-09-30): the gate names
+  // the app and the two ways forward; the connect form is the surface's own.
+  const question = 'Firecrawl needs to be connected before I can continue this task. Connect it in Clementine, or pause to change the request.';
   const options = [
     'I’ve connected Firecrawl — continue this same task',
-    'Pause so I can change the research scope',
+    'Pause so I can change this request',
   ];
   const modelProposedQuestion = 'Le service n’est pas prêt… [ouvrir](/m/?tab=settings&toolkit=google_drive&capability=GOOGLE_DRIVE_UPLOAD_FILE), puis dites « continue » — reconnect Firecrawl too.';
   const modelProposedOptions = [
