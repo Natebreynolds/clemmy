@@ -249,7 +249,10 @@ function downgradeProofTablesToV82() {
           CREATE TRIGGER ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, 'immutable'); END;
           CREATE TRIGGER ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, 'immutable'); END;`);
       }
-      db.prepare('DELETE FROM schema_version WHERE version = 83').run();
+      // Migrations advance from the highest recorded version. A v82 home has
+      // recorded nothing past 82, so every later row goes too; deleting only
+      // 83 left the store claiming 88 and skipped the rebuild under test.
+      db.prepare('DELETE FROM schema_version WHERE version >= 83').run();
     })();
   } finally { db.pragma('foreign_keys = ON'); }
 }
