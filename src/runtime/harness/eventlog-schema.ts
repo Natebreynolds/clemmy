@@ -11254,6 +11254,29 @@ const MIGRATIONS: EventLogMigration[] = [
     },
   },
   { version: 83, sql: '', foreignKeysOff: true, backfill: migrateRetainedSessionProofs },
+  {
+    // An indexed projection of reported model usage for one accepted request.
+    // Session-lifetime totals cannot own a resumed task's token window: other
+    // chat turns and late helpers may accrue in that same session.
+    version: 84,
+    sql: `CREATE TABLE IF NOT EXISTS accepted_source_usage_v1 (
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      source_user_seq INTEGER NOT NULL REFERENCES events(seq) ON DELETE CASCADE,
+      role TEXT NOT NULL,
+      calls INTEGER NOT NULL CHECK(calls >= 0),
+      failed_calls INTEGER NOT NULL CHECK(failed_calls >= 0),
+      uncertified_calls INTEGER NOT NULL CHECK(uncertified_calls >= 0),
+      unknown_cost_calls INTEGER NOT NULL CHECK(unknown_cost_calls >= 0),
+      prompt_tokens INTEGER NOT NULL CHECK(prompt_tokens >= 0),
+      cached_tokens INTEGER NOT NULL CHECK(cached_tokens >= 0),
+      uncached_tokens INTEGER NOT NULL CHECK(uncached_tokens >= 0),
+      output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+      reported_total_tokens INTEGER NOT NULL CHECK(reported_total_tokens >= 0),
+      model_ms REAL NOT NULL CHECK(model_ms >= 0),
+      first_recorded_at TEXT NOT NULL, last_recorded_at TEXT NOT NULL,
+      PRIMARY KEY(session_id, source_user_seq, role)
+    );`,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

@@ -298,7 +298,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
         BEGIN SELECT RAISE(ABORT, 'connection checkpoints are immutable'); END;
       CREATE TRIGGER source_connection_checkpoints_v1_no_update BEFORE UPDATE ON source_connection_checkpoints_v1
         BEGIN SELECT RAISE(ABORT, 'connection checkpoints are immutable'); END;`);
-      db.prepare('DELETE FROM schema_version WHERE version = 83').run();
+      db.prepare('DELETE FROM schema_version WHERE version >= 83').run();
     })();
   } finally { db.pragma('foreign_keys = ON'); }
   applyHarnessMigrations(db);

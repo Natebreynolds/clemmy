@@ -115,3 +115,88 @@ test('a task that names no request is given to the one it was started under, and
   assert.deepEqual(second.participants.filter((row) => row.relation === 'delegated_task').map((row) => row.taskId), []);
   assert.ok(first.unknown.some((line) => /name no request and were given to this one by when they started/.test(line)));
 });
+
+test('real worker lineage follows nested helpers once without borrowing another source in their sessions', () => {
+  const lineage = (parentSessionId: string, parentSourceUserSeq: number, childSessionId: string, childSourceUserSeq: number) =>
+    ({ parentSessionId, parentSourceUserSeq, childSessionId, childSourceUserSeq });
+  const graph: Record<string, ReturnType<typeof event>[]> = {
+    root: [event(1, 'user_input_received', 0),
+      event(2, 'worker_started', 1, lineage('root', 1, 'child', 10)),
+      event(3, 'worker_started', 2, lineage('root', 1, 'child', 10)),
+      event(4, 'worker_started', 3, lineage('root', 90, 'unrelated', 100))],
+    child: [event(11, 'worker_started', 4, lineage('child', 10, 'grandchild', 20)),
+      event(12, 'worker_started', 5, lineage('child', 99, 'unrelated', 100))],
+    grandchild: [event(21, 'worker_started', 6, lineage('grandchild', 20, 'root', 1))],
+  };
+  const actual: WholeTaskUsageSources = {
+    tasks: () => [], events: (session, types) => (graph[session] ?? []).filter(e => types.includes(e.type)),
+    usageForDate: () => [
+      usageRows[0]!, usageRows[1]!, usageRows[2]!, usageRows[3]!, usageRows[4]!,
+    ],
+  };
+  const usageRows = [usage('root:1', 'root:1', 'brain', [100, 0, 1], 1),
+    usage('child:10', 'child:10', 'worker', [200, 0, 2], 5),
+    usage('grandchild:20', 'grandchild:20', 'worker', [300, 0, 3], 7),
+    usage('child:99', 'child:99', 'worker', [9000, 0, 9], 8),
+    usage('unrelated:100', 'unrelated:100', 'worker', [9000, 0, 9], 8)];
+  const result = wholeTaskUsage({ sessionId: 'root', sourceUserSeq: 1 }, actual, new Date(at(20)));
+  assert.deepEqual(result.participants.map(p => [p.sessionId, p.sourceUserSeq]), [['root', 1], ['child', 10], ['grandchild', 20]]);
+  assert.equal(result.totals.calls, 3);
+  assert.equal(result.totals.totalTokens, 606);
+});
+
+test('conflicting worker parents and missing child sources remain unknown instead of claiming a whole session', () => {
+  const invalid: WholeTaskUsageSources = {
+    tasks: () => [],
+    events: (session, types) => (session === 'root' ? [event(1, 'user_input_received', 0),
+      event(2, 'worker_started', 1, { parentSessionId: 'root', parentSourceUserSeq: 1, sourceUserSeq: 9, childSessionId: 'wrong', childSourceUserSeq: 2 }),
+      event(3, 'worker_started', 1, { parentSessionId: 'other', parentSourceUserSeq: 1, childSessionId: 'wrong', childSourceUserSeq: 3 }),
+      event(4, 'worker_started', 1, { parentSourceUserSeq: 1, childSessionId: 'missing' }),
+    ] : []).filter(e => types.includes(e.type)),
+    usageForDate: () => usageRows,
+  };
+  const usageRows = [usage('wrong:2', 'wrong:2', 'worker', [100, 0, 1], 3),
+    usage('wrong:3', 'wrong:3', 'worker', [100, 0, 1], 3),
+    usage('missing:4', 'missing:4', 'worker', [100, 0, 1], 3)];
+  const result = wholeTaskUsage({ sessionId: 'root', sourceUserSeq: 1 }, invalid, new Date(at(20)));
+  assert.equal(result.participants.length, 1);
+  assert.equal(result.totals.calls, 0);
+  assert.ok(result.unknown.some(line => line.includes('worker') && line.includes('conflicting')));
+  assert.ok(result.unknown.some(line => line.includes('worker') && line.includes('child source')));
+});
+
+test('a delegated helper can have its own helper without counting either twice', () => {
+  const nestedRow = usage('nested:40', 'nested:40', 'worker', [400, 0, 4], 33);
+  const nested: WholeTaskUsageSources = { ...sources,
+    events: (session, types) => session === 'sess-worker-b' && types.includes('worker_started')
+      ? [event(2, 'worker_started', 31, { parentSessionId: session, parentSourceUserSeq: 1, childSessionId: 'nested', childSourceUserSeq: 40 })]
+      : sources.events(session, types),
+    usageForDate: date => [...sources.usageForDate(date), nestedRow],
+  };
+  const result = wholeTaskUsage({ sessionId: 'chat-1', sourceUserSeq: 10 }, nested, new Date(at(120)));
+  assert.equal(result.byRelation.delegated_helper.calls, 2);
+  assert.equal(result.participants.find(p => p.sessionId === 'nested')?.taskId, 'bg-1');
+});
+
+test('an exact usage trace wins over a conflicting legacy source string', () => {
+  const conflict = usage('chat-1:10', 'chat-1:20', 'brain', [9999, 0, 99], 2);
+  const result = wholeTaskUsage({ sessionId: 'chat-1', sourceUserSeq: 10 }, { ...sources, usageForDate: () => [conflict] }, new Date(at(120)));
+  assert.equal(result.totals.calls, 0);
+});
+
+test('a reconnect more than forty days after a waiting reply keeps the original request usage', () => {
+  const later = new Date(Date.parse(at(0)) + 60 * 86400_000).toISOString();
+  const acceptedLater = usage('long:10', 'long:10', 'brain', [200, 0, 2], 2, { at: later });
+  const initial = usage('long:10', 'long:10', 'brain', [100, 0, 1], 1);
+  const long: WholeTaskUsageSources = {
+    tasks: () => [],
+    events: (session, types) => (session === 'long' ? [event(10, 'user_input_received', 0),
+      event(11, 'conversation_completed', 2, { sourceUserSeq: 10, needsInput: true }),
+      event(20, 'user_input_received', 3),
+    ] : []).filter(e => types.includes(e.type)),
+    usageForDate: date => [initial, acceptedLater].filter(row => row.at.slice(0, 10) === date.toISOString().slice(0, 10)),
+  };
+  const result = wholeTaskUsage({ sessionId: 'long', sourceUserSeq: 10 }, long, new Date(Date.parse(later) + 1000));
+  assert.equal(result.totals.calls, 2);
+  assert.equal(result.totals.totalTokens, 303);
+});

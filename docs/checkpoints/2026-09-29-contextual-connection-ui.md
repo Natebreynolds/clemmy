@@ -1327,3 +1327,99 @@ acceptance or proof of live-home isolation. The other agent's clean
 The paired UI still needs to project this as one Recovering task and then the
 same task's real progress, retaining visible completed-effect receipts. It
 must not show a fresh chat request or require the user to repeat the objective.
+
+### Exact request spend and real worker lineage — 2026-09-30
+
+Verified in source: the normal model-usage writer now also accumulates reported
+usage by the exact accepted session/source tuple and role. Migration **84** adds
+`accepted_source_usage_v1`; a row is admitted only when that tuple names a real
+user-input event. A physical retry, reopened database or different chat turn
+does not reset or borrow its total. A child with its own accepted source keeps
+that source; rowless learning can use its explicit accounting parent. This
+does not transfer execution permission to a child or learning job.
+
+The projection holds counts and numeric usage only, one row per source/role.
+It does not add prompt text or scan daily files on every turn. Cached tokens,
+conservative uncached work, provider-reported totals, failed calls and
+uncertified usage remain distinct. A failed zero-usage placeholder is counted
+as unknown cost, not certified free work. A failed call that actually reports
+cached work is not mislabeled as missing usage. The sum of provider durations
+is named `modelMs`; it is **not** task wall time, especially under fan-out.
+
+This is a reported-usage projection, not a billing guarantee or a complete
+budget implementation. Its failure cannot turn a model response or completed
+tool effect into an execution failure. Zero stored calls do not prove zero
+spend. Earlier accepted sources are labeled as predating this meter; old usage
+was not backfilled. Provider billing and the existing NDJSON records remain
+independent evidence. Capturing the original budget policy, reserving uncertain
+in-flight spend and enforcing a full-source budget still need implementation.
+
+The read-only whole-task report had three concrete gaps:
+
+1. The actual worker runner writes `parentSourceUserSeq`; the report recognized
+   only `sourceUserSeq`. It now accepts the real lineage and the compatible
+   legacy shape, rejecting contradictory parent tuples.
+2. Only direct helpers were counted. The report now follows nested helper
+   links, including helpers beneath a delegated task, with exact child sources
+   and a visited set. Duplicate links/cycles do not duplicate usage. A missing
+   child source is reported as unknown instead of claiming a whole reused chat
+   session. An exact usage trace wins over a conflicting legacy source string.
+3. A waiting reply could end date scanning, and the scan silently stopped after
+   40 days. It now scans through the stated `usageObservedThrough` time, with
+   exact source/lineage joins excluding other turns. The fixture reconnects the
+   original request 60 days later and counts both calls. This offline report
+   can read more daily files for old tasks; it is not used as a per-frame
+   budget query. Arbitrarily nested background-task delegation is not newly
+   qualified by these helper tests.
+
+Evidence:
+
+- Before the report fix, all five new lineage/late-usage regressions failed,
+  while the three existing report checks passed:
+  `/tmp/clem-whole-task-lineage-red.txt`.
+- The initial usage-meter run found one incorrect fixture expectation: both an
+  undeclared cache dialect **and** a failed zero placeholder are uncertified.
+  The assertion was corrected to match the existing canonical accounting; the
+  accounting policy was not weakened. `/tmp/clem-source-usage-initial.txt`.
+- The final targeted run passed **93/93** checks in six files, including all
+  **39** connection execution recording scenarios, usage writer/observer
+  compatibility, source/role attribution, migration replay and schema readiness:
+  `/tmp/clem-source-usage-regression.txt`. The earlier 49-check green run overlaps
+  this result and is not an additional acceptance suite.
+- Runtime TypeScript passed: `/tmp/clem-source-usage-tsc-final.txt`.
+  `git diff --check` passed.
+- The isolated runner's live-home sentinel was **NOT PERFORMED** while daemon
+  72427 wrote memory WAL/SHM and `secretsMeta`. These are recording-test results,
+  not installed-app/live-home acceptance or proof of live-home isolation.
+
+Not performed: paid generations, real provider calls, credentials/settings
+changes, live-home resets, build, install/hotpatch, merge or tag. No latency or
+token-savings claim follows from correcting accounting. The other agent's clean
+`claude/two-modes` worktree remains at `76c53a1ea` and was not changed. Reconcile
+migrations **83 and 84** against the eventual combined candidate, then rebuild.
+
+Paired desktop/mobile UI requirements, still owed for reviewed execution:
+
+| Runtime evidence | What the user should see |
+| --- | --- |
+| Exact app dependency | One task-local connection card explaining the needed capability, with a readable account when supplied by the provider |
+| Sign-in opened | The same saved task, a return/check action, and no second chat request |
+| Account verified, execution still held | “Connected” and an honest paused reason; no implication that work already resumed |
+| Current execution lease being reacquired | One Recovering state, retained completed receipts and a usable Stop action |
+| Recovery ownership acquired | The original task's progress and plan, without repeating completed work |
+| Explicit budget reached | Recorded spend and the actual limit; an explicit owner action where supported, never a fresh automatic allowance |
+| Missing/uncertified usage | “Usage incomplete” detail rather than a fabricated savings percentage or zero-cost claim |
+
+The existing React and Preact connection components were inspected; they
+already have inline sign-in and readable verified-account handling. This
+increment does **not** claim to have rendered the recovery/budget states above.
+Use a compact summary with expandable details, retain it across reload/device
+handoff, and derive it from durable server state. Do not add another permanent
+dashboard or make users understand receipts/leases to finish setup.
+
+Next implementation remains: freeze the original outer time/token policy and
+account active work across retries without charging time waiting for sign-in;
+then expose an owned Retry/Continue route and its reloadable UI projection.
+`EXECUTION_CONTINUATION_BLOCKER` remains active. Subsequent approval/connection
+cycles, workflow finalization, physical-write no-replay, device handoff and
+controlled installed-app/live-home acceptance are still owed before release.

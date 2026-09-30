@@ -56,6 +56,8 @@ export interface WholeTaskUsage {
   sessionId: string;
   sourceUserSeq: number;
   window: { from: string; to: string };
+  /** Usage can settle after a reply or after the same source reconnects. */
+  usageObservedThrough: string;
   participants: TaskParticipant[];
   totals: UsageTotals;
   byRole: Record<string, UsageTotals>;
@@ -96,54 +98,80 @@ function add(totals: UsageTotals, row: UsageEvent): void {
   if (!canonical?.certified) totals.uncertifiedCalls += 1;
 }
 
-function daysBetween(from: string, to: string): Date[] {
+function* daysBetween(from: string, to: string): Generator<Date> {
   const start = new Date(Date.parse(from));
   const end = new Date(Math.max(Date.parse(to), Date.parse(from)));
-  const days: Date[] = [];
-  const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
-  // One extra day on each side: the log is written in local days and a
-  // request can cross midnight.
-  cursor.setDate(cursor.getDate() - 1);
-  const last = new Date(end.getFullYear(), end.getMonth(), end.getDate() + 1);
-  while (cursor.getTime() <= last.getTime() && days.length < 40) {
-    days.push(new Date(cursor));
-    cursor.setDate(cursor.getDate() + 1);
+  const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate() - 1));
+  // Current usage logs use UTC days. The extra days also let readers find
+  // legacy local-day files across zones. Never silently truncate long work.
+  const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate() + 1));
+  while (cursor.getTime() <= last.getTime()) {
+    yield new Date(cursor);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
-  return days;
 }
 
 function positive(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
+const participantKey = (sessionId: string, seq: number | null) => JSON.stringify([sessionId, seq]);
+
 function helpersOf(
   sources: WholeTaskUsageSources,
   sessionId: string,
   sourceUserSeq: number | null,
   relation: 'helper' | 'delegated_helper',
-  taskId?: string,
+  taskId: string | undefined,
+  known: Set<string>,
+  unknown: string[],
 ): TaskParticipant[] {
-  const found = new Map<string, TaskParticipant>();
-  for (const event of sources.events(sessionId, ['worker_started'])) {
-    if (sourceUserSeq !== null && positive(event.data.sourceUserSeq) !== sourceUserSeq) continue;
-    const child = typeof event.data.childSessionId === 'string' ? event.data.childSessionId.trim() : '';
-    if (!child || child === sessionId) continue;
-    const childSeq = positive(event.data.childSourceUserSeq);
-    found.set(`${child}:${childSeq ?? ''}`, { relation, sessionId: child, ...(childSeq ? { sourceUserSeq: childSeq } : {}),
-      ...(taskId ? { taskId } : {}), owner: typeof event.data.agent === 'string' ? event.data.agent : null });
+  const found: TaskParticipant[] = [];
+  const queue = [{ sessionId, sourceUserSeq }];
+  known.add(participantKey(sessionId, sourceUserSeq));
+  for (let index = 0; index < queue.length; index += 1) {
+    const parent = queue[index]!;
+    for (const event of sources.events(parent.sessionId, ['worker_started'])) {
+      const exact = positive(event.data.parentSourceUserSeq);
+      const legacy = positive(event.data.sourceUserSeq);
+      if (parent.sourceUserSeq !== null && exact !== parent.sourceUserSeq && legacy !== parent.sourceUserSeq) continue;
+      if ((event.data.parentSourceUserSeq !== undefined && exact === null)
+        || (event.data.sourceUserSeq !== undefined && legacy === null)
+        || (exact !== null && legacy !== null && exact !== legacy)
+        || (event.data.parentSessionId !== undefined && event.data.parentSessionId !== parent.sessionId)) {
+        unknown.push(`A worker link at event ${event.seq} has conflicting or invalid parent identity; its costs were not attributed.`);
+        continue;
+      }
+      if (exact === null && legacy === null) {
+        unknown.push(`A worker link at event ${event.seq} names no parent source; its costs were not attributed.`);
+        continue;
+      }
+      const child = typeof event.data.childSessionId === 'string' ? event.data.childSessionId.trim() : '';
+      const childSeq = positive(event.data.childSourceUserSeq);
+      if (!child || childSeq === null) {
+        unknown.push(`A worker link at event ${event.seq} names no exact child source; its costs were not attributed.`);
+        continue;
+      }
+      const key = participantKey(child, childSeq);
+      if (known.has(key) || known.has(participantKey(child, null))) continue;
+      known.add(key);
+      found.push({ relation, sessionId: child, sourceUserSeq: childSeq,
+        ...(taskId ? { taskId } : {}), owner: typeof event.data.agent === 'string' ? event.data.agent : null });
+      queue.push({ sessionId: child, sourceUserSeq: childSeq });
+    }
   }
-  return [...found.values()];
+  return found;
 }
 
 function rowBelongs(row: UsageEvent, participant: TaskParticipant): boolean {
   const accepted = row.trace?.acceptedSource ?? '';
   if (participant.sourceUserSeq !== undefined) {
     const exact = `${participant.sessionId}:${participant.sourceUserSeq}`;
-    return accepted === exact || row.source === exact;
+    return accepted ? accepted === exact : row.source === exact;
   }
   // A delegated task owns its whole run session.
-  return row.source === participant.sessionId || row.source.startsWith(`${participant.sessionId}:`)
-    || accepted.startsWith(`${participant.sessionId}:`);
+  if (accepted) return accepted.startsWith(`${participant.sessionId}:`);
+  return row.source === participant.sessionId || row.source.startsWith(`${participant.sessionId}:`);
 }
 
 export function wholeTaskUsage(
@@ -166,7 +194,8 @@ export function wholeTaskUsage(
     && (positive(event.data.sourceUserSeq) === sourceUserSeq || positive(event.data.sourceUserSeq) === null)) ?? null;
 
   const participants: TaskParticipant[] = [{ relation: 'request', sessionId, sourceUserSeq }];
-  participants.push(...helpersOf(sources, sessionId, sourceUserSeq, 'helper'));
+  const known = new Set([participantKey(sessionId, sourceUserSeq)]);
+  participants.push(...helpersOf(sources, sessionId, sourceUserSeq, 'helper', undefined, known, unknown));
 
   const tasks = sources.tasks().filter((task) => {
     if (task.originSessionId !== sessionId) return false;
@@ -184,7 +213,7 @@ export function wholeTaskUsage(
   for (const task of tasks) {
     participants.push({ relation: 'delegated_task', sessionId: task.runSessionId, taskId: task.id,
       owner: task.delegation?.agentName ?? null });
-    participants.push(...helpersOf(sources, task.runSessionId, null, 'delegated_helper', task.id));
+    participants.push(...helpersOf(sources, task.runSessionId, null, 'delegated_helper', task.id, known, unknown));
   }
   const open = tasks.filter((task) => !task.completedAt && !['done', 'failed', 'aborted', 'interrupted'].includes(task.status));
   if (open.length > 0) {
@@ -207,10 +236,13 @@ export function wholeTaskUsage(
   let unattributedLearningTokens = 0;
   const fromMs = Date.parse(from);
   const toMs = Date.parse(to) + 120_000;
-  for (const day of daysBetween(from, to)) {
+  // A waiting reply is not the end of an accepted request's spend. Scan
+  // through this observation; exact source/lineage joins exclude other turns.
+  const usageObservedThrough = now.toISOString();
+  for (const day of daysBetween(from, usageObservedThrough)) {
     for (const row of sources.usageForDate(day)) {
       const at = Date.parse(row.at);
-      if (!Number.isFinite(at) || at < fromMs - 1_000) continue;
+      if (!Number.isFinite(at) || at < fromMs - 1_000 || at > now.getTime()) continue;
       const owner = participants.find((participant) => rowBelongs(row, participant));
       if (!owner) {
         // Learning settled after the fact with no request named on it cannot
@@ -245,6 +277,7 @@ export function wholeTaskUsage(
   return {
     sessionId, sourceUserSeq,
     window: { from, to },
+    usageObservedThrough,
     participants,
     totals, byRole, byRelation,
     timeline: {

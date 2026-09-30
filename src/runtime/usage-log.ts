@@ -8,6 +8,7 @@ import { sealTraceEnvelope } from './trace-envelope.js';
 import type { TraceEnvelope } from './trace-envelope.js';
 import { resolveWorkflowUsageSource } from './workflow-usage-context.js';
 import { MEMORY_JOBS, memoryJobFromChannel } from '../memory/memory-jobs.js';
+import { recordAcceptedSourceUsage } from './accepted-source-usage.js';
 
 /**
  * Token-usage observability log. Append-only NDJSON per day.
@@ -733,6 +734,14 @@ export function recordModelUsage(args: {
     ...parseWorkflowSource(source),
   };
   recordUsage(event);
+  // Capture the same reported quantities by exact accepted source. A new
+  // physical attempt, connection control, midnight or another session turn
+  // must not reset or borrow this task's usage. Rowless learning can name its
+  // accounting-only parent without inheriting any execution authority.
+  if (traceOwner) {
+    try { recordAcceptedSourceUsage(traceOwner, event); }
+    catch { /* usage observability must not break a model or completed write */ }
+  }
   const observation = modelUsageRecordingObservation.getStore();
   if (observation && args.inputTokens + args.outputTokens > 0) observation.recorded = true;
   try {
