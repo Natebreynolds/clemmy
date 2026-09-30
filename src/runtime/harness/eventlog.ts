@@ -650,6 +650,9 @@ export const EVENT_TYPES = [
   'dependency_request',
   'connection_request',
   'connection_request_satisfied',
+  // Private diagnostic: account setup may proceed, but no exact reviewed
+  // execution checkpoint could be retained. Never implies ready-to-resume.
+  'connection_execution_checkpoint_unavailable',
   'session_history_search_recorded',
   // Effective completion-review policy, stamped once at accept time so a later
   // settings change cannot relabel an already-running task.

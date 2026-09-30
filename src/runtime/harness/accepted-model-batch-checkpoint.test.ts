@@ -27,6 +27,9 @@ const protocol = await import('./conversation-protocol.js');
 const protocolSession = await import('./conversation-protocol-session.js');
 const hostResults = await import('./host-model-result-receipt.js');
 const logicalResults = await import('./logical-model-result-projection-receipt.js');
+const connectionCheckpoints = await import('./source-connection-checkpoints.js');
+const plans = await import('./plan-artifacts.js');
+const sessionStore = await import('./session.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -36,15 +39,25 @@ test.after(() => {
 const digest = (value: string): string => createHash('sha256').update(value).digest('hex');
 let serial = 0;
 
-function fixture(text: string) {
-  const session = eventlog.createSession({ id: `accepted-model-batch-${++serial}`, kind: 'chat' });
+function fixture(text: string, mode: 'normal' | 'plan' | 'execute' = 'normal') {
+  const session = eventlog.createSession({ id: `accepted-model-batch-${++serial}`, kind: 'chat', userId: 'checkpoint-owner' });
+  let executeRef: import('./task-mode.js').PlanRevisionRef | undefined;
+  if (mode === 'execute') {
+    const planSource = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Prepare the controlled task.', taskMode: { version: 1, kind: 'plan' } } });
+    const artifact = plans.publishPlanRevision({ sessionId: session.id, principalId: 'checkpoint-owner',
+      sourceUserSeq: planSource.seq, fullText: text, readiness: 'ready' });
+    executeRef = { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest };
+  }
   const source = eventlog.appendEvent({
     sessionId: session.id,
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text },
+    data: { text, ...(mode !== 'normal' ? { taskMode: { version: 1, kind: mode, ...(executeRef ? { executeRef } : {}) } } : {}) },
   });
+  if (executeRef) plans.claimPlanExecution({ sessionId: session.id, principalId: 'checkpoint-owner',
+    sourceUserSeq: source.seq, executeRef });
   const armed = authority.armHostCallAuthority({
     sessionId: session.id,
     sourceUserSeq: source.seq,
@@ -252,6 +265,186 @@ function projectedTextResult(input: {
     },
     status: 'completed',
   } as AgentInputItem;
+}
+
+function connectionSearchEvidence(task: Fixture, callId = 'call:connection-search') {
+  const value = { query: 'controlled CRM read', role_key: 'source', results: [],
+    brokerCoverage: 'authorized_external_v1', unavailable: [{ source: 'authorized_composio', code: 'no_connections',
+      reason: 'The fixture account is disconnected.', dependencySubject: {
+        version: 1, kind: 'exact_capability_connection', source: 'authorized_composio',
+        query: 'controlled CRM read', roleKey: 'source', toolkit: 'fixturecrm',
+        capability: 'FIXTURECRM_READ', capabilityRef: 'cap:resolved:fixturecrm_read',
+      } }] };
+  const output = JSON.stringify(value);
+  eventlog.writeToolOutput({ sessionId: task.sessionId, callId, tool: 'tool_search', output });
+  eventlog.appendEvent({ sessionId: task.sessionId, turn: 1, role: 'Clem', type: 'tool_returned',
+    data: { sourceUserSeq: task.sourceUserSeq, tool: 'tool_search', callId, accounting: 'top_level', topologyRole: 'control', result: output } });
+  return value;
+}
+
+async function settledConnectionBatch(task: Fixture) {
+  const frame = { callId: 'call:connection-search', toolName: 'tool_search', args: { query: 'controlled CRM read' } };
+  const prior = checkpoints.prepareAcceptedModelBatchRestart(task);
+  const history = prior.status === 'ready' ? prior.checkpoint.history : preHistory(task);
+  const admitted = checkpoints.admitAcceptedModelBatch({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+    preHistory: history, frameHistory: openFrame(frame),
+    ...(prior.status === 'ready' ? { previousResponseId: prior.checkpoint.lastResponseId } : {}),
+    providerResponseId: 'response:connection-search' });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  const value = connectionSearchEvidence(task, frame.callId);
+  await runCall({ task, ...frame, effect: 'read', boundary: 'host_owned_local', localEnvelope: true, invoke: async () => value });
+  const resultItem = exactSettledResult({ task, callId: frame.callId, history: [...history, ...openFrame(frame)] });
+  recordLogicalResult(admitted.admission, resultItem);
+  const final = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
+  assert.ok(final.status === 'committed' || final.status === 'existing');
+  return final.checkpoint;
+}
+
+test('reviewed connection pause retains the exact batch across ASK, reopen and newer chat without replaying a settled write', async () => {
+  const task = fixture('Create the fixture artifact once, then inspect the controlled CRM.', 'execute');
+  const write = { callId: 'call:connection-prior-write', toolName: 'space_publish', args: { title: 'Checkpoint fixture' } };
+  const admitted = checkpoints.admitAcceptedModelBatch({ ...task, preHistory: preHistory(task),
+    frameHistory: openFrame(write), providerResponseId: 'response:connection-prior-write' });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  let writes = 0;
+  const payload = { ok: true, id: 'fixture-artifact' };
+  await runCall({ task, ...write, effect: 'external_write', invoke: async () => { writes += 1; return payload; } });
+  const written = exactSettledResult({ task, callId: write.callId, history: [...preHistory(task), ...openFrame(write)] });
+  recordLogicalResult(admitted.admission, written);
+  assert.ok(['committed', 'existing'].includes(checkpoints.finalizeAcceptedModelBatch(admitted.admission,
+    { committedResultItems: [written] }).status));
+  const canonical = await settledConnectionBatch(task);
+  const withQuestion = [...canonical.history, { role: 'assistant', content: 'ASK: Please connect the fixture CRM.' } as AgentInputItem];
+  sessionStore.HarnessSession.load(task.sessionId)!.recordTurnResult({ history: withQuestion, turn: 1 });
+
+  // Both ordinary ASK projection and an explicit awaiting-input terminal park
+  // through this production seam, after their public question is determined.
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 });
+  assert.ok(pause);
+  const identity = { sessionId: task.sessionId, requestId: pause.requestId };
+  const retained = connectionCheckpoints.readSourceConnectionCheckpoint(identity)!;
+  assert.ok(retained);
+  assert.equal(retained.restartToken.resumeFromHistoryDigest, canonical.historyDigest);
+  assert.equal(retained.restartToken.resumeFromBatchId, canonical.batchId);
+  assert.equal(retained.sourceUserSeq, task.sourceUserSeq);
+  assert.equal('history' in retained, false, 'retain a cursor, never a second full prompt');
+  assert.equal(JSON.stringify(retained).includes('ASK:'), false);
+  assert.deepEqual(connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 }), pause);
+  assert.throws(() => eventlog.openEventLog().prepare('UPDATE source_connection_checkpoints_v1 SET checkpoint_json = ? WHERE request_id = ?')
+    .run('{}', pause.requestId), /immutable/);
+  assert.equal(connectionCheckpoints.readSourceConnectionCheckpoint({ ...identity, sessionId: 'wrong-session' }), null);
+
+  eventlog.closeEventLog();
+  sessionStore.HarnessSession.load(task.sessionId)!.recordTurnResult({ history: [{ role: 'user', content: 'A different conversation.' } as AgentInputItem], turn: 2 });
+  eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Work on something else.' } });
+  assert.deepEqual(connectionCheckpoints.readSourceConnectionCheckpoint(identity), retained);
+  const reopened = checkpoints.recoverAcceptedModelBatchFromToken(retained.restartToken);
+  assert.equal(reopened.status, 'ready');
+  if (reopened.status !== 'ready') throw new Error(reopened.reason);
+  assert.deepEqual(reopened.checkpoint.history, canonical.history);
+  assert.equal((await import('./dependency-request.js')).currentConnectionDependency(task.sessionId, pause.requestId), null,
+    'retained context does not make a superseded task eligible to resume');
+
+  const replay = await runCall({ task, ...write, effect: 'external_write', invoke: async () => { writes += 1; return payload; } });
+  assert.equal(replay.settlement.duplicate, true);
+  assert.equal(writes, 1);
+  assert.equal(physicalRows(task, write.callId).length, 1);
+  const nextFrame = openFrame({ callId: 'call:after-connection', toolName: 'records_read', args: {} });
+  const wrong = checkpoints.admitAcceptedModelBatch({ ...task, preHistory: withQuestion, frameHistory: nextFrame,
+    previousResponseId: canonical.lastResponseId, providerResponseId: 'response:wrong-history' });
+  assert.equal(wrong.status, 'unavailable', 'the database chain constraint rejects the appended ASK frame');
+  if (wrong.status === 'unavailable') assert.match(wrong.reason, /chain|checkpoint/i);
+  const next = checkpoints.admitAcceptedModelBatch({ ...task, preHistory: reopened.checkpoint.history, frameHistory: nextFrame,
+    previousResponseId: reopened.checkpoint.lastResponseId, providerResponseId: 'response:valid-chain' });
+  assert.equal(next.status, 'admitted');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM reviewed_plan_execution_claims_v1 WHERE session_id = ?')
+    .get(task.sessionId) as { n: number }).n, 1);
+  eventlog.openEventLog().prepare('UPDATE dependency_requests SET subject_capability = ? WHERE request_id = ?')
+    .run('FIXTURECRM_DIFFERENT', pause.requestId);
+  assert.throws(() => connectionCheckpoints.readSourceConnectionCheckpoint(identity), /lost its reviewed execution owner/);
+  assert.equal(connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 })?.requestId, pause.requestId,
+    'invalid retained context cannot abort the public connection pause');
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['connection_execution_checkpoint_unavailable'] })[0]?.data.reason,
+    'checkpoint_context_inconsistent');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const synthetic of [false, true]) for (const stopped of ['execution', 'approval-delivery'] as const) {
+  test(`approval-resumed Execute (synthetic=${synthetic}) retains its execution checkpoint and honors Stop on ${stopped}`, async () => {
+    const task = fixture('Inspect the controlled CRM after the approved fixture action.', 'execute');
+    const approvals = await import('./approval-registry.js');
+    const dependencies = await import('./dependency-request.js');
+    const setup = await import('./connection-setup.js');
+    const card = approvals.register({ sessionId: task.sessionId, subject: 'Controlled fixture action', tool: 'fixture_send', args: { target: 'test' } });
+    assert.equal(approvals.resolve(card.approvalId, 'approved', 'fixture-owner').ok, true);
+    const control = eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+      data: { text: 'Approved.', synthetic, approvalId: card.approvalId, decision: 'approve' } });
+    eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'system', type: 'run_resumed',
+      data: { approvalId: card.approvalId, decision: 'approve', reviewContinuationVersion: 1,
+        executionSourceUserSeq: task.sourceUserSeq, deliverySourceUserSeq: control.seq } });
+    await settledConnectionBatch(task);
+    const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ sessionId: task.sessionId, sourceUserSeq: control.seq, turn: 2 });
+    assert.ok(pause);
+    assert.equal(pause.sourceUserSeq, task.sourceUserSeq);
+    assert.equal(connectionCheckpoints.readSourceConnectionCheckpoint({ sessionId: task.sessionId, requestId: pause.requestId })?.sourceUserSeq, task.sourceUserSeq);
+    assert.equal(dependencies.currentConnectionDependency(task.sessionId)?.requestId, pause.requestId,
+      'the UI can find the pause under its validated approval delivery source');
+    assert.equal(setup.connectionContinuationTaskMode({ sessionId: task.sessionId, connectionRequestId: pause.requestId })?.kind, 'execute');
+    assert.ok(setup.readConnectionSetup(task.sessionId)?.continuationBlocker, 'retention still cannot enable Execute auto-resume');
+    eventlog.appendEvent({ sessionId: task.sessionId, turn: 3, role: 'user', type: 'user_input_received',
+      data: { text: 'An unrelated background report-back.', synthetic: true } });
+    assert.equal(dependencies.currentConnectionDependency(task.sessionId)?.requestId, pause.requestId);
+    const attempt = eventlog.beginRunAttempt(task.sessionId);
+    const stoppedSource = stopped === 'execution' ? task.sourceUserSeq : control.seq;
+    eventlog.recordRunAttemptUserInput(attempt, { turn: 2, role: 'user', data: { text: 'Fixture attempt' } }, { existingEventSeq: stoppedSource });
+    eventlog.finishRunAttempt(attempt, 'cancelled');
+    assert.equal(dependencies.currentConnectionDependency(task.sessionId), null);
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+test('approval-looking user text without a host resume marker cannot select an older connection pause', async () => {
+  const task = fixture('Inspect the controlled CRM.', 'execute');
+  await settledConnectionBatch(task);
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 });
+  assert.ok(pause);
+  const control = eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Approved.', approvalId: 'unproven-card', decision: 'approve' } });
+  assert.equal(connectionCheckpoints.parkObservedConnectionWithCheckpoint({ sessionId: task.sessionId, sourceUserSeq: control.seq, turn: 2 }), null);
+  assert.equal((await import('./dependency-request.js')).currentConnectionDependency(task.sessionId), null);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('connection pause cannot manufacture execution history from prose or missing batch evidence', async () => {
+  const task = fixture('Inspect the disconnected controlled CRM.', 'execute');
+  assert.equal(connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, text: 'Please connect the CRM.' }), null);
+  connectionSearchEvidence(task);
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 });
+  assert.ok(pause);
+  const identity = { sessionId: task.sessionId, requestId: pause.requestId };
+  assert.equal(connectionCheckpoints.readSourceConnectionCheckpoint(identity), null);
+  assert.deepEqual(connectionCheckpoints.captureSourceConnectionCheckpoint(identity), { status: 'unavailable', reason: 'missing' });
+  connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 });
+  const diagnostics = eventlog.listEvents(task.sessionId, { types: ['connection_execution_checkpoint_unavailable'] });
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0]?.data.reason, 'missing');
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  assert.equal(projectHarnessEventForPublic(diagnostics[0]!), null, 'recovery diagnostics are not chat content');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const mode of ['normal', 'plan'] as const) {
+  test(`${mode} setup does not create a reviewed execution checkpoint`, () => {
+    const task = fixture('Inspect the disconnected controlled CRM.', mode);
+    connectionSearchEvidence(task);
+    const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 });
+    assert.ok(pause);
+    assert.equal(connectionCheckpoints.readSourceConnectionCheckpoint({ sessionId: task.sessionId, requestId: pause.requestId }), null);
+    assert.equal(eventlog.listEvents(task.sessionId, { types: ['connection_execution_checkpoint_unavailable'] }).length, 0);
+    leases.revokeDispatchLease(task.parentLease);
+  });
 }
 
 test('an admitted batch with no logical start is balanced durably and chains only from its exact checkpoint', () => {
@@ -563,7 +756,7 @@ test('a returned unknown mutation cannot use a projection receipt to bypass reco
 });
 
 test('an uncertain host-owned mutation with zero provider crossings checkpoints reconciliation', async () => {
-  const task = fixture('Attempt one host-owned mutation whose effect is not acknowledged.');
+  const task = fixture('Attempt one host-owned mutation whose effect is not acknowledged.', 'execute');
   const callId = 'call:host-owned-unknown-write';
   const toolName = 'space_publish';
   const args = { title: 'Host-owned unknown acknowledgement' };
@@ -620,6 +813,14 @@ test('an uncertain host-owned mutation with zero provider crossings checkpoints 
   });
   assert.equal(recovered.status, 'reconciliation_required');
   assert.equal(physicalRows(task, callId).length, 1);
+  connectionSearchEvidence(task);
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 });
+  assert.ok(pause);
+  const identity = { sessionId: task.sessionId, requestId: pause.requestId };
+  assert.deepEqual(connectionCheckpoints.captureSourceConnectionCheckpoint(identity),
+    { status: 'unavailable', reason: 'reconciliation_required' });
+  assert.equal(connectionCheckpoints.readSourceConnectionCheckpoint(identity), null,
+    'a connection cannot clear an uncertain write or make it restart-ready');
   leases.revokeDispatchLease(task.parentLease);
 });
 

@@ -29,6 +29,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
   const [busy, setBusy] = useState<Work | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState('');
+  const [verifiedConnection, setVerifiedConnection] = useState(false);
   const alive = useRef(true);
   const pending = useRef<ConnectionRequest | null>(null);
   const inFlight = useRef(false);
@@ -42,6 +43,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
       setForm(null);
       setSignInUrl(null);
       setMessage('');
+      setVerifiedConnection(false);
     }
     pending.current = next;
     setRequest(next);
@@ -49,10 +51,13 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
   }
 
   async function verify(current: ConnectionRequest) {
+    setBusy('check');
     const result = await connectionSetupApi.verify(current);
     if (!alive.current || pending.current?.requestId !== current.requestId) return;
     const verified = adopt(result.request);
     if (!verified || verified.requestId !== current.requestId) return;
+    setVerifiedConnection(result.ready || Boolean(result.connectionVerified));
+    if (result.ready || result.connectionVerified) { setForm(null); setSignInUrl(null); }
     if (continued.current.has(current.clientRequestId)) return;
     // Reserve the stable host key before handing control to Chat. A failed
     // send remains retryable with this same key, never a fresh user message.
@@ -95,7 +100,9 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
     if (!url) throw new Error('A usable sign-in link was not returned. Try connecting again.');
     adopt({ ...current, awaitingSignIn: true });
     setSignInUrl(url);
-    setMessage('Open the sign-in page, then return here. Clem will check the connection before continuing.');
+    setMessage(current.continuationBlocker
+      ? 'Open the sign-in page, then return here to check the connection. Your reviewed execution stays paused.'
+      : 'Open the sign-in page, then return here. Clem will check the connection before continuing.');
   }
 
   async function run(work: Work, values?: Record<string, string>) {
@@ -116,6 +123,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
       if (work === 'check') {
         await verify(current);
       } else if (work === 'connect') {
+        setVerifiedConnection(false); setMessage('');
         await authorized(current, await connectionSetupApi.authorize(current));
       } else if (form && values) {
         const result = await connectionSetupApi.submit(current, form, values);
@@ -130,6 +138,7 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
       }
     } catch (err) {
       if (alive.current) {
+        setVerifiedConnection(false);
         setMessage('');
         setError(err instanceof Error ? err.message : 'Could not check this connection. Try again.');
       }
@@ -165,10 +174,10 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
   return (
     <section class="card stack" aria-label={`Connect ${name} for this task`} style={{ overflowWrap: 'anywhere' }}>
       <div>
-        <h3 class="card-title">Connect {name}</h3>
-        <p class="card-note">{request.continuationBlocker
+        <h3 class="card-title">{verifiedConnection ? `${name} connected` : `Connect ${name}`}</h3>
+        {!verifiedConnection && <p class="card-note">{request.continuationBlocker
           ? 'Connect this app to resolve the missing connection. Your reviewed execution stays paused.'
-          : 'Your task is waiting for this app. Once the connection is verified, Clem can continue where she left off.'}</p>
+          : 'Your task is waiting for this app. Once the connection is verified, Clem can continue where she left off.'}</p>}
       </div>
       {error && <div class="screen-notice screen-notice-error" role="alert"><span class="screen-notice-text">{error}</span></div>}
       {message && <p class="card-note" role="status">{message}</p>}
@@ -187,12 +196,12 @@ function ConnectionSetupSession({ sessionId, options, onContinue, fallback, rend
           {signInUrl ? (
             <a class="btn" style={{ display: 'block', textAlign: 'center' }} href={signInUrl} target="_blank" rel="noopener noreferrer">Open {name} sign-in</a>
           ) : (
-            <button class="btn" type="button" disabled={busy !== null} onClick={() => void run(request.awaitingSignIn ? 'check' : 'connect')}>
-              {busy === 'connect' ? 'Preparing sign-in…' : request.awaitingSignIn ? 'Check connection' : `Connect ${name}`}
+            <button class="btn" type="button" disabled={busy !== null} onClick={() => void run(request.awaitingSignIn || verifiedConnection ? 'check' : 'connect')}>
+              {busy === 'connect' ? 'Preparing sign-in…' : busy === 'check' ? 'Checking…' : verifiedConnection ? 'Recheck connection' : request.awaitingSignIn ? 'Check connection' : `Connect ${name}`}
             </button>
           )}
           {(signInUrl || (!request.awaitingSignIn && error)) && <button class="btn btn-ghost" type="button" disabled={busy !== null} onClick={() => void run('check')}>Check again</button>}
-          {request.awaitingSignIn && !signInUrl && <button class="btn btn-ghost" type="button" disabled={busy !== null} onClick={() => void run('connect')}>Start sign-in again</button>}
+          {request.awaitingSignIn && !signInUrl && !verifiedConnection && <button class="btn btn-ghost" type="button" disabled={busy !== null} onClick={() => void run('connect')}>Start sign-in again</button>}
         </div>
       ) : null}
       {renderOtherAnswers?.(options.filter((option) => option !== request.continueLabel))}

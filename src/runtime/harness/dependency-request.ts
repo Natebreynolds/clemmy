@@ -18,6 +18,7 @@ import {
 } from './eventlog.js';
 import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { renderTypedControlState } from './typed-control-state.js';
+import { completionEvidenceSource } from './recovery-activation.js';
 
 export const DEPENDENCY_REQUEST_VERSION = 1 as const;
 
@@ -396,15 +397,38 @@ export function currentConnectionDependency(sessionId: string, requestId?: strin
     AND (json_type(data_json, '$.synthetic') IS NULL OR json_type(data_json, '$.synthetic') = 'false')
     ORDER BY seq DESC LIMIT 1`).get(sessionId) as { seq: number } | undefined;
   if (!source) return null;
-  const attempt = getRunAttemptBySourceUserSeq(sessionId, source.seq);
-  if (attempt && (['cancelled', 'failed', 'superseded'].includes(attempt.status)
-    || isKillRequested(sessionId, attempt))) return null;
+  // An accepted approval click can own delivery for this same execution.
+  // Its exact validated resume marker is required; a later ordinary message
+  // still retires setup, and Stop on either source remains authoritative.
+  const execution = completionEvidenceSource({ sessionId, sourceUserSeq: source.seq });
+  let deliverySourceUserSeq = source.seq;
+  // Buttons/notifications accept synthetic approval controls. Ignore passive
+  // synthetic report-backs, and consider a control only after its exact host
+  // resume marker proves it continues this latest real request's execution.
+  const controls = db.prepare(`SELECT seq FROM events WHERE session_id = ? AND seq > ?
+    AND type = 'user_input_received' AND role = 'user'
+    AND json_type(data_json, '$.synthetic') = 'true'
+    AND json_type(data_json, '$.approvalId') = 'text'
+    AND json_extract(data_json, '$.decision') IN ('approve', 'approve_with_edits', 'reject')
+    ORDER BY seq DESC`).all(sessionId, source.seq) as Array<{ seq: number }>;
+  for (const control of controls) {
+    const mapped = completionEvidenceSource({ sessionId, sourceUserSeq: control.seq });
+    if (mapped.sourceUserSeq !== control.seq && mapped.sourceUserSeq === execution.sourceUserSeq) {
+      deliverySourceUserSeq = control.seq;
+      break;
+    }
+  }
+  for (const sourceUserSeq of new Set([source.seq, execution.sourceUserSeq, deliverySourceUserSeq])) {
+    const attempt = getRunAttemptBySourceUserSeq(sessionId, sourceUserSeq);
+    if (attempt && (['cancelled', 'failed', 'superseded'].includes(attempt.status)
+      || isKillRequested(sessionId, attempt))) return null;
+  }
   const rows = db.prepare(`SELECT request_id, session_id, source_user_seq,
     subject_toolkit, subject_capability, continue_option_label
     FROM dependency_requests WHERE session_id = ? AND source_user_seq = ?
     AND kind = 'connection_missing' AND status = 'open'
     AND subject_kind = 'exact_capability_connection' AND subject_provider = 'authorized_composio'`
-  ).all(sessionId, source.seq) as Array<{
+  ).all(sessionId, execution.sourceUserSeq) as Array<{
     request_id: string; session_id: string; source_user_seq: number;
     subject_toolkit: string; subject_capability: string; continue_option_label: string;
   }>;

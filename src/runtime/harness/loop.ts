@@ -1,5 +1,6 @@
 import './memory-scope-binding.js';
 import { readApprovalRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
+import { parkObservedConnectionWithCheckpoint } from './source-connection-checkpoints.js';
 import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
 import { archivedTaskMessageReferences, type ArchivedTaskMessageReference } from './archived-task-context.js';
 import { projectArchivedContext } from './archived-context-projection.js';
@@ -176,7 +177,6 @@ import {
 } from './turn-outcome.js';
 import {
   observedConnectionDependencyPresentationForSource,
-  parkObservedConnectionDependencyForSource,
 } from './dependency-request.js';
 import { CONVERGENCE_STEER, convergenceSteerEnabled, priorTurnEndedAwaitingClarification } from './convergence-steer.js';
 import {
@@ -1203,7 +1203,7 @@ function reduceStandardConversationTerminal(input: {
     }
     case 'awaiting_user_input': {
       const question = terminalQuestionText(result);
-      const parked = parkObservedConnectionDependencyForSource({
+      const parked = parkObservedConnectionWithCheckpoint({
         sessionId: result.sessionId,
         sourceUserSeq,
         turn: result.lastTurn,
@@ -2161,7 +2161,7 @@ function commitStandardPauseTerminal(input: {
   const proposedText = publicReplyText(input.reply, '') || publicReplyText(input.summary, '');
   let publicText = proposedText;
   if (Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0) {
-    const parked = parkObservedConnectionDependencyForSource({
+    const parked = parkObservedConnectionWithCheckpoint({
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceUserSeq as number,
       turn: input.turn,

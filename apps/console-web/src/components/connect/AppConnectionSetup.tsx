@@ -72,7 +72,7 @@ export interface AppSetupFormViewProps {
   /** Credentials saved: the exact account connection returned by the existing API. */
   onSaved: (result: AppConnectionSavedResult) => void | Promise<void>;
   /** A sign-in link is ready: open it. */
-  onAuthorized: (res: ComposioConnectResult) => void;
+  onAuthorized: (res: ComposioConnectResult) => void | Promise<void>;
   /** Inline keeps setup inside its calling surface; Connect retains the dialog. */
   presentation?: 'inline' | 'dialog';
   /** Lets the server bind its returned connection to the original task. */
@@ -118,9 +118,9 @@ export function AppSetupFormView({ form, onClose, onSaved, onAuthorized, present
         const result = await setupComposioCredentials(form.slug, values, form.setup.authScheme, connectionContext);
         await onSaved(result);
       } else if (form.kind === 'details') {
-        onAuthorized(await authorizeComposio(form.slug, pick(accountFields), connectionContext));
+        await onAuthorized(await authorizeComposio(form.slug, pick(accountFields), connectionContext));
       } else {
-        onAuthorized(await setupComposioOAuthApp(form.slug, {
+        await onAuthorized(await setupComposioOAuthApp(form.slug, {
           credentials: pick(appFields),
           details: pick(accountFields),
           authScheme: form.app.authScheme,

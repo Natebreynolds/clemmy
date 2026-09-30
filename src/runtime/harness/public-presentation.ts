@@ -111,6 +111,7 @@ export function publicTaskMode(value: unknown): TaskMode | undefined {
 }
 
 const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'connection_execution_checkpoint_unavailable',
   'turn_ended',
   'turn_preflight_decision',
   'conversation_step',
