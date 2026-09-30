@@ -38,10 +38,21 @@ one of them can stop it:
 | Write a file | Create, append or overwrite inside the allowed folders. The bytes that were replaced are kept for recovery. A write to a credential or authority file always asks |
 | Look at a page | Renders an `.html` file in a hidden browser and returns the image. Reads only; follows the file-read rule |
 
-**Allowed folders.** The owner's home folder, Clem's own folder, the folder the
-service runs in, and the folders named in `WORKSPACE_DIRS`. The owner's
-approval setting decides how far this reaches: at its widest setting
-(the default) any path the owner's account can reach is allowed.
+**Allowed folders.** Any path the owner's account can reach, in both modes.
+The folder list (`WORKSPACE_DIRS`, the home folder, Clem's own folder) is a
+set of starting points offered to the model, not a wall; what stops a read or
+a write is the credential rule and the protection of Clem's own stores.
+
+## The two modes
+
+| Mode | What runs without asking | What asks |
+| --- | --- | --- |
+| Auto (default) | Anything that is not disruptive: local files, the shell, reads, ordinary changes in connected apps | A send, a delete, an irreversible or administrative change, one sealed bulk change, a command that leaves this machine |
+| Ask | Local files, the shell, reads | Everything Auto asks, plus an ordinary change in a connected app — once. The approval teaches that kind of change (the operation on that account, read from the receipt) and it runs next time. Kinds unused for sixty days are forgotten; the owner can see and forget them in Settings |
+
+The mode is the only approval setting the owner has. Run limits are fixed: a
+run stops for a terminal outcome, a gate, a stop, or zero progress, never for
+a ceiling.
 
 **Credential files** are recognised by name and location: `.env`, `auth.json`,
 the secrets vault and its index, the desktop tool-server configuration, Clem's
@@ -167,6 +178,8 @@ and carries none of Clem's keys.
 | Page preview follows the file-read rule | `src/tools/page-preview-tools.test.ts` |
 | What a linked folder offers is names only | `src/projects/local-project-offers.test.ts` |
 | Coding agent policy | `src/execution/coding-run-policy.test.ts` |
+| Ask mode pauses an ordinary connected-app change once, the approval teaches the kind, Auto never asks | `src/runtime/harness/host-interactive-consent-direct.integration.test.ts` |
+| Learned kinds are visible and forgettable; run limits cannot be written | `src/dashboard/console-approved-write-kinds.test.ts` |
 
 Written from the source at `84e1c5149` on branch `claude/local-page-viewer`,
 2026-09-29. A guard that changes is changed here in the same commit.
