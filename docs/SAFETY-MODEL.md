@@ -55,7 +55,7 @@ A shell command is sorted into one class by what it does.
 | --- | --- | --- |
 | Reads and computation | `ls`, `cat`, `grep`, `git status`, builds, tests, running a script, a web GET | Runs through the work carrier |
 | Local change | `cp`, `mv`, `mkdir`, `rm`, `git commit`, package installs, output redirected to a file, a wrapped script that cannot be inspected | Runs through the work carrier as ordinary local work: no plan, no card. The guards below still run |
-| Leaves the machine | a web POST, `git push`, a deploy, a publish | NOT YET: refused. No card is raised |
+| Leaves the machine | a web POST, `git push`, a deploy, a publish | Never runs from the turn. The turn opens one card showing the exact command; approving it runs that command once and reports what landed. The guards below still run |
 
 Inside the tool, on every path, these always apply:
 
@@ -139,7 +139,7 @@ and carries none of Clem's keys.
 | Change part of a file | Only by replacing the whole file | Gap |
 | Shell: reads, builds, tests | Through the work carrier | Works |
 | Shell: local changes | Through the work carrier, as ordinary local work | Works |
-| Shell: push, deploy, publish | | Not yet |
+| Shell: push, deploy, publish | One card with the exact command; runs on approval | Works |
 | Look at a rendered page | `page_preview` | Works |
 | Drive a real browser | | Not reachable on a chat turn |
 | Fetch a web page | `http_read` | Works |
@@ -159,6 +159,7 @@ and carries none of Clem's keys.
 | What leaves the machine | `src/runtime/harness/destination-gate.test.ts` |
 | A read-class shell command runs under its own envelope and nothing else does | `src/tools/work-call.foreground-compute.test.ts` |
 | A local change runs as ordinary work with no card; reads keep their envelope; in-tool guards still refuse; off-machine is not carried | `src/runtime/harness/shell-local-change.integration.test.ts` |
+| An off-machine command is refused into one card whose preview is the command; approval runs it once; the tool's guards still refuse after approval | `src/runtime/harness/shell-off-machine-card.integration.test.ts` |
 | The shell is disclosed truthfully | `src/tools/tool-search-relevance.test.ts`, `src/tools/call-tool.test.ts` |
 | A file write without a card keeps its receipt | `src/runtime/harness/normal-native-write.integration.test.ts` |
 | Pages: listing, reading, policy, surfaces | `src/projects/local-pages.test.ts` |
