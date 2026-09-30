@@ -4,7 +4,7 @@ import type { BuildOrchestratorAgentOptions } from './orchestrator.js';
  * connections and authority must still be rebuilt and checked at recovery. */
 export type AgentRebuildContext = Pick<BuildOrchestratorAgentOptions,
   'allowedToolNames' | 'excludeToolNames' | 'allowToolJit' | 'taskContinuation'
-  | 'taskContinuationResolved' | 'turnCandidates'>;
+  | 'taskContinuationResolved' | 'turnCandidates' | 'acceptedRoute'>;
 
 const contexts = new WeakMap<object, AgentRebuildContext>();
 const clone = (value: AgentRebuildContext): AgentRebuildContext => JSON.parse(JSON.stringify(value));
@@ -17,6 +17,7 @@ export function bindAgentRebuildContext(agent: object, options: BuildOrchestrato
     taskContinuation: options.taskContinuation,
     taskContinuationResolved: options.taskContinuationResolved,
     turnCandidates: options.turnCandidates,
+    acceptedRoute: options.acceptedRoute,
   };
   contexts.set(agent, clone(context));
 }

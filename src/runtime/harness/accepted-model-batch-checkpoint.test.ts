@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,6 +31,10 @@ const logicalResults = await import('./logical-model-result-projection-receipt.j
 const connectionCheckpoints = await import('./source-connection-checkpoints.js');
 const plans = await import('./plan-artifacts.js');
 const sessionStore = await import('./session.js');
+const agentEnvelopes = await import('../../agents/capability-envelope.js');
+const agentRebuild = await import('../../agents/agent-rebuild-context.js');
+const mcpAuthority = await import('../mcp-tool-authority.js');
+const { rebuildSourceConnectionAgent } = await import('./connection-agent-rebuild.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -88,6 +93,23 @@ function fixture(text: string, mode: 'normal' | 'plan' | 'execute' = 'normal') {
 }
 
 type Fixture = ReturnType<typeof fixture>;
+
+function connectionAgent(task: Fixture, mcpToolScope: import('../mcp-tool-scope.js').McpToolScope | null = {
+  reason: 'original controlled task scope', authority: 'catalog', deniedServerSlugs: ['fixture-private'], maxTools: 2,
+}, acceptedRoute?: import('../../agents/agent-rebuild-context.js').AgentRebuildContext['acceptedRoute']) {
+  const agent = { model: 'fixture-original-brain', privateProviderState: 'must-not-be-saved', instructions: 'private agent instructions' };
+  const sealed = agentEnvelopes.sealAgentCapabilityUniverse({ sessionId: task.sessionId,
+    universeTools: [{ name: 'tool_search', description: 'Search controlled capability metadata', parameters: { type: 'object' } }],
+    activeToolNames: ['tool_search'], policyHash: 'fixture-policy',
+    budget: { maxUncachedTokens: 1000, maxModelCalls: 8, maxToolCalls: 8, maxElapsedMs: 30000 } });
+  assert.ok(sealed.ok);
+  if (!sealed.ok) throw new Error(sealed.errors.join('; '));
+  agentEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  agentEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  agentRebuild.bindAgentRebuildContext(agent, { excludeToolNames: ['run_shell_command'], allowToolJit: true, acceptedRoute });
+  mcpAuthority.bindAgentMcpToolScope(agent, mcpToolScope);
+  return agent;
+}
 
 function preHistory(task: Fixture): AgentInputItem[] {
   return [{ role: 'user', content: task.text } as AgentInputItem];
@@ -301,6 +323,48 @@ async function settledConnectionBatch(task: Fixture) {
   return final.checkpoint;
 }
 
+for (const shape of ['ask', 'decision'] as const) test(`connection pause after fallback retains the actual executing agent (${shape})`, async () => {
+  const task = fixture('Inspect the controlled CRM after connection.', 'execute');
+  await settledConnectionBatch(task);
+  const original = connectionAgent(task, undefined, 'act');
+  const replacement = connectionAgent(task, null, 'retrieve');
+  replacement.model = 'fixture-fallback-brain';
+  const { runConversation } = await import('./loop.js');
+  const { BoundaryError } = await import('../boundary-error.js');
+  let runs = 0;
+  let rebuilds = 0;
+  const result = await runConversation({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, input: task.text,
+    reuseRecordedUserInput: true, agent: original as never, judgeCompletion: false,
+    suppressMemoryCapture: true, suppressAutomaticMemoryForRequest: true, maxSteps: 2,
+    makeRunner: () => new EventEmitter() as never,
+    runRunner: async (_runner, active, items) => {
+      runs += 1;
+      if (active === original) throw BoundaryError.from(new Error('Controlled transient model failure.'), {
+        kind: 'model.overloaded', retryable: true, userMessage: 'Controlled transient failure.',
+      });
+      assert.equal(active, replacement);
+      return { history: items, lastResponseId: undefined, finalOutput: shape === 'ask'
+        ? 'ASK: Connect the fixture CRM to continue.'
+        : { summary: 'Connect the fixture CRM to continue.', reply: 'Connect the fixture CRM to continue.',
+          done: false, nextAction: 'awaiting_user_input', reason: null } } as never;
+    },
+    falloverModelIds: ['fixture-fallback-brain'],
+    rebuildAgentForBrain: async () => { rebuilds += 1; return replacement as never; },
+  });
+  assert.equal(result.status, 'awaiting_user_input', JSON.stringify(result));
+  assert.equal(runs, 2);
+  assert.equal(rebuilds, 1);
+  const { currentConnectionDependency } = await import('./dependency-request.js');
+  const dependency = currentConnectionDependency(task.sessionId);
+  assert.ok(dependency);
+  const retained = connectionCheckpoints.readSourceConnectionCheckpoint({ sessionId: task.sessionId, requestId: dependency.requestId });
+  assert.equal(retained?.agent?.modelId, replacement.model, 'original model must not replace the actual fallback at pause');
+  assert.equal(retained.agent.mcpToolScope, null);
+  assert.equal(retained.agent.rebuildContext.acceptedRoute, 'retrieve');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('reviewed connection pause retains the exact batch across ASK, reopen and newer chat without replaying a settled write', async () => {
   const task = fixture('Create the fixture artifact once, then inspect the controlled CRM.', 'execute');
   const write = { callId: 'call:connection-prior-write', toolName: 'space_publish', args: { title: 'Checkpoint fixture' } };
@@ -321,7 +385,8 @@ test('reviewed connection pause retains the exact batch across ASK, reopen and n
 
   // Both ordinary ASK projection and an explicit awaiting-input terminal park
   // through this production seam, after their public question is determined.
-  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 });
+  const agent = connectionAgent(task);
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent });
   assert.ok(pause);
   const identity = { sessionId: task.sessionId, requestId: pause.requestId };
   const retained = connectionCheckpoints.readSourceConnectionCheckpoint(identity)!;
@@ -331,6 +396,18 @@ test('reviewed connection pause retains the exact batch across ASK, reopen and n
   assert.equal(retained.sourceUserSeq, task.sourceUserSeq);
   assert.equal('history' in retained, false, 'retain a cursor, never a second full prompt');
   assert.equal(JSON.stringify(retained).includes('ASK:'), false);
+  assert.equal(retained.agent?.modelId, 'fixture-original-brain');
+  assert.deepEqual(retained.agent?.rebuildContext, { excludeToolNames: ['run_shell_command'], allowToolJit: true });
+  assert.deepEqual(retained.agent?.mcpToolScope?.deniedServerSlugs, ['fixture-private']);
+  assert.deepEqual(retained.agent?.bindingRevision?.bound, ['tool_search']);
+  assert.equal(retained.agent?.envelope.envelopeDigest, agentEnvelopes.boundAgentCapabilityEnvelope(agent)?.envelopeDigest);
+  assert.equal(JSON.stringify(retained).includes('must-not-be-saved'), false);
+  assert.equal(JSON.stringify(retained).includes('private agent instructions'), false);
+  agent.model = 'fixture-different-brain';
+  mcpAuthority.bindAgentMcpToolScope(agent, { reason: 'later unrelated scope', authority: 'catalog', allowAll: true });
+  agentRebuild.bindAgentRebuildContext(agent, { allowToolJit: false });
+  assert.deepEqual(connectionCheckpoints.readSourceConnectionCheckpoint(identity), retained,
+    'later mutations or builds cannot alter retained construction context');
   assert.deepEqual(connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1 }), pause);
   assert.throws(() => eventlog.openEventLog().prepare('UPDATE source_connection_checkpoints_v1 SET checkpoint_json = ? WHERE request_id = ?')
     .run('{}', pause.requestId), /immutable/);
@@ -370,6 +447,136 @@ test('reviewed connection pause retains the exact batch across ASK, reopen and n
     'checkpoint_context_inconsistent');
   leases.revokeDispatchLease(task.parentLease);
 });
+
+test('a reviewed connection checkpoint preserves explicit MCP denial and never serializes an opaque model', async () => {
+  const task = fixture('Inspect controlled connection metadata with no external MCP permission.', 'execute');
+  await settledConnectionBatch(task);
+  const agent = connectionAgent(task, null);
+  Object.assign(agent, { model: { getResponse: () => { throw new Error('No model calls allowed.'); }, key: 'do-not-retain-provider-object' } });
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent });
+  assert.ok(pause);
+  const retained = connectionCheckpoints.readSourceConnectionCheckpoint({ sessionId: task.sessionId, requestId: pause.requestId });
+  assert.ok(retained?.agent);
+  assert.equal(retained.agent.mcpToolScope, null);
+  assert.equal(Object.hasOwn(retained.agent, 'modelId'), false);
+  assert.equal(JSON.stringify(retained).includes('do-not-retain-provider-object'), false);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('agent-shaped public fields cannot manufacture private retained connection scope', async () => {
+  const task = fixture('Read the controlled CRM once connected.', 'execute');
+  await settledConnectionBatch(task);
+  const agent = { model: 'pretend-model', mcpToolScope: { authority: 'catalog', allowAll: true },
+    envelope: { envelopeDigest: 'pretend-envelope' }, rebuildContext: { allowToolJit: true } };
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent });
+  assert.ok(pause);
+  const retained = connectionCheckpoints.readSourceConnectionCheckpoint({ sessionId: task.sessionId, requestId: pause.requestId });
+  assert.ok(retained);
+  assert.equal(retained.agent, undefined, 'missing private bindings remain unknown, not unrestricted');
+  await assert.rejects(rebuildSourceConnectionAgent({ sessionId: task.sessionId, requestId: pause.requestId,
+    assertOwned: () => {} }, {
+    prime: async () => { throw new Error('Missing context must stop before catalog construction.'); },
+    revalidate: async () => { throw new Error('Missing context must stop before review.'); },
+    build: async () => { throw new Error('Missing context must not build a default agent.'); },
+  }), /no retained tool context and replayable model identity/);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const denyExternal of [false, true]) for (const route of [undefined, 'act'] as const)
+  test(`connection rebuild restores original model and restrictions (external denial=${denyExternal}, route=${route})`, async () => {
+  const task = fixture('Inspect the controlled CRM after restoring its exact reviewed connection.', 'execute');
+  await settledConnectionBatch(task);
+  const agent = connectionAgent(task, denyExternal ? null : undefined, route);
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent });
+  assert.ok(pause);
+  const identity = { sessionId: task.sessionId, requestId: pause.requestId };
+  const retained = connectionCheckpoints.readSourceConnectionCheckpoint(identity)!;
+  assert.ok(retained.agent);
+  eventlog.closeEventLog();
+  const order: string[] = [];
+  const planning = { fixture: 'fresh original-source planning' } as never;
+  const rebuilt = await rebuildSourceConnectionAgent({ ...identity, assertOwned: () => { order.push('owner'); } }, {
+    prime: async input => {
+      assert.deepEqual(input, { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+      order.push('prime'); return { ok: true, planning } as never;
+    },
+    revalidate: async input => { assert.equal(input, planning); order.push('revalidate'); },
+    build: async options => {
+      order.push('build');
+      assert.equal(options.sourceUserSeq, task.sourceUserSeq);
+      assert.equal(options.model, 'fixture-original-brain');
+      assert.equal(options.allowToolJit, true);
+      assert.equal(options.acceptedRoute, route);
+      assert.deepEqual(options.excludeToolNames, ['run_shell_command']);
+      assert.match(options.userInput!, /Execute reviewed|explicitly selected Execute/);
+      assert.equal(options.hostFreshPlanning, planning);
+      if (denyExternal) assert.equal(options.mcpToolScope?.authority, 'none');
+      else assert.deepEqual(options.mcpToolScope, retained.agent!.mcpToolScope);
+      // The current builder must seal its own output. Copying the old envelope
+      // in the production rebuild helper would make the drift test below pass.
+      const result = connectionAgent(task, options.mcpToolScope, options.acceptedRoute);
+      return result as never;
+    },
+  });
+  assert.equal(rebuilt.model, 'fixture-original-brain');
+  assert.deepEqual(order.filter(x => x !== 'owner'), ['prime', 'revalidate', 'build']);
+  assert.ok(order.slice(order.indexOf('prime') + 1, order.indexOf('revalidate')).includes('owner'));
+  assert.ok(order.slice(order.indexOf('revalidate') + 1, order.indexOf('build')).includes('owner'));
+  assert.equal(order.at(-1), 'owner');
+  assert.deepEqual(connectionCheckpoints.readSourceConnectionCheckpoint(identity), retained);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['approval_requested', 'run_resumed'] }).length, 0,
+    'building context neither grants consent nor starts a continuation');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const drift of ['reviewed-account', 'schema', 'scope', 'model', 'route', 'missing-route', 'construction', 'owner-after-prime', 'owner-after-build'] as const) {
+  test(`connection rebuild refuses ${drift} drift without substituting retained authority`, async () => {
+    const task = fixture('Continue using the original reviewed account and tools.', 'execute');
+    await settledConnectionBatch(task);
+    const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent: connectionAgent(task, undefined, 'act') });
+    assert.ok(pause);
+    let lost = false;
+    let builds = 0;
+    let validations = 0;
+    const attempt = rebuildSourceConnectionAgent({ sessionId: task.sessionId, requestId: pause.requestId,
+      assertOwned: () => { if (lost) throw new Error('original activation lost'); } }, {
+      prime: async () => {
+        if (drift === 'owner-after-prime') lost = true;
+        return { ok: true, planning: {} } as never;
+      },
+      revalidate: async () => { validations += 1; if (drift === 'reviewed-account') throw new Error('Reviewed account changed.'); },
+      build: async options => {
+        builds += 1;
+        const result = connectionAgent(task, options.mcpToolScope, options.acceptedRoute);
+        if (drift === 'schema') {
+          const changed = agentEnvelopes.sealAgentCapabilityUniverse({ sessionId: task.sessionId,
+            universeTools: [{ name: 'tool_search', description: 'Changed callable contract', parameters: { type: 'object' } }],
+            activeToolNames: ['tool_search'], policyHash: 'fixture-policy',
+            budget: { maxUncachedTokens: 1000, maxModelCalls: 8, maxToolCalls: 8, maxElapsedMs: 30000 } });
+          assert.ok(changed.ok);
+          if (changed.ok) agentEnvelopes.bindAgentCapabilityEnvelope(result, changed.envelope);
+        }
+        if (drift === 'scope') mcpAuthority.bindAgentMcpToolScope(result, { reason: 'broader replacement', authority: 'catalog', allowAll: true });
+        if (drift === 'model') result.model = 'unrequested-model';
+        if (['route', 'missing-route', 'construction'].includes(drift)) agentRebuild.bindAgentRebuildContext(result, {
+          excludeToolNames: ['run_shell_command'], allowToolJit: drift !== 'construction',
+          acceptedRoute: drift === 'route' ? 'retrieve' : drift === 'missing-route' ? undefined : options.acceptedRoute,
+        });
+        if (drift === 'owner-after-build') lost = true;
+        return result as never;
+      },
+    });
+    const expected = drift === 'reviewed-account' ? /Reviewed account changed/
+      : drift === 'schema' ? /definitions or policy changed/
+      : drift === 'scope' ? /external tool scope/
+      : drift === 'model' ? /selected model/
+      : ['route', 'missing-route', 'construction'].includes(drift) ? /construction context or accepted route/ : /activation lost/;
+    await assert.rejects(attempt, expected);
+    assert.equal(builds, ['reviewed-account', 'owner-after-prime'].includes(drift) ? 0 : 1);
+    assert.equal(validations, drift === 'owner-after-prime' ? 0 : 1);
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
 
 for (const synthetic of [false, true]) for (const stopped of ['execution', 'approval-delivery'] as const) {
   test(`approval-resumed Execute (synthetic=${synthetic}) retains its execution checkpoint and honors Stop on ${stopped}`, async () => {

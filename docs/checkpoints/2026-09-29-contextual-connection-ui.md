@@ -68,6 +68,65 @@ Final frontend builds passed after the UI adjustments (the existing console larg
 
 Generic provider-reconnect questions without an exact toolkit still retain their existing answer choices; this slice does not infer a toolkit from prose. Local CLI/MCP enrollment, purchases such as phone-number provisioning, callback delivery, and delegated coding setup are subsequent slices, not claimed capabilities here.
 
+### Retained construction context and rebuild checks — September 30
+
+The connection checkpoint now captures the paused agent's privately bound tool
+envelope, binding revision, MCP scope, serializable construction options and
+string model identity. The records are immutable and survive database reopen.
+SDK/provider objects, instructions, closures and credentials are not serialized.
+An opaque custom model remains unknown; it cannot manufacture a replayable
+model ID. Missing private bindings leave the batch cursor intact without
+inventing an unrestricted agent. Explicitly denied MCP access remains denied.
+
+`connection-agent-rebuild.ts` is an **unwired prerequisite**, not a new resume
+entry point. It loads the retained original source, primes current planning,
+runs ordinary reviewed-plan account/capability/schema revalidation, and rebuilds
+against current definitions. It checks fresh tool-envelope identity, original
+MCP scope, model and construction options. It rechecks task ownership after
+awaited work. Successful sign-in cannot replace the reviewed account. The
+helper neither starts a run nor grants an approval, and its production path
+adds no setup-model question.
+
+Review caught and fixed two issues before this slice was saved:
+
+- The fresh core can change agents after a transient model failure. Capturing
+  `options.agent` would retain the abandoned agent. Pause hooks now use the
+  current agent, and a private callback updates the outer terminal reducer.
+- `acceptedRoute` affects tool behavior beyond the sealed schema. The existing
+  construction-context binding now retains it, including its absence; the
+  rebuild check compares the fresh construction context rather than treating
+  a matching envelope as proof of identical behavior.
+
+The new fallback pins exercise the real conversation core with injected
+runners. Both prose ASK and structured awaiting-input capture the replacement
+agent. Removing the fallback fix makes both pins fail on the stale original
+model; restoring it makes them pass. The actual host-engine pause fixtures also
+pass with recording models: one tool read, two model frames, one public pause,
+zero approval cards. Rebuild pins reject changed reviewed accounts, schemas,
+MCP scope, models, accepted routes, constructor restrictions and lost ownership.
+
+The completed targeted run passed **65/65** across accepted model batches,
+actual host connection pauses, existing terminal delivery and recovery
+activation. Logs: `/tmp/clem-connection-context-qualified.txt`,
+`/tmp/clem-connection-fallback-red.txt`. These are transient logs; this section
+retains the outcome and its limits. The isolation sentinel was **NOT PERFORMED**
+while the live daemon remained active; no live acceptance is claimed.
+Existing workflow parent-review and dispatch-handoff checks passed **12/12**,
+for **77 focused checks** in this slice; runtime TypeScript passed. These checks
+do not constitute a full-suite or production qualification. Logs:
+`/tmp/clem-connection-workflow-context-pins.txt` and
+`/tmp/clem-connection-context-qualified-tsc.txt`. The final bounded read-only
+review found no further concrete issue. At the ownership recheck the shell
+agent's separate branch was clean at `c826d4b9c`; this task did not alter it.
+
+**Still owed before enabling reviewed Execute continuation:** durable original
+agent/project/memory identity, a distinct connection activation and delivery
+owner, cancellation and executor leases, retained token-budget semantics,
+fresh capability satisfaction, and proof that settled writes are not replayed.
+The UI/service Execute blocker remains. The UI truthfully says connected but
+paused; building the context alone must never flip it to working or completed.
+No change from this slice is installed, merged to main or tagged.
+
 ## Verification and evidence
 
 Targeted service/dependency/HTTP-route regressions: **31/31 passed**. Actual gateway continuation regressions: **10/10 passed**. These cover exact account readiness, stale tasks, replaced accounts before admission, database reopen, cross-device identity, original Plan mode, unrelated background work, a held desktop lease, and synthetic report-back events. Providers are injected; no paid model or real account action was used.

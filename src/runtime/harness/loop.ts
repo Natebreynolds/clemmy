@@ -1057,6 +1057,7 @@ const deferredToolCallsLimitAuthorities = new WeakMap<
 function reduceStandardConversationTerminal(input: {
   result: RunConversationResult;
   sourceUserSeq: number;
+  agent?: object;
   approvalIdHint?: string;
   deferToolCallsLimitTerminal?: true;
 }): RunConversationResult {
@@ -1206,6 +1207,7 @@ function reduceStandardConversationTerminal(input: {
       const parked = parkObservedConnectionWithCheckpoint({
         sessionId: result.sessionId,
         sourceUserSeq,
+        agent: input.agent,
         turn: result.lastTurn,
         text: question,
       });
@@ -2151,6 +2153,7 @@ function finalizeStandardConversation(input: {
 function commitStandardPauseTerminal(input: {
   sessionId: string;
   sourceUserSeq?: number;
+  agent?: object;
   turn: number;
   steps: number;
   summary: string;
@@ -2164,6 +2167,7 @@ function commitStandardPauseTerminal(input: {
     const parked = parkObservedConnectionWithCheckpoint({
       sessionId: input.sessionId,
       sourceUserSeq: input.sourceUserSeq as number,
+      agent: input.agent,
       turn: input.turn,
       text: proposedText,
     });
@@ -6717,6 +6721,7 @@ async function runConversationWithinRuntimeConfig(
       const reduced = reduceStandardConversationTerminal({
         result,
         sourceUserSeq,
+        agent: activeAgent,
         ...(options.deferToolCallsLimitTerminal ? { deferToolCallsLimitTerminal: true as const } : {}),
       });
       if (reduced.publicPresentation) {
@@ -6744,6 +6749,7 @@ async function runConversationWithinRuntimeConfig(
           const result = await runConversationCore({
             ...options,
             agent: activeAgent,
+            onActiveAgentChanged: (agent) => { activeAgent = agent; },
             sourceUserSeq,
             turnEngine: frozenTurnEngine,
             reuseRecordedUserInput: true,
@@ -6756,6 +6762,7 @@ async function runConversationWithinRuntimeConfig(
             reduced: reduceStandardConversationTerminal({
               result,
               sourceUserSeq,
+              agent: activeAgent,
               ...(options.deferToolCallsLimitTerminal
                 ? { deferToolCallsLimitTerminal: true as const }
                 : {}),
@@ -6813,7 +6820,11 @@ async function runConversationWithinRuntimeConfig(
 async function runConversationCore(
   // The core demands a RESOLVED agent — capability resolution happened at the
   // spine's capability_resolve node (or the caller passed one pre-built).
-  options: RunConversationOptions & { agent: Agent<any, any> },
+  options: RunConversationOptions & {
+    agent: Agent<any, any>;
+    /** Keep terminal checkpoint capture on the agent that actually paused. */
+    onActiveAgentChanged?: (agent: Agent<any, any>) => void;
+  },
 ): Promise<RunConversationResult> {
   // v0.5.19 F2 — `budget` is mutable so the elevate-on-warn path can
   // rebind it mid-conversation. The cached locals below pick up new
@@ -7223,6 +7234,7 @@ async function runConversationCore(
         try { rebuilt = await options.rebuildAgentForBrain!(nextModelId); } catch { rebuilt = null; }
         if (rebuilt) {
           currentAgent = rebuilt;
+          options.onActiveAgentChanged?.(currentAgent);
           safeAppend({
             sessionId: options.sessionId,
             turn: turnResult.turn,
@@ -7334,6 +7346,7 @@ async function runConversationCore(
       : null;
     if (completedTurnQuestion) {
       commitStandardPauseTerminal({
+        agent: currentAgent,
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -7657,6 +7670,7 @@ async function runConversationCore(
         const latestQuestion = awaitingUserQuestionThisTurn(options.sessionId, turnResult.turn)
           ?? 'Awaiting your input.';
         commitStandardPauseTerminal({
+          agent: currentAgent,
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
@@ -7950,6 +7964,7 @@ async function runConversationCore(
           },
         });
         commitStandardPauseTerminal({
+          agent: currentAgent,
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
@@ -7983,6 +7998,7 @@ async function runConversationCore(
       if (toolAskThisTurn) {
         const question = String((toolAskThisTurn.data as { question?: unknown }).question ?? 'Awaiting your input.');
         commitStandardPauseTerminal({
+          agent: currentAgent,
           sessionId: options.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: turnResult.turn,
@@ -8422,6 +8438,7 @@ async function runConversationCore(
             },
           });
           commitStandardPauseTerminal({
+            agent: currentAgent,
             sessionId: options.sessionId,
             sourceUserSeq: activeSourceUserSeq,
             turn: turnResult.turn,
@@ -9909,6 +9926,7 @@ async function runConversationCore(
       const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
         ?? 'Could you clarify how you\'d like me to proceed?';
       commitStandardPauseTerminal({
+        agent: currentAgent,
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -10025,6 +10043,7 @@ async function runConversationCore(
       const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
         ?? 'I reached a point where I need your input to continue — how would you like me to proceed?';
       commitStandardPauseTerminal({
+        agent: currentAgent,
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
@@ -13694,6 +13713,7 @@ async function runConversationFromResumeOwned(opts: {
             reduced: reduceStandardConversationTerminal({
               result,
               sourceUserSeq,
+              agent: activeAgent,
               approvalIdHint: opts.approvalId,
               ...(opts.deferToolCallsLimitTerminal
                 ? { deferToolCallsLimitTerminal: true as const }
@@ -13950,6 +13970,7 @@ async function runConversationFromResumeCore(opts: {
     : null;
   if (firstCompletedQuestion) {
     commitStandardPauseTerminal({
+      agent: opts.agent,
       sessionId: opts.sessionId,
       sourceUserSeq: activeSourceUserSeq,
       turn: firstResult.turn,
@@ -14475,6 +14496,7 @@ async function runConversationFromResumeCore(opts: {
         const awaitingSummary = (decision.reply?.trim() ? decision.reply : decision.summary)
           ?? 'Could you clarify how you\'d like me to proceed?';
         commitStandardPauseTerminal({
+          agent: opts.agent,
           sessionId: opts.sessionId,
           sourceUserSeq: activeSourceUserSeq,
           turn: lastTurn,
@@ -14681,6 +14703,7 @@ async function runConversationFromResumeCore(opts: {
       : null;
     if (completedTurnQuestion) {
       commitStandardPauseTerminal({
+        agent: opts.agent,
         sessionId: opts.sessionId,
         sourceUserSeq: activeSourceUserSeq,
         turn: turnResult.turn,
