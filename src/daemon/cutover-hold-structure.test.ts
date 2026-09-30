@@ -145,6 +145,9 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/runtime/harness/discovery-request-identity.ts',
       'src/runtime/harness/eventlog-schema.ts',
       'src/runtime/harness/host-planned-resolution-coexistence.ts',
+      // Pure leaf (only a `type` import of better-sqlite3): the v83 retained
+      // session-proof rebuild rides along with eventlog-schema's migration list.
+      'src/runtime/harness/retained-session-proof-schema.ts',
       'src/runtime/harness/schema-version.ts',
       'src/runtime/harness/session-history-search-schema.ts',
       'src/runtime/security.ts',
@@ -163,6 +166,7 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/runtime/harness/discovery-request-identity.ts',
       'src/runtime/harness/eventlog-schema.ts',
       'src/runtime/harness/host-planned-resolution-coexistence.ts',
+      'src/runtime/harness/retained-session-proof-schema.ts',
       'src/runtime/harness/schema-version.ts',
       'src/runtime/harness/session-history-search-schema.ts',
       'src/shared/closed-canonical-json.ts',

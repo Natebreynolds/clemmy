@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Fragment, type ComponentChildren, type VNode } from 'preact';
-import { ConnectionsPage } from './Settings.js';
+import { Fragment, h, type ComponentChildren, type VNode } from 'preact';
+
+// The repository's test loader compiles this screen's JSX with the classic
+// runtime (the app's own tsconfig, with preact's automatic runtime, is not
+// the loader's). Give that runtime preact's factory before the screen loads.
+(globalThis as { React?: unknown }).React = { createElement: h, Fragment };
+const { ConnectionsPage } = await import('./Settings.js');
 
 type Props = Parameters<typeof ConnectionsPage>[0];
 const fresh: Props = {

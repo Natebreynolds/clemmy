@@ -32,7 +32,9 @@ test('a running turn can always be moved to the background from its work line', 
 });
 
 test('suggested answers are buttons only where an answer can land', () => {
-  assert.match(SOURCE, /onAnswer\?: \(text: string\)/);
+  // The answer may carry a connection resume (setup inside the task); the
+  // buttons still land only where an answer can.
+  assert.match(SOURCE, /onAnswer\?: \(text: string, resume\?: ConnectionResume\)/);
   assert.match(SOURCE, /const answerable = message\.status === 'awaiting-reply' && Boolean\(onAnswer\)/);
 });
 
