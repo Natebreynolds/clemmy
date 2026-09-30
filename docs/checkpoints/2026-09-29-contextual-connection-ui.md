@@ -492,3 +492,61 @@ The other agent's `claude/shell-anywhere` worktree was rechecked clean at
 on `codex/contextual-connection-ui`; no merge, paid model test, provider write,
 hotpatch or tag occurred in this slice. Full installed identity and live
 acceptance remain owed, as do matched latency/token measurements.
+
+## Keep reviewed execution alive at an exact connection pause — September 30
+
+The two ordinary connection-question terminal paths now attach a small private
+binding only after validating complete retained agent and host recovery. The
+terminal transaction checks the immutable checkpoint, original reviewed claim,
+dependency identity, exact latest settled batch and open host authority. It
+retains both the host authority and any active accepted-task authority. The
+physical foreground attempt still ends as interrupted and releases its
+in-flight owner. A connection question is not a completed task or a new tool
+grant. Generic questions, incomplete legacy checkpoints and opaque model
+objects retain their previous behavior; no closed root is reopened.
+
+Pause lookup uses the same typed projection and exact authority validation as
+ordinary terminal replay. Replaying a historical pause does not depend on a
+currently open dependency, newest chat or selected account. Its immutable
+subject and reviewed execution still must match. The private record never
+appears in the public setup card or brain prompt, and this path makes no model
+or provider call.
+
+Validation: **119/119 tests** passed across accepted-model-batch-checkpoint,
+accepted-task-terminal-publication, accepted-turn-call-authority,
+source-connection-checkpoints.integration and connection-setup. Runtime
+TypeScript passed. Pins cover both retained owners, database reopen and replay,
+ending the physical attempt, no extra dispatch, changed dependency/claim,
+mismatched source/digest/status, unfinished batches, ordinary questions,
+incomplete checkpoints and corrupted terminal projections/root identity.
+The recording integration cases still exercise ASK and structured decisions.
+Logs: `/tmp/clem-connection-pause-regression.txt` and
+`/tmp/clem-connection-pause-tsc.txt`.
+
+Traps found and fixed in this slice:
+
+- Importing the high-level checkpoint validator into eventlog initialized tool
+  adapters before the database path existed. The eventlog validator now has
+  only SQL, crypto and type dependencies; agent reconstruction stays outside.
+- Casting a saved public presentation alone bypassed normal terminal replay
+  checks. Private proof lookup now goes through that shared validator.
+- Checking only the dependency status missed a changed subject between
+  preparation and commit. Capture and publication now share the dependency
+  identity projection, with its digest rechecked in the terminal transaction.
+  The original reviewed claim/event/source relationship is rechecked there too.
+
+These are regression checks, not installed-app acceptance. The live-home
+sentinel was **NOT PERFORMED** while daemon 35630 was changing live stores.
+No model/provider call, configuration change, app restart, build, hotpatch,
+merge or tag was performed. The other agent's clean `5fc52bf4b` checkout and
+installation remain untouched.
+
+**Activation is still disabled for reviewed Execute.** This finishes the
+initial same-source pause part of item 1 above, not its final closure chain.
+Next implement the distinct connection activation owner/control receipt,
+current account/Stop/lease rechecks, preserved outer-window accounting, and
+atomic final closure of the original execution under the new delivery source.
+The essential remaining test is pause → activate → finish → reopen → replay
+both terminals, including intervening approval/cancellation and no repeated
+writes. Only then enable Continue and qualify desktop/mobile setup and device
+handoff on one combined installed candidate.

@@ -3,6 +3,7 @@ import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, rea
 import { currentSourceSessionContext, withSourceSessionContext } from './source-session-context-scope.js';
 import { readApprovalRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
 import { parkObservedConnectionWithCheckpoint } from './source-connection-checkpoints.js';
+import { prepareConnectionExecutionPause, type ConnectionExecutionPauseV1 } from './connection-execution-pause.js';
 import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
 import { archivedTaskMessageReferences, type ArchivedTaskMessageReference } from './archived-task-context.js';
 import { projectArchivedContext } from './archived-context-projection.js';
@@ -1127,6 +1128,7 @@ function reduceStandardConversationTerminal(input: {
   let blockedReason: string | undefined;
   let blockedDetail: string | undefined;
   let transferredToTaskId: string | undefined;
+  let connectionExecutionPause: ConnectionExecutionPauseV1 | undefined;
   switch (result.status) {
     case 'dispatched':
       // A durable async edge is deliberately nonterminal. Callers must release
@@ -1214,6 +1216,9 @@ function reduceStandardConversationTerminal(input: {
         text: question,
       });
       const publicQuestion = parked?.text ?? question;
+      if (parked) connectionExecutionPause = prepareConnectionExecutionPause({
+        sessionId: result.sessionId, sourceUserSeq, requestId: parked.requestId,
+      });
       outcome = {
         version: 2,
         id: turnOutcomeId(identity),
@@ -1354,6 +1359,7 @@ function reduceStandardConversationTerminal(input: {
     legacyReason,
     metadata: {
       steps: result.steps,
+      ...(connectionExecutionPause ? { connectionExecutionPause } : {}),
       ...(result.limitKind ? { limitKind: result.limitKind } : {}),
       ...(transferredToTaskId ? { transferredToTaskId } : {}),
       ...(failureDetail ? { failureDetail } : {}),
@@ -2165,6 +2171,7 @@ function commitStandardPauseTerminal(input: {
   const state = standardArtifactTerminalState(input.sessionId, input.sourceUserSeq);
   const proposedText = publicReplyText(input.reply, '') || publicReplyText(input.summary, '');
   let publicText = proposedText;
+  let connectionExecutionPause: ConnectionExecutionPauseV1 | undefined;
   if (Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0) {
     const parked = parkObservedConnectionWithCheckpoint({
       sessionId: input.sessionId,
@@ -2174,6 +2181,9 @@ function commitStandardPauseTerminal(input: {
       text: proposedText,
     });
     publicText = parked?.text ?? proposedText;
+    if (parked) connectionExecutionPause = prepareConnectionExecutionPause({
+      sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq as number, requestId: parked.requestId,
+    });
   }
   commitStandardNeedsInputTerminal({
     sessionId: input.sessionId,
@@ -2183,6 +2193,7 @@ function commitStandardPauseTerminal(input: {
     legacyReason: 'awaiting_user_input',
     metadata: {
       steps: input.steps,
+      ...(connectionExecutionPause ? { connectionExecutionPause } : {}),
       ...(state ? artifactVerificationProjection(state) : {}),
     },
   });

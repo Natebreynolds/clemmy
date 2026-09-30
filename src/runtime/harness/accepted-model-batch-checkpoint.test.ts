@@ -40,6 +40,9 @@ const { rebuildSourceConnectionAgent } = await import('./connection-agent-rebuil
 const hostProgress = await import('./host-connection-progress.js');
 const { readSourceConnectionHostRecovery } = await import('./connection-host-recovery.js');
 const noProgress = await import('./no-progress-governor.js');
+const connectionPause = await import('./connection-execution-pause.js');
+const delivery = await import('./delivery-committer.js');
+const outcomes = await import('./turn-outcome.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -98,6 +101,167 @@ function fixture(text: string, mode: 'normal' | 'plan' | 'execute' = 'normal') {
 }
 
 type Fixture = ReturnType<typeof fixture>;
+
+async function connectionPauseFixture() {
+  const task = fixture('Inspect the controlled CRM after connection.', 'execute');
+  const batch = await settledConnectionBatch(task);
+  const agent = connectionAgent(task);
+  hostProgress.bindHostConnectionProgress(agent, recordedHostProgress(task, batch));
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent })!;
+  const binding = connectionPause.prepareConnectionExecutionPause({ ...task, requestId: pause.requestId });
+  assert.ok(binding);
+  const identity = { sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, turn: 1 };
+  const outcome: import('./turn-outcome.js').TurnOutcome = {
+    version: 2, identity, id: outcomes.turnOutcomeId(identity), status: 'needs_input', resumable: true,
+    needs: { kind: 'input' }, presentation: { kind: 'question', text: pause.text },
+  };
+  return { task, batch, agent, pause, binding, outcome };
+}
+
+test('a proven connection question retains its original open execution across publication, replay and reopen', async () => {
+  const { task, pause, binding, outcome } = await connectionPauseFixture();
+  const before = authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq);
+  const committed = delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } });
+  assert.equal(committed.presentation.status, 'needs_input');
+  assert.deepEqual(authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq), before);
+  const terminal = eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.deepEqual(terminal.data.connectionExecutionPause, binding);
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  assert.equal(JSON.stringify(projectHarnessEventForPublic(terminal)).includes(binding.checkpointDigest), false,
+    'private execution proof is not a public card or prompt');
+  const expected = { eventId: terminal.id, sourceUserSeq: task.sourceUserSeq, binding };
+  assert.deepEqual(connectionPause.readConnectionExecutionPause(task.sessionId, pause.requestId), expected);
+  eventlog.closeEventLog();
+  // Historical delivery replay cannot depend on today's open dependency or
+  // most recent chat. Neither change grants permission to execute again.
+  eventlog.openEventLog().prepare("UPDATE dependency_requests SET status = 'cancelled' WHERE request_id = ?").run(pause.requestId);
+  eventlog.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'A different task.' } });
+  assert.deepEqual(connectionPause.readConnectionExecutionPause(task.sessionId, pause.requestId), expected);
+  delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } });
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(physicalRows(task, 'call:connection-search').length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('connection publication retains the accepted-task owner as well as the host root', async () => {
+  const { task, binding, outcome } = await connectionPauseFixture();
+  const shadow = await import('../graph/turn-graph-shadow.js');
+  const taskAuthority = await import('./accepted-task-authority.js');
+  assert.ok(shadow.recordTurnGraphShadow({ identity: { ...task, turn: 1 } }));
+  assert.equal(taskAuthority.armAcceptedTaskAuthority(task).status, 'armed');
+  const read = () => eventlog.openEventLog().prepare('SELECT * FROM accepted_task_authority WHERE session_id = ? AND source_user_seq = ?')
+    .get(task.sessionId, task.sourceUserSeq);
+  const before = read();
+  delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } });
+  assert.deepEqual(read(), before, 'a connection question cannot poison the accepted task');
+  eventlog.closeEventLog();
+  delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } });
+  assert.deepEqual(read(), before);
+  assert.equal(eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] }).length, 1);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const defect of ['digest', 'source', 'request', 'status', 'closed-root', 'cancelled-dependency', 'changed-subject', 'changed-claim', 'open-batch'] as const) {
+  test(`connection publication rejects ${defect} atomically`, async () => {
+    const { task, batch, pause, binding, outcome } = await connectionPauseFixture();
+    const metadata = { ...binding };
+    if (defect === 'digest') metadata.checkpointDigest = '0'.repeat(64);
+    if (defect === 'source') metadata.executionSourceUserSeq += 1;
+    if (defect === 'request') metadata.requestId = 'different-dependency';
+    if (defect === 'status') Object.assign(outcome, { status: 'done', resumable: false, needs: undefined,
+      presentation: { kind: 'answer', text: 'Incorrect completion' } });
+    if (defect === 'closed-root') eventlog.openEventLog().prepare("UPDATE accepted_turn_call_authorities SET state = 'closed', revision = revision + 1, closed_at = ?, close_reason = 'host_needs_input' WHERE session_id = ?")
+      .run(new Date().toISOString(), task.sessionId);
+    if (defect === 'cancelled-dependency') eventlog.openEventLog().prepare("UPDATE dependency_requests SET status = 'cancelled' WHERE request_id = ?").run(pause.requestId);
+    if (defect === 'changed-subject') eventlog.openEventLog().prepare('UPDATE dependency_requests SET subject_capability = ? WHERE request_id = ?').run('FIXTURECRM_DIFFERENT', pause.requestId);
+    if (defect === 'changed-claim') eventlog.openEventLog().prepare("UPDATE events SET data_json = json_set(data_json, '$.claim.executionRunId', 'wrong-run') WHERE session_id = ? AND type = 'plan_execution_claimed'").run(task.sessionId);
+    if (defect === 'open-batch') {
+      const next = checkpoints.admitAcceptedModelBatch({ ...task, preHistory: batch.history, previousResponseId: batch.lastResponseId,
+        frameHistory: openFrame({ callId: 'call:unfinished-after-pause', toolName: 'tool_search', args: {} }), providerResponseId: 'response:unfinished' });
+      assert.equal(next.status, 'admitted');
+    }
+    const before = authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq);
+    assert.throws(() => delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: metadata } }), /connection pause|checkpoint|authority/i);
+    assert.equal(eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] }).length, 0);
+    assert.deepEqual(authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq), before);
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+test('an ordinary question cannot retain authority merely because an old connection checkpoint exists', async () => {
+  const { task, outcome } = await connectionPauseFixture();
+  delivery.commitTurnOutcome(outcome);
+  const root = authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq);
+  assert.equal(root.status, 'ok');
+  if (root.status === 'ok') assert.equal(root.authority.state, 'closed');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+test('an incomplete connection checkpoint cannot borrow current context to retain execution', async () => {
+  const task = fixture('Inspect the controlled CRM.', 'execute');
+  await settledConnectionBatch(task);
+  const pause = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...task, turn: 1, agent: connectionAgent(task) })!;
+  assert.equal(connectionPause.prepareConnectionExecutionPause({ ...task, requestId: pause.requestId }), undefined);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
+for (const corruption of ['outcome', 'source', 'root-surface', 'dependency', 'claim'] as const) {
+  test(`the connection proof reader rejects a corrupted ${corruption} just like terminal replay`, async () => {
+    const { task, pause, binding, outcome } = await connectionPauseFixture();
+    delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } });
+    const event = eventlog.listEvents(task.sessionId, { types: ['conversation_completed'] })[0]!;
+    const db = eventlog.openEventLog();
+    let restoreRoot = () => {};
+    if (corruption === 'root-surface') {
+      // The normal writer rejects identity changes. Simulate damaged storage
+      // in this disposable database to also pin defense on the proof read.
+      const original = db.prepare('SELECT surface_digest FROM accepted_turn_call_authorities WHERE session_id = ?').get(task.sessionId) as { surface_digest: string };
+      assert.throws(() => db.prepare('UPDATE accepted_turn_call_authorities SET surface_digest = ? WHERE session_id = ?').run('0'.repeat(64), task.sessionId), /immutable/);
+      const trigger = db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'accepted_turn_call_authorities' AND sql LIKE '%accepted-turn call authority identity is immutable%'").get() as { name: string; sql: string };
+      assert.ok(trigger);
+      db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+      db.prepare("UPDATE accepted_turn_call_authorities SET surface_digest = ? WHERE session_id = ?").run('0'.repeat(64), task.sessionId);
+      restoreRoot = () => {
+        db.prepare('UPDATE accepted_turn_call_authorities SET surface_digest = ? WHERE session_id = ?').run(original.surface_digest, task.sessionId);
+        db.exec(trigger.sql);
+      };
+    } else if (corruption === 'dependency') {
+      db.prepare('UPDATE dependency_requests SET subject_capability = ? WHERE request_id = ?').run('FIXTURECRM_DIFFERENT', pause.requestId);
+    } else if (corruption === 'claim') {
+      db.prepare("UPDATE events SET data_json = json_set(data_json, '$.claim.executionRunId', 'wrong-run') WHERE session_id = ? AND type = 'plan_execution_claimed'").run(task.sessionId);
+    } else {
+      const data = structuredClone(event.data);
+      if (corruption === 'outcome') (data.turnOutcome as Record<string, unknown>).status = 'done';
+      else data.sourceUserSeq = task.sourceUserSeq + 1;
+      db.prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(data), event.id);
+    }
+    try {
+      assert.throws(() => connectionPause.readConnectionExecutionPause(task.sessionId, pause.requestId), /projection|contradicts|authority/i);
+      assert.throws(() => delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } }), /projection|contradicts|authority/i);
+    } finally { restoreRoot(); }
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
+
+test('the normal terminal reducer keeps reviewed execution open while ending its physical attempt', async () => {
+  const { task, agent, pause } = await connectionPauseFixture();
+  const attempt = eventlog.beginRunAttempt(task.sessionId, { attemptId: `connection-pause-attempt-${task.sourceUserSeq}`, runId: `connection-pause-run-${task.sourceUserSeq}` });
+  eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: task.text } },
+    { existingEventSeq: task.sourceUserSeq, armRunInFlight: true });
+  const { _testOnly_reduceStandardConversationTerminal } = await import('./loop.js');
+  const result = _testOnly_reduceStandardConversationTerminal({ sourceUserSeq: task.sourceUserSeq, agent,
+    result: { sessionId: task.sessionId, status: 'awaiting_user_input', steps: 2, lastTurn: 1,
+      lastDecision: { summary: pause.text, reply: pause.text, done: false, nextAction: 'awaiting_user_input', reason: null } } });
+  assert.equal(result.publicPresentation?.status, 'needs_input');
+  assert.ok(connectionPause.readConnectionExecutionPause(task.sessionId, pause.requestId));
+  assert.equal(eventlog.getLatestRunAttempt(task.sessionId)?.status, 'interrupted');
+  assert.ok(eventlog.getLatestRunAttempt(task.sessionId)?.finishedAt);
+  assert.equal(Object.hasOwn(eventlog.getSession(task.sessionId)?.metadata ?? {}, '__run_in_flight_owner'), false);
+  const root = authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq);
+  assert.equal(root.status, 'ok');
+  if (root.status === 'ok') assert.equal(root.authority.state, 'open');
+  leases.revokeDispatchLease(task.parentLease);
+});
 
 function connectionAgent(task: Fixture, mcpToolScope: import('../mcp-tool-scope.js').McpToolScope | null = {
   reason: 'original controlled task scope', authority: 'catalog', deniedServerSlugs: ['fixture-private'], maxTools: 2,

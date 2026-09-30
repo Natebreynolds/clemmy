@@ -17,6 +17,7 @@ import type { McpToolScope } from '../mcp-tool-scope.js';
 import { sealAdmissionEnvelope, type AdmissionEnvelope, type CapabilityBindingRevision } from '../graph/admission-envelope.js';
 import { boundAgentSourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 import { assertHostConnectionProgress, boundHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
+import { connectionDependencyIdentity } from './connection-execution-pause-proof.js';
 
 /** Same construction records retained at workflow handoff. Historical tool
  * definitions and scope are context for rebuilding, never current authority. */
@@ -111,14 +112,7 @@ function store() {
 }
 
 function dependencyIdentity(input: { sessionId: string; requestId: string }) {
-  const db = openEventLog();
-  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dependency_requests'").get()) return null;
-  return db.prepare(`SELECT request_id, session_id, source_user_seq, kind, subject_kind,
-    subject_provider, subject_toolkit, subject_capability, subject_capability_ref,
-    subject_discovery_query, subject_discovery_role, continue_option_id, continue_option_label
-    FROM dependency_requests WHERE request_id = ? AND session_id = ?
-    AND kind = 'connection_missing' AND subject_kind = 'exact_capability_connection'`)
-    .get(input.requestId, input.sessionId) as ({ source_user_seq: number } & Record<string, unknown>) | undefined;
+  return connectionDependencyIdentity(openEventLog(), input);
 }
 
 /** Retained identity remains readable after newer chat overwrites the session

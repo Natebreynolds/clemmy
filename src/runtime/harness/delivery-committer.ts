@@ -90,6 +90,8 @@ export interface DeliveryCommitResult {
  * The committer copies only this allowlist; arbitrary model output, summaries,
  * prompts, tool payloads, and control prose cannot be smuggled in as metadata. */
 const DELIVERY_METADATA_KEYS: ReadonlySet<string> = new Set([
+  // Private checkpoint identity; validated atomically with terminal publication.
+  'connectionExecutionPause',
   'steps',
   'missingReply',
   'blockedReason',

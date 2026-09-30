@@ -43,6 +43,7 @@ import {
 } from './eventlog-schema.js';
 import type { ConversationPreambleDeliveryRequest } from '../../types.js';
 import { proveHostPlannedResolutionCoexistenceInTransaction } from './host-planned-resolution-coexistence.js';
+import { validateConnectionExecutionPause } from './connection-execution-pause-proof.js';
 export {
   acceptedTurnCallAuthorityDigest,
   acceptedTurnCallSurfaceDigest,
@@ -2520,9 +2521,13 @@ function hostTurnCallAuthorityTerminalTarget(presentation: PresentationEvent): {
 function advanceHostTurnCallAuthorityTerminalInTransaction(input: {
   db: Database.Database;
   presentation: PresentationEvent;
+  eventData: Record<string, unknown>;
   now: string;
 }): void {
   const identity = input.presentation.identity;
+  const connectionPause = validateConnectionExecutionPause({
+    db: input.db, presentation: input.presentation, metadata: input.eventData,
+  });
   const row = hostTurnCallAuthorityLifecycleRow(
     input.db,
     identity.sessionId,
@@ -2530,12 +2535,12 @@ function advanceHostTurnCallAuthorityTerminalInTransaction(input: {
   );
   if (!row || (row.authority_kind !== 'host_v1_read_only' && row.authority_kind !== 'host_v1')) return;
   assertExactHostTurnCallAuthorityLifecycle(input.db, row);
-  const target = hostTurnCallAuthorityTerminalTarget(input.presentation);
+  const target = connectionPause ? null : hostTurnCallAuthorityTerminalTarget(input.presentation);
   if (!target) {
     if (row.state !== 'open') {
       throw new AcceptedTaskTerminalPublicationError(
         'conflict',
-        'approval pause cannot retain a non-open host call authority',
+        'pause cannot retain a non-open host call authority',
       );
     }
     return;
@@ -2606,6 +2611,11 @@ function assertHostTurnCallAuthorityTerminalWinner(
   sessionId: string,
   sourceUserSeq: number,
 ): void {
+  // Validate explicit pause metadata even when the referenced root was lost.
+  if (event.data.connectionExecutionPause !== undefined) {
+    const presentation = terminalPublicationPresentation(event.data, { sessionId, sourceUserSeq, turn: event.turn });
+    validateConnectionExecutionPause({ db, presentation, metadata: event.data, historical: true });
+  }
   const row = hostTurnCallAuthorityLifecycleRow(db, sessionId, sourceUserSeq);
   if (!row || (row.authority_kind !== 'host_v1_read_only' && row.authority_kind !== 'host_v1')) return;
   assertExactHostTurnCallAuthorityLifecycle(db, row);
@@ -2614,10 +2624,10 @@ function assertHostTurnCallAuthorityTerminalWinner(
     sourceUserSeq,
     turn: event.turn,
   });
-  const target = hostTurnCallAuthorityTerminalTarget(presentation);
+  const target = event.data.connectionExecutionPause !== undefined ? null : hostTurnCallAuthorityTerminalTarget(presentation);
   if (!target) {
     if (row.state !== 'open') {
-      throw new AcceptedTaskTerminalPublicationError('conflict', 'persisted approval lost open host authority');
+      throw new AcceptedTaskTerminalPublicationError('conflict', 'persisted pause lost open host authority');
     }
     return;
   }
@@ -2627,6 +2637,19 @@ function assertHostTurnCallAuthorityTerminalWinner(
       'conflict',
       'persisted terminal is not the host call-authority winner',
     );
+  }
+}
+
+/** A connection pause publishes a question but does not settle the reviewed
+ * task. Retain only a coherent, still-active task owner; never resurrect one. */
+function assertConnectionPausedTaskAuthority(db: Database.Database, authority: TerminalPublicationAuthorityRow): void {
+  if (authority.terminal_event_id !== null
+    || (authority.state !== 'armed' && authority.state !== 'manifested_verifying')
+    || (authority.state === 'armed' && authority.manifest_id !== null)
+    || (authority.state === 'manifested_verifying'
+      && !authority.host_completion_receipt_id
+      && (!authority.work_contract_id || !terminalPublicationManifestIsExact(db, authority)))) {
+    throw new AcceptedTaskTerminalPublicationError('conflict', 'connection pause lost its active accepted-task authority');
   }
 }
 
@@ -2672,6 +2695,11 @@ function closeAcceptedTaskTerminalPublicationInTransaction(input: {
         );
       }
       assertExactTerminalPublicationGraphStructure(input.db, authority);
+    }
+
+    if (validateConnectionExecutionPause({ db: input.db, presentation, metadata: input.eventData })) {
+      assertConnectionPausedTaskAuthority(input.db, authority);
+      return presentation;
     }
 
     const targetState: AcceptedTaskAuthorityState = authority.state === 'manifested_verifying'
@@ -2900,6 +2928,11 @@ function validatePersistedTerminalPublicationWinner(
         );
       }
       assertExactTerminalPublicationGraphStructure(db, authority);
+    }
+    if (event.data.connectionExecutionPause !== undefined) {
+      // The host winner check above validated the immutable pause proof.
+      assertConnectionPausedTaskAuthority(db, authority);
+      return event;
     }
     if (authority.terminal_event_id !== event.id) {
       throw new AcceptedTaskTerminalPublicationError(
@@ -3257,6 +3290,11 @@ export function appendEvent(input: AppendEventInput): EventRow {
     );
     if (input.type === 'conversation_completed') {
       const terminalSourceUserSeq = terminalPublicationSourceUserSeq(eventData);
+      if (eventData.connectionExecutionPause !== undefined) {
+        if (terminalSourceUserSeq === null) throw new AcceptedTaskTerminalPublicationError('conflict', 'connection pause requires an accepted source');
+        // Untyped rows must not bypass the explicit pause's validation.
+        terminalPublicationPresentation(eventData, { sessionId: input.sessionId, sourceUserSeq: terminalSourceUserSeq, turn: input.turn });
+      }
       let lifecyclePresentation: PresentationEvent | null = null;
       if (terminalSourceUserSeq !== null) {
         const terminalAuthority = terminalPublicationAuthorityRow(
@@ -3294,6 +3332,7 @@ export function appendEvent(input: AppendEventInput): EventRow {
         advanceHostTurnCallAuthorityTerminalInTransaction({
           db,
           presentation: lifecyclePresentation,
+          eventData,
           now,
         });
         // Continuation responsibility ends with the typed terminal, in the same
@@ -4417,6 +4456,16 @@ export function recordRunAttemptUserInput(
   });
   const result = tx();
   return result.inserted ? publishPersistedEvent(result.event) : result.event;
+}
+
+/** Exact read for private continuation proofs. The reader must use the same
+ * projection and authority checks as ordinary terminal replay. */
+export function readValidatedTerminalEvent(eventId: string, sessionId: string, sourceUserSeq: number): EventRow {
+  const db = openEventLog();
+  const row = db.prepare('SELECT * FROM events WHERE id = ? AND session_id = ? AND type = ?')
+    .get(eventId, sessionId, 'conversation_completed') as RawEventRow | undefined;
+  if (!row) throw new AcceptedTaskTerminalPublicationError('conflict', 'retained terminal event is missing');
+  return validatePersistedTerminalPublicationWinner(db, row, sessionId, sourceUserSeq);
 }
 
 /**
