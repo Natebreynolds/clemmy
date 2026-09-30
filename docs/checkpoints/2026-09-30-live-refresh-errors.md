@@ -1009,3 +1009,65 @@ after the accepted chain, now schema 88. Its files were not changed.
 Final source typecheck, including the new route tests, passed at
 `/tmp/clem-source-controls-typecheck-complete.txt`. This still is not a daemon
 package build or installed acceptance.
+
+## Desktop recovery failure: bounded retry ownership before the next patch
+
+Rechecked ownership: our integration tree was clean at `972a325b7`; the shell
+lane remains clean at `76c53a1ea` and is incorporated. Main retains the owner's
+unrelated edits. The schema-85 model-ledger draft remains excluded; the accepted
+chain is schema 88. No other agent's tree or personal integration was changed.
+
+Verified in this slice:
+
+- Installed PID 72427 was killed by its watchdog at 17:50:04Z. Replacement 6735
+  started at 17:50:05.903Z, bound HTTP at 17:51:37.545Z, and exited SIGKILL at
+  17:51:41.116Z. No daemon remained; the native UI showed Reconnecting. This
+  approximately 95-second sequence matches the supervisor's 90-second readiness
+  deadline plus five-second reap grace. The old code did not log its readiness
+  rejection, so that timing is supporting evidence, not proof of the exact
+  caller that sent the second kill or of what caused the original HTTP stall.
+- Read-only extraction of installed `app.asar/dist/daemon-supervisor.js`
+  confirms the defective path is shipped: readiness failure invokes the public
+  stop, which sets `shuttingDown`; the exit handler then suppresses recovery.
+  Extracted file SHA256:
+  `0b27699b1a010f4b7f5145196cc108923cc6ba4f262710b6b924bbb611c73b85`.
+- A production-supervisor lifecycle test reproduced the failure before the
+  change: only one restart was scheduled after a replacement timed out, where
+  recovery required a second. Evidence: `/tmp/clem-supervisor-recovery-red.txt`.
+- Automatic replacement failure now reaps its own process while preserving
+  bounded recovery. First/manual startup failure still reaps before rejecting
+  into Electron's blocking error dialog and leaves no background retry behind
+  that dialog. Explicit Stop cancels scheduled and in-progress starts. A late
+  readiness result or liveness response cannot affect a replacement process.
+- Starts are single-flight even while choosing a port. Startup failure is
+  logged with its PID and recovery lane. Pre-spawn failures use the same bounded
+  retry path. Brief ready/crash cycles no longer reset the eight-replacement
+  limit; five minutes of stable uptime resets it once, and an explicit owner
+  restart begins a fresh budget. Readiness, health, shutdown and backoff timing
+  constants are unchanged.
+- Final focused run: **30/30** across supervisor lifecycle, existing diagnostic
+  checks and shell-path suites. `/tmp/clem-supervisor-recovery-final.txt`.
+  Lifecycle tests drive the production class with mocked process/network/time
+  boundaries; they do not launch Clem, models, CLIs or external writes.
+- Desktop dependencies were absent in this worktree. The first desktop
+  typecheck reported missing Electron types; lockfile-preserving `npm ci
+  --ignore-scripts --no-audit --no-fund` supplied them. The final desktop
+  typecheck and native-shell build passed in
+  `/tmp/clem-supervisor-typecheck-final.txt` and
+  `/tmp/clem-supervisor-shell-build.txt`. No dependency or lockfile changed.
+
+Not performed: installed recovery acceptance, new hotpatch, paid-model work,
+full suite/journeys, matched live timing/token measurements, main merge or tag.
+The installed daemon's last served identity remains `019e8d9d5`, schema 82;
+the built `972a325b7` daemon is superseded by this source change and must be
+rebuilt after the commit. Source-control pins and prior builds remain evidence
+for their exact revisions, not qualification of newly installed bytes.
+
+Still owed: a fresh combined build including **the native desktop shell**, then
+the coordinated Terminal/signing installation with rollback. A daemon-only
+patch cannot install this supervisor fix. Verify served source and schema 88,
+real quit/reopen and recovery, desktop/mobile source controls, workflow
+author/update/enable/execute, approval correction, continuation and no repeated
+completed writes. Recheck the original HTTP stall under an idle machine; this
+patch repairs recovery and does not establish its root cause. Run matched total
+task-token/wall measurements and remaining release gates before merging/tagging.

@@ -445,8 +445,9 @@ export class DaemonSupervisor {
   private lastReadyAt = 0;
   private chosenPort = 0;
   private readyPromise: Promise<{ port: number; url: string }> | null = null;
-  private readyResolve: ((info: { port: number; url: string }) => void) | null = null;
-  private readyReject: ((err: Error) => void) | null = null;
+  private startingPromise: Promise<{ port: number; url: string }> | null = null;
+  private generation = 0;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private livenessTimer: ReturnType<typeof setInterval> | null = null;
   private livenessMisses = 0;
   private livenessProbeInFlight = false;
@@ -473,19 +474,41 @@ export class DaemonSupervisor {
   /** Start (or restart) the daemon. Resolves when the daemon's minimal
    *  health route answers. A terminal readiness failure rejects only after
    *  any still-live child has completed stop/reap. */
-  async start(): Promise<{ port: number; url: string }> {
-    if (this.child) {
+  start(): Promise<{ port: number; url: string }> {
+    return this.beginStart(false);
+  }
+
+  private beginStart(automaticRecovery: boolean): Promise<{ port: number; url: string }> {
+    if (this.child || this.startingPromise) {
       // Already running — return the existing ready promise.
       if (this.readyPromise) return this.readyPromise;
-      throw new Error('Daemon already running but readiness promise lost');
+      return Promise.reject(new Error('Daemon already running but readiness promise lost'));
     }
-
+    this.cancelScheduledRestart();
     this.shuttingDown = false;
-    this.chosenPort = await pickFreePort(this.opts.preferredPort ?? 8520, WEBHOOK_HOST);
+    if (!automaticRecovery) {
+      this.restartAttempts = 0;
+      this.lastReadyAt = 0;
+    }
+    const attempt = this.startDaemon(++this.generation, automaticRecovery);
+    this.readyPromise = attempt;
+    this.startingPromise = attempt;
+    const settled = () => {
+      if (this.startingPromise === attempt) this.startingPromise = null;
+    };
+    void attempt.then(settled, settled);
+    return attempt;
+  }
 
-    this.readyPromise = new Promise((resolve, reject) => {
-      this.readyResolve = resolve;
-      this.readyReject = reject;
+  private async startDaemon(generation: number, automaticRecovery: boolean): Promise<{ port: number; url: string }> {
+    const port = await pickFreePort(this.opts.preferredPort ?? 8520, WEBHOOK_HOST);
+    if (this.shuttingDown || generation !== this.generation) throw new Error('Daemon startup stopped or superseded');
+    this.chosenPort = port;
+    let resolveReady!: (info: { port: number; url: string }) => void;
+    let rejectReady!: (err: Error) => void;
+    const ready = new Promise<{ port: number; url: string }>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
     });
 
     this.emit({ type: 'starting', port: this.chosenPort, attempt: this.restartAttempts });
@@ -625,7 +648,7 @@ export class DaemonSupervisor {
     this.lastIpcHeartbeatAt = 0;
     this.lastIpcHeartbeat = null;
     this.recentDaemonLogs = [];
-    this.child = spawn(command, args, {
+    const child = this.child = spawn(command, args, {
       cwd: this.opts.daemonProjectRoot,
       env,
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -650,57 +673,85 @@ export class DaemonSupervisor {
     // here too (the pre-v0.5.21 direct write) duplicated every daemon line
     // once emit() started mirroring log events into the file, silently
     // doubling supervisor.log's growth (~11MB/day observed).
-    this.child.stdout.on('data', (buf: Buffer) => {
+    child.stdout!.on('data', (buf: Buffer) => {
+      if (this.child !== child) return;
       const line = buf.toString();
       this.recentDaemonLogs = appendSupervisorLogTail(this.recentDaemonLogs, 'stdout', line);
       this.emit({ type: 'log', stream: 'stdout', line });
     });
-    this.child.stderr.on('data', (buf: Buffer) => {
+    child.stderr!.on('data', (buf: Buffer) => {
+      if (this.child !== child) return;
       const line = buf.toString();
       this.recentDaemonLogs = appendSupervisorLogTail(this.recentDaemonLogs, 'stderr', line);
       this.emit({ type: 'log', stream: 'stderr', line });
     });
-    this.child.on('message', (message: unknown) => {
+    child.on('message', (message: unknown) => {
+      if (this.child !== child) return;
       const heartbeat = normalizeDaemonIpcHeartbeatMessage(message);
       if (!heartbeat) return;
       this.lastIpcHeartbeatAt = Date.now();
       this.lastIpcHeartbeat = heartbeat;
     });
 
-    this.child.on('exit', (code, signal) => {
+    let becameReady = false;
+    let readinessFailure: Error | null = null;
+    const exited = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (this.child !== child) return;
       this.stopLivenessWatchdog();
       this.emit({ type: 'exit', code, signal });
       this.logStream?.write(`=== Daemon exited (code=${code}, signal=${signal}) at ${new Date().toISOString()} ===\n`);
       this.logStream?.end();
       this.logStream = null;
       this.child = null;
+      rejectReady(readinessFailure ?? new Error('Daemon exited before ready'));
       if (this.shuttingDown) return;
-      this.scheduleRestart();
+      // A manual first start rejects to a blocking Electron error dialog.
+      // Only recovery of a previously running service may retry behind it.
+      if (becameReady || automaticRecovery) this.scheduleRestart();
+    };
+    child.on('exit', exited);
+    child.on('error', (error) => {
+      this.emit({ type: 'log', stream: 'stderr', line: `[supervisor] daemon process error: ${error.message}` });
+      // A failed spawn has no PID and emits close, but not exit.
+      if (!child.pid) {
+        readinessFailure = error;
+        exited(null, null);
+      }
     });
 
     this.emit({ type: 'running', port: this.chosenPort, pid: this.child.pid ?? -1 });
 
     // Probe the dashboard URL until it answers — the daemon takes a
     // moment to boot the webhook server.
-    const rejectReady = this.readyReject;
-    void this.waitForReady().then(
+    const ownsAttempt = () => this.child === child && generation === this.generation && !this.shuttingDown;
+    void this.waitForReady(child, port, generation).then(
       (info) => {
-        this.restartAttempts = 0;
+        if (!ownsAttempt()) return;
+        becameReady = true;
         this.lastReadyAt = Date.now();
-        this.readyResolve?.(info);
+        resolveReady(info);
         this.emit({ type: 'ready', port: info.port, url: info.url });
         this.startLivenessWatchdog();
       },
       (err: unknown) => {
         const readinessError = err instanceof Error ? err : new Error(String(err));
-        void settleTerminalReadinessFailure(this, readinessError)
+        if (!ownsAttempt()) { rejectReady(readinessError); return; }
+        readinessFailure = readinessError;
+        this.emit({ type: 'log', stream: 'stderr', line: `[supervisor] readiness failed (pid=${child.pid ?? 'none'}, automaticRecovery=${automaticRecovery}): ${readinessError.message}` });
+        void settleTerminalReadinessFailure({
+          isRunning: ownsAttempt,
+          // Reap before reporting failure in both lanes. An automatic
+          // replacement is not an owner-requested stop: its exit must keep
+          // the existing bounded backoff alive.
+          stop: () => automaticRecovery ? this.reapChild(child) : this.stop(),
+        }, readinessError)
           .catch((settledError: unknown) => {
-            rejectReady?.(settledError instanceof Error ? settledError : readinessError);
+            rejectReady(settledError instanceof Error ? settledError : readinessError);
           });
       },
     );
 
-    return this.readyPromise;
+    return ready;
   }
 
   /** Ongoing hang detection — see the LIVENESS_* constants for the rationale.
@@ -711,6 +762,9 @@ export class DaemonSupervisor {
     this.livenessMisses = 0;
     const readyAt = Date.now();
     const url = `http://${WEBHOOK_HOST}:${this.chosenPort}/api/status`;
+    const child = this.child;
+    const ownsProbe = () => this.child === child && !this.shuttingDown;
+    this.livenessProbeInFlight = false;
     this.livenessTimer = setInterval(() => {
       if (this.shuttingDown || !this.child) { this.stopLivenessWatchdog(); return; }
       // Warmup grace: boot does legitimately heavy work (embedding model load,
@@ -721,6 +775,7 @@ export class DaemonSupervisor {
       this.livenessProbeInFlight = true;
       void fetch(url, { signal: AbortSignal.timeout(LIVENESS_PROBE_TIMEOUT_MS) })
         .then((r) => {
+          if (!ownsProbe()) return;
           if (r.status === 200) {
             this.livenessMisses = 0;
             this.livenessIpcDeferrals = 0;
@@ -730,9 +785,11 @@ export class DaemonSupervisor {
           }
         })
         .catch(() => {
+          if (!ownsProbe()) return;
           this.livenessMisses += 1;
         })
         .finally(() => {
+          if (!ownsProbe()) return;
           this.livenessProbeInFlight = false;
           if (this.livenessMisses < LIVENESS_MAX_MISSES || this.shuttingDown || !this.child) return;
           const misses = this.livenessMisses;
@@ -781,6 +838,7 @@ export class DaemonSupervisor {
     this.livenessTimer = null;
     this.livenessMisses = 0;
     this.livenessIpcDeferrals = 0;
+    this.livenessBeaconDeferrals = 0;
   }
 
   private writeHungRestartSnapshot(snapshot: {
@@ -803,10 +861,20 @@ export class DaemonSupervisor {
 
   /** Stop the daemon. Sends SIGTERM, escalates to SIGKILL after 5s. */
   async stop(): Promise<void> {
+    const starting = this.startingPromise;
     this.shuttingDown = true;
+    this.generation += 1;
+    this.cancelScheduledRestart();
     this.stopLivenessWatchdog();
     const child = this.child;
-    if (!child) return;
+    if (child) await this.reapChild(child);
+    // Invalidate and settle a start still selecting its port as well. A
+    // subsequent explicit restart must not rejoin that cancelled promise.
+    await starting?.catch(() => {});
+  }
+
+  private async reapChild(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) return;
     return new Promise<void>((resolve) => {
       const killer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch { /* ignore */ }
@@ -916,32 +984,36 @@ export class DaemonSupervisor {
     throw new Error(`No daemon entry found in ${this.opts.daemonProjectRoot} (expected dist/index.js or src/index.ts)`);
   }
 
-  private async waitForReady(): Promise<{ port: number; url: string }> {
+  private async waitForReady(child: ChildProcess, port: number, generation: number): Promise<{ port: number; url: string }> {
     // Probe the smallest public health route, not `/api/dashboard`.
     // `/api/dashboard` can do real work (state aggregation, MCP status,
     // memory/runs/approvals) and on a cold packaged launch it can cross
     // the old 30s supervisor window even though the daemon is alive.
     // `/api/status` is intentionally minimal and is the correct boot
     // readiness signal.
-    const url = `http://${WEBHOOK_HOST}:${this.chosenPort}/api/status`;
+    const url = `http://${WEBHOOK_HOST}:${port}/api/status`;
     const deadline = Date.now() + READINESS_TIMEOUT_MS;
+    const assertCurrent = () => {
+      if (this.shuttingDown || generation !== this.generation) throw new Error('Daemon startup stopped or superseded');
+      if (this.child !== child) throw new Error('Daemon exited before ready');
+    };
     while (Date.now() < deadline) {
-      if (this.shuttingDown) throw new Error('Daemon shutting down before ready');
-      if (!this.child) throw new Error('Daemon exited before ready');
+      assertCurrent();
+      let response: Response | undefined;
       try {
-        const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
-        if (r.status === 200) {
-          return { port: this.chosenPort, url: `http://${WEBHOOK_HOST}:${this.chosenPort}` };
-        }
+        response = await fetch(url, { signal: AbortSignal.timeout(2000) });
       } catch {
         // Connection refused / abort — keep polling.
       }
+      assertCurrent();
+      if (response?.status === 200) return { port, url: `http://${WEBHOOK_HOST}:${port}` };
       await sleep(READINESS_POLL_MS);
     }
     throw new Error(`Daemon did not become ready within ${READINESS_TIMEOUT_MS}ms`);
   }
 
   private scheduleRestart(): void {
+    this.cancelScheduledRestart();
     // If the daemon was stable for >= STABILITY_RESET_MS before this
     // crash, treat it as a fresh failure: clear the prior count so a
     // long-uptime user doesn't get permanently locked out after 8
@@ -949,6 +1021,9 @@ export class DaemonSupervisor {
     // BEFORE the increment so the rapid back-to-back crash path (where
     // lastReadyAt is recent) still trips the cap at 8.
     const stableUptime = this.lastReadyAt > 0 && (Date.now() - this.lastReadyAt) >= STABILITY_RESET_MS;
+    // Consume this generation's ready timestamp. Failed replacements cannot
+    // keep borrowing an older process's five minutes of stability.
+    this.lastReadyAt = 0;
     if (stableUptime && this.restartAttempts > 0) {
       this.emit({ type: 'restart-counter-reset', reason: 'daemon was stable >=5min before this crash', priorAttempts: this.restartAttempts });
       this.restartAttempts = 0;
@@ -960,11 +1035,29 @@ export class DaemonSupervisor {
     }
     const delayMs = Math.min(RESTART_MAX_MS, RESTART_BASE_MS * Math.pow(2, this.restartAttempts - 1));
     this.emit({ type: 'restart-scheduled', delayMs, attempt: this.restartAttempts });
-    setTimeout(() => {
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
       if (!this.shuttingDown) {
-        this.start().catch(() => { /* exit handler will reschedule */ });
+        const attemptNumber = this.restartAttempts;
+        const attempt = this.beginStart(true);
+        const generation = this.generation;
+        void attempt.catch((error: unknown) => {
+          // Pre-spawn failures (port selection or a missing entry point) have
+          // no child exit event to reschedule recovery. An exit that exhausted
+          // the cap has no timer either; don't count that same failure twice.
+          if (!this.shuttingDown && generation === this.generation
+            && this.restartAttempts === attemptNumber && !this.child && !this.restartTimer) {
+            this.emit({ type: 'log', stream: 'stderr', line: `[supervisor] replacement could not start: ${error instanceof Error ? error.message : String(error)}` });
+            this.scheduleRestart();
+          }
+        });
       }
     }, delayMs);
+  }
+
+  private cancelScheduledRestart(): void {
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.restartTimer = null;
   }
 }
 
