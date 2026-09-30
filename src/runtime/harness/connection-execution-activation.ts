@@ -3,7 +3,8 @@
  * and performs no business action. UI Execute continuation remains disabled
  * until the executor, completion closure and installed acceptance are wired. */
 import {
-  appendEvent, getHarnessChatCancellation, getLatestRunAttemptByRunId, getRunAttemptBySourceUserSeq, isKillRequested,
+  appendEvent, claimRunAttemptLease, getHarnessChatCancellation, getLatestRunAttempt, getLatestRunAttemptByRunId,
+  getRunAttemptBySourceUserSeq, isKillRequested, renewRunAttemptLease,
   openEventLog, recordRunAttemptUserInput, withEventPublicationTransaction, type EventRow,
 } from './eventlog.js';
 import {
@@ -17,13 +18,23 @@ import { readSourceConnectionHostRecovery } from './connection-host-recovery.js'
 import { readConnectionExecutionActivation, type ConnectionExecutionActivationV1 } from './connection-execution-activation-proof.js';
 import { HarnessSession } from './session.js';
 import { readConnectionRecoveryActivation, withRecoveryActivation, type RecoveryActivationOwner } from './recovery-activation.js';
+import { resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
+import { HostRecoveryState } from './host-turn-runner.js';
+import { readConnectionPreparationHold } from './connection-preparation-hold.js';
+
+export const CONNECTION_EXECUTION_LEASE_MS = 90_000;
+export const CONNECTION_EXECUTION_LEASE_RENEW_MS = 30_000;
+
+export class ConnectionExecutionOwnershipError extends Error {
+  constructor(message: string) { super(message); this.name = 'ConnectionExecutionOwnershipError'; }
+}
+
+type ExecutionOwnerInput = { sessionId: string; deliverySourceUserSeq: number; attemptId: string };
 
 /** Recheck around asynchronous preparation and before dispatch. Historical
  * activation/recovery records establish identity, not current ownership. A
  * replayed button receipt cannot reacquire a lease or undo Stop. */
-export function assertConnectionExecutionOwned(input: {
-  sessionId: string; deliverySourceUserSeq: number; attemptId: string; leaseOwner: string;
-}): void {
+function readConnectionExecutionOwner(input: ExecutionOwnerInput) {
   const db = openEventLog();
   const marker = readConnectionExecutionActivation(db, input);
   if (!marker) throw new Error('This connection continuation has no durable activation.');
@@ -33,23 +44,94 @@ export function assertConnectionExecutionOwned(input: {
   if (owner?.sourceUserSeq !== input.deliverySourceUserSeq || owner.attemptId !== input.attemptId
     || owner.connectionContinuation?.activationEventId !== marker.eventId
     || session?.continuationOwnerState(owner) !== 'ours') {
-    throw new Error('This connection continuation no longer owns the conversation.');
+    throw new ConnectionExecutionOwnershipError('This connection continuation no longer owns the conversation.');
   }
   const attempt = getLatestRunAttemptByRunId(input.sessionId, activation.runId);
-  if (!attempt || attempt.attemptId !== input.attemptId || attempt.sourceUserSeq !== input.deliverySourceUserSeq
-    || attempt.status !== 'active' || attempt.finishedAt || attempt.leaseOwner !== input.leaseOwner
-    || !liveLease(attempt.leaseExpiresAt) || isKillRequested(input.sessionId, attempt)) {
-    throw new Error('This connection continuation does not own a live execution lease.');
+  if (!attempt || attempt.attemptId !== input.attemptId || attempt.sourceUserSeq !== input.deliverySourceUserSeq) {
+    throw new ConnectionExecutionOwnershipError('This connection continuation no longer owns its execution attempt.');
   }
-  if (getHarnessChatCancellation(activation.receiptRequestId)
+  if (isKillRequested(input.sessionId, attempt) || getHarnessChatCancellation(activation.receiptRequestId)
     || originalTaskStopped(input.sessionId, activation.executionSourceUserSeq)) {
     throw new Error('The original task or its connection continuation was stopped.');
   }
   const latest = db.prepare(`SELECT seq FROM events WHERE session_id = ? AND type = 'user_input_received'
     AND role = 'user' AND (json_type(data_json, '$.synthetic') IS NULL OR json_type(data_json, '$.synthetic') = 'false')
     ORDER BY seq DESC LIMIT 1`).get(input.sessionId) as { seq: number } | undefined;
-  if (latest?.seq !== input.deliverySourceUserSeq) throw new Error('A newer request owns this conversation.');
+  if (latest?.seq !== input.deliverySourceUserSeq) throw new ConnectionExecutionOwnershipError('A newer request owns this conversation.');
   assertConnectionContinuationAccount({ sessionId: input.sessionId, connectionRequestId: activation.requestId }, activation.verificationBinding);
+  return { marker, owner, session, attempt };
+}
+
+export function assertConnectionExecutionOwned(input: ExecutionOwnerInput & { leaseOwner: string }): void {
+  const { attempt } = readConnectionExecutionOwner(input);
+  if (attempt.status !== 'active' || attempt.finishedAt || attempt.leaseOwner !== input.leaseOwner
+    || !liveLease(attempt.leaseExpiresAt)) {
+    throw new ConnectionExecutionOwnershipError('This connection continuation does not own a live execution lease.');
+  }
+}
+
+/** Renewal is not acquisition. Even this process must not resurrect an
+ * expired lease after a long sleep or overwrite a successor's ownership. */
+export function renewConnectionExecutionLease(input: ExecutionOwnerInput & { leaseOwner: string }): void {
+  withEventPublicationTransaction(() => {
+    assertConnectionExecutionOwned(input);
+    if (!renewRunAttemptLease({ sessionId: input.sessionId, attemptId: input.attemptId },
+      input.leaseOwner, CONNECTION_EXECUTION_LEASE_MS)) {
+      throw new ConnectionExecutionOwnershipError('This connection continuation lost its execution lease.');
+    }
+  });
+}
+
+/** Only a trusted recovery/retry dispatcher calls this. A browser receipt is
+ * not a lease. Keep the exact current blob; never reinstall the setup pause. */
+export function claimConnectionExecutionRecovery(input: {
+  sessionId: string; deliverySourceUserSeq: number; leaseOwner: string; purpose: 'recovery' | 'retry';
+}) {
+  return withEventPublicationTransaction(() => {
+    const db = openEventLog();
+    const marker = readConnectionExecutionActivation(db, input);
+    if (!marker) throw new Error('The connection recovery has no retained execution.');
+    const source = readControlSource(input.sessionId, input.deliverySourceUserSeq);
+    const prior = getLatestRunAttemptByRunId(input.sessionId, marker.activation.runId);
+    if (!prior || prior.sourceUserSeq !== input.deliverySourceUserSeq) throw new Error('The retained execution attempt is missing.');
+    const terminal = resolveExactTerminalForAcceptedSource(source);
+    if (terminal.kind === 'terminal') return { claimed: false as const, reason: 'terminal' as const, attempt: prior };
+    if (terminal.kind !== 'absent') throw new Error('The connection terminal cannot be verified.');
+    const owned = readConnectionExecutionOwner({ ...input, attemptId: prior.attemptId });
+    if (getLatestRunAttempt(input.sessionId)?.attemptId !== prior.attemptId) {
+      throw new ConnectionExecutionOwnershipError('A newer execution attempt owns this conversation.');
+    }
+    if (input.purpose === 'recovery' && readConnectionPreparationHold(input)) {
+      return { claimed: false as const, reason: 'connection_wait' as const, attempt: prior };
+    }
+    const blob = owned.session.loadRecoveryState();
+    if (!blob) throw new Error('Connection recovery needs its current canonical checkpoint; the setup pause was not restored.');
+    const recovery = HostRecoveryState.fromString(blob);
+    if (recovery.sourceUserSeq !== marker.activation.executionSourceUserSeq || !recovery.connectionProgress) {
+      throw new Error('The connection recovery lost its retained execution progress.');
+    }
+    if (prior.status !== 'active' && prior.status !== 'interrupted') throw new Error('The prior connection attempt cannot be resumed.');
+    const claim = claimRunAttemptLease({ sessionId: input.sessionId, runId: marker.activation.runId,
+      ownerId: input.leaseOwner, leaseMs: CONNECTION_EXECUTION_LEASE_MS });
+    if (!claim.claimed) return claim;
+    const nextAttempt = claim.attempt;
+    if (!nextAttempt) throw new Error('The connection recovery lease has no execution attempt.');
+    const owner = activationOwner(marker.activation, marker.eventId, nextAttempt.attemptId);
+    withRecoveryActivation(input.sessionId, owner, () => {
+      recordRunAttemptUserInput(nextAttempt, { turn: source.turn, role: 'user', data: source.data },
+        { existingEventSeq: source.seq, armRunInFlight: true });
+      const saved = owned.session.saveRecoveryState(blob, { mcpToolScope: owned.session.loadRecoveryMcpToolScope(),
+        owner: { sourceUserSeq: recovery.sourceUserSeq, attemptId: nextAttempt.attemptId } });
+      if (!saved.installed || !owned.session.claimContinuationOwner({ sourceUserSeq: recovery.sourceUserSeq,
+        attemptId: nextAttempt.attemptId })) throw new Error('The connection recovery could not adopt its current checkpoint.');
+    });
+    assertConnectionExecutionOwned({ ...input, attemptId: nextAttempt.attemptId });
+    appendEvent({ sessionId: input.sessionId, turn: source.turn, role: 'system', type: 'restart_recovery_decision',
+      parentEventId: marker.eventId, data: { decision: 'connection_execution_lease_adopted', sourceUserSeq: source.seq,
+        executionSourceUserSeq: recovery.sourceUserSeq, previousAttemptId: prior.attemptId,
+        attemptId: nextAttempt.attemptId, purpose: input.purpose } });
+    return claim;
+  });
 }
 
 function liveLease(expiresAt: string | null): boolean {

@@ -1145,3 +1145,106 @@ subsequent setup/approval pauses; completed-write/no-replay and actual
 desktop/mobile acceptance. Keep `EXECUTION_CONTINUATION_BLOCKER` active. Merge
 with the other agent's settings/Auto/Ask/UI work and reconcile migration 83
 before building a combined candidate for installed-app qualification.
+
+### Recover retained execution under fenced leases — 2026-09-30
+
+Verified in this increment: the trusted daemon restart dispatcher can acquire
+an expired or boot-interrupted reviewed connection execution, retain its exact
+current checkpoint and original model, and finish through the existing bridge.
+Acquisition creates a new physical run attempt, not a new user request, plan
+claim or copy of the work. The attempt, checkpoint and continuation owner move
+atomically. A storage refusal rolls back the entire acquisition.
+
+A live lease cannot be stolen. A missing current checkpoint, Stop, changed
+account binding, newer user input or terminal task cannot become permission to
+restart the original setup pause. Renewal first re-proves a live owner; it
+cannot revive an expired, interrupted or finished attempt. While execution is
+awaiting the model, the owning driver renews its lease every 30 seconds, with a
+90-second lease horizon. Renewal stops when that driver returns. Dispatch and
+result acceptance still check ownership separately from the timer.
+
+Two additional defects surfaced under stronger scenarios:
+
+- The previous SQL queue-ordering fix was insufficient by itself. The
+  in-memory dispatcher sorted deliberate connection waits back into its scarce
+  execution slots. It now keeps those waits visible in the recovery report
+  while selecting runnable work for dispatch. Original-task Stop still wins.
+- A lease could expire while a model answer was pending. The existing tool
+  boundary prevented the provider action, but the stale answer had already
+  become an accepted call and left a stuck finalize checkpoint. Ownership is
+  now checked immediately after the model returns, before accepting or
+  journaling that frame. The old executor returns a nonterminal ownership-loss
+  result; it cannot fail the successor's task or dispatch the late tool call.
+
+The restart dispatcher uses an internal server-owned lease identity. Browser
+or model request bodies cannot supply it. Connection preparation waits are not
+automatically retried by recovery; explicit retry still requires its separate
+admission path. Ordinary chat continues through its existing dispatcher.
+
+Verification:
+
+- **497/497** checks passed across the connection execution integration,
+  response bridge, restart recovery, stale-marker recovery, host checkpoint
+  wake and host turn runner files. Output:
+  `/tmp/clem-connection-lease-final.txt`. This is 497 tests including nested
+  cases, not 497 end-to-end user journeys. There are now **31** connection
+  execution scenarios.
+- The successful boot-dispatch scenario enters the actual recovery scanner
+  and `respondPreferHarness`, acquires a new physical attempt, uses the
+  retained model and completes the original plan with five recording frames,
+  one original local read and one pending provider read. No discovery frame,
+  extra plan claim or repeated read is added.
+- Refusal cases cover live-owner contention, expired-owner renewal, Stop,
+  account drift, newer user input, missing current checkpoint and transactional
+  owner-storage failure. A second contender cannot take the newly acquired
+  lease. A successor can finish after the previous executor loses ownership
+  during asynchronous provider verification.
+- Timer tests advance 120 seconds while a model is pending and prove the same
+  live attempt is renewed. Another 120 seconds after completion cannot revive
+  the terminal attempt.
+- The late-model test returns an already-requested fourth recording frame
+  after lease expiry. There is no provider business call, additional model
+  request, new terminal or accepted-call checkpoint. Prior completed local
+  work remains unchanged. It does **not** prove subsequent recovery when the
+  current full checkpoint is absent.
+- Queue red/green evidence:
+  `/tmp/clem-connection-selection-red.txt` and
+  `/tmp/clem-connection-selection-green.txt`. Late-model red/green evidence:
+  `/tmp/clem-connection-lease-late-model.txt` and
+  `/tmp/clem-connection-lease-late-model-fixed.txt`.
+- Earlier focused and 159-check runs overlap the final 497-check run; do not
+  sum them as independent coverage. Final runtime TypeScript produced no
+  diagnostics in `/tmp/clem-connection-lease-tsc-final.txt`; `git diff --check`
+  passed.
+
+Not performed: paid model or live provider requests, installed-app/live-home
+acceptance, public desktop/mobile interaction, build, hotpatch, merge or tag.
+The isolated test runner reports its live-home sentinel **NOT PERFORMED**:
+daemon 72427 was active and changed `secretsMeta` during the final run. The
+recording fixtures use their own homes; the sentinel does not establish
+live-home isolation or acceptance. No measured latency or token reduction is
+claimed. The other agent's `claude/two-modes` worktree remains clean at
+`76c53a1ea`; its files and installed app were left untouched.
+
+Still owed before removing `EXECUTION_CONTINUATION_BLOCKER`:
+
+- Recover a current full checkpoint from canonical progress after the prior
+  checkpoint has been consumed. Until then the scanner preserves that task
+  instead of replaying the setup control or restoring an older pause. Retain
+  spent counters, history and effect receipts during that promotion.
+- Enforce full-source outer time, token and step budgets through reacquisition;
+  handle cold preparation refusals outside the classified provider-check path.
+- Wire explicit public Retry admission and reloadable desktop/mobile pause
+  projection; prove later connection/approval pauses, workflow finalization,
+  Stop, device handoff and completed-write no-replay at those routes.
+- Integrate the other agent's Auto/Ask/settings/UI changes, reconcile migration
+  83, and qualify one fresh combined build on the installed app/live home.
+
+The UI should keep one retained task visible throughout these ownership
+changes. It should show Running only when execution is owned, Waiting for a
+connection with the exact readable account and appropriate action, or
+Recovering when a new executor is being acquired. An ownership-loss response
+must not produce a second task card or an endless Thinking spinner. The missing
+checkpoint case must remain an honest recoverable interruption, not promise an
+automatic resume that has not been implemented. These are UI requirements;
+this increment does not claim they are rendered yet.

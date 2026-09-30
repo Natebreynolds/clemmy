@@ -142,7 +142,8 @@ import {
   type AcceptedSourceTerminalOutcome,
 } from './accepted-source-terminal.js';
 import { clearRunInFlightAfterTerminal, releaseRunInFlightAfterWorkflowTransfer } from './restart-recovery.js';
-import { connectionPreparationHoldText } from './connection-preparation-hold.js';
+import { connectionPreparationHoldText, readConnectionPreparationHold } from './connection-preparation-hold.js';
+import { ConnectionExecutionOwnershipError, claimConnectionExecutionRecovery } from './connection-execution-activation.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import {
   InvalidFreshTurnEngineError,
@@ -166,6 +167,8 @@ export interface RespondHarnessLimits {
   maxSteps?: number;
   /** Internal transport owner only; never copied from a request body. */
   connectionExecutionLeaseOwner?: string;
+  /** Trusted daemon dispatcher only. Never supplied by a browser/model. */
+  connectionRecoveryLeaseOwner?: string;
 }
 
 const MATERIAL_SOURCE_AUTHORITY_BLOCKED_TEXT =
@@ -1308,6 +1311,13 @@ const RESTART_OWNED_WORKFLOW_DISPATCH_REPLY =
 const TYPED_EXECUTION_HELD_REPLY =
   'This exact task is still owned by Clem\'s recovery system. I did not start a duplicate attempt; the existing work will continue from its durable checkpoint.';
 
+function connectionOwnershipChangedResponse(sessionId: string): AssistantResponse {
+  return { sessionId, stoppedReason: 'in-progress',
+    text: 'This executor no longer owns the task. Its saved work is retained for recovery; no replacement task was started.',
+    raw: { transport: 'host_harness', connectionOwnershipLost: true,
+      typedExecution: { owner: 'host', wake: 'recovery', reason: 'recovery_pending' } } };
+}
+
 type RestartOwnedWorkflowDispatchState =
   | { kind: 'pending'; ownership: PendingWorkflowChatDispatchOwnership }
   | { kind: 'unreadable' };
@@ -1481,8 +1491,13 @@ export async function respondViaHarness(
         routeForAcceptedHarness(surface, request, opts.modelOverride, connection.source));
     }
     if (!opts.connectionExecutionLeaseOwner) throw new Error('This connection control needs its current server execution lease.');
-    assertConnectionExecutionOwned({ sessionId, deliverySourceUserSeq: connection.source.seq,
-      attemptId: connection.attempt.attemptId, leaseOwner: opts.connectionExecutionLeaseOwner });
+    try {
+      assertConnectionExecutionOwned({ sessionId, deliverySourceUserSeq: connection.source.seq,
+        attemptId: connection.attempt.attemptId, leaseOwner: opts.connectionExecutionLeaseOwner });
+    } catch (error) {
+      if (error instanceof ConnectionExecutionOwnershipError) return connectionOwnershipChangedResponse(sessionId);
+      throw error;
+    }
   }
 
   if (!getSession(sessionId)) {
@@ -2258,6 +2273,12 @@ export async function respondViaHarness(
   }, { newlyAccepted: newlyAcceptedSource });
   } catch (err) {
     if (err instanceof AgentRuntimeCancelledError) throw err;
+    if (connection && err instanceof ConnectionExecutionOwnershipError) {
+      // A stale executor cannot publish failure for its successor or finish
+      // the retained task just because its own lease ended during an await.
+      preserveRequestAttemptOwnership = true;
+      return connectionOwnershipChangedResponse(sessionId);
+    }
     const signaledOwnership = err instanceof PendingWorkflowChatDispatchOwnershipError
       && err.ownership.originSessionId === sourceUserEvent.sessionId
       && err.ownership.sourceUserSeq === sourceUserEvent.seq
@@ -2621,12 +2642,31 @@ export async function respondPreferHarness(
   legacyRespond: (req: AssistantRequest) => Promise<AssistantResponse>,
   limits: RespondHarnessLimits = {},
 ): Promise<AssistantResponse> {
-  return withRuntimeConfigSnapshot(() => respondPreferHarnessWithinRuntimeConfig(
-    surface,
-    request,
-    legacyRespond,
-    limits,
-  ));
+  try {
+    if (limits.connectionRecoveryLeaseOwner) {
+      const connection = retainedConnectionForRequest(request);
+      if (connection) {
+        const claim = claimConnectionExecutionRecovery({ sessionId: request.sessionId,
+          deliverySourceUserSeq: connection.source.seq, leaseOwner: limits.connectionRecoveryLeaseOwner, purpose: 'recovery' });
+        if (claim.claimed) limits = { ...limits, connectionExecutionLeaseOwner: limits.connectionRecoveryLeaseOwner };
+        else if (claim.reason === 'connection_wait') {
+          const hold = readConnectionPreparationHold({ sessionId: request.sessionId, deliverySourceUserSeq: connection.source.seq });
+          if (!hold) throw new Error('The connection recovery wait cannot be verified.');
+          return { sessionId: request.sessionId, stoppedReason: 'in-progress', text: connectionPreparationHoldText(hold),
+            raw: { transport: 'host_harness', typedExecution: hold } };
+        } else if (claim.reason !== 'terminal') {
+          return { sessionId: request.sessionId, stoppedReason: 'in-progress', text: 'This task already has a live execution owner.',
+            raw: { transport: 'host_harness', typedExecution: { owner: 'host', wake: 'peer', reason: 'peer_in_progress' } } };
+        }
+      }
+    }
+    return await withRuntimeConfigSnapshot(() => respondPreferHarnessWithinRuntimeConfig(
+      surface, request, legacyRespond, limits,
+    ));
+  } catch (error) {
+    if (error instanceof ConnectionExecutionOwnershipError) return connectionOwnershipChangedResponse(request.sessionId);
+    throw error;
+  }
 }
 
 async function respondPreferHarnessWithinRuntimeConfig(

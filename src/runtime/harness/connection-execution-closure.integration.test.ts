@@ -107,7 +107,10 @@ function recordMissingConnection(identity: { sessionId: string; sourceUserSeq: n
 for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile', 'prefer-home', 'prefer-mobile',
   'gateway-mobile', 'account-changed-before-model', 'stopped-before-model', 'account-inactive', 'schema-changed',
   'account-changed-during-check', 'stopped-during-check', 'callable-revoked-during-check', 'unreviewed-capability',
-  'different-reviewed-account', 'definition-relabeled', 'retry-home', 'retry-mobile', 'retry-stopped'] as const) test(`connection execution: ${scenario}`, async t => {
+  'different-reviewed-account', 'definition-relabeled', 'retry-home', 'retry-mobile', 'retry-stopped',
+  'lease-expired', 'lease-boot', 'lease-stopped', 'lease-account-changed', 'lease-missing-checkpoint',
+  'lease-newer-request', 'lease-rollback', 'lease-live-renewal', 'lease-lost-during-check', 'lease-dispatch',
+  'lease-expired-during-model'] as const) test(`connection execution: ${scenario}`, async t => {
   const useExecutor = scenario !== 'publication';
   let configured = 0;
   _setBridgeImplsForTests({ configure: async () => { configured += 1; return { ok: true }; } });
@@ -362,8 +365,8 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     assert.ok(gatewayAccepted);
     assert.equal(modelCalls, 5);
   }
-  const leaseOwner = scenario === 'gateway-mobile' ? `connection-gateway:${process.pid}` : 'fixture-closure-desktop';
-  const lease = scenario === 'gateway-mobile'
+  let leaseOwner = scenario === 'gateway-mobile' ? `connection-gateway:${process.pid}` : 'fixture-closure-desktop';
+  let lease = scenario === 'gateway-mobile'
     ? { claimed: true, attempt: log.getLatestRunAttemptByRunId(session.id, runId)! }
     : log.claimRunAttemptLease({ sessionId: session.id, runId, ownerId: leaseOwner, leaseMs: 90_000 });
   assert.equal(lease.claimed, true);
@@ -382,6 +385,64 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     status: 'done', resumable: false, presentation: { kind: 'answer', text: reply } };
   const publishFinal = () => log.appendTerminalEventOnce({ sessionId: session.id, turn: active.source.turn,
     role: 'system', data: completionDataForTurnOutcome(finalOutcome) }, finalOutcome.id);
+  if (scenario.startsWith('lease-') && !['lease-live-renewal', 'lease-lost-during-check', 'lease-dispatch', 'lease-expired-during-model'].includes(scenario)) {
+    const blob = HarnessSession.load(session.id)!.loadRecoveryState()!;
+    const originalAttemptId = lease.attempt.attemptId;
+    const claim = () => activation.claimConnectionExecutionRecovery({ sessionId: session.id,
+      deliverySourceUserSeq: active.source.seq, leaseOwner: 'fixture-restarted-executor', purpose: 'recovery' });
+    assert.equal(claim().claimed, false, 'a live lease cannot be stolen by restart or another device');
+    assert.equal(log.getLatestRunAttemptByRunId(session.id, runId)!.attemptId, originalAttemptId);
+    if (scenario === 'lease-boot') log.interruptOrphanedRunAttemptsAtBoot();
+    else log.openEventLog().prepare('UPDATE run_attempts SET lease_expires_at = ? WHERE attempt_id = ?')
+      .run('2000-01-01T00:00:00.000Z', originalAttemptId);
+    assert.throws(() => activation.renewConnectionExecutionLease({ sessionId: session.id,
+      deliverySourceUserSeq: active.source.seq, attemptId: originalAttemptId, leaseOwner }), /live execution lease/,
+      'renewal cannot revive an expired or interrupted executor');
+    if (scenario === 'lease-stopped') log.requestKill(session.id, 'stop before recovery adoption', originalAttempt);
+    if (scenario === 'lease-account-changed') connectionSetup.recordConnectionSetupResult(context, { connectionId: 'fixture-other-account' });
+    if (scenario === 'lease-newer-request') log.appendEvent({ sessionId: session.id, turn: 3, role: 'user',
+      type: 'user_input_received', data: { text: 'A newer request.' } });
+    if (scenario === 'lease-missing-checkpoint') {
+      const state = host.HostRecoveryState.fromString(blob);
+      assert.equal(HarnessSession.load(session.id)!.adoptRecoveredConversation({ serializedState: blob,
+        history: state.history, lastResponseId: state.lastResponseId }), true);
+    }
+    if (scenario === 'lease-rollback') log.openEventLog().exec(`CREATE TEMP TRIGGER reject_connection_recovery_owner
+      BEFORE UPDATE ON sessions WHEN NEW.id = '${session.id}'
+        AND json_extract(NEW.metadata_json, '$.__host_recovery_owner.attemptId') != '${originalAttemptId}'
+      BEGIN SELECT RAISE(ABORT, 'recording owner storage refusal'); END`);
+    if (scenario !== 'lease-expired' && scenario !== 'lease-boot') {
+      try { assert.throws(claim, /stopped|account changed|newer request|canonical checkpoint|could not adopt/); }
+      finally { log.openEventLog().exec('DROP TRIGGER IF EXISTS reject_connection_recovery_owner'); }
+      assert.equal(log.getLatestRunAttemptByRunId(session.id, runId)!.attemptId, originalAttemptId,
+        'a refused adoption must not publish a replacement attempt');
+      assert.equal(HarnessSession.load(session.id)!.loadRecoveryState(), scenario === 'lease-missing-checkpoint' ? null : blob);
+      assert.equal(modelCalls, 3);
+      assert.equal(provider!.counts.businessCalls, 0);
+      assert.deepEqual(readRows(), readBefore);
+      if (scenario === 'lease-missing-checkpoint') {
+        let dispatches = 0;
+        const scan = recoverInterruptedChatRuns(Date.now, async () => { dispatches += 1; });
+        await Promise.resolve();
+        assert.equal(scan.records.find(row => row.sessionId === session.id)?.autoResumeSkipped, 'batch_unproven');
+        assert.equal(dispatches, 0, 'a lost current cursor must not become a generic replay of the setup button');
+        assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+      }
+      return;
+    }
+    log.closeEventLog();
+    const adopted = claim();
+    assert.equal(adopted.claimed, true);
+    assert.notEqual(adopted.attempt.attemptId, originalAttemptId);
+    leaseOwner = 'fixture-restarted-executor';
+    lease = { claimed: true, attempt: log.getLatestRunAttemptByRunId(session.id, runId)! };
+    assert.equal(HarnessSession.load(session.id)!.loadRecoveryState(), blob, 'lease adoption cannot rewind or replace progress');
+    assert.equal(HarnessSession.load(session.id)!.continuationOwnerState({ sourceUserSeq: active.source.seq,
+      attemptId: lease.attempt.attemptId }), 'ours');
+    assert.equal(claim().claimed, false, 'a second recovery contender must join the new live owner');
+    assert.equal(log.listEvents(session.id, { types: ['user_input_received'] }).length, 3);
+    assert.equal(log.listEvents(session.id, { types: ['plan_execution_claimed'] }).length, 1);
+  }
   const resumeOptions = { sessionId: session.id, sourceUserSeq: active.source.seq,
     input: setup.continueLabel, runAttemptId: lease.attempt.attemptId,
     connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1' as const,
@@ -399,6 +460,82 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
         async () => { throw new Error('The legacy bridge responder must not run.'); }, { connectionExecutionLeaseOwner: leaseOwner })
     : respondViaHarness(scenario.endsWith('mobile') ? 'webhook' : 'home', bridgeRequest,
         { connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1', modelOverride: 'fixture-wrong-caller-override' });
+  if (scenario === 'lease-dispatch') {
+    const blob = HarnessSession.load(session.id)!.loadRecoveryState()!;
+    const oldAttemptId = lease.attempt.attemptId;
+    log.interruptOrphanedRunAttemptsAtBoot();
+    log.closeEventLog();
+    const resumes: Array<ReturnType<typeof respondPreferHarness>> = [];
+    const scan = recoverInterruptedChatRuns(Date.now, async restart => {
+      const response = respondPreferHarness(restart.surface, { sessionId: restart.sessionId,
+        message: restart.acceptedInput, sourceUserSeq: restart.sourceUserSeq },
+        async () => { throw new Error('Restart cannot use the legacy responder.'); },
+        { connectionRecoveryLeaseOwner: 'fixture-daemon-recovery' });
+      resumes.push(response);
+      assert.equal(HarnessSession.load(session.id)!.loadRecoveryState(), blob);
+      await response;
+    });
+    assert.equal(scan.records.find(row => row.sessionId === session.id)?.autoResumed, true);
+    const responses = await Promise.all(resumes);
+    assert.equal(responses.length, 1);
+    assert.equal(responses[0]!.stoppedReason, 'success');
+    assert.equal(responses[0]!.text, reply);
+    const current = log.getLatestRunAttemptByRunId(session.id, runId)!;
+    assert.notEqual(current.attemptId, oldAttemptId);
+    assert.equal(current.status, 'completed');
+    assert.equal(modelCalls, 5);
+  }
+  if (scenario === 'lease-live-renewal') {
+    t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+    beforeFinalResponse = async () => {
+      for (let tick = 0; tick < 4; tick += 1) {
+        t.mock.timers.tick(30_000);
+        const current = log.getLatestRunAttemptByRunId(session.id, runId)!;
+        assert.ok(Date.parse(current.leaseExpiresAt!) > Date.now(), 'the executor must renew while waiting for its model');
+        assert.equal(current.attemptId, lease.attempt.attemptId);
+      }
+    };
+  }
+  if (scenario === 'lease-expired-during-model') {
+    beforeFinalResponse = async () => {
+      log.openEventLog().prepare('UPDATE run_attempts SET lease_expires_at = ? WHERE attempt_id = ?')
+        .run('2000-01-01T00:00:00.000Z', lease.attempt.attemptId);
+    };
+    const stale = await runBridge();
+    assert.equal(stale.stoppedReason, 'in-progress', 'a late model response cannot close the task after losing its lease');
+    assert.equal((stale.raw as any)?.connectionOwnershipLost, true);
+    assert.equal(modelCalls, 4, 'the already requested model frame returns, without dispatching another');
+    assert.equal(provider!.counts.businessCalls, 0, 'a tool call in the late model frame cannot cross the provider');
+    assert.equal(HarnessSession.load(session.id)!.loadRecoveryState(), null,
+      'the rejected model frame must not become a stuck accepted-call checkpoint');
+    assert.deepEqual(readRows(), readBefore);
+    assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+    return;
+  }
+  if (scenario === 'lease-lost-during-check') {
+    let adopted = false;
+    provider!.beforeSchema(() => {
+      if (adopted) return;
+      log.openEventLog().prepare('UPDATE run_attempts SET lease_expires_at = ? WHERE attempt_id = ?')
+        .run('2000-01-01T00:00:00.000Z', lease.attempt.attemptId);
+      const successor = activation.claimConnectionExecutionRecovery({ sessionId: session.id,
+        deliverySourceUserSeq: active.source.seq, leaseOwner: 'fixture-successor', purpose: 'recovery' });
+      assert.equal(successor.claimed, true);
+      adopted = true;
+    });
+    const stale = await runBridge();
+    assert.equal(adopted, true);
+    assert.equal(stale.stoppedReason, 'in-progress');
+    assert.equal((stale.raw as any)?.connectionOwnershipLost, true);
+    assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1,
+      'a stale executor cannot fail or close the successor’s task');
+    assert.equal(modelCalls, 3);
+    assert.equal(provider!.counts.businessCalls, 0);
+    leaseOwner = 'fixture-successor';
+    lease = { claimed: true, attempt: log.getLatestRunAttemptByRunId(session.id, runId)! };
+    resumeOptions.runAttemptId = lease.attempt.attemptId;
+    resumeOptions.connectionExecutionLeaseOwner = leaseOwner;
+  }
   if (scenario.startsWith('retry-')) {
     provider!.setSchemaAvailable(false);
     const beforeChecks = { ...provider!.counts };
@@ -432,6 +569,28 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     assert.equal(bootDispatches, 0, 'recovery must not poll a task explicitly waiting on its connection');
     assert.deepEqual(provider!.counts, countsBeforeBoot);
     assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+    if (scenario === 'retry-home') {
+      const neighbor = HarnessSession.create({ kind: 'chat', title: 'runnable recovery neighbor' });
+      const neighborAttempt = log.beginRunAttempt(neighbor.id, { runId: 'fixture-runnable-neighbor' });
+      const neighborSource = log.recordRunAttemptUserInput(neighborAttempt, { turn: 1, role: 'user',
+        data: { text: 'Continue the retained local read.' } }, { armRunInFlight: true });
+      neighbor.saveRecoveryState(new host.HostRecoveryState(neighbor.id, neighborSource.seq, 'admit', [],
+        [toolCall('neighbor-local-read', 'task_list', {})] as never, [], undefined, 'neighbor-frame',
+        'host_v1', undefined, 0).toString());
+      log.appendEvent({ sessionId: neighbor.id, turn: 0, role: 'system', type: 'restart_recovery_decision',
+        data: { exactCheckpointRecovery: true, autoResume: true, sourceUserSeq: neighborSource.seq } });
+      try {
+        const selected: string[] = [];
+        recoverInterruptedChatRuns(Date.now, async value => { selected.push(value.sessionId); },
+          { exactCheckpointsOnly: true, exactCheckpointDispatchLimit: 1 });
+        await Promise.resolve();
+        assert.deepEqual(selected, [neighbor.id], 'the in-memory selector must not spend its dispatch slot on a connection wait');
+      } finally {
+        neighbor.clearRecoveryState();
+        neighbor.clearRunInFlight();
+        log.finishRunAttempt(neighborAttempt, 'interrupted');
+      }
+    }
     const repeated = await runBridge();
     assert.equal(repeated.stoppedReason, 'in-progress');
     assert.equal(log.getLatestRunAttemptByRunId(session.id, runId)!.attemptId, lease.attempt.attemptId);
@@ -520,7 +679,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     assert.equal(log.listEvents(session.id, { types: ['plan_execution_claimed'] }).length, 1);
     return;
   }
-  if (useExecutor && scenario !== 'gateway-mobile') {
+  if (useExecutor && scenario !== 'gateway-mobile' && scenario !== 'lease-dispatch') {
     log.closeEventLog();
     if (!scenario.startsWith('retry-')) {
       // Boot must recognize the retained execution under its new delivery
@@ -544,7 +703,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     }
     await assert.rejects(runConversation({ ...resumeOptions, connectionExecutionLeaseOwner: 'wrong-owner' }), /live execution lease/);
     assert.equal(modelCalls, 3, 'a wrong executor cannot spend a model frame');
-    if (scenario.startsWith('bridge-') || scenario.startsWith('prefer-') || scenario.startsWith('retry-')) {
+    if (scenario.startsWith('bridge-') || scenario.startsWith('prefer-') || scenario.startsWith('retry-') || scenario.startsWith('lease-')) {
       const response = await runBridge();
       assert.equal(response.stoppedReason, 'success', JSON.stringify(response));
       assert.equal(response.text, reply);
@@ -585,6 +744,13 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   assert.deepEqual(readRows(), readBefore, 'closure and both exact replays must never repeat the completed local read');
   assert.deepEqual(spaceStore.snapshot(slug), beforeSpace);
   assert.equal(modelCalls, useExecutor ? 5 : 3);
+  if (scenario === 'lease-live-renewal') {
+    t.mock.timers.tick(120_000);
+    const settled = log.getLatestRunAttemptByRunId(session.id, runId)!;
+    assert.equal(settled.status, 'completed');
+    assert.equal(settled.leaseExpiresAt, null, 'renewal must not revive a terminal attempt');
+    assert.equal(modelCalls, 5);
+  }
   if (provider) {
     assert.equal(provider.counts.businessCalls, 1, 'only the pending provider read executes after connection');
     assert.equal(log.listEvents(session.id, { types: ['connection_request_satisfied'] })
@@ -596,7 +762,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     assert.equal(log.listEvents(session.id, { types: ['restart_recovery_decision'] })
       .filter(event => event.data.decision === 'connection_preparation_ready').length, 1);
   }
-  assert.equal(configured, scenario.startsWith('prefer-') || scenario === 'gateway-mobile' ? 1 : 0,
+  assert.equal(configured, scenario.startsWith('prefer-') || scenario === 'gateway-mobile' || scenario === 'lease-dispatch' ? 1 : 0,
     'a completed replay must not configure or re-enter the runtime');
   assert.equal(checks, 1);
   assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 2);

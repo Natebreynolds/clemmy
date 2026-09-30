@@ -2,7 +2,8 @@ import './memory-scope-binding.js';
 import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, readSourceSessionContext } from './source-session-context.js';
 import { currentSourceSessionContext, withSourceSessionContext } from './source-session-context-scope.js';
 import { readApprovalRecoveryActivation, readConnectionRecoveryActivation, readRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
-import { assertConnectionExecutionOwned } from './connection-execution-activation.js';
+import { assertConnectionExecutionOwned, renewConnectionExecutionLease,
+  CONNECTION_EXECUTION_LEASE_RENEW_MS } from './connection-execution-activation.js';
 import { rebuildSourceConnectionAgent } from './connection-agent-rebuild.js';
 import { ConnectionPreparationHoldError, retainConnectionPreparationHold, clearConnectionPreparationHold,
   type ConnectionPreparationHold } from './connection-preparation-hold.js';
@@ -6139,6 +6140,12 @@ function scheduleHostCheckpointRecovery(
       } catch {
         // Retry only while this exact source still owns a readable checkpoint.
         retry = true;
+        if (options.connectionExecutionLeaseOwner && options.runAttemptId) {
+          try {
+            assertConnectionExecutionOwned({ sessionId: options.sessionId, deliverySourceUserSeq: sourceUserSeq,
+              attemptId: options.runAttemptId, leaseOwner: options.connectionExecutionLeaseOwner });
+          } catch { retry = false; /* a new executor must acquire its own lease */ }
+        }
       } finally {
         if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
         if (retry) {
@@ -6223,10 +6230,18 @@ async function runConnectionConversation(options: RunConversationOptions): Promi
     || !options.runAttemptId || !options.connectionExecutionLeaseOwner) {
     throw new Error('The connection control has no current executor and retained execution owner.');
   }
-  const assertOwned = () => assertConnectionExecutionOwned({ sessionId: options.sessionId,
-    deliverySourceUserSeq: sourceUserSeq, attemptId: options.runAttemptId!, leaseOwner: options.connectionExecutionLeaseOwner! });
+  const leaseIdentity = { sessionId: options.sessionId, deliverySourceUserSeq: sourceUserSeq,
+    attemptId: options.runAttemptId!, leaseOwner: options.connectionExecutionLeaseOwner! };
+  const assertOwned = () => assertConnectionExecutionOwned(leaseIdentity);
   assertOwned();
-  const owned = Promise.resolve().then(() => withRuntimeConfigSnapshot(() =>
+  const owned = Promise.resolve().then(async () => {
+    renewConnectionExecutionLease(leaseIdentity);
+    const heartbeat = setInterval(() => {
+      try { renewConnectionExecutionLease(leaseIdentity); }
+      catch { clearInterval(heartbeat); /* every dispatch still rechecks its current owner */ }
+    }, CONNECTION_EXECUTION_LEASE_RENEW_MS);
+    heartbeat.unref?.();
+    try { return await withRuntimeConfigSnapshot(() =>
     withAcceptedSourceCatalogManifestScope(options.acceptedCatalogScope, () =>
       withAcceptedSourceSessionContext({ sessionId: options.sessionId, sourceUserSeq }, execution =>
         withRecoveryActivation(options.sessionId, owner, () => withModelUsageAttribution({
@@ -6272,8 +6287,10 @@ async function runConnectionConversation(options: RunConversationOptions): Promi
             });
           };
           let turn = await run();
+          assertOwned();
           if (checkpointContinuationIsReady(turn, { sessionId: options.sessionId, sourceUserSeq: execution.sourceUserSeq })) {
             turn = await run();
+            assertOwned();
           }
           const result = hostActivationConversationResult(turn, sourceUserSeq);
           if (result.status === 'held') {
@@ -6290,7 +6307,8 @@ async function runConnectionConversation(options: RunConversationOptions): Promi
         })), assertOwned),
       ),
     ),
-  ));
+    ); } finally { clearInterval(heartbeat); }
+  });
   activeHostConversations.set(key, owned);
   try { return await owned; }
   finally { if (activeHostConversations.get(key) === owned) activeHostConversations.delete(key); }

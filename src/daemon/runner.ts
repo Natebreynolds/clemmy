@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { anySessionViewerSeenSince } from '../runtime/harness/session-viewers.js';
 import matter from 'gray-matter';
@@ -2607,6 +2608,7 @@ export async function startDaemon(
     );
   }
   const interruptedChatResumesInFlight = new Set<string>();
+  const connectionRecoveryLeaseOwner = `connection-recovery:${process.pid}:${randomUUID()}`;
   const interruptedChatResumeKey = (sessionId: string, sourceUserSeq: number): string =>
     `${sessionId}:${sourceUserSeq}`;
   const dispatchInterruptedChatResume = async (restart: Parameters<NonNullable<Parameters<typeof reportInterruptedChatRuns>[1]>>[0]) => {
@@ -2622,10 +2624,12 @@ export async function startDaemon(
         channel: restart.channel ?? restart.surface,
         message: restart.acceptedInput,
         sourceUserSeq: restart.sourceUserSeq,
-        // No explicit model: the bridge resolves the ACTIVE brain role (same
+        // No explicit model: ordinary turns resolve the ACTIVE brain role (same
         // subtraction as the improvement consumer; a restart resume on a
         // rate-limited env primary fell over before it began, 2026-09-01).
-      }, (req) => assistant.respond(req));
+        // Reviewed connection continuations retain their original model and
+        // atomically acquire the exact checkpoint under this daemon's lease.
+      }, (req) => assistant.respond(req), { connectionRecoveryLeaseOwner });
     } finally {
       interruptedChatResumesInFlight.delete(key);
     }

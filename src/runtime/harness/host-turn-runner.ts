@@ -9608,6 +9608,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           throw new UnsupportedHostCapabilityError('response_format_repair_tool_call');
         }
       }
+      // Ownership can expire or move while the provider is answering. Reject
+      // that frame before journaling/admission, not merely at the later tool
+      // boundary (which would leave an unprojectable accepted call behind).
+      assertRecoveryActivationOwned();
       ranModelStep = true;
       if (watcherReviewForStep && watcherDriftForStep) {
         recordWatcherReview('delivered', { reviewId: watcherReviewForStep });

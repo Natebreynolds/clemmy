@@ -1,4 +1,4 @@
-import { readRecoveryActivation } from './recovery-activation.js';
+import { readConnectionRecoveryActivation, readRecoveryActivation } from './recovery-activation.js';
 import { WORKFLOW_PARENT_LEASE_PREFIX } from './workflow-parent-activation.js';
 /**
  * Restart recovery for in-flight CHAT runs.
@@ -924,6 +924,7 @@ function selectedRestartRecoveryRows(
 ): SessionRow[] {
   const exactCandidates: ExactCheckpointQueueCandidate[] = [];
   const exactSessionIds = new Set<string>();
+  const waitingConnectionIds = new Set<string>();
 
   for (const row of rows) {
     try {
@@ -938,6 +939,16 @@ function selectedRestartRecoveryRows(
       const sourceUserSeq = checkpointRecoverySourceUserSeq(session, row.id);
       if (sourceUserSeq === null) continue;
       exactSessionIds.add(row.id);
+      const wait = readConnectionPreparationHold({ sessionId: row.id, deliverySourceUserSeq: sourceUserSeq });
+      const connectionSource = wait && readRecoveryActivation(row.id)?.connectionContinuation?.requestSourceUserSeq;
+      if (wait && !isKillRequested(row.id, { sourceUserSeq })
+        && !(connectionSource && isKillRequested(row.id, { sourceUserSeq: connectionSource }))) {
+        // SQL page ranking is not enough: the dispatch sort below must also
+        // exclude deliberate connection waits from its scarce execution slots.
+        // Keep them in the report so their durable pause remains visible.
+        waitingConnectionIds.add(row.id);
+        continue;
+      }
 
       // No dispatcher means there is no honest exact continuation owner in
       // this caller. Preserve the checkpoint rather than converting it into a
@@ -975,7 +986,7 @@ function selectedRestartRecoveryRows(
       ))
       .map((candidate) => candidate.row.id),
   );
-  return rows.filter((row) => !exactSessionIds.has(row.id) || selectedExactIds.has(row.id));
+  return rows.filter((row) => !exactSessionIds.has(row.id) || selectedExactIds.has(row.id) || waitingConnectionIds.has(row.id));
 }
 
 function buildReplayPrimer(sessionId: string, inFlightSince: string): string {
@@ -1403,7 +1414,7 @@ export function recoverInterruptedChatRuns(
       userStopped = isKillRequested(row.id, ownerIdentity
         ? { sourceUserSeq: ownerIdentity.sourceUserSeq }
         : interruptedAttempt ?? undefined);
-      const originalConnectionSource = readRecoveryActivation(row.id)?.connectionContinuation?.requestSourceUserSeq;
+      const originalConnectionSource = readConnectionRecoveryActivation(row.id)?.connectionContinuation?.requestSourceUserSeq;
       if (originalConnectionSource) userStopped ||= isKillRequested(row.id, { sourceUserSeq: originalConnectionSource });
     } catch {
       // A failed kill read must not invent a stop. The ordinary conservative
@@ -1529,6 +1540,22 @@ export function recoverInterruptedChatRuns(
 
     // Auto-resume decision (see the safety bar above). Decided before the
     // recovery state is published or a manual terminal is committed.
+    try {
+      const connectionOwner = readConnectionRecoveryActivation(row.id)?.connectionContinuation;
+      if (connectionOwner && !sess.loadRecoveryState()) {
+        // A crash after adoption cannot fall through to generic replay of the
+        // control text or reinstall the original setup checkpoint. Preserve
+        // the exact owner until its canonical current progress is recoverable.
+        record.autoResumeSkipped = 'batch_unproven';
+        record.errors.push('connection checkpoint promotion is required before dispatch');
+        records.push(record);
+        continue;
+      }
+    } catch (error) {
+      record.errors.push(`connection_owner_check: ${error instanceof Error ? error.message : String(error)}`);
+      records.push(record);
+      continue;
+    }
     const ageMs = now() - Date.parse(since);
     const externalWritesSinceInterrupt = countExternalWritesSince(row.id, since);
     let checkpointRecovery = checkpointRecoveryDescriptor(sess, row.id);
