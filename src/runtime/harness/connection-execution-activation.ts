@@ -21,6 +21,8 @@ import { readConnectionRecoveryActivation, withRecoveryActivation, type Recovery
 import { resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
 import { HostRecoveryState } from './host-turn-runner.js';
 import { readConnectionPreparationHold } from './connection-preparation-hold.js';
+import { readConnectionExecutionProgress } from './connection-execution-progress.js';
+import { prepareAcceptedModelBatchRestart } from './accepted-model-batch-checkpoint.js';
 
 export const CONNECTION_EXECUTION_LEASE_MS = 90_000;
 export const CONNECTION_EXECUTION_LEASE_RENEW_MS = 30_000;
@@ -82,6 +84,51 @@ export function renewConnectionExecutionLease(input: ExecutionOwnerInput & { lea
   });
 }
 
+/** Reconstruct only the latest proven batch with the running executor's exact
+ * spent allowances. This installs bookkeeping, never a lease or permission to
+ * dispatch. Missing, stale, partial or uncertain evidence stays retained. */
+export function promoteConnectionExecutionCheckpoint(input: {
+  sessionId: string; deliverySourceUserSeq: number;
+}): boolean {
+  return withEventPublicationTransaction(() => {
+    const marker = readConnectionExecutionActivation(openEventLog(), input);
+    if (!marker) return false;
+    const prior = getLatestRunAttemptByRunId(input.sessionId, marker.activation.runId);
+    if (!prior || prior.sourceUserSeq !== input.deliverySourceUserSeq) return false;
+    const owned = readConnectionExecutionOwner({ ...input, attemptId: prior.attemptId });
+    if (owned.session.loadRecoveryState()) return true;
+    if (getLatestRunAttempt(input.sessionId)?.attemptId !== prior.attemptId
+      || (prior.status !== 'active' && prior.status !== 'interrupted')
+      || (prior.status === 'active' && liveLease(prior.leaseExpiresAt))
+      || resolveExactTerminalForAcceptedSource(readControlSource(input.sessionId, input.deliverySourceUserSeq)).kind !== 'absent') return false;
+    const progress = readConnectionExecutionProgress(input.sessionId, owned.owner);
+    if (!progress) return false;
+    const prepared = prepareAcceptedModelBatchRestart({ sessionId: input.sessionId,
+      sourceUserSeq: marker.activation.executionSourceUserSeq });
+    if (prepared.status !== 'ready') return false;
+    const batch = prepared.checkpoint;
+    if ((['sessionId', 'sourceUserSeq', 'acceptedTaskId', 'batchOrdinal', 'batchId', 'authorityDigest'] as const)
+      .some(key => batch[key] !== progress.batch[key])) return false;
+    const state = progress.recovery;
+    const recovery = HostRecoveryState.fromString(new HostRecoveryState(input.sessionId, batch.sourceUserSeq,
+      'continue', batch.history, [], [], batch.lastResponseId, undefined, state.turnEngine,
+      state.noProgressCheckpoint, state.stepIndex, progress.batch, state.objectiveJudgeContinuations,
+      state.completionReviewFeedback, progress).toString());
+    const retained = readSourceConnectionCheckpoint({ sessionId: input.sessionId, requestId: marker.activation.requestId });
+    if (!retained?.agent) return false;
+    const saved = withRecoveryActivation(input.sessionId, owned.owner, () => owned.session.saveRecoveryState(
+      recovery.toString(), { owner: { sourceUserSeq: batch.sourceUserSeq, attemptId: prior.attemptId },
+        mcpToolScope: retained.agent!.mcpToolScope }));
+    if (!saved.installed) throw new Error('The connection checkpoint promotion could not retain its current owner.');
+    appendEvent({ sessionId: input.sessionId, turn: 0, role: 'system', type: 'restart_recovery_decision',
+      parentEventId: marker.eventId, data: { decision: 'connection_execution_checkpoint_promoted',
+        sourceUserSeq: input.deliverySourceUserSeq, executionSourceUserSeq: batch.sourceUserSeq,
+        attemptId: prior.attemptId, batchId: batch.batchId, batchOrdinal: batch.batchOrdinal,
+        stepIndex: state.stepIndex, toolCallsUsed: progress.activation.toolCalls.used } });
+    return true;
+  });
+}
+
 /** Only a trusted recovery/retry dispatcher calls this. A browser receipt is
  * not a lease. Keep the exact current blob; never reinstall the setup pause. */
 export function claimConnectionExecutionRecovery(input: {
@@ -103,6 +150,13 @@ export function claimConnectionExecutionRecovery(input: {
     }
     if (input.purpose === 'recovery' && readConnectionPreparationHold(input)) {
       return { claimed: false as const, reason: 'connection_wait' as const, attempt: prior };
+    }
+    if (prior.status === 'active' && liveLease(prior.leaseExpiresAt)) {
+      return { claimed: false as const, reason: 'active' as const, attempt: prior };
+    }
+    if (!owned.session.loadRecoveryState()) {
+      promoteConnectionExecutionCheckpoint(input);
+      owned.session.refresh();
     }
     const blob = owned.session.loadRecoveryState();
     if (!blob) throw new Error('Connection recovery needs its current canonical checkpoint; the setup pause was not restored.');

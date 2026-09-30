@@ -1,5 +1,6 @@
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
+import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { responseFormatRepairPacket } from './response-format-repair.js';
@@ -134,7 +135,7 @@ import {
   noteExactCheckpointReentry,
 } from './exact-checkpoint-reentry.js';
 import pino from 'pino';
-import { appendEvent, getSession, isKillRequested, listEvents, openEventLog } from './eventlog.js';
+import { appendEvent, getSession, isKillRequested, listEvents, openEventLog, withEventPublicationTransaction } from './eventlog.js';
 import { sessionAgentReviewContext } from './session-composition.js';
 import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-steer.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -3970,7 +3971,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (!carriedProgress && !acceptedPlanExecution(identity.sessionId, identity.sourceUserSeq)) return undefined;
     const counter = harnessRunContextStorage.getStore()!.counter;
     return {
-      version: 1, batch,
+      version: 1, batch: { sessionId: batch.sessionId, sourceUserSeq: batch.sourceUserSeq,
+        acceptedTaskId: batch.acceptedTaskId, batchOrdinal: batch.batchOrdinal,
+        batchId: batch.batchId, authorityDigest: batch.authorityDigest },
       recovery: { turnEngine: hostTurnEngine ?? 'host_v1', stepIndex,
         noProgressCheckpoint: currentNoProgressCheckpoint(), objectiveJudgeContinuations, completionReviewFeedback },
       activation: {
@@ -4009,6 +4012,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       hostTurnLogger.warn({ error: error instanceof Error ? error.message : 'unknown' },
         'connection progress could not be retained');
     }
+  };
+  // Unlike the initial pause snapshot, this advances while the retained task
+  // is running. The batch journal owns history; this bounded record owns the
+  // allowances already spent, including a model request whose response is lost.
+  let runningConnectionBatch = latestAcceptedModelBatchRef;
+  const retainRunningConnectionProgress = (batch = runningConnectionBatch): void => {
+    if (!carriedProgress) return;
+    const snapshot = connectionProgressSnapshot(currentHostStepIndex + 1, batch);
+    if (!snapshot) throw new Error('The running connection task has no exact progress snapshot.');
+    retainConnectionExecutionProgress(snapshot);
+    runningConnectionBatch = batch;
   };
   const propagateToolCallsLimit = (error: ToolCallsLimitExceeded): never => {
     hostToolCallsLimitCheckpoints.set(error, {
@@ -6467,6 +6481,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         throw new ToolCallsLimitExceeded(executionContext.counter.limit);
       }
       executionContext.counter.increment();
+      retainRunningConnectionProgress();
     }
     const authoredName = call.name;
     let tool = toolByName.get(authoredName);
@@ -6541,6 +6556,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         })
       : { type: 'allow' as const };
     emit('agent_tool_start', runContext, agent, tool ?? { name: call.name }, lifecycleDetails);
+    // The legacy listener owns the charge when host accounting is disabled.
+    if (!executionContext?.hostOwnsToolAccounting) retainRunningConnectionProgress();
     let output: unknown;
     let hostRefusal: string | undefined;
     let returnedPreDispatchRefusal = false;
@@ -7553,12 +7570,19 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       ...(lastResponseId ? { previousResponseId: lastResponseId } : {}),
       ...(input.responseId ? { providerResponseId: input.responseId } : {}),
     };
-    let admitted = admitAcceptedModelBatch(request);
+    const admit = () => !carriedProgress ? admitAcceptedModelBatch(request) : withEventPublicationTransaction(() => {
+      const result = admitAcceptedModelBatch(request);
+      if (result.status === 'admitted' || result.status === 'existing') {
+        retainRunningConnectionProgress(result.admission);
+      }
+      return result;
+    });
+    let admitted = admit();
     if (admitted.status === 'unavailable') {
       // The retry is exact and idempotent.  No classification or body edge has
       // happened, so a transient local transaction failure cannot create a
       // duplicate effect.
-      admitted = admitAcceptedModelBatch(request);
+      admitted = admit();
     }
     if (admitted.status === 'admitted' || admitted.status === 'existing') {
       return { status: 'ready', frame: { ref: admitted.admission } };
@@ -7901,6 +7925,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     history.push(...input.frameHistory, ...(input.resultItems ?? []));
     latestAcceptedModelBatchRef = input.acceptedFrame.ref;
     if (input.responseId !== undefined) lastResponseId = input.responseId;
+    retainRunningConnectionProgress(input.acceptedFrame.ref);
     if (checkpointRecoveryFrameInProgress && (input.resultItems?.length ?? 0) > 0) {
       return recoveryContinuationOutcome(
         input.acceptedFrame.ref,
@@ -7961,6 +7986,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     history.push(...resultItems);
     latestAcceptedModelBatchRef = acceptedFrame.ref;
+    retainRunningConnectionProgress(acceptedFrame.ref);
     return undefined;
   };
 
@@ -9589,6 +9615,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       };
       recoveredToolFrame = undefined;
     } else try {
+      // Charge the next step before an awaited model request. A lost answer is
+      // not free on restart, even though it never became an admitted frame.
+      retainRunningConnectionProgress();
       if (answerOwner) {
         // A brain draft the chosen writer may rewrite is held; the writer's
         // own reply and a format repair are the answer as written.

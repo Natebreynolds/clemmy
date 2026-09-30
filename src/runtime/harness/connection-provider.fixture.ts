@@ -27,6 +27,7 @@ export async function installConnectionProviderFixture() {
   let operationVersion = '1';
   let currentSchema: Record<string, unknown> = schema;
   let beforeSchema: (() => void) | undefined;
+  let afterBusiness: (() => void) | undefined;
   const counts = { accountChecks: 0, schemaChecks: 0, businessCalls: 0 };
   client.__test__.setComposioApiKeyOverride('connection-fixture-key');
   client.__test__.setConnectedAccountsLoader(async () => {
@@ -73,6 +74,7 @@ export async function installConnectionProviderFixture() {
       assert.equal(body.connected_account_id, account);
       assert.deepEqual(body.arguments, { recordId: 'fixture-board' });
       counts.businessCalls += 1;
+      afterBusiness?.();
       return { successful: true, error: null, data: { status: 'Ready' }, logId: 'fixture-crm-read' };
     },
   } }) }), tools: { execute: async () => { throw new Error('Legacy provider execution is forbidden.'); } } });
@@ -90,6 +92,7 @@ export async function installConnectionProviderFixture() {
     setVersion: (value: string) => { operationVersion = value; },
     setSchema: (value: Record<string, unknown>) => { currentSchema = value; },
     beforeSchema: (fn: () => void) => { beforeSchema = fn; },
+    afterBusiness: (fn: () => void) => { afterBusiness = fn; },
     dispose: () => {
       installProductionTransport(null);
       schemas._setToolSchemaLoaderForTests(null);

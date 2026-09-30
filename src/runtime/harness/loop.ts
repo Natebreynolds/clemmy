@@ -1,4 +1,5 @@
 import './memory-scope-binding.js';
+import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, readSourceSessionContext } from './source-session-context.js';
 import { currentSourceSessionContext, withSourceSessionContext } from './source-session-context-scope.js';
 import { readApprovalRecoveryActivation, readConnectionRecoveryActivation, readRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
@@ -60,6 +61,7 @@ import {
   listEvents,
   listPendingAsyncWorkDispatchBatchClosedEvents,
   openEventLog,
+  withEventPublicationTransaction,
   recentToolOutputs,
   resolveToolOutputTermMatchesForAuthority,
   searchToolOutputs,
@@ -10859,10 +10861,17 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
             });
             return false;
           }
-          return session.adoptRecoveredConversation({
-            serializedState: recoveryBlob!,
-            history: persistedRecoveryState!.history,
+          const adopt = () => session.adoptRecoveredConversation({
+            serializedState: recoveryBlob!, history: persistedRecoveryState!.history,
             lastResponseId: persistedRecoveryState!.lastResponseId,
+          });
+          if (!persistedRecoveryState!.connectionProgress) return adopt();
+          return withEventPublicationTransaction(() => {
+            // Preserve consumed allowances before retiring the full blob. A
+            // crash before the next model boundary can then reopen this exact
+            // canonical batch rather than restoring the old connection pause.
+            retainConnectionExecutionProgress(persistedRecoveryState!.connectionProgress!);
+            return adopt();
           });
         })()
       ) {

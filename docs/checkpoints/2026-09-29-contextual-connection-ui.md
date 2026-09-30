@@ -1248,3 +1248,82 @@ must not produce a second task card or an endless Thinking spinner. The missing
 checkpoint case must remain an honest recoverable interruption, not promise an
 automatic resume that has not been implemented. These are UI requirements;
 this increment does not claim they are rendered yet.
+
+### Current progress survives checkpoint adoption — 2026-09-30
+
+The missing-blob recovery path now has an implementation. A running reviewed
+connection continuation retains a private progress record at checkpoint
+adoption, model-request boundaries, accepted batch admission, tool charging and
+result commit. It contains consumed host allowances, continuation/review state
+and a six-field batch reference. It contains neither conversation history nor
+tool-result bodies, and it is not added to any model prompt. The accepted batch
+journal remains the only history/result authority. The record occupies one
+replaceable session metadata field, not a growing list of prompt copies.
+
+Checkpoint adoption and its initial progress record commit together. New batch
+admission and the corresponding progress reference also commit together for
+these retained executions. Tool charging is retained before invocation. A
+requested model step is retained before awaiting its answer, so losing that
+answer does not grant a free replacement step after recovery. Ordinary fresh
+chat does not acquire these extra progress transactions.
+
+After interruption, the scanner and trusted lease-acquisition path can reopen
+the latest ready canonical batch and reconstruct a normal host checkpoint from
+that progress. They require the same activation, delivery/execution sources,
+attempt, current account binding and exact batch identity. They refuse a live
+executor, Stop, a newer owner, a terminal task, corrupt progress, a stale batch
+reference, missing evidence or a batch requiring reconciliation. Promotion is
+bookkeeping; the separate atomic lease acquisition still owns execution.
+
+The new recording scenarios enter the real recovery scanner and ordinary
+bridge. They interrupt execution immediately after adoption, while a model
+response is pending, just after the provider returns, and on the final-answer
+request after the provider read is committed. Recovery finishes the same plan
+without repeating the original local read or the completed provider read. A
+lost response adds one actual recording model request, correctly charged to
+the retained step allowance. At an exhausted allowance, recovery stops without
+making another model request. Separate corrupt, stale and stopped scenarios
+refuse acquisition without publishing another attempt or terminal.
+
+Evidence and limits:
+
+- The initial unchanged 31 connection scenarios passed with the new runtime:
+  `/tmp/clem-connection-progress-initial.txt`.
+- Six new progress scenarios passed in
+  `/tmp/clem-connection-progress-focused-2.txt`; the two additional adoption and
+  provider-return boundaries passed in
+  `/tmp/clem-connection-progress-boundaries.txt`. An earlier focused run found
+  two old fixture assertions still expecting five calls after a deliberately
+  lost response; the shared replay/reap assertions now expect the actual six.
+- Removing only canonical promotion reproduced both the model-pending and
+  provider-return recovery failures in `/tmp/clem-connection-progress-red.txt`.
+  The candidate implementation was restored immediately afterward.
+- Runtime TypeScript passed in `/tmp/clem-connection-progress-tsc-final.txt`.
+  The combined targeted regression passed **505/505** checks across six files,
+  including **39** connection execution scenarios:
+  `/tmp/clem-connection-progress-regression.txt`. This includes nested tests,
+  not 505 end-to-end journeys. Earlier logs overlap that run and must not be
+  added together. `git diff --check` passed.
+- **10/10** source-connection checkpoint and recovery-activation compatibility
+  checks passed in `/tmp/clem-connection-progress-checkpoint-compat.txt`,
+  including ordinary ASK/decision capture and recovery guard isolation.
+
+Still not done: installed-app/live-home acceptance, public desktop/mobile
+Retry and state projection, full-source outer elapsed-time/token budgets,
+workflow finalization, later connection/approval cycles and physical-write
+no-replay/device-handoff qualification. The new fixtures exercise real
+framework/provider-carrier code with recorded **reads**, not external writes
+or a physical process kill. Elapsed time is preserved as of each durable
+boundary; a lost in-flight interval and the outer task budget still need their
+own accounting. Partial or uncertain batches remain held; this implementation
+does not convert uncertainty into permission to replay a tool.
+
+No paid model or provider, credential/configuration change, build, hotpatch,
+merge or tag was performed. `EXECUTION_CONTINUATION_BLOCKER` remains active.
+The final isolated runner's live-home sentinel was **NOT PERFORMED** while
+daemon 72427 changed the memory stores and `secretsMeta`; this is not installed
+acceptance or proof of live-home isolation. The other agent's clean
+`claude/two-modes` worktree was rechecked and left untouched.
+The paired UI still needs to project this as one Recovering task and then the
+same task's real progress, retaining visible completed-effect receipts. It
+must not show a fresh chat request or require the user to repeat the objective.

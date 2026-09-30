@@ -1,4 +1,5 @@
 import { readConnectionRecoveryActivation, readRecoveryActivation } from './recovery-activation.js';
+import { promoteConnectionExecutionCheckpoint } from './connection-execution-activation.js';
 import { WORKFLOW_PARENT_LEASE_PREFIX } from './workflow-parent-activation.js';
 /**
  * Restart recovery for in-flight CHAT runs.
@@ -1541,15 +1542,17 @@ export function recoverInterruptedChatRuns(
     // Auto-resume decision (see the safety bar above). Decided before the
     // recovery state is published or a manual terminal is committed.
     try {
-      const connectionOwner = readConnectionRecoveryActivation(row.id)?.connectionContinuation;
+      const connectionOwner = readConnectionRecoveryActivation(row.id);
       if (connectionOwner && !sess.loadRecoveryState()) {
-        // A crash after adoption cannot fall through to generic replay of the
-        // control text or reinstall the original setup checkpoint. Preserve
-        // the exact owner until its canonical current progress is recoverable.
-        record.autoResumeSkipped = 'batch_unproven';
-        record.errors.push('connection checkpoint promotion is required before dispatch');
-        records.push(record);
-        continue;
+        if (!promoteConnectionExecutionCheckpoint({ sessionId: row.id, deliverySourceUserSeq: connectionOwner.sourceUserSeq })) {
+          // Never fall through to generic replay of the control text or the
+          // original setup pause when current progress cannot be proved.
+          record.autoResumeSkipped = 'batch_unproven';
+          record.errors.push('connection checkpoint promotion is required before dispatch');
+          records.push(record);
+          continue;
+        }
+        sess.refresh();
       }
     } catch (error) {
       record.errors.push(`connection_owner_check: ${error instanceof Error ? error.message : String(error)}`);
