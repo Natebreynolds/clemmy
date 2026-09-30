@@ -566,3 +566,94 @@ differ from code that assumes its original basename, though relative imports
 and the parent directory are preserved. Windows process/path behavior is not
 certified by the macOS checks. No performance or token improvement is claimed
 from deterministic fixtures alone.
+
+## Durable saved-script occurrence and dataset recovery
+
+The follow-on source change adds `workspace-script-occurrence.ts` and migration
+85. It is an internal source owner between the exact one-shot adapter above
+and the existing dataset ledger. It does not yet enable the scheduler or mint
+recurring consent, and it is not installed-app acceptance.
+
+Before consent, the coordinator preserves the current file-backed dataset,
+then records the exact source declaration, transforms, canonical arguments,
+compiled plan, logical call identity and consent payload. One unpublished
+occurrence per Workspace/source is enforced in SQLite. A new tick, changed
+code or restarted daemon cannot bypass an unfinished/uncertain occurrence by
+inventing a new ID. Pending, declined and unrelated approvals cannot activate
+it. Historical trust records are not used as authorization.
+
+Activation and the coordinator's address are deliberately separate durable
+edges. The shared authority arm publishes activation events after its own
+transaction, so wrapping it in another transaction would risk publishing an
+event whose outer transaction later rolls back. Instead, the coordinator
+records the exact approval address before arming and recovers a missing
+activation address from the kernel's own exact session/logical-call journal.
+It never re-prepares already-armed execution from possibly changed files.
+
+The shared kernel still owns physical dispatch and its retained result. On
+restart the coordinator registers the current host port, but reuses the saved
+plan and canonical argument bytes. Successful host output is checked against
+the occurrence, transformed with one retained observation time, and committed
+through the existing Workspace observation transaction. Recovery checks the
+observation's content digest as well as provenance; it heals a failed file
+projection without running the script again. Memory/retention use the existing
+idempotent finalizer. The source barrier releases only after publication.
+
+A retry's `zeroBody` is not proof that an earlier process had no effects. All
+unfinished/uncertain occurrences remain held. Explicit user resolution of a
+declined, cancelled, changed or uncertain source is still part of the pending
+consent/recovery caller work; this journal is not a new user-facing dead end.
+
+Migration traps found and fixed in this slice:
+
+- Historical v32/v40 upgrade rehearsals retain later tables while replaying
+  migrations. The new table/index use additive `IF NOT EXISTS`, consistent
+  with the existing schema migrations.
+- Source ownership must survive session retention without making unrelated
+  session cleanup fail. The journal intentionally has no cascading session
+  foreign key; deleting a session cannot erase the source barrier.
+- The untouched `connection-continuity` worktree has an uncommitted **different
+  migration 85** for a draft model-invocation ledger. That draft is excluded
+  here. If it is resumed/merged, renumber it after the accepted journal
+  migration and rehearse the combined chain; never silently merge two v85s.
+
+The app still requires a fresh build and coordinated hotpatch. The last
+verified installed runtime was `019e8d9d5` / harness schema 82. The new source
+expects schema 85. No live source manifest, personal workflow, credential,
+setting or installed file was changed in this slice. The fixtures use named
+disposable homes and never reset the live home.
+
+Next production work remains explicit recurring source/schedule/code consent
+with revocation and prior-denial preservation, scheduler/manual/approval
+resolution callers, and an owner-visible way to resolve held work. Then build,
+verify the served fingerprint/schema and run controlled installed-app/live-home
+acceptance. There is still no basis for calling the retired script sources
+fixed in the installed app or declaring a tag ready.
+
+Verification of this occurrence slice:
+
+- `/tmp/clem-script-occurrence-qualification-final.txt`: **131/131**, including
+  19 occurrence checks, the earlier script carrier checks, dataset/history and
+  finalization checks, event-log tests and schema readiness. The two earlier
+  migration failures were introduced by this slice and fixed before this run;
+  they are not described as pre-existing.
+- Three checks use two fresh processes and the emitted production carrier in
+  an explicitly disposable home: crash after kernel settlement, crash after
+  observation commit, and uncertain execution. The successful cases retain
+  one process crossing and one dataset observation after deleting the original
+  script. The uncertain case keeps subsequent ticks held.
+- Additional coverage includes the DB-commit/file-projection failure seam,
+  concurrent reentry, pending/declined/wrong approvals, source edits before
+  publication, preservation of the prior dataset before execution, exact
+  stored-content checking, and the source barrier surviving session cleanup.
+- `/tmp/clem-script-occurrence-red.txt`: **2/2 expected semantic failures** when
+  baseline capture and stored-content verification were temporarily removed.
+  The original candidate bytes were restored in `finally` and SHA-256 checked.
+- `/tmp/clem-script-occurrence-typecheck-final.txt`: TypeScript passed.
+- Component artifacts were regenerated; executable digests are unchanged,
+  while the emitted manifest records the new schema input size. This is not
+  a desktop build. No full suite, canonical journeys, model call, live provider
+  request, hotpatch or tag was performed.
+- The runner's broad live-home isolation sentinel remains **NOT PERFORMED**
+  because live daemon 72427 owns that home. Disposable process fixtures are
+  not represented as proof of installed/live-home behavior.

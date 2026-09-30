@@ -11277,6 +11277,30 @@ const MIGRATIONS: EventLogMigration[] = [
       PRIMARY KEY(session_id, source_user_seq, role)
     );`,
   },
+  {
+    // A saved script's occurrence survives the call -> dataset commit gap.
+    // This journal is an owner/barrier, never an alternate execution grant.
+    // Session retention must neither delete an unfinished source barrier nor
+    // fail because of it, so session_id deliberately has no cascading FK.
+    version: 85,
+    sql: `CREATE TABLE IF NOT EXISTS workspace_script_occurrences_v1 (
+      workspace_id TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      occurrence_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      logical_call_id TEXT NOT NULL UNIQUE,
+      preparation_json TEXT NOT NULL,
+      approval_id TEXT,
+      activation_id TEXT UNIQUE,
+      observed_at TEXT,
+      observation_id TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(workspace_id, source_id, occurrence_id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS workspace_script_one_unpublished_source_v1
+      ON workspace_script_occurrences_v1(workspace_id, source_id)
+      WHERE observation_id IS NULL;`,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

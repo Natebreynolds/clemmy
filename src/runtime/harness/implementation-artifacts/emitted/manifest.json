@@ -708,7 +708,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 561354
+          "bytes": 562361
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
@@ -4053,7 +4053,7 @@
           "bytes": 20691
         },
         "src/runtime/harness/eventlog-schema.ts": {
-          "bytes": 561354
+          "bytes": 562361
         },
         "src/runtime/harness/host-call-capability-binding.ts": {
           "bytes": 32756
