@@ -26,6 +26,7 @@ import {
   RecipientSetIntegrityError,
 } from '../runtime/harness/recipient-integrity-gate.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
+import { isEffectDecidedPerCall } from './tool-registry.js';
 import {
   admitPendingActionCall,
   type AdmittedPendingActionCall,
@@ -199,6 +200,17 @@ function queuedActionNextStep(
     : 'Next step: ask the user whether to execute this queued action. If it requires a formal approval card, call request_approval with pendingActionId set to this id and include a concise preview. After approval, call pending_action_execute with this id so the byte-identical payload fires once; do not re-read and reconstruct the underlying tool call.';
 }
 
+/**
+ * The card for a per-call-effect tool shows the bytes that will run, not a
+ * paraphrase: for such a tool the command IS the content. Any other tool
+ * keeps the preview the model wrote.
+ */
+function exactCommandPreview(toolName: string, payload: unknown): string | undefined {
+  if (!isEffectDecidedPerCall(toolName) || !payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const command = (payload as Record<string, unknown>).command;
+  return typeof command === 'string' && command.trim() ? command : undefined;
+}
+
 export function registerPendingActionTools(server: McpServer): void {
   server.tool(
     'pending_action_queue',
@@ -304,10 +316,14 @@ export function registerPendingActionTools(server: McpServer): void {
           payload,
           executionAuthority,
           targetSummary,
-          preview: input.preview,
+          preview: exactCommandPreview(toolName, payload) ?? input.preview,
           risk: input.risk,
           rollback: input.rollback,
           sessionId,
+          // The accepted source this action was prepared for. An approval
+          // that arrives with no turn of its own (a card button) settles the
+          // approved call under this source.
+          sourceUserSeq: attribution.sourceUserSeq,
           createdBy: input.createdBy ?? 'clementine',
         });
         const edgePersisted = maybeLog(sessionId, 'queued', {

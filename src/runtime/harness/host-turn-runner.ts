@@ -13,6 +13,7 @@ import { reviewedPlanCallRefusal, materializeReviewedPlanCallArguments } from '.
 import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering, takeUndeliveredSteerNotes, hasUndeliveredSteerNotes, formatSteerBlock, type SteerNote } from './steer-notes.js';
 import { autoCaptureProvenanceFromAcceptedEvent, captureInteractionSignals, explicitMemoryInstructionFor } from '../../memory/auto-capture.js';
 import { TOOL_REGISTRY,
+  isEffectDecidedPerCall,
   toolReadsRetainedOutput,
 } from '../../tools/tool-registry.js';
 import { boundWriterModel, resolveRoleModel, type ResolvedRoleModel } from './model-roles.js';
@@ -802,7 +803,7 @@ import {
   type HostToolDisposition,
   type HostToolDispositionOutput,
 } from './host-model-result-receipt.js';
-import { defaultDispositionEdge, edgeToolName } from './next-edge.js';
+import { defaultDispositionEdge, edgeToolName, nextEdge } from './next-edge.js';
 import {
   recordLogicalModelResultProjectionReceipt,
 } from './logical-model-result-projection-receipt.js';
@@ -5463,6 +5464,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const reviewed = reviewedCliShellMatch(command);
       if (reviewed.status === 'matched') return miss(`reviewed_cli_shell_matched:${reviewed.operationId}`);
     }
+    // A per-call-effect tool whose call leaves this machine has no local door
+    // and no provider manifest. It is carried by one approval card that shows
+    // the exact command; the refusal names that door instead of sending the
+    // model to discovery, which cannot publish it.
+    if (decision.effect === 'external_write' && isEffectDecidedPerCall(effectiveName)) {
+      return miss(OFF_MACHINE_CALL_NEEDS_CARD);
+    }
     const root = acceptedTurnCallAuthorityFor(identity.sessionId, identity.sourceUserSeq);
     const acceptedTaskId = acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq);
     const contract = durableLogicalCallContract(acceptedTaskId, name, args);
@@ -6155,6 +6163,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       if (lastExactProductionMiss === 'effective_inner_name_missing') {
         const problem = carrierInnerJsonProblem(args ?? parsedArgs(argumentsJson));
         if (problem) return hostCarrierInnerJsonRepair(name, problem);
+      }
+      if (lastExactProductionMiss === OFF_MACHINE_CALL_NEEDS_CARD) {
+        const effective = unwrapRuntimeEffectiveToolIdentity(name, args ?? parsedArgs(argumentsJson));
+        return offMachineCallNeedsCardRepair(name, effective.toolName?.trim() ?? '', effective.args);
       }
       const boundOperations = plannedWriteOperationIds(
         refusalIdentity.sessionId,
@@ -7135,10 +7147,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       continuationReason: input.continuationReason,
       ...(input.continuationReason || input.retired || input.disposition === 'effect_unknown'
         ? {}
-        : { nextEdge: defaultDispositionEdge({
-          disposition: input.disposition,
-          toolName: innerTool,
-        }) }),
+        : { nextEdge: input.diagnostic && isOffMachineCallNeedsCardRepair(input.diagnostic)
+          // The call was right; only the owner's decision is missing. The
+          // edge is the queue, never a repair of the arguments.
+          ? nextEdge({ tool: 'pending_action_queue', change: 'queue_for_approval' })
+          : defaultDispositionEdge({
+            disposition: input.disposition,
+            toolName: innerTool,
+          }) }),
     });
   };
 
@@ -11060,6 +11076,39 @@ export function literalOperationNotFrozenOperation(reason: string | undefined): 
   if (!reason || !reason.startsWith(HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX)) return null;
   const operationId = reason.slice(HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX.length).trim();
   return operationId || null;
+}
+
+/** The miss recorded when a per-call-effect tool's call leaves this machine. */
+export const OFF_MACHINE_CALL_NEEDS_CARD = 'off_machine_call_needs_card';
+/** The one sentence every off-machine repair carries; the edge is keyed on it. */
+const OFF_MACHINE_CALL_NEEDS_CARD_SENTENCE = 'changes something outside this machine, so it runs only after the owner approves it on one card that shows the exact command.';
+
+/** Whether a host-authored diagnostic is the off-machine repair, so its
+ * disposition carries the queue edge instead of an argument repair. */
+export function isOffMachineCallNeedsCardRepair(diagnostic: string): boolean {
+  return diagnostic.includes(OFF_MACHINE_CALL_NEEDS_CARD_SENTENCE);
+}
+
+/**
+ * What the model is told when a command that leaves this machine was sent
+ * through the work carrier: the one door is the owner's card, which shows the
+ * exact command and runs it once on approval. The command is repeated so the
+ * queued payload is the same bytes the model already chose.
+ */
+export function offMachineCallNeedsCardRepair(carrierName: string, toolName: string, toolArgs: unknown): string {
+  let exactArgs = '';
+  try {
+    const encoded = JSON.stringify(toolArgs);
+    if (encoded && encoded.length <= 2000) exactArgs = ` Its exact arguments were ${encoded}.`;
+  } catch { /* the model still holds the arguments it sent */ }
+  return `Tool '${carrierName}' was refused before dispatch: this ${toolName} call ${OFF_MACHINE_CALL_NEEDS_CARD_SENTENCE}`
+    + ' No local or external change was attempted.'
+    + exactArgs
+    + ` Queue it ONCE: call_tool with name "pending_action_queue" and args_json holding kind "shell_command", toolName "${toolName}", `
+    + 'payloadJson set to exactly those same arguments as a JSON string, a short title, a one-sentence summary of what it changes and where, '
+    + 'and approvalIntent "request_now". Then end the turn with one sentence saying the command is waiting for approval. '
+    + 'After approval the harness runs that exact command once and reports the result; do not run it yourself, do not retry it through '
+    + `${carrierName}, and do not call pending_action_execute.`;
 }
 
 export function hostLiteralOperationNotFrozenBlockedText(operationId: string): string {

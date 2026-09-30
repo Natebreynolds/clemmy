@@ -27,9 +27,12 @@ const {
 } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const {
+  getPendingAction,
   markPendingActionApprovalResolved,
   queuePendingAction,
 } = await import('./pending-actions.js');
+const { _setApprovedCallDispatchForTests } = await import('../../execution/pending-action-executor.js');
+const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { HarnessSession } = await import('./session.js');
 const {
   handleResolvedApprovalForChatResume,
@@ -152,7 +155,7 @@ test('parked resume reuses the exact visible approval-response source instead of
     type: 'user_input_received',
     data: { text: 'newer unrelated message' },
   });
-  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'test').row!;
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
   let source: { sourceUserSeq: number; displayMessage: string } | undefined;
 
   assert.equal(await handleResolvedApprovalForChatResume(
@@ -208,7 +211,7 @@ test('a resolution committed before listener registration is drained from durabl
 test('restart drain reuses the exact source after a crash before dispatch handoff', async () => {
   const sess = createSession({ kind: 'chat' });
   const row = parkApproval(sess.id);
-  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'test').row!;
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
   let firstSource = 0;
   let firstAttempt = '';
 
@@ -242,7 +245,7 @@ test('restart drain reuses the exact source after a crash before dispatch handof
 test('restart drain never re-dispatches an approval source with a confirmed external write', async () => {
   const sess = createSession({ kind: 'chat' });
   const row = parkApproval(sess.id);
-  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'test').row!;
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
   let interruptedAttempt = '';
 
   assert.equal(await handleResolvedApprovalForChatResume(
@@ -338,21 +341,33 @@ test('sibling approvals resolved while the first resume is in flight are drained
   assert.match(directives[1], /proof_second/);
 });
 
-test('a parked pending-action card resumes through exact queued execution, not a reconstructed approval call', async () => {
+/** The provider stand-in for an approved linked action: records what was
+ * dispatched and answers as a provider would. */
+function recordingDispatch() {
+  const dispatched: Array<{ tool: string; payload: unknown; sessionId: string }> = [];
+  _setApprovedCallDispatchForTests(async (tool, payload, sessionId) => {
+    dispatched.push({ tool, payload, sessionId });
+    return { success: true, providerId: 'msg-proof-1' };
+  });
+  return dispatched;
+}
+test.afterEach(() => _setApprovedCallDispatchForTests(null));
+
+test('a parked pending-action card runs its exact stored action on approval, with no model turn', async () => {
   const sess = createSession({ kind: 'chat' });
   const action = queuePendingAction({
     title: 'Send the reviewed proof',
     summary: 'Send one exact reviewed payload.',
-    kind: 'external_send',
-    toolName: 'composio_execute_tool',
-    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    kind: 'shell_command',
+    toolName: 'run_shell_command',
+    payload: { command: 'git push origin main', cwd: '/tmp' },
     sessionId: sess.id,
   });
   const row = approvalRegistry.register({
     sessionId: sess.id,
     subject: 'Send the reviewed proof',
     tool: 'request_approval',
-    args: { pendingActionId: action.id },
+    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) },
   });
   appendEvent({
     sessionId: sess.id,
@@ -361,7 +376,8 @@ test('a parked pending-action card resumes through exact queued execution, not a
     type: 'approval_parked',
     data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id },
   });
-  const resolvedRow = approvalRegistry.resolve(row.approvalId, 'approved', 'test').row!;
+  const resolvedRow = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const dispatched = recordingDispatch();
   const directives: string[] = [];
 
   assert.equal(
@@ -371,10 +387,20 @@ test('a parked pending-action card resumes through exact queued execution, not a
     ),
     true,
   );
-  assert.equal(directives.length, 1);
-  assert.match(directives[0], /pending_action_execute once/);
-  assert.match(directives[0], new RegExp(action.id));
-  assert.doesNotMatch(directives[0], /re-run the approved tool call/i);
+  // The owner's decision is the whole instruction: the stored payload ran
+  // once, the model was not asked to re-issue or reconstruct anything.
+  assert.equal(directives.length, 0);
+  assert.equal(dispatched.length, 1, JSON.stringify(getPendingAction(action.id)));
+  assert.equal(dispatched[0].tool, 'run_shell_command');
+  assert.deepEqual(dispatched[0].payload, action.payload);
+  assert.equal(getPendingAction(action.id)?.status, 'executed');
+  const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
+    .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
+  assert.ok(resumeSource, 'the approval minted its own hidden control source');
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
+    .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
+  assert.ok(terminal, 'that source settled with what landed');
+  assert.match(JSON.stringify(terminal!.data), /Executed the approved run_shell_command call/);
 });
 
 test('an exact linked pending-action card resumes even if a crash lost approval_parked', async () => {
@@ -382,23 +408,23 @@ test('an exact linked pending-action card resumes even if a crash lost approval_
   const action = queuePendingAction({
     title: 'Crash-window send',
     summary: 'The exact linked card survives a missing park event.',
-    kind: 'external_send',
-    toolName: 'composio_execute_tool',
-    payload: { tool_slug: 'GMAIL_SEND_EMAIL', arguments: { to: 'proof@example.com' } },
+    kind: 'shell_command',
+    toolName: 'run_shell_command',
+    payload: { command: 'git push origin main', cwd: '/tmp' },
     sessionId: sess.id,
   });
   const row = approvalRegistry.register({
     sessionId: sess.id,
     subject: action.title,
     tool: 'request_approval',
-    args: { pendingActionId: action.id },
+    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) },
   });
   const resolvedAt = new Date().toISOString();
   openEventLog().prepare(`
     UPDATE pending_approvals
        SET status = 'resolved',
            resolution = 'approved',
-           resolver = 'crash-recovery-test',
+           resolver = 'desktop-chat-card',
            resolved_at = ?
      WHERE approval_id = ?
   `).run(resolvedAt, row.approvalId);
@@ -406,6 +432,7 @@ test('an exact linked pending-action card resumes even if a crash lost approval_
   const resolved = approvalRegistry.get(row.approvalId)!;
   assert.equal(listEvents(sess.id, { types: ['approval_parked'] }).length, 0);
 
+  const dispatched = recordingDispatch();
   const directives: string[] = [];
   assert.equal(
     await handleResolvedApprovalForChatResume(
@@ -414,9 +441,10 @@ test('an exact linked pending-action card resumes even if a crash lost approval_
     ),
     true,
   );
-  assert.equal(directives.length, 1);
-  assert.match(directives[0], new RegExp(action.id));
-  assert.match(directives[0], /pending_action_execute once/);
+  assert.equal(directives.length, 0);
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].payload, action.payload);
+  assert.equal(getPendingAction(action.id)?.status, 'executed');
 });
 
 test('an approved run_batch card resumes through its deterministic batch executor', async () => {
@@ -448,7 +476,7 @@ test('an approved run_batch card resumes through its deterministic batch executo
     type: 'approval_parked',
     data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id },
   });
-  const resolvedRow = approvalRegistry.resolve(row.approvalId, 'approved', 'test').row!;
+  const resolvedRow = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
   const directives: string[] = [];
 
   assert.equal(

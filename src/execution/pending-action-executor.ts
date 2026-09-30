@@ -60,6 +60,13 @@ const defaultDispatch: ApprovedCallDispatch = (toolName, payload, sessionId, cer
     executionCapability,
   );
 
+/** A test's stand-in for the provider dispatch on paths that own their own
+ * executor call (an approval resume). Inert in every non-test process. */
+let dispatchOverrideForTests: ApprovedCallDispatch | null = null;
+export function _setApprovedCallDispatchForTests(dispatch: ApprovedCallDispatch | null): void {
+  dispatchOverrideForTests = dispatch;
+}
+
 /** Nominal local refusal for dispatcher implementations that can establish the
  * provider thunk was never invoked. Text returned from a dispatch is never
  * upgraded into this type: providers can echo local-looking marker prose after
@@ -230,7 +237,7 @@ export async function executeApprovedPendingActionCall(
   const claimedRecord = claim.record;
   const claimToken = claim.claimToken;
   const sessionId = opts.sessionId ?? claimedRecord.sessionId ?? '';
-  const dispatch = opts.dispatch ?? defaultDispatch;
+  const dispatch = opts.dispatch ?? dispatchOverrideForTests ?? defaultDispatch;
   try {
     // Legacy records may predate pending_action_queue's carrier rejection.
     // call_tool authority is turn-scoped (reachable/denied sets), so replaying
@@ -248,7 +255,9 @@ export async function executeApprovedPendingActionCall(
       pendingActionId: claimedRecord.id,
       payloadHash: claimedRecord.payloadHash,
       claimToken,
-      sourceUserSeq: opts.sourceUserSeq ?? 0,
+      // A conversational approval names the reply that carried it; a card
+      // approved outside any turn settles under the source that queued it.
+      sourceUserSeq: opts.sourceUserSeq ?? claimedRecord.sourceUserSeq ?? 0,
     });
     const outText = typeof out === 'string' ? out : JSON.stringify(out ?? '');
     const structuredFailure = detectStructuredToolFailure(outText);

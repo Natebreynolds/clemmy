@@ -40,6 +40,7 @@ const {
 } = await import('./chat-approval-resume.js');
 const {
   executeApprovedPendingActionCall,
+  _setApprovedCallDispatchForTests,
 } = await import('../../execution/pending-action-executor.js');
 
 test.beforeEach(() => {
@@ -195,28 +196,25 @@ test('queue -> one card -> approve -> resume -> exact payload dispatches once', 
   assert.equal(getPendingAction(record.id)?.status, 'approved');
   assert.equal(getPendingAction(record.id)?.approvedBy, 'human');
 
-  const directives: string[] = [];
-  assert.equal(
-    await handleResolvedApprovalForChatResume(
-      resolved.row!,
-      async (_sessionId, directive) => { directives.push(directive); },
-    ),
-    true,
-  );
-  assert.equal(directives.length, 1);
-  assert.match(directives[0], new RegExp(record.id));
-  assert.match(directives[0], /pending_action_execute once/);
-  assert.match(directives[0], /Do not .*reconstruct the underlying call/i);
-
+  // The approval runs the stored payload itself: no directive, no model.
   const dispatched: Array<{ tool: string; payload: unknown; sessionId: string }> = [];
-  const executed = await executeApprovedPendingActionCall(record.id, {
-    sessionId: session.id,
-    dispatch: async (tool, payload, ownerSessionId) => {
-      dispatched.push({ tool, payload, sessionId: ownerSessionId });
-      return { success: true, providerId: 'msg-proof-1' };
-    },
+  _setApprovedCallDispatchForTests(async (tool, payload, ownerSessionId) => {
+    dispatched.push({ tool, payload, sessionId: ownerSessionId });
+    return { success: true, providerId: 'msg-proof-1' };
   });
-  assert.equal(executed.status, 'executed');
+  const directives: string[] = [];
+  try {
+    assert.equal(
+      await handleResolvedApprovalForChatResume(
+        resolved.row!,
+        async (_sessionId, directive) => { directives.push(directive); },
+      ),
+      true,
+    );
+  } finally {
+    _setApprovedCallDispatchForTests(null);
+  }
+  assert.equal(directives.length, 0);
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].tool, record.toolName);
   assert.deepEqual(dispatched[0].payload, record.payload);
