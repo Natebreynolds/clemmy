@@ -38,10 +38,21 @@ one of them can stop it:
 | Write a file | Create, append or overwrite inside the allowed folders. The bytes that were replaced are kept for recovery. A write to a credential or authority file always asks |
 | Look at a page | Renders an `.html` file in a hidden browser and returns the image. Reads only; follows the file-read rule |
 
-**Allowed folders.** The owner's home folder, Clem's own folder, the folder the
-service runs in, and the folders named in `WORKSPACE_DIRS`. The owner's
-approval setting decides how far this reaches: at its widest setting
-(the default) any path the owner's account can reach is allowed.
+**Allowed folders.** Any path the owner's account can reach, in both modes.
+The folder list (`WORKSPACE_DIRS`, the home folder, Clem's own folder) is a
+set of starting points offered to the model, not a wall; what stops a read or
+a write is the credential rule and the protection of Clem's own stores.
+
+## The two modes
+
+| Mode | What runs without asking | What asks |
+| --- | --- | --- |
+| Auto (default) | Anything that is not disruptive: local files, the shell, reads, ordinary changes in connected apps | A send, a delete, an irreversible or administrative change, one sealed bulk change, a command that leaves this machine |
+| Ask | Local files, the shell, reads | Everything Auto asks, plus an ordinary change in a connected app — once. The approval teaches that kind of change (the operation on that account, read from the receipt) and it runs next time. Kinds unused for sixty days are forgotten; the owner can see and forget them in Settings |
+
+The mode is the only approval setting the owner has. Run limits are fixed: a
+run stops for a terminal outcome, a gate, a stop, or zero progress, never for
+a ceiling.
 
 **Credential files** are recognised by name and location: `.env`, `auth.json`,
 the secrets vault and its index, the desktop tool-server configuration, Clem's
@@ -54,8 +65,8 @@ A shell command is sorted into one class by what it does.
 | Class | Examples | On a chat turn |
 | --- | --- | --- |
 | Reads and computation | `ls`, `cat`, `grep`, `git status`, builds, tests, running a script, a web GET | Runs through the work carrier |
-| Local change | `cp`, `mv`, `mkdir`, `rm`, `git commit`, package installs, output redirected to a file, a wrapped script that cannot be inspected | NOT YET: refused. No path exists to ask the owner |
-| Leaves the machine | a web POST, `git push`, a deploy, a publish | NOT YET: refused. No card is raised |
+| Local change | `cp`, `mv`, `mkdir`, `rm`, `git commit`, package installs, output redirected to a file, a wrapped script that cannot be inspected | Runs through the work carrier as ordinary local work: no plan, no card. The guards below still run |
+| Leaves the machine | a web POST, `git push`, a deploy, a publish | Never runs from the turn. The turn opens one card showing the exact command; approving it runs that command once and reports what landed. The guards below still run |
 
 Inside the tool, on every path, these always apply:
 
@@ -138,8 +149,8 @@ and carries none of Clem's keys.
 | Create or replace a file | `write_file`, prior bytes kept | Works |
 | Change part of a file | Only by replacing the whole file | Gap |
 | Shell: reads, builds, tests | Through the work carrier | Works |
-| Shell: local changes | | Not yet |
-| Shell: push, deploy, publish | | Not yet |
+| Shell: local changes | Through the work carrier, as ordinary local work | Works |
+| Shell: push, deploy, publish | One card with the exact command; runs on approval | Works |
 | Look at a rendered page | `page_preview` | Works |
 | Drive a real browser | | Not reachable on a chat turn |
 | Fetch a web page | `http_read` | Works |
@@ -158,6 +169,8 @@ and carries none of Clem's keys.
 | Clem's own stores | `src/tools/shell-state-protection.red.test.ts` |
 | What leaves the machine | `src/runtime/harness/destination-gate.test.ts` |
 | A read-class shell command runs under its own envelope and nothing else does | `src/tools/work-call.foreground-compute.test.ts` |
+| A local change runs as ordinary work with no card; reads keep their envelope; in-tool guards still refuse; off-machine is not carried | `src/runtime/harness/shell-local-change.integration.test.ts` |
+| An off-machine command is refused into one card whose preview is the command; approval runs it once; the tool's guards still refuse after approval | `src/runtime/harness/shell-off-machine-card.integration.test.ts` |
 | The shell is disclosed truthfully | `src/tools/tool-search-relevance.test.ts`, `src/tools/call-tool.test.ts` |
 | A file write without a card keeps its receipt | `src/runtime/harness/normal-native-write.integration.test.ts` |
 | Pages: listing, reading, policy, surfaces | `src/projects/local-pages.test.ts` |
@@ -165,6 +178,8 @@ and carries none of Clem's keys.
 | Page preview follows the file-read rule | `src/tools/page-preview-tools.test.ts` |
 | What a linked folder offers is names only | `src/projects/local-project-offers.test.ts` |
 | Coding agent policy | `src/execution/coding-run-policy.test.ts` |
+| Ask mode pauses an ordinary connected-app change once, the approval teaches the kind, Auto never asks | `src/runtime/harness/host-interactive-consent-direct.integration.test.ts` |
+| Learned kinds are visible and forgettable; run limits cannot be written | `src/dashboard/console-approved-write-kinds.test.ts` |
 
 Written from the source at `84e1c5149` on branch `claude/local-page-viewer`,
 2026-09-29. A guard that changes is changed here in the same commit.

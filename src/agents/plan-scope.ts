@@ -184,12 +184,31 @@ export interface SendTrustGrant {
   sourceProposalResolvedAt?: string;
 }
 
+/**
+ * A kind of change in a connected app the owner approved once in Ask mode:
+ * this operation on this account. It is read from the approved call's own
+ * receipt, never from a name compiled in. The same kind runs next time
+ * without a card; unused, it lapses.
+ */
+export interface ApprovedWriteKind {
+  operationId: string;
+  accountId: string | null;
+  approvalId: string;
+  grantedAt: string;
+  lastUsedAt: string;
+}
+
+/** An approved kind that has not been used for this long is forgotten. */
+const APPROVED_WRITE_KIND_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+
 interface ScopesFile {
   scopes: Record<string, PlanScope>; // keyed by sessionId
   /** Standing grants, keyed by toolName (B2). */
   grants?: Record<string, StandingGrant>;
   /** Scoped send-trust grants (2026-07-21). */
   sendTrust?: SendTrustGrant[];
+  /** Kinds of connected-app change approved once in Ask mode (2026-09-30). */
+  approvedWriteKinds?: ApprovedWriteKind[];
   version: 'v1';
 }
 
@@ -878,6 +897,76 @@ function appendSendTrustGrantUnlocked(
   file.sendTrust.push(grant);
   writeAll(file);
   return grant;
+}
+
+function sameWriteKind(kind: ApprovedWriteKind, operationId: string, accountId: string | null): boolean {
+  return kind.operationId === operationId && (kind.accountId ?? null) === (accountId ?? null);
+}
+
+function liveApprovedWriteKinds(file: ScopesFile, now: number): ApprovedWriteKind[] {
+  return (file.approvedWriteKinds ?? []).filter((kind) => {
+    const used = Date.parse(kind.lastUsedAt || kind.grantedAt);
+    return Number.isFinite(used) && now - used < APPROVED_WRITE_KIND_RETENTION_MS;
+  });
+}
+
+/** Whether the owner already approved this kind of change; a hit renews it. */
+export function hasApprovedWriteKind(operationId: string, accountId: string | null): boolean {
+  const exact = operationId.trim();
+  if (!exact) return false;
+  return withScopesStateMutation(() => {
+    const file = readAll();
+    const now = Date.now();
+    const live = liveApprovedWriteKinds(file, now);
+    const hit = live.find((kind) => sameWriteKind(kind, exact, accountId));
+    if (!hit) {
+      if (live.length !== (file.approvedWriteKinds ?? []).length) { file.approvedWriteKinds = live; writeAll(file); }
+      return false;
+    }
+    hit.lastUsedAt = new Date(now).toISOString();
+    file.approvedWriteKinds = live;
+    writeAll(file);
+    return true;
+  });
+}
+
+/** Remember that the owner approved this kind of change once. */
+export function recordApprovedWriteKind(input: { operationId: string; accountId: string | null; approvalId: string }): ApprovedWriteKind | null {
+  const exact = input.operationId.trim();
+  if (!exact) return null;
+  return withScopesStateMutation(() => {
+    const file = readAll();
+    const now = new Date().toISOString();
+    const live = liveApprovedWriteKinds(file, Date.now());
+    const existing = live.find((kind) => sameWriteKind(kind, exact, input.accountId));
+    if (existing) {
+      existing.lastUsedAt = now;
+      file.approvedWriteKinds = live;
+      writeAll(file);
+      return existing;
+    }
+    const kind: ApprovedWriteKind = { operationId: exact, accountId: input.accountId ?? null, approvalId: input.approvalId, grantedAt: now, lastUsedAt: now };
+    file.approvedWriteKinds = [...live, kind];
+    writeAll(file);
+    return kind;
+  });
+}
+
+/** Every kind still remembered, for the owner to see and forget. */
+export function listApprovedWriteKinds(): ApprovedWriteKind[] {
+  return liveApprovedWriteKinds(readAll(), Date.now());
+}
+
+export function forgetApprovedWriteKind(operationId: string, accountId: string | null): boolean {
+  return withScopesStateMutation(() => {
+    const file = readAll();
+    const before = file.approvedWriteKinds ?? [];
+    const after = before.filter((kind) => !sameWriteKind(kind, operationId, accountId));
+    if (after.length === before.length) return false;
+    file.approvedWriteKinds = after;
+    writeAll(file);
+    return true;
+  });
 }
 
 /**

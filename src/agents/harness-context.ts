@@ -88,17 +88,17 @@ export function renderAutonomy(): string {
     const scope = loadProactivityPolicy().autoApproveScope;
     if (scope === 'yolo') {
       return [
-        'YOLO — the user has granted STANDING APPROVAL for reversible work such as drafts, local files, workspace updates, and recoverable API writes. Irreversible external sends/posts/calls and destructive actions remain exceptions: they require one concrete human or certified grant at the execution gate.',
+        'AUTO MODE — the user has granted STANDING APPROVAL for reversible work such as drafts, local files, workspace updates, and recoverable API writes. Irreversible external sends/posts/calls and destructive actions remain exceptions: they require one concrete human or certified grant at the execution gate.',
         'Do NOT stop to ask permission for reversible work, do NOT add redundant approval steps, and do NOT use ask_user_question to seek sign-off on work already requested — just do it, then report what landed and any assumption you made. For an irreversible action, queue the exact payload and let the one approval card own the pause; never ask once in prose and again at the tool gate.',
         'You MAY still ask a genuine clarifying question when a fact cannot be inferred — set ask_user_question purpose:"clarification" for those. An approval-shaped ask auto-resolves only so the execution gate can apply the real policy; it is not permission to bypass an irreversible-action card.',
       ].join(' ');
     }
-    if (scope === 'workspace') {
-      return 'Workspace — actions on files/paths inside the user\'s workspace are pre-approved. Proceed on those without asking; still confirm before reaching outside the workspace or making irreversible external writes.';
-    }
     if (scope === 'strict') {
-      // Supervised / Approve (legacy 'balanced' is coerced to 'strict' on read).
-      return 'Supervised — get an explicit plan/approval from the user (request_approval) before any mutating or external-write action.';
+      // Ask (legacy 'balanced' and 'workspace' are read as strict).
+      return [
+        'ASK MODE — local work (files, the shell, reads) and anything non-disruptive runs without asking. A change in a connected app waits for the owner\'s approval the first time; the harness opens that one card itself, and the approval teaches that kind of change so it runs next time.',
+        'Do NOT add your own approval steps or ask in prose for work already requested: make the exact call and let the card own the pause. You MAY still ask a genuine clarifying question when a fact cannot be inferred — set ask_user_question purpose:"clarification" for those.',
+      ].join(' ');
     }
     return '';
   } catch {

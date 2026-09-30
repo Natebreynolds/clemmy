@@ -27,18 +27,16 @@ export type ProactivityMode = 'watch' | 'balanced' | 'hands_on';
 // effect-anchored recipient validation, the batch-send floor, and the
 // catastrophic-command denylist. Those are the always-on safety net.
 //
-// TWO user-facing postures (2026-07-20 simplification — the old four confused
-// users; strict and balanced were IDENTICAL on execution, so people just picked
-// YOLO):
-//   - 'yolo'  → "Autonomous" (DEFAULT). Reversible/local work runs without asking;
-//               irreversible sends still surface + are validated. Matches how people
-//               actually use it, made safe by the always-on send gate.
-//   - 'strict'→ "Supervised". Mutating shell/file writes need an explicit plan/approval.
-// The setting is a clean binary — Auto-approve ('yolo') vs Approve ('strict').
-// Legacy stored values are coerced on read (normalizeAutoApproveScope): the old
-// 'balanced' → 'strict' (it always behaved identically). 'workspace' survives as
-// a hidden power-user option (auto-approve inside WORKSPACE_DIRS) but is no longer
-// offered in the UI.
+// TWO modes, and the owner does not tune what is under them (2026-09-30):
+//   - 'yolo'  → "Auto" (DEFAULT). Anything that is not disruptive runs: local
+//               files, the shell, reads, ordinary writes in connected apps. A
+//               send, a delete, an irreversible or administrative change asks
+//               on one card in both modes.
+//   - 'strict'→ "Ask". Also asks before an ordinary change in a connected app,
+//               once: the approval teaches that kind of change (the operation
+//               on that account), so it runs next time. Local work never asks.
+// The stored values keep their old spellings so nothing durable rewrites.
+// Legacy 'balanced' and the retired 'workspace' read as Ask.
 export type AutoApproveScope = 'strict' | 'workspace' | 'yolo';
 
 export interface ProactivityPolicy {
@@ -170,11 +168,11 @@ function normalizeMode(value: unknown): ProactivityMode {
 }
 
 function normalizeAutoApproveScope(value: unknown): AutoApproveScope {
-  // The binary + the one surviving legacy value.
-  if (value === 'yolo' || value === 'strict' || value === 'workspace') return value;
-  // Legacy 'balanced' always behaved identically to strict — coerce it.
-  if (value === 'balanced') return 'strict';
-  // Unknown / corrupt field → fail safe to Supervised (a fresh install gets the
+  if (value === 'yolo' || value === 'strict') return value;
+  // Legacy 'balanced' always behaved identically to strict, and the retired
+  // 'workspace' option was a narrower Auto: both read as Ask.
+  if (value === 'balanced' || value === 'workspace') return 'strict';
+  // Unknown / corrupt field → fail safe to Ask (a fresh install gets the
   // 'yolo' default from DEFAULT_PROACTIVITY_POLICY, not this fallback).
   return 'strict';
 }

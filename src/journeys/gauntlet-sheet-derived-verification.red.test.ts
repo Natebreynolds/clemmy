@@ -236,7 +236,9 @@ export async function runTurn(options: TurnOptions): Promise<TurnResult> {
   // capability that this case never disclosed and turn the no-verifier oracle
   // into a stale-definition failure instead of the intended admission refusal.
   capabilityCatalogs.installHostCapabilityCatalogFactory(null);
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
   const session = options.resetDurableState === false
     ? eventlog.getSession(options.sessionId)

@@ -4141,6 +4141,59 @@ export async function runConversationContinuingPastToolCallsLimit(
   return result;
 }
 
+/**
+ * Open the one formal card for every action this request queued with
+ * request_now (or asked to approve in its reply), exactly as the legacy core
+ * does after its own turn. Returns the result re-shaped as awaiting approval,
+ * or null when nothing was materialized.
+ */
+function materializeHostQueuedApprovals(
+  sessionId: string,
+  turn: number,
+  sourceUserSeq: number,
+  result: RunConversationResult,
+): { result: RunConversationResult; approvalId: string } | null {
+  const transitions = queuedApprovalTransitionsForRequest(sessionId, sourceUserSeq);
+  if (transitions.length === 0) return null;
+  const replyText = result.lastDecision?.reply || result.lastDecision?.summary;
+  const approvalQuestion = isQueuedActionApprovalQuestion(replyText)
+    || (result.lastDecision?.nextAction === 'awaiting_approval' && !isDirectionSeekingQuestion(replyText));
+  const eligible = transitions.filter((transition) => (
+    queuedApprovalTransitionShouldMaterialize(transition, approvalQuestion)
+  ));
+  if (eligible.length === 0) return null;
+  const materialized = materializeQueuedApprovals(sessionId, turn, sourceUserSeq, eligible);
+  if (materialized.length === 0) return null;
+  for (const item of materialized) {
+    safeAppend({
+      sessionId,
+      turn,
+      role: 'system',
+      type: 'heartbeat',
+      data: {
+        kind: 'pending_action_transition_materialized',
+        pendingActionId: item.transition.record.id,
+        approvalId: item.approval.approvalId,
+        sourceEventSeq: item.transition.eventSeq,
+        approvalIntent: item.transition.approvalIntent,
+        autoMaterialize: item.transition.autoMaterialize,
+        message: 'Materialized the exact queued-action approval edge without another model turn.',
+      },
+    });
+  }
+  const lastDecision = result.lastDecision
+    ? { ...result.lastDecision, done: false, nextAction: 'awaiting_approval' as const }
+    : undefined;
+  return {
+    approvalId: materialized[0]!.approval.approvalId,
+    result: {
+      ...result,
+      status: 'awaiting_approval',
+      ...(lastDecision ? { lastDecision } : {}),
+    },
+  };
+}
+
 function hostActivationConversationResult(
   turnResult: RunTurnResult,
   sourceUserSeq?: number,
@@ -6866,10 +6919,22 @@ async function runConversationWithinRuntimeConfig(
           lastTurn: turnResult.turn,
         });
       }
+      // A QUEUED ACTION'S CARD IS OPENED BY THE TURN, ON EVERY LANE.
+      //
+      // The legacy core and the Claude brain both turn a request_now queue
+      // record into the one formal approval card before the turn settles.
+      // This branch returned first, so on the host engine the record stayed
+      // inert and the model's promise ("the harness will open the card now")
+      // was never kept: a command that leaves the machine was queued and
+      // then nothing happened.
+      const hostQueuedCard = zeroToolTurnAuthority
+        ? null
+        : materializeHostQueuedApprovals(options.sessionId, turnResult.turn, sourceUserSeq, result);
       const reduced = reduceStandardConversationTerminal({
-        result,
+        result: hostQueuedCard?.result ?? result,
         sourceUserSeq,
         agent: activeAgent,
+        ...(hostQueuedCard ? { approvalIdHint: hostQueuedCard.approvalId } : {}),
         ...(options.deferToolCallsLimitTerminal ? { deferToolCallsLimitTerminal: true as const } : {}),
       });
       if (reduced.publicPresentation) {

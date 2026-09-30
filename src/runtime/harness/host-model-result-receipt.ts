@@ -160,6 +160,7 @@ const NEXT_EDGE_CHANGES = new Set<NextEdgeChange>([
   'publish_partial',
   'ask_user',
   'choose_other_capability',
+  'queue_for_approval',
 ]);
 
 function parseHostNextEdge(value: unknown): HostNextEdgeV1 | undefined {

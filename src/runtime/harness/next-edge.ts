@@ -51,7 +51,10 @@ export type NextEdgeChange =
   /** Only the user can supply the missing fact. */
   | 'ask_user'
   /** This exact capability cannot serve; a different one must. */
-  | 'choose_other_capability';
+  | 'choose_other_capability'
+  /** The call is right but needs the owner's decision: queue it once with the
+   * same arguments so the turn opens the card, then stop. */
+  | 'queue_for_approval';
 
 export interface NextEdgeFieldV1 {
   /** JSON-pointer-ish path into the tool's own arguments. */
@@ -79,6 +82,7 @@ const DEFAULT_SAY: Record<NextEdgeChange, string> = {
   publish_partial: 'The work is unresolved — publish the honest partial with its gaps named rather than gathering more.',
   ask_user: 'Ask the user this one exact question; it cannot be discovered.',
   choose_other_capability: 'This exact capability cannot serve this step — select a different one.',
+  queue_for_approval: 'Queue this exact call once with pending_action_queue (same tool, same arguments, approvalIntent request_now), then stop for the owner\'s card. Do not retry the call itself.',
 };
 
 /** Build an edge. `say` is derived unless the caller knows something better;

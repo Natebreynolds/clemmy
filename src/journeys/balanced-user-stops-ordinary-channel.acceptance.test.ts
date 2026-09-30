@@ -53,7 +53,10 @@ writeFileSync(path.join(HOME, 'state', 'auth.json'), JSON.stringify({
   },
 }));
 writeFileSync(path.join(HOME, 'state', 'proactivity-policy.json'), JSON.stringify({
-  autoApproveScope: 'strict',
+  // Auto mode (2026-09-30): Ask mode adds one typed approval stop the first
+  // time a kind of connected-app change is made; this corpus pins the stops
+  // that exist in both modes.
+  autoApproveScope: 'yolo',
 }));
 
 const { Usage } = await import('@openai/agents');

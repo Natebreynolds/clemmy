@@ -313,7 +313,7 @@ export function inheritedNestedHarnessContext(sessionId: string, exactHostAdmiss
   };
 }
 
-async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean, localToolOverride?: InvokableTool): Promise<unknown> {
+async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: string, callId: string, counter?: ToolCallsCounter, certifiedBatch?: { batchId: string; payloadHash: string }, batchItem?: boolean, localToolOverride?: InvokableTool, pendingActionExecution?: PendingActionExecutionCapability): Promise<unknown> {
   const real = localToolOverride ?? (await realToolsByName()).get(method);
   if (real?.name !== method) throw new Error('inner-dispatch: configured local tool identity mismatch');
   if (!real || typeof real.invoke !== 'function') {
@@ -384,7 +384,18 @@ async function dispatchInnerLocalTool(method: string, args: unknown, sessionId: 
     }
   }
   const wrapped = wrapToolForHarness(real as never) as InvokableTool;
-  const inheritedContext = inheritedNestedHarnessContext(sessionId, exactHostAdmission, batchItem === false ? callId : undefined);
+  // An approved pending action names the accepted source it was queued for.
+  // The owner's approval arrives with no ambient turn (a card button, a
+  // conversational yes settled outside the model), so the local lane takes
+  // that identity from the approval itself, as the MCP lane already does;
+  // without it a local tool's attempt could not settle and the approved
+  // command never ran.
+  const inheritedContext = {
+    ...inheritedNestedHarnessContext(sessionId, exactHostAdmission, batchItem === false ? callId : undefined),
+    ...(pendingActionExecution?.sourceUserSeq
+      ? { sourceUserSeq: pendingActionExecution.sourceUserSeq }
+      : {}),
+  };
   // Local SDK adapters reopen source identity from RunContext, not just ALS.
   // Carry the same accepted source into both contexts; otherwise the adapter
   // overwrites the exact bracket context with sourceUserSeq:undefined and a
@@ -569,7 +580,7 @@ export async function dispatchBatchItemTool(
           pendingActionExecution,
           exactMcpRequiresNestedAdmission,
         )
-      : await dispatchInnerLocalTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem, localToolOverride);
+      : await dispatchInnerLocalTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem, localToolOverride, pendingActionExecution);
     const ok = toolOutputLooksSuccessful(out);
     try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: batchItem, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;

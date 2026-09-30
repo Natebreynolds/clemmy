@@ -62,12 +62,10 @@ test('a partial save MERGES — a later patch that omits inboxWatchEnabled keeps
   assert.equal(merged.inboxWatchMinutes, 20);
 });
 
-test('autoApproveScope is a clean binary: legacy "balanced" coerces to strict; unknown → strict', () => {
-  // The setting is Auto-approve (yolo) vs Approve (strict); 'balanced' was a
-  // pure alias of strict and is coerced on read so the internals match the UI.
+test('autoApproveScope is two modes: Auto (yolo) or Ask (strict); legacy "balanced" and the retired "workspace" read as Ask; unknown → Ask', () => {
   assert.equal(saveProactivityPolicy({ autoApproveScope: 'balanced' }).autoApproveScope, 'strict');
   assert.equal(saveProactivityPolicy({ autoApproveScope: 'yolo' }).autoApproveScope, 'yolo');
   assert.equal(saveProactivityPolicy({ autoApproveScope: 'strict' }).autoApproveScope, 'strict');
-  assert.equal(saveProactivityPolicy({ autoApproveScope: 'workspace' }).autoApproveScope, 'workspace');
+  assert.equal(saveProactivityPolicy({ autoApproveScope: 'workspace' }).autoApproveScope, 'strict');
   assert.equal(saveProactivityPolicy({ autoApproveScope: 'nonsense' }).autoApproveScope, 'strict');
 });

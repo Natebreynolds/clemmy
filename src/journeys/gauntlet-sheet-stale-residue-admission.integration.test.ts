@@ -312,7 +312,9 @@ after(async () => {
 test('S1-residue: stale process-wide catalog residue must not sink a same-turn-disclosed sheet write', { timeout: 120_000 }, async () => {
   eventlog.resetEventLog();
   resetHarnessRuntimeConfig();
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
   const session = eventlog.createSession({
     id: 'discord-gauntlet-sheet-stale-residue',
@@ -638,7 +640,9 @@ const SURVIVES_RESIDUE_SLUGS = [
 test('S2-residue-survives: registering the selected write must not evict unrelated stale residue from the live factory', { timeout: 120_000 }, async () => {
   eventlog.resetEventLog();
   resetHarnessRuntimeConfig();
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
   const session = eventlog.createSession({
     id: 'discord-gauntlet-sheet-stale-residue-survives',
@@ -959,7 +963,9 @@ const LIVE_PUBLISHED_RESIDUE_SLUGS = [
 test('S3-live-catalog-published: a write selected straight off the live catalog (never staged this turn) still lands in the frozen snapshot', { timeout: 180_000 }, async () => {
   eventlog.resetEventLog();
   resetHarnessRuntimeConfig();
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
   const configured = await configureHarnessRuntime();
   assert.equal(configured.ok, true, configured.ok ? '' : configured.reason);

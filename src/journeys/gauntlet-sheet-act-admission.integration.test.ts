@@ -174,7 +174,9 @@ after(async () => {
 test('S1 prompt: prep-frozen turn still admits and dispatches the same-turn-disclosed sheet write', { timeout: 120_000 }, async () => {
   eventlog.resetEventLog();
   resetHarnessRuntimeConfig();
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
   const session = eventlog.createSession({
     id: 'discord-gauntlet-sheet-admission',
@@ -493,7 +495,9 @@ test('read surface: an exact disclosed read is admitted through the business car
     required: ['query'],
     properties: { query: { type: 'string' } },
   });
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
   const session = eventlog.createSession({
     id: 'discord-gauntlet-drive-read',
     kind: 'chat',

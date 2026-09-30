@@ -79,14 +79,15 @@ test('page_preview refuses what read_file would refuse, and anything that is not
   }
 });
 
-test('page_preview reads only where the owner lets files be read', async () => {
+test('page_preview follows the file-read rule in both modes: no folder wall, credential files refused', async () => {
   const { loadProactivityPolicy, saveProactivityPolicy } = await import('../agents/proactivity-policy.js');
   const before = loadProactivityPolicy().autoApproveScope;
-  saveProactivityPolicy({ autoApproveScope: 'workspace' });
+  saveProactivityPolicy({ autoApproveScope: 'strict' });
   try {
-    const refused = await tool().invoke(context(), JSON.stringify({ path: '/etc/hosts.html' }));
-    assert.ok(refused instanceof HostLocalExecutionFailureResult);
-    assert.match(JSON.stringify(refused), /outside allowed workspace roots/);
+    const outside = await tool().invoke(context(), JSON.stringify({ path: '/etc/hosts.html' }));
+    assert.doesNotMatch(JSON.stringify(outside), /outside allowed workspace roots/, 'a path is never refused for where it is');
+    const credential = await tool().invoke(context(), JSON.stringify({ path: path.join(dir, '.env') }));
+    assert.ok(credential instanceof HostLocalExecutionFailureResult);
   } finally {
     saveProactivityPolicy({ autoApproveScope: before });
   }

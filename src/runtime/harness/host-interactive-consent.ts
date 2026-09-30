@@ -71,6 +71,8 @@ import {
   currentCapabilityManifest,
 } from './capability-manifest.js';
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
+import { hasApprovedWriteKind, recordApprovedWriteKind } from '../../agents/plan-scope.js';
+import { loadProactivityPolicy } from '../../agents/proactivity-policy.js';
 import {
   loadHostCallCapabilityBinding,
   hostCallCapabilityBindingMatchesAttestation,
@@ -380,6 +382,7 @@ function mintHostConsentGrantAdmission(input: {
   consentSubject: HostInteractiveConsentSubjectV1;
   durableApproval: NonNullable<Parameters<typeof evaluatePreparedHostWorkCallConsent>[0]['durableApproval']>;
   userGrant: ExactUserGrantV1;
+  consentMode?: { mode: 'auto' | 'ask'; learnedExternalWrite: boolean };
 }): HostConsentGrantAdmissionV1 | null {
   try {
     if (
@@ -426,6 +429,7 @@ function mintHostConsentGrantAdmission(input: {
       || input.consentSubject.coverageDigest !== digest(input.coverage)
       || input.consentSubject.riskDigest !== digest(input.call.risk)
     ) return null;
+    const consentMode = input.consentMode ?? consentModeForCall(input.call);
     const currentUngrantedDecision = evaluateInteractiveConsentV1({
       call: input.call,
       coverage: input.coverage,
@@ -433,6 +437,7 @@ function mintHostConsentGrantAdmission(input: {
       readiness: { kind: 'ready' },
       crossing: input.crossing,
       reservationAlreadyClaimed: input.reservationAlreadyClaimed,
+      ...consentMode,
     });
     const currentDecisionSubjectDigest = currentUngrantedDecision.kind === 'needs_user'
       && currentUngrantedDecision.need === 'approval'
@@ -458,6 +463,7 @@ function mintHostConsentGrantAdmission(input: {
       readiness: { kind: 'ready' },
       crossing: input.crossing,
       reservationAlreadyClaimed: input.reservationAlreadyClaimed,
+      ...consentMode,
     });
     if (
       reproduced.kind !== 'proceed'
@@ -718,9 +724,13 @@ function localRisk(definition: AuthorizedLocalPlanningDefinitionV1, args: unknow
   }
   const posture = definition.descriptor.destinationPosture;
   return {
+    // Ordinary local work is named as what it is. It proceeds as ordinary
+    // accepted work, never as work that can be undone.
     reversibility: definition.reversibility === 'irreversible'
       ? 'irreversible'
-      : 'reversible',
+      : definition.reversibility === 'ordinary_non_destructive'
+        ? 'ordinary_non_destructive'
+        : 'reversible',
     consequence: posture === 'create_new'
       ? 'create'
       : posture === 'named_existing'
@@ -1151,6 +1161,20 @@ function planPreparationProbe(identity: { sessionId: string; sourceUserSeq: numb
 }
 
 /** Pause and resume reduce the same exact evidence and durable approval. */
+/**
+ * The owner's mode and, in Ask mode, whether this kind of connected-app
+ * change was approved before. Local work never consults it. The scope value
+ * stays as stored: Auto is the widest scope, everything narrower is Ask.
+ */
+function consentModeForCall(call: CapabilityRiskAttestationV1): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean } {
+  let mode: 'auto' | 'ask' = 'auto';
+  try { mode = loadProactivityPolicy().autoApproveScope === 'yolo' ? 'auto' : 'ask'; } catch { mode = 'auto'; }
+  if (mode === 'auto' || call.effect !== 'external_write') return { mode, learnedExternalWrite: false };
+  let learned = false;
+  try { learned = hasApprovedWriteKind(call.operationId, call.accountId); } catch { learned = false; }
+  return { mode, learnedExternalWrite: learned };
+}
+
 function reduceHostConsentEvidence(input: {
   identity: Parameters<typeof exactConsentSubject>[0]['prepared'];
   call: CapabilityRiskAttestationV1;
@@ -1161,9 +1185,10 @@ function reduceHostConsentEvidence(input: {
 }) {
   const { call, coverage, crossing, reservationAlreadyClaimed } = input;
   const preparationProbe = planPreparationProbe(input.identity);
+  const consentMode = consentModeForCall(call);
   const ungrantedDecision = evaluateInteractiveConsentV1({
     call, coverage, userGrant: null, readiness: { kind: 'ready' },
-    crossing, reservationAlreadyClaimed, preparationProbe,
+    crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode,
   });
   const consentSubject = exactConsentSubject({
     prepared: input.identity, call, coverage,
@@ -1178,9 +1203,21 @@ function reduceHostConsentEvidence(input: {
     ? { kind: 'repair', reason: 'scope_mismatch' }
     : userGrant ? evaluateInteractiveConsentV1({
         call, coverage, userGrant, readiness: { kind: 'ready' },
-        crossing, reservationAlreadyClaimed, preparationProbe,
+        crossing, reservationAlreadyClaimed, preparationProbe, ...consentMode,
       }) : ungrantedDecision;
-  return { decision, consentSubject, userGrant };
+  // The approval teaches. A pause that was Ask mode's, and nothing riskier,
+  // is remembered by the operation and account the receipt names, so the
+  // same kind of change runs next time without a card. Both consent paths
+  // (a graph-bound work_call and a direct call) pass through here.
+  if (
+    input.durableApproval && decision.kind === 'proceed' && decision.basis === 'exact_user_grant'
+    && ungrantedDecision.kind === 'needs_user' && ungrantedDecision.teaches === 'external_write_kind'
+  ) {
+    try {
+      recordApprovedWriteKind({ operationId: call.operationId, accountId: call.accountId, approvalId: input.durableApproval.approvalId });
+    } catch { /* the grant stands; learning is best effort */ }
+  }
+  return { decision, consentSubject, userGrant, consentMode, ungrantedDecision };
 }
 
 /** Evaluate a fully materialized plan-bound work_call. */
@@ -1287,7 +1324,7 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     reservationKey: reservationKey({ prepared, cardinality }),
   }) });
   const reservationAlreadyClaimed = priorReservationExists(prepared);
-  const { decision, consentSubject, userGrant } = reduceHostConsentEvidence({
+  const { decision, consentSubject, userGrant, consentMode } = reduceHostConsentEvidence({
     identity: prepared, call, coverage, crossing, reservationAlreadyClaimed,
     durableApproval: input.durableApproval,
   });
@@ -1322,6 +1359,7 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
         consentSubject,
         durableApproval: input.durableApproval,
         userGrant,
+        consentMode,
       })
     : null;
   if (decision.basis === 'exact_user_grant' && !exactGrantAdmission) {
@@ -1591,6 +1629,7 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       sessionId: attestation.sessionId,
       sourceUserSeq: attestation.sourceUserSeq,
     }),
+    ...consentModeForCall(call),
   });
   return { status: 'decided', decision, call, coverage };
 }

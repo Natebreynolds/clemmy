@@ -20,6 +20,19 @@ export const addSendTrust = (body: { domains?: string[]; recipients?: string[]; 
 export const revokeSendTrust = (id: string) =>
   apiDelete<{ revoked: boolean }>(`/api/console/send-trust/${encodeURIComponent(id)}`);
 
+// ─── Kinds of change approved once in Ask mode ──────────────────────────────
+export interface ApprovedWriteKind {
+  operationId: string;
+  accountId: string | null;
+  approvalId: string;
+  grantedAt: string;
+  lastUsedAt: string;
+}
+export const listApprovedWriteKinds = () =>
+  apiGet<{ kinds: ApprovedWriteKind[] }>('/api/console/approved-write-kinds');
+export const forgetApprovedWriteKind = (kind: { operationId: string; accountId: string | null }) =>
+  api<{ forgotten: boolean }>('/api/console/approved-write-kinds', { method: 'DELETE', body: JSON.stringify(kind) });
+
 export interface UserProfile {
   displayName?: string;
   preferredName?: string;
@@ -257,8 +270,6 @@ export const patchProfile = (p: Partial<UserProfile>) =>
   patch<{ profile: UserProfile }>('/api/console/settings/profile', p);
 export const patchPolicy = (p: Partial<Policy>) =>
   patch<{ policy: Policy }>('/api/console/settings/policy', p);
-export const patchBudget = (p: Partial<BudgetSettings>) =>
-  patch<{ runtimeBudget: BudgetSettings }>('/api/console/settings/runtime-budget', p);
 export const patchModels = (p: Partial<ModelTriple>) =>
   patch<{ models: ModelsSnapshot }>('/api/console/settings/models', p);
 export const patchCodexRescueModel = (p: { modelId?: string; clear?: boolean }) =>

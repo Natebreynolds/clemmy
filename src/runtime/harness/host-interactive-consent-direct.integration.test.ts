@@ -268,3 +268,59 @@ for (const kind of ['draft', 'send', 'delete', 'admin', 'unknown'] as const) {
       .get(request.attestation.sessionId) as { n: number }).n, 0);
   });
 }
+
+test('Ask mode: an ordinary connected-app change asks once, the approval teaches the kind, and Auto never asks', async () => {
+  const policy = await import('../../agents/proactivity-policy.js');
+  const scopes = await import('../../agents/plan-scope.js');
+  policy.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  try {
+    // First time: the draft is ordinary work, and Ask mode pauses it once.
+    const first = await exactCall('draft');
+    assert.equal(first.result.status, 'decided', JSON.stringify(first.result));
+    if (first.result.status !== 'decided') return;
+    assert.equal(first.result.decision.kind, 'needs_user', JSON.stringify(first.result.decision));
+    if (first.result.decision.kind !== 'needs_user') return;
+    assert.equal(first.result.decision.teaches, 'external_write_kind');
+    assert.ok(first.result.consentSubject);
+    assert.equal(scopes.listApprovedWriteKinds().length, 0);
+
+    // The owner approves that exact card: the call proceeds and the kind is learned.
+    const subject = first.result.consentSubject!;
+    const request = first.request;
+    const approval = approvals.registerResumable({ sessionId: request.attestation.sessionId,
+      subject: 'Approve this change.', tool: request.attestation.toolName, args: request.args,
+      resumeKey: consent.hostInteractiveConsentApprovalResumeKey(subject)! }).row;
+    assert.equal(approvals.resolve(approval.approvalId, 'approved', 'direct-consent-test').ok, true);
+    const approved = await consent.evaluateUncoveredHostMutationConsent({ ...request, durableApproval: {
+      approvalId: approval.approvalId, persistedSubject: subject,
+      outerToolName: request.attestation.toolName, outerRawArguments: JSON.stringify(request.args) } });
+    assert.equal(approved.status, 'decided', JSON.stringify(approved));
+    if (approved.status !== 'decided') return;
+    assert.equal(approved.decision.kind === 'proceed' ? approved.decision.basis : null, 'exact_user_grant');
+    const learned = scopes.listApprovedWriteKinds();
+    assert.equal(learned.length, 1, JSON.stringify(learned));
+    assert.equal(learned[0]!.operationId, 'EXAMPLE_CREATE_DRAFT');
+    assert.equal(learned[0]!.accountId, 'account:direct:owner');
+
+    // Next time, the same kind runs without a card.
+    const second = await exactCall('draft');
+    assert.equal(second.result.status, 'decided');
+    if (second.result.status !== 'decided') return;
+    assert.equal(second.result.decision.kind === 'proceed' ? second.result.decision.basis : second.result.decision.kind, 'exact_reversible_work');
+
+    // A send still asks in Ask mode, and its pause is its own risk, not the mode's.
+    const send = await exactCall('send');
+    assert.equal(send.result.status === 'decided' ? send.result.decision.kind : null, 'needs_user');
+    assert.equal(send.result.status === 'decided' && send.result.decision.kind === 'needs_user' ? send.result.decision.teaches : 'x', undefined);
+
+    // Forgetting the kind brings the pause back.
+    assert.equal(scopes.forgetApprovedWriteKind('EXAMPLE_CREATE_DRAFT', 'account:direct:owner'), true);
+    const third = await exactCall('draft');
+    assert.equal(third.result.status === 'decided' ? third.result.decision.kind : null, 'needs_user');
+  } finally {
+    policy.saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  }
+  // Auto: the same draft proceeds, as before.
+  const auto = await exactCall('draft');
+  assert.equal(auto.result.status === 'decided' && auto.result.decision.kind === 'proceed' ? auto.result.decision.basis : null, 'exact_reversible_work');
+});

@@ -1,4 +1,6 @@
 import { classifyExternalWrite } from './confirm-first-gate.js';
+import { classifyRuntimeToolEffect } from './tool-effect.js';
+import { isEffectDecidedPerCall } from '../../tools/tool-registry.js';
 
 export interface PendingActionSafetyInput {
   kind: string;
@@ -65,6 +67,14 @@ function baseRequiresHumanApproval(action: PendingActionSafetyInput): boolean {
     // An aggregate write whose actual external carrier is malformed or unknown
     // cannot inherit policy approval from model metadata.
     return plan.sideEffect !== 'read';
+  }
+
+  // A tool whose effect is decided per call is judged by the call it carries:
+  // a command that leaves this machine is approved by the owner, whatever
+  // kind the model wrote beside it.
+  if (isEffectDecidedPerCall(action.toolName)
+    && classifyRuntimeToolEffect(action.toolName, action.payload).effect === 'external_write') {
+    return true;
   }
 
   const effect = classifyExternalWrite(action.toolName, action.payload);

@@ -1531,9 +1531,9 @@ function replayedLocalPlanningDefinition(value: unknown): AuthorizedLocalPlannin
       && safeMode === null
       && descriptor.destinationPosture === null
     : descriptor.effect === 'local_write'
-      && ['local_artifact', 'workspace_definition', 'workflow_definition', 'runtime_configuration']
+      && ['local_artifact', 'workspace_definition', 'workflow_definition', 'runtime_configuration', 'local_execution']
         .includes(String(row.consequence))
-      && ['reversible', 'create_only', 'irreversible'].includes(String(row.reversibility))
+      && ['reversible', 'create_only', 'irreversible', 'ordinary_non_destructive'].includes(String(row.reversibility))
       && (row.reversibility !== 'irreversible' || (safeMode !== null && typeof safeMode === 'object'));
   if (!localShape) return null;
   return {
@@ -3937,6 +3937,19 @@ export async function prepareDurableAcceptedTurnCompile(
   };
 }
 
+/** The hidden control source an approval resume mints: synthetic, and named
+ * as such. Only that exact shape is compiled without the semantic port. */
+function isSyntheticApprovalResumeSource(identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>): boolean {
+  try {
+    const source = listEvents(identity.sessionId, { types: ['user_input_received'] })
+      .find((event) => event.seq === identity.sourceUserSeq);
+    return Boolean(source && source.data.synthetic === true && source.data.source === 'approval_resume'
+      && typeof source.data.approvalId === 'string');
+  } catch {
+    return false;
+  }
+}
+
 export async function admitAndCompileAcceptedSource(input: {
   identity: Pick<TurnIdentity, 'sessionId' | 'turn' | 'sourceUserSeq'>;
   surface: TurnGraphSurface;
@@ -3944,6 +3957,29 @@ export async function admitAndCompileAcceptedSource(input: {
   excludedToolNames?: readonly string[];
   verifiedTaskContinuation?: TaskContinuationContext;
 }): Promise<AdmitAndCompileAcceptedSourceResult> {
+  // An owner's approval of a card is not a message to interpret. The resume
+  // mints a hidden control source ("Approve apr-…") for the one stored action
+  // it will run; read by a semantic model that source is small talk, and the
+  // resume was then refused as "not an action turn" while the approved
+  // command never ran (live 2026-09-30). Compile it as the action it is.
+  if (input.surface === 'approval_resume' && isSyntheticApprovalResumeSource(input.identity)) {
+    const shadow = recordTurnGraphShadow({
+      identity: input.identity,
+      surface: input.surface,
+      allowedToolNames: input.allowedToolNames,
+      excludedToolNames: input.excludedToolNames,
+    });
+    const graph = turnGraphFromShadowEvent(shadow);
+    if (!shadow || !graph) return { ok: false, reason: 'untyped graph persist failed' };
+    return {
+      ok: true,
+      event: shadow,
+      compiled: {
+        graph,
+        validation: { ok: true, errors: [], warnings: [], nodeCount: graph.nodes.length, edgeCount: graph.edges.length },
+      },
+    };
+  }
   const compiled = await compileDurableAcceptedTurnGraph(input);
   if (!compiled.ok) {
     // Legacy shadow compilation is allowed only when no semantic port

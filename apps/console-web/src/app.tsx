@@ -245,7 +245,6 @@ export function App() {
             <Route path="/advanced/diagnostics" element={deferred(<Advanced />)} />
             <Route path="/advanced/observability" element={deferred(<Advanced />)} />
             <Route path="/advanced/traces" element={deferred(<Advanced />)} />
-            <Route path="/advanced/budgets" element={deferred(<Advanced />)} />
             <Route path="/advanced/autonomy" element={deferred(<Advanced />)} />
             <Route path="/advanced/evolution" element={deferred(<Advanced />)} />
             <Route path="/advanced/developer" element={deferred(<Advanced />)} />

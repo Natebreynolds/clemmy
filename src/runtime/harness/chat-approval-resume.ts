@@ -45,7 +45,7 @@ import {
   type RunAttemptRef,
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
-import { getPendingAction } from './pending-actions.js';
+import { getPendingAction, type PendingActionRecord } from './pending-actions.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
@@ -425,6 +425,23 @@ async function settleConversationalApprovalDecisionOnce(
     scheduleConversationalDecisionRetry(row, 'pending-action-approval-transition');
     return false;
   }
+  return await executeApprovedLinkedActionAndSettle(row, source, pendingAction, prepared);
+}
+
+/**
+ * Run the one approved, immutable pending action for an accepted approval
+ * source and settle that source with what landed. No model turn is spent:
+ * the owner's decision is the whole instruction. Shared by a conversational
+ * "yes" and by a card approved on a person surface, whose resume source is
+ * the hidden control edge prepareApprovalResumeSource mints.
+ */
+async function executeApprovedLinkedActionAndSettle(
+  row: approvalRegistry.PendingApprovalRow,
+  source: EventRow,
+  pendingActionInput: PendingActionRecord,
+  prepared: ChatApprovalResumeSource,
+): Promise<boolean> {
+  let pendingAction: PendingActionRecord | null = pendingActionInput;
   if (pendingAction.status === 'approved') {
     const approvedPendingAction = pendingAction;
     await recordAcceptedSourceGraph({
@@ -746,6 +763,27 @@ export async function handleResolvedApprovalForChatResume(
       return false;
     }
     activeResumeSessions.add(row.sessionId);
+    // A card linked to one exact stored action needs no model to act on the
+    // owner's approval: the harness runs that payload once and settles the
+    // resume source with what landed. A model turn here cost tokens and, on
+    // the host engine, never ran: its synthetic source was refused before
+    // the model was reached. Only a card with no stored action still resumes
+    // the model with a directive.
+    if (exactLinkedPendingAction && pendingAction && pendingAction.toolName !== 'run_batch') {
+      const sourceEvent = listEvents(row.sessionId, { types: ['user_input_received'] })
+        .find((event) => event.seq === source.sourceUserSeq);
+      if (sourceEvent) {
+        logger.info({ approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject, pendingActionId },
+          'card approved — running the exact stored action');
+        try {
+          const settled = await executeApprovedLinkedActionAndSettle(row, sourceEvent, pendingAction, source);
+          if (settled) handledApprovalIds.add(row.approvalId);
+          return settled;
+        } finally {
+          activeResumeSessions.delete(row.sessionId);
+        }
+      }
+    }
     logger.info({ approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject },
       'parked approval approved — resuming the chat session');
     try {
@@ -782,6 +820,25 @@ export async function handleResolvedApprovalForChatResume(
 let started = false;
 let listenerRegistered = false;
 let registeredDispatch: ChatApprovalResumeDispatch | null = null;
+/** The resume in flight for each resolved card, so a surface that resolved
+ * the card (a desktop button) can await the one execution instead of racing
+ * it with its own. */
+const resumeFlights = new Map<string, Promise<boolean>>();
+
+function trackResumeFlight(approvalId: string, flight: Promise<boolean>): Promise<boolean> {
+  resumeFlights.set(approvalId, flight);
+  void flight.finally(() => {
+    if (resumeFlights.get(approvalId) === flight) resumeFlights.delete(approvalId);
+  });
+  return flight;
+}
+
+/** The resume that the registry's resolution hook started for this card, or
+ * null when none is in flight. */
+export function approvalResumeInFlight(approvalId: string): Promise<boolean> | null {
+  return resumeFlights.get(approvalId) ?? null;
+}
+
 const dispatchResolvedApproval = (row: approvalRegistry.PendingApprovalRow): void => {
   const dispatch = registeredDispatch;
   // Conversational consent has a live ingress owner. Let that owner atomically
@@ -791,7 +848,7 @@ const dispatchResolvedApproval = (row: approvalRegistry.PendingApprovalRow): voi
   if (row.presentation) {
     settleConversationalApprovalDecisionInBackground(row, 'approval-resolution-listener');
   } else if (dispatch) {
-    void handleResolvedApprovalForChatResume(row, dispatch);
+    void trackResumeFlight(row.approvalId, handleResolvedApprovalForChatResume(row, dispatch));
   }
 };
 

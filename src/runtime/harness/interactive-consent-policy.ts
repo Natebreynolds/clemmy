@@ -228,6 +228,9 @@ export type InteractiveConsentDecisionV1 =
       need: 'approval' | 'credential' | 'choice' | 'essential_input';
       subjectDigest: string;
       reason: string;
+      /** The pause is Ask mode's, not the call's own risk: approving it once
+       * teaches this kind of change, so the same operation runs next time. */
+      teaches?: 'external_write_kind';
     }
   | {
       kind: 'repair';
@@ -270,6 +273,14 @@ export interface EvaluateInteractiveConsentInputV1 {
    * task mode, never from model text.
    */
   preparationProbe?: boolean;
+  /**
+   * The owner's mode. Auto: anything that is not disruptive runs. Ask: a
+   * change in a connected app also waits for the owner once, unless that kind
+   * of change was approved before. Local work is never gated by the mode.
+   */
+  mode?: 'auto' | 'ask';
+  /** Ask mode only: the owner already approved this operation once. */
+  learnedExternalWrite?: boolean;
 }
 
 function sameDestination(
@@ -519,6 +530,21 @@ export function evaluateInteractiveConsentV1(
       need: 'approval',
       subjectDigest: call.bindingDigest,
       reason: 'This exact accepted call is destructive, irreversible, administrative, or a sealed bulk mutation.',
+    };
+  }
+
+  // Ask mode: an ordinary change in a connected app waits for the owner the
+  // first time. The approval teaches the kind (this operation on this
+  // account), so it is asked once, never on every call. Everything above
+  // still decides first: a send, a delete, an irreversible or administrative
+  // change asks in both modes; local work never reaches this line.
+  if (input.mode === 'ask' && call.effect === 'external_write' && !input.learnedExternalWrite) {
+    return {
+      kind: 'needs_user',
+      need: 'approval',
+      subjectDigest: call.bindingDigest,
+      reason: 'Ask mode: this change in a connected app runs after you approve it. Approving it once teaches Clem this kind of change.',
+      teaches: 'external_write_kind',
     };
   }
 

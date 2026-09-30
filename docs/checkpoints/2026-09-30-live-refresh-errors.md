@@ -324,3 +324,69 @@ side effects. It must be reviewed together with the other lane rather than
 copying a raw spawn into Spaces. No claim is made that this notification change
 restores the five retired script sources. Combined integration, the original
 connection/budget lifecycle work and installed/live qualification remain owed.
+
+
+## Combined source review with the shell/two-modes lane
+
+A separate integration checkout now combines committed source from
+`codex/contextual-connection-ui` at `8460a88a5` and `claude/two-modes`
+at `76c53a1ea`. Its branch is `codex/connection-shell-integration` at
+`/Users/nathan.reynolds/.codex/worktrees/connection-shell-integration/clementine-next`.
+The other agent's worktree remained clean at the same revision after checks.
+Main, the installed app, credentials and personal Space declarations were not
+changed. The three-file model invocation ledger/schema-85 draft remains only
+in the original connection checkout; it is deliberately absent here.
+
+The one textual conflict was the host turn's terminal reducer. Both inputs
+are retained: the active agent needed for connection/recovery handling and
+an exact approval id from the shell lane's queued-card materialization. Taking
+either side wholesale would discard a feature. The remaining source merged
+without textual conflicts; that alone is not a regression acceptance claim.
+
+Verification on the combined tree (committed schema 84):
+
+- `/tmp/clem-connection-shell-integration.txt`: **114/114**, covering ordinary
+  shell execution, off-machine command/card/approval execution, chat approval
+  resume, connection execution closure, source connection checkpoints, source
+  budgets, Space read authority, legacy Space decisions, source backoff and
+  scheduler notification admission.
+- `/tmp/clem-connection-shell-consent-integration.txt`: **42/42**, covering
+  approval-resume source compilation, consent policy/direct dispatch, approved
+  write-kind routes and pending-action routes. The source-compilation file was
+  mistyped in the first command; it was explicitly run at its correct path in
+  this second check. The first count does not claim coverage of that file.
+- `/tmp/clem-connection-shell-integration-tsc.txt`: TypeScript passed.
+- `git diff --check --cached` passed; no unresolved merge paths.
+- These use controlled fixture models and loopback endpoints, not paid models
+  or external sends. No full suite, journeys, build, installation or live-home
+  acceptance was performed. The isolation sentinel reported **NOT PERFORMED**
+  because the running daemon (72427) owns and updates the live home; this is
+  not evidence that the fixture run wrote to it, nor a claimed isolation proof.
+
+This is a combined **source** candidate only. Its new fixes are not installed.
+The other lane's checkpoint records installed `019e8d9d5`; no new served
+fingerprint was created or claimed by this integration. A coordinated build,
+install, served-identity check and named controlled live refreshes remain owed.
+
+### Next implementation boundary
+
+The five retired Space script sources still have no execution carrier.
+The shell lane explicitly tests that `run_shell_command` has no workflow
+`localExecution` contract. Adding that field alone would misrepresent opaque
+execution as a reviewed/reconcilable adapter. The existing deterministic
+workflow runner also does not solve this by being callable: its admitted
+workflow revision, run, step, pinned script and terminal lifecycle belong to
+that workflow, not to a saved Space source. Calling its spawn helper directly
+would lose those properties.
+
+The bounded next slice is a source-owned local execution adapter under the
+existing durable call kernel: bind an exact scheduled occurrence, saved
+manifest and script revision; run the existing guarded process substrate;
+settle physical execution once; publish source data only after successful
+structured output; preserve any uncertainty after a process was started.
+Keep script execution's effect truthful, retain exact consent and prior
+human declines, and do not infer read-only behavior from a filename/hash.
+First pins must cover changed bytes, wrong occurrence, refusal before spawn,
+nonzero exit, timeout/Stop, completed-call replay and interrupted-call recovery.
+Do not migrate the owner's manifests or launch their existing scripts to
+paper over the missing framework carrier. This work is not yet implemented.
