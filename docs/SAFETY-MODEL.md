@@ -54,7 +54,7 @@ A shell command is sorted into one class by what it does.
 | Class | Examples | On a chat turn |
 | --- | --- | --- |
 | Reads and computation | `ls`, `cat`, `grep`, `git status`, builds, tests, running a script, a web GET | Runs through the work carrier |
-| Local change | `cp`, `mv`, `mkdir`, `rm`, `git commit`, package installs, output redirected to a file, a wrapped script that cannot be inspected | NOT YET: refused. No path exists to ask the owner |
+| Local change | `cp`, `mv`, `mkdir`, `rm`, `git commit`, package installs, output redirected to a file, a wrapped script that cannot be inspected | Runs through the work carrier as ordinary local work: no plan, no card. The guards below still run |
 | Leaves the machine | a web POST, `git push`, a deploy, a publish | NOT YET: refused. No card is raised |
 
 Inside the tool, on every path, these always apply:
@@ -138,7 +138,7 @@ and carries none of Clem's keys.
 | Create or replace a file | `write_file`, prior bytes kept | Works |
 | Change part of a file | Only by replacing the whole file | Gap |
 | Shell: reads, builds, tests | Through the work carrier | Works |
-| Shell: local changes | | Not yet |
+| Shell: local changes | Through the work carrier, as ordinary local work | Works |
 | Shell: push, deploy, publish | | Not yet |
 | Look at a rendered page | `page_preview` | Works |
 | Drive a real browser | | Not reachable on a chat turn |
@@ -158,6 +158,7 @@ and carries none of Clem's keys.
 | Clem's own stores | `src/tools/shell-state-protection.red.test.ts` |
 | What leaves the machine | `src/runtime/harness/destination-gate.test.ts` |
 | A read-class shell command runs under its own envelope and nothing else does | `src/tools/work-call.foreground-compute.test.ts` |
+| A local change runs as ordinary work with no card; reads keep their envelope; in-tool guards still refuse; off-machine is not carried | `src/runtime/harness/shell-local-change.integration.test.ts` |
 | The shell is disclosed truthfully | `src/tools/tool-search-relevance.test.ts`, `src/tools/call-tool.test.ts` |
 | A file write without a card keeps its receipt | `src/runtime/harness/normal-native-write.integration.test.ts` |
 | Pages: listing, reading, policy, surfaces | `src/projects/local-pages.test.ts` |
