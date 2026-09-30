@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {
@@ -170,4 +170,87 @@ test('timeout: a hung script is killed and flagged timedOut', async () => {
 
 test('DEFAULT_MAX_OUTPUT_BYTES is the 64MB safety cap', () => {
   assert.equal(DEFAULT_MAX_OUTPUT_BYTES, 64 * 1024 * 1024);
+});
+
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= until) throw new Error('controlled script did not reach its expected state');
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+test('cancellation before admission starts no process and is not a launch failure', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const marker = path.join(tmp, 'never-started');
+  const out = await spawnSandboxedScript({
+    command: process.execPath, args: ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+    cwd: tmp, env: scrubbedChildEnv(), stdinPayload: '', timeoutMs: 5_000, signal: controller.signal,
+  });
+  assert.equal(out.aborted, true);
+  assert.equal(out.spawned, false);
+  assert.equal(out.launchError, undefined);
+  assert.equal(out.timedOut, false);
+  assert.equal(existsSync(marker), false);
+});
+
+for (const [inheritedPipes, deadline] of [[false, false], [true, false], [true, true]] as const) {
+  test(`${deadline ? 'Deadline' : 'Stop'} kills a nested TERM-resistant CLI (inherited pipes: ${inheritedPipes})`, {
+    skip: process.platform === 'win32' ? 'POSIX process-group proof' : false,
+    timeout: 15_000,
+  }, async () => {
+    const suffix = deadline ? 'deadline' : inheritedPipes ? 'pipes' : 'detached-stdio';
+    const ready = path.join(tmp, `grandchild-${suffix}.pid`);
+    const late = path.join(tmp, `grandchild-${suffix}.late`);
+    const nested = writeScript(`nested-${suffix}.mjs`, [
+      'import fs from "node:fs";',
+      'process.on("SIGTERM", () => {});',
+      `fs.writeFileSync(${JSON.stringify(ready)}, String(process.pid));`,
+      `setTimeout(() => { fs.writeFileSync(${JSON.stringify(late)}, 'unexpected effect'); process.exit(0); }, 6_000);`,
+    ].join('\n'));
+    const wrapper = writeScript(`wrapper-${suffix}.mjs`, [
+      'import {spawn} from "node:child_process";',
+      `spawn(process.execPath, [${JSON.stringify(nested)}], {stdio: ${JSON.stringify(inheritedPipes ? 'inherit' : 'ignore')}});`,
+      'setTimeout(() => process.exit(0), 7_000);',
+    ].join('\n'));
+    const controller = new AbortController();
+    const pending = spawnSandboxedScript({
+      command: process.execPath, args: [wrapper], cwd: tmp,
+      env: scrubbedChildEnv(), stdinPayload: '', timeoutMs: deadline ? 2_000 : 10_000, signal: controller.signal,
+    });
+    let pid: number | undefined;
+    try {
+      await waitUntil(() => existsSync(ready));
+      pid = Number(readFileSync(ready, 'utf8'));
+      const started = Date.now();
+      if (!deadline) controller.abort();
+      const out = await pending;
+      assert.equal(out.aborted, !deadline);
+      assert.equal(out.spawned, true, 'Stop must not claim that no process ran');
+      assert.equal(out.timedOut, deadline);
+      assert.ok(Date.now() - started < 5_000, 'Stop/deadline cannot wait for the nested command to finish naturally');
+      await waitUntil(() => !processAlive(pid!));
+      assert.equal(existsSync(late), false, 'stopped child cannot perform its delayed write');
+    } finally {
+      controller.abort();
+      if (pid && processAlive(pid)) try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+      await pending;
+    }
+  });
+}
+
+test('synchronous spawn argument failure is returned with no process started', async () => {
+  const out = await spawnSandboxedScript({
+    command: 'invalid\0command', args: [], cwd: tmp,
+    env: scrubbedChildEnv(), stdinPayload: '', timeoutMs: 1_000,
+  });
+  assert.ok(out.launchError);
+  assert.equal(out.spawned, false);
+  assert.equal(out.aborted, false);
 });

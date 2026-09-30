@@ -390,3 +390,62 @@ First pins must cover changed bytes, wrong occurrence, refusal before spawn,
 nonzero exit, timeout/Stop, completed-call replay and interrupted-call recovery.
 Do not migrate the owner's manifests or launch their existing scripts to
 paper over the missing framework carrier. This work is not yet implemented.
+
+
+## Process cancellation prerequisite for scheduled local execution
+
+On combined source `1b94cbeec`, review of the shared process substrate found
+that `spawnSandboxedScript` terminated only the interpreter process and had
+no caller cancellation signal. A nested CLI could survive a timeout. Existing
+deterministic workflow steps also bypassed the run's cancellation watcher
+while waiting for the script. This is a separate framework defect discovered
+during adapter work; it is not claimed to be the cause of the morning's
+`local_runner` refusals.
+
+The shared process substrate now accepts the owning run's AbortSignal. An
+already-aborted owner starts no process. A started process reports `spawned`
+even when later cancelled, and cancellation is distinct from timeout or a
+launch failure. On POSIX the child starts in an owned process group; Stop,
+timeout and output overflow terminate that group and escalate to SIGKILL.
+A wrapper's early close also kills remaining group members instead of
+assuming its close means every child exited. Timer/listener cleanup is tied
+to the one process outcome. Windows uses taskkill /T /F, with a direct-child
+fallback if that mechanism fails; Windows behavior was not exercised here.
+This is process-group ownership, not an OS confinement claim: deliberately
+escaped processes and already-produced effects are not rolled back.
+
+Deterministic workflow steps and loop probes now register an abort target
+with the same per-run watcher used by model/tool attempts. It still reads
+cancellation state once per run rather than once per fan-out child. The
+exact target is removed in finally. A stopped script throws the existing
+WorkflowRunCancelledError, preventing retry or success publication; a final
+cancellation check also covers Stop arriving as the child exits. An unrelated
+run retains its own watcher and can finish normally. No approval semantics,
+credentials, source declarations or model routes were changed.
+
+Verification (controlled temporary homes, no model/provider traffic):
+
+- `/tmp/clem-deterministic-process-stop-final.txt`: **33/33** across the shared
+  substrate, deterministic workflow runner and durable cancellation tests.
+  Pins include pre-launch cancellation with no marker write, nested children
+  that ignore SIGTERM with inherited or detached stdio, nested-child timeout,
+  synchronous launch argument failure, active workflow Stop, no step-completed
+  event for the stopped process, and an unrelated concurrent run completing.
+- `/tmp/clem-deterministic-process-stop-overlap.txt`: **3/3** existing workflow
+  checks for Tasks-board Stop during an approval wait, exact approval-resume
+  attempt identity, and the Tasks-board cancellation source.
+- `/tmp/clem-deterministic-process-stop-red.txt`: **6/6 expected failures** when
+  both production modules are temporarily restored to `1b94cbeec`. Candidate
+  bytes were saved and restored exactly in finally; no test process remains.
+- `/tmp/clem-deterministic-process-stop-tsc.txt`: TypeScript passed.
+- The broad live-home isolation sentinel remains **NOT PERFORMED**, because
+  daemon 72427 owns and writes that home. These are fixture checks, not
+  installed-app acceptance. No full suite/journeys/build/hotpatch/tag was run.
+
+The other agent's `claude/two-modes` checkout remains clean at `76c53a1ea`.
+Main and the installed app were untouched. This fixes cancellation for an
+existing execution surface and supplies a prerequisite for the scheduled
+adapter. The five retired Space scripts are **still not executable** through
+that adapter; their durable source/occurrence binding, authority, once-only
+settlement and restart recovery remain the next implementation work. The
+wider connection-continuity ledger and release qualification remain open.

@@ -4309,10 +4309,24 @@ async function runDeterministicWorkflowStep(
     CLEMENTINE_WORKFLOW_STEP_ID: payload.stepId,
     ...electronNodeEnv(resolved.command, resolved.isElectron),
   });
-  const outcome = await spawnSandboxedScript({
-    command: resolved.command, args: resolved.args, cwd: resolved.cwd, env,
-    stdinPayload: input, timeoutMs: WORKFLOW_DETERMINISTIC_TIMEOUT_MS,
-  });
+  const controller = new AbortController();
+  const unregisterCancellation = registerWorkflowCancellationTarget(
+    payload.runId, `script:${randomUUID()}`, () => controller.abort(),
+  );
+  let outcome: Awaited<ReturnType<typeof spawnSandboxedScript>>;
+  try {
+    outcome = await spawnSandboxedScript({
+      command: resolved.command, args: resolved.args, cwd: resolved.cwd, env,
+      stdinPayload: input, timeoutMs: WORKFLOW_DETERMINISTIC_TIMEOUT_MS,
+      signal: controller.signal,
+    });
+  } finally {
+    unregisterCancellation();
+  }
+  if (outcome.aborted) throw new WorkflowRunCancelledError();
+  // Stop can win between process exit and output publication. Never turn the
+  // stopped run green just because its child managed to print valid JSON.
+  throwIfWorkflowRunCancelled(payload.runId);
   if (outcome.launchError) throw explainDeterministicSpawnError(outcome.launchError, resolved.target);
   const cleanStdout = redactProcessOutput(outcome.stdout.trim());
   const cleanStderr = redactProcessOutput(outcome.stderr.trim());
@@ -4694,16 +4708,11 @@ const WORKFLOW_CANCEL_POLL_MS = Number.isFinite(WORKFLOW_CANCEL_POLL_CONFIG)
   ? Math.max(100, WORKFLOW_CANCEL_POLL_CONFIG)
   : 500;
 
-interface ActiveWorkflowStepAttempt {
-  sessionId: string;
-  attempt: RunAttemptRef;
-}
-
 // One cancellation watcher per WORKFLOW RUN, not per fan-out item. A 200-item
 // step can have several child attempts live at once; polling the two durable
 // run stores once and fanning an exact latch to each child keeps Stop responsive
 // without multiplying filesystem reads by worker concurrency.
-const activeWorkflowStepAttempts = new Map<string, Map<string, ActiveWorkflowStepAttempt>>();
+const activeWorkflowCancellationTargets = new Map<string, Map<string, () => void>>();
 const workflowCancellationPolls = new Map<string, ReturnType<typeof setInterval>>();
 const observedWorkflowRunCancellations = new Set<string>();
 
@@ -4712,9 +4721,9 @@ function latchWorkflowRunCancellation(workflowRunId: string): boolean {
     if (!isWorkflowRunCancelled(workflowRunId)) return false;
     observedWorkflowRunCancellations.add(workflowRunId);
   }
-  for (const { sessionId, attempt } of activeWorkflowStepAttempts.get(workflowRunId)?.values() ?? []) {
+  for (const cancel of activeWorkflowCancellationTargets.get(workflowRunId)?.values() ?? []) {
     try {
-      requestKill(sessionId, 'Workflow run cancelled by user.', attempt);
+      cancel();
     } catch {
       // The durable cancelled run record remains authoritative; ordinary step
       // boundaries still stop progress if the event log is temporarily busy.
@@ -4723,30 +4732,40 @@ function latchWorkflowRunCancellation(workflowRunId: string): boolean {
   return true;
 }
 
-function registerActiveWorkflowStepAttempt(
+function registerWorkflowCancellationTarget(
   workflowRunId: string,
-  sessionId: string,
-  attempt: RunAttemptRef,
+  targetId: string,
+  cancel: () => void,
 ): () => void {
-  const attempts = activeWorkflowStepAttempts.get(workflowRunId) ?? new Map<string, ActiveWorkflowStepAttempt>();
-  attempts.set(attempt.attemptId, { sessionId, attempt });
-  activeWorkflowStepAttempts.set(workflowRunId, attempts);
+  const targets = activeWorkflowCancellationTargets.get(workflowRunId) ?? new Map<string, () => void>();
+  targets.set(targetId, cancel);
+  activeWorkflowCancellationTargets.set(workflowRunId, targets);
   if (!workflowCancellationPolls.has(workflowRunId)) {
     const poll = setInterval(() => latchWorkflowRunCancellation(workflowRunId), WORKFLOW_CANCEL_POLL_MS);
     poll.unref?.();
     workflowCancellationPolls.set(workflowRunId, poll);
   }
+  latchWorkflowRunCancellation(workflowRunId);
   return () => {
-    const current = activeWorkflowStepAttempts.get(workflowRunId);
-    current?.delete(attempt.attemptId);
+    const current = activeWorkflowCancellationTargets.get(workflowRunId);
+    current?.delete(targetId);
     if (current && current.size > 0) return;
-    activeWorkflowStepAttempts.delete(workflowRunId);
+    activeWorkflowCancellationTargets.delete(workflowRunId);
     observedWorkflowRunCancellations.delete(workflowRunId);
     const poll = workflowCancellationPolls.get(workflowRunId);
     if (poll) clearInterval(poll);
     workflowCancellationPolls.delete(workflowRunId);
   };
 }
+function registerActiveWorkflowStepAttempt(
+  workflowRunId: string,
+  sessionId: string,
+  attempt: RunAttemptRef,
+): () => void {
+  return registerWorkflowCancellationTarget(workflowRunId, attempt.attemptId,
+    () => requestKill(sessionId, 'Workflow run cancelled by user.', attempt));
+}
+
 // 24h aligns with approval-registry's DEFAULT_APPROVAL_TTL_MS so the workflow
 // step waits exactly as long as the approval itself is alive. The reaper will
 // expire the approval at 24h; we time out the workflow step on the same beat.

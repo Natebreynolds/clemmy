@@ -16,7 +16,7 @@
  * OWN path resolution, stdin payload shape, and output handling — only the
  * dangerous spawn mechanics live here, once.
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, statSync, accessSync, constants as fsConstants } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -139,6 +139,8 @@ export interface SandboxedSpawnInput {
   /** Written to the child's stdin and then closed; EPIPE on early exit is swallowed. */
   stdinPayload: string;
   timeoutMs: number;
+  /** The owning run may stop a pending or already-started process. */
+  signal?: AbortSignal;
   /** Cap on captured stdout (default DEFAULT_MAX_OUTPUT_BYTES). */
   maxOutputBytes?: number;
 }
@@ -152,6 +154,10 @@ export interface SandboxedSpawnOutcome {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Cancellation is distinct from a deadline or process failure. */
+  aborted: boolean;
+  /** True once a process was created; cancellation does not imply no effects. */
+  spawned: boolean;
   /** True when stdout exceeded the cap and the child was killed. */
   overflowed: boolean;
 }
@@ -164,47 +170,103 @@ export interface SandboxedSpawnOutcome {
  */
 export function spawnSandboxedScript(input: SandboxedSpawnInput): Promise<SandboxedSpawnOutcome> {
   const maxBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const empty: SandboxedSpawnOutcome = {
+    code: null, signal: null, stdout: '', stderr: '', timedOut: false,
+    overflowed: false, aborted: false, spawned: false,
+  };
+  // Stop owns admission too: a cancelled caller never briefly launches a child.
+  if (input.signal?.aborted) return Promise.resolve({ ...empty, aborted: true });
   return new Promise<SandboxedSpawnOutcome>((resolve) => {
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(input.command, input.args, {
+        cwd: input.cwd,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: input.env,
+        // A deadline/Stop owns the process group, including nested CLIs. A
+        // script can deliberately escape it; this is not an OS sandbox.
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+      });
+    } catch (error) {
+      resolve({ ...empty, launchError: error instanceof Error ? error : new Error(String(error)) });
+      return;
+    }
     let settled = false;
+    let stopping = false;
     let stdout = '';
+    let stdoutBytes = 0;
     let stderr = '';
     let timedOut = false;
     let overflowed = false;
-    const finish = (o: SandboxedSpawnOutcome): void => { if (settled) return; settled = true; resolve(o); };
-
-    const child = spawn(input.command, input.args, {
-      cwd: input.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: input.env,
-    });
-    const killHard = (): void => {
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 2_000).unref?.();
+    let aborted = false;
+    const spawned = child.pid !== undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let escalation: ReturnType<typeof setTimeout> | undefined;
+    const signalTree = (signal: NodeJS.Signals): void => {
+      if (process.platform !== 'win32' && child.pid) {
+        try { process.kill(-child.pid, signal); }
+        catch (error) {
+          // ESRCH means the owned group is gone. Do not address a possibly
+          // reused child PID after its wrapper has already exited.
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+            try { child.kill(signal); } catch { /* outcome remains stopped/uncertain */ }
+          }
+        }
+      } else if (process.platform === 'win32' && child.pid) {
+        try {
+          const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+            stdio: 'ignore', windowsHide: true,
+          });
+          killer.once('error', () => { try { child.kill(signal); } catch { /* already exited */ } });
+        } catch { try { child.kill(signal); } catch { /* already exited */ } }
+      } else {
+        try { child.kill(signal); } catch { /* launch never started */ }
+      }
     };
-    const timer = setTimeout(() => { timedOut = true; killHard(); }, input.timeoutMs);
+    const finish = (details: Pick<SandboxedSpawnOutcome, 'code' | 'signal' | 'launchError'>): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (escalation) clearTimeout(escalation);
+      input.signal?.removeEventListener('abort', onAbort);
+      // A wrapper can exit on TERM while a child ignores it and has its stdio
+      // detached. Its close event is not proof that the owned group stopped.
+      if (stopping && process.platform !== 'win32') signalTree('SIGKILL');
+      resolve({ ...details, stdout, stderr, timedOut, overflowed, aborted, spawned });
+    };
+    const stop = (reason: 'abort' | 'timeout' | 'overflow'): void => {
+      if (settled || stopping) return;
+      stopping = true;
+      aborted = reason === 'abort';
+      timedOut = reason === 'timeout';
+      overflowed = reason === 'overflow';
+      signalTree('SIGTERM');
+      escalation = setTimeout(() => signalTree('SIGKILL'), 2_000);
+      escalation.unref?.();
+    };
+    const onAbort = (): void => stop('abort');
+    timer = setTimeout(() => stop('timeout'), input.timeoutMs);
     timer.unref?.();
+    input.signal?.addEventListener('abort', onAbort, { once: true });
+    // Covers an abort that occurred while spawn/registration was being set up.
+    if (input.signal?.aborted) onAbort();
 
     child.stdout.setEncoding('utf-8');
     child.stderr.setEncoding('utf-8');
     child.stdout.on('data', (c) => {
-      if (overflowed) return;
-      stdout += String(c);
-      if (Buffer.byteLength(stdout) > maxBytes) { overflowed = true; killHard(); }
+      if (stdoutBytes > maxBytes) return;
+      const text = String(c);
+      stdout += text;
+      stdoutBytes += Buffer.byteLength(text);
+      if (stdoutBytes > maxBytes) stop('overflow');
     });
     child.stderr.on('data', (c) => { if (stderr.length < 100_000) stderr += String(c); });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      finish({ launchError: err, code: null, signal: null, stdout, stderr, timedOut, overflowed });
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      finish({ code, signal, stdout, stderr, timedOut, overflowed });
-    });
-    // A fast runner (e.g. a shell echo) can exit before we finish writing the
-    // payload, closing its stdin — that surfaces as an ASYNC 'error' (EPIPE) on
-    // the stream, which a try/catch can't catch and would otherwise become an
-    // uncaughtException. Swallow it: stdin is optional input.
-    child.stdin.on('error', () => { /* child closed stdin early — fine */ });
+    child.on('error', (err) => finish({ launchError: err, code: null, signal: null }));
+    child.on('close', (code, signal) => finish({ code, signal }));
+    // A child may exit before it consumes stdin. The close/error receipt owns
+    // that outcome; EPIPE must not escape as an unhandled stream error.
+    child.stdin.on('error', () => { /* child closed stdin early */ });
     try { child.stdin.end(input.stdinPayload); } catch { /* stdin optional */ }
   });
 }

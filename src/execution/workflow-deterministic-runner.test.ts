@@ -21,6 +21,7 @@ process.env.CLEMENTINE_HOME = testHome;
 const { validateWorkflowDefinition } = await import('./workflow-validator.js');
 const { checkWorkflowRunReadiness } = await import('./workflow-run-readiness.js');
 const { executeStep } = await import('./workflow-runner.js');
+const { requestWorkflowRunCancellation } = await import('./workflow-run-cancellation.js');
 const { readWorkflowEvents } = await import('./workflow-events.js');
 const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 
@@ -108,4 +109,69 @@ test('executeStep runs the owner-authored runner and enforces its output contrac
   // A runner outside scripts/ is refused before anything spawns.
   const escape = { id: 'pull', prompt: '', sideEffect: 'read', deterministic: { runner: '../escape.mjs' } };
   await assert.rejects(executeStep(escape as never, context(escape, slug, 'escape-run')));
+});
+
+
+async function waitForScriptStart(file: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(file)) {
+    if (Date.now() > deadline) throw new Error('controlled workflow script never started');
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+test('Stop reaches a running deterministic step, retains run isolation and never publishes its success', { timeout: 15_000 }, async () => {
+  const slug = 'deterministic-stop';
+  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  for (const id of ['stopped', 'kept']) {
+    writeFileSync(path.join(scriptsDir, `${id}.mjs`), [
+      'import fs from "node:fs";',
+      `fs.writeFileSync(${JSON.stringify(path.join(scriptsDir, `${id}.started`))}, 'started');`,
+      `const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(path.join(scriptsDir, `${id}.release`))})) {`,
+      'clearInterval(timer); process.stdout.write(JSON.stringify({summary:"done"})); process.exit(0); } }, 20);',
+      'setTimeout(() => {process.stdout.write(JSON.stringify({summary:"late"})); process.exit(0);}, 8_000);',
+    ].join('\n'));
+  }
+  const stopped = { id: 'pull', prompt: '', sideEffect: 'read', deterministic: { runner: 'stopped.mjs' } };
+  const kept = { id: 'pull', prompt: '', sideEffect: 'read', deterministic: { runner: 'kept.mjs' } };
+  const stopRunId = 'deterministic-stop-owned';
+  const keepRunId = 'deterministic-stop-unrelated';
+  const rejected = assert.rejects(executeStep(stopped as never, context(stopped, slug, stopRunId)), {
+    name: 'WorkflowRunCancelledError',
+  });
+  const unrelated = executeStep(kept as never, context(kept, slug, keepRunId));
+  // Attach a rejection handler immediately while the first process starts.
+  const unrelatedResult = unrelated.then(value => ({ value }), error => ({ error }));
+  try {
+    await Promise.all(['stopped', 'kept'].map(id => waitForScriptStart(path.join(scriptsDir, `${id}.started`))));
+    const at = Date.now();
+    requestWorkflowRunCancellation(stopRunId, 'Controlled user Stop.', 'fixture');
+    await rejected;
+    assert.ok(Date.now() - at < 4_000, 'Stop should interrupt the process instead of waiting for natural completion');
+    const stoppedEvents = readWorkflowEvents(slug, stopRunId);
+    assert.equal(stoppedEvents.some(event => event.kind === 'step_completed'), false);
+    writeFileSync(path.join(scriptsDir, 'kept.release'), 'continue');
+    const result = await unrelatedResult;
+    assert.ok('value' in result, JSON.stringify(result));
+    assert.deepEqual(result.value, { summary: 'done' });
+    assert.ok(readWorkflowEvents(slug, keepRunId).some(event => event.kind === 'step_completed'));
+  } finally {
+    requestWorkflowRunCancellation(stopRunId, 'Fixture cleanup.', 'fixture');
+    requestWorkflowRunCancellation(keepRunId, 'Fixture cleanup.', 'fixture');
+    await Promise.allSettled([rejected, unrelatedResult]);
+  }
+});
+
+test('a deterministic step already cancelled before entry never starts its script', async () => {
+  const slug = 'deterministic-stop-before-entry';
+  const scriptsDir = path.join(WORKFLOWS_DIR, slug, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  const marker = path.join(scriptsDir, 'unexpected');
+  writeFileSync(path.join(scriptsDir, 'run.mjs'), `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'started');`);
+  const runId = 'deterministic-stopped-before-entry';
+  requestWorkflowRunCancellation(runId, 'Stop before starting.', 'fixture');
+  const step = { id: 'pull', prompt: '', sideEffect: 'read', deterministic: { runner: 'run.mjs' } };
+  await assert.rejects(executeStep(step as never, context(step, slug, runId)), { name: 'WorkflowRunCancelledError' });
+  assert.equal(existsSync(marker), false);
 });
