@@ -1,4 +1,5 @@
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
+import { activateConnectionExecution } from '../runtime/harness/connection-execution-activation.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
@@ -16803,7 +16804,7 @@ export function registerConsoleRoutes(
 
     let reviewedPlanOwnerControl: ReviewedPlanOwnerControlV1 | undefined;
     let executeIngress: Parameters<typeof inspectPlanExecutionIngress>[0] | null = null;
-    if (taskMode?.kind === 'execute') {
+    if (taskMode?.kind === 'execute' && !connectionContext) {
       try {
         const control = resolveReviewedPlanOwnerControl({ sessionId, ref: taskMode.executeRef,
           actor: { surface: 'desktop', id: 'desktop' } });
@@ -17232,6 +17233,11 @@ export function registerConsoleRoutes(
           .find((event) => event.seq === previous.sourceUserSeq);
         if (!source) throw new Error('The original accepted source is unavailable.');
         const outcome = acceptedSourceOutcome(source);
+        if (source.data.source === 'connection_continuation' && !outcome) {
+          // A transport retry may observe an unfinished retained execution;
+          // only its checkpoint recovery may adopt a new physical attempt.
+          return { attempt: previous, claimed: false, reason: 'active', interruptedAttemptId: null };
+        }
         if (outcome?.kind === 'dispatched') {
           // An expired HTTP lease cannot reclaim an exact source already owned
           // by its activated workflow group. Rejoin without model/tool replay.
@@ -17310,8 +17316,14 @@ export function registerConsoleRoutes(
     let requestAcceptedUserEvent: HarnessEventRow | undefined;
     if (shouldSchedule && requestAttempt) {
       try {
-        const newlyAccepted = !acceptedApprovalId && getRunAttemptSourceUserEvent(requestAttempt) === null;
-        const acceptedUserEvent = recordRunAttemptUserInput(requestAttempt, {
+        const resumesConnectionExecution = connectionContext && taskMode?.kind === 'execute';
+        const newlyAccepted = !resumesConnectionExecution && !acceptedApprovalId && getRunAttemptSourceUserEvent(requestAttempt) === null;
+        if (resumesConnectionExecution && !connectionVerification) throw new Error('This continuation needs a fresh connection check.');
+        const acceptedUserEvent = resumesConnectionExecution
+          ? activateConnectionExecution({ context: connectionContext!, verified: connectionVerification!, text: input,
+              clientRequestId: requestIdentity.requestId, runId: requestRunId,
+              attemptId: requestAttempt.attemptId, leaseOwner: HARNESS_CHAT_LEASE_OWNER }).source
+          : recordRunAttemptUserInput(requestAttempt, {
           turn: 1,
           role: 'user',
           data: {
@@ -18019,6 +18031,8 @@ export function registerConsoleRoutes(
               : (result.lastDecision?.summary ?? '');
             return { text: replyText, sessionId };
           },
+          connectionContext && taskMode?.kind === 'execute'
+            ? { connectionExecutionLeaseOwner: HARNESS_CHAT_LEASE_OWNER } : {},
         );
         // The active bridge owns runConversation; its legacy callback above is
         // not invoked. Read the typed bridge outcome here so a held activation

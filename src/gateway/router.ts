@@ -1,5 +1,8 @@
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
-import { connectionContinuationAudience, connectionContinuationTaskMode, withConnectionContinuationAdmission, type ConnectionSetupContext, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
+import { connectionContinuationAudience, connectionContinuationTaskMode, readConnectionSetup, withConnectionContinuationAdmission, type ConnectionSetupContext, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
+import { activateConnectionExecution } from '../runtime/harness/connection-execution-activation.js';
+import { completionEvidenceSource } from '../runtime/harness/recovery-activation.js';
+import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
 import { parseTaskMode, taskModeDigest, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
 import { withReviewedPlanExecuteAdmission, type ReviewedPlanOwnerControlV1 } from '../runtime/harness/reviewed-plan-owner-control.js';
 import pino from 'pino';
@@ -374,15 +377,18 @@ function gatewayAudienceIdentity(request: GatewayRequest): {
   };
 }
 
-function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGatewayTurn {
+function acceptGatewayTurn(request: GatewayRequest, runId: string, connectionExecutionLeaseOwner?: string): AcceptedGatewayTurn {
   ensureGatewayHarnessSession(request);
   const previous = getLatestRunAttemptByRunId(request.sessionId, runId);
   if (previous?.sourceUserSeq) {
     const source = listHarnessEvents(request.sessionId, { types: ['user_input_received'] })
       .find((event) => event.seq === previous.sourceUserSeq);
     if (!source) throw new Error(`accepted gateway source ${previous.sourceUserSeq} is missing`);
+    const expectedMode = source.data.source === 'connection_continuation'
+      ? acceptedTaskMode(request.sessionId, completionEvidenceSource({ sessionId: request.sessionId, sourceUserSeq: source.seq }).sourceUserSeq)
+      : parseTaskMode(source.data.taskMode);
     if (publicUserInputText(source.data) !== request.message.trim()
-      || taskModeDigest(parseTaskMode(source.data.taskMode)) !== taskModeDigest(request.taskMode)) {
+      || taskModeDigest(expectedMode) !== taskModeDigest(request.taskMode)) {
       throw new Error(`gateway run ${runId} is already bound to different input`);
     }
     if (!previous.finishedAt) {
@@ -402,6 +408,16 @@ function acceptGatewayTurn(request: GatewayRequest, runId: string): AcceptedGate
 
   const admit = (): AcceptedGatewayTurn => {
     const attempt = beginRunAttempt(request.sessionId, { runId });
+    if (request.connectionContinuation && request.taskMode?.kind === 'execute') {
+      const setup = readConnectionSetup(request.sessionId, request.connectionContinuation.connectionRequestId);
+      if (!setup || !request.connectionContinuationVerification || !connectionExecutionLeaseOwner) {
+        throw new Error('This reviewed connection needs its current verification and execution lease.');
+      }
+      const activation = activateConnectionExecution({ context: request.connectionContinuation,
+        verified: request.connectionContinuationVerification, text: request.message,
+        clientRequestId: setup.clientRequestId, runId, attemptId: attempt.attemptId, leaseOwner: connectionExecutionLeaseOwner });
+      return { source: activation.source, attempt, replayedSource: activation.kind === 'existing' };
+    }
     const audience = request.connectionContinuation
       ? connectionContinuationAudience(request.connectionContinuation, runId, request.message)
       : gatewayAudienceIdentity(request);
@@ -1181,12 +1197,16 @@ export class ClementineGateway {
     // Validate its server-owned receipt before acquiring an execution lease.
     connectionContinuationAudience(context, runId, request.message);
     const taskMode = connectionContinuationTaskMode(context);
-    if (taskMode?.kind === 'execute') throw new Error('Continue this connection from its reviewed plan execution.');
     request = { ...request, taskMode };
     const prior = getLatestRunAttemptByRunId(request.sessionId, runId);
     const source = prior?.sourceUserSeq ? listHarnessEvents(request.sessionId, { types: ['user_input_received'] })
       .find((event) => event.seq === prior.sourceUserSeq) : undefined;
     if (source && acceptedSourceOutcome(source)) return this.handleAcceptedMessage(request);
+    if (source?.data.source === 'connection_continuation') {
+      request.onAcceptedTurn?.({ source, attempt: prior });
+      return { sessionId: request.sessionId, runId, stoppedReason: 'in-progress',
+        text: 'Your original task already has a continuation. Its saved execution remains the owner.' };
+    }
     if (prior && !prior.finishedAt && prior.leaseExpiresAt && Date.parse(prior.leaseExpiresAt) > Date.now()) {
       return { sessionId: request.sessionId, runId, text: 'Your original request is already running.' };
     }
@@ -1200,11 +1220,11 @@ export class ClementineGateway {
     const attempt = claim.attempt;
     const renew = setInterval(() => { renewRunAttemptLease(attempt, ownerId, 90_000); }, 30_000);
     renew.unref();
-    try { return await this.handleAcceptedMessage(request); }
+    try { return await this.handleAcceptedMessage(request, taskMode?.kind === 'execute' ? ownerId : undefined); }
     finally { clearInterval(renew); }
   }
 
-  private async handleAcceptedMessage(request: GatewayRequest): Promise<GatewayResponse> {
+  private async handleAcceptedMessage(request: GatewayRequest, connectionExecutionLeaseOwner?: string): Promise<GatewayResponse> {
     request = { ...request, taskMode: parseTaskMode(request.taskMode) };
     const run = startRun({
       id: request.runId,
@@ -1217,7 +1237,7 @@ export class ClementineGateway {
     });
     let accepted: AcceptedGatewayTurn;
     try {
-      accepted = acceptGatewayTurn(request, run.id);
+      accepted = acceptGatewayTurn(request, run.id, connectionExecutionLeaseOwner);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       logger.error({ err: detail, sessionId: request.sessionId, runId: run.id }, 'gateway turn acceptance failed');
@@ -1398,7 +1418,7 @@ export class ClementineGateway {
         onChunk: request.onChunk,
         onReasoning: request.onReasoning,
         onToolActivity: request.onToolActivity,
-      }, (req) => this.assistant.respond(req));
+      }, (req) => this.assistant.respond(req), { connectionExecutionLeaseOwner });
       const route = recordGatewayRoute(run.id, response, request.model);
       const sourceOutcomeAfterResponse = acceptedSourceOutcome(accepted.source);
       if (sourceOutcomeAfterResponse?.kind === 'dispatched') {

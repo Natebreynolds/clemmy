@@ -403,6 +403,30 @@ work, not claims that the whole experience has shipped.
 
 Keep each UI slice attached to a real state transition and its recovery path. Avoid another collection of status cards that cannot explain or control the underlying task.
 
+### Setup state and interaction contract
+
+Refine the existing chat/setup components on both surfaces. Preserve the warm
+canvas, orange accent and current typography; this is an interaction refinement,
+not a new visual identity. The task remains the anchor throughout the flow.
+
+| Durable state | What the person sees and can do |
+| --- | --- |
+| Missing connection | The task's next step and why an app/account is needed; one Connect action beside the request |
+| Sign-in cancelled or failed | The retained task stays available; retry setup or leave it paused, without resubmitting the business task |
+| Account verified, execution not yet ready | Readable verified account plus the specific remaining requirement; never imply that sign-in completed the task |
+| Ready to resume | Continue the same task using its retained plan, agent and account; do not prompt for the objective again |
+| Running or receiving a duplicate request | One progress view linked to the same execution; an HTTP retry cannot create another task or approval |
+| Account changed or task stopped | A concrete reason and the appropriate recovery action; no silent switch to another account or automatic restart after Stop |
+| Effect confirmed or result delivered | Human-readable destination and result, with expandable receipt details; distinguish local setup from an actual sent message, created event or purchased resource |
+
+Desktop can keep supporting detail beside the conversation; mobile presents the
+same decision in a focused sheet or task view with its primary action visible.
+Both use the same durable task/approval identity. Preserve focus after sign-in,
+label controls for keyboard/screen readers, and show long account names and
+destinations without hiding the information needed to decide. Technical IDs and
+trace details belong in an expansion, never in place of the recipient's name.
+These are acceptance requirements, not claims of completed visual testing.
+
 ## Retained execution progress now governs host re-entry — September 30
 
 This slice connects the retained connection checkpoint to the ordinary host
@@ -895,3 +919,55 @@ remain the next paired slices from the roadmap above.
 Fixture traps: Space `initialData` is create-only, so parameterized cases need
 distinct slugs; keep those slugs inside the existing 63-character limit. Do
 not weaken the production creation or slug rules to accommodate test reuse.
+
+## Desktop bridge and mobile gateway admission — September 30
+
+Verified: desktop admission and the mobile gateway now recognize the retained
+reviewed execution before fresh Execute claim handling. They activate its
+server-owned control and pass the acquired lease owner through the bridge to
+the retained executor. The owner is internal transport state, never browser
+input. Ordinary chat and Plan setup retain their existing admission paths.
+The bridge uses the original task mode, model and host engine even when a caller
+supplies a different current model. It retains the one original plan claim and
+attributes work to that source while delivering through the new control.
+
+An unfinished accepted connection control is not reclaimed by an HTTP retry.
+Mobile acknowledges the existing source as in progress; exact completed replay
+returns its terminal without runtime configuration or another model call. The
+bridge checks ownership before preparation and again after asynchronous runtime
+configuration. Checkpoint recovery remains responsible for ownership adoption.
+
+Evidence:
+
+- **179/179** checks across six ingress/bridge files passed, including ordinary
+  gateway behavior, surface parity, connection routes and desktop idempotency:
+  `/tmp/clem-connection-ingress-regression.txt`.
+- **9/9** recording integration cases passed in
+  `/tmp/clem-connection-route-final.txt`. Cases cover direct desktop/mobile
+  bridges, the outer configured bridges, actual mobile gateway activation and
+  completion, exact replay after reopening, and Stop/account change before
+  dispatch. The gateway case also retries while its model frame is pending:
+  the retry retains the same source and attempt, publishes no terminal and
+  dispatches no second model. Each completed case preserves one plan claim and
+  one physical completed board read. These nine include prior executor cases;
+  they are not nine wholly new behaviors.
+- Final runtime TypeScript and `git diff --check` passed. TypeScript output:
+  `/tmp/clem-connection-route-final-tsc.txt`.
+
+Not performed: fresh paid model/provider calls, live business actions, browser
+Execute admission, desktop/mobile visual acceptance, build, installation,
+hotpatch, merge or tag. The preceding runner's live-home sentinel was
+**NOT PERFORMED** because daemon 72427 owns those stores; isolated checks are not
+installed-app acceptance. No speed or token savings are claimed. The other
+agent's clean `claude/two-modes` checkout remains at `76c53a1ea` when rechecked.
+
+Still owed: fresh same-root callable/account attestation, held-lease renewal and
+boot adoption, total outer-budget accounting, workflow finalization, subsequent
+setup/approval pauses and completed-write/device-handoff acceptance. The
+`EXECUTION_CONTINUATION_BLOCKER` remains active, so the actual HTTP/UI path does
+not yet advertise reviewed Execute Continue as ready. Enabling that path and
+qualifying it in the installed app is a separate remaining step.
+
+The UI state contract above is paired with this work. Broader projects/agents,
+inbound event health and purposeful proactive check-ins remain planned slices;
+this routing change does not claim to ship them.

@@ -55,6 +55,9 @@ const connectionPause = await import('./connection-execution-pause.js');
 const connectionSetup = await import('./connection-setup.js');
 const activation = await import('./connection-execution-activation.js');
 const { runConversation } = await import('./loop.js');
+const { respondViaHarness, respondPreferHarness, _setBridgeImplsForTests } = await import('./respond-bridge.js');
+const { ClementineGateway } = await import('../../gateway/router.js');
+const { readConnectionExecutionActivation } = await import('./connection-execution-activation-proof.js');
 const { recoverInterruptedChatRuns } = await import('./restart-recovery.js');
 const closure = await import('./connection-execution-closure-proof.js');
 const { completionDataForTurnOutcome } = await import('./delivery-committer.js');
@@ -97,8 +100,11 @@ function recordMissingConnection(identity: { sessionId: string; sourceUserSeq: n
       accounting: 'top_level', topologyRole: 'control', result: output } });
 }
 
-for (const scenario of ['publication', 'executor', 'account-changed-before-model', 'stopped-before-model'] as const) test(`connection execution: ${scenario}`, async t => {
+for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile', 'prefer-home', 'prefer-mobile', 'gateway-mobile', 'account-changed-before-model', 'stopped-before-model'] as const) test(`connection execution: ${scenario}`, async t => {
   const useExecutor = scenario !== 'publication';
+  let configured = 0;
+  _setBridgeImplsForTests({ configure: async () => { configured += 1; return { ok: true }; } });
+  t.after(() => _setBridgeImplsForTests({}));
   log.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
@@ -107,7 +113,7 @@ for (const scenario of ['publication', 'executor', 'account-changed-before-model
     initialData: { rows: [{ account: 'Southgate', status: 'Ready', note: 'Parts arrived' }] },
     viewContent: '<!doctype html><html><body>Southgate: Ready — Parts arrived</body></html>' });
   const beforeSpace = spaceStore.snapshot(slug);
-  const session = log.createSession({ id: 'connection-closure-planned-read', kind: 'chat', userId: 'fixture-owner' });
+  const session = log.createSession({ id: `connection-closure-${scenario}`, kind: 'chat', userId: 'fixture-owner' });
   const objective = 'Track one read-only verification of the saved controlled board and report its current status without changing it.';
   const planSource = log.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: `Plan this task: ${objective}`, taskMode: { version: 1, kind: 'plan' } } });
@@ -155,8 +161,10 @@ for (const scenario of ['publication', 'executor', 'account-changed-before-model
     [message('Southgate is Ready; its note is Parts arrived. The saved board was not changed.')],
   ];
   let modelCalls = 0;
+  let beforeFinalResponse: (() => Promise<void>) | undefined;
   const model: Model = {
     async getResponse() {
+      if (modelCalls === 3) await beforeFinalResponse?.();
       const output = frames[modelCalls++];
       assert.ok(output, 'the recording model must not run beyond its four scripted frames');
       return { responseId: `controlled-closure-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output } as never;
@@ -304,16 +312,47 @@ for (const scenario of ['publication', 'executor', 'account-changed-before-model
     log.claimHarnessChatRequest({ ...sharedReceipt, sessionId: session.id, runId,
       sinceSeq: log.listEvents(session.id).at(-1)!.seq });
   } finally { t.mock.timers.reset(); }
-  const leaseOwner = 'fixture-closure-desktop';
-  const lease = log.claimRunAttemptLease({ sessionId: session.id, runId, ownerId: leaseOwner, leaseMs: 90_000 });
+  const gateway = new ClementineGateway({ respond: async () => { throw new Error('The legacy gateway responder must not run.'); } } as never);
+  let gatewayAccepted: import('./eventlog.js').EventRow | undefined;
+  const gatewayRequest = { sessionId: session.id, runId, userId: 'fixture-owner', channel: 'mobile', source: 'mobile' as const,
+    message: setup.continueLabel, connectionContinuation: context,
+    connectionContinuationVerification: { sourceUserSeq: source.seq, binding: verified.verificationBinding },
+    failClosedOnUnsettledReplay: true,
+    onAcceptedTurn: ({ source: accepted }: { source: import('./eventlog.js').EventRow }) => { gatewayAccepted = accepted; } };
+  if (scenario === 'gateway-mobile') {
+    beforeFinalResponse = async () => {
+      beforeFinalResponse = undefined;
+      const originalControl = gatewayAccepted;
+      const originalAttemptId = log.getLatestRunAttemptByRunId(session.id, runId)!.attemptId;
+      const retry = await gateway.handleMessage(gatewayRequest);
+      assert.equal(retry.stoppedReason, 'in-progress', 'a lost-response retry rejoins the current task');
+      assert.equal(retry.terminal, undefined, 'a concurrent retry cannot publish a terminal');
+      assert.equal(gatewayAccepted?.seq, originalControl?.seq, 'the retry acknowledges the same accepted control');
+      assert.equal(log.getLatestRunAttemptByRunId(session.id, runId)!.attemptId, originalAttemptId,
+        'a retry cannot replace the executing attempt');
+      assert.equal(modelCalls, 3, 'the retry does not dispatch a second model');
+    };
+    const response = await gateway.handleMessage(gatewayRequest);
+    assert.equal(response.text, reply, JSON.stringify(response));
+    assert.equal(response.terminal?.status, 'done');
+    assert.ok(gatewayAccepted);
+    assert.equal(modelCalls, 4);
+  }
+  const leaseOwner = scenario === 'gateway-mobile' ? `connection-gateway:${process.pid}` : 'fixture-closure-desktop';
+  const lease = scenario === 'gateway-mobile'
+    ? { claimed: true, attempt: log.getLatestRunAttemptByRunId(session.id, runId)! }
+    : log.claimRunAttemptLease({ sessionId: session.id, runId, ownerId: leaseOwner, leaseMs: 90_000 });
   assert.equal(lease.claimed, true);
-  const active = activation.activateConnectionExecution({ context, text: setup.continueLabel,
+  const active = scenario === 'gateway-mobile'
+    ? { kind: 'activated', source: gatewayAccepted!, activation: readConnectionExecutionActivation(log.openEventLog(),
+        { sessionId: session.id, deliverySourceUserSeq: gatewayAccepted!.seq })!.activation }
+    : activation.activateConnectionExecution({ context, text: setup.continueLabel,
     clientRequestId: setup.clientRequestId, runId, attemptId: lease.attempt.attemptId, leaseOwner,
     verified: { sourceUserSeq: source.seq, binding: verified.verificationBinding } });
   assert.equal(active.kind, 'activated');
   assert.equal(active.activation.executionSourceUserSeq, source.seq);
   assert.notEqual(active.source.seq, source.seq);
-  assert.deepEqual(proveOriginal(), { ok: true }, 'control acceptance cannot replace the original completion evidence');
+  if (scenario !== 'gateway-mobile') assert.deepEqual(proveOriginal(), { ok: true }, 'control acceptance cannot replace the original completion evidence');
   const deliveryIdentity = { sessionId: session.id, sourceUserSeq: active.source.seq, turn: active.source.turn };
   const finalOutcome: TurnOutcome = { version: 2, id: turnOutcomeId(deliveryIdentity), identity: deliveryIdentity,
     status: 'done', resumable: false, presentation: { kind: 'answer', text: reply } };
@@ -326,6 +365,16 @@ for (const scenario of ['publication', 'executor', 'account-changed-before-model
     // model or completion policy. The recording provider rejects auxiliaries.
     maxTurns: 100, toolCallsPerTurn: 100, judgeCompletion: true,
     buildAgent: async () => { throw new Error('A connection control cannot construct a fresh caller-selected agent.'); } };
+  const bridgeRequest = {
+    sessionId: session.id, sourceUserSeq: active.source.seq, runId,
+    message: setup.continueLabel, taskMode: { version: 1 as const, kind: 'execute' as const, executeRef },
+    model: 'fixture-wrong-current-selection',
+  };
+  const runBridge = () => scenario.startsWith('prefer-')
+    ? respondPreferHarness(scenario === 'prefer-mobile' ? 'webhook' : 'home', bridgeRequest,
+        async () => { throw new Error('The legacy bridge responder must not run.'); }, { connectionExecutionLeaseOwner: leaseOwner })
+    : respondViaHarness(scenario === 'bridge-mobile' ? 'webhook' : 'home', bridgeRequest,
+        { connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1', modelOverride: 'fixture-wrong-caller-override' });
   if (scenario === 'account-changed-before-model' || scenario === 'stopped-before-model') {
     let invalidated = false;
     beforeResumeModel = () => {
@@ -344,7 +393,7 @@ for (const scenario of ['publication', 'executor', 'account-changed-before-model
     assert.equal(log.listEvents(session.id, { types: ['plan_execution_claimed'] }).length, 1);
     return;
   }
-  if (useExecutor) {
+  if (useExecutor && scenario !== 'gateway-mobile') {
     log.closeEventLog();
     // Boot must recognize the retained execution under its new delivery
     // control, even when generic chat auto-resume is disabled. This dispatcher
@@ -366,9 +415,18 @@ for (const scenario of ['publication', 'executor', 'account-changed-before-model
     }
     await assert.rejects(runConversation({ ...resumeOptions, connectionExecutionLeaseOwner: 'wrong-owner' }), /live execution lease/);
     assert.equal(modelCalls, 3, 'a wrong executor cannot spend a model frame');
-    const [resumed, concurrent] = await Promise.all([runConversation(resumeOptions), runConversation(resumeOptions)]);
-    assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
-    assert.deepEqual(concurrent, resumed, 'concurrent controls share one executor and terminal');
+    if (scenario.startsWith('bridge-') || scenario.startsWith('prefer-')) {
+      const response = await runBridge();
+      assert.equal(response.stoppedReason, 'success', JSON.stringify(response));
+      assert.equal(response.text, reply);
+      const routed = log.listEvents(session.id, { types: ['turn_model_routed'] }).at(-1);
+      assert.equal(routed?.data.model, modelId, 'the bridge reports the retained brain, not current settings');
+      assert.equal(routed?.data.sourceUserSeq, active.source.seq);
+    } else {
+      const [resumed, concurrent] = await Promise.all([runConversation(resumeOptions), runConversation(resumeOptions)]);
+      assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
+      assert.deepEqual(concurrent, resumed, 'concurrent controls share one executor and terminal');
+    }
   }
   const completed = useExecutor ? { inserted: true, event: log.listEvents(session.id, { types: ['conversation_completed'] })
     .find(event => event.data.sourceUserSeq === active.source.seq)! } : publishFinal();
@@ -391,11 +449,15 @@ for (const scenario of ['publication', 'executor', 'account-changed-before-model
   assert.equal(log.readValidatedTerminalEvent(completed.event.id, session.id, active.source.seq).id, completed.event.id);
   assert.equal(connectionPause.readConnectionExecutionPause(session.id, dependency.requestId)?.eventId, paused.event.id);
   assert.equal(publishPause().inserted, false);
-  if (useExecutor) assert.equal((await runConversation(resumeOptions)).status, 'completed');
+  if (scenario === 'gateway-mobile') assert.equal((await gateway.handleMessage(gatewayRequest)).text, reply);
+  else if (scenario.startsWith('bridge-') || scenario.startsWith('prefer-')) assert.equal((await runBridge()).stoppedReason, 'success');
+  else if (useExecutor) assert.equal((await runConversation(resumeOptions)).status, 'completed');
   else assert.equal(publishFinal().inserted, false);
   assert.deepEqual(readRows(), readBefore, 'closure and both exact replays must never repeat the completed local read');
   assert.deepEqual(spaceStore.snapshot(slug), beforeSpace);
   assert.equal(modelCalls, useExecutor ? 4 : 3);
+  assert.equal(configured, scenario.startsWith('prefer-') || scenario === 'gateway-mobile' ? 1 : 0,
+    'a completed replay must not configure or re-enter the runtime');
   assert.equal(checks, 1);
   assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 2);
   assert.equal(log.listEvents(session.id, { types: ['plan_execution_claimed'] }).length, 1);

@@ -6,6 +6,9 @@ import { getPlanRevision, type PlanArtifactV1 } from './plan-artifacts.js';
 import { checkReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { parseTaskMode, taskModeDigest, taskModeFields } from './task-mode.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
+import { readConnectionExecutionActivation } from './connection-execution-activation-proof.js';
+import { assertConnectionExecutionOwned } from './connection-execution-activation.js';
+import { readSourceConnectionCheckpoint } from './source-connection-checkpoints.js';
 /**
  * respondViaHarness — the CANON-ONE-LOOP convergence bridge.
  *
@@ -91,6 +94,7 @@ import {
   getSession,
   isKillRequested,
   listEvents,
+  openEventLog,
   preserveCurrentKillAndClearStale,
   recordRunAttemptUserInput,
   requestKill,
@@ -159,6 +163,8 @@ export type HarnessSurface = 'webhook' | 'cron' | 'background' | 'cli' | 'dashbo
 export interface RespondHarnessLimits {
   maxTurns?: number;
   maxSteps?: number;
+  /** Internal transport owner only; never copied from a request body. */
+  connectionExecutionLeaseOwner?: string;
 }
 
 const MATERIAL_SOURCE_AUTHORITY_BLOCKED_TEXT =
@@ -1415,6 +1421,25 @@ function commitBridgeFailedTerminal(input: {
   return committed.event;
 }
 
+/** A setup control already owns a reviewed execution. Resolve it before the
+ * fresh Execute admission path; accepted source numbers are not bearer tokens. */
+function retainedConnectionForRequest(request: AssistantRequest) {
+  const source = durableSourceEventForRequest(request);
+  if (source?.data.source !== 'connection_continuation') return null;
+  if (!acceptedSourceIdentityForReplay(request)) throw new Error('The connection control does not match its accepted request.');
+  const marker = readConnectionExecutionActivation(openEventLog(), {
+    sessionId: source.sessionId, deliverySourceUserSeq: source.seq,
+  });
+  if (!marker) throw new Error('The connection control has no retained execution.');
+  const checkpoint = readSourceConnectionCheckpoint({ sessionId: source.sessionId, requestId: marker.activation.requestId });
+  const attempt = getRunAttemptBySourceUserSeq(source.sessionId, source.seq);
+  if (!checkpoint?.agent?.modelId || !checkpoint.hostProgress || !attempt
+    || checkpoint.sourceUserSeq !== marker.activation.executionSourceUserSeq || attempt.runId !== marker.activation.runId) {
+    throw new Error('The connection control lost its retained model, progress or attempt.');
+  }
+  return { source, marker, checkpoint, attempt };
+}
+
 export async function respondViaHarness(
   surface: HarnessSurface,
   request: AssistantRequest,
@@ -1428,6 +1453,8 @@ export async function respondViaHarness(
     /** Optional one-shot smoke/eval limits; ordinary surfaces omit these. */
     maxTurns?: number;
     maxSteps?: number;
+    /** The server-side owner that acquired this connection execution lease. */
+    connectionExecutionLeaseOwner?: string;
   } = {},
 ): Promise<AssistantResponse> {
   // Request-local offsets expose pre-routing work without another model call
@@ -1441,6 +1468,21 @@ export async function respondViaHarness(
   const sessionId = request.sessionId;
   const acceptedSourceUserSeq = opts.sourceUserSeq ?? request.sourceUserSeq;
   const displayMessage = request.displayMessage ?? request.message;
+  const connection = retainedConnectionForRequest({ ...request, sourceUserSeq: acceptedSourceUserSeq });
+  if (connection) {
+    if (request.taskMode && taskModeDigest(request.taskMode)
+      !== taskModeDigest(acceptedTaskMode(sessionId, connection.checkpoint.sourceUserSeq))) throw new Error('accepted task mode mismatch');
+    opts = { ...opts, modelOverride: connection.checkpoint.agent!.modelId!,
+      turnEngine: connection.checkpoint.hostProgress!.recovery.turnEngine };
+    const replay = exactTerminalReplayForRequest({ ...request, sourceUserSeq: acceptedSourceUserSeq });
+    if (replay) {
+      return withRouteDiagnostics(responseForExactTerminalReplayUnderPolicy(surface, request, replay),
+        routeForAcceptedHarness(surface, request, opts.modelOverride, connection.source));
+    }
+    if (!opts.connectionExecutionLeaseOwner) throw new Error('This connection control needs its current server execution lease.');
+    assertConnectionExecutionOwned({ sessionId, deliverySourceUserSeq: connection.source.seq,
+      attemptId: connection.attempt.attemptId, leaseOwner: opts.connectionExecutionLeaseOwner });
+  }
 
   if (!getSession(sessionId)) {
     const titleSeed = displayMessage.trim().replace(/\s+/g, ' ');
@@ -1459,7 +1501,7 @@ export async function respondViaHarness(
   // idempotent; background/workflow/cron callers gain exact cancellation rather
   // than a session-global poll that can jump to a newer turn.
   const providedMode = parseTaskMode(request.taskMode);
-  const sourceMode = acceptedTaskMode(sessionId, acceptedSourceUserSeq);
+  const sourceMode = acceptedTaskMode(sessionId, connection?.checkpoint.sourceUserSeq ?? acceptedSourceUserSeq);
   if (acceptedSourceUserSeq !== undefined && providedMode && taskModeDigest(providedMode) !== taskModeDigest(sourceMode)) throw new Error('accepted task mode mismatch');
   const requestedMode = providedMode ?? sourceMode;
   // A fresh Execute runs the pure preparation check BEFORE its one-per-revision
@@ -1484,7 +1526,7 @@ export async function respondViaHarness(
       }
     }
   }
-  const reviewedAdmission = requestedMode?.kind === 'execute' ? admitPlanExecutionBridgeSource({
+  const reviewedAdmission = !connection && requestedMode?.kind === 'execute' ? admitPlanExecutionBridgeSource({
     sessionId, sourceUserSeq: acceptedSourceUserSeq, runId: request.runId, mode: requestedMode,
     displayText: displayMessage, modelDirectiveApplied: displayMessage !== request.message, surface,
   }) : null;
@@ -1492,10 +1534,10 @@ export async function respondViaHarness(
     return { sessionId, text: 'This reviewed revision already has an execution. The existing run remains its owner; no duplicate work was started.', stoppedReason: 'awaiting-input',
       raw: { reviewedPlanExecutionJoined: true, planExecutionRunId: reviewedAdmission.claim.executionRunId, planExecutionSessionId: reviewedAdmission.claim.sessionId, planExecutionSourceUserSeq: reviewedAdmission.claim.sourceUserSeq } };
   }
-  const requestAttempt = reviewedAdmission?.attempt ?? beginRunAttempt(sessionId, { runId: request.runId });
+  const requestAttempt = connection?.attempt ?? reviewedAdmission?.attempt ?? beginRunAttempt(sessionId, { runId: request.runId });
   const newlyAcceptedSource = reviewedAdmission?.newlyAccepted
     ?? (acceptedSourceUserSeq === undefined && getRunAttemptSourceUserEvent(requestAttempt) === null);
-  const sourceUserEvent = reviewedAdmission?.source ?? recordRunAttemptUserInput(requestAttempt, {
+  const sourceUserEvent = connection?.source ?? reviewedAdmission?.source ?? recordRunAttemptUserInput(requestAttempt, {
     turn: 1,
     role: 'user',
     data: {
@@ -1515,22 +1557,22 @@ export async function respondViaHarness(
   let preserveRequestAttemptOwnership = false;
   try {
   return await withAcceptedSourceSessionContext({ sessionId, sourceUserSeq: sourceUserEvent.seq }, async execution => {
-  const resumesApprovalCheckpoint = execution.sourceUserSeq !== sourceUserEvent.seq;
-  if (resumesApprovalCheckpoint) {
-    // The validated approval control owns delivery, not a new business query.
+  const resumesExecutionCheckpoint = execution.sourceUserSeq !== sourceUserEvent.seq;
+  if (resumesExecutionCheckpoint) {
+    // A validated approval/setup control owns delivery, not a new business query.
     // Let the loop reopen its exact checkpoint/consent receipts. Do not run
     // fresh clarification, source-selection or discovery over "Approved".
     const original = listEvents(sessionId, { types: ['user_input_received'], sinceSeq: execution.sourceUserSeq - 1, limit: 1 })
       .find(event => event.seq === execution.sourceUserSeq);
-    if (!original) throw new Error('The approved execution source is unavailable.');
+    if (!original) throw new Error('The retained execution source is unavailable.');
     request = { ...request, message: String(original.data.text ?? ''), semanticTaskInput: undefined,
       taskContinuation: undefined, taskContinuationResolved: true, turnCandidates: undefined };
   }
-  const durableTaskMode = parseTaskMode(sourceUserEvent.data.taskMode);
+  const durableTaskMode = connection ? sourceMode : parseTaskMode(sourceUserEvent.data.taskMode);
   if (request.taskMode && taskModeDigest(request.taskMode) !== taskModeDigest(durableTaskMode)) throw new Error('accepted task mode mismatch');
   request = { ...request, taskMode: durableTaskMode };
   if (durableTaskMode?.kind === 'execute') {
-    request = { ...request, runId: requestAttempt.runId!, message: acceptedPlanExecutionText(sessionId, sourceUserEvent.seq)!, displayMessage,
+    request = { ...request, runId: requestAttempt.runId!, message: acceptedPlanExecutionText(sessionId, execution.sourceUserSeq)!, displayMessage,
       maxWallClockMs: request.maxWallClockMs ?? 30 * 60_000 };
   }
 
@@ -1542,7 +1584,7 @@ export async function respondViaHarness(
   // Caller-supplied semantic context is stripped when no valid packet exists.
   const hostOwnsTurn = Boolean(opts.turnEngine && isHostTurnEngine(opts.turnEngine));
   const callerSourceStrategyBinding = request.turnCandidates?.sourceStrategyBinding;
-  if (hostOwnsTurn && !resumesApprovalCheckpoint) {
+  if (hostOwnsTurn && !resumesExecutionCheckpoint) {
     await prepareCheckedHostClarificationAnswer({
       sessionId: request.sessionId,
       sourceUserSeq: sourceUserEvent.seq,
@@ -1557,11 +1599,11 @@ export async function respondViaHarness(
     });
   }
   markPreparation('clarification_checked');
-  const typedClassification = !resumesApprovalCheckpoint && semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
+  const typedClassification = !resumesExecutionCheckpoint && semanticPortParticipated(request.sessionId, sourceUserEvent.seq)
     ? (typedClassificationFromLastInterpretation(request.sessionId, sourceUserEvent.seq) ?? { keepOpen: true as const })
     : undefined;
   const requestBeforeContinuity = request;
-  if (!resumesApprovalCheckpoint) request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
+  if (!resumesExecutionCheckpoint) request = await enrichAcceptedRequestWithTaskContinuity(request, sourceUserEvent.seq, {
     ...(hostOwnsTurn ? { continuationOnly: true, resolveCandidates: false } : {}),
     typedClassification,
   });
@@ -1579,7 +1621,7 @@ export async function respondViaHarness(
     )
     ? request.semanticTaskInput
     : undefined;
-  if (hostOwnsTurn && !resumesApprovalCheckpoint) {
+  if (hostOwnsTurn && !resumesExecutionCheckpoint) {
     const materialSource = inspectDurableMaterialSourceContinuation({
       sessionId,
       sourceUserSeq: sourceUserEvent.seq,
@@ -1715,7 +1757,7 @@ export async function respondViaHarness(
   // fallover rebuild. A retrieval failure remains advisory-only: existing
   // caller/continuation candidates survive, while no candidate ever grants
   // dispatch authority.
-  const resolveFreshHostCandidates = hostOwnsTurn && !resumesApprovalCheckpoint
+  const resolveFreshHostCandidates = hostOwnsTurn && !resumesExecutionCheckpoint
     && request.taskContinuation === undefined
     && !(typedClassification && 'keepOpen' in typedClassification);
   if (resolveFreshHostCandidates && request.turnCandidates?.sourceStrategyBinding) {
@@ -1760,7 +1802,7 @@ export async function respondViaHarness(
     }
     return acceptedTurnCandidatesPromise;
   };
-  if (!resumesApprovalCheckpoint && (!opts.turnEngine || !isHostTurnEngine(opts.turnEngine))) {
+  if (!resumesExecutionCheckpoint && (!opts.turnEngine || !isHostTurnEngine(opts.turnEngine))) {
     await observeAcceptedBridgeTurnGraph(surface, request, sourceUserEvent);
   }
   markPreparation('graph_observed');
@@ -1837,7 +1879,7 @@ export async function respondViaHarness(
     // model ids + a rebuild factory so a transient model/codex error mid-turn
     // re-dispatches to the next brain instead of immediately asking. Best-effort
     // + gated by CLEMMY_BRAIN_FALLOVER; absence = today's ask behavior.
-    const fallover = config.kind === 'chat'
+    const fallover = config.kind === 'chat' && !connection
       ? buildChatFalloverWiring({
           userInput: request.message,
           sessionId,
@@ -1905,6 +1947,7 @@ export async function respondViaHarness(
       ...(request.taskContinuationResolved ? { taskContinuationResolved: true as const } : {}),
       sourceUserSeq: sourceUserEvent.seq,
       runAttemptId: requestAttempt.attemptId,
+      ...(connection ? { connectionExecutionLeaseOwner: opts.connectionExecutionLeaseOwner } : {}),
       turnEngine: opts.turnEngine,
       maxTurns: opts.maxTurns,
       maxSteps: opts.maxSteps,
@@ -2324,6 +2367,12 @@ async function respondPreferHarnessOnce(
       return responseForUnverifiableTerminalLedger(surface, request);
     }
   }
+  const connection = retainedConnectionForRequest(request);
+  if (connection) {
+    if (!limits.connectionExecutionLeaseOwner) throw new Error('This connection control needs its current server execution lease.');
+    assertConnectionExecutionOwned({ sessionId: request.sessionId, deliverySourceUserSeq: connection.source.seq,
+      attemptId: connection.attempt.attemptId, leaseOwner: limits.connectionExecutionLeaseOwner });
+  }
   // Do not introduce an async boundary into the established hot path merely
   // to discover that an ordinary request is not an answer-repeat request. Cron and
   // background admission rely on synchronous fall-through up to their chosen
@@ -2368,6 +2417,8 @@ async function respondPreferHarnessOnce(
           totalMs: Math.max(0, performance.now() - runtimeConfigurationStartedAt) } });
     } catch { /* Diagnostics cannot change runtime admission. */ }
   }
+  if (connection) assertConnectionExecutionOwned({ sessionId: request.sessionId, deliverySourceUserSeq: connection.source.seq,
+    attemptId: connection.attempt.attemptId, leaseOwner: limits.connectionExecutionLeaseOwner! });
   if (!auth.ok) {
     return await blockedPreRunResponse(
       surface,
@@ -2382,7 +2433,7 @@ async function respondPreferHarnessOnce(
   // second executor in front of it.
   let turnEngine: TurnEngineMode;
   try {
-    turnEngine = selectTurnEngine({
+    turnEngine = connection?.checkpoint.hostProgress!.recovery.turnEngine ?? selectTurnEngine({
       sessionKind: SURFACE_CONFIG[surface].kind,
     });
   } catch (err) {
@@ -2586,7 +2637,11 @@ async function respondPreferHarnessWithinRuntimeConfig(
   let key: string | null = null;
   try {
     const source = acceptedSourceIdentityForReplay(request);
-    if (source && request.taskMode && taskModeDigest(request.taskMode) !== taskModeDigest(parseTaskMode(source.data.taskMode))) {
+    const connection = source?.data.source === 'connection_continuation' ? retainedConnectionForRequest(request) : null;
+    const expectedMode = connection
+      ? acceptedTaskMode(request.sessionId, connection.checkpoint.sourceUserSeq)
+      : parseTaskMode(source?.data.taskMode);
+    if (source && request.taskMode && taskModeDigest(request.taskMode) !== taskModeDigest(expectedMode)) {
       return responseForAcceptedSourceIdentityMismatch(surface, request);
     }
     // source.seq is the immutable logical-turn identity. The ordinary harness
