@@ -550,3 +550,75 @@ The essential remaining test is pause → activate → finish → reopen → rep
 both terminals, including intervening approval/cancellation and no repeated
 writes. Only then enable Continue and qualify desktop/mobile setup and device
 handoff on one combined installed candidate.
+
+## Durable connection activation and current ownership — September 30
+
+This slice adds the server-side activation primitive; it does **not** enable
+reviewed Execute continuation in the UI or route live requests into it yet.
+
+The original reviewed task now has one durable connection-control identity
+bound to its pause, checkpoint, original execution source, shared chat receipt,
+accepted delivery control, and verified account selection. One managed event
+transaction installs canonical recovery, records the new delivery owner, and
+publishes the control. A failed install rolls back all of them, including live
+subscriber publications. It creates no new plan claim and performs no model or
+business tool call.
+
+The distinct connection recovery owner carries the original execution identity
+through recovery adoption and database reopen. Composition and completion
+evidence map to that original source while delivery belongs to the connection
+control. Repeating the click, including from another device, returns the
+existing receipt without reinstalling an old checkpoint or resetting spent
+host progress. These are database-backed simulated device controls, not actual
+phone acceptance. The private activation proof is excluded from public chat
+payloads.
+
+`assertConnectionExecutionOwned` is the separate, current ownership check for
+asynchronous preparation and subsequent executor integration. It checks the
+exact active attempt/lease, recovery and continuation owners, original and
+delivery Stop, shared request cancellation, latest ordinary source and account
+binding. It remains valid after recovery adoption and dependency satisfaction;
+an open setup card is not the authority to continue. Malformed lease dates are
+rejected. Returning a historical receipt does not grant fresh execution. The
+recording rebuild pin proves Stop during an awaited preparation prevents later
+validation and construction.
+
+Validation: **178/178 tests passed** across accepted-model-batch-checkpoint,
+recovery-activation, connection-setup, source-session-context,
+accepted-task-terminal-publication, accepted-turn-call-authority and
+source-connection-checkpoints.integration. Runtime TypeScript passed. The
+earlier focused run passed 129/129. Logs are
+`/tmp/clem-connection-activation-regression.txt`,
+`/tmp/clem-connection-activation-tests.txt` and
+`/tmp/clem-connection-activation-tsc.txt`.
+
+Traps retained for integration:
+
+- Use `withEventPublicationTransaction` as the outer activation transaction.
+  The existing raw connection-admission transaction cannot contain it; a raw
+  outer transaction would also break the publication/rollback contract.
+- A persisted owner or repeated-click receipt proves identity, not a live
+  lease. Recheck current ownership after each awaited preparation operation.
+- Recovery adoption removes the blob but retains its owner. Losing that blob
+  must neither lose original task composition nor authorize checkpoint reset.
+- Account verification and owner checks do not satisfy callable discovery or
+  grant permission to write. Keep the fresh capability/account attestation and
+  existing per-effect authority checks in the execution path.
+
+Still owed before enabling Continue: route admission before fresh Execute
+claims; executor/timer/retirement and restart integration; original-source
+outer-window/token accounting; same-root fresh callable attestation; and atomic
+final closure with a historical pause → activation → terminal proof chain.
+The current activation reader intentionally still requires the retained root
+to be open. It is not yet the final historical replay reader for a completed
+continuation. Pin intervening approval/cancellation, recovery after adoption,
+multiple connection pauses and no replay of completed writes at integration.
+
+The live-home sentinel was **NOT PERFORMED** because daemon 35630 was changing
+live stores during deterministic testing. No paid-model/provider test,
+configuration change, app restart, build, hotpatch, merge or tag was performed.
+The other agent's checkout was rechecked clean at `5fc52bf4b`; its installation
+has not been replaced or independently qualified here. Installed desktop/mobile
+acceptance and matched latency/token measurements remain owed. UI priorities
+and paired acceptance remain as described above; this is their recovery
+foundation, not a claim that the end-to-end setup experience has shipped.

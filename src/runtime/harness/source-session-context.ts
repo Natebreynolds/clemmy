@@ -4,7 +4,7 @@ import { getSession, openEventLog, type SessionKind } from './eventlog.js';
 import { composeSession, type SessionMount } from './session-composition.js';
 import { getAgentRecord } from '../../agents/agent-record.js';
 import { agentScopeKey, type MemoryScope } from '../../memory/memory-scope.js';
-import { readApprovalRecoveryActivation } from './recovery-activation.js';
+import { readRecoveryActivation } from './recovery-activation.js';
 import { currentSourceSessionContext, withSourceSessionContext,
   type SourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 
@@ -159,14 +159,15 @@ export function withAcceptedSourceSessionContext<T>(
   run: (execution: Pick<SourceSessionContextRef, 'sessionId' | 'sourceUserSeq'>) => T,
   options: { newlyAccepted?: boolean } = {},
 ): T {
-  // Approval checkpoints have a delivery source and a different execution
+  // Task-control checkpoints have a delivery source and a different execution
   // root. Resolve the validated root BEFORE retrieval or construction. Never
   // nest a control-event context around the original execution's context.
   const rawOwner = getSession(input.sessionId)?.metadata?.__host_recovery_owner as { sourceUserSeq?: number } | undefined;
   const activation = rawOwner?.sourceUserSeq === input.sourceUserSeq
-    ? readApprovalRecoveryActivation(input.sessionId) : null;
-  const execution = activation?.approvalContinuation
-    ? { sessionId: input.sessionId, sourceUserSeq: activation.approvalContinuation.requestSourceUserSeq }
+    ? readRecoveryActivation(input.sessionId) : null;
+  const continuation = activation?.approvalContinuation ?? activation?.connectionContinuation;
+  const execution = continuation
+    ? { sessionId: input.sessionId, sourceUserSeq: continuation.requestSourceUserSeq }
     : input;
   const active = currentSourceSessionContext(execution.sessionId);
   if (active && active.sourceUserSeq !== execution.sourceUserSeq) throw new Error('Task composition source changed during execution.');

@@ -99,6 +99,7 @@ function recoveryOwnerToken(owner: RecoveryOwner): string {
     sourceUserSeq: owner.sourceUserSeq,
     attemptId: owner.attemptId ?? null,
     ...(owner.approvalContinuation ? { approvalContinuation: owner.approvalContinuation } : {}),
+    ...(owner.connectionContinuation ? { connectionContinuation: owner.connectionContinuation } : {}),
   });
 }
 // Restart-recovery marker: set while a runConversation is in flight, cleared in

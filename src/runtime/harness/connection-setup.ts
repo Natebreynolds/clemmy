@@ -71,6 +71,13 @@ export function connectionContinuationIdentity(context: ConnectionSetupContext, 
 export function assertConnectionContinuationCurrent(context: ConnectionSetupContext, sourceUserSeq: number, binding: string): void {
   const current = readConnectionSetup(context.sessionId, context.connectionRequestId);
   if (!current || current.sourceUserSeq !== sourceUserSeq) throw new Error('This task changed while connecting. Return to the current conversation.');
+  assertConnectionContinuationAccount(context, binding);
+}
+
+/** Account selection must still match after asynchronous preparation, even
+ * after fresh tool attestation has satisfied the original dependency. This
+ * comparison is not a new provider check or a callable capability grant. */
+export function assertConnectionContinuationAccount(context: ConnectionSetupContext, binding: string): void {
   ensureSetupTable();
   const account = openEventLog().prepare('SELECT connection_id, updated_at FROM connection_setup_attempts WHERE request_id = ? AND session_id = ?')
     .get(context.connectionRequestId, context.sessionId) as { connection_id: string; updated_at: string } | undefined;

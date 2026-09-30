@@ -43,6 +43,9 @@ const noProgress = await import('./no-progress-governor.js');
 const connectionPause = await import('./connection-execution-pause.js');
 const delivery = await import('./delivery-committer.js');
 const outcomes = await import('./turn-outcome.js');
+const connectionSetup = await import('./connection-setup.js');
+const connectionActivation = await import('./connection-execution-activation.js');
+const recoveryActivation = await import('./recovery-activation.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -116,6 +119,213 @@ async function connectionPauseFixture() {
     needs: { kind: 'input' }, presentation: { kind: 'question', text: pause.text },
   };
   return { task, batch, agent, pause, binding, outcome };
+}
+
+async function connectionActivationFixture() {
+  const f = await connectionPauseFixture();
+  const originalAttempt = eventlog.beginRunAttempt(f.task.sessionId, { runId: `original-${f.task.sourceUserSeq}` });
+  eventlog.recordRunAttemptUserInput(originalAttempt, { turn: 1, role: 'user', data: { text: f.task.text } },
+    { existingEventSeq: f.task.sourceUserSeq, armRunInFlight: true });
+  delivery.commitTurnOutcome(f.outcome, { metadata: { connectionExecutionPause: f.binding } });
+  const context = { sessionId: f.task.sessionId, connectionRequestId: f.pause.requestId };
+  connectionSetup.recordConnectionSetupResult(context, { connectionId: 'ca_controlled_fixture_account' });
+  const checked = await connectionSetup.verifyConnectionSetup(context, async () => ({ ok: true }));
+  assert.equal(checked.connectionVerified, true);
+  assert.ok(checked.verificationBinding && checked.request);
+  const setup = connectionSetup.readConnectionSetup(f.task.sessionId)!;
+  const text = setup.continueLabel;
+  const identity = connectionSetup.connectionContinuationIdentity(context, text, setup.clientRequestId);
+  const runId = `controlled-connection-${f.task.sourceUserSeq}`;
+  eventlog.claimHarnessChatRequest({ ...identity, sessionId: f.task.sessionId, runId,
+    sinceSeq: eventlog.listEvents(f.task.sessionId).at(-1)!.seq });
+  const leaseOwner = 'controlled-desktop';
+  const claim = eventlog.claimRunAttemptLease({ sessionId: f.task.sessionId, runId, ownerId: leaseOwner, leaseMs: 90000 });
+  assert.equal(claim.claimed, true);
+  assert.ok(claim.attempt);
+  const input = { context, text, clientRequestId: setup.clientRequestId, runId,
+    attemptId: claim.attempt.attemptId, leaseOwner,
+    verified: { sourceUserSeq: f.task.sourceUserSeq, binding: checked.verificationBinding } };
+  return { ...f, input, attempt: claim.attempt, originalAttempt };
+}
+
+test('connection activation retains the exact task and canonical recovery behind one new control', async () => {
+  const f = await connectionActivationFixture();
+  const acceptedBefore = eventlog.listEvents(f.task.sessionId, { types: ['user_input_received'] }).length;
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  assert.equal(active.kind, 'activated');
+  connectionActivation.assertConnectionExecutionOwned({ sessionId: f.task.sessionId, deliverySourceUserSeq: active.source.seq,
+    attemptId: f.attempt.attemptId, leaseOwner: f.input.leaseOwner });
+  assert.notEqual(active.source.seq, f.task.sourceUserSeq);
+  assert.equal(active.source.data.taskMode, undefined, 'setup continuation is not a new Execute request');
+  assert.equal(active.activation.executionSourceUserSeq, f.task.sourceUserSeq);
+  assert.equal(eventlog.listEvents(f.task.sessionId, { types: ['user_input_received'] }).length, acceptedBefore + 1);
+  assert.equal(eventlog.listEvents(f.task.sessionId, { types: ['plan_execution_claimed'] }).length, 1);
+  const session = sessionStore.HarnessSession.load(f.task.sessionId)!;
+  assert.equal(session.recoveryOwnedByActivation({ sourceUserSeq: active.source.seq, attemptId: f.attempt.attemptId }), true);
+  assert.equal(session.recoveryOwnedByActivation({ sourceUserSeq: f.task.sourceUserSeq, attemptId: f.attempt.attemptId }), false);
+  const state = JSON.parse(session.loadRecoveryState()!);
+  assert.equal(state.sourceUserSeq, f.task.sourceUserSeq);
+  assert.equal(state.connectionProgress.activation.toolCalls.used, 2);
+  assert.deepEqual(state.history, f.batch.history);
+  assert.deepEqual(recoveryActivation.readConnectionRecoveryActivation(f.task.sessionId), active.owner);
+  assert.deepEqual(recoveryActivation.completionEvidenceSource({ sessionId: f.task.sessionId, sourceUserSeq: active.source.seq }),
+    { sessionId: f.task.sessionId, sourceUserSeq: f.task.sourceUserSeq });
+  sessionContext.withAcceptedSourceSessionContext({ sessionId: f.task.sessionId, sourceUserSeq: active.source.seq }, execution => {
+    assert.equal(execution.sourceUserSeq, f.task.sourceUserSeq);
+    assert.equal(sessionContextScope.currentSourceSessionContext(f.task.sessionId)?.sourceUserSeq, f.task.sourceUserSeq);
+  }, { newlyAccepted: true });
+  assert.equal(sessionContext.readSourceSessionContext({ sessionId: f.task.sessionId, sourceUserSeq: active.source.seq }), null);
+  assert.equal(connectionSetup.readConnectionSetup(f.task.sessionId)?.sourceUserSeq, f.task.sourceUserSeq);
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const marker = eventlog.listEvents(f.task.sessionId, { types: ['run_resumed'] })[0]!;
+  assert.deepEqual(projectHarnessEventForPublic(marker)?.data, {}, 'recovery proof does not become card text or a brain prompt');
+  assert.equal(physicalRows(f.task, 'call:connection-search').length, 1);
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+test('repeated device continuation and reopen do not install an old checkpoint after adoption', async () => {
+  const f = await connectionActivationFixture();
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  const session = sessionStore.HarnessSession.load(f.task.sessionId)!;
+  assert.equal(session.adoptRecoveredConversation({ serializedState: session.loadRecoveryState()!, history: f.batch.history,
+    lastResponseId: f.batch.lastResponseId }), true);
+  assert.equal(session.loadRecoveryState(), null);
+  eventlog.closeEventLog();
+  const replay = connectionActivation.activateConnectionExecution({ ...f.input, leaseOwner: 'controlled-phone' });
+  assert.equal(replay.kind, 'existing');
+  assert.equal(replay.source.seq, active.source.seq);
+  assert.equal(sessionStore.HarnessSession.load(f.task.sessionId)!.loadRecoveryState(), null);
+  assert.deepEqual(recoveryActivation.readConnectionRecoveryActivation(f.task.sessionId), active.owner);
+  sessionContext.withAcceptedSourceSessionContext({ sessionId: f.task.sessionId, sourceUserSeq: active.source.seq }, execution => {
+    assert.equal(execution.sourceUserSeq, f.task.sourceUserSeq, 'adoption must not lose the original composition');
+  });
+  assert.equal(eventlog.listEvents(f.task.sessionId, { types: ['run_resumed'] }).length, 1);
+  connectionActivation.assertConnectionExecutionOwned({ sessionId: f.task.sessionId, deliverySourceUserSeq: active.source.seq,
+    attemptId: f.attempt.attemptId, leaseOwner: f.input.leaseOwner });
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+for (const defect of ['account-changed', 'request-stopped', 'newer-source', 'expired-lease', 'malformed-lease', 'foreign-lease', 'different-action', 'existing-recovery'] as const) {
+  test(`connection activation refuses ${defect} before accepting another control`, async () => {
+    const f = await connectionActivationFixture();
+    if (defect === 'account-changed') connectionSetup.recordConnectionSetupResult(f.input.context, { connectionId: 'ca_different_account' });
+    if (defect === 'request-stopped') eventlog.requestHarnessChatCancellation(f.input.clientRequestId);
+    if (defect === 'newer-source') eventlog.appendEvent({ sessionId: f.task.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'A new task.' } });
+    if (defect === 'expired-lease') eventlog.openEventLog().prepare('UPDATE run_attempts SET lease_expires_at = ? WHERE attempt_id = ?').run(new Date(0).toISOString(), f.attempt.attemptId);
+    if (defect === 'malformed-lease') eventlog.openEventLog().prepare("UPDATE run_attempts SET lease_expires_at = 'invalid-date' WHERE attempt_id = ?").run(f.attempt.attemptId);
+    if (defect === 'foreign-lease') f.input.leaseOwner = 'other-owner';
+    if (defect === 'different-action') f.input.text = 'Do something different.';
+    if (defect === 'existing-recovery') assert.equal(sessionStore.HarnessSession.load(f.task.sessionId)!.saveRecoveryState('retained-other-checkpoint').installed, true);
+    const before = eventlog.listEvents(f.task.sessionId).length;
+    assert.throws(() => connectionActivation.activateConnectionExecution(f.input));
+    assert.equal(eventlog.listEvents(f.task.sessionId).length, before);
+    assert.equal(eventlog.getLatestRunAttemptByRunId(f.task.sessionId, f.input.runId)?.sourceUserSeq, null);
+    leases.revokeDispatchLease(f.task.parentLease);
+  });
+}
+
+for (const adopted of [false, true]) {
+  for (const defect of ['account-changed', 'request-stopped', 'original-stopped', 'delivery-stopped', 'newer-source',
+    'expired-lease', 'malformed-lease', 'foreign-lease', 'lost-continuation-owner', 'lost-recovery-owner'] as const) {
+    test(`connection preparation rechecks ${defect} after activation (adopted=${adopted})`, async () => {
+      const f = await connectionActivationFixture();
+      const active = connectionActivation.activateConnectionExecution(f.input);
+      const session = sessionStore.HarnessSession.load(f.task.sessionId)!;
+      if (adopted) assert.equal(session.adoptRecoveredConversation({ serializedState: session.loadRecoveryState()!,
+        history: f.batch.history, lastResponseId: f.batch.lastResponseId }), true);
+      const owner = { sessionId: f.task.sessionId, deliverySourceUserSeq: active.source.seq,
+        attemptId: f.attempt.attemptId, leaseOwner: f.input.leaseOwner };
+      connectionActivation.assertConnectionExecutionOwned(owner);
+      if (defect === 'account-changed') connectionSetup.recordConnectionSetupResult(f.input.context, { connectionId: 'ca_replaced_during_prepare' });
+      if (defect === 'request-stopped') eventlog.requestHarnessChatCancellation(f.input.clientRequestId);
+      if (defect === 'original-stopped') eventlog.requestKill(f.task.sessionId, 'Owner stopped original task', f.originalAttempt);
+      if (defect === 'delivery-stopped') eventlog.requestKill(f.task.sessionId, 'Owner stopped continuation', f.attempt);
+      if (defect === 'newer-source') eventlog.appendEvent({ sessionId: f.task.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'A newer request.' } });
+      if (defect === 'expired-lease' || defect === 'malformed-lease') eventlog.openEventLog().prepare('UPDATE run_attempts SET lease_expires_at = ? WHERE attempt_id = ?')
+        .run(defect === 'expired-lease' ? new Date(0).toISOString() : 'invalid-date', f.attempt.attemptId);
+      if (defect === 'foreign-lease') owner.leaseOwner = 'another-process';
+      if (defect === 'lost-continuation-owner') assert.equal(session.releaseContinuationOwner({ sourceUserSeq: active.source.seq, attemptId: f.attempt.attemptId }), true);
+      if (defect === 'lost-recovery-owner') eventlog.openEventLog().prepare("UPDATE sessions SET metadata_json = json_remove(metadata_json, '$.__host_recovery_owner') WHERE id = ?").run(f.task.sessionId);
+      assert.throws(() => connectionActivation.assertConnectionExecutionOwned(owner));
+      // A retry is allowed to retrieve its historical receipt, never to reset
+      // the conversation, erase Stop, or authorize more model/tool work.
+      assert.equal(connectionActivation.activateConnectionExecution(f.input).kind, 'existing');
+      assert.throws(() => connectionActivation.assertConnectionExecutionOwned(owner));
+      assert.equal(eventlog.listEvents(f.task.sessionId, { types: ['run_resumed'] }).length, 1);
+      assert.equal(physicalRows(f.task, 'call:connection-search').length, 1);
+      leases.revokeDispatchLease(f.task.parentLease);
+    });
+  }
+}
+
+test('satisfying the dependency does not retire the current connection execution owner', async () => {
+  const f = await connectionActivationFixture();
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  // Status alone is neither account verification nor callable authority. This
+  // exercises the owner guard after the separate attestation writer succeeds.
+  eventlog.openEventLog().prepare("UPDATE dependency_requests SET status = 'satisfied' WHERE request_id = ?").run(f.pause.requestId);
+  assert.equal(connectionSetup.readConnectionSetup(f.task.sessionId), null);
+  connectionActivation.assertConnectionExecutionOwned({ sessionId: f.task.sessionId, deliverySourceUserSeq: active.source.seq,
+    attemptId: f.attempt.attemptId, leaseOwner: f.input.leaseOwner });
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+test('Stop during asynchronous connection rebuild prevents subsequent preparation and tool construction', async () => {
+  const f = await connectionActivationFixture();
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  let laterWork = 0;
+  await assert.rejects(rebuildSourceConnectionAgent({ sessionId: f.task.sessionId, requestId: f.pause.requestId,
+    assertOwned: () => connectionActivation.assertConnectionExecutionOwned({ sessionId: f.task.sessionId,
+      deliverySourceUserSeq: active.source.seq, attemptId: f.attempt.attemptId, leaseOwner: f.input.leaseOwner }) }, {
+    prime: async () => {
+      await Promise.resolve();
+      eventlog.requestKill(f.task.sessionId, 'Owner stopped during preparation', f.originalAttempt);
+      return { ok: true, planning: {} } as never;
+    },
+    revalidate: async () => { laterWork++; },
+    build: async () => { laterWork++; return f.agent as never; },
+  }), /stopped/);
+  assert.equal(laterWork, 0);
+  assert.equal(physicalRows(f.task, 'call:connection-search').length, 1);
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+test('failed recovery installation rolls back its control, marker and live publications together', async () => {
+  const f = await connectionActivationFixture();
+  const db = eventlog.openEventLog();
+  const { actionBus } = await import('../action-bus.js');
+  const published: unknown[] = [];
+  const unsubscribe = actionBus.subscribe(event => { if (event.kind === 'harness.event' && event.sessionId === f.task.sessionId) published.push(event); });
+  const before = eventlog.listEvents(f.task.sessionId).length;
+  db.exec(`CREATE TRIGGER fixture_connection_recovery_write_failure BEFORE UPDATE ON sessions
+    WHEN NEW.id = '${f.task.sessionId}' AND json_extract(NEW.metadata_json, '$.__host_recovery_state') IS NOT NULL
+    BEGIN SELECT RAISE(ABORT, 'controlled recovery install failure'); END`);
+  try {
+    assert.throws(() => connectionActivation.activateConnectionExecution(f.input), /could not retain/);
+    assert.equal(eventlog.listEvents(f.task.sessionId).length, before);
+    assert.equal(published.length, 0, 'rolled-back controls must not reach desktop/mobile subscribers');
+    assert.equal(eventlog.getLatestRunAttemptByRunId(f.task.sessionId, f.input.runId)?.sourceUserSeq, null);
+    assert.equal(sessionStore.HarnessSession.load(f.task.sessionId)!.loadRecoveryState(), null);
+  } finally { db.exec('DROP TRIGGER fixture_connection_recovery_write_failure'); unsubscribe(); }
+  assert.equal(connectionActivation.activateConnectionExecution(f.input).kind, 'activated', 'retry consumes one source after the failed transaction');
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+for (const defect of ['wrong-marker', 'wrong-root', 'foreign-attempt', 'both-kinds', 'wrong-blob-source'] as const) {
+  test(`connection recovery refuses ${defect} instead of using current task context`, async () => {
+    const f = await connectionActivationFixture();
+    connectionActivation.activateConnectionExecution(f.input);
+    const metadata = structuredClone(eventlog.getSession(f.task.sessionId)!.metadata);
+    const owner = metadata.__host_recovery_owner as import('./recovery-activation.js').RecoveryActivationOwner;
+    if (defect === 'wrong-marker') owner.connectionContinuation!.activationEventId = 'missing-marker';
+    if (defect === 'wrong-root') owner.connectionContinuation!.requestSourceUserSeq = owner.sourceUserSeq;
+    if (defect === 'foreign-attempt') owner.attemptId = 'unrelated-attempt';
+    if (defect === 'both-kinds') owner.approvalContinuation = { requestSourceUserSeq: f.task.sourceUserSeq, approvalId: 'unrelated-approval', decision: 'approve' };
+    if (defect === 'wrong-blob-source') metadata.__host_recovery_state = JSON.stringify({ ...JSON.parse(String(metadata.__host_recovery_state)), sourceUserSeq: owner.sourceUserSeq });
+    eventlog.openEventLog().prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), f.task.sessionId);
+    assert.throws(() => recoveryActivation.readRecoveryActivation(f.task.sessionId), /does not match/);
+    leases.revokeDispatchLease(f.task.parentLease);
+  });
 }
 
 test('a proven connection question retains its original open execution across publication, replay and reopen', async () => {
