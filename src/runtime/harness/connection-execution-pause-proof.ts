@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type Database from 'better-sqlite3';
 import type { PresentationEvent } from './turn-outcome.js';
 import type { SourceConnectionCheckpoint } from './source-connection-checkpoints.js';
+import { readConnectionExecutionClosure } from './connection-execution-closure-proof.js';
 
 export interface ConnectionExecutionPauseV1 {
   version: 1;
@@ -32,12 +33,28 @@ export function connectionDependencyIdentity(db: Database.Database, input: { ses
  * and batch against the current journal and require no unsettled dispatch.
  * Historical replay checks the retained batch, never a later batch/account.
  * A future activation must prove its closure chain before UI resume is enabled. */
-export function validateConnectionExecutionPause(input: {
+type PauseProofInput = {
   db: Database.Database;
   presentation: PresentationEvent;
   metadata: Record<string, unknown>;
   historical?: boolean;
-}): ConnectionExecutionPauseV1 | null {
+};
+
+export function validateConnectionExecutionPause(input: PauseProofInput): ConnectionExecutionPauseV1 | null {
+  const binding = validateConnectionExecutionPauseCheckpoint(input);
+  if (!binding) return null;
+  const root = input.db.prepare(`SELECT state FROM accepted_turn_call_authorities
+    WHERE session_id = ? AND source_user_seq = ? AND authority_kind = 'host_v1'`)
+    .get(input.presentation.identity.sessionId, binding.executionSourceUserSeq) as { state: string } | undefined;
+  if (root?.state !== 'open' && (!input.historical || !readConnectionExecutionClosure(input.db, {
+    sessionId: input.presentation.identity.sessionId, executionSourceUserSeq: binding.executionSourceUserSeq,
+  }))) throw new Error('The connection pause lost its open execution or exact terminal closure.');
+  return binding;
+}
+
+/** Immutable identity half of the proof. Only closure-chain validation uses
+ * this directly; callers asking to replay a pause must also prove lifecycle. */
+export function validateConnectionExecutionPauseCheckpoint(input: PauseProofInput): ConnectionExecutionPauseV1 | null {
   const raw = input.metadata.connectionExecutionPause;
   if (raw === undefined) return null;
   const invalid = (): never => { throw new Error('The connection pause does not match its execution authority.'); };
@@ -101,7 +118,7 @@ export function validateConnectionExecutionPause(input: {
   const root = input.db.prepare(`SELECT state, authority_digest FROM accepted_turn_call_authorities
     WHERE session_id = ? AND source_user_seq = ? AND authority_kind = 'host_v1'`)
     .get(identity.sessionId, binding.executionSourceUserSeq) as { state: string; authority_digest: string } | undefined;
-  if (root?.state !== 'open' || root.authority_digest !== token.authorityDigest) return invalid();
+  if (!root || root.authority_digest !== token.authorityDigest) return invalid();
   const batch = input.db.prepare(`SELECT batch_id, authority_digest, history_digest, history_json, disposition
     FROM accepted_model_batch_checkpoints WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?`)
     .get(identity.sessionId, identity.sourceUserSeq, token.resumeFromBatchOrdinal) as {

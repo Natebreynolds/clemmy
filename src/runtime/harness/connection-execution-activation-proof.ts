@@ -3,7 +3,8 @@
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { presentationEventFromCompletionData } from './turn-outcome.js';
-import { validateConnectionExecutionPause } from './connection-execution-pause-proof.js';
+import { validateConnectionExecutionPause, validateConnectionExecutionPauseCheckpoint } from './connection-execution-pause-proof.js';
+import { readApprovalExecutionSource } from './approval-execution-source.js';
 
 export interface ConnectionExecutionActivationV1 {
   version: 1;
@@ -21,9 +22,46 @@ export interface ConnectionExecutionActivationV1 {
 type Event = { id: string; seq: number; turn: number; role: string; parent_event_id: string | null; data_json: string };
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 
-export function readConnectionExecutionActivation(db: Database.Database, input: {
+type ActivationLookup = {
   sessionId: string; deliverySourceUserSeq?: number; requestId?: string; activationEventId?: string;
-}): { eventId: string; activation: ConnectionExecutionActivationV1 } | null {
+};
+
+export function readConnectionExecutionActivation(db: Database.Database, input: ActivationLookup) {
+  return readActivation(db, input, true);
+}
+
+/** For the closure validator only: avoid recursively asking a closed pause to
+ * validate its closure while validating that closure's immutable activation. */
+export function readConnectionExecutionActivationIdentity(db: Database.Database, input: ActivationLookup) {
+  return readActivation(db, input, false);
+}
+
+/** A later approval click may own delivery for this same reviewed execution.
+ * Ordinary approval tasks without a connection activation keep their existing
+ * lifecycle. Resolve only through the shared host/card proof, never recency
+ * alone or a caller-provided original source. */
+export function readConnectionExecutionDelivery(db: Database.Database,
+  input: { sessionId: string; deliverySourceUserSeq: number }, identityOnly = false) {
+  const control = db.prepare(`SELECT json_extract(data_json, '$.source') AS source FROM events
+    WHERE session_id = ? AND seq = ? AND type = 'user_input_received' AND role = 'user'`)
+    .get(input.sessionId, input.deliverySourceUserSeq) as { source: string | null } | undefined;
+  const read = identityOnly ? readConnectionExecutionActivationIdentity : readConnectionExecutionActivation;
+  if (control?.source === 'connection_continuation') {
+    const marker = read(db, input);
+    if (!marker) throw new Error('Connection delivery has no exact execution activation.');
+    return marker;
+  }
+  const executionSourceUserSeq = readApprovalExecutionSource(db, { sessionId: input.sessionId, sourceUserSeq: input.deliverySourceUserSeq });
+  if (executionSourceUserSeq === null) return null;
+  const prior = db.prepare(`SELECT id FROM events WHERE session_id = ? AND type = 'run_resumed' AND role = 'system'
+    AND seq < ? AND json_extract(data_json, '$.connectionContinuationVersion') = 1
+    AND json_extract(data_json, '$.connectionContinuation.executionSourceUserSeq') = ? ORDER BY seq DESC LIMIT 1`)
+    .get(input.sessionId, input.deliverySourceUserSeq, executionSourceUserSeq) as { id: string } | undefined;
+  return prior ? read(db, { sessionId: input.sessionId, activationEventId: prior.id }) : null;
+}
+
+function readActivation(db: Database.Database, input: ActivationLookup, lifecycle: boolean):
+  { eventId: string; activation: ConnectionExecutionActivationV1 } | null {
   const invalid = (): never => { throw new Error('The connection continuation does not match its durable activation.'); };
   if (!input.sessionId || (!input.deliverySourceUserSeq && !input.requestId && !input.activationEventId)) return invalid();
   const rows = db.prepare(`SELECT id, seq, turn, role, parent_event_id, data_json FROM events
@@ -73,7 +111,8 @@ export function readConnectionExecutionActivation(db: Database.Database, input: 
   const presentation = presentationEventFromCompletionData(pauseData);
   if (!presentation || presentation.identity.sessionId !== input.sessionId || presentation.identity.turn !== pause.turn
     || presentation.identity.sourceUserSeq !== a.executionSourceUserSeq) return invalid();
-  const retained = validateConnectionExecutionPause({ db, presentation, metadata: pauseData, historical: true });
+  const retained = (lifecycle ? validateConnectionExecutionPause : validateConnectionExecutionPauseCheckpoint)(
+    { db, presentation, metadata: pauseData, historical: true });
   if (!retained || retained.requestId !== a.requestId || retained.checkpointDigest !== a.checkpointDigest) return invalid();
   return { eventId: event.id, activation: { ...a } };
 }

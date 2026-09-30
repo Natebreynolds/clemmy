@@ -1,4 +1,4 @@
-import { acceptedPlanExecution, acceptedPlanExecutionObjective, acceptedPlanExecutionText } from '../runtime/harness/accepted-plan-execution.js';
+import { acceptedPlanExecution, acceptedPlanExecutionObjective, acceptedPlanExecutionText, acceptedPlanOwnerScopeInput } from '../runtime/harness/accepted-plan-execution.js';
 import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -1487,7 +1487,12 @@ async function executePlanTask(
       recoveryTool: 'ask_user_question',
     });
   }
-  const requestedEffectScope = requestedCapabilityEffectScope(objective);
+  // Host policy and plan-rendering instructions are not requests for writes.
+  // Keep the full reviewed objective for planning, but infer the owner's effect
+  // scope from the same accepted source/steering projection used elsewhere.
+  const requestedEffectScope = requestedCapabilityEffectScope(
+    acceptedPlanOwnerScopeInput(sessionId, sourceUserSeq, objective),
+  );
   const completenessCapabilities = planCompletenessCapabilities(planning, input.draft.bindings);
   // A plan whose operations are ALL reads is a legitimate GATHERING STAGE, not
   // an incomplete write — reads never need a write bound (owner directive

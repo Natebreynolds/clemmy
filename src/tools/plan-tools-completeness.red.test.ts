@@ -526,9 +526,7 @@ test('a wholly-read plan for a read-then-write ask is ADMITTED as a gather stage
   assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
   if (!primed.ok) return;
   const readRef = await discloseLocal(primed.planning, 'user_profile_read');
-  const planTask = buildPlanTaskTool({ planning: primed.planning }) as unknown as {
-    invoke(context: unknown, input: string, details?: unknown): Promise<unknown>;
-  };
+  const planTask = brackets.wrapToolForHarness(buildPlanTaskTool({ planning: primed.planning }) as never);
   const readOnlyDraft = {
     criteria: ['Read the current profile and present it to the user for validation before any write.'],
     cardinality: null,
@@ -546,28 +544,50 @@ test('a wholly-read plan for a read-then-write ask is ADMITTED as a gather stage
     deliverables: [{ id: 'profile_evidence', kind: 'evidence' }],
     evidenceRequirements: ['tool_result'],
   };
-  const output = String(await brackets.withHarnessRunContext({
-    ...identity,
-    counter: new brackets.ToolCallsCounter(4),
-  }, () => planTask.invoke(null, JSON.stringify({
-    preamble: 'I’ll read your profile and show you what I find before writing anything.',
-    draft: readOnlyDraft,
-  }), { toolCall: { callId: 'read-gather-plan' } })));
+  let calls = 0;
+  const model = {
+    async getResponse(request: unknown) {
+      calls += 1;
+      assert.ok(calls <= 2, 'the recording fixture must not launch additional model work');
+      if (calls === 1) return { responseId: 'gather-plan', output: [toolCall('read-gather-plan', 'plan_task', {
+        preamble: 'I’ll read your profile and show you what I find before writing anything.', draft: readOnlyDraft,
+      })] };
+      assert.match(JSON.stringify(request), /writeDeferred/, 'the actual settled result must reach the next model frame');
+      return { responseId: 'gather-hold', output: [{ type: 'message', role: 'assistant', status: 'completed',
+        content: [{ type: 'output_text', text: 'ASK: Controlled fixture pauses before the planned read.' }] }] };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent = { model, tools: [planTask] };
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({
+    sessionId: session.id, universeTools: [planTask], activeToolNames: [planTask.name], policyHash: 'gather-stage-fixture',
+    budget: { maxUncachedTokens: 2_000, maxModelCalls: 2, maxToolCalls: 4, maxElapsedMs: 60_000 },
+  });
+  assert.ok(sealed.ok, JSON.stringify(sealed));
+  if (!sealed.ok) throw new Error('The controlled gather surface must seal.');
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const outcome = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(4),
+    behaviorScopeId: `${session.id}::source:${source.seq}` }, () => hostRunRunner(throwingRunner() as never,
+    agent as never, [{ type: 'message', role: 'user', content: source.data.text }] as never,
+    { maxTurns: 2, hostTurnEngine: 'host_v1', hostJudgeCompletion: false, context: identity } as never));
+  assert.equal(calls, 2, JSON.stringify(outcome));
+  assert.equal(outcome.terminal?.status, 'blocked', 'admitting a gather stage must not complete its unfinished work');
+  assert.equal(outcome.terminal?.reason, 'max_turns', 'the fixture stops at its two-frame budget without an uncertain tool effect');
+  const output = eventlog.getToolOutput(session.id, 'read-gather-plan')!.output;
   const result = JSON.parse(output) as { ok?: unknown; code?: unknown; writeDeferred?: unknown; next?: unknown };
   // The regression: a WHOLLY-READ plan for a write ask must NOT be walled as an
   // incomplete write. Before 2026-09-02 this returned plan_incomplete_missing_write
   // and the validate-first turn died 'same wall twice' (live sess-desktop-d146).
   assert.notEqual(result.code, 'plan_incomplete_missing_write',
     'a read/gather stage is admitted, never refused for a deferred write');
-  // The gather stage carries the write-deferred contract into the model: run the
-  // reads, present, validate before the write, and never claim done. It rides
-  // whichever result the admission plumbing produces (a downstream persist step
-  // here is exercised by the live chat rerun, not this unit harness).
-  if (result.ok === true) {
-    assert.equal(result.writeDeferred, true, 'the admitted read stage is flagged write-deferred');
-    assert.match(String(result.next), /present what you found and ask the user to validate/i);
-    assert.match(String(result.next), /do NOT claim the task is done/i);
-  }
+  // Require real graph/contract admission through host settlement. A refusal
+  // from a direct tool invocation must not make this success test pass vacuously.
+  assert.equal(result.ok, true, output);
+  assert.equal(expectedWork.loadExpectedWorkContract(session.id, source.seq).status, 'ok');
+  assert.equal(result.writeDeferred, true, 'the admitted read stage is flagged write-deferred');
+  assert.match(String(result.next), /present what you found and ask the user to validate/i);
+  assert.match(String(result.next), /do NOT claim the task is done/i);
 });
 
 function readOnlyFileDraftForContinuation(capabilityRef: string) {

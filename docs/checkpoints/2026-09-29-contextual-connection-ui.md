@@ -622,3 +622,113 @@ has not been replaced or independently qualified here. Installed desktop/mobile
 acceptance and matched latency/token measurements remain owed. UI priorities
 and paired acceptance remain as described above; this is their recovery
 foundation, not a claim that the end-to-end setup experience has shipped.
+
+## Original-task completion after connection recovery — September 30
+
+The final delivery control can now close the original reviewed execution and
+accepted-task authority in the same event transaction. Its public presentation
+still names the actual delivery source and physical attempt. Completion proof,
+the reviewed plan claim, graph, manifest and settled tool results remain bound
+to the original execution. No fresh task owner or plan claim replaces them.
+
+An immutable, private closure record binds those identities to the actual final
+stored terminal, including its run/attempt fields and digest. Historical replay
+can validate the original connection question after the root closes, then
+validate the later terminal with the normal completion-proof checks. The
+original task's terminal-publication reader returns that final winner; ordinary
+source-level duplicate delivery continues to return its own earlier event.
+Replaying a receipt does not reopen a root or grant a current execution lease.
+
+An intervening approval retains the same original work until its resolved
+control publishes a terminal. Approval lineage uses one shared SQL identity
+reader rather than duplicated event scans. Approval and connection identity
+remain separate from consent, callable freshness and current ownership.
+Injected failure during terminal cleanup rolls back the event, closure, both
+original authorities, physical-attempt completion and continuation-owner cleanup.
+Corrupting the final terminal invalidates replay of the earlier pause too.
+
+The new closure schema rejects mutation/deletion while its session exists, but
+allows the owning session's eventual cascade. The storage pin exercises actual
+production DDL in a minimal database; it is not qualification of retention for
+the entire older plan/context proof chain. Code review found that
+`reviewed_plan_*_v1` and `source_session_contexts_v1` still have unconditional
+immutable-delete guards and restrictive event/session references. Their
+interaction with `reapStaleSessions` needs a bounded fixture and resolution
+before promoting this combined feature. Do not silently remove active proof
+or skip the normal retention eligibility checks to make cleanup pass.
+
+### Two plan protocol defects exposed by the integration pin
+
+The real reviewed-read fixture initially stopped before the intended connection
+pause. `plan_task` inferred requested effects from the host-expanded reviewed
+plan text, so policy words such as “send” turned an ordinary reviewed read into
+deferred-write work. Effect inference now uses the existing accepted-owner
+source/steering projection. The full reviewed plan remains the planning context;
+its frozen methods, arguments and per-call consent requirements are unchanged.
+
+Separately, the producer already emitted `writeDeferred: true` for valid gather
+stages, but the host's exact success union rejected that field. The host now
+accepts precisely that variant with only read/compute requirements. False,
+string, unknown-key and contradictory write/unverified-mutation variants still
+fail. A valid shape still needs durable activation authority; it grants none.
+
+The older gather-stage test could pass on a refusal because its success checks
+were conditional. It now drives the actual wrapped tool through the host,
+requires a successful graph/contract, and verifies that the settled result
+reaches the next recording-model frame. Its deliberately unfinished work stops
+at the fixture's two-frame limit and cannot claim completion. The ordinary
+reviewed-read integration separately asserts there is no false write deferral.
+
+### Evidence and remaining UI integration
+
+Verified:
+
+- The surrounding terminal/recovery group passed **223/223** before the plan
+  repair. The focused closure/plan repair group passed **195/195**.
+- The final surrounding regression group passed **397/397** across 15 files:
+  accepted model batches, accepted task publication, host call authority,
+  connection checkpoints/setup, recovery, source composition, approval evidence,
+  delivery, closure integration, tool invocation, plan completeness, eventlog,
+  explicit reviewed execution and recorded provider-plan execution. Afterward,
+  the strengthened plan-completeness file passed **6/6**; it is included in the
+  previous count, not six additional distinct tests.
+- The new integration uses production reviewed `plan_task`, `work_call`, a real
+  controlled local `space_get`, graph/manifest/settlement, pause, activation and
+  terminal publication. The missing connection, verification response and model
+  wire are controlled. It proves one original claim, one completed local read,
+  three recording-model calls, two terminals, reopen and exact replay with no
+  new read or model call. It does not prove a real provider connection or resumed
+  external write.
+- Pins also cover done/cancelled/blocked/failed/uncertain closure, approval then
+  approve/reject, corruption, cleanup rollback and storage-lifetime behavior.
+- Runtime TypeScript and `git diff --check` passed. Logs:
+  `/tmp/clem-connection-closure-final.txt`,
+  `/tmp/clem-connection-closure-repair.txt`,
+  `/tmp/clem-connection-gather-protocol.txt`, and
+  `/tmp/clem-connection-closure-tsc-final.txt`.
+
+Not performed: paid-model/provider calls, live business work, UI changes or
+browser acceptance in this slice, app restart, build, hotpatch, merge or tag.
+The runner's live-home sentinel remained **NOT PERFORMED** because the running
+daemon changed live stores during tests (35630 earlier, 72427 in the latest
+focused run). This is not an isolation-sentinel pass or live-home acceptance.
+The other agent's clean branch advanced to `76c53a1ea` with its own installation
+checkpoint. Its installed identity was not independently qualified here.
+
+Still owed: route admission before fresh Execute claims; executor/timer and boot
+integration; original-source outer-window/token accounting; fresh same-root
+callable/account attestation; multiple setup pauses; and full approval/resume,
+Stop and no-replay-of-completed-writes paths. Qualify the retention interaction
+above before enabling reviewed Execute Continue. Then combine the owned series
+with the other agent's latest source and test the installed desktop/mobile flow,
+including device handoff and matched full-task latency/token measurements.
+The small `plan-tools.ts` and `host-tool-invocation.ts` repairs overlap that
+agent's planning area and must be preserved explicitly during integration.
+
+The UI direction above remains part of the implementation, not a later cosmetic
+pass: show the verified account beside the task, one understandable decision,
+the actual waiting/running/completed state, and a direct return to the retained
+conversation. **Reviewed Execute Continue is still disabled.** These host-side
+checks are its completion foundation, not a claim that the complete resume
+experience has shipped. This slice adds no model call or prompt text; matched
+performance savings remain unmeasured.

@@ -1084,6 +1084,7 @@ function settledPlanTaskResultDisposition(input: {
     !(
       exactPlanTaskResultKeys(payload, successKeys)
       || exactPlanTaskResultKeys(payload, [...successKeys, 'unverifiedMutations'])
+      || exactPlanTaskResultKeys(payload, [...successKeys, 'writeDeferred'])
     )
     || payload.acceptedTaskId !== input.acceptedTaskId
     || payload.graphId !== `turn-graph:v1:${input.sourceUserSeq}`
@@ -1098,6 +1099,11 @@ function settledPlanTaskResultDisposition(input: {
     || new Set(payload.requirements.map((requirement) => (
       (requirement as Record<string, unknown>).id
     ))).size !== payload.requirements.length
+    || (Object.prototype.hasOwnProperty.call(payload, 'writeDeferred')
+      && (payload.writeDeferred !== true
+        || payload.requirements.some((requirement) => (
+          requirement.effect !== 'read' && requirement.effect !== 'compute'
+        ))))
     || !exactPlanTaskUnverifiedMutations(payload.unverifiedMutations, payload.requirements)
     || !boundedPlanTaskResultText(payload.next, 2_048)
   ) return null;

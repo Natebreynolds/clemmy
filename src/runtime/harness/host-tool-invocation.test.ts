@@ -650,7 +650,7 @@ test('a success-settled non-boolean discriminator still fails closed on first re
   leases.revokeDispatchLease(task.parentLease);
 });
 
-test('an exact successful plan_task result still requires durable post-settlement activation', async () => {
+for (const writeDeferred of [false, true]) test(`an exact successful plan_task result still requires durable post-settlement activation (deferred=${writeDeferred})`, async () => {
   const task = fixture('Prepare and execute the current request.');
   const value = JSON.stringify({
     ok: true,
@@ -666,6 +666,7 @@ test('an exact successful plan_task result still requires durable post-settlemen
       cardinality: { kind: 'once' },
     }],
     next: 'Invoke the exact admitted work requirement.',
+    ...(writeDeferred ? { writeDeferred: true } : {}),
   });
   let bodies = 0;
   const execute = () => runCall(task, {
@@ -695,6 +696,36 @@ test('an exact successful plan_task result still requires durable post-settlemen
   assert.equal(bodies, 1, 'the successful settled replay is rechecked without redispatch');
   leases.revokeDispatchLease(task.parentLease);
 });
+
+for (const variant of ['false', 'string', 'write', 'unverified', 'extra'] as const) {
+  test(`plan_task write deferral rejects malformed or contradictory success (${variant})`, async () => {
+    const task = fixture('Read the records and show me before writing.');
+    let bodies = 0;
+    const execute = () => runCall(task, {
+      callId: `model:invalid-deferral-${variant}`, toolName: 'plan_task', effect: 'host_only', businessCall: false,
+      args: { draft: { version: 1 }, preamble: 'Read first.' }, deadlineMs: 200,
+      invoke: async () => {
+        bodies += 1;
+        return JSON.stringify({ ok: true, acceptedTaskId: task.acceptedTaskId,
+          graphId: `turn-graph:v1:${task.sourceUserSeq}`, graphHash: 'a'.repeat(64),
+          contractId: `expected-work:v1:${'b'.repeat(64)}`,
+          requirements: [{ id: 'selected-work', effect: variant === 'write' ? 'external_write' : 'read',
+            coverage: variant === 'write' ? null : 'single', dependsOn: [], cardinality: { kind: 'once' } }],
+          next: 'Read and present the evidence before writing.',
+          writeDeferred: variant === 'false' ? false : variant === 'string' ? 'true' : true,
+          ...(variant === 'unverified' ? { unverifiedMutations: ['selected-work'] } : {}),
+          ...(variant === 'extra' ? { grantsConsent: true } : {}),
+        });
+      },
+    });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await assert.rejects(execute(), (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError
+        && /not an exact typed success or refusal/.test(error.message));
+    }
+    assert.equal(bodies, 1, 'a rejected settled shape cannot cause redispatch on replay');
+    leases.revokeDispatchLease(task.parentLease);
+  });
+}
 
 test('an already-aborted caller opens zero logical and zero physical authority', async () => {
   const task = fixture();

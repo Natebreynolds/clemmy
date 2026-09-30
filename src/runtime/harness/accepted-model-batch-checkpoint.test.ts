@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import Database from 'better-sqlite3';
 import type { AgentInputItem } from '@openai/agents';
 import type { AcceptedModelBatchRef } from './accepted-model-batch-checkpoint.js';
 
@@ -46,6 +47,7 @@ const outcomes = await import('./turn-outcome.js');
 const connectionSetup = await import('./connection-setup.js');
 const connectionActivation = await import('./connection-execution-activation.js');
 const recoveryActivation = await import('./recovery-activation.js');
+const connectionClosure = await import('./connection-execution-closure-proof.js');
 
 test.after(() => {
   eventlog.closeEventLog();
@@ -146,6 +148,185 @@ async function connectionActivationFixture() {
     attemptId: claim.attempt.attemptId, leaseOwner,
     verified: { sourceUserSeq: f.task.sourceUserSeq, binding: checked.verificationBinding } };
   return { ...f, input, attempt: claim.attempt, originalAttempt };
+}
+
+function connectionTerminal(f: Awaited<ReturnType<typeof connectionActivationFixture>>,
+  active: ReturnType<typeof connectionActivation.activateConnectionExecution>, status: 'done' | 'cancelled' | 'blocked' | 'failed' | 'uncertain' = 'done') {
+  const identity = { sessionId: f.task.sessionId, sourceUserSeq: active.source.seq, turn: active.source.turn };
+  const outcome = { version: 2, identity, id: outcomes.turnOutcomeId(identity), status,
+    resumable: status === 'blocked' || status === 'uncertain',
+    presentation: { kind: status === 'done' ? 'answer' : status === 'cancelled' ? 'stopped' : status === 'failed' ? 'error' : 'blocked',
+      text: `Controlled continuation ${status}.` } } as import('./turn-outcome.js').TurnOutcome;
+  return eventlog.appendTerminalEventOnce({ sessionId: identity.sessionId, turn: identity.turn, role: 'system',
+    data: delivery.completionDataForTurnOutcome(outcome) }, outcome.id);
+}
+
+for (const status of ['done', 'cancelled', 'blocked', 'failed', 'uncertain'] as const) {
+  test(`connection ${status} closes original execution once and replays both terminals after reopen`, async () => {
+    const f = await connectionActivationFixture();
+    const pauseBefore = connectionPause.readConnectionExecutionPause(f.task.sessionId, f.pause.requestId);
+    const active = connectionActivation.activateConnectionExecution(f.input);
+    const result = connectionTerminal(f, active, status);
+    assert.equal(result.inserted, true);
+    assert.equal(result.event.data.sourceUserSeq, active.source.seq, 'delivery belongs to its actual control');
+    const root = authority.acceptedTurnCallAuthorityFor(f.task.sessionId, f.task.sourceUserSeq);
+    assert.equal(root.status, status === 'failed' || status === 'uncertain' ? 'conflict' : 'ok');
+    if (root.status === 'ok') assert.equal(root.authority.state, status === 'failed' || status === 'uncertain' ? 'conflict' : 'closed');
+    assert.equal(eventlog.getLatestRunAttemptByRunId(f.task.sessionId, f.input.runId)?.finishedAt !== null, true);
+    assert.equal(sessionStore.HarnessSession.load(f.task.sessionId)!.continuationOwnerState(active.owner), 'absent');
+    assert.equal(connectionClosure.readConnectionExecutionClosure(eventlog.openEventLog(), {
+      sessionId: f.task.sessionId, executionSourceUserSeq: f.task.sourceUserSeq })?.terminalEventId, result.event.id);
+    eventlog.closeEventLog();
+    assert.equal(connectionTerminal(f, active, status).inserted, false);
+    assert.deepEqual(connectionPause.readConnectionExecutionPause(f.task.sessionId, f.pause.requestId), pauseBefore);
+    assert.equal(delivery.commitTurnOutcome(f.outcome, { metadata: { connectionExecutionPause: f.binding } }).inserted, false);
+    assert.equal(connectionActivation.activateConnectionExecution(f.input).kind, 'existing');
+    assert.throws(() => connectionActivation.assertConnectionExecutionOwned({ sessionId: f.task.sessionId,
+      deliverySourceUserSeq: active.source.seq, attemptId: f.attempt.attemptId, leaseOwner: f.input.leaseOwner }));
+    assert.equal(eventlog.listEvents(f.task.sessionId, { types: ['conversation_completed'] }).length, 2);
+    assert.equal(physicalRows(f.task, 'call:connection-search').length, 1);
+    leases.revokeDispatchLease(f.task.parentLease);
+  });
+}
+
+test('connection terminal closes the retained accepted-task owner rather than a fresh control authority', async () => {
+  const f = await connectionActivationFixture();
+  const shadow = await import('../graph/turn-graph-shadow.js');
+  const taskAuthority = await import('./accepted-task-authority.js');
+  assert.ok(shadow.recordTurnGraphShadow({ identity: { ...f.task, turn: 1 } }));
+  assert.equal(taskAuthority.armAcceptedTaskAuthority(f.task).status, 'armed');
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  assert.throws(() => connectionTerminal(f, active, 'done'), /no exact completion proof/);
+  assert.equal(connectionClosure.readConnectionExecutionClosure(eventlog.openEventLog(), {
+    sessionId: f.task.sessionId, executionSourceUserSeq: f.task.sourceUserSeq }), null);
+  const terminal = connectionTerminal(f, active, 'blocked');
+  const task = taskAuthority.loadAcceptedTaskAuthority(f.task.sessionId, f.task.sourceUserSeq);
+  assert.equal(task.status, 'ok');
+  if (task.status === 'ok') {
+    assert.equal(task.authority.state, 'conflict');
+    assert.equal(task.authority.terminalEventId, terminal.event.id);
+  }
+  assert.equal(taskAuthority.loadAcceptedTaskAuthority(f.task.sessionId, active.source.seq).status, 'legacy');
+  assert.ok(connectionPause.readConnectionExecutionPause(f.task.sessionId, f.pause.requestId));
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+test('terminal cleanup failure rolls back the closure, original authorities, event and physical completion', async () => {
+  const f = await connectionActivationFixture();
+  const shadow = await import('../graph/turn-graph-shadow.js');
+  const taskAuthority = await import('./accepted-task-authority.js');
+  assert.ok(shadow.recordTurnGraphShadow({ identity: { ...f.task, turn: 1 } }));
+  assert.equal(taskAuthority.armAcceptedTaskAuthority(f.task).status, 'armed');
+  const readTask = () => taskAuthority.loadAcceptedTaskAuthority(f.task.sessionId, f.task.sourceUserSeq);
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  const db = eventlog.openEventLog();
+  const beforeTask = readTask();
+  const beforeHost = authority.acceptedTurnCallAuthorityFor(f.task.sessionId, f.task.sourceUserSeq);
+  db.exec(`CREATE TRIGGER fixture_connection_closure_failure BEFORE UPDATE ON sessions
+    WHEN NEW.id = '${f.task.sessionId}' AND json_extract(OLD.metadata_json, '$.__continuation_owner') IS NOT NULL
+      AND json_extract(NEW.metadata_json, '$.__continuation_owner') IS NULL
+    BEGIN SELECT RAISE(ABORT, 'controlled terminal cleanup failure'); END`);
+  try {
+    assert.throws(() => connectionTerminal(f, active, 'blocked'), /controlled terminal cleanup failure/);
+    assert.deepEqual(readTask(), beforeTask);
+    assert.deepEqual(authority.acceptedTurnCallAuthorityFor(f.task.sessionId, f.task.sourceUserSeq), beforeHost);
+    assert.equal(connectionClosure.readConnectionExecutionClosure(db, { sessionId: f.task.sessionId,
+      executionSourceUserSeq: f.task.sourceUserSeq }), null);
+    assert.equal(eventlog.listEvents(f.task.sessionId, { types: ['conversation_completed'] }).length, 1);
+    connectionActivation.assertConnectionExecutionOwned({ sessionId: f.task.sessionId, deliverySourceUserSeq: active.source.seq,
+      attemptId: f.attempt.attemptId, leaseOwner: f.input.leaseOwner });
+  } finally { db.exec('DROP TRIGGER fixture_connection_closure_failure'); }
+  assert.equal(connectionTerminal(f, active, 'blocked').inserted, true);
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+test('a closed root with a corrupted terminal cannot validate its earlier connection pause', async () => {
+  const f = await connectionActivationFixture();
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  const terminal = connectionTerminal(f, active);
+  const db = eventlog.openEventLog();
+  assert.throws(() => db.prepare("UPDATE source_connection_execution_closures_v1 SET terminal_digest = 'wrong' WHERE session_id = ?")
+    .run(f.task.sessionId), /immutable/);
+  db.prepare("UPDATE events SET data_json = json_set(data_json, '$.runId', 'another-run') WHERE id = ?").run(terminal.event.id);
+  eventlog.closeEventLog();
+  assert.throws(() => connectionPause.readConnectionExecutionPause(f.task.sessionId, f.pause.requestId), /terminal closure/);
+  assert.throws(() => connectionTerminal(f, active), /terminal closure/);
+  leases.revokeDispatchLease(f.task.parentLease);
+});
+
+test('connection closure schema is immutable during session life but permits the owning session cascade', async () => {
+  const f = await connectionActivationFixture();
+  const active = connectionActivation.activateConnectionExecution(f.input);
+  connectionTerminal(f, active);
+  // Exercise the actual installed DDL independently of older plan/context
+  // retention constraints. This is a storage lifetime check, not execution proof.
+  const ddl = eventlog.openEventLog().prepare(`SELECT sql FROM sqlite_master
+    WHERE tbl_name = 'source_connection_execution_closures_v1' AND sql IS NOT NULL
+    ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END`).all() as Array<{ sql: string }>;
+  const db = new Database(':memory:');
+  try {
+    db.pragma('foreign_keys = ON');
+    db.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY);
+      CREATE TABLE events (id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE);`);
+    for (const item of ddl) db.exec(item.sql);
+    for (const id of ['expired', 'retained']) {
+      db.prepare('INSERT INTO sessions VALUES (?)').run(id);
+      for (const suffix of ['activation', 'terminal']) db.prepare('INSERT INTO events VALUES (?, ?)').run(`${id}-${suffix}`, id);
+      db.prepare('INSERT INTO source_connection_execution_closures_v1 VALUES (?, 1, 2, ?, ?, ?)')
+        .run(id, `${id}-activation`, `${id}-terminal`, 'controlled-storage-digest');
+    }
+    assert.throws(() => db.exec("DELETE FROM source_connection_execution_closures_v1 WHERE session_id = 'expired'"), /immutable/);
+    assert.throws(() => db.exec("DELETE FROM events WHERE id = 'expired-terminal'"), /immutable/);
+    db.exec("DELETE FROM sessions WHERE id = 'expired'");
+    assert.deepEqual(db.prepare('SELECT session_id FROM source_connection_execution_closures_v1').all(), [{ session_id: 'retained' }]);
+    assert.equal((db.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n, 2);
+  } finally {
+    db.close();
+    leases.revokeDispatchLease(f.task.parentLease);
+  }
+});
+
+for (const decision of ['approve', 'reject'] as const) {
+  test(`connection then approval ${decision} retains the original task through final delivery and replay`, async () => {
+    const f = await connectionActivationFixture();
+    const shadow = await import('../graph/turn-graph-shadow.js');
+    const taskAuthority = await import('./accepted-task-authority.js');
+    const approvals = await import('./approval-registry.js');
+    assert.ok(shadow.recordTurnGraphShadow({ identity: { ...f.task, turn: 1 } }));
+    assert.equal(taskAuthority.armAcceptedTaskAuthority(f.task).status, 'armed');
+    const active = connectionActivation.activateConnectionExecution(f.input);
+    const card = approvals.register({ sessionId: f.task.sessionId, subject: 'Controlled write', tool: 'fixture_write', args: { value: 'test' } });
+    const identity = { sessionId: f.task.sessionId, sourceUserSeq: active.source.seq, turn: active.source.turn };
+    const pause: import('./turn-outcome.js').TurnOutcome = { version: 2, identity, id: outcomes.turnOutcomeId(identity),
+      status: 'needs_input', resumable: true, needs: { kind: 'approval' },
+      presentation: { kind: 'approval', approvalId: card.approvalId, text: 'Review the controlled write.' } };
+    const beforeTask = taskAuthority.loadAcceptedTaskAuthority(f.task.sessionId, f.task.sourceUserSeq);
+    const approvalPause = eventlog.appendTerminalEventOnce({ sessionId: f.task.sessionId, turn: identity.turn, role: 'system',
+      data: delivery.completionDataForTurnOutcome(pause) }, pause.id);
+    assert.deepEqual(taskAuthority.loadAcceptedTaskAuthority(f.task.sessionId, f.task.sourceUserSeq), beforeTask);
+    assert.equal(connectionClosure.readConnectionExecutionClosure(eventlog.openEventLog(), { sessionId: f.task.sessionId,
+      executionSourceUserSeq: f.task.sourceUserSeq }), null);
+    assert.equal(approvals.resolve(card.approvalId, decision === 'approve' ? 'approved' : 'rejected', 'controlled-owner').ok, true);
+    const attempt = eventlog.beginRunAttempt(f.task.sessionId, { runId: `approval-${f.task.sourceUserSeq}` });
+    const control = eventlog.recordRunAttemptUserInput(attempt, { turn: 2, role: 'user', data: {
+      text: decision, synthetic: true, approvalId: card.approvalId, decision,
+    } }, { armRunInFlight: true });
+    eventlog.appendEvent({ sessionId: f.task.sessionId, turn: 2, role: 'system', type: 'run_resumed', data: {
+      reviewContinuationVersion: 1, approvalId: card.approvalId, decision,
+      executionSourceUserSeq: f.task.sourceUserSeq, deliverySourceUserSeq: control.seq,
+    } });
+    const terminal = connectionTerminal(f, { ...active, source: control }, decision === 'reject' ? 'cancelled' : 'blocked');
+    const loaded = taskAuthority.loadAcceptedTaskAuthority(f.task.sessionId, f.task.sourceUserSeq);
+    assert.equal(loaded.status, 'ok');
+    if (loaded.status === 'ok') assert.equal(loaded.authority.terminalEventId, terminal.event.id);
+    eventlog.closeEventLog();
+    assert.ok(connectionPause.readConnectionExecutionPause(f.task.sessionId, f.pause.requestId));
+    assert.equal(eventlog.readValidatedTerminalEvent(approvalPause.event.id, f.task.sessionId, active.source.seq).id, approvalPause.event.id);
+    assert.equal(eventlog.readValidatedTerminalEvent(terminal.event.id, f.task.sessionId, control.seq).id, terminal.event.id);
+    assert.equal(eventlog.listEvents(f.task.sessionId, { types: ['conversation_completed'] }).length, 3);
+    assert.equal(physicalRows(f.task, 'call:connection-search').length, 1);
+    leases.revokeDispatchLease(f.task.parentLease);
+  });
 }
 
 test('connection activation retains the exact task and canonical recovery behind one new control', async () => {
@@ -446,8 +627,8 @@ for (const corruption of ['outcome', 'source', 'root-surface', 'dependency', 'cl
       db.prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(data), event.id);
     }
     try {
-      assert.throws(() => connectionPause.readConnectionExecutionPause(task.sessionId, pause.requestId), /projection|contradicts|authority/i);
-      assert.throws(() => delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } }), /projection|contradicts|authority/i);
+      assert.throws(() => connectionPause.readConnectionExecutionPause(task.sessionId, pause.requestId), /projection|contradicts|authority|another execution/i);
+      assert.throws(() => delivery.commitTurnOutcome(outcome, { metadata: { connectionExecutionPause: binding } }), /projection|contradicts|authority|another execution/i);
     } finally { restoreRoot(); }
     leases.revokeDispatchLease(task.parentLease);
   });

@@ -1,8 +1,9 @@
 /** Delivery activation and execution source are distinct after a task control.
  * This scope changes checkpoint ownership only, never tool/batch authority. */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { getSession, openEventLog, listEvents } from './eventlog.js';
+import { getSession, openEventLog } from './eventlog.js';
 import { readConnectionExecutionActivation } from './connection-execution-activation-proof.js';
+import { readApprovalExecutionSource } from './approval-execution-source.js';
 
 export interface RecoveryActivationOwner {
   sourceUserSeq: number;
@@ -115,19 +116,6 @@ export function completionEvidenceSource(input: { sessionId: string; sourceUserS
     if (!connection) throw new Error('The connection control has no durable activation.');
     return { sessionId: input.sessionId, sourceUserSeq: connection.activation.executionSourceUserSeq };
   }
-  if (typeof control.approvalId !== 'string' || !['approve', 'approve_with_edits', 'reject'].includes(String(control.decision))) return input;
-  const candidates = listEvents(input.sessionId, { types: ['run_resumed'], sinceSeq: input.sourceUserSeq })
-    .filter(event => event.role === 'system' && event.data.reviewContinuationVersion === 1
-      && event.data.deliverySourceUserSeq === input.sourceUserSeq
-      && event.data.approvalId === control.approvalId && event.data.decision === control.decision);
-  const sources = new Set(candidates.map(event => event.data.executionSourceUserSeq));
-  if (sources.size !== 1) return input;
-  const source = [...sources][0];
-  if (!Number.isSafeInteger(source) || Number(source) <= 0 || Number(source) >= input.sourceUserSeq) return input;
-  const card = db.prepare('SELECT status, resolution FROM pending_approvals WHERE session_id = ? AND approval_id = ?')
-    .get(input.sessionId, control.approvalId) as { status: string; resolution: string } | undefined;
-  if (card?.status !== 'resolved' || card.resolution !== (control.decision === 'reject' ? 'rejected' : 'approved')) return input;
-  if (!db.prepare("SELECT 1 FROM events WHERE session_id = ? AND seq = ? AND type = 'user_input_received'")
-    .get(input.sessionId, source)) return input;
-  return { sessionId: input.sessionId, sourceUserSeq: Number(source) };
+  const source = readApprovalExecutionSource(db, input);
+  return source === null ? input : { sessionId: input.sessionId, sourceUserSeq: source };
 }
