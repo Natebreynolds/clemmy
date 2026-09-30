@@ -1333,7 +1333,21 @@ export function listExactCheckpointRecoverySessions(limit = 64): SessionRow[] {
       FROM checkpoint_sessions
      WHERE recovery_source_user_seq IS NOT NULL
        AND recovery_source_user_seq > 0
-     ORDER BY COALESCE((
+     ORDER BY CASE
+       -- Queue ordering is only a hint; the recovery scanner re-proves the
+       -- exact owner and Stop target. Connection waits must not occupy the
+       -- whole bounded page ahead of runnable work, even after that work has
+       -- already been attempted. Stop remains eligible on a waiting task.
+       WHEN EXISTS (SELECT 1 FROM run_kill_requests k WHERE k.session_id = checkpoint_sessions.id)
+         OR EXISTS (SELECT 1 FROM kill_switches k WHERE k.session_id = checkpoint_sessions.id) THEN 0
+       WHEN (SELECT json_extract(e.data_json, '$.decision') FROM events e
+         WHERE e.session_id = checkpoint_sessions.id AND e.type = 'restart_recovery_decision'
+           AND json_extract(e.data_json, '$.executionSourceUserSeq') = checkpoint_sessions.recovery_source_user_seq
+           AND json_extract(e.data_json, '$.decision') IN ('connection_preparation_held', 'connection_preparation_ready')
+         ORDER BY e.seq DESC LIMIT 1) = 'connection_preparation_held' THEN 2
+       ELSE 1
+     END ASC,
+     COALESCE((
        SELECT MAX(events.seq)
          FROM events
         WHERE events.session_id = checkpoint_sessions.id

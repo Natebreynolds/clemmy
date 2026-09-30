@@ -4,6 +4,8 @@ import { currentSourceSessionContext, withSourceSessionContext } from './source-
 import { readApprovalRecoveryActivation, readConnectionRecoveryActivation, readRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
 import { assertConnectionExecutionOwned } from './connection-execution-activation.js';
 import { rebuildSourceConnectionAgent } from './connection-agent-rebuild.js';
+import { ConnectionPreparationHoldError, retainConnectionPreparationHold, clearConnectionPreparationHold,
+  type ConnectionPreparationHold } from './connection-preparation-hold.js';
 import { parkObservedConnectionWithCheckpoint } from './source-connection-checkpoints.js';
 import { prepareConnectionExecutionPause, type ConnectionExecutionPauseV1 } from './connection-execution-pause.js';
 import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
@@ -3882,9 +3884,9 @@ export interface RunConversationResult {
   /** The host's machine reason/detail for a blocked terminal (see RunTurnResult). */
   blockedReason?: string;
   blockedDetail?: string;
-  /** Nonterminal exact-source ownership retained by a peer or restart
-   * reconciler. No public terminal or user-input dependency exists yet. */
-  hold?: {
+  /** Nonterminal exact-source ownership retained by a peer, restart
+   * reconciler or a connection wait. Never a public completion/failure. */
+  hold?: ConnectionPreparationHold | {
     owner: 'host';
     wake: 'peer' | 'recovery';
     reason: 'peer_in_progress' | 'recovery_pending';
@@ -6133,7 +6135,7 @@ function scheduleHostCheckpointRecovery(
           suppressMemoryCapture: true,
           mcpToolScope: session.loadRecoveryMcpToolScope() ?? options.mcpToolScope,
         });
-        retry = result.status === 'held';
+        retry = result.status === 'held' && result.hold?.wake !== 'connection';
       } catch {
         // Retry only while this exact source still owns a readable checkpoint.
         retry = true;
@@ -6244,7 +6246,20 @@ async function runConnectionConversation(options: RunConversationOptions): Promi
             throw new Error('The connection control lost its exact retained progress.');
           }
           if (options.turnEngine && options.turnEngine !== recovery.turnEngine) throw new Error('The connection execution engine changed.');
-          const agent = await rebuildSourceConnectionAgent({ sessionId: options.sessionId, requestId: link.requestId, assertOwned });
+          const preparationOwner = { sessionId: options.sessionId, requestId: link.requestId, assertOwned };
+          let agent: Awaited<ReturnType<typeof rebuildSourceConnectionAgent>>;
+          try {
+            agent = await rebuildSourceConnectionAgent(preparationOwner);
+          } catch (error) {
+            if (!(error instanceof ConnectionPreparationHoldError)) throw error;
+            // The fresh account/schema check may refuse without losing the
+            // original task. Re-prove ownership here so Stop, account drift or
+            // a stolen lease cannot be disguised as a recoverable pause.
+            const hold = retainConnectionPreparationHold(preparationOwner, error);
+            return { sessionId: options.sessionId, status: 'held' as const, steps: 0,
+              lastTurn: source.turn, hold };
+          }
+          clearConnectionPreparationHold(preparationOwner);
           const run = async () => {
             assertOwned();
             return runTurn({ agent, sessionId: options.sessionId,

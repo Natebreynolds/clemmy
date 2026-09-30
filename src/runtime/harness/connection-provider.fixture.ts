@@ -23,6 +23,7 @@ export async function installConnectionProviderFixture() {
     properties: { recordId: { type: 'string' } } };
   const outputSchema = { type: 'object', properties: { status: { type: 'string' } } };
   let active = true;
+  let schemaAvailable = true;
   let operationVersion = '1';
   let currentSchema: Record<string, unknown> = schema;
   let beforeSchema: (() => void) | undefined;
@@ -39,6 +40,7 @@ export async function installConnectionProviderFixture() {
     assert.equal(identifier, operation);
     counts.schemaChecks += 1;
     beforeSchema?.();
+    if (!schemaAvailable) throw new Error('Recording provider metadata is temporarily unavailable.');
     return { inputParameters: currentSchema, outputParameters: outputSchema,
       providerObservedAt: Date.now(), providerOperationVersion: operationVersion };
   });
@@ -84,6 +86,7 @@ export async function installConnectionProviderFixture() {
   peekHostCapabilityCatalogFactory()!.register(registeredCapabilityFromManifest({ manifest, observation, invoke: invoke as never }));
   return { operation, capability, account, schema, counts,
     setActive: (value: boolean) => { active = value; },
+    setSchemaAvailable: (value: boolean) => { schemaAvailable = value; },
     setVersion: (value: string) => { operationVersion = value; },
     setSchema: (value: Record<string, unknown>) => { currentSchema = value; },
     beforeSchema: (fn: () => void) => { beforeSchema = fn; },

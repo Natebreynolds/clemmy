@@ -20,7 +20,9 @@ import assert from 'node:assert/strict';
 const { HarnessSession } = await import('./session.js');
 const {
   acceptUserInputForRun,
+  appendEvent,
   beginRunAttempt,
+  clearKill,
   finishRunAttempt,
   getLatestRunAttempt,
   listEvents,
@@ -28,6 +30,7 @@ const {
   listSessions,
   openEventLog,
   recordRunAttemptUserInput,
+  requestKill,
 } = await import('./eventlog.js');
 const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
@@ -277,6 +280,45 @@ test('marker round-trip: set then clear', () => {
   assert.equal(HarnessSession.load(s.id)?.runInFlightSince(), '2026-06-07T00:00:00.000Z');
   HarnessSession.load(s.id)!.clearRunInFlight();
   assert.equal(HarnessSession.load(s.id)?.runInFlightSince(), null);
+});
+
+test('connection waits cannot crowd runnable checkpoints or Stop out of the bounded recovery page', () => {
+  const fixtures: Array<{ session: InstanceType<typeof HarnessSession>; source: { seq: number } }> = [];
+  const make = (waiting: boolean) => {
+    const session = HarnessSession.create({ kind: 'chat', title: 'connection recovery queue fixture' });
+    const { source } = armAcceptedInterruptedTurn(session, new Date().toISOString());
+    session.saveRecoveryState(JSON.stringify({ __clemHostRecovery: 1, sessionId: session.id,
+      sourceUserSeq: source.seq, phase: 'continue', frameHistory: [] }));
+    const row = { session, source };
+    fixtures.push(row);
+    if (waiting) appendEvent({ sessionId: session.id, turn: 0, role: 'system', type: 'restart_recovery_decision',
+      data: { decision: 'connection_preparation_held', executionSourceUserSeq: source.seq } });
+    return row;
+  };
+  try {
+    const waiting = Array.from({ length: 65 }, () => make(true));
+    const runnable = make(false);
+    appendEvent({ sessionId: runnable.session.id, turn: 0, role: 'system', type: 'restart_recovery_decision',
+      data: { sourceUserSeq: runnable.source.seq, exactCheckpointRecovery: true, autoResume: true } });
+    assert.equal(listExactCheckpointRecoverySessions(1)[0]?.id, runnable.session.id,
+      'even previously attempted work outranks more than one page of connection waits');
+    const stopped = waiting.at(-1)!;
+    requestKill(stopped.session.id, 'stop waiting work', { sourceUserSeq: stopped.source.seq });
+    assert.equal(listExactCheckpointRecoverySessions(1)[0]?.id, stopped.session.id,
+      'a waiting task with Stop stays reachable without paging through every wait');
+    clearKill(stopped.session.id, { sourceUserSeq: stopped.source.seq });
+    const ready = waiting[0]!;
+    appendEvent({ sessionId: ready.session.id, turn: 0, role: 'system', type: 'restart_recovery_decision',
+      data: { decision: 'connection_preparation_ready', executionSourceUserSeq: ready.source.seq } });
+    assert.equal(listExactCheckpointRecoverySessions(1)[0]?.id, ready.session.id,
+      'a later successful preparation removes the stale wait ranking');
+  } finally {
+    for (const { session } of fixtures) {
+      clearKill(session.id);
+      session.clearRecoveryState();
+      session.clearRunInFlight();
+    }
+  }
 });
 
 test('surfaces ONLY interrupted chat runs; leaves clean + non-chat sessions alone', () => {

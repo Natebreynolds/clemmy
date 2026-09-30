@@ -57,6 +57,7 @@ import {
   noteUnchangedCheckpointResume,
 } from './exact-checkpoint-reentry.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
+import { readConnectionPreparationHold } from './connection-preparation-hold.js';
 import { prepareAcceptedModelBatchRestart } from './accepted-model-batch-checkpoint.js';
 import { HostRecoveryState } from './host-turn-runner.js';
 import { addNotification } from '../notifications.js';
@@ -785,6 +786,7 @@ export interface RestartRecoveryRecord {
     | 'boot_cap'
     | 'user_stopped'
     | 'identity_missing'
+    | 'connection_wait'
     | 'batch_unproven'
     | 'not_exact_checkpoint';
   errors: string[];
@@ -1401,6 +1403,8 @@ export function recoverInterruptedChatRuns(
       userStopped = isKillRequested(row.id, ownerIdentity
         ? { sourceUserSeq: ownerIdentity.sourceUserSeq }
         : interruptedAttempt ?? undefined);
+      const originalConnectionSource = readRecoveryActivation(row.id)?.connectionContinuation?.requestSourceUserSeq;
+      if (originalConnectionSource) userStopped ||= isKillRequested(row.id, { sourceUserSeq: originalConnectionSource });
     } catch {
       // A failed kill read must not invent a stop. The ordinary conservative
       // external-write/age checks still decide whether resume is safe.
@@ -1556,6 +1560,22 @@ export function recoverInterruptedChatRuns(
       && acceptedInput !== null
       && checkpointRecoverySource === recoveryIdentity.sourceUserSeq,
     );
+    if (exactCheckpointRecovery && !userStopped && recoveryIdentity) {
+      try {
+        if (readConnectionPreparationHold({ sessionId: row.id, deliverySourceUserSeq: recoveryIdentity.sourceUserSeq })) {
+          // Verification already told the user which connection action is
+          // needed. Retain that checkpoint across boot/ticks without polling
+          // metadata, spending model calls or publishing duplicate notices.
+          record.autoResumeSkipped = 'connection_wait';
+          records.push(record);
+          continue;
+        }
+      } catch (error) {
+        record.errors.push(`connection_wait_check: ${error instanceof Error ? error.message : String(error)}`);
+        records.push(record);
+        continue;
+      }
+    }
     // Later user inputs are not stop or settlement authority. They can be
     // status questions, continuations, or corrections to this same work. Only
     // the exact committed terminal above or the existing user-stop authority

@@ -1051,3 +1051,97 @@ implemented and the combined installed app/live-home candidate is qualified.
 The UI must show which requirement remains, keep the task and completed work
 visible, and offer the correct connection retry or reviewed-plan change. It
 must not promise completion just because this new metadata check succeeded.
+
+### Connection verification waits retain execution — 2026-09-30
+
+Verified in this increment: a recognized provider metadata refusal no longer
+escapes retained-agent preparation as a generic failed terminal. The executor
+returns a typed, nonterminal connection wait while retaining the same source,
+plan claim, run attempt, recovery cursor and completed work. The bridge keeps
+that attempt active and returns the appropriate explanation. Unexpected
+exceptions still follow the existing failure path; exception prose is never
+used to infer that a retry is safe.
+
+The new state is `hold.wake = connection`, `reason = connection_preparation`,
+with the exact connection request, refusal code and `nextAction`. Provider
+refusal codes explicitly map to `retry`, `reconnect` or `review_plan`.
+Definition/schema/account changes cannot silently widen the reviewed task.
+Ownership is rechecked before recording a wait, so Stop, account receipt drift,
+lease loss or a newer request cannot be disguised as this recoverable state.
+
+Preparation state is recorded under the existing recovery-decision event and
+bound to the validated activation. Identical failures create one state receipt;
+a later successful preparation clears it. These records are diagnostic/UI
+state, never execution authority, new plan claims or completed-effect receipts.
+An explicit retry still needs the current execution lease and performs fresh
+provider checks. It never reinstalls the original pause over a newer cursor.
+
+Recovery timers stop polling on this typed wait. Boot and periodic scans retain
+the exact checkpoint without provider/model calls or repeated interruption
+notices. Stop on the original execution also outranks the connection wait.
+Queue ordering keeps waiting connections behind runnable recovery work, and
+keeps Stop reachable. Ordering is only a hint: the scanner still proves the
+actual ownership and Stop target before acting. Without that ordering fix,
+more than one page of waiting connections could starve previously attempted
+work. The new queue pin reproduced that failure when only the ranking change
+was temporarily removed; the candidate was restored afterward.
+
+Verification:
+
+- The new desktop/home and mobile/webhook bridge fixtures first fail provider
+  schema refresh, reopen the database, retry the same failure, restore the
+  provider and finish the same task. There remains one plan claim, one prior
+  local read and one subsequently executed provider read; five recording model
+  frames total, with zero frames or business calls spent on failed preparation.
+  These enter the internal bridge, **not the disabled public Execute button**.
+- The Stop fixture proves that a restored connection cannot restart an
+  explicitly stopped original task, including during boot recovery. Existing
+  account, definition, schema, callable-revocation and pre-model invalidation
+  cases remain covered. A drift refusal requests plan review, not blind retry.
+- **136/136** bridge/setup/connection checks passed before the recovery-scan
+  refinement: `/tmp/clem-connection-retry-regression.txt`.
+- **38/38** final connection and restart checks passed, including all twenty
+  connection cases and the queue test with 65 waiting tasks:
+  `/tmp/clem-connection-retry-recovery-final.txt`. Coverage overlaps the prior
+  run; these are not additive independent test totals.
+- Red evidence: `/tmp/clem-connection-retry-red.txt` shows the bridge returning
+  `error` instead of retaining the task after metadata failure.
+  `/tmp/clem-connection-retry-queue-red.txt` shows the bounded queue selecting a
+  waiting task ahead of runnable work without the ranking fix.
+- **31/31** neighboring recovery checks passed after restoring the queue
+  fix: `/tmp/clem-connection-retry-queue-final.txt` (restart, stale-marker and
+  host checkpoint wake files). Eighteen restart checks overlap the prior run.
+- Runtime TypeScript passed in `/tmp/clem-connection-retry-tsc-final.txt`;
+  `git diff --check` passed.
+
+Not performed: public browser/phone interaction, paid-model or live-provider
+requests, installed-app/live-home acceptance, build, hotpatch, merge or tag.
+The test runner's live-home sentinel was NOT PERFORMED while daemon 72427 owned
+the changing live stores. No token/latency improvement is claimed from these
+recording fixtures. The other agent's clean `claude/two-modes` worktree was
+rechecked at `76c53a1ea` and left untouched.
+
+UI work to pair with this state:
+
+| State | Presentation and action |
+| --- | --- |
+| Temporary metadata failure | Keep one task card with saved progress and the readable account; offer Retry when the owned retry endpoint exists |
+| Inactive, missing or suppressed reviewed connection | Explain which account needs attention and link to its connection controls; never silently enable or replace it |
+| Reviewed operation changed | Show what changed and offer plan review; do not relabel it as a sign-in problem |
+| Verification passed after a wait | Replace the pause state with genuine execution progress in the same task view |
+| Stop | Preserve completed-effect receipts and show Stopped; reconnecting cannot restart the work |
+
+The response remains nonterminal for transport compatibility; the UI must use
+the typed wait to show a pause instead of an endless Thinking spinner. Reload
+must reconstruct that state from the same validated activation and state
+receipt. Do not infer readiness from the mere presence of a connection badge.
+Neither the public retry endpoint nor that visual projection is enabled by
+this increment.
+
+Still owed: held-lease renewal and exact boot adoption; explicit public retry
+admission after a lease expires; cold-rebuild refusals outside the classified
+provider-check path; full-source outer budgets; workflow finalization;
+subsequent setup/approval pauses; completed-write/no-replay and actual
+desktop/mobile acceptance. Keep `EXECUTION_CONTINUATION_BLOCKER` active. Merge
+with the other agent's settings/Auto/Ask/UI work and reconcile migration 83
+before building a combined candidate for installed-app qualification.

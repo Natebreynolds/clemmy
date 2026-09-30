@@ -142,6 +142,7 @@ import {
   type AcceptedSourceTerminalOutcome,
 } from './accepted-source-terminal.js';
 import { clearRunInFlightAfterTerminal, releaseRunInFlightAfterWorkflowTransfer } from './restart-recovery.js';
+import { connectionPreparationHoldText } from './connection-preparation-hold.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import {
   InvalidFreshTurnEngineError,
@@ -2011,13 +2012,13 @@ export async function respondViaHarness(
 
     switch (result.status) {
       case 'held': {
-        // No terminal exists: a peer activation or restart reconciler still
-        // owns this exact accepted source. Preserve its attempt and return only
-        // a nonterminal acknowledgement; never reinterpret it as done, failed,
-        // blocked, or a question for the user.
+        // No terminal exists: a peer, restart reconciler or connection wait
+        // retains this exact source. Preserve its attempt and return a typed
+        // acknowledgement with the appropriate next action. A connection
+        // wait is not a promise of automatic recovery or a completed turn.
         preserveRequestAttemptOwnership = true;
         return withRouteDiagnostics({
-          text: TYPED_EXECUTION_HELD_REPLY,
+          text: result.hold?.wake === 'connection' ? connectionPreparationHoldText(result.hold) : TYPED_EXECUTION_HELD_REPLY,
           sessionId,
           stoppedReason: 'in-progress',
           turnsUsed: result.lastTurn,

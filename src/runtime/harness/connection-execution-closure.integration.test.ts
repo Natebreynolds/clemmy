@@ -55,7 +55,9 @@ const connectionCheckpoints = await import('./source-connection-checkpoints.js')
 const connectionPause = await import('./connection-execution-pause.js');
 const connectionSetup = await import('./connection-setup.js');
 const activation = await import('./connection-execution-activation.js');
+const { readConnectionPreparationHold } = await import('./connection-preparation-hold.js');
 const { runConversation } = await import('./loop.js');
+const { HarnessSession } = await import('./session.js');
 const { respondViaHarness, respondPreferHarness, _setBridgeImplsForTests } = await import('./respond-bridge.js');
 const { ClementineGateway } = await import('../../gateway/router.js');
 const { readConnectionExecutionActivation } = await import('./connection-execution-activation-proof.js');
@@ -105,7 +107,7 @@ function recordMissingConnection(identity: { sessionId: string; sourceUserSeq: n
 for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile', 'prefer-home', 'prefer-mobile',
   'gateway-mobile', 'account-changed-before-model', 'stopped-before-model', 'account-inactive', 'schema-changed',
   'account-changed-during-check', 'stopped-during-check', 'callable-revoked-during-check', 'unreviewed-capability',
-  'different-reviewed-account', 'definition-relabeled'] as const) test(`connection execution: ${scenario}`, async t => {
+  'different-reviewed-account', 'definition-relabeled', 'retry-home', 'retry-mobile', 'retry-stopped'] as const) test(`connection execution: ${scenario}`, async t => {
   const useExecutor = scenario !== 'publication';
   let configured = 0;
   _setBridgeImplsForTests({ configure: async () => { configured += 1; return { ok: true }; } });
@@ -395,8 +397,64 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const runBridge = () => scenario.startsWith('prefer-')
     ? respondPreferHarness(scenario === 'prefer-mobile' ? 'webhook' : 'home', bridgeRequest,
         async () => { throw new Error('The legacy bridge responder must not run.'); }, { connectionExecutionLeaseOwner: leaseOwner })
-    : respondViaHarness(scenario === 'bridge-mobile' ? 'webhook' : 'home', bridgeRequest,
+    : respondViaHarness(scenario.endsWith('mobile') ? 'webhook' : 'home', bridgeRequest,
         { connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1', modelOverride: 'fixture-wrong-caller-override' });
+  if (scenario.startsWith('retry-')) {
+    provider!.setSchemaAvailable(false);
+    const beforeChecks = { ...provider!.counts };
+    const pauseBlob = HarnessSession.load(session.id)!.loadRecoveryState();
+    const response = await runBridge();
+    assert.equal(response.stoppedReason, 'in-progress', 'temporary metadata failure must not close the reviewed task');
+    assert.match(response.text, /paused|saved/i);
+    assert.match(response.text, /retry/i);
+    assert.doesNotMatch(response.text, /will continue/i, 'a connection wait cannot promise automatic recovery');
+    assert.equal((response.raw as any)?.typedExecution?.wake, 'connection');
+    assert.equal((response.raw as any)?.typedExecution?.nextAction, 'retry');
+    assert.equal(modelCalls, 3);
+    assert.equal(provider!.counts.businessCalls, 0);
+    assert.ok(provider!.counts.schemaChecks > beforeChecks.schemaChecks);
+    assert.equal(log.getLatestRunAttemptByRunId(session.id, runId)!.status, 'active');
+    const root = hostAuthority.acceptedTurnCallAuthorityFor(session.id, source.seq);
+    assert.ok(root.status === 'ok' && root.authority.state === 'open');
+    assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+    assert.equal(closure.readConnectionExecutionClosure(log.openEventLog(), {
+      sessionId: session.id, executionSourceUserSeq: source.seq }), null);
+    assert.deepEqual(readRows(), readBefore);
+    log.closeEventLog();
+    const hold = readConnectionPreparationHold({ sessionId: session.id, deliverySourceUserSeq: active.source.seq });
+    assert.equal(hold?.nextAction, 'retry', 'reopening preserves the truthful next action');
+    assert.equal(readConnectionPreparationHold({ sessionId: session.id, deliverySourceUserSeq: source.seq }), null);
+    const countsBeforeBoot = { ...provider!.counts };
+    let bootDispatches = 0;
+    const boot = recoverInterruptedChatRuns(Date.now, async () => { bootDispatches += 1; });
+    await Promise.resolve();
+    assert.equal(boot.records.find(row => row.sessionId === session.id)?.autoResumeSkipped, 'connection_wait');
+    assert.equal(bootDispatches, 0, 'recovery must not poll a task explicitly waiting on its connection');
+    assert.deepEqual(provider!.counts, countsBeforeBoot);
+    assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+    const repeated = await runBridge();
+    assert.equal(repeated.stoppedReason, 'in-progress');
+    assert.equal(log.getLatestRunAttemptByRunId(session.id, runId)!.attemptId, lease.attempt.attemptId);
+    assert.equal(HarnessSession.load(session.id)!.loadRecoveryState(), pauseBlob,
+      'a retry must preserve the actual retained cursor');
+    assert.equal(log.listEvents(session.id, { types: ['restart_recovery_decision'] })
+      .filter(event => event.data.decision === 'connection_preparation_held').length, 1,
+      'the same verification failure must not create repeated pause cards or receipts');
+    provider!.setSchemaAvailable(true);
+    if (scenario === 'retry-stopped') {
+      log.requestKill(session.id, 'Owner stopped the retained task while connection was unavailable', originalAttempt);
+      await assert.rejects(runConversation(resumeOptions), /stopped/);
+      const stopped = recoverInterruptedChatRuns(Date.now, async () => { bootDispatches += 1; });
+      await Promise.resolve();
+      assert.equal(stopped.records.find(row => row.sessionId === session.id)?.autoResumeSkipped, 'user_stopped',
+        'Stop on the original task takes priority over its connection wait during recovery');
+      assert.equal(bootDispatches, 0);
+      assert.equal(modelCalls, 3);
+      assert.equal(provider!.counts.businessCalls, 0);
+      assert.deepEqual(readRows(), readBefore);
+      return;
+    }
+  }
   if (['account-inactive', 'schema-changed', 'account-changed-during-check', 'stopped-during-check',
     'callable-revoked-during-check', 'unreviewed-capability', 'different-reviewed-account', 'definition-relabeled'].includes(scenario)) {
     const beforeChecks = provider ? { ...provider.counts } : null;
@@ -413,7 +471,18 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     if (scenario === 'callable-revoked-during-check') provider!.beforeSchema(() => {
       catalogs.peekHostCapabilityCatalogFactory()!.forget(provider!.capability);
     });
-    await assert.rejects(runConversation(resumeOptions), /connected operation|account changed|was stopped|operation changed|outside the reviewed plan|differs from the reviewed account/);
+    if (scenario === 'account-changed-during-check' || scenario === 'stopped-during-check') {
+      await assert.rejects(runConversation(resumeOptions), /account changed|was stopped/);
+    } else {
+      const held = await runConversation(resumeOptions);
+      assert.equal(held.status, 'held');
+      assert.equal(held.hold?.wake, 'connection');
+      assert.equal(held.hold?.wake === 'connection' && held.hold.nextAction,
+        scenario === 'account-inactive' ? 'reconnect' : 'review_plan');
+      assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1);
+      const root = hostAuthority.acceptedTurnCallAuthorityFor(session.id, source.seq);
+      assert.ok(root.status === 'ok' && root.authority.state === 'open');
+    }
     assert.equal(modelCalls, 3, 'a metadata refusal cannot spend another model frame');
     assert.equal(provider?.counts.businessCalls ?? 0, 0, 'verification cannot execute a business operation');
     assert.deepEqual(readRows(), readBefore);
@@ -453,27 +522,29 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   }
   if (useExecutor && scenario !== 'gateway-mobile') {
     log.closeEventLog();
-    // Boot must recognize the retained execution under its new delivery
-    // control, even when generic chat auto-resume is disabled. This dispatcher
-    // records selection only; acquiring a fresh boot lease is a separate gate.
-    const dispatched: Array<{ sessionId: string; sourceUserSeq: number }> = [];
-    const previousAutoResume = process.env.CLEMMY_CHAT_AUTO_RESUME;
-    process.env.CLEMMY_CHAT_AUTO_RESUME = 'off';
-    try {
-      const scan = recoverInterruptedChatRuns(Date.now, async control => { dispatched.push(control); });
-      await Promise.resolve();
-      assert.equal(scan.records.find(row => row.sessionId === session.id)?.autoResumed, true, JSON.stringify(scan));
-      assert.deepEqual(dispatched.map(({ sessionId, sourceUserSeq }) => ({ sessionId, sourceUserSeq })),
-        [{ sessionId: session.id, sourceUserSeq: active.source.seq }]);
-      assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1,
-        'the original setup pause cannot be treated as completion of the resumed task');
-    } finally {
-      if (previousAutoResume === undefined) delete process.env.CLEMMY_CHAT_AUTO_RESUME;
-      else process.env.CLEMMY_CHAT_AUTO_RESUME = previousAutoResume;
+    if (!scenario.startsWith('retry-')) {
+      // Boot must recognize the retained execution under its new delivery
+      // control, even when generic chat auto-resume is disabled. This dispatcher
+      // records selection only; acquiring a fresh boot lease is a separate gate.
+      const dispatched: Array<{ sessionId: string; sourceUserSeq: number }> = [];
+      const previousAutoResume = process.env.CLEMMY_CHAT_AUTO_RESUME;
+      process.env.CLEMMY_CHAT_AUTO_RESUME = 'off';
+      try {
+        const scan = recoverInterruptedChatRuns(Date.now, async control => { dispatched.push(control); });
+        await Promise.resolve();
+        assert.equal(scan.records.find(row => row.sessionId === session.id)?.autoResumed, true, JSON.stringify(scan));
+        assert.deepEqual(dispatched.map(({ sessionId, sourceUserSeq }) => ({ sessionId, sourceUserSeq })),
+          [{ sessionId: session.id, sourceUserSeq: active.source.seq }]);
+        assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1,
+          'the original setup pause cannot be treated as completion of the resumed task');
+      } finally {
+        if (previousAutoResume === undefined) delete process.env.CLEMMY_CHAT_AUTO_RESUME;
+        else process.env.CLEMMY_CHAT_AUTO_RESUME = previousAutoResume;
+      }
     }
     await assert.rejects(runConversation({ ...resumeOptions, connectionExecutionLeaseOwner: 'wrong-owner' }), /live execution lease/);
     assert.equal(modelCalls, 3, 'a wrong executor cannot spend a model frame');
-    if (scenario.startsWith('bridge-') || scenario.startsWith('prefer-')) {
+    if (scenario.startsWith('bridge-') || scenario.startsWith('prefer-') || scenario.startsWith('retry-')) {
       const response = await runBridge();
       assert.equal(response.stoppedReason, 'success', JSON.stringify(response));
       assert.equal(response.text, reply);
@@ -518,6 +589,12 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     assert.equal(provider.counts.businessCalls, 1, 'only the pending provider read executes after connection');
     assert.equal(log.listEvents(session.id, { types: ['connection_request_satisfied'] })
       .filter(event => event.data.kind === 'reviewed_execution_callable').length, 1);
+  }
+  if (scenario.startsWith('retry-')) {
+    assert.equal(readConnectionPreparationHold({ sessionId: session.id, deliverySourceUserSeq: active.source.seq }), null,
+      'successful explicit retry clears the diagnostic pause');
+    assert.equal(log.listEvents(session.id, { types: ['restart_recovery_decision'] })
+      .filter(event => event.data.decision === 'connection_preparation_ready').length, 1);
   }
   assert.equal(configured, scenario.startsWith('prefer-') || scenario === 'gateway-mobile' ? 1 : 0,
     'a completed replay must not configure or re-enter the runtime');

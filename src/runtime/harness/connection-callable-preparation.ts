@@ -8,6 +8,7 @@ import { connectionDependencyIdentity } from './connection-execution-pause-proof
 import { readConnectionContinuationAccount } from './connection-setup.js';
 import { appendEvent, openEventLog, withEventPublicationTransaction } from './eventlog.js';
 import { currentReviewedProviderIdentity, reviewedProviderIdentityMismatch } from './reviewed-provider-identity.js';
+import { ConnectionPreparationHoldError } from './connection-preparation-hold.js';
 
 const object = (v: unknown): v is Record<string, unknown> => Boolean(v && typeof v === 'object' && !Array.isArray(v));
 
@@ -29,19 +30,19 @@ export async function prepareConnectionExecutionCapability(input: {
     && row.capabilityRef === dependency.subject_capability_ref) : undefined;
   if (!object(binding) || !object(binding.identity) || binding.identity.providerKind !== 'composio'
     || binding.identity.operationId !== dependency.subject_capability) {
-    throw new Error('The missing connection is outside the reviewed plan. Revise the plan before continuing.');
+    throw new ConnectionPreparationHoldError('operation_outside_reviewed_plan');
   }
   const reviewed = binding.identity;
   const account = readConnectionContinuationAccount({ sessionId: input.sessionId, connectionRequestId: input.requestId },
     activation.verificationBinding);
-  if (reviewed.account !== account) throw new Error('The connected account differs from the reviewed account. Revise the plan before continuing.');
+  if (reviewed.account !== account) throw new ConnectionPreparationHoldError('reviewed_account_changed');
   const current = currentReviewedProviderIdentity(dependency.subject_capability_ref);
   if (!current.ok || reviewedProviderIdentityMismatch(current, reviewed)) {
-    throw new Error('The reviewed operation is unavailable or changed. Revise the plan before continuing.');
+    throw new ConnectionPreparationHoldError('reviewed_operation_changed');
   }
   const manifest = current.entry.manifest;
   if (!manifest?.definitionFingerprint || !manifest.operationVersion || !manifest.externalDefinition?.providerOutputSchemaObserved) {
-    throw new Error('The reviewed operation lacks its complete provider definition.');
+    throw new ConnectionPreparationHoldError('reviewed_definition_incomplete');
   }
   // A cached callable row is not enough after reconnect. This existing exact
   // provider path forces an account snapshot and schema refresh, without a
@@ -58,19 +59,19 @@ export async function prepareConnectionExecutionCapability(input: {
     operationSemantics: manifest.operationSemantics ?? null,
   }]);
   input.assertOwned();
-  if (!result.ok) throw new Error(`The connected operation could not be verified (${result.refusal.code}).`);
+  if (!result.ok) throw new ConnectionPreparationHoldError(result.refusal.code);
   const fresh = result.definitions.get(current.canonical.operationId.toLowerCase());
   // A provider version-label successor is useful to fresh planning, but it
   // cannot silently replace the exact identity of this reviewed execution.
   if (!fresh || fresh.definitionFingerprint !== manifest.definitionFingerprint
     || fresh.providerOperationVersion !== manifest.operationVersion || fresh.accountIdentity !== account) {
-    throw new Error('The connected operation changed since review. Revise the plan before continuing.');
+    throw new ConnectionPreparationHoldError('reviewed_operation_changed');
   }
   withEventPublicationTransaction(() => {
     input.assertOwned();
     const now = currentReviewedProviderIdentity(dependency.subject_capability_ref as string);
     if (!now.ok || reviewedProviderIdentityMismatch(now, reviewed)) {
-      throw new Error('The reviewed operation changed during connection verification.');
+      throw new ConnectionPreparationHoldError('reviewed_operation_changed');
     }
     const status = db.prepare(`SELECT status FROM dependency_requests WHERE request_id = ? AND session_id = ?`)
       .get(input.requestId, input.sessionId) as { status: string } | undefined;
