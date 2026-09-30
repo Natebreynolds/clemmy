@@ -51,7 +51,10 @@ test('manual unproven Composio refresh is refused before durable authority with 
     const result = await runner.refreshSpaceData(slug, 'contacts', { cause: 'manual' });
     assert.equal(result.length, 1);
     assert.equal(result[0]?.ok, false);
-    assert.match(result[0]?.error ?? '', /exact read catalog preparation was refused.*accepted_source_missing_or_changed/i);
+    // A manual refresh now carries its own accepted source, so the exact
+    // operation is asked for and refused for want of a definition, before any
+    // provider body.
+    assert.match(result[0]?.error ?? '', /exact read catalog preparation was refused.*exact_operation_provisioning_refused.*exact_definition_unavailable/i);
     assert.equal(retiredProviderBodies, 0, 'manual console refresh entered zero provider bodies');
   } finally {
     runner._setSpaceComposioDispatchForTests(null);

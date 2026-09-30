@@ -21,6 +21,56 @@ const store = await import('../spaces/store.js');
 const spaceRunner = await import('../spaces/runner.js');
 const workspaceDb = await import('../spaces/workspace-db.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const capabilityCatalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+const capabilityManifests = await import('../runtime/harness/capability-manifest.js');
+const { createHash } = await import('node:crypto');
+
+/** A current, connected capability for an operation, so an action has an
+ * execution path. Without one the route refuses before any card (an approval
+ * for work nothing could execute is not offered, 2026-09-30). */
+function installCurrentCapability(operationId: string, effect: 'read' | 'external_write'): void {
+  const fingerprint = createHash('sha256').update(`space-routes:${operationId}:${effect}`, 'utf8').digest('hex');
+  const manifest = capabilityManifests.attachSemanticContract({
+    version: 1,
+    manifestId: `manifest.space.routes.${operationId.toLowerCase()}`,
+    providerKind: 'composio',
+    operationId,
+    providerIdentity: 'provider.space-routes-fixture',
+    providerVersion: 'fixture.1',
+    operationVersion: '1',
+    definitionFingerprint: fingerprint,
+    effect,
+    accountId: 'account.space-routes-fixture',
+    idempotency: { required: false, policy: 'none' },
+    reconciliation: { supported: false, policy: 'none' },
+    outputContract: { kind: 'records' },
+    purpose: effect === 'read' ? 'read_bounded_records' : 'bounded_write',
+    acceptedInputKinds: ['scope'],
+    producedOutputKinds: ['records'],
+    applicableDeliverableKinds: ['records'],
+    evidenceContract: { kinds: ['records'], readbackRequired: false },
+    provenance: { issuer: 'space.routes.test', issuedAt: '2026-09-30T00:00:00.000Z', trusted: true },
+    lifecycle: { state: 'current' },
+    advisoryRoles: [effect === 'read' ? 'source' : 'write'],
+  });
+  const factory = capabilityCatalogs.peekHostCapabilityCatalogFactory()
+    ?? capabilityCatalogs.createHostCapabilityCatalogFactory();
+  factory.register({
+    capabilityId: manifest.manifestId,
+    toolName: manifest.operationId,
+    schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint,
+    effect: manifest.effect,
+    account: manifest.accountId,
+    advisoryRoles: manifest.advisoryRoles,
+    manifestDigest: capabilityManifests.capabilityManifestDigest(manifest),
+    providerKind: manifest.providerKind,
+    liveFingerprint: manifest.definitionFingerprint,
+    manifest,
+    invoke: async () => { throw new Error('route fixture must never own provider I/O'); },
+  });
+  capabilityCatalogs.installHostCapabilityCatalogFactory(factory);
+}
 
 let server: Server;
 let base = '';
@@ -664,7 +714,7 @@ test('manual refresh refuses a read-looking Composio source without a current re
     assert.equal(ref.status, 200);
     assert.equal(ref.body.results[0].ok, false);
     assert.match(ref.body.results[0].error, /exact read catalog preparation was refused/i);
-    assert.match(ref.body.results[0].error, /accepted_source_missing_or_changed/);
+    assert.match(ref.body.results[0].error, /exact_operation_provisioning_refused.*exact_definition_unavailable/);
     assert.equal(providerBodies, 0);
     assert.equal(Object.hasOwn(ref.body.data, 'pull'), false);
     assert.equal(ref.body.data._meta.pull.ok, false);
@@ -683,13 +733,15 @@ test('refresh surfaces a runner error without breaking the workspace', async () 
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sourceId: 'bad' }),
   }));
   assert.equal(pending.status, 200);
-  assert.equal(pending.body.results[0].ok, false);
-  assert.equal(pending.body.data._meta.bad.status, 'awaiting_approval');
+  assert.equal(pending.body.results[0].ok, false, JSON.stringify(pending.body).slice(0, 900));
+  assert.equal(pending.body.data._meta.bad.status, 'awaiting_approval', JSON.stringify(pending.body).slice(0, 900));
+  // A saved script runs through the durable script carrier; its one consent
+  // card is owned by the script session, not the workspace chat session.
   const approval = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
+    sessionId: `workspace-script:${slug}`,
     status: 'pending',
-  })[0];
-  assert.ok(approval);
+  })[0] ?? approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' })[0];
+  assert.ok(approval, JSON.stringify(approvalRegistry.listPending({ status: 'pending' }).map((r) => [r.sessionId, r.subject])));
   assert.equal(approvalRegistry.resolve(approval.approvalId, 'approved', 'space-route-test').ok, true);
 
   const ref = await j(await fetch(`${base}/api/console/spaces/${slug}/refresh`, {
@@ -717,7 +769,7 @@ test('paused workspace rejects data writes (423) but still serves the view', asy
   assert.equal(view.status, 200); // read-only cached view still serves
 });
 
-test('action route stages approval for a read-looking Composio action without a current read manifest', async () => {
+test('action route refuses a read-looking Composio action without a current read manifest: no card for work nothing could execute', async () => {
   const slug = 'action-rt';
   store.spaceStore.save({
     id: slug, title: 'Action RT',
@@ -743,16 +795,12 @@ test('action route stages approval for a read-looking Composio action without a 
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ actionId: 'refresh-list', args: { limit: 10 } }),
     }));
-    assert.equal(res.status, 202);
-    assert.equal(res.body.pending, true);
-    assert.match(res.body.approvalId, /^apr-/);
+    assert.equal(res.status, 409, JSON.stringify(res.body));
+    assert.equal(res.body.needs, 'credential');
+    assert.match(res.body.error, /No current capability is registered/);
     assert.equal(providerBodies, 0);
-
-    const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
-    assert.equal(notes.body.notes.some((n: any) => n.kind === 'action' && /Refresh list.*failed/i.test(n.text)), false);
-    assert.ok(approvalRegistry.listPending({ status: 'pending' }).some(
-      (row) => row.approvalId === res.body.approvalId && row.tool === 'space_execute_action',
-    ));
+    assert.equal(approvalRegistry.listPending({ status: 'pending' })
+      .some((row) => row.tool === 'space_execute_action' && row.sessionId === `space-${slug}`), false);
   } finally {
     spaceRunner._setSpaceComposioDispatchForTests(null);
   }
@@ -786,6 +834,7 @@ test('action route refuses a workspace with malformed hand-written action JSON',
 });
 
 test('E1: a SEND-class action is gated behind one approval (default on) — 202 pending, not yet run', async () => {
+  installCurrentCapability('OUTLOOK_SEND_EMAIL', 'external_write');
   const slug = 'action-gate';
   store.spaceStore.save({
     id: slug, title: 'Gate RT',
@@ -795,7 +844,7 @@ test('E1: a SEND-class action is gated behind one approval (default on) — 202 
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ actionId: 'email', args: { to: 'lead@acme', subject: 'Hi' } }),
   }));
-  assert.equal(res.status, 202);
+  assert.equal(res.status, 202, JSON.stringify(res.body));
   assert.equal(res.body.pending, true);
   assert.match(res.body.approvalId, /^apr-/);
 

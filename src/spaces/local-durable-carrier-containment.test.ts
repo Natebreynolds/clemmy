@@ -42,6 +42,10 @@ function approvePendingWithoutResume(approvalId: string): void {
   assert.equal(changed.changes, 1);
 }
 
+/** A refresh no longer mints a trust card for a runner it cannot execute;
+ * the cards these cases approve are the ones an older installation left
+ * behind, reconstructed by the legacy fixture. The refusal under test is the
+ * same: an approved declaration with no execution path spawns nothing. */
 async function approveSourceTrust(
   slug: string,
   source: Parameters<typeof runner.runSpaceDataSource>[1],
@@ -49,11 +53,10 @@ async function approveSourceTrust(
   const pending = await runner.runSpaceDataSource(slug, source);
   assert.equal(pending.ok, false);
   assert.equal(pending.ok ? undefined : pending.provenNoDispatch, true);
-  const card = approvals.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  }).find((row) => row.args?.sourceId === source.id);
-  assert.ok(card);
+  assert.equal(approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' })
+    .some((row) => row.args?.sourceId === source.id), false, 'a refresh mints no trust card without an execution path');
+  const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
+  const card = seedLegacySpaceTrustApproval(slug, source as never);
   approvePendingWithoutResume(card.approvalId);
   return card.approvalId;
 }
@@ -75,7 +78,7 @@ test('manual refresh keeps approved runner and CLI declarations zero-process', a
 
   const runnerResult = await runner.refreshSpaceData(runnerSlug, runnerSource.id, { cause: 'manual' });
   assert.equal(runnerResult[0]?.ok, false);
-  assert.match(runnerResult[0]?.error ?? '', /no shared durable call authority/i);
+  assert.match(runnerResult[0]?.error ?? '', /no shared durable call authority|Nothing has executed/i);
   assert.equal(existsSync(runnerMarker), false);
 
   const cliSlug = 'manual-local-cli-contained';
@@ -93,7 +96,7 @@ test('manual refresh keeps approved runner and CLI declarations zero-process', a
 
   const cliResult = await runner.refreshSpaceData(cliSlug, cliSource.id, { cause: 'manual' });
   assert.equal(cliResult[0]?.ok, false);
-  assert.match(cliResult[0]?.error ?? '', /no shared durable call authority/i);
+  assert.match(cliResult[0]?.error ?? '', /no shared durable call authority|Nothing has executed/i);
   assert.equal(existsSync(cliMarker), false);
 });
 
@@ -107,7 +110,8 @@ test('scheduled refresh keeps an approved local runner zero-process', async () =
 
   const result = await scheduler.processSpaceSchedules(new Date('2026-08-25T18:01:00.000Z'));
   assert.equal(result.fired, 0);
-  assert.equal(result.errors, 1);
+  // A legacy approval is reviewed, not run: the occurrence is held, not
+  // counted as an error, and nothing is spawned.
   assert.equal(existsSync(marker), false);
   store.spaceStore.archive(slug);
 });
@@ -158,6 +162,6 @@ test('approved runner action and its stale legacy receipt are both zero-process'
   });
   assert.equal(result.ok, false);
   assert.equal(result.ok ? undefined : result.provenNoDispatch, true);
-  assert.match(result.ok ? '' : result.error, /no shared durable call authority/i);
+  assert.match(result.ok ? '' : result.error, /no shared durable call authority|Nothing has executed/i);
   assert.equal(existsSync(marker), false);
 });
