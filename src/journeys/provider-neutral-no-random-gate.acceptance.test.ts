@@ -36,7 +36,9 @@ mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-provider-neutral-no-gate\n');
 writeFileSync(
   path.join(HOME, 'state', 'proactivity-policy.json'),
-  JSON.stringify({ autoApproveScope: 'strict' }, null, 2),
+  // Auto mode (2026-09-30): in Ask mode the first change of a kind waits for
+  // the owner by design; the gate this journey rules out is the random one.
+  JSON.stringify({ autoApproveScope: 'yolo' }, null, 2),
 );
 
 const eventlog = await import('../runtime/harness/eventlog.js');
@@ -988,7 +990,12 @@ test('provider-neutral authorized requests cross unrelated capabilities without 
   });
 });
 
-test('generic consent under strict policy preserves real gates without granting workflow work globally', () => {
+test('generic consent under strict policy preserves real gates without granting workflow work globally', async () => {
+  // This case inspects the legacy taxonomy under Ask (stored 'strict').
+  const proactivity = await import('../agents/proactivity-policy.js');
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  const restore = () => proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
   const intrinsicallyLocal = [
     taxonomy.decideToolApproval({
       toolName: 'write_file',
@@ -1079,6 +1086,9 @@ test('generic consent under strict policy preserves real gates without granting 
     action: 'ask_user',
     retry: false,
   });
+  } finally {
+    restore();
+  }
 });
 
 type LocalPlanningDefinition = import(

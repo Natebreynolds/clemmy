@@ -339,7 +339,9 @@ test('cold natural Discord request performs one restaurant read and one new-Shee
 
   eventlog.resetEventLog();
   resetHarnessRuntimeConfig();
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
   const session = eventlog.createSession({
     id: 'discord-natural-restaurant-sheet',

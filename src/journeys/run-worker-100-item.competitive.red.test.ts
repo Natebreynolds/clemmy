@@ -352,7 +352,9 @@ test('GATE: cold host plans once, fans 100 read-only workers, replays exactly on
   eventlog.resetEventLog();
   workerConcurrency._resetWorkerConcurrencyForTest();
   resetHarnessRuntimeConfig();
-  proactivity.saveProactivityPolicy({ autoApproveScope: 'strict' });
+  // Auto mode (2026-09-30): this journey pins the provider write pipeline,
+  // not the mode; in Ask mode the first change of a kind waits for the owner.
+  proactivity.saveProactivityPolicy({ autoApproveScope: 'yolo' });
 
   const configured = await configureHarnessRuntime();
   assert.equal(configured.ok, true, configured.ok ? '' : configured.reason);
