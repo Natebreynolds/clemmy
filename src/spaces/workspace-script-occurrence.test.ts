@@ -19,6 +19,7 @@ const kernel = await import('../runtime/harness/workflow-read-only-call-kernel.j
 const workspaces = await import('./workspace-db.js');
 const dataStore = await import('./data-store.js');
 const schema = await import('../runtime/harness/eventlog-schema.js');
+const { HARNESS_SCHEMA_VERSION } = await import('../runtime/harness/schema-version.js');
 
 test.after(() => { eventlog.closeEventLog(); workspaces.closeWorkspaceDb(); rmSync(home, { recursive: true, force: true }); });
 test.afterEach(() => {
@@ -63,7 +64,7 @@ test('migration from v84 preserves existing rows and installs one unpublished so
     const before = db.prepare('SELECT * FROM schema_version ORDER BY version').all();
     schema.applyHarnessMigrations(db);
     assert.deepEqual(db.prepare('SELECT * FROM schema_version WHERE version <= 84 ORDER BY version').all(), before);
-    assert.equal((db.prepare('SELECT MAX(version) AS v FROM schema_version').get() as { v: number }).v, 85);
+    assert.equal((db.prepare('SELECT MAX(version) AS v FROM schema_version').get() as { v: number }).v, HARNESS_SCHEMA_VERSION);
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'workspace_script_one_unpublished_source_v1'").get());
     schema.applyHarnessMigrations(db);
     assert.equal((db.prepare('SELECT COUNT(*) AS n FROM workspace_script_occurrences_v1').get() as { n: number }).n, 0);

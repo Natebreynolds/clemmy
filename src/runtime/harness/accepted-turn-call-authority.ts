@@ -7,6 +7,8 @@
  * therefore reuse the same physical-dispatch and settlement evidence.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { savedSourceWorkflowConsentState, persistSavedSourceWorkflowConsent,
+  hasRetainedSavedSourceWorkflowConsent, type SavedSourceWorkflowConsentAuthorization } from './saved-source-consent.js';
 import { createHash } from 'node:crypto';
 import {
   acceptedTurnCallAuthorityDigest,
@@ -1677,6 +1679,9 @@ function verifyRow(
     const autoReceipt = exactInput && !authorization
       ? exactWorkflowV3AutoReceiptInTransaction(db, workflowV3AutoConsentArmInput(exactInput))
       : null;
+    const savedSourceReceipt = exactInput && activation && !authorization
+      ? hasRetainedSavedSourceWorkflowConsent(activation.activation_id, workflowV3AutoConsentArmInput(exactInput), db)
+      : false;
     const graphResolution = db.prepare(`
       SELECT 1 FROM accepted_task_resolutions
        WHERE session_id = ? AND source_user_seq = ?
@@ -1688,7 +1693,7 @@ function verifyRow(
       || graphResolution
       || (binding.effect !== 'host_only'
         && (!authorizationRow || authorizationRow.consumed_at === null)
-        && !autoReceipt)
+        && !autoReceipt && !savedSourceReceipt)
       || activation.activation_digest !== activationDigest
       || activation.activation_id !== workflowNodeInvocationActivationId(activationDigest)
       || activation.authority_root_id !== workflowNodeCallAuthorityRootId(activationDigest)
@@ -2241,6 +2246,7 @@ export interface ArmWorkflowV3CallAuthorityInput extends ArmWorkflowReadOnlyCall
    * It is deliberately not an approval row and carries no copyable authority
    * fields. The durable decision receipt is appended atomically by arm(). */
   autoConsentAuthorization?: WorkflowV3AutoConsentAuthorizationV1;
+  savedSourceConsentAuthorization?: SavedSourceWorkflowConsentAuthorization;
 }
 
 /** Process-opaque authority for one canonical Auto decision. A structural
@@ -2251,7 +2257,7 @@ export interface WorkflowV3AutoConsentAuthorizationV1 {
 
 export type WorkflowV3AutoConsentArmInput = Omit<
   ArmWorkflowV3CallAuthorityInput,
-  'oneShotActivationAuthorization' | 'autoConsentAuthorization'
+  'oneShotActivationAuthorization' | 'autoConsentAuthorization' | 'savedSourceConsentAuthorization'
 >;
 
 interface WorkflowV3AutoConsentDecisionReceiptV1 {
@@ -2512,10 +2518,11 @@ function validWorkflowV3ArmInput(
   if (!validWorkflowV3BaseArmInput(input)) return false;
   const human = input.oneShotActivationAuthorization !== undefined;
   const automatic = exactWorkflowV3AutoConsentState(input) !== null;
-  if (human && automatic) return false;
+  const savedSource = savedSourceWorkflowConsentState(input.savedSourceConsentAuthorization, workflowV3AutoConsentArmInput(input)) !== null;
+  if ([human, automatic, savedSource].filter(Boolean).length > 1) return false;
   return input.binding.effect === 'host_only'
-    ? !human && !automatic
-    : human || automatic;
+    ? !human && !automatic && !savedSource
+    : human || automatic || savedSource;
 }
 
 function workflowV3AutoDigest(domain: string, value: unknown): string {
@@ -3033,10 +3040,10 @@ function workflowV3InputFromRows(
     return authorization ? null : input;
   }
   if (authorization) return validWorkflowV3ArmInput(input) ? input : null;
-  return exactWorkflowV3AutoReceiptInTransaction(
+  return (exactWorkflowV3AutoReceiptInTransaction(
     db,
     workflowV3AutoConsentArmInput(input),
-  ) ? input : null;
+  ) || hasRetainedSavedSourceWorkflowConsent(activation.activation_id, workflowV3AutoConsentArmInput(input), db)) ? input : null;
 }
 
 function workflowAuthorityRef(
@@ -3429,6 +3436,7 @@ export function armWorkflowV3CallAuthority(
     return { status: 'conflict', reason: 'workflow v3 call-authority input is invalid or lacks exact consent' };
   }
   const autoConsent = exactWorkflowV3AutoConsentState(input);
+  const savedSourceConsent = savedSourceWorkflowConsentState(input.savedSourceConsentAuthorization, workflowV3AutoConsentArmInput(input));
   const activationDigest = workflowV3ActivationDigest(input);
   const activationId = workflowNodeInvocationActivationId(activationDigest);
   const authorityRootId = workflowNodeCallAuthorityRootId(activationDigest);
@@ -3499,6 +3507,8 @@ export function armWorkflowV3CallAuthority(
         );
         if (!consumed.ok) return { status: 'conflict', reason: consumed.reason };
       }
+
+      if (savedSourceConsent) persistSavedSourceWorkflowConsent(activationId, savedSourceConsent, db);
 
       if (autoConsent) {
         if (

@@ -657,3 +657,75 @@ Verification of this occurrence slice:
 - The runner's broad live-home isolation sentinel remains **NOT PERFORMED**
   because live daemon 72427 owns that home. Disposable process fixtures are
   not represented as proof of installed/live-home behavior.
+
+## Explicit recurring consent through the existing v3 kernel
+
+The next slice adds `runtime/harness/saved-source-consent.ts`, schema 86, and
+the occurrence coordinator's `activateWorkspaceScriptOccurrenceWithGrant`.
+This is still internal source work: scheduler/manual entry points, scope-card
+presentation/resolution recovery and user-facing revocation are not connected.
+Do not offer these cards in production until their full resolution path exists.
+
+One explicit `workspace_source_script_consent` approval names the Workspace,
+saved source, entrypoint hash, whole declaration digest, runner, cron and time
+zone. It says that manual runs and the saved schedule use local user credentials,
+network and live dependencies, only while the approved source/script match and
+until revoked. It does not call arbitrary script execution a read, imply an OS
+sandbox or imply downstream business success from process exit. The card's
+answer deadline is separate from this explicitly described recurring scope.
+
+The approved card is consumed exactly once into a retained scope grant. Every
+new occurrence gets its own v3 root and an exact consent derivation receipt in
+the same activation transaction. No fake per-tick human approvals are created.
+The module-minted authorization must match an authentic prepared call and the
+durable source-owned occurrence. Wrong source, account, operation, runner,
+schedule, zone, argument bytes, code or declaration cannot borrow the grant.
+A structural copy of the authorization grants nothing. Existing one-shot and
+canonical Auto consent paths retain their behavior.
+
+Revocation is rechecked inside the activation transaction, before process
+launch, and by the running carrier's cancellation monitor. Revoking a running
+script stops its owned process and holds uncertain effects rather than retrying.
+Historical consent remains readable after revocation, so completed results
+can replay without re-executing or pretending the grant is still active.
+An already-used/revoked approval cannot recreate an active grant.
+
+Verification:
+
+- `/tmp/clem-script-consent-qualification.txt`: **151/151** across new scope
+  checks, saved-script execution/occurrence recovery, existing Space action
+  v3 and Auto paths, generic v3 durable activation, reviewed local workflow
+  execution and event-log migrations/retention.
+- `/tmp/clem-script-consent-migration.txt`: **1/1** additional v85→v86 check:
+  unfinished source owners survive unchanged; no grant is fabricated; migration
+  replay is idempotent. Schema readiness now expects 86, not 85.
+- The repeated-run check uses one real scope approval for scheduled → manual
+  → scheduled execution and counts exactly three logical calls, three physical
+  crossings and three settlements. Two further fresh-process checks use the
+  emitted production carrier in named disposable homes, preserving active and
+  revoked grants, completed replay, and one approval across restarts.
+- `/tmp/clem-script-consent-red.txt`: **2/2 expected semantic failures** when
+  the current-revocation and exact-cron checks were temporarily removed. The
+  original candidate bytes were restored in `finally` and SHA-256 checked.
+- `/tmp/clem-script-consent-typecheck.txt`: TypeScript passed.
+- `/tmp/clem-script-consent-artifacts-verified.txt`: component artifacts verified
+  source-current. This is not an app build or hotpatch.
+- No model calls, live provider calls, personal source edits, full suite,
+  canonical journeys, installed-app/live-home acceptance or tag occurred.
+  The broad live-home sentinel remains NOT PERFORMED while daemon 72427 runs.
+
+Next: the real refresh caller must select/recover the source-owned occurrence,
+check current scope and historical denials, offer one readable executable scope
+card when needed, and resume that exact occurrence after approval/restart. It
+must preserve the existing Space refresh queue and reuse the coordinator's
+committed observation rather than double-transforming or writing it twice.
+Decline, revoke, source edits and uncertain effects need truthful actionable
+states; none is permission to auto-clear the source barrier. Standalone approval
+routing must recognize the new tool so a scope decision never starts a second
+chat/worker turn. Only after these callers are complete should this candidate
+be built/hotpatched for controlled installed acceptance.
+
+The uncommitted model-ledger draft on `connection-continuity` still calls its
+separate migration 85. It remains excluded. If resumed, renumber it after the
+accepted 85/86 chain and test the combined upgrade; do not overwrite either
+committed source-ownership migration.

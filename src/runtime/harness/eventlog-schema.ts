@@ -11301,6 +11301,26 @@ const MIGRATIONS: EventLogMigration[] = [
       ON workspace_script_occurrences_v1(workspace_id, source_id)
       WHERE observation_id IS NULL;`,
   },
+  {
+    version: 86,
+    sql: `CREATE TABLE IF NOT EXISTS saved_source_script_grants_v1 (
+      grant_id TEXT PRIMARY KEY,
+      approval_id TEXT NOT NULL UNIQUE,
+      scope_json TEXT NOT NULL,
+      decision_json TEXT NOT NULL,
+      decision_digest TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      revoked_at TEXT,
+      revocation_reason TEXT
+    );
+    CREATE TABLE IF NOT EXISTS workflow_v3_saved_source_consent_v1 (
+      activation_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      logical_call_id TEXT NOT NULL UNIQUE,
+      grant_id TEXT NOT NULL,
+      receipt_json TEXT NOT NULL
+    );`,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

@@ -12,6 +12,7 @@ import { hostPreDispatchRefusal } from '../runtime/harness/host-pre-dispatch-ref
 import { DEFAULT_MAX_OUTPUT_BYTES, electronNodeEnv, interpreterFor, scrubbedChildEnv,
   spawnSandboxedScript } from '../runtime/sandboxed-script.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
+import { savedSourceCallConsentIsCurrent } from '../runtime/harness/saved-source-consent.js';
 import { SPACES_DIR, resolveInSpace, runnerFilenameError, spaceStore } from './store.js';
 import { canonicalWorkspaceJson } from './workspace-set-data-contract.js';
 import { WORKSPACE_SCRIPT_OPERATION, workspaceScriptArguments, type WorkspaceScriptArguments } from './workspace-script-contract.js';
@@ -94,6 +95,9 @@ export async function executeReviewedWorkspaceScript(input: WorkspaceScriptArgum
   }
   const current = () => {
     if (!isDispatchLeaseCurrent(lease)) return false;
+    const source = spaceStore.get(args.slug)?.dataSources.find(source => source.id === args.source_id);
+    if (!source || !savedSourceCallConsentIsCurrent(owner.sessionId, owner.logicalCallId,
+      source.timezone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone)) return false;
     const root = readWorkflowV3CallAuthority(owner.activationId);
     return root.status === 'ok' && root.authority.state === 'open'
       && root.authority.authorityDigest === owner.authorityDigest

@@ -6,7 +6,8 @@ import { createHash } from 'node:crypto';
 import { createSession, getSession, openEventLog } from '../runtime/harness/eventlog.js';
 import { get as getApproval } from '../runtime/harness/approval-registry.js';
 import { ensureReviewedLocalWorkflowCapability } from '../runtime/harness/reviewed-local-workflow-capability.js';
-import { executeActivatedWorkflowNodeCall } from '../execution/workflow-node-invocation-executor.js';
+import { executeActivatedWorkflowNodeCall, activatePreparedWorkflowNodeCall, authorizePreparedSavedSourceWorkflowCall } from '../execution/workflow-node-invocation-executor.js';
+import { readSavedSourceScriptGrant } from '../runtime/harness/saved-source-consent.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 import { prepareWorkspaceScriptCall, activateApprovedWorkspaceScriptCall } from './workspace-script-authority.js';
 import { captureWorkspaceScriptArguments } from './workspace-script-carrier.js';
@@ -148,6 +149,42 @@ export function activateWorkspaceScriptOccurrence(key: WorkspaceScriptOccurrence
 export type ExecuteWorkspaceScriptOccurrenceResult =
   | { status: 'published'; observationId: string; replayed: boolean }
   | { status: 'held'; reason: string };
+
+/** Subsequent occurrences use the explicit scope grant, not a fabricated
+ * per-tick approved card. Each occurrence still gets its own exact root. */
+export function activateWorkspaceScriptOccurrenceWithGrant(key: WorkspaceScriptOccurrenceKey, grantId: string): string {
+  const db = openEventLog();
+  let row = rowFor(key);
+  if (!row) throw new Error('Saved script occurrence was not reserved.');
+  const grant = readSavedSourceScriptGrant(grantId);
+  if (!grant) throw new Error('Saved script scope grant is missing.');
+  if (row.approval_id && row.approval_id !== grant.approvalId) throw new Error('Saved script occurrence already owns a different approval.');
+  const recovered = recoverActivation(row);
+  if (recovered) return recovered; // Recovery replays; carrier checks active scope before any new I/O.
+  const saved = JSON.parse(row.preparation_json) as Preparation;
+  const zone = saved.source.timezone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (!grant.active || grant.scope.runner !== saved.source.runner || grant.scope.schedule.timeZone !== zone) {
+    throw new Error('Saved source grant is revoked or does not match the current runner and time zone.');
+  }
+  const current = prepareWorkspaceScriptCall(saved.args);
+  if (closedCanonicalJson(current.plan) !== closedCanonicalJson(saved.plan)
+    || closedCanonicalJson(current.consent) !== closedCanonicalJson(saved.consent)) {
+    throw new Error('Saved script binding changed after occurrence preparation.');
+  }
+  const token = authorizePreparedSavedSourceWorkflowCall({ sessionId: row.session_id,
+    prepared: current.prepared.prepared, proof: current.prepared.proof, grantId });
+  db.prepare(`UPDATE ${table} SET approval_id = ? WHERE workspace_id = ? AND source_id = ?
+    AND occurrence_id = ? AND approval_id IS NULL`).run(grant.approvalId, ...keyArgs(key));
+  row = rowFor(key)!;
+  if (row.approval_id !== grant.approvalId) throw new Error('Saved script occurrence lost its exact approval address.');
+  const active = activatePreparedWorkflowNodeCall({ sessionId: row.session_id,
+    prepared: current.prepared.prepared, proof: current.prepared.proof, savedSourceConsentAuthorization: token });
+  if ('reason' in active) throw new Error(`Saved script scope activation refused: ${active.reason}`);
+  crash('after_activation');
+  db.prepare(`UPDATE ${table} SET activation_id = ? WHERE workspace_id = ? AND source_id = ?
+    AND occurrence_id = ? AND activation_id IS NULL`).run(active.activationId, ...keyArgs(key));
+  return active.activationId;
+}
 
 /** Only the kernel's retained host result may become a dataset. The source
  * barrier releases after the canonical observation and file projection are

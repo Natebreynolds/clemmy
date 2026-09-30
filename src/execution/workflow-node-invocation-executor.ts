@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { authorizeSavedSourceWorkflowCall, type SavedSourceWorkflowConsentAuthorization } from '../runtime/harness/saved-source-consent.js';
 
 import {
   compileWorkflowNodeInvocationArguments,
@@ -534,6 +535,27 @@ export type ActivatePreparedWorkflowNodeCallResult =
       executable: false;
     };
 
+/** Bind a recurring saved-source grant to one authentic prepared occurrence.
+ * The consent adapter additionally verifies the durable source owner; it
+ * cannot authorize another tool, account, code revision or unreserved tick. */
+export function authorizePreparedSavedSourceWorkflowCall(input: {
+  sessionId: string; prepared: PreparedWorkflowNodeCallV1;
+  proof: WorkflowNodeCallAuthorityProof; grantId: string;
+}): SavedSourceWorkflowConsentAuthorization {
+  if (!workflowNodeCallAuthorityProofOwnsPrepared(input.proof, input.prepared)) {
+    throw new Error('Saved source call preparation is not authentic.');
+  }
+  const authority = preparedWorkflowNodeCallAuthorities.get(input.prepared as object);
+  if (!authority || authority.authorityBindingDigest !== input.proof.authorityBindingDigest
+    || authority.call.logicalCallId !== input.proof.logicalCallId) {
+    throw new Error('Saved source call lost its exact authority binding.');
+  }
+  return authorizeSavedSourceWorkflowCall({
+    authority: workflowV3ArmInputForPrepared({ sessionId: input.sessionId, prepared: input.prepared, authority }),
+    args: input.prepared.canonicalArgs as Record<string, unknown>, grantId: input.grantId,
+  });
+}
+
 export interface WorkflowV3CallConsentRequestV1 {
   version: 1;
   sessionBound: true;
@@ -594,6 +616,7 @@ export function activatePreparedWorkflowNodeCall(input: {
   proof: WorkflowNodeCallAuthorityProof;
   oneShotActivationAuthorization?: OneShotActivationAuthorization;
   autoConsentAuthorization?: WorkflowV3AutoConsentAuthorizationV1;
+  savedSourceConsentAuthorization?: SavedSourceWorkflowConsentAuthorization;
 }): ActivatePreparedWorkflowNodeCallResult {
   if (!workflowNodeCallAuthorityProofOwnsPrepared(input.proof, input.prepared)) {
     return { status: 'blocked', reason: 'prepared_call_not_authentic', executable: false };
@@ -612,10 +635,11 @@ export function activatePreparedWorkflowNodeCall(input: {
     (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
     && !input.oneShotActivationAuthorization
     && !input.autoConsentAuthorization
+    && !input.savedSourceConsentAuthorization
   ) {
     return { status: 'blocked', reason: 'exact_one_shot_authorization_required', executable: false };
   }
-  if (input.oneShotActivationAuthorization && input.autoConsentAuthorization) {
+  if ([input.oneShotActivationAuthorization, input.autoConsentAuthorization, input.savedSourceConsentAuthorization].filter(Boolean).length > 1) {
     return { status: 'blocked', reason: 'conflicting_exact_authorizations', executable: false };
   }
   const armed = armWorkflowV3CallAuthority({
@@ -629,6 +653,9 @@ export function activatePreparedWorkflowNodeCall(input: {
       : {}),
     ...(input.autoConsentAuthorization
       ? { autoConsentAuthorization: input.autoConsentAuthorization }
+      : {}),
+    ...(input.savedSourceConsentAuthorization
+      ? { savedSourceConsentAuthorization: input.savedSourceConsentAuthorization }
       : {}),
   });
   if ('ref' in armed) {
