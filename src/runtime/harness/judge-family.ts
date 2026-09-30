@@ -156,6 +156,17 @@ export function exactJudgeBoundaryTimeoutMs(): number {
   return Number.isFinite(raw) && raw >= 1000 ? raw : 90000;
 }
 
+/** A write-constraint review reads the saved instructions, the proposed
+ * arguments and retained observations, and opens evidence when it needs to.
+ * Live 2026-09-30 it averaged 76 s per verdict on a 90 s deadline and timed
+ * out on three of four reviews, so the write it was checking was never judged
+ * at all. It runs inside a workflow step, not on a chat's latency path; a
+ * review that answers in three minutes beats one that never answers. */
+export function mutationReviewTimeoutMs(): number {
+  const raw = Number.parseInt(getRuntimeEnv('CLEMMY_MUTATION_REVIEW_TIMEOUT_MS', '240000') ?? '240000', 10);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 240000;
+}
+
 export function goalJudgeTimeoutMs(): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_GOAL_JUDGE_TIMEOUT_MS', '90000') ?? '90000', 10);
   return Number.isFinite(raw) && raw >= 1000 ? raw : 90000;

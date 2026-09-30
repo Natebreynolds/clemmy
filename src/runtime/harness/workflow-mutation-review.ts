@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { evaluateSystemOne } from '../jev/client.js';
 import { runHedgedJudge } from './objective-judge.js';
-import { recordJudgeMetric } from './judge-family.js';
+import { mutationReviewTimeoutMs, recordJudgeMetric } from './judge-family.js';
 import type { JudgeEvidenceSource, JudgeEvidenceEntry } from './judge-evidence-tools.js';
 import { describeJsonShape } from './tool-output-digest.js';
 
@@ -123,7 +123,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   try {
     const reviewed = await judge(SYSTEM, prompt,
       output => parseWorkflowMutationReview(output, proposalDigest), value => value.verdict === 'compatible',
-      'mutation_constraints', { requireCompletePrompt: true, evidence });
+      'mutation_constraints', { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs() });
     if (reviewed.value) return reviewed.value;
     failure = reviewed.failure ?? 'error';
   } catch { failure = 'error'; }
@@ -131,7 +131,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
     try {
       const plain = await judge(SYSTEM, serialized,
         output => parseWorkflowMutationReview(output, proposalDigest), value => value.verdict === 'compatible',
-        'mutation_constraints', { requireCompletePrompt: false });
+        'mutation_constraints', { requireCompletePrompt: false, timeoutMs: mutationReviewTimeoutMs() });
       if (plain.value) return plain.value;
       failure = plain.failure ?? 'error';
     } catch { failure = 'error'; }
