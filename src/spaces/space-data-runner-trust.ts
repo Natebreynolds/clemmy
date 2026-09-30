@@ -1,41 +1,33 @@
 /**
- * Compatibility authority for runner-backed Workspace data sources.
+ * Historical trust receipts for runner-backed Workspace data sources.
  *
  * Older Clementine versions allowed arbitrary local runner code to refresh
  * automatically. New Workspaces must use a provably read-only provider action,
  * but silently disabling installed runners strands otherwise-useful surfaces.
  *
- * Migration is therefore explicit about the authority Clementine can enforce:
- *   - only a runner already declared by the installed manifest is eligible;
- *   - one human approval is bound to workspace + source + filename + entrypoint
- *     hash + automatic schedule policy;
- *   - entrypoint or schedule drift invalidates the grant before another spawn;
- *   - pending retries converge on one approval card;
- *   - a rejection is terminal for that exact snapshot.
- *
- * Arbitrary code is not statically "read-only". Only the entrypoint bytes are
- * pinned; helpers, runtimes, CLIs, files, auth, and network dependencies remain
- * live and outside the digest.
+ * Saved grants remain audit evidence, not execution authority. Runtime checks
+ * never create new compatibility cards: unsupported declarations report the
+ * missing executor, and supported CLI reads use the shared durable read kernel.
+ * Old pending cards for the exact snapshot are retired without rewriting a
+ * human's historical decision. Approval-resolution recovery remains available
+ * for decisions recorded by earlier installations.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   claimResumableApproval,
-  isActionable,
   isExpired,
   listPending,
   onApprovalResolved,
-  registerResumable,
   resolve,
   type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
-import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
-import { reviewedCliShellMatch } from '../runtime/harness/reviewed-cli-shell-match.js';
-import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
+import { compileReviewedCliArgv } from '../runtime/harness/reviewed-cli-shell-match.js';
 import { createSession, getSession } from '../runtime/harness/eventlog.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
+import type { SpaceSourceFailureCode } from './runner.js';
 import { appendNote, listNotes } from './data-store.js';
 import {
   projectWorkspaceApprovalDecision,
@@ -57,7 +49,6 @@ import {
 export { SPACE_CLI_SOURCE_TRUST_TOOL, SPACE_DATA_RUNNER_TRUST_TOOL };
 export const SPACE_DATA_RUNNER_TRUST_VERSION = 1;
 export const SPACE_CLI_SOURCE_TRUST_VERSION = 1;
-const RUNNER_TRUST_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 interface RunnerTrustSnapshot {
   spaceDataRunnerTrustVersion: typeof SPACE_DATA_RUNNER_TRUST_VERSION;
@@ -88,15 +79,15 @@ interface CliSourceTrustSnapshot {
 export type RunnerTrustDecision =
   | { state: 'approved'; runnerSha256: string; approvalId: string }
   | { state: 'pending'; approvalId: string; error: string }
-  | { state: 'rejected' | 'expired' | 'cancelled' | 'blocked'; error: string };
+  | { state: 'rejected' | 'expired' | 'cancelled' | 'blocked'; error: string; failureCode?: 'local_runner' | 'local_command' };
 
 export type CliSourceTrustDecision =
   | { state: 'approved'; cliArgv: string[]; approvalId: string }
   | { state: 'pending'; approvalId: string; error: string }
-  | { state: 'rejected' | 'expired' | 'cancelled' | 'blocked'; error: string };
+  | { state: 'rejected' | 'expired' | 'cancelled' | 'blocked'; error: string; failureCode?: 'local_runner' | 'local_command' };
 
 export interface RunnerTrustAuthorizationOptions {
-  /** Only an explicit foreground refresh may ask again after a terminal no. */
+  /** Legacy caller field. Refresh cannot invent a runnable carrier or erase a prior no. */
   requestFreshApproval?: boolean;
 }
 
@@ -108,6 +99,7 @@ export interface RunnerTrustRefreshRequest {
 
 export interface RunnerTrustRefreshOutcome {
   ok: boolean;
+  failureCode?: SpaceSourceFailureCode;
   sourceId: string;
   error?: string;
   pendingApprovalId?: string;
@@ -290,7 +282,7 @@ function terminalApprovalExplanation(input: {
   return {
     resolution,
     resolvedAt,
-    text: `${decision}. ${input.executionLabel} remained blocked and was not executed. Ask Clementine to refresh this source again if you want a new approval.`,
+    text: `${decision}. ${input.executionLabel} remained blocked and was not executed. This historical decision is preserved. A refresh must have a supported executor before it can run; another approval alone cannot fix a missing executor.`,
   };
 }
 
@@ -322,7 +314,7 @@ function terminalAuthorizationRefusal(input: {
     });
     return {
       state: 'expired',
-      error: `The grant from approval ${input.row.approvalId} for data source “${input.sourceId}” expired on ${approvalDecisionDateLabel(expiredAt)}. ${input.executionLabel} remained blocked and was not executed. Ask Clementine to refresh this source again if you want a new approval.`,
+      error: `The grant from approval ${input.row.approvalId} for data source “${input.sourceId}” expired on ${approvalDecisionDateLabel(expiredAt)}. ${input.executionLabel} remained blocked and was not executed. This historical decision is preserved. A refresh must have a supported executor before it can run; another approval alone cannot fix a missing executor.`,
     };
   }
   return null;
@@ -424,9 +416,13 @@ function resumeApprovedSourceRefresh(
   }).then((results) => {
     const succeeded = results.length > 0 && results.every((result) => result.ok);
     const failures = results.filter((result) => !result.ok);
+    const missingExecutor = failures.some(result => result.failureCode === 'local_runner' || result.failureCode === 'local_command');
+    const nextAction = missingExecutor
+      ? 'Open the Workspace activity log for technical details. The source needs a supported executor before another refresh can work.'
+      : 'Open the Workspace activity log for technical details, then retry the refresh.';
     const reply = succeeded
       ? `Approved ${row.approvalId}. “${rec.title}” refreshed ${sourceId} successfully.`
-      : `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId} (${failures.length} failed step${failures.length === 1 ? '' : 's'}). Open the activity log for technical details, then try again.`;
+      : `Approved ${row.approvalId}, but “${rec.title}” could not refresh ${sourceId} (${failures.length} failed step${failures.length === 1 ? '' : 's'}). ${nextAction}`;
     if (!succeeded) {
       recordOperationalEvent({
         source: 'workspace',
@@ -454,7 +450,7 @@ function resumeApprovedSourceRefresh(
           }],
         },
         ...(!succeeded
-          ? { nextAction: 'Open the Workspace activity log for technical details, then retry the refresh.' }
+          ? { nextAction }
           : {}),
       },
       {
@@ -608,266 +604,84 @@ function cliSnapshot(
   return { ok: true, rec, snapshot, trustKey };
 }
 
-/**
- * Resolve or request the one decision for this frozen CLI declaration. The
- * approval pins the exact argv vector plus the automatic schedule policy; any
- * argv or schedule change mints a new trustKey and re-asks. Merely calling
- * this function never executes the command.
- */
+/** Reconcile only the exact historical snapshot. Obsolete cards cannot remain
+ * actionable when their approved path has no executor. Never change a past
+ * human decision, and never register a new card to repair missing capability. */
+function historicalTrustDecision(input: {
+  sessionId: string;
+  tool: string;
+  trustKey: string;
+  sourceId: string;
+  executionLabel: string;
+}): { row: PendingApprovalRow | undefined; refusal: ReturnType<typeof terminalAuthorizationRefusal> } {
+  const matching = () => listPending({ sessionId: input.sessionId, status: 'any' })
+    .filter((row) => row.tool === input.tool && row.args?.trustKey === input.trustKey);
+  let row = matching()[0];
+  if (row?.status === 'pending') {
+    resolve(row.approvalId, isExpired(row) ? 'expired' : 'cancelled_by_system', 'workspace-refresh:executor-readiness');
+    row = matching()[0];
+  }
+  return {
+    row,
+    refusal: row ? terminalAuthorizationRefusal({
+      row, sourceId: input.sourceId, executionLabel: input.executionLabel, now: Date.now(),
+    }) : null,
+  };
+}
+
+/** A frozen argv is usable only when its complete argument vector compiles to
+ * a reviewed read. Matching the command head alone is not sufficient. The
+ * shared read kernel still proves connection, account, schema and execution
+ * authority; a registry trust grant does not supply any of those. */
 export function authorizeCliDataSource(
   slug: string,
   source: SpaceDataSource,
-  options: RunnerTrustAuthorizationOptions = {},
+  _options: RunnerTrustAuthorizationOptions = {},
 ): CliSourceTrustDecision {
   const resolved = cliSnapshot(slug, source);
   if (!resolved.ok) return { state: 'blocked', error: resolved.error };
   const { rec, snapshot, trustKey } = resolved;
-  const sessionId = ensureSpaceSession(rec);
-  const now = Date.now();
   const commandLabel = snapshot.cliArgv.join(' ');
-  const matchingRows = (): ReturnType<typeof listPending> => listPending({ sessionId, status: 'any' })
-    .filter((row) => (
-      row.tool === SPACE_CLI_SOURCE_TRUST_TOOL
-      && row.args?.spaceCliSourceTrustVersion === SPACE_CLI_SOURCE_TRUST_VERSION
-      && row.args?.trustKey === trustKey
-    ));
-  let latest = matchingRows()[0];
-
-  // Same liveness rule as runner trust: never depend on the background reaper
-  // to free the resumable-key uniqueness slot after expiry.
-  if (latest?.status === 'pending' && isExpired(latest, new Date(now))) {
-    resolve(latest.approvalId, 'expired', 'space-cli-source-trust');
-    latest = matchingRows()[0];
-  }
-
-  // A frozen command that IS a reviewed CLI read (the same descriptor the
-  // chat lane dispatches without a card) is already decided: the harness
-  // grants it itself, durably, so the source refreshes unattended. A card
-  // already raised for it is settled the same way. Only a command the
-  // catalog does not review still asks a person.
-  // Matched on the catalog declaration, then proven dispatchable by the
-  // reviewed-CLI read carrier's own descriptor list (the CLI is connected on
-  // this machine) — a Space refresh runs outside any chat objective, so the
-  // chat lane's per-objective callable entry is not the right proof here.
-  const declared = reviewedCliShellMatch(commandLabel, { requireCallable: false });
-  const reviewed = declared.status === 'matched'
-    && listReviewedCliReadDescriptors().some((descriptor) => descriptor.operationId === declared.operationId)
-    ? declared
-    : { status: 'unmatched' as const };
-  if (reviewed.status === 'matched') {
-    if (latest?.status === 'pending') {
-      resolve(latest.approvalId, 'approved', `harness:reviewed_cli_read:${reviewed.operationId}`);
-      latest = matchingRows()[0];
-    }
-    if (!(latest?.status === 'resolved' && latest.resolution === 'approved' && Date.parse(latest.expiresAt) > now)) {
-      const { row: granted } = registerResumable({
-        sessionId,
-        resumeKey: `space-cli-source-trust:v${SPACE_CLI_SOURCE_TRUST_VERSION}:${trustKey}`,
-        ttlMs: RUNNER_TRUST_TTL_MS,
-        subject: `Reviewed read ${reviewed.operationId} refreshes “${rec.title}”`,
-        tool: SPACE_CLI_SOURCE_TRUST_TOOL,
-        args: { ...snapshot, trustKey, reviewedOperationId: reviewed.operationId },
-      });
-      if (granted.status === 'pending') {
-        resolve(granted.approvalId, 'approved', `harness:reviewed_cli_read:${reviewed.operationId}`);
-      }
-      latest = matchingRows()[0];
-    }
-    appendNote(rec.id, {
-      text: `Data source “${snapshot.sourceId}” runs the reviewed read ${reviewed.operationId}; no approval was needed.`,
-      kind: 'data-source',
-      meta: { kind: SPACE_CLI_SOURCE_TRUST_TOOL, sourceId: snapshot.sourceId, cliArgv: snapshot.cliArgv, approvalId: latest?.approvalId ?? null, status: 'approved', reviewedOperationId: reviewed.operationId },
-    });
-    return { state: 'approved', cliArgv: snapshot.cliArgv, approvalId: latest?.approvalId ?? `reviewed:${reviewed.operationId}` };
-  }
-
-  if (
-    latest?.status === 'resolved'
-    && latest.resolution === 'approved'
-    && Date.parse(latest.expiresAt) > now
-  ) {
-    return {
-      state: 'approved',
-      cliArgv: snapshot.cliArgv,
-      approvalId: latest.approvalId,
-    };
-  }
-  if (latest && isActionable(latest)) {
-    return {
-      state: 'pending',
-      approvalId: latest.approvalId,
-      error: `Frozen CLI refresh "${commandLabel}" is awaiting one-time approval (${latest.approvalId}); it was not executed.`,
-    };
-  }
-  const terminal = latest ? terminalAuthorizationRefusal({
-    row: latest,
-    sourceId: snapshot.sourceId,
-    executionLabel: `The frozen CLI refresh “${commandLabel}”`,
-    now,
-  }) : null;
-  if (terminal && !options.requestFreshApproval) {
-    return terminal;
-  }
-
-  const subject = `Allow “${commandLabel}” to refresh “${rec.title}” automatically`;
-  const reason = 'This approval freezes the exact command line shown — no shell, no substitutions — and lets it run on the declared schedule without asking again. '
-    + 'The command binary itself, plus the local auth state and network services it uses, stay live on this machine and outside the freeze; approve only a command you know is read-only. '
-    + 'The grant expires after 90 days; any command or schedule change invalidates it.';
-  const { row, created } = registerResumable({
-    sessionId,
-    resumeKey: `space-cli-source-trust:v${SPACE_CLI_SOURCE_TRUST_VERSION}:${trustKey}`,
-    ttlMs: RUNNER_TRUST_TTL_MS,
-    subject,
-    tool: SPACE_CLI_SOURCE_TRUST_TOOL,
-    args: {
-      ...snapshot,
-      trustKey,
-      subject,
-      reason,
-      preview: {
-        count: 1,
-        samples: [{
-          label: 'Frozen command',
-          value: commandLabel,
-          secondary: `${rec.title} · ${snapshot.sourceId}${snapshot.schedulePolicy.schedule ? ` · ${snapshot.schedulePolicy.schedule}` : ''}`,
-        }],
-      },
-    },
+  const history = historicalTrustDecision({
+    sessionId: ensureSpaceSession(rec), tool: SPACE_CLI_SOURCE_TRUST_TOOL, trustKey,
+    sourceId: snapshot.sourceId, executionLabel: `The frozen CLI refresh “${commandLabel}”`,
   });
-  if (created) {
-    appendNote(rec.id, {
-      text: `Data source “${snapshot.sourceId}” is waiting for one-time approval of its frozen CLI command (${row.approvalId}).`,
-      kind: 'data-source',
-      meta: {
-        kind: SPACE_CLI_SOURCE_TRUST_TOOL,
-        sourceId: snapshot.sourceId,
-        cliArgv: snapshot.cliArgv,
-        approvalId: row.approvalId,
-        status: 'pending',
-      },
-    });
-    emitApprovalRequestedCard({
-      sessionId,
-      approvalId: row.approvalId,
-      extra: {
-        workspaceId: rec.id,
-        sourceId: snapshot.sourceId,
-      },
-    });
+  const reviewed = compileReviewedCliArgv(snapshot.cliArgv);
+  if (reviewed.status !== 'matched') {
+    const reason = reviewed.status === 'refused'
+      ? `names the reviewed read ${reviewed.operationId} but cannot be carried by it: ${reviewed.reason}`
+      : 'is not a reviewed CLI read from the catalog';
+    return {
+      state: 'blocked', failureCode: 'local_command',
+      error: `${history.refusal ? `${history.refusal.error} ` : ''}Workspace "${slug}" local CLI "${commandLabel}" ${reason}; no shared durable call authority is available. The process was not started. This source needs a supported read operation; another approval cannot make this command runnable.`,
+    };
   }
+  // A prior explicit no remains a no even if a later catalog learns the read.
+  // System retirement of an obsolete card is not a human denial of the read.
+  if (history.refusal && (history.row?.resolution === 'rejected' || history.row?.resolution === 'cancelled_by_user')) return history.refusal;
   return {
-    state: 'pending',
-    approvalId: row.approvalId,
-    error: `Frozen CLI refresh "${commandLabel}" needs one-time approval (${row.approvalId}) before it can refresh automatically; it was not executed.`,
+    state: 'approved', cliArgv: snapshot.cliArgv,
+    approvalId: history.row?.resolution === 'approved' ? history.row.approvalId : `reviewed:${reviewed.operationId}`,
   };
 }
 
-/**
- * Resolve or request the one compatibility decision for this installed runner
- * entrypoint snapshot. Merely calling this function never executes the runner.
- */
+/** Runner declarations retain historical decisions for diagnosis. The retired
+ * raw runner has no shared durable carrier: do not offer a button whose yes
+ * would only fail at the next boundary. */
 export function authorizeInstalledDataRunner(
   slug: string,
   source: SpaceDataSource,
-  options: RunnerTrustAuthorizationOptions = {},
+  _options: RunnerTrustAuthorizationOptions = {},
 ): RunnerTrustDecision {
   const resolved = runnerSnapshot(slug, source);
   if (!resolved.ok) return { state: 'blocked', error: resolved.error };
   const { rec, snapshot, trustKey } = resolved;
-  const sessionId = ensureSpaceSession(rec);
-  const now = Date.now();
-  const matchingRows = (): ReturnType<typeof listPending> => listPending({ sessionId, status: 'any' })
-    .filter((row) => (
-      row.tool === SPACE_DATA_RUNNER_TRUST_TOOL
-      && row.args?.spaceDataRunnerTrustVersion === SPACE_DATA_RUNNER_TRUST_VERSION
-      && row.args?.trustKey === trustKey
-    ));
-  let latest = matchingRows()[0];
-
-  // Do not depend on the background approval reaper for liveness. A daemon
-  // that was asleep past expiry may still have the old row marked `pending`,
-  // which would otherwise occupy the resumable-key uniqueness slot forever.
-  if (latest?.status === 'pending' && isExpired(latest, new Date(now))) {
-    resolve(latest.approvalId, 'expired', 'space-data-runner-trust');
-    latest = matchingRows()[0];
-  }
-
-  if (
-    latest?.status === 'resolved'
-    && latest.resolution === 'approved'
-    && Date.parse(latest.expiresAt) > now
-  ) {
-    return {
-      state: 'approved',
-      runnerSha256: snapshot.runnerSha256,
-      approvalId: latest.approvalId,
-    };
-  }
-  if (latest && isActionable(latest)) {
-    return {
-      state: 'pending',
-      approvalId: latest.approvalId,
-      error: `Legacy data runner "data/${snapshot.runner}" is awaiting one-time approval (${latest.approvalId}); it was not executed.`,
-    };
-  }
-  const terminal = latest ? terminalAuthorizationRefusal({
-    row: latest,
-    sourceId: snapshot.sourceId,
-    executionLabel: `The pinned runner entrypoint “data/${snapshot.runner}”`,
-    now,
-  }) : null;
-  if (terminal && !options.requestFreshApproval) {
-    return terminal;
-  }
-
-  const subject = `Allow pinned entrypoint “${snapshot.runner}” to refresh “${rec.title}” automatically`;
-  const reason = 'Legacy compatibility: this approval pins only the runner entrypoint bytes. Helpers, packages, CLIs, local files, auth state, and network services remain live and outside the digest; arbitrary runner code is not a read-only sandbox. The grant expires after 90 days; any entrypoint, source, or schedule change invalidates it.';
-  const { row, created } = registerResumable({
-    sessionId,
-    resumeKey: `space-data-runner-trust:v${SPACE_DATA_RUNNER_TRUST_VERSION}:${trustKey}`,
-    ttlMs: RUNNER_TRUST_TTL_MS,
-    subject,
-    tool: SPACE_DATA_RUNNER_TRUST_TOOL,
-    args: {
-      ...snapshot,
-      trustKey,
-      subject,
-      reason,
-      preview: {
-        count: 1,
-        samples: [{
-          label: 'Pinned entrypoint',
-          value: `${rec.title} · ${snapshot.sourceId} · data/${snapshot.runner}`,
-          secondary: `SHA-256 ${snapshot.runnerSha256.slice(0, 12)}…`,
-        }],
-      },
-    },
+  const history = historicalTrustDecision({
+    sessionId: ensureSpaceSession(rec), tool: SPACE_DATA_RUNNER_TRUST_TOOL, trustKey,
+    sourceId: snapshot.sourceId, executionLabel: `The pinned runner entrypoint “data/${snapshot.runner}”`,
   });
-  if (created) {
-    appendNote(rec.id, {
-      text: `Data source “${snapshot.sourceId}” is waiting for one-time runner approval (${row.approvalId}).`,
-      kind: 'data-source',
-      meta: {
-        kind: SPACE_DATA_RUNNER_TRUST_TOOL,
-        sourceId: snapshot.sourceId,
-        runner: snapshot.runner,
-        runnerSha256: snapshot.runnerSha256,
-        approvalId: row.approvalId,
-        status: 'pending',
-      },
-    });
-    emitApprovalRequestedCard({
-      sessionId,
-      approvalId: row.approvalId,
-      extra: {
-        workspaceId: rec.id,
-        sourceId: snapshot.sourceId,
-      },
-    });
-  }
   return {
-    state: 'pending',
-    approvalId: row.approvalId,
-    error: `Legacy data runner "data/${snapshot.runner}" needs one-time approval (${row.approvalId}) before it can refresh automatically; it was not executed.`,
+    state: 'blocked', failureCode: 'local_runner',
+    error: `${history.refusal ? `${history.refusal.error} ` : ''}Workspace "${slug}" local runner "${snapshot.runner}" is unavailable: no shared durable call authority was supplied. The process was not started. This source needs a supported executor; another approval cannot make the retired runner runnable.`,
   };
 }

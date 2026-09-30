@@ -6,7 +6,7 @@
  * read. Unknown is not read. Arbitrary runner code is opaque executable code:
  * it can use fetch, CLIs on PATH, and credentials under HOME, so new runner data
  * sources are refused here. Installed legacy declarations are handled by the
- * separate exact-hash, time-bounded human migration authority.
+ * historical trust receipt reader; approval does not restore their retired executor.
  */
 import { classifyCanonicalExternalEffect } from '../runtime/harness/execution-gate.js';
 import type { SpaceAction, SpaceDataSource } from './store.js';
@@ -33,13 +33,12 @@ export function workspaceDataSourceSafetyError(source: SpaceDataSource): string 
   if (source.runner?.trim()) {
     return `Data source "${source.id}" uses opaque runner "${source.runner.trim()}". `
       + 'Automatic, scheduled, and manual Workspace refreshes cannot execute arbitrary code because it may mutate external systems without approval. '
-      + 'Replace it with a provably read-only Composio action or a frozen CLI declaration (cli_argv); keep executable runners only as approval-gated Workspace actions.';
+      + 'Replace it with a provably read-only Composio action, a supported reviewed CLI read (cli_argv), or a workflow that publishes data through space_set_data. A runner trust approval cannot supply the missing executor.';
   }
   if (source.cliArgv?.length) {
-    // A frozen argv is not statically read-only either, but unlike an opaque
-    // runner its full invocation fits on one approval card. The CLI trust
-    // authority requires that one human decision before any spawn; policy here
-    // only vouches that the declaration shape is reviewable.
+    // Declaration compatibility only. Runtime must compile the complete argv
+    // into a supported reviewed read; a trust card cannot make an unknown
+    // command runnable. Preserve installed declarations for repair.
     return null;
   }
   const slug = source.composioSlug?.trim();

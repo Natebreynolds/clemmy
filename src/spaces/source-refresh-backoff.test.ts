@@ -21,6 +21,9 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 const eventlog = await import('../runtime/harness/eventlog.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
 const manifests = await import('../runtime/harness/capability-manifest.js');
+const manifestStores = await import('../runtime/harness/capability-manifest-store.js');
+const externalCatalog = await import('../execution/workflow-step-external-catalog.js');
+const readAuthority = await import('./space-read-authority.js');
 const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
 const observations = await import('../runtime/harness/independent-capability-observation.js');
 const ports = await import('../runtime/harness/production-capability-ports.js');
@@ -29,6 +32,7 @@ const notifications = await import('../runtime/notifications.js');
 const intent = await import('../runtime/notification-intent.js');
 const store = await import('./store.js');
 const runner = await import('./runner.js');
+const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
 const sched = await import('./scheduler.js');
 const backoff = await import('./source-refresh-backoff.js');
 const workspaceDb = await import('./workspace-db.js');
@@ -38,6 +42,8 @@ const STATE_FILE = path.join(TEST_HOME, 'state', 'space-schedule-state.json');
 test.after(() => {
   composio._setConnectedToolkitsSnapshotForTests(null);
   catalogs.installHostCapabilityCatalogFactory(null);
+  manifestStores.installCapabilityManifestStore(null);
+  readAuthority._setExactSpaceReadCatalogPreparerForTests(null);
   observations.clearIndependentCapabilityObservations();
   ports.clearProductionCapabilityPorts();
   eventlog.closeEventLog();
@@ -57,11 +63,15 @@ function installSwitchableRead(operationId: string): {
   const manifest = manifests.attachSemanticContract({
     version: 1,
     manifestId: `manifest.space.backoff.${operationId.toLowerCase()}`,
-    providerKind: 'local_registry',
+    providerKind: 'composio',
     operationId,
     providerIdentity: 'runtime.test',
     providerVersion: 'runtime.1',
     operationVersion: '1',
+    externalDefinition: {
+      version: 1, providerInputSchemaDigest: digest(`input:${operationId}`), semanticName: operationId,
+      behaviorHints: { readOnly: true, destructive: false, idempotent: true, openWorld: false },
+    },
     definitionFingerprint: digest(`schema:${operationId}`),
     effect: 'read',
     accountId: `account.space.${operationId}`,
@@ -88,7 +98,7 @@ function installSwitchableRead(operationId: string): {
     },
   ).ok, true);
   const factory = catalogs.peekHostCapabilityCatalogFactory() ?? catalogs.createHostCapabilityCatalogFactory();
-  factory.register({
+  const entry: catalogs.RegisteredHostCapability = {
     capabilityId: manifest.manifestId,
     toolName: manifest.operationId,
     schemaVersion: manifest.operationVersion,
@@ -102,25 +112,29 @@ function installSwitchableRead(operationId: string): {
     invoke: async () => {
       throw new Error('catalog invoke must not own the workspace crossing');
     },
-  });
+  };
+  factory.register(entry);
   catalogs.installHostCapabilityCatalogFactory(factory);
-  assert.equal(observations.registerIndependentCapabilityObservation({
-    operationId: manifest.operationId,
-    accountId: manifest.accountId,
-    definitionFingerprint: manifest.definitionFingerprint,
-    providerVersion: manifest.providerVersion,
-    operationVersion: manifest.operationVersion,
-    observedAt: Date.now(),
-    origin: 'independent',
-    observe: () => ({
-      operationId: manifest.operationId,
-      accountId: manifest.accountId,
-      definitionFingerprint: manifest.definitionFingerprint,
-      providerVersion: manifest.providerVersion,
-      operationVersion: manifest.operationVersion,
-      observedAt: Date.now(),
-    }),
-  }).ok, true);
+  composio._setConnectedToolkitsSnapshotForTests([{
+    slug: operationId.split('_')[0]!.toLowerCase(), connectionId: manifest.accountId, status: 'ACTIVE',
+  }]);
+  const manifestStore = manifestStores.createCapabilityManifestStore();
+  assert.equal(manifestStore.install(manifest).ok, true);
+  manifestStores.installCapabilityManifestStore(manifestStore);
+  // Refreshes revalidate a provider definition on every occurrence. Supply
+  // fixture metadata at that boundary while keeping the real catalog compiler,
+  // independent observation, durable read kernel and result settlement.
+  const definition = {
+    identifier: operationId, schemaDigest: digest(`input:${operationId}`), accountIdentity: manifest.accountId,
+    definitionFingerprint: manifest.definitionFingerprint, outputSchemaDigest: null,
+    providerOperationVersion: manifest.operationVersion, invokePortId: manifest.invokePortId,
+    schema: { type: 'object' }, fingerprint: digest(`source-schema:${operationId}`), outputSchema: null,
+  };
+  readAuthority._setExactSpaceReadCatalogPreparerForTests(input => externalCatalog.prepareWorkflowStepExternalCatalog(input, {
+    manifestStore, catalogFactory: factory,
+    revalidate: async () => ({ ok: true, definitions: new Map([[operationId.toLowerCase(), definition]]) }),
+    refresh: () => { factory.register(entry); }, ready: ids => ids.every(id => Boolean(factory.get(id))),
+  }));
   return {
     bodies: () => bodies,
     fail: (message) => { failure = message; },
@@ -132,11 +146,7 @@ async function approveLocalRunner(slug: string, source: Parameters<typeof runner
   const dir = store.resolveInSpace(slug, 'data');
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, source.runner!), 'process.stdout.write("{}");', 'utf-8');
-  const blocked = await runner.runSpaceDataSource(slug, source);
-  assert.equal(blocked.ok, false);
-  const card = approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' })
-    .find((row) => row.args?.sourceId === source.id);
-  assert.ok(card, 'the local script asks once for its trust decision');
+  const card = seedLegacySpaceTrustApproval(slug, source);
   eventlog.openEventLog().prepare(`
     UPDATE pending_approvals
        SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
@@ -315,7 +325,7 @@ test('a failing provider source recovers on its first success and a later streak
   const base = '2026-06-21T08:00:00.000Z';
   try {
     for (let n = 0; n < 3; n += 1) await sched.processSpaceSchedules(hour(base, n));
-    assert.equal(read.bodies(), 3, 'each failing hour really called the app');
+    assert.equal(read.bodies(), 3, `each failing hour really called the app: ${JSON.stringify(workspaceDb.listWorkspaceDatasetObservations(slug, { sourceKey: 'records', limit: 3 }).map(row => row.error))}`);
     const [notice] = noticesFor(slug);
     assert.ok(notice);
     assert.equal(notice.metadata?.failureCode, 'provider_error');

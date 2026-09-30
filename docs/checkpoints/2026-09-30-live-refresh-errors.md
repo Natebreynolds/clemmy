@@ -155,3 +155,94 @@ Legacy script execution, the old declined approval's recovery UX, grouped
 failure notices, original connection-continuity work and full release
 qualification remain open. This change is not a claim of a general latency
 improvement or readiness to tag.
+
+## Executor readiness before compatibility approvals
+
+Follow-up source repair on `codex/contextual-connection-ui`, after `1a4e6fdeb`.
+This removes a misleading approval path; it does **not** implement a replacement
+executor for arbitrary legacy scripts. The other agent remains clean at
+`76c53a1ea` on `claude/two-modes`. No source declaration, credentials, mode,
+notification destination, installed bundle or running process was changed.
+
+`space-data-runner-trust.ts` no longer registers compatibility approval cards.
+An installed legacy runner or unsupported frozen command reports the missing
+executor with `local_runner` / `local_command`, rather than `not_approved`.
+A frozen command must compile its entire argv into a supported reviewed read;
+a command-head match does not suffice. Supported reads proceed to the existing
+read kernel without an unrelated human trust grant. That kernel still proves
+the current descriptor, binary, arguments, connection/account and call authority.
+No new raw spawn path or effect-classification bypass was added.
+
+When refresh encounters an old pending card for the **exact** declaration/hash/
+schedule snapshot, it retires that card (or expires it) and projects the existing
+waiting observation to an error. Repeated reconciliation is idempotent and does
+not retire another source's card. Existing human denials/cancellations remain in
+the registry and cannot silently become permission, including when a command
+later becomes a reviewed read. Changing a runner or cadence does not create a
+new futile card. Existing offline approvals still consume their one-shot recovery
+claim and report the actual failed refresh; a missing executor's outcome now
+explains that repair is required instead of inviting an identical retry.
+
+Save-time warnings and the Workspace context no longer teach the model that
+editing an old runner and approving it will restore execution. They preserve the
+saved data and point to a supported read source or an ordinary workflow publishing
+through `space_set_data`. The existing Workspace-context size pin stays unchanged.
+No personal source was migrated and no background task was launched to repair it.
+
+### Verification
+
+- `/tmp/clem-space-executor-readiness-final-2.txt`: **96/96** across nine focused
+  suites: runner, historical terminal decisions, smoke, scheduler, Space read
+  authority, failure backoff, save-time enforcement, Workspace context and CLI
+  argv compilation.
+- `/tmp/clem-space-executor-readiness-schema84.txt`: the same **96/96** with the
+  unrelated in-progress schema-85 files temporarily restored to committed
+  schema 84. Their exact draft bytes were restored in `finally`. This change
+  does not depend on the unfinished model invocation ledger.
+- A new positive fixture provisions a real executable through the existing
+  reviewed-CLI descriptor/carrier, drives manual and scheduled Space refreshes,
+  observes one physical process per occurrence, checks the exact accepted query,
+  and verifies the dataset rows. It asserts zero compatibility approval rows.
+  The binary only reads/writes its isolated fixture files; no actual business
+  CLI, credentials, network provider or model is used.
+- `/tmp/clem-space-executor-readiness-red.txt`: restoring the old trust module
+  makes both new unsupported-runner/CLI regression pins fail (**2/2 red**).
+  Exact current source bytes were restored in `finally`.
+- `/tmp/clem-space-executor-readiness-outcomes.txt`: **32/32** runner and
+  historical-terminal checks after the final outcome-copy refinement (overlaps
+  the 96 above; do not add the counts). The missing-executor outcome explicitly
+  requests repair and does not say to retry.
+- Final TypeScript passed in
+  `/tmp/clem-space-executor-readiness-tsc-final-3.txt`; `git diff --check` passed.
+
+Historical-decision tests now explicitly seed the persisted old card shape;
+they no longer require current production code to recreate the bug before
+checking recovery. This preserves restart, terminal projection, no-process,
+old-denial and idempotency assertions. Two backoff fixtures previously used a
+local-registry manifest pretending to be a provider read; after `1a4e6fdeb`,
+refresh correctly revalidates metadata and those fixtures failed. They now
+supply an actual fixture Composio manifest, connected namespace, metadata
+revalidation and independently observed catalog. The actual read kernel,
+physical fixture port, failing/recovering reads, scheduler and notice assertions
+remain real. These intermediate failures were corrected, not waived as
+pre-existing production defects.
+
+The live-home sentinel remains **NOT PERFORMED** because daemon 72427 is active.
+No full corpus, journeys, build, hotpatch, paid-model test, live business call or
+installed acceptance was run. Source-test success is not evidence that the
+owner's installed sources have recovered.
+
+### Remaining incident work
+
+- Integrate supported legacy-script execution through the shared tracked shell/
+  workflow machinery, or complete an owner-reviewed source redesign separately.
+  Do not reopen the retired subprocess path or claim arbitrary code is read-only.
+- Group simultaneous failure notices without hiding exact source failures or
+  changing delivery destinations. This patch does not reduce cross-channel
+  fan-out or suppress genuine failures.
+- Review the combined candidate with the shell/two-modes lane, build and install
+  it once, verify the served fingerprint, and run controlled live-home source
+  refreshes. Check saved/implicit accounts and provider-definition recovery.
+- The independent connection-continuity lifecycle/usage ledger, public recovery
+  controls and full release qualification are still unfinished. Do not tag this
+  branch or expose Execute Continue as if those obligations were complete.

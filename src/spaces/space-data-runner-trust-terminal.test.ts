@@ -10,6 +10,7 @@ import path from 'node:path';
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-runner-terminal-test-'));
 
 const runner = await import('./runner.js');
+const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
 const store = await import('./store.js');
 const dataStore = await import('./data-store.js');
 const workspaceDb = await import('./workspace-db.js');
@@ -24,7 +25,7 @@ const cases = [
   { resolution: 'cancelled_by_system', copy: /Clementine cancelled approval/i },
 ] as const;
 
-test('terminal CLI trust decisions close stale observations and only an explicit refresh asks again', async () => {
+test('historical terminal CLI decisions close stale observations and survive explicit retries', async () => {
   for (const fixture of cases) {
     const suffix = fixture.resolution.replaceAll('_', '-');
     const slug = `terminal-cli-${suffix}`;
@@ -45,9 +46,7 @@ test('terminal CLI trust decisions close stale observations and only an explicit
       dataSources: [source],
     });
 
-    const first = await runner.refreshSpaceData(slug, source.id, { cause: 'manual' });
-    const approvalId = first[0]?.pendingApprovalId;
-    assert.match(approvalId ?? '', /^apr-/);
+    const approvalId = seedLegacySpaceTrustApproval(slug, source, true).approvalId;
     assert.equal(existsSync(sentinel), false);
     assert.equal(
       workspaceDb.listWorkspaceDatasetObservations(slug, {
@@ -143,23 +142,12 @@ test('terminal CLI trust decisions close stale observations and only an explicit
       runner.refreshSpaceData(slug, source.id, { cause: 'manual' }),
       runner.refreshSpaceData(slug, source.id, { cause: 'manual' }),
     ]);
-    const newApprovalId = explicit[0]?.pendingApprovalId;
-    assert.match(newApprovalId ?? '', /^apr-/);
-    assert.equal(duplicateExplicit[0]?.pendingApprovalId, newApprovalId);
-    assert.notEqual(newApprovalId, approvalId, 'the old decision is never revived as authority');
-    const pending = approvalRegistry.listPending({
-      sessionId: `space-${slug}`,
-      status: 'pending',
-    });
-    assert.equal(pending.length, 1, 'concurrent explicit requests converge on one fresh card');
-    assert.equal(pending[0]?.approvalId, newApprovalId);
-    assert.equal(approvalRegistry.get(approvalId!)?.resolution, fixture.resolution);
-    assert.equal(
-      eventlog.listEvents(`space-${slug}`, { types: ['approval_requested'] })
-        .filter((event) => event.data.approvalId === newApprovalId).length,
-      1,
-      'the fresh decision reuses the ordinary chat/mobile approval-card event',
-    );
+    assert.equal(explicit[0]?.pendingApprovalId, undefined);
+    assert.equal(duplicateExplicit[0]?.pendingApprovalId, undefined);
+    assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length, 0);
+    assert.equal(approvalRegistry.get(approvalId)?.resolution, fixture.resolution);
+    assert.equal(eventlog.listEvents(`space-${slug}`, { types: ['approval_requested'] }).length, 1,
+      'only the historical card exists; no new request is emitted');
     assert.equal(existsSync(sentinel), false);
   }
 });

@@ -23,6 +23,7 @@ import path from 'node:path';
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-runner-test-'));
 
 const runner = await import('./runner.js');
+const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
 const store = await import('./store.js');
 const dataStore = await import('./data-store.js');
 const workspaceDb = await import('./workspace-db.js');
@@ -108,21 +109,13 @@ function writeRunner(slug: string, file: string, body: string, exec = false): vo
   if (exec) chmodSync(p, 0o755);
 }
 
-/** Install exact runner trust without firing the live approval-resolution
- * resume listener. These fixtures exercise refresh/scheduler persistence, not
- * approval orchestration, and the entrypoint still crosses the production
- * pinned-hash gate on every run. */
+/** Reconstruct an old approved row without firing the resolution listener.
+ * Historical trust cannot unlock the retired executor. */
 async function approveInstalledRunnerFixture(
   slug: string,
   source: Parameters<typeof runner.runSpaceDataSource>[1],
 ): Promise<void> {
-  const blocked = await runner.runSpaceDataSource(slug, source);
-  assert.equal(blocked.ok, false);
-  const card = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  }).find((row) => row.args?.sourceId === source.id);
-  assert.ok(card, `expected runner-trust card for ${slug}:${source.id}`);
+  const card = seedLegacySpaceTrustApproval(slug, source);
   eventlog.openEventLog().prepare(`
     UPDATE pending_approvals
        SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
@@ -288,63 +281,22 @@ process.stdout.write('[]');`,
   );
 });
 
-test('an installed legacy data runner trust card remains migration metadata after approval', async () => {
-  const slug = 'legacy-runner-trust';
-  const source = {
-    id: 'pull',
-    runner: 'pull.mjs',
-    schedule: '0 7 * * *',
-    timezone: 'America/Los_Angeles',
-  };
-  writeRunner(slug, 'pull.mjs', 'process.stdout.write(JSON.stringify({version:1}));');
-  store.spaceStore.save({
-    id: slug,
-    title: 'Legacy runner trust',
-    dataSources: [source],
-  });
-
-  const first = await runner.runSpaceDataSource(slug, source);
-  assert.equal(first.ok, false);
-  assert.match(first.ok ? '' : first.error, /one-time approval|awaiting.*approval/i);
-  const cards = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  });
-  assert.equal(cards.length, 1, 'first compatibility refresh mints one decision');
-  assert.equal(cards[0]?.tool, 'space_trust_data_runner');
-  assert.equal(cards[0]?.args?.spaceSlug, slug);
-  assert.equal(cards[0]?.args?.sourceId, source.id);
-  assert.equal(cards[0]?.args?.runner, source.runner);
-  assert.match(String(cards[0]?.args?.runnerSha256 ?? ''), /^[a-f0-9]{64}$/);
-  assert.match(cards[0]?.subject ?? '', /pinned entrypoint/i);
-  assert.match(String(cards[0]?.args?.reason ?? ''), /helpers.*packages.*CLIs.*local files.*auth.*network/i);
-  assert.match(String(cards[0]?.args?.reason ?? ''), /not.*read-only sandbox/i);
-  assert.doesNotMatch(String(cards[0]?.args?.reason ?? ''), /this exact local code/i);
-  assert.deepEqual(cards[0]?.args?.schedulePolicy, {
-    schedule: source.schedule,
-    timezone: source.timezone,
-  });
-  const inlineCards = eventlog.listEvents(`space-${slug}`, { types: ['approval_requested'] });
-  assert.equal(inlineCards.length, 1, 'the exact trust card is visible in Workspace chat');
-  assert.equal(
-    (inlineCards[0]?.data as { approvalId?: string }).approvalId,
-    cards[0]?.approvalId,
-  );
-
-  const duplicate = await runner.runSpaceDataSource(slug, source);
-  assert.equal(duplicate.ok, false);
-  assert.equal(
-    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
-    1,
-    'retries and scheduler ticks converge on the same pending card',
-  );
-
-  const resolved = approvalRegistry.resolve(cards[0]!.approvalId, 'approved', 'runner-trust-test');
-  assert.equal(resolved.ok, true);
-  const approved = await runner.runSpaceDataSource(slug, source);
-  assert.equal(approved.ok, false);
-  assert.equal(approved.ok ? undefined : approved.provenNoDispatch, true);
-  assert.match(approved.ok ? '' : approved.error, /no shared durable call authority/i);
+test('an installed legacy runner reports its missing executor without creating a futile card', async () => {
+  const slug = 'legacy-runner-unavailable';
+  const source = { id: 'pull', runner: 'pull.mjs', schedule: '0 7 * * *' };
+  writeRunner(slug, source.runner, 'process.stdout.write("{}");');
+  store.spaceStore.save({ id: slug, title: 'Legacy runner', dataSources: [source] });
+  for (const options of [{}, { requestFreshTrustApproval: true }]) {
+    const result = await runner.runSpaceDataSource(slug, source, options);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error('unexpected execution');
+    assert.equal(result.provenNoDispatch, true);
+    assert.equal(result.code, 'local_runner');
+    assert.equal(result.pendingApprovalId, undefined);
+    assert.match(result.error, /supported executor.*another approval cannot/i);
+  }
+  assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 0);
+  assert.equal(eventlog.listEvents(`space-${slug}`, { types: ['approval_requested'] }).length, 0);
 });
 
 test('daemon-owned runner-trust recovery consumes an offline decision without spawning', async () => {
@@ -363,9 +315,7 @@ process.stdout.write('{}');`,
     dataSources: [source],
   });
 
-  const refresh = await runner.refreshSpaceData(slug, source.id);
-  const approvalId = refresh[0]?.pendingApprovalId;
-  assert.match(approvalId ?? '', /^apr-/);
+  const approvalId = seedLegacySpaceTrustApproval(slug, source, true).approvalId;
 
   // Simulate a decision committed by another process while the daemon and its
   // live resolution listener were offline.
@@ -385,126 +335,25 @@ process.stdout.write('{}');`,
   assert.equal(existsSync(recoveredPath), false);
 });
 
-test('frozen CLI data source approval pins argv + schedule but cannot mint process authority', async () => {
-  const slug = 'cli-source-trust';
-  const source = {
-    id: 'pull',
-    cliArgv: ['node', '-e', 'console.log(JSON.stringify({ rows: [1, 2, 3] }))'],
-    schedule: '0 7 * * *',
-    timezone: 'America/Los_Angeles',
-  };
-  store.spaceStore.save({
-    id: slug,
-    title: 'CLI source trust',
-    dataSources: [source],
-  });
-
-  // 1. First refresh never spawns — it mints exactly one approval card that
-  //    shows the human the full frozen command line.
-  const first = await runner.runSpaceDataSource(slug, source);
-  assert.equal(first.ok, false);
-  assert.match(first.ok ? '' : first.error, /one-time approval/i);
-  assert.equal(first.provenNoDispatch, true, 'blocked CLI refresh must prove it never spawned');
-  const cards = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' });
-  assert.equal(cards.length, 1, 'first refresh mints one decision');
-  assert.equal(cards[0]?.tool, 'space_trust_cli_source');
-  assert.deepEqual(cards[0]?.args?.cliArgv, source.cliArgv, 'the card pins the exact argv vector');
-  assert.deepEqual(cards[0]?.args?.schedulePolicy, { schedule: source.schedule, timezone: source.timezone });
-  assert.match(cards[0]?.subject ?? '', /refresh .*automatically/i);
-  assert.match(String(cards[0]?.args?.reason ?? ''), /no shell, no substitutions/i);
-  assert.match(String(cards[0]?.args?.reason ?? ''), /auth state.*network services.*live/i);
-  assert.match(String(cards[0]?.args?.reason ?? ''), /90 days/);
-
-  // 2. Retries and scheduler ticks converge on the same pending card.
-  await runner.runSpaceDataSource(slug, source);
-  assert.equal(
-    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
-    1,
-  );
-
-  // 3. Approval remains useful migration metadata but cannot mint the shared
-  //    kernel activation/plan required to start a process.
-  assert.equal(approvalRegistry.resolve(cards[0]!.approvalId, 'approved', 'cli-trust-test').ok, true);
-  const approved = await runner.runSpaceDataSource(slug, source);
-  assert.equal(approved.ok, false);
-  assert.equal(approved.ok ? undefined : approved.provenNoDispatch, true);
-  assert.match(approved.ok ? '' : approved.error, /no shared durable call authority/i);
-  const again = await runner.runSpaceDataSource(slug, source);
-  assert.equal(again.ok, false, 'repeat refreshes remain contained without a new decision');
-  assert.equal(
-    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
-    0,
-    'covered refreshes never mint another card',
-  );
-
-  // 4. Any argv drift voids the grant BEFORE a spawn and re-asks.
-  const drifted = {
-    ...source,
-    cliArgv: ['node', '-e', 'console.log(JSON.stringify({ rows: ["changed"] }))'],
-  };
-  store.spaceStore.save({ id: slug, title: 'CLI source trust', dataSources: [drifted] });
-  const afterDrift = await runner.runSpaceDataSource(slug, drifted);
-  assert.equal(afterDrift.ok, false);
-  assert.match(afterDrift.ok ? '' : afterDrift.error, /one-time approval/i);
-  assert.equal(
-    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
-    1,
-    'a changed argv is a NEW decision',
-  );
-});
-
-test('frozen CLI source: schedule drift re-asks, caller/installed mismatch and unknown commands fail closed', async () => {
-  const slug = 'cli-source-trust-edges';
-  const source = {
-    id: 'pull',
-    cliArgv: ['node', '-e', 'console.log("plain text, not json")'],
-  };
-  store.spaceStore.save({ id: slug, title: 'CLI edges', dataSources: [source] });
-
-  const first = await runner.runSpaceDataSource(slug, source);
-  assert.equal(first.ok, false);
-  const card = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' })[0];
-  assert.ok(card);
-  assert.equal(approvalRegistry.resolve(card.approvalId, 'approved', 'cli-trust-test').ok, true);
-
-  // The approved command never reaches stdout parsing without kernel authority.
-  const text = await runner.runSpaceDataSource(slug, source);
-  assert.equal(text.ok, false);
-  assert.equal(text.ok ? undefined : text.provenNoDispatch, true);
-  assert.match(text.ok ? '' : text.error, /no shared durable call authority/i);
-
-  // A caller-supplied argv that differs from the installed manifest is not the
-  // approved program — blocked without spawning, and without minting a card
-  // for the mismatched shape.
-  const tampered = await runner.runSpaceDataSource(slug, {
-    id: 'pull',
-    cliArgv: ['node', '-e', 'console.log("tampered")'],
-  });
+test('unsupported frozen CLI sources never ask for trust, including drift and missing binaries', async () => {
+  const slug = 'cli-source-unavailable';
+  const sentinel = path.join(process.env.CLEMENTINE_HOME!, 'unsupported-cli-executed');
+  const source = { id: 'pull', cliArgv: ['node', '-e', `require('node:fs').writeFileSync(${JSON.stringify(sentinel)}, 'bad')`] };
+  for (const declaration of [source, { ...source, schedule: '*/5 * * * *' }, { ...source, cliArgv: ['definitely-not-installed', '--version'] }]) {
+    store.spaceStore.save({ id: slug, title: 'CLI unavailable', dataSources: [declaration] });
+    const result = await runner.runSpaceDataSource(slug, declaration, { requestFreshTrustApproval: true });
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error('unexpected execution');
+    assert.equal(result.code, 'local_command');
+    assert.equal(result.provenNoDispatch, true);
+    assert.equal(result.pendingApprovalId, undefined);
+    assert.match(result.error, /another approval cannot/i);
+    assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 0);
+  }
+  const tampered = await runner.runSpaceDataSource(slug, source);
   assert.equal(tampered.ok, false);
   assert.match(tampered.ok ? '' : tampered.error, /does not exactly match its installed CLI declaration/i);
-  assert.equal(tampered.provenNoDispatch, true);
-
-  // Schedule drift on the same argv is a new decision (the human approved
-  // "runs at THIS cadence", not "runs whenever").
-  const rescheduled = { ...source, schedule: '*/5 * * * *' };
-  store.spaceStore.save({ id: slug, title: 'CLI edges', dataSources: [rescheduled] });
-  const afterReschedule = await runner.runSpaceDataSource(slug, rescheduled);
-  assert.equal(afterReschedule.ok, false);
-  assert.match(afterReschedule.ok ? '' : afterReschedule.error, /one-time approval/i);
-
-  // Even an approved command that is not installed is refused before PATH
-  // lookup because legacy CLI trust is not shared-kernel authority.
-  const missing = { id: 'gone', cliArgv: ['definitely-not-a-real-cli-9f3a', '--version'] };
-  store.spaceStore.save({ id: `${slug}-missing`, title: 'CLI missing', dataSources: [missing] });
-  const pendingMissing = await runner.runSpaceDataSource(`${slug}-missing`, missing);
-  assert.equal(pendingMissing.ok, false);
-  const missingCard = approvalRegistry.listPending({ sessionId: `space-${slug}-missing`, status: 'pending' })[0];
-  assert.ok(missingCard);
-  assert.equal(approvalRegistry.resolve(missingCard.approvalId, 'approved', 'cli-trust-test').ok, true);
-  const ran = await runner.runSpaceDataSource(`${slug}-missing`, missing);
-  assert.equal(ran.ok, false);
-  assert.equal(ran.ok ? undefined : ran.provenNoDispatch, true);
-  assert.match(ran.ok ? '' : ran.error, /no shared durable call authority/i);
+  assert.equal(existsSync(sentinel), false);
 });
 
 test('a pinned legacy entrypoint digest does not unlock the retired raw runner', async () => {
@@ -536,19 +385,7 @@ process.stdout.write('{}');`,
       dataSources: [source],
     });
 
-    const refresh = await runner.refreshSpaceData(slug, source.id);
-    assert.match(refresh[0]?.pendingApprovalId ?? '', /^apr-/);
-    const approvalId = refresh[0]!.pendingApprovalId!;
-    const repeated = await runner.refreshSpaceData(slug, source.id);
-    assert.equal(repeated[0]?.pendingApprovalId, approvalId);
-    assert.equal(
-      workspaceDb.listWorkspaceDatasetObservations(slug, {
-        sourceKey: source.id,
-        limit: 10,
-      }).filter((observation) => observation.status === 'awaiting_approval').length,
-      1,
-      'repeated clicks on one trust card remain one historical observation',
-    );
+    const approvalId = seedLegacySpaceTrustApproval(slug, source, true).approvalId;
     assert.equal(approvalRegistry.resolve(approvalId, resolution, 'runner-trust-note-test').ok, true);
 
     const spawnedPath = store.resolveInSpace(slug, 'data/decision-spawned.txt');
@@ -626,9 +463,7 @@ test('contained approved refresh reports a safe async Outcome without entering r
     dataSources: [source],
   });
 
-  const refresh = await runner.refreshSpaceData(slug, source.id);
-  const approvalId = refresh[0]?.pendingApprovalId;
-  assert.match(approvalId ?? '', /^apr-/);
+  const approvalId = seedLegacySpaceTrustApproval(slug, source, true).approvalId;
   assert.equal(approvalRegistry.resolve(approvalId!, 'approved', 'safe-failure-test').ok, true);
 
   let outcome: ReturnType<typeof eventlog.listEvents>[number] | undefined;
@@ -650,6 +485,8 @@ test('contained approved refresh reports a safe async Outcome without entering r
   assert.ok(outcome);
   assert.equal(outcome.data.status, 'failed');
   assert.match(String(outcome.data.text ?? ''), /activity log for technical details/i);
+  assert.match(String(outcome.data.text ?? ''), /needs a supported executor/i);
+  assert.doesNotMatch(String(outcome.data.text ?? ''), /then (?:try again|retry)/i);
   assert.doesNotMatch(String(outcome.data.text ?? ''), /provider-secret-diagnostic/);
   assert.equal(
     eventlog.listEvents(`space-${slug}`, { types: ['conversation_completed'] })
@@ -668,128 +505,62 @@ test('contained approved refresh reports a safe async Outcome without entering r
   );
 });
 
-test('an unreaped expired runner-trust card renews cleanly without executing the runner', async () => {
-  const slug = 'legacy-runner-trust-expired';
+test('an expired historical card stays expired and cannot be renewed into a missing executor', async () => {
+  const slug = 'legacy-expired-no-renewal';
   const source = { id: 'pull', runner: 'pull.mjs' };
-  writeRunner(
-    slug,
-    'pull.mjs',
-    `import { writeFileSync } from 'node:fs';
-writeFileSync(new URL('./expired-card-spawned.txt', import.meta.url), 'yes');
-process.stdout.write('{}');`,
-  );
-  store.spaceStore.save({
-    id: slug,
-    title: 'Legacy runner trust expired',
-    dataSources: [source],
-  });
-
-  await runner.runSpaceDataSource(slug, source);
-  const firstCard = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  })[0];
-  assert.ok(firstCard);
-  eventlog.openEventLog().prepare(
-    'UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?',
-  ).run('2000-01-01T00:00:00.000Z', firstCard.approvalId);
-
-  const automaticRetry = await runner.runSpaceDataSource(slug, source);
-  assert.equal(automaticRetry.ok, false);
-  assert.match(automaticRetry.ok ? '' : automaticRetry.error, /expired.*new approval/i);
-  assert.equal(
-    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
-    0,
-    'a background-style retry does not silently replace the expired decision',
-  );
-
-  const renewed = await runner.runSpaceDataSource(slug, source, {
-    requestFreshTrustApproval: true,
-  });
-  assert.equal(renewed.ok, false);
-  assert.equal(
-    (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/expired-card-spawned.txt')),
-    false,
-    'an expired decision never executes opaque code',
-  );
-  const pending = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  });
-  assert.equal(pending.length, 1);
-  assert.notEqual(pending[0]?.approvalId, firstCard.approvalId);
-  assert.equal(
-    approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' })
-      .find((row) => row.approvalId === firstCard.approvalId)?.status,
-    'expired',
-  );
+  writeRunner(slug, source.runner, 'process.stdout.write("{}");');
+  store.spaceStore.save({ id: slug, title: 'Expired', dataSources: [source] });
+  const card = seedLegacySpaceTrustApproval(slug, source);
+  eventlog.openEventLog().prepare('UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?')
+    .run('2000-01-01T00:00:00.000Z', card.approvalId);
+  for (const requestFreshTrustApproval of [false, true]) {
+    const result = await runner.runSpaceDataSource(slug, source, { requestFreshTrustApproval });
+    assert.equal(result.ok, false);
+    assert.match(result.ok ? '' : result.error, /expired.*another approval/i);
+    assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length, 0);
+  }
+  assert.equal(approvalRegistry.get(card.approvalId)?.resolution, 'expired');
+  assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 1);
 });
 
-test('editing a trusted runner entrypoint or its automatic schedule invalidates the pinned grant before spawn', async () => {
-  const slug = 'legacy-runner-trust-drift';
-  const source = {
-    id: 'pull',
-    runner: 'pull.mjs',
-    schedule: '0 7 * * *',
-    timezone: 'America/Los_Angeles',
-  };
-  writeRunner(slug, 'pull.mjs', 'process.stdout.write(JSON.stringify({version:1}));');
-  store.spaceStore.save({
-    id: slug,
-    title: 'Legacy runner trust drift',
-    dataSources: [source],
-  });
-
+test('retiring a historical pending card closes its waiting observation and does not touch another source', async () => {
+  const slug = 'legacy-pending-retirement';
+  const source = { id: 'pull', runner: 'pull.mjs' };
+  const sibling = { id: 'other', runner: 'other.mjs' };
+  writeRunner(slug, source.runner, 'process.stdout.write("{}");');
+  writeRunner(slug, sibling.runner, 'process.stdout.write("{}");');
+  store.spaceStore.save({ id: slug, title: 'Pending', dataSources: [source, sibling] });
+  const card = seedLegacySpaceTrustApproval(slug, source, true);
+  const other = seedLegacySpaceTrustApproval(slug, sibling, true);
   await runner.runSpaceDataSource(slug, source);
-  const firstCard = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  })[0];
-  assert.ok(firstCard);
-  assert.equal(approvalRegistry.resolve(firstCard.approvalId, 'approved', 'runner-trust-test').ok, true);
-  const approved = await runner.runSpaceDataSource(slug, source);
-  assert.equal(approved.ok, false);
-  assert.equal(approved.ok ? undefined : approved.provenNoDispatch, true);
-  assert.match(approved.ok ? '' : approved.error, /no shared durable call authority/i);
+  assert.equal(approvalRegistry.get(card.approvalId)?.resolution, 'cancelled_by_system');
+  assert.equal(approvalRegistry.get(other.approvalId)?.status, 'pending');
+  const observations = workspaceDb.listWorkspaceDatasetObservations(slug, { sourceKey: source.id, limit: 10 });
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0]?.status, 'error');
+  assert.equal(observations[0]?.provenance.approvalId, card.approvalId);
+  const before = JSON.stringify(dataStore.listNotes(slug));
+  await runner.runSpaceDataSource(slug, source);
+  assert.equal(JSON.stringify(dataStore.listNotes(slug)), before, 'retirement is idempotent');
+});
 
-  writeRunner(
-    slug,
-    'pull.mjs',
-    `import { writeFileSync } from 'node:fs';
-writeFileSync(new URL('./unapproved-spawn.txt', import.meta.url), 'yes');
-process.stdout.write(JSON.stringify({version:2}));`,
-  );
-  const codeDrift = await runner.runSpaceDataSource(slug, source);
-  assert.equal(codeDrift.ok, false);
-  assert.match(codeDrift.ok ? '' : codeDrift.error, /approval/i);
-  assert.equal(
-    (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/unapproved-spawn.txt')),
-    false,
-    'changed entrypoint bytes never inherit the old durable grant',
-  );
-
-  const codeCard = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  })[0];
-  assert.ok(codeCard);
-  assert.notEqual(codeCard.approvalId, firstCard.approvalId);
-  assert.notEqual(codeCard.args?.runnerSha256, firstCard.args?.runnerSha256);
-  assert.equal(approvalRegistry.resolve(codeCard.approvalId, 'approved', 'runner-trust-test').ok, true);
-
-  const changedSchedule = { ...source, schedule: '*/5 * * * *' };
-  store.spaceStore.update(slug, { dataSources: [changedSchedule] });
-  const scheduleDrift = await runner.runSpaceDataSource(slug, changedSchedule);
-  assert.equal(scheduleDrift.ok, false);
-  const pending = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  });
-  assert.equal(pending.length, 1, 'schedule drift gets one fresh exact decision');
-  assert.deepEqual(pending[0]?.args?.schedulePolicy, {
-    schedule: changedSchedule.schedule,
-    timezone: changedSchedule.timezone,
-  });
+test('runner entrypoint and schedule drift cannot reuse a grant or generate a new futile card', async () => {
+  const slug = 'legacy-runner-drift';
+  const source = { id: 'pull', runner: 'pull.mjs', schedule: '0 7 * * *' };
+  writeRunner(slug, source.runner, 'process.stdout.write("{}");');
+  store.spaceStore.save({ id: slug, title: 'Drift', dataSources: [source] });
+  await approveInstalledRunnerFixture(slug, source);
+  const sentinel = store.resolveInSpace(slug, 'data/should-not-execute');
+  writeRunner(slug, source.runner, `require('node:fs').writeFileSync(${JSON.stringify(sentinel)}, 'bad');`);
+  for (const current of [source, { ...source, schedule: '*/5 * * * *' }]) {
+    store.spaceStore.update(slug, { dataSources: [current] });
+    const result = await runner.runSpaceDataSource(slug, current);
+    assert.equal(result.ok, false);
+    assert.match(result.ok ? '' : result.error, /no shared durable call authority/i);
+    assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length, 0);
+  }
+  assert.equal(existsSync(sentinel), false);
+  assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 1);
 });
 
 test('runner-backed actions cannot execute without approval authority', async () => {
@@ -1032,17 +803,6 @@ test('refreshSpaceData does not advance lastRefreshedAt when every source fails'
   });
   store.spaceStore.update(slug, { lastRefreshedAt: oldSuccess });
   writeRunner(slug, 'bad.mjs', `process.stderr.write('source broke'); process.exit(2);`);
-  await runner.runSpaceDataSource(slug, store.spaceStore.get(slug)!.dataSources[0]);
-  const approval = approvalRegistry.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  })[0];
-  assert.ok(approval);
-  assert.equal(
-    approvalRegistry.resolve(approval.approvalId, 'approved', 'runner-failure-test').ok,
-    true,
-  );
-
   const res = await runner.refreshSpaceData(slug);
 
   assert.equal(res[0].ok, false);
@@ -1105,17 +865,7 @@ test('a frozen CLI source that is a reviewed read is compiled into its operation
   const source = { id: 'opportunities', cliArgv: argv };
   store.spaceStore.save({ id: slug, title: 'Reviewed read source', dataSources: [source] });
 
-  // No reviewed-CLI descriptor registry exists in this isolated home, so the
-  // trust card still asks once; the executor question is separate from trust.
-  const first = await runner.runSpaceDataSource(slug, source);
-  assert.equal(first.ok, false);
-  const cards = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' });
-  assert.equal(cards.length, 1);
-  assert.equal(approvalRegistry.resolve(cards[0]!.approvalId, 'approved', 'cli-reviewed-test').ok, true);
-
-  // Once trusted, the frozen line is the reviewed OPERATION: without a minted
-  // authority it is refused at the kernel door by operation id, never as an
-  // unavailable local CLI, and nothing is spawned.
+  // A reviewed read needs execution authority, never an unrelated trust card.
   const approved = await runner.runSpaceDataSource(slug, source);
   assert.equal(approved.ok, false);
   assert.equal(approved.ok ? undefined : approved.provenNoDispatch, true);
@@ -1128,14 +878,31 @@ test('a frozen CLI source that is a reviewed read is compiled into its operation
   // A line the reviewed read cannot carry is refused by the exact token.
   const stray = { id: 'stray', cliArgv: [...head, required.token, 'SELECT Id FROM Lead', '--result-format', 'csv'] };
   store.spaceStore.save({ id: slug, title: 'Reviewed read source', dataSources: [source, stray] });
-  await runner.runSpaceDataSource(slug, stray);
-  const strayCard = approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'pending' })[0];
-  assert.ok(strayCard);
-  assert.equal(approvalRegistry.resolve(strayCard.approvalId, 'approved', 'cli-reviewed-test').ok, true);
   const refused = await runner.runSpaceDataSource(slug, stray);
   assert.equal(refused.ok, false);
   assert.equal(refused.ok ? undefined : refused.provenNoDispatch, true);
   assert.match(refused.ok ? '' : refused.error, new RegExp(`names the reviewed read ${reviewed.operationId} but cannot be carried by it: option "--result-format"`));
+  assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 0);
+});
+
+test('a newly reviewed CLI read does not erase an older explicit denial', async () => {
+  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+  const entry = CLI_CATALOG.find(candidate => candidate.reviewedRead)!;
+  const reviewed = entry.reviewedRead!;
+  const required = reviewed.arguments.find(argument => argument.required)!;
+  const source = { id: 'rows', cliArgv: [entry.command, ...reviewed.argvPrefix, required.token, 'SELECT Id FROM Opportunity LIMIT 5'] };
+  const slug = 'reviewed-read-historical-denial';
+  store.spaceStore.save({ id: slug, title: 'Historical denial', dataSources: [source] });
+  const card = seedLegacySpaceTrustApproval(slug, source, true);
+  assert.equal(approvalRegistry.resolve(card.approvalId, 'rejected', 'owner-fixture').ok, true);
+  const before = JSON.stringify(approvalRegistry.get(card.approvalId));
+  for (const requestFreshTrustApproval of [false, true]) {
+    const result = await runner.runSpaceDataSource(slug, source, { requestFreshTrustApproval });
+    assert.equal(result.ok, false);
+    assert.match(result.ok ? '' : result.error, /You declined approval/);
+    assert.equal(JSON.stringify(approvalRegistry.get(card.approvalId)), before);
+  }
+  assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 1);
 });
 
 test('a reviewed read stores what the command produced: parsed JSON on a clean exit, a named failure otherwise', () => {

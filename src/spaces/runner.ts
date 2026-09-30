@@ -358,7 +358,7 @@ async function runSpaceDataSourceRead(
         error: trust.error,
         provenNoDispatch: true,
         ...(trust.state === 'pending' ? { pendingApprovalId: trust.approvalId } : {}),
-        code: trustRefusalCode(trust.state),
+        code: ('failureCode' in trust ? trust.failureCode : undefined) ?? trustRefusalCode(trust.state),
       };
     }
     return runScript(
@@ -378,7 +378,7 @@ async function runSpaceDataSourceRead(
         error: trust.error,
         provenNoDispatch: true,
         ...(trust.state === 'pending' ? { pendingApprovalId: trust.approvalId } : {}),
-        code: trustRefusalCode(trust.state),
+        code: ('failureCode' in trust ? trust.failureCode : undefined) ?? trustRefusalCode(trust.state),
       };
     }
     const reviewed = compileReviewedCliArgv(trust.cliArgv);

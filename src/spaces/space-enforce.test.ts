@@ -276,7 +276,7 @@ test('an opaque data-source runner is rejected even when its staged file exists'
   assert.match(prep.errors.join(' '), /opaque runner|read-only Composio/i);
 });
 
-test('an installed runner declaration survives metadata/view saves but remains approval-gated at runtime', () => {
+test('an installed runner declaration survives metadata/view saves and reports its missing executor', () => {
   writeRunner('legacy-preserved', 'pull.mjs');
   const existingDataSources = [{
     id: 'pull',
@@ -295,7 +295,7 @@ test('an installed runner declaration survives metadata/view saves but remains a
   assert.deepEqual(prep.dataSources, existingDataSources);
   assert.match(
     prep.warnings.join(' '),
-    /legacy runner.*preserved.*entrypoint hash.*approval.*helpers.*outside the digest/i,
+    /legacy runner.*preserved.*executor is unavailable.*approval does not enable refresh/i,
   );
 });
 

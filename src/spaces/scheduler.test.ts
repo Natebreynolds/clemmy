@@ -17,6 +17,7 @@ const store = await import('./store.js');
 const data = await import('./data-store.js');
 const sched = await import('./scheduler.js');
 const runner = await import('./runner.js');
+const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 
@@ -30,13 +31,7 @@ async function approveInstalledRunnerFixture(
   slug: string,
   source: Parameters<typeof runner.runSpaceDataSource>[1],
 ): Promise<void> {
-  const blocked = await runner.runSpaceDataSource(slug, source);
-  assert.equal(blocked.ok, false);
-  const card = approvals.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  }).find((row) => row.args?.sourceId === source.id);
-  assert.ok(card);
+  const card = seedLegacySpaceTrustApproval(slug, source);
   eventlog.openEventLog().prepare(`
     UPDATE pending_approvals
        SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
@@ -148,7 +143,7 @@ test('a data source with no schedule never fires', async () => {
   assert.deepEqual(data.readData(slug), {});
 });
 
-test('a due installed legacy runner requests one decision without counting as a scheduler error', async () => {
+test('a due installed legacy runner reports an executor failure without asking the owner', async () => {
   const slug = 'sched-legacy-trust';
   store.spaceStore.save({
     id: slug,
@@ -165,11 +160,11 @@ process.stdout.write('{}');`,
 
   const res = await sched.processSpaceSchedules(new Date('2026-06-08T10:00:00.000Z'));
   assert.equal(res.fired, 0);
-  assert.equal(res.errors, 0);
-  assert.equal(res.awaitingApproval, 1);
+  assert.equal(res.errors, 1);
+  assert.equal(res.awaitingApproval, 0);
   assert.equal(
     approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
-    1,
+    0,
   );
   assert.equal(
     (await import('node:fs')).existsSync(store.resolveInSpace(slug, 'data/must-not-run.txt')),

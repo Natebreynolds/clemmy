@@ -13,7 +13,7 @@
  */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -435,17 +435,10 @@ test('a reviewed-CLI Workspace refresh acquires the reviewed read just in time a
     return { status: 'present' };
   });
   try {
-    // Trust first (no descriptor registry in this home, so the card asks once).
-    await runner.refreshSpaceData(slug, 'opportunities', { cause: 'manual' });
-    const card = approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' })[0];
-    assert.ok(card, 'the frozen line asks for trust once');
-    assert.equal(approvals.resolve(card.approvalId, 'approved', 'reviewed-read-test').ok, true);
-    acquisitions.length = 0;
-
     const result = await runner.refreshSpaceData(slug, 'opportunities', { cause: 'scheduled' });
     assert.equal(result.length, 1);
-    // Approving the card also auto-resumes the blocked refresh, so more than
-    // one refresh may have minted; every mint names the reviewed operation.
+    // A supported read reaches authority preparation without a trust card.
+    assert.equal(approvals.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 0);
     assert.ok(acquisitions.length >= 1, 'the refresh acquires the reviewed read');
     for (const acquisition of acquisitions) {
       assert.deepEqual(acquisition, {
@@ -542,4 +535,51 @@ test('space_save still refuses a declared source the preparation cannot confirm 
   } finally {
     readAuthority._setExactSpaceReadCatalogPreparerForTests(null);
   }
+});
+
+
+test('a supported frozen CLI refresh executes exactly once per occurrence without a compatibility approval', async () => {
+  const { CLI_CATALOG } = await import('../integrations/cli-catalog/catalog.js');
+  const config = await import('../runtime/harness/reviewed-cli-read-config.js');
+  const approvals = await import('../runtime/harness/approval-registry.js');
+  const entry = CLI_CATALOG.find(candidate => candidate.reviewedRead)!;
+  const reviewed = entry.reviewedRead!;
+  const required = reviewed.arguments.find(argument => argument.required)!;
+  const executable = path.join(TEST_HOME, 'framework-read-cli');
+  const counter = path.join(TEST_HOME, 'framework-read-count');
+  writeFileSync(counter, '0');
+  writeFileSync(executable, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    `const counter = ${JSON.stringify(counter)};`,
+    "const n = Number(fs.readFileSync(counter, 'utf8')) + 1;",
+    "fs.writeFileSync(counter, String(n));",
+    "process.stdout.write(JSON.stringify({ records: [{ id: 'fixture-row', n }], argv: process.argv.slice(2) }));",
+  ].join('\n'));
+  chmodSync(executable, 0o700);
+  await config.provisionReviewedCliReadDescriptor({
+    version: 1, descriptorId: reviewed.descriptorId, operationId: reviewed.operationId,
+    displayName: 'Framework Space read', description: 'Framework Space read', effect: 'read',
+    accountId: 'reviewed_cli:host', executablePath: executable,
+    argvPrefix: [...reviewed.argvPrefix], arguments: reviewed.arguments.map(argument => ({ ...argument })),
+    limits: { timeoutMs: 2_000, maxStdoutBytes: 16_384, maxStderrBytes: 4_096, maxArgumentBytes: 4_096 },
+  });
+  readAuthority._setReviewedCliReadAcquirerForTests(null);
+  const slug = 'framework-space-real-cli';
+  const query = 'SELECT Id FROM Opportunity LIMIT 5';
+  store.spaceStore.save({ id: slug, title: 'FRAMEWORK-TEST CLI refresh', dataSources: [{
+    id: 'rows', cliArgv: [entry.command, ...reviewed.argvPrefix, required.token, query],
+  }] });
+  try {
+    for (const [index, cause] of ['manual', 'scheduled'].entries()) {
+      const [result] = await runner.refreshSpaceData(slug, 'rows', { cause });
+      assert.equal(result?.ok, true, result?.error);
+      assert.equal(readFileSync(counter, 'utf8'), String(index + 1));
+      const current = await import('./data-store.js');
+      const data = current.readData(slug) as { rows: { records: Array<{ id: string; n: number }>; argv: string[] } };
+      assert.deepEqual(data.rows.records, [{ id: 'fixture-row', n: index + 1 }]);
+      assert.ok(data.rows.argv.includes(query), 'the accepted argument reached the pinned binary');
+      assert.equal(approvals.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 0);
+    }
+  } finally { store.spaceStore.archive(slug); }
 });

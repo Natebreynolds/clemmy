@@ -164,7 +164,7 @@ export function checkSpaceForWrite(
       const declaration = runnerDeclarationKey(s);
       if (declaration && legacyRunnerDeclarations.has(declaration)) {
         warnings.push(
-          `Legacy runner data source "${s.id}" was preserved. Its runner entrypoint hash and automatic schedule require one human approval before refresh; any later entrypoint or schedule change invalidates that grant. Helpers, packages, CLIs, local files, auth state, and network services remain live outside the digest.`,
+          `Legacy runner data source "${s.id}" was preserved. Its legacy executor is unavailable; another approval does not enable refresh. Preserve its data and replace the source with a supported read operation or a workflow that writes the dataset through space_set_data.`,
         );
       } else {
         errors.push(safetyError);

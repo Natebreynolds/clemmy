@@ -17,6 +17,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-space-smo
 const smoke = await import('./space-smoke.js');
 const store = await import('./store.js');
 const runner = await import('./runner.js');
+const { seedLegacySpaceTrustApproval } = await import('./legacy-space-trust.fixture.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 
@@ -30,13 +31,7 @@ async function approveInstalledRunnerFixture(
   slug: string,
   source: Parameters<typeof runner.runSpaceDataSource>[1],
 ): Promise<void> {
-  const blocked = await runner.runSpaceDataSource(slug, source);
-  assert.equal(blocked.ok, false);
-  const card = approvals.listPending({
-    sessionId: `space-${slug}`,
-    status: 'pending',
-  }).find((row) => row.args?.sourceId === source.id);
-  assert.ok(card);
+  const card = seedLegacySpaceTrustApproval(slug, source);
   eventlog.openEventLog().prepare(`
     UPDATE pending_approvals
        SET status = 'resolved', resolution = 'approved', resolver = ?, resolved_at = ?
@@ -77,15 +72,14 @@ test('smoke: an approved local source is a contained failure before its rows exe
   assert.equal(res.empty.length, 0);
 });
 
-test('smoke: an installed legacy runner waits for pinned-entrypoint approval without being mislabeled broken', async () => {
+test('smoke: an installed legacy runner reports unavailable execution without a futile approval', async () => {
   const slug = 'smoke-fail';
   store.spaceStore.save({ id: slug, title: 'Fail', dataSources: [{ id: 'pull', runner: 'bad.mjs' }] });
   writeRunner(slug, 'bad.mjs', 'process.exit(3)');
   const res = await smoke.runSpaceCreationSmoke(slug);
-  assert.deepEqual(res.failed, []);
-  assert.equal(res.awaitingApproval.length, 1);
-  assert.equal(res.awaitingApproval[0]?.id, 'pull');
-  assert.match(res.awaitingApproval[0]?.approvalId ?? '', /^apr-/);
+  assert.equal(res.failed.length, 1);
+  assert.match(res.failed[0]?.error ?? '', /supported executor/);
+  assert.equal(res.awaitingApproval.length, 0);
 });
 
 test('smoke: contained local source cannot be classified from fabricated empty output', async () => {
