@@ -79,7 +79,11 @@ function capabilityTotalChanges(): number {
 }
 
 test('unbounded run_shell_command still cannot enter local planning as a read', () => {
-  assert.equal(local.isRegistryDeclaredLocalPlanningCapability('run_shell_command'), false);
+  // The shell is declared as ordinary local WORK (a mutation whose per-call
+  // effect decides at dispatch), never as a native planning read: a reviewed
+  // CLI read keeps its own descriptor, binary and argv proof.
+  assert.equal(local.isRegistryDeclaredNativePlanningRead('run_shell_command'), false);
+  assert.equal(local.isRegistryDeclaredLocalPlanningMutation('run_shell_command'), true);
 });
 
 test('a Salesforce CLI search nominates the reviewed SOQL identity; a GitHub search does not', () => {
