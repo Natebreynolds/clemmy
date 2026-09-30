@@ -10947,8 +10947,10 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     });
   }
 
+  const retainedToolBudget = (persistedRecoveryState ?? adoptedRecoveryState)?.connectionProgress?.activation.toolCalls;
   const toolCounter = new ToolCallsCounter(
-    options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
+    retainedToolBudget?.limit ?? options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
+    retainedToolBudget?.used ?? 0,
   );
   const heartbeatBudget = getHarnessBudgetSettings();
   const heartbeatMs = Math.max(60_000, heartbeatBudget.checkInMinutes * 60 * 1000);
@@ -13022,8 +13024,10 @@ export async function resumePendingApproval(
   });
   session.clearInterruptState({ emitEvent: false });
 
+  const retainedToolBudget = state instanceof HostInterruptState ? state.connectionProgress?.activation.toolCalls : undefined;
   const toolCounter = new ToolCallsCounter(
-    options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
+    retainedToolBudget?.limit ?? options.toolCallsPerTurn ?? defaultToolCallsPerTurn(),
+    retainedToolBudget?.used ?? 0,
   );
   const heartbeatBudget = getHarnessBudgetSettings();
   const heartbeatMs = Math.max(60_000, heartbeatBudget.checkInMinutes * 60 * 1000);

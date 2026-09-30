@@ -1686,6 +1686,8 @@ test('a local checkpoint-store failure holds privately and exact recovery never 
   assert.equal(model.calls(), 1, 'recovery finalizes bytes without dispatching another model');
   const continuation = HostRecoveryState.fromString(resumed.serializedRecoveryState!);
   assert.equal(continuation.phase, 'continue');
+  assert.equal(continuation.stepIndex, recovery.stepIndex,
+    'finalizing an already-spent model frame must not charge a second model step');
   assert.deepEqual(continuation.frameHistory, []);
   assert.deepEqual(continuation.resultItems, []);
   assert.equal(continuation.acceptedModelBatchRef?.batchId, recovery.acceptedModelBatchRef?.batchId,
@@ -9975,6 +9977,331 @@ test('completion review receives the memory actually shown to the brain, not a f
   assert.equal(judged, 1);
   assert.match(reviewedEvidence, /remembered-742/);
   assert.doesNotMatch(reviewedEvidence, /unseen-963/);
+});
+
+/** A real settled read and an interrupted checkpoint, repaired without another
+ * tool/model invocation. Connection activation itself is deliberately not
+ * enabled here; these pins exercise the runner consuming its retained state. */
+async function connectionProgressFixture(label: string, nextFrames: unknown[][], toolLimit = 8,
+  options: { judgeCompletion?: boolean; extraTools?: Array<{ name: string }> } = {}) {
+  const fixture = acceptJudgedSource(label, 'Read the current harness status and report it.');
+  fixture.parent.counter = new brackets.ToolCallsCounter(toolLimit);
+  const model = scriptedRecordingModel([
+    [toolCall(`${label}-first`, 'call_tool', { name: 'harness_status', args_json: '{}' })],
+    ...nextFrames,
+  ]);
+  const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set(['harness_status']), firstClassNames: new Set(['call_tool']),
+    deniedNames: new Set(), mcpToolScope: null, controlOnlyBuiltins: true,
+    admitBuiltinAcquisition: async name => name === 'harness_status' ? { ok: true }
+      : { ok: false, kind: 'requires_readmission', outside: [name] },
+  }) as never);
+  const agent = { model, tools: [carrier, ...(options.extraTools ?? [])] };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const run = (state: unknown, overrides: Record<string, unknown> = {}) => brackets.withHarnessRunContext(fixture.parent,
+    () => productionHostRunRunner(throwingRunner() as never, agent as never, state as never,
+      { maxTurns: 8, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: options.judgeCompletion === true, ...overrides } as never));
+  const db = eventlog.openEventLog();
+  const trigger = `reject_connection_progress_${acceptedSerial}`;
+  const quotedSession = fixture.session.id.replaceAll("'", "''");
+  const rejectCheckpoint = () => db.exec(`CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON accepted_model_batch_checkpoints
+    WHEN NEW.session_id = '${quotedSession}' BEGIN SELECT RAISE(ABORT, 'connection progress fixture'); END`);
+  const restoreCheckpoint = () => db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  rejectCheckpoint();
+  let held: Awaited<ReturnType<typeof run>>;
+  try { held = await run([{ type: 'message', role: 'user', content: fixture.source.data.text }]); }
+  finally { restoreCheckpoint(); }
+  assert.ok(held.serializedRecoveryState);
+  const repaired = await run(HostRecoveryState.fromString(held.serializedRecoveryState));
+  assert.ok(repaired.serializedRecoveryState);
+  const state = HostRecoveryState.fromString(repaired.serializedRecoveryState);
+  assert.equal(model.calls(), 1);
+  assert.equal(fixture.parent.counter.currentCount, 1);
+  assert.equal(state.stepIndex, 1, 'checkpoint-only re-entry does not consume a model step');
+  assert.ok(state.acceptedModelBatchRef);
+  const progress: import('./host-connection-progress.js').HostConnectionProgress = {
+    version: 1, batch: state.acceptedModelBatchRef,
+    recovery: { turnEngine: state.turnEngine, stepIndex: state.stepIndex,
+      noProgressCheckpoint: state.noProgressCheckpoint, objectiveJudgeContinuations: state.objectiveJudgeContinuations,
+      completionReviewFeedback: state.completionReviewFeedback },
+    activation: { maxTurns: 8, toolCalls: { used: 1, limit: toolLimit }, elapsedMs: 1200, judgeCompletion: options.judgeCompletion === true },
+    continuations: { acceptedReadPlanUsed: true, acceptedUniqueWorkflowUsed: true, workflowStepResultUsed: 1,
+      continueMarkerUsed: 1, planFinalPublishSpent: true, modelStallRetriesRemaining: 0 },
+    watcher: { checksUsed: 0, injectionsUsed: 0, deliveredSteers: 0, unresolvedDrift: false,
+      lastCheckedAt: 0, lastFailureSeq: 0, checkInFlight: false },
+  };
+  const restore = () => HostRecoveryState.fromString(JSON.stringify({ ...JSON.parse(state.toString()), connectionProgress: progress }));
+  return { fixture, model, run, state, progress, restore, rejectCheckpoint, restoreCheckpoint };
+}
+
+test('connection resume cannot refresh the spent model or tool allowance', async t => {
+  const prior = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { if (prior === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prior; });
+  const capped = await connectionProgressFixture('connection-spent-model', [[textMsg('must not run')]]);
+  capped.progress.activation.maxTurns = 1;
+  capped.fixture.parent.counter = new brackets.ToolCallsCounter(8);
+  const outcome = await capped.run(capped.restore(), { maxTurns: 100 });
+  assert.equal(outcome.terminal?.reason, 'max_turns');
+  assert.equal(capped.model.calls(), 1, 're-entry cannot buy another model response with larger caller options');
+  assert.equal(capped.fixture.parent.counter.currentCount, 1);
+
+  const spent = await connectionProgressFixture('connection-spent-tool', [
+    [toolCall('connection-excess-read', 'call_tool', { name: 'harness_status', args_json: '{}' })],
+  ], 1);
+  spent.fixture.parent.counter = new brackets.ToolCallsCounter(1);
+  await assert.rejects(() => spent.run(spent.restore()), brackets.ToolCallsLimitExceeded);
+  const succeeded = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id FROM logical_call_settlements
+    WHERE session_id = ? AND outcome_kind = 'succeeded'`).all(spent.fixture.session.id);
+  assert.deepEqual(succeeded, [{ logical_tool_call_id: 'connection-spent-tool-first' }],
+    'the second read must not execute using a newly constructed physical counter');
+});
+
+test('connection progress keeps an exhausted model-stall retry allowance exhausted', async t => {
+  const keys = ['HARNESS_TOOL_BRACKETS', 'CLEMMY_MODEL_STREAM_STALL_MS', 'CLEMMY_MODEL_STREAM_STALL_RETRIES'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { for (const key of keys) {
+    if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
+  } });
+  const task = await connectionProgressFixture('connection-spent-stall', [[textMsg('must not run')]]);
+  process.env.CLEMMY_MODEL_STREAM_STALL_MS = '25';
+  process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = '3';
+  let attempts = 0;
+  task.model.getResponse = async request => {
+    attempts++;
+    const signal = (request as { signal: AbortSignal }).signal;
+    return new Promise<never>((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  };
+  const result = await task.run(task.restore());
+  assert.equal(result.terminal?.reason, 'model_stalled');
+  assert.equal(attempts, 1, 'a reconnect cannot mint the three newly configured retry attempts');
+});
+
+test('connection progress remains authoritative through another checkpoint and keeps completion review enabled', async t => {
+  const prior = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => { reviews++; return { done: true, reason: 'the settled read supports the answer' }; });
+  t.after(() => { _setHostObjectiveJudgeForTests(null); if (prior === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prior; });
+  const task = await connectionProgressFixture('connection-next-checkpoint', [
+    [toolCall('connection-second-read', 'call_tool', { name: 'harness_status', args_json: '{}' })],
+    [textMsg('The current harness status was read successfully.')],
+  ], 8, { judgeCompletion: true });
+  task.fixture.parent.counter = new brackets.ToolCallsCounter(8);
+  task.rejectCheckpoint();
+  let held: Awaited<ReturnType<typeof task.run>>;
+  try { held = await task.run(task.restore(), { hostJudgeCompletion: false }); }
+  finally { task.restoreCheckpoint(); }
+  assert.ok(held.serializedRecoveryState);
+  const checkpoint = HostRecoveryState.fromString(held.serializedRecoveryState);
+  assert.equal(checkpoint.connectionProgress?.activation.toolCalls.used, 2);
+  assert.equal(checkpoint.connectionProgress?.activation.maxTurns, 8);
+  assert.ok(checkpoint.connectionProgress!.activation.elapsedMs >= 1200);
+  assert.equal(checkpoint.connectionProgress?.continuations.acceptedReadPlanUsed, true);
+  assert.equal(checkpoint.connectionProgress?.continuations.continueMarkerUsed, 1);
+  assert.equal(checkpoint.connectionProgress?.recovery.stepIndex, 2);
+  task.fixture.parent.counter = new brackets.ToolCallsCounter(8);
+  const repaired = await task.run(checkpoint);
+  assert.equal(task.model.calls(), 2, 'finalization does not ask the model again or repeat either read');
+  assert.ok(repaired.serializedRecoveryState);
+  const next = HostRecoveryState.fromString(repaired.serializedRecoveryState);
+  assert.equal(next.stepIndex, 2);
+  assert.equal(next.connectionProgress?.activation.toolCalls.used, 2);
+  const result = await task.run(next, { hostJudgeCompletion: false, maxTurns: 100 });
+  assert.equal(result.finalOutput, 'The current harness status was read successfully.');
+  assert.equal(reviews, 1, 'the caller cannot silently disable the retained completion review');
+  assert.equal(task.fixture.parent.counter.currentCount, 2);
+  assert.equal(task.model.calls(), 3);
+});
+
+test('connection progress survives repeated admission holds before the next tool frame is accepted', async t => {
+  const prior = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { if (prior === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prior; });
+  const task = await connectionProgressFixture('connection-admission-hold', [
+    [toolCall('connection-admission-second-read', 'call_tool', { name: 'harness_status', args_json: '{}' })],
+    [textMsg('Both status reads completed.')],
+  ]);
+  task.progress.activation.maxTurns = 3;
+  const db = eventlog.openEventLog();
+  const trigger = `reject_connection_admission_${acceptedSerial}`;
+  db.exec(`CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON accepted_model_batch_admissions
+    WHEN NEW.session_id = '${task.fixture.session.id.replaceAll("'", "''")}'
+    BEGIN SELECT RAISE(ABORT, 'connection admission fixture'); END`);
+  let state = task.restore();
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      task.fixture.parent.counter = new brackets.ToolCallsCounter(8);
+      const held = await task.run(state);
+      assert.ok(held.serializedRecoveryState);
+      state = HostRecoveryState.fromString(held.serializedRecoveryState);
+      assert.equal(state.phase, 'admit');
+      assert.equal(state.acceptedModelBatchRef, undefined, 'an unaccepted frame cannot claim a new batch');
+      assert.equal(state.connectionProgress?.batch.batchId, task.progress.batch.batchId,
+        'the prior accepted batch continues to own spending through every admission hold');
+      assert.equal(state.connectionProgress?.activation.toolCalls.used, 1);
+      assert.equal(task.model.calls(), 2, 'only the original attempt asked the model for this frame');
+    }
+  } finally { db.exec(`DROP TRIGGER IF EXISTS ${trigger}`); }
+  const repaired = await task.run(state);
+  assert.ok(repaired.serializedRecoveryState);
+  const next = HostRecoveryState.fromString(repaired.serializedRecoveryState);
+  assert.equal(next.connectionProgress?.activation.toolCalls.used, 2);
+  assert.equal(next.stepIndex, 2);
+  const result = await task.run(next);
+  assert.equal(result.finalOutput, 'Both status reads completed.');
+  assert.equal(task.model.calls(), 3);
+});
+
+test('connection progress survives approval and result recovery without spending another model step or replaying the call', async t => {
+  const prior = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { if (prior === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prior; });
+  let bodies = 0;
+  const reader = brackets.wrapToolForHarness({ type: 'function', name: 'workspace_roots',
+    description: 'List directories Clementine is allowed to inspect or operate in.',
+    parameters: { type: 'object', properties: {} }, needsApproval: async () => true,
+    invoke: async () => { bodies++; return 'fixture roots'; },
+  });
+  const task = await connectionProgressFixture('connection-approval-recovery', [
+    [toolCall('connection-approved-read', 'workspace_roots', {})],
+    [textMsg('The approved read completed.')],
+  ], 8, { extraTools: [reader] });
+  task.progress.activation.maxTurns = 3;
+  task.fixture.parent.counter = new brackets.ToolCallsCounter(8);
+  const paused = await task.run(task.restore());
+  assert.equal(paused.hasInterruptions, true);
+  assert.equal(bodies, 0);
+  const approval = HostInterruptState.fromString(paused.serializedState!);
+  assert.equal(approval.connectionProgress?.recovery.stepIndex, 2);
+  assert.equal(approval.connectionProgress?.activation.toolCalls.used, 1);
+  const malformed = JSON.parse(approval.toString());
+  malformed.objectiveJudgeContinuations = 1;
+  assert.throws(() => HostInterruptState.fromString(JSON.stringify(malformed)), /retained.*progress/);
+  approval.approve(approval.getInterruptions()[0]!);
+  task.rejectCheckpoint();
+  let held: Awaited<ReturnType<typeof task.run>>;
+  try { held = await task.run(approval); } finally { task.restoreCheckpoint(); }
+  assert.equal(bodies, 1);
+  assert.equal(task.model.calls(), 2, 'settling the existing approved frame does not ask the model again');
+  assert.ok(held.serializedRecoveryState);
+  const recovery = HostRecoveryState.fromString(held.serializedRecoveryState);
+  assert.equal(recovery.stepIndex, 2);
+  assert.equal(recovery.connectionProgress?.activation.toolCalls.used, 2);
+  task.fixture.parent.counter = new brackets.ToolCallsCounter(8);
+  const repaired = await task.run(recovery);
+  assert.ok(repaired.serializedRecoveryState);
+  const next = HostRecoveryState.fromString(repaired.serializedRecoveryState);
+  assert.equal(next.stepIndex, 2);
+  assert.equal(bodies, 1);
+  const result = await task.run(next);
+  assert.equal(result.finalOutput, 'The approved read completed.');
+  assert.equal(task.model.calls(), 3, 'the genuine last model step remains available');
+  assert.equal(bodies, 1, 'approved work is not repeated during checkpoint repair');
+});
+
+test('connection progress preserves pending watcher advice but discards it when its evidence changes', async t => {
+  const watcher = await import('./watcher-judge.js');
+  const keys = ['HARNESS_TOOL_BRACKETS', 'CLEMMY_WATCHER_JUDGE', 'CLEMMY_WATCHER_INTERVAL_TOOLS', 'CLEMMY_TEST_ISOLATED_HOME'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+  let checks = 0;
+  watcher._setWatcherJudgeForTests(async () => { checks++; return null; });
+  t.after(() => { watcher._setWatcherJudgeForTests(null); for (const key of keys) {
+    if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
+  } });
+  for (const variant of ['fresh', 'objective', 'plan', 'workers', 'settlements'] as const) {
+    process.env.CLEMMY_WATCHER_JUDGE = 'off';
+    const task = await connectionProgressFixture(`connection-watcher-${variant}`, [[textMsg('Current status inspected.')]]);
+    const contract = expectedWorkContracts.loadExpectedWorkContract(task.fixture.session.id, task.fixture.source.seq);
+    task.progress.watcher = { ...task.progress.watcher, checksUsed: watcher.MAX_WATCHER_CHECKS,
+      unresolvedDrift: true, pendingSteer: { onTrack: false, miss: 'Missing the requested comparison.',
+        steer: 'Include the comparison of the observed status.', reviewId: `retained-${variant}`,
+        objective: task.fixture.source.data.text as string,
+        planIdentity: contract.status === 'ok' ? contract.contract.contractId : contract.status,
+        workerProgress: watcher.summarizeWorkerProgressForWatcher(task.fixture.session.id, { sourceUserSeq: task.fixture.source.seq }),
+        toolCallCount: 1 } };
+    const pending = task.progress.watcher.pendingSteer!;
+    if (variant === 'objective') pending.objective = 'A different request.';
+    if (variant === 'plan') pending.planIdentity = 'a different plan';
+    if (variant === 'workers') pending.workerProgress = 'different child results';
+    if (variant === 'settlements') pending.toolCallCount = 0;
+    process.env.CLEMMY_WATCHER_JUDGE = 'on';
+    const result = await task.run(task.restore());
+    assert.equal(result.finalOutput, 'Current status inspected.');
+    const wire = JSON.stringify(task.model.requests[1]);
+    const events = eventlog.listEvents(task.fixture.session.id, { types: ['guardrail_tripped'] })
+      .filter(event => event.data.kind === 'trajectory_review' && event.data.reviewId === `retained-${variant}`);
+    if (variant === 'fresh') {
+      assert.match(wire, /Include the comparison of the observed status/);
+      assert.equal(events.filter(event => event.data.phase === 'delivered').length, 1);
+    } else {
+      assert.doesNotMatch(wire, /Include the comparison of the observed status/);
+      assert.equal(events.filter(event => event.data.phase === 'discarded').length, 1);
+    }
+  }
+  assert.equal(checks, 0, 'an exhausted watcher allowance is never replenished by reconnecting');
+});
+
+test('connection progress replaces an interrupted watcher only within its remaining allowance', async t => {
+  const watcher = await import('./watcher-judge.js');
+  const keys = ['HARNESS_TOOL_BRACKETS', 'CLEMMY_WATCHER_JUDGE', 'CLEMMY_WATCHER_INTERVAL_TOOLS', 'CLEMMY_TEST_ISOLATED_HOME'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+  process.env.CLEMMY_WATCHER_INTERVAL_TOOLS = '12';
+  let checks = 0;
+  watcher._setWatcherJudgeForTests(async () => { checks++; return null; });
+  t.after(() => { watcher._setWatcherJudgeForTests(null); for (const key of keys) {
+    if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
+  } });
+  for (const exhausted of [false, true]) {
+    process.env.CLEMMY_WATCHER_JUDGE = 'off';
+    const task = await connectionProgressFixture(`connection-watcher-interrupted-${exhausted}`, [[textMsg('Current status inspected.')]]);
+    task.progress.watcher.checksUsed = watcher.MAX_WATCHER_CHECKS - (exhausted ? 0 : 1);
+    task.progress.watcher.checkInFlight = true;
+    task.progress.watcher.lastCheckedAt = 1;
+    process.env.CLEMMY_WATCHER_JUDGE = 'on';
+    await task.run(task.restore());
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(checks, 1, 'one remaining check can replace the lost promise, but a spent allowance cannot');
+    const reviews = eventlog.listEvents(task.fixture.session.id, { types: ['guardrail_tripped'] })
+      .filter(event => event.data.kind === 'trajectory_review');
+    assert.equal(reviews.filter(event => event.data.phase === 'started').length, exhausted ? 0 : 1);
+    assert.equal(reviews.filter(event => event.data.phase === 'verdict').length, 0,
+      'a lost or unavailable advisory cannot become an invented successful verdict');
+  }
+});
+
+test('connection recovery rejects mixed-source progress and contradictory review state before dispatch', async t => {
+  const prior = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { if (prior === undefined) delete process.env.HARNESS_TOOL_BRACKETS; else process.env.HARNESS_TOOL_BRACKETS = prior; });
+  const task = await connectionProgressFixture('connection-progress-binding', [[textMsg('must not run')]]);
+  const wire = JSON.parse(task.restore().toString());
+  for (const alter of [
+    (value: typeof wire) => { value.connectionProgress.batch.sourceUserSeq++; },
+    (value: typeof wire) => { value.connectionProgress.batch.batchId += '-foreign'; },
+    (value: typeof wire) => { value.connectionProgress.recovery.stepIndex++; },
+    (value: typeof wire) => { value.objectiveJudgeContinuations = 1; },
+    (value: typeof wire) => { value.connectionProgress.recovery.noProgressCheckpoint = undefined; },
+    (value: typeof wire) => { value.connectionProgress.activation.toolCalls.used = -1; },
+  ]) {
+    const modified = structuredClone(wire);
+    alter(modified);
+    assert.throws(() => HostRecoveryState.fromString(JSON.stringify(modified)), /retained.*progress/);
+  }
+  const legacy = { ...wire };
+  delete legacy.connectionProgress;
+  assert.equal(HostRecoveryState.fromString(JSON.stringify(legacy)).connectionProgress, undefined);
+  task.fixture.parent.counter = new brackets.ToolCallsCounter(9);
+  await assert.rejects(() => task.run(task.restore()), /connection_progress_owner_mismatch/);
+  assert.equal(task.model.calls(), 1);
 });
 
 test('the completion judge budget survives serialized checkpoint recovery and resets only for a fresh source', async (t) => {

@@ -30,7 +30,7 @@ export function readSourceConnectionHostRecovery(input: { sessionId: string; req
   const hostState = HostRecoveryState.fromString(new HostRecoveryState(
     input.sessionId, retained.sourceUserSeq, 'continue', batch.history, [], [],
     batch.lastResponseId, undefined, state.turnEngine, state.noProgressCheckpoint,
-    state.stepIndex, progress.batch, state.objectiveJudgeContinuations, feedback,
+    state.stepIndex, progress.batch, state.objectiveJudgeContinuations, feedback, progress,
   ).toString());
   // A needs-input terminal currently closes host authority. Reporting that
   // fact is essential: inspection must never masquerade as executable state.

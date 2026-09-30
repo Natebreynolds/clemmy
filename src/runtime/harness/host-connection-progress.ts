@@ -34,6 +34,13 @@ export interface HostConnectionProgress {
     /** A pending verdict is not a completed review. Re-entry must read fresh
      * evidence, never fabricate an on-track result for the unfinished call. */
     checkInFlight: boolean;
+    /** A verdict waiting for the next model boundary must survive a pause.
+     * Its ordinary objective/plan/settlement freshness checks still apply. */
+    pendingSteer?: {
+      onTrack: boolean; miss: string; steer: string;
+      objective: string; reviewId: string; workerProgress: string;
+      toolCallCount: number; planIdentity: string;
+    };
   };
 }
 
@@ -68,6 +75,11 @@ export function assertHostConnectionProgress(value: HostConnectionProgress): voi
     || [continuations.acceptedReadPlanUsed, continuations.acceptedUniqueWorkflowUsed,
       continuations.planFinalPublishSpent, watcher.unresolvedDrift, watcher.checkInFlight]
       .some(v => typeof v !== 'boolean')) return fail();
+  const pending = watcher.pendingSteer;
+  if (pending !== undefined && (!pending || typeof pending.onTrack !== 'boolean'
+    || !natural(pending.toolCallCount)
+    || [pending.miss, pending.steer, pending.objective, pending.reviewId, pending.workerProgress, pending.planIdentity]
+      .some(v => typeof v !== 'string'))) return fail();
 }
 
 export function bindHostConnectionProgress(agent: object, value: HostConnectionProgress): void {

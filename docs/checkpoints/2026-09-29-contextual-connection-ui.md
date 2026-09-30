@@ -402,3 +402,93 @@ work, not claims that the whole experience has shipped.
 | Long tasks and learning | Concise progress and completion receipts with expandable evidence, account/model identity, and cost | Full task continuity and total-token accounting survive compaction and device handoff |
 
 Keep each UI slice attached to a real state transition and its recovery path. Avoid another collection of status cards that cannot explain or control the underlying task.
+
+## Retained execution progress now governs host re-entry — September 30
+
+This slice connects the retained connection checkpoint to the ordinary host
+runner's allowances. It does **not** enable automatic reviewed Execute after
+connection setup, reopen a closed root, create an execution claim or satisfy
+a missing capability from account verification. The UI still keeps that
+continuation unavailable until the remaining ownership path is implemented.
+
+When the runner consumes a retained checkpoint, it now restores the original
+model-step ceiling, spent tool calls, retry/continuation allowances, watcher
+spending and pending advice. Tool counts restore monotonically. A larger
+caller limit cannot replenish the retained allowance, and an incompatible
+tool-counter limit is rejected before dispatch. The source's captured
+completion policy remains authoritative; a caller's later review switch does
+not replace it. Recovery and approval states carry current progress through
+subsequent pauses, including cumulative active elapsed time. Paused time is
+not charged as active execution.
+
+Pending watcher advice keeps the existing objective, plan, child-progress and
+settled-work freshness checks. A process-local unfinished review cannot be
+restored as a successful verdict; one replacement may start only if its
+original check allowance permits it. No extra model call is needed to restore
+this state, and this metadata is not appended to the brain's conversation.
+
+Three recovery traps were found and pinned while implementing the restoration:
+
+- Finalizing a saved model frame incremented its already-advanced step cursor
+  again. An approval-result checkpoint failure did the same before any new
+  model response. Both now preserve the existing next-step cursor, leaving a
+  genuinely unused last model step available.
+- An admission hold has no new accepted batch reference. A second failed
+  admission must keep the prior accepted batch as the owner of spent progress,
+  rather than silently dropping the record and resuming with fresh defaults.
+- Duplicate metadata cannot disagree across the host state and its progress
+  record: source, accepted batch, engine, cursor, completion-review count,
+  no-progress checkpoint and review feedback must match. Unknown legacy
+  progress is not fabricated.
+
+Recording-host pins exercise real local reads, checkpoint write failures,
+approval before execution, exact result recovery and unchanged body counts.
+They also cover exhausted model/tool/stall allowances, subsequent checkpoint
+spending, retained review settings, fresh versus stale watcher advice, an
+interrupted watcher at/below its ceiling, and mixed-source rejection. The
+final surrounding regression run passed **496/496 tests** across
+`host-turn-runner.test.ts`, `brackets.test.ts`,
+`accepted-model-batch-checkpoint.test.ts` and
+`source-connection-checkpoints.integration.test.ts`. Runtime TypeScript passed
+and `git diff --check` was clean. Read-only review found the approval cursor
+issue above, and found no further concrete defect after correction. Logs are
+`/tmp/clem-connection-resume-regression-final.txt` and
+`/tmp/clem-connection-resume-progress-tsc.txt`.
+
+These are deterministic regression checks, not live-home acceptance. The
+runner's live-home sentinel was **NOT PERFORMED** while daemon 35630 owned the
+changing stores (it observed changing secret metadata and capability identity).
+The daemon was not stopped, and no isolation proof or installed-app pass is
+claimed. No UI code changed in this runtime slice; the account-display browser
+checks remain the separately recorded checks above.
+
+Remaining work, in dependency order:
+
+1. Retain open execution authority only when the terminal transaction has
+   validated the exact connection checkpoint. Do not reopen historical closed
+   roots. Make terminal replay validate the durable pause/activation chain and
+   close the original execution root atomically at final delivery.
+2. Extend the existing recovery-activation owner with a distinct connection
+   variant, binding checkpoint, original execution claim, verified account and
+   accepted control receipt. Carry that identity through cancellation,
+   retirement, restart recovery and delivery-to-execution source mapping.
+3. Rebuild the original agent/project/model/tool context and revalidate current
+   capability/account authority. Recheck Stop, source, account and lease after
+   asynchronous preparation and before installing canonical recovery under the
+   new delivery owner. Avoid the fresh Execute admission and fresh approval
+   budget paths.
+4. Complete source-level token/outer-window accounting and the same-root
+   capability-discovery path; the saved host elapsed scalar is not by itself
+   full wall/token-budget enforcement. Fresh callable attestation, rather than
+   connection verification, retires the capability dependency.
+5. Enable the desktop/mobile continuation only after those paths pass their
+   controlled integration checks, then combine with the other agent's current
+   candidate and qualify in the installed app/live home. Verify Stop,
+   repeated clicks, account changes, process/device handoff, approval and no
+   replay of completed writes.
+
+The other agent's `claude/shell-anywhere` worktree was rechecked clean at
+`5fc52bf4b`. Its newer installation has not been replaced. This series remains
+on `codex/contextual-connection-ui`; no merge, paid model test, provider write,
+hotpatch or tag occurred in this slice. Full installed identity and live
+acceptance remain owed, as do matched latency/token measurements.

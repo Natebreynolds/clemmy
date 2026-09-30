@@ -307,10 +307,18 @@ export function assertNotKilled(sessionId: string, target?: KillRequestTarget): 
 export class ToolCallsCounter {
   private count = 0;
 
-  constructor(public readonly limit: number) {
+  constructor(public readonly limit: number, consumed = 0) {
     if (limit < 1) {
       throw new Error(`ToolCallsCounter limit must be >= 1, got ${limit}`);
     }
+    this.retainConsumed(consumed);
+  }
+
+  /** A checkpoint can restore spending, never replenish it. Counts above the
+   * limit remain exhausted (the legacy increment can record that crossing). */
+  retainConsumed(consumed: number): void {
+    if (!Number.isSafeInteger(consumed) || consumed < 0) throw new Error('Invalid consumed tool-call count');
+    this.count = Math.max(this.count, consumed);
   }
 
   /** Tool calls made so far this runTurn (read-only). */

@@ -692,6 +692,22 @@ test('ToolCallsCounter.reset clears the per-turn count', () => {
   assert.throws(() => c.increment(), ToolCallsLimitExceeded);
 });
 
+test('ToolCallsCounter restores spending monotonically without refreshing an exhausted allowance', () => {
+  const counter = new ToolCallsCounter(3, 2);
+  counter.retainConsumed(1);
+  assert.equal(counter.currentCount, 2);
+  counter.increment();
+  assert.equal(counter.willExceed(), true);
+  counter.retainConsumed(0);
+  assert.equal(counter.willExceed(), true);
+  const crossed = new ToolCallsCounter(3, 4);
+  assert.equal(crossed.willExceed(), true, 'legacy over-limit counts stay exhausted');
+  for (const invalid of [-1, 0.5, NaN, Infinity]) {
+    assert.throws(() => counter.retainConsumed(invalid), /Invalid consumed/);
+    assert.throws(() => new ToolCallsCounter(3, invalid), /Invalid consumed/);
+  }
+});
+
 test('ToolCallsCounter rejects an invalid limit', () => {
   assert.throws(() => new ToolCallsCounter(0));
   assert.throws(() => new ToolCallsCounter(-1));

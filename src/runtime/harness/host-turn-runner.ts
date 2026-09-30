@@ -1,5 +1,5 @@
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
-import { bindHostConnectionProgress, clearHostConnectionProgress } from './host-connection-progress.js';
+import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { responseFormatRepairPacket } from './response-format-repair.js';
 import { verifiedMemoryIntakeContext, verifiedMemoryConsolidationEvidence } from './durable-memory-intake-receipt.js';
@@ -60,6 +60,7 @@ import { parseModelToolArgumentObject } from './model-tool-argument-json.js';
  * the conversation owner persists that resumable state.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { withPlanCompletionReview, planReviewDigest, type PlanReviewCandidate } from './plan-publication-review.js';
 import {
   GuardrailExecutionError,
@@ -1850,6 +1851,32 @@ function hostCompletionReviewFeedbackContext(feedback: HostCompletionReviewFeedb
 
 type HostRecoveryPhase = 'admit' | 'finalize' | 'continue';
 
+function parseConnectionProgress(raw: unknown, expected: {
+  sessionId?: string; sourceUserSeq?: number; turnEngine: HostTurnEngineMode;
+  stepIndex?: number; ref?: AcceptedModelBatchRef;
+  objectiveJudgeContinuations: number;
+  noProgressCheckpoint?: HostNoProgressCheckpoint;
+  completionReviewFeedback?: HostCompletionReviewFeedback;
+}): HostConnectionProgress | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw as HostConnectionProgress;
+  assertHostConnectionProgress(value);
+  if (value.recovery.turnEngine !== expected.turnEngine
+    || (expected.sessionId !== undefined && value.batch.sessionId !== expected.sessionId)
+    || (expected.sourceUserSeq !== undefined && value.batch.sourceUserSeq !== expected.sourceUserSeq)
+    || (expected.stepIndex !== undefined && value.recovery.stepIndex !== expected.stepIndex)
+    || value.recovery.objectiveJudgeContinuations !== expected.objectiveJudgeContinuations
+    || !isDeepStrictEqual(value.recovery.noProgressCheckpoint, expected.noProgressCheckpoint)
+    || !isDeepStrictEqual(value.recovery.completionReviewFeedback, expected.completionReviewFeedback)
+    || (expected.ref && (['sessionId', 'sourceUserSeq', 'acceptedTaskId', 'batchOrdinal', 'batchId', 'authorityDigest'] as const)
+      .some(key => value.batch[key] !== expected.ref![key]))
+    || (!expected.sessionId && !expected.ref)) {
+    throw new Error('The retained connection progress does not match its host checkpoint.');
+  }
+  return JSON.parse(JSON.stringify(value)) as HostConnectionProgress;
+}
+
+
 function parseHostObjectiveJudgeContinuations(value: unknown): number {
   if (value === undefined) return 0;
   if (typeof value !== 'number' || !Number.isSafeInteger(value)
@@ -1883,6 +1910,7 @@ export class HostRecoveryState {
     public readonly acceptedModelBatchRef?: AcceptedModelBatchRef,
     public readonly objectiveJudgeContinuations: number = 0,
     public readonly completionReviewFeedback?: HostCompletionReviewFeedback,
+    public readonly connectionProgress?: HostConnectionProgress,
   ) {}
 
   static isHostState(blob: string): boolean {
@@ -1989,6 +2017,10 @@ export class HostRecoveryState {
       ref,
       parseHostObjectiveJudgeContinuations(parsed.objectiveJudgeContinuations),
       parseHostCompletionReviewFeedback(parsed.completionReviewFeedback),
+      parseConnectionProgress(parsed.connectionProgress, { sessionId, sourceUserSeq, turnEngine, stepIndex, ref,
+        objectiveJudgeContinuations: parseHostObjectiveJudgeContinuations(parsed.objectiveJudgeContinuations),
+        noProgressCheckpoint: parseHostNoProgressCheckpoint(parsed.noProgressCheckpoint, history.length),
+        completionReviewFeedback: parseHostCompletionReviewFeedback(parsed.completionReviewFeedback) }),
     );
   }
 
@@ -2010,6 +2042,7 @@ export class HostRecoveryState {
       stepIndex: this.stepIndex,
       objectiveJudgeContinuations: this.objectiveJudgeContinuations,
       ...(this.completionReviewFeedback ? { completionReviewFeedback: this.completionReviewFeedback } : {}),
+      ...(this.connectionProgress ? { connectionProgress: this.connectionProgress } : {}),
       ...(this.acceptedModelBatchRef
         ? { acceptedModelBatchRef: this.acceptedModelBatchRef }
         : {}),
@@ -2047,6 +2080,7 @@ export class HostInterruptState {
     public readonly completionReviewFeedback?: HostCompletionReviewFeedback,
     /** V7 preserves old unkeyed native cards while keying newly created pauses. */
     public readonly nativeApprovalKeys: boolean = true,
+    public readonly connectionProgress?: HostConnectionProgress,
   ) {
     // At construction a pending call's bytes ARE the bytes the pause admitted:
     // the pause loop builds rawItem from its admitted arguments, and a pre-V6
@@ -2071,6 +2105,7 @@ export class HostInterruptState {
       objectiveJudgeContinuations?: unknown;
       completionReviewFeedback?: unknown;
       nativeApprovalKeys?: unknown;
+      connectionProgress?: unknown;
     };
     const version = parsed[HOST_STATE_KEY];
     if (
@@ -2140,6 +2175,11 @@ export class HostInterruptState {
       version < 7 ? false : typeof parsed.nativeApprovalKeys === 'boolean'
         ? parsed.nativeApprovalKeys
         : (() => { throw new Error('paused host state has no native approval identity mode'); })(),
+      parseConnectionProgress(parsed.connectionProgress, { turnEngine,
+        ref: version >= 5 ? parseAcceptedModelBatchRef(parsed.acceptedModelBatchRef) : undefined,
+        objectiveJudgeContinuations: parseHostObjectiveJudgeContinuations(parsed.objectiveJudgeContinuations),
+        noProgressCheckpoint: version >= 4 ? parseHostNoProgressCheckpoint(parsed.noProgressCheckpoint, (parsed.history ?? []).length) : undefined,
+        completionReviewFeedback: parseHostCompletionReviewFeedback(parsed.completionReviewFeedback) }),
     );
   }
 
@@ -2152,6 +2192,7 @@ export class HostInterruptState {
       turnEngine: this.turnEngine,
       objectiveJudgeContinuations: this.objectiveJudgeContinuations,
       ...(this.completionReviewFeedback ? { completionReviewFeedback: this.completionReviewFeedback } : {}),
+      ...(this.connectionProgress ? { connectionProgress: this.connectionProgress } : {}),
       ...(this.lastResponseId !== undefined ? { lastResponseId: this.lastResponseId } : {}),
       ...(this.noProgressCheckpoint
         ? { noProgressCheckpoint: this.noProgressCheckpoint }
@@ -2860,6 +2901,15 @@ function priorZeroCrossingRefusalCounts(
 const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   clearHostConnectionProgress(agent);
   const connectionActivationStartedAt = Date.now();
+  const carriedProgress = itemsOrState instanceof HostRecoveryState || itemsOrState instanceof HostInterruptState
+    ? parseConnectionProgress(itemsOrState.connectionProgress, {
+      ...(itemsOrState instanceof HostRecoveryState ? { sessionId: itemsOrState.sessionId,
+        sourceUserSeq: itemsOrState.sourceUserSeq, stepIndex: itemsOrState.stepIndex } : {}),
+      turnEngine: itemsOrState.turnEngine, ref: itemsOrState.acceptedModelBatchRef,
+      objectiveJudgeContinuations: itemsOrState.objectiveJudgeContinuations,
+      noProgressCheckpoint: itemsOrState.noProgressCheckpoint,
+      completionReviewFeedback: itemsOrState.completionReviewFeedback,
+    }) : undefined;
   const emitter = runner as unknown as EmitterLike;
   const contextValue = (opts as { context?: unknown }).context ?? {};
   const runContext = new RunContext(contextValue as never);
@@ -3062,7 +3112,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     localArgumentPreparations.get(`${tool?.name ?? ''}\0${raw}`) ?? materializedToolArgumentsJson(tool, raw)
   );
   const hostJudgeCompletion = hostProduction
-    && (opts as { hostJudgeCompletion?: unknown }).hostJudgeCompletion === true;
+    && (carriedProgress?.activation.judgeCompletion ?? (opts as { hostJudgeCompletion?: unknown }).hostJudgeCompletion === true);
   const configuredHostApprovalId = (opts as { hostApprovalId?: unknown }).hostApprovalId;
   const configuredHostApprovalIds = (opts as { hostApprovalIds?: unknown }).hostApprovalIds;
   const hostApprovalIds = new Set<string>();
@@ -3081,9 +3131,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     && configuredPreviousResponseId.trim()
     ? configuredPreviousResponseId
     : undefined;
-  const maxTurns = Number((opts as { maxTurns?: unknown }).maxTurns) > 0
+  const maxTurns = carriedProgress?.activation.maxTurns ?? (Number((opts as { maxTurns?: unknown }).maxTurns) > 0
     ? Number((opts as { maxTurns?: unknown }).maxTurns)
-    : 20;
+    : 20);
   const configuredToolConcurrency = Number((opts as {
     toolExecution?: { maxFunctionToolConcurrency?: unknown };
   }).toolExecution?.maxFunctionToolConcurrency);
@@ -3615,6 +3665,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       || resumedRecoveryState.sourceUserSeq !== identity.sourceUserSeq
     ) throw new HostCallAuthorityBoundaryError('checkpoint_recovery_source_mismatch');
   }
+  if (carriedProgress) {
+    const identity = exactHostIdentity();
+    const counter = harnessRunContextStorage.getStore()!.counter;
+    if (carriedProgress.batch.sessionId !== identity.sessionId
+      || carriedProgress.batch.sourceUserSeq !== identity.sourceUserSeq
+      || counter.limit !== carriedProgress.activation.toolCalls.limit) {
+      throw new HostCallAuthorityBoundaryError('connection_progress_owner_mismatch');
+    }
+    counter.retainConsumed(carriedProgress.activation.toolCalls.used);
+  }
   const zeroCrossingRefusalCounts = priorZeroCrossingRefusalCounts(history);
   const retiredZeroCrossingFrames = new Set(
     [...zeroCrossingRefusalCounts.entries()]
@@ -3624,29 +3684,32 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // A successful plan_task followed by prose is not a completed host turn.
   // Give the already-bound read carrier one deterministic model step before
   // terminal reduction; a second stop is handled by the delivery hold floor.
-  let acceptedReadPlanContinuationUsed = false;
-  let acceptedUniqueWorkflowContinuationUsed = false;
-  let workflowStepResultContinuationsUsed = 0;
-  let continueMarkerContinuationsUsed = 0;
+  let acceptedReadPlanContinuationUsed = carriedProgress?.continuations.acceptedReadPlanUsed ?? false;
+  let acceptedUniqueWorkflowContinuationUsed = carriedProgress?.continuations.acceptedUniqueWorkflowUsed ?? false;
+  let workflowStepResultContinuationsUsed = carriedProgress?.continuations.workflowStepResultUsed ?? 0;
+  let continueMarkerContinuationsUsed = carriedProgress?.continuations.continueMarkerUsed ?? 0;
   let pendingHostModelDirective: string | undefined;
   // TRAJECTORY WATCHER state (host_v1). Budgets are the shared watcher-judge
   // constants so this mount cannot outspend the legacy one.
   const hostWatcherEnabled = watcherJudgeEnabled() && !conversationalCheckInSurface();
   const hostWatcherIntervalTools = watcherCheckIntervalTools();
   const hostWatcherHistoryStart = history.length;
-  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string; toolCallCount: number; planIdentity: string }) | null } = { pending: null };
-  let hostWatcherChecksUsed = 0;
-  let hostWatcherInjectionsUsed = 0;
+  const hostWatcherSteer: { pending: (WatcherVerdict & { objective: string; reviewId: string; workerProgress: string; toolCallCount: number; planIdentity: string }) | null } = { pending: carriedProgress?.watcher.pendingSteer ?? null };
+  let hostWatcherChecksUsed = carriedProgress?.watcher.checksUsed ?? 0;
+  let hostWatcherInjectionsUsed = carriedProgress?.watcher.injectionsUsed ?? 0;
   /** A drift verdict is outstanding. Keeps the watcher WATCHING after it has
    *  spent its right to speak — see shouldStartWatcherCheck. Cleared by the
    *  next on_track. */
-  let hostWatcherUnresolvedDrift = false;
+  let hostWatcherUnresolvedDrift = carriedProgress?.watcher.unresolvedDrift ?? false;
   /** Steers the model actually RECEIVED. An injected-but-undelivered steer was
    *  never seen, so it is not a warning anyone ignored. */
-  let hostWatcherDeliveredSteers = 0;
-  let hostWatcherLastCheckedAt = 0;
+  let hostWatcherDeliveredSteers = carriedProgress?.watcher.deliveredSteers ?? 0;
+  let hostWatcherLastCheckedAt = carriedProgress?.watcher.lastCheckedAt ?? 0;
+  // A process-local promise cannot survive a pause/restart. Keep its spent
+  // check and request fresh advisory evidence; never invent an on-track result.
   let hostWatcherCheckInFlight = false;
-  let hostWatcherLastFailureSeq = 0;
+  let recoveredWatcherNeedsCheck = carriedProgress?.watcher.checkInFlight ?? false;
+  let hostWatcherLastFailureSeq = carriedProgress?.watcher.lastFailureSeq ?? 0;
   const latestWatcherFailure = () => {
     const identity = exactHostIdentity();
     const failed = openEventLog().prepare(`SELECT s.rowid AS seq, s.logical_tool_call_id AS callId,
@@ -3839,7 +3902,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   /** Business-call count at the last negative verdict that armed a
    *  continuation, so a continuation that added no evidence is recognisable
    *  before a second identical verdict is bought. */
-  let judgedBusinessCallsAtLastVerdict: number | undefined;
+  let judgedBusinessCallsAtLastVerdict: number | undefined = carriedProgress?.continuations.judgedBusinessCallsAtLastVerdict;
   let pendingResponseFormatRepair: { objective: string; instructions: string; text: string } | undefined;
   /** Set by the review when the answer ships without the claims it flagged. */
   let reviewedReplacementText: string | undefined;
@@ -3871,7 +3934,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   /** A Plan turn whose governor has exhausted gets ONE publish-only step
    *  before it stops (see the terminalize branch); this records that it was
    *  spent so the second exhaustion stops for real. */
-  let planFinalPublishStepSpent = false;
+  let planFinalPublishStepSpent = carriedProgress?.continuations.planFinalPublishSpent ?? false;
   let planFinalPublishStep = false;
   let noProgressRecoveryDirectiveWritten =
     resumedNoProgressCheckpoint?.recoveryDirectiveWritten ?? false;
@@ -3894,50 +3957,54 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // reports the identity this host last ACCEPTED. Only an admitted response
   // may replace it; a rejected one leaves it exactly as it was.
   let lastResponseId: string | undefined = resumedResponseId ?? hostPreviousResponseId;
-  let latestAcceptedModelBatchRef = resumedAcceptedModelBatchRef;
-  let currentHostStepIndex = resumedRecoveryState?.stepIndex ?? 0;
-  let remainingModelStallRetries = modelStreamStallRetries();
+  // An admission hold has no new batch ref yet. Its retained prior batch still
+  // owns the spent progress if admission needs another checkpoint-only retry.
+  let latestAcceptedModelBatchRef = resumedAcceptedModelBatchRef ?? carriedProgress?.batch;
+  let currentHostStepIndex = resumedRecoveryState?.stepIndex ?? carriedProgress?.recovery.stepIndex ?? 0;
+  let remainingModelStallRetries = carriedProgress?.continuations.modelStallRetriesRemaining ?? modelStreamStallRetries();
+  const connectionProgressSnapshot = (stepIndex = currentHostStepIndex + 1,
+    batch = latestAcceptedModelBatchRef): HostConnectionProgress | undefined => {
+    if (!hostProduction || !batch || conversationalCheckInSurface()) return undefined;
+    const identity = exactHostIdentity();
+    if (!carriedProgress && !acceptedPlanExecution(identity.sessionId, identity.sourceUserSeq)) return undefined;
+    const counter = harnessRunContextStorage.getStore()!.counter;
+    return {
+      version: 1, batch,
+      recovery: { turnEngine: hostTurnEngine ?? 'host_v1', stepIndex,
+        noProgressCheckpoint: currentNoProgressCheckpoint(), objectiveJudgeContinuations, completionReviewFeedback },
+      activation: {
+        maxTurns, toolCalls: { used: counter.currentCount, limit: counter.limit },
+        elapsedMs: (carriedProgress?.activation.elapsedMs ?? 0) + Math.max(0, Date.now() - connectionActivationStartedAt),
+        judgeCompletion: hostJudgeCompletion,
+      },
+      continuations: {
+        acceptedReadPlanUsed: acceptedReadPlanContinuationUsed,
+        acceptedUniqueWorkflowUsed: acceptedUniqueWorkflowContinuationUsed,
+        workflowStepResultUsed: workflowStepResultContinuationsUsed,
+        continueMarkerUsed: continueMarkerContinuationsUsed, planFinalPublishSpent: planFinalPublishStepSpent,
+        modelStallRetriesRemaining: remainingModelStallRetries,
+        ...(judgedBusinessCallsAtLastVerdict !== undefined ? { judgedBusinessCallsAtLastVerdict } : {}),
+      },
+      watcher: {
+        checksUsed: hostWatcherChecksUsed, injectionsUsed: hostWatcherInjectionsUsed,
+        deliveredSteers: hostWatcherDeliveredSteers, unresolvedDrift: hostWatcherUnresolvedDrift,
+        lastCheckedAt: hostWatcherLastCheckedAt, lastFailureSeq: hostWatcherLastFailureSeq,
+        checkInFlight: hostWatcherCheckInFlight || recoveredWatcherNeedsCheck,
+        ...(hostWatcherSteer.pending ? { pendingSteer: {
+          onTrack: hostWatcherSteer.pending.onTrack, miss: hostWatcherSteer.pending.miss, steer: hostWatcherSteer.pending.steer,
+          objective: hostWatcherSteer.pending.objective, reviewId: hostWatcherSteer.pending.reviewId,
+          workerProgress: hostWatcherSteer.pending.workerProgress, toolCallCount: hostWatcherSteer.pending.toolCallCount,
+          planIdentity: hostWatcherSteer.pending.planIdentity,
+        } } : {}),
+      },
+    };
+  };
   const retainConnectionProgress = (): void => {
     try {
-      // Only reviewed execution needs this private resume prerequisite. Normal
-      // answers acquire no durable record or extra model/context work.
-      if (!hostProduction || !latestAcceptedModelBatchRef || conversationalCheckInSurface()) return;
-      const identity = exactHostIdentity();
-      if (!acceptedPlanExecution(identity.sessionId, identity.sourceUserSeq)) return;
-      const counter = harnessRunContextStorage.getStore()!.counter;
-      bindHostConnectionProgress(agent, {
-        version: 1,
-        batch: latestAcceptedModelBatchRef,
-        recovery: {
-          turnEngine: hostTurnEngine ?? 'host_v1', stepIndex: currentHostStepIndex + 1,
-          noProgressCheckpoint: currentNoProgressCheckpoint(), objectiveJudgeContinuations,
-          completionReviewFeedback,
-        },
-        activation: {
-          maxTurns, toolCalls: { used: counter.currentCount, limit: counter.limit },
-          elapsedMs: Math.max(0, Date.now() - connectionActivationStartedAt),
-          judgeCompletion: (opts as { hostJudgeCompletion?: unknown }).hostJudgeCompletion === true,
-        },
-        continuations: {
-          acceptedReadPlanUsed: acceptedReadPlanContinuationUsed,
-          acceptedUniqueWorkflowUsed: acceptedUniqueWorkflowContinuationUsed,
-          workflowStepResultUsed: workflowStepResultContinuationsUsed,
-          continueMarkerUsed: continueMarkerContinuationsUsed,
-          planFinalPublishSpent: planFinalPublishStepSpent,
-          modelStallRetriesRemaining: remainingModelStallRetries,
-          ...(judgedBusinessCallsAtLastVerdict !== undefined ? { judgedBusinessCallsAtLastVerdict } : {}),
-        },
-        watcher: {
-          checksUsed: hostWatcherChecksUsed, injectionsUsed: hostWatcherInjectionsUsed,
-          deliveredSteers: hostWatcherDeliveredSteers, unresolvedDrift: hostWatcherUnresolvedDrift,
-          lastCheckedAt: hostWatcherLastCheckedAt, lastFailureSeq: hostWatcherLastFailureSeq,
-          checkInFlight: hostWatcherCheckInFlight,
-        },
-      });
+      const snapshot = connectionProgressSnapshot();
+      if (snapshot) bindHostConnectionProgress(agent, snapshot);
     } catch (error) {
       clearHostConnectionProgress(agent);
-      // Optional recovery retention cannot turn a valid public pause into a
-      // failed turn. Missing proof keeps automatic Execute continuation off.
       hostTurnLogger.warn({ error: error instanceof Error ? error.message : 'unknown' },
         'connection progress could not be retained');
     }
@@ -4638,6 +4705,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       input.acceptedModelBatchRef,
       objectiveJudgeContinuations,
       completionReviewFeedback,
+      carriedProgress ? connectionProgressSnapshot(input.stepIndexOverride
+        ?? (input.phase === 'finalize' ? currentHostStepIndex + 1 : currentHostStepIndex),
+        input.acceptedModelBatchRef ?? latestAcceptedModelBatchRef) : undefined,
     );
     hostTurnLogger.error({
       reason: input.reason,
@@ -4658,6 +4728,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   const recoveryContinuationOutcome = (
     ref: AcceptedModelBatchRef | undefined,
     reason: string,
+    nextStepIndex = currentHostStepIndex + 1,
   ): RunOutcome => {
     if (!ref) {
       throw new HostCallAuthorityBoundaryError('checkpoint_recovery_batch_ref_missing');
@@ -4674,10 +4745,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       undefined,
       hostTurnEngine ?? 'host_v1',
       currentNoProgressCheckpoint(),
-      currentHostStepIndex + 1,
+      nextStepIndex,
       ref,
       objectiveJudgeContinuations,
       completionReviewFeedback,
+      carriedProgress ? connectionProgressSnapshot(nextStepIndex, ref) : undefined,
     );
     hostTurnLogger.info({
       reason,
@@ -4735,6 +4807,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         ref,
         objectiveJudgeContinuations,
         completionReviewFeedback,
+        itemsOrState instanceof HostInterruptState ? itemsOrState.nativeApprovalKeys : true,
+        carriedProgress ? connectionProgressSnapshot(currentHostStepIndex, ref) : undefined,
       ).toString(),
     } satisfies RunOutcome;
   };
@@ -7878,6 +7952,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         resultItems,
         responseId: resumedResponseId,
         acceptedModelBatchRef: acceptedFrame.ref,
+        // An approval resumed its existing frame; no model step ran here.
+        stepIndexOverride: currentHostStepIndex,
         reason: committed.reason,
       });
     }
@@ -8352,7 +8428,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         reason: 'reason' in reopened ? reopened.reason : 'accepted batch reopen unavailable',
       });
     }
-    return recoveryContinuationOutcome(ref, 'accepted_result_checkpoint_recovered');
+    // Finalize state already points beyond the model frame it is persisting.
+    // Bookkeeping must not spend another model step.
+    return recoveryContinuationOutcome(ref, 'accepted_result_checkpoint_recovered', currentHostStepIndex);
   }
 
   // Resume: settle the user's decisions FIRST — the approved tool executes
@@ -8587,6 +8665,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         resumedAcceptedFrame.ref,
         objectiveJudgeContinuations,
         completionReviewFeedback,
+        itemsOrState instanceof HostInterruptState ? itemsOrState.nativeApprovalKeys : true,
+        carriedProgress ? connectionProgressSnapshot(currentHostStepIndex, resumedAcceptedFrame.ref) : undefined,
       ).toString(),
     } satisfies RunOutcome;
   }
@@ -9065,8 +9145,9 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       const gate = hostWatcherGate(watcherToolCalls);
       // A new concrete failure is a useful review boundary. Waiting for the
       // ordinary call cadence let Plan exhaust its repairs before review began.
-      if (shouldStartWatcherCheck(failure && failure.seq > hostWatcherLastFailureSeq
+      if (shouldStartWatcherCheck(recoveredWatcherNeedsCheck || (failure && failure.seq > hostWatcherLastFailureSeq)
         ? rearmedWatcherCadence(gate) : gate)) {
+        recoveredWatcherNeedsCheck = false;
         hostWatcherLastFailureSeq = failure?.seq ?? hostWatcherLastFailureSeq;
         startHostWatcherCheck(watcherToolCalls);
       }
@@ -10871,6 +10952,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         acceptedFrame.ref,
         objectiveJudgeContinuations,
         completionReviewFeedback,
+        true,
+        carriedProgress ? connectionProgressSnapshot(currentHostStepIndex + 1, acceptedFrame.ref) : undefined,
       );
       // The card names what its ids refer to, from this conversation's own
       // results; bounded, display-only, and absent when Jev is not sure.
