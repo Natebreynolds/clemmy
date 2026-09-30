@@ -23,6 +23,7 @@ const catalogs = await import('../runtime/harness/host-capability-catalog-factor
 const observations = await import('../runtime/harness/independent-capability-observation.js');
 const ports = await import('../runtime/harness/production-capability-ports.js');
 const manifestStores = await import('../runtime/harness/capability-manifest-store.js');
+const readAuthority = await import('../spaces/space-read-authority.js');
 
 type Handler = (args: Record<string, unknown>) => unknown | Promise<unknown>;
 const tools: Record<string, Handler> = {};
@@ -44,6 +45,7 @@ function checked(result: unknown) {
 }
 
 after(() => {
+  readAuthority._setExactSpaceReadCatalogPreparerForTests(null);
   catalogs.installHostCapabilityCatalogFactory(null);
   manifestStores.installCapabilityManifestStore(null);
   observations.clearIndependentCapabilityObservations(); ports.clearProductionCapabilityPorts();
@@ -168,15 +170,18 @@ test('actual contained local-runner smoke issues a truthful paused snapshot rece
   assert.equal(checked(waiting).manifest.status, 'active');
   assert.match(text(waiting), /waiting for your one-time approval/);
   const approvals = await import('../runtime/harness/approval-registry.js');
-  const pending = approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' });
+  // The saved source runs as a Workspace script; its consent card belongs to that scope.
+  const pending = approvals.listPending({ sessionId: `workspace-script:${slug}`, status: 'pending' });
   assert.equal(pending.length, 1);
   eventlog.openEventLog().prepare(`UPDATE pending_approvals SET status='resolved', resolution='approved', resolver=?, resolved_at=? WHERE approval_id=? AND status='pending'`)
     .run('isolated-space-receipt-fixture', new Date().toISOString(), pending[0]!.approvalId);
   const result = await tools.space_save(args);
   const saved = checked(result);
   assert.equal(saved.manifest.status, 'paused');
-  assert.match(text(result), /no shared durable call authority/);
-  assert.doesNotMatch(text(result), /Data refreshed:/);
+  // A fixture-resolved card carries no crossing the executor can honor: the
+  // refresh is held and says so; the runner body never starts.
+  assert.match(text(result), /This saved refresh is held|no shared durable call authority/);
+  assert.doesNotMatch(text(result), /RUNNER MUST NOT EXECUTE|Data refreshed:/);
   assert.ok(workspaceDb.listWorkspaceDatasetObservations(slug, { limit: 10 }).some((row) => row.status === 'error'));
 });
 
@@ -234,6 +239,20 @@ function installReadCapability(operationId: string): { portBodies: () => number 
     ?? catalogs.createHostCapabilityCatalogFactory();
   factory.register(entry);
   catalogs.installHostCapabilityCatalogFactory(factory);
+  // A saved source is prepared exactly before its read is judged. This fixture
+  // is already warm (durable manifest + independent observation + port), so
+  // the preparer answers from the catalog it has instead of provisioning.
+  readAuthority._setExactSpaceReadCatalogPreparerForTests(async (input) => {
+    const ids = input.allowedTools.map((id) => id.trim().toUpperCase());
+    const rows = ids.map((id) => factory.snapshot().find((row) => row.toolName === id)).filter((row) => row !== undefined);
+    if (rows.length !== ids.length) return { status: 'none' };
+    return {
+      status: 'ready',
+      manifestIds: rows.map((row) => row.manifest.manifestId),
+      operationIds: rows.map((row) => row.manifest.operationId),
+      catalogIdentities: [],
+    };
+  });
   assert.equal(observations.registerIndependentCapabilityObservation({
     operationId: exactManifest.operationId,
     accountId: exactManifest.accountId,

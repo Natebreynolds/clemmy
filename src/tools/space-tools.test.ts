@@ -585,7 +585,7 @@ test('space_save preserves an installed runner source and holds its smoke for pi
   assert.equal(store.spaceStore.get(slug)?.status, 'active', 'migration wait is not a broken build');
   assert.equal(store.spaceStore.get(slug)?.dataSources[0]?.runner, 'pull.mjs');
   assert.equal(
-    approvals.listPending({ sessionId: `space-${slug}`, status: 'pending' }).length,
+    approvals.listPending({ sessionId: `workspace-script:${slug}`, status: 'pending' }).length,
     1,
   );
 
