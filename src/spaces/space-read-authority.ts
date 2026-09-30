@@ -23,6 +23,7 @@ import {
 } from '../execution/workflow-step-external-catalog.js';
 import { workspaceComposioIsProvablyReadOnly } from './space-execution-policy.js';
 import type { SpaceSharedDurableComposioAuthority } from './runner.js';
+import { beginSpaceReadPreparation, readSpaceReadPreparation, type SpaceReadPreparationSource } from './read-preparation-source.js';
 
 /** Identity charset accepted by the durable activation tables. */
 const EXACT_WORKFLOW_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
@@ -81,17 +82,19 @@ export async function ensureWorkspaceReadClassification(
   toolSlug: string,
   dependencies: WorkflowStepExternalCatalogDependencies = {},
   accountId?: string,
+  acceptedSource?: SpaceReadPreparationSource,
 ): Promise<EnsureWorkspaceReadClassificationResult> {
   const operationId = toolSlug.trim().toUpperCase();
   if (!operationId) return { ok: false, operationId, error: 'workspace read operation is blank' };
   // A warm operation can belong to a different account. Prepare the exact
   // saved account even when another account already supplied a read entry.
-  if (!accountId && workspaceComposioIsProvablyReadOnly(operationId)) return { ok: true, operationId };
+  if (!acceptedSource && !accountId && workspaceComposioIsProvablyReadOnly(operationId)) return { ok: true, operationId };
   let prepared: Awaited<ReturnType<typeof prepareWorkflowStepExternalCatalog>>;
   try {
     prepared = await exactSpaceReadCatalogPreparer({
       immutablePrompt: accountId ?? '',
       allowedTools: [operationId],
+      ...(acceptedSource ? { acceptedSource } : {}),
     }, dependencies);
   } catch (error) {
     return {
@@ -149,9 +152,16 @@ export async function prepareAndAcquireSpaceReadAuthority(
   },
   dependencies: WorkflowStepExternalCatalogDependencies = {},
 ): Promise<AcquireSpaceReadAuthorityResult> {
-  const classified = await ensureWorkspaceReadClassification(input.toolSlug, dependencies, input.accountId);
+  let source: SpaceReadPreparationSource;
+  try { source = beginSpaceReadPreparation(input); }
+  catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+  const classified = await ensureWorkspaceReadClassification(input.toolSlug, dependencies, input.accountId, source);
   if (!classified.ok) return { ok: false, error: classified.error };
-  return acquireSpaceReadAuthority({ ...input, toolSlug: classified.operationId });
+  if (!readSpaceReadPreparation(source.sessionId, source.sourceUserSeq)) {
+    return { ok: false, error: 'workspace read declaration changed during preparation' };
+  }
+  return acquireSpaceReadAuthority({ ...input, toolSlug: classified.operationId,
+    preparationSource: source });
 }
 
 type ReviewedCliReadAcquirer = (input: {
@@ -234,6 +244,7 @@ export function acquireSpaceReadAuthority(input: {
   args: Record<string, unknown>;
   /** Provenance only; it never widens what the activation may execute. */
   cause: string;
+  preparationSource?: SpaceReadPreparationSource;
 }): AcquireSpaceReadAuthorityResult {
   const sessionId = exactIdOrDigest(`workspace:${input.slug}`);
   try {
@@ -254,7 +265,9 @@ export function acquireSpaceReadAuthority(input: {
   }
   // Every refresh is its own run occurrence: a fresh durable activation whose
   // one exact call the kernel executes (or replays) exactly once.
-  const occurrence = `refresh:${exactIdOrDigest(input.cause)}:${randomUUID()}`;
+  const occurrence = input.preparationSource
+    ? `refresh:source:${input.preparationSource.sourceUserSeq}`
+    : `refresh:${exactIdOrDigest(input.cause)}:${randomUUID()}`;
   const acquired = acquireWorkflowReadOnlyOperationAuthority({
     sessionId,
     workflowId: exactIdOrDigest(`workspace-refresh:${input.slug}`),

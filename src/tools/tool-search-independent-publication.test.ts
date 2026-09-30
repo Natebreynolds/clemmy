@@ -384,3 +384,207 @@ for (const scenario of ['missing', 'unquoted', 'write-review-unavailable'] as co
     assert.equal(businessCalls, 0);
   });
 }
+
+for (const scenario of ['cold-pinned', 'warm-unpinned'] as const) {
+test(`scheduled Space read re-provisions a moved definition through real source proof without a fabricated chat: ${scenario}`, async () => {
+  setup();
+  const { spaceStore } = await import('../spaces/store.js');
+  const authority = await import('../spaces/space-read-authority.js');
+  const external = await import('../execution/workflow-step-external-catalog.js');
+  const runner = await import('../spaces/runner.js');
+  const slug = `fixture-scheduled-definition-${scenario}`;
+  const connections = [
+    ...(scenario === 'cold-pinned' ? [{ slug: 'outlook', connectionId: 'fixture-other', status: 'ACTIVE', accountEmail: 'other@invalid.test' }] : []),
+    { slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL },
+  ];
+  composio.__test__.setConnectedAccountsLoader(async () => connections.map(row => ({
+    id: row.connectionId, status: row.status, user_id: 'fixture-owner', toolkit: { slug: row.slug },
+    data: { user_info: { email: row.accountEmail } },
+  })));
+  let version = '20260903_00';
+  schemas._setToolSchemaLoaderForTests(async () => ({ ...definition(), providerOperationVersion: version }));
+  const text = `Read ${TARGET} from connection ${ACCOUNT}.`;
+  const seed = source(text);
+  resolution.recordAdmissionCapabilityResolution({ ...seed, acceptedInput: text, entries: [{
+    intent: 'seed definition', kind: 'composio', identifier: TARGET, status: 'proven', connection: 'active',
+    accountIdentity: ACCOUNT, effectClass: 'read',
+  }] });
+  assert.ok((await provisioning.registerProofProvisionedCapabilities(seed, {
+    allowedIdentifiers: [TARGET], expectedSchemaDigests: [{ identifier: TARGET, schemaDigest: contracts.digestSchema(INPUT) }],
+  })).registered.length);
+  version = '20260930_00';
+  // Rehearse a cold restart: persisted manifests remain, process catalog and
+  // observations are gone, and the provider now reports a successor.
+  if (scenario === 'cold-pinned') {
+    catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+    observations.clearIndependentCapabilityObservations();
+  }
+  spaceStore.save({ id: slug, title: 'Framework fixture', dataSources: [{
+    id: 'mail', composioSlug: TARGET, ...(scenario === 'cold-pinned' ? { composioAccountId: ACCOUNT } : {}),
+    composioArgs: { message_id: 'fixture-message' },
+  }] });
+  let exactLookups = 0;
+  let providerCalls = 0;
+  const isolatedTransport = await import('../runtime/harness/isolated-attested-transport.fixture.js');
+  isolatedTransport.installIsolatedAttestedTransport(async call => {
+    providerCalls += 1;
+    assert.equal(call.operationId, TARGET);
+    assert.equal(call.accountId, ACCOUNT);
+    assert.equal(call.args.message_id, 'fixture-message');
+    return { successful: true, data: { id: 'fixture-message', subject: 'Synthetic' } };
+  });
+  authority._setExactSpaceReadCatalogPreparerForTests(input => external.prepareWorkflowStepExternalCatalog(input, {
+    warm: async () => {},
+    // This file installs fixture transport/catalog ports rather than booting
+    // the daemon readiness controller. Require the real proof's callable
+    // entries below; operation/account/schema comparisons still run normally.
+    refresh: () => {},
+    ready: ids => ids.every(id => Boolean(catalogs.peekHostCapabilityCatalogFactory()?.get(id))),
+    provisionExactOperations: data => {
+      exactLookups += 1;
+      return sources.provisionExactWorkflowProviderOperations(data, {
+        materializeExact: async () => [{ toolkit: 'outlook', slug: TARGET, name: TARGET, score: 1, inputParameters: INPUT }],
+        freshConnections: async () => connections,
+      });
+    },
+  }));
+  try {
+    const result = await runner.refreshSpaceData(slug, 'mail', { cause: 'scheduled' });
+    assert.equal(result[0]?.ok, true, JSON.stringify(result));
+    assert.equal(exactLookups, 1, 'one bounded repair, no discovery loop');
+    assert.equal(providerCalls, 1, 'one shared-kernel read after metadata repair');
+    const sessionId = `workspace:${slug}`;
+    assert.equal(eventlog.listEvents(sessionId, { types: ['user_input_received'] }).length, 0);
+    const receipts = eventlog.listEvents(sessionId, { types: ['workspace_read_preparation_started'] });
+    assert.equal(receipts.length, 1);
+    const proof = resolution.provenCapabilityEntriesForTurn({ sessionId, sourceUserSeq: receipts[0]!.seq });
+    assert.equal(proof.find(row => row.identifier === TARGET)?.accountIdentity, ACCOUNT);
+    assert.ok(manifests.peekCapabilityManifestStore()!.list().some(row => row.manifest.lifecycle.state === 'current'
+      && row.manifest.operationId === TARGET && row.manifest.accountId === ACCOUNT && row.manifest.operationVersion === version));
+    eventlog.closeEventLog();
+    const { readSpaceReadPreparation } = await import('../spaces/read-preparation-source.js');
+    assert.ok(readSpaceReadPreparation(sessionId, receipts[0]!.seq), 'receipt survives reopening the journal');
+  } finally {
+    authority._setExactSpaceReadCatalogPreparerForTests(null);
+    isolatedTransport.installIsolatedAttestedTransport(null);
+    spaceStore.archive(slug);
+  }
+});
+}
+
+test('Space read preparation cannot substitute an account, become a write or survive a declaration edit', async () => {
+  setup();
+  const { spaceStore } = await import('../spaces/store.js');
+  const { beginSpaceReadPreparation, readSpaceReadPreparation } = await import('../spaces/read-preparation-source.js');
+  const slug = 'fixture-read-preparation-scope';
+  const dataSource = { id: 'mail', composioSlug: TARGET, composioAccountId: ACCOUNT, composioArgs: { message_id: 'fixture-message' } };
+  spaceStore.save({ id: slug, title: 'Framework fixture', dataSources: [dataSource] });
+  try {
+    assert.throws(() => beginSpaceReadPreparation({ slug, sourceId: 'mail', toolSlug: TARGET,
+      accountId: 'invented', args: dataSource.composioArgs, cause: 'scheduled' }), /changed/);
+    const receipt = beginSpaceReadPreparation({ slug, sourceId: 'mail', toolSlug: TARGET,
+      accountId: ACCOUNT, args: dataSource.composioArgs, cause: 'scheduled' });
+    const connections = [{ slug: 'outlook', connectionId: 'other-only', status: 'ACTIVE', accountEmail: 'other@invalid.test' }];
+    const route = await routing.resolveSourceAccountRouting({ ...receipt, toolkit: 'outlook', operation: TARGET, effect: 'read', connections });
+    assert.equal(route.kind, 'account_selection_required');
+    const write = await routing.resolveSourceAccountRouting({ ...receipt, toolkit: 'outlook', operation: TARGET,
+      effect: 'write', connections: [{ ...connections[0]!, connectionId: ACCOUNT }] });
+    assert.equal(write.kind, 'account_selection_required');
+    let lookups = 0;
+    const wrongOperation = await sources.provisionExactWorkflowProviderOperations({ ...receipt,
+      operationIds: ['OUTLOOK_CREATE_DRAFT'] }, { materializeExact: async () => { lookups += 1; return []; } });
+    assert.equal(wrongOperation.ok, false);
+    assert.equal(lookups, 0);
+    resolution.recordAdmissionCapabilityResolution({ ...receipt, entries: [{ intent: 'not authorized by read declaration',
+      kind: 'composio', identifier: TARGET, status: 'proven', connection: 'active', accountIdentity: ACCOUNT, effectClass: 'write' }] });
+    assert.deepEqual(resolution.provenCapabilityEntriesForTurn(receipt), []);
+    spaceStore.save({ id: slug, title: 'Framework fixture', dataSources: [{ ...dataSource, composioArgs: { message_id: 'changed' } }] });
+    assert.equal(readSpaceReadPreparation(receipt.sessionId, receipt.sourceUserSeq), null);
+    const changed = await sources.provisionExactWorkflowProviderOperations({ ...receipt, operationIds: [TARGET] }, {
+      materializeExact: async () => { lookups += 1; return []; },
+    });
+    assert.equal(changed.ok, false);
+    assert.equal(lookups, 0);
+  } finally { spaceStore.archive(slug); }
+});
+
+test('an edit during Space metadata lookup cannot publish proof or call the provider', async () => {
+  setup();
+  const { spaceStore } = await import('../spaces/store.js');
+  const { beginSpaceReadPreparation } = await import('../spaces/read-preparation-source.js');
+  const slug = 'fixture-edit-during-preparation';
+  const dataSource = { id: 'mail', composioSlug: TARGET, composioAccountId: ACCOUNT, composioArgs: { message_id: 'before' } };
+  spaceStore.save({ id: slug, title: 'Framework fixture', dataSources: [dataSource] });
+  let publications = 0;
+  try {
+    const receipt = beginSpaceReadPreparation({ slug, sourceId: 'mail', toolSlug: TARGET,
+      accountId: ACCOUNT, args: dataSource.composioArgs, cause: 'scheduled' });
+    const result = await sources.provisionExactWorkflowProviderOperations({ ...receipt, operationIds: [TARGET] }, {
+      materializeExact: async () => {
+        spaceStore.save({ id: slug, title: 'Framework fixture', dataSources: [{ ...dataSource, composioArgs: { message_id: 'after' } }] });
+        return [{ toolkit: 'outlook', slug: TARGET, name: TARGET, score: 1, inputParameters: INPUT }];
+      },
+      freshConnections: async () => [{ slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL }],
+      registerProof: async () => { publications += 1; return { registered: [] }; },
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.detail, 'workspace_source_changed_or_operation_not_read');
+    assert.equal(publications, 0);
+    assert.equal(eventlog.listEvents(receipt.sessionId, { types: ['capability_resolution'] }).length, 0);
+  } finally { spaceStore.archive(slug); }
+});
+
+test('a saved source naming a write cannot provision it as a scheduled read', async () => {
+  setup();
+  const { spaceStore } = await import('../spaces/store.js');
+  const { beginSpaceReadPreparation } = await import('../spaces/read-preparation-source.js');
+  const slug = 'fixture-write-not-read';
+  const operation = 'OUTLOOK_CREATE_DRAFT';
+  spaceStore.save({ id: slug, title: 'Framework fixture', dataSources: [{ id: 'mail', composioSlug: operation,
+    composioAccountId: ACCOUNT, composioArgs: {} }] });
+  let publications = 0;
+  try {
+    const receipt = beginSpaceReadPreparation({ slug, sourceId: 'mail', toolSlug: operation, accountId: ACCOUNT, args: {}, cause: 'scheduled' });
+    const result = await sources.provisionExactWorkflowProviderOperations({ ...receipt, operationIds: [operation] }, {
+      materializeExact: async () => [{ toolkit: 'outlook', slug: operation, name: operation, score: 1, inputParameters: INPUT }],
+      freshConnections: async () => [{ slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL }],
+      registerProof: async () => { publications += 1; return { registered: [] }; },
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.detail, 'workspace_source_changed_or_operation_not_read');
+    assert.equal(publications, 0);
+  } finally { spaceStore.archive(slug); }
+});
+
+test('an unpinned Space read uses the taught read default without inheriting a sibling source account', async () => {
+  setup();
+  const { spaceStore } = await import('../spaces/store.js');
+  const { beginSpaceReadPreparation } = await import('../spaces/read-preparation-source.js');
+  const aliases = await import('../memory/account-alias-store.js');
+  const slug = 'fixture-unpinned-read-default';
+  const operation = 'SLACK_SEARCH_MESSAGES';
+  const connections = [
+    { slug: 'slack', connectionId: 'slack-selected', status: 'ACTIVE', accountEmail: 'selected@invalid.test' },
+    { slug: 'slack', connectionId: 'slack-other', status: 'ACTIVE', accountEmail: 'other@invalid.test' },
+  ];
+  spaceStore.save({ id: slug, title: 'Framework fixture', dataSources: [{ id: 'slack', composioSlug: operation, composioArgs: {} }] });
+  try {
+    const receipt = beginSpaceReadPreparation({ slug, sourceId: 'slack', toolSlug: operation, args: {}, cause: 'scheduled' });
+    const input = { ...receipt, toolkit: 'slack', operation, effect: 'read' as const, connections };
+    assert.equal((await routing.resolveSourceAccountRouting(input)).kind, 'account_selection_required',
+      'several accounts and no taught default are an actual choice');
+    aliases.rememberAccountAlias({ toolkit: 'slack', label: routing.READ_DEFAULT_ACCOUNT_LABEL,
+      email: connections[0]!.accountEmail, connectionId: connections[0]!.connectionId });
+    const resolved = await routing.resolveSourceAccountRouting(input);
+    assert.equal(resolved.kind, 'resolved');
+    if (resolved.kind === 'resolved') assert.equal(resolved.connection.connectionId, 'slack-selected');
+    const conflict = await sources.provisionExactWorkflowProviderOperations({ ...receipt, operationIds: [operation],
+      selectedAccounts: [{ operationId: operation, accountId: 'slack-other' }] }, {
+      materializeExact: async () => [{ toolkit: 'slack', slug: operation, name: operation, score: 1, inputParameters: { type: 'object' } }],
+      freshConnections: async () => connections,
+      registerProof: async () => { assert.fail('a taught default cannot switch the predecessor account'); },
+    });
+    assert.equal(conflict.ok, false);
+    if (!conflict.ok) assert.equal(conflict.detail, 'selected_account_changed_during_refresh');
+  } finally { spaceStore.archive(slug); }
+});

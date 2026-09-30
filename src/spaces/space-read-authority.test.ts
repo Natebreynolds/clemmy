@@ -201,7 +201,21 @@ function installReadCapability(operationId: string): { portBodies: () => number 
 
 test('a composio-read Workspace refresh mints shared durable read authority and dispatches', async () => {
   const slug = 'authority-minted-read';
-  const capability = installReadCapability(OPERATION);
+  // A refresh revalidates even a warm provider definition. Model this as a
+  // real Composio manifest, not a local-registry entry with a provider name.
+  const bodies = new Map<string, number>();
+  const capability = coldComposioReadCapability(OPERATION, bodies);
+  const manifestStore = manifestStores.createCapabilityManifestStore();
+  assert.equal(manifestStore.install(capability.manifest).ok, true);
+  manifestStores.installCapabilityManifestStore(manifestStore);
+  const factory = catalogs.createHostCapabilityCatalogFactory();
+  catalogs.installHostCapabilityCatalogFactory(factory);
+  readAuthority._setExactSpaceReadCatalogPreparerForTests(input => externalCatalog.prepareWorkflowStepExternalCatalog(input, {
+    manifestStore, catalogFactory: factory,
+    revalidate: async () => ({ ok: true, definitions: new Map([[OPERATION.toLowerCase(), capability.definition]]) }),
+    refresh: () => { factory.register(capability.entry); },
+    ready: ids => ids.every(id => Boolean(factory.get(id))),
+  }));
   store.spaceStore.save({
     id: slug,
     title: 'Minted read',
@@ -215,13 +229,14 @@ test('a composio-read Workspace refresh mints shared durable read authority and 
     const first = await runner.refreshSpaceData(slug, 'contacts', { cause: 'manual' });
     assert.equal(first.length, 1);
     assert.equal(first[0]?.ok, true, `refresh refused: ${first[0]?.error ?? ''}`);
-    assert.equal(capability.portBodies(), 1, 'exactly one provider body ran');
+    assert.equal(bodies.get(OPERATION), 1, 'exactly one provider body ran');
 
     // A second refresh is a fresh occurrence: a new activation, a new dispatch.
     const second = await runner.refreshSpaceData(slug, 'contacts', { cause: 'scheduled' });
     assert.equal(second[0]?.ok, true, `second refresh refused: ${second[0]?.error ?? ''}`);
-    assert.equal(capability.portBodies(), 2, 'each refresh redeems its own activation');
+    assert.equal(bodies.get(OPERATION), 2, 'each refresh redeems its own activation');
   } finally {
+    readAuthority._setExactSpaceReadCatalogPreparerForTests(null);
     store.spaceStore.archive(slug);
   }
 });

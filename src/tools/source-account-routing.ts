@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { getSession, listEvents } from '../runtime/harness/eventlog.js';
+import { readSpaceReadPreparation } from '../spaces/read-preparation-source.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering } from '../runtime/harness/steer-notes.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
@@ -345,6 +346,42 @@ export async function resolveSourceAccountRouting(input: {
     labels: accountChoiceLabels(relevant),
     ...(reason ? { reason } : {}),
   });
+  const preparation = readSpaceReadPreparation(input.sessionId, input.sourceUserSeq);
+  if (preparation) {
+    // This is a saved READ declaration, not conversational prose. Preserve
+    // its exact account; never inherit another source's account in the same
+    // Workspace session or ask a model to reinterpret it. An unpinned read
+    // keeps the ordinary owner-taught read default; that is not permission to
+    // change the predecessor account checked by the provisioner.
+    if (input.effect !== 'read' || input.operation.trim().toUpperCase() !== preparation.operationId) return blocked();
+    let candidates = preparation.accountId
+      ? relevant.filter(row => row.connectionId === preparation.accountId)
+      : relevant;
+    if (!preparation.accountId && new Set(candidates.map(identityOf)).size > 1) {
+      const remembered = resolveAccountAlias(READ_DEFAULT_ACCOUNT_LABEL, toolkit);
+      candidates = remembered ? candidates.filter(row => (
+        (remembered.connectionId && row.connectionId === remembered.connectionId)
+        || (remembered.email && emailOf(row) === remembered.email.toLowerCase())
+      )) : [];
+    }
+    if (!candidates.length || new Set(candidates.map(identityOf)).size !== 1) return blocked();
+    const selected = selectToolkitConnection(input.operation, candidates,
+      preparation.accountId ?? identityOf(candidates[0]!));
+    if (selected.kind !== 'resolved') return blocked();
+    const connection = candidates.find(row => row.connectionId === selected.connectionId);
+    const session = getSession(input.sessionId);
+    if (!connection || !session) return blocked();
+    const sourceDigest = digest(preparation.acceptedInput);
+    return { kind: 'resolved', connection, evidence: {
+      version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId,
+      principalId: session.userId || session.id, toolkit, identity: identityOf(connection),
+      sourceSessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, sourceQuote: null, sourceDigest,
+      checkedForSourceUserSeq: input.sourceUserSeq, checkedForSourceDigest: sourceDigest,
+      connectionRevision: digest(JSON.stringify(candidates.map(row => ({ id: row.connectionId,
+        identity: identityOf(row), status: row.status })).sort((a, b) => a.id.localeCompare(b.id)))),
+      judgeModelIdentity: 'host:workspace_read_declaration',
+    } };
+  }
   const source = acceptedSource(input.sessionId, input.sourceUserSeq);
   const session = getSession(input.sessionId);
   if (!source || !session) return blocked();

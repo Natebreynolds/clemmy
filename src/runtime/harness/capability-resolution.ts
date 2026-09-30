@@ -40,6 +40,7 @@ import { resolveActiveTaskContext } from './active-task-context.js';
 import { recallLearnedContracts, renderLearnedContracts } from '../../tools/tool-contract-recall.js';
 import { renderReviewedCliWorkCallExample, reviewedCliShellMatch } from './reviewed-cli-shell-match.js';
 import { lexicalCapabilityMatchesForRequest } from '../read-path/lexical-capability-matches.js';
+import { readSpaceReadPreparation } from '../../spaces/read-preparation-source.js';
 
 export type CapabilityStatus = 'proven' | 'previously_failed';
 export type ConnectionState = 'active' | 'missing' | 'unknown' | 'not_applicable';
@@ -201,7 +202,14 @@ function resolutionBelongsToAcceptedTask(
     sinceSeq: sourceUserSeq - 1,
     limit: 1,
   });
-  if (accepted?.seq !== sourceUserSeq) return false;
+  if (accepted?.seq !== sourceUserSeq) {
+    const preparation = readSpaceReadPreparation(sessionId, sourceUserSeq);
+    return Boolean(preparation && normalizeAuthorityInput(preparation.acceptedInput) === resolutionInput
+      && resolution.entries.every(entry => entry.kind === 'composio'
+        && entry.identifier.trim().toUpperCase() === preparation.operationId
+        && entry.effectClass === 'read'
+        && (!preparation.accountId || entry.accountIdentity === preparation.accountId)));
+  }
   const acceptedDisplay = normalizeAuthorityInput(accepted?.data.displayText);
   const acceptedInput = acceptedDisplay ?? normalizeAuthorityInput(accepted?.data.text);
   return acceptedInput !== null && acceptedInput === resolutionInput;

@@ -649,6 +649,9 @@ export const EVENT_TYPES = [
   'interactive_consent_decided',
   'exact_call_delivery_basis',
   'workflow_node_invocation_activated',
+  // Metadata preparation for one persisted Space read, never a user turn or
+  // an executable call authority. The existing read kernel owns dispatch.
+  'workspace_read_preparation_started',
   // Immutable parent for one provider-neutral paginated workflow read. Every
   // page is a child call of this one activation/node attempt; no page is
   // represented as another workflow attempt or fabricated user turn.

@@ -6,6 +6,7 @@ import { scheduleOperationDeliveryLearning } from '../runtime/harness/learned-op
 import { createHash } from 'node:crypto';
 import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
+import { readSpaceReadPreparation } from '../spaces/read-preparation-source.js';
 import {
   mcpToolScopeAuthority,
   type McpToolScope,
@@ -1569,6 +1570,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
   signal?: AbortSignal;
   deadlineAt?: number;
 }, dependencies: ExactWorkflowProviderProvisionDependencies = {}): Promise<ExactWorkflowProviderProvisionResult> {
+  const preparation = readSpaceReadPreparation(input.sessionId, input.sourceUserSeq);
   const accepted = listEvents(input.sessionId, {
     sinceSeq: input.sourceUserSeq - 1,
     types: ['user_input_received'],
@@ -1577,7 +1579,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
   const acceptedText = normalizedAcceptedSourceText(
     typeof accepted?.data.displayText === 'string' && accepted.data.displayText.trim()
       ? accepted.data.displayText
-      : accepted?.data.text,
+      : accepted?.data.text ?? preparation?.acceptedInput,
   );
   if (
     !acceptedText
@@ -1599,6 +1601,11 @@ export async function provisionExactWorkflowProviderOperations(input: {
       code: 'invalid_exact_operation',
       identifier: operationIds[32] ?? operationIds[0] ?? 'unknown',
     };
+  }
+  if (preparation && (operationIds.length !== 1 || operationIds[0] !== preparation.operationId
+    || (input.selectedAccounts ?? []).some(row => row.operationId.trim().toUpperCase() !== preparation.operationId
+      || (preparation.accountId && row.accountId !== preparation.accountId)))) {
+    return { ok: false, code: 'accepted_source_missing_or_changed', identifier: operationIds[0]! };
   }
   const requests: ExactMaterializationRequest[] = [];
   for (const operation of operationIds) {
@@ -1700,6 +1707,11 @@ export async function provisionExactWorkflowProviderOperations(input: {
       { sessionId: input.sessionId },
     );
   } catch { /* learning never blocks discovery */ }
+  if (preparation && (classifyComposioSlugEffect(preparation.operationId) !== 'read'
+    || !readSpaceReadPreparation(input.sessionId, input.sourceUserSeq))) {
+    return { ok: false, code: 'proof_provisioning_refused', identifier: preparation.operationId,
+      detail: 'workspace_source_changed_or_operation_not_read' };
+  }
   const selectedAccounts = new Map((input.selectedAccounts ?? []).map(entry => [
     entry.operationId.trim().toUpperCase(), entry.accountId.trim(),
   ]));
@@ -1795,7 +1807,8 @@ export async function provisionExactWorkflowProviderOperations(input: {
       {
         allowedIdentifiers: operationIds,
         expectedSchemaDigests,
-        publicationGuard: () => discoveryStillActive(guard),
+        publicationGuard: () => discoveryStillActive(guard)
+          && (!preparation || Boolean(readSpaceReadPreparation(input.sessionId, input.sourceUserSeq))),
       },
     ),
     ...guard,
