@@ -432,3 +432,109 @@ test('the failing-source notice routes exactly like a workflow outcome', async (
     body: 'Tap to see why and what would fix it.',
   });
 });
+
+function saveFailingSources(slug: string, ids: string[]) {
+  const sources = ids.map(id => ({ id, runner: `${id}.mjs`, schedule: '0 * * * *' }));
+  store.spaceStore.save({ id: slug, title: `FRAMEWORK-TEST ${slug}`, dataSources: sources });
+  const dir = store.resolveInSpace(slug, 'data');
+  mkdirSync(dir, { recursive: true });
+  for (const source of sources) writeFileSync(path.join(dir, source.runner), 'process.stdout.write("{}");');
+  return sources;
+}
+
+test('simultaneous failures form one report per Space, preserve every source, and concurrent ticks do not repeat it', async () => {
+  const a = 'framework-group-a';
+  const b = 'framework-group-b';
+  const first = saveFailingSources(a, ['pipeline', 'transcripts']);
+  saveFailingSources(b, ['contacts']);
+  const base = '2026-06-23T08:00:00.000Z';
+  try {
+    await sched.processSpaceSchedules(hour(base, 0));
+    await sched.processSpaceSchedules(hour(base, 1));
+    const results = await Promise.all([
+      sched.processSpaceSchedules(hour(base, 2)),
+      sched.processSpaceSchedules(hour(base, 2)),
+    ]);
+    assert.equal(results.reduce((n, result) => n + result.told, 0), 2, 'two reports, not three source alerts');
+    assert.equal(results.reduce((n, result) => n + result.errors, 0), 3, 'each due source ran once');
+    const [group, ...extra] = noticesFor(a);
+    assert.ok(group);
+    assert.equal(extra.length, 0);
+    assert.deepEqual(group.metadata?.sourceIds, ['pipeline', 'transcripts']);
+    assert.equal(group.metadata?.failedSourceCount, 2);
+    assert.match(group.body ?? '', /"pipeline" source/);
+    assert.match(group.body ?? '', /"transcripts" source/);
+    assert.equal((group.body?.match(/What would fix it:/g) ?? []).length, 2);
+    assert.equal(noticesFor(b).length, 1, 'unrelated Spaces remain independently actionable');
+    for (const source of first) {
+      assert.deepEqual(persistedStreak(`${a}:${source.id}`)?.told, ['local_runner']);
+      assert.equal(observationCount(a, source.id), 3);
+    }
+    const next = await sched.processSpaceSchedules(hour(base, 3));
+    assert.equal(next.heldBack, 3, 'grouping does not change per-source backoff');
+    assert.equal(next.told, 0);
+    assert.equal(noticesFor(a).length, 1);
+    const { notificationDeliveryInternalsForTest } = await import('../runtime/notification-delivery.js');
+    assert.deepEqual(notificationDeliveryInternalsForTest.buildPushCopy(group), {
+      title: `2 sources in FRAMEWORK-TEST ${a} aren't refreshing`,
+      body: 'Tap to see each source and what would fix it.',
+    });
+  } finally { store.spaceStore.archive(a); store.spaceStore.archive(b); }
+});
+
+test('a partial notification write retains a durable group and retries it without rerunning held sources', async () => {
+  const slug = 'framework-group-delivery-recovery';
+  const sources = saveFailingSources(slug, ['rows', 'activity']);
+  const base = '2026-06-24T08:00:00.000Z';
+  try {
+    await sched.processSpaceSchedules(hour(base, 0));
+    await sched.processSpaceSchedules(hour(base, 1));
+    notifications._failNextNotificationDeliveryQueueWriteForTest(new Error('fixture queue write failed'));
+    const [failed] = await Promise.all([
+      sched.processSpaceSchedules(hour(base, 2)),
+      sched.retryPausedSpaces(hour(base, 2)),
+    ]);
+    assert.equal(failed.told, 0, 'failed queue admission is not successful notification admission');
+    const saved = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+    const pending = Object.values(saved.pendingSourceNotices) as Array<{ id: string; createdAt: string; metadata: Record<string, unknown> }>;
+    assert.equal(pending.length, 1, 'the paused retry did not overwrite the pending generation');
+    const original = pending[0]!;
+    assert.equal(original.metadata.failedSourceCount, 2);
+    assert.equal(original.createdAt, hour(base, 2).toISOString());
+    const before = sources.map(source => observationCount(slug, source.id));
+    // Restore from disk on the next tick, before any source is due. Reject
+    // routing fields not owned by this failure-report outbox on restore.
+    saved.pendingSourceNotices[original.id].metadata.destinationIds = ['unrelated-destination'];
+    writeFileSync(STATE_FILE, JSON.stringify(saved));
+    const recovered = await sched.processSpaceSchedules(new Date(Date.parse(base) + (2 * 60 + 1) * 60_000));
+    assert.equal(recovered.told, 1);
+    assert.deepEqual(sources.map(source => observationCount(slug, source.id)), before);
+    const [notice, ...others] = noticesFor(slug);
+    assert.equal(others.length, 0);
+    assert.equal(notice?.id, original.id);
+    assert.equal(notice?.createdAt, original.createdAt);
+    assert.equal(notice?.metadata?.destinationIds, undefined);
+    assert.equal(notifications.listQueuedNotificationDeliveries().filter(job => job.notificationId === original.id).length, 1);
+    assert.deepEqual(JSON.parse(readFileSync(STATE_FILE, 'utf8')).pendingSourceNotices, {});
+    assert.equal((await sched.processSpaceSchedules(new Date(Date.parse(base) + (2 * 60 + 2) * 60_000))).told, 0);
+  } finally { store.spaceStore.archive(slug); }
+});
+
+test('group identity is order independent, retains mixed causes, and keeps singleton ids compatible', () => {
+  const base = {
+    failures: 3, codeFailures: 3, error: 'fixture detail', firstFailedAt: '2026-06-25T00:00:00.000Z',
+    lastFailedAt: '2026-06-25T02:00:00.000Z', skipsRemaining: 1, told: [], declarationDigest: 'd',
+    connectionDigest: null, okObservationId: null,
+  };
+  const a = { spaceId: 'same-space', spaceTitle: 'Same Space', source: { id: 'a', runner: 'a.mjs' },
+    streak: { ...base, code: 'local_runner' as const } };
+  const b = { ...a, source: { id: 'b', composioSlug: 'FIXTURE_LIST_RECORDS' },
+    streak: { ...base, code: 'provider_error' as const } };
+  const first = backoff.sourceStreakGroupNotice([a, b]);
+  assert.deepEqual(backoff.sourceStreakGroupNotice([b, a, a]), first);
+  assert.deepEqual(backoff.sourceStreakGroupNotice([a]), backoff.sourceStreakNotice(a));
+  assert.equal(first.metadata.failureCode, undefined, 'mixed causes cannot pretend to be one cause');
+  assert.deepEqual((first.metadata.failures as Array<{ failureCode: string }>).map(row => row.failureCode), ['local_runner', 'provider_error']);
+  assert.notEqual(backoff.sourceStreakGroupNotice([a, { ...b, streak: { ...b.streak, firstFailedAt: '2026-06-26T00:00:00.000Z' } }]).id, first.id);
+  assert.throws(() => backoff.sourceStreakGroupNotice([a, { ...b, spaceId: 'another-space' }]), /cannot cross Spaces/);
+});

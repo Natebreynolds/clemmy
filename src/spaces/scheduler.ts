@@ -14,13 +14,14 @@
  *
  * Mirrors processWorkflowSchedules (dedupe-by-minute, 24h catch-up, prune).
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { cronMatches, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
 import { peekConnectedToolkits } from '../integrations/composio/client.js';
 import { addNotification } from '../runtime/notifications.js';
+import { withFileLock } from '../runtime/atomic-json.js';
 import { spaceStore, type SpaceDataSource, type SpaceRecord } from './store.js';
 import { refreshSpaceData, type RefreshResult } from './runner.js';
 import { readData } from './data-store.js';
@@ -33,7 +34,10 @@ import {
   restartAfterChange,
   sourceIdentity,
   sourceIdentityChanged,
-  sourceStreakNotice,
+  sourceStreakGroupNotice,
+  SPACE_SOURCE_NOTICE_SOURCE,
+  type SourceStreakNotice,
+  type SourceStreakNoticeInput,
   type SourceRefreshStreak,
   type SourceStreakCode,
 } from './source-refresh-backoff.js';
@@ -52,6 +56,50 @@ interface SpaceScheduleState {
   pausedRetryBySlug: Record<string, { attempts: number; lastAtMs: number }>;
   /** "space:source" → its current run of failed scheduled refreshes. */
   sourceStreakByKey: Record<string, SourceRefreshStreak>;
+  /** Durable notification outbox: admission may fail after a streak is saved. */
+  pendingSourceNotices: Record<string, SourceStreakNotice & { createdAt: string }>;
+}
+
+/** Admit only failure-report metadata. Restoring an outbox cannot invent a
+ * delivery target, approval action or exact-origin authority from extra fields. */
+function readPendingSourceNotices(raw: unknown): SpaceScheduleState['pendingSourceNotices'] {
+  const out: SpaceScheduleState['pendingSourceNotices'] = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [id, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    const meta = row.metadata as Record<string, unknown> | undefined;
+    if ((!id.startsWith('space-source-') && !id.startsWith('space-sources-'))
+      || row.id !== id || typeof row.title !== 'string' || typeof row.body !== 'string'
+      || typeof row.createdAt !== 'string' || !Number.isFinite(Date.parse(row.createdAt))
+      || !meta || meta.source !== SPACE_SOURCE_NOTICE_SOURCE || meta.status !== 'failed'
+      || typeof meta.workspaceId !== 'string' || typeof meta.spaceTitle !== 'string') continue;
+    const metadata: Record<string, unknown> = {
+      source: SPACE_SOURCE_NOTICE_SOURCE, status: 'failed', workspaceId: meta.workspaceId, spaceTitle: meta.spaceTitle,
+    };
+    for (const field of ['sourceId', 'failureCode', 'firstFailedAt', 'lastFailedAt']) {
+      if (typeof meta[field] === 'string') metadata[field] = meta[field];
+    }
+    for (const field of ['consecutiveFailures', 'failedSourceCount']) {
+      if (Number.isSafeInteger(meta[field]) && (meta[field] as number) > 0) metadata[field] = meta[field];
+    }
+    if (Array.isArray(meta.sourceIds)) metadata.sourceIds = meta.sourceIds.filter(id => typeof id === 'string');
+    if (Array.isArray(meta.failures)) metadata.failures = meta.failures.map(value => {
+      const failure = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+      return Object.fromEntries(['noticeId', 'sourceId', 'failureCode', 'firstFailedAt', 'lastFailedAt', 'consecutiveFailures']
+        .filter(key => typeof failure[key] === 'string' || (key === 'consecutiveFailures' && Number.isSafeInteger(failure[key])))
+        .map(key => [key, failure[key]]));
+    });
+    out[id] = { id, title: row.title, body: row.body, createdAt: row.createdAt, metadata };
+  }
+  return out;
+}
+
+// Both entrypoints own the same persisted state. Reuse the existing process-
+// and cross-process lock through awaited work, so retries cannot overwrite a
+// pending notification generation or execute one due tick concurrently.
+function withScheduleStateOwner<T>(work: () => Promise<T>): Promise<T> {
+  return withFileLock(STATE_FILE, work);
 }
 
 function loadState(): SpaceScheduleState {
@@ -64,10 +112,11 @@ function loadState(): SpaceScheduleState {
         lastReengageByKey: (parsed.lastReengageByKey && typeof parsed.lastReengageByKey === 'object') ? parsed.lastReengageByKey : {},
         pausedRetryBySlug: (parsed.pausedRetryBySlug && typeof parsed.pausedRetryBySlug === 'object') ? parsed.pausedRetryBySlug : {},
         sourceStreakByKey: readSourceRefreshStreaks(parsed.sourceStreakByKey),
+        pendingSourceNotices: readPendingSourceNotices(parsed.pendingSourceNotices),
       };
     }
   } catch { /* fresh */ }
-  return { lastRunByMinute: {}, lastReengageByKey: {}, pausedRetryBySlug: {}, sourceStreakByKey: {} };
+  return { lastRunByMinute: {}, lastReengageByKey: {}, pausedRetryBySlug: {}, sourceStreakByKey: {}, pendingSourceNotices: {} };
 }
 
 /**
@@ -94,8 +143,19 @@ function saveState(state: SpaceScheduleState): void {
   const dir = path.dirname(STATE_FILE);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const tmp = `${STATE_FILE}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf-8');
-  renameSync(tmp, STATE_FILE);
+  try {
+    const fd = openSync(tmp, 'w');
+    try { writeFileSync(fd, JSON.stringify(state, null, 2), 'utf-8'); fsyncSync(fd); }
+    finally { closeSync(fd); }
+    renameSync(tmp, STATE_FILE);
+    if (process.platform !== 'win32') {
+      const directory = openSync(dir, 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    }
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* already renamed or never opened */ }
+    throw error;
+  }
 }
 
 /** Stable per-minute dedup key (UTC, minute precision). */
@@ -151,7 +211,11 @@ function connectionSnapshot() {
  * Evaluate every active Workspace's scheduled data sources against the wall
  * clock (with catch-up) and refresh any that are due. Idempotent per minute.
  */
-export async function processSpaceSchedules(now: Date = new Date()): Promise<SpaceFireResult> {
+export function processSpaceSchedules(now: Date = new Date()): Promise<SpaceFireResult> {
+  return withScheduleStateOwner(() => processSpaceSchedulesOwned(now));
+}
+
+async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
   const state = loadState();
   const minutes = scheduleCatchupWindow(state.lastEvaluatedAtMs, now.getTime());
   const lastRun = state.lastRunByMinute;
@@ -165,6 +229,7 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
   let awaitingApproval = 0;
   let heldBack = 0;
   let told = 0;
+  const newlyToldBySpace = new Map<string, SourceStreakNoticeInput[]>();
 
   const recordFailure = (
     space: SpaceRecord,
@@ -180,24 +245,9 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
     });
     streaks[key] = recorded.streak;
     if (!recorded.tell) return;
-    try {
-      const notice = sourceStreakNotice({
-        spaceId: space.id,
-        spaceTitle: space.title,
-        source: ds,
-        streak: recorded.streak,
-      });
-      addNotification({
-        id: notice.id,
-        kind: 'system',
-        title: notice.title,
-        body: notice.body,
-        createdAt: now.toISOString(),
-        read: false,
-        metadata: notice.metadata,
-      });
-      told += 1;
-    } catch { /* telling is best-effort; the streak and its backoff still hold */ }
+    const group = newlyToldBySpace.get(space.id) ?? [];
+    group.push({ spaceId: space.id, spaceTitle: space.title, source: ds, streak: recorded.streak });
+    newlyToldBySpace.set(space.id, group);
   };
 
   for (const space of spaceStore.list()) {
@@ -321,7 +371,23 @@ export async function processSpaceSchedules(now: Date = new Date()): Promise<Spa
   }
   state.lastEvaluatedAtMs = now.getTime();
   state.lastRunByMinute = prune(lastRun, now.getTime());
+  for (const group of newlyToldBySpace.values()) {
+    const notice = sourceStreakGroupNotice(group);
+    state.pendingSourceNotices[notice.id] ??= { ...notice, createdAt: now.toISOString() };
+  }
+  // Freeze membership and the original timestamp with the streak before
+  // notification admission. A failed write is retried next tick, even if no
+  // source is due or its backoff is holding it. Stable ids also repair a crash
+  // after notifications.json was written but before its delivery queue was.
   saveState(state);
+  for (const notice of Object.values(state.pendingSourceNotices)) {
+    try {
+      addNotification({ ...notice, kind: 'system', read: false });
+      delete state.pendingSourceNotices[notice.id];
+      told += 1;
+    } catch { /* Keep the durable outbox entry; never equate failure with delivery. */ }
+  }
+  if (told > 0) saveState(state);
   return { evaluated, fired, errors, awaitingApproval, heldBack, told };
 }
 
@@ -342,7 +408,11 @@ const PAUSE_RETRY_SPACING_MS = 15 * 60 * 1000;     // between attempts
 
 export interface PausedRetryResult { examined: number; reactivated: number; stillPaused: number }
 
-export async function retryPausedSpaces(now: Date = new Date()): Promise<PausedRetryResult> {
+export function retryPausedSpaces(now: Date = new Date()): Promise<PausedRetryResult> {
+  return withScheduleStateOwner(() => retryPausedSpacesOwned(now));
+}
+
+async function retryPausedSpacesOwned(now: Date): Promise<PausedRetryResult> {
   const state = loadState();
   const retries = state.pausedRetryBySlug;
   const out: PausedRetryResult = { examined: 0, reactivated: 0, stillPaused: 0 };

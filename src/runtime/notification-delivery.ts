@@ -232,6 +232,10 @@ function buildPushCopy(notification: NotificationRecord): { title: string; body:
   }
 
   const spaceTitle = pushFact(meta, 'spaceTitle');
+  const failedSourceCount = pushCount(meta, 'sourceIds');
+  if (spaceTitle && meta?.source === 'space_source_refresh' && failedSourceCount > 1) {
+    return { title: `${failedSourceCount} sources in ${spaceTitle} aren't refreshing`, body: 'Tap to see each source and what would fix it.' };
+  }
   if (spaceTitle && typeof meta?.failureCode === 'string') {
     return { title: `${spaceTitle} isn't refreshing`, body: 'Tap to see why and what would fix it.' };
   }

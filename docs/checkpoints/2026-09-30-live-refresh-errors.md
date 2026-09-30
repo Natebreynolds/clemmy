@@ -246,3 +246,81 @@ owner's installed sources have recovered.
 - The independent connection-continuity lifecycle/usage ledger, public recovery
   controls and full release qualification are still unfinished. Do not tag this
   branch or expose Execute Continue as if those obligations were complete.
+
+## Grouped source reports and reliable notification admission
+
+Follow-up after `4ee7f6261`. This is source work, not a hotpatch. Ownership was
+rechecked: the shell/two-modes worktree is still clean at `76c53a1ea`.
+
+Simultaneous sources reaching the existing failure-notice threshold now form
+one report **per Space per scheduler evaluation**. Every source keeps its own
+failure count, typed reason, repair guidance, observation and backoff. Different
+Spaces remain separate. A single-source report retains its original id and
+format. A group id is derived from sorted member-streak ids, independent of
+iteration order and delivery time; mixed causes remain separate in metadata.
+The phone banner names the number of sources without quoting their data.
+Destination selection is unchanged. This consolidates reports; it does not
+suppress genuine errors, merge unrelated tasks, or automatically repair data.
+
+Review found a second defect: `recordSourceRefreshFailure` marked a code told
+before `addNotification` succeeded, and its catch discarded the write failure.
+The scheduler now commits an immutable pending report with the streak state
+before attempting notification admission. A partial notification/queue write
+keeps that outbox entry. The next scheduler tick retries the exact id and
+original timestamp, even with no due source; it does not rerun reads to send
+an alert. Existing notification admission recovers its own queue on stable-id
+retry, preserving destination receipts. Restored outbox metadata admits only
+failure-report fields, never arbitrary routing/approval authority.
+
+Both scheduled refresh and paused-Space retry now use the existing shared file
+lock across their state read/awaited work/write. This prevents one entrypoint
+from overwriting another's outbox generation and serializes concurrent ticks.
+State saves flush the file and renamed directory before notification admission.
+The source retry policy and catch-up behavior are unchanged. Legacy decline
+copy no longer suggests that a refresh click erases an old decision.
+
+Verification:
+
+- `/tmp/clem-grouped-source-notices-green.txt`: **63/63** across source backoff,
+  scheduler, notification delivery and notification durability.
+- `/tmp/clem-grouped-source-notices-schema84.txt`: **20/20** source/scheduler
+  checks on committed schema 84 with final locale-independent ordering and
+  outbox-id validation. The unrelated schema-85 draft bytes were restored in
+  `finally`. These counts overlap; do not sum them.
+- `/tmp/clem-grouped-source-notices-red.txt`: restoring the previous scheduler
+  makes both new integration pins fail (**2/2 red**). Exact source bytes restored.
+- Final TypeScript passed in `/tmp/clem-grouped-source-notices-tsc-final-2.txt`.
+  `git diff --check` passed.
+- The grouped test drives three due sources across two Spaces and two concurrent
+  scheduler calls: two reports, three failures, one observation per source per
+  occurrence, and unchanged per-source backoff. The recovery test forces the
+  actual notification delivery-queue write to fail after record persistence,
+  interleaves paused-Space retry, reloads the JSON state and admits exactly one
+  queued notification without another source refresh. This is disk reload
+  evidence, not a killed-daemon or installed-phone acceptance claim.
+
+No models, live provider calls, external messages, app restart, install, build
+or tag. Live-home sentinel still **NOT PERFORMED** with daemon 72427 running.
+Installed acceptance must confirm readable desktop/mobile details, navigation,
+one grouped report on each configured destination, and retained per-source
+failure/recovery facts. Existing delivered alerts were not deleted or rewritten.
+
+### Execution integration is still real work, not an approval toggle
+
+The other lane's shell improvements operate on accepted chat `work_call`s.
+Our source branch does not yet include that lane's `run_shell_command` ordinary
+local-change and off-machine approval work. The reviewed-local workflow carrier
+currently covers file reads, file revisions, artifact bundles and Workspace
+datasets; it has no general shell adapter. `workflow-node-invocation-executor`
+explicitly distinguishes attested computation from opaque execution. Simply
+relabelling a script as a read/compute capability, reusing an old trust card,
+or calling the retired `runScript` body would bypass those contracts.
+
+The remaining supported-script route needs an owned scheduled occurrence,
+exact declaration/entrypoint binding, the existing shell effect/consent checks,
+shared logical and physical dispatch/settlement, bounded result handling, Stop
+and restart behavior, and no replay when an earlier process may have produced
+side effects. It must be reviewed together with the other lane rather than
+copying a raw spawn into Spaces. No claim is made that this notification change
+restores the five retired script sources. Combined integration, the original
+connection/budget lifecycle work and installed/live qualification remain owed.

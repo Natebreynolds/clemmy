@@ -283,7 +283,7 @@ function plainReason(code: SourceStreakCode, declared: { read: string; through: 
     case 'not_approved':
       return {
         why: 'Running this source was declined, or its approval ended.',
-        fix: 'Open the Space and refresh it to approve it again, or ask Clem to change the source.',
+        fix: 'Review the earlier decision with Clem and repair or change the source; refreshing it does not erase that decision.',
         detail: true,
       };
     case 'definition':
@@ -338,12 +338,16 @@ export const SPACE_SOURCE_NOTICE_SOURCE = 'space_source_refresh';
  * repeated attempt to tell (a restart before state was saved) is the same
  * notice, never a second one.
  */
-export function sourceStreakNotice(input: {
+export interface SourceStreakNoticeInput {
   spaceId: string;
   spaceTitle: string;
   source: SpaceDataSource;
   streak: SourceRefreshStreak;
-}): { id: string; title: string; body: string; metadata: Record<string, unknown> } {
+}
+
+export interface SourceStreakNotice { id: string; title: string; body: string; metadata: Record<string, unknown> }
+
+export function sourceStreakNotice(input: SourceStreakNoticeInput): SourceStreakNotice {
   const { spaceId, source, streak } = input;
   const spaceTitle = input.spaceTitle.trim() || spaceId;
   const reason = plainReason(streak.code, declaredRead(source));
@@ -372,6 +376,33 @@ export function sourceStreakNotice(input: {
       consecutiveFailures: streak.codeFailures,
       firstFailedAt: streak.firstFailedAt,
       lastFailedAt: streak.lastFailedAt,
+    },
+  };
+}
+
+
+/** One Space report for the sources reaching their notice threshold together.
+ * Membership owns the identity, not source order, wording or delivery time.
+ * Singleton ids stay compatible with notices emitted by older installations. */
+export function sourceStreakGroupNotice(inputs: readonly SourceStreakNoticeInput[]): SourceStreakNotice {
+  if (inputs.length === 0) throw new Error('a source failure notice needs at least one source');
+  const first = inputs[0]!;
+  if (inputs.some(input => input.spaceId !== first.spaceId)) throw new Error('source failure groups cannot cross Spaces');
+  const notices = [...new Map(inputs.map(input => {
+    const notice = sourceStreakNotice(input);
+    return [notice.id, notice] as const;
+  })).values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  if (notices.length === 1) return notices[0]!;
+  const title = first.spaceTitle.trim() || first.spaceId;
+  return {
+    id: `space-sources-${first.spaceId}-${digest(notices.map(notice => notice.id))}`,
+    title: `${notices.length} sources in ${title} aren't refreshing`,
+    body: notices.map(notice => notice.body).join('\n\n——\n\n'),
+    metadata: {
+      source: SPACE_SOURCE_NOTICE_SOURCE, workspaceId: first.spaceId, spaceTitle: title, status: 'failed',
+      failedSourceCount: notices.length,
+      sourceIds: notices.map(notice => notice.metadata.sourceId),
+      failures: notices.map(notice => ({ noticeId: notice.id, ...notice.metadata })),
     },
   };
 }
