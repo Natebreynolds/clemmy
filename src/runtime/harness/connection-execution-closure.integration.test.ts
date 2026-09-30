@@ -44,6 +44,7 @@ const brackets = await import('./brackets.js');
 const host = await import('./host-turn-runner.js');
 const hostAuthority = await import('./accepted-turn-call-authority.js');
 const hostProgress = await import('./host-connection-progress.js');
+const sourceBudgets = await import('./source-budget-policy.js');
 const batchCheckpoints = await import('./accepted-model-batch-checkpoint.js');
 const sourceContext = await import('./source-session-context.js');
 const { withSourceSessionContext } = await import('./source-session-context-scope.js');
@@ -226,11 +227,13 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   });
   const runner = new EventEmitter();
   Object.assign(runner, { run() { throw new Error('The legacy runner must not execute this fixture.'); } });
+  const preparationStartedAt = Date.now() - 1200;
   const outcome = await withSourceSessionContext(retainedContext, () => brackets.withHarnessRunContext({ ...identity,
     counter: new brackets.ToolCallsCounter(8), behaviorScopeId: `${session.id}::source:${source.seq}` },
   () => host.hostRunRunner(runner as never, agent as never,
     [{ type: 'message', role: 'user', content: executeInput }] as never,
-    { maxTurns: scenario === 'progress-exhausted' ? 5 : 6, hostTurnEngine: 'host_v1', hostJudgeCompletion: false, context: identity } as never)));
+    { maxTurns: scenario === 'progress-exhausted' ? 5 : 6, hostTurnEngine: 'host_v1', hostJudgeCompletion: false,
+      maxWallClockMs: 42_000, maxRunTokens: 1234, hostActivationStartedAt: preparationStartedAt, context: identity } as never)));
   assert.equal(modelCalls, 3, JSON.stringify({ outcome,
     planResult: log.getToolOutput(session.id, 'controlled-reviewed-plan') }));
   assert.match(String(outcome.finalOutput), /Connect the controlled fixture CRM/);
@@ -274,6 +277,11 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   const canonical = batchCheckpoints.prepareAcceptedModelBatchRestart(identity);
   assert.equal(canonical.status, 'ready');
   const progress = hostProgress.boundHostConnectionProgress(agent, identity);
+  assert.ok(progress?.activation.outerBudget, 'the connection pause must retain its original outer policy');
+  const retainedBudget = sourceBudgets.readSourceBudgetPolicy(identity, progress.activation.outerBudget)!;
+  assert.equal(retainedBudget.policy.maxActiveMs, 42_000);
+  assert.equal(retainedBudget.policy.maxUncachedTokens, 1234);
+  assert.ok(progress.activation.elapsedMs >= 1200, 'active preparation belongs to the interval before the host starts');
   assert.ok(progress, 'the real host must retain consumed progress at its input pause');
   recordMissingConnection(identity);
   const dependency = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...identity, agent });
@@ -454,7 +462,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
     connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1' as const,
     // Later caller defaults cannot overwrite the reviewed source's budget,
     // model or completion policy. The recording provider rejects auxiliaries.
-    maxTurns: 100, toolCallsPerTurn: 100, judgeCompletion: true,
+    maxTurns: 100, toolCallsPerTurn: 100, judgeCompletion: true, maxWallClockMs: 0, maxRunTokens: 999_999,
     buildAgent: async () => { throw new Error('A connection control cannot construct a fresh caller-selected agent.'); } };
   const bridgeRequest = {
     sessionId: session.id, sourceUserSeq: active.source.seq, runId,
@@ -496,6 +504,7 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
       'only actually requested model steps are charged, including a lost response');
     assert.equal(saved.activation.toolCalls.used, progress!.activation.toolCalls.used + (afterRead ? 1 : 0));
     assert.equal(saved.activation.maxTurns, scenario === 'progress-exhausted' ? 5 : 6);
+    assert.deepEqual(saved.activation.outerBudget, progress!.activation.outerBudget);
     assert.equal(Object.hasOwn(saved, 'history'), false, 'progress must not duplicate the canonical conversation');
     assert.deepEqual(Object.keys(saved.batch).sort(), ['acceptedTaskId', 'authorityDigest', 'batchId',
       'batchOrdinal', 'sessionId', 'sourceUserSeq'], 'only a bounded batch reference is retained');
@@ -829,6 +838,9 @@ for (const scenario of ['publication', 'executor', 'bridge-home', 'bridge-mobile
   else assert.equal(publishFinal().inserted, false);
   assert.deepEqual(readRows(), readBefore, 'closure and both exact replays must never repeat the completed local read');
   assert.deepEqual(spaceStore.snapshot(slug), beforeSpace);
+  assert.deepEqual(sourceBudgets.readSourceBudgetPolicy(identity, progress!.activation.outerBudget), retainedBudget);
+  assert.equal(log.listEvents(session.id, { types: ['accepted_source_budget'] }).length, 1,
+    'a reconnect control cannot open a fresh budget policy');
   assert.equal(modelCalls, ['progress-model-pending', 'progress-result-landed'].includes(scenario) ? 6 : useExecutor ? 5 : 3);
   if (scenario === 'lease-live-renewal') {
     t.mock.timers.tick(120_000);

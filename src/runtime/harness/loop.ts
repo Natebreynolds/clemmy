@@ -17,6 +17,7 @@ import { revalidateReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { thisTurnSearchAccountSelectionBlockers } from '../../tools/tool-search-provider-sources.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
+import { captureSourceBudgetPolicy, readSourceBudgetPolicy } from './source-budget-policy.js';
 import { retainedHistoryPrefixProjection } from './retained-history-prefix.js';
 import {
   approvalCallPreview,
@@ -3474,6 +3475,9 @@ export function rewriteHistoryWithNativeCompaction(
 }
 
 export interface RunTurnOptions {
+  /** Internal active-interval origin, before preparation. Never includes a
+   * parked sign-in interval, and never conveys a new allowance on recovery. */
+  hostActivationStartedAt?: number;
   /** The host's own conversational check-in activation: one tool-free model
    *  request whose PURPOSE is to speak about unfinished work and ask how to
    *  finish. Only the host sets it; a model cannot. */
@@ -6219,6 +6223,7 @@ export async function runConversation(
 /** A setup control resumes the already-reviewed host task. It cannot mint a
  * fresh plan claim, reinterpret the button text, or reinstall an older cursor. */
 async function runConnectionConversation(options: RunConversationOptions): Promise<RunConversationResult> {
+  const activationStartedAt = Date.now();
   const sourceUserSeq = options.sourceUserSeq!;
   const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
   const key = `${options.sessionId}:${sourceUserSeq}`;
@@ -6262,6 +6267,8 @@ async function runConnectionConversation(options: RunConversationOptions): Promi
           if (recovery.sessionId !== options.sessionId || recovery.sourceUserSeq !== execution.sourceUserSeq || !progress) {
             throw new Error('The connection control lost its exact retained progress.');
           }
+          if (progress.activation.outerBudget) readSourceBudgetPolicy(
+            { sessionId: options.sessionId, sourceUserSeq: execution.sourceUserSeq }, progress.activation.outerBudget);
           if (options.turnEngine && options.turnEngine !== recovery.turnEngine) throw new Error('The connection execution engine changed.');
           const preparationOwner = { sessionId: options.sessionId, requestId: link.requestId, assertOwned };
           let agent: Awaited<ReturnType<typeof rebuildSourceConnectionAgent>>;
@@ -6277,16 +6284,18 @@ async function runConnectionConversation(options: RunConversationOptions): Promi
               lastTurn: source.turn, hold };
           }
           clearConnectionPreparationHold(preparationOwner);
+          let runStartedAt = activationStartedAt;
           const run = async () => {
             assertOwned();
-            return runTurn({ agent, sessionId: options.sessionId,
+            try { return await runTurn({ agent, sessionId: options.sessionId,
+              hostActivationStartedAt: runStartedAt,
               input: acceptedRequestText(options.sessionId, execution.sourceUserSeq) ?? '',
               sourceUserSeq: execution.sourceUserSeq, runAttemptId: options.runAttemptId,
               internalContinuation: true, hostOwnedContinuation: true, reuseRecordedUserInput: true,
               suppressMemoryCapture: true, turnEngine: recovery.turnEngine,
               judgeCompletion: progress.activation.judgeCompletion,
               maxTurns: progress.activation.maxTurns, toolCallsPerTurn: progress.activation.toolCalls.limit,
-            });
+            }); } finally { runStartedAt = Date.now(); }
           };
           let turn = await run();
           assertOwned();
@@ -6355,6 +6364,7 @@ export function checkpointContinuationIsReady(
 async function runConversationWithinRuntimeConfig(
   options: RunConversationOptions & { sourceUserSeq: number },
 ): Promise<RunConversationResult> {
+  const activationStartedAt = Date.now();
   // Acceptance/replay and the exact-source activation owner live in the public
   // entry point, so a ready checkpoint hop keeps the same executor throughout.
   const sourceUserSeq = options.sourceUserSeq;
@@ -6370,6 +6380,7 @@ async function runConversationWithinRuntimeConfig(
   );
   const hostOwnsFreshTurn = options.runRunner === undefined
     && isHostTurnEngine(frozenTurnEngine);
+  if (hostOwnsFreshTurn) captureSourceBudgetPolicy({ sessionId: options.sessionId, sourceUserSeq }, options);
   // The host engine is the fresh-turn owner. Seal that ownership before the
   // semantic port participates, then compile exactly one durable graph. The
   // graph describes accepted work; it does not transfer execution to the
@@ -6756,6 +6767,7 @@ async function runConversationWithinRuntimeConfig(
       await resolveCapability?.();
       if (!activeAgent) throw new Error('capability resolution did not produce an agent before the host core.');
       const hostTurnOptions: RunTurnOptions = {
+        hostActivationStartedAt: activationStartedAt,
         agent: activeAgent,
         sessionId: options.sessionId,
         input: options.input,
@@ -10691,9 +10703,14 @@ export function goalObjectiveString(goal: PlanProposal): string | undefined {
 }
 
 export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
+  const activeOptions = { ...options, hostActivationStartedAt: options.hostActivationStartedAt ?? Date.now() };
+  if (options.runRunner === undefined && options.sourceUserSeq
+    && isHostTurnEngine(options.turnEngine ?? selectTurnEngine({ sessionKind: getSession(options.sessionId)?.kind ?? '' }))) {
+    captureSourceBudgetPolicy({ sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq });
+  }
   const context = options.sourceUserSeq && !currentSourceSessionContext(options.sessionId)
     ? readSourceSessionContext({ sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq }) : null;
-  return context ? withSourceSessionContext(context, () => runTurnWithSessionContext(options)) : runTurnWithSessionContext(options);
+  return context ? withSourceSessionContext(context, () => runTurnWithSessionContext(activeOptions)) : runTurnWithSessionContext(activeOptions);
 }
 
 async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTurnResult> {
@@ -12313,6 +12330,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
       // (2026-09-01: it only ever ran in the legacy core, which host_v1 never
       // enters — every live reply shipped unjudged).
       opts.hostJudgeCompletion = options.judgeCompletion === true;
+      opts.hostActivationStartedAt = options.hostActivationStartedAt;
       opts.hostPreviousResponseId = session.previousResponseId();
       if (options.hostConversationalCheckIn === true) {
         (opts as { hostConversationalCheckIn?: boolean }).hostConversationalCheckIn = true;

@@ -29,6 +29,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
 import { acceptedPlanExecution, acceptedPlanExecutionText } from './accepted-plan-execution.js';
+import { captureSourceBudgetPolicy, readSourceBudgetPolicy } from './source-budget-policy.js';
 import { acceptedTaskMode, acceptedTaskModeIdentity, planModeCallRefusal, planModeReadOnlyRefusalText } from './accepted-task-mode.js';
 import { getPlanRevision } from './plan-artifacts.js';
 import { normalizeCallableArguments } from './callable-contract.js';
@@ -2902,7 +2903,10 @@ function priorZeroCrossingRefusalCounts(
  */
 const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   clearHostConnectionProgress(agent);
-  const connectionActivationStartedAt = Date.now();
+  const configuredActivationStartedAt = opts.hostActivationStartedAt;
+  const connectionActivationStartedAt = typeof configuredActivationStartedAt === 'number'
+    && Number.isSafeInteger(configuredActivationStartedAt) && configuredActivationStartedAt >= 0
+    && configuredActivationStartedAt <= Date.now() ? configuredActivationStartedAt : Date.now();
   const carriedProgress = itemsOrState instanceof HostRecoveryState || itemsOrState instanceof HostInterruptState
     ? parseConnectionProgress(itemsOrState.connectionProgress, {
       ...(itemsOrState instanceof HostRecoveryState ? { sessionId: itemsOrState.sessionId,
@@ -3190,6 +3194,17 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       maxLogicalCalls: ambient.counter.limit,
     };
   };
+
+  const outerBudget = hostProduction && !conversationalCheckInSurface()
+    ? carriedProgress?.activation.outerBudget
+      ? readSourceBudgetPolicy(exactHostIdentity(), carriedProgress.activation.outerBudget)
+      : itemsOrState instanceof HostRecoveryState || itemsOrState instanceof HostInterruptState
+        ? readSourceBudgetPolicy(exactHostIdentity())
+        : captureSourceBudgetPolicy(exactHostIdentity(), {
+          ...(typeof opts.maxWallClockMs === 'number' ? { maxWallClockMs: opts.maxWallClockMs } : {}),
+          ...(typeof opts.maxRunTokens === 'number' ? { maxRunTokens: opts.maxRunTokens } : {}),
+        })
+    : null;
 
   const poisonExactHostAuthority = (sessionId: string, sourceUserSeq: number, reason: string): void => {
     const current = acceptedTurnCallAuthorityFor(sessionId, sourceUserSeq);
@@ -3980,6 +3995,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         maxTurns, toolCalls: { used: counter.currentCount, limit: counter.limit },
         elapsedMs: (carriedProgress?.activation.elapsedMs ?? 0) + Math.max(0, Date.now() - connectionActivationStartedAt),
         judgeCompletion: hostJudgeCompletion,
+        ...(outerBudget ? { outerBudget: { eventId: outerBudget.eventId, digest: outerBudget.digest } } : {}),
       },
       continuations: {
         acceptedReadPlanUsed: acceptedReadPlanContinuationUsed,

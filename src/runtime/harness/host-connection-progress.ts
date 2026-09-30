@@ -3,6 +3,7 @@
  * journal remains the sole owner of conversation and settled-result bytes. */
 import type { AcceptedModelBatchRef } from './accepted-model-batch-checkpoint.js';
 import type { HostRecoveryState } from './host-turn-runner.js';
+import { assertSourceBudgetPolicyRef, type SourceBudgetPolicyRef } from './source-budget-policy.js';
 
 export interface HostConnectionProgress {
   version: 1;
@@ -14,6 +15,8 @@ export interface HostConnectionProgress {
     toolCalls: { used: number; limit: number };
     elapsedMs: number;
     judgeCompletion: boolean;
+    /** Absent in historical progress; never replace it with today's defaults. */
+    outerBudget?: SourceBudgetPolicyRef;
   };
   continuations: {
     acceptedReadPlanUsed: boolean;
@@ -55,6 +58,7 @@ export function assertHostConnectionProgress(value: HostConnectionProgress): voi
   if (!value || value.version !== 1 || !value.batch || !value.recovery
     || !value.activation || !value.continuations || !value.watcher) return fail();
   const { batch, recovery, activation, continuations, watcher } = value;
+  if (activation.outerBudget !== undefined) assertSourceBudgetPolicyRef(activation.outerBudget);
   const natural = (n: unknown) => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
   const nonempty = (s: unknown) => typeof s === 'string' && s.length > 0;
   if (!nonempty(batch.sessionId) || !natural(batch.sourceUserSeq) || batch.sourceUserSeq < 1

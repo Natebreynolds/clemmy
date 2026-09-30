@@ -1423,3 +1423,86 @@ then expose an owned Retry/Continue route and its reloadable UI projection.
 `EXECUTION_CONTINUATION_BLOCKER` remains active. Subsequent approval/connection
 cycles, workflow finalization, physical-write no-replay, device handoff and
 controlled installed-app/live-home acceptance are still owed before release.
+
+### Original outer policy and preparation time — 2026-09-30
+
+The next slice records the original host request's outer policy before
+capability preparation: configured active-time ceiling, configured uncached
+token ceiling, and the existing token-enforcement setting. It uses one
+`accepted_source_budget` event bound to the exact accepted user event. It does
+not change defaults, add a cap, or create a rollout flag. Explicit zero remains
+unlimited. Re-entering the same source reopens its existing policy even when
+the caller or environment now supplies different values. A new user source
+gets its own policy.
+
+Connection progress carries only the policy event id and digest. The ordinary
+host parser checks that reference's shape; execution reopens and validates the
+original source, parent event, system role, policy values and digest before
+agent reconstruction or host work. Reconnect controls do not create a new
+policy event. Duplicate/conflicting records are refused, not resolved by
+choosing the latest setting. A historical source that already has turn-start
+evidence but no retained policy stays unknown. Its original settings are not
+inferred from today's defaults. No new database migration is needed for this
+event; migration 84 from the preceding increment remains the latest here.
+
+Active-time snapshots now receive the activation origin from before host
+preparation. This includes fresh conversation preparation and successful
+connection re-attestation, instead of starting the clock only after those
+awaits have finished. A second checkpoint-only hop starts its next interval
+after the first call returns; it must not double-charge the first interval.
+The existing retained elapsed total remains the base. This is still boundary
+accounting, **not** an exact clock across a process death: an in-flight gap or
+preparation that throws before a snapshot is retained is not yet accounted.
+
+Verified:
+
+- The ordinary `runConversation` connection-pause fixture asserts that its
+  explicit policy exists **before** agent construction and is retained in the
+  actual ASK/decision checkpoint.
+- All 39 execution-closure scenarios capture the original policy, including
+  desktop/mobile bridges and lease/checkpoint recovery. Successful replay and
+  database reopen retain the same event, and contradictory continuation
+  options do not overwrite it. Progress recovery carries the same reference.
+  The fixture also proves pre-host preparation time enters the snapshot.
+- Six policy checks cover reopen, changed options, unlimited, the existing
+  enforcement setting, independent new sources, tuple/reference mismatch,
+  historical uncertainty, invalid time values and ambiguous policy records.
+- `/tmp/clem-source-budget-regression.txt`: **65/65** checks across five files,
+  including all 39 execution scenarios, source/approval checkpoint
+  compatibility and original agent/project context.
+- `/tmp/clem-source-budget-host-compat.txt`: **345/345** checks across three
+  files, including nested host-runner checks and the strengthened ordinary
+  entry-point assertions. This overlaps the 65-check run; do not add the
+  totals together. Runtime TypeScript passed in
+  `/tmp/clem-source-budget-policy-tsc-final-2.txt`.
+- Removing only the retained budget reference from the host snapshot made the
+  actual publication scenario fail with “the connection pause must retain its
+  original outer policy”: `/tmp/clem-source-budget-reference-red.txt`. The
+  original candidate bytes were restored in `finally`; the mutation was not
+  retained. `git diff --check` passed on the restored candidate.
+
+One implementation error was caught and corrected locally: the new timing
+value was initially referenced inside `runTurnWithSessionContext` without
+being passed through the outer `runTurn` wrapper. TypeScript and the first
+recording run both exposed it. That obsolete run was terminated; its partial
+results are in `/tmp/clem-source-budget-initial.txt`. The timing value now
+travels through the internal options object, and the later checks above ran
+the correction.
+
+Still owed, in order: enforce the frozen outer policy at safe host boundaries;
+include exact descendant/auxiliary spend and represent unreported in-flight
+usage honestly; retain active-time intervals across interruption/preparation
+failure; then wire the owned Retry/Continue action and durable desktop/mobile
+state projection. Policy capture alone is not budget enforcement or a new
+allowance. The recorded fixture ceilings in this slice test **continuity**,
+not limit-stop behavior. The public `EXECUTION_CONTINUATION_BLOCKER` remains.
+
+The UI should show the original task's limit only when configured and disclose
+incomplete usage/time evidence in expanded details. A setup card must not
+claim “resumed,” a reset budget or a fresh task while only the connection was
+verified. This slice does not edit or claim to render that UI.
+
+No paid model/provider, credentials/settings mutation, build, hotpatch, merge
+or tag. The isolated live-home sentinel was **NOT PERFORMED** while daemon
+72427 wrote its normal stores; these pins do not replace installed acceptance.
+The other agent remains clean at `76c53a1ea` on `claude/two-modes`.

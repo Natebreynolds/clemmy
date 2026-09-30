@@ -190,6 +190,9 @@ export const EVENT_TYPES = [
   'conversation_recovery_candidate',
   'conversation_completed',
   'conversation_limit_exceeded',
+  // Exact accepted-source outer policy. A setup control cannot replace it
+  // with current settings or treat reconnection as a new allowance.
+  'accepted_source_budget',
   // Auto-capture writeback: emitted from the harness loop whenever a
   // user message produced durable facts or a profile patch via
   // captureInteractionSignals. Lets the trace show "Clementine learned

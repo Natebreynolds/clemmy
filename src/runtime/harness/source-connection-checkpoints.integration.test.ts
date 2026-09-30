@@ -30,6 +30,7 @@ const { bindAgentMcpToolScope } = await import('../mcp-tool-authority.js');
 const { readSourceConnectionCheckpoint } = await import('./source-connection-checkpoints.js');
 const { readSourceConnectionHostRecovery } = await import('./connection-host-recovery.js');
 const hostProgress = await import('./host-connection-progress.js');
+const sourceBudgets = await import('./source-budget-policy.js');
 const { currentConnectionDependency } = await import('./dependency-request.js');
 const { bindAgentSourceSessionContext } = await import('./source-session-context-scope.js');
 const { createAgentRecord } = await import('../../agents/agent-record.js');
@@ -117,10 +118,13 @@ for (const answerShape of ['ask', 'decision'] as const) test(`real ${answerShape
 
   const result = await runConversation({ sessionId: session.id, sourceUserSeq: source.seq, input: String(source.data.text),
     reuseRecordedUserInput: true, buildAgent: async () => {
+      const beforeConstruction = sourceBudgets.readSourceBudgetPolicy({ sessionId: session.id, sourceUserSeq: source.seq });
+      assert.equal(beforeConstruction?.policy.maxActiveMs, 43_000, 'original policy is recorded before capability preparation');
+      assert.equal(beforeConstruction.policy.maxUncachedTokens, 4567);
       bindAgentSourceSessionContext(agent, session.id);
       return agent as never;
     }, turnEngine: 'host_v1', judgeCompletion: false,
-    suppressMemoryCapture: true, maxTurns: 3, maxSteps: 2,
+    suppressMemoryCapture: true, maxTurns: 3, maxSteps: 2, maxWallClockMs: 43_000, maxRunTokens: 4567,
     makeRunner: () => new EventEmitter() as never });
   assert.equal(result.status, 'awaiting_user_input', JSON.stringify(result));
   assert.equal(calls, 2);
@@ -139,6 +143,9 @@ for (const answerShape of ['ask', 'decision'] as const) test(`real ${answerShape
   assert.equal(retained.hostProgress.activation.maxTurns, 3);
   assert.equal(retained.hostProgress.activation.toolCalls.used, 1);
   assert.equal(retained.hostProgress.activation.judgeCompletion, false);
+  assert.ok(retained.hostProgress.activation.outerBudget);
+  assert.equal(sourceBudgets.readSourceBudgetPolicy({ sessionId: session.id, sourceUserSeq: source.seq },
+    retained.hostProgress.activation.outerBudget)?.policy.maxUncachedTokens, 4567);
   assert.ok(retained.hostProgress.activation.elapsedMs >= 0);
   assert.equal('history' in retained.hostProgress, false, 'a connection record must not copy a full prompt');
   const root = (await import('./accepted-turn-call-authority.js')).acceptedTurnCallAuthorityFor(session.id, source.seq);
