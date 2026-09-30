@@ -29,6 +29,10 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-wf-ceiling-continue-')
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.CLEMENTINE_WORKFLOW_HARNESS_POLL_MS = '20';
+// The step clock is a ceiling only under a capped preset (2026-09-30). These
+// cases pin the ceiling and its continuations, so they run capped; the
+// unlimited case below pins that no clock is passed at all.
+process.env.HARNESS_BUDGET_PRESET = 'long';
 // A tight cap keeps the never-progressing-ceiling case cheap while still
 // proving the cap is what bounds it.
 process.env.CLEMMY_CHAT_AUTO_CONTINUE_CAP = '3';
@@ -853,4 +857,50 @@ test('a settlement-guarded capture finalizes a capped checkpoint as success exac
   assert.equal(sourceTerminals[0]?.data?.reason, 'success');
   assert.equal(eventlog.getSession(stepSessionId)?.status, 'completed');
   assert.equal((JSON.parse(readFileSync(runFile, 'utf-8')) as { status?: string }).status, 'completed');
+});
+
+test('under the unlimited preset a step carries no clock: a long step is not parked for time', async () => {
+  const prior = process.env.HARNESS_BUDGET_PRESET;
+  process.env.HARNESS_BUDGET_PRESET = 'unlimited';
+  const workflowName = 'No Ceiling Unlimited';
+  writeWorkflow('no-ceiling-unlimited', {
+    name: workflowName,
+    description: '',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'long_step', prompt: 'Collect every tracker row.', sideEffect: 'read' }],
+  });
+  const runFile = queueRun(workflowName, 'no-ceiling-unlimited-run');
+  let activations = 0;
+  let stepSessionId = '';
+  let sourceUserSeq = 0;
+  let wallClockMs: number | undefined;
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    stepWallClockMs: 1_000,
+    runConversation: (async (request: { sessionId?: string; sourceUserSeq?: number; maxWallClockMs?: number }) => {
+      activations += 1;
+      stepSessionId = String(request.sessionId ?? '');
+      sourceUserSeq = Number(request.sourceUserSeq ?? 0);
+      wallClockMs = request.maxWallClockMs;
+      // Outlive the capped clock; under unlimited that means nothing.
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+      recordStepResult(stepSessionId, { ok: true, rows: [{ id: 'late-row' }] });
+      return {
+        sessionId: stepSessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { summary: 'Collected.', reply: 'Collected.', done: true, nextAction: 'completed', reason: null },
+      };
+    }) as never,
+  });
+  try {
+    await drain();
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+    if (prior === undefined) delete process.env.HARNESS_BUDGET_PRESET; else process.env.HARNESS_BUDGET_PRESET = prior;
+  }
+  assert.equal(activations, 1);
+  assert.equal(wallClockMs, 0, 'no clock is passed under the unlimited preset');
+  assert.equal((JSON.parse(readFileSync(runFile, 'utf-8')) as { status?: string }).status, 'completed');
+  assert.equal(sourceUserSeq > 0, true);
 });

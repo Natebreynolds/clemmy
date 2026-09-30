@@ -7313,10 +7313,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // The call was right; only the owner's decision is missing. The
           // edge is the queue, never a repair of the arguments.
           ? nextEdge({ tool: 'pending_action_queue', change: 'queue_for_approval' })
-          : defaultDispositionEdge({
-            disposition: input.disposition,
-            toolName: innerTool,
-          }) }),
+          : input.diagnostic && input.diagnostic.includes('workflow_write_checker_unavailable')
+            // The write was not judged because the checker was down. Retrying
+            // the same call re-runs the same outage; the honest move is to
+            // finish with this write named as not done.
+            ? nextEdge({ tool: innerTool, change: 'publish_partial',
+              say: 'The constraint checker could not judge this write. Do not retry it: finish the step and report this write as not done, with the values it would have written.' })
+            : defaultDispositionEdge({
+              disposition: input.disposition,
+              toolName: innerTool,
+            }) }),
     });
   };
 

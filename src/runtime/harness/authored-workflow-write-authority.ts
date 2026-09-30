@@ -31,6 +31,7 @@ import {
   getSession,
   getRunAttemptBySourceUserSeq,
   openEventLog,
+  appendEvent,
 } from './eventlog.js';
 import { currentAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
@@ -742,11 +743,24 @@ function landedWriteInEarlierAttempt(input: {
 /** Constraint review is a refusal boundary, never a replacement for consent.
  * Run before reserving an authored send, so a corrected proposal can still use
  * its one occurrence. Errors return a non-null hold and cannot fall through. */
+/** The owner's exact approval of this write was the consent basis. */
+function journalConstraintCheckerUnavailable(attestation: HostCallAttestation, result: { reason: string; checkerFailure?: string }): void {
+  try {
+    appendEvent({
+      sessionId: attestation.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+      data: { kind: 'workflow_write_checker_unavailable', sourceUserSeq: attestation.sourceUserSeq,
+        tool: attestation.toolName, failure: result.checkerFailure ?? 'error', reason: result.reason },
+    });
+  } catch { /* a journal miss never changes the decision */ }
+}
+
 async function reviewAuthoredWriteConstraints(input: {
   attestation: HostCallAttestation;
   args: Record<string, unknown>;
   reopened: ReopenedAuthoredStep;
   schema?: unknown;
+  /** The consent that reached this review was the owner's exact grant of this write. */
+  ownerApprovedExactly?: boolean;
 }): Promise<HostInteractiveConsentResult | null> {
   try {
     const argsDigest = digest(input.args);
@@ -779,6 +793,16 @@ async function reviewAuthoredWriteConstraints(input: {
       return { status: 'hold', retryable: true, reason: 'workflow_write_authority_changed_during_review' };
     }
     if (result.verdict === 'compatible') return null;
+    if (result.checkerFailure) {
+      // No reviewer answered. That is the checker's outage, not a fact about
+      // the write, so it is never handed to the model as evidence to
+      // "reconcile". The owner's own exact approval of this write carries it
+      // (the constraint review is a belt over that consent); a standing grant
+      // does not, and the step stops truthfully with this write undone.
+      journalConstraintCheckerUnavailable(input.attestation, result);
+      if (input.ownerApprovedExactly) return null;
+      return { status: 'hold', retryable: true, reason: `workflow_write_checker_unavailable: ${result.reason}` };
+    }
     return result.verdict === 'conflict'
       ? { status: 'repair', retryable: true, reason: `workflow_write_constraint_conflict: ${result.reason}` }
       : { status: 'hold', retryable: true, reason: `workflow_write_constraints_unverified: ${result.reason}` };
@@ -1190,7 +1214,8 @@ async function evaluateAuthoredCatalogWrite(input: {
       // covers the ordinary writes a follow-up may continue.
       const landed = gate === 'send' ? null : landedWriteInEarlierAttempt({ reopened, attestation, args: input.args });
       if (landed) return landed;
-      const refusal = await reviewAuthoredWriteConstraints({ ...input, schema });
+      const refusal = await reviewAuthoredWriteConstraints({ ...input, schema,
+        ownerApprovedExactly: decision.basis === 'exact_user_grant' });
       if (refusal) return refusal;
     }
     if (gate === 'send' && decision.basis === 'exact_user_grant') {

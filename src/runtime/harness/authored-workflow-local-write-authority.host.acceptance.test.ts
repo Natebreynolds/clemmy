@@ -736,6 +736,43 @@ test('native workflow write constraints reject before execution and allow correc
 });
 
 
+test('a constraint checker that cannot answer stops the step truthfully instead of looping the model', async () => {
+  // Live 2026-09-30: three reviewer timeouts in one step were reported as
+  // "could not be verified"; the model re-proposed the same write each time
+  // until the step's clock ran out.
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
+  const { bodies, tools } = fixtureTools(['goal_upsert']);
+  let reviews = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    reviews++;
+    return { verdict: 'uncertain', reason: 'The constraint checker did not answer within its deadline; this write was not judged.',
+      proposalDigest: 'fixture-review', checkerFailure: 'timeout' };
+  });
+  try {
+    const model = stubModel([
+      [toolCall('native-unjudged', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      // A model that ignores the edge and retries is refused the same way; it
+      // must be told to finish, not to reconcile.
+      [toolCall('native-unjudged-again', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [textMsg('The goal title could not be saved: the constraint checker was unavailable. It would have set the title to Approved title, status active.')],
+    ]);
+    const agent = { model, tools };
+    bindSurface(fixture, agent, tools);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(bodies.goal_upsert ?? 0, 0, 'an unjudged write under a standing grant does not run');
+    const history = JSON.stringify(outcome.history);
+    assert.match(history, /workflow_write_checker_unavailable/);
+    assert.match(history, /publish_partial/, 'the typed edge is to finish, not to repair');
+    assert.doesNotMatch(history, /workflow_write_constraints_unverified/);
+    assert.doesNotMatch(history, /retain the proposal and reconcile/);
+    assert.equal(pendingApprovalCount(fixture), 0);
+    const journaled = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+      .filter(event => event.data.kind === 'workflow_write_checker_unavailable');
+    assert.equal(journaled.length, reviews, 'each outage is journaled');
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
 test('an authored native write gets its current schema before consent when required arguments are missing', async () => {
   const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write', prompt: 'Write a prepared local report.' });
   const { tools } = fixtureTools(['write_file']);

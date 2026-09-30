@@ -5573,8 +5573,17 @@ async function runStepViaHarness(
     const approvalIds: string[] = [];
     let hadApprovals = false;
     const startedAt = Date.now();
-    const stepDeadlineAt = startedAt + workflowStepWallClockMsImpl;
-    const remainingStepWallClockMs = (): number => Math.max(0, stepDeadlineAt - Date.now());
+    // A step's clock is a ceiling only when the owner chose a capped preset.
+    // Under the unlimited preset a step that is landing work has no ceiling
+    // (a run stops for a terminal outcome, a gate, a stop, or zero progress,
+    // never for a clock): live 2026-09-30 a Slack-review step lost its last
+    // sheet write to the 15-minute clock after ten minutes of checker retries.
+    // Zero means "no cap" everywhere below, the same spelling the budget
+    // settings use.
+    const stepCapMs = getHarnessBudgetSettings().unlimited ? 0 : workflowStepWallClockMsImpl;
+    const stepDeadlineAt = stepCapMs > 0 ? startedAt + stepCapMs : undefined;
+    const remainingStepWallClockMs = (): number => (stepDeadlineAt === undefined ? 0 : Math.max(0, stepDeadlineAt - Date.now()));
+    const stepWallClockSpent = (): boolean => stepDeadlineAt !== undefined && remainingStepWallClockMs() <= 0;
 
     // Close the race where the board was cancelled after the caller's last
     // step-boundary check but before this child attempt was registered.
@@ -5658,7 +5667,7 @@ async function runStepViaHarness(
         sourceUserSeq: sourceUserEvent.seq,
         acceptedInput: message,
       },
-      deadlineAt: stepDeadlineAt,
+      ...(stepDeadlineAt === undefined ? {} : { deadlineAt: stepDeadlineAt }),
     });
     if (preparedExternalCatalog.status === 'refused') {
       throw catalogPreparationRefusalToCapabilityBlock(step, preparedExternalCatalog);
@@ -5863,7 +5872,7 @@ async function runStepViaHarness(
       };
     } else {
       const initialWallClockMs = remainingStepWallClockMs();
-      if (initialWallClockMs <= 0) {
+      if (stepWallClockSpent()) {
         throw new Error(`workflow step "${step.id}" exhausted its wall-clock budget before model execution`);
       }
       result = await runWorkflowConversationImpl({
@@ -5907,7 +5916,6 @@ async function runStepViaHarness(
     // while the parked activation actually made progress.
     const { chatAutoContinueDecision, chatAutoContinueCap, buildContinueInput } =
       await import('../runtime/harness/continue-directive.js');
-    const { getHarnessBudgetSettings } = await import('../runtime/harness/budget-settings.js');
     let continueAttempts = 0;
     // What the harness DID about the ceiling, so the failure can say it. A
     // bare "tool calls per turn exceeded the limit of 64" reads as "the ceiling
@@ -5940,7 +5948,7 @@ async function runStepViaHarness(
         continueAttempts += 1;
         if (latchWorkflowRunCancellation(workflowRunId)) throw new WorkflowRunCancelledError();
         const continuationWallClockMs = remainingStepWallClockMs();
-        if (continuationWallClockMs <= 0) { continueStop = 'wall_clock'; break; }
+        if (stepWallClockSpent()) { continueStop = 'wall_clock'; break; }
         result = await runWorkflowConversationImpl({
           agent,
           sessionId: realSessionId,
@@ -6078,7 +6086,7 @@ async function runStepViaHarness(
         observedApprovalIds: approvalIds,
       });
       const approvalResumeWallClockMs = remainingStepWallClockMs();
-      if (approvalResumeWallClockMs <= 0) {
+      if (stepWallClockSpent()) {
         throw new Error(`workflow step "${step.id}" exhausted its wall-clock budget before approval resume`);
       }
 

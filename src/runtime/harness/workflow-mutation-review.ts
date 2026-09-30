@@ -10,6 +10,11 @@ export type WorkflowMutationReview = {
   verdict: 'compatible' | 'conflict' | 'uncertain';
   reason: string;
   proposalDigest: string;
+  /** Set when no reviewer answered: the verdict is not a judgement about the
+   * write but the checker's own failure (its deadline, an unparseable reply,
+   * an error). A caller must not send the model to "reconcile" evidence the
+   * reviewer never weighed. */
+  checkerFailure?: 'timeout' | 'invalid' | 'error';
 };
 export interface WorkflowMutationReviewInput {
   sessionId: string;
@@ -107,12 +112,31 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
       }
     } catch { /* The configured reviewer remains the fallback. */ }
   }
+  // The checker's failure is not a verdict. Live 2026-09-30: a review that
+  // opened retained evidence averaged 78 s and timed out three times in one
+  // step; each timeout was reported as "could not be verified", the model
+  // re-proposed the same write, and the step spent ten minutes going in
+  // circles until its clock ran out. A timed-out review is retried once as a
+  // plain read of the proposal, and a checker that still cannot answer says so.
+  const judge = deps.judge ?? runHedgedJudge;
+  let failure: WorkflowMutationReview['checkerFailure'] = 'error';
   try {
-    const reviewed = await (deps.judge ?? runHedgedJudge)(SYSTEM, prompt,
+    const reviewed = await judge(SYSTEM, prompt,
       output => parseWorkflowMutationReview(output, proposalDigest), value => value.verdict === 'compatible',
       'mutation_constraints', { requireCompletePrompt: true, evidence });
-    return reviewed.value ?? uncertain('Write constraints could not be verified; retain the proposal and reconcile before dispatch.');
-  } catch {
-    return uncertain('Write constraints could not be verified; retain the proposal and reconcile before dispatch.');
+    if (reviewed.value) return reviewed.value;
+    failure = reviewed.failure ?? 'error';
+  } catch { failure = 'error'; }
+  if (failure === 'timeout') {
+    try {
+      const plain = await judge(SYSTEM, serialized,
+        output => parseWorkflowMutationReview(output, proposalDigest), value => value.verdict === 'compatible',
+        'mutation_constraints', { requireCompletePrompt: false });
+      if (plain.value) return plain.value;
+      failure = plain.failure ?? 'error';
+    } catch { failure = 'error'; }
   }
+  const said = failure === 'timeout' ? 'did not answer within its deadline'
+    : failure === 'invalid' ? 'answered in a shape that could not be read' : 'could not be reached';
+  return { ...uncertain(`The constraint checker ${said}; this write was not judged.`), checkerFailure: failure };
 }

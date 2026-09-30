@@ -92,3 +92,39 @@ test('large observations do not hide the write or saved constraints behind a loo
   });
   assert.equal(result.verdict, 'compatible', result.reason);
 });
+
+test('a checker that does not answer says so, retries a timed-out review once as a plain read, and never calls the outage a verdict', async () => {
+  // Live 2026-09-30: reviews averaging 78 s timed out three times in one step
+  // and were reported as "could not be verified"; the model re-proposed the
+  // same write until the step's clock ran out.
+  const calls: Array<{ prompt: string; complete: boolean | undefined }> = [];
+  const timedOut = await reviewWorkflowMutation(input, { evaluate: async () => { throw new Error('offline'); },
+    judge: async (_system, prompt, _parse, _pass, _lane, opts) => {
+      calls.push({ prompt, complete: opts?.requireCompletePrompt });
+      return { value: null, failure: 'timeout' };
+    } });
+  assert.equal(timedOut.verdict, 'uncertain');
+  assert.equal(timedOut.checkerFailure, 'timeout');
+  assert.match(timedOut.reason, /did not answer within its deadline/);
+  assert.equal(calls.length, 2, 'one retry as a plain read');
+  assert.equal(calls[0]!.complete, true);
+  assert.equal(calls[1]!.complete, false);
+
+  // A plain read that answers wins.
+  let n = 0;
+  const answered = await reviewWorkflowMutation(input, { evaluate: async () => { throw new Error('offline'); },
+    judge: async (_system, _prompt, parse) => {
+      n += 1;
+      if (n === 1) return { value: null, failure: 'timeout' };
+      const digest = /"proposalDigest":"([a-f0-9]{64})"/.exec(_prompt)?.[1];
+      return { value: parse({ verdict: 'conflict', reason: 'row-1 is the header; the write targets row-1', proposalDigest: digest }), failure: null };
+    } });
+  assert.equal(answered.verdict, 'conflict');
+  assert.equal(answered.checkerFailure, undefined);
+
+  // An unparseable answer is not retried as a timeout would be, and is named.
+  const invalid = await reviewWorkflowMutation(input, { evaluate: async () => { throw new Error('offline'); },
+    judge: async () => ({ value: null, failure: 'invalid' }) });
+  assert.equal(invalid.checkerFailure, 'invalid');
+  assert.match(invalid.reason, /could not be read/);
+});
