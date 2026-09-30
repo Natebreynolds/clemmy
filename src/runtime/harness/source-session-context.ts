@@ -5,6 +5,7 @@ import { composeSession, type SessionMount } from './session-composition.js';
 import { getAgentRecord } from '../../agents/agent-record.js';
 import { agentScopeKey, type MemoryScope } from '../../memory/memory-scope.js';
 import { readRecoveryActivation } from './recovery-activation.js';
+import { ensureSourceSessionContextStore } from './retained-session-proof-schema.js';
 import { currentSourceSessionContext, withSourceSessionContext,
   type SourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 
@@ -27,15 +28,7 @@ const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(valu
 
 function table() {
   const db = openEventLog();
-  db.exec(`CREATE TABLE IF NOT EXISTS source_session_contexts_v1 (
-    session_id TEXT NOT NULL, source_user_seq INTEGER NOT NULL,
-    identity_json TEXT NOT NULL, identity_digest TEXT NOT NULL,
-    PRIMARY KEY(session_id, source_user_seq), FOREIGN KEY(source_user_seq) REFERENCES events(seq)
-  );
-  CREATE TRIGGER IF NOT EXISTS source_session_contexts_v1_no_update BEFORE UPDATE ON source_session_contexts_v1
-    BEGIN SELECT RAISE(ABORT, 'source composition is immutable'); END;
-  CREATE TRIGGER IF NOT EXISTS source_session_contexts_v1_no_delete BEFORE DELETE ON source_session_contexts_v1
-    BEGIN SELECT RAISE(ABORT, 'source composition is immutable'); END;`);
+  ensureSourceSessionContextStore(db);
   return db;
 }
 
@@ -148,7 +141,7 @@ export function captureFreshSourceSessionContext(input: Pick<SourceSessionContex
       mountDigest: mountDigest(mount), memoryScope,
       ...(parent ? { parent: { sessionId: parent.sessionId, sourceUserSeq: parent.sourceUserSeq, digest: parent.digest } } : {}) };
     const digest = hash(identity);
-    table().prepare('INSERT INTO source_session_contexts_v1 VALUES (?, ?, ?, ?)')
+    table().prepare('INSERT INTO source_session_contexts_v1 (session_id, source_user_seq, identity_json, identity_digest) VALUES (?, ?, ?, ?)')
       .run(input.sessionId, input.sourceUserSeq, JSON.stringify(identity), digest);
     return { ...input, digest, mount, memoryScope };
   }).immediate();

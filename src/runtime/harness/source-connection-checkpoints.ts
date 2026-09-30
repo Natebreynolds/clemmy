@@ -18,6 +18,7 @@ import { sealAdmissionEnvelope, type AdmissionEnvelope, type CapabilityBindingRe
 import { boundAgentSourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 import { assertHostConnectionProgress, boundHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { connectionDependencyIdentity } from './connection-execution-pause-proof.js';
+import { ensureSourceConnectionCheckpointStore } from './retained-session-proof-schema.js';
 
 /** Same construction records retained at workflow handoff. Historical tool
  * definitions and scope are context for rebuilding, never current authority. */
@@ -94,20 +95,7 @@ function assertRetainedAgent(value: ConnectionAgentCheckpoint, sessionId: string
 
 function store() {
   const db = openEventLog();
-  db.exec(`CREATE TABLE IF NOT EXISTS source_connection_checkpoints_v1 (
-    request_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    source_user_seq INTEGER NOT NULL,
-    checkpoint_json TEXT NOT NULL,
-    checkpoint_digest TEXT NOT NULL,
-    FOREIGN KEY(request_id) REFERENCES dependency_requests(request_id)
-  );
-  CREATE TRIGGER IF NOT EXISTS source_connection_checkpoints_v1_no_update
-    BEFORE UPDATE ON source_connection_checkpoints_v1
-    BEGIN SELECT RAISE(ABORT, 'connection checkpoints are immutable'); END;
-  CREATE TRIGGER IF NOT EXISTS source_connection_checkpoints_v1_no_delete
-    BEFORE DELETE ON source_connection_checkpoints_v1
-    BEGIN SELECT RAISE(ABORT, 'connection checkpoints are immutable'); END;`);
+  ensureSourceConnectionCheckpointStore(db);
   return db;
 }
 

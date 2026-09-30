@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
 import { SESSION_HISTORY_SEARCH_SCHEMA_V1 } from './session-history-search-schema.js';
+import { migrateRetainedSessionProofs } from './retained-session-proof-schema.js';
 import {
   PLAN_TASK_ACTIVATION_RECEIPTS_TABLE,
   PLAN_TASK_BINDING_SEAL_RECOVERY_CURSOR_TABLE,
@@ -11252,6 +11253,7 @@ const MIGRATIONS: EventLogMigration[] = [
       }
     },
   },
+  { version: 83, sql: '', foreignKeysOff: true, backfill: migrateRetainedSessionProofs },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

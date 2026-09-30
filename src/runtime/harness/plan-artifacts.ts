@@ -5,6 +5,7 @@ import {
 } from './eventlog.js';
 import { sameConversationAncestorSessionIds } from './accepted-source-session-branch.js';
 import { parseTaskMode, type PlanRevisionRef } from './task-mode.js';
+import { ensureReviewedPlanStore } from './retained-session-proof-schema.js';
 
 export type PlanJson = null | boolean | number | string | PlanJson[] | { [key: string]: PlanJson };
 export type PlanStructuredOutline = { [key: string]: PlanJson };
@@ -99,39 +100,7 @@ function checkedRef(ref: PlanRevisionRef): PlanRevisionRef {
 }
 
 function ensureStore(db: Db): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS reviewed_plan_revisions_v1 (
-      plan_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision > 0), digest TEXT NOT NULL,
-      session_id TEXT NOT NULL REFERENCES sessions(id), source_user_seq INTEGER NOT NULL REFERENCES events(seq),
-      principal_id TEXT NOT NULL, artifact_json TEXT NOT NULL, event_id TEXT NOT NULL REFERENCES events(id),
-      PRIMARY KEY(plan_id, revision), UNIQUE(session_id, source_user_seq)
-    );
-    CREATE TABLE IF NOT EXISTS reviewed_plan_execution_claims_v1 (
-      claim_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, revision INTEGER NOT NULL,
-      session_id TEXT NOT NULL REFERENCES sessions(id), source_user_seq INTEGER NOT NULL REFERENCES events(seq),
-      claim_json TEXT NOT NULL, event_id TEXT NOT NULL REFERENCES events(id),
-      UNIQUE(plan_id, revision), UNIQUE(session_id, source_user_seq),
-      FOREIGN KEY(plan_id, revision) REFERENCES reviewed_plan_revisions_v1(plan_id, revision)
-    );
-    CREATE TABLE IF NOT EXISTS reviewed_plan_execution_observers_v1 (
-      session_id TEXT NOT NULL REFERENCES sessions(id), source_user_seq INTEGER NOT NULL REFERENCES events(seq),
-      claim_id TEXT NOT NULL REFERENCES reviewed_plan_execution_claims_v1(claim_id),
-      source_digest TEXT NOT NULL,
-      PRIMARY KEY(session_id, source_user_seq)
-    );
-    CREATE TRIGGER IF NOT EXISTS reviewed_plan_revisions_v1_no_update BEFORE UPDATE ON reviewed_plan_revisions_v1
-      BEGIN SELECT RAISE(ABORT, 'reviewed plan revisions are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS reviewed_plan_revisions_v1_no_delete BEFORE DELETE ON reviewed_plan_revisions_v1
-      BEGIN SELECT RAISE(ABORT, 'reviewed plan revisions are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS reviewed_plan_execution_claims_v1_no_update BEFORE UPDATE ON reviewed_plan_execution_claims_v1
-      BEGIN SELECT RAISE(ABORT, 'reviewed plan execution claims are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS reviewed_plan_execution_claims_v1_no_delete BEFORE DELETE ON reviewed_plan_execution_claims_v1
-      BEGIN SELECT RAISE(ABORT, 'reviewed plan execution claims are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS reviewed_plan_execution_observers_v1_no_update BEFORE UPDATE ON reviewed_plan_execution_observers_v1
-      BEGIN SELECT RAISE(ABORT, 'reviewed plan execution observers are immutable'); END;
-    CREATE TRIGGER IF NOT EXISTS reviewed_plan_execution_observers_v1_no_delete BEFORE DELETE ON reviewed_plan_execution_observers_v1
-      BEGIN SELECT RAISE(ABORT, 'reviewed plan execution observers are immutable'); END;
-  `);
+  ensureReviewedPlanStore(db);
 }
 
 function ownedSession(scope: Scope): void {
@@ -272,7 +241,7 @@ export function publishPlanRevision(input: PublishPlanRevisionInput): PlanArtifa
     if (Buffer.byteLength(canonical(next)) > MAX_PLAN_ARTIFACT_BYTES) fail('invalid', `Complete plan exceeds the ${MAX_PLAN_ARTIFACT_BYTES}-byte artifact limit including its identity. No partial revision was stored.`);
     event = insertInternalEventInTransaction(db, { sessionId: input.sessionId, turn: origin.turn, role: 'host',
       type: 'plan_revision_published', parentEventId: origin.id, data: publicationData(next) });
-    db.prepare('INSERT INTO reviewed_plan_revisions_v1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+    db.prepare('INSERT INTO reviewed_plan_revisions_v1 (plan_id, revision, digest, session_id, source_user_seq, principal_id, artifact_json, event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
       next.planId, next.revision, next.digest, next.sessionId, next.sourceUserSeq, next.principalId, canonical(next), event.id);
     return next;
   }).immediate();

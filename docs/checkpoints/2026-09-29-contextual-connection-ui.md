@@ -732,3 +732,88 @@ conversation. **Reviewed Execute Continue is still disabled.** These host-side
 checks are its completion foundation, not a claim that the complete resume
 experience has shipped. This slice adds no model call or prompt text; matched
 performance savings remain unmeasured.
+
+## Retained proof lifetime and session cleanup — September 30
+
+The UI continuation depends on keeping the original plan, context and completed
+work available. Older immutable-delete guards prevented eligible sessions from
+being cleaned up at all. Removing those guards alone would let a surviving
+worker or later plan revision lose the evidence it still needs.
+
+Reviewed plans, execution claims/observers, captured source contexts and
+connection checkpoints now share SQL-only storage definitions. Their records
+remain immutable while their owning session exists and cascade only with that
+session. Generated references expose the existing JSON parent identities without
+changing their payloads or digests. Restrictive references protect parent
+contexts and prior plan revisions; claims and observers retain their existing
+proof references. The reaper's existing fixed-point selection now retains every
+ancestor needed by a surviving consumer. An open connection execution is retained
+even if an old physical-session display status says completed. Existing age,
+pin, archive and replay-receipt rules remain in force.
+
+The full host integration exposed an additional deletion-order problem:
+session-owned execution evidence has mutually dependent RESTRICT references.
+Even when every referenced row belonged to the same expired session, SQLite
+could reject an intermediate cascade. A synchronous helper now defers checks
+inside the deletion transaction, validates the resulting entire foreign-key
+graph, and restores the previous constraint mode before returning. Foreign keys
+and immutable triggers stay enabled. A surviving reference or injected failure
+rolls back all cleanup. The helper is also used by the session API's hard-delete
+path. A session still needed by another task is archived through the existing
+retained-replay response rather than producing a foreign-key error. A no-op
+retention sweep does not run the full integrity scan.
+
+Migration **83** rebuilds only proof tables already present, copying all original
+stored columns exactly. A missing referenced parent or failed integrity check
+rolls back the migration, leaving the old data and schema version intact. New
+installs create the same definitions lazily. This is a schema integration point:
+the other agent's current clean `claude/shell-anywhere` head `76c53a1ea` still
+declares schema 82. Reconcile migration numbering and rehearse the combined
+candidate on a safe snapshot before installation; do not run a downgrade or
+fixture reset against the live home.
+
+Verified:
+
+- **318/318** checks across 13 files passed: retained-proof lifetime, actual
+  host connection completion, eventlog, session API, plans, source context,
+  connection checkpoint/setup, accepted batches, local execution evidence,
+  physical returns, pointer-schema migration and schema readiness.
+- The actual host integration was then strengthened to migrate a host-produced
+  checkpoint through its historical table shape. That updated test passed
+  **1/1**, already represented in the 318 count. Its exact checkpoint survives
+  migration, the open task survives attempted expiry, final closure and both
+  replays preserve one completed read, and the closed eligible session then
+  expires atomically. It still uses three recording-model calls, no paid model.
+- Lifetime pins cover transitive consumers, pinned/archived children, reviewed
+  revisions, execution observers, real session API deletion, rollback, immutable
+  proof guards and restoring an already-deferred caller. Migration pins compare
+  every original stored column, reopen, re-entry and corrupt-parent rollback.
+- Runtime TypeScript and `git diff --check` passed. Logs:
+  `/tmp/clem-retained-proof-regression.txt`,
+  `/tmp/clem-retained-proof-migration.txt`,
+  `/tmp/clem-retained-proof-tsc-final.txt`.
+
+Not performed: model/provider calls, live-home mutation or acceptance, UI edits,
+build, hotpatch, merge or tag. The isolated runner's live-home sentinel remained
+**NOT PERFORMED** because daemon 72427 owns the live stores. These are controlled
+regression and migration checks, not installed-app acceptance. The other agent's
+checkout and installation were left untouched. No latency or token savings are
+claimed; this slice adds no prompt content or model call.
+
+Still owed: the route/executor, outer-budget, boot-recovery and fresh-callable
+attestation work listed above before reviewed Execute Continue can be enabled.
+Dependency-request history and setup-account rows retain their older separate
+storage lifetime; this migration does not claim to clean up every historical
+metadata table. With no surviving accepted source they do not form a valid
+connection control. Include that metadata lifetime in the remaining integration
+review. Then qualify the combined installed desktop/mobile experience and
+matched full-task measurements.
+
+Trap: accepted-source binding timestamps are immutable authority. Historical
+retention fixtures must create them under a controlled historical clock through
+the real writer, not update their timestamps or weaken guards to age a test.
+
+The paired UI direction remains section “Direction for the remaining UI work”:
+setup beside the request, the verified account, one understandable decision,
+purposeful progress, projects/agents and proactive check-ins with direct task
+links. **Reviewed Execute Continue remains disabled and no new UI is installed.**

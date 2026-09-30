@@ -25,6 +25,7 @@ import {
   type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
 } from '../runtime/harness/eventlog.js';
+import { withSessionProofCascade } from '../runtime/harness/retained-session-proof-schema.js';
 import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import { pendingActionApprovalViewFromArgs } from '../runtime/harness/pending-action-view.js';
@@ -837,13 +838,10 @@ export function deleteUnifiedSession(
       };
     }
     const db = openEventLog();
-    const deleted = db.transaction(() => {
-      let count = 0;
-      for (const target of related) {
-        count += db.prepare('DELETE FROM sessions WHERE id = ?').run(target.id).changes;
-      }
-      return count;
-    }).immediate();
+    const deleted = db.transaction(() => withSessionProofCascade(db, () =>
+      db.prepare(`DELETE FROM sessions WHERE id IN (${related.map(() => '?').join(', ')})`)
+        .run(...related.map(target => target.id)).changes,
+    )).immediate();
     return { ok: deleted === related.length, mode: 'deleted', authorityPayloadsDeleted: true };
   }
   for (const target of related) {

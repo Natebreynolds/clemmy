@@ -46,6 +46,7 @@ import { proveHostPlannedResolutionCoexistenceInTransaction } from './host-plann
 import { validateConnectionExecutionPause } from './connection-execution-pause-proof.js';
 import { readConnectionExecutionDelivery } from './connection-execution-activation-proof.js';
 import { bindConnectionExecutionClosure, readConnectionExecutionClosure, hostTurnCallAuthorityTerminalTarget } from './connection-execution-closure-proof.js';
+import { pruneRetainedProofSessionOwners, sessionHasRetainedProofConsumer, withSessionProofCascade } from './retained-session-proof-schema.js';
 export {
   acceptedTurnCallAuthorityDigest,
   acceptedTurnCallSurfaceDigest,
@@ -7043,7 +7044,7 @@ export function sessionHasAcceptedSourceReplayBinding(sessionId: string): boolea
       OR EXISTS(SELECT 1 FROM accepted_source_session_pointers p WHERE p.head_session_id = ?)
     ) AS retained
   `).get(id, id, id) as { retained?: number } | undefined;
-  return row?.retained === 1;
+  return row?.retained === 1 || sessionHasRetainedProofConsumer(openEventLog(), id);
 }
 
 export function configuredSessionRetentionDays(): number {
@@ -7140,6 +7141,7 @@ export function reapStaleSessions(maxAgeDays?: number): number {
                  )
             )
       `).run(cutoff, cutoff, cutoff, cutoff).changes;
+      pruned += pruneRetainedProofSessionOwners(db);
     } while (pruned > 0);
 
     const doomedCount = (db.prepare(
@@ -7147,67 +7149,69 @@ export function reapStaleSessions(maxAgeDays?: number): number {
     ).get() as { n: number }).n;
     if (doomedCount === 0) return 0;
 
-    // Replay authority has the same explicit bounded horizon as its terminal
-    // session. During the window the fixed set excludes it. After expiry,
-    // remove receipt -> immutable binding -> pointer only for that exact set.
-    db.prepare(`
-      DELETE FROM harness_chat_requests
-       WHERE julianday(created_at) < julianday('now', ?)
-         AND session_id IN (SELECT id FROM reap_doomed_session_ids)
-    `).run(cutoff);
-    db.prepare(`
-      DELETE FROM accepted_source_session_bindings
-       WHERE julianday(created_at) < julianday('now', ?)
-         AND session_id IN (SELECT id FROM reap_doomed_session_ids)
-    `).run(cutoff);
-    db.prepare(`
-      DELETE FROM accepted_source_session_pointers
-       WHERE julianday(updated_at) < julianday('now', ?)
-         AND head_session_id IN (SELECT id FROM reap_doomed_session_ids)
-         AND NOT EXISTS (
-           SELECT 1 FROM accepted_source_session_bindings b
-            WHERE b.root_session_id = accepted_source_session_pointers.root_session_id
-              AND b.continuity_digest = accepted_source_session_pointers.continuity_digest
+    return withSessionProofCascade(db, () => {
+      // Replay authority has the same explicit bounded horizon as its terminal
+      // session. During the window the fixed set excludes it. After expiry,
+      // remove receipt -> immutable binding -> pointer only for that exact set.
+      db.prepare(`
+        DELETE FROM harness_chat_requests
+         WHERE julianday(created_at) < julianday('now', ?)
+           AND session_id IN (SELECT id FROM reap_doomed_session_ids)
+      `).run(cutoff);
+      db.prepare(`
+        DELETE FROM accepted_source_session_bindings
+         WHERE julianday(created_at) < julianday('now', ?)
+           AND session_id IN (SELECT id FROM reap_doomed_session_ids)
+      `).run(cutoff);
+      db.prepare(`
+        DELETE FROM accepted_source_session_pointers
+         WHERE julianday(updated_at) < julianday('now', ?)
+           AND head_session_id IN (SELECT id FROM reap_doomed_session_ids)
+           AND NOT EXISTS (
+             SELECT 1 FROM accepted_source_session_bindings b
+              WHERE b.root_session_id = accepted_source_session_pointers.root_session_id
+                AND b.continuity_digest = accepted_source_session_pointers.continuity_digest
+           )
+      `).run(cutoff);
+
+      const retainedReplayRows = (db.prepare(`
+        SELECT COUNT(*) AS n FROM reap_doomed_session_ids doomed
+         WHERE EXISTS (
+           SELECT 1 FROM accepted_source_session_pointers p
+            WHERE p.head_session_id = doomed.id
          )
-    `).run(cutoff);
+            OR EXISTS (
+              SELECT 1 FROM accepted_source_session_bindings b
+               WHERE b.session_id = doomed.id
+            )
+      `).get() as { n: number }).n;
+      if (retainedReplayRows > 0) {
+        throw new Error(`session reaper exact set retained ${retainedReplayRows} replay-authority row(s)`);
+      }
 
-    const retainedReplayRows = (db.prepare(`
-      SELECT COUNT(*) AS n FROM reap_doomed_session_ids doomed
-       WHERE EXISTS (
-         SELECT 1 FROM accepted_source_session_pointers p
-          WHERE p.head_session_id = doomed.id
-       )
-          OR EXISTS (
-            SELECT 1 FROM accepted_source_session_bindings b
-             WHERE b.session_id = doomed.id
-          )
-    `).get() as { n: number }).n;
-    if (retainedReplayRows > 0) {
-      throw new Error(`session reaper exact set retained ${retainedReplayRows} replay-authority row(s)`);
-    }
+      db.prepare(`
+        DELETE FROM physical_dispatch_authority_sealed
+         WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
+      `).run();
+      db.prepare(`
+        DELETE FROM physical_dispatch_authority_payload
+         WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
+      `).run();
+      db.prepare(`
+        DELETE FROM physical_dispatch_authority
+         WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
+      `).run();
 
-    db.prepare(`
-      DELETE FROM physical_dispatch_authority_sealed
-       WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
-    `).run();
-    db.prepare(`
-      DELETE FROM physical_dispatch_authority_payload
-       WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
-    `).run();
-    db.prepare(`
-      DELETE FROM physical_dispatch_authority
-       WHERE session_id IN (SELECT id FROM reap_doomed_session_ids)
-    `).run();
-
-    const result = db.prepare(`
-      DELETE FROM sessions
-       WHERE id IN (SELECT id FROM reap_doomed_session_ids)
-    `).run();
-    if (result.changes !== doomedCount) {
-      throw new Error(`session reaper exact-set mismatch: selected ${doomedCount}, deleted ${result.changes}`);
-    }
-    db.exec('DELETE FROM reap_doomed_session_ids');
-    return result.changes;
+      const result = db.prepare(`
+        DELETE FROM sessions
+         WHERE id IN (SELECT id FROM reap_doomed_session_ids)
+      `).run();
+      if (result.changes !== doomedCount) {
+        throw new Error(`session reaper exact-set mismatch: selected ${doomedCount}, deleted ${result.changes}`);
+      }
+      db.exec('DELETE FROM reap_doomed_session_ids');
+      return result.changes;
+    });
   });
   const deleted = reap.immediate();
   // Best-effort WAL merge so the on-disk file actually shrinks after a reap.

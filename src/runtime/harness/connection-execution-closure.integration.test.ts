@@ -30,6 +30,7 @@ const originalFetch = globalThis.fetch;
 globalThis.fetch = async () => { throw new Error('Connection closure fixtures must never access the network.'); };
 
 const log = await import('./eventlog.js');
+const { applyHarnessMigrations } = await import('./eventlog-schema.js');
 const plans = await import('./plan-artifacts.js');
 const publisher = await import('../../tools/publish-plan.js');
 const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
@@ -230,6 +231,32 @@ test('connection completion closes a real host-planned manifested task and repla
   recordMissingConnection(identity);
   const dependency = connectionCheckpoints.parkObservedConnectionWithCheckpoint({ ...identity, agent });
   assert.ok(dependency);
+  // Rehearse the actual old checkpoint table with a host-produced payload.
+  // The migration must retain the exact checkpoint, not reconstruct authority.
+  const db = log.openEventLog();
+  const checkpointRows = () => db.prepare('SELECT * FROM source_connection_checkpoints_v1 ORDER BY request_id').all();
+  const checkpointBefore = checkpointRows();
+  db.pragma('foreign_keys = OFF');
+  try {
+    db.transaction(() => {
+      db.exec(`CREATE TABLE fixture_legacy_checkpoints (
+        request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, source_user_seq INTEGER NOT NULL,
+        checkpoint_json TEXT NOT NULL, checkpoint_digest TEXT NOT NULL,
+        FOREIGN KEY(request_id) REFERENCES dependency_requests(request_id)
+      );
+      INSERT INTO fixture_legacy_checkpoints SELECT * FROM source_connection_checkpoints_v1;
+      DROP TABLE source_connection_checkpoints_v1;
+      ALTER TABLE fixture_legacy_checkpoints RENAME TO source_connection_checkpoints_v1;
+      CREATE TRIGGER source_connection_checkpoints_v1_no_delete BEFORE DELETE ON source_connection_checkpoints_v1
+        BEGIN SELECT RAISE(ABORT, 'connection checkpoints are immutable'); END;
+      CREATE TRIGGER source_connection_checkpoints_v1_no_update BEFORE UPDATE ON source_connection_checkpoints_v1
+        BEGIN SELECT RAISE(ABORT, 'connection checkpoints are immutable'); END;`);
+      db.prepare('DELETE FROM schema_version WHERE version = 83').run();
+    })();
+  } finally { db.pragma('foreign_keys = ON'); }
+  applyHarnessMigrations(db);
+  assert.deepEqual(checkpointRows(), checkpointBefore);
+  assert.deepEqual(db.pragma('foreign_key_check'), []);
   const pauseBinding = connectionPause.prepareConnectionExecutionPause({ ...identity, requestId: dependency.requestId });
   assert.ok(pauseBinding, 'the real planned root and completed batch must support a proven pause');
   const pauseOutcome: TurnOutcome = { version: 2, id: turnOutcomeId(identity), identity,
@@ -241,6 +268,15 @@ test('connection completion closes a real host-planned manifested task and repla
   const paused = publishPause();
   assert.equal(paused.inserted, true);
   assert.deepEqual(hostAuthority.acceptedTurnCallAuthorityFor(session.id, source.seq), rootBefore);
+  const ageSession = () => {
+    log.updateSession(session.id, { status: 'completed' });
+    log.openEventLog().prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
+      .run('2020-01-01T00:00:00.000Z', session.id);
+  };
+  ageSession();
+  assert.equal(log.reapStaleSessions(14), 0, 'an open connection execution survives stale physical-session status');
+  assert.deepEqual(hostAuthority.acceptedTurnCallAuthorityFor(session.id, source.seq), rootBefore);
+  log.updateSession(session.id, { status: 'active' });
   const context = { sessionId: session.id, connectionRequestId: dependency.requestId };
   connectionSetup.recordConnectionSetupResult(context, { connectionId: 'fixture-server-returned-account' });
   let checks = 0;
@@ -254,8 +290,13 @@ test('connection completion closes a real host-planned manifested task and repla
   assert.ok(setup);
   const sharedReceipt = connectionSetup.connectionContinuationIdentity(context, setup.continueLabel, setup.clientRequestId);
   const runId = 'fixture-connection-control';
-  log.claimHarnessChatRequest({ ...sharedReceipt, sessionId: session.id, runId,
-    sinceSeq: log.listEvents(session.id).at(-1)!.seq });
+  // Create the receipt at a historical clock so the final retention assertion
+  // exercises real expiry without mutating an immutable acceptance timestamp.
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2020-01-01T00:00:00.000Z') });
+  try {
+    log.claimHarnessChatRequest({ ...sharedReceipt, sessionId: session.id, runId,
+      sinceSeq: log.listEvents(session.id).at(-1)!.seq });
+  } finally { t.mock.timers.reset(); }
   const leaseOwner = 'fixture-closure-desktop';
   const lease = log.claimRunAttemptLease({ sessionId: session.id, runId, ownerId: leaseOwner, leaseMs: 90_000 });
   assert.equal(lease.claimed, true);
@@ -297,4 +338,15 @@ test('connection completion closes a real host-planned manifested task and repla
   assert.equal(checks, 1);
   assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 2);
   assert.equal(log.listEvents(session.id, { types: ['plan_execution_claimed'] }).length, 1);
+  ageSession();
+  assert.equal(log.reapStaleSessions(14), 1, 'closed execution proof expires atomically with its eligible session');
+  assert.equal(log.getSession(session.id), null);
+  for (const table of ['reviewed_plan_revisions_v1', 'reviewed_plan_execution_claims_v1',
+    'reviewed_plan_execution_observers_v1', 'source_session_contexts_v1', 'source_connection_checkpoints_v1']) {
+    assert.equal((log.openEventLog().prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE session_id = ?`)
+      .get(session.id) as { n: number }).n, 0, table);
+  }
+  assert.equal(closure.readConnectionExecutionClosure(log.openEventLog(), {
+    sessionId: session.id, executionSourceUserSeq: source.seq }), null);
+  assert.equal(modelCalls, 3);
 });
