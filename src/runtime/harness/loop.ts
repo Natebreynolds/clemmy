@@ -1,7 +1,9 @@
 import './memory-scope-binding.js';
 import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, readSourceSessionContext } from './source-session-context.js';
 import { currentSourceSessionContext, withSourceSessionContext } from './source-session-context-scope.js';
-import { readApprovalRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
+import { readApprovalRecoveryActivation, readConnectionRecoveryActivation, readRecoveryActivation, recoveryActivationOwner, withRecoveryActivation } from './recovery-activation.js';
+import { assertConnectionExecutionOwned } from './connection-execution-activation.js';
+import { rebuildSourceConnectionAgent } from './connection-agent-rebuild.js';
 import { parkObservedConnectionWithCheckpoint } from './source-connection-checkpoints.js';
 import { prepareConnectionExecutionPause, type ConnectionExecutionPauseV1 } from './connection-execution-pause.js';
 import { capacityAwareCompactionThresholds } from './context-capacity-policy.js';
@@ -3712,6 +3714,9 @@ function declinesAutomaticContextWarm(options: RunConversationOptions): boolean 
 }
 
 export interface RunConversationOptions {
+  /** Internal executor's exact lease owner for a durable connection control.
+   * Never accepted from a browser, model, or retained historical receipt. */
+  connectionExecutionLeaseOwner?: string;
   /** The spine's context_resolve node already warmed this turn's memory
    *  (Clem 4, context interior). Set by the spine only. */
   contextWarmedAtNode?: boolean;
@@ -6110,9 +6115,9 @@ function scheduleHostCheckpointRecovery(
         if (!session || !recoveryBlob) return;
         let recovery: HostRecoveryState;
         try { recovery = HostRecoveryState.fromString(recoveryBlob); } catch { return; }
-        const approvalOwner = readApprovalRecoveryActivation(options.sessionId);
+        const continuationOwner = readRecoveryActivation(options.sessionId);
         if (recovery.sessionId !== options.sessionId || (recovery.sourceUserSeq !== sourceUserSeq
-          && approvalOwner?.sourceUserSeq !== sourceUserSeq)) return;
+          && continuationOwner?.sourceUserSeq !== sourceUserSeq)) return;
         const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
         const sourceText = typeof source.data.text === 'string' ? source.data.text : options.input;
         const {
@@ -6139,7 +6144,7 @@ function scheduleHostCheckpointRecovery(
             const blob = HarnessSession.load(options.sessionId)?.loadRecoveryState();
             const held = blob ? HostRecoveryState.fromString(blob) : undefined;
             if (held?.sessionId === options.sessionId && (held.sourceUserSeq === sourceUserSeq
-              || readApprovalRecoveryActivation(options.sessionId)?.sourceUserSeq === sourceUserSeq)) {
+              || readRecoveryActivation(options.sessionId)?.sourceUserSeq === sourceUserSeq)) {
               scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
             }
           } catch { /* unreadable private state is not wake authority */ }
@@ -6155,6 +6160,9 @@ function scheduleHostCheckpointRecovery(
 export async function runConversation(
   options: RunConversationOptions,
 ): Promise<RunConversationResult> {
+  if (options.sourceUserSeq && acceptedUserEvent(options.sessionId, options.sourceUserSeq).data.source === 'connection_continuation') {
+    return runConnectionConversation(options);
+  }
   const approvalRecovery = readApprovalRecoveryActivation(options.sessionId);
   if (approvalRecovery && approvalRecovery.sourceUserSeq === options.sourceUserSeq && approvalRecovery.approvalContinuation) {
     const link = approvalRecovery.approvalContinuation;
@@ -6195,6 +6203,82 @@ export async function runConversation(
       }
     },
   ));
+}
+
+/** A setup control resumes the already-reviewed host task. It cannot mint a
+ * fresh plan claim, reinterpret the button text, or reinstall an older cursor. */
+async function runConnectionConversation(options: RunConversationOptions): Promise<RunConversationResult> {
+  const sourceUserSeq = options.sourceUserSeq!;
+  const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
+  const key = `${options.sessionId}:${sourceUserSeq}`;
+  const prior = activeHostConversations.get(key);
+  if (prior) return prior;
+  const replay = replayedRunConversationResult(source);
+  if (replay) return replay;
+  const owner = readConnectionRecoveryActivation(options.sessionId);
+  const link = owner?.connectionContinuation;
+  if (!owner || owner.sourceUserSeq !== sourceUserSeq || !link
+    || !options.runAttemptId || !options.connectionExecutionLeaseOwner) {
+    throw new Error('The connection control has no current executor and retained execution owner.');
+  }
+  const assertOwned = () => assertConnectionExecutionOwned({ sessionId: options.sessionId,
+    deliverySourceUserSeq: sourceUserSeq, attemptId: options.runAttemptId!, leaseOwner: options.connectionExecutionLeaseOwner! });
+  assertOwned();
+  const owned = Promise.resolve().then(() => withRuntimeConfigSnapshot(() =>
+    withAcceptedSourceCatalogManifestScope(options.acceptedCatalogScope, () =>
+      withAcceptedSourceSessionContext({ sessionId: options.sessionId, sourceUserSeq }, execution =>
+        withRecoveryActivation(options.sessionId, owner, () => withModelUsageAttribution({
+          sessionId: options.sessionId, sourceUserSeq: execution.sourceUserSeq,
+          attemptId: options.runAttemptId,
+          role: harnessRunContextStorage.getStore()?.workerScope ? 'worker' : 'brain',
+        }, () => withTurnQueryVectorScope(async () => {
+          if (execution.sourceUserSeq !== link.requestSourceUserSeq) throw new Error('The connection execution identity changed.');
+          const blob = HarnessSession.load(options.sessionId)?.loadRecoveryState();
+          // A crash after adoption needs canonical checkpoint promotion. Never
+          // reset to the original sign-in pause and repeat its completed calls.
+          if (!blob) return { sessionId: options.sessionId, status: 'held' as const, steps: 0,
+            lastTurn: source.turn, hold: { owner: 'host' as const, wake: 'recovery' as const, reason: 'recovery_pending' as const } };
+          const recovery = HostRecoveryState.fromString(blob);
+          const progress = recovery.connectionProgress;
+          if (recovery.sessionId !== options.sessionId || recovery.sourceUserSeq !== execution.sourceUserSeq || !progress) {
+            throw new Error('The connection control lost its exact retained progress.');
+          }
+          if (options.turnEngine && options.turnEngine !== recovery.turnEngine) throw new Error('The connection execution engine changed.');
+          const agent = await rebuildSourceConnectionAgent({ sessionId: options.sessionId, requestId: link.requestId, assertOwned });
+          const run = async () => {
+            assertOwned();
+            return runTurn({ agent, sessionId: options.sessionId,
+              input: acceptedRequestText(options.sessionId, execution.sourceUserSeq) ?? '',
+              sourceUserSeq: execution.sourceUserSeq, runAttemptId: options.runAttemptId,
+              internalContinuation: true, hostOwnedContinuation: true, reuseRecordedUserInput: true,
+              suppressMemoryCapture: true, turnEngine: recovery.turnEngine,
+              judgeCompletion: progress.activation.judgeCompletion,
+              maxTurns: progress.activation.maxTurns, toolCallsPerTurn: progress.activation.toolCalls.limit,
+            });
+          };
+          let turn = await run();
+          if (checkpointContinuationIsReady(turn, { sessionId: options.sessionId, sourceUserSeq: execution.sourceUserSeq })) {
+            turn = await run();
+          }
+          const result = hostActivationConversationResult(turn, sourceUserSeq);
+          if (result.status === 'held') {
+            scheduleHostCheckpointRecovery(options, sourceUserSeq);
+            return result;
+          }
+          assertOwned();
+          const reduced = reduceStandardConversationTerminal({ result, sourceUserSeq, agent });
+          if (reduced.publicPresentation) {
+            emitRuntimeTerminalEvent(options.sessionId, reduced);
+            clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
+          }
+          return reduced;
+        })), assertOwned),
+      ),
+    ),
+  ));
+  activeHostConversations.set(key, owned);
+  try { return await owned; }
+  finally { if (activeHostConversations.get(key) === owned) activeHostConversations.delete(key); }
 }
 
 /**
@@ -10642,7 +10726,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
       let ownerPublishedTypedTerminal = false;
       try {
         ownerPublishedTypedTerminal = resolveExactTerminalForAcceptedSource(
-          acceptedUserEvent(options.sessionId, readApprovalRecoveryActivation(options.sessionId)?.sourceUserSeq ?? persistedRecoveryState.sourceUserSeq),
+          acceptedUserEvent(options.sessionId, readRecoveryActivation(options.sessionId)?.sourceUserSeq ?? persistedRecoveryState.sourceUserSeq),
         ).kind === 'terminal';
       } catch { /* unreadable ⇒ treat the blob as live and hold */ }
       if (ownerPublishedTypedTerminal) {

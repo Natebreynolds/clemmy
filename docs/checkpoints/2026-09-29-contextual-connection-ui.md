@@ -817,3 +817,81 @@ The paired UI direction remains section “Direction for the remaining UI work�
 setup beside the request, the verified account, one understandable decision,
 purposeful progress, projects/agents and proactive check-ins with direct task
 links. **Reviewed Execute Continue remains disabled and no new UI is installed.**
+
+## Retained host executor and dispatch ownership — September 30
+
+Verified: a durable connection control now has an internal `runConversation`
+path that rebuilds the retained agent and resumes the current host checkpoint.
+It uses the original execution source for work, memory context and model-usage
+attribution, and the connection control for delivery. It does not claim the
+reviewed plan again, construct a new caller-selected agent, replace the retained
+model/completion policy or restore an older setup cursor. Concurrent controls
+join one executor; exact completed replay needs no new model or tool work.
+The turn retains the ordinary per-task query-vector scope.
+
+The recovery reader now recognizes connection controls alongside approval
+controls. The original setup question is already a public terminal, but is not
+completion of its newly resumed work. Boot selection and stale-checkpoint
+retirement therefore follow the delivery owner while retaining the original
+execution source. The recording integration verifies boot selection even with
+generic chat auto-resume disabled. It does not qualify fresh boot lease
+acquisition or post-adoption checkpoint promotion.
+
+A process-local guard rereads durable ownership, Stop and the exact verified
+account before the next model dispatch, host invocation and physical crossing.
+It is not serialized as authority. The invocation-entry check alone was too
+early: asynchronous account/schema preparation could outlive the owner. Two
+new tests failed without the final check and now prove zero-crossing,
+pre-dispatch refusal for local and external calls. Nested provider business
+calls and metadata probes also recheck after their awaits. Existing dispatch
+leases, effect reservations, consent and settlement rules remain authoritative.
+
+Evidence:
+
+- `clem-connection-executor-regression.txt`: **255/255** across ten focused
+  files: actual host closure, invocation, recovery activation/restart, accepted
+  batches, source checkpoints, connection setup, nested logical identity and
+  physical-dispatch grounding/lease behavior.
+- `clem-connection-executor-continuations.txt`: **27/27** covering approval
+  continuation, checkpoint hopping, continuation ownership, superseded recovery
+  and the strengthened connection integration. Four connection cases overlap
+  the previous count; these are not 282 distinct tests.
+- The connection integration uses a recording model with the network disabled.
+  The resumed task takes exactly one additional frame, keeps the completed
+  board read at one physical host crossing, preserves one plan claim and
+  publishes one final control terminal. Reopen, concurrent continuation and
+  completed replay preserve those counts. Changing the account or stopping the
+  original task during model resolution prevents that additional model frame.
+- The final focused executor passed **4/4** after the query-vector scope change;
+  runtime TypeScript and `git diff --check` also passed. Results are recorded in
+  `/tmp/clem-connection-executor-final.txt` and
+  `/tmp/clem-connection-executor-tsc-final.txt`. Other logs above are in `/tmp/`.
+  The initial red ownership pins are `/tmp/clem-connection-dispatch-red.txt`.
+
+Not performed: paid model/provider calls, live business actions, desktop/mobile
+visual acceptance, build, hotpatch, merge or tag. No end-to-end latency or token
+saving is claimed. The runner's live-home sentinel remained **NOT PERFORMED**
+because daemon 72427 owns the live stores. Other-agent source and installed
+bytes were left alone; its checkout is now named `claude/two-modes`, still at
+`76c53a1ea` when rechecked. This source slice is not installed-app acceptance.
+
+Still owed before enabling reviewed Execute Continue: server-only lease-owner
+wiring through desktop/mobile bridge admission before any fresh Execute claim;
+fresh same-root account-bound callable attestation; lease renewal and boot
+ownership after adoption; total source budget/accounting across all resumes;
+workflow handoff finalization; subsequent setup pauses and approval continuation;
+completed-write replay protection and installed desktop/mobile handoff tests.
+The executor deliberately holds if the current recovery blob is absent rather
+than reinstalling the original pause. Its held wake/recovery path still needs
+the boot/admission work above. Do not enable the UI on this checkpoint alone.
+
+UI implementation remains paired with these transitions: connect next to the
+request, show the verified account, resume the same task, and show a concrete
+stopped/changed-account reason when it cannot continue. No opaque channel IDs,
+duplicate approvals or endless “Thinking” state should substitute for that
+state. Projects, agents, useful background progress and proactive check-ins
+remain the next paired slices from the roadmap above.
+
+Fixture traps: Space `initialData` is create-only, so parameterized cases need
+distinct slugs; keep those slugs inside the existing 63-character limit. Do
+not weaken the production creation or slug rules to accommodate test reuse.

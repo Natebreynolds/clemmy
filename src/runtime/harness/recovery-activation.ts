@@ -19,12 +19,16 @@ export interface RecoveryActivationOwner {
     activationEventId: string;
   };
 }
-const scope = new AsyncLocalStorage<{ sessionId: string; owner: RecoveryActivationOwner }>();
+const scope = new AsyncLocalStorage<{ sessionId: string; owner: RecoveryActivationOwner; assertOwned?: () => void }>();
 
-export function withRecoveryActivation<T>(sessionId: string, owner: RecoveryActivationOwner, fn: () => T): T {
+export function withRecoveryActivation<T>(sessionId: string, owner: RecoveryActivationOwner, fn: () => T, assertOwned?: () => void): T {
   if (owner.approvalContinuation && owner.connectionContinuation) throw new Error('A recovery cannot have two activation kinds.');
-  return scope.run({ sessionId, owner }, fn);
+  return scope.run({ sessionId, owner, ...(assertOwned ? { assertOwned } : {}) }, fn);
 }
+
+/** Process-local dispatch guard, never persisted as authority. The executor
+ * supplies a reader of the current durable lease, Stop and account binding. */
+export function assertRecoveryActivationOwned(): void { scope.getStore()?.assertOwned?.(); }
 
 export function recoveryActivationOwner(sessionId: string, owner: RecoveryActivationOwner): RecoveryActivationOwner {
   const active = scope.getStore();

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import pino from 'pino';
 import {
   acceptedTaskIdFor,
@@ -1161,6 +1162,7 @@ function enforceSettledPlanTaskResult(input: {
 export async function invokeHostToolCall<T>(
   input: InvokeHostToolCallInput<T>,
 ): Promise<HostToolInvocationResult<T>> {
+  assertRecoveryActivationOwned();
   const modelCallId = exactModelCallId(input.identity.modelCallId);
   if (
     !input.identity.sessionId.trim()
@@ -1627,6 +1629,7 @@ export async function invokeHostToolCall<T>(
         const nestedPhysicalDispatch = input.boundary === 'nested_owned'
           ? {
               reserve: (request: { toolName: string; args?: unknown }): void => {
+                assertRecoveryActivationOwned();
                 assertDispatchLeaseCurrent(childLease);
                 const admitted = beginPhysicalDispatch({
                   identity: {
@@ -1782,6 +1785,10 @@ export async function invokeHostToolCall<T>(
               );
             }
           }
+          // Preparation may await account/schema work. Recheck the original
+          // continuation immediately before reserving any effect or crossing.
+          try { assertRecoveryActivationOwned(); }
+          catch (error) { await refuseBeforePhysical('recovery activation refused before physical dispatch', error); }
           if (externalWriteDescriptor && externalWritePhysicalDispatchId) {
             try {
               externalWriteReservation = projectExternalWriteReservation({

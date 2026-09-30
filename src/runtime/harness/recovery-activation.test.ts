@@ -8,7 +8,7 @@ process.env.CLEMENTINE_HOME = home;
 const events = await import('./eventlog.js');
 const approvals = await import('./approval-registry.js');
 const { HarnessSession } = await import('./session.js');
-const { withRecoveryActivation, recoveryActivationOwner, readApprovalRecoveryActivation } = await import('./recovery-activation.js');
+const { withRecoveryActivation, recoveryActivationOwner, readApprovalRecoveryActivation, assertRecoveryActivationOwned } = await import('./recovery-activation.js');
 const { exactCheckpointReentryKey } = await import('./exact-checkpoint-reentry.js');
 after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 let ordinal = 0;
@@ -68,4 +68,20 @@ test('boot and in-process recovery debit the same execution-frame reentry budget
   const frame = { sourceUserSeq: 7, phase: 'finalize', frameCallIds: ['settled-call'] };
   assert.equal(exactCheckpointReentryKey('s', frame), exactCheckpointReentryKey('s', { ...frame, sourceUserSeq: 19, executionSourceUserSeq: 7 }));
   assert.notEqual(exactCheckpointReentryKey('s', frame), exactCheckpointReentryKey('s', { ...frame, sourceUserSeq: 19 }));
+});
+
+test('the live recovery guard follows async execution and cannot escape into another task', async () => {
+  let owned = true;
+  await withRecoveryActivation('guarded', { sourceUserSeq: 1 }, async () => {
+    assert.doesNotThrow(assertRecoveryActivationOwned);
+    await Promise.resolve();
+    owned = false;
+    assert.throws(assertRecoveryActivationOwned, /lost owner/);
+    await withRecoveryActivation('ordinary', { sourceUserSeq: 2 }, async () => {
+      await Promise.resolve();
+      assert.doesNotThrow(assertRecoveryActivationOwned);
+    });
+    assert.throws(assertRecoveryActivationOwned, /lost owner/);
+  }, () => { if (!owned) throw new Error('lost owner'); });
+  assert.doesNotThrow(assertRecoveryActivationOwned);
 });

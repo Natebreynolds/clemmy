@@ -1,4 +1,4 @@
-import { readApprovalRecoveryActivation } from './recovery-activation.js';
+import { readRecoveryActivation } from './recovery-activation.js';
 import { WORKFLOW_PARENT_LEASE_PREFIX } from './workflow-parent-activation.js';
 /**
  * Restart recovery for in-flight CHAT runs.
@@ -206,14 +206,14 @@ function checkpointRecoveryDescriptor(
       ? parsed.phase
       : null;
     const frameCallIds = exactCheckpointFrameCallIds(parsed.frameHistory);
-    const approvalOwner = readApprovalRecoveryActivation(sessionId);
+    const continuationOwner = readRecoveryActivation(sessionId);
     return parsed.__clemHostRecovery === 1
       && parsed.sessionId === sessionId
       && phase !== null
       && Number.isSafeInteger(sourceUserSeq)
       && sourceUserSeq > 0
-      ? { serializedState: blob, sourceUserSeq: approvalOwner?.sourceUserSeq ?? sourceUserSeq,
-          ...(approvalOwner ? { executionSourceUserSeq: sourceUserSeq } : {}), phase, frameCallIds }
+      ? { serializedState: blob, sourceUserSeq: continuationOwner?.sourceUserSeq ?? sourceUserSeq,
+          ...(continuationOwner ? { executionSourceUserSeq: sourceUserSeq } : {}), phase, frameCallIds }
       : null;
   } catch {
     return null;

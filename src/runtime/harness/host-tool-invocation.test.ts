@@ -19,6 +19,7 @@ const attemptSettlements = await import('./attempt-settlement.js');
 const settlementAudit = await import('./accepted-source-settlement-audit.js');
 const brackets = await import('./brackets.js');
 const invocation = await import('./host-tool-invocation.js');
+const { withRecoveryActivation } = await import('./recovery-activation.js');
 const settlements = await import('./logical-call-settlement-store.js');
 const discoveryBoundary = await import('./discovery-boundary.js');
 const discoveryGovernorModule = await import('./discovery-governor.js');
@@ -951,6 +952,59 @@ test('async physical preparation failure is a zero-business pre-dispatch refusal
   });
   leases.revokeDispatchLease(task.parentLease);
 });
+
+for (const boundary of ['host_owned_local', 'host_owned_external'] as const) {
+  test(`a recovery owner lost during ${boundary} preparation cannot cross or leave an uncertain call`, async () => {
+    const task = fixture();
+    const callId = `model:recovery-prepare-${boundary}`;
+    let owned = true;
+    let bodies = 0;
+    try {
+      await assert.rejects(withRecoveryActivation(task.sessionId, { sourceUserSeq: task.sourceUserSeq }, () => runCall(task, {
+        callId, boundary, effect: boundary === 'host_owned_external' ? 'external_write' : 'read', deadlineMs: 200,
+        beforePhysicalPreparation: async () => {
+          await Promise.resolve();
+          owned = false;
+        },
+        invoke: async () => { bodies += 1; return 'must not run'; },
+      }), () => { if (!owned) throw new Error('The original continuation no longer owns its account and lease.'); }),
+      /recovery activation refused/);
+      assert.equal(bodies, 0);
+      assert.equal(rows(task, callId).length, 0);
+      assert.deepEqual(eventlog.openEventLog().prepare(`SELECT execution_kind, physical_crossing_count, outcome_kind
+        FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+        .get(task.sessionId, task.sourceUserSeq, callId), {
+        execution_kind: 'refused_pre_dispatch', physical_crossing_count: 0, outcome_kind: 'policy_denial',
+      });
+    } finally { leases.revokeDispatchLease(task.parentLease); }
+  });
+}
+
+for (const kind of ['business', 'preparation'] as const) {
+  test(`a nested provider ${kind} crossing rechecks its recovery owner after an await`, async () => {
+    const task = fixture();
+    const callId = `model:recovery-nested-${kind}`;
+    let owned = true;
+    let providerCalls = 0;
+    try {
+      await assert.rejects(withRecoveryActivation(task.sessionId, { sourceUserSeq: task.sourceUserSeq }, () => runCall(task, {
+        callId, boundary: 'nested_owned', deadlineMs: 200,
+        invoke: async () => identities.withLogicalToolCall({
+          sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, logicalToolCallId: callId,
+          tool: 'read_file', args: { query: 'alpha' },
+        }, async () => {
+          await Promise.resolve();
+          owned = false;
+          const cross = kind === 'business' ? identities.withPhysicalDispatch : identities.withPhysicalPreparationDispatch;
+          return cross({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq, tool: 'read_file', args: { query: 'alpha' } },
+            async () => { providerCalls += 1; return 'must not run'; });
+        }),
+      }), () => { if (!owned) throw new Error('lost live owner'); }));
+      assert.equal(providerCalls, 0);
+      assert.equal(rows(task, callId).length, 0);
+    } finally { leases.revokeDispatchLease(task.parentLease); }
+  });
+}
 
 test('typed provider-argument repair refuses before crossing and a corrected call succeeds on the same source', async () => {
   const task = fixture('Look up the exact record and keep working after a correctable argument error.');

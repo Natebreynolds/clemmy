@@ -25,6 +25,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import {
   admitLogicalCall,
   beginPreparationPhysicalDispatch,
@@ -504,6 +505,13 @@ async function withPhysicalDispatchMode<T>(
   work: (identity: PhysicalDispatchIdentity) => Promise<T>,
   preparation: boolean,
 ): Promise<T> {
+  // Nested adapters, retries and metadata probes can await after their host
+  // invocation was admitted. A historical activation cannot authorize the
+  // next provider crossing after Stop, account replacement or lease loss.
+  try { assertRecoveryActivationOwned(); }
+  catch (error) {
+    throw new PhysicalDispatchPreDispatchError(`recovery activation refused: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
   const dispatchLease = currentDispatchLease();
   const frame = logicalStorage.getStore();

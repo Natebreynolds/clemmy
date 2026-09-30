@@ -1,4 +1,5 @@
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
+import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import { assertHostConnectionProgress, bindHostConnectionProgress, clearHostConnectionProgress, type HostConnectionProgress } from './host-connection-progress.js';
 import { declaresWorkflowDispatchReceipt } from './workflow-dispatch-commit.js';
 import { responseFormatRepairPacket } from './response-format-repair.js';
@@ -5023,6 +5024,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ...(hostProduction
             ? {
                 beforeModelDispatch: (request: ModelRequest) => {
+                  assertRecoveryActivationOwned();
                   const identity = exactHostIdentity();
                   const provenance = recordModelRequestDispatchProvenance({
                     sessionId: identity.sessionId,

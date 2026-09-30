@@ -54,6 +54,8 @@ const connectionCheckpoints = await import('./source-connection-checkpoints.js')
 const connectionPause = await import('./connection-execution-pause.js');
 const connectionSetup = await import('./connection-setup.js');
 const activation = await import('./connection-execution-activation.js');
+const { runConversation } = await import('./loop.js');
+const { recoverInterruptedChatRuns } = await import('./restart-recovery.js');
 const closure = await import('./connection-execution-closure-proof.js');
 const { completionDataForTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
@@ -95,10 +97,12 @@ function recordMissingConnection(identity: { sessionId: string; sourceUserSeq: n
       accounting: 'top_level', topologyRole: 'control', result: output } });
 }
 
-test('connection completion closes a real host-planned manifested task and replays both sources without another read', async t => {
+for (const scenario of ['publication', 'executor', 'account-changed-before-model', 'stopped-before-model'] as const) test(`connection execution: ${scenario}`, async t => {
+  const useExecutor = scenario !== 'publication';
+  log.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
-  const slug = 'connection-closure-controlled-board';
+  const slug = `connection-board-${scenario}`;
   spaceStore.save({ id: slug, title: 'Controlled closure board',
     initialData: { rows: [{ account: 'Southgate', status: 'Ready', note: 'Parts arrived' }] },
     viewContent: '<!doctype html><html><body>Southgate: Ready — Parts arrived</body></html>' });
@@ -148,12 +152,13 @@ test('connection completion closes a real host-planned manifested task and repla
       universe_selector: null, seal_amendment: null,
       name: 'space_get', args_json: JSON.stringify({ slug }) })],
     [message('ASK: Connect the controlled fixture CRM to continue.')],
+    [message('Southgate is Ready; its note is Parts arrived. The saved board was not changed.')],
   ];
   let modelCalls = 0;
   const model: Model = {
     async getResponse() {
       const output = frames[modelCalls++];
-      assert.ok(output, 'the recording model must not run beyond its three scripted frames');
+      assert.ok(output, 'the recording model must not run beyond its four scripted frames');
       return { responseId: `controlled-closure-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output } as never;
     },
     async *getStreamedResponse(request) {
@@ -165,8 +170,10 @@ test('connection completion closes a real host-planned manifested task and repla
   };
   // A string id remains recoverable. Replace only its provider resolution;
   // never relabel an opaque recording model after the accepted batch ran.
+  let beforeResumeModel: (() => void) | undefined;
   t.mock.method(RouterModelProvider.prototype, 'getModel', (requested?: string) => {
     assert.equal(requested, modelId, 'no auxiliary or paid model may run');
+    beforeResumeModel?.();
     return model;
   });
   const agent = await withSourceSessionContext(retainedContext, async () => {
@@ -312,8 +319,61 @@ test('connection completion closes a real host-planned manifested task and repla
     status: 'done', resumable: false, presentation: { kind: 'answer', text: reply } };
   const publishFinal = () => log.appendTerminalEventOnce({ sessionId: session.id, turn: active.source.turn,
     role: 'system', data: completionDataForTurnOutcome(finalOutcome) }, finalOutcome.id);
-  const completed = publishFinal();
+  const resumeOptions = { sessionId: session.id, sourceUserSeq: active.source.seq,
+    input: setup.continueLabel, runAttemptId: lease.attempt.attemptId,
+    connectionExecutionLeaseOwner: leaseOwner, turnEngine: 'host_v1' as const,
+    // Later caller defaults cannot overwrite the reviewed source's budget,
+    // model or completion policy. The recording provider rejects auxiliaries.
+    maxTurns: 100, toolCallsPerTurn: 100, judgeCompletion: true,
+    buildAgent: async () => { throw new Error('A connection control cannot construct a fresh caller-selected agent.'); } };
+  if (scenario === 'account-changed-before-model' || scenario === 'stopped-before-model') {
+    let invalidated = false;
+    beforeResumeModel = () => {
+      beforeResumeModel = undefined;
+      invalidated = true;
+      if (scenario === 'account-changed-before-model') {
+        connectionSetup.recordConnectionSetupResult(context, { connectionId: 'fixture-different-account' });
+      } else {
+        log.requestKill(session.id, 'Owner stopped the original task before dispatch', originalAttempt);
+      }
+    };
+    await assert.rejects(runConversation(resumeOptions));
+    assert.equal(invalidated, true, 'the ownership change must happen after rebuild at model resolution');
+    assert.equal(modelCalls, 3, 'losing account or Stop authority must prevent the next model frame');
+    assert.deepEqual(readRows(), readBefore, 'an invalid continuation cannot repeat the completed read');
+    assert.equal(log.listEvents(session.id, { types: ['plan_execution_claimed'] }).length, 1);
+    return;
+  }
+  if (useExecutor) {
+    log.closeEventLog();
+    // Boot must recognize the retained execution under its new delivery
+    // control, even when generic chat auto-resume is disabled. This dispatcher
+    // records selection only; acquiring a fresh boot lease is a separate gate.
+    const dispatched: Array<{ sessionId: string; sourceUserSeq: number }> = [];
+    const previousAutoResume = process.env.CLEMMY_CHAT_AUTO_RESUME;
+    process.env.CLEMMY_CHAT_AUTO_RESUME = 'off';
+    try {
+      const scan = recoverInterruptedChatRuns(Date.now, async control => { dispatched.push(control); });
+      await Promise.resolve();
+      assert.equal(scan.records.find(row => row.sessionId === session.id)?.autoResumed, true, JSON.stringify(scan));
+      assert.deepEqual(dispatched.map(({ sessionId, sourceUserSeq }) => ({ sessionId, sourceUserSeq })),
+        [{ sessionId: session.id, sourceUserSeq: active.source.seq }]);
+      assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 1,
+        'the original setup pause cannot be treated as completion of the resumed task');
+    } finally {
+      if (previousAutoResume === undefined) delete process.env.CLEMMY_CHAT_AUTO_RESUME;
+      else process.env.CLEMMY_CHAT_AUTO_RESUME = previousAutoResume;
+    }
+    await assert.rejects(runConversation({ ...resumeOptions, connectionExecutionLeaseOwner: 'wrong-owner' }), /live execution lease/);
+    assert.equal(modelCalls, 3, 'a wrong executor cannot spend a model frame');
+    const [resumed, concurrent] = await Promise.all([runConversation(resumeOptions), runConversation(resumeOptions)]);
+    assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
+    assert.deepEqual(concurrent, resumed, 'concurrent controls share one executor and terminal');
+  }
+  const completed = useExecutor ? { inserted: true, event: log.listEvents(session.id, { types: ['conversation_completed'] })
+    .find(event => event.data.sourceUserSeq === active.source.seq)! } : publishFinal();
   assert.equal(completed.inserted, true);
+  assert.ok(completed.event);
   assert.equal(completed.event.data.sourceUserSeq, active.source.seq);
   const closedRoot = hostAuthority.acceptedTurnCallAuthorityFor(session.id, source.seq);
   assert.ok(closedRoot.status === 'ok' && closedRoot.authority.state === 'closed');
@@ -331,10 +391,11 @@ test('connection completion closes a real host-planned manifested task and repla
   assert.equal(log.readValidatedTerminalEvent(completed.event.id, session.id, active.source.seq).id, completed.event.id);
   assert.equal(connectionPause.readConnectionExecutionPause(session.id, dependency.requestId)?.eventId, paused.event.id);
   assert.equal(publishPause().inserted, false);
-  assert.equal(publishFinal().inserted, false);
+  if (useExecutor) assert.equal((await runConversation(resumeOptions)).status, 'completed');
+  else assert.equal(publishFinal().inserted, false);
   assert.deepEqual(readRows(), readBefore, 'closure and both exact replays must never repeat the completed local read');
   assert.deepEqual(spaceStore.snapshot(slug), beforeSpace);
-  assert.equal(modelCalls, 3);
+  assert.equal(modelCalls, useExecutor ? 4 : 3);
   assert.equal(checks, 1);
   assert.equal(log.listEvents(session.id, { types: ['conversation_completed'] }).length, 2);
   assert.equal(log.listEvents(session.id, { types: ['plan_execution_claimed'] }).length, 1);
@@ -348,5 +409,5 @@ test('connection completion closes a real host-planned manifested task and repla
   }
   assert.equal(closure.readConnectionExecutionClosure(log.openEventLog(), {
     sessionId: session.id, executionSourceUserSeq: source.seq }), null);
-  assert.equal(modelCalls, 3);
+  assert.equal(modelCalls, useExecutor ? 4 : 3);
 });

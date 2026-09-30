@@ -1,7 +1,7 @@
 /** Rebuild and check the retained model, tool surface and execution route.
- * This is an unwired prerequisite, not a complete execution restore. Durable
- * connection activation, leases, cancellation, delivery ownership and per-call
- * consent remain separate requirements. Original agent/project/memory identity
+ * The retained executor uses this after durable activation and lease checks;
+ * browser admission, fresh callable attestation and per-call consent remain
+ * separate requirements. Original agent/project/memory identity
  * is revalidated here before any retrieval or construction. */
 import { isDeepStrictEqual } from 'node:util';
 import type { Agent } from '@openai/agents';
