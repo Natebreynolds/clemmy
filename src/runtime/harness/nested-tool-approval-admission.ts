@@ -287,7 +287,7 @@ export function issueExactNativeCallAdmission(input: {
   targetArgs: unknown;
   definition: AuthorizedLocalPlanningDefinitionV1;
   authorityDigest: string;
-  consentBasis: 'exact_reversible_work' | 'exact_ordinary_work';
+  consentBasis: 'exact_reversible_work' | 'exact_ordinary_work' | 'exact_user_grant';
   consentAdmission: object;
 }): object | null {
   try {

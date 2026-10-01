@@ -90,7 +90,9 @@ export interface HostNativeConsentAdmissionExpectationV1 {
   schemaFingerprint: string;
   envelopeFingerprint: string;
   authorityDigest: string;
-  consentBasis: 'exact_reversible_work' | 'exact_ordinary_work';
+  /** The call's own exactness, or the owner's exact grant for the one
+   * local call that asked. */
+  consentBasis: 'exact_reversible_work' | 'exact_ordinary_work' | 'exact_user_grant';
 }
 
 const issuedNativeConsentAdmissions = new WeakMap<object, Readonly<HostNativeConsentAdmissionExpectationV1>>();
@@ -1498,8 +1500,14 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
       call, decision, carrier: semantic.carrier, semanticSource: semantic.semanticSource,
     });
+    // A local call proceeds on its own exactness (reversible or ordinary
+    // work) or on the owner's exact grant for the one call that asked (a
+    // credential-path write). Each is sealed into the same one-shot native
+    // admission; without it the work carrier has no token for the approved
+    // call and the owner's yes went nowhere (live 2026-09-30).
     if (binding.bindingKind === 'local_envelope' && decision.kind === 'proceed'
-      && (decision.basis === 'exact_reversible_work' || decision.basis === 'exact_ordinary_work')) {
+      && (decision.basis === 'exact_reversible_work' || decision.basis === 'exact_ordinary_work'
+        || (decision.basis === 'exact_user_grant' && input.durableApproval))) {
       const definition = await exactLocalDefinitionForPrepared({ prepared: target });
       if (!definition || definition.schemaFingerprint !== semantic.schemaFingerprint
         || definition.envelopeFingerprint !== semantic.semanticBasis.digest) {
