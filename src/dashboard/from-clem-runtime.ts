@@ -18,7 +18,7 @@ import { buildFromClem, type FromClem, type FromClemRow } from './from-clem.js';
 import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
-import { appendEvent } from '../runtime/harness/eventlog.js';
+import { appendEvent, getSession, updateSession } from '../runtime/harness/eventlog.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 
 const logger = pino({ name: 'clementine.from-clem' });
@@ -93,10 +93,22 @@ export interface ClemThreadDeps {
   post: (message: { key: string; heartbeat: string; text: string }) => void;
   primer: (text: string) => void;
 }
+/** A desktop conversation's own identity: the chat route continues a thread
+ *  only for the principal it belongs to, and splits anything else off. */
+const CLEM_THREAD_IDENTITY = { source: 'desktop', channelId: CLEM_THREAD_ID, userId: 'desktop', clemThread: true } as const;
+
 export const productionClemThread: ClemThreadDeps = {
   ensure: () => {
-    if (HarnessSession.load(CLEM_THREAD_ID)) return;
-    HarnessSession.create({ id: CLEM_THREAD_ID, kind: 'chat', channel: 'desktop', title: 'Clem', metadata: { pinned: true, source: 'clem_thread' } });
+    const existing = getSession(CLEM_THREAD_ID);
+    if (!existing) {
+      HarnessSession.create({ id: CLEM_THREAD_ID, kind: 'chat', userId: 'desktop', title: 'Clem', metadata: { ...CLEM_THREAD_IDENTITY, pinned: true } });
+      return;
+    }
+    const meta = (existing.metadata ?? {}) as Record<string, unknown>;
+    if (meta.source !== 'desktop' || meta.channelId !== CLEM_THREAD_ID || meta.userId !== 'desktop' || meta.clemThread !== true) {
+      // Keep the owner's own choices (a pin they removed stays removed).
+      updateSession(CLEM_THREAD_ID, { metadata: { ...meta, ...CLEM_THREAD_IDENTITY, pinned: meta.pinned ?? true } });
+    }
   },
   post: (message) => {
     appendEvent({ sessionId: CLEM_THREAD_ID, turn: 0, role: 'Clem', type: 'clem_message', data: { version: 1, ...message } });
@@ -193,6 +205,9 @@ export async function voiceFromClemRows(
 
 let voicing: Promise<number> | null = null;
 export function startFromClemVoice(): { stop: () => void } {
+  // A thread written before it carried a desktop chat's identity is healed
+  // once at start, so the owner's next message there continues it.
+  try { if (getSession(CLEM_THREAD_ID)) productionClemThread.ensure(); } catch { /* the next post heals it */ }
   const pass = (): void => {
     if (voicing) return;
     voicing = readFromClem()
