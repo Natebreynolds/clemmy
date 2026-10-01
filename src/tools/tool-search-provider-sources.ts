@@ -6,7 +6,7 @@ import { scheduleOperationDeliveryLearning } from '../runtime/harness/learned-op
 import { createHash } from 'node:crypto';
 import { rankCatalogEntriesLexically, toolSchemaSearchText } from '../agents/tool-catalog.js';
 import { resolveSourceAccountRouting, type SourceAccountNomination } from './source-account-routing.js';
-import { readSpaceReadPreparation } from '../spaces/read-preparation-source.js';
+import { readSavedReadPreparation } from '../runtime/harness/saved-read-preparation.js';
 import {
   mcpToolScopeAuthority,
   type McpToolScope,
@@ -1570,7 +1570,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
   signal?: AbortSignal;
   deadlineAt?: number;
 }, dependencies: ExactWorkflowProviderProvisionDependencies = {}): Promise<ExactWorkflowProviderProvisionResult> {
-  const preparation = readSpaceReadPreparation(input.sessionId, input.sourceUserSeq);
+  const preparation = readSavedReadPreparation(input.sessionId, input.sourceUserSeq);
   const accepted = listEvents(input.sessionId, {
     sinceSeq: input.sourceUserSeq - 1,
     types: ['user_input_received'],
@@ -1708,7 +1708,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
     );
   } catch { /* learning never blocks discovery */ }
   if (preparation && (classifyComposioSlugEffect(preparation.operationId) !== 'read'
-    || !readSpaceReadPreparation(input.sessionId, input.sourceUserSeq))) {
+    || !readSavedReadPreparation(input.sessionId, input.sourceUserSeq))) {
     return { ok: false, code: 'proof_provisioning_refused', identifier: preparation.operationId,
       detail: 'workspace_source_changed_or_operation_not_read' };
   }
@@ -1808,7 +1808,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
         allowedIdentifiers: operationIds,
         expectedSchemaDigests,
         publicationGuard: () => discoveryStillActive(guard)
-          && (!preparation || Boolean(readSpaceReadPreparation(input.sessionId, input.sourceUserSeq))),
+          && (!preparation || Boolean(readSavedReadPreparation(input.sessionId, input.sourceUserSeq))),
       },
     ),
     ...guard,

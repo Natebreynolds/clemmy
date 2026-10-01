@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { getSession, listEvents } from '../runtime/harness/eventlog.js';
-import { readSpaceReadPreparation } from '../spaces/read-preparation-source.js';
+import { readSavedReadPreparation } from '../runtime/harness/saved-read-preparation.js';
 import { sameConversationAncestorSessionIds } from '../runtime/harness/accepted-source-session-branch.js';
 import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering } from '../runtime/harness/steer-notes.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
@@ -346,7 +346,7 @@ export async function resolveSourceAccountRouting(input: {
     labels: accountChoiceLabels(relevant),
     ...(reason ? { reason } : {}),
   });
-  const preparation = readSpaceReadPreparation(input.sessionId, input.sourceUserSeq);
+  const preparation = readSavedReadPreparation(input.sessionId, input.sourceUserSeq);
   if (preparation) {
     // This is a saved READ declaration, not conversational prose. Preserve
     // its exact account; never inherit another source's account in the same

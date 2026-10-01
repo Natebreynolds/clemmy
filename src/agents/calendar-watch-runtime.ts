@@ -48,6 +48,7 @@ import {
 } from './calendar-read-recipe.js';
 import { peekAttestedTransport } from '../runtime/harness/implementation-artifacts/attested-transport.js';
 import { ensureLiveComposioSchemaFingerprint, liveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
+import { beginCalendarWatchReadPreparation } from './calendar-read-declaration.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { appendEvent } from '../runtime/harness/eventlog.js';
 import { prepareWorkflowStepExternalCatalog } from '../execution/workflow-step-external-catalog.js';
@@ -600,14 +601,23 @@ export function _setCalendarReadPreparerForTests(preparer: CalendarReadPreparer 
  */
 async function prepareLearnedRead(operation: ConnectedCalendarOperation, tickId: string, sessionId: string): Promise<string | undefined> {
   const accounts = [...new Set(operation.manifests.map((m) => m.accountId).filter(Boolean))];
+  const toolkit = listLearnedCalendarReads()
+    .find((read) => read.recipe.operationId.toUpperCase() === operation.operationId.toUpperCase())?.toolkit;
   const notes: string[] = [];
   for (const accountId of accounts.length ? accounts : ['']) {
-    const acceptedInput = `Calendar watch ${tickId}: read ${operation.operationId}${accountId ? ` on ${accountId}` : ''}`;
     let source: { sessionId: string; sourceUserSeq: number; acceptedInput: string };
     try {
-      const event = appendEvent({ sessionId, turn: 0, role: 'system', type: 'user_input_received',
-        data: { text: acceptedInput, synthetic: true, source: 'calendar_watch', tickId, operationId: operation.operationId, ...(accountId ? { accountId } : {}) } });
-      source = { sessionId, sourceUserSeq: event.seq, acceptedInput };
+      if (toolkit && accountId) {
+        // Each account the watch reads is named by a saved read declaration,
+        // so a provider's definition change rebinds on that same account
+        // without anyone having to choose it again.
+        source = beginCalendarWatchReadPreparation({ toolkit, operationId: operation.operationId, accountId, tickId });
+      } else {
+        const acceptedInput = `Calendar watch ${tickId}: read ${operation.operationId}${accountId ? ` on ${accountId}` : ''}`;
+        const event = appendEvent({ sessionId, turn: 0, role: 'system', type: 'user_input_received',
+          data: { text: acceptedInput, synthetic: true, source: 'calendar_watch', tickId, operationId: operation.operationId, ...(accountId ? { accountId } : {}) } });
+        source = { sessionId, sourceUserSeq: event.seq, acceptedInput };
+      }
     } catch (error) {
       notes.push(`${accountId || 'any account'}: could not record the preparation (${error instanceof Error ? error.message : String(error)})`);
       continue;

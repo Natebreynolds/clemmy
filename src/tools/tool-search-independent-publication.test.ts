@@ -472,6 +472,88 @@ test(`scheduled Space read re-provisions a moved definition through real source 
 });
 }
 
+test('a calendar watch read rebinds a moved definition on its declared account, with two accounts connected and no person in the loop', async () => {
+  setup();
+  const external = await import('../execution/workflow-step-external-catalog.js');
+  const recipes = await import('../agents/calendar-read-recipe.js');
+  const declaration = await import('../agents/calendar-read-declaration.js');
+  const OTHER = 'fixture-second-outlook';
+  // Two connections of one toolkit on the same mailbox address, as a stale
+  // second connection leaves them.
+  const connections = [
+    { slug: 'outlook', connectionId: OTHER, status: 'ACTIVE', accountEmail: EMAIL },
+    { slug: 'outlook', connectionId: ACCOUNT, status: 'ACTIVE', accountEmail: EMAIL },
+  ];
+  composio.__test__.setConnectedAccountsLoader(async () => connections.map(row => ({
+    id: row.connectionId, status: row.status, user_id: 'fixture-owner', toolkit: { slug: row.slug },
+    data: { user_info: { email: row.accountEmail } },
+  })));
+  let version = '20260903_00';
+  schemas._setToolSchemaLoaderForTests(async () => ({ ...definition(), providerOperationVersion: version }));
+  for (const account of [ACCOUNT, OTHER]) {
+    const text = `Read ${TARGET} from connection ${account}.`;
+    const seed = source(text);
+    resolution.recordAdmissionCapabilityResolution({ ...seed, acceptedInput: text, entries: [{
+      intent: 'seed definition', kind: 'composio', identifier: TARGET, status: 'proven', connection: 'active',
+      accountIdentity: account, effectClass: 'read',
+    }] });
+    assert.ok((await provisioning.registerProofProvisionedCapabilities(seed, {
+      allowedIdentifiers: [TARGET], expectedSchemaDigests: [{ identifier: TARGET, schemaDigest: contracts.digestSchema(INPUT) }],
+    })).registered.length);
+  }
+  recipes.rememberCalendarRead({ toolkit: 'outlook', definitionFingerprint: 'fixture-fp',
+    basis: { learnedAt: '2026-10-01T00:00:00Z', modelIdentity: 'fixture' },
+    recipe: { version: 1, operationId: TARGET,
+      window: { start: 'from', end: 'to', limit: null, timezone: null, fixed: null },
+      fields: { id: 'id', title: 'subject', start: 'start', end: 'end', allDay: null, cancelled: null, showAs: null,
+        myResponse: null, myResponseFromAttendee: null, attendees: null, organizer: null, location: null } } });
+  if (!eventlog.getSession('watch:calendar')) eventlog.createSession({ id: 'watch:calendar', kind: 'workflow', title: 'Calendar watch' });
+  version = '20260930_00';
+  let exactLookups = 0;
+  const prepare = (acceptedSource: { sessionId: string; sourceUserSeq: number; acceptedInput: string }) =>
+    external.prepareWorkflowStepExternalCatalog({ immutablePrompt: ACCOUNT, allowedTools: [TARGET], acceptedSource }, {
+      warm: async () => {},
+      refresh: () => {},
+      ready: ids => ids.every(id => Boolean(catalogs.peekHostCapabilityCatalogFactory()?.get(id))),
+      provisionExactOperations: data => {
+        exactLookups += 1;
+        return sources.provisionExactWorkflowProviderOperations(data, {
+          materializeExact: async () => [{ toolkit: 'outlook', slug: TARGET, name: TARGET, score: 1, inputParameters: INPUT }],
+          freshConnections: async () => connections,
+        });
+      },
+    });
+
+  // A system event that only mentions the account is no one's choice: the
+  // rebind cannot pick between two connections on it.
+  const mentionText = `Calendar watch tick-fixture: read ${TARGET} on ${ACCOUNT}`;
+  const mention = eventlog.appendEvent({ sessionId: 'watch:calendar', turn: 0, role: 'system', type: 'user_input_received',
+    data: { text: mentionText, synthetic: true } });
+  const refused = await prepare({ sessionId: 'watch:calendar', sourceUserSeq: mention.seq, acceptedInput: mentionText });
+  assert.equal(refused.status, 'refused');
+  assert.match(JSON.stringify(refused), /account_selection_required/);
+
+  // The watch's saved read declaration names the account: the rebind keeps it.
+  const receipt = declaration.beginCalendarWatchReadPreparation({ toolkit: 'outlook', operationId: TARGET, accountId: ACCOUNT, tickId: 'tick-fixture' });
+  const prepared = await prepare(receipt);
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
+  assert.equal(exactLookups, 2, 'one bounded rebind each time, no discovery loop');
+  const proof = resolution.provenCapabilityEntriesForTurn({ sessionId: receipt.sessionId, sourceUserSeq: receipt.sourceUserSeq });
+  assert.equal(proof.find(row => row.identifier === TARGET)?.accountIdentity, ACCOUNT);
+  const current = manifests.peekCapabilityManifestStore()!.list()
+    .filter(row => row.manifest.lifecycle.state === 'current' && row.manifest.operationId === TARGET);
+  assert.ok(current.some(row => row.manifest.accountId === ACCOUNT && row.manifest.operationVersion === version),
+    'the declared account moved to the provider\'s current definition');
+  assert.ok(current.every(row => row.manifest.accountId !== OTHER || row.manifest.operationVersion !== version),
+    'the other connection was not touched');
+  assert.equal(businessCalls, 0);
+
+  // Once the watch no longer reads this operation, it is no longer this declaration.
+  recipes.forgetCalendarRead(TARGET);
+  assert.equal(declaration.readCalendarWatchReadPreparation(receipt.sessionId, receipt.sourceUserSeq), null);
+  assert.throws(() => declaration.beginCalendarWatchReadPreparation({ toolkit: 'outlook', operationId: TARGET, accountId: ACCOUNT, tickId: 'tick-2' }));
+});
+
 test('Space read preparation cannot substitute an account, become a write or survive a declaration edit', async () => {
   setup();
   const { spaceStore } = await import('../spaces/store.js');

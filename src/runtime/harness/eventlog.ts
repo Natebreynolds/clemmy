@@ -652,6 +652,8 @@ export const EVENT_TYPES = [
   // Metadata preparation for one persisted Space read, never a user turn or
   // an executable call authority. The existing read kernel owns dispatch.
   'workspace_read_preparation_started',
+  // The same for one calendar watch read on one named account.
+  'watch_read_preparation_started',
   // Immutable parent for one provider-neutral paginated workflow read. Every
   // page is a child call of this one activation/node attempt; no page is
   // represented as another workflow attempt or fabricated user turn.
@@ -1440,8 +1442,8 @@ export function sumSessionTokensUsedByPrefix(prefix: string): number {
   if (!prefix) return 0;
   try {
     const row = openEventLog().prepare(
-      "SELECT COALESCE(SUM(tokens_used), 0) AS total FROM sessions WHERE id LIKE ? ESCAPE '\\'",
-    ).get(`${prefix.replace(/[%_\\]/g, (c) => `\\${c}`)}%`) as { total: number } | undefined;
+      'SELECT COALESCE(SUM(tokens_used), 0) AS total FROM sessions WHERE id >= ? AND id < ?',
+    ).get(...prefixKeyRange(prefix)) as { total: number } | undefined;
     return typeof row?.total === 'number' ? row.total : 0;
   } catch {
     return 0;
@@ -4613,20 +4615,37 @@ export function appendTerminalEventOnce(
   }
 }
 
+/** Exported so a test can read the query plan of the exact statement. */
+export const LATEST_EVENT_AT_FOR_SESSION_PREFIX_SQL = 'SELECT MAX(created_at) AS at FROM events WHERE session_id >= ? AND session_id < ?';
+
 /**
  * Newest event timestamp across every session whose id starts with `prefix`
  * (e.g. 'workflow:<runId>:' spans all of a run's step sessions). Used by the
  * workflow watchdog's silent-running detection — a 'running' run whose step
  * sessions have emitted nothing for many minutes is wedged, not working.
- * Returns null when no events match.
+ * Returns null when no events match. Answered from the session index.
  */
 export function latestEventAtForSessionPrefix(prefix: string): string | null {
   if (!prefix) return null;
   const db = openEventLog();
   const row = db
-    .prepare("SELECT MAX(created_at) AS at FROM events WHERE session_id LIKE ? ESCAPE '\\'")
-    .get(`${prefix.replace(/[%_\\]/g, (m) => `\\${m}`)}%`) as { at: string | null };
+    .prepare(LATEST_EVENT_AT_FOR_SESSION_PREFIX_SQL)
+    .get(...prefixKeyRange(prefix)) as { at: string | null };
   return row?.at ?? null;
+}
+
+/**
+ * Every key that starts with `prefix`, as a half-open range an index can walk.
+ *
+ * `LIKE 'prefix%'` cannot use a BINARY-collated index, because SQLite's LIKE
+ * folds ASCII case, so a prefix lookup written that way reads the whole
+ * table — on a long-lived home's event log that is many seconds of a blocked
+ * main loop each time a watchdog asks. Under BINARY collation the keys that
+ * start with `prefix` are exactly those >= prefix and < prefix followed by
+ * the highest code point, so the same answer comes from the index alone.
+ */
+export function prefixKeyRange(prefix: string): [string, string] {
+  return [prefix, `${prefix}\u{10FFFF}`];
 }
 
 export function listEvents(sessionId: string, options: ListEventsOptions = {}): EventRow[] {

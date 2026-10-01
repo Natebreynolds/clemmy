@@ -40,7 +40,7 @@ import { resolveActiveTaskContext } from './active-task-context.js';
 import { recallLearnedContracts, renderLearnedContracts } from '../../tools/tool-contract-recall.js';
 import { renderReviewedCliWorkCallExample, reviewedCliShellMatch } from './reviewed-cli-shell-match.js';
 import { lexicalCapabilityMatchesForRequest } from '../read-path/lexical-capability-matches.js';
-import { readSpaceReadPreparation } from '../../spaces/read-preparation-source.js';
+import { readSavedReadPreparation } from './saved-read-preparation.js';
 
 export type CapabilityStatus = 'proven' | 'previously_failed';
 export type ConnectionState = 'active' | 'missing' | 'unknown' | 'not_applicable';
@@ -203,7 +203,7 @@ function resolutionBelongsToAcceptedTask(
     limit: 1,
   });
   if (accepted?.seq !== sourceUserSeq) {
-    const preparation = readSpaceReadPreparation(sessionId, sourceUserSeq);
+    const preparation = readSavedReadPreparation(sessionId, sourceUserSeq);
     return Boolean(preparation && normalizeAuthorityInput(preparation.acceptedInput) === resolutionInput
       && resolution.entries.every(entry => entry.kind === 'composio'
         && entry.identifier.trim().toUpperCase() === preparation.operationId
