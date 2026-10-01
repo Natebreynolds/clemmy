@@ -213,24 +213,26 @@ export function connectedCalendarOperations(): ConnectedCalendarOperation[] {
 }
 
 // ── learning the read ─────────────────────────────────────────────────────────
-// Two stages, so learning costs what it must and no more. Live 2026-10-01 the
-// one-stage version sent every connected provider's 40 operations with their
-// full input and output schemas, one provider at a time, to the judge: 13
-// calls, 1.32M prompt tokens in 2.5 minutes, and it would have re-asked every
-// provider without a calendar every 30 minutes. Now one call sees operation
-// names and short descriptions across all providers and picks each one's
-// calendar-window operation or none; only a chosen operation's schema goes to
-// the recipe call; and "no calendar read here" is remembered against the
-// provider's operation list until that list changes.
-const MAX_CANDIDATE_OPERATIONS = 40;
-const MAX_DESCRIPTION_CHARS = 160;
+// Two stages, so learning costs what it must and no more. Schemas are what
+// make a learning call expensive, so they never go to the call that has to
+// see every provider. One call sees every connected provider's whole
+// operation list by id and names up to three candidate window reads per
+// provider, or none; a provider's read can sit anywhere in a long list, so
+// the list is never cut. Each candidate's own definition then goes to the
+// recipe call, one at a time, until one yields a recipe that passes its
+// checks. "No calendar read here" is remembered against the provider's
+// operation list until that list changes.
+const MAX_CANDIDATE_OPERATIONS = 1_000;
+const MAX_PICKS_PER_PROVIDER = 3;
 const MAX_SCHEMA_CHARS = 6_000;
 const MAX_SAMPLE_CHARS = 6_000;
 const LEARN_RETRY_MS = 30 * 60_000;
 const REJECTED_RECIPE_RETRY_MS = 24 * 60 * 60_000;
-/** Per provider: when learning may be tried again after a failure. */
+/** Per provider: when learning may be tried again after a failure, and why
+ * it failed, so a tick inside the wait still says what is wrong. */
 const learnRetryAt = new Map<string, number>();
-export function _resetCalendarReadLearningForTests(): void { learnRetryAt.clear(); resampled.clear(); }
+const learnFailure = new Map<string, string>();
+export function _resetCalendarReadLearningForTests(): void { learnRetryAt.clear(); learnFailure.clear(); resampled.clear(); }
 
 function bounded(value: unknown, max: number): string {
   let text: string;
@@ -285,7 +287,12 @@ export async function ensureLearnedCalendarReads(overrides: Partial<CalendarRead
       try { current = await deps.fingerprint(existing.recipe.operationId); } catch { current = undefined; }
       if (!current || current === existing.definitionFingerprint) continue;
     }
-    if ((learnRetryAt.get(toolkit) ?? 0) > now) continue;
+    const retryAt = learnRetryAt.get(toolkit) ?? 0;
+    if (retryAt > now) {
+      const why = learnFailure.get(toolkit);
+      if (why && !existing) notes.push(`${toolkit}: ${why} (tried again after ${new Date(retryAt).toISOString()})`);
+      continue;
+    }
     let tools: ToolRow[];
     try { tools = (await deps.listTools(toolkit, MAX_CANDIDATE_OPERATIONS)).slice(0, MAX_CANDIDATE_OPERATIONS); }
     catch (error) { notes.push(`${toolkit}: its operations could not be listed: ${error instanceof Error ? error.message : String(error)}`); continue; }
@@ -300,9 +307,8 @@ export async function ensureLearnedCalendarReads(overrides: Partial<CalendarRead
     for (const c of candidates) learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS);
     return [...notes, 'no model is available to learn calendar reads; it will be tried again'];
   }
-  // Stage 1: one call, names and short descriptions only.
-  const providers = candidates.map((c) => ({ toolkit: c.toolkit,
-    operations: c.tools.map((t) => ({ operationId: t.slug, description: bounded(t.description ?? t.name ?? '', MAX_DESCRIPTION_CHARS) })) }));
+  // Stage 1: one call, every operation id, nothing else.
+  const providers = candidates.map((c) => ({ toolkit: c.toolkit, operations: c.tools.map((t) => t.slug).sort() }));
   const evidenceDigest = createHash('sha256').update(JSON.stringify(providers), 'utf8').digest('hex');
   let picks: Awaited<ReturnType<NonNullable<typeof port.findCalendarReadOperations>>>;
   try {
@@ -311,20 +317,37 @@ export async function ensureLearnedCalendarReads(overrides: Partial<CalendarRead
     for (const c of candidates) learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS);
     return [...notes, `the model could not pick calendar operations: ${error instanceof Error ? error.message : String(error)}`];
   }
-  const pickFor = new Map(picks.picks.map((p) => [p.toolkit.trim().toLowerCase(), p.operationId]));
+  const pickFor = new Map(picks.picks.map((p) => [p.toolkit.trim().toLowerCase(), p.operationIds]));
+  const failed = (toolkit: string, why: string, waitMs: number): void => {
+    learnRetryAt.set(toolkit, now + waitMs);
+    learnFailure.set(toolkit, why);
+    notes.push(`${toolkit}: ${why}`);
+    logger.warn({ toolkit, why }, 'calendar watch: could not learn the provider\'s calendar read');
+  };
   for (const c of candidates) {
-    if (!pickFor.has(c.toolkit)) { learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS); notes.push(`${c.toolkit}: the model did not answer for it`); continue; }
-    const operationId = pickFor.get(c.toolkit) ?? null;
-    if (!operationId) {
+    if (!pickFor.has(c.toolkit)) { failed(c.toolkit, 'the model did not answer for it', LEARN_RETRY_MS); continue; }
+    const ranked = [...new Set((pickFor.get(c.toolkit) ?? []).map((id) => id.trim()).filter(Boolean))].slice(0, MAX_PICKS_PER_PROVIDER);
+    if (ranked.length === 0) {
       rememberCalendarReadAbsence({ toolkit: c.toolkit, operationsDigest: c.digest, at: new Date(now).toISOString(), reason: 'none of its operations lists calendar events in a time window' });
       continue;
     }
-    const chosen = c.tools.find((t) => t.slug.toLowerCase() === operationId.trim().toLowerCase());
-    if (!chosen) { learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS); notes.push(`${c.toolkit}: the model named an operation it does not list (${operationId})`); continue; }
-    // Stage 2: the recipe, from this one operation's own definition.
-    const note = await deriveRecipe(c.toolkit, chosen, deps);
-    if (note) { learnRetryAt.set(c.toolkit, now + (note.startsWith('recipe rejected') ? REJECTED_RECIPE_RETRY_MS : LEARN_RETRY_MS)); notes.push(`${c.toolkit}: ${note}`); }
-    else learnRetryAt.delete(c.toolkit);
+    // Stage 2: a recipe from each candidate's own definition, best first,
+    // until one passes. A candidate that cannot carry a window is not the
+    // provider's last chance.
+    const tried: string[] = [];
+    let learned = false;
+    for (const operationId of ranked) {
+      const chosen = c.tools.find((t) => t.slug.toLowerCase() === operationId.toLowerCase());
+      if (!chosen) { tried.push(`the model named an operation it does not list (${operationId})`); continue; }
+      const note = await deriveRecipe(c.toolkit, chosen, deps);
+      if (!note) { learned = true; break; }
+      tried.push(`${chosen.slug}: ${note}`);
+    }
+    if (learned) { learnRetryAt.delete(c.toolkit); learnFailure.delete(c.toolkit); continue; }
+    // Every candidate was read and its recipe refused: the provider's
+    // definitions decide that, so it waits for them, not for the next tick.
+    const allRejected = tried.length > 0 && tried.every((t) => t.includes(': recipe rejected'));
+    failed(c.toolkit, tried.join('; '), allRejected ? REJECTED_RECIPE_RETRY_MS : LEARN_RETRY_MS);
   }
   return notes;
 }
@@ -568,9 +591,8 @@ export function _setCalendarReadPreparerForTests(preparer: CalendarReadPreparer 
  * Prepare one learned read against the provider's CURRENT definition before
  * compiling it, the way a workflow step and a Space refresh do. A provider
  * that changes an operation's definition leaves the watch's durable manifest
- * behind; the compiler then refuses it as mismatched on every tick (live
- * 2026-09-25 → 10-01: 443 of 768 reads failed that way, nothing was ever
- * rebound). The preparer revalidates, and provisions the live definition as
+ * behind; the compiler then refuses it as mismatched on every tick, and
+ * nothing rebinds it. The preparer revalidates, and provisions the live definition as
  * the stored manifest's successor when it drifted. It needs an accepted
  * source for that rebind; the watch mints one per tick in its own session,
  * a system event, never a person's turn. Returns a note when preparation
@@ -605,10 +627,12 @@ async function prepareLearnedRead(operation: ConnectedCalendarOperation, tickId:
 export async function readCalendarAccountsAttested(
   window: { startIso: string; endIso: string; top: number; timezone: string },
   tickId: string,
+  /** What this tick's learning already said; learning is not run twice. */
+  learningNotes?: readonly string[],
 ): Promise<{ reads: CalendarWatchAccountRead[]; failures: CalendarWatchReadFailure[] }> {
   const reads: CalendarWatchAccountRead[] = [];
   const failures: CalendarWatchReadFailure[] = [];
-  for (const note of await ensureLearnedCalendarReads()) failures.push({ operationId: 'calendar', reason: `calendar read not learned for ${note}` });
+  for (const note of learningNotes ?? await ensureLearnedCalendarReads()) failures.push({ operationId: 'calendar', reason: `calendar read not learned for ${note}` });
   const operations = connectedCalendarOperations();
   if (operations.length === 0) {
     if (failures.length === 0) failures.push({ operationId: 'calendar', reason: 'no connected provider lists a calendar (connect one in Settings)' });
@@ -778,10 +802,11 @@ export function runCalendarWatchTick(options: { source: string; force?: boolean 
   const tickId = newTickId(nowMs);
   const run = (async (): Promise<CalendarWatchTickResult> => {
     // A home with no calendar is quiet, not failing: no read to retry every
-    // five minutes, no error on the card. Live (blank home): the first tick
-    // reported "Read failed" and armed the failed-read retry. A connected
-    // provider whose read is not learned yet is given its chance here first.
-    const learningNotes = connectedCalendarOperations().length === 0 ? await ensureLearnedCalendarReads() : [];
+    // five minutes, no error on the card. A connected provider whose read is
+    // not learned yet is given its chance here first, and what that learning
+    // says is what the read reports.
+    const learnedHere = connectedCalendarOperations().length === 0;
+    const learningNotes = learnedHere ? await ensureLearnedCalendarReads() : [];
     if (connectedCalendarOperations().length === 0 && learningNotes.length === 0) {
       const state = loadCalendarWatchState();
       const finding: CalendarWatchState['lastFinding'] = {
@@ -805,7 +830,7 @@ export function runCalendarWatchTick(options: { source: string; force?: boolean 
       source: options.source,
       timezone: watchTimezone(),
       config: calendarWatchConfig(),
-      readAccounts: (window) => readCalendarAccountsAttested(window, tickId),
+      readAccounts: (window) => readCalendarAccountsAttested(window, tickId, learnedHere ? learningNotes : undefined),
       judgeChange: judgeCalendarChangeWithJev,
       notify: addNotification,
       isNotificationRead: (id) => getNotification(id)?.read === true,

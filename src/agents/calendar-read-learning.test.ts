@@ -2,11 +2,12 @@
  * Run: node scripts/run-tests-isolated.mjs src/agents/calendar-read-learning.test.ts
  *
  * The calendar watch names no operation. A connected provider's calendar
- * read is learned in two stages — one names-only call that picks each
- * provider's window operation or none, then one recipe call for a chosen
- * operation — remembered against its definition, and "none" is remembered
- * against the provider's operation list. No provider is spelled anywhere but
- * in these fixtures.
+ * read is learned in two stages — one ids-only call over every provider's
+ * whole operation list that ranks up to three window reads per provider or
+ * none, then a recipe call per candidate, best first, until one passes —
+ * remembered against its definition, and "none" is remembered against the
+ * provider's operation list. No provider is spelled anywhere but in these
+ * fixtures.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,11 +42,11 @@ const RECIPE = {
     myResponse: null, myResponseFromAttendee: null, attendees: null, organizer: null, location: null },
 };
 
-type FindCall = { purpose: string; providers: ReadonlyArray<{ toolkit: string; operations: ReadonlyArray<Record<string, unknown>> }>; evidenceDigest: string };
+type FindCall = { purpose: string; providers: ReadonlyArray<{ toolkit: string; operations: ReadonlyArray<string> }>; evidenceDigest: string };
 type DeriveCall = { purpose: string; operations: ReadonlyArray<{ operationId: string }>; sample?: unknown; evidenceDigest: string };
 
 /** A scripted model: stage one picks per provider, stage two writes a recipe. */
-function scriptedPort(recipe: (call: DeriveCall) => unknown, pick: (toolkit: string) => string | null = (t) => (t.startsWith('fixturecal') ? 'FIXTURECAL_LIST_EVENTS' : null)) {
+function scriptedPort(recipe: (call: DeriveCall) => unknown, pick: (toolkit: string) => string[] = (t) => (t.startsWith('fixturecal') ? ['FIXTURECAL_LIST_EVENTS'] : [])) {
   const finds: FindCall[] = [];
   const derives: DeriveCall[] = [];
   return {
@@ -54,7 +55,7 @@ function scriptedPort(recipe: (call: DeriveCall) => unknown, pick: (toolkit: str
       async findCalendarReadOperations(call: FindCall) {
         finds.push(call);
         assert.equal(call.purpose, CALENDAR_READ_OPERATION_PURPOSE);
-        return { picks: call.providers.map((p) => ({ toolkit: p.toolkit, operationId: pick(p.toolkit) })), evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
+        return { picks: call.providers.map((p) => ({ toolkit: p.toolkit, operationIds: pick(p.toolkit) })), evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
       },
       async deriveCalendarRead(call: DeriveCall) {
         derives.push(call);
@@ -66,7 +67,7 @@ function scriptedPort(recipe: (call: DeriveCall) => unknown, pick: (toolkit: str
 }
 const toolsFor = (catalog: Record<string, typeof TOOLS>) => async (toolkit: string) => catalog[toolkit] ?? [];
 
-test('learning costs one names-only call across providers and one recipe call for the chosen operation, then asks nothing again', async () => {
+test('learning costs one ids-only call across providers and one recipe call for the chosen operation, then asks nothing again', async () => {
   // Live 2026-10-01: every provider's 40 operations with full schemas went to
   // the judge one provider at a time — 13 calls, 1.32M prompt tokens.
   runtime._resetCalendarReadLearningForTests();
@@ -80,11 +81,10 @@ test('learning costs one names-only call across providers and one recipe call fo
   assert.equal(model.finds.length, 1, 'one stage-one call for every provider');
   assert.deepEqual(model.finds[0]!.providers.map((p) => p.toolkit).sort(), ['fixturecal', 'fixturemail', 'fixturesheet']);
   for (const provider of model.finds[0]!.providers) {
-    for (const op of provider.operations) {
-      assert.deepEqual(Object.keys(op).sort(), ['description', 'operationId'], 'names and descriptions only, no schemas');
-      assert.ok(String(op.description).length <= 161, 'descriptions are short');
-    }
+    assert.ok(provider.operations.every((op) => typeof op === 'string'), 'operation ids only: no descriptions, no schemas');
   }
+  assert.deepEqual(model.finds[0]!.providers.find((p) => p.toolkit === 'fixturecal')!.operations,
+    ['FIXTURECAL_FREE_BUSY', 'FIXTURECAL_GET_EVENT', 'FIXTURECAL_LIST_EVENTS']);
   assert.equal(model.derives.length, 1, 'one recipe call, for the chosen operation only');
   assert.deepEqual(model.derives[0]!.operations.map((op) => op.operationId), ['FIXTURECAL_LIST_EVENTS']);
   assert.ok(recipes.learnedCalendarRead('FIXTURECAL_LIST_EVENTS', 'fp-1'), 'the recipe is remembered');
@@ -113,7 +113,7 @@ test('a recipe that maps start and end to one argument, or names arguments the o
   runtime._resetCalendarReadLearningForTests();
   const badWindow = { ...RECIPE, operationId: 'FIXTURECAL2_LIST_EVENTS', window: { start: 'filter', end: 'filter', limit: 'top', timezone: null, fixed: null } };
   const tools = [{ ...TOOLS[1]!, slug: 'FIXTURECAL2_LIST_EVENTS', inputParameters: { type: 'object', properties: { filter: { type: 'string' }, top: { type: 'integer' } } } }];
-  const model = scriptedPort(() => badWindow, (t) => (t === 'fixturecal2' ? 'FIXTURECAL2_LIST_EVENTS' : null));
+  const model = scriptedPort(() => badWindow, (t) => (t === 'fixturecal2' ? ['FIXTURECAL2_LIST_EVENTS'] : []));
   let now = Date.parse('2026-10-01T16:00:00Z');
   const deps = {
     now: () => now,
@@ -121,11 +121,13 @@ test('a recipe that maps start and end to one argument, or names arguments the o
     listTools: toolsFor({ fixturecal2: tools as typeof TOOLS }), fingerprint: async () => 'fp-1', port: model.port,
   };
   const notes = await runtime.ensureLearnedCalendarReads(deps);
-  assert.match(notes[0] ?? '', /fixturecal2: recipe rejected: the window start and end are the same argument \(filter\)/);
+  assert.match(notes[0] ?? '', /fixturecal2: FIXTURECAL2_LIST_EVENTS: recipe rejected: the window start and end are the same argument \(filter\)/);
   assert.equal(recipes.listLearnedCalendarReads().some((row) => row.toolkit === 'fixturecal2'), false);
-  // Not re-asked within a day; asked again after.
-  await runtime.ensureLearnedCalendarReads(deps);
+  // Not re-asked within a day, and a tick inside the wait still says why;
+  // asked again after.
+  const waiting = await runtime.ensureLearnedCalendarReads(deps);
   assert.equal(model.finds.length, 1);
+  assert.match(waiting[0] ?? '', /fixturecal2: FIXTURECAL2_LIST_EVENTS: recipe rejected: .*\(tried again after 2026-10-02T16:00:00\.000Z\)/);
   now += 25 * 60 * 60_000;
   await runtime.ensureLearnedCalendarReads(deps);
   assert.equal(model.finds.length, 2);
@@ -143,10 +145,51 @@ test('no model, or a model that names an operation the provider does not list, t
   const deps = { listToolkits: async () => [{ slug: 'fixturecal3', status: 'ACTIVE' }], listTools: toolsFor({ fixturecal3: TOOLS }), fingerprint: async () => 'fp-1' };
   assert.match((await runtime.ensureLearnedCalendarReads({ ...deps, port: () => null }))[0] ?? '', /no model is available/);
   runtime._resetCalendarReadLearningForTests();
-  const wrong = scriptedPort(() => RECIPE, () => 'FIXTURECAL3_NOT_LISTED');
+  const wrong = scriptedPort(() => RECIPE, () => ['FIXTURECAL3_NOT_LISTED']);
   assert.match((await runtime.ensureLearnedCalendarReads({ ...deps, port: wrong.port }))[0] ?? '', /named an operation it does not list/);
   assert.equal(wrong.derives.length, 0);
   assert.equal(recipes.listLearnedCalendarReads().some((row) => row.toolkit === 'fixturecal3'), false);
+});
+
+test('the whole operation list is seen, and a candidate that cannot carry a window is not the provider\'s last chance', async () => {
+  // A provider's window read can sit deep in a long list, behind a general
+  // list operation that takes only a filter expression.
+  runtime._resetCalendarReadLearningForTests();
+  const filler = Array.from({ length: 120 }, (_, i) => ({ slug: `FIXTURECAL4_OP_${String(i).padStart(3, '0')}`, description: 'Something else.', inputParameters: { type: 'object' } }));
+  const filterOnly = { slug: 'FIXTURECAL4_LIST_EVENTS', description: 'List events.', inputParameters: { type: 'object', properties: { filter: { type: 'string' }, top: { type: 'integer' } } } };
+  const windowRead = { slug: 'FIXTURECAL4_GET_CALENDAR_VIEW', description: 'Events in a window.', inputParameters: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' }, limit: { type: 'integer' } } } };
+  const tools = [filterOnly, ...filler.slice(0, 100), windowRead, ...filler.slice(100)];
+  const model = scriptedPort(
+    (call) => (call.operations[0]!.operationId === filterOnly.slug
+      ? { ...RECIPE, operationId: filterOnly.slug, window: { start: 'filter', end: 'filter', limit: 'top', timezone: null, fixed: null } }
+      : { ...RECIPE, operationId: windowRead.slug }),
+    (t) => (t === 'fixturecal4' ? [filterOnly.slug, windowRead.slug] : []),
+  );
+  const notes = await runtime.ensureLearnedCalendarReads({
+    listToolkits: async () => [{ slug: 'fixturecal4', status: 'ACTIVE' }],
+    listTools: toolsFor({ fixturecal4: tools as typeof TOOLS }), fingerprint: async () => 'fp-1', port: model.port,
+  });
+  assert.deepEqual(notes, []);
+  assert.equal(model.finds.length, 1);
+  assert.equal(model.finds[0]!.providers[0]!.operations.length, 122, 'every operation id, none cut');
+  assert.ok(model.finds[0]!.providers[0]!.operations.includes(windowRead.slug));
+  assert.deepEqual(model.derives.map((call) => call.operations[0]!.operationId), [filterOnly.slug, windowRead.slug],
+    'the refused candidate, then the next one, in the same tick');
+  assert.ok(recipes.learnedCalendarRead(windowRead.slug, 'fp-1'));
+  recipes.forgetCalendarRead(windowRead.slug);
+});
+
+test('a tick that learned reports what learning said, not "no calendar connected"', async () => {
+  runtime._resetCalendarReadLearningForTests();
+  const result = await runtime.readCalendarAccountsAttested(
+    { startIso: '2026-10-01T00:00:00Z', endIso: '2026-10-02T00:00:00Z', top: 50, timezone: 'UTC' },
+    'tick-notes',
+    ['fixturecal5: FIXTURECAL5_LIST_EVENTS: recipe rejected: the window start and end are the same argument (filter)'],
+  );
+  assert.equal(result.reads.length, 0);
+  assert.equal(result.failures[0]?.reason,
+    'calendar read not learned for fixturecal5: FIXTURECAL5_LIST_EVENTS: recipe rejected: the window start and end are the same argument (filter)');
+  assert.equal(result.failures.some((f) => /connect one in Settings/.test(f.reason)), false);
 });
 
 test('a recipe that reads nothing out of a non-empty response is wrong about the fields, not an empty calendar', () => {

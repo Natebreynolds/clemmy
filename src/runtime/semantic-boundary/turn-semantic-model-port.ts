@@ -204,17 +204,20 @@ export interface RequestEffectJudgeResult {
 
 export const CALENDAR_READ_OPERATION_PURPOSE = 'calendar_read_operation' as const;
 
-/** Every connected provider's operations, by name and a short description
- * only (no schemas), asked which one per provider lists calendar events in
- * a time window. Cheap on purpose: the recipe call that follows sees one
- * operation's schema, not every provider's. */
+/** Every connected provider's whole operation list, by id only (no
+ * descriptions, no schemas), asked which few per provider could list
+ * calendar events in a time window, best first. Cheap on purpose: the recipe
+ * call that follows sees one operation's definition at a time, not every
+ * provider's. The whole list, because a provider's window read can sit
+ * anywhere in a long one. */
 export interface CalendarReadOperationCall {
   purpose: typeof CALENDAR_READ_OPERATION_PURPOSE;
-  providers: ReadonlyArray<{ toolkit: string; operations: ReadonlyArray<{ operationId: string; description: string }> }>;
+  providers: ReadonlyArray<{ toolkit: string; operations: ReadonlyArray<string> }>;
   evidenceDigest: string;
 }
 export interface CalendarReadOperationResult {
-  picks: ReadonlyArray<{ toolkit: string; operationId: string | null }>;
+  /** Up to three operation ids per provider, best first; empty = none. */
+  picks: ReadonlyArray<{ toolkit: string; operationIds: ReadonlyArray<string> }>;
   evidenceDigest: string;
   modelIdentity: string;
 }

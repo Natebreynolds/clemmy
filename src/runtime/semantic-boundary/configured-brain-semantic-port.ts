@@ -211,14 +211,15 @@ const NOTICING_ANSWER_SYSTEM = [
 ].join(' ');
 
 export const CalendarReadOperationsV1Schema = z.object({
-  picks: z.array(z.object({ toolkit: z.string().min(1), operationId: z.string().min(1).nullable() }).strict()),
+  picks: z.array(z.object({ toolkit: z.string().min(1), operationIds: z.array(z.string().min(1)) }).strict()),
 }).strict();
 
 const CALENDAR_READ_OPERATION_SYSTEM = [
-  'You are given connected providers, each with its operations by id and a short description.',
-  'For EACH provider, pick the ONE operation that lists the events on a calendar between a start and an end time: a window of events, not a single event by id, not free/busy slots, not a text search, not a write. If the provider has none, answer null for it.',
-  'Most providers are not calendars; answer null for them without hesitation. Copy operation ids and provider names exactly.',
-  'Return only a CalendarReadOperationsV1 JSON object with one pick per provider.',
+  'You are given connected providers, each with the ids of all its operations.',
+  'For EACH provider, list up to three operation ids, best first, that could list the events on a calendar between a start and an end time: a window of events, not a single event by id, not free/busy slots, not a text search, not a write.',
+  'Judge from the ids. Rank first an operation that reads a window or view of the calendar, which takes the start and end as its own inputs, over a general event list that needs a filter expression.',
+  'Most providers are not calendars; answer an empty list for them without hesitation. Copy operation ids and provider names exactly.',
+  'Return only a CalendarReadOperationsV1 JSON object with one entry per provider.',
 ].join(' ');
 
 export function semanticModelRoleForPurpose(
@@ -658,7 +659,9 @@ export function configuredBrainSemanticPort(
       recordSemanticModelUsage({ ...result });
       const parsed = CalendarReadOperationsV1Schema.safeParse(result.raw);
       return {
-        picks: parsed.success ? parsed.data.picks : [],
+        picks: parsed.success
+          ? parsed.data.picks.map((pick) => ({ toolkit: pick.toolkit, operationIds: pick.operationIds.slice(0, 3) }))
+          : [],
         evidenceDigest: call.evidenceDigest,
         modelIdentity: result.modelIdentity,
       };
