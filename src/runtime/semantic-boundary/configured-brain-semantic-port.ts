@@ -34,8 +34,11 @@ import type {
   TurnSemanticModelResult,
   RequestEffectJudgeCall,
   RequestEffectJudgeResult,
+  CalendarReadRecipeCall,
+  CalendarReadRecipeResult,
 } from './turn-semantic-model-port.js';
 import { installTurnSemanticModelPort } from './turn-semantic-port-registry.js';
+import { CalendarReadRecipeV1Schema } from '../../agents/calendar-read-recipe.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'configured-brain-semantic-port' });
@@ -46,14 +49,15 @@ export type ConfiguredSemanticPurpose =
   | 'turn_semantics_plan_grounding'
   | 'turn_semantics_account_selection'
   | 'operation_delivery_judge'
-  | 'request_effect_judge';
+  | 'request_effect_judge'
+  | 'calendar_read_recipe';
 
 export interface ConfiguredBrainSemanticComplete {
   (input: {
     purpose: ConfiguredSemanticPurpose;
     system: string;
     user: string;
-    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1';
+    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'CalendarReadRecipeV1';
   }): Promise<{
     raw: unknown;
     modelIdentity: string;
@@ -158,6 +162,22 @@ const REQUEST_EFFECT_SYSTEM = [
   'confidence is your probability, from 0 to 1, that the answer is right.',
   'Copy evidenceDigest exactly.',
   'Return only a RequestEffectJudgeV1 JSON object.',
+].join(' ');
+
+/** The wire shape: the recipe itself is validated by the watch's own schema
+ * after the call; here the model may also answer that no operation fits. */
+export const CalendarReadRecipeAnswerV1Schema = z.object({
+  recipe: CalendarReadRecipeV1Schema.nullable(),
+  evidenceDigest: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+
+const CALENDAR_READ_RECIPE_SYSTEM = [
+  'You are given the current read operations of one connected calendar provider: each with its id, description and input schema (and output schema when declared), and sometimes one real response.',
+  'Choose the ONE operation that lists the events on a calendar between a start and an end time (a window, not a single event, not free/busy slots, not a search by text). If none does, answer recipe: null.',
+  'Write a recipe for it. window: the exact argument names that receive the window start (ISO 8601 instant) and end, the argument for a maximum number of results when there is one, the argument naming a time zone when there is one, and in fixed any arguments the read should always send so that recurring events are expanded into instances and results are ordered by start time.',
+  'fields: dot paths INSIDE ONE RETURNED EVENT object (never the envelope) for its id, title, start and end (a time value may be a string or an object holding dateTime/timeZone or date), and where present: allDay (path, and the value meaning all-day), cancelled (path, and the value meaning cancelled), showAs (path, plus the values meaning free and tentative), the owner\'s own response as myResponse (a path) or myResponseFromAttendee (the attendee entry flagged as the owner and its response path), attendees (the list path), organizer and location (candidate paths, first non-empty wins).',
+  'Use the schemas and the sample only; do not invent fields. operationId must be copied exactly. version is 1.',
+  'Copy evidenceDigest exactly. Return only a CalendarReadRecipeAnswerV1 JSON object.',
 ].join(' ');
 
 export function semanticModelRoleForPurpose(
@@ -438,7 +458,7 @@ export async function completeViaConfiguredBrain(input: {
   purpose: ConfiguredSemanticPurpose;
   system: string;
   user: string;
-  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1';
+  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'CalendarReadRecipeV1';
 }): Promise<{
   raw: unknown;
   modelIdentity: string;
@@ -454,6 +474,8 @@ export async function completeViaConfiguredBrain(input: {
     user: input.user,
     schema: input.schemaName === 'SourceAccountJudgeV1'
       ? SourceAccountJudgeV1Schema
+      : input.schemaName === 'CalendarReadRecipeV1'
+      ? CalendarReadRecipeAnswerV1Schema
       : input.schemaName === 'RequestEffectJudgeV1'
       ? RequestEffectJudgeV1Schema
       : input.schemaName === 'OperationDeliveryJudgeV1'
@@ -570,6 +592,25 @@ export function configuredBrainSemanticPort(
       return {
         changesProvider: confident ? parsed.data.changesProvider : 'uncertain',
         confidence: confident ? parsed.data.confidence : 0,
+        evidenceDigest: parsed.success ? parsed.data.evidenceDigest : '',
+        modelIdentity: result.modelIdentity,
+      };
+    },
+    async deriveCalendarRead(call: CalendarReadRecipeCall): Promise<CalendarReadRecipeResult> {
+      const result = await complete({
+        purpose: call.purpose,
+        system: CALENDAR_READ_RECIPE_SYSTEM,
+        user: JSON.stringify({
+          operations: call.operations,
+          ...(call.sample ? { sample: call.sample } : {}),
+          evidenceDigest: call.evidenceDigest,
+        }),
+        schemaName: 'CalendarReadRecipeV1',
+      });
+      recordSemanticModelUsage({ ...result });
+      const parsed = CalendarReadRecipeAnswerV1Schema.safeParse(result.raw);
+      return {
+        recipe: parsed.success ? parsed.data.recipe : null,
         evidenceDigest: parsed.success ? parsed.data.evidenceDigest : '',
         modelIdentity: result.modelIdentity,
       };

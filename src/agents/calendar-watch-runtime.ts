@@ -30,7 +30,19 @@ import { nextWorkflowNodeAttempt } from '../runtime/harness/accepted-turn-call-a
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import { refreshIndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
 import { peekProductionCapabilityAdapter } from '../runtime/harness/production-capability-adapter.js';
-import { listConnectedToolkits, peekConnectedToolkits } from '../integrations/composio/client.js';
+import { listComposioToolkitTools, listConnectedToolkits, peekConnectedToolkits } from '../integrations/composio/client.js';
+import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
+import { CALENDAR_READ_RECIPE_PURPOSE } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
+import {
+  CalendarReadRecipeV1Schema,
+  learnedCalendarRead,
+  listLearnedCalendarReads,
+  recipeArgs,
+  recipeParse,
+  recipeReadsPayload,
+  rememberCalendarRead,
+  type LearnedCalendarRead,
+} from './calendar-read-recipe.js';
 import { peekAttestedTransport } from '../runtime/harness/implementation-artifacts/attested-transport.js';
 import { ensureLiveComposioSchemaFingerprint, liveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import { HarnessSession } from '../runtime/harness/session.js';
@@ -40,7 +52,6 @@ import { loadUserProfile } from '../runtime/user-profile.js';
 import { closedCanonicalJson } from '../shared/closed-canonical-json.js';
 import {
   DEFAULT_CALENDAR_WATCH_CONFIG,
-  calendarReadOperation,
   emptyCalendarWatchState,
   formatWhen,
   processCalendarWatchTick,
@@ -131,14 +142,38 @@ export interface ConnectedCalendarOperation {
   provider: CalendarReadOperation;
 }
 
-/** Operations that have a CURRENT durable manifest. Nothing is acquired or
- * searched for a provider the owner never connected; that keeps a quiet tick
- * free of discovery work. */
+function readOperationFromRecipe(learned: LearnedCalendarRead): CalendarReadOperation {
+  const { recipe } = learned;
+  return {
+    operationId: recipe.operationId,
+    args: (window) => recipeArgs(recipe, window),
+    parse: (payload, context) => recipeParse(recipe, payload, context),
+  };
+}
+
+/** The calendar reads the watch knows how to make: one learned read per
+ * connected provider, with every CURRENT durable manifest the catalog holds
+ * for it (one per account). A learned read whose provider is no longer
+ * connected is left alone; it is not read. */
 export function connectedCalendarOperations(): ConnectedCalendarOperation[] {
+  const connectedToolkits = new Set(peekConnectedToolkits()
+    .filter((row) => String(row.status ?? '').toLowerCase() !== 'disconnected')
+    .map((row) => String(row.slug ?? '').trim().toLowerCase())
+    .filter(Boolean));
+  const learned = listLearnedCalendarReads()
+    .filter((row) => connectedToolkits.size === 0 || connectedToolkits.has(row.toolkit));
+  if (learned.length === 0) return [];
+  const byOperation = new Map<string, ConnectedCalendarOperation>();
+  for (const row of learned) {
+    byOperation.set(row.recipe.operationId.toLowerCase(), {
+      operationId: row.recipe.operationId,
+      providerKind: 'composio',
+      manifests: [],
+      provider: readOperationFromRecipe(row),
+    });
+  }
   const store = peekCapabilityManifestStore();
-  if (!store) return [];
-  const present = new Map<string, ConnectedCalendarOperation>();
-  for (const entry of store.list()) {
+  for (const entry of store?.list() ?? []) {
     const manifest = entry.manifest as {
       manifestId?: unknown;
       operationId?: unknown;
@@ -152,29 +187,147 @@ export function connectedCalendarOperations(): ConnectedCalendarOperation[] {
     const state = manifest.lifecycle?.state;
     if (state !== undefined && state !== 'current') continue;
     if (typeof manifest.operationId !== 'string') continue;
-    const provider = calendarReadOperation(manifest.operationId);
-    if (!provider) continue;
+    const target = byOperation.get(manifest.operationId.toLowerCase());
+    if (!target) continue;
     const str = (value: unknown): string => (typeof value === 'string' ? value : '');
-    const row = {
-      manifestId: str(manifest.manifestId),
-      accountId: str(manifest.accountId),
-      definitionFingerprint: str(manifest.definitionFingerprint),
-      providerVersion: str(manifest.providerVersion),
-      operationVersion: str(manifest.operationVersion),
-    };
-    const existing = present.get(manifest.operationId);
-    if (existing) {
-      if (row.manifestId) existing.manifests.push(row);
-      continue;
+    // The catalog's own spelling wins once a manifest exists.
+    target.operationId = manifest.operationId;
+    target.providerKind = str(manifest.providerKind) || target.providerKind;
+    if (str(manifest.manifestId)) {
+      target.manifests.push({
+        manifestId: str(manifest.manifestId),
+        accountId: str(manifest.accountId),
+        definitionFingerprint: str(manifest.definitionFingerprint),
+        providerVersion: str(manifest.providerVersion),
+        operationVersion: str(manifest.operationVersion),
+      });
     }
-    present.set(manifest.operationId, {
-      operationId: manifest.operationId,
-      providerKind: str(manifest.providerKind) || 'unknown',
-      manifests: row.manifestId ? [row] : [],
-      provider,
-    });
   }
-  return [...present.values()];
+  return [...byOperation.values()];
+}
+
+// ── learning the read ─────────────────────────────────────────────────────────
+const MAX_CANDIDATE_OPERATIONS = 40;
+const MAX_SCHEMA_CHARS = 4_000;
+const MAX_SAMPLE_CHARS = 6_000;
+const LEARN_RETRY_MS = 30 * 60_000;
+/** Per toolkit: when learning last failed, so a quiet tick does not spend a
+ * model call every few minutes on a provider that keeps refusing. */
+const learnAttempts = new Map<string, number>();
+export function _resetCalendarReadLearningForTests(): void { learnAttempts.clear(); resampled.clear(); }
+
+function bounded(value: unknown, max: number): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value ?? null);
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Make sure every connected provider that can list a calendar has a learned
+ * read. A provider with no recipe, or whose definition changed since the
+ * recipe was written, gets one derived from its own current definitions by
+ * the judge role; the recipe is remembered against that definition. Returns
+ * what could not be learned, named, for the tick's failure list.
+ */
+export interface CalendarReadLearningDeps {
+  now: () => number;
+  listToolkits: () => Promise<Array<{ slug: string; status: string }>>;
+  listTools: (toolkit: string, limit: number) => Promise<Array<{ slug: string; name?: string; description?: string; inputParameters?: unknown; outputParameters?: unknown }>>;
+  fingerprint: (operationId: string) => Promise<string | undefined>;
+  port: () => Pick<NonNullable<ReturnType<typeof peekTurnSemanticModelPort>>, 'deriveCalendarRead'> | null;
+}
+const productionLearningDeps: CalendarReadLearningDeps = {
+  now: Date.now,
+  listToolkits: async () => (await listConnectedToolkits()).map((row) => ({ slug: String(row.slug ?? ''), status: String(row.status ?? '') })),
+  listTools: (toolkit, limit) => listComposioToolkitTools(toolkit, limit),
+  fingerprint: (operationId) => ensureLiveComposioSchemaFingerprint(operationId),
+  port: () => peekTurnSemanticModelPort(),
+};
+export async function ensureLearnedCalendarReads(overrides: Partial<CalendarReadLearningDeps> = {}): Promise<string[]> {
+  const deps = { ...productionLearningDeps, ...overrides };
+  const now = deps.now;
+  const notes: string[] = [];
+  let toolkits: Array<{ slug: string; status: string }> = [];
+  try {
+    toolkits = (await deps.listToolkits()).map((row) => ({ slug: row.slug.trim().toLowerCase(), status: row.status }));
+  } catch (error) {
+    return [`connected providers unavailable: ${error instanceof Error ? error.message : String(error)}`];
+  }
+  const active = [...new Set(toolkits.filter((row) => row.slug && row.status.toLowerCase() !== 'disconnected').map((row) => row.slug))];
+  const learned = new Map(listLearnedCalendarReads().map((row) => [row.toolkit, row]));
+  for (const toolkit of active) {
+    const existing = learned.get(toolkit);
+    if (existing) {
+      // Still the definition it was read from? A changed definition means
+      // the recipe is no longer evidence.
+      let current: string | undefined;
+      try { current = await deps.fingerprint(existing.recipe.operationId); } catch { current = undefined; }
+      if (!current || current === existing.definitionFingerprint) continue;
+    }
+    const last = learnAttempts.get(toolkit) ?? 0;
+    if (now() - last < LEARN_RETRY_MS) continue;
+    learnAttempts.set(toolkit, now());
+    const note = await learnCalendarReadForToolkit(toolkit, deps);
+    if (note) notes.push(`${toolkit}: ${note}`);
+    else learnAttempts.delete(toolkit);
+  }
+  return notes;
+}
+
+async function learnCalendarReadForToolkit(toolkit: string, deps: CalendarReadLearningDeps, sample?: { operationId: string; response: string }): Promise<string | null> {
+  const port = deps.port();
+  if (!port?.deriveCalendarRead) return 'no model is available to learn this provider\'s calendar read; it will be tried again';
+  let tools: Awaited<ReturnType<CalendarReadLearningDeps['listTools']>>;
+  try {
+    tools = await deps.listTools(toolkit, MAX_CANDIDATE_OPERATIONS);
+  } catch (error) {
+    return `its operations could not be listed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (tools.length === 0) return 'it lists no operations';
+  const operations = tools.map((tool) => ({
+    operationId: tool.slug,
+    description: bounded(tool.description ?? tool.name ?? '', 600),
+    inputSchema: bounded(closedCanonicalJson(tool.inputParameters ?? {}), MAX_SCHEMA_CHARS),
+    ...(tool.outputParameters ? { outputSchema: bounded(closedCanonicalJson(tool.outputParameters), MAX_SCHEMA_CHARS) } : {}),
+  }));
+  const evidenceDigest = createHash('sha256').update(closedCanonicalJson({ toolkit, operations, sample: sample ?? null }), 'utf8').digest('hex');
+  let answer: Awaited<ReturnType<NonNullable<typeof port.deriveCalendarRead>>>;
+  try {
+    answer = await port.deriveCalendarRead({ purpose: CALENDAR_READ_RECIPE_PURPOSE, operations, ...(sample ? { sample } : {}), evidenceDigest });
+  } catch (error) {
+    return `the model could not read its definitions: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (answer.evidenceDigest !== evidenceDigest) return 'the model answered for different evidence';
+  if (answer.recipe === null) return 'none of its operations lists calendar events in a time window';
+  const parsed = CalendarReadRecipeV1Schema.safeParse(answer.recipe);
+  if (!parsed.success) return `the model\'s recipe was not well-formed: ${parsed.error.issues[0]?.message ?? 'invalid'}`;
+  const chosen = tools.find((tool) => tool.slug.toLowerCase() === parsed.data.operationId.toLowerCase());
+  if (!chosen) return `the model named an operation this provider does not list (${parsed.data.operationId})`;
+  const recipe = { ...parsed.data, operationId: chosen.slug };
+  let fingerprint: string | undefined;
+  try { fingerprint = await deps.fingerprint(chosen.slug); } catch { fingerprint = undefined; }
+  if (!fingerprint) return `the live definition of ${chosen.slug} could not be fingerprinted`;
+  rememberCalendarRead({
+    recipe, toolkit, definitionFingerprint: fingerprint,
+    basis: { learnedAt: new Date().toISOString(), modelIdentity: answer.modelIdentity, ...(sample ? { fromSample: true } : {}) },
+  });
+  logger.info({ toolkit, operationId: chosen.slug, model: answer.modelIdentity, fromSample: Boolean(sample) }, 'calendar watch: learned the provider\'s calendar read');
+  return null;
+}
+
+/** A recipe that reads no event out of a non-empty response is wrong about
+ * the fields. Derive it again once with that response as the sample. */
+const resampled = new Set<string>();
+async function relearnFromSample(toolkit: string, operationId: string, payload: unknown): Promise<LearnedCalendarRead | null> {
+  const deps = productionLearningDeps;
+  const key = `${toolkit}:${operationId.toLowerCase()}`;
+  if (resampled.has(key)) return null;
+  resampled.add(key);
+  const note = await learnCalendarReadForToolkit(toolkit, deps, { operationId, response: bounded(payload, MAX_SAMPLE_CHARS) });
+  if (note) {
+    logger.warn({ toolkit, operationId, note }, 'calendar watch: could not relearn the read from a sample');
+    return null;
+  }
+  return listLearnedCalendarReads().find((row) => row.toolkit === toolkit) ?? null;
 }
 
 /**
@@ -357,9 +510,10 @@ export async function readCalendarAccountsAttested(
 ): Promise<{ reads: CalendarWatchAccountRead[]; failures: CalendarWatchReadFailure[] }> {
   const reads: CalendarWatchAccountRead[] = [];
   const failures: CalendarWatchReadFailure[] = [];
+  for (const note of await ensureLearnedCalendarReads()) failures.push({ operationId: 'calendar', reason: `calendar read not learned for ${note}` });
   const operations = connectedCalendarOperations();
   if (operations.length === 0) {
-    failures.push({ operationId: 'calendar', reason: 'no connected calendar read is registered (connect Outlook or Google Calendar)' });
+    if (failures.length === 0) failures.push({ operationId: 'calendar', reason: 'no connected provider lists a calendar (connect one in Settings)' });
     return { reads, failures };
   }
   const sessionId = ensureWatchSession().id;
@@ -395,11 +549,25 @@ export async function readCalendarAccountsAttested(
         failures.push({ operationId, ...(read.accountId ? { accountId: read.accountId } : {}), reason });
         continue;
       }
+      let events = operation.parse(read.payload, { timezone: window.timezone });
+      if (events.length === 0) {
+        // The provider answered with events the recipe cannot read: the
+        // recipe is wrong about the fields, not the calendar empty.
+        const learned = listLearnedCalendarReads().find((row) => row.recipe.operationId.toLowerCase() === operationId.toLowerCase());
+        if (learned && recipeReadsPayload(learned.recipe, read.payload, window.timezone) === 'misses') {
+          const relearned = await relearnFromSample(learned.toolkit, operationId, read.payload);
+          if (relearned) events = recipeParse(relearned.recipe, read.payload, { timezone: window.timezone });
+          if (events.length === 0) {
+            failures.push({ operationId, accountId: read.accountId, reason: 'the provider returned events the learned read could not interpret' });
+            continue;
+          }
+        }
+      }
       reads.push({
         operationId: operation.operationId,
         accountId: read.accountId,
         accountLabel: accountLabels.get(read.accountId) ?? read.accountId,
-        events: operation.parse(read.payload, { timezone: window.timezone }),
+        events,
       });
     }
   }
@@ -509,40 +677,44 @@ export function runCalendarWatchTick(options: { source: string; force?: boolean 
   if (inFlight) return inFlight;
   const nowMs = Date.now();
   const tickId = newTickId(nowMs);
-  // A home with no calendar connected is quiet, not failing: no read to
-  // retry every five minutes, no error on the card. Live (blank home): the
-  // first tick reported "Read failed" and armed the failed-read retry.
-  if (connectedCalendarOperations().length === 0) {
-    const state = loadCalendarWatchState();
-    const finding: CalendarWatchState['lastFinding'] = {
-      tickId, at: new Date(nowMs).toISOString(), source: options.source, durationMs: 0,
-      accounts: 0, events: 0, changes: 0, produced: 0, vetoed: 0, retired: 0, quiet: true, readFailures: 0,
-      summary: 'No calendar connected yet (connect Outlook or Google Calendar to start watching).',
-    };
-    state.lastTickAt = finding.at;
-    state.lastFinding = finding;
-    state.metrics.ticks += 1;
-    state.metrics.quietTicks += 1;
-    saveCalendarWatchState(state);
-    return Promise.resolve({
-      ...finding,
-      items: [], changesByKind: {}, judged: 0, duplicatesSuppressed: 0, acknowledged: 0, failures: [], seenEvents: [],
-    } as CalendarWatchTickResult);
-  }
-  const run = processCalendarWatchTick({
-    now: () => Date.now(),
-    tickId,
-    source: options.source,
-    timezone: watchTimezone(),
-    config: calendarWatchConfig(),
-    readAccounts: (window) => readCalendarAccountsAttested(window, tickId),
-    judgeChange: judgeCalendarChangeWithJev,
-    notify: addNotification,
-    isNotificationRead: (id) => getNotification(id)?.read === true,
-    markNotificationRead: (id) => { markNotificationRead(id); },
-    loadState: loadCalendarWatchState,
-    saveState: saveCalendarWatchState,
-  }).then((result) => {
+  const run = (async (): Promise<CalendarWatchTickResult> => {
+    // A home with no calendar is quiet, not failing: no read to retry every
+    // five minutes, no error on the card. Live (blank home): the first tick
+    // reported "Read failed" and armed the failed-read retry. A connected
+    // provider whose read is not learned yet is given its chance here first.
+    const learningNotes = connectedCalendarOperations().length === 0 ? await ensureLearnedCalendarReads() : [];
+    if (connectedCalendarOperations().length === 0 && learningNotes.length === 0) {
+      const state = loadCalendarWatchState();
+      const finding: CalendarWatchState['lastFinding'] = {
+        tickId, at: new Date(nowMs).toISOString(), source: options.source, durationMs: 0,
+        accounts: 0, events: 0, changes: 0, produced: 0, vetoed: 0, retired: 0, quiet: true, readFailures: 0,
+        summary: 'No calendar connected yet (connect one in Settings to start watching).',
+      };
+      state.lastTickAt = finding.at;
+      state.lastFinding = finding;
+      state.metrics.ticks += 1;
+      state.metrics.quietTicks += 1;
+      saveCalendarWatchState(state);
+      return {
+        ...finding,
+        items: [], changesByKind: {}, judged: 0, duplicatesSuppressed: 0, acknowledged: 0, failures: [], seenEvents: [],
+      } as CalendarWatchTickResult;
+    }
+    return processCalendarWatchTick({
+      now: () => Date.now(),
+      tickId,
+      source: options.source,
+      timezone: watchTimezone(),
+      config: calendarWatchConfig(),
+      readAccounts: (window) => readCalendarAccountsAttested(window, tickId),
+      judgeChange: judgeCalendarChangeWithJev,
+      notify: addNotification,
+      isNotificationRead: (id) => getNotification(id)?.read === true,
+      markNotificationRead: (id) => { markNotificationRead(id); },
+      loadState: loadCalendarWatchState,
+      saveState: saveCalendarWatchState,
+    });
+  })().then((result) => {
     logger.info(
       {
         tickId,

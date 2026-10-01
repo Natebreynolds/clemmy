@@ -235,23 +235,7 @@ export function emptyCalendarWatchState(): CalendarWatchState {
   };
 }
 
-// ── provider payload parsing (defensive; shared with the old monitor) ────────
-function asArray(x: unknown): unknown[] { return Array.isArray(x) ? x : []; }
-function pick(obj: unknown, ...keys: string[]): unknown {
-  let cur: unknown = obj;
-  for (const k of keys) {
-    if (cur && typeof cur === 'object' && k in (cur as Record<string, unknown>)) cur = (cur as Record<string, unknown>)[k];
-    else return undefined;
-  }
-  return cur;
-}
-function str(x: unknown): string { return typeof x === 'string' ? x : ''; }
-function parseMs(dt: string): number {
-  if (!dt) return NaN;
-  const hasZone = dt.endsWith('Z') || /[+-]\d\d:?\d\d$/.test(dt);
-  return Date.parse(hasZone ? dt : `${dt}Z`);
-}
-
+// ── wall-clock conversion (used by the learned read) ──────────────────────────
 function zoneOffsetMs(zone: string, atMs: number): number {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: zone,
@@ -264,12 +248,11 @@ function zoneOffsetMs(zone: string, atMs: number): number {
 }
 
 /**
- * Graph returns `start.dateTime` as a WALL-CLOCK time in `start.timeZone`:
- * UTC when nothing was asked for, the requested zone otherwise (the watch
- * asks for the owner's zone, so a 9:00 meeting comes back as "09:00" with
- * timeZone "America/Los_Angeles"). A bare datetime is therefore converted
- * from that zone; treating it as UTC put every item seven hours early
- * (live 2026-09-22, "Tue 2:00 AM" for a 9:00 AM meeting).
+ * Some providers return a WALL-CLOCK time with a zone label beside it (UTC
+ * when nothing was asked for, the requested zone otherwise: a 9:00 meeting
+ * comes back as "09:00" with the owner's zone). A bare datetime is converted
+ * from that zone; reading it as UTC put every item seven hours early (live
+ * 2026-09-22, "Tue 2:00 AM" for a 9:00 AM meeting).
  */
 export function wallClockToUtcMs(dt: string, zone: string | undefined): number {
   if (!dt) return NaN;
@@ -287,20 +270,6 @@ export function wallClockToUtcMs(dt: string, zone: string | undefined): number {
     return asUtc; // an unknown zone label: keep the bare reading rather than drop the event
   }
 }
-export function locateCalendarEvents(payload: unknown): unknown[] {
-  return asArray(
-    pick(payload, 'data', 'value')
-    ?? pick(payload, 'data', 'events')
-    ?? pick(payload, 'data', 'items')
-    ?? pick(payload, 'data', 'response_data', 'value')
-    ?? pick(payload, 'value')
-    ?? pick(payload, 'items')
-    ?? pick(payload, 'events')
-    ?? pick(payload, 'records')
-    ?? (Array.isArray(payload) ? payload : []),
-  );
-}
-
 export interface CalendarReadOperation {
   operationId: string;
   args: (window: { startIso: string; endIso: string; top: number; timezone: string }) => Record<string, unknown>;
@@ -309,87 +278,8 @@ export interface CalendarReadOperation {
   parse: (payload: unknown, context: { timezone: string }) => CalEvent[];
 }
 
-const OUTLOOK: CalendarReadOperation = {
-  operationId: 'outlook_get_calendar_view',
-  // The exact argument shape the host's proven strategy already dispatches.
-  args: ({ startIso, endIso, top, timezone }) => ({
-    start_datetime: startIso,
-    end_datetime: endIso,
-    timezone,
-    top,
-    orderby: 'start/dateTime asc',
-  }),
-  parse: (payload, context) => locateCalendarEvents(payload).map((e): CalEvent => ({
-    id: str(pick(e, 'id')),
-    subject: str(pick(e, 'subject')) || '(no title)',
-    startMs: wallClockToUtcMs(str(pick(e, 'start', 'dateTime')), zoneLabel(str(pick(e, 'start', 'timeZone')), context.timezone)),
-    endMs: wallClockToUtcMs(str(pick(e, 'end', 'dateTime')), zoneLabel(str(pick(e, 'end', 'timeZone')), context.timezone)),
-    isAllDay: pick(e, 'isAllDay') === true,
-    isCancelled: pick(e, 'isCancelled') === true || /^canceled:|^cancelled:/i.test(str(pick(e, 'subject'))),
-    showAs: str(pick(e, 'showAs')),
-    myResponse: str(pick(e, 'responseStatus', 'response')),
-    attendeeCount: asArray(pick(e, 'attendees')).length,
-    ...(str(pick(e, 'organizer', 'emailAddress', 'name')) || str(pick(e, 'organizer', 'emailAddress', 'address'))
-      ? { organizer: str(pick(e, 'organizer', 'emailAddress', 'name')) || str(pick(e, 'organizer', 'emailAddress', 'address')) }
-      : {}),
-    ...(str(pick(e, 'location', 'displayName')) ? { location: str(pick(e, 'location', 'displayName')) } : {}),
-  })).filter((e) => e.id && Number.isFinite(e.startMs)),
-};
-
-/** Graph labels the zone it converted to: 'UTC', an IANA name, or a Windows
- * display name when the caller asked with one. Only UTC and IANA names are
- * convertible here; anything else means "the zone we asked for". */
-function zoneLabel(label: string, requested: string): string {
-  const trimmed = label.trim();
-  if (!trimmed) return 'UTC';
-  if (trimmed.toUpperCase() === 'UTC') return 'UTC';
-  try {
-    new Intl.DateTimeFormat('en-US', { timeZone: trimmed });
-    return trimmed;
-  } catch {
-    return requested;
-  }
-}
-
-const GOOGLE: CalendarReadOperation = {
-  operationId: 'googlecalendar_events_list',
-  args: ({ startIso, endIso, top }) => ({
-    timeMin: startIso,
-    timeMax: endIso,
-    max_results: top,
-    single_events: true,
-    order_by: 'startTime',
-  }),
-  parse: (payload) => locateCalendarEvents(payload).map((e): CalEvent => {
-    const startRaw = str(pick(e, 'start', 'dateTime')) || str(pick(e, 'start', 'date'));
-    const endRaw = str(pick(e, 'end', 'dateTime')) || str(pick(e, 'end', 'date'));
-    const attendees = asArray(pick(e, 'attendees'));
-    const self = attendees.find((a) => pick(a, 'self') === true);
-    return {
-      id: str(pick(e, 'id')),
-      subject: str(pick(e, 'summary')) || '(no title)',
-      startMs: parseMs(startRaw),
-      endMs: parseMs(endRaw),
-      isAllDay: !str(pick(e, 'start', 'dateTime')),
-      isCancelled: str(pick(e, 'status')) === 'cancelled',
-      showAs: str(pick(e, 'transparency')) === 'transparent' ? 'free' : 'busy',
-      myResponse: str(pick(self, 'responseStatus')),
-      attendeeCount: attendees.length,
-      ...(str(pick(e, 'organizer', 'displayName')) || str(pick(e, 'organizer', 'email'))
-        ? { organizer: str(pick(e, 'organizer', 'displayName')) || str(pick(e, 'organizer', 'email')) }
-        : {}),
-      ...(str(pick(e, 'location')) ? { location: str(pick(e, 'location')) } : {}),
-    };
-  }).filter((e) => e.id && Number.isFinite(e.startMs)),
-};
-
-export const CALENDAR_READ_OPERATIONS: readonly CalendarReadOperation[] = [OUTLOOK, GOOGLE];
-
-export function calendarReadOperation(operationId: string): CalendarReadOperation | undefined {
-  const key = operationId.trim().toLowerCase();
-  return CALENDAR_READ_OPERATIONS.find((op) => op.operationId === key);
-}
-
+/** The read the watch applies for one provider. Built from a learned
+ * recipe (calendar-read-recipe.ts); no operation is named in this module. */
 // ── deterministic change detection ───────────────────────────────────────────
 const UNANSWERED = new Set(['notResponded', 'none', 'needsAction']);
 

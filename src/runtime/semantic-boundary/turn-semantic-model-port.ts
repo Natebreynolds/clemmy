@@ -202,6 +202,36 @@ export interface RequestEffectJudgeResult {
   modelIdentity: string;
 }
 
+export const CALENDAR_READ_RECIPE_PURPOSE = 'calendar_read_recipe' as const;
+
+/** One connected provider's current read definitions, asked which of them
+ * lists calendar events in a time window and how to read what it returns.
+ * The answer is a recipe the watch then applies deterministically; the
+ * provider's name is not part of the question. */
+export interface CalendarReadRecipeCall {
+  purpose: typeof CALENDAR_READ_RECIPE_PURPOSE;
+  operations: ReadonlyArray<{
+    operationId: string;
+    description: string;
+    /** Canonical JSON text of the input schema, bounded. */
+    inputSchema: string;
+    /** Canonical JSON text of the output schema when the provider declares one. */
+    outputSchema?: string;
+  }>;
+  /** One real response from the chosen operation, bounded, when a first
+   * recipe read nothing out of it. */
+  sample?: { operationId: string; response: string };
+  evidenceDigest: string;
+}
+
+export interface CalendarReadRecipeResult {
+  /** The chosen operation's recipe (validated by the caller), or null when
+   * none of these operations lists calendar events in a window. */
+  recipe: unknown | null;
+  evidenceDigest: string;
+  modelIdentity: string;
+}
+
 export interface TurnSemanticModelPort {
   interpret(call: TurnSemanticModelCall): Promise<TurnSemanticModelResult>;
   /** Independent tool-less judge. Must not see the proposing model's write claim. */
@@ -217,4 +247,8 @@ export interface TurnSemanticModelPort {
    * anything on its provider. A verdict is evidence for the learned
    * request-effect store only. */
   judgeRequestEffect?(call: RequestEffectJudgeCall): Promise<RequestEffectJudgeResult>;
+  /** On the judge role: which current read lists calendar events in a
+   * window, and how its arguments and fields are read. Evidence for the
+   * learned calendar-read store only. */
+  deriveCalendarRead?(call: CalendarReadRecipeCall): Promise<CalendarReadRecipeResult>;
 }

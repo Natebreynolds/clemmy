@@ -18,11 +18,12 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 const {
   DEFAULT_CALENDAR_WATCH_CONFIG,
-  calendarReadOperation,
   detectCalendarChanges,
   emptyCalendarWatchState,
   processCalendarWatchTick,
 } = await import('./calendar-watch.js');
+const { recipeArgs, recipeParse } = await import('./calendar-read-recipe.js');
+import type { CalendarReadRecipeV1 } from './calendar-read-recipe.js';
 import type {
   CalEvent,
   CalendarWatchChange,
@@ -123,19 +124,46 @@ test('an existing overlap does not re-fire; a self-created block is not an invit
   assert.deepEqual(detect([a, b, self], [a, b, self]), []);
 });
 
-test('the Outlook parser reads Graph shapes; the Google parser reads the self response', async () => {
-  const outlook = calendarReadOperation('OUTLOOK_GET_CALENDAR_VIEW')!;
-  const parsed = outlook.parse({ data: { value: [{
+// Two learned recipes, as a model writes them from a provider's definitions:
+// one for a provider that returns wall-clock times with a zone label beside
+// them, one for a provider that returns instants and flags the owner among
+// the attendees. Fixtures here; nothing in the code names a provider.
+const WALL_CLOCK_RECIPE: CalendarReadRecipeV1 = {
+  version: 1, operationId: 'FIXTURE_WALLCLOCK_CALENDAR_VIEW',
+  window: { start: 'start_datetime', end: 'end_datetime', limit: 'top', timezone: 'timezone', fixed: { orderby: 'start/dateTime asc' } },
+  fields: {
+    id: 'id', title: 'subject', start: 'start', end: 'end',
+    allDay: { path: 'isAllDay' }, cancelled: { path: 'isCancelled' },
+    showAs: { path: 'showAs', free: ['free'], tentative: ['tentative'] },
+    myResponse: 'responseStatus.response', attendees: 'attendees',
+    organizer: ['organizer.emailAddress.name', 'organizer.emailAddress.address'], location: ['location.displayName'],
+  },
+};
+const INSTANT_RECIPE: CalendarReadRecipeV1 = {
+  version: 1, operationId: 'FIXTURE_INSTANT_EVENTS_LIST',
+  window: { start: 'timeMin', end: 'timeMax', limit: 'max_results', fixed: { single_events: true, order_by: 'startTime' } },
+  fields: {
+    id: 'id', title: 'summary', start: 'start', end: 'end',
+    cancelled: { path: 'status', equals: 'cancelled' },
+    showAs: { path: 'transparency', free: ['transparent'] },
+    myResponseFromAttendee: { self: 'self', response: 'responseStatus' }, attendees: 'attendees',
+    organizer: ['organizer.displayName', 'organizer.email'], location: ['location'],
+  },
+};
+
+test('a learned recipe reads wall-clock shapes with zone labels, and instant shapes with the self response', async () => {
+  const parsed = recipeParse(WALL_CLOCK_RECIPE, { data: { value: [{
     id: 'x', subject: 'Canceled: Nate 1:1', start: { dateTime: '2026-09-22T18:00:00.0000000' }, end: { dateTime: '2026-09-22T18:30:00.0000000' },
     isAllDay: false, isCancelled: false, showAs: 'free', responseStatus: { response: 'organizer' }, attendees: [{}], organizer: { emailAddress: { name: 'Tim' } },
   }] } }, { timezone: 'America/Los_Angeles' });
   assert.equal(parsed.length, 1);
-  assert.equal(parsed[0]!.isCancelled, true, 'a "Canceled:" subject from Graph counts as cancelled');
-  assert.equal(parsed[0]!.startMs, Date.parse('2026-09-22T18:00:00Z'), 'a bare Graph datetime with no zone label is UTC');
+  assert.equal(parsed[0]!.isCancelled, true, 'a "Canceled:" title counts as cancelled');
+  assert.equal(parsed[0]!.startMs, Date.parse('2026-09-22T18:00:00Z'), 'a bare wall clock with no zone label is UTC');
   assert.equal(parsed[0]!.organizer, 'Tim');
-  // Live 2026-09-22: the read asks for the owner's zone, so Graph returns
-  // wall-clock times labelled with it. 09:00 in Los Angeles is 16:00Z.
-  const zoned = outlook.parse({ data: { value: [{
+  assert.equal(parsed[0]!.showAs, 'free');
+  // Live 2026-09-22: the read asks for the owner's zone, so the provider
+  // returns wall-clock times labelled with it. 09:00 in Los Angeles is 16:00Z.
+  const zoned = recipeParse(WALL_CLOCK_RECIPE, { data: { value: [{
     id: 'z', subject: 'Weekly Recruiting Meeting', start: { dateTime: '2026-09-22T09:00:00.0000000', timeZone: 'America/Los_Angeles' }, end: { dateTime: '2026-09-22T10:00:00.0000000', timeZone: 'America/Los_Angeles' }, attendees: [{}, {}],
   }, {
     id: 'w', subject: 'Windows label', start: { dateTime: '2026-09-22T09:00:00.0000000', timeZone: 'Pacific Standard Time' }, end: { dateTime: '2026-09-22T10:00:00.0000000', timeZone: 'Pacific Standard Time' }, attendees: [{}],
@@ -150,13 +178,18 @@ test('the Outlook parser reads Graph shapes; the Google parser reads the self re
   const { wallClockToUtcMs } = await import('./calendar-watch.js');
   assert.equal(wallClockToUtcMs('2026-01-15T09:00:00', 'America/New_York'), Date.parse('2026-01-15T14:00:00Z'));
   assert.equal(wallClockToUtcMs('2026-07-15T09:00:00', 'America/New_York'), Date.parse('2026-07-15T13:00:00Z'));
-  const args = outlook.args({ startIso: 's', endIso: 'e', top: 50, timezone: 'America/Los_Angeles' });
-  assert.deepEqual(Object.keys(args).sort(), ['end_datetime', 'orderby', 'start_datetime', 'timezone', 'top']);
+  const args = recipeArgs(WALL_CLOCK_RECIPE, { startIso: 's', endIso: 'e', top: 50, timezone: 'America/Los_Angeles' });
+  assert.deepEqual(args, { orderby: 'start/dateTime asc', start_datetime: 's', end_datetime: 'e', top: 50, timezone: 'America/Los_Angeles' });
 
-  const google = calendarReadOperation('googlecalendar_events_list')!;
-  const g = google.parse({ items: [{ id: 'g1', summary: 'Sync', start: { dateTime: '2026-09-22T18:00:00Z' }, end: { dateTime: '2026-09-22T19:00:00Z' }, attendees: [{ self: true, responseStatus: 'needsAction' }, { email: 'b@x' }] }] }, { timezone: 'UTC' });
+  const g = recipeParse(INSTANT_RECIPE, { items: [{ id: 'g1', summary: 'Sync', start: { dateTime: '2026-09-22T18:00:00Z' }, end: { dateTime: '2026-09-22T19:00:00Z' }, attendees: [{ self: true, responseStatus: 'needsAction' }, { email: 'b@x' }] },
+    { id: 'g2', summary: 'Offsite', start: { date: '2026-09-23' }, end: { date: '2026-09-24' }, status: 'cancelled', transparency: 'transparent' }] }, { timezone: 'UTC' });
   assert.equal(g[0]!.myResponse, 'needsAction');
   assert.equal(g[0]!.attendeeCount, 2);
+  assert.equal(g[0]!.showAs, 'busy', 'no transparency value reads as busy');
+  assert.equal(g[1]!.isAllDay, true, 'a date alone is an all-day event');
+  assert.equal(g[1]!.isCancelled, true);
+  assert.equal(g[1]!.showAs, 'free');
+  assert.deepEqual(recipeArgs(INSTANT_RECIPE, { startIso: 's', endIso: 'e', top: 5, timezone: 'UTC' }), { single_events: true, order_by: 'startTime', timeMin: 's', timeMax: 'e', max_results: 5 });
 });
 
 // ── the tick ──────────────────────────────────────────────────────────────────
