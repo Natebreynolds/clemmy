@@ -19,7 +19,7 @@ import {
 } from './heartbeat-contracts.js';
 import { phonePushReadiness, type PhonePushReadiness } from './phone-push-readiness.js';
 
-export const HEARTBEAT_IDS = ['work-review', 'calendar', 'workflow-suggestions'] as const;
+export const HEARTBEAT_IDS = ['work-review', 'calendar', 'workflow-suggestions', 'noticing'] as const;
 export type HeartbeatId = (typeof HEARTBEAT_IDS)[number];
 
 export function isHeartbeatId(value: string): value is HeartbeatId {
@@ -66,6 +66,7 @@ const CADENCE_RANGE: Record<HeartbeatId, { min: number; max: number }> = {
   'work-review': { min: 15, max: 1440 },
   calendar: { min: 5, max: 240 },
   'workflow-suggestions': { min: 30, max: 1440 },
+  noticing: { min: 30, max: 1440 },
 };
 
 async function currentPhonePush(): Promise<PhonePushReadiness> {
@@ -91,6 +92,28 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
       metrics: pickMetrics(s.metrics),
       openItems: s.openItems.map((i) => ({ key: i.key, kind: i.kind, subject: i.subject, detail: i.detail, createdAt: i.createdAt, acknowledgedAt: i.acknowledgedAt })),
       recentlyRetired: s.recentlyRetired.map((i) => ({ key: i.key, kind: i.kind, subject: i.subject, detail: i.detail, createdAt: i.createdAt, retiredAt: i.retiredAt, retiredReason: i.retiredReason })),
+      rulesApply: true,
+      contract,
+      phonePush,
+    };
+  }
+  if (id === 'noticing') {
+    const { noticingStatus } = await import('./noticing-runtime.js');
+    const s = noticingStatus();
+    const item = (p: typeof s.openItems[number]): HeartbeatItem => ({
+      key: p.id, kind: p.goalId ? 'proposal_for_goal' : 'proposal', subject: p.title, detail: p.why, createdAt: p.createdAt,
+      ...(p.answer ? { acknowledgedAt: p.answer.at } : {}),
+      ...(p.status !== 'open' ? { retiredAt: p.answer?.at ?? p.createdAt, retiredReason: p.answer ? `${p.answer.decision}: ${p.answer.text}` : p.retiredReason ?? p.status } : {}),
+    });
+    return {
+      id, title: s.title, purpose: s.purpose, enabled: s.enabled, cadenceMinutes: s.cadenceMinutes, cadenceRange: CADENCE_RANGE[id],
+      quietHoursActive: s.quietHoursActive, running: s.running,
+      ...(s.lastTickAt ? { lastTickAt: s.lastTickAt } : {}), ...(s.nextTickAt ? { nextTickAt: s.nextTickAt } : {}),
+      ...(s.lastFinding ? { lastFinding: s.lastFinding } : {}),
+      ...(s.lastError ? { lastError: s.lastError } : {}),
+      metrics: pickMetrics(s.metrics),
+      openItems: s.openItems.map(item),
+      recentlyRetired: s.recentlyRetired.map(item),
       rulesApply: true,
       contract,
       phonePush,
@@ -191,6 +214,9 @@ export async function patchHeartbeat(id: HeartbeatId, patch: HeartbeatPatch): Pr
     } else if (id === 'calendar') {
       const { setCalendarWatchPolicy } = await import('./calendar-watch-runtime.js');
       setCalendarWatchPolicy(policyPatch);
+    } else if (id === 'noticing') {
+      const { setNoticingPolicy } = await import('./noticing-runtime.js');
+      setNoticingPolicy(policyPatch);
     } else {
       const { setWorkflowSuggestionsPolicy } = await import('./workflow-suggestions.js');
       setWorkflowSuggestionsPolicy(policyPatch);
@@ -211,6 +237,10 @@ export async function tickHeartbeat(id: HeartbeatId, source: 'heartbeat' | 'manu
   } else if (id === 'calendar') {
     const { runCalendarWatchTick } = await import('./calendar-watch-runtime.js');
     const tick = await runCalendarWatchTick({ source, force: true });
+    summary = tick.summary; produced = tick.produced; quiet = tick.quiet;
+  } else if (id === 'noticing') {
+    const { runNoticingTickNow } = await import('./noticing-runtime.js');
+    const tick = await runNoticingTickNow({ source });
     summary = tick.summary; produced = tick.produced; quiet = tick.quiet;
   } else {
     const { runWorkflowSuggestionsTick } = await import('./workflow-suggestions.js');

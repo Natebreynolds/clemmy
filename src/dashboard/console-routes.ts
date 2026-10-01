@@ -9189,6 +9189,35 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Noticing: what Clem read, weighed, proposed and set aside, per tick; the
+  // proposals and their answers; the daily cap beside the cadence. The
+  // desktop and the phone draw the "Clem thinking" view from this.
+  app.get('/api/console/noticing', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { noticingStatus, settleNoticingAnswers } = await import('../agents/noticing-runtime.js');
+      await settleNoticingAnswers().catch(() => 0);
+      res.json({ noticing: noticingStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  app.patch('/api/console/noticing', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { setNoticingPolicy, noticingStatus } = await import('../agents/noticing-runtime.js');
+      const body = (req.body ?? {}) as { enabled?: unknown; cadenceMinutes?: unknown; dailyCap?: unknown };
+      setNoticingPolicy({
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+        ...(typeof body.cadenceMinutes === 'number' && Number.isFinite(body.cadenceMinutes) ? { cadenceMinutes: body.cadenceMinutes } : {}),
+        ...(typeof body.dailyCap === 'number' && Number.isFinite(body.dailyCap) ? { dailyCap: body.dailyCap } : {}),
+      });
+      res.json({ noticing: noticingStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/heartbeats/:id/rules', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

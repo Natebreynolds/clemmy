@@ -57,7 +57,7 @@ test('heartbeats are listed with their contracts, changed by the owner, given ru
     const list = await send(`${server.url}/api/console/heartbeats`, 'GET');
     assert.equal(list.status, 200, JSON.stringify(list.body).slice(0, 200));
     const beats = list.body.heartbeats as Status[];
-    assert.deepEqual(beats.map((b) => b.id), ['work-review', 'calendar', 'workflow-suggestions']);
+    assert.deepEqual(beats.map((b) => b.id), ['work-review', 'calendar', 'workflow-suggestions', 'noticing']);
     const review = beats[0];
     assert.equal(review.enabled, true);
     assert.equal(review.cadenceMinutes, 60);
@@ -96,6 +96,28 @@ test('heartbeats are listed with their contracts, changed by the owner, given ru
     assert.deepEqual((removed.body.heartbeat as Status).contract.rules, []);
     const gone = await send(`${server.url}/api/console/heartbeats/work-review/rules/${ruleId}`, 'DELETE');
     assert.equal(gone.status, 404);
+
+    // Noticing: on the same contract, with its own cap, and a thinking record
+    // the owner can read. With no model in this process a tick says so and
+    // proposes nothing.
+    const noticing = await send(`${server.url}/api/console/noticing`, 'GET');
+    assert.equal(noticing.status, 200, JSON.stringify(noticing.body).slice(0, 200));
+    const n = noticing.body.noticing as { enabled: boolean; cadenceMinutes: number; dailyCap: number; thinking: unknown[] };
+    assert.equal(n.enabled, true);
+    assert.equal(n.cadenceMinutes, 180);
+    assert.equal(n.dailyCap, 2);
+    const patchedCap = await send(`${server.url}/api/console/noticing`, 'PATCH', { dailyCap: 30, cadenceMinutes: 60 });
+    assert.equal((patchedCap.body.noticing as { dailyCap: number }).dailyCap, 10, 'the cap is clamped');
+    assert.equal((patchedCap.body.noticing as { cadenceMinutes: number }).cadenceMinutes, 60);
+    const noticed = await send(`${server.url}/api/console/heartbeats/noticing/tick`, 'POST', {});
+    assert.equal(noticed.status, 200, JSON.stringify(noticed.body).slice(0, 300));
+    const nt = noticed.body.tick as { summary: string; produced: number; quiet: boolean };
+    assert.equal(nt.produced, 0);
+    assert.match(nt.summary, /no model/);
+    const afterTick = await send(`${server.url}/api/console/noticing`, 'GET');
+    const thinking = (afterTick.body.noticing as { thinking: Array<{ summary: string; read: { goals: number } }> }).thinking;
+    assert.equal(thinking.length, 1);
+    assert.match(thinking[0]!.summary, /no model/);
   } finally {
     await server.close();
   }

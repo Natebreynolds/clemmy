@@ -3474,6 +3474,12 @@ export async function startDaemon(
     // one line per thing worth their attention, under the rules they wrote.
     const { startWorkReviewHeartbeat } = await import('../agents/work-review-runtime.js');
     startWorkReviewHeartbeat();
+    // Noticing rides the same contract: on its cadence, one proposal worth
+    // making across goals and what is happening, asked as a question in the
+    // owner's inbox; a yes starts an ordinary turn the owner can watch.
+    const { bindNoticingRespond, startNoticingHeartbeat } = await import('../agents/noticing-runtime.js');
+    bindNoticingRespond((request) => respondPreferHarness('background', request, (next) => assistant.respond(next)));
+    startNoticingHeartbeat();
     logger.info(
       { enabled: watchPolicy.enabled, cadenceMinutes: watchPolicy.cadenceMinutes },
       watchPolicy.enabled ? 'Calendar watch armed on the prepared read path' : 'Calendar watch heartbeat armed (watch disabled by policy)',

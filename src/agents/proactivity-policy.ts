@@ -71,6 +71,11 @@ export interface ProactivityPolicy {
    *  under the owner's own rules. Read-only. */
   workReviewEnabled: boolean;
   workReviewMinutes: number; // how often to check, 15–1440
+  /** Noticing heartbeat: looks across goals and what is happening and
+   *  proposes one thing worth doing, with its evidence; acts only on a yes. */
+  noticingEnabled: boolean;
+  noticingMinutes: number;  // how often to think, 30–1440
+  noticingDailyCap: number; // proposals per rolling day, 1–10
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
@@ -133,6 +138,9 @@ export const DEFAULT_PROACTIVITY_POLICY: ProactivityPolicy = {
   workflowSuggestionsMinutes: 360,
   workReviewEnabled: true,
   workReviewMinutes: 60,
+  noticingEnabled: true,
+  noticingMinutes: 180,
+  noticingDailyCap: 2,
   quietHoursEnabled: false,
   quietHoursStart: '22:00',
   quietHoursEnd: '07:00',
@@ -197,6 +205,9 @@ function normalizePolicy(input: RawProactivityPolicy = {}): ProactivityPolicy {
     workflowSuggestionsMinutes: clampInteger(input.workflowSuggestionsMinutes, DEFAULT_PROACTIVITY_POLICY.workflowSuggestionsMinutes, 30, 1440),
     workReviewEnabled: input.workReviewEnabled !== false,
     workReviewMinutes: clampInteger(input.workReviewMinutes, DEFAULT_PROACTIVITY_POLICY.workReviewMinutes, 15, 1440),
+    noticingEnabled: input.noticingEnabled !== false,
+    noticingMinutes: clampInteger(input.noticingMinutes, DEFAULT_PROACTIVITY_POLICY.noticingMinutes, 30, 1440),
+    noticingDailyCap: clampInteger(input.noticingDailyCap, DEFAULT_PROACTIVITY_POLICY.noticingDailyCap, 1, 10),
     quietHoursEnabled: input.quietHoursEnabled === true,
     quietHoursStart: normalizeTime(input.quietHoursStart, DEFAULT_PROACTIVITY_POLICY.quietHoursStart),
     quietHoursEnd: normalizeTime(input.quietHoursEnd, DEFAULT_PROACTIVITY_POLICY.quietHoursEnd),

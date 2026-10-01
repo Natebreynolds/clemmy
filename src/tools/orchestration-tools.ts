@@ -2290,12 +2290,12 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'heartbeat_refine',
     [
-      'Change one of the owner\'s heartbeats (the checks Clementine runs on her own: work review, calendar watch, workflow suggestions) the way the owner just asked.',
+      'Change one of the owner\'s heartbeats (the checks Clementine runs on her own: work review, calendar watch, workflow suggestions, noticing) the way the owner just asked.',
       'Use when the owner says how a heartbeat should behave: "stop telling me about fixture runs", "check every two hours", "push those to my phone", "turn the calendar watch off".',
       'add_rule stores the owner\'s wish in plain words and Jev applies it to every future item; remove_rule takes one back; cadence_minutes, notify and enabled change the contract directly. Read the current contract first with action "status" when unsure.',
     ].join(' '),
     {
-      heartbeat: z.enum(['work-review', 'calendar', 'workflow-suggestions']).describe('Which heartbeat.'),
+      heartbeat: z.enum(['work-review', 'calendar', 'workflow-suggestions', 'noticing']).describe('Which heartbeat.'),
       action: z.enum(['status', 'add_rule', 'remove_rule', 'set']).describe('status = read it; add_rule / remove_rule = the rules in the owner\'s words; set = cadence, notify or on/off.'),
       rule: z.string().max(400).optional().describe('add_rule: the rule in the owner\'s own words, one sentence. remove_rule: the rule id or its exact text.'),
       cadence_minutes: z.number().int().min(5).max(1440).optional(),

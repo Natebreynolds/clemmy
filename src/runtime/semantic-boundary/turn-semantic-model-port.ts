@@ -232,6 +232,41 @@ export interface CalendarReadRecipeResult {
   modelIdentity: string;
 }
 
+export const NOTICING_PROPOSAL_PURPOSE = 'noticing_proposal' as const;
+export const NOTICING_ANSWER_PURPOSE = 'noticing_answer' as const;
+
+/** Everything the noticing heartbeat read this tick, asked for at most one
+ * proposal worth making now. The observation is data about the owner's own
+ * work; nothing in it is an instruction to the model. */
+export interface NoticingProposalCall {
+  purpose: typeof NOTICING_PROPOSAL_PURPOSE;
+  observation: unknown;
+  rules: readonly string[];
+  standingAnswers: ReadonlyArray<{ about: string; said: string }>;
+  recentProposals: ReadonlyArray<{ title: string; status: string; createdAt: string }>;
+  evidenceDigest: string;
+}
+export interface NoticingProposalResult {
+  /** The NoticingAnswerV1 shape, validated by the caller. */
+  answer: unknown;
+  modelIdentity: string;
+}
+
+/** The owner's words about one proposal, read into a decision. */
+export interface NoticingAnswerCall {
+  purpose: typeof NOTICING_ANSWER_PURPOSE;
+  proposal: { title: string; action: string };
+  answer: string;
+  evidenceDigest: string;
+}
+export interface NoticingAnswerResult {
+  decision: 'do_it' | 'not_now' | 'never' | 'unclear';
+  /** Anything the owner added that changes how it should be done. */
+  instruction?: string;
+  evidenceDigest: string;
+  modelIdentity: string;
+}
+
 export interface TurnSemanticModelPort {
   interpret(call: TurnSemanticModelCall): Promise<TurnSemanticModelResult>;
   /** Independent tool-less judge. Must not see the proposing model's write claim. */
@@ -251,4 +286,8 @@ export interface TurnSemanticModelPort {
    * window, and how its arguments and fields are read. Evidence for the
    * learned calendar-read store only. */
   deriveCalendarRead?(call: CalendarReadRecipeCall): Promise<CalendarReadRecipeResult>;
+  /** On the brain role: one proposal worth making now, or none. */
+  noticing?(call: NoticingProposalCall): Promise<NoticingProposalResult>;
+  /** On the brain role: what the owner's answer to a proposal means. */
+  readNoticingAnswer?(call: NoticingAnswerCall): Promise<NoticingAnswerResult>;
 }
