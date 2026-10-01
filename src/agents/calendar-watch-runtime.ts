@@ -46,6 +46,9 @@ import {
 import { peekAttestedTransport } from '../runtime/harness/implementation-artifacts/attested-transport.js';
 import { ensureLiveComposioSchemaFingerprint, liveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { appendEvent } from '../runtime/harness/eventlog.js';
+import { prepareWorkflowStepExternalCatalog } from '../execution/workflow-step-external-catalog.js';
+import { isolatedTestContractActive } from '../runtime/harness/isolated-test-contract.js';
 import { tryJevWatchChangeVerdict } from '../runtime/jev/control-plane.js';
 import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
 import { loadUserProfile } from '../runtime/user-profile.js';
@@ -503,6 +506,50 @@ async function readOneAccount(input: {
   return { ok: true, accountId, payload: result.result };
 }
 
+type CalendarReadPreparer = typeof prepareWorkflowStepExternalCatalog;
+let calendarReadPreparer: CalendarReadPreparer = prepareWorkflowStepExternalCatalog;
+export function _setCalendarReadPreparerForTests(preparer: CalendarReadPreparer | null): void {
+  if (!isolatedTestContractActive()) throw new Error('calendar read preparer overrides are isolated-test only');
+  calendarReadPreparer = preparer ?? prepareWorkflowStepExternalCatalog;
+}
+
+/**
+ * Prepare one learned read against the provider's CURRENT definition before
+ * compiling it, the way a workflow step and a Space refresh do. A provider
+ * that changes an operation's definition leaves the watch's durable manifest
+ * behind; the compiler then refuses it as mismatched on every tick (live
+ * 2026-09-25 → 10-01: 443 of 768 reads failed that way, nothing was ever
+ * rebound). The preparer revalidates, and provisions the live definition as
+ * the stored manifest's successor when it drifted. It needs an accepted
+ * source for that rebind; the watch mints one per tick in its own session,
+ * a system event, never a person's turn. Returns a note when preparation
+ * refused; the compiler still decides on its own.
+ */
+async function prepareLearnedRead(operation: ConnectedCalendarOperation, tickId: string, sessionId: string): Promise<string | undefined> {
+  const accounts = [...new Set(operation.manifests.map((m) => m.accountId).filter(Boolean))];
+  const notes: string[] = [];
+  for (const accountId of accounts.length ? accounts : ['']) {
+    const acceptedInput = `Calendar watch ${tickId}: read ${operation.operationId}${accountId ? ` on ${accountId}` : ''}`;
+    let source: { sessionId: string; sourceUserSeq: number; acceptedInput: string };
+    try {
+      const event = appendEvent({ sessionId, turn: 0, role: 'system', type: 'user_input_received',
+        data: { text: acceptedInput, synthetic: true, source: 'calendar_watch', tickId, operationId: operation.operationId, ...(accountId ? { accountId } : {}) } });
+      source = { sessionId, sourceUserSeq: event.seq, acceptedInput };
+    } catch (error) {
+      notes.push(`${accountId || 'any account'}: could not record the preparation (${error instanceof Error ? error.message : String(error)})`);
+      continue;
+    }
+    try {
+      const prepared = await calendarReadPreparer({ immutablePrompt: accountId, allowedTools: [operation.operationId], acceptedSource: source });
+      if (prepared.status === 'ready') continue;
+      notes.push(`${accountId || 'any account'}: ${prepared.status === 'refused' ? [prepared.reason, prepared.detail].filter(Boolean).join(':') : 'no durable manifest'}`);
+    } catch (error) {
+      notes.push(`${accountId || 'any account'}: preparation failed (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
+  return notes.length ? `preparation: ${notes.join('; ')}` : undefined;
+}
+
 /** Read every connected calendar account through the prepared read path. */
 export async function readCalendarAccountsAttested(
   window: { startIso: string; endIso: string; top: number; timezone: string },
@@ -521,7 +568,8 @@ export async function readCalendarAccountsAttested(
   for (const connected of operations) {
     const { operationId, provider: operation } = connected;
     const args = operation.args(window);
-    const warmNote = await warmProviderObservation(connected);
+    const prepareNote = await prepareLearnedRead(connected, tickId, sessionId);
+    const warmNote = [await warmProviderObservation(connected), prepareNote].filter(Boolean).join('; ') || undefined;
     const first = await readOneAccount({ operationId, args, tickId, sessionId });
     const perAccount: AccountRead[] = [];
     if (!first.ok && first.choiceSet) {
@@ -545,7 +593,7 @@ export async function readCalendarAccountsAttested(
       if (!read.ok) {
         const reason = isCapabilityNotRegisteredMessage(read.reason)
           ? `${read.reason} (catalog: ${explainMissingCandidates(connected)}${warmNote ? `; ${warmNote}` : ''})`
-          : read.reason;
+          : prepareNote ? `${read.reason} (${prepareNote})` : read.reason;
         failures.push({ operationId, ...(read.accountId ? { accountId: read.accountId } : {}), reason });
         continue;
       }

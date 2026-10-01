@@ -128,3 +128,37 @@ test('a recipe that reads nothing out of a non-empty response is wrong about the
   assert.equal(recipes.recipeReadsPayload({ ...RECIPE, fields: { id: 'uid', title: 'title', start: 'starts', end: 'ends' } }, payload, 'UTC'), 'reads');
   assert.equal(recipes.recipeReadsPayload(RECIPE, { data: { items: [] } }, 'UTC'), 'empty');
 });
+
+test('each tick prepares the learned read against the current definition, with an accepted source of its own, before compiling it', async () => {
+  // Live 09-25 → 10-01: the provider changed the operation's definition and the
+  // watch's durable manifest was never rebound, so every read refused as
+  // mismatched. A workflow step rebinds through preparation; so does the watch now.
+  runtime._resetCalendarReadLearningForTests();
+  const judge = scriptedPort(() => RECIPE);
+  await runtime.ensureLearnedCalendarReads({
+    listToolkits: async () => [{ slug: 'fixturecal', status: 'ACTIVE' }],
+    listTools: async () => TOOLS, fingerprint: async () => 'fp-1', port: judge.port,
+  });
+  const prepared: Array<{ allowedTools: readonly string[]; immutablePrompt: string; source?: { sessionId: string; sourceUserSeq: number; acceptedInput: string } }> = [];
+  runtime._setCalendarReadPreparerForTests(async (input) => {
+    prepared.push({ allowedTools: input.allowedTools, immutablePrompt: input.immutablePrompt, source: input.acceptedSource });
+    return { status: 'refused', reason: 'exact_operation_provisioning_refused', operationId: 'FIXTURECAL_LIST_EVENTS', detail: 'fixture: no provider in this test' };
+  });
+  try {
+    const result = await runtime.readCalendarAccountsAttested({ startIso: '2026-10-01T00:00:00Z', endIso: '2026-10-08T00:00:00Z', top: 50, timezone: 'UTC' }, 'tick-fixture');
+    assert.equal(prepared.length, 1, 'one preparation per operation when no account is known yet');
+    assert.deepEqual(prepared[0]!.allowedTools, ['FIXTURECAL_LIST_EVENTS']);
+    assert.ok(prepared[0]!.source, 'the preparer gets an accepted source');
+    assert.equal(prepared[0]!.source!.sessionId, 'watch:calendar');
+    assert.match(prepared[0]!.source!.acceptedInput, /Calendar watch tick-fixture: read FIXTURECAL_LIST_EVENTS/);
+    const { listEvents } = await import('../runtime/harness/eventlog.js');
+    const minted = listEvents('watch:calendar', { types: ['user_input_received'] }).find((e) => e.seq === prepared[0]!.source!.sourceUserSeq);
+    assert.equal(minted?.role, 'system', 'the source is a system event, never a person\'s turn');
+    assert.equal(minted?.data.synthetic, true);
+    assert.equal(result.reads.length, 0);
+    assert.equal(result.failures.length, 1);
+    assert.match(result.failures[0]!.reason, /preparation: any account: exact_operation_provisioning_refused:fixture/, result.failures[0]!.reason);
+  } finally {
+    runtime._setCalendarReadPreparerForTests(null);
+  }
+});
