@@ -126,6 +126,7 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'workflow_parent_checkpoint',
   'workspace_read_preparation_started',
   'watch_read_preparation_started',
+  'clem_message',
   'workflow_parent_continuation_requested',
   'turn_memory_primer',
   'guardrail_tripped',

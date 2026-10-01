@@ -115,7 +115,13 @@ export function FromClemPane({
         id={headingId}
         label="From Clem"
         count={asks}
-        aside={<Link to="/heartbeats" className="rounded-sm font-semibold text-primary hover:underline">How Clem checks in</Link>}
+        aside={(
+          <>
+            <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId('clem'))}`} className="rounded-sm font-semibold text-primary hover:underline">Her thread</Link>
+            <span aria-hidden>·</span>
+            <Link to="/heartbeats" className="rounded-sm font-semibold text-primary hover:underline">How Clem checks in</Link>
+          </>
+        )}
       />
       <PaneCard>
         {loading && !data ? (

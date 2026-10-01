@@ -48,9 +48,9 @@ test('she writes each item once, a few per pass, again when it changes, and forg
     },
   });
   const rows = stream().rows;
-  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 2 }), 2);
-  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 2 }), 2);
-  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 2 }), 0, 'nothing left to say');
+  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 2, thread: null }), 2);
+  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 2, thread: null }), 2);
+  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 2, thread: null }), 0, 'nothing left to say');
   assert.equal(calls.length, 4);
 
   // The stream now carries her words; the record's own words stay as facts.
@@ -63,12 +63,35 @@ test('she writes each item once, a few per pass, again when it changes, and forg
 
   // A changed item is said again; a gone one is forgotten.
   const changed = rows.map((row) => (row.key === 'notif:cal' ? { ...row, voiceDigest: 'changed' } : row)).filter((row) => row.key !== 'notif:wr');
-  assert.equal(await voiceFromClemRows(changed, { port: port as never }), 1);
+  assert.equal(await voiceFromClemRows(changed, { port: port as never, thread: null }), 1);
   const after = JSON.parse(fs.readFileSync(path.join(TMP, 'state', 'from-clem-voice.json'), 'utf8')) as { entries: Record<string, unknown> };
   assert.equal(after.entries['notif:wr'], undefined);
 
   // No model: nothing is written and the items keep their own words.
-  assert.equal(await voiceFromClemRows(rows, { port: () => null }), 0);
+  assert.equal(await voiceFromClemRows(rows, { port: () => null, thread: null }), 0);
+});
+
+test('what she writes lands in her own thread once, oldest first, and the thread knows what she raised', async () => {
+  const fs = await import('node:fs');
+  fs.rmSync(path.join(TMP, 'state', 'from-clem-voice.json'), { force: true });
+  const posts: Array<{ key: string; text: string }> = [];
+  const primers: string[] = [];
+  let ensured = 0;
+  const thread = { ensure: () => { ensured += 1; }, post: (m: { key: string; text: string }) => { posts.push(m); }, primer: (t: string) => { primers.push(t); } };
+  const port = () => ({
+    async voiceProactiveItem(call: { item: { title: string }; evidenceDigest: string }) {
+      return { message: `Clem: ${call.item.title}`, evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
+    },
+  });
+  const rows = stream().rows;
+  await voiceFromClemRows(rows, { port: port as never, max: 10, thread });
+  assert.deepEqual(posts.map((post) => post.key), ['plan:plan1', 'noticing:p1', 'notif:wr', 'notif:cal'], 'oldest first');
+  assert.ok(ensured >= 1);
+  assert.match(primers.at(-1)!, /^\[clem-raised\] What I \(Clem\) raised/);
+  assert.match(primers.at(-1)!, /Calendar watch: Clem: Cancelled: Interview/);
+  // Nothing new: nothing posted again.
+  await voiceFromClemRows(rows, { port: port as never, max: 10, thread });
+  assert.equal(posts.length, 4);
 });
 
 function deps(over: Partial<FromClemReplyDeps> = {}, decision: { decision: string; instruction?: string } = { decision: 'done' }) {

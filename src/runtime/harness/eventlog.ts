@@ -654,6 +654,9 @@ export const EVENT_TYPES = [
   'workspace_read_preparation_started',
   // The same for one calendar watch read on one named account.
   'watch_read_preparation_started',
+  // One thing Clem raised with the owner on her own, in her own words, in her
+  // own conversation. Read by the transcript; never a turn or an authority.
+  'clem_message',
   // Immutable parent for one provider-neutral paginated workflow read. Every
   // page is a child call of this one activation/node attempt; no page is
   // represented as another workflow attempt or fabricated user turn.

@@ -10,6 +10,7 @@
 import type { WorkflowSavedEventData } from '../../execution/workflow-saved-event.js';
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
+import { assertPublicPresentationText } from './turn-outcome.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
   publicCompletionText,
@@ -71,6 +72,8 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       'plan_revision_published',
       // A workflow the reply created or changed rides on that reply as a card.
       'workflow_saved',
+      // What she raised on her own, in her own conversation.
+      'clem_message',
     ],
     limit,
   });
@@ -277,7 +280,19 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     }
   }
 
-  const settled: Unit[] = [...orphanAssistants];
+  // Her own messages stand on their own, in the order she sent them. The text
+  // is held to the same public floor as her check-ins.
+  const fromClem: Unit[] = [];
+  for (const event of events) {
+    if (event.type !== 'clem_message' || event.role !== 'Clem') continue;
+    const raw = typeof event.data.text === 'string' ? event.data.text.trim() : '';
+    let text = '';
+    try { text = raw ? assertPublicPresentationText(raw) : ''; } catch { text = ''; }
+    if (!text || text.length > 600) continue;
+    fromClem.push({ order: event.seq, turns: [{ role: 'assistant', text, createdAt: event.createdAt, fromClem: true }] });
+  }
+
+  const settled: Unit[] = [...orphanAssistants, ...fromClem];
   const unpaired: Unit[] = [];
   for (const source of sources.values()) {
     const assistant = assistantBySource.get(source.key);
@@ -328,7 +343,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
 /** The most recent meaningful turn text, for a list preview. Empty if none. */
 export function harnessPreview(sessionId: string): string {
   const events = listEvents(sessionId, {
-    types: ['user_input_received', 'conversation_completed'],
+    types: ['user_input_received', 'conversation_completed', 'clem_message'],
     limit: 1,
     desc: true,
   });
@@ -337,5 +352,6 @@ export function harnessPreview(sessionId: string): string {
   if (latest.type === 'user_input_received') {
     return publicUserInputText(latest.data);
   }
+  if (latest.type === 'clem_message') return typeof latest.data.text === 'string' ? latest.data.text.trim() : '';
   return humanHarnessText(latest.data, '');
 }

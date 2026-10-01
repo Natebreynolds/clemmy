@@ -1,7 +1,8 @@
 /**
  * From Clem, live. Reads the heartbeats' records into the stream (the desktop
  * and the phone share this), has Clem put each item in her own words once, and
- * acts on the owner's reply to any of them.
+ * acts on the owner's reply to any of them. What she says also lands in her
+ * own pinned conversation, where "do it" runs.
  *
  * Her words are written by the brain the owner chose, one short message per
  * item, and kept against what the item says: a changed item is said again, a
@@ -17,6 +18,8 @@ import { buildFromClem, type FromClem, type FromClemRow } from './from-clem.js';
 import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
+import { appendEvent } from '../runtime/harness/eventlog.js';
+import { HarnessSession } from '../runtime/harness/session.js';
 
 const logger = pino({ name: 'clementine.from-clem' });
 const VOICE_FILE = path.join(BASE_DIR, 'state', 'from-clem-voice.json');
@@ -26,7 +29,8 @@ const FIRST_VOICE_PASS_DELAY_MS = 45_000;
 const MAX_KEPT_VOICES = 300;
 
 // ── her words, kept ───────────────────────────────────────────────────────────
-interface VoiceEntry { digest: string; message: string; model: string; at: string }
+/** `posted` is the digest last posted to her thread, so a message lands there once. */
+interface VoiceEntry { digest: string; message: string; model: string; at: string; posted?: string }
 interface VoiceFile { version: 1; entries: Record<string, VoiceEntry> }
 
 function loadVoices(): VoiceFile {
@@ -77,6 +81,38 @@ export async function readFromClem(): Promise<FromClem> {
   });
 }
 
+// ── her thread ────────────────────────────────────────────────────────────────
+/** Her own conversation: pinned, named Clem. What she raises on her own lands
+ *  here, and the owner's "do it" runs here, so it reads as one assistant. */
+export const CLEM_THREAD_ID = 'clem';
+const RAISED_PRIMER = '[clem-raised]';
+const MAX_RAISED_IN_PRIMER = 8;
+
+export interface ClemThreadDeps {
+  ensure: () => void;
+  post: (message: { key: string; heartbeat: string; text: string }) => void;
+  primer: (text: string) => void;
+}
+export const productionClemThread: ClemThreadDeps = {
+  ensure: () => {
+    if (HarnessSession.load(CLEM_THREAD_ID)) return;
+    HarnessSession.create({ id: CLEM_THREAD_ID, kind: 'chat', channel: 'desktop', title: 'Clem', metadata: { pinned: true, source: 'clem_thread' } });
+  },
+  post: (message) => {
+    appendEvent({ sessionId: CLEM_THREAD_ID, turn: 0, role: 'Clem', type: 'clem_message', data: { version: 1, ...message } });
+  },
+  // The model in her thread sees what she raised, so a reply there is read
+  // against it. Replaced, never appended: one current block.
+  primer: (text) => { HarnessSession.load(CLEM_THREAD_ID)?.setContextPrimer(RAISED_PRIMER, text); },
+};
+
+function raisedPrimer(rows: ReadonlyArray<FromClemRow & { say: string }>): string {
+  return [
+    `${RAISED_PRIMER} What I (Clem) raised with the owner on my own recently, newest first. A reply here may be about one of these; if it is unclear which, ask.`,
+    ...rows.slice(0, MAX_RAISED_IN_PRIMER).map((row) => `- ${row.at} · ${row.heartbeatTitle}: ${row.say} (the record: ${[row.text, row.detail].filter(Boolean).join(' — ').slice(0, 400)})`),
+  ].join('\n');
+}
+
 type VoicePort = Pick<TurnSemanticModelPort, 'voiceProactiveItem'>;
 
 /**
@@ -85,7 +121,7 @@ type VoicePort = Pick<TurnSemanticModelPort, 'voiceProactiveItem'>;
  */
 export async function voiceFromClemRows(
   rows: readonly FromClemRow[],
-  deps: { port: () => VoicePort | null; now?: () => number; max?: number } = { port: () => peekTurnSemanticModelPort() },
+  deps: { port: () => VoicePort | null; now?: () => number; max?: number; thread?: ClemThreadDeps | null } = { port: () => peekTurnSemanticModelPort() },
 ): Promise<number> {
   const file = loadVoices();
   const live = new Set(rows.map((row) => row.key));
@@ -115,6 +151,33 @@ export async function voiceFromClemRows(
       } catch (error) {
         logger.warn({ key: row.key, err: error instanceof Error ? error.message : String(error) }, 'from clem: could not write the message; the item keeps its own words');
         break;
+      }
+    }
+  }
+  // Each written message lands in her thread once, newest last, and the
+  // thread's primer names what she raised.
+  const thread = deps.thread === undefined ? productionClemThread : deps.thread;
+  if (thread) {
+    const unposted = rows.filter((row) => {
+      const entry = file.entries[row.key];
+      return entry && entry.digest === row.voiceDigest && entry.posted !== entry.digest;
+    }).sort((a, b) => a.at.localeCompare(b.at));
+    if (unposted.length > 0) {
+      try {
+        thread.ensure();
+        for (const row of unposted) {
+          const entry = file.entries[row.key]!;
+          thread.post({ key: row.key, heartbeat: row.heartbeat, text: entry.message });
+          entry.posted = entry.digest;
+          changed = true;
+        }
+        const said = rows.flatMap((row) => {
+          const entry = file.entries[row.key];
+          return entry && entry.digest === row.voiceDigest ? [{ ...row, say: entry.message }] : [];
+        });
+        thread.primer(raisedPrimer(said));
+      } catch (error) {
+        logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'from clem: could not post to her thread');
       }
     }
   }
@@ -230,10 +293,11 @@ export async function replyToFromClem(key: string, text: string, deps: FromClemR
   }
 }
 
-/** Starts a desktop conversation for the owner's "do it" without waiting for it. */
-export function startFromClemTurn(input: { title: string; message: string; displayMessage: string }, createSession: (title: string) => string): string {
+/** Runs the owner's "do it" in her thread, without waiting for it. */
+export function startFromClemTurn(input: { title: string; message: string; displayMessage: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): string {
   if (!respondImpl) throw new Error('no turn runner is bound');
-  const sessionId = createSession(input.title);
+  thread.ensure();
+  const sessionId = CLEM_THREAD_ID;
   const respond = respondImpl;
   void respond({ sessionId, channel: 'desktop', message: input.message, displayMessage: input.displayMessage }).catch((error: unknown) => {
     logger.warn({ sessionId, err: error instanceof Error ? error.message : String(error) }, 'from clem: the reply turn failed');

@@ -185,6 +185,8 @@ export interface UnifiedSessionTurn {
    *  so someone who walked away can read what happened while they were gone —
    *  including on a turn that is still running and has no reply yet. */
   checkIn?: boolean;
+  /** Something Clem raised on her own (From Clem), not a reply to a turn. */
+  fromClem?: boolean;
   /** Who this exchange was answered by: a saved agent's name, null for Clem
    *  without an agent. Absent when the turn left no route marker. */
   agentName?: string | null;

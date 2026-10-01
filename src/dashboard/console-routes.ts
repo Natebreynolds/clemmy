@@ -14339,10 +14339,9 @@ export function registerConsoleRoutes(
     const text = typeof req.body?.text === 'string' ? req.body.text.trim().slice(0, 4_000) : '';
     if (!key || !text) { res.status(400).json({ error: 'key and text are required' }); return; }
     try {
-      const [{ readFromClem, replyToFromClem, startFromClemTurn }, { addRule, HEARTBEAT_IDS }, { createSession: createHarnessSession }, { peekTurnSemanticModelPort }] = await Promise.all([
+      const [{ readFromClem, replyToFromClem, startFromClemTurn }, { addRule, HEARTBEAT_IDS }, { peekTurnSemanticModelPort }] = await Promise.all([
         import('./from-clem-runtime.js'),
         import('../agents/heartbeats.js'),
-        import('../runtime/harness/eventlog.js'),
         import('../runtime/semantic-boundary/turn-semantic-port-registry.js'),
       ]);
       const result = await replyToFromClem(key, text, {
@@ -14366,9 +14365,7 @@ export function registerConsoleRoutes(
         },
         rejectPlan: (planProposalId, reason) => Boolean(rejectPlanProposal(planProposalId, reason)),
         snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
-        startTurn: (input) => startFromClemTurn(input, (title) => createHarnessSession({
-          kind: 'chat', channel: 'desktop', title, metadata: { source: 'from_clem' } as never,
-        }).id),
+        startTurn: (input) => startFromClemTurn(input),
       });
       res.json(result);
     } catch (err) {
