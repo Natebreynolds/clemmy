@@ -8,7 +8,7 @@
  * the heartbeats' own records and returns one stream: each row is what a
  * heartbeat said, in its own words, with the one way to answer it that
  * already exists (words for a proposal, yes/no for a suggestion, done for a
- * finding). A heartbeat with nothing to say still reports its last look, so a
+ * finding), newest first. A heartbeat with nothing to say still reports its last look, so a
  * quiet Clem is visibly a watching one. Pure: the route supplies the records.
  */
 import type { NotificationRecord } from '../runtime/notifications.js';
@@ -107,8 +107,9 @@ export function buildFromClem(input: FromClemInput): FromClem {
     covers.planProposalIds.push(plan.id);
   }
 
-  // What waits on the owner first, then newest first.
-  rows.sort((a, b) => Number(b.asks) - Number(a.asks) || b.at.localeCompare(a.at));
+  // A stream: newest first. What waits on the owner says so on its row; a
+  // fresh finding is never buried under days-old reminders.
+  rows.sort((a, b) => b.at.localeCompare(a.at));
   const pulses = input.heartbeats.map((row) => ({
     heartbeat: row.id, title: row.title, enabled: row.enabled,
     ...(row.lastFinding ? { lastAt: row.lastFinding.at, summary: row.lastFinding.summary } : {}),

@@ -42,11 +42,12 @@ const input = (over: Partial<FromClemInput> = {}): FromClemInput => ({
   ...over,
 });
 
-test('one stream of what the heartbeats said, waiting-on-you first, each with its own way to answer', () => {
+test('one stream of what the heartbeats said, newest first, each with its own way to answer', () => {
   const out = buildFromClem(input());
   assert.deepEqual(out.rows.map((row) => row.key), [
-    'noticing:p-open', 'notif:cal-ask', 'plan:plan-s', 'notif:cal-1', 'notif:wr-1',
+    'notif:cal-1', 'notif:wr-1', 'noticing:p-open', 'notif:cal-ask', 'plan:plan-s',
   ]);
+  assert.deepEqual(out.rows.map((row) => row.asks), [false, false, true, true, true]);
   const proposal = out.rows.find((row) => row.key === 'noticing:p-open')!;
   assert.equal(proposal.asks, true);
   assert.equal(proposal.text, 'Settle the panel goal');
