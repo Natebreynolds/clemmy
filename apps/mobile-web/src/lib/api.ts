@@ -1835,6 +1835,31 @@ export async function setCompletionReview(enabled: boolean) {
   }));
 }
 
+/** The one approval mode, shared with the desktop (same policy file). */
+export type ApprovalMode = 'auto' | 'ask';
+export interface LearnedWriteKind {
+  operationId: string;
+  accountId: string | null;
+  grantedAt: string;
+  lastUsedAt: string;
+}
+export interface ApprovalModeSettings {
+  mode: ApprovalMode;
+  learned: LearnedWriteKind[];
+}
+
+export async function getApprovalMode(): Promise<ApprovalModeSettings> {
+  return api<ApprovalModeSettings>('/m/api/settings/mode');
+}
+
+export async function setApprovalMode(mode: ApprovalMode): Promise<ApprovalModeSettings> {
+  return api<ApprovalModeSettings>('/m/api/settings/mode', { method: 'PATCH', body: JSON.stringify({ mode }) });
+}
+
+export async function forgetLearnedWriteKind(kind: { operationId: string; accountId: string | null }): Promise<ApprovalModeSettings> {
+  return api<ApprovalModeSettings>('/m/api/settings/mode/learned', { method: 'DELETE', body: JSON.stringify(kind) });
+}
+
 export async function getModelSettings(): Promise<ModelSettings> {
   return api<ModelSettings>('/m/api/settings/models');
 }

@@ -5206,3 +5206,11 @@ textarea.cz-input { resize: vertical; }
 .ws-source-close textarea { display: block; box-sizing: border-box; width: 100%; min-height: 96px; padding: var(--sp-3); margin-block: var(--sp-2) var(--sp-3); border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--bg-2); color: var(--fg); font: inherit; resize: vertical; }
 .ws-source-error { color: var(--clem-danger); }
 .ws-source-controls button:disabled { opacity: 0.5; cursor: default; }
+
+/* ── Approvals: the one mode, shared with the Mac ─────────────────────────
+   The segmented control is the customize sheet's; here it sits in a card
+   with its explanation beneath, so the choice reads as a setting, not a
+   filter. */
+.settings-mode { gap: var(--sp-2); }
+.settings-mode-seg { margin-bottom: var(--sp-1); }
+.settings-mode-seg button:disabled { opacity: 0.6; }

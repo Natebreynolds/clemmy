@@ -2,6 +2,8 @@ import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
 import { accountStatus, creditRefusalSentence, presentUsageMeters } from '@clem/chat-engine';
 import {
+  forgetLearnedWriteKind,
+  getApprovalMode,
   getCompletionReview,
   getConnectionsHealth,
   getDaemonStatus,
@@ -12,9 +14,11 @@ import {
   listHeartbeats,
   revokeAllDevices,
   revokeDevice,
+  setApprovalMode,
   setCodexRescueModel,
   setHeartbeatNotify,
   setJudgeFallback,
+  type ApprovalModeSettings,
   type JudgeFallbackSetting,
   type CodexRescueSettings,
   type MobileDeviceRow,
@@ -49,6 +53,7 @@ import {
   SECTION_TITLES,
   connectionStateWords,
   connectionsSummary,
+  daysSince,
   deviceDisplayName,
   devicesSummary,
   groupConnections,
@@ -84,6 +89,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
   const models = useScreenData(getModelSettings);
   const connections = useScreenData(getConnectionsHealth);
   const heartbeats = useScreenData(listHeartbeats);
+  const approvals = useScreenData(getApprovalMode);
   const usage = useScreenData(getUsageStatus, { intervalMs: 30_000 });
 
   // The open page lives in the URL (?tab=settings&section=…) so the back
@@ -116,7 +122,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
     connections.error ? 'connections' : '',
   ].filter(Boolean);
   const retryAll = () => Promise.allSettled([
-    devices.refresh(), daemon.refresh(), models.refresh(), connections.refresh(), heartbeats.refresh(), usage.refresh(),
+    devices.refresh(), daemon.refresh(), models.refresh(), connections.refresh(), heartbeats.refresh(), usage.refresh(), approvals.refresh(),
   ]).then(() => undefined);
 
   if (section) {
@@ -137,6 +143,8 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
             heartbeatsError={heartbeats.error}
             onChanged={() => Promise.all([heartbeats.refresh(), devices.refresh()])}
           />
+        ) : section === 'mode' ? (
+          <ModePage loaded={approvals.data} error={approvals.error} onChanged={() => void approvals.refresh()} onRetry={() => void approvals.refresh()} />
         ) : section === 'models' ? (
           <ModelsCard loaded={models.data} onRefresh={models.refresh} />
         ) : section === 'accounts' ? (
@@ -204,6 +212,12 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
 
       <IndexGroup label="Clementine">
         <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5" /></svg>}
+          title="Approvals"
+          note={modeSummary(approvals.data)}
+          onOpen={() => openSection('mode')}
+        />
+        <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a4 4 0 0 0-4 4v1a4 4 0 0 0-3 3.9A4 4 0 0 0 7 19h1a4 4 0 0 0 8 0h1a4 4 0 0 0 2-7.1V11a4 4 0 0 0-3-3.9V7a4 4 0 0 0-4-4z" /><path d="M12 3v18" /></svg>}
           title="Models"
           note={models.data ? `${brainSummary(models.data)} does the work` : ''}
@@ -235,6 +249,91 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
 
       <p class="settings-foot">Sign-ins, keys and clean-up live on your Mac, in Settings.</p>
     </div>
+  );
+}
+
+/** One line for the index: the mode, and how many kinds Ask has learned. */
+export function modeSummary(settings: ApprovalModeSettings | null | undefined): string {
+  if (!settings) return '';
+  if (settings.mode === 'auto') return 'Auto · anything non-disruptive runs';
+  const n = settings.learned.length;
+  return `Ask · ${n === 0 ? 'nothing learned yet' : `${n} kind${n === 1 ? '' : 's'} of change learned`}`;
+}
+
+/** The approval mode and what Ask learned — the same control as the Mac. */
+function ModePage({ loaded, error, onChanged, onRetry }: {
+  loaded: ApprovalModeSettings | null | undefined;
+  error: string | null | undefined;
+  onChanged: () => void;
+  onRetry: () => void;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  // What the daemon answered last; shown at once, then the screen refreshes.
+  const [current, setCurrent] = useState<ApprovalModeSettings | null>(null);
+  useEffect(() => { setCurrent(null); }, [loaded]);
+  const run = async (key: string, work: () => Promise<ApprovalModeSettings>) => {
+    setBusy(key);
+    setFailed(null);
+    try {
+      setCurrent(await work());
+      onChanged();
+      haptic('light');
+    } catch (err) {
+      setFailed(err instanceof Error ? err.message : 'Could not save. Try again.');
+    } finally {
+      setBusy(null);
+    }
+  };
+  const shown = current ?? loaded;
+  if (!shown) {
+    return (
+      <section class="card settings-card">
+        <p class="card-note">{error ? `Could not load the approval mode: ${error}` : 'Loading…'}</p>
+        {error ? <button type="button" class="btn btn-secondary" onClick={onRetry}>Try again</button> : null}
+      </section>
+    );
+  }
+  const mode = shown.mode;
+  return (
+    <Fragment>
+      <section class="card settings-card settings-mode">
+        <div class="cz-seg settings-mode-seg" role="group" aria-label="Approval mode">
+          <button type="button" class={mode === 'auto' ? 'on' : ''} aria-pressed={mode === 'auto'} disabled={busy !== null} onClick={() => mode !== 'auto' && void run('mode', () => setApprovalMode('auto'))}>Auto</button>
+          <button type="button" class={mode === 'ask' ? 'on' : ''} aria-pressed={mode === 'ask'} disabled={busy !== null} onClick={() => mode !== 'ask' && void run('mode', () => setApprovalMode('ask'))}>Ask</button>
+        </div>
+        <p class="card-note" role="status">
+          {busy === 'mode' ? 'Saving…' : mode === 'auto'
+            ? 'Anything that is not disruptive just runs: local files, the shell, reads, ordinary changes in your connected apps.'
+            : 'Clem also checks with you before an ordinary change in a connected app, once. Approving it teaches her that kind of change.'}
+        </p>
+        <p class="card-note">In both modes a send, a delete or anything irreversible always asks, on one card. Same setting as your Mac.</p>
+        {failed ? <p class="error card-note" role="alert">{failed}</p> : null}
+      </section>
+      <section class="card settings-card">
+        <h2 class="settings-card-title">What Ask learned</h2>
+        {shown.learned.length === 0 ? (
+          <p class="card-note">Nothing yet. Each approval in Ask mode is remembered here by the operation and account it named; a kind unused for sixty days is forgotten on its own.</p>
+        ) : (
+          <ul class="settings-list">
+            {shown.learned.map((kind) => {
+              const key = `${kind.operationId}|${kind.accountId ?? ''}`;
+              return (
+                <li key={key} class="settings-row">
+                  <span class="settings-row-main">
+                    <span class="settings-row-label">{kind.operationId}</span>
+                    <span class="settings-row-note">{kind.accountId ? `on ${kind.accountId} · ` : ''}last used {daysSince(kind.lastUsedAt) === 0 ? 'today' : `${daysSince(kind.lastUsedAt)}d ago`}</span>
+                  </span>
+                  <button type="button" class="settings-row-action" disabled={busy !== null} onClick={() => void run(key, () => forgetLearnedWriteKind({ operationId: kind.operationId, accountId: kind.accountId }))}>
+                    {busy === key ? 'Forgetting…' : 'Forget'}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+    </Fragment>
   );
 }
 

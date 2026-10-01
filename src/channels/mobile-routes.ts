@@ -202,6 +202,8 @@ import { buildOrchestratorAgent, buildOrchestratorAgentForApprovalResume } from 
 import { configureHarnessRuntime } from '../runtime/harness/codex-client.js';
 import { runConversationFromResume } from '../runtime/harness/loop.js';
 import { routeReplyToPendingApproval } from '../runtime/harness/approval-reply-routing.js';
+import { loadProactivityPolicy, saveProactivityPolicy } from '../agents/proactivity-policy.js';
+import { forgetApprovedWriteKind, listApprovedWriteKinds } from '../agents/plan-scope.js';
 import { buildContinueInput, isContinueCompletionReason } from '../runtime/harness/continue-directive.js';
 import {
   projectForegroundWorkingNowSnapshot,
@@ -2468,6 +2470,41 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         judgeSource: judge.source,
       },
     });
+  });
+
+  /**
+   * The approval mode — the phone half of the one control the desktop has.
+   * Auto: anything that is not disruptive runs. Ask: an ordinary change in a
+   * connected app checks with the owner once and the approval teaches that
+   * kind. The policy file is the single store (`autoApproveScope`), so the
+   * two surfaces can never disagree; what Ask learned is listed here with
+   * the same forget the desktop offers.
+   */
+  const modeView = () => ({
+    mode: loadProactivityPolicy().autoApproveScope === 'yolo' ? 'auto' : 'ask',
+    learned: listApprovedWriteKinds().map((kind) => ({
+      operationId: kind.operationId, accountId: kind.accountId, grantedAt: kind.grantedAt, lastUsedAt: kind.lastUsedAt,
+    })),
+  });
+  router.get('/api/settings/mode', requireMobileSession, (_req, res) => {
+    res.json(modeView());
+  });
+  router.patch('/api/settings/mode', requireMobileSession, (req, res) => {
+    const body = (req.body ?? {}) as { mode?: unknown };
+    if (body.mode !== 'auto' && body.mode !== 'ask') {
+      res.status(400).json({ error: 'mode must be "auto" or "ask"' });
+      return;
+    }
+    saveProactivityPolicy({ autoApproveScope: body.mode === 'auto' ? 'yolo' : 'strict' });
+    res.json(modeView());
+  });
+  router.delete('/api/settings/mode/learned', requireMobileSession, (req, res) => {
+    const body = (req.body ?? {}) as { operationId?: unknown; accountId?: unknown };
+    const operationId = typeof body.operationId === 'string' ? body.operationId.trim() : '';
+    const accountId = typeof body.accountId === 'string' && body.accountId.trim() ? body.accountId.trim() : null;
+    if (!operationId) { res.status(400).json({ error: 'operationId is required' }); return; }
+    if (!forgetApprovedWriteKind(operationId, accountId)) { res.status(404).json({ error: 'no learned kind matches' }); return; }
+    res.json(modeView());
   });
 
   router.get('/api/whoami', requireMobileSession, async (req, res) => {
