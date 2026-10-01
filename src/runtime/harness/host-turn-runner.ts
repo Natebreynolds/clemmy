@@ -7319,6 +7319,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             // finish with this write named as not done.
             ? nextEdge({ tool: innerTool, change: 'publish_partial',
               say: 'The constraint checker could not judge this write. Do not retry it: finish the step and report this write as not done, with the values it would have written.' })
+          : input.diagnostic && input.diagnostic.includes('workflow_write_authority_changed_during_review')
+            // This attempt no longer owns the step: another attempt took it
+            // over while the write was under review. Nothing here is wrong
+            // with the call, and no other tool can carry it for this attempt.
+            ? nextEdge({ tool: innerTool, change: 'publish_partial',
+              say: 'This attempt no longer owns the step; another attempt of the same step has taken over. Do not retry this write and do not route around it with other tools: finish now and report this write as not done by this attempt.' })
             : defaultDispositionEdge({
               disposition: input.disposition,
               toolName: innerTool,
@@ -10805,16 +10811,32 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           approvalExactProduction.logicalToolName,
           approvalExactProduction.logicalArgs,
         );
-        const authoredWorkflowConsent = acceptedFrame.ref
+        const authoredConsentInput = acceptedFrame.ref
           && authoredMaterial?.toolName === approvalExactProduction.attestation.toolName
           && authoredMaterial.argumentDigest === approvalExactProduction.attestation.argumentDigest
-          ? await evaluateAuthoredWorkflowMutationConsent({
+          ? {
               attestation: approvalExactProduction.attestation,
               args: authoredMaterial.args,
               acceptedBatch: acceptedFrame.ref,
               callIndex,
-            })
+            }
           : null;
+        let authoredWorkflowConsent = authoredConsentInput
+          ? await evaluateAuthoredWorkflowMutationConsent(authoredConsentInput)
+          : null;
+        // A retryable hold is the step's own state, not a fault in the call.
+        // Live 2026-09-30: a write reviewed for a minute found its attempt
+        // superseded when the review ended, and the hold reached the model
+        // as "refused, repair your arguments"; it tried four other tools and
+        // the turn ended blocked while the other attempt did the same write.
+        // Reopen once; a hold that stands is named as what it is below.
+        if (authoredConsentInput && authoredWorkflowConsent?.status === 'hold' && authoredWorkflowConsent.retryable) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          const reopened = await evaluateAuthoredWorkflowMutationConsent(authoredConsentInput);
+          // Only a decision replaces the hold; a second look that finds no
+          // authority at all says less than the hold already does.
+          if (reopened?.status === 'decided') authoredWorkflowConsent = reopened;
+        }
         // A constraint refusal belongs to the exact effective write, including
         // a nested work_call. Preparation must not replace it with a grant.
         const consent = authoredWorkflowConsent && authoredWorkflowConsent.status !== 'decided'

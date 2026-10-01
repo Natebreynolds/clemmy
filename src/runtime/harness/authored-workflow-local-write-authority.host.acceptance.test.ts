@@ -773,6 +773,39 @@ test('a constraint checker that cannot answer stops the step truthfully instead 
   } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
 });
 
+test('an attempt superseded while its write was under review is told so, not sent to repair or route around the write', async () => {
+  // Live 2026-09-30: a second attempt of the same step began during a
+  // minute-long review; the first attempt's write was then held as
+  // "authority changed" and the model, told to repair, tried four other
+  // tools before the turn ended blocked.
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
+  const { bodies, tools } = fixtureTools(['goal_upsert']);
+  let reviews = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    reviews++;
+    // Another attempt of this step begins while the review runs.
+    eventlog.beginRunAttempt(fixture.session.id, { runId: `takeover:${fixture.session.id}`, attemptId: `attempt:takeover:${reviews}` });
+    return { verdict: 'compatible', reason: 'Fine.', proposalDigest: 'fixture-review' };
+  });
+  try {
+    const model = stubModel([
+      [toolCall('native-superseded', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [textMsg('Another attempt of this step took over; this attempt did not save the title.')],
+    ]);
+    const agent = { model, tools };
+    bindSurface(fixture, agent, tools);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(bodies.goal_upsert ?? 0, 0, 'a superseded attempt writes nothing');
+    const history = JSON.stringify(outcome.history);
+    assert.match(history, /workflow_write_authority_changed_during_review/);
+    assert.match(history, /publish_partial/, 'the typed edge is to finish');
+    assert.match(history, /no longer owns the step/);
+    assert.doesNotMatch(history, /repair_arguments/);
+    assert.ok(reviews >= 1);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
+
 test('an authored native write gets its current schema before consent when required arguments are missing', async () => {
   const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write', prompt: 'Write a prepared local report.' });
   const { tools } = fixtureTools(['write_file']);
