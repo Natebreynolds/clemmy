@@ -220,7 +220,8 @@ const learnAttempts = new Map<string, number>();
 export function _resetCalendarReadLearningForTests(): void { learnAttempts.clear(); resampled.clear(); }
 
 function bounded(value: unknown, max: number): string {
-  const text = typeof value === 'string' ? value : JSON.stringify(value ?? null);
+  let text: string;
+  try { text = typeof value === 'string' ? value : JSON.stringify(value ?? null) ?? 'null'; } catch { text = String(value); }
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
@@ -289,10 +290,13 @@ async function learnCalendarReadForToolkit(toolkit: string, deps: CalendarReadLe
   const operations = tools.map((tool) => ({
     operationId: tool.slug,
     description: bounded(tool.description ?? tool.name ?? '', 600),
-    inputSchema: bounded(closedCanonicalJson(tool.inputParameters ?? {}), MAX_SCHEMA_CHARS),
-    ...(tool.outputParameters ? { outputSchema: bounded(closedCanonicalJson(tool.outputParameters), MAX_SCHEMA_CHARS) } : {}),
+    // A provider schema is text for the model, not a closed-domain value:
+    // live 2026-10-01 a description holding a non-JSON value refused the
+    // canonical form and the whole tick with it.
+    inputSchema: bounded(tool.inputParameters ?? {}, MAX_SCHEMA_CHARS),
+    ...(tool.outputParameters ? { outputSchema: bounded(tool.outputParameters, MAX_SCHEMA_CHARS) } : {}),
   }));
-  const evidenceDigest = createHash('sha256').update(closedCanonicalJson({ toolkit, operations, sample: sample ?? null }), 'utf8').digest('hex');
+  const evidenceDigest = createHash('sha256').update(JSON.stringify({ toolkit, operations, sample: sample ?? null }), 'utf8').digest('hex');
   let answer: Awaited<ReturnType<NonNullable<typeof port.deriveCalendarRead>>>;
   try {
     answer = await port.deriveCalendarRead({ purpose: CALENDAR_READ_RECIPE_PURPOSE, operations, ...(sample ? { sample } : {}), evidenceDigest });

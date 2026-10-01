@@ -30,8 +30,9 @@ const TOOLS = [
 ];
 const RECIPE = {
   version: 1 as const, operationId: 'fixturecal_list_events',
-  window: { start: 'from', end: 'to', limit: 'limit' },
-  fields: { id: 'id', title: 'name', start: 'when.start', end: 'when.end' },
+  window: { start: 'from', end: 'to', limit: 'limit', timezone: null, fixed: null },
+  fields: { id: 'id', title: 'name', start: 'when.start', end: 'when.end', allDay: null, cancelled: null, showAs: null,
+    myResponse: null, myResponseFromAttendee: null, attendees: null, organizer: null, location: null },
 };
 
 function scriptedPort(answer: (call: { operations: ReadonlyArray<{ operationId: string }>; sample?: unknown }) => unknown) {

@@ -62,9 +62,12 @@ export const NoticingProposalV1Schema = z.object({
   goalId: z.string().min(1).nullable(),
   confidence: z.number().min(0).max(1),
 });
-export const NoticingAnswerV1Schema = z.object({
+/** What the model answers; the port binds it to the evidence digest. */
+export const NoticingAnswerWireV1Schema = z.object({
   proposal: NoticingProposalV1Schema.nullable(),
   setAside: z.array(z.object({ subject: z.string().min(1).max(160), why: z.string().min(1).max(300) })).max(8),
+}).strict();
+export const NoticingAnswerV1Schema = NoticingAnswerWireV1Schema.extend({
   evidenceDigest: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
 export type NoticingProposalV1 = z.infer<typeof NoticingProposalV1Schema>;

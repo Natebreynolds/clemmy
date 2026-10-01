@@ -21,7 +21,10 @@ export const CALENDAR_READ_RECIPE_VERSION = 1 as const;
 
 /** A dot path into one returned event (`start.dateTime`). */
 const pathString = z.string().min(1).max(200);
-const flagRule = z.object({ path: pathString, equals: z.unknown().optional() });
+// Structured output wants every property present: absent means null, never
+// undefined, so each optional part of a recipe is nullable.
+const scalar = z.union([z.string(), z.number(), z.boolean()]);
+const flagRule = z.object({ path: pathString, equals: scalar.nullable() });
 
 export const CalendarReadRecipeV1Schema = z.object({
   version: z.literal(CALENDAR_READ_RECIPE_VERSION),
@@ -30,26 +33,26 @@ export const CalendarReadRecipeV1Schema = z.object({
   window: z.object({
     start: z.string().min(1),
     end: z.string().min(1),
-    limit: z.string().min(1).optional(),
-    timezone: z.string().min(1).optional(),
+    limit: z.string().min(1).nullable(),
+    timezone: z.string().min(1).nullable(),
     /** Arguments the read always sends (expand recurrences, order by start). */
-    fixed: z.record(z.string(), z.unknown()).optional(),
+    fixed: z.array(z.object({ name: z.string().min(1), value: scalar })).nullable(),
   }),
   fields: z.object({
     id: pathString,
     title: pathString,
     start: pathString,
     end: pathString,
-    allDay: flagRule.optional(),
-    cancelled: flagRule.optional(),
-    showAs: z.object({ path: pathString, free: z.array(z.unknown()).optional(), tentative: z.array(z.unknown()).optional() }).optional(),
+    allDay: flagRule.nullable(),
+    cancelled: flagRule.nullable(),
+    showAs: z.object({ path: pathString, free: z.array(scalar).nullable(), tentative: z.array(scalar).nullable() }).nullable(),
     /** The owner's own response: a path on the event, or found on the
      * attendee flagged as the owner. */
-    myResponse: pathString.optional(),
-    myResponseFromAttendee: z.object({ self: pathString, response: pathString }).optional(),
-    attendees: pathString.optional(),
-    organizer: z.array(pathString).max(4).optional(),
-    location: z.array(pathString).max(4).optional(),
+    myResponse: pathString.nullable(),
+    myResponseFromAttendee: z.object({ self: pathString, response: pathString }).nullable(),
+    attendees: pathString.nullable(),
+    organizer: z.array(pathString).max(4).nullable(),
+    location: z.array(pathString).max(4).nullable(),
   }),
 });
 export type CalendarReadRecipeV1 = z.infer<typeof CalendarReadRecipeV1Schema>;
@@ -110,12 +113,12 @@ function zoneLabel(label: string, requested: string): string {
     return requested;
   }
 }
-function flag(event: unknown, rule: { path: string; equals?: unknown } | undefined): boolean {
+function flag(event: unknown, rule: { path: string; equals?: unknown } | null | undefined): boolean {
   if (!rule) return false;
   const value = at(event, rule.path);
-  return rule.equals === undefined ? value === true : value === rule.equals;
+  return rule.equals === undefined || rule.equals === null ? value === true : value === rule.equals;
 }
-function firstString(event: unknown, paths: readonly string[] | undefined): string {
+function firstString(event: unknown, paths: readonly string[] | null | undefined): string {
   for (const p of paths ?? []) {
     const value = str(at(event, p));
     if (value) return value;
@@ -146,7 +149,7 @@ export function locateEventList(payload: unknown): unknown[] {
 export function recipeArgs(recipe: CalendarReadRecipeV1, window: { startIso: string; endIso: string; top: number; timezone: string }): Record<string, unknown> {
   const w = recipe.window;
   return {
-    ...(w.fixed ?? {}),
+    ...Object.fromEntries((w.fixed ?? []).map((entry) => [entry.name, entry.value])),
     [w.start]: window.startIso,
     [w.end]: window.endIso,
     ...(w.limit ? { [w.limit]: window.top } : {}),
@@ -166,8 +169,8 @@ export function recipeParse(recipe: CalendarReadRecipeV1, payload: unknown, cont
       : undefined;
     const showAsRaw = f.showAs ? at(e, f.showAs.path) : undefined;
     const showAs = !f.showAs ? ''
-      : (f.showAs.free ?? []).includes(showAsRaw) ? 'free'
-      : (f.showAs.tentative ?? []).includes(showAsRaw) ? 'tentative'
+      : (f.showAs.free ?? []).some((v) => v === showAsRaw) ? 'free'
+      : (f.showAs.tentative ?? []).some((v) => v === showAsRaw) ? 'tentative'
       : str(showAsRaw) || 'busy';
     const organizer = firstString(e, f.organizer);
     const location = firstString(e, f.location);

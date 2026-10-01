@@ -130,23 +130,23 @@ test('an existing overlap does not re-fire; a self-created block is not an invit
 // the attendees. Fixtures here; nothing in the code names a provider.
 const WALL_CLOCK_RECIPE: CalendarReadRecipeV1 = {
   version: 1, operationId: 'FIXTURE_WALLCLOCK_CALENDAR_VIEW',
-  window: { start: 'start_datetime', end: 'end_datetime', limit: 'top', timezone: 'timezone', fixed: { orderby: 'start/dateTime asc' } },
+  window: { start: 'start_datetime', end: 'end_datetime', limit: 'top', timezone: 'timezone', fixed: [{ name: 'orderby', value: 'start/dateTime asc' }] },
   fields: {
     id: 'id', title: 'subject', start: 'start', end: 'end',
-    allDay: { path: 'isAllDay' }, cancelled: { path: 'isCancelled' },
+    allDay: { path: 'isAllDay', equals: null }, cancelled: { path: 'isCancelled', equals: null },
     showAs: { path: 'showAs', free: ['free'], tentative: ['tentative'] },
-    myResponse: 'responseStatus.response', attendees: 'attendees',
+    myResponse: 'responseStatus.response', myResponseFromAttendee: null, attendees: 'attendees',
     organizer: ['organizer.emailAddress.name', 'organizer.emailAddress.address'], location: ['location.displayName'],
   },
 };
 const INSTANT_RECIPE: CalendarReadRecipeV1 = {
   version: 1, operationId: 'FIXTURE_INSTANT_EVENTS_LIST',
-  window: { start: 'timeMin', end: 'timeMax', limit: 'max_results', fixed: { single_events: true, order_by: 'startTime' } },
+  window: { start: 'timeMin', end: 'timeMax', limit: 'max_results', timezone: null, fixed: [{ name: 'single_events', value: true }, { name: 'order_by', value: 'startTime' }] },
   fields: {
     id: 'id', title: 'summary', start: 'start', end: 'end',
-    cancelled: { path: 'status', equals: 'cancelled' },
-    showAs: { path: 'transparency', free: ['transparent'] },
-    myResponseFromAttendee: { self: 'self', response: 'responseStatus' }, attendees: 'attendees',
+    allDay: null, cancelled: { path: 'status', equals: 'cancelled' },
+    showAs: { path: 'transparency', free: ['transparent'], tentative: null },
+    myResponse: null, myResponseFromAttendee: { self: 'self', response: 'responseStatus' }, attendees: 'attendees',
     organizer: ['organizer.displayName', 'organizer.email'], location: ['location'],
   },
 };
