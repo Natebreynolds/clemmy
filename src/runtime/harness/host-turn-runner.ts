@@ -10829,8 +10829,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         // superseded when the review ended, and the hold reached the model
         // as "refused, repair your arguments"; it tried four other tools and
         // the turn ended blocked while the other attempt did the same write.
-        // Reopen once; a hold that stands is named as what it is below.
-        if (authoredConsentInput && authoredWorkflowConsent?.status === 'hold' && authoredWorkflowConsent.retryable) {
+        // Reopen that one hold once (a reviewer's own verdict is never re-run
+        // here); a hold that stands is named as what it is below.
+        if (authoredConsentInput && authoredWorkflowConsent?.status === 'hold' && authoredWorkflowConsent.retryable
+          && authoredWorkflowConsent.reason.startsWith('workflow_write_authority_changed_during_review')) {
           await new Promise((resolve) => setTimeout(resolve, 250));
           const reopened = await evaluateAuthoredWorkflowMutationConsent(authoredConsentInput);
           // Only a decision replaces the hold; a second look that finds no
