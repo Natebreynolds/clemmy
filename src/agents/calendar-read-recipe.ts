@@ -200,23 +200,57 @@ export function recipeReadsPayload(recipe: CalendarReadRecipeV1, payload: unknow
 
 // ── the store: one recipe per operation, receipted by its definition ─────────
 const FILE = path.join(BASE_DIR, 'state', 'calendar-read-recipes.json');
-interface RecipeFileV1 { version: 1; reads: Record<string, LearnedCalendarRead> }
+/**
+ * What is wrong with a recipe, checked before it is trusted. The window's
+ * start and end must be different arguments (live 2026-10-01 a model mapped
+ * both to one `filter` argument, so the read would have sent only the end),
+ * and every argument the recipe names must be one the operation declares when
+ * its input schema lists them. Empty means no problem found.
+ */
+export function recipeProblems(recipe: CalendarReadRecipeV1, inputSchema?: unknown): string[] {
+  const problems: string[] = [];
+  const w = recipe.window;
+  const named = [w.start, w.end, w.limit, w.timezone, ...(w.fixed ?? []).map((f) => f.name)].filter((n): n is string => typeof n === 'string');
+  if (w.start === w.end) problems.push(`the window start and end are the same argument (${w.start})`);
+  const seen = new Set<string>();
+  for (const n of named) { if (seen.has(n)) problems.push(`argument ${n} is used twice`); seen.add(n); }
+  const properties = inputSchema && typeof inputSchema === 'object'
+    ? (inputSchema as { properties?: unknown }).properties : undefined;
+  if (properties && typeof properties === 'object' && Object.keys(properties).length > 0) {
+    const declared = new Set(Object.keys(properties as Record<string, unknown>));
+    for (const n of named) if (!declared.has(n)) problems.push(`argument ${n} is not one the operation declares`);
+  }
+  return [...new Set(problems)];
+}
+
+/** A provider with no calendar read, remembered against the operations it
+ * listed then, so the question is asked again only when those change. */
+export interface CalendarReadAbsence { toolkit: string; operationsDigest: string; at: string; reason: string }
+
+interface RecipeFileV1 { version: 1; reads: Record<string, LearnedCalendarRead>; absences?: Record<string, CalendarReadAbsence> }
 
 function readFile(): RecipeFileV1 {
   try {
-    if (!existsSync(FILE)) return { version: 1, reads: {} };
+    if (!existsSync(FILE)) return { version: 1, reads: {}, absences: {} };
     const raw = JSON.parse(readFileSync(FILE, 'utf-8')) as Partial<RecipeFileV1>;
-    if (raw.version !== 1 || !raw.reads || typeof raw.reads !== 'object') return { version: 1, reads: {} };
+    if (raw.version !== 1 || !raw.reads || typeof raw.reads !== 'object') return { version: 1, reads: {}, absences: {} };
     const reads: Record<string, LearnedCalendarRead> = {};
     for (const [key, value] of Object.entries(raw.reads)) {
       const parsed = CalendarReadRecipeV1Schema.safeParse((value as LearnedCalendarRead | undefined)?.recipe);
       const row = value as LearnedCalendarRead;
       if (!parsed.success || typeof row.definitionFingerprint !== 'string' || typeof row.toolkit !== 'string') continue;
+      // A stored recipe that fails the schema-free checks is not evidence.
+      if (recipeProblems(parsed.data).length > 0) continue;
       reads[key] = { recipe: parsed.data, toolkit: row.toolkit, definitionFingerprint: row.definitionFingerprint, basis: row.basis };
     }
-    return { version: 1, reads };
+    const absences: Record<string, CalendarReadAbsence> = {};
+    for (const [key, value] of Object.entries(raw.absences ?? {})) {
+      const a = value as Partial<CalendarReadAbsence>;
+      if (typeof a?.operationsDigest === 'string' && typeof a.toolkit === 'string') absences[key] = a as CalendarReadAbsence;
+    }
+    return { version: 1, reads, absences };
   } catch {
-    return { version: 1, reads: {} };
+    return { version: 1, reads: {}, absences: {} };
   }
 }
 function writeFile(file: RecipeFileV1): void {
@@ -224,6 +258,15 @@ function writeFile(file: RecipeFileV1): void {
   const tmp = `${FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(file, null, 2));
   renameSync(tmp, FILE);
+}
+
+export function calendarReadAbsence(toolkit: string): CalendarReadAbsence | null {
+  return readFile().absences?.[toolkit.trim().toLowerCase()] ?? null;
+}
+export function rememberCalendarReadAbsence(row: CalendarReadAbsence): void {
+  const file = readFile();
+  (file.absences ??= {})[row.toolkit.trim().toLowerCase()] = row;
+  writeFile(file);
 }
 
 export function learnedCalendarRead(operationId: string, definitionFingerprint: string): LearnedCalendarRead | null {

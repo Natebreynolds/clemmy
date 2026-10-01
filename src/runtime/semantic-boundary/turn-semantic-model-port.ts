@@ -202,6 +202,23 @@ export interface RequestEffectJudgeResult {
   modelIdentity: string;
 }
 
+export const CALENDAR_READ_OPERATION_PURPOSE = 'calendar_read_operation' as const;
+
+/** Every connected provider's operations, by name and a short description
+ * only (no schemas), asked which one per provider lists calendar events in
+ * a time window. Cheap on purpose: the recipe call that follows sees one
+ * operation's schema, not every provider's. */
+export interface CalendarReadOperationCall {
+  purpose: typeof CALENDAR_READ_OPERATION_PURPOSE;
+  providers: ReadonlyArray<{ toolkit: string; operations: ReadonlyArray<{ operationId: string; description: string }> }>;
+  evidenceDigest: string;
+}
+export interface CalendarReadOperationResult {
+  picks: ReadonlyArray<{ toolkit: string; operationId: string | null }>;
+  evidenceDigest: string;
+  modelIdentity: string;
+}
+
 export const CALENDAR_READ_RECIPE_PURPOSE = 'calendar_read_recipe' as const;
 
 /** One connected provider's current read definitions, asked which of them
@@ -285,6 +302,8 @@ export interface TurnSemanticModelPort {
   /** On the judge role: which current read lists calendar events in a
    * window, and how its arguments and fields are read. Evidence for the
    * learned calendar-read store only. */
+  /** Which operation per provider lists calendar events in a window. */
+  findCalendarReadOperations?(call: CalendarReadOperationCall): Promise<CalendarReadOperationResult>;
   deriveCalendarRead?(call: CalendarReadRecipeCall): Promise<CalendarReadRecipeResult>;
   /** On the brain role: one proposal worth making now, or none. */
   noticing?(call: NoticingProposalCall): Promise<NoticingProposalResult>;

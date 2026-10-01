@@ -32,15 +32,18 @@ import { refreshIndependentCapabilityObservation } from '../runtime/harness/inde
 import { peekProductionCapabilityAdapter } from '../runtime/harness/production-capability-adapter.js';
 import { listComposioToolkitTools, listConnectedToolkits, peekConnectedToolkits } from '../integrations/composio/client.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
-import { CALENDAR_READ_RECIPE_PURPOSE } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
+import { CALENDAR_READ_OPERATION_PURPOSE, CALENDAR_READ_RECIPE_PURPOSE } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import {
   CalendarReadRecipeV1Schema,
+  calendarReadAbsence,
   learnedCalendarRead,
   listLearnedCalendarReads,
   recipeArgs,
   recipeParse,
   recipeReadsPayload,
+  recipeProblems,
   rememberCalendarRead,
+  rememberCalendarReadAbsence,
   type LearnedCalendarRead,
 } from './calendar-read-recipe.js';
 import { peekAttestedTransport } from '../runtime/harness/implementation-artifacts/attested-transport.js';
@@ -210,14 +213,24 @@ export function connectedCalendarOperations(): ConnectedCalendarOperation[] {
 }
 
 // ── learning the read ─────────────────────────────────────────────────────────
+// Two stages, so learning costs what it must and no more. Live 2026-10-01 the
+// one-stage version sent every connected provider's 40 operations with their
+// full input and output schemas, one provider at a time, to the judge: 13
+// calls, 1.32M prompt tokens in 2.5 minutes, and it would have re-asked every
+// provider without a calendar every 30 minutes. Now one call sees operation
+// names and short descriptions across all providers and picks each one's
+// calendar-window operation or none; only a chosen operation's schema goes to
+// the recipe call; and "no calendar read here" is remembered against the
+// provider's operation list until that list changes.
 const MAX_CANDIDATE_OPERATIONS = 40;
-const MAX_SCHEMA_CHARS = 4_000;
+const MAX_DESCRIPTION_CHARS = 160;
+const MAX_SCHEMA_CHARS = 6_000;
 const MAX_SAMPLE_CHARS = 6_000;
 const LEARN_RETRY_MS = 30 * 60_000;
-/** Per toolkit: when learning last failed, so a quiet tick does not spend a
- * model call every few minutes on a provider that keeps refusing. */
-const learnAttempts = new Map<string, number>();
-export function _resetCalendarReadLearningForTests(): void { learnAttempts.clear(); resampled.clear(); }
+const REJECTED_RECIPE_RETRY_MS = 24 * 60 * 60_000;
+/** Per provider: when learning may be tried again after a failure. */
+const learnRetryAt = new Map<string, number>();
+export function _resetCalendarReadLearningForTests(): void { learnRetryAt.clear(); resampled.clear(); }
 
 function bounded(value: unknown, max: number): string {
   let text: string;
@@ -225,19 +238,14 @@ function bounded(value: unknown, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-/**
- * Make sure every connected provider that can list a calendar has a learned
- * read. A provider with no recipe, or whose definition changed since the
- * recipe was written, gets one derived from its own current definitions by
- * the judge role; the recipe is remembered against that definition. Returns
- * what could not be learned, named, for the tick's failure list.
- */
+type ToolRow = { slug: string; name?: string; description?: string; inputParameters?: unknown; outputParameters?: unknown };
+
 export interface CalendarReadLearningDeps {
   now: () => number;
   listToolkits: () => Promise<Array<{ slug: string; status: string }>>;
-  listTools: (toolkit: string, limit: number) => Promise<Array<{ slug: string; name?: string; description?: string; inputParameters?: unknown; outputParameters?: unknown }>>;
+  listTools: (toolkit: string, limit: number) => Promise<ToolRow[]>;
   fingerprint: (operationId: string) => Promise<string | undefined>;
-  port: () => Pick<NonNullable<ReturnType<typeof peekTurnSemanticModelPort>>, 'deriveCalendarRead'> | null;
+  port: () => Pick<NonNullable<ReturnType<typeof peekTurnSemanticModelPort>>, 'deriveCalendarRead' | 'findCalendarReadOperations'> | null;
 }
 const productionLearningDeps: CalendarReadLearningDeps = {
   now: Date.now,
@@ -246,9 +254,20 @@ const productionLearningDeps: CalendarReadLearningDeps = {
   fingerprint: (operationId) => ensureLiveComposioSchemaFingerprint(operationId),
   port: () => peekTurnSemanticModelPort(),
 };
+
+function operationsDigest(tools: readonly ToolRow[]): string {
+  return createHash('sha256').update(tools.map((t) => t.slug.toLowerCase()).sort().join('\n'), 'utf8').digest('hex').slice(0, 24);
+}
+
+/**
+ * Make sure every connected provider that can list a calendar has a learned
+ * read, at the least cost: providers with a current recipe or a remembered
+ * absence (same operation list) are not asked again. Returns what could not
+ * be learned, named, for the tick's failure list.
+ */
 export async function ensureLearnedCalendarReads(overrides: Partial<CalendarReadLearningDeps> = {}): Promise<string[]> {
   const deps = { ...productionLearningDeps, ...overrides };
-  const now = deps.now;
+  const now = deps.now();
   const notes: string[] = [];
   let toolkits: Array<{ slug: string; status: string }> = [];
   try {
@@ -258,58 +277,83 @@ export async function ensureLearnedCalendarReads(overrides: Partial<CalendarRead
   }
   const active = [...new Set(toolkits.filter((row) => row.slug && row.status.toLowerCase() !== 'disconnected').map((row) => row.slug))];
   const learned = new Map(listLearnedCalendarReads().map((row) => [row.toolkit, row]));
+  const candidates: Array<{ toolkit: string; tools: ToolRow[]; digest: string }> = [];
   for (const toolkit of active) {
     const existing = learned.get(toolkit);
     if (existing) {
-      // Still the definition it was read from? A changed definition means
-      // the recipe is no longer evidence.
       let current: string | undefined;
       try { current = await deps.fingerprint(existing.recipe.operationId); } catch { current = undefined; }
       if (!current || current === existing.definitionFingerprint) continue;
     }
-    const last = learnAttempts.get(toolkit) ?? 0;
-    if (now() - last < LEARN_RETRY_MS) continue;
-    learnAttempts.set(toolkit, now());
-    const note = await learnCalendarReadForToolkit(toolkit, deps);
-    if (note) notes.push(`${toolkit}: ${note}`);
-    else learnAttempts.delete(toolkit);
+    if ((learnRetryAt.get(toolkit) ?? 0) > now) continue;
+    let tools: ToolRow[];
+    try { tools = (await deps.listTools(toolkit, MAX_CANDIDATE_OPERATIONS)).slice(0, MAX_CANDIDATE_OPERATIONS); }
+    catch (error) { notes.push(`${toolkit}: its operations could not be listed: ${error instanceof Error ? error.message : String(error)}`); continue; }
+    if (tools.length === 0) continue;
+    const digest = operationsDigest(tools);
+    if (!existing && calendarReadAbsence(toolkit)?.operationsDigest === digest) continue;
+    candidates.push({ toolkit, tools, digest });
+  }
+  if (candidates.length === 0) return notes;
+  const port = deps.port();
+  if (!port?.findCalendarReadOperations || !port.deriveCalendarRead) {
+    for (const c of candidates) learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS);
+    return [...notes, 'no model is available to learn calendar reads; it will be tried again'];
+  }
+  // Stage 1: one call, names and short descriptions only.
+  const providers = candidates.map((c) => ({ toolkit: c.toolkit,
+    operations: c.tools.map((t) => ({ operationId: t.slug, description: bounded(t.description ?? t.name ?? '', MAX_DESCRIPTION_CHARS) })) }));
+  const evidenceDigest = createHash('sha256').update(JSON.stringify(providers), 'utf8').digest('hex');
+  let picks: Awaited<ReturnType<NonNullable<typeof port.findCalendarReadOperations>>>;
+  try {
+    picks = await port.findCalendarReadOperations({ purpose: CALENDAR_READ_OPERATION_PURPOSE, providers, evidenceDigest });
+  } catch (error) {
+    for (const c of candidates) learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS);
+    return [...notes, `the model could not pick calendar operations: ${error instanceof Error ? error.message : String(error)}`];
+  }
+  const pickFor = new Map(picks.picks.map((p) => [p.toolkit.trim().toLowerCase(), p.operationId]));
+  for (const c of candidates) {
+    if (!pickFor.has(c.toolkit)) { learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS); notes.push(`${c.toolkit}: the model did not answer for it`); continue; }
+    const operationId = pickFor.get(c.toolkit) ?? null;
+    if (!operationId) {
+      rememberCalendarReadAbsence({ toolkit: c.toolkit, operationsDigest: c.digest, at: new Date(now).toISOString(), reason: 'none of its operations lists calendar events in a time window' });
+      continue;
+    }
+    const chosen = c.tools.find((t) => t.slug.toLowerCase() === operationId.trim().toLowerCase());
+    if (!chosen) { learnRetryAt.set(c.toolkit, now + LEARN_RETRY_MS); notes.push(`${c.toolkit}: the model named an operation it does not list (${operationId})`); continue; }
+    // Stage 2: the recipe, from this one operation's own definition.
+    const note = await deriveRecipe(c.toolkit, chosen, deps);
+    if (note) { learnRetryAt.set(c.toolkit, now + (note.startsWith('recipe rejected') ? REJECTED_RECIPE_RETRY_MS : LEARN_RETRY_MS)); notes.push(`${c.toolkit}: ${note}`); }
+    else learnRetryAt.delete(c.toolkit);
   }
   return notes;
 }
 
-async function learnCalendarReadForToolkit(toolkit: string, deps: CalendarReadLearningDeps, sample?: { operationId: string; response: string }): Promise<string | null> {
+async function deriveRecipe(toolkit: string, chosen: ToolRow, deps: CalendarReadLearningDeps, sample?: { operationId: string; response: string }): Promise<string | null> {
   const port = deps.port();
-  if (!port?.deriveCalendarRead) return 'no model is available to learn this provider\'s calendar read; it will be tried again';
-  let tools: Awaited<ReturnType<CalendarReadLearningDeps['listTools']>>;
-  try {
-    tools = await deps.listTools(toolkit, MAX_CANDIDATE_OPERATIONS);
-  } catch (error) {
-    return `its operations could not be listed: ${error instanceof Error ? error.message : String(error)}`;
-  }
-  if (tools.length === 0) return 'it lists no operations';
-  const operations = tools.map((tool) => ({
-    operationId: tool.slug,
-    description: bounded(tool.description ?? tool.name ?? '', 600),
-    // A provider schema is text for the model, not a closed-domain value:
-    // live 2026-10-01 a description holding a non-JSON value refused the
-    // canonical form and the whole tick with it.
-    inputSchema: bounded(tool.inputParameters ?? {}, MAX_SCHEMA_CHARS),
-    ...(tool.outputParameters ? { outputSchema: bounded(tool.outputParameters, MAX_SCHEMA_CHARS) } : {}),
-  }));
+  if (!port?.deriveCalendarRead) return 'no model is available to write the recipe';
+  const operations = [{
+    operationId: chosen.slug,
+    description: bounded(chosen.description ?? chosen.name ?? '', 600),
+    // A provider schema is text for the model, not a closed-domain value.
+    inputSchema: bounded(chosen.inputParameters ?? {}, MAX_SCHEMA_CHARS),
+    ...(chosen.outputParameters ? { outputSchema: bounded(chosen.outputParameters, MAX_SCHEMA_CHARS) } : {}),
+  }];
   const evidenceDigest = createHash('sha256').update(JSON.stringify({ toolkit, operations, sample: sample ?? null }), 'utf8').digest('hex');
   let answer: Awaited<ReturnType<NonNullable<typeof port.deriveCalendarRead>>>;
   try {
     answer = await port.deriveCalendarRead({ purpose: CALENDAR_READ_RECIPE_PURPOSE, operations, ...(sample ? { sample } : {}), evidenceDigest });
   } catch (error) {
-    return `the model could not read its definitions: ${error instanceof Error ? error.message : String(error)}`;
+    return `the model could not read the operation's definition: ${error instanceof Error ? error.message : String(error)}`;
   }
   if (answer.evidenceDigest !== evidenceDigest) return 'the model answered for different evidence';
-  if (answer.recipe === null) return 'none of its operations lists calendar events in a time window';
+  if (answer.recipe === null) return 'the model found no window read in the chosen operation';
   const parsed = CalendarReadRecipeV1Schema.safeParse(answer.recipe);
-  if (!parsed.success) return `the model\'s recipe was not well-formed: ${parsed.error.issues[0]?.message ?? 'invalid'}`;
-  const chosen = tools.find((tool) => tool.slug.toLowerCase() === parsed.data.operationId.toLowerCase());
-  if (!chosen) return `the model named an operation this provider does not list (${parsed.data.operationId})`;
+  if (!parsed.success) return `recipe rejected: not well-formed (${parsed.error.issues[0]?.message ?? 'invalid'})`;
+  if (parsed.data.operationId.toLowerCase() !== chosen.slug.toLowerCase()) return `recipe rejected: it names ${parsed.data.operationId}, not ${chosen.slug}`;
   const recipe = { ...parsed.data, operationId: chosen.slug };
+  const problems = recipeProblems(recipe, chosen.inputParameters);
+  if (problems.length > 0) return `recipe rejected: ${problems.join('; ')}`;
   let fingerprint: string | undefined;
   try { fingerprint = await deps.fingerprint(chosen.slug); } catch { fingerprint = undefined; }
   if (!fingerprint) return `the live definition of ${chosen.slug} could not be fingerprinted`;
@@ -322,14 +366,17 @@ async function learnCalendarReadForToolkit(toolkit: string, deps: CalendarReadLe
 }
 
 /** A recipe that reads no event out of a non-empty response is wrong about
- * the fields. Derive it again once with that response as the sample. */
+ * the fields. Derive it again once, from that operation and the response. */
 const resampled = new Set<string>();
 async function relearnFromSample(toolkit: string, operationId: string, payload: unknown): Promise<LearnedCalendarRead | null> {
   const deps = productionLearningDeps;
   const key = `${toolkit}:${operationId.toLowerCase()}`;
   if (resampled.has(key)) return null;
   resampled.add(key);
-  const note = await learnCalendarReadForToolkit(toolkit, deps, { operationId, response: bounded(payload, MAX_SAMPLE_CHARS) });
+  let chosen: ToolRow | undefined;
+  try { chosen = (await deps.listTools(toolkit, MAX_CANDIDATE_OPERATIONS)).find((t) => t.slug.toLowerCase() === operationId.toLowerCase()); } catch { chosen = undefined; }
+  if (!chosen) return null;
+  const note = await deriveRecipe(toolkit, chosen, deps, { operationId, response: bounded(payload, MAX_SAMPLE_CHARS) });
   if (note) {
     logger.warn({ toolkit, operationId, note }, 'calendar watch: could not relearn the read from a sample');
     return null;
