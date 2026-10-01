@@ -61,9 +61,12 @@ export interface FromClemInput {
   voiced?: (key: string, voiceDigest: string) => string | undefined;
 }
 
+/** Bumped when what she is asked to say changes, so every item is said again. */
+const VOICE_RUBRIC = 2;
+
 /** What she would be speaking about: a changed item is said again. */
-export function fromClemVoiceDigest(row: Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks'>): string {
-  return createHash('sha256').update(JSON.stringify([row.heartbeat, row.text, row.detail ?? '', row.asks])).digest('hex').slice(0, 24);
+export function fromClemVoiceDigest(row: Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks' | 'at'>): string {
+  return createHash('sha256').update(JSON.stringify([VOICE_RUBRIC, row.heartbeat, row.text, row.detail ?? '', row.asks, row.at])).digest('hex').slice(0, 24);
 }
 
 const str = (value: unknown): string => (typeof value === 'string' ? value : '');

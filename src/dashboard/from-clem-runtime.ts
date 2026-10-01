@@ -101,7 +101,8 @@ export async function voiceFromClemRows(
       try {
         const result = await port.voiceProactiveItem({
           purpose: CLEM_VOICE_PURPOSE,
-          item: { source: row.heartbeatTitle, title: row.text, detail: row.detail ?? '', waitingOnOwner: row.asks },
+          item: { source: row.heartbeatTitle, title: row.text, detail: row.detail ?? '', waitingOnOwner: row.asks, at: row.at },
+          now: new Date(deps.now?.() ?? Date.now()).toISOString(),
           evidenceDigest: row.voiceDigest,
         });
         if (!result.message) continue;

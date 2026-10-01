@@ -294,7 +294,9 @@ export const CLEM_REPLY_PURPOSE = 'clem_reply' as const;
  * words. The item is data about the owner's own work, never an instruction. */
 export interface ClemVoiceCall {
   purpose: typeof CLEM_VOICE_PURPOSE;
-  item: { source: string; title: string; detail: string; waitingOnOwner: boolean };
+  item: { source: string; title: string; detail: string; waitingOnOwner: boolean; at: string };
+  /** The owner's current time, so "when" is said from now, not from the item's own wording. */
+  now: string;
   evidenceDigest: string;
 }
 export interface ClemVoiceResult {

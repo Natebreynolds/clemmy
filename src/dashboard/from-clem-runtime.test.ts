@@ -41,8 +41,9 @@ const stream = (voiced?: (key: string, digest: string) => string | undefined) =>
 test('she writes each item once, a few per pass, again when it changes, and forgets what is gone', async () => {
   const calls: string[] = [];
   const port = () => ({
-    async voiceProactiveItem(call: { item: { title: string }; evidenceDigest: string }) {
+    async voiceProactiveItem(call: { item: { title: string; at: string }; now: string; evidenceDigest: string }) {
       calls.push(call.item.title);
+      assert.ok(call.item.at && call.now, 'she is told when it happened and what time it is now');
       return { message: `I saw: ${call.item.title}`, evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
     },
   });
