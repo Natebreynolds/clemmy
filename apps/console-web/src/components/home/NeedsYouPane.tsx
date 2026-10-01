@@ -29,7 +29,7 @@ const MAX_ROWS = 4;
  * and keep the row's link so the owner can still go to where it can be
  * answered.
  */
-function AnswerRow({
+export function AnswerRow({
   question,
   busy,
   onAnswer,

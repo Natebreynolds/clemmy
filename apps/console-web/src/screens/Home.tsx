@@ -51,6 +51,8 @@ import { WhileAwayPane } from '@/components/home/WhileAwayPane';
 import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { MadePane } from '@/components/home/MadePane';
 import { TodayPane } from '@/components/home/TodayPane';
+import { FromClemPane } from '@/components/home/FromClemPane';
+import { useFromClem, withoutFromClem } from '@/lib/from-clem';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
 import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
 import { cn } from '@/lib/cn';
@@ -100,9 +102,12 @@ function LiveHome() {
   const panes = visiblePanes(prefs);
   const shown = (id: HomePaneId) => panes.includes(id);
   const today = useHomeToday(shown('today'));
+  // What the heartbeats brought the owner leads Home, once; the other lists
+  // leave those items out so nothing shows twice.
+  const fromClem = useFromClem();
 
-  const needsYou = (cc.data?.needsYou ?? []) as HomeFeedItem[];
-  const recent = (cc.data?.recentCompleted ?? []) as HomeFeedItem[];
+  const needsYou = withoutFromClem((cc.data?.needsYou ?? []) as HomeFeedItem[], fromClem.data?.covers);
+  const recent = withoutFromClem((cc.data?.recentCompleted ?? []) as HomeFeedItem[], fromClem.data?.covers);
   const workingView = presentWorkingNow(workingNow.data?.entries ?? [], workingNow.data?.observedAt ?? '');
   const away = awayCounts(recent);
 
@@ -397,6 +402,16 @@ function LiveHome() {
       </div>}
       {savePrefs.isError && (
         <HomeNotice notice={{ tone: 'error', text: 'That change to your Home didn’t save. Try it again.' }} onDismiss={() => savePrefs.reset()} />
+      )}
+
+      {!daemonUnreachable && (
+        <FromClemPane
+          headingId="home-from-clem"
+          data={fromClem.data}
+          loading={fromClem.isLoading}
+          error={fromClem.isError}
+          onRetry={() => { void fromClem.refetch(); }}
+        />
       )}
 
       {homeIsBare ? (

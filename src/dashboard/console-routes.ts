@@ -14320,6 +14320,38 @@ export function registerConsoleRoutes(
     }
   });
 
+  // From Clem on Home: what the heartbeats brought the owner, as one stream
+  // (dashboard/from-clem.ts). Reads their records only; no model or provider call.
+  app.get('/api/console/home/from-clem', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const [{ listHeartbeats }, { loadNoticingState }, { loadNotifications }, { listPlanProposals }, { buildFromClem }] = await Promise.all([
+        import('../agents/heartbeats.js'),
+        import('../agents/noticing-runtime.js'),
+        import('../runtime/notifications.js'),
+        import('../agents/plan-proposals.js'),
+        import('./from-clem.js'),
+      ]);
+      const needsYouRef = needsYouReferents();
+      res.json(buildFromClem({
+        heartbeats: (await listHeartbeats()).map((row) => ({
+          id: row.id, title: row.title, enabled: row.enabled,
+          ...(row.lastFinding ? { lastFinding: { at: row.lastFinding.at, summary: row.lastFinding.summary } } : {}),
+        })),
+        noticingProposals: Object.values(loadNoticingState().proposals),
+        notifications: loadNotifications(),
+        planProposals: listPlanProposals({ status: 'pending' }).map((proposal) => ({
+          id: proposal.id, proposedAt: proposal.proposedAt, proposedByAgent: proposal.proposedByAgent, status: proposal.status,
+          title: proposal.plan?.objective || proposal.originatingRequest || proposal.id,
+          ...(proposal.context ? { context: proposal.context } : {}),
+        })),
+        asksOwner: (notification) => notificationNeedsYou(notification, needsYouRef),
+      }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   // Summaries of the Spaces on Home, from the same projection the phone uses
   // (dashboard/home-space-summary.ts). Read-only; nothing is refreshed.
   app.get('/api/console/home/space-summaries', async (req, res) => {
@@ -14784,8 +14816,9 @@ export function registerConsoleRoutes(
         inboxNotifs.filter((notification) => !notification.read
           && notificationNeedsYou(notification, needsYouRef)
           && !isGenericWorkflowEcho(notification)
-          // A carrier for a decision already on this list is that decision.
-          && !/^(approval|plan|trust):/.test(needsYouKey(notification, needsYouRef))),
+          // A carrier for a decision already on this list is that decision —
+          // a check-in's carrier included: its question is listed above.
+          && !/^(approval|plan|trust|checkin):/.test(needsYouKey(notification, needsYouRef))),
         50,
       ).map((notification) => ({
         kind: 'workflow',
