@@ -67,9 +67,17 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
     schema: input.schema, args: input.args, observations: input.observations.summary }));
   const proposalDigest = createHash('sha256').update(closedCanonicalJson(proposal)).digest('hex');
   const uncertain = (reason: string): WorkflowMutationReview => ({ verdict: 'uncertain', reason, proposalDigest });
+  // The parts that do not change between the reviews of one step (its saved
+  // instructions, the tool, its schema) lead the prompt; what changes with
+  // each proposed write (arguments, observations, the digest) follows. Live
+  // 2026-09-30 every review of a run started with the digest and so paid its
+  // whole base uncached, eight times. The digest is over the canonical
+  // proposal and is unchanged by this order.
+  const ordered = { instructions: proposal.instructions, tool: proposal.tool, schema: proposal.schema,
+    args: proposal.args, observations: proposal.observations };
   // Large proposed payloads are looked up intact, never prefix-clipped into a
   // claim about the whole write. Existing evidence refs remain independently scoped.
-  const serialized = JSON.stringify({ ...proposal, proposalDigest });
+  const serialized = JSON.stringify({ ...ordered, proposalDigest });
   const large = serialized.length > 12_000;
   const proposalRef = `proposed-write:${proposalDigest}`;
   const sourceEvidence = input.observations.evidence;
@@ -84,10 +92,10 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   // The reviewer must see what it is judging before spending a lookup. Keep
   // constraints and the authenticated evidence index visible; retain large
   // argument/schema fields separately instead of hiding the entire request.
-  const prompt = large ? JSON.stringify({ proposalDigest, proposalRef,
-    instructions: proposal.instructions, tool: proposal.tool,
-    schema: present('schema', proposal.schema), args: present('args', proposal.args),
-    observations: proposal.observations,
+  const prompt = large ? JSON.stringify({
+    instructions: proposal.instructions, tool: proposal.tool, schema: present('schema', proposal.schema),
+    args: present('args', proposal.args), observations: proposal.observations,
+    proposalRef, proposalDigest,
   }) : serialized;
   const evidence: JudgeEvidenceSource = {
     refKind: 'the exact proposed write and authenticated prior observations',
