@@ -9218,6 +9218,51 @@ export function registerConsoleRoutes(
     }
   });
 
+  // The owner's own goals (the persistent store goal_upsert writes), with
+  // progress, next actions, blockers, and what Noticing has proposed for
+  // each. Distinct from /api/console/goals, which lists runs' objectives.
+  app.get('/api/console/my-goals', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { listGoalRecords } = await import('../memory/goals-list.js');
+      const { loadNoticingState } = await import('../agents/noticing-runtime.js');
+      const proposals = Object.values(loadNoticingState().proposals);
+      const goals = listGoalRecords()
+        .sort((a, b) => (a.status === b.status ? b.updatedAt.localeCompare(a.updatedAt) : a.status === 'active' ? -1 : b.status === 'active' ? 1 : a.status.localeCompare(b.status)))
+        .map((goal) => ({
+          ...goal,
+          proposals: proposals.filter((p) => p.goalId === goal.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+            .map((p) => ({ id: p.id, title: p.title, action: p.action, why: p.why, status: p.status, createdAt: p.createdAt, answer: p.answer ?? null })),
+        }));
+      res.json({ goals, unassignedProposals: proposals.filter((p) => !p.goalId && p.status === 'open').map((p) => ({ id: p.id, title: p.title, why: p.why, createdAt: p.createdAt })) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+  app.post('/api/console/my-goals', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { upsertGoalRecord } = await import('../memory/goals-list.js');
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const str = (k: string): string | undefined => (typeof body[k] === 'string' ? (body[k] as string) : undefined);
+      const list = (k: string): string[] | undefined => (Array.isArray(body[k]) ? (body[k] as unknown[]).filter((v): v is string => typeof v === 'string').map((v) => v.trim()).filter(Boolean) : undefined);
+      const priority = ['high', 'medium', 'low'].includes(String(body.priority)) ? body.priority as 'high' | 'medium' | 'low' : undefined;
+      const status = ['active', 'paused', 'completed', 'blocked'].includes(String(body.status)) ? body.status as 'active' | 'paused' | 'completed' | 'blocked' : undefined;
+      const reviewFrequency = ['daily', 'weekly', 'on-demand'].includes(String(body.reviewFrequency)) ? body.reviewFrequency as 'daily' | 'weekly' | 'on-demand' : undefined;
+      const result = upsertGoalRecord({
+        ...(str('id') ? { id: str('id') } : {}), ...(str('title') ? { title: str('title') } : {}), ...(str('description') ? { description: str('description') } : {}),
+        ...(priority ? { priority } : {}), ...(status ? { status } : {}), ...(reviewFrequency ? { reviewFrequency } : {}),
+        ...(str('targetDate') !== undefined ? { targetDate: str('targetDate') } : {}),
+        ...(str('progressNote') ? { progressNote: str('progressNote') } : {}),
+        ...(list('nextActions') ? { nextActions: list('nextActions') } : {}), ...(list('blockers') ? { blockers: list('blockers') } : {}),
+      });
+      if (!result.ok) { res.status(400).json({ error: result.reason }); return; }
+      res.status(result.created ? 201 : 200).json({ goal: result.goal, created: result.created });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/heartbeats/:id/rules', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

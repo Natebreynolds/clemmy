@@ -1,21 +1,9 @@
-import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { GOALS_DIR, ensureDir, textResult } from './shared.js';
-import type { GoalRecord } from '../memory/goals-list.js';
-
-function readGoal(id: string): GoalRecord | null {
-  const filePath = path.join(GOALS_DIR, `${id}.json`);
-  if (!existsSync(filePath)) return null;
-  return JSON.parse(readFileSync(filePath, 'utf-8')) as GoalRecord;
-}
-
-function writeGoal(goal: GoalRecord): void {
-  ensureDir(GOALS_DIR);
-  writeFileSync(path.join(GOALS_DIR, `${goal.id}.json`), JSON.stringify(goal, null, 2), 'utf-8');
-}
+import { upsertGoalRecord, type GoalRecord } from '../memory/goals-list.js';
 
 export function registerGoalTools(server: McpServer): void {
   server.tool(
@@ -36,53 +24,12 @@ export function registerGoalTools(server: McpServer): void {
       linkedCronJobs: z.array(z.string()).optional().describe('Replaces the goal\'s linked cron jobs.'),
       autoSchedule: z.boolean().optional(),
     },
-    async ({ id, title, description, owner, priority, status, targetDate, nextActions, progressNote, blockers, reviewFrequency, linkedCronJobs, autoSchedule }) => {
-      const now = new Date().toISOString();
-
-      // UPDATE path — an id was supplied.
-      if (id) {
-        const goal = readGoal(id);
-        if (!goal) return textResult(`Goal not found: ${id}. Omit id to create a new goal.`);
-        if (title) goal.title = title;
-        if (description) goal.description = description;
-        if (owner) goal.owner = owner;
-        if (priority) goal.priority = priority;
-        if (status) goal.status = status;
-        if (targetDate !== undefined) goal.targetDate = targetDate;
-        if (progressNote) goal.progressNotes.push(`[${now.slice(0, 16)}] ${progressNote}`);
-        if (nextActions) goal.nextActions = nextActions;
-        if (blockers) goal.blockers = blockers;
-        if (reviewFrequency) goal.reviewFrequency = reviewFrequency;
-        if (linkedCronJobs) goal.linkedCronJobs = linkedCronJobs;
-        if (autoSchedule !== undefined) goal.autoSchedule = autoSchedule;
-        goal.updatedAt = now;
-        writeGoal(goal);
-        return textResult(`Goal "${goal.title}" updated (status: ${goal.status}).`);
-      }
-
-      // CREATE path — no id.
-      if (!title || !description) {
-        return textResult('To create a goal, provide both `title` and `description` (or pass an `id` to update an existing goal).');
-      }
-      const goal: GoalRecord = {
-        id: randomBytes(4).toString('hex'),
-        title,
-        description,
-        owner: owner || 'clementine',
-        priority: priority || 'medium',
-        status: status || 'active',
-        createdAt: now,
-        updatedAt: now,
-        targetDate,
-        reviewFrequency: reviewFrequency || 'weekly',
-        progressNotes: progressNote ? [`[${now.slice(0, 16)}] ${progressNote}`] : [],
-        nextActions: nextActions || [],
-        blockers: blockers || [],
-        linkedCronJobs: linkedCronJobs || [],
-        autoSchedule,
-      };
-      writeGoal(goal);
-      return textResult(`Goal created: "${goal.title}" (ID: ${goal.id})`);
+    async (patch) => {
+      const result = upsertGoalRecord(patch);
+      if (!result.ok) return textResult(result.reason);
+      return textResult(result.created
+        ? `Goal created: "${result.goal.title}" (ID: ${result.goal.id})`
+        : `Goal "${result.goal.title}" updated (status: ${result.goal.status}).`);
     },
   );
 

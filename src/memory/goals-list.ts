@@ -1,5 +1,6 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { BASE_DIR } from '../config.js';
 
 /**
@@ -51,6 +52,82 @@ export interface GoalRecord {
   blockers: string[];
   linkedCronJobs: string[];
   autoSchedule?: boolean;
+}
+
+export interface GoalRecordPatch {
+  id?: string;
+  title?: string;
+  description?: string;
+  owner?: string;
+  priority?: GoalRecord['priority'];
+  status?: GoalRecord['status'];
+  targetDate?: string;
+  nextActions?: string[];
+  /** Appended, timestamped, to the progress log. */
+  progressNote?: string;
+  blockers?: string[];
+  reviewFrequency?: GoalRecord['reviewFrequency'];
+  linkedCronJobs?: string[];
+  autoSchedule?: boolean;
+}
+
+/** The ONE writer for the goals dir: creates when `id` is absent (title and
+ * description required), otherwise changes only the fields given. Shared by
+ * the goal_upsert tool and the console. */
+export function upsertGoalRecord(patch: GoalRecordPatch, now = new Date().toISOString()):
+  | { ok: true; goal: GoalRecord; created: boolean }
+  | { ok: false; reason: string } {
+  mkdirSync(GOALS_DIR, { recursive: true });
+  const write = (goal: GoalRecord): void => {
+    const target = path.join(GOALS_DIR, `${goal.id}.json`);
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(goal, null, 2), 'utf-8');
+    renameSync(tmp, target);
+  };
+  if (patch.id) {
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(patch.id)) return { ok: false, reason: 'invalid goal id' };
+    const file = path.join(GOALS_DIR, `${patch.id}.json`);
+    if (!existsSync(file)) return { ok: false, reason: `Goal not found: ${patch.id}` };
+    let goal: GoalRecord;
+    try { goal = JSON.parse(readFileSync(file, 'utf-8')) as GoalRecord; } catch { return { ok: false, reason: `Goal unreadable: ${patch.id}` }; }
+    if (patch.title) goal.title = patch.title;
+    if (patch.description) goal.description = patch.description;
+    if (patch.owner) goal.owner = patch.owner;
+    if (patch.priority) goal.priority = patch.priority;
+    if (patch.status) goal.status = patch.status;
+    if (patch.targetDate !== undefined) goal.targetDate = patch.targetDate || undefined;
+    if (patch.progressNote?.trim()) (goal.progressNotes ??= []).push(`[${now.slice(0, 16)}] ${patch.progressNote.trim()}`);
+    if (patch.nextActions) goal.nextActions = patch.nextActions;
+    if (patch.blockers) goal.blockers = patch.blockers;
+    if (patch.reviewFrequency) goal.reviewFrequency = patch.reviewFrequency;
+    if (patch.linkedCronJobs) goal.linkedCronJobs = patch.linkedCronJobs;
+    if (patch.autoSchedule !== undefined) goal.autoSchedule = patch.autoSchedule;
+    goal.updatedAt = now;
+    write(goal);
+    return { ok: true, goal, created: false };
+  }
+  if (!patch.title?.trim() || !patch.description?.trim()) {
+    return { ok: false, reason: 'To create a goal, provide both `title` and `description` (or pass an `id` to update an existing goal).' };
+  }
+  const goal: GoalRecord = {
+    id: randomBytes(4).toString('hex'),
+    title: patch.title.trim(),
+    description: patch.description.trim(),
+    owner: patch.owner || 'clementine',
+    priority: patch.priority || 'medium',
+    status: patch.status || 'active',
+    createdAt: now,
+    updatedAt: now,
+    ...(patch.targetDate ? { targetDate: patch.targetDate } : {}),
+    reviewFrequency: patch.reviewFrequency || 'weekly',
+    progressNotes: patch.progressNote?.trim() ? [`[${now.slice(0, 16)}] ${patch.progressNote.trim()}`] : [],
+    nextActions: patch.nextActions || [],
+    blockers: patch.blockers || [],
+    linkedCronJobs: patch.linkedCronJobs || [],
+    ...(patch.autoSchedule !== undefined ? { autoSchedule: patch.autoSchedule } : {}),
+  };
+  write(goal);
+  return { ok: true, goal, created: true };
 }
 
 /** Read ALL parsed goal records from the store (no status filter — callers

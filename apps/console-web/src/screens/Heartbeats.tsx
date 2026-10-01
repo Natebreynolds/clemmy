@@ -21,6 +21,7 @@ import { Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { StatusPill, Tag } from '@/components/ui/StatusPill';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
+import { NoticingThinking } from '@/components/noticing/NoticingThinking';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
@@ -50,6 +51,8 @@ function inWords(iso?: string): string {
 }
 
 const KIND_WORDS: Record<string, string> = {
+  proposal: 'Proposal',
+  proposal_for_goal: 'For a goal',
   run_failed: 'Failed run',
   run_waiting: 'Still waiting',
   chat_waiting: 'Still waiting',
@@ -251,6 +254,7 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
           </div>
         </aside>
       </div>
+      {h.id === 'noticing' ? <NoticingThinking /> : null}
     </Card>
   );
 }

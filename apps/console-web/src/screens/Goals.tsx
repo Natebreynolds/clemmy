@@ -6,6 +6,7 @@ import {
   RotateCw, SlidersHorizontal, Sparkles, Timer, Trash2, XCircle,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
+import { MyGoals } from '@/components/noticing/MyGoals';
 import { Card } from '@/components/ui/Card';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Button } from '@/components/ui/Button';
@@ -397,7 +398,7 @@ export function Goals() {
   return (
     <Page
       title="Goals"
-      subtitle="Long-running outcomes Clementine can track, resume, and validate."
+      subtitle="Your goals, with Clementine's proposals against them; below, the outcomes her runs track, resume and validate."
       actions={(
         <Button
           variant="secondary"
@@ -410,7 +411,9 @@ export function Goals() {
         </Button>
       )}
     >
-      <div className="grid min-w-0 gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <MyGoals />
+
+      <div className="mt-6 grid min-w-0 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Active" value={payload?.counts.active ?? 0} tone="info" />
         <StatCard label="Needs you" value={payload?.counts.parked ?? 0} tone="warning" />
         <StatCard label="Self-driving" value={payload?.counts.selfDriving ?? 0} tone="live" />

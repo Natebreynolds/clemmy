@@ -1,7 +1,7 @@
 /** Heartbeats: what Clementine checks on her own, and the owner's contract for each. */
 import { api, apiGet, apiPost } from './api';
 
-export type HeartbeatId = 'work-review' | 'calendar' | 'workflow-suggestions';
+export type HeartbeatId = 'work-review' | 'calendar' | 'workflow-suggestions' | 'noticing';
 export type HeartbeatNotifyMode = 'quiet' | 'push';
 
 export interface HeartbeatRule {
