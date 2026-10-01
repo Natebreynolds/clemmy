@@ -174,3 +174,34 @@ test('an ordinary write is read at a measured depth first; only a non-compatible
   });
   assert.deepEqual(efforts, [undefined]);
 });
+
+test('the review view says where each proposed value already appears, so the reviewer need not open results to learn it', async () => {
+  const { valueProvenance } = await import('./workflow-mutation-review.js');
+  const evidence = {
+    refKind: 'authenticated results', refs: () => ['rh_source', 'rh_destination'],
+    resolve: (ref: string) => ref === 'rh_source' ? { text: JSON.stringify({ messages: [{ text: 'Launch review moved to Thursday' }] }) }
+      : ref === 'rh_destination' ? { text: JSON.stringify({ values: [['2026-09-29', 'Budget approved']] }) } : undefined,
+  };
+  const found = valueProvenance({ values: [['2026-09-30', 'Launch review moved to Thursday', 'Budget approved', 'Brand new line']], range: 'Log!A1' }, evidence);
+  assert.deepEqual(found, {
+    'Launch review moved to Thursday': ['rh_source'],
+    'Budget approved': ['rh_destination'],
+    'Brand new line': 'not in any retained result',
+    'Log!A1': 'not in any retained result',
+  });
+  assert.equal(valueProvenance({ values: [['2026-09-30']] }, evidence), null, 'dates and numbers alone are not searched');
+  assert.equal(valueProvenance({ note: 'anything' }, undefined), null);
+
+  // It rides in the prompt, after the stable parts and before the digest.
+  let seen: Record<string, unknown> | null = null;
+  await reviewWorkflowMutation({ ...input, args: { destination: 'row-2', values: ['Budget approved'] },
+    observations: { complete: false, summary: 'see refs', evidence }, stakes: 'high' }, {
+    evaluate: async () => { throw new Error('no classifier'); },
+    judge: async (_system, prompt, parse) => {
+      seen = JSON.parse(prompt);
+      return { value: parse({ verdict: 'compatible', reason: 'ok', proposalDigest: seen!.proposalDigest }), failure: null };
+    },
+  });
+  assert.deepEqual(Object.keys(seen!), ['instructions', 'tool', 'schema', 'args', 'observations', 'valueProvenance', 'proposalDigest']);
+  assert.deepEqual(seen!.valueProvenance, { 'Budget approved': ['rh_destination'] });
+});

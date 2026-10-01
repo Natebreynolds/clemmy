@@ -39,10 +39,48 @@ const SYSTEM = [
   'Check destination, values, preserved existing data, deduplication, ordering and any prerequisites actually required by the saved instructions.',
   'Do not invent additional approval or read requirements. A permitted intermediate write need not complete the whole objective.',
   'Use authenticated observations and open retained evidence when needed. An omitted record or clipped view does not prove absence.',
+  'valueProvenance, when present, lists for each proposed value the retained results that contain it verbatim. It is a search, not a judgement: a value found in a read of the destination may already be there, a value found in a source read was taken from it, a value found nowhere was not read from this run. Judge what that means; open a result only when the verdict needs more than where a value appears.',
   'compatible means this exact proposed write respects the applicable saved constraints. conflict means it contradicts them.',
   'uncertain means required facts are missing or ambiguous. Never resolve uncertainty by assuming a safe destination or unchanged contents.',
   'Return JSON with verdict (compatible, conflict, uncertain), reason (specific correction or missing evidence), and the supplied proposalDigest exactly.',
 ].join(' ');
+
+const PROVENANCE_MIN_CHARS = 6;
+const PROVENANCE_MAX_VALUES = 40;
+const PROVENANCE_MAX_REFS = 24;
+
+/** Leaf strings of the proposed arguments, deduplicated, longest first. */
+function leafStrings(value: unknown, out: Set<string>, depth = 0): void {
+  if (depth > 8 || out.size >= PROVENANCE_MAX_VALUES * 4) return;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (text.length >= PROVENANCE_MIN_CHARS && !/^[\d\s.,:/-]+$/.test(text)) out.add(text);
+    return;
+  }
+  if (Array.isArray(value)) { for (const item of value) leafStrings(item, out, depth + 1); return; }
+  if (value && typeof value === 'object') for (const item of Object.values(value as Record<string, unknown>)) leafStrings(item, out, depth + 1);
+}
+
+/** For each proposed value, the retained results that contain it verbatim.
+ * Null when there is nothing to search or nothing worth searching for. */
+export function valueProvenance(args: unknown, evidence: JudgeEvidenceSource | undefined): Record<string, string[] | 'not in any retained result'> | null {
+  if (!evidence) return null;
+  const values = new Set<string>();
+  leafStrings(args, values);
+  if (values.size === 0) return null;
+  const texts: Array<{ ref: string; text: string }> = [];
+  for (const ref of evidence.refs().slice(0, PROVENANCE_MAX_REFS)) {
+    const entry = evidence.resolve(ref);
+    if (entry?.text) texts.push({ ref, text: entry.text });
+  }
+  if (texts.length === 0) return null;
+  const out: Record<string, string[] | 'not in any retained result'> = {};
+  for (const value of [...values].sort((a, b) => b.length - a.length).slice(0, PROVENANCE_MAX_VALUES)) {
+    const found = texts.filter((item) => item.text.includes(value) || item.text.includes(JSON.stringify(value).slice(1, -1))).map((item) => item.ref);
+    out[value.length > 80 ? `${value.slice(0, 80)}…` : value] = found.length ? found : 'not in any retained result';
+  }
+  return out;
+}
 
 export function parseWorkflowMutationReview(value: unknown, expectedDigest: string): WorkflowMutationReview | null {
   let parsed: unknown = value;
@@ -92,11 +130,19 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   // The reviewer must see what it is judging before spending a lookup. Keep
   // constraints and the authenticated evidence index visible; retain large
   // argument/schema fields separately instead of hiding the entire request.
-  const prompt = large ? JSON.stringify({
-    instructions: proposal.instructions, tool: proposal.tool, schema: present('schema', proposal.schema),
-    args: present('args', proposal.args), observations: proposal.observations,
-    proposalRef, proposalDigest,
-  }) : serialized;
+  // Where the proposed values already appear. A reviewer's lookups mostly
+  // answer two questions — did these values come from this run's reads, and
+  // does the destination already hold them — and both are a search of the
+  // retained results for the exact strings. The search is done here, by
+  // value, naming each result that contains it; what that means for the
+  // write (sourced, duplicated, invented) stays the reviewer's judgement.
+  const provenance = valueProvenance(proposal.args, sourceEvidence);
+  const prompt = JSON.stringify({
+    instructions: proposal.instructions, tool: proposal.tool, schema: large ? present('schema', proposal.schema) : proposal.schema,
+    args: large ? present('args', proposal.args) : proposal.args, observations: proposal.observations,
+    ...(provenance ? { valueProvenance: provenance } : {}),
+    ...(large ? { proposalRef } : {}), proposalDigest,
+  });
   const evidence: JudgeEvidenceSource = {
     refKind: 'the exact proposed write and authenticated prior observations',
     refs: () => [proposalRef, ...fields.keys(), ...(sourceEvidence?.refs() ?? [])],
