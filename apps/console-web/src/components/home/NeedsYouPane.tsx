@@ -33,10 +33,12 @@ export function AnswerRow({
   question,
   busy,
   onAnswer,
+  placeholder = 'Answer so she can carry on…',
 }: {
   question?: InboxQuestionRow;
   busy: boolean;
   onAnswer: (text: string) => void;
+  placeholder?: string;
 }) {
   const [draft, setDraft] = useState('');
   if (question && !question.answerable) {
@@ -75,7 +77,7 @@ export function AnswerRow({
         onChange={(event) => setDraft(event.target.value)}
         disabled={busy}
         aria-label="Your answer"
-        placeholder="Answer so she can carry on…"
+        placeholder={placeholder}
         className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-small text-fg outline-none placeholder:text-faint focus:border-border-strong disabled:opacity-50"
       />
       <Button type="submit" size="sm" className="h-8 px-3 text-small" disabled={busy || !draft.trim()}>

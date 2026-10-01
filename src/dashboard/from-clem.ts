@@ -11,6 +11,7 @@
  * finding), newest first. A heartbeat with nothing to say still reports its last look, so a
  * quiet Clem is visibly a watching one. Pure: the route supplies the records.
  */
+import { createHash } from 'node:crypto';
 import type { NotificationRecord } from '../runtime/notifications.js';
 
 export interface FromClemRow {
@@ -21,8 +22,13 @@ export interface FromClemRow {
   at: string;
   /** Waiting on the owner's answer (vs. telling them something). */
   asks: boolean;
+  /** Clem's own words about it, once she has written them. */
+  say?: string;
+  /** The record's own words: what the heartbeat wrote. */
   text: string;
   detail?: string;
+  /** Changes whenever what she would be speaking about changes. */
+  voiceDigest: string;
   /** How the owner answers, through the route that already settles it. */
   answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string };
   /** Marks a finding seen; its heartbeat counts it acknowledged. */
@@ -51,6 +57,13 @@ export interface FromClemInput {
   planProposals: ReadonlyArray<{ id: string; proposedAt: string; proposedByAgent: string; status: string; title: string; context?: string }>;
   /** Heartbeat items that are still waiting on the owner (the Needs you rule). */
   asksOwner: (notification: NotificationRecord) => boolean;
+  /** Clem's words already written for this row, if any. */
+  voiced?: (key: string, voiceDigest: string) => string | undefined;
+}
+
+/** What she would be speaking about: a changed item is said again. */
+export function fromClemVoiceDigest(row: Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks'>): string {
+  return createHash('sha256').update(JSON.stringify([row.heartbeat, row.text, row.detail ?? '', row.asks])).digest('hex').slice(0, 24);
 }
 
 const str = (value: unknown): string => (typeof value === 'string' ? value : '');
@@ -65,7 +78,7 @@ function heartbeatOf(notification: NotificationRecord): string | null {
 export function buildFromClem(input: FromClemInput): FromClem {
   const titleOf = new Map(input.heartbeats.map((row) => [row.id, row.title]));
   const title = (id: string): string => titleOf.get(id) ?? id;
-  const rows: FromClemRow[] = [];
+  const rows: Array<Omit<FromClemRow, 'voiceDigest'>> = [];
   const covers = { questionIds: [] as string[], planProposalIds: [] as string[], notificationIds: [] as string[] };
 
   for (const proposal of input.noticingProposals) {
@@ -110,9 +123,14 @@ export function buildFromClem(input: FromClemInput): FromClem {
   // A stream: newest first. What waits on the owner says so on its row; a
   // fresh finding is never buried under days-old reminders.
   rows.sort((a, b) => b.at.localeCompare(a.at));
+  const voicedRows: FromClemRow[] = rows.map((row) => {
+    const voiceDigest = fromClemVoiceDigest(row);
+    const say = input.voiced?.(row.key, voiceDigest);
+    return { ...row, voiceDigest, ...(say ? { say } : {}) };
+  });
   const pulses = input.heartbeats.map((row) => ({
     heartbeat: row.id, title: row.title, enabled: row.enabled,
     ...(row.lastFinding ? { lastAt: row.lastFinding.at, summary: row.lastFinding.summary } : {}),
   }));
-  return { rows, pulses, covers };
+  return { rows: voicedRows, pulses, covers };
 }

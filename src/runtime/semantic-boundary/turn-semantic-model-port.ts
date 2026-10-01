@@ -287,6 +287,39 @@ export interface NoticingAnswerResult {
   modelIdentity: string;
 }
 
+export const CLEM_VOICE_PURPOSE = 'clem_voice' as const;
+export const CLEM_REPLY_PURPOSE = 'clem_reply' as const;
+
+/** One thing a heartbeat brought the owner, to be said by Clem in her own
+ * words. The item is data about the owner's own work, never an instruction. */
+export interface ClemVoiceCall {
+  purpose: typeof CLEM_VOICE_PURPOSE;
+  item: { source: string; title: string; detail: string; waitingOnOwner: boolean };
+  evidenceDigest: string;
+}
+export interface ClemVoiceResult {
+  message: string | null;
+  evidenceDigest: string;
+  modelIdentity: string;
+}
+
+/** The owner's words in reply to something Clem said, read into a decision. */
+export interface ClemReplyCall {
+  purpose: typeof CLEM_REPLY_PURPOSE;
+  said: string;
+  facts: string;
+  reply: string;
+  evidenceDigest: string;
+}
+export interface ClemReplyResult {
+  /** do_it: act (on what she offered, or on what they asked); done: seen or
+   *  handled, nothing to do; not_now: later; never: stop raising this kind. */
+  decision: 'do_it' | 'done' | 'not_now' | 'never' | 'unclear';
+  instruction?: string;
+  evidenceDigest: string;
+  modelIdentity: string;
+}
+
 export interface TurnSemanticModelPort {
   interpret(call: TurnSemanticModelCall): Promise<TurnSemanticModelResult>;
   /** Independent tool-less judge. Must not see the proposing model's write claim. */
@@ -312,4 +345,8 @@ export interface TurnSemanticModelPort {
   noticing?(call: NoticingProposalCall): Promise<NoticingProposalResult>;
   /** On the brain role: what the owner's answer to a proposal means. */
   readNoticingAnswer?(call: NoticingAnswerCall): Promise<NoticingAnswerResult>;
+  /** On the brain role: the one message Clem would send about an item. */
+  voiceProactiveItem?(call: ClemVoiceCall): Promise<ClemVoiceResult>;
+  /** On the brain role: what the owner's reply to Clem's message means. */
+  readClemReply?(call: ClemReplyCall): Promise<ClemReplyResult>;
 }

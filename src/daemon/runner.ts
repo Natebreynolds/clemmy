@@ -3480,6 +3480,11 @@ export async function startDaemon(
     const { bindNoticingRespond, startNoticingHeartbeat } = await import('../agents/noticing-runtime.js');
     bindNoticingRespond((request) => respondPreferHarness('background', request, (next) => assistant.respond(next)));
     startNoticingHeartbeat();
+    // From Clem: each item the heartbeats raise, put in Clem's own words once,
+    // and the owner's reply to any of them starts an ordinary turn.
+    const { bindFromClemRespond, startFromClemVoice } = await import('../dashboard/from-clem-runtime.js');
+    bindFromClemRespond((request) => respondPreferHarness('background', request, (next) => assistant.respond(next)));
+    startFromClemVoice();
     logger.info(
       { enabled: watchPolicy.enabled, cadenceMinutes: watchPolicy.cadenceMinutes },
       watchPolicy.enabled ? 'Calendar watch armed on the prepared read path' : 'Calendar watch heartbeat armed (watch disabled by policy)',

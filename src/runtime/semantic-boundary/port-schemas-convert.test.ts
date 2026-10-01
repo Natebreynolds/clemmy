@@ -12,6 +12,8 @@ import { tool } from '@openai/agents-core';
 import {
   CalendarReadRecipeAnswerV1Schema,
   CalendarReadOperationsV1Schema,
+  ClemReplyV1Schema,
+  ClemVoiceV1Schema,
   NoticingDecisionV1Schema,
   OperationDeliveryJudgeV1Schema,
   RequestEffectJudgeV1Schema,
@@ -22,6 +24,7 @@ import { NoticingAnswerWireV1Schema } from '../../agents/noticing.js';
 test('every structured port answer converts to a wire JSON schema', () => {
   for (const [name, schema] of Object.entries({
     CalendarReadRecipeAnswerV1Schema, CalendarReadOperationsV1Schema, NoticingAnswerWireV1Schema, NoticingDecisionV1Schema,
+    ClemVoiceV1Schema, ClemReplyV1Schema,
     OperationDeliveryJudgeV1Schema, RequestEffectJudgeV1Schema, SourceAccountJudgeV1Schema,
   })) {
     // The public tool() builder runs the SDK's strict zod→JSON-schema

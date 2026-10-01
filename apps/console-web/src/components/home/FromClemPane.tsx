@@ -2,16 +2,17 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/Button';
-import { answerInboxQuestion, decidePlanProposal, markNotificationRead } from '@/lib/inbox';
-import { recentPulses, type FromClem, type FromClemRow } from '@/lib/from-clem';
+import { decidePlanProposal, markNotificationRead } from '@/lib/inbox';
+import { recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
 import { cn } from '@/lib/cn';
+import { unifiedChatSessionId } from '@/lib/last-session';
 import { agoLabel } from './home-model';
 import { AnswerRow } from './NeedsYouPane';
 import { LoadFailedLine, PaneCard, PaneRow, RowSkeleton, SectionHeader } from './HomeSection';
 
 interface RowState {
   busy?: 'answer' | 'yes' | 'no' | 'done';
-  notice?: { tone: 'success' | 'error'; text: string };
+  notice?: { tone: 'success' | 'error'; text: string; sessionId?: string };
 }
 
 /**
@@ -43,11 +44,17 @@ export function FromClemPane({
   const asks = rows.filter((row) => row.asks).length;
   const pulses = recentPulses(data?.pulses ?? []);
 
-  const act = (row: FromClemRow, busy: NonNullable<RowState['busy']>, run: () => Promise<unknown>, success: string) => {
+  const act = (
+    row: FromClemRow,
+    busy: NonNullable<RowState['busy']>,
+    run: () => Promise<unknown>,
+    success: string | ((result: unknown) => { text: string; sessionId?: string }),
+  ) => {
     setStates((all) => ({ ...all, [row.key]: { busy } }));
     run().then(
-      () => {
-        setStates((all) => ({ ...all, [row.key]: { notice: { tone: 'success', text: success } } }));
+      (result) => {
+        const said = typeof success === 'string' ? { text: success } : success(result);
+        setStates((all) => ({ ...all, [row.key]: { notice: { tone: 'success', ...said } } }));
         void qc.invalidateQueries({ queryKey: ['home-from-clem'] });
         void qc.invalidateQueries({ queryKey: ['command-center'] });
       },
@@ -58,46 +65,49 @@ export function FromClemPane({
     );
   };
 
-  const actions = (row: FromClemRow, state: RowState) => {
-    if (row.answer?.kind === 'words') {
-      const questionId = row.answer.questionId;
-      return (
-        <AnswerRow
-          busy={state.busy === 'answer'}
-          onAnswer={(text) => {
-            if (text.trim()) act(row, 'answer', () => answerInboxQuestion(questionId, text.trim()), 'Sent — she’ll take it from here.');
-          }}
-        />
-      );
-    }
+  const reply = (row: FromClemRow, text: string) => act(row, 'answer', () => replyFromClem(row.key, text), (result) => {
+    const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
+    return { text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
+  });
+
+  const quick = (row: FromClemRow, state: RowState) => {
     if (row.answer?.kind === 'yes_no') {
       const id = row.answer.planProposalId;
       return (
-        <div className="flex flex-wrap items-center gap-2">
+        <>
           <Button size="sm" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
-            onClick={() => act(row, 'yes', () => decidePlanProposal(id, 'approve'), 'Yes — she’s on it.')}>
+            onClick={() => act(row, 'yes', () => decidePlanProposal(id, 'approve'), 'Approved.')}>
             {state.busy === 'yes' ? 'Sending…' : 'Yes'}
           </Button>
           <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
-            onClick={() => act(row, 'no', () => decidePlanProposal(id, 'reject'), 'Noted — she won’t.')}>
+            onClick={() => act(row, 'no', () => decidePlanProposal(id, 'reject'), 'Declined.')}>
             No
           </Button>
-        </div>
+        </>
       );
     }
     if (row.done) {
       const id = row.done.notificationId;
       return (
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
-            onClick={() => act(row, 'done', () => markNotificationRead(id), 'Marked done.')}>
-            {state.busy === 'done' ? 'Saving…' : 'Done'}
-          </Button>
-        </div>
+        <Button size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={Boolean(state.busy)}
+          onClick={() => act(row, 'done', () => markNotificationRead(id), 'Cleared.')}>
+          {state.busy === 'done' ? 'Saving…' : 'Done'}
+        </Button>
       );
     }
     return null;
   };
+
+  const actions = (row: FromClemRow, state: RowState) => (
+    <div className="flex flex-col gap-2">
+      <AnswerRow
+        busy={state.busy === 'answer'}
+        placeholder="Reply to Clem…"
+        onAnswer={(text) => { if (text.trim()) reply(row, text.trim()); }}
+      />
+      {quick(row, state) && <div className="flex flex-wrap items-center gap-2">{quick(row, state)}</div>}
+    </div>
+  );
 
   return (
     <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-2.5">
@@ -139,11 +149,23 @@ export function FromClemPane({
                   <span>{agoLabel(row.at)}</span>
                   {row.asks && <span className="ml-auto font-semibold text-primary">Waiting on you</span>}
                 </div>
-                <p className="text-body text-fg">{row.text}</p>
-                {row.detail && <p className="line-clamp-3 whitespace-pre-line text-small text-muted">{row.detail}</p>}
+                {row.say ? (
+                  <>
+                    <p className="text-body text-fg">{row.say}</p>
+                    <p className="line-clamp-2 whitespace-pre-line text-small text-faint">{[row.text, row.detail].filter(Boolean).join(' · ')}</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-body text-fg">{row.text}</p>
+                    {row.detail && <p className="line-clamp-3 whitespace-pre-line text-small text-muted">{row.detail}</p>}
+                  </>
+                )}
                 {state.notice ? (
                   <p role="status" className={cn('text-small', state.notice.tone === 'error' ? 'text-warning' : 'text-muted')}>
                     {state.notice.text}
+                    {state.notice.sessionId && (
+                      <>{' '}<Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(state.notice.sessionId))}`} className="font-semibold text-primary hover:underline">Open</Link></>
+                    )}
                   </p>
                 ) : actions(row, state)}
               </PaneRow>

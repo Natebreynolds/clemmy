@@ -14320,33 +14320,57 @@ export function registerConsoleRoutes(
     }
   });
 
-  // From Clem on Home: what the heartbeats brought the owner, as one stream
-  // (dashboard/from-clem.ts). Reads their records only; no model or provider call.
+  // From Clem on Home: what the heartbeats brought the owner, as one stream,
+  // in Clem's own words once she has written them (dashboard/from-clem*.ts).
   app.get('/api/console/home/from-clem', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const [{ listHeartbeats }, { loadNoticingState }, { loadNotifications }, { listPlanProposals }, { buildFromClem }] = await Promise.all([
+      const { readFromClem } = await import('./from-clem-runtime.js');
+      res.json(await readFromClem());
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // The owner's reply to one From Clem row, in their own words.
+  app.post('/api/console/home/from-clem/reply', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim().slice(0, 4_000) : '';
+    if (!key || !text) { res.status(400).json({ error: 'key and text are required' }); return; }
+    try {
+      const [{ readFromClem, replyToFromClem, startFromClemTurn }, { addRule, HEARTBEAT_IDS }, { createSession: createHarnessSession }, { peekTurnSemanticModelPort }] = await Promise.all([
+        import('./from-clem-runtime.js'),
         import('../agents/heartbeats.js'),
-        import('../agents/noticing-runtime.js'),
-        import('../runtime/notifications.js'),
-        import('../agents/plan-proposals.js'),
-        import('./from-clem.js'),
+        import('../runtime/harness/eventlog.js'),
+        import('../runtime/semantic-boundary/turn-semantic-port-registry.js'),
       ]);
-      const needsYouRef = needsYouReferents();
-      res.json(buildFromClem({
-        heartbeats: (await listHeartbeats()).map((row) => ({
-          id: row.id, title: row.title, enabled: row.enabled,
-          ...(row.lastFinding ? { lastFinding: { at: row.lastFinding.at, summary: row.lastFinding.summary } } : {}),
-        })),
-        noticingProposals: Object.values(loadNoticingState().proposals),
-        notifications: loadNotifications(),
-        planProposals: listPlanProposals({ status: 'pending' }).map((proposal) => ({
-          id: proposal.id, proposedAt: proposal.proposedAt, proposedByAgent: proposal.proposedByAgent, status: proposal.status,
-          title: proposal.plan?.objective || proposal.originatingRequest || proposal.id,
-          ...(proposal.context ? { context: proposal.context } : {}),
-        })),
-        asksOwner: (notification) => notificationNeedsYou(notification, needsYouRef),
-      }));
+      const result = await replyToFromClem(key, text, {
+        read: readFromClem,
+        port: () => peekTurnSemanticModelPort(),
+        answerQuestion: (questionId, answer) => {
+          const answered = answerInboxQuestion({ id: questionId, answer, requestId: `desktop-from-clem:${Date.now()}:${randomBytes(6).toString('hex')}`, surface: 'desktop' });
+          return answered.status === 'answered' || answered.status === 'resuming';
+        },
+        markRead: (notificationId) => { markNotificationRead(notificationId); },
+        addRule: (heartbeat, rule) => {
+          if ((HEARTBEAT_IDS as readonly string[]).includes(heartbeat)) addRule(heartbeat as (typeof HEARTBEAT_IDS)[number], rule, 'owner');
+        },
+        approvePlan: (planProposalId) => {
+          const existing = getPlanProposal(planProposalId);
+          if (!existing || planProposalNeedsUserInput(existing)) return false;
+          const approved = approvePlanAndQueueBackgroundTask(planProposalId, {});
+          if (!approved) return false;
+          setImmediate(() => { processBackgroundTasks(assistant, 1).catch(() => { /* the queued task is still there */ }); });
+          return true;
+        },
+        rejectPlan: (planProposalId, reason) => Boolean(rejectPlanProposal(planProposalId, reason)),
+        snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
+        startTurn: (input) => startFromClemTurn(input, (title) => createHarnessSession({
+          kind: 'chat', channel: 'desktop', title, metadata: { source: 'from_clem' } as never,
+        }).id),
+      });
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
