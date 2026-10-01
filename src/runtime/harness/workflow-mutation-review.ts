@@ -25,6 +25,12 @@ export interface WorkflowMutationReviewInput {
   args: Record<string, unknown>;
   /** Authenticated observations, including earlier settled writes. */
   observations: { summary: string; complete: boolean; evidence?: JudgeEvidenceSource };
+  /** What the review protects. An ordinary recoverable write (a row appended,
+   * a draft updated) is read at a measured depth first, and only a
+   * conflict, an uncertainty or a checker failure brings the full review; a
+   * send, a delete or an irreversible change is read at full depth from the
+   * start. Omitted means full. */
+  stakes?: 'ordinary' | 'high';
 }
 
 const SYSTEM = [
@@ -119,18 +125,34 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   // circles until its clock ran out. A timed-out review is retried once as a
   // plain read of the proposal, and a checker that still cannot answer says so.
   const judge = deps.judge ?? runHedgedJudge;
+  const parse = (output: unknown) => parseWorkflowMutationReview(output, proposalDigest);
+  const pass = (value: WorkflowMutationReview) => value.verdict === 'compatible';
   let failure: WorkflowMutationReview['checkerFailure'] = 'error';
+  // Depth by stakes. Live 2026-09-30: every proposed write of one workflow
+  // ran the full evidence review at the provider's default depth, eight
+  // reviews at 60–100 s and ~20k tokens a round; the writes were ordinary row
+  // appends. A measured first read answers the compatible case; anything
+  // else is decided by the full review, never by the measured one.
+  if (input.stakes === 'ordinary') {
+    try {
+      const started = Date.now();
+      const measured = await judge(SYSTEM, prompt, parse, pass, 'mutation_constraints',
+        { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs(), effort: 'medium' });
+      if (measured.value?.verdict === 'compatible') {
+        recordJudgeMetric({ lane: 'mutation_constraints', outcome: 'passed', durationMs: Date.now() - started, fast: true });
+        return measured.value;
+      }
+    } catch { /* the full review decides */ }
+  }
   try {
-    const reviewed = await judge(SYSTEM, prompt,
-      output => parseWorkflowMutationReview(output, proposalDigest), value => value.verdict === 'compatible',
+    const reviewed = await judge(SYSTEM, prompt, parse, pass,
       'mutation_constraints', { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs() });
     if (reviewed.value) return reviewed.value;
     failure = reviewed.failure ?? 'error';
   } catch { failure = 'error'; }
   if (failure === 'timeout') {
     try {
-      const plain = await judge(SYSTEM, serialized,
-        output => parseWorkflowMutationReview(output, proposalDigest), value => value.verdict === 'compatible',
+      const plain = await judge(SYSTEM, serialized, parse, pass,
         'mutation_constraints', { requireCompletePrompt: false, timeoutMs: mutationReviewTimeoutMs() });
       if (plain.value) return plain.value;
       failure = plain.failure ?? 'error';

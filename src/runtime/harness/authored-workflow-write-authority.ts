@@ -761,6 +761,8 @@ async function reviewAuthoredWriteConstraints(input: {
   schema?: unknown;
   /** The consent that reached this review was the owner's exact grant of this write. */
   ownerApprovedExactly?: boolean;
+  /** An ordinary recoverable write is reviewed at a measured depth first. */
+  stakes?: 'ordinary' | 'high';
 }): Promise<HostInteractiveConsentResult | null> {
   try {
     const argsDigest = digest(input.args);
@@ -784,6 +786,7 @@ async function reviewAuthoredWriteConstraints(input: {
       schema,
       args: input.args,
       observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
+      stakes: input.stakes ?? 'high',
     });
     // Model review is asynchronous. Do not project a verdict into an attempt
     // that ended or whose adopted authority changed while it was running.
@@ -1215,7 +1218,8 @@ async function evaluateAuthoredCatalogWrite(input: {
       const landed = gate === 'send' ? null : landedWriteInEarlierAttempt({ reopened, attestation, args: input.args });
       if (landed) return landed;
       const refusal = await reviewAuthoredWriteConstraints({ ...input, schema,
-        ownerApprovedExactly: decision.basis === 'exact_user_grant' });
+        ownerApprovedExactly: decision.basis === 'exact_user_grant',
+        stakes: gate === 'ordinary_write' ? 'ordinary' : 'high' });
       if (refusal) return refusal;
     }
     if (gate === 'send' && decision.basis === 'exact_user_grant') {
@@ -1401,7 +1405,8 @@ async function evaluateAuthoredLocalWrite(input: {
   if (decision.basis !== 'settled_replay') {
     const landed = landedWriteInEarlierAttempt({ reopened, attestation, args: input.args });
     if (landed) return landed;
-    const refusal = await reviewAuthoredWriteConstraints(input);
+    // This branch admits only exact reversible / ordinary local work.
+    const refusal = await reviewAuthoredWriteConstraints({ ...input, stakes: 'ordinary' });
     if (refusal) return refusal;
   }
   return { status: 'decided', decision, call, coverage };

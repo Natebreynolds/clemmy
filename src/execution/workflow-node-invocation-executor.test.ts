@@ -725,6 +725,20 @@ test('the run reviewers see a settled workflow read as authenticated evidence of
   assert.match(evidence.summary, /record\.reviewed-evidence/, 'the reviewer reads the settled result itself');
   assert.equal(evidence.available, true, evidence.summary);
 
+  // The per-write review reads the same settlements as a compact index: the
+  // rules once at the head, one numbered entry per settlement with its sealed
+  // request and its result, and no per-row boilerplate. Same refs, same
+  // availability; the full form stays for the completion review.
+  const compact = readWorkflowTargetEvidence(identity.runId, { compactResults: true, consumerStepId: identity.nodeId });
+  assert.equal(compact.available, true, compact.summary);
+  assert.match(compact.summary, /Each settlement below: its sealed request arguments/);
+  assert.match(compact.summary, new RegExp(`#1 .* -> ${installed.entry.toolName} \\[call=.*; outcome=succeeded; read\\]`));
+  assert.match(compact.summary, /\n  request \(sealed\): \{/);
+  assert.match(compact.summary, /record\.reviewed-evidence/);
+  assert.doesNotMatch(compact.summary, /VERIFIED REQUEST SCOPE|<<<TOOL RESULT DATA/);
+  assert.ok(compact.summary.length < evidence.summary.length, `${compact.summary.length} < ${evidence.summary.length}`);
+  assert.deepEqual(compact.results?.map((row) => [row.toolName, row.status]), evidence.results?.map((row) => [row.toolName, row.status]));
+
   // A session named for another run cannot lend that run this call's
   // authority: the activation, not the session name, says whose work it was.
   const borrowed = installExecutionFixture({ label: 'borrowed-evidence' });

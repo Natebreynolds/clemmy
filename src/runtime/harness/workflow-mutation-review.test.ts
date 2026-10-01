@@ -128,3 +128,49 @@ test('a checker that does not answer says so, retries a timed-out review once as
   assert.equal(invalid.checkerFailure, 'invalid');
   assert.match(invalid.reason, /could not be read/);
 });
+
+test('an ordinary write is read at a measured depth first; only a non-compatible answer brings the full review', async () => {
+  const retained: WorkflowMutationReviewInput['observations'] = { complete: false,
+    summary: 'Prior rows retained at prior-rows.', evidence: {
+      refKind: 'authenticated records', refs: () => ['prior-rows'], resolve: ref => ref === 'prior-rows' ? { text: 'rows' } : undefined,
+    } };
+  // Compatible on the measured read: one call, effort medium, counted as fast.
+  resetJudgeMetricsForTests();
+  const efforts: Array<string | undefined> = [];
+  const compatible = await reviewWorkflowMutation({ ...input, observations: retained, stakes: 'ordinary' }, {
+    evaluate: async () => { throw new Error('retained evidence never takes the classifier path'); },
+    judge: async (_system, prompt, parse, _pass, _lane, opts) => {
+      efforts.push(opts?.effort);
+      return { value: parse({ verdict: 'compatible', reason: 'Appends one row; header preserved.', proposalDigest: JSON.parse(prompt).proposalDigest }), failure: null };
+    },
+  });
+  assert.equal(compatible.verdict, 'compatible');
+  assert.deepEqual(efforts, ['medium']);
+  assert.equal(getJudgeMetricsSnapshot().lanes.find((lane) => lane.lane === 'mutation_constraints')?.fastDecisions, 1);
+
+  // Uncertain on the measured read: the full review (no effort cap) decides, and its verdict stands.
+  efforts.length = 0;
+  const decided = await reviewWorkflowMutation({ ...input, observations: retained, stakes: 'ordinary' }, {
+    evaluate: async () => { throw new Error('no classifier'); },
+    judge: async (_system, prompt, parse, _pass, _lane, opts) => {
+      efforts.push(opts?.effort);
+      const digest = JSON.parse(prompt).proposalDigest;
+      return opts?.effort === 'medium'
+        ? { value: parse({ verdict: 'uncertain', reason: 'Cannot see whether row-2 is still the data row.', proposalDigest: digest }), failure: null }
+        : { value: parse({ verdict: 'conflict', reason: 'row-2 now holds the header.', proposalDigest: digest }), failure: null };
+    },
+  });
+  assert.equal(decided.verdict, 'conflict');
+  assert.deepEqual(efforts, ['medium', undefined]);
+
+  // High stakes (a send, a delete): the full review from the start, no measured read.
+  efforts.length = 0;
+  await reviewWorkflowMutation({ ...input, observations: retained, stakes: 'high' }, {
+    evaluate: async () => { throw new Error('no classifier'); },
+    judge: async (_system, prompt, parse, _pass, _lane, opts) => {
+      efforts.push(opts?.effort);
+      return { value: parse({ verdict: 'compatible', reason: 'ok', proposalDigest: JSON.parse(prompt).proposalDigest }), failure: null };
+    },
+  });
+  assert.deepEqual(efforts, [undefined]);
+});
