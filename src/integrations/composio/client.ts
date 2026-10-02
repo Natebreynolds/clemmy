@@ -1369,11 +1369,19 @@ export async function revalidateSelectedComposioConnections(
 ): Promise<SelectedComposioConnectionRevalidation> {
   if (selections.length === 0) return { ok: true };
   // A listing that could not be made says nothing about the connection, and no
-  // dispatch has happened yet: ask once more before it becomes a refusal. A
-  // provider that stays unreachable still refuses.
+  // dispatch has happened yet: ask once more before it becomes a refusal —
+  // inside the caller's cancellation and deadline, never past them. A provider
+  // that stays unreachable still refuses.
   let fresh: ConnectedToolkit[];
   try { fresh = await refreshConnectedToolkits(); }
-  catch { fresh = await refreshConnectedToolkits(); }
+  catch (err) {
+    const deadlineAt = currentToolAbortDeadlineAt();
+    if (
+      currentToolAbortSignal()?.aborted
+      || (deadlineAt !== undefined && deadlineAt - Date.now() < CONNECTED_ACCOUNTS_LIST_TIMEOUT_MS)
+    ) throw err;
+    fresh = await refreshConnectedToolkits();
+  }
   const usable = filterSuppressedConnectedToolkits(
     fresh,
     readComposioConnectionSuppressionState(),

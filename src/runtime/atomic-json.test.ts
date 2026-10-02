@@ -15,6 +15,8 @@ import {
   rmSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
 import { performance } from 'node:perf_hooks';
@@ -176,6 +178,47 @@ test('a lease this process failed to release is reclaimed by its own next acquis
   assert.ok(ran);
   assert.ok(performance.now() - startedAt < 2_000, 'the next acquisition reclaims instead of waiting out the lock');
   assert.equal(existsSync(lockPath), false, 'and releases normally afterwards');
+});
+
+test('an abandoned lease survives a reclaim whose replacement and fallback unlink both fail', (t) => {
+  if (process.getuid?.() === 0) { t.skip('root ignores directory permissions'); return; }
+  const dir = mkdtempSync(path.join(TMP, 'abandoned-reclaim-fails-'));
+  const target = path.join(dir, 'snapshot');
+  const lockPath = `${target}.lock`;
+  try {
+    withFileLockSyncStrict(target, () => { chmodSync(dir, 0o555); });
+  } finally {
+    chmodSync(dir, 0o755);
+  }
+  assert.ok(existsSync(lockPath));
+
+  // The reclaim gets its guard, then neither swaps its lock in nor removes the
+  // abandoned one (the pathname refuses both).
+  const refuse = (call: string) => Object.assign(new Error(`${call} refused for the lock`), { code: 'EIO' });
+  const realRename = fs.renameSync;
+  const realUnlink = fs.unlinkSync;
+  const rename = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    if (String(to) === lockPath) throw refuse('rename');
+    return realRename(from, to);
+  });
+  const unlink = t.mock.method(fs, 'unlinkSync', (p: fs.PathLike) => {
+    if (String(p) === lockPath) throw refuse('unlink');
+    return realUnlink(p);
+  });
+  syncBuiltinESMExports();
+  try {
+    withFileLockSync(target, () => undefined); // best effort: runs after its bounded wait
+  } finally {
+    rename.mock.restore();
+    unlink.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.ok(existsSync(lockPath), 'the failed reclaim left the abandoned lease in place');
+
+  const startedAt = performance.now();
+  withFileLockSyncStrict(target, () => undefined);
+  assert.ok(performance.now() - startedAt < 2_000, 'a later acquisition still recognises and reclaims it');
+  assert.equal(existsSync(lockPath), false);
 });
 
 test('a lease under this PID that this isolate never gave up is still a live owner', () => {

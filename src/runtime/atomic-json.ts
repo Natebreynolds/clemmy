@@ -507,9 +507,13 @@ function tryReapStaleFileLock(
       || !deletionGuardStillOwned(guard)
     ) return null;
     waitAfterDeletionGuardValidationForTest();
-    // The validated generation leaves either way: renamed over, or unlinked.
-    abandonedLeases.delete(lockPath);
-    return replaceStaleFileLock(lockPath);
+    const claimed = replaceStaleFileLock(lockPath);
+    // Forget an abandoned generation only once it has left the pathname. A
+    // replacement and fallback unlink that both failed leave it in place, and
+    // this process's next acquisition must still recognise it as its own.
+    const remaining = claimed ? null : readFileLockSnapshot(lockPath);
+    if (!remaining || !abandonedByThisProcess(lockPath, remaining)) abandonedLeases.delete(lockPath);
+    return claimed;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return null;

@@ -10,6 +10,7 @@ process.env.CLEMENTINE_HOME = fixtureHome;
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async () => { throw new Error('Provider network is forbidden in this fixture.'); };
 const { __test__, revalidateSelectedComposioConnections, clearConnectedToolkitsCache } = await import('./client.js');
+const { runWithToolAbortSignal } = await import('../../runtime/tool-abort-context.js');
 afterEach(() => __test__.setConnectedAccountsLoader(null));
 after(() => { globalThis.fetch = originalFetch; rmSync(fixtureHome, { recursive: true, force: true }); });
 const selection = [{ identifier: 'OUTLOOK_LIST_MESSAGES', connectionId: 'ca_selected' }];
@@ -53,6 +54,22 @@ test('one listing that could not be made is asked once more before the check ref
   clearConnectedToolkitsCache();
   assert.deepEqual(await revalidateSelectedComposioConnections(selection), { ok: true });
   assert.equal(calls, 2);
+});
+
+test('the second ask stays inside the caller: a cancelled call or one without time left refuses on the first miss', async () => {
+  let calls = 0;
+  __test__.setConnectedAccountsLoader(async () => {
+    calls++;
+    throw new Error('Fixture listing missed its deadline');
+  });
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(runWithToolAbortSignal(cancelled.signal, () => revalidateSelectedComposioConnections(selection)));
+  assert.equal(calls, 1, 'a cancelled call is not asked again');
+  calls = 0;
+  await assert.rejects(runWithToolAbortSignal(new AbortController().signal,
+    () => revalidateSelectedComposioConnections(selection), Date.now() + 5_000));
+  assert.equal(calls, 1, 'a deadline shorter than one listing is not spent on a second');
 });
 
 test('a failed refresh cannot return an old verified account label from the last-good cache', async () => {
