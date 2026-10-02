@@ -54,6 +54,12 @@ import { BoundaryError } from './boundary-error.js';
  * Zero-cost when there's no contention.
  */
 const inProcessLocks = new Map<string, Promise<void>>();
+/** File locks this process holds right now through the ASYNC path. A sync
+ *  waiter on the same thread can never see one released: the holder needs the
+ *  event loop the waiter is blocking. Waiting for it was a guaranteed full
+ *  timeout with the main thread frozen (the 14–56 s daemon.timer.watchdogs
+ *  stalls when scheduled workflows started). */
+const asyncHeldFileLocks = new Map<string, number>();
 
 interface HeldFileLockScope {
   filePath: string;
@@ -660,14 +666,29 @@ export async function withFileLock<T>(filePath: string, work: () => Promise<T> |
       await new Promise<void>((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
       lease = tryAcquireFileLock(filePath);
     }
+    asyncHeldFileLocks.set(filePath, (asyncHeldFileLocks.get(filePath) ?? 0) + 1);
     try {
       return await runWithHeldFileLockAsync(filePath, work);
     } finally {
+      const held = (asyncHeldFileLocks.get(filePath) ?? 1) - 1;
+      if (held > 0) asyncHeldFileLocks.set(filePath, held); else asyncHeldFileLocks.delete(filePath);
       releaseFileLock(filePath, lease);
     }
   } finally {
     inProcessRelease();
   }
+}
+
+/** Held by async work on this thread: a sync wait cannot succeed. */
+function heldByThisThreadAsync(filePath: string): boolean {
+  return (asyncHeldFileLocks.get(filePath) ?? 0) > 0;
+}
+
+const SLOW_SYNC_LOCK_WAIT_MS = 1_000;
+function noteSlowSyncLockWait(filePath: string, waitedMs: number, outcome: 'acquired' | 'proceeded' | 'timed_out'): void {
+  if (waitedMs < SLOW_SYNC_LOCK_WAIT_MS) return;
+  // Names the file a stall was spent on, so the next freeze is attributable.
+  process.emitWarning(`sync file lock wait ${Math.round(waitedMs)}ms on ${path.basename(filePath)} (${outcome})`, { code: 'CLEM_SYNC_LOCK_WAIT' });
 }
 
 /** Park the thread synchronously without burning CPU. Used only by the
@@ -697,10 +718,13 @@ export function withFileLockSync<T>(filePath: string, work: () => T): T {
   assertFileLockIsNotReentrant(filePath);
   const startedAt = Date.now();
   let lease = tryAcquireFileLock(filePath);
-  while (!lease && Date.now() - startedAt < SYNC_LOCK_MAX_WAIT_MS) {
+  // Held by async work on this thread: proceed now, as the best-effort
+  // contract already does after its wait, instead of freezing the loop.
+  while (!lease && !heldByThisThreadAsync(filePath) && Date.now() - startedAt < SYNC_LOCK_MAX_WAIT_MS) {
     sleepSync(LOCK_RETRY_MS);
     lease = tryAcquireFileLock(filePath);
   }
+  noteSlowSyncLockWait(filePath, Date.now() - startedAt, lease ? 'acquired' : 'proceeded');
   try {
     return runWithHeldFileLockSync(filePath, work);
   } finally {
@@ -717,8 +741,19 @@ export function withFileLockSyncStrict<T>(filePath: string, work: () => T): T {
   assertFileLockIsNotReentrant(filePath);
   const startedAt = Date.now();
   let lease = tryAcquireFileLock(filePath);
+  if (!lease && heldByThisThreadAsync(filePath)) {
+    // The same retryable failure the timeout raises, without the frozen wait.
+    throw new BoundaryError({
+      kind: 'state.write_failed',
+      retryable: true,
+      userMessage: `Couldn't get a write lock on ${path.basename(filePath)} — it is busy. Try again.`,
+      operatorMessage: `withFileLockSyncStrict: ${filePath} is held by async work on this thread; a sync wait cannot succeed`,
+      context: { filePath, waitedMs: 0, reason: 'held_by_this_thread_async' },
+    });
+  }
   while (!lease) {
     if (Date.now() - startedAt > LOCK_MAX_WAIT_MS) {
+      noteSlowSyncLockWait(filePath, Date.now() - startedAt, 'timed_out');
       throw new BoundaryError({
         kind: 'state.write_failed',
         retryable: true,
@@ -730,6 +765,7 @@ export function withFileLockSyncStrict<T>(filePath: string, work: () => T): T {
     sleepSync(LOCK_RETRY_MS);
     lease = tryAcquireFileLock(filePath);
   }
+  noteSlowSyncLockWait(filePath, Date.now() - startedAt, 'acquired');
   try {
     return runWithHeldFileLockSync(filePath, work);
   } finally {

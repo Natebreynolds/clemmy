@@ -521,3 +521,32 @@ test('atomicAppendNdjson rejects multi-line input (caller bug)', async () => {
   assert.equal((caught as InstanceType<typeof BoundaryError>).kind, 'state.write_failed');
   assert.ok(!existsSync(file), 'file should not be created on caller-input error');
 });
+
+// The 14–56 s main-thread freezes when scheduled workflows started: a timer on
+// the main thread asked SYNCHRONOUSLY for a file lock that async work on the
+// same thread held across an await. The holder needs the event loop the sync
+// waiter is blocking, so the wait always ran to its full timeout.
+test('a sync strict lock held by async work on this thread fails fast instead of freezing the loop', async () => {
+  const target = path.join(TMP, 'held-by-async.json');
+  let releaseHolder!: () => void;
+  const holding = new Promise<void>((resolve) => { releaseHolder = resolve; });
+  let entered!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const holder = withFileLock(target, async () => { entered(); await holding; });
+  await inside;
+  const startedAt = Date.now();
+  assert.throws(
+    () => withFileLockSyncStrict(target, () => 'never'),
+    (err: unknown) => err instanceof BoundaryError && err.retryable === true
+      && err.context.reason === 'held_by_this_thread_async',
+  );
+  assert.ok(Date.now() - startedAt < 500, `strict wait must not freeze the thread (took ${Date.now() - startedAt} ms)`);
+  // The best-effort variant proceeds at once, as its contract already allows after a wait.
+  const bestEffortStartedAt = Date.now();
+  assert.equal(withFileLockSync(target, () => 'ran'), 'ran');
+  assert.ok(Date.now() - bestEffortStartedAt < 500, 'best-effort wait must not freeze the thread');
+  releaseHolder();
+  await holder;
+  // Once released, the strict lock is ordinary again.
+  assert.equal(withFileLockSyncStrict(target, () => 'acquired'), 'acquired');
+});
