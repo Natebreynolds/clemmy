@@ -34,6 +34,8 @@ export function Composer({
   placeholder = 'Ask Clementine anything…',
   sessionId,
   agentSlot,
+  agentId,
+  applyAgent,
 }: {
   busy: boolean;
   mode?: ComposerMode;
@@ -54,6 +56,12 @@ export function Composer({
   /** A chip drawn beside the model chip — the agent this thread works in.
    *  The composer stays generic; the surface decides what goes here. */
   agentSlot?: ReactNode;
+  /** The agent chip's choice (null = Clem): the model chip names that
+   *  agent's own model when it answers. Undefined where no agent applies. */
+  agentId?: string | null;
+  /** Apply the agent chip's choice now, so a model picked in this
+   *  conversation is the one that answers it. */
+  applyAgent?: () => Promise<unknown>;
 }) {
   const [value, setValue] = useState('');
   const [deliveryError, setDeliveryError] = useState('');
@@ -266,7 +274,7 @@ export function Composer({
 
         <div className="ml-auto flex min-w-0 items-center gap-1.5">
           {agentSlot}
-          <ModelPicker sessionId={sessionId} />
+          <ModelPicker sessionId={sessionId} agentId={agentId} applyAgent={applyAgent} />
         </div>
 
         {/* Offered only where the browser actually provides speech recognition —

@@ -17,7 +17,7 @@ import { haptic } from '../lib/native-bridge';
  * connecting a new brain is the Mac's job. Mirrors the console's no-restart
  * contract: a switch applies to your next message.
  */
-export function BrainSheet({ open, onClose, onChanged, sessionId }: {
+export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent, beforeChange }: {
   open: boolean;
   onClose: () => void;
   /** Fired after a successful switch so hosts can refresh their own view. */
@@ -27,6 +27,11 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
    *  switch really applies to its next message; without it the switch is
    *  global-only and steers new conversations. */
   sessionId?: string;
+  /** An agent's own model answers the next message (owner, 10-02); a pick
+   *  here in the conversation answers it instead. */
+  answeringAgent?: { modelId: string; agentName: string } | null;
+  /** Apply the chat's pending agent choice first, so the pick is the later one. */
+  beforeChange?: () => Promise<void>;
 }) {
   const [settings, setSettings] = useState<ModelSettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -81,6 +86,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
     setSwitchError(null);
     setSwitched(null);
     try {
+      if (sessionId) await beforeChange?.().catch(() => undefined);
       await setBrain(value, sessionId);
       haptic('light');
       setSwitched(label);
@@ -95,8 +101,11 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
     }
   };
 
-  const current = settings?.options.find((o) => o.value === settings.effectiveValue);
-  const currentLabel = current?.label ?? settings?.brain.modelId ?? '';
+  // The agent's own model, when it answers, is the current one here.
+  const agentOption = answeringAgent ? settings?.options.find((o) => o.value.endsWith(`:${answeringAgent.modelId}`)) : undefined;
+  const currentValue = answeringAgent ? agentOption?.value ?? '' : settings?.effectiveValue;
+  const current = settings?.options.find((o) => o.value === currentValue);
+  const currentLabel = answeringAgent ? agentOption?.label ?? answeringAgent.modelId : current?.label ?? settings?.brain.modelId ?? '';
 
   return (
     <div class="brain-layer" role="dialog" aria-modal="true" aria-labelledby="brain-sheet-title">
@@ -119,7 +128,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
               <span class="brain-dot ok" aria-hidden="true" />
               <div class="min-w-0">
                 <div class="brain-current-name truncate">{currentLabel}</div>
-                <div class="brain-current-meta">{sessionId ? 'Answers your next message' : 'Answers new conversations'}</div>
+                <div class="brain-current-meta">{answeringAgent ? `${answeringAgent.agentName}’s own model` : sessionId ? 'Answers your next message' : 'Answers new conversations'}</div>
               </div>
             </div>
             {settings.brain.inactiveBinding && settings.brain.inactiveBinding.modelId !== settings.brain.modelId ? (
@@ -130,7 +139,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
 
             <div class="brain-roster" role="list">
               {settings.options.map((option) => {
-                const isCurrent = option.value === settings.effectiveValue;
+                const isCurrent = option.value === currentValue;
                 return (
                   <button
                     key={option.value}
@@ -155,13 +164,19 @@ export function BrainSheet({ open, onClose, onChanged, sessionId }: {
 
             {switched ? (
               <p class="brain-note switched">
-                Switched to {switched}. {sessionId ? 'Applies to your next message.' : 'Applies to new conversations.'}
+                Switched to {switched}. {sessionId ? 'Applies to your next message.'
+                  : answeringAgent ? `Applies to new conversations; ${answeringAgent.agentName} answers this one on its own model.`
+                  : 'Applies to new conversations.'}
               </p>
             ) : null}
             {switchError ? <p class="error brain-note">{switchError}</p> : null}
             {!switched && !switchError ? (
               <p class="brain-note muted">
-                {sessionId
+                {answeringAgent
+                  ? (sessionId
+                    ? `${answeringAgent.agentName} answers on its own model. Pick another to use it in this conversation.`
+                    : `${answeringAgent.agentName} answers on its own model. Once the conversation starts, you can pick another for it here.`)
+                  : sessionId
                   ? 'Switching applies to your next message. No restart needed.'
                   : 'Switching applies to new conversations. A conversation already underway keeps its model unless you switch from inside it.'}
               </p>

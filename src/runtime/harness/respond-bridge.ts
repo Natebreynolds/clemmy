@@ -79,6 +79,7 @@ import {
   type PendingWorkflowChatDispatchOwnership,
 } from '../../tools/workflow-run-queue.js';
 import { buildOrchestratorAgent } from '../../agents/orchestrator.js';
+import { sessionAgentAnsweringModel } from '../../agents/session-agent-model.js';
 import { executionLaneToolSearchEnabled } from '../../agents/tool-catalog.js';
 import { configureHarnessRuntime } from './codex-client.js';
 import {
@@ -1498,6 +1499,14 @@ export async function respondViaHarness(
       if (error instanceof ConnectionExecutionOwnershipError) return connectionOwnershipChangedResponse(sessionId);
       throw error;
     }
+  }
+
+  // A conversation switched to a saved agent the owner pinned a model to
+  // answers on that model, until the owner picks one for this conversation
+  // (session-agent-model.ts). A resumed connection keeps its own model.
+  if (config.kind === 'chat' && !connection && !opts.modelOverride) {
+    const agentModel = sessionAgentAnsweringModel(sessionId);
+    if (agentModel) opts = { ...opts, modelOverride: agentModel.modelId };
   }
 
   if (!getSession(sessionId)) {

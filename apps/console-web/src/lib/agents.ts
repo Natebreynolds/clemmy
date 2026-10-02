@@ -125,6 +125,18 @@ export const setConversationAgent = (sessionId: string, agentId: string | null) 
     { agentId },
   );
 
+/** An agent's own model, when it answers the next message. */
+export interface AnsweringAgentModel { modelId: string; agentId: string; agentName: string }
+
+/** Whether the next message is answered on an agent's own model: `agentId` is
+ *  the agent chip's choice (null = Clem), applied on send like the switch. */
+export const getAnsweringModel = (sessionId: string | undefined, agentId: string | null) => {
+  const query = new URLSearchParams();
+  if (sessionId) query.set('sessionId', sessionId);
+  query.set('agentId', agentId ?? '');
+  return apiGet<{ agent: AnsweringAgentModel | null }>(`/api/console/answering-model?${query}`).then((r) => r.agent ?? null);
+};
+
 /** The chips a roster card shows: what the agent reaches for first. */
 export function agentReachSummary(agent: AgentRecord, modelLabel?: string | null): string[] {
   const parts: string[] = [];

@@ -403,6 +403,8 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
           onBackground={chat.background}
           placeholder={`Message ${agent.name}…`}
           agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started={!fresh} /><AgentPicker bound={agent.name} /></>}
+          agentId={agent.id}
+          applyAgent={() => agentChoice.prepare(chat.sessionId.current, chat.busy)}
         />
       </div>
     </div>

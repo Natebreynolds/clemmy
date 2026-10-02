@@ -10,6 +10,7 @@ import {
 } from '../agents/agent-record.js';
 import { listSubagentRunsForAgent } from '../agents/subagent-runs.js';
 import { setSessionAgent } from '../agents/session-agent.js';
+import { nextAnsweringAgentModel } from '../agents/session-agent-model.js';
 import { listSessionsForAgent } from './sessions-api.js';
 import { listActiveSkills } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
@@ -130,6 +131,21 @@ export function registerConsoleAgentsRoutes(
         return;
       }
       res.json({ sessionId, agentId: result.agentId, agentName: result.agentName, changed: result.changed });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // The agent's own model when it answers the next message, for the model
+  // chip: `sessionId` is the conversation (absent before it exists), `agentId`
+  // the agent chip's choice ('' = Clem, absent = the conversation's own).
+  app.get('/api/console/answering-model', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const rawSession = typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : '';
+      const sessionId = rawSession.startsWith('harness:') ? rawSession.slice('harness:'.length) : rawSession;
+      const agentId = typeof req.query.agentId === 'string' ? req.query.agentId.trim() || null : undefined;
+      res.json({ agent: nextAnsweringAgentModel(sessionId || null, agentId) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

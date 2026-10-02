@@ -1,4 +1,5 @@
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
+import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
 import { activateConnectionExecution } from '../runtime/harness/connection-execution-activation.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
@@ -16463,6 +16464,9 @@ export function registerConsoleRoutes(
       // sessionId ⇒ no pin is touched: other live conversations keep theirs.
       if (switchSessionId) {
         try { pinSessionBrain(switchSessionId); } catch { /* pin is affinity, never a switch blocker */ }
+        // The owner chose this conversation's model: it now answers over an
+        // agent's pinned model (session-agent-model.ts).
+        try { recordBrainChosenForSession(switchSessionId); } catch { /* never a switch blocker */ }
       }
 
       res.json({ activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot() });

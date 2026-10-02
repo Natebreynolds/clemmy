@@ -4,6 +4,11 @@
  * write the same setting mobile's chip writes and re-pin THIS conversation;
  * workers and judge are global today and the popover says so.
  *
+ * An agent the owner pinned a model to answers on that model from the switch
+ * (owner, 10-02); the chip names it, and a model picked here afterwards
+ * answers this conversation instead. The agent chip's choice is applied first
+ * so the pick lands after the switch.
+ *
  * The popover is drawn at the top of the page and placed against the WINDOW
  * (lib/popover-placement.ts): the composer also lives in narrow, scrolling
  * places — a Space's 400px Ask Clem dock — whose overflow cut a 420px card
@@ -15,7 +20,9 @@ import { Link } from 'react-router-dom';
 import { ChevronUp, Info } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
-import { PROVIDER_LABEL, roleLabel, shortModelLabel, useModelRoles, type BrainChoice } from '@/lib/model-roles';
+import { PROVIDER_LABEL, brainProvider, friendlyModelLabel, roleLabel, shortModelLabel, useModelRoles, type BrainChoice } from '@/lib/model-roles';
+import { getAnsweringModel } from '@/lib/agents';
+import { usePoll } from '@/lib/poll';
 import { ClaudeLoginForm } from '@/screens/settings/ClaudeLoginForm';
 import { placePopover } from '@/lib/popover-placement';
 
@@ -93,8 +100,22 @@ function Roster({ rows, value, busy, onPick }: { rows: BrainChoice[]; value: str
   );
 }
 
-export function ModelPicker({ sessionId, className }: { sessionId?: string; className?: string }) {
+export function ModelPicker({ sessionId, agentId, applyAgent, className }: {
+  sessionId?: string;
+  /** The agent chip's choice (null = Clem); undefined where no agent applies. */
+  agentId?: string | null;
+  applyAgent?: () => Promise<unknown>;
+  className?: string;
+}) {
   const roles = useModelRoles({ sessionId });
+  const asksAgent = typeof agentId === 'string' && agentId.length > 0;
+  const answering = usePoll(
+    ['answering-model', sessionId ?? null, agentId ?? null],
+    () => getAnsweringModel(sessionId, agentId ?? null),
+    0,
+    { enabled: asksAgent },
+  );
+  const agentModel = asksAgent ? answering.data ?? null : null;
   const [open, setOpen] = useState(false);
   const [roster, setRoster] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -173,8 +194,22 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
     if (picked !== null && roles.saved === 'brain' && !roles.fetching && roles.brainValue === picked) setPicked(null);
   }, [picked, roles.saved, roles.fetching, roles.brainValue]);
   if (!mr) return null;
-  const brain = shortModelLabel(roleLabel(mr, 'brain'));
-  const brainProv = mr.roles.brain.provider;
+  // The agent's own model answers: name it, from the roster when it is there.
+  const agentOption = agentModel ? (mr.brainOptions ?? []).find((o) => o.value.endsWith(`:${agentModel.modelId}`)) : undefined;
+  const brain = agentModel
+    ? shortModelLabel(friendlyModelLabel(agentOption?.label ?? agentModel.modelId))
+    : shortModelLabel(roleLabel(mr, 'brain'));
+  const brainProv = agentModel ? (agentOption ? brainProvider(agentOption.value) : 'unknown') : mr.roles.brain.provider;
+  const rosterValue = agentModel ? agentOption?.value ?? '' : roles.brainValue;
+  const pickBrain = (value: string) => {
+    setRoster(false);
+    setPicked(value);
+    void (async () => {
+      // A pending agent switch lands first, so this pick is the later choice.
+      if (sessionId) { try { await applyAgent?.(); } catch { /* the next send applies it */ } }
+      await roles.onBrain(value);
+    })();
+  };
   const workerProv = mr.roles.worker.provider;
   const judgeProv = mr.roles.judge.provider;
   const busy = roles.busy !== null;
@@ -186,7 +221,7 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
         onClick={() => (open ? close(false) : setOpen(true))}
         aria-expanded={open}
         aria-haspopup="dialog"
-        title="Models for this conversation — who answers, who helps, who checks"
+        title={agentModel ? `${agentModel.agentName} answers on its own model, ${brain}` : 'Models for this conversation — who answers, who helps, who checks'}
         className="inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1 pl-2 pr-2.5 text-small font-semibold text-fg shadow-xs transition-colors hover:border-border-strong"
       >
         <span className="h-2 w-2 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden />
@@ -205,13 +240,13 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
           className="z-[120] overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-border bg-surface pb-1 pt-2 shadow-lg outline-none"
         >
           <div className={ROLE_ROW}>
-            <span><span className="block text-small font-semibold text-fg">Does the work</span><span className="block text-caption text-faint">{sessionId ? 'answers your next message' : 'answers new conversations'}</span></span>
+            <span><span className="block text-small font-semibold text-fg">Does the work</span><span className="block text-caption text-faint">{agentModel ? `${agentModel.agentName}’s own model` : sessionId ? 'answers your next message' : 'answers new conversations'}</span></span>
             <button type="button" onClick={() => setRoster((v) => !v)} aria-expanded={roster} disabled={busy} title={brain} className={ROLE_TRIGGER}>
               <span className="inline-flex min-w-0 items-center gap-2"><span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden /><span className="truncate">{brain}</span></span>
               <ChevronUp className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform', !roster && 'rotate-180')} aria-hidden />
             </button>
           </div>
-          {roster && <Roster rows={roles.brains} value={roles.brainValue} busy={busy} onPick={(v) => { setRoster(false); setPicked(v); void roles.onBrain(v); }} />}
+          {roster && <Roster rows={roles.brains} value={rosterValue} busy={busy} onPick={pickBrain} />}
           {roles.claudeSignInFor && <div className="mx-4 mb-2"><ClaudeLoginForm embedded /></div>}
           <div className={cn(ROLE_ROW, 'border-t border-border')}>
             <span><span className="block text-small font-semibold text-fg">Helps in parallel</span><span className="block text-caption text-faint">side tasks · everywhere</span></span>
@@ -245,8 +280,15 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
             <span className="min-w-0 flex-1" role={roles.error || brainMismatch ? 'alert' : 'status'}>
               {roles.error ? <span className="text-danger">{roles.error}</span>
                 : brainMismatch ? <span className="text-danger">That change didn’t take: Clem is still on {brain}. Try again, or check Settings.</span>
-                : roles.saved && !roles.fetching ? <span className="text-success">Saved · takes effect on your next message</span>
-                : busy || roles.fetching ? 'Switching…' : 'Takes effect on your next message.'}
+                : roles.saved && !roles.fetching && !answering.isFetching ? (agentModel
+                  // Saved as the owner's model, and the agent's own still answers here.
+                  ? `Saved as your model. ${agentModel.agentName} still answers here on its own model${sessionId ? ' — pick again to change that.' : '; once this conversation starts, you can pick another for it here.'}`
+                  : <span className="text-success">Saved · takes effect on your next message</span>)
+                : busy || roles.fetching ? 'Switching…'
+                : agentModel ? (sessionId
+                  ? `${agentModel.agentName} answers on its own model. Pick another above to use it in this conversation.`
+                  : `${agentModel.agentName} answers on its own model. Once the conversation starts, you can pick another for it here.`)
+                : 'Takes effect on your next message.'}
             </span>
             <Link to="/settings#models" className="shrink-0 underline underline-offset-2 hover:text-muted">All settings</Link>
           </div>

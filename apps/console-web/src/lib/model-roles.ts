@@ -145,7 +145,12 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     return () => window.clearInterval(timer);
   }, [qc, mr?.discovery?.refreshing]);
 
-  const refresh = () => { void qc.invalidateQueries({ queryKey: ['settings'] }); };
+  // A pick in a conversation also decides whether an agent's own model still
+  // answers it (the model chip reads that).
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: ['settings'] });
+    void qc.invalidateQueries({ queryKey: ['answering-model'] });
+  };
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key); setError(null); setSaved(null);
     try { await fn(); setSaved(key); refresh(); }

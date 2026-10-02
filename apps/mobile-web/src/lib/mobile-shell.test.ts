@@ -250,3 +250,16 @@ test('Projects is a primary place, deep-linkable, and settles the shared Needs-y
   const deepLink = read('./deep-link.ts');
   assert.match(deepLink, /if \(input\.tab === 'projects' && input\.projectId\) params\.set\('project', input\.projectId\);/);
 });
+
+test('an agent pinned to a model: the chat chip names it, and a pick in the conversation lands after the switch', () => {
+  const chat = read('../screens/Chat.tsx');
+  const sheet = read('../components/BrainSheet.tsx');
+  const api = read('./api.ts');
+  assert.match(api, /\/m\/api\/chat\/answering-model\?/, 'the phone asks the daemon what answers next');
+  assert.match(chat, /getAnsweringModel\(answeringSessionId, answeringAgentId\)/);
+  assert.match(chat, /modelDisplayName\(agentModel\?\.modelId \?\? brainLabel\)/, 'the chip names the agent\'s own model when it answers');
+  assert.match(chat, /answeringAgent=\{agentModel\}/);
+  assert.match(chat, /beforeChange=\{\(\) => applyAgentChoice\(/);
+  assert.match(sheet, /await beforeChange\?\.\(\)[\s\S]{0,80}await setBrain\(value, sessionId\)/,
+    'a pending agent switch lands before the pick, so the pick is the later choice');
+});

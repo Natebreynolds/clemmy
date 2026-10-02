@@ -47,3 +47,17 @@ test('the helper and checker stay native selects with a full-width label, in the
   assert.doesNotMatch(SOURCE, />Brain<|>Workers<|>Judge</, 'one vocabulary with the phone and Settings');
   assert.equal([...SOURCE.matchAll(/<RoleSelect/g)].length, 2);
 });
+
+test('an agent pinned to a model: the chip names it on every composer, and a pick in the conversation lands after the switch', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  assert.match(SOURCE, /getAnsweringModel\(sessionId, agentId \?\? null\)/, 'the chip asks the daemon what answers next');
+  assert.match(SOURCE, /const brain = agentModel\s*\?/, 'the chip names the agent\'s own model when it answers');
+  assert.match(SOURCE, /await applyAgent\?\.\(\);[\s\S]{0,160}await roles\.onBrain\(value\)/,
+    'a pending agent switch lands before the pick, so the pick is the later choice');
+  assert.match(read('../../lib/model-roles.ts'), /invalidateQueries\(\{ queryKey: \['answering-model'\] \}\)/,
+    'a pick re-reads what answers next');
+  assert.match(read('./Composer.tsx'), /<ModelPicker sessionId=\{sessionId\} agentId=\{agentId\} applyAgent=\{applyAgent\} \/>/);
+  for (const site of ['../../features/conversations/chat/ConversationThread.tsx', '../../screens/Chat.tsx', '../../screens/Home.tsx', '../../screens/AgentWorkspace.tsx']) {
+    assert.match(read(site), /agentId=\{/, `${site} tells the chip which agent answers`);
+  }
+});

@@ -1791,6 +1791,41 @@ test('respondPreferHarness: Codex OAuth chat keeps the same shared host route', 
   assert.equal(res.route?.transport, 'host_harness');
 });
 
+test('respondPreferHarness: a conversation switched to an agent pinned to a model answers on that model', async (t) => {
+  // Owner, 10-02: an agent pinned to Claude answers on Claude when the chat
+  // is switched to it, whatever the owner's own model is.
+  process.env.AUTH_MODE = 'codex_oauth';
+  process.env.OPENAI_MODEL_PRIMARY = 'gpt-5.5';
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const agentModel = await import('../../agents/session-agent-model.js');
+  agentModel._setSessionAgentModelDepsForTests({ live: () => true });
+  t.after(() => agentModel._setSessionAgentModelDepsForTests({}));
+  const saved = createAgentRecord({ name: 'Bridge Pinned Agent', handles: 'Answers on its own model', model: 'claude-sonnet-4-6' });
+  assert.ok(saved.ok);
+  if (!saved.ok) return;
+  const sessionId = 'agent-pinned-model-route';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop' });
+  assert.equal(setSessionAgent(sessionId, saved.agent.id, { by: 'owner' }).ok, true);
+  const builtWith: Array<string | undefined> = [];
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: (async (input: { model?: string }) => { builtWith.push(input.model); return FAKE_AGENT; }) as never,
+    runConversation: (async (opts: { sessionId: string; buildAgent?: (identity: unknown) => Promise<unknown> }) => {
+      await opts.buildAgent?.(stubBuildIdentity(opts as never));
+      return { sessionId: opts.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'answered as the agent', done: true, nextAction: 'completed' } };
+    }) as never,
+  });
+  const res = await respondPreferHarness('home', { message: 'hi', sessionId }, async (req) => ({ text: 'legacy', sessionId: req.sessionId }));
+  assert.equal(res.text, 'answered as the agent');
+  assert.equal(res.route?.effectiveModel, 'claude-sonnet-4-6', 'the agent\'s model, not the owner\'s gpt-5.5');
+  assert.equal(res.route?.provider, 'claude');
+  assert.deepEqual(builtWith, ['claude-sonnet-4-6'], 'the turn is built on the agent\'s model');
+  const routed = listEvents(sessionId, { types: ['turn_model_routed'] });
+  assert.equal(routed.at(-1)?.data.model, 'claude-sonnet-4-6');
+});
+
 test('respondPreferHarness: shared Claude host binds an exact compound decline without legacy graph entry', async (t) => {
   // Fresh production chat enters host_v1 before semantic graph compilation;
   // task-continuation authority still narrows private retrieval semantics to

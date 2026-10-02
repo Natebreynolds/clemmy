@@ -10,6 +10,7 @@ import { Users } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { usePoll } from '@/lib/poll';
 import { listAgents, type AgentRecord, type ConversationAgent } from '@/lib/agents';
+import { friendlyModelLabel } from '@/lib/model-roles';
 import { CHOICE_CHIP, ChoiceChip } from './ChoiceChip';
 
 export function AgentPicker({
@@ -67,9 +68,9 @@ export function AgentPicker({
   );
 }
 
-/** What the agent handles, and the model its helpers run on when it names one
- *  (the conversation itself keeps the model chip's choice). */
+/** What the agent handles, and the model it answers on when it names one
+ *  (until a model is picked in the conversation on the model chip). */
 function agentNote(agent: AgentRecord): string {
-  const helpers = agent.model ? `helpers on ${agent.model}` : '';
-  return [agent.handles, helpers].filter(Boolean).join(' · ');
+  const model = agent.model ? `on ${friendlyModelLabel(agent.model)}` : '';
+  return [agent.handles, model].filter(Boolean).join(' · ');
 }

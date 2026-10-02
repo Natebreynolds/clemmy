@@ -130,6 +130,7 @@ export function Chat() {
     ]);
     await chat.send({ ...input, ...addressed, ...placed });
   };
+  const applyAgent = () => agentChoice.prepare(chat.sessionId.current, chat.busy);
   const agentSlot = (
     <>
       <ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} started={hasThread} />
@@ -223,7 +224,7 @@ export function Chat() {
       <div className="flex h-full min-h-0 flex-col">
         <div className="min-h-0 flex-1" />
         <div className={CHAT_COMPOSER_WRAP}>
-          <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} />
+          <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} agentId={agent?.id ?? null} applyAgent={applyAgent} />
         </div>
       </div>
     );
@@ -265,7 +266,7 @@ export function Chat() {
         </div>
       </div>
       <div className={CHAT_COMPOSER_WRAP}>
-        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} />
+        <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} agentId={agent?.id ?? null} applyAgent={applyAgent} />
       </div>
     </div>
   );

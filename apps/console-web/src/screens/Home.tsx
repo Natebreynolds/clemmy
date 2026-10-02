@@ -378,6 +378,7 @@ function LiveHome() {
           onStop={chat.stop}
           agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} /></>}
           placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined}
+          agentId={agentChoice.chosen?.id ?? null}
         />
         {shown('quick_actions') && (
           <QuickActions

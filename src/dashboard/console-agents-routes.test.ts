@@ -240,3 +240,36 @@ test('POST /api/console/sessions/:id/agent switches who answers next; auth gated
     await close();
   }
 });
+
+test('GET /api/console/answering-model names an agent\'s own model for the model chip; a pick in the conversation wins', async () => {
+  const { createSession } = await import('../runtime/harness/eventlog.js');
+  const { _setSessionAgentModelDepsForTests, recordBrainChosenForSession } = await import('../agents/session-agent-model.js');
+  _setSessionAgentModelDepsForTests({ live: () => true });
+  const auth = { v: true };
+  const { url, close } = await boot(auth);
+  const read = async (query: string) => (await fetch(`${url}/api/console/answering-model?${query}`)).json() as Promise<{ agent: { modelId: string; agentName: string } | null }>;
+  try {
+    const created = await fetch(`${url}/api/console/agents`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Chip Designer', handles: 'Design work.', model: 'claude-opus-5-5' }),
+    });
+    const agent = ((await created.json()) as { agent: Agent }).agent;
+    // A new conversation about to open inside the agent.
+    assert.deepEqual((await read(`agentId=${agent.id}`)).agent, { modelId: 'claude-opus-5-5', agentId: agent.id, agentName: 'Chip Designer' });
+    assert.equal((await read('agentId=')).agent, null, 'Clem with no agent');
+
+    const session = createSession({ kind: 'chat', title: 'chip' });
+    await fetch(`${url}/api/console/sessions/${session.id}/agent`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentId: agent.id }),
+    });
+    assert.equal((await read(`sessionId=harness:${session.id}&agentId=${agent.id}`)).agent?.modelId, 'claude-opus-5-5');
+    recordBrainChosenForSession(session.id, new Date(Date.now() + 1_000));
+    assert.equal((await read(`sessionId=${session.id}&agentId=${agent.id}`)).agent, null, 'the owner\'s later pick answers');
+
+    auth.v = false;
+    assert.equal((await fetch(`${url}/api/console/answering-model?agentId=${agent.id}`)).status, 401);
+  } finally {
+    _setSessionAgentModelDepsForTests({});
+    await close();
+  }
+});

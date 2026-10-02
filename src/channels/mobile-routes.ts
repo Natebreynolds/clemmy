@@ -1,4 +1,5 @@
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
+import { nextAnsweringAgentModel, recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { getStorageInventory } from '../runtime/storage-inventory.js';
 import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
@@ -3811,6 +3812,19 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     }
   });
 
+  // The agent's own model when it answers the next message, for the chat's
+  // model chip — the desktop chip's read: `agentId` '' = Clem, absent = the
+  // conversation's own agent.
+  router.get('/api/chat/answering-model', requireMobileSession, (req, res) => {
+    try {
+      const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : '';
+      const agentId = typeof req.query.agentId === 'string' ? req.query.agentId.trim() || null : undefined;
+      res.json({ agent: nextAnsweringAgentModel(sessionId || null, agentId) });
+    } catch {
+      res.status(500).json({ error: 'ANSWERING_MODEL_FAILED' });
+    }
+  });
+
   router.get('/api/chat/sessions/:sessionId', requireMobileSession, (req, res) => {
     const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId;
     const session = harnessGetSession(sessionId);
@@ -6214,6 +6228,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       if (switchSessionId) {
         const { pinSessionBrain } = await import('../runtime/harness/model-roles.js');
         try { pinSessionBrain(switchSessionId); } catch { /* pin is affinity, never a switch blocker */ }
+        // The owner chose this conversation's model: it now answers over an
+        // agent's pinned model (session-agent-model.ts).
+        try { recordBrainChosenForSession(switchSessionId); } catch { /* never a switch blocker */ }
       }
 
       res.json({

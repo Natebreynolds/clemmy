@@ -64,19 +64,19 @@ export function setSessionAgent(
     db.prepare(
       `UPDATE sessions SET
          metadata_json = json_set(COALESCE(metadata_json, '{}'),
-           '$.agentId', ?, '$.agentName', ?, '$.agentIds', json(?), '$.agentSetBy', ?),
+           '$.agentId', ?, '$.agentName', ?, '$.agentIds', json(?), '$.agentSetBy', ?, '$.agentSetAt', ?),
          updated_at = ?
        WHERE id = ?`,
-    ).run(agent.id, agent.name, JSON.stringify(agentIds), opts.by, now, sessionId);
+    ).run(agent.id, agent.name, JSON.stringify(agentIds), opts.by, now, now, sessionId);
   } else {
     db.prepare(
       `UPDATE sessions SET
          metadata_json = json_set(
            json_remove(COALESCE(metadata_json, '{}'), '$.agentId', '$.agentName'),
-           '$.agentIds', json(?), '$.agentSetBy', ?),
+           '$.agentIds', json(?), '$.agentSetBy', ?, '$.agentSetAt', ?),
          updated_at = ?
        WHERE id = ?`,
-    ).run(JSON.stringify(current.agentIds), opts.by, now, sessionId);
+    ).run(JSON.stringify(current.agentIds), opts.by, now, now, sessionId);
   }
   forgetSessionMemoryScope(sessionId);
   return { ok: true, changed: true, agentId: agent?.id ?? null, agentName: agent?.name ?? null };

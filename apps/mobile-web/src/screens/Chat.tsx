@@ -76,7 +76,7 @@ import { replySpeakers } from '../lib/chat-speakers';
 import { refusalWords } from '../lib/project-words';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
-import { getModelSettings } from '../lib/api';
+import { getAnsweringModel, getModelSettings, type AnsweringAgentModel } from '../lib/api';
 import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
 import { Composer } from '../components/Composer';
@@ -284,6 +284,20 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const takesAgent = !(snapshot?.sessionId ?? initialSessionId ?? '').startsWith('space-');
   const showAgentChip = takesAgent && (Boolean(agent) || (agentChoices?.length ?? 0) > 0);
   const agentLabel = agent?.name || (agent ? 'Agent' : 'Clem');
+  // An agent pinned to a model answers on it (owner, 10-02): the model chip
+  // names it, read again whenever the agent, the conversation or the brain changes.
+  const answeringSessionId = snapshot?.sessionId ?? initialSessionId ?? undefined;
+  const answeringAgentId = takesAgent ? agent?.id ?? null : null;
+  const [agentModel, setAgentModel] = useState<AnsweringAgentModel | null>(null);
+  const [brainTick, setBrainTick] = useState(0);
+  useEffect(() => {
+    if (!answeringAgentId) { setAgentModel(null); return; }
+    let cancelled = false;
+    getAnsweringModel(answeringSessionId, answeringAgentId)
+      .then((result) => { if (!cancelled) setAgentModel(result); })
+      .catch(() => { if (!cancelled) setAgentModel(null); });
+    return () => { cancelled = true; };
+  }, [answeringSessionId, answeringAgentId, brainTick]);
   const agentMarks = agentThreadMarks(messages, agent?.name ?? null);
   const speakers = replySpeakers(messages, agentMarks);
   // A Space dock works in its Space, never in a project.
@@ -337,23 +351,26 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     setAgentPickOpen(false);
   }
 
+  /** Tell the daemon about the agent chip. Only when the chip changed: a
+   *  plain follow-up must never wait on, or fail on, a switch to what the
+   *  conversation already has (live 09-26: that call failed and every
+   *  follow-up in an existing thread was silently dropped). */
+  async function applyAgentChoice(sessionId: string | null | undefined) {
+    const wanted = agent?.id ?? null;
+    if (!sessionId || busy || !takesAgent || wanted === sessionAgentId.current) return;
+    const result = await switchChatAgent(sessionId, wanted);
+    sessionAgentId.current = result.agentId ?? null;
+    // Who actually replies (a deleted agent falls back to Clem).
+    if ((result.agentId ?? null) !== wanted) {
+      setAgent(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
+    }
+  }
+
   /** Send a new message to whoever the chip names. A message sent while a
    *  reply runs steers that reply; the choice waits for the next one. */
   async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = []) {
     const sessionId = snapshot?.sessionId;
-    // The daemon is told about the chip only when the chip changed: a plain
-    // follow-up must never wait on, or fail on, a switch to what the
-    // conversation already has (live 09-26: that call failed and every
-    // follow-up in an existing thread was silently dropped).
-    const wanted = agent?.id ?? null;
-    if (sessionId && !busy && takesAgent && wanted !== sessionAgentId.current) {
-      const result = await switchChatAgent(sessionId, wanted);
-      sessionAgentId.current = result.agentId ?? null;
-      // Who actually replies (a deleted agent falls back to Clem).
-      if ((result.agentId ?? null) !== wanted) {
-        setAgent(result.agentId ? { id: result.agentId, name: result.agentName ?? '' } : null);
-      }
-    }
+    await applyAgentChoice(sessionId);
     // The same rule for the project: told only when it changed.
     const wantedProject = project?.id ?? null;
     if (sessionId && !busy && takesAgent && wantedProject !== sessionProjectId.current) {
@@ -594,8 +611,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         <BrainSheet
           open={brainOpen}
           onClose={() => setBrainOpen(false)}
-          onChanged={loadBrain}
+          onChanged={() => { loadBrain(); setBrainTick((n) => n + 1); }}
           sessionId={snapshot?.sessionId ?? initialSessionId ?? undefined}
+          answeringAgent={agentModel}
+          beforeChange={() => applyAgentChoice(snapshot?.sessionId ?? initialSessionId ?? undefined)}
         />
         {connection === 'recovering' || connection === 'connecting' ? (
           <div class="conn-pill conn-recovering">reconnecting…</div>
@@ -695,14 +714,14 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
               >
                 {executing ? 'Executing plan' : planning ? 'Plan' : 'Act'}
               </button>
-              {brainLabel ? (
+              {brainLabel || agentModel ? (
                 <button
                   type="button"
                   class="composer-chip brain-chip"
-                  title="Does the work: the model that answers your next message"
+                  title={agentModel ? `${agentModel.agentName} answers on its own model` : 'Does the work: the model that answers your next message'}
                   onClick={() => { haptic('light'); setBrainOpen(true); }}
                 >
-                  <span class="truncate">{modelDisplayName(brainLabel)}</span>
+                  <span class="truncate">{modelDisplayName(agentModel?.modelId ?? brainLabel)}</span>
                 </button>
               ) : null}
             </>
