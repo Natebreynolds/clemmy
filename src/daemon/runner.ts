@@ -1402,8 +1402,8 @@ function reportBootSetupIssues(): void {
     if (!bootAuthSetupSatisfied(auth.configured)) {
       issues.push({
         slug: 'auth',
-        title: 'Authentication not configured — agent runs will fail',
-        body: `${auth.message}\n\nOpen the desktop app → Settings → Re-authenticate, or run \`clementine auth login\`. Until this is fixed, cron jobs, workflows, chat, and background tasks all error out.`,
+        title: 'Set up a model so Clem can work',
+        body: `${auth.message}\n\nOpen the desktop app → Settings → Models to sign in, or run \`clementine auth login\`. Until a model is set up, chat, workflows and background tasks cannot run; scheduled jobs wait instead of failing.`,
       });
     }
   } catch (err) {
