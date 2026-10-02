@@ -126,3 +126,36 @@ The first phone build rejected a discriminated union whose one arm grouped two
 state literals, although the root compiler accepted it. Split those literals
 into separate arms so both compiler versions narrow identically. Rebuild all
 artifacts after this fix; the earlier console-only pass is not a combined build.
+
+## Combined regression run and import-boundary correction
+
+The frozen combined source `305bc3d400389dbd55a129fc421ae10b47260934`
+completed its full suite on October 2 at approximately 10:27 UTC: 19,522 tests,
+19,513 passed, one failed, eight skipped, zero cancellations. The sole failure
+was `held parent and migration child have exact minimal runtime import closures`
+in `src/daemon/cutover-hold-structure.test.ts`. The new exact-history schema and
+decoder leaf was absent from that test's two explicit dependency manifests.
+No new npm package, SDK, credential loader or task runtime entered the migration
+child; the held foreground parent's dependency closure was unchanged.
+
+Corrected both exact manifests to name `accepted-model-history-store.ts`.
+Kept exact equality and the existing package lists; no wildcard allowance or
+weakened boundary. The correction changes a structural test only, not runtime
+behavior. All 36 targeted cases then passed: held startup structure, real
+cutover integration, exact history store/converter, actual maintenance worker,
+and the v3.14 upgrade rehearsal. Full log and targeted log are respectively
+`output/storage-efficiency/combined-full-suite.log` and
+`output/storage-efficiency/final-boundary-pins.log`.
+
+The eight full-suite skips remain unexercised: the no-CLT branch on this CLT
+machine, local exact Facebook retained-data control, the p3 retained draft
+snapshot-dependent replay, and five installed-browser rendering checks. The
+runner's live-home sentinel is also NOT PERFORMED while PID 64188 owns and
+writes the live home. Neither the fixture suite nor this structural correction
+substitutes for installed-app/live-home acceptance. The full suite ran at the
+frozen SHA above; do not describe it as a zero-failure full run at the subsequent
+commit. Rebuild after committing this checkpoint and test correction.
+
+The other branch was rechecked clean at `2ed7effc3` after the run. Its changes
+are included in this candidate. Main and its worktree remain untouched; the
+storage candidate is not installed, scheduled for conversion, or tagged.

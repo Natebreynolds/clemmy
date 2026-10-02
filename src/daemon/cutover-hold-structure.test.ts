@@ -139,6 +139,9 @@ test('held parent and migration child have exact minimal runtime import closures
       'src/daemon/process.ts',
       'src/runtime/build-info.ts',
       'src/runtime/cutover-hold.ts',
+      // Exact-history schema/decoder leaf for v89/v90: Node crypto/zlib only,
+      // with a type-only SQLite import; no SDK, eventlog, credential or task runtime.
+      'src/runtime/harness/accepted-model-history-store.ts',
       // Pure leaf (only a `type` import of better-sqlite3): the v72 async-read
       // refinement schema module rides along with eventlog-schema's migration list.
       'src/runtime/harness/async-read-refinement-schema.ts',
@@ -158,6 +161,7 @@ test('held parent and migration child have exact minimal runtime import closures
   });
   assert.deepEqual(runtimeImportClosure('src/runtime/harness/eventlog-schema.ts'), {
     modules: [
+      'src/runtime/harness/accepted-model-history-store.ts',
       'src/runtime/harness/async-read-refinement-schema.ts',
       // Pure, IO-free leaves the v79/v80 migrations need: the session-history
       // search DDL, the discovery-request digest, and the shared canonical
