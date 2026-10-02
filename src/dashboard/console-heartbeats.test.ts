@@ -98,8 +98,8 @@ test('heartbeats are listed with their contracts, changed by the owner, given ru
     assert.equal(gone.status, 404);
 
     // Noticing: on the same contract, with its own cap, and a thinking record
-    // the owner can read. With no model in this process a tick says so and
-    // proposes nothing.
+    // the owner can read. With no model in this process a tick waits quietly
+    // for one and proposes nothing (a home not set up yet is not a failure).
     const noticing = await send(`${server.url}/api/console/noticing`, 'GET');
     assert.equal(noticing.status, 200, JSON.stringify(noticing.body).slice(0, 200));
     const n = noticing.body.noticing as { enabled: boolean; cadenceMinutes: number; dailyCap: number; thinking: unknown[] };
@@ -113,11 +113,11 @@ test('heartbeats are listed with their contracts, changed by the owner, given ru
     assert.equal(noticed.status, 200, JSON.stringify(noticed.body).slice(0, 300));
     const nt = noticed.body.tick as { summary: string; produced: number; quiet: boolean };
     assert.equal(nt.produced, 0);
-    assert.match(nt.summary, /no model/);
+    assert.match(nt.summary, /waiting until a model is set up/);
     const afterTick = await send(`${server.url}/api/console/noticing`, 'GET');
     const thinking = (afterTick.body.noticing as { thinking: Array<{ summary: string; read: { goals: number } }> }).thinking;
     assert.equal(thinking.length, 1);
-    assert.match(thinking[0]!.summary, /no model/);
+    assert.match(thinking[0]!.summary, /waiting until a model is set up/);
   } finally {
     await server.close();
   }
