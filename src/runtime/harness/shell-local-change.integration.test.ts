@@ -272,3 +272,22 @@ test('a command that leaves the machine is not carried as local work', async () 
   assert.deepEqual(run.dispatches, [], run.history);
   assert.ok(run.bindings.every((row) => row.effect !== 'local_write' || row.capability_id !== ORDINARY), JSON.stringify(run.bindings));
 });
+
+test('a local command that changes files and then exits non-zero returns its exact result and the turn goes on', async () => {
+  // The first steps land; the last one fails. That is a known result, not an
+  // uncertain effect: the model gets the exit code and output and answers.
+  const run = await runShellTurn({
+    id: 'shell-partial-nonzero',
+    prompt: 'Make out-partial, copy assets/brand.css into it, then report its size.',
+    command: "mkdir -p out-partial && cp assets/brand.css out-partial/brand.css && sh -c 'exit 3'",
+    requirementId: ORDINARY,
+  });
+  assert.match(run.history, /exit_code: 3/);
+  assert.match(run.history, /Earlier steps of this command may already have taken effect/);
+  assert.match(run.history, /Done\./, 'the next model step ran');
+  assert.doesNotMatch(run.history, /could not reopen the saved checkpoint/);
+  assert.equal(readFileSync(path.join(WORK, 'out-partial', 'brand.css'), 'utf8'), 'body{color:#123}\n');
+  assert.deepEqual(run.dispatches.map((row) => row.state), ['returned'], 'the command body ran once');
+  assert.equal(run.approvals, 0);
+  assert.equal(run.interrupted, false);
+});

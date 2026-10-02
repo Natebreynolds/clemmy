@@ -1226,10 +1226,16 @@ function runCommand(command: string, cwd: string, timeoutMs: number): Promise<Sh
       const interactiveHint = promptShaped
         ? '\n\n[non-interactive shell] This CLI opened an INTERACTIVE prompt, which cannot work here (no TTY — prompts hang or crash mid-action, and a mutating command may have PARTIALLY completed; verify before retrying). Re-run non-interactively: pass the answers as explicit flags/args (e.g. --account-slug/--site/--team, --yes/--force/--json), or prefix with CI=1 to make the CLI fail fast instead of prompting.'
         : '';
+      // A non-zero exit can follow steps that already ran (mkdir && cp && a
+      // failing last step). Say so, so the next step checks state first.
+      const partialNote = (code ?? 0) !== 0 && !promptShaped
+        ? '[non-zero exit] Earlier steps of this command may already have taken effect; check the current state before running it again.'
+        : '';
       const output = [
         `exit_code: ${code ?? 0}`,
         stdout ? `stdout:\n${stdout}` : '',
         annotated ? `stderr:\n${annotated}${interactiveHint}` : interactiveHint.trim() ? interactiveHint.trim() : '',
+        partialNote,
       ].filter(Boolean).join('\n\n');
       resolve({
         text: output || `exit_code: ${code ?? 0}`,

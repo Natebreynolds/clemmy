@@ -1535,7 +1535,7 @@ for (const candidate of [
 }
 
 for (const variant of ['local_control', 'business_local', 'external', 'admin', 'wrong_parent', 'wrong_source', 'no_failure', 'catalog_binding'] as const) {
-  test(`only the exact returned local coordinator failure may checkpoint model feedback (${variant})`, async () => {
+  test(`a returned local write keeps its exact bytes; external, admin and catalog-bound writes still reconcile (${variant})`, async () => {
     const task = fixture(`Retain the exact ${variant} result, without replay or success.`);
     const callId = `call:coordinator-failure:${variant}`;
     const toolName = 'fixture_coordinator';
@@ -1569,13 +1569,15 @@ for (const variant of ['local_control', 'business_local', 'external', 'admin', '
     const resultItem = projectedTextResult({ callId, toolName, value: payload });
     recordLogicalResult(admitted.admission, resultItem);
     const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
-    if (variant === 'local_control') {
+    // The local envelope's own returned result is a known outcome, whichever
+    // receipt the body wrote; only the effect class and binding decide.
+    if (variant !== 'external' && variant !== 'admin' && variant !== 'catalog_binding') {
       assert.ok(finalized.status === 'committed' || finalized.status === 'existing');
       const recovered = checkpoints.recoverAcceptedModelBatchForRestart({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
       assert.equal(recovered.status, 'ready');
       if (recovered.status !== 'ready') throw new Error(recovered.reason);
       assert.equal(resultText(recovered.checkpoint.history, callId), payload);
-    } else assert.equal(finalized.status, 'evidence_unavailable', 'unknown mutations and unrelated receipts cannot borrow coordinator feedback authority');
+    } else assert.equal(finalized.status, 'evidence_unavailable', 'external, admin and catalog-bound unknown mutations still need reconciliation');
     assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ?').get(task.sessionId) as { n: number }).n, 0);
     assert.equal(bodies, 1, 'failure projection never re-enters the body');
     leases.revokeDispatchLease(task.parentLease);
