@@ -227,7 +227,7 @@ function GoalCard({
 export function Goals() {
   const qc = useQueryClient();
   const [searchParams] = useSearchParams();
-  const [filter, setFilter] = useState<GoalFilter>('all');
+  const [filter, setFilter] = useState<GoalFilter>('active');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [draftNotes, setDraftNotes] = useState('');
@@ -398,7 +398,7 @@ export function Goals() {
   return (
     <Page
       title="Goals"
-      subtitle="Your goals, with Clementine's proposals against them; below, the outcomes her runs track, resume and validate."
+      subtitle="What you're working toward. Clem anchors her work to these and reports against them."
       actions={(
         <Button
           variant="secondary"
@@ -413,6 +413,19 @@ export function Goals() {
     >
       <MyGoals />
 
+      {/* Run bookkeeping is not a goal: each run binds its own objective so
+          completion can be checked, and those are kept here, folded, for the
+          days the reaper keeps them. Open by default only when one needs you. */}
+      <details className="group mt-8 rounded-lg border border-border bg-surface" open={(payload?.counts.parked ?? 0) > 0}>
+        <summary className="flex cursor-pointer list-none flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-3 hover:bg-hover">
+          <span className="text-body font-semibold text-fg">Work Clem is tracking</span>
+          <span className="text-small text-muted">
+            {payload?.counts.active ?? 0} active
+            {(payload?.counts.parked ?? 0) > 0 ? ` · ${payload?.counts.parked} need you` : ''}
+            {' · '}what each run was for, kept a week after it finishes
+          </span>
+        </summary>
+        <div className="border-t border-border px-4 pb-4">
       <div className="mt-6 grid min-w-0 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Active" value={payload?.counts.active ?? 0} tone="info" />
         <StatCard label="Needs you" value={payload?.counts.parked ?? 0} tone="warning" />
@@ -711,6 +724,8 @@ export function Goals() {
           ))
         )}
       </div>
+        </div>
+      </details>
     </Page>
   );
 }

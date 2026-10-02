@@ -168,15 +168,15 @@ export function MyGoals() {
             <Target className="h-5 w-5 text-primary" aria-hidden />
             <h3 className="text-title-sm font-semibold text-fg">Your goals</h3>
           </div>
-          <p className="mt-1 text-small text-muted">What you are working toward. Clementine reads these when she notices things, and proposes against them. Tell her in chat or edit here; both write the same goal.</p>
+          <p className="mt-1 text-small text-muted">Clem reads these when she notices things and proposes against them. Tell her in chat or edit here; both write the same goal.</p>
         </div>
         <Button variant="secondary" size="sm" onClick={() => setAdding((v) => !v)}><Plus size={16} aria-hidden /> {adding ? 'Cancel' : 'Add a goal'}</Button>
       </div>
       {adding ? (
         <Card className="mt-3 p-4">
           <div className="grid gap-2">
-            <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="The goal, in one line" aria-label="New goal title" />
-            <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder="What done looks like, and anything Clementine should know" aria-label="New goal description" />
+            <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="The goal, in one line — e.g. My team books 10 appointments a week" aria-label="New goal title" />
+            <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder="What done looks like, how you will know, and anything Clem should know" aria-label="New goal description" />
             <div className="flex items-center gap-2">
               <Button size="sm" disabled={busy || !title.trim() || !description.trim()} onClick={() => { void create(); }}>{busy ? <Loader2 size={16} className="animate-spin" aria-hidden /> : null} Save goal</Button>
               {error ? <span className="text-caption text-danger">{error}</span> : null}
@@ -186,7 +186,7 @@ export function MyGoals() {
       ) : null}
       <div className="mt-3 grid gap-3">
         {q.isLoading && goals.length === 0 ? <p className="text-small text-muted">Loading…</p>
-          : goals.length === 0 ? <p className="text-small text-muted">No goals yet. Add one, or tell Clementine what you are working toward.</p>
+          : goals.length === 0 ? <p className="text-small text-muted">No goals yet. A goal is what Clem anchors her work to and reports against: one line with a number in it reads best, such as “My team books 10 appointments a week.” Add one here, or tell Clem in chat.</p>
           : goals.map((g) => <GoalCard key={g.id} goal={g} onSaved={refresh} />)}
       </div>
     </section>
