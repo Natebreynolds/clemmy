@@ -6,6 +6,8 @@
  */
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fsForInterleave from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, utimesSync } from 'node:fs';
@@ -1206,6 +1208,71 @@ test('queueWorkflowRun: writes originSessionId when provided (Gap E)', () => {
   assert.equal(r.status, 'queued');
   const rec = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, runFiles()[0]), 'utf-8'));
   assert.equal(rec.originSessionId, 'sess-chat-1');
+});
+
+test('pending ownership reads leave absent source groups absent', () => {
+  const groups = path.join(WORKFLOW_RUNS_DIR, '.origin-groups');
+  const before = existsSync(groups) ? readdirSync(groups).sort() : null;
+  for (let sourceUserSeq = 1; sourceUserSeq <= 8; sourceUserSeq += 1) {
+    assert.equal(readPendingWorkflowChatDispatchOwnership({
+      sessionId: 'sess-no-workflow-read', sourceUserSeq,
+    }), null);
+  }
+  assert.deepEqual(existsSync(groups) ? readdirSync(groups).sort() : null, before,
+    'an empty ownership query cannot create a workflow group or lock');
+});
+
+test('pending ownership reads still recover canonical held runs without a source group index', () => {
+  const identity = { sessionId: 'sess-legacy-held-without-index', sourceUserSeq: 40 };
+  const sourceGroupId = workflowOriginSourceGroupId(identity);
+  const id = 'legacy-held-no-group';
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${id}.json`), JSON.stringify({
+    id, status: 'awaiting_chat_dispatch_seal', chatDispatchSourceGroupId: sourceGroupId,
+    chatDispatchQueueRequestDigest: 'a'.repeat(64),
+  }));
+  assert.deepEqual(readPendingWorkflowChatDispatchOwnership(identity), {
+    sourceGroupId, originSessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+    phase: 'prepared', runIds: [id], runStatuses: { [id]: 'awaiting_chat_dispatch_seal' },
+  });
+});
+
+test('pending ownership reads recheck an admission published after the empty canonical scan', () => {
+  const identity = { sessionId: 'sess-admission-during-ownership-read', sourceUserSeq: 42,
+    replyTarget: { type: 'origin_chat' as const } };
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const original = fsForInterleave.readdirSync;
+  let queued: ReturnType<typeof queueWorkflowRun> | undefined;
+  let interleaved = false;
+  fsForInterleave.readdirSync = ((...args: Parameters<typeof readdirSync>) => {
+    const entries = (original as (...args: unknown[]) => unknown)(...args);
+    if (!interleaved && args[0] === WORKFLOW_RUNS_DIR) {
+      interleaved = true;
+      queued = queueWorkflowRun('audit-brief', { url: 'https://ownership-interleave.example' }, {
+        originSessionId: identity.sessionId, originObserver: identity,
+        prepareChatDispatch: durablePreparationCallback(),
+      });
+    }
+    return entries;
+  }) as typeof readdirSync;
+  syncBuiltinESMExports();
+  try {
+    const ownership = readPendingWorkflowChatDispatchOwnership(identity);
+    assert.ok(interleaved && queued?.id, 'a real admission must publish between the two observations');
+    assert.deepEqual(ownership?.runIds, [queued.id]);
+    assert.equal(ownership?.phase, 'prepared');
+  } finally {
+    fsForInterleave.readdirSync = original;
+    syncBuiltinESMExports();
+  }
+});
+
+test('pending ownership reads reject a non-directory source group rather than claiming absence', () => {
+  const identity = { sessionId: 'sess-corrupt-source-group-path', sourceUserSeq: 43 };
+  const root = path.join(WORKFLOW_RUNS_DIR, '.origin-groups');
+  mkdirSync(root, { recursive: true });
+  writeFileSync(path.join(root, createHash('sha256').update(workflowOriginSourceGroupId(identity)).digest('hex')), '{}');
+  assert.throws(() => readPendingWorkflowChatDispatchOwnership(identity), /directory is invalid/);
 });
 
 test('queueWorkflowRun: exact origin is held without legacy authority until its group activates', () => {

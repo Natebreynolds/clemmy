@@ -91,6 +91,7 @@ import {
   workflowChatDispatchQueueRequestDigest,
   workflowOriginGroupAdmissionForRequest,
   workflowOriginSourceGroupId,
+  workflowOriginGroupDirectoryExists,
   workflowRunHasRecordedChatDispatchPreparation,
   workflowRunIsTerminalForOriginGroup,
   workflowRunOriginObserverId,
@@ -844,6 +845,36 @@ export class PendingWorkflowChatDispatchOwnershipError extends Error {
   }
 }
 
+function canonicalWorkflowChatDispatchRunIds(sourceGroupId: string): Set<string> {
+  const runIds = new Set<string>();
+  if (existsSync(WORKFLOW_RUNS_DIR)) {
+    for (const entry of readdirSync(WORKFLOW_RUNS_DIR).filter((file) => file.endsWith('.json')).sort()) {
+      const file = path.join(WORKFLOW_RUNS_DIR, entry);
+      let run: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+        run = parsed as Record<string, unknown>;
+      } catch {
+        // An unreadable unrelated run cannot be attributed to this source. An
+        // indexed member is validated again below and therefore still fails
+        // closed if its own canonical record is unreadable.
+        continue;
+      }
+      if (run.chatDispatchSourceGroupId !== sourceGroupId) continue;
+      const runId = normalizedOptionalString(run.id);
+      if (!runId || entry !== `${runId}.json`) {
+        throw new Error(`Workflow origin group ${sourceGroupId} has a mismatched canonical held run.`);
+      }
+      if (!/^[a-f0-9]{64}$/.test(String(run.chatDispatchQueueRequestDigest ?? ''))) {
+        throw new Error(`Workflow origin group ${sourceGroupId} run ${runId} lost its queue request authority.`);
+      }
+      runIds.add(runId);
+    }
+  }
+  return runIds;
+}
+
 /**
  * Read the queue ownership that still prevents an exact chat source from
  * becoming terminal. A fresh exact run is installed non-executable before its
@@ -869,6 +900,15 @@ export function readPendingWorkflowChatDispatchOwnership(
     throw new Error('pending workflow chat dispatch ownership requires an exact source identity');
   }
   const sourceGroupId = workflowOriginSourceGroupId({ sessionId: originSessionId, sourceUserSeq });
+  // Empty reads must not manufacture workflow groups/locks for every chat.
+  // Retain the canonical fallback for legacy/pre-index held records. Current
+  // writers create the group parent before publishing their run; the second
+  // observation catches an admission that began during the canonical scan.
+  // If still absent, this read linearizes before any later group admission,
+  // just as the locked read may precede a writer acquiring the released lock.
+  if (!workflowOriginGroupDirectoryExists(sourceGroupId)
+    && canonicalWorkflowChatDispatchRunIds(sourceGroupId).size === 0
+    && !workflowOriginGroupDirectoryExists(sourceGroupId)) return null;
   return withWorkflowOriginGroupAuthorityLock(sourceGroupId, () => {
     if (readActiveWorkflowOriginGroup(sourceGroupId)) return null;
 
@@ -899,31 +939,7 @@ export function readPendingWorkflowChatDispatchOwnership(
       candidateRunIds.add(receipt.runId);
     }
 
-    if (existsSync(WORKFLOW_RUNS_DIR)) {
-      for (const entry of readdirSync(WORKFLOW_RUNS_DIR).filter((file) => file.endsWith('.json')).sort()) {
-        const file = path.join(WORKFLOW_RUNS_DIR, entry);
-        let run: Record<string, unknown>;
-        try {
-          const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
-          run = parsed as Record<string, unknown>;
-        } catch {
-          // An unreadable unrelated run cannot be attributed to this source. An
-          // indexed member is validated again below and therefore still fails
-          // closed if its own canonical record is unreadable.
-          continue;
-        }
-        if (run.chatDispatchSourceGroupId !== sourceGroupId) continue;
-        const runId = normalizedOptionalString(run.id);
-        if (!runId || entry !== `${runId}.json`) {
-          throw new Error(`Workflow origin group ${sourceGroupId} has a mismatched canonical held run.`);
-        }
-        if (!/^[a-f0-9]{64}$/.test(String(run.chatDispatchQueueRequestDigest ?? ''))) {
-          throw new Error(`Workflow origin group ${sourceGroupId} run ${runId} lost its queue request authority.`);
-        }
-        candidateRunIds.add(runId);
-      }
-    }
+    for (const runId of canonicalWorkflowChatDispatchRunIds(sourceGroupId)) candidateRunIds.add(runId);
 
     if (candidateRunIds.size === 0) return null;
     const runIds = [...candidateRunIds].sort();

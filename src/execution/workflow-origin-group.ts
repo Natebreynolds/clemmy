@@ -5,6 +5,7 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -187,6 +188,24 @@ function readJson(file: string, label: string): unknown {
 
 function groupDir(groupId: string): string {
   return path.join(WORKFLOW_ORIGIN_GROUPS_DIR, createHash('sha256').update(groupId).digest('hex'));
+}
+
+/** Metadata observation only, never group authority. Current admissions create
+ * this parent before publishing a canonical held run under its group lock.
+ * Compaction retains it and its tombstone. Unknown access is not absence. */
+export function workflowOriginGroupDirectoryExists(groupId: string): boolean {
+  const id = nonEmptyString(groupId);
+  if (!id) throw new Error('workflow origin group id is required');
+  try {
+    const stat = lstatSync(groupDir(id));
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error('workflow origin group directory is invalid');
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function sealedGroupFile(groupId: string): string {
