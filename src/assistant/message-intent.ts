@@ -19,6 +19,7 @@
  * suppress context the agent might need.
  */
 
+import { ASSISTANT_NAME } from '../config.js';
 import { classifyExternalEffectRequest } from './external-effect-taxonomy.js';
 import { hasDurableOrStandingProjectShape } from './project-shape.js';
 import {
@@ -459,7 +460,35 @@ export function selfContainedConversation(
   // So the opener is stripped here and whatever remains must stand on its own.
   // "hey" closes a turn; "hey" plus a question about Tim does not.
   const remainder = remainderAfterConversationalOpeners(trimmed);
-  return remainder === '' || isSelfContainedComputation(remainder);
+  return remainder === '' || addressesOrPleasantriesOnly(remainder) || isSelfContainedComputation(remainder);
+}
+
+/**
+ * What may follow a greeting and still leave only a greeting: a plain address
+ * ("there", "again", "friend"), the assistant's own configured name or a
+ * shortening of it, or a pleasantry ("hope you're well", "glad you're here").
+ * The set is closed on purpose: every part of the remainder must be one of
+ * these, so a question or request after the opener still pays full admission.
+ */
+const ADDRESS_WORDS = new Set(['there', 'again', 'friend', 'buddy', 'everyone', 'all', 'team', 'then', 'understood']);
+const PLEASANTRY_RE = new RegExp('^(?:' + [
+  "(?:i\\s+)?hope\\s+(?:you(?:['\u2019]?re|\\s+are)\\s+(?:well|good|doing\\s+well)|all\\s+is\\s+well|things\\s+are\\s+good)",
+  "glad\\s+you(?:['\u2019]?re|\\s+are)\\s+here",
+  "(?:(?:it['\u2019]?s\\s+)?(?:nice|good|great|awesome|amazing|sweet)\\s+)?to\\s+see\\s+you(?:\\s+again)?",
+  'a\\s+lot|so\\s+much|work|job|one',
+].join('|') + ')$', 'i');
+
+function addressWord(word: string): boolean {
+  const lower = word.toLowerCase();
+  if (ADDRESS_WORDS.has(lower)) return true;
+  const name = ASSISTANT_NAME.trim().toLowerCase();
+  return lower.length >= 3 && name.startsWith(lower);
+}
+
+function addressesOrPleasantriesOnly(remainder: string): boolean {
+  const parts = remainder.split(/[,;:.!?\u2014\u2013]+/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) return false;
+  return parts.every((part) => PLEASANTRY_RE.test(part) || part.split(/\s+/).every(addressWord));
 }
 
 /** Every opener CASUAL_PATTERNS can match — greetings, acknowledgements and
@@ -467,7 +496,8 @@ export function selfContainedConversation(
  *  which of two opener lists happened to match. */
 const CONVERSATIONAL_OPENER_RE = new RegExp(
   '^(?:'
-  + 'hey|hi|hello|yo|sup|howdy'
+  // "there" after a greeting addresses Clem; it names nothing to look up.
+  + '(?:hey|hi|hello|yo|howdy)(?:\\s+there)?|sup'
   + '|good\\s+(?:morning|afternoon|evening|night)'
   + '|thanks|thank\\s+you|ty|cheers|appreciate\\s+it'
   + '|ok|okay|cool|got\\s+it|sounds\\s+good|nice|sweet|perfect'

@@ -15,6 +15,7 @@ import {
   isCasualCheckIn,
   memoryBudgetFor,
   refersToUserOrHostedWorld,
+  selfContainedConversation,
 } from './message-intent.js';
 
 // ─── casual ────────────────────────────────────────────────────
@@ -401,4 +402,13 @@ test('classifier returns human-readable reasons', () => {
   assert.ok(deployed.reasons.length > 0);
   assert.ok(deployed.reasons.some((reason) => /external effect: publication/.test(reason)));
   assert.ok(deployed.confidence >= plain.confidence);
+});
+
+test('a greeting addressed with "there" is still a greeting; a request after it still is not', () => {
+  for (const text of ['Hey there', 'Hi there!', 'hello there']) {
+    assert.equal(selfContainedConversation(text, classifyMessageIntent(text, {})), true, text);
+  }
+  for (const text of ['hey there, what meetings does tim have tomorrow', 'hi there check salesforce for tim']) {
+    assert.equal(selfContainedConversation(text, classifyMessageIntent(text, {})), false, text);
+  }
 });

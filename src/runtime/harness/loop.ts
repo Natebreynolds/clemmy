@@ -6521,7 +6521,9 @@ async function runConversationWithinRuntimeConfig(
       turn: acceptedSource.turn,
     });
     if (reoffered) return reoffered;
-    const deictic = offerBareDeicticClarification({
+    // A closed conversational turn ("got it", "appreciate it") has no referent
+    // to resolve: its "it" points at nothing the host must ask about.
+    const deictic = hostPlainConversation ? null : offerBareDeicticClarification({
       sessionId: options.sessionId,
       sourceUserSeq,
       turn: acceptedSource.turn,
