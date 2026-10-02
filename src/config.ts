@@ -256,9 +256,13 @@ export function resolveOpenAiAgentsTracingDisabled(
   return apiKey.trim() ? undefined : '1';
 }
 
+// The key that counts is the one the SDK's exporter will read: the process
+// environment. Clem's own key (from its .env) never reaches the exporter, so
+// judging by it left tracing on with an exporter that could not export and
+// logged "No API key provided" after every turn (1,445 lines in 72 h).
 const agentsTracingDisabled = resolveOpenAiAgentsTracingDisabled(
   getEnv('OPENAI_AGENTS_DISABLE_TRACING', ''),
-  getOpenAiApiKey(),
+  process.env.OPENAI_API_KEY ?? '',
 );
 if (agentsTracingDisabled) process.env.OPENAI_AGENTS_DISABLE_TRACING = agentsTracingDisabled;
 
