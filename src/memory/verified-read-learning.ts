@@ -30,6 +30,7 @@
 import {
   getActiveRunAttempt,
   getRunAttemptSourceUserEvent,
+  getUserInputEventAtSequence,
   listEvents,
 } from '../runtime/harness/eventlog.js';
 import { priorTurnEndedAwaitingClarification } from '../runtime/harness/convergence-steer.js';
@@ -137,13 +138,9 @@ export function resolveAcceptedSource(
   if (!sessionId) return undefined;
   try {
     if (typeof sourceUserSeq === 'number') {
-      for (const event of listEvents(sessionId)) {
-        if (event.seq !== sourceUserSeq) continue;
-        if (event.type !== 'user_input_received') return undefined;
-        const phrase = eventText(event.data);
-        return phrase ? { sourceUserSeq, phrase } : undefined;
-      }
-      return undefined;
+      const event = getUserInputEventAtSequence(sessionId, sourceUserSeq);
+      const phrase = event ? eventText(event.data) : undefined;
+      return phrase ? { sourceUserSeq, phrase } : undefined;
     }
     const attempt = getActiveRunAttempt(sessionId);
     if (!attempt) return undefined;

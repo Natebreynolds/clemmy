@@ -1,5 +1,6 @@
 import { acceptedTaskIdFor } from '../harness/attempt-identity.js';
-import { listEvents } from '../harness/eventlog.js';
+import { listReadReceiptEventsForSource, listReadReceiptEventsForId, getUserInputEventAtSequence,
+  getLatestToolAttemptSettlementForSource } from '../harness/eventlog.js';
 import { redeemSuccessfulSettlementResultForHost } from '../harness/result-handle.js';
 import { inspectProviderEnvelope } from '../harness/provider-read-evidence.js';
 import { recordsAtRecordPath } from '../harness/result-facts.js';
@@ -37,9 +38,7 @@ export function canonicalVerifiedReadReceipt(input: {
   const identifier = input.identifier.trim();
   if (!origin || !identifier) return null;
   try {
-    const events = listEvents(origin.sessionId);
-    const receiptEvents = events.filter((event) => event.type === 'read_receipt'
-      && (event.data as { record?: { receiptId?: unknown } }).record?.receiptId === origin.receiptId);
+    const receiptEvents = listReadReceiptEventsForId(origin.sessionId, origin.receiptId);
     if (receiptEvents.length !== 1) return null;
     const receiptEvent = receiptEvents[0]!;
     const record = (receiptEvent.data as { record?: DurableReceiptRecord }).record;
@@ -58,14 +57,9 @@ export function canonicalVerifiedReadReceipt(input: {
       || (input.schemaFingerprint
         && record.schemaFingerprint !== input.schemaFingerprint)) return null;
 
-    const settlements = events.filter((event) => {
-      if (event.type !== 'tool_attempt_settled' || event.seq >= receiptEvent.seq) return false;
-      const data = event.data as Record<string, unknown>;
-      return data.sourceUserSeq === origin.sourceUserSeq
-        && typeof data.tool === 'string'
-        && data.tool.toLowerCase() === identifier.toLowerCase();
-    });
-    const settlement = settlements.at(-1);
+    const settlement = getLatestToolAttemptSettlementForSource(
+      origin.sessionId, origin.sourceUserSeq, identifier, receiptEvent.seq,
+    );
     if (!settlement) return null;
     const data = settlement.data as Record<string, unknown>;
     return data.acceptedTaskId === acceptedTaskIdFor(origin.sessionId, origin.sourceUserSeq)
@@ -95,9 +89,9 @@ export function verifiedReadOriginMatchesAliasDigest(
   const origin = parseVerifiedReadCapabilityOrigin(originValue);
   if (!origin || !aliasDigest) return false;
   try {
-    const source = listEvents(origin.sessionId, { types: ['user_input_received'] })
-      .find((event) => event.seq === origin.sourceUserSeq && typeof event.data.text === 'string');
-    return Boolean(source && acceptedPhraseDigest(String(source.data.text)) === aliasDigest);
+    const source = getUserInputEventAtSequence(origin.sessionId, origin.sourceUserSeq);
+    return Boolean(source && typeof source.data.text === 'string'
+      && acceptedPhraseDigest(source.data.text) === aliasDigest);
   } catch {
     return false;
   }
@@ -152,17 +146,11 @@ export function canonicalVerifiedReadResultShape(input: {
     || !verifiedReadOriginMatchesAliasDigest(origin, input.aliasDigest)
     || !canonicalVerifiedReadReceipt(input)) return null;
   try {
-    const events = listEvents(origin.sessionId);
-    const receipt = events.find((event) => event.type === 'read_receipt'
-      && (event.data as { record?: { receiptId?: unknown } }).record?.receiptId === origin.receiptId);
+    const receipt = listReadReceiptEventsForId(origin.sessionId, origin.receiptId)[0];
     if (!receipt) return null;
-    const settlement = events.filter((event) => {
-      if (event.type !== 'tool_attempt_settled' || event.seq >= receipt.seq) return false;
-      const data = event.data as Record<string, unknown>;
-      return data.sourceUserSeq === origin.sourceUserSeq
-        && typeof data.tool === 'string'
-        && data.tool.toLowerCase() === input.identifier.trim().toLowerCase();
-    }).at(-1);
+    const settlement = getLatestToolAttemptSettlementForSource(
+      origin.sessionId, origin.sourceUserSeq, input.identifier.trim(), receipt.seq,
+    );
     const logicalToolCallId = settlement?.data.logicalToolCallId;
     if (typeof logicalToolCallId !== 'string' || !logicalToolCallId.trim()) return null;
     const redeemed = redeemSuccessfulSettlementResultForHost({
@@ -296,22 +284,15 @@ export function recoverCanonicalVerifiedReadOriginForAlias(
   row: CapabilityAliasRow,
 ): VerifiedReadCapabilityOrigin | null {
   for (const claim of capabilityAliasLearningClaims(row)) {
-    let events: ReturnType<typeof listEvents>;
+    let receipts: ReturnType<typeof listReadReceiptEventsForSource>;
     try {
-      events = listEvents(claim.sessionId, {
-        types: ['user_input_received', 'read_receipt', 'tool_attempt_settled'],
-      });
+      const source = getUserInputEventAtSequence(claim.sessionId, claim.sourceUserSeq);
+      if (!source || typeof source.data.text !== 'string'
+        || acceptedPhraseDigest(source.data.text) !== row.aliasDigest) continue;
+      receipts = listReadReceiptEventsForSource(claim.sessionId, claim.sourceUserSeq);
     } catch {
       continue;
     }
-    const source = events.find((event) => event.type === 'user_input_received'
-      && event.seq === claim.sourceUserSeq
-      && typeof event.data.text === 'string');
-    if (!source || acceptedPhraseDigest(String(source.data.text)) !== row.aliasDigest) continue;
-
-    const receipts = events
-      .filter((event) => event.type === 'read_receipt')
-      .sort((left, right) => right.seq - left.seq);
     for (const event of receipts) {
       const record = (event.data as { record?: DurableReceiptRecord }).record;
       const evidenceDigest = /^evt:([a-f0-9]{24})$/.exec(record?.readEvidenceRef ?? '')?.[1];

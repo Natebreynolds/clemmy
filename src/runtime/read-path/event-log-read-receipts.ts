@@ -1,6 +1,6 @@
 /** Dependency-neutral adapter over the existing durable read-receipt events. */
 import type { DurableReceiptRecord, ReceiptResolver } from '../../memory/procedure-receipts.js';
-import { listEvents } from '../harness/eventlog.js';
+import { listReadReceiptEventsForId } from '../harness/eventlog.js';
 import { canonicalVerifiedReadReceipt } from './verified-read-origin-authority.js';
 
 function canonicalLearningReceipt(record: DurableReceiptRecord): DurableReceiptRecord | undefined {
@@ -26,8 +26,7 @@ export function eventLogReceiptResolver(sessionId: string): ReceiptResolver {
   return {
     resolve(receiptId: string): DurableReceiptRecord | undefined {
       try {
-        for (const event of listEvents(sessionId)) {
-          if (event.type !== 'read_receipt') continue;
+        for (const event of listReadReceiptEventsForId(sessionId, receiptId)) {
           const data = event.data as { record?: DurableReceiptRecord } | undefined;
           if (data?.record?.receiptId === receiptId) return canonicalLearningReceipt(data.record);
         }

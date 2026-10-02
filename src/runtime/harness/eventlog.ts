@@ -4704,6 +4704,66 @@ export function listToolCalledEventsForCallId(sessionId: string, callId: string)
   return rows.map(rowToEvent);
 }
 
+/** At most two exact receipt events: one proves unique presence, two prove
+ * ambiguity. This is a lookup, not receipt validation or learning authority.
+ * Bind the required index: planner estimates otherwise sometimes prefer the
+ * broad session/type index and deserialize unrelated receipt metadata. */
+export function listReadReceiptEventsForId(sessionId: string, receiptId: string): EventRow[] {
+  if (!sessionId || !receiptId) return [];
+  const rows = prepareCached(openEventLog(), `SELECT * FROM events INDEXED BY idx_events_read_receipt_identity_v1
+    WHERE session_id = ? AND type = 'read_receipt' AND json_valid(data_json)
+      AND json_extract(data_json, '$.record.receiptId') = ?
+    ORDER BY seq ASC LIMIT 2`).all(sessionId, receiptId) as RawEventRow[];
+  return rows.map(rowToEvent);
+}
+
+/** Legacy alias recovery has no receipt id yet. Load receipts only for its
+ * exact accepted source, newest first, without an arbitrary truncation that
+ * could lose an older valid proof. Canonical validation still follows. */
+export function listReadReceiptEventsForSource(sessionId: string, sourceUserSeq: number): EventRow[] {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq < 1) return [];
+  const rows = prepareCached(openEventLog(), `SELECT * FROM events INDEXED BY idx_events_read_receipt_source_v1
+    WHERE session_id = ? AND type = 'read_receipt' AND json_valid(data_json)
+      AND json_extract(data_json, '$.record.source.sourceUserSeq') = ?
+    ORDER BY seq DESC`).all(sessionId, sourceUserSeq) as RawEventRow[];
+  return rows.map(rowToEvent).filter(event =>
+    (event.data as { record?: { source?: { sourceUserSeq?: unknown } } }).record?.source?.sourceUserSeq === sourceUserSeq);
+}
+
+/** Resolve an exact same-session user input using its global sequence key.
+ * No newest-message fallback and no historical session hydration. */
+export function getUserInputEventAtSequence(sessionId: string, seq: number): EventRow | undefined {
+  if (!sessionId || !Number.isSafeInteger(seq) || seq < 1) return undefined;
+  const row = prepareCached(openEventLog(), `SELECT * FROM events
+    WHERE seq = ? AND session_id = ? AND type = 'user_input_received'`).get(seq, sessionId) as RawEventRow | undefined;
+  return row ? rowToEvent(row) : undefined;
+}
+
+/** Nearest matching settlement before a receipt for one accepted source.
+ * Iterate that indexed source in descending order rather than parsing a whole
+ * session. Match tool case in JS so Unicode case folding stays identical to
+ * the historical verifier; SQLite lower() folds only ASCII. Return failures
+ * too: callers must not skip a newer failure to reuse an older success. */
+export function getLatestToolAttemptSettlementForSource(
+  sessionId: string, sourceUserSeq: number, identifier: string, beforeSeq: number,
+): EventRow | undefined {
+  if (!sessionId || !identifier || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq < 1
+    || !Number.isSafeInteger(beforeSeq) || beforeSeq < 1) return undefined;
+  const target = identifier.toLowerCase();
+  const rows = prepareCached(openEventLog(), `SELECT * FROM events INDEXED BY idx_events_read_settlement_source_v1
+    WHERE session_id = ? AND type = 'tool_attempt_settled' AND json_valid(data_json)
+      AND json_extract(data_json, '$.sourceUserSeq') = ? AND seq < ?
+    ORDER BY seq DESC`).iterate(sessionId, sourceUserSeq, beforeSeq) as Iterable<RawEventRow>;
+  for (const row of rows) {
+    const event = rowToEvent(row);
+    // SQLite's JSON booleans become 0/1; preserve the original typed source
+    // comparison, not just the indexed SQL equality.
+    if (event.data.sourceUserSeq === sourceUserSeq
+      && typeof event.data.tool === 'string' && event.data.tool.toLowerCase() === target) return event;
+  }
+  return undefined;
+}
+
 /**
  * Bounded global recovery query for workflow batches that crossed the durable
  * foreground close boundary but have no public dispatch winner yet. Oldest

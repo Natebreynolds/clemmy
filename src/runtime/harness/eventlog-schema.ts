@@ -11372,6 +11372,21 @@ const MIGRATIONS: EventLogMigration[] = [
   },
   { version: 89, sql: '', backfill: createAcceptedModelHistorySchema },
   { version: 90, sql: '', backfill: createAcceptedModelHistoryConversionSchema },
+  {
+    version: 91,
+    // Lookup-only indexes: no copy of receipts, authority or historical bodies.
+    // Partial predicates also keep malformed unrelated legacy JSON out of the
+    // expression index. Duplicate receipts remain detectable, never deduped.
+    sql: `CREATE INDEX IF NOT EXISTS idx_events_read_receipt_identity_v1
+      ON events(session_id, json_extract(data_json, '$.record.receiptId'), seq)
+      WHERE type = 'read_receipt' AND json_valid(data_json);
+    CREATE INDEX IF NOT EXISTS idx_events_read_settlement_source_v1
+      ON events(session_id, json_extract(data_json, '$.sourceUserSeq'), seq)
+      WHERE type = 'tool_attempt_settled' AND json_valid(data_json);
+    CREATE INDEX IF NOT EXISTS idx_events_read_receipt_source_v1
+      ON events(session_id, json_extract(data_json, '$.record.source.sourceUserSeq'), seq)
+      WHERE type = 'read_receipt' AND json_valid(data_json);`,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

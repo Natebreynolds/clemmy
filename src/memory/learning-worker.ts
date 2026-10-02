@@ -18,7 +18,7 @@
 import { createHash } from 'node:crypto';
 import { BASE_DIR } from '../config.js';
 import { getMachineId } from '../runtime/machine-id.js';
-import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent, listReadReceiptEventsForId } from '../runtime/harness/eventlog.js';
 import { eventLogReceiptResolver } from '../runtime/read-path/event-log-read-receipts.js';
 import {
   composioToolOperationVersion,
@@ -90,8 +90,7 @@ async function acquireLiveContract(identifier: string): Promise<string | undefin
 
 function receiptAlreadyDurable(sessionId: string, receiptId: string): boolean {
   try {
-    return listEvents(sessionId).some((event) => event.type === 'read_receipt'
-      && (event.data as { record?: { receiptId?: string } }).record?.receiptId === receiptId);
+    return listReadReceiptEventsForId(sessionId, receiptId).length > 0;
   } catch {
     return false;
   }
