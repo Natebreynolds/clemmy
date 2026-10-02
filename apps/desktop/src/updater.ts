@@ -30,6 +30,7 @@ import path from 'node:path';
 const { autoUpdater } = electronUpdater;
 import { accessSync, appendFileSync, constants, existsSync, mkdirSync } from 'node:fs';
 import { compareVersions } from './version-compare.js';
+import { freeDiskBytes, gigabytes, updateRoomShortfall, updateZipBytes } from './update-room.js';
 import {
   isMissingReleaseMetadataError,
   shouldReportUpdaterCondition,
@@ -74,6 +75,8 @@ let status: UpdaterStatus = { state: 'idle' };
 let onStatusChangeListeners: Array<(s: UpdaterStatus) => void> = [];
 let periodicHandle: NodeJS.Timeout | null = null;
 let downloadInFlight = false;
+/** Size of the update the next download would fetch, from its release metadata. */
+let availableZipBytes: number | undefined;
 let updaterLog: UpdaterLog | undefined;
 let lastMissingReleaseReportedAt = 0;
 
@@ -416,6 +419,7 @@ export function initAutoUpdater(opts: { logFile: string }): void {
     }
 
     log('info', 'update available', { version: info.version });
+    availableZipBytes = updateZipBytes(info.files);
     updateStatus({
       state: 'available',
       version: info.version,
@@ -533,6 +537,14 @@ function beginUpdateDownload(log?: UpdaterLog): {
 } {
   if (downloadInFlight) {
     return { ok: true, action: 'downloading', reason: 'Update download is already running.' };
+  }
+  const free = freeDiskBytes(app.getPath('userData'));
+  const shortfall = free === null ? null : updateRoomShortfall(availableZipBytes, free);
+  if (shortfall) {
+    const reason = `Not enough free disk space to install this update: it needs about ${gigabytes(shortfall.neededBytes)} GB free and ${gigabytes(shortfall.freeBytes)} GB is free. The next update check tries again.`;
+    log?.('warn', 'update download held for disk space', { neededBytes: shortfall.neededBytes, freeBytes: shortfall.freeBytes });
+    updateStatus({ state: 'error', error: reason });
+    return { ok: false, reason };
   }
   try {
     downloadInFlight = true;

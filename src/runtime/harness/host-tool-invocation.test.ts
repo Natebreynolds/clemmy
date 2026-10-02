@@ -924,7 +924,9 @@ test('async physical preparation failure is a zero-business pre-dispatch refusal
       beforePhysicalPreparation: async () => {
         order.push('connection-refresh');
         assert.equal(rows(task, 'model:before-physical-preparation-refused').length, 0);
-        throw new Error('sealed connected account ca-old is missing_or_changed');
+        throw new Error('exact connected-account refresh was unavailable', {
+          cause: new Error('connected-account listing deadline exceeded'),
+        });
       },
       invoke: async () => {
         order.push('business-body');
@@ -932,7 +934,9 @@ test('async physical preparation failure is a zero-business pre-dispatch refusal
       },
     }),
     (error: unknown) => error instanceof invocation.HostToolInvocationAuthorityError
-      && /before-physical preparation refused/i.test(error.message),
+      && /before-physical preparation refused/i.test(error.message)
+      // The refusal keeps why the check could not be made, not only which check.
+      && /refresh was unavailable: connected-account listing deadline exceeded/.test(error.message),
   );
   assert.deepEqual(order, ['connection-refresh']);
   assert.equal(rows(task, 'model:before-physical-preparation-refused').length, 0);

@@ -1368,7 +1368,12 @@ export async function revalidateSelectedComposioConnections(
   options: { includeAccountDisplay?: boolean } = {},
 ): Promise<SelectedComposioConnectionRevalidation> {
   if (selections.length === 0) return { ok: true };
-  const fresh = await refreshConnectedToolkits();
+  // A listing that could not be made says nothing about the connection, and no
+  // dispatch has happened yet: ask once more before it becomes a refusal. A
+  // provider that stays unreachable still refuses.
+  let fresh: ConnectedToolkit[];
+  try { fresh = await refreshConnectedToolkits(); }
+  catch { fresh = await refreshConnectedToolkits(); }
   const usable = filterSuppressedConnectedToolkits(
     fresh,
     readComposioConnectionSuppressionState(),

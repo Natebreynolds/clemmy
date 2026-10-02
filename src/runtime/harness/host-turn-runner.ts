@@ -4963,7 +4963,12 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           ? streamMs
           : preContentMs;
         if (escalatedAt === 0) {
-          if (Date.now() - observedActivityAt < windowMs) return;
+          // Wire-level liveness (any provider frame, from any request in this
+          // run) keeps a queued provider alive before it starts. Once this
+          // answer has started, only what its stream delivers is progress: a
+          // keepalive frame cannot hold a stalled answer open.
+          const progressAt = sawActionableActivity ? lastSemanticActivityAt : observedActivityAt;
+          if (Date.now() - progressAt < windowMs) return;
           // ESCALATE, do not reject: abort the stalled attempt with a typed
           // deadline reason so the fallback boundary can switch brains, then
           // keep this step alive while a rescue is in flight. Rejecting in the
@@ -4981,6 +4986,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             preContent: error.preContent,
             bufferedProviderRequestInFlight,
             falloverGraceMs,
+            latestProviderStreamEvent: ambient?.latestProviderStreamEvent,
           }, 'host model step stalled — retiring the attempt so the brain chain can rescue it');
           if (!controller.signal.aborted) controller.abort(error);
           if (falloverGraceMs <= 0) reject(error);

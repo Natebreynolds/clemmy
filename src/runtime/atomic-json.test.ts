@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   readFileSync,
   readdirSync,
@@ -13,6 +14,7 @@ import {
   mkdtempSync,
   rmSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import { performance } from 'node:perf_hooks';
@@ -27,6 +29,7 @@ const {
   atomicJsonMutate,
   atomicAppendNdjson,
   withFileLock,
+  withFileLockSync,
   withFileLockSyncStrict,
 } = await import('./atomic-json.js');
 const { BoundaryError } = await import('./boundary-error.js');
@@ -151,6 +154,44 @@ test('strict lock release cannot unlink a replacement owner generation', () => {
 
   assert.equal(readFileSync(lockPath, 'utf-8'), replacementToken);
   unlinkSync(lockPath);
+});
+
+test('a lease this process failed to release is reclaimed by its own next acquisition, not waited on', (t) => {
+  if (process.getuid?.() === 0) { t.skip('root ignores directory permissions'); return; }
+  const dir = mkdtempSync(path.join(TMP, 'abandoned-'));
+  const target = path.join(dir, 'snapshot');
+  const lockPath = `${target}.lock`;
+  try {
+    // Release needs a new marker file beside the lock; a directory that takes
+    // no new files (a full disk does the same) makes it fail after the work.
+    withFileLockSyncStrict(target, () => { chmodSync(dir, 0o555); });
+  } finally {
+    chmodSync(dir, 0o755);
+  }
+  assert.ok(existsSync(lockPath), 'the failed release left the lease behind under this live PID');
+
+  const startedAt = performance.now();
+  let ran = false;
+  withFileLockSyncStrict(target, () => { ran = true; });
+  assert.ok(ran);
+  assert.ok(performance.now() - startedAt < 2_000, 'the next acquisition reclaims instead of waiting out the lock');
+  assert.equal(existsSync(lockPath), false, 'and releases normally afterwards');
+});
+
+test('a lease under this PID that this isolate never gave up is still a live owner', () => {
+  const target = path.join(TMP, 'same-pid-foreign-lease.json');
+  const lockPath = `${target}.lock`;
+  // A worker thread shares the PID; its lease is not this isolate's to reclaim.
+  const foreign = `${process.pid}:${Date.now()}:${randomUUID()}`;
+  writeFileSync(lockPath, foreign, 'utf-8');
+  try {
+    let ran = false;
+    withFileLockSync(target, () => { ran = true; });
+    assert.ok(ran, 'best-effort work still runs after its bounded wait');
+    assert.equal(readFileSync(lockPath, 'utf-8'), foreign, 'the live lease was not evicted');
+  } finally {
+    unlinkSync(lockPath);
+  }
 });
 
 test('a paused stale observer cannot evict an intervening live strict-lock owner', async () => {

@@ -548,6 +548,17 @@ export function reconcileRevokedHostToolInvocations(
   };
 }
 
+/** A refusal's message with its causes: the outer error names the check that
+ * could not be made, its cause says why (a missed deadline, a refused fetch). */
+function refusalDetail(error: unknown): string {
+  const reasons: string[] = [];
+  for (let at: unknown = error; at !== undefined && reasons.length < 3;
+    at = at instanceof Error ? at.cause : undefined) {
+    reasons.push(String(at instanceof Error ? at.message : at));
+  }
+  return reasons.join(': ').replace(/\s+/g, ' ').trim().slice(0, 260);
+}
+
 function exactModelCallId(value: string): string {
   if (
     typeof value !== 'string'
@@ -1719,10 +1730,7 @@ export async function invokeHostToolCall<T>(
                 throw new Error('beforePhysicalAdmission must be synchronous');
               }
             } catch (error) {
-              const detail = String(error instanceof Error ? error.message : error)
-                .replace(/\s+/g, ' ')
-                .trim()
-                .slice(0, 180);
+              const detail = refusalDetail(error);
               await refuseBeforePhysical(
                 detail
                   ? `before-physical admission refused: ${detail}`
@@ -1773,10 +1781,7 @@ export async function invokeHostToolCall<T>(
                 };
               }
             } catch (error) {
-              const detail = String(error instanceof Error ? error.message : error)
-                .replace(/\s+/g, ' ')
-                .trim()
-                .slice(0, 180);
+              const detail = refusalDetail(error);
               await refuseBeforePhysical(
                 detail
                   ? `before-physical preparation refused: ${detail}`

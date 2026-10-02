@@ -239,7 +239,27 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-function lockSnapshotIsStale(snapshot: FileLockSnapshot): boolean {
+/**
+ * Leases this process could not take down, by lock path. A release that fails
+ * (no space for its deletion guard, or a guard that never comes free) leaves
+ * the canonical lock under this live PID, and no contender may evict a live
+ * PID's lease — so every later acquisition in this process would wait on a
+ * lock nobody holds until a restart. This process knows it gave the lease up,
+ * so its own next acquisition reclaims exactly that generation through the
+ * ordinary reaper. Per isolate: a worker thread shares the PID, but its leases
+ * never appear here.
+ */
+const abandonedLeases = new Map<string, FileLockLease>();
+
+function abandonedByThisProcess(lockPath: string, snapshot: FileLockLease): boolean {
+  const lease = abandonedLeases.get(lockPath);
+  return lease !== undefined
+    && lease.ownerToken === snapshot.ownerToken
+    && sameFileGeneration(lease, snapshot);
+}
+
+function lockSnapshotIsStale(lockPath: string, snapshot: FileLockSnapshot): boolean {
+  if (abandonedByThisProcess(lockPath, snapshot)) return true;
   const ownerPid = lockOwnerPid(snapshot.ownerToken);
   if (ownerPid !== null) return !isPidAlive(ownerPid);
   return Date.now() - snapshot.ctimeMs > STALE_LOCK_MS;
@@ -474,9 +494,10 @@ function tryReapStaleFileLock(
     const current = readFileLockSnapshot(lockPath);
     const currentOwnerPid = current ? lockOwnerPid(current.ownerToken) : null;
     const currentIsStillStale = current
-      ? (currentOwnerPid !== null
-          ? !isPidAlive(currentOwnerPid)
-          : Date.now() - observed.ctimeMs > STALE_LOCK_MS)
+      ? (abandonedByThisProcess(lockPath, current)
+          || (currentOwnerPid !== null
+            ? !isPidAlive(currentOwnerPid)
+            : Date.now() - observed.ctimeMs > STALE_LOCK_MS))
       : false;
     if (
       !current
@@ -486,6 +507,8 @@ function tryReapStaleFileLock(
       || !deletionGuardStillOwned(guard)
     ) return null;
     waitAfterDeletionGuardValidationForTest();
+    // The validated generation leaves either way: renamed over, or unlinked.
+    abandonedLeases.delete(lockPath);
     return replaceStaleFileLock(lockPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
@@ -537,6 +560,8 @@ function tryAcquireFileLock(filePath: string): FileLockLease | null {
   try {
     // 'wx' fails if the file already exists — atomic create.
     fd = openSync(lockPath, 'wx');
+    // The pathname was free, so any lease this process gave up there is gone.
+    abandonedLeases.delete(lockPath);
     writeFileSync(fd, ownerToken, 'utf-8');
     fsyncSync(fd);
     const stat = fstatSync(fd, { bigint: true });
@@ -544,7 +569,7 @@ function tryAcquireFileLock(filePath: string): FileLockLease | null {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     const observed = readFileLockSnapshot(lockPath);
-    if (observed && lockSnapshotIsStale(observed)) {
+    if (observed && lockSnapshotIsStale(lockPath, observed)) {
       waitAfterStaleLockObservationForTest();
       // The reaper takes the lock it just cleared. Returning null here would
       // put it back at the end of the queue behind every waiting contender.
@@ -557,7 +582,9 @@ function tryAcquireFileLock(filePath: string): FileLockLease | null {
   }
 }
 
-function releaseFileLockOwned(filePath: string, lease: FileLockLease): void {
+/** True when the canonical lock no longer carries this lease; false when the
+ * deletion guard never came free and the lease is still in place. */
+function releaseFileLockOwned(filePath: string, lease: FileLockLease): boolean {
   const lockPath = lockFilePath(filePath);
   const deadline = Date.now() + LOCK_MAX_WAIT_MS;
   while (true) {
@@ -566,11 +593,11 @@ function releaseFileLockOwned(filePath: string, lease: FileLockLease): void {
       !current
       || current.ownerToken !== lease.ownerToken
       || !sameFileGeneration(lease, current)
-    ) return;
+    ) return true;
 
     const guard = tryAcquireDeletionGuard(lockPath);
     if (!guard) {
-      if (Date.now() >= deadline) return;
+      if (Date.now() >= deadline) return false;
       sleepSync(LOCK_RETRY_MS);
       continue;
     }
@@ -590,20 +617,24 @@ function releaseFileLockOwned(filePath: string, lease: FileLockLease): void {
     } finally {
       releaseDeletionGuard(guard);
     }
-    return;
+    const after = readFileLockSnapshot(lockPath);
+    return !after || after.ownerToken !== lease.ownerToken || !sameFileGeneration(lease, after);
   }
 }
 
 function releaseFileLock(filePath: string, lease: FileLockLease): void {
+  let released = false;
   try {
-    releaseFileLockOwned(filePath, lease);
+    released = releaseFileLockOwned(filePath, lease);
   } catch {
     // The critical section may already have durably committed. Reporting that
     // operation as failed solely because post-commit lock cleanup hit an
     // unsupported/transient filesystem operation invites a duplicate retry.
-    // Leave the canonical lease in place (fail closed); a process restart makes
-    // its PID stale and the normal generation-safe reaper can recover it.
+    // Leave the canonical lease in place (fail closed for other processes).
   }
+  // This process no longer holds the lease, so its own next acquisition may
+  // reclaim it; every other process still sees a live owner.
+  if (!released) abandonedLeases.set(lockFilePath(filePath), lease);
 }
 
 export async function withFileLock<T>(filePath: string, work: () => Promise<T> | T): Promise<T> {

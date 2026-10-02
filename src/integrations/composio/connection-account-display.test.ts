@@ -43,6 +43,18 @@ test('missing labels remain unknown and inactive or mismatched accounts expose n
   });
 });
 
+test('one listing that could not be made is asked once more before the check refuses', async () => {
+  let calls = 0;
+  __test__.setConnectedAccountsLoader(async () => {
+    calls++;
+    if (calls === 1) throw new Error('Fixture listing missed its deadline');
+    return [account('ca_selected', 'work@example.test')];
+  });
+  clearConnectedToolkitsCache();
+  assert.deepEqual(await revalidateSelectedComposioConnections(selection), { ok: true });
+  assert.equal(calls, 2);
+});
+
 test('a failed refresh cannot return an old verified account label from the last-good cache', async () => {
   let unavailable = false;
   __test__.setConnectedAccountsLoader(async () => {

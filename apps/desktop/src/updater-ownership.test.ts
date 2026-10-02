@@ -25,7 +25,7 @@ function harness(inApplications = true) {
   const module = { exports: {} as any };
   const imports: Record<string, any> = {
     electron: {
-      app: { isPackaged: true, isInApplicationsFolder: () => inApplications, getVersion: () => '3.18.6' },
+      app: { isPackaged: true, isInApplicationsFolder: () => inApplications, getVersion: () => '3.18.6', getPath: () => '/fixture/user-data' },
       dialog: { showErrorBox: () => { throw new Error('blocking dialog'); } },
       Notification: class { show() {} },
     },
@@ -38,6 +38,8 @@ function harness(inApplications = true) {
     'node:fs': { accessSync: () => { throw new Error('EACCES'); }, constants: { W_OK: 2 },
       appendFileSync() {}, existsSync: () => true, mkdirSync() {} },
     './version-compare.js': versions, './updater-errors.js': errors,
+    // Room on the volume is its own module and test; these fixtures always have it.
+    './update-room.js': { freeDiskBytes: () => 64 * 1024 ** 3, gigabytes: String, updateRoomShortfall: () => null, updateZipBytes: () => undefined },
   };
   vm.runInNewContext(code, { module, exports: module.exports,
     require: (id: string) => { assert.ok(id in imports, id); return imports[id]; },
