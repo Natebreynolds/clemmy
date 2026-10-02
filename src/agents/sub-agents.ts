@@ -30,6 +30,7 @@ import { sessionIdFromRunContext } from '../runtime/harness/tool-output-context.
 import { resolveWorkerMaxTurns, type WorkerToolInput } from './worker-job-packet.js';
 import { resolveAgentBinding } from './agent-binding.js';
 import { runPacketWorkerWithHost } from '../runtime/harness/worker-host-runner.js';
+import { bindHostLocalCallPreparation } from '../runtime/harness/host-local-call-preparation.js';
 import { toolCallHint } from '../runtime/harness/tool-call-hint.js';
 import {
   externalMcpScopeFromExactToolNames,
@@ -362,6 +363,19 @@ export async function buildWorkerAgent(options: {
     // call_tool/work_call carrier. Never hand an SDK child a raw server.
   });
   bindAgentMcpToolScope(agent, externalMcpScope);
+  // Ordinary local work (a folder, a file) runs in a worker exactly as it does
+  // on a chat turn: a direct call takes its requirement from the live local
+  // definition, and consent decides it as ordinary work. Without this binding
+  // a worker's write had no definition and was refused (live 10-02). Work
+  // under the parent's contract keeps its own carrier and is not bound here.
+  if (options.hostFreshPlanning && !actionWork) {
+    bindHostLocalCallPreparation(agent, {
+      planning: options.hostFreshPlanning,
+      configuredNames: new Set(capabilityUniverseTools
+        .map((toolRef) => (toolRef as { name?: string }).name ?? '')
+        .filter(Boolean)),
+    });
+  }
   // Seal the worker's complete post-blocklist catalog, while revision 1 binds
   // only the active (possibly slim) surface. Deferred acquisitions can then
   // append monotonically inside this immutable universe; they can never widen

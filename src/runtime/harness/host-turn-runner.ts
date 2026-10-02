@@ -98,7 +98,7 @@ import { approvalPrecheck } from './approval-precheck.js';
 import { removeReviewedClaims } from './reviewed-claim-removal.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
-import { isRegistryDeclaredLocalPlanningCapability, isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
+import { isRegistryDeclaredLocalPlanningCapability, isRegistryDeclaredLocalPlanningMutation, isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 import {
   canonicalLogicalToolName,
@@ -10162,7 +10162,13 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const canonicalCalls = admission.frame.calls;
     if (hostProduction) {
       for (const call of canonicalCalls) {
-        if (NATIVE_PRODUCT_AUTHORING_TOOLS.has(call.name) && toolByName.has(call.name)) {
+        // Any first-class local change the registry declares safe to plan
+        // (a file, a folder, a Space) takes its requirement from its live
+        // definition here, not only the native authoring tools: a worker's
+        // direct write_file had no requirement and was refused (live 10-02).
+        // An agent with no preparation binding gets none, as before.
+        if ((NATIVE_PRODUCT_AUTHORING_TOOLS.has(call.name) || isRegistryDeclaredLocalPlanningMutation(call.name))
+          && toolByName.has(call.name)) {
           const identity = exactHostIdentity();
           const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
           if (args && !actionExpectedWorkRequired(identity)) {

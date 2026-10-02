@@ -30,6 +30,7 @@ import {
   type EnvelopeBudget,
 } from '../runtime/graph/admission-envelope.js';
 import { classifyRuntimeToolEffect } from '../runtime/harness/tool-effect.js';
+import { isEffectDecidedPerCall } from '../tools/tool-registry.js';
 
 export interface SealableToolLike {
   name?: unknown;
@@ -90,6 +91,11 @@ export function turnStateToolsLast<T>(tools: readonly T[]): T[] {
 /** Widest effect class a tool may perform, from the runtime classifier that
  *  already fails closed: unknown and admin flatten UP to 'send', never down. */
 export function toolEffectClass(name: string): AdmittedCapability['effectClass'] {
+  // A tool whose effect is decided by each call's arguments has no effect
+  // without them: sealing it by its argument-less reading flattened the shell
+  // DOWN to a read, and a worker's mkdir was refused as a mismatch (live
+  // 10-02). It seals at the widest; each call's own effect decides at dispatch.
+  if (isEffectDecidedPerCall(name)) return 'send';
   const effect = classifyRuntimeToolEffect(name, undefined).effect;
   if (effect === 'read' || effect === 'compute') return 'read';
   if (effect === 'local_write') return 'write';

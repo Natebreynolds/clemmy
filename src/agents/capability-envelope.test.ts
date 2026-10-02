@@ -55,6 +55,10 @@ test('effect classes flatten UP, never down', () => {
   assert.equal(toolEffectClass('write_file'), 'write');
   assert.equal(toolEffectClass('some_tool_nobody_classified_yet'), 'send',
     'an unknown tool flattened DOWN below the ceiling');
+  // A tool whose effect each call decides seals at the widest, never at its
+  // argument-less reading: the shell sealed as a read refused a worker's
+  // mkdir (live 10-02). Each call's own effect still decides at dispatch.
+  assert.equal(toolEffectClass('run_shell_command'), 'send');
 });
 
 test('sealing admits a real surface and refuses a dishonest one', () => {
