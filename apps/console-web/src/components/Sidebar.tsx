@@ -63,20 +63,19 @@ function NavRow({
       aria-label={showBadge && badgeLabel ? `${dest.label}, ${badgeLabel}` : undefined}
       className={({ isActive }) =>
         cn(
-          'group relative flex h-10 items-center gap-3 rounded-sm px-3 text-body font-medium transition-colors duration-fast cursor-pointer',
+          // Navigation recedes so the page leads: a quiet fill and full-strength
+          // text mark where you are, inactive rows stay muted, icons are small.
+          'group relative flex h-10 items-center gap-2.5 rounded-sm px-3 text-body font-medium transition-colors duration-fast cursor-pointer',
           collapsed && 'w-11 justify-center px-0',
           isActive
-            ? 'bg-primary-tint text-primary'
+            ? 'bg-subtle text-fg'
             : 'text-muted hover:bg-hover hover:text-fg',
         )
       }
     >
       {({ isActive }) => (
         <>
-          {isActive && !collapsed && (
-            <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-primary" aria-hidden />
-          )}
-          <Icon className="h-5 w-5 shrink-0" aria-hidden />
+          <Icon className={cn('h-4 w-4 shrink-0', isActive ? 'text-primary' : 'text-faint group-hover:text-muted')} strokeWidth={1.75} aria-hidden />
           {!collapsed && <span className="truncate">{dest.label}</span>}
           {showBadge && !collapsed && (
             <span
@@ -158,17 +157,17 @@ export function Sidebar({
         {!collapsed && <span className="text-h3 font-bold text-fg">Clementine</span>}
       </div>
 
-      <div className={cn('flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-2', collapsed && 'items-center px-0')}>
+      <div className={cn('flex flex-1 flex-col gap-1.5 overflow-y-auto px-3 py-2', collapsed && 'items-center px-0')}>
         {renderRows(nav.pinned)}
         {renderRows(nav.shown)}
 
         {nav.more.length > 0 && (
-          <div className={cn('flex flex-col gap-1 pt-2', collapsed && 'items-center')}>
+          <div className={cn('flex flex-col gap-1.5 pt-3', collapsed && 'items-center')}>
             <button
               type="button"
               onClick={toggleMore}
               className={cn(
-                'flex h-10 items-center gap-3 rounded-sm px-3 text-body font-medium text-faint transition-colors duration-fast hover:bg-hover hover:text-muted cursor-pointer',
+                'flex h-10 items-center gap-2.5 rounded-sm px-3 text-body font-medium text-faint transition-colors duration-fast hover:bg-hover hover:text-muted cursor-pointer',
                 collapsed ? 'w-11 justify-center px-0' : 'w-full',
                 moreOpen && 'text-muted',
               )}
@@ -178,17 +177,17 @@ export function Sidebar({
               title={collapsed ? 'More' : undefined}
             >
               {collapsed ? (
-                <Ellipsis className="h-5 w-5" aria-hidden />
+                <Ellipsis className="h-4 w-4" strokeWidth={1.75} aria-hidden />
               ) : (
                 <>
-                  <ChevronRight className={cn('h-5 w-5 transition-transform duration-fast', moreOpen && 'rotate-90')} aria-hidden />
+                  <ChevronRight className={cn('h-4 w-4 transition-transform duration-fast', moreOpen && 'rotate-90')} strokeWidth={1.75} aria-hidden />
                   <span>More</span>
                 </>
               )}
             </button>
             <div
               id="sidebar-more"
-              className={cn(moreOpen ? 'flex' : 'hidden', 'flex-col gap-1', collapsed && 'items-center')}
+              className={cn(moreOpen ? 'flex' : 'hidden', 'flex-col gap-1.5', collapsed && 'items-center')}
             >
               {renderRows(nav.more)}
             </div>
