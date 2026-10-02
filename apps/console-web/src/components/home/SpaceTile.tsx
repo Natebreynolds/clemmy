@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { AlertCircle, ArrowUp, RefreshCw, Trash2 } from 'lucide-react';
+import { AlertCircle, ArrowUp, MoreHorizontal, RefreshCw, Trash2 } from 'lucide-react';
 import { getSpace, latestRefreshFailures, refreshSpace } from '@/lib/spaces';
 import { usePoll } from '@/lib/poll';
 import { useChangeHomeLayout, type HomeLayout, type HomeTile } from '@/lib/home-layout';
@@ -68,16 +68,24 @@ export function SpaceTile({ tile, layout, view, summary, summaryLoading, onView,
       : latestRefresh(summary) ? `Refreshed ${agoLabel(latestRefresh(summary)!)}` : 'Not refreshed yet');
   const canRefresh = full ? Boolean(space && space.dataSources.length > 0) : Boolean(summary && summary.sources.length > 0);
 
+  // Stale or failed data is the one time Refresh earns a place while reading;
+  // otherwise it waits in the tile's menu with the layout choices.
+  const needsRefresh = canRefresh && (Boolean(failedSource) || failures.length > 0
+    || (full ? space?.health?.freshness.state === 'stale' : summary?.freshness === 'stale'));
+
   const header = (
     <div className="flex min-w-0 items-center gap-2 px-4 pt-3.5">
       <Link className="min-w-0 flex-1 truncate text-body font-semibold text-fg hover:text-primary" to={href} title={title}>{title}</Link>
-      <ViewToggle view={view} title={title} onView={onView} />
       <details className="relative">
-        <summary className="cursor-pointer list-none rounded-sm px-2 py-1 text-small text-muted hover:bg-hover hover:text-fg" aria-label={`Tile settings for ${title}`}>Tune</summary>
-        <div className="absolute right-0 z-30 mt-1 flex w-56 flex-col gap-3 rounded-md border border-border bg-surface p-3 shadow-popover">
+        <summary className="flex h-7 w-7 cursor-pointer list-none items-center justify-center rounded-sm text-faint hover:bg-hover hover:text-fg" aria-label={`Options for ${title}`} title="Options">
+          <MoreHorizontal className="h-4 w-4" aria-hidden />
+        </summary>
+        <div className="absolute right-0 z-30 mt-1 flex w-60 flex-col gap-3 rounded-md border border-border bg-surface p-3 shadow-popover">
+          <div className="flex flex-col gap-1 text-small">Show as<ViewToggle view={view} title={title} onView={onView} /></div>
           <label className="text-small">Size<select aria-label="Tile size" className="mt-1 w-full rounded-sm border border-border bg-canvas p-2" value={tile.width} disabled={mutation.isPending} onChange={e => change({ width: e.target.value as HomeTile['width'] })}>
             <option value="small">Small</option><option value="medium">Medium</option><option value="wide">Large</option>
           </select></label>
+          {canRefresh && <Button size="sm" variant="ghost" disabled={refreshing} onClick={() => { void refresh(); }}><RefreshCw className={cn('h-4 w-4', refreshing && 'animate-spin')} aria-hidden /> Refresh now</Button>}
           <Button size="sm" variant="ghost" disabled={mutation.isPending} onClick={() => change({ position: 'start' })}><ArrowUp className="h-4 w-4" aria-hidden /> Move to first</Button>
           <Button size="sm" variant="ghost" disabled={mutation.isPending} onClick={() => navigate(`/chat?prompt=${encodeURIComponent(`Help me refine the Space ${JSON.stringify(tile.spaceId)} shown on my Home. Read its current content and ask what I want to change.`)}`)}>Ask Clem about it</Button>
           <Button size="sm" variant="ghost" disabled={mutation.isPending} onClick={() => change({ operation: 'remove' })}><Trash2 className="h-4 w-4" aria-hidden /> Remove from Home</Button>
@@ -113,7 +121,7 @@ export function SpaceTile({ tile, layout, view, summary, summaryLoading, onView,
       )}
       <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border px-4 py-2.5">
         <span className="min-w-0 flex-1 text-caption text-muted">{status}</span>
-        {canRefresh && <Button size="sm" variant="ghost" disabled={refreshing} onClick={() => { void refresh(); }}><RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} aria-hidden /> Refresh</Button>}
+        {needsRefresh && <Button size="sm" variant="ghost" disabled={refreshing} onClick={() => { void refresh(); }}><RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} aria-hidden /> Refresh</Button>}
         <Link className="text-small font-semibold text-primary hover:underline" to={href}>Open ›</Link>
       </div>
       {error && <p role="alert" className="border-t border-border px-4 py-2 text-small text-danger">{error}</p>}
@@ -123,14 +131,14 @@ export function SpaceTile({ tile, layout, view, summary, summaryLoading, onView,
 
 function ViewToggle({ view, title, onView }: { view: HomeSpaceView; title: string; onView: (view: HomeSpaceView) => void }) {
   return (
-    <span role="group" aria-label={`Show ${title} as`} className="inline-flex shrink-0 overflow-hidden rounded-sm border border-border">
+    <span role="group" aria-label={`Show ${title} as`} className="inline-flex w-full shrink-0 overflow-hidden rounded-sm border border-border">
       {(['summary', 'full'] as const).map((v) => (
         <button
           key={v}
           type="button"
           aria-pressed={view === v}
           onClick={() => { if (view !== v) onView(v); }}
-          className={cn('px-2 py-0.5 text-caption font-semibold transition-colors cursor-pointer', view === v ? 'bg-subtle text-fg' : 'text-faint hover:text-fg')}
+          className={cn('flex-1 px-2 py-1 text-small font-semibold transition-colors cursor-pointer', view === v ? 'bg-subtle text-fg' : 'text-muted hover:text-fg')}
         >
           {v === 'summary' ? 'Summary' : 'Full'}
         </button>

@@ -208,8 +208,9 @@ export type NeedsYouDecision =
   | { kind: 'plan'; id: string };
 
 /**
- * Inline Approve / Not now exist ONLY where the Inbox already exposes an
- * approve/reject call for that item kind. Everything else opens.
+ * Review / Not now exist ONLY where the Inbox already exposes an
+ * approve/reject call for that item kind. Everything else opens. Approving
+ * happens in Needs you, beside the exact content — never from this preview.
  *
  * A QUESTION is settled a third way and returns null here on purpose: it has
  * no approve/reject, it has an answer. NeedsYouPane handles that case itself

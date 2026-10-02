@@ -1,9 +1,9 @@
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, CheckCircle2, AlertCircle, X } from 'lucide-react';
+import { CheckCircle2, AlertCircle, X } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { answerInboxQuestion, decideApproval, dismissInboxItem, listInboxQuestions, snoozeNeedsYou, type InboxQuestionRow } from '@/lib/inbox';
+import { answerInboxQuestion, dismissInboxItem, listInboxQuestions, snoozeNeedsYou, type InboxQuestionRow } from '@/lib/inbox';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
@@ -34,13 +34,22 @@ export function AnswerRow({
   busy,
   onAnswer,
   placeholder = 'Answer so she can carry on…',
+  value,
+  onValueChange,
+  autoFocus,
 }: {
   question?: InboxQuestionRow;
   busy: boolean;
   onAnswer: (text: string) => void;
   placeholder?: string;
+  /** A draft the caller keeps, so it survives the row closing or a refresh. */
+  value?: string;
+  onValueChange?: (text: string) => void;
+  autoFocus?: boolean;
 }) {
-  const [draft, setDraft] = useState('');
+  const [ownDraft, setOwnDraft] = useState('');
+  const draft = value ?? ownDraft;
+  const setDraft = onValueChange ?? setOwnDraft;
   if (question && !question.answerable) {
     return (
       <p className="text-small text-muted">
@@ -76,6 +85,7 @@ export function AnswerRow({
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
         disabled={busy}
+        autoFocus={autoFocus}
         aria-label="Your answer"
         placeholder={placeholder}
         className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-small text-fg outline-none placeholder:text-faint focus:border-border-strong disabled:opacity-50"
@@ -89,7 +99,7 @@ export function AnswerRow({
 
 
 interface RowState {
-  busy?: 'approve' | 'snooze' | 'dismiss' | 'answer';
+  busy?: 'snooze' | 'dismiss' | 'answer';
   notice?: { tone: 'success' | 'error'; text: string };
 }
 
@@ -139,6 +149,9 @@ export function NeedsYouPane({
 }) {
   const qc = useQueryClient();
   const [rows, setRows] = useState<Record<string, RowState>>({});
+  // One question open at a time; a typed answer survives closing it.
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
 
   const settle = () => {
     for (const key of ['command-center', 'needs-you-summary', 'approvals', 'approvals-count', 'plan-proposals', 'notifications', 'inbox-questions', 'working-now-badge']) {
@@ -183,33 +196,6 @@ export function NeedsYouPane({
               : /already answered|superseded/i.test(message)
                 ? 'Already answered — Clementine has moved on.'
                 : message.trim() || 'Couldn’t send that answer.',
-          },
-        },
-      }));
-    } finally {
-      settle();
-    }
-  };
-
-  // Home approves inline only; declining is a considered choice that lives
-  // in Needs you, next to the draft. A plan is always reviewed first.
-  const approve = async (key: string, item: HomeFeedItem) => {
-    const target = needsYouDecision(item);
-    if (!target || target.kind !== 'approval' || rows[key]?.busy) return;
-    setRows((prev) => ({ ...prev, [key]: { busy: 'approve' } }));
-    try {
-      await decideApproval(target.id, 'approve', { kind: target.approvalKind });
-      setRows((prev) => ({
-        ...prev,
-        [key]: { notice: { tone: 'success', text: 'Approved — Clementine is carrying on.' } },
-      }));
-    } catch (err) {
-      setRows((prev) => ({
-        ...prev,
-        [key]: {
-          notice: {
-            tone: 'error',
-            text: err instanceof Error && err.message.trim() ? err.message : 'Couldn’t approve this.',
           },
         },
       }));
@@ -302,15 +288,29 @@ export function NeedsYouPane({
               const href = needsYouTarget(item);
               const when = agoLabel(item.createdAt);
               const canDismiss = Boolean(item.dismissKind && item.dismissId);
+              // A question is answered here once opened, with its options or a
+              // reply box; everything else opens the exact item where its full
+              // content is shown. Nothing is approved from a two-line preview.
+              const answerable = !decision && Boolean(item.questionId);
+              const open = answerable && openKey === key;
+              const title = <span className="line-clamp-2">{plainText(item.title) || 'Pending approval'}</span>;
               return (
-                <PaneRow key={key} className={cn('flex-col items-stretch gap-2', rowCard)}>
+                <PaneRow key={key} className={cn('flex-col items-stretch gap-1.5', rowCard)}>
                   <div className="flex items-start gap-2">
-                    <Link
-                      to={href}
-                      className="min-w-0 flex-1 rounded-sm text-body font-semibold text-fg hover:text-primary"
-                    >
-                      <span className="line-clamp-2">{plainText(item.title) || 'Pending approval'}</span>
-                    </Link>
+                    {answerable ? (
+                      <button
+                        type="button"
+                        aria-expanded={open}
+                        onClick={() => setOpenKey(open ? null : key)}
+                        className="min-w-0 flex-1 rounded-sm text-left text-body font-semibold text-fg hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                      >
+                        {title}
+                      </button>
+                    ) : (
+                      <Link to={href} className="min-w-0 flex-1 rounded-sm text-body font-semibold text-fg hover:text-primary">
+                        {title}
+                      </Link>
+                    )}
                     {when && <span className="shrink-0 pt-0.5 text-caption text-faint">{when}</span>}
                     {canDismiss && (
                       <button
@@ -325,7 +325,7 @@ export function NeedsYouPane({
                       </button>
                     )}
                   </div>
-                  {item.meta && <p className="text-small text-muted">{plainText(item.meta, 160)}</p>}
+                  {item.meta && <p className={cn('text-small text-muted', !open && 'line-clamp-2')}>{plainText(item.meta, open ? 600 : 160)}</p>}
                   <ProjectLabelTag label={projectOf(item)} link className="self-start" />
                   {state.notice ? (
                     <p
@@ -340,43 +340,39 @@ export function NeedsYouPane({
                         : <AlertCircle className="h-3.5 w-3.5" aria-hidden />}
                       {state.notice.text}
                     </p>
+                  ) : open ? (
+                    <div className="flex flex-col gap-2">
+                      <AnswerRow
+                        question={questionFor(item.questionId)}
+                        busy={state.busy === 'answer'}
+                        value={drafts[key] ?? ''}
+                        onValueChange={(text) => setDrafts((all) => ({ ...all, [key]: text }))}
+                        autoFocus
+                        onAnswer={(text) => void answer(key, item.questionId!, text)}
+                      />
+                      <Link to={href} className="self-start text-small font-semibold text-muted hover:text-fg">Open in Needs you</Link>
+                    </div>
                   ) : (
-                    <div className="flex flex-wrap items-center gap-2">
-                      {!decision && item.questionId && (
-                        <AnswerRow
-                          question={questionFor(item.questionId)}
-                          busy={state.busy === 'answer'}
-                          onAnswer={(text) => void answer(key, item.questionId!, text)}
-                        />
-                      )}
-                      {decision?.kind === 'approval' && (
-                        <Button
-                          size="sm"
-                          className="h-8 px-3 text-small"
-                          disabled={Boolean(state.busy)}
-                          onClick={() => void approve(key, item)}
-                        >
-                          <Check className="h-3.5 w-3.5" aria-hidden />
-                          {state.busy === 'approve' ? 'Approving…' : 'Approve'}
-                        </Button>
-                      )}
+                    <div className="flex flex-wrap items-center gap-3 text-small">
+                      {answerable ? (
+                        <button type="button" onClick={() => setOpenKey(key)} className="font-semibold text-primary hover:underline">
+                          {drafts[key]?.trim() ? 'Finish your answer' : 'Answer'}
+                        </button>
+                      ) : decision ? (
+                        <Link to={href} className="font-semibold text-primary hover:underline">
+                          {decision.kind === 'plan' ? 'Review plan' : 'Review'}
+                        </Link>
+                      ) : null}
                       {decision && item.snoozeKey && (
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          className="h-8 px-3 text-small"
+                        <button
+                          type="button"
                           disabled={Boolean(state.busy)}
                           onClick={() => void snooze(key, item)}
+                          className="font-semibold text-muted hover:text-fg disabled:opacity-50"
                         >
                           {state.busy === 'snooze' ? 'Setting aside…' : 'Not now'}
-                        </Button>
+                        </button>
                       )}
-                      <Link
-                        to={href}
-                        className="inline-flex h-8 items-center rounded-md px-3 text-small font-semibold text-muted transition-colors hover:bg-hover hover:text-fg"
-                      >
-                        {decision?.kind === 'plan' ? 'Review plan' : decision ? 'Review' : 'Open'}
-                      </Link>
                     </div>
                   )}
                 </PaneRow>

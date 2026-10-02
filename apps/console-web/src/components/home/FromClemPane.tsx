@@ -17,8 +17,9 @@ interface RowState {
 
 /**
  * From Clem: what Clem's heartbeats brought you, in their own words, in one
- * place. What waits on you comes first and is answered right here — in your
- * words for a proposal, yes or no for a suggestion, Done for a finding. With
+ * place. What waits on you comes first. Each message reads on its own; opening
+ * one shows what it is about and answers it right here — in your words for a
+ * proposal, yes or no for a suggestion, Done for a finding. With
  * nothing to say, the pane still shows when each heartbeat last looked and
  * what it found, so a quiet Clem reads as a watching one. How often she looks
  * lives one level down, in Heartbeats.
@@ -40,6 +41,10 @@ export function FromClemPane({
 }) {
   const qc = useQueryClient();
   const [states, setStates] = useState<Record<string, RowState>>({});
+  // One item open at a time: its source, its reply box and its quick answers.
+  // Closed items are a message to read, not a form. Drafts outlive closing.
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
   const rows = data?.rows ?? [];
   const asks = rows.filter((row) => row.asks).length;
   const pulses = recentPulses(data?.pulses ?? []);
@@ -103,6 +108,9 @@ export function FromClemPane({
       <AnswerRow
         busy={state.busy === 'answer'}
         placeholder="Reply to Clem…"
+        value={drafts[row.key] ?? ''}
+        onValueChange={(text) => setDrafts((all) => ({ ...all, [row.key]: text }))}
+        autoFocus
         onAnswer={(text) => { if (text.trim()) reply(row, text.trim()); }}
       />
       {quick(row, state) && <div className="flex flex-wrap items-center gap-2">{quick(row, state)}</div>}
@@ -147,25 +155,35 @@ export function FromClemPane({
         ) : (
           rows.slice(0, maxRows).map((row) => {
             const state = states[row.key] ?? {};
+            const open = openKey === row.key;
+            // What the message is about: the record behind it, shown on request.
+            const source = (row.say ? [row.text, row.detail] : [row.detail]).filter(Boolean).join(' · ');
+            const drafted = Boolean(drafts[row.key]?.trim());
             return (
               <PaneRow key={row.key} className="flex-col items-stretch gap-1.5 py-3.5">
-                <div className="flex items-center gap-2 text-caption text-faint">
-                  <span className="font-semibold text-muted">{row.heartbeatTitle}</span>
-                  <span aria-hidden>·</span>
-                  <span>{agoLabel(row.at)}</span>
-                  {row.asks && <span className="ml-auto font-semibold text-primary">Waiting on you</span>}
-                </div>
-                {row.say ? (
-                  <>
-                    <p className="text-body text-fg">{row.say}</p>
-                    <p className="line-clamp-2 whitespace-pre-line text-small text-faint">{[row.text, row.detail].filter(Boolean).join(' · ')}</p>
-                  </>
-                ) : (
-                  <>
-                    <p className="text-body text-fg">{row.text}</p>
-                    {row.detail && <p className="line-clamp-3 whitespace-pre-line text-small text-muted">{row.detail}</p>}
-                  </>
-                )}
+                <button
+                  type="button"
+                  aria-expanded={open}
+                  onClick={() => setOpenKey(open ? null : row.key)}
+                  className="flex flex-col items-stretch gap-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                >
+                  <span className="flex items-center gap-2 text-caption text-faint">
+                    <span className="font-semibold text-muted">{row.heartbeatTitle}</span>
+                    <span aria-hidden>·</span>
+                    <span>{agoLabel(row.at)}</span>
+                    {row.asks && (
+                      <span className="ml-auto inline-flex items-center gap-1.5 text-muted">
+                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-primary" />
+                        {drafted && !open ? 'Draft saved' : 'Waiting on you'}
+                      </span>
+                    )}
+                  </span>
+                  <span className={cn('text-body text-fg', !open && 'line-clamp-2')}>{row.say || row.text}</span>
+                  {!open && !state.notice && (
+                    <span className="text-small font-medium text-primary">{row.asks ? 'Reply' : 'Read more'}</span>
+                  )}
+                </button>
+                {open && source && <p className="whitespace-pre-line text-small text-muted">{source}</p>}
                 {state.notice ? (
                   <p role="status" className={cn('text-small', state.notice.tone === 'error' ? 'text-warning' : 'text-muted')}>
                     {state.notice.text}
@@ -173,7 +191,7 @@ export function FromClemPane({
                       <>{' '}<Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(state.notice.sessionId))}`} className="font-semibold text-primary hover:underline">Open</Link></>
                     )}
                   </p>
-                ) : actions(row, state)}
+                ) : open ? actions(row, state) : null}
               </PaneRow>
             );
           })
