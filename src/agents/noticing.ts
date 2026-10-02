@@ -235,6 +235,10 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
 
   // 4. Think, unless there is nothing to read or no room to speak.
   let answer: NoticingAnswerV1 | null = null;
+  // No model signed in yet is a home that is not set up, not a failure:
+  // the tick is quiet and says so plainly (live 10-02: a fresh install's
+  // home page read "Could not finish: no model is available to think with").
+  let waitingForModel = false;
   if (observation && !capped) {
     const evidenceDigest = observationDigest(observation, deps.rules);
     const recent = Object.values(state.proposals)
@@ -243,7 +247,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
     try {
       const reply = await deps.propose({ observation, rules: deps.rules, standingAnswers: state.standingAnswers, recentProposals: recent, evidenceDigest });
       if (reply === null) {
-        error = 'no model is available to think with';
+        waitingForModel = true;
       } else {
         state.metrics.modelCalls += 1;
         model = reply.modelIdentity;
@@ -295,6 +299,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
   // 6. Write the thinking down.
   const quiet = produced === 0;
   const summary = error ? `Could not finish: ${error}`
+    : waitingForModel ? 'Quiet: waiting until a model is set up to think with'
     : produced ? `Proposed: ${state.proposals[proposalId!]!.title}`
     : capped ? 'Quiet: today\'s proposals are used up'
     : considered.length ? `Quiet: considered ${considered.length} thing${considered.length === 1 ? '' : 's'}, nothing worth asking now`

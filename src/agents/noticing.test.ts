@@ -151,12 +151,17 @@ test('an open proposal answered in the inbox leaves "open" on the next tick, and
   assert.equal(Object.values(stale.state().proposals)[0]!.status, 'expired');
 });
 
-test('no model, a wrong digest, or a read failure is written down as such and proposes nothing', async () => {
+test('no model is a quiet wait; a wrong digest or a read failure is written down as such; none proposes anything', async () => {
   const none = await runNoticingTick(harness({}).deps);
   assert.equal(none.produced, 0);
+  // A home with no model signed in is not set up yet, not failing (live
+  // 10-02: a fresh install read "Could not finish: no model is available").
   const noModel = harness({}); noModel.deps.propose = async () => null;
   const tick = await runNoticingTick(noModel.deps);
-  assert.match(tick.error ?? '', /no model/);
+  assert.equal(tick.error, undefined);
+  assert.equal(tick.quiet, true);
+  assert.equal(tick.produced, 0);
+  assert.match(tick.summary, /^Quiet: waiting until a model is set up/);
   const wrong = harness({ answer: () => proposal('0'.repeat(64)) });
   const mismatch = await runNoticingTick(wrong.deps);
   assert.match(mismatch.error ?? '', /different evidence/);
