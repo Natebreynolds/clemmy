@@ -6,10 +6,14 @@
  * runConversation, and host_v1. The model wire is immediate and recording;
  * every other potentially expensive or effectful wire is a counting tripwire.
  *
- * The positive cohort proves that ordinary talk is still one real model turn,
- * not a canned classifier response, while paying none of the action ceremony.
- * The near-action negatives prove the cheap surface is conservative: a social
- * prefix cannot hide a concrete request from the full foreground action path.
+ * The positive cohort (greetings and acknowledgements) proves that ordinary
+ * talk is still one real model turn, not a canned classifier response, while
+ * paying none of the action ceremony. Questions, explanations and generation
+ * keep the full surface: "who is X?" cannot be told from a question about a
+ * contact a connected tool knows, so a question never meets a wall; they still
+ * take one primary request with no hidden planner. The near-action negatives
+ * prove the cheap surface is conservative: a social prefix cannot hide a
+ * concrete request from the full foreground action path.
  */
 import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -234,7 +238,7 @@ const NEAR_ACTION_NEGATIVES = [
   'Yo, put the poem into a new Google Doc.',
 ] as const;
 
-type CaseKind = 'conversation' | 'near_action';
+type CaseKind = 'conversation' | 'question' | 'near_action';
 
 interface ConversationCase {
   id: string;
@@ -569,22 +573,25 @@ after(async () => {
   rmSync(HOME, { recursive: true, force: true });
 });
 
-test('130 ordinary chats and direct generations use one foreground request with zero action ceremony; adversarial social-prefix effects retain the full path', { timeout: 180_000 }, async (t) => {
+test('62 greetings, acknowledgements and arithmetic use one foreground request with zero action ceremony; questions, generation and social-prefix effects keep the full path in one request', { timeout: 180_000 }, async (t) => {
   const conversations: ConversationCase[] = [
     ...GREETINGS.map((prompt, index) => ({ id: `greeting-${index + 1}`, prompt, kind: 'conversation' as const })),
     ...THANKS_AND_ACKS.map((prompt, index) => ({ id: `thanks-${index + 1}`, prompt, kind: 'conversation' as const })),
-    ...CONVERSATIONAL_QUESTIONS.map((prompt, index) => ({ id: `question-${index + 1}`, prompt, kind: 'conversation' as const })),
-    ...SIMPLE_EXPLANATIONS.map((prompt, index) => ({ id: `explanation-${index + 1}`, prompt, kind: 'conversation' as const })),
-    ...DIRECT_GENERATION.map((prompt, index) => ({ id: `generation-${index + 1}`, prompt, kind: 'conversation' as const })),
+    // Arithmetic is provably self-contained: the one question kind that keeps the cheap path.
+    ...CONVERSATIONAL_QUESTIONS.flatMap((prompt, index) => (/\d/.test(prompt)
+      ? [{ id: `arithmetic-${index + 1}`, prompt, kind: 'conversation' as const }] : [])),
   ];
-  const negatives: ConversationCase[] = NEAR_ACTION_NEGATIVES.map((prompt, index) => ({
-    id: `near-action-${index + 1}`,
-    prompt,
-    kind: 'near_action',
-  }));
-  assert.equal(conversations.length, 130);
-  assert.equal(new Set(conversations.map((entry) => entry.prompt.toLowerCase())).size, conversations.length,
-    'the positive cohort contains 130 distinct natural utterances');
+  const negatives: ConversationCase[] = [
+    ...CONVERSATIONAL_QUESTIONS.flatMap((prompt, index) => (/\d/.test(prompt)
+      ? [] : [{ id: `question-${index + 1}`, prompt, kind: 'question' as const }])),
+    ...SIMPLE_EXPLANATIONS.map((prompt, index) => ({ id: `explanation-${index + 1}`, prompt, kind: 'question' as const })),
+    ...DIRECT_GENERATION.map((prompt, index) => ({ id: `generation-${index + 1}`, prompt, kind: 'question' as const })),
+    ...NEAR_ACTION_NEGATIVES.map((prompt, index) => ({ id: `near-action-${index + 1}`, prompt, kind: 'near_action' as const })),
+  ];
+  assert.equal(conversations.length, 62);
+  assert.equal(negatives.length, 83);
+  assert.equal(new Set([...conversations, ...negatives].map((entry) => entry.prompt.toLowerCase())).size,
+    conversations.length + negatives.length, 'every cohort utterance is distinct');
 
   eventlog.resetEventLog();
   resetHarnessRuntimeConfig();
@@ -892,15 +899,7 @@ test('130 ordinary chats and direct generations use one foreground request with 
     maxMs: fixed(sorted.at(-1)!),
     meanMs: fixed(sorted.reduce((sum, value) => sum + value, 0) / sorted.length),
   };
-  const generationSorted = hostOverheads
-    .filter((entry) => entry.caseId.startsWith('generation-'))
-    .map((entry) => entry.ms)
-    .sort((left, right) => left - right);
-  t.diagnostic(`ordinary host overhead (immediate recording model): ${JSON.stringify({
-    ...overhead,
-    directGenerationMedianMs: fixed(percentile(generationSorted, 0.50)),
-    directGenerationP95Ms: fixed(percentile(generationSorted, 0.95)),
-  })}`);
+  t.diagnostic(`ordinary host overhead (immediate recording model): ${JSON.stringify(overhead)}`);
   const cohortPrefix = (caseId: string): string => caseId.split('-', 1)[0] ?? caseId;
   const cohortTiming = Object.fromEntries(
     [...new Set(hostOverheads.map((entry) => cohortPrefix(entry.caseId)))].map((cohort) => {
@@ -1053,9 +1052,7 @@ test('130 ordinary chats and direct generations use one foreground request with 
   }
   const positiveBuilds = buildRecords.filter((entry) => entry.caseId.startsWith('greeting-')
     || entry.caseId.startsWith('thanks-')
-    || entry.caseId.startsWith('question-')
-    || entry.caseId.startsWith('explanation-')
-    || entry.caseId.startsWith('generation-'));
+    || entry.caseId.startsWith('arithmetic-'));
   if (positiveBuilds.length !== conversations.length) {
     violations.push({
       gate: 'positive_one_agent_build_per_source',
