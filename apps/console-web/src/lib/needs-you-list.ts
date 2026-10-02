@@ -5,6 +5,7 @@
  * supplies the rows it already polls. Order and membership follow the feeds
  * exactly — this only decides how a row reads, never what counts.
  */
+import { decisionPreview, oneLine } from '@clem/chat-engine';
 import type { Tone } from '@/components/ui/StatusPill';
 import {
   attentionPill,
@@ -45,53 +46,11 @@ export interface NeedsYouRowView {
   href?: string;
 }
 
-const PREVIEW_MAX = 140;
 const TITLE_MAX = 160;
 
-/** Collapse markdown and whitespace into one readable line. */
-export function oneLine(text: string | null | undefined, max = PREVIEW_MAX): string {
-  const flat = String(text ?? '')
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/[*_`#>]+/g, '')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (flat.length <= max) return flat;
-  const cut = flat.slice(0, max - 1);
-  const lastSpace = cut.lastIndexOf(' ');
-  return `${(lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
-}
-
-/** A bare reference (`noticing:ntc-…`, a run id): no spaces, punctuation and
- *  digits. It belongs behind a disclosure, never in the line a person reads. */
-export function isIdentifierLike(text: string | null | undefined): boolean {
-  const value = String(text ?? '').trim();
-  return value.length >= 8 && !/\s/.test(value) && /[:/_.-]/.test(value) && /\d/.test(value);
-}
-
-const HEADING_MAX = 140;
-
-/** A heading stays a heading: long text leads with its own first line or
- *  first sentence and the rest moves into the body. Only when neither fits is
- *  the lead cut at a word, and then the body keeps the whole text. */
-export function detailHeading(text: string, max = HEADING_MAX): { heading: string; body?: string } {
-  const trimmed = text.trim();
-  const flat = trimmed.replace(/\s+/g, ' ');
-  if (flat.length <= max) return { heading: flat };
-  const firstLine = trimmed.split(/\n/, 1)[0]!.trim();
-  if (firstLine.length >= 20 && firstLine.length <= max) {
-    return { heading: firstLine, body: trimmed.slice(trimmed.indexOf(firstLine) + firstLine.length).trim() };
-  }
-  const sentence = /^(.{20,}?[.?!])\s/.exec(flat)?.[1];
-  if (sentence && sentence.length <= max) return { heading: sentence, body: flat.slice(sentence.length).trim() };
-  // A little over is still one heading; a cut would leave a stub behind it.
-  if (flat.length <= max * 1.5) return { heading: flat };
-  // Cut at a word; the body continues exactly where the heading stops.
-  const cut = flat.slice(0, max - 1);
-  const lastSpace = cut.lastIndexOf(' ');
-  const lead = (lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd();
-  return { heading: `${lead}…`, body: `…${flat.slice(lead.length).trimStart()}` };
-}
+/** The shared reading rules (one line, no reference ids, short headings). */
+export { oneLine, isIdentifierLike, decisionHeading as detailHeading } from '@clem/chat-engine';
+const previewFor = decisionPreview;
 
 /** Where an attention item is resolved, from the server's own grouping key
  *  (dashboard/needs-you.ts): a conversation, or a workflow. */
@@ -102,20 +61,6 @@ export function attentionDestination(needsYouKey: string | null | undefined): { 
   }
   if (key.startsWith('flow:') && key.length > 'flow:'.length) {
     return { href: `/automate?workflow=${encodeURIComponent(key.slice('flow:'.length))}`, label: 'Open the workflow' };
-  }
-  return undefined;
-}
-
-/** A preview only when it adds something the title does not already say. */
-function previewFor(title: string, candidates: Array<string | null | undefined>): string | undefined {
-  const normalizedTitle = title.toLowerCase().replace(/…$/, '');
-  for (const candidate of candidates) {
-    if (isIdentifierLike(candidate)) continue;
-    const line = oneLine(candidate);
-    if (!line) continue;
-    const normalized = line.toLowerCase().replace(/…$/, '');
-    if (normalized === normalizedTitle || normalizedTitle.startsWith(normalized) || normalized.startsWith(normalizedTitle)) continue;
-    return line;
   }
   return undefined;
 }

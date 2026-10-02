@@ -30,3 +30,4 @@ export * from './workflow-name.js';
 export * from './memory-work.js';
 
 export * from "./approval-review.js";
+export * from './decision-presentation.js';

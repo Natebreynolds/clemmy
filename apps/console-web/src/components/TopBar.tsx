@@ -1,6 +1,5 @@
 import { Activity, PanelLeftClose, PanelLeft, Search, Mic } from 'lucide-react';
-import type { ActivityEntry } from '@/lib/activity';
-import type { PresentedWorkingNowEntry } from '@/lib/activity-presentation';
+import type { PresentedLiveWork } from '@/lib/activity-presentation';
 import type { HomeLiveStatus } from '@/lib/home-prefs';
 import { LiveStatus } from './home/LiveStatus';
 import { BrainChip } from './BrainChip';
@@ -34,7 +33,7 @@ export function TopBar({
   /** Clem at work, said in the header: the presented working-now entries, the
    *  owner's live-status style, and the next scheduled check. Off or unknown
    *  falls back to the plain Running button; unknown is never "caught up". */
-  liveEntries: readonly PresentedWorkingNowEntry<ActivityEntry>[];
+  liveEntries: readonly PresentedLiveWork[];
   liveMode: HomeLiveStatus;
   nextCheckAt?: string | null;
   liveUnavailable?: boolean;

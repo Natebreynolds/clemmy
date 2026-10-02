@@ -52,10 +52,10 @@ test('isolated test runner retains source-only defaults when only reporter optio
   );
 });
 
-test('broad and serialized journey targets partition every src/apps TypeScript test exactly once', () => {
+test('broad and serialized journey targets partition every src/apps/packages TypeScript test exactly once', () => {
   // The relay's own suite and the live A/B comparison rules are plain ESM
   // (.mjs); both are real tests the broad target runs, so they belong in the partition.
-  const allTests = expandTestTargets(['src/**/*.test.ts', 'apps/**/*.test.ts', 'apps/relay/**/*.test.mjs', 'scripts/live-ab/**/*.test.mjs']).sort();
+  const allTests = expandTestTargets(['src/**/*.test.ts', 'apps/**/*.test.ts', 'packages/**/*.test.ts', 'apps/relay/**/*.test.mjs', 'scripts/live-ab/**/*.test.mjs']).sort();
   const allJourneys = expandTestTargets(['src/journeys/**/*.test.ts']).sort();
   const expectedBroad = allTests.filter((file) => !file.startsWith('src/journeys/'));
   const expandedBroad = expandTestTargets(DEFAULT_TEST_TARGETS);

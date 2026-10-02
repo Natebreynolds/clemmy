@@ -1,6 +1,7 @@
 import { writeRowLabel, writeRowStatus, writeRowTone } from '../../../../packages/chat-engine/src/write-ledger';
 import type { ActivityItem, MessageStatus } from './useChat';
-import { MODEL_PHASE_ACTIVITY_ID } from '@clem/chat-engine';
+import { MODEL_PHASE_ACTIVITY_ID, type PresentedWorkingNowEntry } from '@clem/chat-engine';
+import type { ActivityEntry } from './activity';
 import { isWorkPlanRow, workPlanStepLabel } from './work-plan-presentation';
 
 export type ActivityTerminalOutcome = 'completed' | 'failed' | 'interrupted' | 'waiting';
@@ -280,3 +281,7 @@ export {
   type WorkingNowPresentation,
   type WorkingNowView,
 } from '../../../../packages/chat-engine/src/activity-presentation';
+
+/** One live entry as the shell's top bar receives it: already presented,
+ *  so the bar never reads raw activity itself. */
+export type PresentedLiveWork = PresentedWorkingNowEntry<ActivityEntry>;

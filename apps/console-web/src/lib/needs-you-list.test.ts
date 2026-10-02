@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { attentionDestination, buildNeedsYouItems, detailHeading, isIdentifierLike, needsYouRowView, oneLine } from './needs-you-list.js';
+import { attentionDestination, buildNeedsYouItems, needsYouRowView } from './needs-you-list.js';
 import type { ApprovalRow, InboxQuestionRow, PlanProposalRow } from './inbox.js';
 
 const longText = 'Clem found that the research steps you ran three times this week share the same inputs. '.repeat(12);
@@ -40,11 +40,6 @@ test('a preview never repeats the title', () => {
   assert.equal(approvalView.preview, undefined);
 });
 
-test('markdown and code in a record read as plain words', () => {
-  assert.equal(oneLine('**Bold** `code` and [a link](https://example.test)\n\nnext'), 'Bold code and a link next');
-  assert.equal(oneLine('```\nblock\n```after'), 'after');
-});
-
 test('order and membership follow the feeds; older approvals sit last; only approvals are batch-decidable', () => {
   const items = buildNeedsYouItems({
     workspaceChoosers: [],
@@ -65,30 +60,9 @@ test('order and membership follow the feeds; older approvals sit last; only appr
   assert.equal(views.find((v) => v.id === 'u1')!.href, '/automate?workflow=weekly-report');
 });
 
-test('a reference id is never the line a person reads', () => {
-  assert.equal(isIdentifierLike('noticing:ntc-mupqxx8k-aa8684'), true);
-  assert.equal(isIdentifierLike('Waiting for a connection'), false);
-  assert.equal(isIdentifierLike('Q3'), false);
+test('a reference id is never a row preview', () => {
   const view = needsYouRowView({ kind: 'question', id: 'q3', row: question({ context: 'noticing:ntc-mupqxx8k-aa8684' }) });
   assert.equal(view.preview, undefined);
-});
-
-test('a long title becomes a short heading and the whole text stays in the body', () => {
-  assert.deepEqual(detailHeading('Pick the next goal step'), { heading: 'Pick the next goal step' });
-  const sentence = `Should I close the stalled goal? ${longText}`;
-  const split = detailHeading(sentence);
-  assert.equal(split.heading, 'Should I close the stalled goal?');
-  assert.ok(split.body?.startsWith('Clem found that'));
-  const objective = 'Save this kind of request as a reusable workflow named "Docs search", built from the exact tools that chat already used (docs_search) for it';
-  assert.deepEqual(detailHeading(objective), { heading: objective }, 'a little over the limit stays whole, no stub');
-  const stalled = 'and it has been stalled for weeks waiting on a decision '.repeat(6);
-  const lined = detailHeading(`Settle the panel goal — close it or re-scope it (for your goal 249a2309)\n\nThis is the only open goal ${stalled}`);
-  assert.equal(lined.heading, 'Settle the panel goal — close it or re-scope it (for your goal 249a2309)', 'the text’s own first line leads');
-  assert.ok(lined.body?.startsWith('This is the only open goal'));
-  const runOn = `Settle the panel goal — close it or re-scope it (for your goal 249a2309) ${stalled}`;
-  const cut = detailHeading(runOn);
-  assert.ok(cut.heading.length <= 140 && cut.heading.endsWith('…'));
-  assert.equal(`${cut.heading.slice(0, -1)} ${cut.body!.slice(1)}`, runOn.trim(), 'the body continues where the heading stops; nothing lost or repeated');
 });
 
 test('an attention item links to where it is resolved, by the server key alone', () => {

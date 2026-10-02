@@ -26,6 +26,10 @@ export const DEFAULT_TEST_TARGETS = Object.freeze([
   'src/tasks/**/*.test.ts',
   'src/tools/**/*.test.ts',
   'apps/**/*.test.ts',
+  // The presenters both apps render from (desktop and phone). Outside this
+  // list their suites ran only in part, at release, and one shared-presenter
+  // rule had already gone red unnoticed.
+  'packages/**/*.test.ts',
   // The relay is the one first-party app written in plain .mjs — zero
   // dependencies, in no tsconfig, deliberately. Without this line its suite
   // exists and never runs, which is worse than having none: a green `npm test`
