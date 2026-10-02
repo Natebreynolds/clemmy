@@ -10,6 +10,7 @@ import {
 } from './conversation-protocol.js';
 import { durableConversationProtocolEvidenceForCall } from './conversation-protocol-session.js';
 import { openEventLog } from './eventlog.js';
+import { storeAcceptedModelHistory } from './accepted-model-history-store.js';
 import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { proveHostPlannedResolutionCoexistenceInTransaction } from './host-planned-resolution-coexistence.js';
 import {
@@ -501,7 +502,7 @@ function latestAdmissionRow(
   sourceUserSeq: number,
 ): AdmissionRow | undefined {
   return db.prepare(`
-    SELECT * FROM accepted_model_batch_admissions
+    SELECT * FROM accepted_model_batch_admissions_readable_v1
      WHERE session_id = ? AND source_user_seq = ?
      ORDER BY batch_ordinal DESC
      LIMIT 1
@@ -513,7 +514,7 @@ function checkpointRowFor(
   ref: Pick<AcceptedModelBatchRef, 'sessionId' | 'sourceUserSeq' | 'batchOrdinal'>,
 ): CheckpointRow | undefined {
   return db.prepare(`
-    SELECT * FROM accepted_model_batch_checkpoints
+    SELECT * FROM accepted_model_batch_checkpoints_readable_v1
      WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?
   `).get(ref.sessionId, ref.sourceUserSeq, ref.batchOrdinal) as CheckpointRow | undefined;
 }
@@ -614,6 +615,8 @@ export function admitAcceptedModelBatch(input: {
       callIds: validated.callIds,
     });
     const admittedAt = input.now?.() ?? new Date().toISOString();
+    const preStored = storeAcceptedModelHistory(db, validated.preHistoryJson);
+    const frameStored = storeAcceptedModelHistory(db, validated.frameHistoryJson);
     db.prepare(`
       INSERT INTO accepted_model_batch_admissions
         (session_id, source_user_seq, accepted_task_id, batch_ordinal,
@@ -622,8 +625,9 @@ export function admitAcceptedModelBatch(input: {
          work_contract_id, previous_response_id, provider_response_id,
          accepted_response_digest, pre_history_json, pre_history_digest,
          pre_history_item_count, frame_history_json, frame_history_digest,
-         frame_history_item_count, call_ids_json, call_count, admitted_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         frame_history_item_count, call_ids_json, call_count, admitted_at,
+         pre_history_object_digest, frame_history_object_digest)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.sessionId,
       input.sourceUserSeq,
@@ -640,15 +644,17 @@ export function admitAcceptedModelBatch(input: {
       input.previousResponseId ?? null,
       input.providerResponseId ?? null,
       acceptedResponseDigest,
-      validated.preHistoryJson,
+      preStored.inlineJson,
       preHistoryDigest,
       input.preHistory.length,
-      validated.frameHistoryJson,
+      frameStored.inlineJson,
       frameHistoryDigest,
       input.frameHistory.length,
       exactJson(validated.callIds),
       validated.callIds.length,
       admittedAt,
+      preStored.objectDigest,
+      frameStored.objectDigest,
     );
     const inserted = latestAdmissionRow(db, input.sessionId, input.sourceUserSeq);
     if (!inserted || inserted.batch_id !== batchId) {
@@ -685,7 +691,7 @@ export function reopenAcceptedModelBatch(
   try {
     const db = openEventLog();
     const row = db.prepare(`
-      SELECT * FROM accepted_model_batch_admissions
+      SELECT * FROM accepted_model_batch_admissions_readable_v1
        WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?
     `).get(ref.sessionId, ref.sourceUserSeq, ref.batchOrdinal) as AdmissionRow | undefined;
     if (
@@ -1284,7 +1290,7 @@ export function finalizeAcceptedModelBatch(
   const db = openEventLog();
   const transact = db.transaction((): FinalizeAcceptedModelBatchResult => {
     const row = db.prepare(`
-      SELECT * FROM accepted_model_batch_admissions
+      SELECT * FROM accepted_model_batch_admissions_readable_v1
        WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?
     `).get(ref.sessionId, ref.sourceUserSeq, ref.batchOrdinal) as AdmissionRow | undefined;
     if (
@@ -1371,13 +1377,14 @@ export function finalizeAcceptedModelBatch(
     const historyDigest = sha256(historyJson);
     const lastResponseId = row.provider_response_id ?? row.previous_response_id;
     const committedAt = options.now?.() ?? new Date().toISOString();
+    const stored = storeAcceptedModelHistory(db, historyJson);
     db.prepare(`
       INSERT INTO accepted_model_batch_checkpoints
         (session_id, source_user_seq, accepted_task_id, batch_ordinal,
          batch_id, protocol_version, authority_digest, graph_event_id,
          graph_hash, work_contract_id, disposition, history_json,
-         history_digest, history_item_count, last_response_id, committed_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         history_digest, history_item_count, last_response_id, committed_at, history_object_digest)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       ref.sessionId,
       ref.sourceUserSeq,
@@ -1389,11 +1396,12 @@ export function finalizeAcceptedModelBatch(
       currentBinding?.graphHash ?? null,
       currentBinding?.workContractId ?? null,
       reconstructed.disposition,
-      historyJson,
+      stored.inlineJson,
       historyDigest,
       reconstructed.history.length,
       lastResponseId,
       committedAt,
+      stored.objectDigest,
     );
     const inserted = checkpointRowFor(db, ref);
     if (!inserted) throw new Error('model-batch checkpoint insert did not read back');

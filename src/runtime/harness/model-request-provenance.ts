@@ -510,7 +510,7 @@ function sealedLogicalFrameReversesStub(
   ) return false;
   const rows = openEventLog().prepare(`
     SELECT item.value AS item_json
-      FROM accepted_model_batch_checkpoints checkpoint,
+      FROM accepted_model_batch_checkpoints_readable_v1 checkpoint,
            json_each(checkpoint.history_json) item
      WHERE checkpoint.session_id = ? AND checkpoint.source_user_seq = ?
        AND checkpoint.committed_at <= ?
@@ -518,7 +518,7 @@ function sealedLogicalFrameReversesStub(
        AND json_extract(item.value, '$.callId') = ?
     UNION
     SELECT item.value AS item_json
-      FROM accepted_model_batch_admissions admission,
+      FROM accepted_model_batch_admissions_readable_v1 admission,
            json_each(admission.pre_history_json) item
      WHERE admission.session_id = ? AND admission.source_user_seq = ?
        AND admission.admitted_at <= ?
@@ -665,13 +665,13 @@ function sealedHostFrameReversesStub(
   const rows = [
     ...(db.prepare(`
       SELECT history_json AS items_json
-        FROM accepted_model_batch_checkpoints
+        FROM accepted_model_batch_checkpoints_readable_v1
        WHERE session_id = ? AND source_user_seq = ?
        ORDER BY batch_ordinal DESC
     `).all(receipt.sessionId, receipt.sourceUserSeq) as Array<{ items_json: string }>),
     ...(db.prepare(`
       SELECT pre_history_json AS items_json
-        FROM accepted_model_batch_admissions
+        FROM accepted_model_batch_admissions_readable_v1
        WHERE session_id = ? AND source_user_seq = ?
        ORDER BY batch_ordinal DESC
     `).all(receipt.sessionId, receipt.sourceUserSeq) as Array<{ items_json: string }>),
@@ -726,7 +726,7 @@ function acceptedBatchAdmissionCountForResult(input: {
 }): number {
   return Number((input.db.prepare(`
     SELECT COUNT(*) AS n
-      FROM accepted_model_batch_admissions admission
+      FROM accepted_model_batch_admissions_readable_v1 admission
      WHERE admission.session_id = ? AND admission.source_user_seq = ?
        AND (
          SELECT COUNT(*)

@@ -53,7 +53,7 @@ export function pendingAcceptedLocalWork(input: {
   const db = openEventLog();
   const admissions = db.prepare(`
     SELECT a.frame_history_json, a.frame_history_digest
-      FROM accepted_model_batch_admissions a
+      FROM accepted_model_batch_admissions_readable_v1 a
       JOIN accepted_turn_call_authorities root
         ON root.session_id = a.session_id AND root.source_user_seq = a.source_user_seq
        AND root.authority_digest = a.authority_digest

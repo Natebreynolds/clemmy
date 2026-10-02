@@ -120,7 +120,7 @@ export function validateConnectionExecutionPauseCheckpoint(input: PauseProofInpu
     .get(identity.sessionId, binding.executionSourceUserSeq) as { state: string; authority_digest: string } | undefined;
   if (!root || root.authority_digest !== token.authorityDigest) return invalid();
   const batch = input.db.prepare(`SELECT batch_id, authority_digest, history_digest, history_json, disposition
-    FROM accepted_model_batch_checkpoints WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?`)
+    FROM accepted_model_batch_checkpoints_readable_v1 WHERE session_id = ? AND source_user_seq = ? AND batch_ordinal = ?`)
     .get(identity.sessionId, identity.sourceUserSeq, token.resumeFromBatchOrdinal) as {
       batch_id: string; authority_digest: string; history_digest: string; history_json: string; disposition: string;
     } | undefined;
@@ -130,7 +130,7 @@ export function validateConnectionExecutionPauseCheckpoint(input: PauseProofInpu
   if (!input.historical) {
     const dependency = input.db.prepare(`SELECT status FROM dependency_requests WHERE request_id = ? AND session_id = ?`)
       .get(binding.requestId, identity.sessionId) as { status: string } | undefined;
-    const latest = input.db.prepare(`SELECT batch_id FROM accepted_model_batch_admissions
+    const latest = input.db.prepare(`SELECT batch_id FROM accepted_model_batch_admissions_readable_v1
       WHERE session_id = ? AND source_user_seq = ? ORDER BY batch_ordinal DESC LIMIT 1`)
       .get(identity.sessionId, identity.sourceUserSeq) as { batch_id: string } | undefined;
     if (dependency?.status !== 'open' || latest?.batch_id !== token.resumeFromBatchId) return invalid();

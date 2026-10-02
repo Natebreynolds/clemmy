@@ -296,7 +296,7 @@ export function prepareAsyncReadRefinementIntentBeforeAdmission(input: {
 
     const batches = db.prepare(`
       SELECT accepted_task_id, work_contract_id, frame_history_json, pre_history_json
-        FROM accepted_model_batch_admissions
+        FROM accepted_model_batch_admissions_readable_v1
        WHERE session_id = ? AND source_user_seq = ?
          AND EXISTS (SELECT 1 FROM json_each(call_ids_json) WHERE json_each.value = ?)
     `).all(input.sessionId, input.sourceUserSeq, input.startLogicalToolCallId) as Array<{

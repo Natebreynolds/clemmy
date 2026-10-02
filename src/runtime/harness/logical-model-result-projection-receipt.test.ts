@@ -907,6 +907,10 @@ test('explicit checkpoint clipping of a nested projected result survives the nex
   assert.equal(sealed.status, 'committed', JSON.stringify(sealed));
   if (sealed.status !== 'committed') return;
 
+  const historyObject = eventlog.openEventLog().prepare(`SELECT history_object_digest FROM accepted_model_batch_checkpoints
+    WHERE batch_id = ?`).get(admission.batchId) as { history_object_digest: string | null };
+  assert.ok(historyObject.history_object_digest, 'the subsequent SQL grounding and compaction checks exercise compressed history');
+
   // Production parks the INNER operation's raw output while the model sees
   // the OUTER carrier's bounded projection. Both the name and bytes differ.
   eventlog.writeToolOutput({

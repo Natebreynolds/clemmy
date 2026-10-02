@@ -866,6 +866,29 @@ function connectionSearchEvidence(task: Fixture, callId = 'call:connection-searc
   return value;
 }
 
+test('large model histories share immutable bytes across checkpoint and successor admission without losing restart context', async () => {
+  const task = fixture('Keep this approved plan and later correction: café 日本語 🐕\n'.repeat(2_000));
+  const batch = await settledConnectionBatch(task);
+  const checkpoint = eventlog.openEventLog().prepare(`SELECT history_json, history_object_digest
+    FROM accepted_model_batch_checkpoints WHERE session_id = ?`).get(task.sessionId) as { history_json: string; history_object_digest: string };
+  assert.equal(checkpoint.history_json, '[]', 'inline slot is explicitly replaced, not a fake message');
+  assert.ok(checkpoint.history_object_digest);
+  eventlog.closeEventLog();
+  const recovered = checkpoints.prepareAcceptedModelBatchRestart(task);
+  assert.equal(recovered.status, 'ready');
+  if (recovered.status !== 'ready') throw new Error('large checkpoint did not reopen');
+  assert.deepEqual(recovered.checkpoint.history, batch.history);
+  const next = checkpoints.admitAcceptedModelBatch({ ...task, preHistory: recovered.checkpoint.history,
+    previousResponseId: batch.lastResponseId, providerResponseId: 'response:shared-history',
+    frameHistory: openFrame({ callId: 'call:next-large', toolName: 'records_read', args: {} }) });
+  assert.equal(next.status, 'admitted');
+  const admission = eventlog.openEventLog().prepare(`SELECT pre_history_object_digest FROM accepted_model_batch_admissions
+    WHERE session_id = ? ORDER BY batch_ordinal DESC LIMIT 1`).get(task.sessionId) as { pre_history_object_digest: string };
+  assert.equal(admission.pre_history_object_digest, checkpoint.history_object_digest, 'successor references the exact same object');
+  assert.deepEqual(eventlog.openEventLog().pragma('foreign_key_check'), []);
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 async function settledConnectionBatch(task: Fixture) {
   const frame = { callId: 'call:connection-search', toolName: 'tool_search', args: { query: 'controlled CRM read' } };
   const prior = checkpoints.prepareAcceptedModelBatchRestart(task);

@@ -488,7 +488,7 @@ export function recordLogicalModelResultProjectionReceipt(input: {
       const admission = db.prepare(`
         SELECT admission.pre_history_json, admission.frame_history_json,
                root.source_event_id
-          FROM accepted_model_batch_admissions admission
+          FROM accepted_model_batch_admissions_readable_v1 admission
           JOIN accepted_turn_call_authorities root
             ON root.session_id = admission.session_id
            AND root.source_user_seq = admission.source_user_seq

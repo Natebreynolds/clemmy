@@ -2,6 +2,7 @@ import { DISCOVERY_REQUEST_CALLS_SCHEMA_V1 } from './discovery-request-identity.
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
+import { createAcceptedModelHistorySchema, registerAcceptedModelHistoryReader } from './accepted-model-history-store.js';
 import { SESSION_HISTORY_SEARCH_SCHEMA_V1 } from './session-history-search-schema.js';
 import { migrateRetainedSessionProofs } from './retained-session-proof-schema.js';
 import {
@@ -11369,6 +11370,7 @@ const MIGRATIONS: EventLogMigration[] = [
         WHERE observation_id IS NULL AND resolution_json IS NULL;`);
     },
   },
+  { version: 89, sql: '', backfill: createAcceptedModelHistorySchema },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
@@ -11487,6 +11489,7 @@ export function applyHarnessMigrationsThroughVersionForTests(
 }
 
 function runMigrations(db: Database.Database, throughVersion = HARNESS_SCHEMA_VERSION): void {
+  registerAcceptedModelHistoryReader(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
       version    INTEGER PRIMARY KEY,

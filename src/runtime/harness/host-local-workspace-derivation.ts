@@ -884,7 +884,7 @@ export function validateHostLocalWorkspaceSourceBeforeDispatch(input: {
     }
     const batches = input.db.prepare(`
       SELECT accepted_task_id, work_contract_id, frame_history_json, pre_history_json
-        FROM accepted_model_batch_admissions
+        FROM accepted_model_batch_admissions_readable_v1
        WHERE session_id = ? AND source_user_seq = ?
          AND EXISTS (
            SELECT 1 FROM json_each(call_ids_json)
@@ -1076,8 +1076,8 @@ export function proveHostLocalWorkspaceDerivation(input: {
       SELECT admission.accepted_task_id, admission.work_contract_id,
              admission.frame_history_json, admission.pre_history_json,
              checkpoint.disposition
-        FROM accepted_model_batch_admissions admission
-        JOIN accepted_model_batch_checkpoints checkpoint
+        FROM accepted_model_batch_admissions_readable_v1 admission
+        JOIN accepted_model_batch_checkpoints_readable_v1 checkpoint
           ON checkpoint.session_id = admission.session_id
          AND checkpoint.source_user_seq = admission.source_user_seq
          AND checkpoint.batch_ordinal = admission.batch_ordinal

@@ -14,7 +14,7 @@ were not overwritten. A final integration record must identify the combined
 commit and source fingerprint after building; this document is not an install
 receipt.
 
-Read-only GET `/api/console/build-info` at 2026-10-02 08:12 UTC reported daemon
+Read-only GET `/api/console/build-info` during this wave reported daemon
 source 1eee0ee6b64e058a685e679d1f4ab595d395bd9b, fingerprint
 1e93e65e72dbdbd038db6989a8f2ed4ae41595bbdeda2ff03b2def4f6e5f0e27,
 schema 88, PID 45556. Native shell version was still 3.18.24: neither that version

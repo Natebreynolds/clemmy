@@ -95,7 +95,7 @@ function pendingRows(
          AND authority.accepted_task_id = intent.accepted_task_id
          AND authority.authority_kind = 'host_v1'
          AND authority.state = 'open'
-        JOIN accepted_model_batch_admissions batch
+        JOIN accepted_model_batch_admissions_readable_v1 batch
           ON batch.session_id = intent.session_id
          AND batch.source_user_seq = intent.source_user_seq
          AND batch.accepted_task_id = intent.accepted_task_id
@@ -106,7 +106,7 @@ function pendingRows(
         JOIN sessions session ON session.id = intent.session_id
        WHERE call.state = 'open'
          AND NOT EXISTS (
-           SELECT 1 FROM accepted_model_batch_checkpoints checkpoint
+           SELECT 1 FROM accepted_model_batch_checkpoints_readable_v1 checkpoint
             WHERE checkpoint.session_id = batch.session_id
               AND checkpoint.source_user_seq = batch.source_user_seq
               AND checkpoint.batch_ordinal = batch.batch_ordinal
@@ -272,14 +272,14 @@ export function claimPendingAsyncReadRefinementRecoveries(
                 AND authority.authority_digest = ?
            )
            AND EXISTS (
-             SELECT 1 FROM accepted_model_batch_admissions batch
+             SELECT 1 FROM accepted_model_batch_admissions_readable_v1 batch
               WHERE batch.session_id = ? AND batch.source_user_seq = ?
                 AND batch.accepted_task_id = ? AND batch.batch_id = ?
                 AND batch.batch_ordinal = ? AND batch.authority_digest = ?
                 AND batch.call_count = 1
                 AND json_extract(batch.call_ids_json, '$[0]') = ?
                 AND NOT EXISTS (
-                  SELECT 1 FROM accepted_model_batch_checkpoints checkpoint
+                  SELECT 1 FROM accepted_model_batch_checkpoints_readable_v1 checkpoint
                    WHERE checkpoint.session_id = batch.session_id
                      AND checkpoint.source_user_seq = batch.source_user_seq
                      AND checkpoint.batch_ordinal = batch.batch_ordinal
