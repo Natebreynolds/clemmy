@@ -8,9 +8,103 @@ const MIN_BYTES = 32 * 1024;
 const MAX_BYTES = 32 * 1024 * 1024;
 const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 
-export function registerAcceptedModelHistoryReader(db: Database.Database): void {
-  db.function('clem_exact_history_v1', { deterministic: true }, (encoded: unknown, codec: unknown,
-    plaintextBytes: unknown, digest: unknown, itemCount: unknown) => {
+const preparedBrand: unique symbol = Symbol('prepared exact history');
+export interface PreparedAcceptedModelHistory { readonly [preparedBrand]: true }
+export interface ExistingAcceptedModelHistory {
+  encoded: Buffer; codec: string; plaintext_bytes: number; digest: string; item_count: number;
+}
+interface PreparedBytes { json: string; digest: string | null; bytes: number; itemCount: number; encoded: Buffer | null }
+// Encoded bytes never escape this module. A forged/copied handle cannot bypass
+// preparation, and a caller cannot mutate its buffer before publication.
+const preparedHistories = new WeakMap<PreparedAcceptedModelHistory, PreparedBytes>();
+const preparedReaderScopes = new WeakMap<Database.Database, PreparedBytes>();
+
+function matchesPreparedHistory(prepared: PreparedBytes, encoded: unknown, codec: unknown,
+  plaintextBytes: unknown, digest: unknown, itemCount: unknown): boolean {
+  return !!prepared.encoded && Buffer.isBuffer(encoded) && codec === 'deflate-raw'
+    && plaintextBytes === prepared.bytes && digest === prepared.digest && itemCount === prepared.itemCount
+    && encoded.equals(prepared.encoded);
+}
+
+/** Pure codec preparation: no database connection, transaction or publication.
+ * Maintenance runs it after closing its read snapshot and before asking for
+ * the writer lock. It grants no source or execution authority. */
+export function prepareAcceptedModelHistory(json: string, existing?: ExistingAcceptedModelHistory): PreparedAcceptedModelHistory {
+  const plain = Buffer.from(json, 'utf8');
+  let digest: string | null = null;
+  let itemCount = 0;
+  let encoded: Buffer | null = null;
+  if (plain.length >= MIN_BYTES && plain.length <= MAX_BYTES) {
+    const history: unknown = JSON.parse(json);
+    if (!Array.isArray(history)) throw new Error('accepted history must be an array');
+    digest = hash(plain);
+    itemCount = history.length;
+    if (existing) {
+      if (!Buffer.isBuffer(existing.encoded)) throw new Error('accepted history object metadata is invalid');
+      const owned = Buffer.from(existing.encoded);
+      if (decodeAcceptedModelHistory(owned, existing.codec, existing.plaintext_bytes,
+        existing.digest, existing.item_count) !== json) throw new Error('accepted history object digest collision');
+      encoded = owned;
+    } else {
+      const compressed = deflateRawSync(plain, { level: 3 });
+      if (compressed.length + 128 < plain.length) {
+        // Use the identical strict reader before publication, not an assumption
+        // that compression succeeded. Keep these validated bytes private.
+        if (decodeAcceptedModelHistory(compressed, 'deflate-raw', plain.length, digest, itemCount) !== json) {
+          throw new Error('prepared accepted history is not exact');
+        }
+        encoded = compressed;
+      }
+    }
+  }
+  const handle: PreparedAcceptedModelHistory = Object.freeze({ [preparedBrand]: true as const });
+  preparedHistories.set(handle, { json, digest, bytes: plain.length, itemCount, encoded });
+  return handle;
+}
+
+/** One synchronous publication scope on one connection. This is an exact
+ * encoded-byte witness, never a cached model/tool result or source authority.
+ * Exception/rollback paths release it; normal later reads decode afresh. */
+export function withPreparedAcceptedModelHistoryReader<T>(db: Database.Database,
+  handle: PreparedAcceptedModelHistory, publish: () => T): T {
+  const prepared = preparedHistories.get(handle);
+  if (!prepared) throw new Error('exact history preparation handle is invalid');
+  const previous = preparedReaderScopes.get(db);
+  if (prepared.encoded) preparedReaderScopes.set(db, prepared);
+  try { return publish(); }
+  finally {
+    if (previous) preparedReaderScopes.set(db, previous);
+    else preparedReaderScopes.delete(db);
+  }
+}
+
+/** Publish only inside the owning source/cursor transaction. Existing objects
+ * are fully decoded/verified, and source UPDATE guards still independently
+ * prove exact bytes/counts. Preparation is not an authority or result cache. */
+export function storePreparedAcceptedModelHistory(db: Database.Database, handle: PreparedAcceptedModelHistory): {
+  inlineJson: string; objectDigest: string | null;
+} {
+  const prepared = preparedHistories.get(handle);
+  if (!prepared) throw new Error('exact history preparation handle is invalid');
+  const { json, digest, bytes, itemCount, encoded } = prepared;
+  if (digest === null) return { inlineJson: json, objectDigest: null };
+  const existing = db.prepare(`SELECT encoded, codec, plaintext_bytes, digest, item_count
+    FROM accepted_model_history_objects_v1 WHERE digest = ?`).get(digest) as ExistingAcceptedModelHistory | undefined;
+  if (existing) {
+    if (!matchesPreparedHistory(prepared, existing.encoded, existing.codec,
+      existing.plaintext_bytes, existing.digest, existing.item_count)
+      && decodeAcceptedModelHistory(existing.encoded, existing.codec, existing.plaintext_bytes,
+        existing.digest, existing.item_count) !== json) throw new Error('accepted history object digest collision');
+    return { inlineJson: '[]', objectDigest: digest };
+  }
+  if (!encoded) return { inlineJson: json, objectDigest: null };
+  db.prepare(`INSERT INTO accepted_model_history_objects_v1 (digest, codec, plaintext_bytes, item_count, encoded)
+    VALUES (?, 'deflate-raw', ?, ?, ?)`).run(digest, bytes, itemCount, encoded);
+  return { inlineJson: '[]', objectDigest: digest };
+}
+
+function decodeAcceptedModelHistory(encoded: unknown, codec: unknown,
+    plaintextBytes: unknown, digest: unknown, itemCount: unknown): string {
     if (!Buffer.isBuffer(encoded) || codec !== 'deflate-raw'
       || typeof plaintextBytes !== 'number' || !Number.isSafeInteger(plaintextBytes)
       || plaintextBytes < MIN_BYTES || plaintextBytes > MAX_BYTES
@@ -29,6 +123,18 @@ export function registerAcceptedModelHistoryReader(db: Database.Database): void 
     const history: unknown = JSON.parse(text);
     if (!Array.isArray(history) || history.length !== itemCount) throw new Error('accepted history object item count is invalid');
     return text;
+}
+
+export function registerAcceptedModelHistoryReader(db: Database.Database): void {
+  db.function('clem_exact_history_v1', { deterministic: true }, (encoded: unknown, codec: unknown,
+    plaintextBytes: unknown, digest: unknown, itemCount: unknown) => {
+    const prepared = preparedReaderScopes.get(db);
+    // Match the actual BLOB, not just a digest/row revision or immutable-object
+    // assumption. Every metadata value must match the fully decoded witness.
+    // A different encoding, corrupt bytes or changed source proof falls back
+    // to the complete strict reader, including trailing-stream rejection.
+    if (prepared && matchesPreparedHistory(prepared, encoded, codec, plaintextBytes, digest, itemCount)) return prepared.json;
+    return decodeAcceptedModelHistory(encoded, codec, plaintextBytes, digest, itemCount);
   });
 }
 
