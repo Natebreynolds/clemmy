@@ -223,6 +223,17 @@ test('a saved agent the request names is in the context with how to hand it work
       { enabled: true, hitCount: 0, source: 'unified', injected: false },
     );
     assert.doesNotMatch(unrelated.text, /Saved agents:/);
+
+    // A question about the agents names none of them; the compact roster
+    // answers it from context (live 10-02: 92 s of lookups for four names).
+    const roster = buildAgentContextPacket(
+      'hey what agents do we have',
+      { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    );
+    assert.match(roster.text, /All saved agents \(\d+\): [^\n]*Packet Design Studio \(runs on claude-opus-5-5\)/);
+    assert.match(roster.text, /a question about the agents is answered from it/);
+    // A request that names an agent keeps the detailed lines and the roster.
+    assert.match(named.text, /All saved agents \(\d+\): /);
   } finally {
     if (saved.ok) deleteAgentRecord(saved.agent.id);
   }

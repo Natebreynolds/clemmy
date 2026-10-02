@@ -404,31 +404,58 @@ function assignedProjectNames(agent: AgentRecord): string[] {
  *  way to know they existed short of a team_list it could miss: live 10-02,
  *  "hand Design Studio this brief" found no Design Studio and the handoff was
  *  refused, though the agent had been saved an hour earlier. */
-function rankSavedAgents(input: string): RankedContextCandidate[] {
+function rankSavedAgents(input: string, agents: readonly AgentRecord[]): RankedContextCandidate[] {
   const queryTokens = tokens(input);
   if (queryTokens.length === 0) return [];
   try {
-    return listAgentRecords()
+    return agents
       .map((agent) => {
         const { score, matched } = candidateScore(queryTokens, [
           { text: agent.name, weight: 6 },
           { text: agent.id, weight: 4 },
           { text: agent.handles, weight: 3 },
         ]);
+        return { agent, score, matched, named: explicitlyNamesCandidate(input, agent.name) };
+      })
+      .filter((candidate) => candidate.named || (candidate.score >= 8 && candidate.matched.length >= 2))
+      .sort((left, right) => Number(right.named) - Number(left.named) || right.score - left.score)
+      .slice(0, 4)
+      // Projects are read only for the few agents shown in detail.
+      .map(({ agent, score, matched }) => {
         const projects = assignedProjectNames(agent);
         return {
           name: agent.name,
           description: clip(`${agent.handles || '(no description)'}${agent.model ? ` · runs on ${agent.model}` : ''}${projects.length > 0 ? ` · works in project ${projects.join(', ')}` : ''}`, 260),
           score,
           reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
-          matchCount: matched.length,
-          named: explicitlyNamesCandidate(input, agent.name),
         };
-      })
-      .filter((candidate) => candidate.named || (candidate.score >= 8 && candidate.matchCount >= 2))
-      .sort((left, right) => Number(right.named) - Number(left.named) || right.score - left.score)
-      .slice(0, 4)
-      .map(({ name, description, score, reason }) => ({ name, description, score, reason }));
+      });
+  } catch {
+    return [];
+  }
+}
+
+/** How many saved agents the per-turn roster names before it points at
+ *  team_list for the rest. */
+const SAVED_AGENT_ROSTER_MAX = 24;
+
+/** Every saved agent by name, with the model it runs on, in one compact
+ *  line. A question about the agents themselves names none of them: live
+ *  10-02, "what agents do we have" took 92 s of lookups, re-checks and
+ *  discovery for an answer four names long. Built from the records the turn
+ *  already read, with no per-agent lookup: it rides on every turn, greetings
+ *  included. */
+function savedAgentRoster(agents: readonly AgentRecord[]): string {
+  if (agents.length === 0) return '';
+  const shown = agents.slice(0, SAVED_AGENT_ROSTER_MAX)
+    .map((agent) => (agent.model ? `${agent.name} (runs on ${agent.model})` : agent.name));
+  const more = agents.length - shown.length;
+  return `All saved agents (${agents.length}): ${shown.join(', ')}${more > 0 ? `, and ${more} more (team_list lists every one)` : ''}.`;
+}
+
+function readSavedAgents(): AgentRecord[] {
+  try {
+    return listAgentRecords();
   } catch {
     return [];
   }
@@ -723,7 +750,9 @@ export function buildAgentContextPacket(
   const constrainedWorkflowNode = opts?.sessionKind === 'workflow';
   const skills = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankSkills(input);
   const workflows = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankWorkflows(input);
-  const savedAgents = suppressActionSemanticEnrichment ? [] : rankSavedAgents(input);
+  const agentRecords = suppressActionSemanticEnrichment ? [] : readSavedAgents();
+  const savedAgents = rankSavedAgents(input, agentRecords);
+  const agentRoster = savedAgentRoster(agentRecords);
   const projectCommands = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankProjectCommands(input);
   const toolScope: McpToolScope = plainConversationSurface
     ? { authority: 'none', reason: 'accepted source proved a plain conversation surface' }
@@ -948,6 +977,9 @@ export function buildAgentContextPacket(
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. Shared names or keywords do not establish that a workflow fits the current task. If the user asks to run a saved workflow, call workflow_run with their exact phrasing; inspect its definition when needed to supply its inputs. Otherwise use workflow_get only when the workflow\'s purpose is relevant and its steps could help with the requested work. A candidate does not prove that its capabilities, accounts or arguments apply here. Continue directly when they do not fit. Do NOT auto-run a workflow the user did not ask to run.')),
     ...renderCandidates('Saved agents', savedAgents, 'The owner\'s saved agents. To hand one of them a piece of work you wait on here, call run_worker with agent set to its name. To hand one longer, multi-step work that runs on its own and reports back here, call dispatch_background_task with agent set to its name, and project set to the project it works in when it has one. Either way the work runs as that agent, with its instructions and on its model. Credit a result to an agent only when the work ran as it, and say which model ran it when that matters.'),
+    savedAgents.length === 0 && agentRoster
+      ? `${agentRoster} This is the current list, so a question about the agents is answered from it. To hand one work, call run_worker (or dispatch_background_task for longer work) with agent set to its name.`
+      : agentRoster,
     healthWarnings.length > 0
       ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
       : '',
