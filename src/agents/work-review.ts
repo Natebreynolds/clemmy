@@ -345,6 +345,20 @@ export function retirableItems(items: WorkReviewItem[], candidates: WorkReviewCa
   return items.filter((item) => !item.retiredAt && !live.has(item.key) && item.kind !== 'run_failed');
 }
 
+/** Failures a later completed run of the same workflow has superseded.
+ *  "Want me to run it again?" is no longer a question once it ran again and
+ *  worked; the failure stays on record, the ask leaves. A one-step try is not
+ *  a real run and supersedes nothing. */
+export function supersededFailures(items: WorkReviewItem[], observation: WorkObservation): WorkReviewItem[] {
+  return items.filter((item) => {
+    if (item.retiredAt || item.kind !== 'run_failed') return false;
+    const raised = ms(item.createdAt);
+    if (raised === null) return false;
+    return observation.runs.some((run) => run.workflow === item.subject && run.status === 'completed' && !run.targetStepId
+      && (ms(run.finishedAt) ?? -Infinity) > raised);
+  });
+}
+
 export function workReviewNotificationId(key: string, at: string): string {
   return `work-review:${key}:${at}`;
 }
@@ -418,11 +432,12 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
   const nowMs = deps.now();
   const candidates = deriveWorkReviewCandidates(observation, cfg, nowMs, lastTickMs);
   const open = Object.values(state.items).filter((i) => !i.retiredAt);
-  const retired = retirableItems(open, candidates);
+  const superseded = supersededFailures(open, observation);
+  const retired = [...retirableItems(open, candidates), ...superseded];
   const at = new Date(nowMs).toISOString();
   for (const item of retired) {
     item.retiredAt = at;
-    item.retiredReason = 'resolved';
+    item.retiredReason = superseded.includes(item) ? 'superseded' : 'resolved';
     state.metrics.itemsRetired += 1;
     // The card leaves Needs you with the thing it pointed at.
     if (item.notificationId) { try { deps.markNotificationRead(item.notificationId); } catch { /* the state still says resolved */ } }

@@ -232,3 +232,24 @@ test('the notification reads as the item, and a read failure is a recorded error
   assert.match(tick.summary, /read failed \(disk gone\)/);
   assert.equal(h.state.lastError?.reason, 'disk gone');
 });
+
+test('a failure a later successful run of the same workflow superseded stops asking; the failure alone does not', async () => {
+  const h = harness({ notify: 'push' });
+  await runWorkReviewTick(h.deps);
+  const failed = h.state.items['run_failed:r-fail'];
+  assert.ok(failed && !failed.retiredAt);
+  const raisedMs = Date.parse(failed.createdAt);
+  // A one-step try that worked supersedes nothing.
+  const tried: WorkObservation = { ...observation, runs: [...observation.runs,
+    { runId: 'r-try-ok', workflow: 'friday-dashboard-daily-refresh', status: 'completed', createdAt: new Date(raisedMs + 60_000).toISOString(), finishedAt: new Date(raisedMs + 120_000).toISOString(), targetStepId: 'collect' }] };
+  await runWorkReviewTick({ ...h.deps, tickId: 't2', now: () => NOW + 30 * 60_000, observe: async () => ({ observation: tried, readFailures: 0 }) });
+  assert.equal(h.state.items['run_failed:r-fail'].retiredAt, undefined);
+  // The real run completing afterwards does.
+  const reran: WorkObservation = { ...observation, runs: [...observation.runs,
+    { runId: 'r-rerun', workflow: 'friday-dashboard-daily-refresh', status: 'completed', createdAt: new Date(raisedMs + 60_000).toISOString(), finishedAt: new Date(raisedMs + 300_000).toISOString() }] };
+  await runWorkReviewTick({ ...h.deps, tickId: 't3', now: () => NOW + 60 * 60_000, observe: async () => ({ observation: reran, readFailures: 0 }) });
+  assert.equal(h.state.items['run_failed:r-fail'].retiredReason, 'superseded');
+  assert.ok(h.markedRead.includes(failed.notificationId!), 'the card leaves Needs you and From Clem');
+  // Another workflow's failure is untouched.
+  assert.equal(h.state.items['run_failed:r-error'].retiredAt, undefined);
+});
