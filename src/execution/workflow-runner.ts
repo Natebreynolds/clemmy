@@ -6,6 +6,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
+import { LOGIN_KEYCHAIN_LOCKED_GUIDANCE, probeLoginKeychain } from '../runtime/login-keychain.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import { peekConnectedToolkits } from '../integrations/composio/client.js';
@@ -1016,6 +1017,11 @@ export interface QueuedRunRecord {
   terminalOutcome?: WorkflowTerminalOutcome;
   blockedSteps?: Array<{ stepId: string; reason: string }>;
   proposedFixId?: string | null;
+  /** A local command step failed while the owner's login keychain was
+   *  locked. Followed up once when it is unlocked (keychain-unlock-followup). */
+  failureContext?: { loginKeychain: 'locked'; observedAt: string };
+  /** The one follow-up made for a keychain-locked failure. */
+  keychainFollowUp?: { at: string; action: 'rerun' | 'asked'; rerunId?: string };
   /**
    * Bounded autonomous self-heal: how many times this run has already been
    * auto-healed (a safe edit_step fix applied) + re-queued. Carried run→run via
@@ -17359,6 +17365,20 @@ async function processOneRunFile(
         : error instanceof Error ? error.message : String(error);
       let cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
       const requestedCancellation = cancelled;
+      // A local command step that failed while the owner's login keychain was
+      // locked: tools that keep their sign-ins there fail in their own words
+      // ("org not found"), which reads as a broken integration (live 10-02).
+      // Say what was locked first, and mark the run for one follow-up when
+      // the keychain is unlocked again.
+      let keychainLockedAt: string | null = null;
+      if (!cancelled && structuredFailure) {
+        try {
+          if ((await probeLoginKeychain()).state === 'locked') keychainLockedAt = new Date().toISOString();
+        } catch { /* the probe never decides a failure */ }
+      }
+      if (keychainLockedAt) {
+        message = `${LOGIN_KEYCHAIN_LOCKED_GUIDANCE} I'll follow up on this run once it is unlocked.\n\n${message}`;
+      }
       // Preview the post-failure count without mutating the advisory ledger.
       // The real update happens only after an error terminal state wins.
       const prospectiveFailureCount = cancelled
@@ -17441,6 +17461,7 @@ async function processOneRunFile(
           blockedSteps: [{ stepId: '(run)', reason: message }],
           ...(structuredFailure ? { failure: structuredFailure } : {}),
           ...(healFixId ? { proposedFixId: healFixId } : {}),
+          ...(keychainLockedAt ? { failureContext: { loginKeychain: 'locked' as const, observedAt: keychainLockedAt } } : {}),
         }),
       }, requestedReport);
       const canonicalTerminal = terminalRecord.record;
@@ -17495,6 +17516,7 @@ async function processOneRunFile(
             failureRunner: structuredFailure.runner,
             failureStepId: structuredFailure.stepId,
           } : {}),
+          ...(keychainLockedAt && !cancelled ? { failureCause: 'login_keychain_locked' } : {}),
           ...(healFixId ? { proposedFixId: healFixId, needsAttention: true } : {}),
         },
       });

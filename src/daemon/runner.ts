@@ -3214,6 +3214,18 @@ export async function startDaemon(
   const authKeepaliveTimer = setInterval(tickAuthKeepaliveInPhase, 5 * 60_000);
   authKeepaliveTimer.unref?.();
 
+  // A workflow run that failed while the owner's login keychain was locked
+  // gets one follow-up once it is unlocked again: a safe re-run, or one
+  // message asking. Asks the keychain only when such a run is waiting.
+  const tickKeychainFollowUp = () => {
+    void import('../execution/keychain-unlock-followup.js')
+      .then((mod) => mod.followUpKeychainLockedRuns())
+      .catch(() => { /* a follow-up never takes down the daemon */ });
+  };
+  setTimeout(tickKeychainFollowUp, 45_000).unref?.();
+  const keychainFollowUpTimer = setInterval(tickKeychainFollowUp, 5 * 60_000);
+  keychainFollowUpTimer.unref?.();
+
   // Boot warmup: one model call + one embed ping shortly after boot so the
   // FIRST real user turn doesn't pay the cold-start tax (observed live on the
   // 0.9.1 update: a 35s model call + hybrid-recall timeout on the first
