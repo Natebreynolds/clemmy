@@ -60,7 +60,8 @@ export function observationFrom(row, receipt) {
       invalidCalls: typeof m.invalidUsageCalls === 'number' ? m.invalidUsageCalls : null,
     },
     /** Quiet is a measurement, not a default: unknown liveness counts as contended. */
-    contended: row.liveness === 'unknown' || busyAtStart === null
+    // Rows from before liveness was sampled carry no reading at all.
+    contended: row.liveness !== 'fresh' || busyAtStart === null
       || busyAtStart.length > 0 || (busyAtEnd !== null && busyAtEnd.length > 0),
     reply: String(turn?.terminal?.reply ?? row.reply ?? ''),
   };

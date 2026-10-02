@@ -56,12 +56,13 @@ test('observations read the receipt: its reply, its own assertions, certified us
     terminal: { reply: 'Done — fixture note B5', turnOutcome: { status: 'done' } },
     measurement: { turnWallMs: 13_629, sdkDurationMs: 12_001, promptTokens: 40_000, usageAttributionCertified: true, uncertifiedUsageCalls: 0, invalidUsageCalls: 0 },
   }] };
-  const o = observationFrom({ id: 'file-write-read', pass: 1, repairs: 0, otherFailures: [] }, receipt);
+  const o = observationFrom({ id: 'file-write-read', pass: 1, repairs: 0, otherFailures: [], busyAtStart: [] }, receipt);
   assert.equal(o.reply, 'Done — fixture note B5');
   assert.equal(o.assertionsPassed, false);
   assert.equal(o.repairs, 1);
   assert.equal(o.modelWorkMs, 12_001);
-  assert.equal(o.contended, true, 'a row with no liveness sample is not assumed quiet');
+  assert.equal(o.contended, true, 'a row with no liveness reading is not assumed quiet, even with an empty busy list');
+  assert.equal(observationFrom({ id: 'x', pass: 1, liveness: 'fresh', busyAtStart: [], busyAtEnd: [] }, receipt).contended, false);
 });
 
 test('a run qualifies only with no regression and nothing unresolved or missing', () => {
