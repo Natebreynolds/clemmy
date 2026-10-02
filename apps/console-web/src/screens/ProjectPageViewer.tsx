@@ -105,6 +105,24 @@ function Viewer({ projectId, pageId }: { projectId: string; pageId: string }) {
 }
 
 function PageFrame({ projectId, projectName, page }: { projectId: string; projectName: string; page: ProjectPageView }) {
+  const title = projectPageTitle(page);
+  const place = projectPagePlace(page);
+  return (
+    <Page className="flex min-h-full max-w-none flex-col">
+      <div><BackLink to={projectPath(projectId)}>{projectName}</BackLink></div>
+      <header className="mb-4 min-w-0">
+        <h2 className="break-words text-h2 text-fg">{title}</h2>
+        <p className="truncate text-small text-muted" title={place}>{place}</p>
+      </header>
+      <ProjectPagePreview projectId={projectId} page={page} />
+    </Page>
+  );
+}
+
+/** The page itself with its width choices, reload and Open in browser. The
+ *  viewer route and the chat's side panel show the same thing, so a page is
+ *  looked at the same way wherever it is opened. */
+export function ProjectPagePreview({ projectId, page }: { projectId: string; page: ProjectPageView }) {
   const [choice, setChoice] = useState<WidthChoice>('desktop');
   const [reload, setReload] = useState(0);
   const [opening, setOpening] = useState(false);
@@ -112,7 +130,6 @@ function PageFrame({ projectId, projectName, page }: { projectId: string; projec
   const [openError, setOpenError] = useState('');
 
   const title = projectPageTitle(page);
-  const place = projectPagePlace(page);
   const width = WIDTHS.find((row) => row.id === choice)?.width ?? null;
   // Asked again on every reload, so the frame is only drawn over a document that is there.
   const check = usePoll(projectKeys.pageDocument(projectId, page.id, reload), () => checkPageDocument(projectId, page.id), 0);
@@ -132,13 +149,7 @@ function PageFrame({ projectId, projectName, page }: { projectId: string; projec
   };
 
   return (
-    <Page className="flex min-h-full max-w-none flex-col">
-      <div><BackLink to={projectPath(projectId)}>{projectName}</BackLink></div>
-      <header className="mb-4 min-w-0">
-        <h2 className="break-words text-h2 text-fg">{title}</h2>
-        <p className="truncate text-small text-muted" title={place}>{place}</p>
-      </header>
-
+    <div className="flex min-h-0 flex-1 flex-col">
       <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2">
         <div role="group" aria-label="Width the page is shown at" className="inline-flex max-w-full flex-wrap gap-0.5 rounded-md border border-border bg-subtle p-0.5">
           {WIDTHS.map(({ id, label, width: px, Icon }) => (
@@ -197,6 +208,6 @@ function PageFrame({ projectId, projectName, page }: { projectId: string; projec
         )}
       </div>
       <p className="mt-2 text-caption text-muted">{PROJECT_PAGE_FRAME_NOTE}</p>
-    </Page>
+    </div>
   );
 }

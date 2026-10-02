@@ -55,3 +55,15 @@ test('the viewer is a deferred route beside the project page', () => {
     'it is registered with the project routes',
   );
 });
+
+test('a page opened from a reply shows beside the conversation, never in its place', () => {
+  // Live 10-02: View under a reply replaced the chat with the viewer route.
+  const receipt = read('../components/chat/TurnReceipt.tsx');
+  const panel = read('../components/chat/PagePreviewPanel.tsx');
+  assert.doesNotMatch(receipt, /to=\{pageViewerPath\(/, 'the reply card does not navigate to the viewer');
+  assert.match(receipt, /<PagePreviewPanel\b/);
+  assert.match(panel, /<ProjectPagePreview\b/, 'the panel shows the viewer\'s own preview');
+  assert.doesNotMatch(panel, /<iframe\b/, 'the panel draws no frame of its own, so the sandbox is said in one place');
+  assert.match(panel, /key === 'Escape'/, 'Escape closes the panel back to the conversation');
+  assert.match(viewer, /export function ProjectPagePreview\b/);
+});

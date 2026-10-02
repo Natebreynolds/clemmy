@@ -20,8 +20,9 @@ import { answerModelRuleOffer } from '@/lib/chat';
 import type { ActivityItem } from '@/lib/useChat';
 import type { TerminalFacts } from '@clem/chat-engine';
 import { openFile, resolveDeliverablePath } from '@/lib/files';
-import { findSessionPage, isPageName, pageViewerPath, type ProjectPageView } from '@/lib/projects';
+import { findSessionPage, isPageName, type ProjectPageView } from '@/lib/projects';
 import { TurnEvidenceLine } from '@/components/chat/TurnEvidenceLine';
+import { PagePreviewPanel } from '@/components/chat/PagePreviewPanel';
 
 /** A file she saved this turn, as something you can open. The harness names
  *  the latest file by basename; the path is resolved on demand and the button
@@ -33,6 +34,8 @@ function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: st
   // A page written into a linked local project lies outside Clem's own
   // files, where Open cannot reach. It is looked at in the project's viewer.
   const [page, setPage] = useState<{ projectId: string; page: ProjectPageView } | null>(null);
+  // The page opens beside the conversation, never in its place.
+  const [previewing, setPreviewing] = useState(false);
   const name = file?.name ?? '';
   const folder = file?.dir ?? '';
   useEffect(() => {
@@ -55,13 +58,18 @@ function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: st
           <span className="truncate text-small font-semibold text-fg" title={title}>{title}</span>
           <span className="truncate text-caption text-faint" title={projectPagePlace(page.page)}>{projectPagePlace(page.page)}</span>
         </span>
-        <Link
-          to={pageViewerPath(page.projectId, page.page.id)}
+        <button
+          type="button"
+          onClick={() => setPreviewing(true)}
+          aria-haspopup="dialog"
           aria-label={`View the page ${title}`}
           className="shrink-0 rounded-sm border border-border-strong px-3 py-1 text-caption font-semibold text-fg transition-colors hover:bg-subtle active:scale-press"
         >
           View
-        </Link>
+        </button>
+        {previewing && (
+          <PagePreviewPanel projectId={page.projectId} page={page.page} onClose={() => setPreviewing(false)} />
+        )}
       </div>
     );
   }
