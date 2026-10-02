@@ -50,6 +50,8 @@ import {
 } from '../lib/inbox-projects';
 import { listProjectLabels } from '../lib/project-api';
 import { useScreenData } from '../lib/use-screen-data';
+import { buildNeedsRows, type NeedsRowKind } from '../lib/needs-you-rows';
+import { decisionHeading, isIdentifierLike } from '@clem/chat-engine';
 
 type InboxTab = 'needs' | 'updates';
 
@@ -248,6 +250,11 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const [clearing, setClearing] = useState(false);
   // A bulk clear asks once, in place, naming its own size. No modal.
   const [confirmClear, setConfirmClear] = useState(false);
+  // Needs you is a list; one item opens on its own with Back. The list's
+  // scroll position is kept so Back lands where the person was.
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const listScroll = useRef(0);
+  const screenRef = useRef<HTMLDivElement>(null);
   const handledDeepLink = useRef<string | null>(null);
   const clearingLock = useRef(false);
 
@@ -315,6 +322,22 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
     () => collapseAttentionNotifications((data?.notifications ?? []).filter(stillNeedsUser)).length,
     [data?.notifications, stillNeedsUser],
   );
+  const needsRows = useMemo(() => buildNeedsRows({
+    questions,
+    trustProposals,
+    workspaceChoosers,
+    plans,
+    approvals,
+    unlisted,
+    attention: notificationNeeds,
+    projectOf: (kind: NeedsRowKind, row: unknown) => kind === 'question'
+      ? projectNameFor(row as InboxQuestion, questionSessions(row as InboxQuestion), projectLabels)
+      : kind === 'approval' || kind === 'plan'
+        ? projectNameFor(row as ApprovalRow, approvalSessions(row as ApprovalRow), projectLabels)
+        : kind === 'attention'
+          ? projectNameFor({}, notificationSessions(row as InboxNotification), projectLabels)
+          : null,
+  }), [approvals, notificationNeeds, plans, projectLabels, questions, trustProposals, unlisted, workspaceChoosers]);
   const confirmedNeedsCount = questions.length + approvals.length + plans.length + workspaceChoosers.length + trustProposals.length + confirmedNotificationNeeds + unlisted.length;
   const resolvedQuestionItems = new Set(
     notifications
@@ -412,6 +435,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       fallbackNotification && notificationNeeds.some(({ row }) => row.id === fallbackNotification.id),
     );
     setTab(belongsInNeeds ? 'needs' : 'updates');
+    if (belongsInNeeds) setOpenKey(target);
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         const element = document.getElementById(`inbox-${target}`);
@@ -425,6 +449,33 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
     });
   }, [approvalIds, data, initialNotificationId, notificationNeeds, notifications, planIds, questionIds, trustIds, updates]);
 
+  const scroller = () => screenRef.current?.closest<HTMLElement>('.app-main') ?? null;
+  const openRow = (key: string) => {
+    listScroll.current = scroller()?.scrollTop ?? 0;
+    setOpenKey(key);
+    window.requestAnimationFrame(() => {
+      scroller()?.scrollTo({ top: 0 });
+      document.getElementById('needs-back')?.focus({ preventScroll: true });
+    });
+  };
+  // Back to the list, where the person left it. After a decision lands the
+  // item is gone, so focus goes to the receipt instead of a missing row.
+  const returnToList = (focusId?: string) => {
+    const key = openKey;
+    setOpenKey(null);
+    window.requestAnimationFrame(() => {
+      scroller()?.scrollTo({ top: listScroll.current });
+      (document.getElementById(focusId ?? `needs-row-${key}`) ?? document.getElementById('inbox-tab-needs'))?.focus({ preventScroll: true });
+    });
+  };
+  // An opened item that settled elsewhere (or here) leaves the detail view.
+  useEffect(() => {
+    if (openKey && data && !needsRows.some((row) => row.key === openKey)) setOpenKey(null);
+  }, [data, needsRows, openKey]);
+  useEffect(() => {
+    if (tab !== 'needs') setOpenKey(null);
+  }, [tab]);
+
   const recordDecision = (id: string, text: string) => {
     setDecided((current) => [
       { id, text, at: Date.now() },
@@ -435,6 +486,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const resolved = (text: string, tone: 'success' | 'error' = 'success') => {
     setNotice({ tone, text });
     if (tone === 'success') recordDecision(`decision-${Date.now().toString(36)}`, text);
+    if (tone === 'success' && openKey) returnToList('inbox-action-receipt');
     void refresh();
     window.requestAnimationFrame(() => document.getElementById('inbox-action-receipt')?.focus());
   };
@@ -442,6 +494,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const answered = (question: InboxQuestion, receipt: Omit<AnswerReceipt, 'id'>) => {
     recordDecision(question.id, receipt.text ? `${receipt.title} · ${receipt.text}` : receipt.title);
     setNotice(null);
+    if (openKey) returnToList(`inbox-receipt-${question.id}`);
     void refresh();
     window.requestAnimationFrame(() => {
       document.getElementById(`inbox-receipt-${question.id}`)?.focus();
@@ -538,7 +591,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   };
 
   return (
-    <div class="inbox-screen" aria-busy={refreshing}>
+    <div class="inbox-screen" aria-busy={refreshing} ref={screenRef}>
       <div class="inbox-tabs" role="tablist" aria-label="Inbox views">
         <button
           id="inbox-tab-needs"
@@ -598,7 +651,37 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             </div>
           ) : null}
 
-          {questions.map((question) => (
+          {/* The list: one row per waiting item. Opening one shows only that
+              item, full width, with Back — never every card expanded at once. */}
+          {openKey === null && needsRows.length > 0 ? (
+            <ul class="needs-list" aria-label="Waiting on you">
+              {needsRows.map((row) => (
+                <li key={row.key}>
+                  <button id={`needs-row-${row.key}`} type="button" class="needs-row" onClick={() => openRow(row.key)}>
+                    <span class="needs-row-main">
+                      <span class="needs-row-title">{row.title}</span>
+                      {row.preview ? <span class="needs-row-preview">{row.preview}</span> : null}
+                      <span class="needs-row-meta">
+                        <span class={row.urgent ? 'needs-row-label urgent' : 'needs-row-label'}>{row.label}</span>
+                        {row.context ? <span class="needs-row-context">{row.context}</span> : null}
+                        {row.at ? <time dateTime={row.at}>{relativeTime(row.at)}</time> : null}
+                      </span>
+                    </span>
+                    <svg class="needs-row-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          {openKey !== null ? (
+            <button id="needs-back" type="button" class="needs-back" onClick={() => returnToList()}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+              Needs you
+            </button>
+          ) : null}
+
+          {questions.filter((question) => question.id === openKey).map((question) => (
             <QuestionCard
               key={question.id}
               question={question}
@@ -608,20 +691,20 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             />
           ))}
 
-          {trustProposals.map((proposal) => (
+          {trustProposals.filter((proposal) => `trust:${proposal.id}` === openKey).map((proposal) => (
             <TrustProposalCard key={proposal.id} proposal={proposal} onResolved={resolved} />
           ))}
 
           <Decisions
-            approvals={approvals}
-            plans={plans}
-            workspaceChoosers={workspaceChoosers}
+            approvals={approvals.filter((row) => `approval:${row.approvalId}` === openKey)}
+            plans={plans.filter((row) => `plan:${row.id}` === openKey)}
+            workspaceChoosers={workspaceChoosers.filter((row) => `chooser:${row.chooserId}` === openKey)}
             onResolved={resolved}
             onReply={(sessionId, draft) => onReply(sessionId || null, draft)}
             projectOf={(row) => projectNameFor(row, approvalSessions(row), projectLabels)}
           />
 
-          {unlisted.map((item) => (
+          {unlisted.filter((item) => `unlisted:${item.key}` === openKey).map((item) => (
             <article key={item.key} class="inbox-card inbox-attention-card">
               <CardMeta label={item.kind === 'workflow_binding' ? 'Flow · stopped' : item.kind === 'workflow_paused' ? 'Flow · paused' : 'Needs you'} urgent />
               <h2>{item.title}</h2>
@@ -634,7 +717,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             </article>
           ))}
 
-          {notificationNeeds.map(({ row, earlier }) => {
+          {notificationNeeds.filter(({ row }) => `notification:${row.id}` === openKey).map(({ row, earlier }) => {
             // The run this row is ABOUT (see notificationRunTarget) — the same
             // destination the push for this same notification lands on.
             const runTarget = notificationRunTarget(row);
@@ -710,7 +793,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             );
           })}
 
-          {decidedToday.length > 0 ? (
+          {openKey === null && decidedToday.length > 0 ? (
             <section class="inbox-decided" aria-labelledby="inbox-decided-head">
               <h3 id="inbox-decided-head" class="pane-head">Decided earlier today</h3>
               <div class="inbox-decided-list" role="list">
@@ -1088,6 +1171,9 @@ function QuestionCard({ question, project, onAnswered, onReply }: {
   const [error, setError] = useState<string | null>(null);
   const actionLock = useRef(false);
   const errorId = `answer-error-${question.id}`;
+  const { heading, body: headingBody } = decisionHeading(question.question);
+  // A long explanation folds to its first lines so the answer stays near.
+  const [folded, setFolded] = useState(() => (headingBody?.length ?? 0) > 280);
 
   const updateAnswer = (value: string) => {
     setAnswer(value);
@@ -1138,8 +1224,18 @@ function QuestionCard({ question, project, onAnswered, onReply }: {
         urgent={question.urgency === 'high'}
       />
       <ProjectChip name={project} />
-      <h2>{question.question}</h2>
-      {question.context && question.context.trim() !== question.question.trim() ? (
+      <h2>{heading}</h2>
+      {headingBody ? (
+        <>
+          <p class={folded ? 'inbox-card-body folded' : 'inbox-card-body'}>{headingBody}</p>
+          {headingBody.length > 280 ? (
+            <button type="button" class="inbox-unfold" aria-expanded={!folded} onClick={() => setFolded(!folded)}>
+              {folded ? 'Read all of it' : 'Show less'}
+            </button>
+          ) : null}
+        </>
+      ) : null}
+      {question.context && question.context.trim() !== question.question.trim() && !isIdentifierLike(question.context) ? (
         <details class="inbox-context">
           <summary>Why I’m asking</summary>
           <p>{question.context}</p>

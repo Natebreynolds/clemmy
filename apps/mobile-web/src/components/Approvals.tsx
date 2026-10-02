@@ -1,6 +1,7 @@
 /**
  * Reusable response cards for the durable Needs-you inbox.
  */
+import { decisionHeading } from '@clem/chat-engine';
 import { useRef, useState } from 'preact/hooks';
 import {
   approveApproval,
@@ -220,14 +221,21 @@ function PlanCard({ row, index, acting, disabled, onAct, onReply }: {
   const needsInput = row.needsUserInput.length > 0;
   const [open, setOpen] = useState(false);
   const steps = open ? row.steps : row.steps.slice(0, 3);
+  const { heading, body: headingBody } = decisionHeading(row.objective || 'Proposed plan');
   return (
     <article id={`inbox-plan:${row.id}`} class="card card-plan rise" style={{ '--i': index }} tabIndex={-1}>
       <header class="card-head">
         <span class="chip chip-kind">Plan · ready to start</span>
         <span class="card-when">{relativeTime(row.proposedAt)}</span>
       </header>
-      <h2 class="card-title">I made a plan for “{row.objective}.”</h2>
-      {row.context ? <p class="card-note">{row.context}</p> : null}
+      <h2 class="card-title">{heading}</h2>
+      {headingBody ? <p class="card-note">{headingBody}</p> : null}
+      {row.context ? (
+        <details class="inbox-context">
+          <summary>Why this plan</summary>
+          <p>{row.context}</p>
+        </details>
+      ) : null}
       <ol class="plan-steps">
         {steps.map((step) => <li key={step.n}>{step.action}</li>)}
       </ol>

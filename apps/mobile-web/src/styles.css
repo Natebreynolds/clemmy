@@ -671,9 +671,19 @@ input, textarea, select { font: inherit; font-size: 16px; }
   background: var(--accent-soft);
   border-color: rgba(239, 95, 12, 0.24);
 }
+/* A plan is a proposal to read, not a warning: it sits on the plain card.
+   The warm surface stays for an approval, the one card that acts on the world. */
 .card-plan {
-  background: var(--warn-soft, rgba(176, 125, 10, 0.09));
-  border-color: rgba(176, 125, 10, 0.22);
+  background: var(--bg-1);
+  border-color: var(--line-strong);
+}
+/* Outranks the screen-wide `.app-main h2` display size: a decision card's
+   title reads at body size, like every other card heading. */
+.app-main .card-plan h2.card-title,
+.app-main .card-approval h2.card-title {
+  font-size: var(--t-body);
+  line-height: 1.3;
+  margin: 0 0 var(--sp-2);
 }
 
 .chip {
@@ -2493,6 +2503,80 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .inbox-notice-error { border-color: rgba(208, 69, 58, 0.3); background: var(--fail-soft); color: var(--accent-fail); }
 .inbox-notice:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
 .inbox-stack { display: grid; gap: var(--sp-3); }
+
+/* Needs you as one list: a row says what, for what work, how current. */
+.needs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
+  overflow: hidden;
+}
+.needs-list li + li { border-top: 1px solid var(--line); }
+.needs-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 64px;
+  padding: var(--sp-3) var(--sp-4);
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  font: inherit;
+}
+.needs-row:active { background: var(--bg-2); }
+.needs-row:focus-visible { outline: 2px solid var(--line-hot); outline-offset: -2px; }
+.needs-row-main { display: grid; gap: 3px; min-width: 0; flex: 1 1 auto; }
+.needs-row-title {
+  overflow: hidden;
+  font-family: var(--font-display);
+  font-size: var(--t-body);
+  font-weight: 650;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.needs-row-preview {
+  overflow: hidden;
+  color: var(--fg-2);
+  font-size: var(--t-sm);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.needs-row-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  color: var(--fg-3);
+  font-size: var(--t-xs);
+}
+.needs-row-label { flex: 0 0 auto; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; }
+.needs-row-label.urgent { color: var(--accent-deep); }
+.needs-row-context { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.needs-row-meta time { flex: 0 0 auto; margin-left: auto; }
+.needs-row-chevron { width: 18px; height: 18px; flex: 0 0 auto; color: var(--fg-3); }
+.needs-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  justify-self: start;
+  min-height: 44px;
+  padding: 0 var(--sp-2) 0 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-display);
+  font-size: var(--t-sm);
+  font-weight: 750;
+}
+.needs-back svg { width: 20px; height: 20px; }
+.needs-back:focus-visible { outline: 2px solid var(--line-hot); outline-offset: 2px; border-radius: 8px; }
 .inbox-receipt {
   display: flex;
   align-items: flex-start;
@@ -2527,10 +2611,9 @@ input, textarea, select { font: inherit; font-size: 16px; }
   outline: none;
 }
 .inbox-card:focus-visible { border-color: var(--line-hot); box-shadow: 0 0 0 4px var(--accent-soft); }
-.inbox-question-card, .inbox-attention-card {
-  border-color: rgba(239, 95, 12, 0.28);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.5), transparent 42%), var(--accent-soft);
-}
+/* A question is ordinary work, not a warning: it reads on the plain card.
+   Urgency is carried by the label (CardMeta's .urgent), not by a tinted panel. */
+.inbox-question-card, .inbox-attention-card { border-color: var(--line-strong); }
 .inbox-trust-card {
   border-color: rgba(138, 96, 0, 0.28);
   background: linear-gradient(180deg, rgba(138, 96, 0, 0.08), transparent 58%), var(--bg-1);
@@ -2565,6 +2648,13 @@ input, textarea, select { font: inherit; font-size: 16px; }
   overflow-wrap: anywhere;
 }
 .inbox-card-fine { margin: var(--sp-2) 0 0; color: var(--fg-3); font-size: var(--t-xs); }
+.inbox-card-body.folded {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.inbox-unfold { min-height: 44px; padding: 0; border: 0; background: transparent; color: var(--accent); font-size: var(--t-sm); font-weight: 700; }
 .inbox-card-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-3); }
 .inbox-card-actions > * { flex: 1 1 138px; }
 .trust-scope { display: grid; gap: 0; margin: var(--sp-3) 0 0; border-top: 1px solid var(--line); }
