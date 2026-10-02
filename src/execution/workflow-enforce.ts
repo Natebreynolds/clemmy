@@ -413,6 +413,28 @@ export function workflowExecutionSurfaceChanged(before: WorkflowDefinition, afte
  *  - write steps need the author's explicit loop_safe idempotency assertion
  * Disabled drafts are never blocked (same house pattern as the send gate).
  */
+/**
+ * A run input's default is text; a number or true/false counts as its text. A
+ * list or object default cannot be supplied to a run, so it is refused before
+ * the workflow is enabled, naming the exact field. A disabled draft keeps it
+ * as a warning to fix.
+ */
+export function checkInputDefaults(def: WorkflowDefinition): string[] {
+  const out: string[] = [];
+  for (const [key, meta] of Object.entries(def.inputs ?? {})) {
+    if (!meta || typeof meta !== 'object') continue;
+    const authored = 'unsupportedDefault' in meta ? meta.unsupportedDefault : (meta as { default?: unknown }).default;
+    if (
+      authored === undefined || authored === null
+      || typeof authored === 'string' || typeof authored === 'boolean'
+      || (typeof authored === 'number' && Number.isFinite(authored))
+    ) continue;
+    const shape = Array.isArray(authored) ? 'a list' : typeof authored === 'object' ? 'an object' : 'not a usable value';
+    out.push(`inputs.${key}.default is ${shape}; a workflow input default must be text, a number, or true/false. Write it as text (a list as its JSON text) or remove it.`);
+  }
+  return out;
+}
+
 export function checkLoopUntilAuthoring(def: WorkflowDefinition): string[] {
   if (!def.enabled) return [];
   const errors: string[] = [];
@@ -755,7 +777,8 @@ export function checkWorkflowForWrite(
     allowDisabledExactSendDraft: opts.allowDisabledExactSendDraft,
     exactSendCommittedReplayStepIds: opts.exactSendCommittedReplayStepIds,
   });
-  const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkGoalAuthoring(def), ...checkDependencyBinding(def)];
+  const inputDefaults = checkInputDefaults(def);
+  const errors = [...result.errors, ...checkSendGate(def), ...checkLoopUntilAuthoring(def), ...checkGoalAuthoring(def), ...checkDependencyBinding(def), ...(def.enabled ? inputDefaults : [])];
   // Runnability constraints are non-blocking (demoted to warnings per graceful degradation design)
   const runnabilityWarnings = checkRunnabilityConstraints(def);
   // Model-routing advisories: a step tagged with an intent that matches no active
@@ -763,7 +786,7 @@ export function checkWorkflowForWrite(
   // if tagged. Non-blocking — a silent routing regression is a quality issue, not
   // a structural failure, so it warns but never blocks the write.
   const routingWarnings = renderWorkflowRoutingAdvisories(analyzeWorkflowRouting(def));
-  const warnings = [...result.warnings, ...runnabilityWarnings, ...workflowAuthoringAdvisories(def), ...routingWarnings];
+  const warnings = [...result.warnings, ...runnabilityWarnings, ...workflowAuthoringAdvisories(def), ...routingWarnings, ...(def.enabled ? [] : inputDefaults)];
   return { ok: errors.length === 0, errors, warnings };
 }
 

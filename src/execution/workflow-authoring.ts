@@ -1,5 +1,6 @@
 import { normalizeWorkflowCallArguments } from './workflow-call-arguments.js';
 import {
+  parseWorkflowInputs,
   type WorkflowDefinition,
   type WorkflowEventTrigger,
   type WorkflowInputDef,
@@ -539,8 +540,8 @@ export function prepareWorkflowEnableForWrite(def: WorkflowDefinition): Workflow
 }
 
 export function normalizeWorkflowInputs(input: unknown): Record<string, WorkflowInputDef> | undefined {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
-  return input as Record<string, WorkflowInputDef>;
+  // Authored and loaded inputs share one reading of a default.
+  return parseWorkflowInputs(input);
 }
 
 const WORKFLOW_RESOURCE_KINDS = new Set<WorkflowResourceKind>([

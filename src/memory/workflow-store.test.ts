@@ -627,3 +627,59 @@ test('a step call account binding round-trips through write→read and a malform
   assert.equal(malformed?.call?.tool, 'salesforce_sf_soql_query');
   assert.equal(malformed?.call?.account, undefined);
 });
+
+test('hand-authored input defaults: 0 and false are values, null is none, a list is kept and refused before enable', () => {
+  const dir = path.join(WORKFLOWS_DIR, 'typed-defaults');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'SKILL.md'),
+    [
+      '---',
+      'name: typed-defaults',
+      'description: input defaults written as YAML scalars',
+      'enabled: false',
+      'trigger:',
+      '  manual: true',
+      'inputs:',
+      '  limit:',
+      '    default: 0',
+      '  dryRun:',
+      '    default: false',
+      '  owner:',
+      '    default: null',
+      '  regions:',
+      '    default: [west, east]',
+      'steps:',
+      '  - id: report',
+      '---',
+      '',
+      '## step: report',
+      '',
+      'Report {{input.limit}} {{input.dryRun}} {{input.owner}} {{input.regions}}.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+  const wf = readWorkflow('typed-defaults')!;
+  const inputs = wf.data.inputs!;
+  assert.equal(inputs.limit.default, '0');
+  assert.equal(inputs.dryRun.default, 'false');
+  assert.equal('default' in inputs.owner, false);
+  assert.equal(inputs.regions.default, undefined);
+  assert.deepEqual(inputs.regions.unsupportedDefault, ['west', 'east']);
+
+  // A save keeps what the author wrote; it never silently drops the list.
+  writeWorkflow('typed-defaults', wf.data);
+  const reread = readWorkflow('typed-defaults')!;
+  assert.deepEqual(reread.data.inputs!.regions.unsupportedDefault, ['west', 'east']);
+  assert.match(readFileSync(path.join(dir, 'SKILL.md'), 'utf-8'), /regions:\n\s+default:\n\s+- west\n\s+- east/);
+
+  // A disabled draft is warned; enabling is refused, naming the exact field.
+  const draft = checkWorkflowForWrite(reread.data);
+  assert.equal(draft.errors.some((e) => e.includes('inputs.regions.default')), false);
+  assert.ok(draft.warnings.some((w) => w.includes('inputs.regions.default is a list')));
+  const enabling = checkWorkflowForWrite({ ...reread.data, enabled: true });
+  assert.equal(enabling.ok, false);
+  assert.ok(enabling.errors.some((e) => e.includes('inputs.regions.default is a list')));
+  assert.equal(enabling.errors.some((e) => /inputs\.(limit|dryRun|owner)\.default/.test(e)), false);
+});

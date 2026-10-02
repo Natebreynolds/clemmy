@@ -516,7 +516,11 @@ export interface WorkflowEventTrigger {
 export interface WorkflowInputDef {
   type?: WorkflowContractType;
   required?: boolean;
+  /** Run inputs are text: a number or true/false is read as its exact text. */
   default?: string;
+  /** A default that cannot be a run input (a list or object), kept exactly as
+   *  authored so a save does not drop it; validation names it. */
+  unsupportedDefault?: unknown;
   description?: string;
 }
 
@@ -726,6 +730,38 @@ function cleanResourceObject(value: unknown): Record<string, unknown> | undefine
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+/** Run inputs are text. A YAML default of 0 or false is that text ("0",
+ * "false") — a value, never "missing"; an empty or null default is none. A
+ * list or object cannot be a text default: it is kept as authored, under its
+ * own field, rather than reaching code that reads a default as text. */
+export function parseWorkflowInputs(raw: unknown): WorkflowDefinition['inputs'] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, WorkflowInputDef> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      out[key] = value as WorkflowInputDef;
+      continue;
+    }
+    const { default: authored, unsupportedDefault: _ignored, ...rest } = value as Record<string, unknown>;
+    const def = { ...rest } as WorkflowInputDef;
+    if (typeof authored === 'string') def.default = authored;
+    else if (typeof authored === 'boolean' || (typeof authored === 'number' && Number.isFinite(authored))) def.default = String(authored);
+    else if (authored !== undefined && authored !== null) def.unsupportedDefault = authored;
+    out[key] = def;
+  }
+  return out;
+}
+
+/** The authored file form of workflow inputs: a kept unsupported default goes
+ *  back under `default`, exactly as it was written. */
+function workflowInputsFrontmatter(inputs: Record<string, WorkflowInputDef>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(inputs).map(([key, def]) => {
+    if (!def || typeof def !== 'object' || !('unsupportedDefault' in def)) return [key, def];
+    const { unsupportedDefault, ...rest } = def;
+    return [key, { ...rest, default: unsupportedDefault }];
+  }));
 }
 
 function parseWorkflowResources(raw: unknown): Record<string, WorkflowResourceBinding> | undefined {
@@ -1051,7 +1087,7 @@ if (step.optional === true || (step as Record<string, unknown>).optional === 'tr
       allowedTools: parseAllowedTools(data.allowed_tools ?? data.allowedTools),
       resources: parseWorkflowResources(data.resources),
       steps,
-      inputs: typeof data.inputs === 'object' && data.inputs ? data.inputs as WorkflowDefinition['inputs'] : undefined,
+      inputs: parseWorkflowInputs(data.inputs),
       synthesis: typeof data.synthesis === 'object' && data.synthesis ? data.synthesis as WorkflowSynthesis : undefined,
       description_body: body.description_body || undefined,
       // Preserve explicit standing send consent in either direction. Undefined
@@ -1274,7 +1310,7 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
       return out;
     });
   }
-  if (def.inputs && Object.keys(def.inputs).length > 0) frontmatter.inputs = def.inputs;
+  if (def.inputs && Object.keys(def.inputs).length > 0) frontmatter.inputs = workflowInputsFrontmatter(def.inputs);
   if (def.synthesis?.prompt) frontmatter.synthesis = def.synthesis;
   // Exact unattended structured sends distinguish explicit true standing
   // consent from the legacy undefined default, so preserve both booleans.

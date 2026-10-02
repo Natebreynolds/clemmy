@@ -12,11 +12,20 @@ export const COMMON_WORKFLOW_INPUT_KEYS = new Set([
   'topic',
 ]);
 
+/** A declared default as run-input text: text, or a number/true-false as its
+ *  exact text. Anything else (a list, an object, nothing) supplies no value. */
+function defaultText(meta: unknown): string {
+  const value = meta && typeof meta === 'object' ? (meta as { default?: unknown }).default : undefined;
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) return String(value);
+  return '';
+}
+
 export function collectRequiredWorkflowInputs(workflow: WorkflowDefinition): string[] {
   const required = new Set<string>();
   const declaredInputs = workflow.inputs ?? {};
   for (const [key, meta] of Object.entries(declaredInputs)) {
-    if (meta.required !== false && (!meta.default || meta.default.trim().length === 0)) {
+    if (meta?.required !== false && defaultText(meta).length === 0) {
       required.add(key);
     }
   }
@@ -48,8 +57,8 @@ export function collectRequiredWorkflowInputs(workflow: WorkflowDefinition): str
   // chat agent to retry the same call ~137× — a runaway + 429 storm.
   for (const [key, meta] of Object.entries(declaredInputs)) {
     if (
-      meta.required === false
-      || (meta.default && meta.default.trim().length > 0)
+      meta?.required === false
+      || defaultText(meta).length > 0
     ) required.delete(key);
   }
 

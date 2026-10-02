@@ -76,3 +76,18 @@ test('missingWorkflowRunInputs reports missing required values only', () => {
   assert.deepEqual(missingWorkflowRunInputs(def, normalizeWorkflowRunInputs({})), ['clientName', 'url']);
   assert.deepEqual(missingWorkflowRunInputs(def, normalizeWorkflowRunInputs({ domain: 'example.com', clientName: 'Example' })), []);
 });
+
+test('a default of any shape never crashes the required-input check; 0 and false are values', () => {
+  const required = collectRequiredWorkflowInputs(workflow({
+    steps: [{ id: 'report', prompt: 'Use {{input.limit}} {{input.flag}} {{input.blank}} {{input.none}} {{input.list}} {{input.obj}}.' }],
+    inputs: {
+      limit: { default: 0 },
+      flag: { default: false },
+      blank: { default: '   ' },
+      none: { default: null },
+      list: { default: ['a'] },
+      obj: { default: { a: 1 } },
+    } as unknown as WorkflowDefinition['inputs'],
+  }));
+  assert.deepEqual(required, ['blank', 'list', 'none', 'obj']);
+});
