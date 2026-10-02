@@ -47,7 +47,8 @@ export function observationFrom(row, receipt) {
     assertionsPassed,
     failures,
     rounds: turn?.modelRequests ?? row.modelRequests ?? null,
-    repairs: repairMatch ? Number(repairMatch[1]) : (typeof row.repairs === 'number' ? row.repairs : null),
+    // A receipt's assertions name every repair; none named is zero, not unknown.
+    repairs: repairMatch ? Number(repairMatch[1]) : receiptFailures !== null ? 0 : (typeof row.repairs === 'number' ? row.repairs : null),
     promptTokens: m.promptTokens ?? row.promptTokens ?? null,
     uncachedInputTokens: m.uncachedInputTokens ?? row.uncachedInputTokens ?? null,
     outputTokens: m.outputTokens ?? row.outputTokens ?? null,

@@ -70,3 +70,8 @@ test('a run qualifies only with no regression and nothing unresolved or missing'
   assert.equal(compareRuns(base, base).verdict, 'NO REGRESSION');
   assert.equal(compareRuns(base, [obs({ id: 'x' })]).verdict, 'NOT QUALIFIED');
 });
+
+test('a receipt whose assertions name no repair counts zero repairs, not unknown', () => {
+  const receipt = { turns: [{ assertions: { passed: true, failures: [] }, terminal: { turnOutcome: { status: 'done' } }, measurement: {} }] };
+  assert.equal(observationFrom({ id: 'x', pass: 1, liveness: 'fresh', busyAtStart: [], busyAtEnd: [] }, receipt).repairs, 0);
+});
