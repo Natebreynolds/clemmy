@@ -718,6 +718,23 @@ async function runCronJob(
 ): Promise<void> {
   const startedAt = new Date().toISOString();
   const startMs = Date.now();
+  // A scheduled run on a home with no model set up waits instead of failing:
+  // every default job used to post "Cron job failed: …" with a raw error on
+  // a fresh install (live 10-02). The boot setup notice already says what to
+  // set up once a day. A run the owner starts by hand still runs and shows
+  // its real result.
+  if (source === 'schedule' && !scheduledRunHasAModel()) {
+    appendRunLog(job.name, {
+      status: 'skipped',
+      startedAt,
+      finishedAt: startedAt,
+      durationMs: 0,
+      source,
+      skippedReason: 'waiting until a model is set up',
+    });
+    logger.info({ job: job.name }, 'Cron job skipped: no model is set up yet');
+    return;
+  }
   const cronSessionId = identity
     ? cronOccurrenceSessionId(job.name, identity.occurrenceAtMs)
     : `cron:${job.name}`;
@@ -1422,6 +1439,23 @@ function reportBootSetupIssues(): void {
       read: false,
       metadata: { errorCategory: 'setup_gap', slug: issue.slug },
     });
+  }
+}
+
+let scheduledRunModelCheckForTests: (() => boolean) | null = null;
+/** Test seam: whether scheduled runs see a model set up. */
+export function _testOnly_setScheduledRunHasAModel(check: (() => boolean) | null): void {
+  scheduledRunModelCheckForTests = check;
+}
+
+/** Whether a scheduled run has a model to run on. An unreadable answer
+ *  lets the run go ahead, as before. */
+export function scheduledRunHasAModel(): boolean {
+  if (scheduledRunModelCheckForTests) return scheduledRunModelCheckForTests();
+  try {
+    return bootAuthSetupSatisfied(getAuthStatus().configured);
+  } catch {
+    return true;
   }
 }
 

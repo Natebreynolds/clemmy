@@ -48,6 +48,8 @@ const {
 const { CRON_FILE: cronFile } = await import('../memory/vault.js');
 
 setCronResponseExecutor((assistant, request) => assistant.respond(request));
+// These scheduled runs have a model set up (a home without one waits).
+(await import('./runner.js') as unknown as { _testOnly_setScheduledRunHasAModel: (check: (() => boolean) | null) => void })._testOnly_setScheduledRunHasAModel(() => true);
 
 type CronState = {
   lastCronRunByMinute: Record<string, string>;
@@ -321,4 +323,34 @@ test('a recurring first YAML job cannot refresh its way ahead of an older held s
   assert.deepEqual(ran, ['cron-a-recurring-first']);
   await processCronAndWait(stubAssistant, state, new Date(2026, 6, 30, 9, 5));
   assert.deepEqual(ran, ['cron-a-recurring-first', 'cron-z-recurring-held']);
+});
+
+test('a scheduled run on a home with no model set up waits quietly instead of failing', async () => {
+  // Live 10-02: every default job posted "Cron job failed: …" on a fresh
+  // install that had no model signed in.
+  const runner = await import('./runner.js') as unknown as {
+    _testOnly_setScheduledRunHasAModel: (check: (() => boolean) | null) => void;
+  };
+  const { loadNotifications } = await import('../runtime/notifications.js');
+  writeFileSync(cronFile, [
+    '---',
+    'jobs:',
+    '  - name: morning-briefing',
+    "    schedule: '0 8 * * *'",
+    '    prompt: Brief me',
+    '    enabled: true',
+    '---',
+    '',
+  ].join('\n'), 'utf8');
+  runner._testOnly_setScheduledRunHasAModel(() => false);
+  try {
+    const before = loadNotifications().length;
+    await processCron(stubAssistant, loadDaemonState(), new Date('2026-10-02T08:00:30'));
+    await waitForCronScheduleIdle();
+    assert.deepEqual(ran, [], 'nothing ran without a model');
+    const added = loadNotifications().slice(0, loadNotifications().length - before);
+    assert.ok(!added.some((n) => /Cron job (failed|needs attention)/.test(n.title)), 'no failure notice');
+  } finally {
+    runner._testOnly_setScheduledRunHasAModel(() => true);
+  }
 });

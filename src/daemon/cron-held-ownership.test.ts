@@ -30,8 +30,11 @@ writeFileSync(path.join(TEST_HOME, 'state', 'claude-auth.json'), JSON.stringify(
 const {
   _testOnly_processCronSchedules: processCronSchedules,
   _testOnly_waitForCronScheduleIdle: waitForCronScheduleIdle,
+  _testOnly_setScheduledRunHasAModel: setScheduledRunHasAModel,
   cronOccurrenceSessionId,
 } = await import('./runner.js');
+// These scheduled runs have a model set up (a home without one waits).
+setScheduledRunHasAModel(() => true);
 const { CRON_FILE } = await import('../memory/vault.js');
 const { CRON_RUNS_DIR } = await import('../tools/shared.js');
 const {
