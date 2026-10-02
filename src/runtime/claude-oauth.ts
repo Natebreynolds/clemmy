@@ -441,7 +441,48 @@ export interface ClaudeAuthSnapshot {
 }
 
 const REFRESH_BEFORE_MS = 5 * 60_000;
-let refreshClaudeTokensImpl = refreshClaudeTokens;
+let refreshClaudeTokensImpl: (refreshToken: string, options?: { timeoutMs?: number }) => Promise<ClaudeTokenSet> = refreshClaudeTokens;
+let saveRefreshedTokensImpl: (tokens: ClaudeTokenSet) => void = saveClaudeTokens;
+
+/** How long a request waits on a refresh before it uses a fallback. */
+let refreshWaitMs = 15_000;
+/** How long the refresh itself may run. Anthropic rotates the refresh token on
+ *  every success, so abandoning a request the server then completes throws the
+ *  new token away, and the next refresh with the old one is invalid_grant: the
+ *  grant died exactly that way on 10-02 after four 15 s timeouts in a network
+ *  blip. The request now keeps going after callers stop waiting, and whatever
+ *  it returns is saved. One refresh per token at a time; callers share it. */
+const REFRESH_DEADLINE_MS = 120_000;
+const inflightVaultRefreshes = new Map<string, Promise<void>>();
+
+function refreshVaultGrantOnce(refreshToken: string, scopes: string[] | undefined): Promise<void> {
+  const existing = inflightVaultRefreshes.get(refreshToken);
+  if (existing) return existing;
+  const run = refreshClaudeTokensImpl(refreshToken, { timeoutMs: REFRESH_DEADLINE_MS })
+    .then((refreshed) => {
+      saveRefreshedTokensImpl({
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken ?? refreshToken, // persist the ROTATED token
+        expiresAt: refreshed.expiresAt,
+        scopes: refreshed.scopes ?? scopes,
+      });
+      logger.info('Claude subscription token refreshed');
+    })
+    .finally(() => { inflightVaultRefreshes.delete(refreshToken); });
+  // A caller that stopped waiting is not listening; the outcome is still saved.
+  run.catch(() => {});
+  inflightVaultRefreshes.set(refreshToken, run);
+  return run;
+}
+
+function waitAtMost<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Claude token refresh still running after ${ms}ms`)), ms);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  return Promise.race([work, deadline]).finally(() => { if (timer) clearTimeout(timer); });
+}
 
 async function tryClaudeCodeFallback(reason: string): Promise<string | null> {
   await ensureClaudeCodeReadiness();
@@ -519,18 +560,18 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
       if (fallback) return fallback;
     } else {
       try {
-        const refreshed = await refreshClaudeTokensImpl(refreshToken);
-        saveClaudeTokens({
-          accessToken: refreshed.accessToken,
-          refreshToken: refreshed.refreshToken ?? refreshToken, // persist the ROTATED token
-          expiresAt: refreshed.expiresAt,
-          scopes: refreshed.scopes ?? tokens.scopes,
-        });
+        await waitAtMost(refreshVaultGrantOnce(refreshToken, tokens.scopes), refreshWaitMs);
         tokens = getStoredClaudeTokens();
-        logger.info('Claude subscription token refreshed');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (isPermanentGrantFailure(err)) {
+        const current = getStoredClaudeTokens();
+        const rotatedElsewhere = current?.source === 'vault' && Boolean(current.refreshToken)
+          && current.refreshToken !== refreshToken && Boolean(current.accessToken?.startsWith(OAT_PREFIX));
+        if (rotatedElsewhere) {
+          // Another refresh already replaced this token; its rejection of the
+          // old one says nothing about the grant. Use the new one.
+          tokens = current;
+        } else if (isPermanentGrantFailure(err)) {
           // Mark the grant dead so we stop re-attempting it every request. Log
           // ONCE, loudly, with the fix — not once per call.
           markClaudeVaultRefreshDead(refreshToken, msg);
@@ -542,8 +583,10 @@ export async function loadFreshClaudeAccessToken(): Promise<string> {
           // Transient (timeout / 5xx / network) — keep retrying on the next call.
           logger.warn({ err: msg }, 'Claude token refresh failed (transient) — will retry');
         }
-        const fallback = await tryClaudeCodeFallback('vault_refresh_failed');
-        if (fallback) return fallback;
+        if (!rotatedElsewhere) {
+          const fallback = await tryClaudeCodeFallback('vault_refresh_failed');
+          if (fallback) return fallback;
+        }
       }
     }
   }
@@ -670,8 +713,14 @@ export const __test__ = {
   setRawCredentialReaderForTests(fn: (() => string | null) | null): void {
     rawCredentialReader = fn ?? readRawCredentialJsonFromSystem;
   },
-  setRefreshClaudeTokensForTests(fn: ((refreshToken: string) => Promise<ClaudeTokenSet>) | null): void {
+  setRefreshClaudeTokensForTests(fn: ((refreshToken: string, options?: { timeoutMs?: number }) => Promise<ClaudeTokenSet>) | null): void {
     refreshClaudeTokensImpl = fn ?? refreshClaudeTokens;
+  },
+  setSaveRefreshedTokensForTests(fn: ((tokens: ClaudeTokenSet) => void) | null): void {
+    saveRefreshedTokensImpl = fn ?? saveClaudeTokens;
+  },
+  setRefreshWaitMsForTests(ms: number | null): void {
+    refreshWaitMs = ms ?? 15_000;
   },
   setClaudeVaultDeadFileForTests(file: string | null): void {
     claudeVaultDeadFile = file ?? CLAUDE_VAULT_DEAD_FILE;

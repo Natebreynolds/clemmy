@@ -99,9 +99,13 @@ export async function completeClaudeLogin(rawCode: string, verifier: string, fal
 // to the current token; configure falls back to another brain).
 const REFRESH_TIMEOUT_MS = 15_000;
 
-export async function refreshClaudeTokens(refreshToken: string): Promise<ClaudeTokenSet> {
+export async function refreshClaudeTokens(
+  refreshToken: string,
+  options: { timeoutMs?: number } = {},
+): Promise<ClaudeTokenSet> {
+  const timeoutMs = options.timeoutMs ?? REFRESH_TIMEOUT_MS;
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), REFRESH_TIMEOUT_MS);
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
   (timer as { unref?: () => void }).unref?.();
   let res: Response;
   try {
@@ -112,7 +116,7 @@ export async function refreshClaudeTokens(refreshToken: string): Promise<ClaudeT
       signal: ctl.signal,
     });
   } catch (err) {
-    if (ctl.signal.aborted) throw new Error(`Claude token refresh timed out after ${REFRESH_TIMEOUT_MS}ms`);
+    if (ctl.signal.aborted) throw new Error(`Claude token refresh timed out after ${timeoutMs}ms`);
     throw err;
   } finally {
     clearTimeout(timer);

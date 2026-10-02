@@ -547,3 +547,90 @@ test('an expired CLI-owned credential still fails closed once the bounded wait e
     await assert.rejects(() => loadFreshClaudeAccessToken(), (e) => e instanceof ClaudeAuthError && e.kind === 'expired');
   } finally { resetKeychainFixture(); }
 });
+
+// ── refresh outlives its callers; one refresh per token ─────────────────────
+// The 10-02 failure: four refreshes timed out client-side in a network blip;
+// Anthropic rotates the refresh token on success, so a completed-but-abandoned
+// refresh threw the new token away and the next one was invalid_grant.
+
+function vaultFixture(refreshToken: string) {
+  let stored = { accessToken: 'sk-ant-oat01-expired-vault', refreshToken, expiresAt: Date.now() - 60_000, source: 'vault' as const };
+  const saved: Array<{ accessToken: string; refreshToken?: string }> = [];
+  __test__.setVaultTokenReaderForTests(() => stored);
+  __test__.setSaveRefreshedTokensForTests((tokens) => {
+    saved.push(tokens);
+    stored = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken ?? refreshToken, expiresAt: tokens.expiresAt ?? Date.now() + 3_600_000, source: 'vault' };
+  });
+  return { saved, replace: (next: typeof stored) => { stored = next; } };
+}
+
+function resetRefreshFixture() {
+  __test__.setVaultTokenReaderForTests(null);
+  __test__.setRawCredentialReaderForTests(null);
+  __test__.setRefreshClaudeTokensForTests(null);
+  __test__.setSaveRefreshedTokensForTests(null);
+  __test__.setRefreshWaitMsForTests(null);
+  __test__.resetDegradedStateForTests();
+}
+
+test('concurrent requests near expiry share ONE refresh of the rotating token', async () => {
+  __test__.resetDegradedStateForTests();
+  const fixture = vaultFixture('rotating-1');
+  __test__.setRawCredentialReaderForTests(() => null);
+  let calls = 0;
+  __test__.setRefreshClaudeTokensForTests(async () => {
+    calls += 1;
+    await new Promise((r) => setTimeout(r, 20));
+    return { accessToken: 'sk-ant-oat01-fresh', refreshToken: 'rotating-2', expiresAt: Date.now() + 3_600_000 };
+  });
+  try {
+    const [a, b, c] = await Promise.all([loadFreshClaudeAccessToken(), loadFreshClaudeAccessToken(), loadFreshClaudeAccessToken()]);
+    assert.equal(calls, 1, 'one refresh, shared');
+    assert.deepEqual([a, b, c], ['sk-ant-oat01-fresh', 'sk-ant-oat01-fresh', 'sk-ant-oat01-fresh']);
+    assert.equal(fixture.saved.length, 1);
+    assert.equal(fixture.saved[0]!.refreshToken, 'rotating-2', 'the rotated token is persisted');
+  } finally {
+    resetRefreshFixture();
+  }
+});
+
+test('a refresh slower than the wait still saves the rotated token when it lands', async () => {
+  __test__.resetDegradedStateForTests();
+  const fixture = vaultFixture('slow-1');
+  __test__.setRawCredentialReaderForTests(() => JSON.stringify({ claudeAiOauth: { accessToken: 'sk-ant-oat01-cli-good', expiresAt: FUTURE } }));
+  __test__.setRefreshWaitMsForTests(10);
+  let deadline: number | undefined;
+  __test__.setRefreshClaudeTokensForTests(async (_token, options) => {
+    deadline = options?.timeoutMs;
+    await new Promise((r) => setTimeout(r, 60));
+    return { accessToken: 'sk-ant-oat01-late', refreshToken: 'slow-2', expiresAt: Date.now() + 3_600_000 };
+  });
+  try {
+    const first = await loadFreshClaudeAccessToken();
+    assert.equal(first, 'sk-ant-oat01-cli-good', 'the request does not wait past its budget');
+    assert.ok((deadline ?? 0) > 15_000, 'the refresh itself is not abandoned at the request budget');
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(fixture.saved.at(-1)?.refreshToken, 'slow-2', 'the server-side rotation is not lost');
+    assert.equal(claudeVaultRefreshDead(), false);
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-late');
+  } finally {
+    resetRefreshFixture();
+  }
+});
+
+test('an invalid_grant for a token another refresh already replaced does not kill the grant', async () => {
+  __test__.resetDegradedStateForTests();
+  const fixture = vaultFixture('old-token');
+  __test__.setRawCredentialReaderForTests(() => null);
+  __test__.setRefreshClaudeTokensForTests(async () => {
+    // Meanwhile another process refreshed and wrote the new grant.
+    fixture.replace({ accessToken: 'sk-ant-oat01-from-other-refresh', refreshToken: 'new-token', expiresAt: Date.now() + 3_600_000, source: 'vault' });
+    throw new Error('Claude token refresh failed (400): {"error": "invalid_grant"}');
+  });
+  try {
+    assert.equal(await loadFreshClaudeAccessToken(), 'sk-ant-oat01-from-other-refresh');
+    assert.equal(claudeVaultRefreshDead(), false);
+  } finally {
+    resetRefreshFixture();
+  }
+});
