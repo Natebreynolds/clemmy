@@ -3160,15 +3160,38 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
     const prepared = await materializeLocalRuntimeToolArguments(name, effective.args);
     if (!prepared) return;
-    directLocalCallRequirements.set(call.callId, requirement);
-    unplannedNativeCarries.set(call.callId, {
+    const carry: OffSurfaceDirectCarry = {
       carrierName: 'work_call',
       carrierArgs: { requirement_id: requirement, name, args_json: JSON.stringify(prepared.args) },
-    });
+    };
+    // ONE CALL, ONE CONTRACT. The host attests the carrier it runs, but admits
+    // and settles the call under the model's authored name. Both must be the
+    // same logical contract, so the authored call takes the same
+    // schema-completed arguments as its carrier, exactly as a work_call does
+    // above. Live 10-02: a carried read that left out its tool's nullable
+    // fields was attested with them and admitted without them; the mismatch
+    // poisoned the whole accepted turn ("could not reopen the saved
+    // checkpoint"). A carry whose two forms still differ is not carried at
+    // all; the call keeps its ordinary path.
+    const authoredPreparedJson = isPlainOrClementineLocalTool(call.name, 'call_tool')
+      ? JSON.stringify({ ...authoredArgs, name, args_json: carry.carrierArgs.args_json })
+      : carry.carrierArgs.args_json;
+    const acceptedTaskId = acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq);
+    const authoredContract = durableLogicalCallContract(acceptedTaskId, call.name, parsedArgs(authoredPreparedJson));
+    const carriedContract = durableLogicalCallContract(acceptedTaskId, carry.carrierName, carry.carrierArgs);
+    if (!authoredContract || !carriedContract
+      || authoredContract.toolName !== carriedContract.toolName
+      || authoredContract.argumentDigest !== carriedContract.argumentDigest) return;
+    localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`, authoredPreparedJson);
+    directLocalCallRequirements.set(call.callId, requirement);
+    unplannedNativeCarries.set(call.callId, carry);
   };
 
-  const materializedArgumentsJson = (tool: FunctionToolLike | undefined, raw: string): string => (
-    localArgumentPreparations.get(`${tool?.name ?? ''}\0${raw}`) ?? materializedToolArgumentsJson(tool, raw)
+  // Keyed by the call's own name, not its surface object: a call off the
+  // surface has no object, and two such calls with the same bytes must not
+  // share one preparation.
+  const materializedArgumentsJson = (name: string, raw: string): string => (
+    localArgumentPreparations.get(`${name}\0${raw}`) ?? materializedToolArgumentsJson(toolByName.get(name), raw)
   );
   const hostJudgeCompletion = hostProduction
     && (carriedProgress?.activation.judgeCompletion ?? (opts as { hostJudgeCompletion?: unknown }).hostJudgeCompletion === true);
@@ -5621,7 +5644,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       : undefined;
     if (carriedHostControl && carriedHostControlTool) {
       const routedArgumentsJson = materializedArgumentsJson(
-        carriedHostControlTool,
+        carriedHostControl.toolName,
         JSON.stringify(carriedHostControl.args),
       );
       const routedArgs = parsedArgs(routedArgumentsJson) ?? carriedHostControl.args;
@@ -6573,7 +6596,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     }
     const authoredName = call.name;
     let tool = toolByName.get(authoredName);
-    const authoredArgumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+    const authoredArgumentsJson = materializedArgumentsJson(authoredName, call.argumentsJson);
     const authoredParsedArguments = parsedArgs(authoredArgumentsJson);
     const offSurfaceCarry = selectedDirectCarry(authoredName, authoredParsedArguments, authoredArgumentsJson, call.callId) ?? ((!tool || typeof tool.invoke !== 'function')
       ? resolveOffSurfaceDirectCarry({
@@ -7169,7 +7192,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     acceptedFrameRecovery = false,
   ): { argumentsJson: string; completion: CarrierCompletion | null; boundTargets?: string[] } => {
     const tool = toolByName.get(call.name);
-    const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+    const argumentsJson = materializedArgumentsJson(call.name, call.argumentsJson);
     const directGateway = isRegisteredCarrierGateway(call.name);
     // Finalize recovery intentionally runs before refreshTools. Its caller
     // has reopened the exact raw admission, so known carrier serialization
@@ -7195,7 +7218,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         let argumentsJson = call.argumentsJson;
         try {
           argumentsJson = materializedArgumentsJson(
-            toolByName.get(call.name),
+            call.name,
             call.argumentsJson,
           );
         } catch {
@@ -7397,7 +7420,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       maxToolConcurrency,
       (call) => {
         const tool = toolByName.get(call.name);
-        const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+        const argumentsJson = materializedArgumentsJson(call.name, call.argumentsJson);
         const argumentsValue = parsedArgs(argumentsJson);
         if (!argumentsValue) return 'barrier';
         const effect = currentFrameEffects.get(call.callId)
@@ -7490,7 +7513,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           rawItem: {
             name: call.name,
             callId: call.callId,
-            arguments: materializedArgumentsJson(toolByName.get(call.name), argumentsJson),
+            arguments: materializedArgumentsJson(call.name, argumentsJson),
           },
         }, 'activation_budget_stopped_before_dispatch', true);
       }
@@ -7882,7 +7905,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               callId: call.callId, name: call.name,
               rawItem: {
                 name: call.name, callId: call.callId,
-                arguments: materializedArgumentsJson(toolByName.get(call.name), call.argumentsJson),
+                arguments: materializedArgumentsJson(call.name, call.argumentsJson),
               },
             }, 'sibling_barrier_stopped_before_dispatch', true)) {
             return { status: 'safe_stop', reason: 'host_result_receipt_commit_failed' };
@@ -8838,7 +8861,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       let argumentsJson = pending.rawItem.arguments;
       let args: Record<string, unknown> | null = null;
       try {
-        argumentsJson = materializedArgumentsJson(tool, argumentsJson);
+        argumentsJson = materializedArgumentsJson(pending.name, argumentsJson);
         args = parsedArgs(argumentsJson);
       } catch {
         resumeFrameRepair = true;
@@ -10261,7 +10284,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     // exactly the canonical ask once materialized (options: null).
     const admittedAskArguments = (call: CanonicalHostCall): Record<string, unknown> | null => {
       try {
-        return parsedArgs(materializedArgumentsJson(toolByName.get(call.name), call.argumentsJson));
+        return parsedArgs(materializedArgumentsJson(call.name, call.argumentsJson));
       } catch {
         return parsedArgs(call.argumentsJson);
       }
@@ -10281,7 +10304,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         || canonicalCalls.some((call) => {
           if (permittedNoProgressRecoveryToolNames!.has(call.name)) return false;
           const authoredArgumentsJson = materializedArgumentsJson(
-            toolByName.get(call.name),
+            call.name,
             call.argumentsJson,
           );
           if (hostRecoveryCallMatchesOperation(
@@ -10615,7 +10638,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     try {
       soleControls = canonicalCalls.flatMap((call) => {
         const tool = toolByName.get(call.name);
-        const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+        const argumentsJson = materializedArgumentsJson(call.name, call.argumentsJson);
         const argumentsValue = parsedArgs(argumentsJson);
         const directPolicy = hostControlFrameFor(call.name);
         const effective = argumentsValue
@@ -10732,7 +10755,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // entry keeps the authored call: that is the sealed identity a resume
       // compares against.
       const authoredSurfaceTool = toolByName.get(authoredCall.name);
-      const authoredAdmittedJson = materializedArgumentsJson(authoredSurfaceTool, authoredCall.argumentsJson);
+      const authoredAdmittedJson = materializedArgumentsJson(authoredCall.name, authoredCall.argumentsJson);
       const admissionCarry = selectedDirectCarry(authoredCall.name, parsedArgs(authoredAdmittedJson), authoredAdmittedJson, authoredCall.callId) ?? ((!authoredSurfaceTool || typeof authoredSurfaceTool.invoke !== 'function')
         ? resolveOffSurfaceDirectCarry({
             authoredName: authoredCall.name,
@@ -10750,7 +10773,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         : authoredCall;
       try {
       const tool = toolByName.get(call.name);
-      const argumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
+      const argumentsJson = materializedArgumentsJson(call.name, call.argumentsJson);
       const parsedArguments = parsedArgs(argumentsJson);
       let approvalExactProduction: ExactProductionHostCall | null = null;
       let canaryRefusal = readOnlyCanaryRefusal(
@@ -11099,7 +11122,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         callId: call.callId, name: call.name,
         rawItem: {
           name: call.name, callId: call.callId,
-          arguments: materializedArgumentsJson(toolByName.get(call.name), call.argumentsJson),
+          arguments: materializedArgumentsJson(call.name, call.argumentsJson),
         },
       }, 'sibling_frame_replanned_before_dispatch'));
       for (const call of canonicalCalls) {

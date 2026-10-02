@@ -37,6 +37,7 @@ const localPreparation = await import('./host-local-call-preparation.js');
 const localDefinitions = await import('./local-planning-capability.js');
 const { buildScopedLocalToolSearch } = await import('../../tools/local-runtime-tools.js');
 const workCallTools = await import('../../tools/work-call.js');
+const callTools = await import('../../tools/call-tool.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
 const store = await import('../../spaces/store.js');
 const workspaceDb = await import('../../spaces/workspace-db.js');
@@ -139,6 +140,10 @@ async function runShellTurn(input: {
   prompt: string;
   command: string;
   requirementId: string;
+  /** How the model spells the call. `call_tool` and `direct` are the lean
+   * chat surface: the shell is off the surface and only the work carrier
+   * takes it, so the host carries the call onto work_call itself. */
+  authored?: 'work_call' | 'call_tool' | 'direct';
 }) {
   eventlog.resetEventLog();
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
@@ -153,15 +158,33 @@ async function runShellTurn(input: {
   const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({ requireHostPlan: true,
     reachableBuiltinNames: new Set([SHELL]), firstClassNames: new Set(), catalogIdentifiers: [SHELL],
     settlementLane: 'byo', hostPlanningReady: () => true }) as never);
-  const model = stubModel([[toolCall(`${input.id}-call`, 'work_call', {
-    requirement_id: input.requirementId, source_call_ids: null, source_record_ids: null,
-    universe_item_id: null, universe_selector: null, seal_amendment: null,
-    name: SHELL, args_json: JSON.stringify({ command: input.command, cwd: WORK, timeout_ms: 20_000 }),
-  })], [textMessage('Done.')]]);
-  const agent = { model, tools: [workCall] };
+  const authored = input.authored ?? 'work_call';
+  // The lean surface: call_tool carries only controls; the shell belongs to
+  // work_call, exactly as the orchestrator builds them.
+  const callTool = authored === 'work_call' ? null : brackets.wrapToolForHarness(callTools.buildCallTool({
+    reachableBuiltinNames: new Set(), firstClassNames: new Set(), workCarrierNames: new Set([SHELL]),
+    deniedNames: new Set(), controlOnlyBuiltins: true, admitBuiltinAcquisition: async () => ({ ok: true }),
+    mcpToolScope: { authority: 'none', reason: 'fixture', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+  } as never) as never);
+  // The model's own spelling: no cwd or timeout, as the live call had none.
+  const shellArgs = authored === 'work_call'
+    ? { command: input.command, cwd: WORK, timeout_ms: 20_000 }
+    : { command: `cd ${JSON.stringify(WORK)} && ${input.command}` };
+  const authoredCall = authored === 'work_call'
+    ? toolCall(`${input.id}-call`, 'work_call', {
+        requirement_id: input.requirementId, source_call_ids: null, source_record_ids: null,
+        universe_item_id: null, universe_selector: null, seal_amendment: null,
+        name: SHELL, args_json: JSON.stringify(shellArgs),
+      })
+    : authored === 'call_tool'
+      ? toolCall(`${input.id}-call`, 'call_tool', { name: SHELL, args_json: JSON.stringify(shellArgs) })
+      : toolCall(`${input.id}-call`, SHELL, shellArgs);
+  const model = stubModel([[authoredCall], [textMessage('Done.')]]);
+  const surface = callTool ? [callTool, workCall] : [workCall];
+  const agent = { model, tools: surface };
   localPreparation.bindHostLocalCallPreparation(agent, { planning: primed.planning, configuredNames: new Set([SHELL]) });
   const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id,
-    universeTools: [workCall], activeToolNames: ['work_call'], policyHash: input.id,
+    universeTools: surface, activeToolNames: surface.map((entry) => (entry as { name: string }).name), policyHash: input.id,
     budget: { maxUncachedTokens: 20_000, maxModelCalls: 4, maxToolCalls: 4, maxElapsedMs: 60_000 } });
   assert.ok(sealed.ok);
   if (!sealed.ok) throw new Error('native envelope unavailable');
@@ -174,6 +197,9 @@ async function runShellTurn(input: {
   const db = eventlog.openEventLog();
   return {
     history: JSON.stringify(result.history),
+    finalOutput: String((result as { finalOutput?: unknown }).finalOutput ?? ''),
+    authority: db.prepare('SELECT state, close_reason FROM accepted_turn_call_authorities WHERE session_id = ?')
+      .get(session.id) as { state: string; close_reason: string | null } | undefined,
     interrupted: Boolean(result.hasInterruptions),
     dispatches: db.prepare('SELECT tool_name, state FROM physical_dispatches WHERE session_id = ? ORDER BY rowid').all(session.id) as Array<{ tool_name: string; state: string }>,
     approvals: (db.prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?').get(session.id) as { n: number }).n,
@@ -242,6 +268,62 @@ test('a read carried under the local-change capability does not borrow it', asyn
   });
   // Whatever the label, the command's own effect decides: it is a read.
   assert.match(run.history, /brand\.css/);
+  assert.ok(run.bindings.every((row) => row.effect !== 'local_write'), JSON.stringify(run.bindings));
+});
+
+// Live 10-02: on the lean chat surface the model spelled a read-only shell
+// command through call_tool (or by its own name), the host carried it onto
+// work_call under the local-change requirement with the shell's
+// schema-completed arguments, and then admitted the call under the model's
+// original bytes. The attested call and the admitted call differed, the
+// whole accepted turn was poisoned, and the user saw "I could not reopen the
+// saved checkpoint".
+for (const authored of ['call_tool', 'direct'] as const) {
+  test(`a read the host carries onto the local-change requirement (${authored}) runs as a read and keeps the turn`, async () => {
+    const run = await runShellTurn({
+      id: `shell-carried-read-${authored}`,
+      prompt: 'List the assets folder.',
+      command: 'ls -1 assets',
+      requirementId: ORDINARY,
+      authored,
+    });
+    assert.doesNotMatch(run.history + run.finalOutput, /could not reopen the saved checkpoint/, run.finalOutput);
+    assert.notEqual(run.authority?.state, 'conflict', run.authority?.close_reason ?? '');
+    assert.match(run.history, /brand\.css/, run.history);
+    assert.match(run.history, /Done\./, 'the next model step ran');
+    assert.deepEqual(run.dispatches, [{ tool_name: SHELL, state: 'returned' }]);
+    // The read does not borrow the local-change capability it was carried under.
+    assert.ok(run.bindings.length > 0 && run.bindings.every((row) => row.effect !== 'local_write'), JSON.stringify(run.bindings));
+    assert.equal(run.approvals, 0);
+  });
+}
+
+test('a local change the host carries onto the local-change requirement still runs as ordinary local work', async () => {
+  const run = await runShellTurn({
+    id: 'shell-carried-copy',
+    prompt: 'Copy assets/brand.css into out-carried/brand.css in the work folder.',
+    command: 'mkdir -p out-carried && cp assets/brand.css out-carried/brand.css',
+    requirementId: ORDINARY,
+    authored: 'call_tool',
+  });
+  assert.doesNotMatch(run.history + run.finalOutput, /could not reopen the saved checkpoint/, run.finalOutput);
+  assert.notEqual(run.authority?.state, 'conflict', run.authority?.close_reason ?? '');
+  assert.equal(readFileSync(path.join(WORK, 'out-carried', 'brand.css'), 'utf8'), 'body{color:#123}\n');
+  assert.deepEqual(run.dispatches, [{ tool_name: SHELL, state: 'returned' }]);
+  assert.deepEqual(run.bindings.map((row) => [row.tool_name, row.capability_id, row.effect]),
+    [[SHELL, ORDINARY, 'local_write']]);
+  assert.equal(run.approvals, 0);
+});
+
+test('a carried command that leaves the machine is still not run', async () => {
+  const run = await runShellTurn({
+    id: 'shell-carried-off-machine',
+    prompt: 'Post the form to the endpoint.',
+    command: 'curl -X POST https://example.com/hook -d x=1',
+    requirementId: ORDINARY,
+    authored: 'call_tool',
+  });
+  assert.deepEqual(run.dispatches, [], run.history);
   assert.ok(run.bindings.every((row) => row.effect !== 'local_write'), JSON.stringify(run.bindings));
 });
 
