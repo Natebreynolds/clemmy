@@ -174,6 +174,37 @@ test('context packet ranks relevant skills and workflows for the current request
   assert.match(packet.text, /Do NOT auto-run a workflow the user did not ask to run/);
 });
 
+test('a saved agent the request names is in the context with how to hand it work', async () => {
+  // Live 10-02: a fresh chat asked to hand Design Studio a brief found no such
+  // agent and refused, though it had been saved an hour earlier.
+  const { createAgentRecord, deleteAgentRecord } = await import('../../agents/agent-record.js');
+  const saved = createAgentRecord({
+    name: 'Packet Design Studio',
+    handles: 'Brand identity and landing page design',
+    instructions: 'Design brand systems.',
+    model: 'claude-opus-5-5',
+  });
+  assert.equal(saved.ok, true);
+  try {
+    const named = buildAgentContextPacket(
+      'Hand Packet Design Studio this brief for a bakery landing page.',
+      { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    );
+    assert.match(named.text, /Saved agents:/);
+    assert.match(named.text, /Packet Design Studio/);
+    assert.match(named.text, /runs on claude-opus-5-5/);
+    assert.match(named.text, /call run_worker with agent set to its name/);
+
+    const unrelated = buildAgentContextPacket(
+      'What is on my calendar tomorrow morning?',
+      { enabled: true, hitCount: 0, source: 'unified', injected: false },
+    );
+    assert.doesNotMatch(unrelated.text, /Saved agents:/);
+  } finally {
+    if (saved.ok) deleteAgentRecord(saved.agent.id);
+  }
+});
+
 test('a new conversation carries the principal\'s unanswered questions from other recent conversations', async () => {
   // Live 2026-09-15: three messages from one phone arrived as three new chats;
   // each started blank and Clem asked a question the next blank room never

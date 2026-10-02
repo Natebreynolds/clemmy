@@ -8,6 +8,7 @@ import {
   skillEligibleForAutomaticRecall,
 } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
+import { listAgentRecords } from '../../agents/agent-record.js';
 import { listWorkspaceProjects } from '../../tools/shared.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
@@ -385,6 +386,39 @@ export function knownPitfallLineForInput(input: string): string | null {
   }
 }
 
+/** The owner's saved agents this request names or fits. A fresh chat had no
+ *  way to know they existed short of a team_list it could miss: live 10-02,
+ *  "hand Design Studio this brief" found no Design Studio and the handoff was
+ *  refused, though the agent had been saved an hour earlier. */
+function rankSavedAgents(input: string): RankedContextCandidate[] {
+  const queryTokens = tokens(input);
+  if (queryTokens.length === 0) return [];
+  try {
+    return listAgentRecords()
+      .map((agent) => {
+        const { score, matched } = candidateScore(queryTokens, [
+          { text: agent.name, weight: 6 },
+          { text: agent.id, weight: 4 },
+          { text: agent.handles, weight: 3 },
+        ]);
+        return {
+          name: agent.name,
+          description: clip(`${agent.handles || '(no description)'}${agent.model ? ` · runs on ${agent.model}` : ''}`, 200),
+          score,
+          reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
+          matchCount: matched.length,
+          named: explicitlyNamesCandidate(input, agent.name),
+        };
+      })
+      .filter((candidate) => candidate.named || (candidate.score >= 8 && candidate.matchCount >= 2))
+      .sort((left, right) => Number(right.named) - Number(left.named) || right.score - left.score)
+      .slice(0, 4)
+      .map(({ name, description, score, reason }) => ({ name, description, score, reason }));
+  } catch {
+    return [];
+  }
+}
+
 function rankWorkflows(input: string): RankedContextCandidate[] {
   const queryTokens = tokens(input);
   if (queryTokens.length === 0) return [];
@@ -674,6 +708,7 @@ export function buildAgentContextPacket(
   const constrainedWorkflowNode = opts?.sessionKind === 'workflow';
   const skills = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankSkills(input);
   const workflows = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankWorkflows(input);
+  const savedAgents = suppressActionSemanticEnrichment ? [] : rankSavedAgents(input);
   const projectCommands = constrainedWorkflowNode || suppressActionSemanticEnrichment ? [] : rankProjectCommands(input);
   const toolScope: McpToolScope = plainConversationSurface
     ? { authority: 'none', reason: 'accepted source proved a plain conversation surface' }
@@ -897,6 +932,7 @@ export function buildAgentContextPacket(
     ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. Shared names or keywords do not establish that a workflow fits the current task. If the user asks to run a saved workflow, call workflow_run with their exact phrasing; inspect its definition when needed to supply its inputs. Otherwise use workflow_get only when the workflow\'s purpose is relevant and its steps could help with the requested work. A candidate does not prove that its capabilities, accounts or arguments apply here. Continue directly when they do not fit. Do NOT auto-run a workflow the user did not ask to run.')),
+    ...renderCandidates('Saved agents', savedAgents, 'The owner\'s saved agents. To hand one of them work, call run_worker with agent set to its name: the work then runs as that agent, with its instructions and on its model. Credit a result to an agent only when run_worker ran as it, and say which model ran it when that matters.'),
     healthWarnings.length > 0
       ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
       : '',
