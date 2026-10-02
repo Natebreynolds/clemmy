@@ -18,6 +18,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { transcribeAudio, hasOpenAiKey } from '../runtime/transcribe.js';
 import { getBuildInfo } from '../runtime/build-info.js';
+import { getStorageInventory } from '../runtime/storage-inventory.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationTaskMode, connectionContinuationAudience, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { transcribeLocalMeetingAudio } from '../integrations/local-meetings/whisper-runtime.js';
 import * as childProcess from 'node:child_process';
@@ -8856,6 +8857,13 @@ export function registerConsoleRoutes(
    * Tiny endpoint the dashboard hits on first load to populate the
    * version chip in the header + foot bar. Reads from package.json.
    */
+  app.get('/api/console/storage', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    try { res.json(await getStorageInventory()); }
+    catch { res.status(503).json({ error: 'Storage measurement is unavailable. Try again shortly.' }); }
+  });
+
   app.get('/api/console/build-info', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {

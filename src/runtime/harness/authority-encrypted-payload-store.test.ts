@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { deflateRawSync } from 'node:zlib';
 import Database from 'better-sqlite3';
 import {
   chmodSync,
@@ -26,6 +27,7 @@ process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.CLEMMY_AUTHORITY_SEAL_KEY = 'a'.repeat(64);
 
 const store = await import('./authority-encrypted-payload-store.js');
+const seal = await import('./authority-argument-seal.js');
 const RECLAMATION_DB = new Database(':memory:');
 RECLAMATION_DB.exec(`
   CREATE TABLE staged_transfer_plans (
@@ -154,6 +156,63 @@ test('oversized payloads refuse before any durable write', () => {
     (error: unknown) => error instanceof store.AuthorityEncryptedPayloadError
       && error.code === 'authority_payload_too_large',
   );
+});
+
+const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+
+function replaceTestEnvelope(reference: store.AuthorityEncryptedPayloadReference, envelope: unknown) {
+  const bytes = Buffer.from(JSON.stringify(envelope));
+  writeFileSync(store.authorityEncryptedPayloadFilePath(reference.payloadId), bytes, { mode: 0o600 });
+  return { ...reference, sealedFileSha256: digest(bytes), sealedFileBytes: bytes.byteLength };
+}
+
+test('model snapshots shrink before encryption and preserve exact Unicode and mixed raw/compressed chunks', () => {
+  const bytes = Buffer.concat([Buffer.from('meeting: café 日本語 🐕\n'.repeat(2_000)), randomBytes(24_000)]);
+  const bindingDigest = digest(Buffer.from('compressed model'));
+  const reference = store.persistAuthorityEncryptedPayload({ payloadKind: 'model_request_snapshot', bindingDigest, bytes });
+  const file = readFileSync(store.authorityEncryptedPayloadFilePath(reference.payloadId));
+  const stored = JSON.parse(file.toString());
+  const protocols = stored.sealedChunks.map((chunk: string) => seal.openCanonicalArguments(chunk)?.protocol);
+  assert.ok(protocols.includes('authority_encrypted_payload_chunk_v2'));
+  assert.ok(protocols.includes('authority_encrypted_payload_chunk_v1'), 'incompressible chunks fall back to raw');
+  assert.ok(file.byteLength < bytes.byteLength, 'compressed repetitive prefix outweighs sealed random tail');
+  assert.equal(file.includes('meeting'), false);
+  assert.deepEqual(store.readAuthorityEncryptedPayload({ reference, payloadKind: 'model_request_snapshot', bindingDigest }), { status: 'ok', bytes });
+  assert.deepEqual(store.persistAuthorityEncryptedPayload({ payloadKind: 'model_request_snapshot', bindingDigest, bytes }), reference);
+});
+
+test('legacy raw model snapshots remain readable and replays preserve their exact file reference', () => {
+  const bytes = Buffer.from('legacy history\n'.repeat(2_000));
+  const bindingDigest = digest(Buffer.from('legacy model'));
+  const seeded = store.persistAuthorityEncryptedPayload({ payloadKind: 'model_request_snapshot', bindingDigest, bytes });
+  const envelope = JSON.parse(readFileSync(store.authorityEncryptedPayloadFilePath(seeded.payloadId), 'utf8'));
+  envelope.sealedChunks = envelope.sealedChunks.map((cipher: string, index: number) => {
+    const opened = seal.openCanonicalArguments(cipher)!;
+    const { chunkEncoding: _encoding, ...legacy } = opened;
+    return seal.sealCanonicalArguments({ ...legacy, protocol: 'authority_encrypted_payload_chunk_v1',
+      chunkBase64: bytes.subarray(index * 12_000, (index + 1) * 12_000).toString('base64') });
+  });
+  const reference = replaceTestEnvelope(seeded, envelope);
+  assert.deepEqual(store.readAuthorityEncryptedPayload({ reference, payloadKind: 'model_request_snapshot', bindingDigest }), { status: 'ok', bytes });
+  assert.deepEqual(store.persistAuthorityEncryptedPayload({ payloadKind: 'model_request_snapshot', bindingDigest, bytes }), reference);
+});
+
+test('compressed chunks reject oversized inflation, trailing streams, unknown codecs and wrong original bytes', () => {
+  for (const fault of ['oversized', 'trailing', 'codec', 'digest', 'binding'] as const) {
+    const bytes = Buffer.from('x'.repeat(12_000));
+    const bindingDigest = digest(Buffer.from(fault));
+    const seeded = store.persistAuthorityEncryptedPayload({ payloadKind: 'model_request_snapshot', bindingDigest, bytes });
+    const envelope = JSON.parse(readFileSync(store.authorityEncryptedPayloadFilePath(seeded.payloadId), 'utf8'));
+    const opened = seal.openCanonicalArguments(envelope.sealedChunks[0])!;
+    if (fault === 'oversized') opened.chunkBase64 = deflateRawSync(Buffer.alloc(12_001)).toString('base64');
+    if (fault === 'trailing') opened.chunkBase64 = Buffer.concat([Buffer.from(opened.chunkBase64 as string, 'base64'), Buffer.from('tail')]).toString('base64');
+    if (fault === 'codec') opened.chunkEncoding = 'unknown';
+    if (fault === 'digest') opened.chunkSha256 = '0'.repeat(64);
+    if (fault === 'binding') opened.bindingDigest = '0'.repeat(64);
+    envelope.sealedChunks[0] = seal.sealCanonicalArguments(opened);
+    const reference = replaceTestEnvelope(seeded, envelope);
+    assert.equal(store.readAuthorityEncryptedPayload({ reference, payloadKind: 'model_request_snapshot', bindingDigest }).status, 'corrupt', fault);
+  }
 });
 
 function runRaceWriter(readyFile: string): Promise<store.AuthorityEncryptedPayloadReference> {

@@ -10,6 +10,7 @@
  * detected before any plaintext is returned.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import type Database from 'better-sqlite3';
 import {
   closeSync,
@@ -314,7 +315,7 @@ function parseStored(bytes: Buffer): StoredEncryptedPayload | null {
       || !DIGEST_RE.test(parsed.plaintextSha256)
       || !validNonNegativeSafeInteger(parsed.plaintextBytes)
       || parsed.plaintextBytes > AUTHORITY_ENCRYPTED_PAYLOAD_MAX_PLAINTEXT_BYTES
-      || !validNonNegativeSafeInteger(parsed.chunkCount)
+      || parsed.chunkCount !== Math.ceil(Number(parsed.plaintextBytes) / AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES)
       || !Array.isArray(parsed.sealedChunks)
       || parsed.sealedChunks.length !== parsed.chunkCount
       || parsed.sealedChunks.some((chunk) => typeof chunk !== 'string')
@@ -384,8 +385,18 @@ export function persistAuthorityEncryptedPayload(input: {
     for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
       const offset = chunkIndex * AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES;
       const chunk = plain.subarray(offset, offset + AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES);
+      // Keep the v1 file/reference identity and original-byte partition. Only
+      // model snapshots use the authenticated v2 chunk codec; credentials and
+      // provider returns keep their existing representation. Old chunks remain
+      // readable and identical replays adopt their original immutable file.
+      const compressed = input.payloadKind === 'model_request_snapshot'
+        ? deflateRawSync(chunk, { level: 3 })
+        : null;
+      const encoded = compressed && compressed.byteLength + 128 < chunk.byteLength ? compressed : chunk;
+      const compressedChunk = encoded !== chunk;
       sealedChunks.push(sealCanonicalArguments({
-        protocol: 'authority_encrypted_payload_chunk_v1',
+        protocol: compressedChunk ? 'authority_encrypted_payload_chunk_v2' : 'authority_encrypted_payload_chunk_v1',
+        ...(compressedChunk ? { chunkEncoding: 'deflate-raw' } : {}),
         payloadId,
         payloadKind: input.payloadKind,
         bindingDigest: input.bindingDigest,
@@ -394,7 +405,7 @@ export function persistAuthorityEncryptedPayload(input: {
         chunkIndex,
         chunkCount,
         chunkSha256: sha256(chunk),
-        chunkBase64: chunk.toString('base64'),
+        chunkBase64: encoded.toString('base64'),
       }));
     }
     const stored: StoredEncryptedPayload = {
@@ -523,7 +534,8 @@ export function readAuthorityEncryptedPayload(input: {
     const opened = openCanonicalArguments(stored.sealedChunks[chunkIndex]!);
     if (
       !opened
-      || opened.protocol !== 'authority_encrypted_payload_chunk_v1'
+      || (opened.protocol !== 'authority_encrypted_payload_chunk_v1'
+        && opened.protocol !== 'authority_encrypted_payload_chunk_v2')
       || opened.payloadId !== stored.payloadId
       || opened.payloadKind !== stored.payloadKind
       || opened.bindingDigest !== stored.bindingDigest
@@ -538,13 +550,39 @@ export function readAuthorityEncryptedPayload(input: {
     }
     let chunk: Buffer;
     try {
-      chunk = Buffer.from(opened.chunkBase64, 'base64');
+      const encoded = Buffer.from(opened.chunkBase64, 'base64');
+      if (encoded.toString('base64') !== opened.chunkBase64
+        || encoded.byteLength > AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES) {
+        return { status: 'corrupt', reason: 'encrypted authority payload chunk is invalid' };
+      }
+      if (opened.protocol === 'authority_encrypted_payload_chunk_v2') {
+        if (stored.payloadKind !== 'model_request_snapshot' || opened.chunkEncoding !== 'deflate-raw') {
+          return { status: 'corrupt', reason: 'encrypted authority payload codec is invalid' };
+        }
+        const expectedBytes = Math.min(AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES,
+          stored.plaintextBytes - chunkIndex * AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES);
+        // Bound decompression before allocation, not after it. Reject trailing
+        // streams too; the exact encoded chunk is part of the authenticated seal.
+        // Node's info option returns { buffer, engine }; @types/node's sync
+        // signature still declares Buffer regardless of that option.
+        const inflated = inflateRawSync(encoded, { maxOutputLength: expectedBytes, info: true }) as unknown as {
+          buffer: Buffer; engine: { bytesWritten: number };
+        };
+        if (inflated.engine.bytesWritten !== encoded.byteLength) {
+          return { status: 'corrupt', reason: 'encrypted authority payload compressed stream is invalid' };
+        }
+        chunk = inflated.buffer;
+      } else {
+        if (opened.chunkEncoding !== undefined) {
+          return { status: 'corrupt', reason: 'encrypted authority payload codec is invalid' };
+        }
+        chunk = encoded;
+      }
     } catch {
       return { status: 'corrupt', reason: 'encrypted authority payload chunk is invalid' };
     }
     if (
-      chunk.toString('base64') !== opened.chunkBase64
-      || sha256(chunk) !== opened.chunkSha256
+      sha256(chunk) !== opened.chunkSha256
       || chunk.byteLength > AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES
       || (chunkIndex < stored.chunkCount - 1 && chunk.byteLength !== AUTHORITY_ENCRYPTED_PAYLOAD_CHUNK_BYTES)
     ) {

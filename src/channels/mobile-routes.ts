@@ -1,5 +1,6 @@
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
+import { getStorageInventory } from '../runtime/storage-inventory.js';
 import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
 import { registerWorkspaceSourceControlRoutes } from '../dashboard/workspace-source-control-routes.js';
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
@@ -2443,6 +2444,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
    * Execute boundaries and deterministic write receipts are identical in both
    * states.
    */
+  router.get('/api/settings/storage', requireMobileSession, async (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    try { res.json(await getStorageInventory()); }
+    catch { res.status(503).json({ error: 'Storage measurement is unavailable. Try again shortly.' }); }
+  });
+
   router.get('/api/settings/completion-review', requireMobileSession, (_req, res) => {
     const judge = resolveRoleModel('judge');
     res.json({

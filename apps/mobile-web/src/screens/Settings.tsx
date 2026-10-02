@@ -36,6 +36,7 @@ import {
   unsubscribePush,
 } from '../lib/push';
 import { BrainSheet } from '../components/BrainSheet';
+import { StoragePage } from '../components/StoragePage';
 import { RoleSheet } from '../components/RoleSheet';
 import {
   ROLE_COPY,
@@ -147,6 +148,8 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
           <ModePage loaded={approvals.data} error={approvals.error} onChanged={() => void approvals.refresh()} onRetry={() => void approvals.refresh()} />
         ) : section === 'models' ? (
           <ModelsCard loaded={models.data} onRefresh={models.refresh} />
+        ) : section === 'storage' ? (
+          <StoragePage />
         ) : section === 'accounts' ? (
           <UsageCard />
         ) : section === 'connections' ? (
@@ -235,6 +238,15 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
           title="Connections"
           note={connections.error || connections.offline ? 'Status unavailable · open to retry' : connectionsSummary(connections.data?.connections)}
           onOpen={() => openSection('connections')}
+        />
+      </IndexGroup>
+
+      <IndexGroup label="Upkeep">
+        <IndexRow
+          icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 14h18M16 17h2" /></svg>}
+          title="Storage"
+          note="Conversations, memory, execution evidence and backups on your computer."
+          onOpen={() => openSection('storage')}
         />
       </IndexGroup>
 

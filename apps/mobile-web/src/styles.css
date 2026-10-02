@@ -4637,6 +4637,11 @@ textarea.cz-input { resize: vertical; }
   letter-spacing: -0.02em;
 }
 .settings-page .settings-card-title { display: none; }
+.storage-rows { margin: 0; }
+.storage-row { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-3) 0; border-top: 1px solid var(--line); }
+.storage-row dt { min-width: 0; }
+.storage-row dd { margin: 0; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.storage-note { display: block; margin-top: var(--sp-1); font-size: var(--t-xs); color: var(--fg-2); }
 .settings-caveat { color: var(--fg-2); }
 .settings-this-phone .settings-row { min-height: 56px; }
 .settings-this-phone .settings-row-label { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }

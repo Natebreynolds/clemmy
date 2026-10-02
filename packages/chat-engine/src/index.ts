@@ -31,3 +31,4 @@ export * from './memory-work.js';
 
 export * from "./approval-review.js";
 export * from './decision-presentation.js';
+export * from './storage-presentation.js';

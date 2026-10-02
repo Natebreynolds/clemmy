@@ -5,13 +5,14 @@
  */
 import type { MobileDeviceRow, PhoneHeartbeat } from './api';
 
-export type SettingsSection = 'notifications' | 'mode' | 'models' | 'accounts' | 'connections' | 'devices';
+export type SettingsSection = 'notifications' | 'mode' | 'models' | 'accounts' | 'connections' | 'devices' | 'storage';
 
 export const SETTINGS_SECTIONS: ReadonlySet<SettingsSection> = new Set<SettingsSection>([
-  'notifications', 'mode', 'models', 'accounts', 'connections', 'devices',
+  'notifications', 'mode', 'models', 'accounts', 'connections', 'devices', 'storage',
 ]);
 
 export const SECTION_TITLES: Record<SettingsSection, string> = {
+  storage: 'Storage',
   notifications: 'Notifications',
   mode: 'Approvals',
   models: 'Models',

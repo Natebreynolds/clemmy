@@ -4452,7 +4452,7 @@ test('mobile chat cancel rejects a stale exact id and stops the exact live attem
 test('mobile settings routes are session-gated: anon requests get 401 at every door', async () => {
   const h = await startHarness();
   try {
-    for (const p of ['/m/api/settings/models', '/m/api/settings/usage', '/m/api/tidy/plan', '/m/api/settings/connections', '/m/api/settings/status', '/m/api/devices']) {
+    for (const p of ['/m/api/settings/models', '/m/api/settings/usage', '/m/api/tidy/plan', '/m/api/settings/connections', '/m/api/settings/status', '/m/api/settings/storage', '/m/api/devices']) {
       const anon = await fetch(`${h.url}${p}`);
       assert.equal(anon.status, 401, `GET ${p} must demand a mobile session`);
     }
@@ -4852,6 +4852,21 @@ test('connections health is a session-gated read-only list', async () => {
     assert.equal(res.status, 200);
     const body = (await res.json()) as { connections?: Array<{ id: string; name: string; state: string }> };
     assert.ok(Array.isArray(body.connections), 'a plain list the phone can render as rows');
+  } finally { await h.close(); }
+});
+
+test('phone storage reports the host inventory behind its paired session without paths or contents', async () => {
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Storage phone');
+    const response = await fetch(`${h.url}/m/api/settings/storage`, { headers: { cookie } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const body = await response.json() as { categories: unknown[]; measuredAt: string };
+    assert.equal(body.categories.length, 6);
+    assert.ok(Number.isFinite(Date.parse(body.measuredAt)));
+    assert.equal(JSON.stringify(body).includes(TMP_ROOT), false);
+    assert.equal(JSON.stringify(body).includes('TestPin1!'), false);
   } finally { await h.close(); }
 });
 

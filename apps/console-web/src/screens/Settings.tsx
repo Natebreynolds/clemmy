@@ -17,6 +17,7 @@ import { ModelsSection } from './settings/ModelsRoutingSection';
 import { DeveloperModeCard } from './settings/DeveloperModeCard';
 import { NotchSettingsCard } from './settings/NotchSettingsCard';
 import { CleanupCard } from './settings/CleanupCard';
+import { StorageCard } from './settings/StorageCard';
 import { cn } from '@/lib/cn';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
@@ -48,6 +49,7 @@ const NAV_GROUPS: { group: string; items: { id: string; label: string }[] }[] = 
     { id: 'notch', label: 'In the notch' },
   ] },
   { group: 'Upkeep', items: [
+    { id: 'storage', label: 'Storage' },
     { id: 'cleanup', label: 'Clean up' },
     { id: 'developer', label: 'Developer mode' },
   ] },
@@ -115,6 +117,10 @@ export function Settings() {
           </section>
           <section id="notch" className="scroll-mt-16"><NotchSettingsCard /></section>
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">Upkeep</p>
+          <section id="storage" className="scroll-mt-16">
+            <h2 className="mb-3 text-h2 text-fg">Storage</h2>
+            <StorageCard />
+          </section>
           <section id="cleanup" className="scroll-mt-16">
             <h2 className="mb-1 text-h2 text-fg">Clean up</h2>
             <p className="mb-3 text-small text-muted">Clear what is only taking up room. Nothing is deleted: updates are marked read, stale asks cancelled, stuck runs stopped, old conversations archived.</p>

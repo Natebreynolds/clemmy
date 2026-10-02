@@ -19,6 +19,7 @@ test('a section only reads on the settings tab, and its URL round-trips', () => 
   assert.equal(sectionFromSearch(settingsSearch(null)), null);
   // The approval mode is a page of its own, reachable by link like the rest.
   assert.equal(sectionFromSearch('?tab=settings&section=mode'), 'mode');
+  assert.equal(sectionFromSearch(settingsSearch('storage')), 'storage');
 });
 
 test('this phone comes first and phones unseen for two weeks are set apart', () => {
