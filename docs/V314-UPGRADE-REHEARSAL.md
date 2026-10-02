@@ -9,9 +9,9 @@ exercises the installed product against the same disposable migrated home. The
 only model endpoint is a loopback fixture server. Every path remains below the
 operating system's temporary directory.
 
-## Current candidate: harness schema v88
+## Current candidate: harness schema v92
 
-Target reviewed: 2026-09-30. The migration authority is
+Target reviewed: 2026-10-02. The migration authority is
 `src/runtime/harness/eventlog-schema.ts`; retained-proof migration details live
 in `src/runtime/harness/retained-session-proof-schema.ts`.
 
@@ -28,6 +28,10 @@ execute saved scripts, or replay completed effects.
 | 86 | Add `saved_source_script_grants_v1` and `workflow_v3_saved_source_consent_v1`. | Start empty. Existing declarations or historical approvals do not become new grants merely because the tables exist. |
 | 87 | Add `workspace_script_reports_v1`, its pending-report index and a unique event index for textual `outcomeDeliveryId` values. | Start with no synthesized reports. Existing events remain intact; conflicting indexed delivery identifiers must fail migration rather than be silently deleted or rewritten. Report delivery must not replay script execution. |
 | 88 | Add `workspace_source_controls_v1` and idempotent `workspace_source_control_receipts_v1`; add nullable `resolution_json` to script occurrences and narrow the unpublished barrier to unresolved occurrences. | Preserve occurrence rows and observations. Existing unresolved occurrences still hold their barrier. A stop or owner resolution is not a fresh execution grant. |
+| 89 | Add `accepted_model_history_objects_v1` (exact deflate-compressed history bytes keyed by digest), nullable `*_object_digest` references on batch admissions and checkpoints, binding triggers, and the `*_readable_v1` views. | Existing rows keep their inline histories byte for byte; only new histories of 32 KB or more may be stored as a referenced object with an empty inline slot. Every reader decodes through the readable views and the digest and item count must match exactly. |
+| 90 | Replace the batch admission and checkpoint UPDATE fences with fences that allow only an exact inline-to-object storage conversion, and add `accepted_model_history_conversion_v1` cursors. | No row is converted by the migration. A conversion must reproduce the original bytes exactly; every semantic column, DELETE fence and digest stays unchanged, and a no-op or downgrade update is still refused. |
+| 91 | Add three partial expression indexes on `events` for read receipts and settlements. | Lookup only: no event is copied, rewritten or deduplicated; duplicate receipts remain detectable. |
+| 92 | Recreate the host and logical result-receipt lineage triggers to read the admitted frame through `accepted_model_batch_admissions_readable_v1`. | Every lineage condition is unchanged; a frame held as an object is found exactly as an inline one. No receipt is created or altered by the migration. |
 
 A second open must preserve the resulting schema and rows. The rehearsal must
 reach the exported current schema version and compare both migrated boots.
@@ -66,7 +70,7 @@ v3.14 graph; any installed dependency drift refuses exact-tag execution.
 
 | Store | v3.14.0 | Current target | Upgrade behavior | Rehearsed |
 |---|---:|---:|---|---|
-| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 88) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
+| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 92) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
 | `state/memory.db` | migration 32 | exported `MEMORY_SCHEMA_VERSION` | numbered migrations 33 through current; opening an old DB must first make an immutable pre-migration backup | Yes, including backup existence and second-open idempotence |
 | `state/workspaces.db` | `PRAGMA user_version=3` | 5 | v4 adds workflow binding/run projection/partition tables; v5 adds the canonical-entity projection head; Space remains a read model | Yes, with a v3 Space and dataset observation |
 | `state/workflow-triggers.db` | schema contract 4 | 4 | additive shape validation; no release-boundary version change | Yes, with exact cron and event triggers compiled by v3.14 |
