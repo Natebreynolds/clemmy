@@ -190,11 +190,9 @@ export function ModelPicker({ sessionId, className }: { sessionId?: string; clas
         className="inline-flex items-center gap-2 rounded-full border border-border bg-surface py-1 pl-2 pr-2.5 text-small font-semibold text-fg shadow-xs transition-colors hover:border-border-strong"
       >
         <span className="h-2 w-2 rounded-full" style={{ backgroundColor: dotColor(brainProv) }} aria-hidden />
+        {/* The model that answers, by name. Who helps and who checks are named
+            in the popover; two colour dots here said it to no one. */}
         <span className="max-w-[150px] truncate">{brain}</span>
-        <span className="flex" aria-hidden>
-          <span className="h-2 w-2 rounded-full ring-1 ring-surface" style={{ backgroundColor: dotColor(workerProv) }} />
-          <span className="-ml-0.5 h-2 w-2 rounded-full ring-1 ring-surface" style={{ backgroundColor: dotColor(judgeProv) }} />
-        </span>
         <ChevronUp className={cn('h-3.5 w-3.5 text-faint transition-transform', open && 'rotate-180')} aria-hidden />
       </button>
       {open && createPortal(

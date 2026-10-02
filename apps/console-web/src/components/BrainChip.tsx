@@ -22,8 +22,11 @@ export function BrainChip() {
   const label = shortModelLabel(roleLabel(mr, 'brain'));
   const swapped = brain.inactiveBinding && brain.inactiveBinding.modelId !== brain.modelId ? brain.inactiveBinding : null;
   const color = (PROVIDER_DOT as Record<string, string>)[brain.provider] ?? PROVIDER_DOT.unknown;
+  // Say why in Clem's words: the server's reason distinguishes "your pick
+  // needs a sign-in" from "the active-model switch chose another".
+  const reason = swapped?.reason ?? '';
   const title = swapped
-    ? `Your pick, ${modelDisplayName(swapped.modelId)}, isn’t available, so ${label} does the work. Open Who does what.`
+    ? `${label} is standing in for your pick, ${modelDisplayName(swapped.modelId)}.${reason ? ` ${reason}` : ''} Open Who does what.`
     : `${label} does the work. Open Who does what.`;
   return (
     <button
@@ -35,7 +38,11 @@ export function BrainChip() {
     >
       <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color }} aria-hidden />
       <span className="max-w-[10rem] truncate">{label}</span>
-      {swapped && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden />}
+      {swapped && (
+        <span className="inline-flex shrink-0 items-center gap-1 text-caption text-warning">
+          <AlertTriangle className="h-3.5 w-3.5" aria-hidden /> stand-in
+        </span>
+      )}
     </button>
   );
 }

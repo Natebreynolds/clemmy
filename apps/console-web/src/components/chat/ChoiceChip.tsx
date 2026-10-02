@@ -131,8 +131,10 @@ export function ChoiceChip({
         <Icon className={cn('h-3.5 w-3.5 shrink-0', chosen ? 'text-primary' : 'text-faint')} aria-hidden />
         {/* The name gives way before the icon and the arrow do, so a chip
             squeezed for room is still whole. */}
+        {/* Nothing chosen: the kind of choice in a word, muted, never a bare
+            icon whose meaning needs a hover. */}
         {quietDefault && !chosen
-          ? <span className="sr-only">{label}</span>
+          ? <span className="truncate text-left">{heading}</span>
           : <span className="min-w-[2.25rem] max-w-[150px] flex-1 truncate text-left">{label}</span>}
         <ChevronUp className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform', open && 'rotate-180')} aria-hidden />
       </button>

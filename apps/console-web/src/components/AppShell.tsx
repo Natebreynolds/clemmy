@@ -23,6 +23,8 @@ import { useHomeToday } from '@/lib/home-data';
 const NARROW_QUERY = '(max-width: 720px)';
 
 function titleForPath(pathname: string): string {
+  // Today lives at /chat; a conversation under it is a conversation, not Today.
+  if (pathname.startsWith('/chat/')) return 'Chat';
   // Longest matching prefix wins (so /advanced/usage beats /advanced).
   const match = [...ALL_NAV, DEVELOPER_NAV]
     .sort((a, b) => b.path.length - a.path.length)
