@@ -1061,3 +1061,45 @@ test('explicit checkpoint clipping of a nested projected result survives the nex
   }), (error: unknown) => error instanceof provenance.ModelRequestProvenanceError
     && error.code === 'logical_result_projection_mismatch', 'a different session cannot donate a sealed frame');
 });
+
+test('a large model step stored as a shared history object still carries its result receipts', () => {
+  // Live 10-02, schema 91: a step that wrote a ~40 KB page had its frame moved
+  // to the shared history store, leaving '[]' in the inline column. Both
+  // receipt lineage triggers read that inline column, found no call, and
+  // refused, so the turn ended "could not reopen the saved checkpoint" after
+  // the file was already written.
+  const task = accept('large frame stored as an object');
+  const callId = 'large-frame-call';
+  const toolName = 'session_history';
+  const content = 'Brand colours, fonts and section order for the style brief.\n'.repeat(900);
+  const admission = admit({ task, callId, toolName, args: { query: content } });
+  const stored = eventlog.openEventLog().prepare(`SELECT frame_history_json, frame_history_object_digest
+    FROM accepted_model_batch_admissions WHERE batch_id = ?`).get(admission.batchId) as {
+    frame_history_json: string; frame_history_object_digest: string | null;
+  };
+  assert.equal(stored.frame_history_json, '[]', 'the frame is held by the shared history store');
+  assert.ok(stored.frame_history_object_digest);
+
+  settleRead({ task, logicalToolCallId: callId, toolName });
+  const projected = projections.recordLogicalModelResultProjectionReceipt({
+    admission,
+    resultItem: structuredResult({ callId, toolName }),
+  });
+  assert.equal(projected.status, 'recorded', JSON.stringify(projected));
+
+  const hostTask = accept('large host frame stored as an object');
+  const hostCallId = 'large-host-frame-call';
+  const hostAdmission = admit({ task: hostTask, callId: hostCallId, toolName: 'work_call', args: { args_json: content } });
+  const refusal = hostResults.buildHostToolDispositionResult({
+    callId: hostCallId,
+    toolName: 'work_call',
+    disposition: 'refused_pre_dispatch',
+    frameDigest: 'c'.repeat(64),
+    frameIndex: 0,
+    frameSize: 1,
+    countsRefusal: true,
+    diagnostic: 'Refused before dispatch for this fixture.',
+  });
+  assert.doesNotThrow(() => hostResults.recordHostModelResultReceipts({ admission: hostAdmission, resultItems: [refusal] }));
+  assert.equal(hostResults.hostModelResultReceiptRowsForCall(eventlog.openEventLog(), hostTask.sessionId, hostCallId).length, 1);
+});

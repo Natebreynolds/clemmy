@@ -11387,6 +11387,84 @@ const MIGRATIONS: EventLogMigration[] = [
       ON events(session_id, json_extract(data_json, '$.record.source.sourceUserSeq'), seq)
       WHERE type = 'read_receipt' AND json_valid(data_json);`,
   },
+  {
+    version: 92,
+    // The two result-receipt lineage triggers read the admitted frame through
+    // the verified readable view. From v89 a frame of 32 KB or more is held by
+    // the shared history store and its inline column is '[]'; read directly,
+    // the call was never found, every receipt for it was refused, and the
+    // turn ended unable to reopen its checkpoint after its work had landed
+    // (live 10-02). Every other condition is unchanged.
+    sql: `DROP TRIGGER IF EXISTS trg_host_model_result_receipt_exact_lineage;
+    CREATE TRIGGER trg_host_model_result_receipt_exact_lineage
+    BEFORE INSERT ON host_model_result_receipts
+    WHEN NOT EXISTS (
+      SELECT 1
+        FROM accepted_model_batch_admissions_readable_v1 admission
+        JOIN accepted_turn_call_authorities root
+          ON root.session_id = admission.session_id
+         AND root.source_user_seq = admission.source_user_seq
+        JOIN events source ON source.id = root.source_event_id
+       WHERE admission.session_id = NEW.session_id
+         AND admission.source_user_seq = NEW.source_user_seq
+         AND admission.accepted_task_id = NEW.accepted_task_id
+         AND admission.batch_ordinal = NEW.batch_ordinal
+         AND admission.batch_id = NEW.batch_id
+         AND root.accepted_task_id = NEW.accepted_task_id
+         AND root.source_event_id = NEW.source_event_id
+         AND root.state = 'open'
+         AND source.session_id = NEW.session_id
+         AND source.seq = NEW.source_user_seq
+         AND source.role = 'user'
+         AND source.type = 'user_input_received'
+         AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+         AND (
+           SELECT COUNT(*)
+             FROM json_each(admission.frame_history_json) item
+            WHERE json_extract(item.value, '$.type') = 'function_call'
+              AND json_extract(item.value, '$.callId') = NEW.call_id
+              AND json_extract(item.value, '$.name') = NEW.tool_name
+         ) = 1
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'host model result receipt requires exact accepted source/call lineage');
+    END;
+    DROP TRIGGER IF EXISTS trg_logical_model_result_projection_exact_lineage;
+    CREATE TRIGGER trg_logical_model_result_projection_exact_lineage
+    BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NOT EXISTS (
+      SELECT 1
+        FROM accepted_model_batch_admissions_readable_v1 admission
+        JOIN accepted_turn_call_authorities root
+          ON root.session_id = admission.session_id
+         AND root.source_user_seq = admission.source_user_seq
+        JOIN events source ON source.id = root.source_event_id
+       WHERE admission.session_id = NEW.session_id
+         AND admission.source_user_seq = NEW.source_user_seq
+         AND admission.accepted_task_id = NEW.accepted_task_id
+         AND admission.batch_ordinal = NEW.batch_ordinal
+         AND admission.batch_id = NEW.batch_id
+         AND root.accepted_task_id = NEW.accepted_task_id
+         AND root.source_event_id = NEW.source_event_id
+         AND source.session_id = NEW.session_id
+         AND source.seq = NEW.source_user_seq
+         AND source.role = 'user'
+         AND source.type = 'user_input_received'
+         AND COALESCE(json_extract(source.data_json, '$.synthetic'), 0) != 1
+         AND (
+           SELECT COUNT(*)
+             FROM json_each(admission.frame_history_json) item
+            WHERE json_extract(item.value, '$.type') = 'function_call'
+              AND json_extract(item.value, '$.callId') = NEW.call_id
+              AND json_extract(item.value, '$.name') = NEW.tool_name
+              AND json_extract(item.value, '$.namespace') IS NEW.call_namespace
+         ) = 1
+    )
+    BEGIN
+      SELECT RAISE(ABORT,
+        'logical model result projection requires exact accepted source/call lineage');
+    END;`,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

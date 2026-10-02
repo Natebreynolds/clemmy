@@ -16,6 +16,7 @@ const { canonicalVerifiedReadReceipt, verifiedReadOriginMatchesAliasDigest } =
 const { acceptedPhraseDigest } = await import('../../memory/capability-alias-index.js');
 const { resolveAcceptedSource } = await import('../../memory/verified-read-learning.js');
 const { applyHarnessMigrations } = await import('./eventlog-schema.js');
+const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 
 test.beforeEach(() => log.resetEventLog());
 test.after(() => { log.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
@@ -163,7 +164,7 @@ test('v91 indexes preserve duplicate receipts, unrelated payloads and incomplete
     const before = db.prepare('SELECT * FROM events ORDER BY seq').all();
     applyHarnessMigrations(db);
     assert.deepEqual(db.prepare('SELECT * FROM events ORDER BY seq').all(), before);
-    assert.equal((db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version, 91);
+    assert.equal((db.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number }).version, HARNESS_SCHEMA_VERSION);
     assert.equal(db.pragma('integrity_check', { simple: true }), 'ok');
   } finally { db.close(); }
 });
