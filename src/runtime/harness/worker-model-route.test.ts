@@ -167,3 +167,29 @@ test('no offer when a saved rule already puts that model on that kind of work', 
   assert.equal(decision.kind === 'route' && decision.model, 'flagship-writer');
   assert.equal(decision.kind === 'route' ? decision.offer : 'refused', undefined);
 });
+
+test("a model pinned on the saved agent the work runs as is the owner's choice: it runs, with no ask", async () => {
+  const asks = setup({
+    requestText: 'Hand Design Studio this brief and bring back its design.',
+    answers: () => ({ asked: noul(0.03) }),
+  });
+  const decision = await routeWorkerModel({ sessionId: 's', sourceUserSeq: 1, model: 'flagship-writer', ownerPinnedModel: 'flagship-writer', intent: 'design', objective: 'Design the landing page', item: 'design' });
+  assert.equal(decision.kind, 'route');
+  if (decision.kind !== 'route') return;
+  assert.equal(decision.model, 'flagship-writer', 'the agent runs on the model it is pinned to');
+  assert.equal(decision.trace.askCheck, 'not_needed');
+  assert.equal(decision.hostNote, undefined);
+  assert.equal(asks.length, 0, 'an owner pin needs no check of the wording');
+});
+
+test('a pin on the agent does not cover a different model the call names', async () => {
+  setup({
+    requestText: 'Hand Design Studio this brief.',
+    answers: () => ({ asked: noul(0.03) }),
+  });
+  const decision = await routeWorkerModel({ sessionId: 's', sourceUserSeq: 1, model: 'mid-reviewer', ownerPinnedModel: 'flagship-writer', intent: null, objective: 'Design', item: 'design' });
+  assert.equal(decision.kind, 'route');
+  if (decision.kind !== 'route') return;
+  assert.equal(decision.model, 'fast-default', 'an unasked, unpinned model is still gated');
+  assert.equal(decision.trace.askCheck, 'not_asked');
+});

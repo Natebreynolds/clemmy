@@ -86,6 +86,11 @@ export interface WorkerModelRouteInput {
   /** Defaults to the accepted source's own text. */
   requestText?: string;
   model?: string | null;
+  /** The model pinned on the saved agent this work runs as. The owner set it
+   *  (and sees it on the agent), so it counts as their choice, like a saved
+   *  rule: a design agent pinned to a flagship model runs on it without the
+   *  request having to name the model again. */
+  ownerPinnedModel?: string | null;
   intent?: string | null;
   objective: string;
   item?: string;
@@ -243,7 +248,9 @@ export async function routeWorkerModel(input: WorkerModelRouteInput): Promise<Wo
     let resolved = requested ? exactCatalogMatch(catalog, requested) : undefined;
     let brainId = '';
     try { brainId = deps.brainModelId(); } catch { brainId = ''; }
-    const ownerChosen = new Set([brainId, def.modelId, ...rules.map((rule) => rule.modelId)].filter(Boolean));
+    const pinned = input.ownerPinnedModel?.trim() ?? '';
+    const pinnedId = pinned ? (exactCatalogMatch(catalog, pinned)?.id ?? pinned) : '';
+    const ownerChosen = new Set([brainId, def.modelId, pinnedId, ...rules.map((rule) => rule.modelId)].filter(Boolean));
     const needWhich = Boolean(requested && !resolved);
     const needAsked = Boolean(requested && (needWhich || (resolved && !ownerChosen.has(resolved.id))));
     const ruleCandidates = !exactRule && rules.length > 0 ? rules.slice(0, WORKER_RULE_WINDOW) : [];

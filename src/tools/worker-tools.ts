@@ -240,6 +240,7 @@ export function registerWorkerTools(server: McpServer): void {
         sessionId: manifestSessionId,
         sourceUserSeq: manifestSourceUserSeq,
         model: agentRequest.kind === 'bound' ? agentRequest.model : call.model,
+        ...(agentRequest.kind === 'bound' && agentRequest.pinnedModel ? { ownerPinnedModel: agentRequest.pinnedModel } : {}),
         intent: call.intent,
         objective: call.objective,
         item: callItems[0],

@@ -2578,6 +2578,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         sessionId: routeSessionId,
         sourceUserSeq: routeSourceUserSeq,
         model: agentRequest.kind === 'bound' ? agentRequest.model : call.model,
+        ...(agentRequest.kind === 'bound' && agentRequest.pinnedModel ? { ownerPinnedModel: agentRequest.pinnedModel } : {}),
         intent: call.intent,
         objective: call.objective,
         item: callItems[0],

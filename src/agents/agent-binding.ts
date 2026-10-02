@@ -102,7 +102,14 @@ export function agentModelIsRole(model: string | null | undefined): model is Mod
 export type WorkerAgentRequest =
   | { kind: 'none' }
   | { kind: 'refuse'; reason: string; shapes: string[] }
-  | { kind: 'bound'; binding: AgentBinding; model: string | null | undefined };
+  | {
+    kind: 'bound';
+    binding: AgentBinding;
+    model: string | null | undefined;
+    /** The model the owner pinned on this saved agent, resolved; an owner
+     *  choice the helper router honours like a saved rule. */
+    pinnedModel?: string;
+  };
 
 /**
  * One decision per run_worker call: which saved agent the workers run as, and
@@ -121,11 +128,11 @@ export function resolveWorkerAgentRequest(call: { agent?: string | null; model?:
       shapes: ['agent:not_saved'],
     };
   }
-  let model = call.model;
-  if (!model && binding.model) {
-    model = agentModelIsRole(binding.model)
+  const pinnedModel = binding.model
+    ? (agentModelIsRole(binding.model)
       ? resolveRoleModel(binding.model.trim().toLowerCase() as ModelRole).modelId
-      : binding.model;
-  }
-  return { kind: 'bound', binding, model };
+      : binding.model)
+    : undefined;
+  const model = call.model || pinnedModel;
+  return { kind: 'bound', binding, model, ...(pinnedModel ? { pinnedModel } : {}) };
 }
