@@ -94,6 +94,9 @@ export interface WatchdogRunView {
   /** Newest harness event across the run's step sessions (caller-populated
    *  for status='running' runs). Drives silent-running detection. */
   lastActivityAt?: string;
+  /** A readmission from a pause is activity: silence is measured from it. */
+  resumedAt?: string;
+  capabilityBlock?: { resumedAt?: string; resumeAuthorityConsumedAt?: string };
 }
 
 export interface StalledRun {
@@ -143,9 +146,17 @@ export function findStalledRuns(
       // for hours. The stream-stall watchdog (loop.ts) should abort these
       // first; this is the user-facing net if anything else ever wedges.
       const silentMs = opts.runningSilentStallMs ?? DEFAULT_RUNNING_SILENT_STALL_MS;
-      const ref = run.lastActivityAt ?? run.createdAt;
-      const last = ref ? Date.parse(ref) : Number.NaN;
-      if (!Number.isFinite(last)) continue;
+      // Silence starts at the newest sign of life: step activity, or the
+      // readmission that put a parked run back to work. A run resumed after a
+      // long pause has not been silent for the length of the pause.
+      const times = [
+        run.lastActivityAt ?? run.createdAt,
+        run.resumedAt,
+        run.capabilityBlock?.resumedAt,
+        run.capabilityBlock?.resumeAuthorityConsumedAt,
+      ].map((value) => (value ? Date.parse(value) : Number.NaN)).filter(Number.isFinite);
+      if (times.length === 0) continue;
+      const last = Math.max(...times);
       const ageMs = now - last;
       if (ageMs >= silentMs) {
         out.push({ id: run.id, workflow: run.workflow, ageMs, reason: 'running_silent' });

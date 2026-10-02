@@ -891,6 +891,9 @@ export interface WorkflowRunGoalValidationV1 {
 export interface QueuedRunRecord {
   id: string;
   workflow: string;
+  /** When a parked run was last readmitted to running (a resume is activity:
+   *  the silent-running watchdog measures from it, not from before the pause). */
+  resumedAt?: string;
   /** How many times this run has been re-resumed by a daemon BOOT (crash,
    *  hang-kill, or restart) rather than by its own progress. A crash loop
    *  otherwise replays the same paid work every cycle — on 2026-09-10 one
@@ -12407,6 +12410,7 @@ function readmitMutationBlockedRun(
   const resumedRecord = writeRunRecord(filePath, {
     ...run,
     status: 'running',
+    resumedAt,
     mutationBlock: undefined,
   }).record;
   if (isTerminalRunRecord(resumedRecord) || resumedRecord.status !== 'running') return false;

@@ -391,3 +391,18 @@ test('reportedBackRunIdsFrom + dropReportedBackTerminalRuns: silenced undelivere
   // Before the fix the undelivered echo would have masked this; now it's KEPT.
   assert.deepEqual(dropReportedBackTerminalRuns(stalled, reported).map((r) => r.id), ['self-notify-run']);
 });
+
+test('a run resumed after a long pause is not silent for the length of the pause; a wedged one still is', () => {
+  const hour = 60 * 60_000;
+  const pausedLongAgo = new Date(T0 - 3 * hour).toISOString();
+  const resumedJustNow = new Date(T0 - 60_000).toISOString();
+  const runs = [
+    { id: 'resumed-capability', workflow: 'w', status: 'running', createdAt: pausedLongAgo, lastActivityAt: pausedLongAgo,
+      capabilityBlock: { resumedAt: resumedJustNow } },
+    { id: 'resumed-mutation', workflow: 'w', status: 'running', createdAt: pausedLongAgo, lastActivityAt: pausedLongAgo,
+      resumedAt: resumedJustNow },
+    { id: 'wedged', workflow: 'w', status: 'running', createdAt: pausedLongAgo, lastActivityAt: pausedLongAgo },
+  ];
+  const stalled = findStalledRuns(runs, T0, { queuedStallMs: FIVE_MIN, runningSilentStallMs: 30 * 60_000 });
+  assert.deepEqual(stalled.map((run) => run.id), ['wedged']);
+});
