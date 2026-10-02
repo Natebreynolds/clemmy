@@ -3433,6 +3433,9 @@ test('host-proven plain conversation ignores action-shaped scope and fanout resi
   });
 
   assert.deepEqual(agent.tools ?? [], [], 'the proof remains an exact zero-tool surface');
+  const envelope = boundAgentCapabilityEnvelope(agent);
+  assert.ok(envelope, 'plain conversation still binds an explicit capability envelope');
+  assert.deepEqual(envelope.capabilities, [], 'zero-tool proof cannot retain hidden action capabilities');
   const scope = boundAgentMcpToolScope(agent).scope;
   assert.equal(scope?.authority, 'none');
   assert.deepEqual(scope?.allowedServerSlugs ?? [], []);

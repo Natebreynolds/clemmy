@@ -4397,11 +4397,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   try {
     const budgetSettings = getHarnessBudgetSettings();
     const universeByName = new Map<string, SealableToolLike>();
-    for (const toolRef of [
+    // The host's closed-world conversation proof excludes deferred actions as
+    // well as advertised tools. Keeping assembled controls here gave a zero-
+    // tool greeting a hidden worker capability and classified it through the
+    // live catalog. Actionable builds retain their full acquisition universe.
+    const universeTools = plainConversationSurface ? modelTools : [
       ...actionScopedDiscoveryTools,
       ...assembledTools,
       ...modelTools,
-    ] as unknown as SealableToolLike[]) {
+    ];
+    for (const toolRef of universeTools as unknown as SealableToolLike[]) {
       const name = typeof toolRef.name === 'string' ? toolRef.name : '';
       if (name) universeByName.set(name, toolRef); // later (active) instances win
     }
