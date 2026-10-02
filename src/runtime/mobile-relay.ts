@@ -236,6 +236,11 @@ export function getMobileRelayRuntime(): MobileRelayRuntime | null {
 
 const RECONNECT_BASE_MS = 2000;
 const RECONNECT_MAX_MS = 60_000;
+/** The relay sends a PING every 30 s. Three missed in a row means the tunnel
+ *  is gone even though no close arrived: a relay restart or a proxy that
+ *  drops an idle connection leaves this side's socket open and silent. */
+const HEARTBEAT_DEADLINE_MS = 90_000;
+const HEARTBEAT_CHECK_MS = 15_000;
 
 export interface MobileRelayClient {
   stop(): void;
@@ -253,6 +258,9 @@ export interface StartRelayClientOptions {
   certPem: string;
   keyPem: string;
   logger?: Pick<typeof logger, 'info' | 'warn' | 'error'>;
+  /** Test seams for the heartbeat watchdog. */
+  heartbeatDeadlineMs?: number;
+  heartbeatCheckMs?: number;
 }
 
 export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRelayClient {
@@ -288,6 +296,24 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
       rejectUnauthorized: false,
     });
     activeSocket = socket;
+    socket.setKeepAlive(true, 30_000);
+    // Live 10-02: the relay restarted, this side kept a silent socket it
+    // believed registered, and the phone could not reach the Mac until Clem
+    // was restarted. The relay's heartbeat is the proof the tunnel is alive;
+    // once one has arrived, its absence past the deadline ends this
+    // connection and the ordinary reconnect registers a fresh one. A relay
+    // that never sends heartbeats never arms the watchdog.
+    let lastHeartbeatAt = 0;
+    const heartbeatDeadlineMs = opts.heartbeatDeadlineMs ?? HEARTBEAT_DEADLINE_MS;
+    const heartbeatWatch = setInterval(() => {
+      if (lastHeartbeatAt === 0 || socket.destroyed) return;
+      if (Date.now() - lastHeartbeatAt > heartbeatDeadlineMs) {
+        log.warn({ silentMs: Date.now() - lastHeartbeatAt }, 'mobile-relay: relay heartbeat stopped; reconnecting');
+        socket.destroy();
+      }
+    }, opts.heartbeatCheckMs ?? HEARTBEAT_CHECK_MS);
+    heartbeatWatch.unref();
+    socket.once('close', () => clearInterval(heartbeatWatch));
     const streams = new Map<number, net.Socket>();
     activeStreams = streams;
     const feed = frameReader();
@@ -350,6 +376,7 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
         return;
       }
       if (frame.type === FRAME.PING) {
+        lastHeartbeatAt = Date.now();
         socket.write(encodeFrame(FRAME.PONG, 0));
         return;
       }

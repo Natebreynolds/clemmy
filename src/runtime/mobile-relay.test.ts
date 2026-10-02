@@ -323,3 +323,85 @@ test('loopback survives, because a same-machine relay reports it honestly', () =
   assert.equal(sanitizeRelayClientIp('::1'), '::1');
   assert.equal(sanitizeRelayClientIp('::ffff:127.0.0.1'), '127.0.0.1');
 });
+
+/** A relay that registers the tunnel, optionally sends heartbeats, and can
+ *  then go silent without closing, as a restarted relay or a proxy that drops
+ *  an idle connection does. */
+async function silentRelay(opts: { heartbeats: number }) {
+  const identity = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, `silent-relay-${opts.heartbeats}`) });
+  let connections = 0;
+  const sockets: tls.TLSSocket[] = [];
+  const server = tls.createServer({ key: identity.keyPem, cert: identity.certPem }, (socket) => {
+    connections += 1;
+    sockets.push(socket);
+    const read = frameReader();
+    socket.on('data', (chunk: Buffer) => {
+      for (const frame of read(chunk)) {
+        if (frame.type === FRAME.HELLO) {
+          socket.write(encodeFrame(FRAME.HELLO_OK, 0));
+          for (let i = 0; i < opts.heartbeats; i++) socket.write(encodeFrame(FRAME.PING, 0));
+        }
+      }
+    });
+    socket.on('error', () => {});
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as net.AddressInfo).port;
+  return {
+    port,
+    fingerprint: identity.fingerprint,
+    connections: () => connections,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+function silentClient(relay: { port: number; fingerprint: string }) {
+  const daemon = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, `silent-daemon-${relay.port}`) });
+  return startMobileRelayClient({
+    config: { url: `127.0.0.1:${relay.port}`, baseDomain: 'r.test.local', relayCertFp: relay.fingerprint },
+    pairId: relayPairId(daemon.certPem),
+    authToken: 'test-token',
+    localPort: 1,
+    certPem: daemon.certPem,
+    keyPem: daemon.keyPem,
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    heartbeatDeadlineMs: 300,
+    heartbeatCheckMs: 50,
+  });
+}
+
+test('a tunnel whose relay heartbeat stops is dropped and registered again', async () => {
+  // Live 10-02: the relay restarted, the Mac kept a silent socket it thought
+  // was registered, and the phone could not reach it until Clem restarted.
+  const relay = await silentRelay({ heartbeats: 1 });
+  const client = silentClient(relay);
+  try {
+    for (let i = 0; i < 100 && !client.connected(); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(client.connected(), 'the tunnel registers');
+    // One heartbeat arrives, then silence. Past the deadline the client ends
+    // the connection and the ordinary reconnect (2 s base) registers again.
+    for (let i = 0; i < 250 && relay.connections() < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(relay.connections(), 2, 'a fresh tunnel is registered after the heartbeat stops');
+  } finally {
+    client.stop();
+    await relay.close();
+  }
+});
+
+test('a relay that never sends heartbeats is not treated as dead', async () => {
+  const relay = await silentRelay({ heartbeats: 0 });
+  const client = silentClient(relay);
+  try {
+    for (let i = 0; i < 100 && !client.connected(); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(client.connected());
+    await new Promise((r) => setTimeout(r, 900));
+    assert.equal(relay.connections(), 1, 'no heartbeat ever arrived, so the watchdog never armed');
+    assert.ok(client.connected());
+  } finally {
+    client.stop();
+    await relay.close();
+  }
+});
