@@ -28,6 +28,7 @@ const localPreparation = await import('./host-local-call-preparation.js');
 const localDefinitions = await import('./local-planning-capability.js');
 const { buildScopedLocalToolSearch } = await import('../../tools/local-runtime-tools.js');
 const workCallTools = await import('../../tools/work-call.js');
+const callTools = await import('../../tools/call-tool.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
 const store = await import('../../spaces/store.js');
 const workspaceDb = await import('../../spaces/workspace-db.js');
@@ -418,6 +419,63 @@ test(`a native write carrying ${label === 'sibling' ? "another configured operat
     assert.match(JSON.stringify(result.history), /work_contract_required|not yet published/);
     assert.equal(readFileSync(file, 'utf8'), 'Original draft\n');
     assert.equal(dispatches, 0);
+  }
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 0);
+});
+}
+
+// A first try through call_tool, on a turn with no plan, is the configured
+// local write it carries: covered once, run once, no refusal and no search.
+for (const label of ['carried', 'no-variant', 'provider'] as const) {
+test(`call_tool carrying ${label === 'carried' ? 'a configured local write runs it in one round' : label === 'no-variant' ? 'arguments that match no write variant keeps the refusal' : 'a provider write is not carried as local'}`, async () => {
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: `call-tool-native-${label}`, kind: 'chat', userId: 'native-fixture-owner' });
+  const file = path.join(TEST_HOME, `call-tool-${label}.md`);
+  const prompt = `Write ${file} containing exactly: fixture note.`;
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: prompt, taskMode: { version: 1, kind: 'normal' } } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({ requireHostPlan: true,
+    reachableBuiltinNames: new Set(['write_file']), firstClassNames: new Set(), catalogIdentifiers: ['write_file'],
+    settlementLane: 'byo', hostPlanningReady: () => true }) as never);
+  // As a real turn builds it: control-only, with write_file named only as work.
+  const callTool = brackets.wrapToolForHarness(callTools.buildCallTool({ reachableBuiltinNames: new Set(),
+    firstClassNames: new Set(), workCarrierNames: new Set(['write_file']) }) as never);
+  const carried = label === 'provider'
+    ? { name: 'SLACK_SEND_MESSAGE', args_json: JSON.stringify({ channel: 'C0FIXTURE', markdown_text: 'fixture note' }) }
+    : { name: 'write_file', args_json: JSON.stringify({ path: file, content: 'fixture note\n',
+        mode: label === 'carried' ? 'create' : 'scribble', append: null }) };
+  const model = stubModel([[toolCall(`call-tool-${label}`, 'call_tool', carried)], [textMessage('Done.')]]);
+  const agent = { model, tools: [workCall, callTool] };
+  localPreparation.bindHostLocalCallPreparation(agent, { planning: primed.planning, configuredNames: new Set(['write_file']) });
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id,
+    universeTools: [workCall, callTool], activeToolNames: ['work_call', 'call_tool'], policyHash: `call-tool-native-${label}`,
+    budget: { maxUncachedTokens: 20_000, maxModelCalls: 4, maxToolCalls: 4, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok);
+  if (!sealed.ok) throw new Error('native envelope unavailable');
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(4),
+    behaviorScopeId: `${session.id}::turn:1` }, () => hostRunRunner(throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: prompt }] as never,
+    { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
+  const dispatches = (eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+    .get(session.id) as { n: number }).n;
+  const history = JSON.stringify(result.history);
+  if (label === 'carried') {
+    assert.equal(model.calls(), 2, history);
+    assert.doesNotMatch(history, /coverage_missing|tool_search|not yet published/);
+    assert.equal(readFileSync(file, 'utf8'), 'fixture note\n');
+    assert.equal(dispatches, 1);
+  } else {
+    assert.equal(dispatches, 0, history);
+    assert.throws(() => readFileSync(file, 'utf8'));
   }
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?')
     .get(session.id) as { n: number }).n, 0);

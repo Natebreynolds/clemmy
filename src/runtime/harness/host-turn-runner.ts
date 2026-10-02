@@ -664,6 +664,7 @@ import {
   runtimeToolAuthorityBinding,
   trustedRuntimeEffectCarrier,
   unwrapRuntimeEffectiveToolIdentity,
+  type OffSurfaceDirectCarry,
   type RuntimeToolEffect,
   type TrustedRuntimeEffectCarrier,
   providerOperationFromNameForm,
@@ -3109,11 +3110,46 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // below consumes the same locally schema-completed carrier bytes instead.
   const localArgumentPreparations = new Map<string, string>();
   const directLocalCallRequirements = new Map<string, string>();
-  const selectedDirectCarry = (name: string, args: Record<string, unknown> | null, argumentsJson: string) => {
+  // A carried or off-surface native write on a turn with no frozen plan, keyed
+  // by call id, carried onto the exact local definition prepared before the
+  // frame (the same definition a disclosure would have published).
+  const unplannedNativeCarries = new Map<string, OffSurfaceDirectCarry>();
+  const selectedDirectCarry = (name: string, args: Record<string, unknown> | null, argumentsJson: string, callId?: string) => {
     const carrier = toolByName.get('work_call');
-    return hostProduction && carrier && isHostPlanRequiredWorkCall(carrier)
-      ? plannedNativeDirectCarry({ ...exactHostIdentity(), authoredName: name, authoredArgs: args, authoredArgumentsJson: argumentsJson })
-      : null;
+    if (!hostProduction || !carrier || !isHostPlanRequiredWorkCall(carrier)) return null;
+    return plannedNativeDirectCarry({ ...exactHostIdentity(), authoredName: name, authoredArgs: args, authoredArgumentsJson: argumentsJson })
+      ?? (callId ? unplannedNativeCarries.get(callId) ?? null : null);
+  };
+  /** `call_tool{X}`, or an X that is not on this turn's surface, where X is a
+   *  configured local write: on a turn with no frozen plan, prepare X's exact
+   *  current definition the way a disclosure would and carry the call onto
+   *  work_call under it. Anything that is not exactly one current local write
+   *  variant (a provider or MCP write, an admin tool, a destructive entry,
+   *  arguments matching no variant) keeps the ordinary path. */
+  const prepareUnplannedNativeCarry = async (call: { callId: string; name: string; argumentsJson: string }): Promise<void> => {
+    const carrier = toolByName.get('work_call');
+    if (!hostProduction || !carrier || !isHostPlanRequiredWorkCall(carrier)) return;
+    if (!isPlainOrClementineLocalTool(call.name, 'call_tool') && toolByName.has(call.name)) return;
+    const authoredJson = materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson);
+    const authoredArgs = parsedArgs(authoredJson);
+    const identity = exactHostIdentity();
+    if (!authoredArgs || actionExpectedWorkRequired(identity)) return;
+    if (plannedNativeDirectCarry({ ...identity, authoredName: call.name, authoredArgs, authoredArgumentsJson: authoredJson })) return;
+    const effective = unwrapRuntimeEffectiveToolIdentity(call.name, authoredArgs);
+    const name = effective.toolName;
+    if (!name || isPlainOrClementineLocalTool(name, 'work_call') || isPlainOrClementineLocalTool(name, 'call_tool')) return;
+    if (!effective.args || typeof effective.args !== 'object' || Array.isArray(effective.args)) return;
+    const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
+    const requirement = await prepareDirectHostLocalCall(agent, { ...identity, operationId: name, args: effective.args });
+    if (!requirement) return;
+    const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
+    const prepared = await materializeLocalRuntimeToolArguments(name, effective.args);
+    if (!prepared) return;
+    directLocalCallRequirements.set(call.callId, requirement);
+    unplannedNativeCarries.set(call.callId, {
+      carrierName: 'work_call',
+      carrierArgs: { requirement_id: requirement, name, args_json: JSON.stringify(prepared.args) },
+    });
   };
 
   const materializedArgumentsJson = (tool: FunctionToolLike | undefined, raw: string): string => (
@@ -6524,7 +6560,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     let tool = toolByName.get(authoredName);
     const authoredArgumentsJson = materializedArgumentsJson(tool, call.argumentsJson);
     const authoredParsedArguments = parsedArgs(authoredArgumentsJson);
-    const offSurfaceCarry = selectedDirectCarry(authoredName, authoredParsedArguments, authoredArgumentsJson) ?? ((!tool || typeof tool.invoke !== 'function')
+    const offSurfaceCarry = selectedDirectCarry(authoredName, authoredParsedArguments, authoredArgumentsJson, call.callId) ?? ((!tool || typeof tool.invoke !== 'function')
       ? resolveOffSurfaceDirectCarry({
           authoredName,
           authoredArgs: authoredParsedArguments,
@@ -10123,7 +10159,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           }
           continue;
         }
-        if (!isPlainOrClementineLocalTool(call.name, 'work_call')) continue;
+        if (!isPlainOrClementineLocalTool(call.name, 'work_call')) {
+          await prepareUnplannedNativeCarry(call);
+          continue;
+        }
         const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
         if (!args || typeof args.requirement_id !== 'string' || !args.requirement_id.startsWith('cap:local:')) continue;
         const effective = unwrapRuntimeEffectiveToolIdentity(call.name, args);
@@ -10403,7 +10442,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         const effectiveName = provenRead?.effectiveName ?? (argumentsValue
           ? unwrapRuntimeEffectiveToolIdentity(call.name, argumentsValue).toolName
           : null);
-        const selectedNative = selectedDirectCarry(call.name, argumentsValue, argumentsJson);
+        const selectedNative = selectedDirectCarry(call.name, argumentsValue, argumentsJson, call.callId);
         const classifiedEffect = selectedNative ? 'local_write' as const : argumentsValue
           ? classifyRuntimeToolEffect(call.name, argumentsValue).effect
           : 'unknown' as const;
@@ -10652,7 +10691,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
       // compares against.
       const authoredSurfaceTool = toolByName.get(authoredCall.name);
       const authoredAdmittedJson = materializedArgumentsJson(authoredSurfaceTool, authoredCall.argumentsJson);
-      const admissionCarry = selectedDirectCarry(authoredCall.name, parsedArgs(authoredAdmittedJson), authoredAdmittedJson) ?? ((!authoredSurfaceTool || typeof authoredSurfaceTool.invoke !== 'function')
+      const admissionCarry = selectedDirectCarry(authoredCall.name, parsedArgs(authoredAdmittedJson), authoredAdmittedJson, authoredCall.callId) ?? ((!authoredSurfaceTool || typeof authoredSurfaceTool.invoke !== 'function')
         ? resolveOffSurfaceDirectCarry({
             authoredName: authoredCall.name,
             authoredArgs: parsedArgs(authoredAdmittedJson),
