@@ -12,8 +12,8 @@ import { convertAcceptedModelHistoryBatch, inspectAcceptedModelHistoryConversion
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 const history = (label: string) => `[ { "role": "user", "content": ${JSON.stringify(`${label} 日本語 🐕\n`.repeat(4_000))} } ]`;
 
-function fixture(filename = ':memory:', installConversion = true) {
-  const db = new Database(filename);
+function fixture(filename = ':memory:', installConversion = true, verbose?: (sql: string) => void) {
+  const db = new Database(filename, { verbose });
   db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');
   db.exec(`CREATE TABLE IF NOT EXISTS accepted_model_batch_admissions (
@@ -217,6 +217,103 @@ test('new foreground work yields between atomic rows without advancing the next 
     assert.equal((db.prepare('SELECT history_object_digest AS ref FROM accepted_model_batch_checkpoints WHERE id = 2').get() as { ref: string | null }).ref, null);
     assert.equal(convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000 }).converted, 1);
   } finally { db.close(); }
+});
+
+test('foreground admission can write while a retained history is being read for preparation, then prevent publication', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-history-prepare-'));
+  let db: Database.Database | undefined;
+  let peer: Database.Database | undefined;
+  let armed = false;
+  let foreground = false;
+  try {
+    const filename = path.join(dir, 'fixture.db');
+    db = fixture(filename, true, sql => {
+      if (!armed || !sql.startsWith('SELECT history_json AS json,')) return;
+      armed = false;
+      // A second real connection must acquire the writer before compression,
+      // rather than merely observing that JavaScript ran in another thread.
+      peer!.prepare('INSERT INTO foreground_admissions VALUES (1)').run();
+      foreground = true;
+    });
+    seed(db, 1);
+    db.exec('CREATE TABLE foreground_admissions (id INTEGER PRIMARY KEY)');
+    peer = fixture(filename);
+    peer.pragma('busy_timeout = 1');
+    armed = true;
+    const result = convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000,
+      shouldContinue: () => !foreground });
+    assert.equal(foreground, true, 'the foreground writer ran before publication');
+    assert.equal(result.state, 'deferred');
+    assert.equal(result.scanned, 0);
+    assert.equal(inspectAcceptedModelHistoryConversion(db, 'checkpoint').lastRowid, null);
+    assert.equal((db.prepare('SELECT count(*) AS n FROM accepted_model_history_objects_v1').get() as { n: number }).n, 0);
+    assert.equal((peer.prepare('SELECT count(*) AS n FROM foreground_admissions').get() as { n: number }).n, 1);
+  } finally { peer?.close(); db?.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a converter that advances during preparation is rechecked under the writer lock without replaying its cursor', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-history-cursor-race-'));
+  let db: Database.Database | undefined;
+  let peer: Database.Database | undefined;
+  let armed = false;
+  let competingConversions = 0;
+  try {
+    const filename = path.join(dir, 'fixture.db');
+    db = fixture(filename, true, sql => {
+      if (!armed || !sql.startsWith('SELECT history_json AS json,')) return;
+      armed = false;
+      competingConversions += convertAcceptedModelHistoryBatch(peer!, {
+        lane: 'checkpoint', maxRows: 1, maxDurationMs: 1_000,
+      }).converted;
+    });
+    const json = seed(db, 1);
+    peer = fixture(filename);
+    peer.pragma('busy_timeout = 1');
+    armed = true;
+    const result = convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000 });
+    assert.equal(competingConversions, 1);
+    assert.equal(result.converted, 0);
+    assert.equal(result.state, 'caught_up');
+    assert.deepEqual(db.prepare('SELECT last_rowid, scanned, converted FROM accepted_model_history_conversion_v1 WHERE lane = ?').get('checkpoint'),
+      { last_rowid: 1, scanned: 1, converted: 1 });
+    assert.equal((db.prepare('SELECT history_json AS json FROM accepted_model_batch_checkpoints_readable_v1').get() as { json: string }).json, json);
+  } finally { peer?.close(); db?.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the SQL fence checks current source bytes even when its length and declared proof still match the read snapshot', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-history-current-bytes-'));
+  let db: Database.Database | undefined;
+  let peer: Database.Database | undefined;
+  let armed = false;
+  let damaged = '';
+  try {
+    const filename = path.join(dir, 'fixture.db');
+    db = fixture(filename, true, sql => {
+      if (!armed || !sql.startsWith('SELECT history_json AS json,')) return;
+      armed = false;
+      // Simulate offline/source damage only in this disposable fixture. The
+      // legitimate writer's exact conversion fence is restored before it runs.
+      peer!.transaction(() => {
+        peer!.exec('DROP TRIGGER trg_accepted_model_batch_checkpoint_immutable');
+        peer!.prepare('UPDATE accepted_model_batch_checkpoints SET history_json = ? WHERE id = 1').run(damaged);
+        createAcceptedModelHistoryConversionSchema(peer!);
+      }).immediate();
+    });
+    const json = seed(db, 1);
+    damaged = json.replace('Keep', 'Drop');
+    assert.notEqual(damaged, json);
+    assert.equal(Buffer.byteLength(damaged), Buffer.byteLength(json));
+    peer = fixture(filename);
+    peer.pragma('busy_timeout = 1');
+    armed = true;
+    const result = convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000 });
+    assert.equal(result.state, 'blocked');
+    assert.equal(result.converted, 0);
+    assert.equal(result.scanned, 0);
+    assert.equal(inspectAcceptedModelHistoryConversion(db, 'checkpoint').lastRowid, null);
+    assert.equal((db.prepare('SELECT count(*) AS n FROM accepted_model_history_objects_v1').get() as { n: number }).n, 0);
+    assert.equal((db.prepare('SELECT history_json AS json FROM accepted_model_batch_checkpoints').get() as { json: string }).json, damaged);
+  } finally { peer?.close(); db?.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('disk reclamation preserves conversion cursors on composite-key source tables in the bundled SQLite', () => {
