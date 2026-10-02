@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { getSecretStore } from '../runtime/secrets/index.js';
 import { invalidateCachedScan as invalidateCliScan, resolveSafeCliProbe } from '../runtime/cli-discovery.js';
+import { augmentPath } from '../runtime/spawn-env.js';
 
 export const BROWSER_HARNESS_REPO_URL = 'https://github.com/browser-use/browser-harness';
 export const BROWSER_HARNESS_DIR = path.join(os.homedir(), 'Developer', 'browser-harness');
@@ -343,6 +344,42 @@ export function validateInstallCommand(command: string): { ok: true; normalized:
   return { ok: true, normalized };
 }
 
+/** The environment an approved install runs in: the owner's own toolchain
+ *  first (their Node manager's default npm — nvm, volta, fnm — ahead of a
+ *  root-owned system npm), the same order Clem's CLI scan reads, so what is
+ *  installed is what Clem then finds. Live 10-02: `npm install -g` resolved
+ *  /usr/local's root-owned npm and failed with EACCES. */
+export function installCommandEnv(): NodeJS.ProcessEnv {
+  const env = browserHarnessEnv();
+  return { ...env, PATH: augmentPath(env.PATH) };
+}
+
+/** Not a login shell: macOS's login profile (path_helper) puts /usr/local/bin
+ *  back in front of the owner's toolchain. */
+function installShellCommand(command: string): { command: string; args: string[] } {
+  if (process.platform === 'win32') return shellCommand(command);
+  return { command: '/bin/sh', args: ['-c', command] };
+}
+
+/** A finished install is remembered by the job itself, whichever door
+ *  started it: a catalog CLI is recorded as connected, a named one joins the
+ *  saved list. Before, only the Connect screen's poll recorded it, so an
+ *  install started from chat never reached the roster. */
+async function rememberFinishedInstall(job: InstallJob): Promise<void> {
+  if (job.status !== 'succeeded' || job.connectedRecorded) return;
+  try {
+    if (job.metadata?.cliCatalogId) {
+      const { findCatalogEntry, recordConnectedCli } = await import('./cli-catalog/catalog.js');
+      const entry = findCatalogEntry(job.metadata.cliCatalogId);
+      if (entry) { recordConnectedCli(entry); job.connectedRecorded = true; }
+    } else if (job.metadata?.savedCli) {
+      const { addSavedCli } = await import('../runtime/saved-clis.js');
+      addSavedCli(job.metadata.savedCli);
+      job.connectedRecorded = true;
+    }
+  } catch { /* the Connect screen's poll records it on its next read */ }
+}
+
 export function startApprovedInstallCommand(command: string, title = 'Install capability', metadata?: Record<string, string>): InstallJob {
   const checked = validateInstallCommand(command);
   if (!checked.ok) throw new Error(checked.error);
@@ -359,10 +396,10 @@ export function startApprovedInstallCommand(command: string, title = 'Install ca
   };
   jobs.set(id, job);
 
-  const shell = shellCommand(checked.normalized);
+  const shell = installShellCommand(checked.normalized);
   const child = spawn(shell.command, shell.args, {
     cwd: os.homedir(),
-    env: browserHarnessEnv(),
+    env: installCommandEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (chunk) => { job.output = truncate(job.output + String(chunk)); });
@@ -381,7 +418,10 @@ export function startApprovedInstallCommand(command: string, title = 'Install ca
     // adds something to $PATH or a directory we probe. Bust the CLI
     // cache so the agent and dashboard see the new tool immediately
     // instead of waiting for the 10-min TTL.
-    if (code === 0) invalidateCliScan();
+    if (code === 0) {
+      invalidateCliScan();
+      void rememberFinishedInstall(job);
+    }
   });
   return job;
 }
