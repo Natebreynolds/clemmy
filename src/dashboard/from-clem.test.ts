@@ -76,3 +76,20 @@ test('a quiet Clem still says when each heartbeat last looked', () => {
     { heartbeat: 'noticing', title: 'Noticing', enabled: true, lastAt: '2026-10-01T19:26:00.000Z', summary: 'Quiet: considered 7 things' });
   assert.equal(out.pulses.find((pulse) => pulse.heartbeat === 'work-review')?.lastAt, undefined);
 });
+
+test('a check that failed says when it looked, never what went wrong', () => {
+  // Live 10-02: another owner's home page showed "Read failed: calendar read
+  // not learned…" as Clem's latest word. The reason belongs to the
+  // heartbeat's own page; Home shows only that it looked.
+  const out = buildFromClem(input({
+    noticingProposals: [], notifications: [], planProposals: [],
+    heartbeats: [
+      { id: 'calendar', title: 'Calendar watch', enabled: true, lastFinding: { at: '2026-10-01T21:09:00.000Z', summary: 'Read failed: calendar read not learned for gmail: the model did not answer for it', failed: true } },
+      { id: 'noticing', title: 'Noticing', enabled: true, lastFinding: { at: '2026-10-01T19:26:00.000Z', summary: 'Quiet: considered 7 things', failed: false } },
+    ],
+  }));
+  assert.deepEqual(out.pulses.find((pulse) => pulse.heartbeat === 'calendar'),
+    { heartbeat: 'calendar', title: 'Calendar watch', enabled: true, lastAt: '2026-10-01T21:09:00.000Z' });
+  assert.equal(out.pulses.find((pulse) => pulse.heartbeat === 'noticing')?.summary, 'Quiet: considered 7 things');
+  assert.ok(!JSON.stringify(out).includes('Read failed'), 'no failure text anywhere in the stream');
+});

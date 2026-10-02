@@ -51,7 +51,7 @@ export interface FromClem {
 }
 
 export interface FromClemInput {
-  heartbeats: ReadonlyArray<{ id: string; title: string; enabled: boolean; lastFinding?: { at: string; summary: string } }>;
+  heartbeats: ReadonlyArray<{ id: string; title: string; enabled: boolean; lastFinding?: { at: string; summary: string; failed?: boolean } }>;
   noticingProposals: ReadonlyArray<{ id: string; title: string; why?: string; action?: string; status: string; createdAt: string; checkInId?: string; notificationId?: string }>;
   notifications: readonly NotificationRecord[];
   planProposals: ReadonlyArray<{ id: string; proposedAt: string; proposedByAgent: string; status: string; title: string; context?: string }>;
@@ -131,9 +131,13 @@ export function buildFromClem(input: FromClemInput): FromClem {
     const say = input.voiced?.(row.key, voiceDigest);
     return { ...row, voiceDigest, ...(say ? { say } : {}) };
   });
+  // A check that failed says when it looked, never what went wrong: the
+  // reason is the heartbeat's own page's to explain, in its own words. Live
+  // 10-02: another owner's home page read "Read failed: calendar read not
+  // learned…" and "Could not finish: …" as Clem's latest word.
   const pulses = input.heartbeats.map((row) => ({
     heartbeat: row.id, title: row.title, enabled: row.enabled,
-    ...(row.lastFinding ? { lastAt: row.lastFinding.at, summary: row.lastFinding.summary } : {}),
+    ...(row.lastFinding ? { lastAt: row.lastFinding.at, ...(row.lastFinding.failed ? {} : { summary: row.lastFinding.summary }) } : {}),
   }));
   return { rows: voicedRows, pulses, covers };
 }

@@ -71,6 +71,17 @@ function voiced(file: VoiceFile) {
   };
 }
 
+/** Whether a heartbeat's latest check is the one that failed: its error was
+ *  recorded at, or within the same check as, its latest finding. Checks are
+ *  minutes apart, so a two-minute window cannot reach an older one. */
+export function lastCheckFailed(findingAt: string, errorAt: string | undefined): boolean {
+  if (!errorAt) return false;
+  const finding = Date.parse(findingAt);
+  const error = Date.parse(errorAt);
+  if (!Number.isFinite(finding) || !Number.isFinite(error)) return false;
+  return error >= finding - 2 * 60_000;
+}
+
 // ── the stream ────────────────────────────────────────────────────────────────
 export async function readFromClem(): Promise<FromClem> {
   const [{ listHeartbeats }, { loadNoticingState }, { loadNotifications }, { listPlanProposals }] = await Promise.all([
@@ -83,7 +94,11 @@ export async function readFromClem(): Promise<FromClem> {
   return buildFromClem({
     heartbeats: (await listHeartbeats()).map((row) => ({
       id: row.id, title: row.title, enabled: row.enabled,
-      ...(row.lastFinding ? { lastFinding: { at: row.lastFinding.at, summary: row.lastFinding.summary } } : {}),
+      ...(row.lastFinding ? { lastFinding: {
+        at: row.lastFinding.at,
+        summary: row.lastFinding.summary,
+        failed: lastCheckFailed(row.lastFinding.at, row.lastError?.at),
+      } } : {}),
     })),
     noticingProposals: Object.values(loadNoticingState().proposals),
     notifications: loadNotifications(),

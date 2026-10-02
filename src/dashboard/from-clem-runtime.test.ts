@@ -308,3 +308,12 @@ test('her words are background usage and reading a reply is work in her thread, 
   await replyToFromClem('notif:cal', 'hmm', run.all);
   assert.equal(replyOwner, 'clem');
 });
+
+test('a heartbeat\'s latest check counts as failed only when its error belongs to that check', async () => {
+  const { lastCheckFailed } = await import('./from-clem-runtime.js');
+  assert.equal(lastCheckFailed('2026-10-02T10:00:00.000Z', undefined), false);
+  assert.equal(lastCheckFailed('2026-10-02T10:00:00.000Z', '2026-10-02T10:00:00.000Z'), true, 'the same check');
+  assert.equal(lastCheckFailed('2026-10-02T10:00:40.000Z', '2026-10-02T10:00:00.000Z'), true, 'error recorded as the check started');
+  assert.equal(lastCheckFailed('2026-10-02T10:30:00.000Z', '2026-10-02T10:00:00.000Z'), false, 'an older failure, since checked cleanly');
+  assert.equal(lastCheckFailed('not a date', '2026-10-02T10:00:00.000Z'), false);
+});
