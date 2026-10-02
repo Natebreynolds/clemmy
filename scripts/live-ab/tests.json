@@ -1,0 +1,20 @@
+[
+  { "id": "one-sentence",
+    "message": "Live A/B fixture {LABEL}: in one sentence, what is a heartbeat in Clementine?",
+    "expect": { "terminalStatuses": ["done"], "maxReplyChars": 600 } },
+  { "id": "heartbeats-read",
+    "message": "Live A/B fixture {LABEL}: list the heartbeats you run and how often each one checks. Short list.",
+    "expect": { "terminalStatuses": ["done"], "minToolCalls": 1 } },
+  { "id": "calendar-read",
+    "message": "Live A/B fixture {LABEL}: what is on my calendar tomorrow? Times and titles only.",
+    "expect": { "terminalStatuses": ["done"], "minToolCalls": 1 } },
+  { "id": "shell-local",
+    "message": "Live A/B fixture {LABEL}: using the shell, make the folder {FIXTURES}/{LABEL} and copy {FIXTURES}/source.txt into it, then tell me the copied file's size in bytes.",
+    "expect": { "terminalStatuses": ["done"], "minToolCalls": 1, "replyIncludes": ["24"] } },
+  { "id": "file-write-read",
+    "message": "Live A/B fixture {LABEL}: write the file {FIXTURES}/{LABEL}/note.md containing exactly the line: fixture note {LABEL}. Then read it back and quote it.",
+    "expect": { "terminalStatuses": ["done"], "minToolCalls": 2, "replyIncludes": ["fixture note {LABEL}"] } },
+  { "id": "goals-read",
+    "message": "Live A/B fixture {LABEL}: what goals am I tracking right now? One line each.",
+    "expect": { "terminalStatuses": ["done"], "minToolCalls": 1 } }
+]

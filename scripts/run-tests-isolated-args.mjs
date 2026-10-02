@@ -38,6 +38,10 @@ export const DEFAULT_TEST_TARGETS = Object.freeze([
   // rest of this list: adding a source area is a decision about which gate owns
   // it, not a wildcard.
   'apps/relay/*.test.mjs',
+  // The live A/B comparison decides whether a candidate regressed; its rules
+  // are pure and belong in the ordinary gate (the live runner beside it is not
+  // a test and needs the installed app).
+  'scripts/live-ab/*.test.mjs',
 ]);
 
 const TEST_OPTIONS_WITH_SEPARATE_VALUE = new Set([
