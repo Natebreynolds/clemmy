@@ -35,3 +35,39 @@ test('with no calendar connected a tick is quiet, records no failure, and keeps 
   const nextMs = Date.parse(due.nextAt ?? '');
   assert.ok(nextMs - Date.now() > 20 * 60_000, 'the normal cadence applies, not the failed-read retry');
 });
+
+test('connected apps with no calendar found yet stay quiet, whatever the learning says', async () => {
+  // Live 10-02: a home with other apps connected but no calendar showed
+  // "Read failed: calendar read not learned…" and was re-checked every five
+  // minutes, because trouble finding a calendar was recorded as a failed read.
+  const { _setCalendarReadLearningDepsForTests, _resetCalendarReadLearningForTests } = await import('./calendar-watch-runtime.js');
+  for (const [label, port] of [
+    ['no model is available', () => null],
+    ['the model could not be asked', () => ({
+      findCalendarReadOperations: async () => { throw new Error('provider timeout'); },
+      deriveCalendarRead: async () => { throw new Error('unused'); },
+    })],
+    ['the model did not answer for the app', () => ({
+      findCalendarReadOperations: async () => ({ picks: [] }),
+      deriveCalendarRead: async () => { throw new Error('unused'); },
+    })],
+  ] as const) {
+    _resetCalendarReadLearningForTests();
+    _setCalendarReadLearningDepsForTests({
+      listToolkits: async () => [{ slug: 'gmail', status: 'ACTIVE' }, { slug: 'slack', status: 'ACTIVE' }],
+      listTools: async (toolkit: string) => [{ slug: `${toolkit.toUpperCase()}_LIST_ITEMS` }, { slug: `${toolkit.toUpperCase()}_SEND` }],
+      fingerprint: async () => undefined,
+      port: port as never,
+    });
+    const tick = await runCalendarWatchTick({ source: 'manual', force: true });
+    assert.equal(tick.quiet, true, label);
+    assert.equal(tick.readFailures, 0, label);
+    assert.match(tick.summary, /No calendar connected yet/, label);
+    assert.doesNotMatch(tick.summary, /fail|not learned|model/i, label);
+    const status = calendarWatchStatus();
+    assert.equal(status.lastError, undefined, label);
+    const due = isCalendarWatchDue();
+    assert.ok(Date.parse(due.nextAt ?? '') - Date.now() > 20 * 60_000, `${label}: the normal cadence, not the failed-read retry`);
+  }
+  _resetCalendarReadLearningForTests();
+});

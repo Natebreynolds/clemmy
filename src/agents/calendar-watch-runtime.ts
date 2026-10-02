@@ -233,7 +233,10 @@ const REJECTED_RECIPE_RETRY_MS = 24 * 60 * 60_000;
  * it failed, so a tick inside the wait still says what is wrong. */
 const learnRetryAt = new Map<string, number>();
 const learnFailure = new Map<string, string>();
-export function _resetCalendarReadLearningForTests(): void { learnRetryAt.clear(); learnFailure.clear(); resampled.clear(); }
+export function _resetCalendarReadLearningForTests(): void { learnRetryAt.clear(); learnFailure.clear(); resampled.clear(); learningDepsForTests = {}; }
+/** Test seam: the learning a heartbeat tick runs, with its deps replaced. */
+let learningDepsForTests: Partial<CalendarReadLearningDeps> = {};
+export function _setCalendarReadLearningDepsForTests(overrides: Partial<CalendarReadLearningDeps>): void { learningDepsForTests = overrides; }
 
 function bounded(value: unknown, max: number): string {
   let text: string;
@@ -816,8 +819,15 @@ export function runCalendarWatchTick(options: { source: string; force?: boolean 
     // not learned yet is given its chance here first, and what that learning
     // says is what the read reports.
     const learnedHere = connectedCalendarOperations().length === 0;
-    const learningNotes = learnedHere ? await ensureLearnedCalendarReads() : [];
-    if (connectedCalendarOperations().length === 0 && learningNotes.length === 0) {
+    const learningNotes = learnedHere ? await ensureLearnedCalendarReads(learningDepsForTests) : [];
+    // Until a calendar has been found among the connected apps, trouble
+    // finding one is Clem's own work, not a calendar of the owner's that
+    // failed: it is logged, the tick stays quiet and the normal cadence
+    // holds. Live 10-02: a home with Gmail and Slack connected but no
+    // calendar showed "Read failed: calendar read not learned…" on its home
+    // page and was re-checked every five minutes.
+    if (connectedCalendarOperations().length === 0) {
+      if (learningNotes.length > 0) logger.info({ notes: learningNotes }, 'calendar watch: no calendar read learned yet');
       const state = loadCalendarWatchState();
       const finding: CalendarWatchState['lastFinding'] = {
         tickId, at: new Date(nowMs).toISOString(), source: options.source, durationMs: 0,
