@@ -65,7 +65,7 @@ export function FromClemPane({
     );
   };
 
-  const reply = (row: FromClemRow, text: string) => act(row, 'answer', () => replyFromClem(row.key, text), (result) => {
+  const reply = (row: FromClemRow, text: string) => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest), (result) => {
     const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
     return { text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
   });

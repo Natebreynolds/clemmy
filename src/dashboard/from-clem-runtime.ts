@@ -10,6 +10,7 @@
  * shown. A reply is read by the same brain into a decision; the host then
  * takes the one path that already settles that kind of item.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
@@ -18,7 +19,7 @@ import { buildFromClem, type FromClem, type FromClemRow } from './from-clem.js';
 import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
-import { appendEvent, getSession, updateSession } from '../runtime/harness/eventlog.js';
+import { appendEvent, getSession, listEvents, updateSession } from '../runtime/harness/eventlog.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 
 const logger = pino({ name: 'clementine.from-clem' });
@@ -27,17 +28,29 @@ const MAX_VOICES_PER_PASS = 4;
 const VOICE_PASS_MS = 60_000;
 const FIRST_VOICE_PASS_DELAY_MS = 45_000;
 const MAX_KEPT_VOICES = 300;
+/** An item whose words could not be written waits before it is asked again. */
+const VOICE_RETRY_BASE_MS = 5 * 60_000;
+const VOICE_RETRY_MAX_MS = 6 * 60 * 60_000;
 
 // ── her words, kept ───────────────────────────────────────────────────────────
 /** `posted` is the digest last posted to her thread, so a message lands there once. */
 interface VoiceEntry { digest: string; message: string; model: string; at: string; posted?: string }
-interface VoiceFile { version: 1; entries: Record<string, VoiceEntry> }
+/** One item that could not be said backs off on its own; the rest are still said. */
+interface VoiceFailure { digest: string; count: number; at: string }
+/** `primer` is the digest of the raised-context text her thread last received. */
+interface VoiceFile { version: 1; entries: Record<string, VoiceEntry>; failures?: Record<string, VoiceFailure>; primer?: string }
 
 function loadVoices(): VoiceFile {
   try {
     if (!existsSync(VOICE_FILE)) return { version: 1, entries: {} };
     const raw = JSON.parse(readFileSync(VOICE_FILE, 'utf-8')) as Partial<VoiceFile>;
-    return raw.version === 1 && raw.entries && typeof raw.entries === 'object' ? { version: 1, entries: raw.entries } : { version: 1, entries: {} };
+    if (raw.version !== 1 || !raw.entries || typeof raw.entries !== 'object') return { version: 1, entries: {} };
+    return {
+      version: 1,
+      entries: raw.entries,
+      ...(raw.failures && typeof raw.failures === 'object' ? { failures: raw.failures } : {}),
+      ...(typeof raw.primer === 'string' ? { primer: raw.primer } : {}),
+    };
   } catch {
     return { version: 1, entries: {} };
   }
@@ -90,8 +103,12 @@ const MAX_RAISED_IN_PRIMER = 8;
 
 export interface ClemThreadDeps {
   ensure: () => void;
-  post: (message: { key: string; heartbeat: string; text: string }) => void;
-  primer: (text: string) => void;
+  /** Post keys already in her thread. A message is one item at one version,
+   *  so a crash between posting and remembering it never posts it twice. */
+  postedKeys: () => ReadonlySet<string>;
+  post: (message: { key: string; heartbeat: string; text: string; postKey: string }) => void;
+  /** True once her thread carries this text; false when there is no thread yet. */
+  primer: (text: string) => boolean;
 }
 /** A desktop conversation's own identity: the chat route continues a thread
  *  only for the principal it belongs to, and splits anything else off. */
@@ -110,15 +127,24 @@ export const productionClemThread: ClemThreadDeps = {
       updateSession(CLEM_THREAD_ID, { metadata: { ...meta, ...CLEM_THREAD_IDENTITY, pinned: meta.pinned ?? true } });
     }
   },
+  postedKeys: () => new Set(listEvents(CLEM_THREAD_ID, { types: ['clem_message'] })
+    .map((event) => (event.data as { postKey?: unknown }).postKey)
+    .filter((postKey): postKey is string => typeof postKey === 'string')),
   post: (message) => {
     appendEvent({ sessionId: CLEM_THREAD_ID, turn: 0, role: 'Clem', type: 'clem_message', data: { version: 1, ...message } });
   },
   // The model in her thread sees what she raised, so a reply there is read
   // against it. Replaced, never appended: one current block.
-  primer: (text) => { HarnessSession.load(CLEM_THREAD_ID)?.setContextPrimer(RAISED_PRIMER, text); },
+  primer: (text) => {
+    const session = HarnessSession.load(CLEM_THREAD_ID);
+    if (!session) return false;
+    session.setContextPrimer(RAISED_PRIMER, text);
+    return true;
+  },
 };
 
 function raisedPrimer(rows: ReadonlyArray<FromClemRow & { say: string }>): string {
+  if (rows.length === 0) return `${RAISED_PRIMER} Nothing I (Clem) raised with the owner on my own is open right now.`;
   return [
     `${RAISED_PRIMER} What I (Clem) raised with the owner on my own recently, newest first. A reply here may be about one of these; if it is unclear which, ask.`,
     ...rows.slice(0, MAX_RAISED_IN_PRIMER).map((row) => `- ${row.at} · ${row.heartbeatTitle}: ${row.say} (the record: ${[row.text, row.detail].filter(Boolean).join(' — ').slice(0, 400)})`),
@@ -126,6 +152,12 @@ function raisedPrimer(rows: ReadonlyArray<FromClemRow & { say: string }>): strin
 }
 
 type VoicePort = Pick<TurnSemanticModelPort, 'voiceProactiveItem'>;
+
+function waitingAfterFailure(failure: VoiceFailure | undefined, digest: string, nowMs: number): boolean {
+  if (!failure || failure.digest !== digest) return false;
+  const wait = Math.min(VOICE_RETRY_MAX_MS, VOICE_RETRY_BASE_MS * 2 ** Math.max(0, failure.count - 1));
+  return nowMs - Date.parse(failure.at) < wait;
+}
 
 /**
  * Write Clem's words for the rows that have none (or whose item changed),
@@ -136,61 +168,82 @@ export async function voiceFromClemRows(
   deps: { port: () => VoicePort | null; now?: () => number; max?: number; thread?: ClemThreadDeps | null } = { port: () => peekTurnSemanticModelPort() },
 ): Promise<number> {
   const file = loadVoices();
+  const failures = file.failures ?? {};
   const live = new Set(rows.map((row) => row.key));
   let changed = false;
   for (const key of Object.keys(file.entries)) {
     if (!live.has(key)) { delete file.entries[key]; changed = true; }
   }
+  for (const key of Object.keys(failures)) {
+    if (!live.has(key)) { delete failures[key]; changed = true; }
+  }
+  const nowMs = deps.now?.() ?? Date.now();
   const port = deps.port();
   let written = 0;
   if (port?.voiceProactiveItem) {
-    const pending = rows.filter((row) => file.entries[row.key]?.digest !== row.voiceDigest).slice(0, deps.max ?? MAX_VOICES_PER_PASS);
+    const pending = rows
+      .filter((row) => file.entries[row.key]?.digest !== row.voiceDigest && !waitingAfterFailure(failures[row.key], row.voiceDigest, nowMs))
+      .slice(0, deps.max ?? MAX_VOICES_PER_PASS);
     for (const row of pending) {
+      const unsaid = (reason: string): void => {
+        const prior = failures[row.key];
+        failures[row.key] = { digest: row.voiceDigest, count: (prior?.digest === row.voiceDigest ? prior.count : 0) + 1, at: new Date(nowMs).toISOString() };
+        changed = true;
+        logger.warn({ key: row.key, reason }, 'from clem: could not write the message; the item keeps its own words');
+      };
       try {
         const result = await port.voiceProactiveItem({
           purpose: CLEM_VOICE_PURPOSE,
           item: { source: row.heartbeatTitle, title: row.text, detail: row.detail ?? '', waitingOnOwner: row.asks, at: row.at },
-          now: new Date(deps.now?.() ?? Date.now()).toISOString(),
+          now: new Date(nowMs).toISOString(),
           evidenceDigest: row.voiceDigest,
         });
-        if (!result.message) continue;
+        if (!result.message) { unsaid('no message'); continue; }
         file.entries[row.key] = {
           digest: row.voiceDigest, message: result.message.slice(0, 600), model: result.modelIdentity,
-          at: new Date(deps.now?.() ?? Date.now()).toISOString(),
+          at: new Date(nowMs).toISOString(),
         };
+        delete failures[row.key];
         written += 1;
         changed = true;
       } catch (error) {
-        logger.warn({ key: row.key, err: error instanceof Error ? error.message : String(error) }, 'from clem: could not write the message; the item keeps its own words');
-        break;
+        // One item that cannot be said waits on its own; the rest are still said.
+        unsaid(error instanceof Error ? error.message : String(error));
       }
     }
   }
+  file.failures = failures;
   // Each written message lands in her thread once, newest last, and the
   // thread's primer names what she raised.
   const thread = deps.thread === undefined ? productionClemThread : deps.thread;
   if (thread) {
-    const unposted = rows.filter((row) => {
-      const entry = file.entries[row.key];
-      return entry && entry.digest === row.voiceDigest && entry.posted !== entry.digest;
-    }).sort((a, b) => a.at.localeCompare(b.at));
-    if (unposted.length > 0) {
-      try {
+    try {
+      const unposted = rows.filter((row) => {
+        const entry = file.entries[row.key];
+        return entry && entry.digest === row.voiceDigest && entry.posted !== entry.digest;
+      }).sort((a, b) => a.at.localeCompare(b.at));
+      if (unposted.length > 0) {
         thread.ensure();
+        const already = thread.postedKeys();
         for (const row of unposted) {
           const entry = file.entries[row.key]!;
-          thread.post({ key: row.key, heartbeat: row.heartbeat, text: entry.message });
+          const postKey = `${row.key}:${entry.digest}`;
+          if (!already.has(postKey)) thread.post({ key: row.key, heartbeat: row.heartbeat, text: entry.message, postKey });
           entry.posted = entry.digest;
           changed = true;
         }
-        const said = rows.flatMap((row) => {
-          const entry = file.entries[row.key];
-          return entry && entry.digest === row.voiceDigest ? [{ ...row, say: entry.message }] : [];
-        });
-        thread.primer(raisedPrimer(said));
-      } catch (error) {
-        logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'from clem: could not post to her thread');
       }
+      // What her thread knows she raised follows the stream: an item that is
+      // resolved leaves it on the next pass, not only when something new posts.
+      const said = rows.flatMap((row) => {
+        const entry = file.entries[row.key];
+        return entry && entry.digest === row.voiceDigest ? [{ ...row, say: entry.message }] : [];
+      });
+      const text = raisedPrimer(said);
+      const digest = createHash('sha256').update(text).digest('hex').slice(0, 24);
+      if (file.primer !== digest && thread.primer(text)) { file.primer = digest; changed = true; }
+    } catch (error) {
+      logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'from clem: could not post to her thread');
     }
   }
   const keys = Object.keys(file.entries);
@@ -234,6 +287,7 @@ export function bindFromClemRespond(respond: FromClemRespond | null): void { res
 
 export type FromClemReplyOutcome =
   | { outcome: 'gone' }
+  | { outcome: 'changed' }
   | { outcome: 'unclear'; decision: 'unclear' }
   | { outcome: 'started'; decision: ClemReplyResult['decision']; sessionId: string }
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added'; decision: ClemReplyResult['decision'] }
@@ -242,7 +296,8 @@ export type FromClemReplyOutcome =
 export interface FromClemReplyDeps {
   read: () => Promise<FromClem>;
   port: () => Pick<TurnSemanticModelPort, 'readClemReply'> | null;
-  answerQuestion: (questionId: string, text: string) => boolean;
+  /** `requestId` is the owner's one reply, so a retried send is the same answer. */
+  answerQuestion: (questionId: string, text: string, requestId?: string) => boolean;
   markRead: (notificationId: string) => void;
   addRule: (heartbeat: string, text: string) => void;
   approvePlan: (planProposalId: string) => boolean;
@@ -263,17 +318,54 @@ function factsOf(row: FromClemRow): string {
  * settles it: a turn for "do it", the plan decision for a suggestion, read
  * for "done" or "not now", and a rule in the owner's own words for "never".
  */
-export async function replyToFromClem(key: string, text: string, deps: FromClemReplyDeps): Promise<FromClemReplyOutcome> {
+export interface FromClemReplyRequest {
+  /** One owner reply: a retried or double-tapped send carries the same id and
+   *  gets the first answer back instead of acting again. */
+  requestId?: string;
+  /** The version of the item the owner was looking at when they replied. */
+  seenDigest?: string;
+}
+
+const replyQueues = new Map<string, Promise<unknown>>();
+const recentReplies = new Map<string, Promise<FromClemReplyOutcome>>();
+const MAX_RECENT_REPLIES = 200;
+
+export function replyToFromClem(key: string, text: string, deps: FromClemReplyDeps, request: FromClemReplyRequest = {}): Promise<FromClemReplyOutcome> {
+  const requestId = request.requestId?.trim() || undefined;
+  const known = requestId ? recentReplies.get(requestId) : undefined;
+  if (known) return known;
+  // Replies to one item are taken one at a time, so a second reply (another
+  // device, a second tap) is read against what the first one already did.
+  const prior = replyQueues.get(key) ?? Promise.resolve();
+  const run = prior.catch(() => undefined).then(() => replyOnce(key, text, deps, requestId, request.seenDigest));
+  replyQueues.set(key, run);
+  run.finally(() => { if (replyQueues.get(key) === run) replyQueues.delete(key); }).catch(() => undefined);
+  if (requestId) {
+    recentReplies.set(requestId, run);
+    if (recentReplies.size > MAX_RECENT_REPLIES) recentReplies.delete(recentReplies.keys().next().value!);
+    // A reply that failed outright may be sent again under the same id.
+    run.catch(() => { if (recentReplies.get(requestId) === run) recentReplies.delete(requestId); });
+  }
+  return run;
+}
+
+async function replyOnce(key: string, text: string, deps: FromClemReplyDeps, requestId: string | undefined, seenDigest: string | undefined): Promise<FromClemReplyOutcome> {
   const reply = text.trim();
   const row = (await deps.read()).rows.find((candidate) => candidate.key === key);
   if (!row || !reply) return { outcome: 'gone' };
+  // The owner answered the version they saw; a changed item is shown again first.
+  if (seenDigest && seenDigest !== row.voiceDigest) return { outcome: 'changed' };
   if (row.answer?.kind === 'words') {
-    return deps.answerQuestion(row.answer.questionId, reply) ? { outcome: 'answered', questionId: row.answer.questionId } : { outcome: 'gone' };
+    return deps.answerQuestion(row.answer.questionId, reply, requestId) ? { outcome: 'answered', questionId: row.answer.questionId } : { outcome: 'gone' };
   }
   const port = deps.port();
   if (!port?.readClemReply) return { outcome: 'unclear', decision: 'unclear' };
   const said = row.say ?? row.text;
   const read = await port.readClemReply({ purpose: CLEM_REPLY_PURPOSE, said, facts: factsOf(row), reply, evidenceDigest: row.voiceDigest });
+  // Reading the reply took a while: act only on the item as it was read.
+  const current = (await deps.read()).rows.find((candidate) => candidate.key === key);
+  if (!current) return { outcome: 'gone' };
+  if (current.voiceDigest !== row.voiceDigest) return { outcome: 'changed' };
   const planId = row.answer?.kind === 'yes_no' ? row.answer.planProposalId : null;
   const notificationId = row.done?.notificationId ?? null;
   switch (read.decision) {

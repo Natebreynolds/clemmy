@@ -14338,6 +14338,8 @@ export function registerConsoleRoutes(
     const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
     const text = typeof req.body?.text === 'string' ? req.body.text.trim().slice(0, 4_000) : '';
     if (!key || !text) { res.status(400).json({ error: 'key and text are required' }); return; }
+    const requestId = typeof req.body?.requestId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(req.body.requestId) ? req.body.requestId : undefined;
+    const seenDigest = typeof req.body?.voiceDigest === 'string' ? req.body.voiceDigest.slice(0, 64) : undefined;
     try {
       const [{ readFromClem, replyToFromClem, startFromClemTurn }, { addRule, HEARTBEAT_IDS }, { peekTurnSemanticModelPort }] = await Promise.all([
         import('./from-clem-runtime.js'),
@@ -14347,8 +14349,8 @@ export function registerConsoleRoutes(
       const result = await replyToFromClem(key, text, {
         read: readFromClem,
         port: () => peekTurnSemanticModelPort(),
-        answerQuestion: (questionId, answer) => {
-          const answered = answerInboxQuestion({ id: questionId, answer, requestId: `desktop-from-clem:${Date.now()}:${randomBytes(6).toString('hex')}`, surface: 'desktop' });
+        answerQuestion: (questionId, answer, replyId) => {
+          const answered = answerInboxQuestion({ id: questionId, answer, requestId: `desktop-from-clem:${replyId ?? `${Date.now()}:${randomBytes(6).toString('hex')}`}`, surface: 'desktop' });
           return answered.status === 'answered' || answered.status === 'resuming';
         },
         markRead: (notificationId) => { markNotificationRead(notificationId); },
@@ -14366,7 +14368,7 @@ export function registerConsoleRoutes(
         rejectPlan: (planProposalId, reason) => Boolean(rejectPlanProposal(planProposalId, reason)),
         snoozePlan: (planProposalId) => { void snoozeHomeItem(`plan:${planProposalId}`, DEFAULT_SNOOZE_HOURS); },
         startTurn: (input) => startFromClemTurn(input),
-      });
+      }, { ...(requestId ? { requestId } : {}), ...(seenDigest ? { seenDigest } : {}) });
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

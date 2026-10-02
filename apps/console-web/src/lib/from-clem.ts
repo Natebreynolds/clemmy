@@ -36,14 +36,24 @@ export const getFromClem = () => apiGet<FromClem>('/api/console/home/from-clem')
 
 export type FromClemReplyOutcome =
   | { outcome: 'gone' }
+  | { outcome: 'changed' }
   | { outcome: 'unclear' }
   | { outcome: 'started'; sessionId: string }
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added' }
   | { outcome: 'answered'; questionId: string };
 
-/** The owner's reply to one row, in their own words. */
-export const replyFromClem = (key: string, text: string) =>
-  apiPost<FromClemReplyOutcome>('/api/console/home/from-clem/reply', { key, text });
+/** The owner's reply to one row, in their own words. One reply, one id: a
+ *  retried send is the same answer, and the version the owner saw goes with
+ *  it, so a changed item is shown again rather than acted on. */
+export const replyFromClem = (key: string, text: string, voiceDigest?: string) =>
+  apiPost<FromClemReplyOutcome>('/api/console/home/from-clem/reply', {
+    key, text, requestId: newReplyId(), ...(voiceDigest ? { voiceDigest } : {}),
+  });
+
+function newReplyId(): string {
+  const random = globalThis.crypto?.randomUUID?.();
+  return random ? random.replace(/-/g, '') : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+}
 
 /** What the reply did, said plainly. Clem's own reaction comes from her, in the conversation. */
 export function replyOutcomeText(outcome: FromClemReplyOutcome, heartbeatTitle: string): string {
@@ -56,6 +66,7 @@ export function replyOutcomeText(outcome: FromClemReplyOutcome, heartbeatTitle: 
     case 'later': return 'Moved to later.';
     case 'rule_added': return `Saved as a rule for ${heartbeatTitle}.`;
     case 'unclear': return 'That didn’t settle it. Try “do it”, “not now” or “never”, or say what you want.';
+    case 'changed': return 'This changed while you were replying. Have another look.';
     default: return 'Already handled.';
   }
 }

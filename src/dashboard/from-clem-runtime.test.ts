@@ -21,7 +21,7 @@ const { buildFromClem } = await import('./from-clem.js');
 const { voiceFromClemRows, replyToFromClem } = await import('./from-clem-runtime.js');
 type FromClemReplyDeps = Parameters<typeof replyToFromClem>[2];
 
-const stream = (voiced?: (key: string, digest: string) => string | undefined) => buildFromClem({
+const stream = (voiced?: (key: string, digest: string) => string | undefined, readIds: ReadonlySet<string> = new Set()) => buildFromClem({
   heartbeats: [
     { id: 'calendar', title: 'Calendar watch', enabled: true },
     { id: 'work-review', title: 'Work review', enabled: true },
@@ -32,7 +32,7 @@ const stream = (voiced?: (key: string, digest: string) => string | undefined) =>
   notifications: [
     { id: 'cal', kind: 'execution', title: 'Cancelled: Interview', body: 'Was 4:00 PM.', createdAt: '2026-10-01T12:00:00.000Z', read: false, metadata: { watch: 'calendar', itemKey: 'k1' } },
     { id: 'wr', kind: 'execution', title: 'Still waiting on you: standup', body: 'Waiting since yesterday.', createdAt: '2026-10-01T11:00:00.000Z', read: false, metadata: { heartbeatId: 'work-review', itemKey: 'k2' } },
-  ],
+  ].map((n) => ({ ...n, read: readIds.has(n.id) })),
   planProposals: [{ id: 'plan1', proposedAt: '2026-10-01T09:00:00.000Z', proposedByAgent: 'workflow-suggestions', status: 'pending', title: 'Save this as a workflow' }],
   asksOwner: (n) => n.id === 'wr',
   ...(voiced ? { voiced } : {}),
@@ -77,7 +77,12 @@ test('what she writes lands in her own thread once, oldest first, and the thread
   const posts: Array<{ key: string; text: string }> = [];
   const primers: string[] = [];
   let ensured = 0;
-  const thread = { ensure: () => { ensured += 1; }, post: (m: { key: string; text: string }) => { posts.push(m); }, primer: (t: string) => { primers.push(t); } };
+  const thread = {
+    ensure: () => { ensured += 1; },
+    postedKeys: () => new Set<string>(),
+    post: (m: { key: string; text: string }) => { posts.push(m); },
+    primer: (t: string) => { primers.push(t); return true; },
+  };
   const port = () => ({
     async voiceProactiveItem(call: { item: { title: string }; evidenceDigest: string }) {
       return { message: `Clem: ${call.item.title}`, evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
@@ -163,4 +168,119 @@ test('unclear words change nothing, and a row that is gone says so', async () =>
   assert.deepEqual(await replyToFromClem('notif:cal', 'hmm', run.all), { outcome: 'unclear', decision: 'unclear' });
   assert.equal(run.log.length, 1, 'only the read');
   assert.deepEqual(await replyToFromClem('notif:missing', 'ok', run.all), { outcome: 'gone' });
+});
+
+// ── durability: crash/retry, stale versions, double replies ──────────────────
+
+test('a message already in her thread is not posted again when the record of posting it was lost', async () => {
+  const fs = await import('node:fs');
+  fs.rmSync(path.join(TMP, 'state', 'from-clem-voice.json'), { force: true });
+  const port = () => ({
+    async voiceProactiveItem(call: { item: { title: string }; evidenceDigest: string }) {
+      return { message: `Clem: ${call.item.title}`, evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
+    },
+  });
+  const rows = stream().rows;
+  const cal = rows.find((row) => row.key === 'notif:cal')!;
+  // The thread already has this item at this version (posted, then the voice
+  // file write was lost); the voice file says nothing was posted.
+  const posts: string[] = [];
+  const thread = {
+    ensure: () => undefined,
+    postedKeys: () => new Set([`notif:cal:${cal.voiceDigest}`]),
+    post: (m: { key: string }) => { posts.push(m.key); },
+    primer: () => true,
+  };
+  await voiceFromClemRows(rows, { port: port as never, max: 10, thread });
+  assert.equal(posts.includes('notif:cal'), false, 'not posted twice');
+  assert.ok(posts.includes('notif:wr'));
+});
+
+test('her thread forgets a raised item once it is resolved, even with nothing new to post', async () => {
+  const fs = await import('node:fs');
+  fs.rmSync(path.join(TMP, 'state', 'from-clem-voice.json'), { force: true });
+  const port = () => ({
+    async voiceProactiveItem(call: { item: { title: string }; evidenceDigest: string }) {
+      return { message: `Clem: ${call.item.title}`, evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
+    },
+  });
+  const primers: string[] = [];
+  const thread = { ensure: () => undefined, postedKeys: () => new Set<string>(), post: () => undefined, primer: (t: string) => { primers.push(t); return true; } };
+  await voiceFromClemRows(stream().rows, { port: port as never, max: 10, thread });
+  assert.match(primers.at(-1)!, /Cancelled: Interview/);
+  // The calendar finding is cleared: no new post, and the primer follows.
+  await voiceFromClemRows(stream(undefined, new Set(['cal'])).rows, { port: port as never, max: 10, thread });
+  assert.doesNotMatch(primers.at(-1)!, /Cancelled: Interview/);
+  const count = primers.length;
+  await voiceFromClemRows(stream(undefined, new Set(['cal'])).rows, { port: port as never, max: 10, thread });
+  assert.equal(primers.length, count, 'an unchanged primer is not rewritten');
+  await voiceFromClemRows([], { port: port as never, max: 10, thread });
+  assert.match(primers.at(-1)!, /^\[clem-raised\] Nothing I \(Clem\) raised/);
+});
+
+test('one item that cannot be said waits on its own; the others are still said', async () => {
+  const fs = await import('node:fs');
+  fs.rmSync(path.join(TMP, 'state', 'from-clem-voice.json'), { force: true });
+  const asked: string[] = [];
+  const port = () => ({
+    async voiceProactiveItem(call: { item: { title: string }; evidenceDigest: string }) {
+      asked.push(call.item.title);
+      if (call.item.title === 'Save this as a workflow') throw new Error('fixture model refused');
+      return { message: `Clem: ${call.item.title}`, evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
+    },
+  });
+  let now = Date.parse('2026-10-01T13:00:00.000Z');
+  const rows = stream().rows;
+  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 10, thread: null, now: () => now }), 3, 'the failing item does not stop the pass');
+  asked.length = 0;
+  now += 60_000;
+  assert.equal(await voiceFromClemRows(rows, { port: port as never, max: 10, thread: null, now: () => now }), 0);
+  assert.deepEqual(asked, [], 'it waits before being asked again');
+  now += 10 * 60_000;
+  await voiceFromClemRows(rows, { port: port as never, max: 10, thread: null, now: () => now });
+  assert.deepEqual(asked, ['Save this as a workflow'], 'and is asked again after its wait');
+});
+
+test('a reply to a version the owner did not see, or an item that changed while reading it, does nothing', async () => {
+  let run = deps({}, { decision: 'done' });
+  assert.deepEqual(await replyToFromClem('notif:cal', 'got it', run.all, { seenDigest: 'an-older-version' }), { outcome: 'changed' });
+  assert.deepEqual(run.log, []);
+
+  let reads = 0;
+  run = deps({
+    read: async () => {
+      reads += 1;
+      const current = stream();
+      if (reads === 1) return current;
+      return { ...current, rows: current.rows.map((row) => (row.key === 'notif:cal' ? { ...row, voiceDigest: 'moved-on' } : row)) };
+    },
+  }, { decision: 'done' });
+  assert.deepEqual(await replyToFromClem('notif:cal', 'got it', run.all), { outcome: 'changed' });
+  assert.equal(run.log.some((line) => line.startsWith('read-notif:')), false);
+});
+
+test('one reply is one action: a retried send returns the first answer, and a second reply reads what the first did', async () => {
+  const readIds = new Set<string>();
+  let turns = 0;
+  const run = deps({
+    read: async () => stream(undefined, readIds),
+    markRead: (id) => { readIds.add(id); },
+    startTurn: () => { turns += 1; return 'sess-1'; },
+  }, { decision: 'do_it' });
+  const [first, retried] = await Promise.all([
+    replyToFromClem('notif:cal', 'let the organizer know', run.all, { requestId: 'reply-aaaaaaaa' }),
+    replyToFromClem('notif:cal', 'let the organizer know', run.all, { requestId: 'reply-aaaaaaaa' }),
+  ]);
+  assert.deepEqual(first, retried);
+  assert.equal(turns, 1);
+  // The same reply from another device, with its own id, finds the item handled.
+  assert.deepEqual(await replyToFromClem('notif:cal', 'let the organizer know', run.all, { requestId: 'reply-bbbbbbbb' }), { outcome: 'gone' });
+  assert.equal(turns, 1);
+});
+
+test('a Noticing answer carries the reply id, so the check-in sees one answer', async () => {
+  const ids: Array<string | undefined> = [];
+  const run = deps({ answerQuestion: (_id, _text, requestId) => { ids.push(requestId); return true; } });
+  await replyToFromClem('noticing:p1', 'yes', run.all, { requestId: 'reply-cccccccc' });
+  assert.deepEqual(ids, ['reply-cccccccc']);
 });
