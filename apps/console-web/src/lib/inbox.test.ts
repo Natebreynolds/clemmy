@@ -65,15 +65,17 @@ test('desktop Inbox makes workflow gates actionable and never approves a plan th
   const source = readFileSync(new URL('../screens/Inbox.tsx', import.meta.url), 'utf8');
   const automate = readFileSync(new URL('../screens/Automate.tsx', import.meta.url), 'utf8');
   const api = readFileSync(new URL('./inbox.ts', import.meta.url), 'utf8');
-  assert.match(source, /WorkflowCapabilityCard/);
+  assert.match(source, /function CapabilityDetail/);
+  assert.match(source, /<CapabilityDetail gate=\{item\.row\.workflowCapability\}/);
   assert.match(api, /choiceSetDigest: gate\.resolution\.choiceSetDigest/);
-  assert.match(source, /Use \$\{candidate\.label\}/);
-  assert.match(source, /I connected it — resume this run/);
-  assert.match(source, /Retry exact metadata now/);
-  assert.match(source, /!needsInput && \(/);
-  assert.match(source, /Answer in the conversation/);
+  assert.match(source, /if \(choice\) onResolve\(choice\)/);
+  assert.match(source, /Use \$\{choice\?\.label/);
+  assert.match(source, /I connected it — resume/);
+  assert.match(source, /resolution\.kind === 'retry_exact_metadata'/);
+  // A plan that still needs answers offers the conversation, never Approve.
+  assert.match(source, /\{needsInput\s+\? conversation && <Link[^\n]*Answer in the conversation<\/Link>\s+: <Button disabled=\{busy\} onClick=\{onApprove\}>/);
   assert.match(source, /to=\{`\/chat\/\$\{encodeURIComponent\(row\.sessionId\)\}`\}/);
-  assert.match(source, /Decline it and ask Clem to draft a new plan/);
+  assert.match(source, /Decline it and ask Clem for a new plan/);
   assert.match(automate, /Open exact Needs You gate/);
   assert.match(automate, /Choose an exact account/);
   assert.doesNotMatch(automate, /resumeWorkflowCapability/);

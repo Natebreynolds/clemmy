@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, X, RefreshCw, Mail, BellRing, Send } from 'lucide-react';
+import { Check, X, RefreshCw, Mail, BellRing, Send, MoreHorizontal } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -16,6 +16,9 @@ import { applyTidy, describeTidy } from '@/lib/tidy';
 import { cn } from '@/lib/cn';
 import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
+import { useMediaQuery } from '@/lib/use-media-query';
+import { attentionDestination, buildNeedsYouItems, isIdentifierLike, needsYouRowView, type NeedsYouItem, type NeedsYouRowView } from '@/lib/needs-you-list';
+import { DecisionFrame, DecisionRow, Disclosure } from '@/components/inbox/DecisionList';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
   listWorkspaceDestinationChoosers, resolveWorkspaceDestinationChooser,
@@ -25,7 +28,7 @@ import {
   listInboxQuestions, answerInboxQuestion,
   resolveWorkflowCapability,
   relativeTime,
-  approvalDecisionSuccessText, attentionPill, collapseAttentionRows, getNeedsYouSummary, notifTone, notifFailed,
+  approvalDecisionSuccessText, collapseAttentionRows, getNeedsYouSummary, notifTone, notifFailed,
   summarizeApprovalDecisionBatch,
   type ApprovalRow, type NotificationRow, type TrustProposalRow, type PlanProposalRow, type InboxQuestionRow,
   type WorkspaceDestinationChooser, type WorkflowCapabilityAccountChoice, type WorkflowCapabilityInboxGate,
@@ -63,7 +66,13 @@ export function Inbox() {
   const [tab, setTab] = useState<Tab>(initialTab);
   const [selected, setSelected] = useState<string | null>(searchParams.get('select'));
   const userPicked = useRef(false);
-  const pick = (id: string | null) => { userPicked.current = id !== null; setSelected(id); };
+  // Wide: list beside one detail. Narrow: the list, or one decision with Back.
+  const wide = useMediaQuery('(min-width: 1024px)');
+  const [opened, setOpened] = useState(Boolean(searchParams.get('select')));
+  const pick = (id: string | null) => { userPicked.current = id !== null; setSelected(id); setOpened(id !== null); };
+  // What the auto-select effect may open, refreshed every render.
+  const needsViewsRef = useRef<NeedsYouRowView[]>([]);
+  const plainNotifIdsRef = useRef<string[]>([]);
   // Multi-select for bulk approve/reject — the "manage in the board" ask: clear
   // several held sends in one click instead of one card at a time. Each still
   // resolves through the same per-row decideApproval (kind routing + resume
@@ -110,7 +119,6 @@ export function Inbox() {
   // Server sorts urgent-first; aged cards (48h+ unanswered, nothing parked on
   // them) render below a divider and stop counting toward "needs you".
   const urgentApprovalRows = approvalRows.filter((a) => !a.stale);
-  const agedApprovalRows = approvalRows.filter((a) => a.stale);
   const notifRows = notifications.data?.notifications ?? [];
   const trustRows = trustProposals.data?.proposals ?? [];
   const planRows = planProposals.data?.proposals ?? [];
@@ -120,11 +128,15 @@ export function Inbox() {
   // The detail pane never sits empty next to a list: the first decision opens
   // itself until the person picks another ("Pick something on the left" was
   // a blank slab beside fifty-one buttons, live 09-26).
+  // On a wide screen the detail opens the first decision of any kind, so it
+  // is never an empty pane beside the list. A narrow screen waits for a tap.
   useEffect(() => {
-    if (selected || userPicked.current || tab !== 'needs') return;
-    const first = approvalRows[0]?.approvalId ?? planRows[0]?.id ?? null;
-    if (first) setSelected(first);
-  }, [selected, tab, approvalRows, planRows]);
+    if (!wide || userPicked.current) return;
+    const ids = tab === 'needs' ? needsViewsRef.current.filter((view) => !view.href).map((view) => view.id) : plainNotifIdsRef.current;
+    if (selected && ids.includes(selected)) return;
+    const first = ids[0] ?? null;
+    if (first !== selected) setSelected(first);
+  });
   // Unread needs-attention notifications are DECISIONS → they live on "Needs you"
   // beside approvals (and leave once read); everything else stays in Notifications.
   // A carrier for a decision already on this list as a card is that decision.
@@ -138,10 +150,23 @@ export function Inbox() {
     && !(n.needsYouKey && listedDecisionKeys.has(n.needsYouKey)));
   const attentionIds = new Set(attentionRows.map((n) => n.id));
   const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
+  plainNotifIdsRef.current = plainNotifRows.map((n) => n.id);
   // A burst of blocked runs from one workflow is ONE decision, not ten rows —
   // collapse duplicates to the newest and badge the earlier ones.
   const collapsedAttention = collapseAttentionRows(attentionRows);
   const unlistedRows = needsSummary.data?.unlisted ?? [];
+  // One list for every kind of decision; how each row reads is decided once.
+  const needsItems = useMemo(() => buildNeedsYouItems({
+    workspaceChoosers: workspaceChooserRows,
+    questions: questionRows,
+    plans: planRows,
+    approvals: approvalRows,
+    trust: trustRows,
+    attention: collapsedAttention,
+    unlisted: unlistedRows,
+  }), [workspaceChooserRows, questionRows, planRows, approvalRows, trustRows, collapsedAttention, unlistedRows]);
+  const needsViews = useMemo(() => needsItems.map(needsYouRowView), [needsItems]);
+  needsViewsRef.current = needsViews;
   // The badge is the server's total whenever it has answered: the sidebar and
   // the phone show that same number. The local sum is only the fallback.
   const needsCount = needsSummary.data?.total
@@ -449,10 +474,6 @@ export function Inbox() {
     { key: 'notifications', label: 'Notifications', icon: BellRing, count: unread },
   ];
 
-  const selApproval = approvalRows.find((a) => a.approvalId === selected);
-  const selPlan = planRows.find((p) => p.id === selected);
-  const selNotif = notifRows.find((n) => n.id === selected);
-
   const loading =
     (tab === 'needs' && (approvals.isLoading || workspaceChoosers.isLoading || notifications.isLoading || trustProposals.isLoading || planProposals.isLoading || questions.isLoading)) ||
     (tab === 'notifications' && notifications.isLoading);
@@ -467,19 +488,52 @@ export function Inbox() {
     void notifications.refetch();
   };
 
+  const selItem = tab === 'needs' ? needsItems.find((item) => item.id === selected) : undefined;
+  const selView = selItem ? needsViews.find((view) => view.id === selItem.id) : undefined;
+  const selNotif = tab === 'notifications' ? plainNotifRows.find((n) => n.id === selected) : undefined;
+  // Narrow screens show one surface at a time: the list, or the opened decision.
+  const showList = wide || !opened || (!selItem && !selNotif);
+  const showDetail = hasRows && (wide || (opened && Boolean(selItem || selNotif)));
+  const back = wide ? undefined : () => { setOpened(false); userPicked.current = false; };
+
+  const firstAgedIndex = needsViews.findIndex((view) => view.aged);
+  const cleanupMenu = tab === 'needs' && anyDecisionRows > 0 ? (
+    confirmClearAsks ? (
+      <span className="inline-flex flex-wrap items-center gap-2 text-small text-muted">
+        Decline all {needsCount} pending decisions? Nothing is sent or approved.
+        <Button variant="danger" size="sm" onClick={onClearAsks}>Decline all</Button>
+        <Button variant="ghost" size="sm" onClick={() => setConfirmClearAsks(false)}>Keep them</Button>
+      </span>
+    ) : (
+      <details className="relative">
+        <summary className="inline-flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-small text-muted hover:bg-hover hover:text-fg">
+          <MoreHorizontal className="h-4 w-4" aria-hidden /> Clean up
+        </summary>
+        <div className="absolute right-0 z-20 mt-1 w-80 rounded-md border border-border-raised bg-raised p-1.5 shadow-lg">
+          {approvalRows.length > 0 && (
+            <button type="button" onClick={onCancelStale} className="block w-full rounded px-3 py-2 text-left hover:bg-hover">
+              <span className="block text-small font-medium text-fg">Cancel approvals waiting over an hour</span>
+              <span className="block text-caption text-muted">Each request is cancelled; nothing is sent.</span>
+            </button>
+          )}
+          <button type="button" onClick={() => setConfirmClearAsks(true)} className="block w-full rounded px-3 py-2 text-left hover:bg-hover">
+            <span className="block text-small font-medium text-danger">Decline all {needsCount} decisions…</span>
+            <span className="block text-caption text-muted">Approvals, plans, suggestions and check-ins are declined.</span>
+          </button>
+        </div>
+      </details>
+    )
+  ) : tab === 'notifications' && unread > 0
+    ? <Button variant="secondary" size="sm" onClick={onClearUpdates}><Check className="h-4 w-4" aria-hidden /> Mark all {unread} read</Button>
+    : undefined;
+
   return (
     <Page
       title="Needs you"
       subtitle="Decisions waiting on you, and updates from finished work"
-      actions={tab === 'needs' && anyDecisionRows > 0
-        ? (confirmClearAsks
-          ? <span className="inline-flex items-center gap-2 text-small text-muted">Decline all {needsCount}? <Button variant="danger" size="sm" onClick={onClearAsks}>Yes, clear all</Button><Button variant="ghost" size="sm" onClick={() => setConfirmClearAsks(false)}>Keep</Button></span>
-          : <span className="inline-flex items-center gap-2">{approvalRows.length > 0 ? <Button variant="secondary" size="sm" onClick={onCancelStale}><RefreshCw className="h-4 w-4" aria-hidden /> Clear stale</Button> : null}<Button variant="secondary" size="sm" onClick={() => setConfirmClearAsks(true)}><X className="h-4 w-4" aria-hidden /> Clear all ({needsCount})</Button></span>)
-        : tab === 'notifications' && unread > 0
-          ? <Button variant="secondary" size="sm" onClick={onClearUpdates}><Check className="h-4 w-4" aria-hidden /> Clear all ({unread})</Button>
-          : undefined}
+      actions={cleanupMenu}
     >
-      <div className="mb-4 flex gap-1 border-b border-border">
+      <div className="mb-4 flex gap-1 overflow-x-auto border-b border-border">
         {tabs.map((t) => {
           const Icon = t.icon;
           const active = tab === t.key;
@@ -487,9 +541,9 @@ export function Inbox() {
             <button
               key={t.key}
               type="button"
-              onClick={() => { setTab(t.key); userPicked.current = false; setSelected(null); }}
+              onClick={() => { setTab(t.key); userPicked.current = false; setSelected(null); setOpened(false); }}
               className={cn(
-                'inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium cursor-pointer -mb-px',
+                'inline-flex shrink-0 items-center gap-2 whitespace-nowrap border-b-2 px-3 py-2.5 text-body font-medium cursor-pointer -mb-px',
                 active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg',
               )}
             >
@@ -520,198 +574,108 @@ export function Inbox() {
         </div>
       )}
 
-      {/* Hide the reading pane when the current tab has nothing to select — an
-          empty list beside an empty "select an item" box reads as a broken page. */}
-      <div className={cn('grid gap-4', hasRows && 'lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]')}>
-        {/* List */}
-        <div className="space-y-2">
-          {loading && [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
+      <div className={cn('grid gap-4', hasRows && wide && 'grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)]')}>
+        {showList && (
+          <div className="min-w-0 space-y-2">
+            {loading && [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
 
-          {!loading && queryUnavailable && (
-            <QueryUnavailable
-              title="Inbox is unavailable"
-              description="Clementine couldn’t verify what needs your attention. This is not an all-caught-up state."
-              onRetry={retryCurrentTab}
-              className="py-10"
-            />
-          )}
-
-          {!loading && !queryUnavailable && tab === 'needs' && (anyDecisionRows === 0
-            ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
-            : (
-              <>
-                {workspaceChooserRows.map((chooser) => (
-                  <WorkspaceChooserCard
-                    key={chooser.chooserId}
-                    chooser={chooser}
-                    busy={chooserBusy === chooser.chooserId}
-                    onChoose={(choiceId) => onChooseWorkspace(chooser, choiceId)}
-                  />
-                ))}
-                {questionRows.map((question) => (
-                  <InboxQuestionCard
-                    key={question.id}
-                    row={question}
-                    project={projectOf(question)}
-                    selected={selected === question.id}
-                    answer={questionAnswers[question.id] ?? ''}
-                    busy={questionBusy === question.id}
-                    globallyBusy={questionBusy !== null}
-                    onSelect={() => pick(question.id)}
-                    onAnswerChange={(answer) => setQuestionAnswers((previous) => ({ ...previous, [question.id]: answer }))}
-                    onSubmit={(option) => { void onAnswerQuestion(question, option); }}
-                  />
-                ))}
-                {planRows.map((plan) => (
-                  <PlanProposalCard
-                    key={plan.id}
-                    row={plan}
-                    project={projectOf(plan)}
-                    selected={selected === plan.id}
-                    busy={planBusy === plan.id}
-                    onSelect={() => pick(plan.id)}
-                    onApprove={() => onDecidePlan(plan.id, 'approve')}
-                    onReject={() => onDecidePlan(plan.id, 'reject')}
-                  />
-                ))}
-                {approvalRows.length > 1 && (
-                  <div className="flex items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2">
-                    <input type="checkbox" aria-label="Select all approvals"
-                      className="h-4 w-4 shrink-0 cursor-pointer accent-primary"
-                      checked={checkedCount === approvalRows.length}
-                      ref={(el) => { if (el) el.indeterminate = checkedCount > 0 && checkedCount < approvalRows.length; }}
-                      onChange={() => setChecked(checkedCount === approvalRows.length ? new Set() : new Set(approvalRows.map((a) => a.approvalId)))} />
-                    {checkedCount > 0 ? (
-                      <>
-                        <span className="text-body text-fg">{checkedCount} selected</span>
-                        <div className="ml-auto flex gap-2">
-                          <Button size="sm" disabled={bulkBusy} onClick={() => onBulkDecide('approve')}>
-                            <Check className="h-4 w-4" aria-hidden /> Approve {checkedCount}
-                          </Button>
-                          <Button size="sm" variant="secondary" disabled={bulkBusy} onClick={() => onBulkDecide('reject')}>
-                            <X className="h-4 w-4" aria-hidden /> Decline {checkedCount}
-                          </Button>
-                        </div>
-                      </>
-                    ) : (
-                      <span className="text-body text-muted">Select to approve or reject in bulk</span>
-                    )}
-                  </div>
-                )}
-                {urgentApprovalRows.map((a) => (
-                  <ApprovalCard key={a.approvalId} row={a} project={projectOf(a)} selected={selected === a.approvalId}
-                    checked={checked.has(a.approvalId)}
-                    decisionState={decisionStates[a.approvalId]}
-                    disabled={bulkBusy}
-                    onToggleCheck={() => toggleChecked(a.approvalId)}
-                    onSelect={() => pick(a.approvalId)}
-                    onApprove={() => onDecide(a.approvalId, 'approve')}
-                    onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
-                ))}
-                {agedApprovalRows.length > 0 && (
-                  <div className="flex items-center gap-2 pt-2 text-caption text-muted">
-                    <span className="h-px flex-1 bg-border" aria-hidden />
-                    Older approvals — waiting 2+ days, still approvable
-                    <span className="h-px flex-1 bg-border" aria-hidden />
-                  </div>
-                )}
-                {agedApprovalRows.map((a) => (
-                  <ApprovalCard key={a.approvalId} row={a} project={projectOf(a)} selected={selected === a.approvalId}
-                    checked={checked.has(a.approvalId)}
-                    decisionState={decisionStates[a.approvalId]}
-                    disabled={bulkBusy}
-                    onToggleCheck={() => toggleChecked(a.approvalId)}
-                    onSelect={() => pick(a.approvalId)}
-                    onApprove={() => onDecide(a.approvalId, 'approve')}
-                    onReject={(note) => onDecide(a.approvalId, 'reject', note)} />
-                ))}
-                {trustRows.map((p) => (
-                  <TrustProposalCard key={p.id} row={p}
-                    busy={trustBusy === p.id}
-                    globallyBusy={trustBusy !== null}
-                    onApprove={() => onDecideTrust(p, 'approve')}
-                    onDecline={() => onDecideTrust(p, 'decline')} />
-                ))}
-                {collapsedAttention.map(({ row: n, collapsedCount }) => (
-                  n.workflowCapability ? (
-                    <WorkflowCapabilityCard
-                      key={n.id}
-                      gate={n.workflowCapability}
-                      title={n.title}
-                      body={n.body}
-                      createdAt={n.createdAt}
-                      busy={capabilityBusy === n.id}
-                      globallyBusy={capabilityBusy !== null}
-                      onResolve={(choice) => { void onResolveCapability(n.workflowCapability as WorkflowCapabilityInboxGate, choice); }}
-                    />
-                  ) : (
-                    <ListRow key={n.id} selected={selected === n.id} onSelect={() => pick(n.id)}
-                      title={n.title || n.body || 'Needs attention'}
-                      meta={`${relativeTime(n.createdAt)}${collapsedCount > 0 ? ` · +${collapsedCount} earlier` : ''}`}
-                      tone={attentionPill(n)} />
-                  )
-                ))}
-                {unlistedRows.map((item) => (
-                  <Link key={item.key}
-                    to={item.workflow ? `/automate?workflow=${encodeURIComponent(item.workflow)}` : '/home'}
-                    className="flex w-full items-center gap-3 rounded-md border border-border bg-surface px-3.5 py-3 text-left transition-colors hover:bg-hover">
-                    <StatusPill tone="warning">{item.kind === 'workflow_binding' ? 'Stopped' : item.kind === 'workflow_paused' ? 'Paused' : 'Needs you'}</StatusPill>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-body text-fg">{item.title}</span>
-                      <span className="block truncate text-small text-muted">{item.detail}</span>
-                    </span>
-                  </Link>
-                ))}
-              </>
-            ))}
-
-          {!loading && !queryUnavailable && tab === 'notifications' && (plainNotifRows.length === 0
-            ? <EmptyState title="No notifications" description="Updates from completed work will appear here." />
-            : plainNotifRows.map((n) => (
-              <ListRow key={n.id} selected={selected === n.id} onSelect={() => pick(n.id)}
-                title={n.title || n.body || 'Notification'} meta={relativeTime(n.createdAt)}
-                tone={notifTone(n)} dim={n.read} />
-            )))}
-        </div>
-
-        {/* Reading pane — only rendered when the tab has selectable rows. */}
-        {hasRows && (
-          // Sized to what it shows and kept in view while the list scrolls —
-          // stretched to the list's height it was an empty white slab.
-          <div className="self-start rounded-lg border border-border-raised bg-raised p-5 lg:sticky lg:top-4 lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto">
-            {selApproval && (
-              <ApprovalDetail
-                row={selApproval}
-                project={projectOf(selApproval)}
-                decisionState={decisionStates[selApproval.approvalId]}
-                disabled={bulkBusy}
-                onApprove={() => onDecide(selApproval.approvalId, 'approve')}
-                onReject={() => onDecide(selApproval.approvalId, 'reject')}
+            {!loading && queryUnavailable && (
+              <QueryUnavailable
+                title="Inbox is unavailable"
+                description="Clementine couldn’t verify what needs your attention. This is not an all-caught-up state."
+                onRetry={retryCurrentTab}
+                className="py-10"
               />
             )}
-            {selPlan && (
-              <PlanProposalDetail
-                row={selPlan}
-                project={projectOf(selPlan)}
-                busy={planBusy === selPlan.id}
-                onApprove={() => onDecidePlan(selPlan.id, 'approve')}
-                onReject={() => onDecidePlan(selPlan.id, 'reject')}
-              />
-            )}
-            {selNotif?.workflowCapability ? (
-              <WorkflowCapabilityCard
-                gate={selNotif.workflowCapability}
-                title={selNotif.title}
-                body={selNotif.body}
-                createdAt={selNotif.createdAt}
-                busy={capabilityBusy === selNotif.id}
-                globallyBusy={capabilityBusy !== null}
-                onResolve={(choice) => { void onResolveCapability(selNotif.workflowCapability as WorkflowCapabilityInboxGate, choice); }}
+
+            {!loading && !queryUnavailable && tab === 'needs' && (anyDecisionRows === 0
+              ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
+              : (
+                <>
+                  {checkedCount > 0 && (
+                    <div className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2">
+                      <span className="text-body text-fg">{checkedCount} approval{checkedCount === 1 ? '' : 's'} selected</span>
+                      <div className="ml-auto flex gap-2">
+                        <Button size="sm" disabled={bulkBusy} onClick={() => onBulkDecide('approve')}>
+                          <Check className="h-4 w-4" aria-hidden /> Approve {checkedCount}
+                        </Button>
+                        <Button size="sm" variant="secondary" disabled={bulkBusy} onClick={() => onBulkDecide('reject')}>
+                          <X className="h-4 w-4" aria-hidden /> Decline {checkedCount}
+                        </Button>
+                        <Button size="sm" variant="ghost" disabled={bulkBusy} onClick={() => setChecked(new Set())}>Clear selection</Button>
+                      </div>
+                    </div>
+                  )}
+                  <ul className="overflow-hidden rounded-lg border border-border bg-surface divide-y divide-border" aria-label="Decisions waiting on you">
+                    {needsViews.map((view, index) => (
+                      <li key={view.id}>
+                        {index === firstAgedIndex && (
+                          <div className="bg-subtle px-3.5 py-1.5 text-caption text-muted">Older approvals — waiting 2+ days, still approvable</div>
+                        )}
+                        <DecisionRow
+                          view={view}
+                          selected={selected === view.id}
+                          checked={checked.has(view.id)}
+                          disabled={bulkBusy || decisionStates[view.id]?.busy === true}
+                          onToggleCheck={() => toggleChecked(view.id)}
+                          onSelect={() => pick(view.id)}
+                        />
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ))}
+
+            {!loading && !queryUnavailable && tab === 'notifications' && (plainNotifRows.length === 0
+              ? <EmptyState title="No notifications" description="Updates from completed work will appear here." />
+              : (
+                <ul className="overflow-hidden rounded-lg border border-border bg-surface divide-y divide-border" aria-label="Notifications">
+                  {plainNotifRows.map((n) => (
+                    <li key={n.id}>
+                      <ListRow selected={selected === n.id} onSelect={() => pick(n.id)}
+                        title={n.title || n.body || 'Notification'} meta={relativeTime(n.createdAt)}
+                        tone={notifTone(n)} dim={n.read} />
+                    </li>
+                  ))}
+                </ul>
+              ))}
+          </div>
+        )}
+
+        {/* The one place a selected item is read and decided. Sized to what it
+            shows, kept in view while the list scrolls, actions in its footer. */}
+        {showDetail && (
+          <div className={cn(
+            'flex min-w-0 flex-col self-start rounded-lg border border-border-raised bg-raised p-5',
+            wide && 'sticky top-4 max-h-[calc(100vh-8rem)]',
+          )}>
+            {selItem && selView ? (
+              <NeedsYouDetail
+                key={selItem.id}
+                item={selItem}
+                view={selView}
+                project={'row' in selItem && (selItem.kind === 'question' || selItem.kind === 'plan' || selItem.kind === 'approval') ? projectOf(selItem.row) : undefined}
+                onBack={back}
+                approval={{ decisionState: selItem.kind === 'approval' ? decisionStates[selItem.id] : undefined, disabled: bulkBusy,
+                  onApprove: () => onDecide(selItem.id, 'approve'), onReject: (note?: string) => onDecide(selItem.id, 'reject', note) }}
+                plan={{ busy: planBusy === selItem.id, onApprove: () => onDecidePlan(selItem.id, 'approve'), onReject: () => onDecidePlan(selItem.id, 'reject') }}
+                question={{ answer: questionAnswers[selItem.id] ?? '', busy: questionBusy === selItem.id, globallyBusy: questionBusy !== null,
+                  onAnswerChange: (answer: string) => setQuestionAnswers((previous) => ({ ...previous, [selItem.id]: answer })),
+                  onSubmit: (option?: string) => { if (selItem.kind === 'question') void onAnswerQuestion(selItem.row, option); } }}
+                workspace={{ busy: selItem.kind === 'workspace' && chooserBusy === selItem.id,
+                  onChoose: (choiceId: string) => { if (selItem.kind === 'workspace') void onChooseWorkspace(selItem.row, choiceId); } }}
+                trust={{ busy: trustBusy === selItem.id, globallyBusy: trustBusy !== null,
+                  onApprove: () => { if (selItem.kind === 'trust') void onDecideTrust(selItem.row, 'approve'); },
+                  onDecline: () => { if (selItem.kind === 'trust') void onDecideTrust(selItem.row, 'decline'); } }}
+                capability={{ busy: capabilityBusy === selItem.id, globallyBusy: capabilityBusy !== null,
+                  onResolve: (choice?: WorkflowCapabilityAccountChoice) => {
+                    if (selItem.kind === 'attention' && selItem.row.workflowCapability) void onResolveCapability(selItem.row.workflowCapability, choice);
+                  } }}
+                notification={{ onRead: () => onRead(selItem.id), onRetry: () => onRetry(selItem.id) }}
               />
             ) : selNotif ? (
-              <NotifDetail row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} />
-            ) : null}
-            {!selApproval && !selPlan && !selNotif && (
+              <NotifDetail key={selNotif.id} row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} onBack={back} />
+            ) : (
               <div className="flex min-h-40 flex-col items-center justify-center gap-1 text-center">
                 <p className="text-body font-medium text-fg">Pick something on the left</p>
                 <p className="text-small text-muted">You’ll see the details and what happens when you decide.</p>
@@ -724,19 +688,60 @@ export function Inbox() {
   );
 }
 
+/** A notification row: the same quiet one-line shape as a decision row. */
 function ListRow({ title, meta, tone, selected, onSelect, dim }: {
   title: string; meta: string; tone: { tone: Parameters<typeof StatusPill>[0]['tone']; label: string };
   selected: boolean; onSelect: () => void; dim?: boolean;
 }) {
   return (
-    <button type="button" onClick={onSelect}
-      className={cn('flex w-full items-center gap-3 rounded-md border px-3.5 py-3 text-left transition-colors cursor-pointer',
-        selected ? 'border-primary bg-primary-tint' : 'border-border bg-surface hover:bg-hover', dim && 'opacity-60')}>
+    <button type="button" onClick={onSelect} aria-pressed={selected}
+      className={cn('flex w-full items-center gap-3 px-3.5 py-3 text-left transition-colors cursor-pointer',
+        selected ? 'bg-primary-tint' : 'hover:bg-hover', dim && 'opacity-60')}>
       <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
       <span className="min-w-0 flex-1 truncate text-body text-fg">{plainText(title, 200)}</span>
       {meta && <span className="shrink-0 text-caption text-faint">{meta}</span>}
     </button>
   );
+}
+
+type ApprovalHandlers = { decisionState?: RowDecisionState; disabled: boolean; onApprove: () => void; onReject: (note?: string) => void };
+type PlanHandlers = { busy: boolean; onApprove: () => void; onReject: () => void };
+type QuestionHandlers = { answer: string; busy: boolean; globallyBusy: boolean; onAnswerChange: (answer: string) => void; onSubmit: (option?: string) => void };
+type WorkspaceHandlers = { busy: boolean; onChoose: (choiceId: string) => void };
+type TrustHandlers = { busy: boolean; globallyBusy: boolean; onApprove: () => void; onDecline: () => void };
+type CapabilityHandlers = { busy: boolean; globallyBusy: boolean; onResolve: (choice?: WorkflowCapabilityAccountChoice) => void };
+type NotificationHandlers = { onRead: () => void; onRetry: () => void };
+
+/** The selected decision, whatever its kind, in the one detail shape. */
+function NeedsYouDetail({ item, view, project, onBack, approval, plan, question, workspace, trust, capability, notification }: {
+  item: NeedsYouItem;
+  view: NeedsYouRowView;
+  project?: SessionProjectLabel;
+  onBack?: () => void;
+  approval: ApprovalHandlers;
+  plan: PlanHandlers;
+  question: QuestionHandlers;
+  workspace: WorkspaceHandlers;
+  trust: TrustHandlers;
+  capability: CapabilityHandlers;
+  notification: NotificationHandlers;
+}) {
+  switch (item.kind) {
+    case 'approval': return <ApprovalDetail row={item.row} view={view} project={project} onBack={onBack} {...approval} />;
+    case 'plan': return <PlanDetail row={item.row} view={view} project={project} onBack={onBack} {...plan} />;
+    case 'question': return <QuestionDetail row={item.row} view={view} project={project} onBack={onBack} {...question} />;
+    case 'workspace': return <WorkspaceDetail chooser={item.row} view={view} onBack={onBack} {...workspace} />;
+    case 'trust': return <TrustDetail row={item.row} view={view} onBack={onBack} {...trust} />;
+    case 'attention': return item.row.workflowCapability
+      ? <CapabilityDetail gate={item.row.workflowCapability} row={item.row} view={view} onBack={onBack} {...capability} />
+      : <NotifDetail row={item.row} view={view} onBack={onBack} destination={attentionDestination(item.row.needsYouKey)} {...notification} />;
+    case 'unlisted': return (
+      <DecisionFrame view={view} title={item.row.title} onBack={onBack}
+        actions={view.href ? <Link to={view.href} className="text-small font-medium text-primary hover:underline">Open</Link> : undefined}>
+        {item.row.detail && <p className="whitespace-pre-wrap">{item.row.detail}</p>}
+      </DecisionFrame>
+    );
+  }
 }
 
 /** The name alone; the identifier is a caption, never part of the title. */
@@ -759,7 +764,7 @@ function WorkspaceChoices({ chooser, busy, onChoose }: {
   const pickedChoice = existing.find((choice) => choice.choiceId === picked) ?? existing[0];
   if (existing.length > 3) {
     return (
-      <div className="mt-3 flex flex-wrap items-center gap-2">
+      <>
         <select
           aria-label="Existing Workspaces"
           className="min-w-[16rem] max-w-full rounded-md border border-border bg-canvas px-2.5 py-1.5 text-small text-fg"
@@ -769,16 +774,15 @@ function WorkspaceChoices({ chooser, busy, onChoose }: {
         >
           {existing.map((choice) => <option key={choice.choiceId} value={choice.choiceId}>{workspaceChoiceTitle(choice)}</option>)}
         </select>
-        {pickedChoice ? <span className="font-mono text-caption text-faint">{pickedChoice.workspaceId}</span> : null}
         <Button size="sm" disabled={busy || !pickedChoice} onClick={() => { if (pickedChoice) onChoose(pickedChoice.choiceId); }}>
           {busy ? 'Saving…' : `Use ${pickedChoice ? workspaceChoiceTitle(pickedChoice) : 'this'}`}
         </Button>
         {createNew ? <Button size="sm" variant="secondary" disabled={busy} onClick={() => onChoose(createNew.choiceId)}>Prepare a new one</Button> : null}
-      </div>
+      </>
     );
   }
   return (
-    <div className="mt-3 flex flex-wrap gap-2">
+    <>
       {chooser.choices.map((choice) => (
         <Button
           key={choice.choiceId}
@@ -791,391 +795,187 @@ function WorkspaceChoices({ chooser, busy, onChoose }: {
           {busy ? 'Saving…' : choice.kind === 'existing' ? workspaceChoiceTitle(choice) : choice.label}
         </Button>
       ))}
-    </div>
+    </>
   );
 }
 
-function WorkspaceChooserCard({ chooser, busy, onChoose }: {
-  chooser: WorkspaceDestinationChooser;
-  busy: boolean;
-  onChoose: (choiceId: string) => void;
+function WorkspaceDetail({ chooser, view, busy, onChoose, onBack }: WorkspaceHandlers & {
+  chooser: WorkspaceDestinationChooser; view: NeedsYouRowView; onBack?: () => void;
 }) {
+  const existing = chooser.choices.filter((choice) => choice.kind === 'existing');
   return (
-    <div className="rounded-md border border-primary/40 bg-primary-tint/40 px-3.5 py-3">
-      <div className="flex w-full items-start gap-3">
-        <StatusPill tone="live">Workspace</StatusPill>
-        <div className="min-w-0 flex-1">
-          <div className="text-body font-medium text-fg">Where should these records live?</div>
-          <div className="mt-1 text-caption text-muted">
-            Choose an exact existing Workspace, or have Clem stage a separate new-Workspace approval.
-          </div>
-        </div>
-        <span className="shrink-0 text-caption text-faint">{relativeTime(chooser.createdAt)}</span>
-      </div>
-      <WorkspaceChoices chooser={chooser} busy={busy} onChoose={onChoose} />
-    </div>
+    <DecisionFrame view={view} title="Where should these records live?" onBack={onBack}
+      actions={<WorkspaceChoices chooser={chooser} busy={busy} onChoose={onChoose} />}>
+      <p className="text-muted">Choose an existing Workspace, or have Clem prepare a new one. A new Workspace is its own approval.</p>
+      {existing.length > 0 && (
+        <Disclosure summary={`Workspace identifiers (${existing.length})`}>
+          <ul className="space-y-1">
+            {existing.map((choice) => (
+              <li key={choice.choiceId}>{workspaceChoiceTitle(choice)} <span className="font-mono text-caption text-faint">{choice.workspaceId}</span></li>
+            ))}
+          </ul>
+        </Disclosure>
+      )}
+    </DecisionFrame>
   );
 }
 
-function InboxQuestionCard({ row, project, selected, answer, busy, globallyBusy, onSelect, onAnswerChange, onSubmit }: {
-  row: InboxQuestionRow;
-  /** The project the asking session works in, when it works in one. */
-  project?: SessionProjectLabel;
-  selected: boolean;
-  answer: string;
-  busy: boolean;
-  globallyBusy: boolean;
-  onSelect: () => void;
-  onAnswerChange: (answer: string) => void;
-  onSubmit: (option?: string) => void;
+function QuestionDetail({ row, view, project, answer, busy, globallyBusy, onAnswerChange, onSubmit, onBack }: QuestionHandlers & {
+  row: InboxQuestionRow; view: NeedsYouRowView; project?: SessionProjectLabel; onBack?: () => void;
 }) {
   const disabled = globallyBusy || !row.answerable;
   return (
-    <div id={`inbox-${row.id}`} className={cn('rounded-md border bg-warning-tint px-3.5 py-3', selected ? 'border-primary' : 'border-warning/40')}>
-      <button type="button" onClick={onSelect} className="flex w-full items-start gap-3 text-left cursor-pointer">
-        <StatusPill tone="warning">Question</StatusPill>
-        <div className="min-w-0 flex-1">
-          <div className="text-body font-medium text-fg">{row.question}</div>
-          <div className="mt-1 text-caption text-muted">
-            {row.agentLabel} · {row.source === 'workflow' ? 'workflow' : row.source === 'background_task' ? 'task' : 'check-in'} · {relativeTime(row.askedAt)}
-          </div>
-        </div>
-      </button>
-      <ProjectLabelTag label={project} link className="mt-2" />
-      {row.context && <p className="mt-2 whitespace-pre-wrap text-small text-muted">{row.context}</p>}
-      {row.unavailableReason && <p role="status" className="mt-2 text-small text-warning">{row.unavailableReason}</p>}
-      {row.options.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-2">
+    <DecisionFrame view={view} title={row.question} onBack={onBack}
+      aside={project ? <ProjectLabelTag label={project} link /> : undefined}
+      actions={(
+        <>
           {row.options.map((option) => (
-            <Button key={option} size="sm" variant="secondary" disabled={disabled} onClick={() => onSubmit(option)}>
-              {option}
-            </Button>
+            <Button key={option} size="sm" variant="secondary" disabled={disabled} onClick={() => onSubmit(option)}>{option}</Button>
           ))}
-        </div>
+          <form className="flex basis-full items-end gap-2" onSubmit={(event) => { event.preventDefault(); onSubmit(); }}>
+            <label className="min-w-0 flex-1">
+              <span className="sr-only">Answer {row.question}</span>
+              <textarea
+                rows={2}
+                value={answer}
+                disabled={disabled}
+                onChange={(event) => onAnswerChange(event.target.value)}
+                placeholder={row.answerable ? (row.options.length > 0 ? 'Or type your own answer…' : 'Type your answer…') : 'Answer where this was asked'}
+                className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-60"
+              />
+            </label>
+            <Button type="submit" disabled={disabled || !answer.trim()}>{busy ? 'Sending…' : 'Answer'}</Button>
+          </form>
+        </>
+      )}>
+      {row.context && (isIdentifierLike(row.context)
+        ? <Disclosure summary="Reference"><span className="break-all font-mono text-caption text-muted">{row.context}</span></Disclosure>
+        : <p className="whitespace-pre-wrap text-muted">{linkify(row.context)}</p>)}
+      {row.unavailableReason && <p role="status" className="text-small text-muted">{row.unavailableReason}</p>}
+      {row.sessionId && (
+        <Link className="inline-block text-small font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
+          Open the conversation
+        </Link>
       )}
-      <div className="mt-3 flex items-end gap-2">
-        <label className="min-w-0 flex-1">
-          <span className="sr-only">Answer {row.question}</span>
-          <textarea
-            rows={2}
-            value={answer}
-            disabled={disabled}
-            onChange={(event) => onAnswerChange(event.target.value)}
-            placeholder={row.answerable ? 'Type the answer Clem needs…' : 'Open the authorized origin to answer'}
-            className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg outline-none focus:border-primary focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-60"
-          />
-        </label>
-        <Button disabled={disabled || !answer.trim()} onClick={() => onSubmit()}>
-          {busy ? 'Sending…' : 'Answer & resume'}
-        </Button>
-      </div>
-    </div>
+    </DecisionFrame>
   );
 }
 
-function PlanProposalCard({ row, project, selected, busy, onSelect, onApprove, onReject }: {
-  row: PlanProposalRow;
-  project?: SessionProjectLabel;
-  selected: boolean;
-  busy: boolean;
-  onSelect: () => void;
-  onApprove: () => void;
-  onReject: () => void;
-}) {
-  const questions = (row.plan.needsUserInput ?? []).filter((question) => typeof question === 'string' && question.trim());
-  const needsInput = questions.length > 0;
-  return (
-    <div className={cn('rounded-md border px-3.5 py-3', selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
-      <button type="button" onClick={onSelect} className="flex w-full items-start gap-3 text-left cursor-pointer">
-        <StatusPill tone="warning">Plan</StatusPill>
-        <span className="min-w-0 flex-1 text-body text-fg">{row.plan.objective || row.originatingRequest}</span>
-        <span className="shrink-0 text-caption text-faint">{relativeTime(row.proposedAt)}</span>
-      </button>
-      <p className="mt-1 line-clamp-2 text-caption text-muted">{row.originatingRequest}</p>
-      <ProjectLabelTag label={project} link className="mt-1.5" />
-      {needsInput && (
-        <div className="mt-2 text-small text-muted">
-          <p className="font-medium text-fg">Clem needs these answers before this plan can be approved:</p>
-          <ul className="mt-1 list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
-          {row.sessionId ? (
-            <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
-              Answer in the conversation
-            </Link>
-          ) : (
-            <p role="status" className="mt-2 text-warning">This proposal has no linked conversation. Decline it and ask Clem to draft a new plan with your answers.</p>
-          )}
-        </div>
-      )}
-      <div className="mt-2.5 flex gap-2">
-        {!needsInput && (
-          <Button size="sm" disabled={busy} onClick={onApprove}>
-            <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve plan'}
-          </Button>
-        )}
-        <Button size="sm" variant="secondary" disabled={busy} onClick={onReject}>
-          <X className="h-4 w-4" aria-hidden /> Decline
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-function PlanProposalDetail({ row, project, busy, onApprove, onReject }: {
-  row: PlanProposalRow;
-  project?: SessionProjectLabel;
-  busy: boolean;
-  onApprove: () => void;
-  onReject: () => void;
+function PlanDetail({ row, view, project, busy, onApprove, onReject, onBack }: PlanHandlers & {
+  row: PlanProposalRow; view: NeedsYouRowView; project?: SessionProjectLabel; onBack?: () => void;
 }) {
   const questions = (row.plan.needsUserInput ?? []).filter((question) => typeof question === 'string' && question.trim());
   const needsInput = questions.length > 0;
   const steps = (row.plan.steps ?? []).filter((step) => (step.action || step.description)?.trim());
+  const conversation = row.sessionId ? `/chat/${encodeURIComponent(row.sessionId)}` : null;
   return (
-    <div>
-      <h3 className="mb-3 text-h3 text-fg">{row.plan.objective || 'Proposed plan'}</h3>
-      {project && <Field label="Project"><ProjectLabelTag label={project} link /></Field>}
+    <DecisionFrame view={view} title={row.plan.objective || 'Proposed plan'} onBack={onBack}
+      aside={project ? <ProjectLabelTag label={project} link /> : undefined}
+      actions={(
+        <>
+          {needsInput
+            ? conversation && <Link to={conversation} className="inline-flex h-11 items-center rounded-md bg-primary px-4 text-body font-medium text-primary-fg hover:bg-primary-hover active:bg-primary-press">Answer in the conversation</Link>
+            : <Button disabled={busy} onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve & continue'}</Button>}
+          <Button variant="secondary" disabled={busy} onClick={onReject}><X className="h-4 w-4" aria-hidden /> Decline</Button>
+        </>
+      )}>
       <Field label="You asked"><span className="whitespace-pre-wrap">{row.originatingRequest}</span></Field>
-      {row.context && <Field label="Context"><span className="whitespace-pre-wrap">{row.context}</span></Field>}
-      <Field label="Proposed">{relativeTime(row.proposedAt) || row.proposedAt}</Field>
+      {needsInput && (
+        <Field label="Answers needed first">
+          <ul className="list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
+          {!conversation && <p className="mt-2 text-small text-muted">This plan has no linked conversation. Decline it and ask Clem for a new plan with your answers.</p>}
+        </Field>
+      )}
       {steps.length > 0 && (
-        <Field label="What she’ll do">
+        <Field label="Steps">
           <ol className="list-decimal space-y-1.5 pl-5">
             {steps.map((step, index) => <li key={step.id ?? index}>{step.action || step.description}</li>)}
           </ol>
         </Field>
       )}
-      {row.sessionId && (
-        <Link className="mt-1 inline-block text-small font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
-          Open the conversation
-        </Link>
+      {row.context && <Disclosure summary="Why this plan"><span className="whitespace-pre-wrap">{row.context}</span></Disclosure>}
+      <Disclosure summary="Technical details"><Mono value={row.plan} /></Disclosure>
+      {conversation && !needsInput && (
+        <Link className="inline-block text-small font-medium text-primary hover:underline" to={conversation}>Open the conversation</Link>
       )}
-      <details className="mt-3 text-caption text-muted">
-        <summary className="cursor-pointer select-none hover:text-fg">Technical details</summary>
-        <div className="mt-2"><Mono value={row.plan} /></div>
-      </details>
-      {needsInput && (
-        <Field label="Answers needed">
-          <ul className="list-disc space-y-1 pl-5">{questions.map((question) => <li key={question}>{question}</li>)}</ul>
-          {row.sessionId ? (
-            <Link className="mt-2 inline-block font-medium text-primary hover:underline" to={`/chat/${encodeURIComponent(row.sessionId)}`}>
-              Answer in the conversation
-            </Link>
-          ) : (
-            <p className="mt-2 text-warning">No linked conversation is available. Decline this proposal and ask Clem for a new plan after supplying the answers.</p>
-          )}
-        </Field>
-      )}
-      <div className="mt-4 flex gap-2">
-        {!needsInput && <Button disabled={busy} onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve & continue'}</Button>}
-        <Button variant="secondary" disabled={busy} onClick={onReject}><X className="h-4 w-4" aria-hidden /> Decline</Button>
-      </div>
-    </div>
+    </DecisionFrame>
   );
 }
 
-function WorkflowCapabilityCard({ gate, title, body, createdAt, busy, globallyBusy, onResolve }: {
-  gate: WorkflowCapabilityInboxGate;
-  title?: string;
-  body?: string;
-  createdAt?: string;
-  busy: boolean;
-  globallyBusy: boolean;
-  onResolve: (choice?: WorkflowCapabilityAccountChoice) => void;
+function CapabilityDetail({ gate, row, view, busy, globallyBusy, onResolve, onBack }: CapabilityHandlers & {
+  gate: WorkflowCapabilityInboxGate; row: NotificationRow; view: NeedsYouRowView; onBack?: () => void;
 }) {
   const resolution = gate.resolution;
+  const [picked, setPicked] = useState(0);
+  const candidates = resolution.kind === 'choose_account' ? resolution.candidates : [];
+  const choice = candidates[picked] ?? candidates[0];
   return (
-    <div id={`inbox-${gate.notificationId}`} className="rounded-md border border-warning/40 bg-warning-tint px-3.5 py-3" aria-busy={busy}>
-      <div className="flex items-start gap-3">
-        <StatusPill tone="warning">Workflow</StatusPill>
-        <div className="min-w-0 flex-1">
-          <div className="text-body font-medium text-fg">{title || `${gate.workflow} needs you`}</div>
-          <div className="mt-1 text-caption text-muted">{gate.workflow} · step {gate.stepId} · {relativeTime(createdAt)}</div>
-        </div>
-      </div>
-      {body && <p className="mt-2 whitespace-pre-wrap text-small text-muted">{body}</p>}
-      <p className="mt-2 text-caption text-muted">No {gate.tool} dispatch occurred. Completed work is preserved.</p>
-      {resolution.kind === 'choose_account' ? (
-        <div className="mt-3 space-y-2" aria-label={`Exact ${gate.toolkit} account choices`}>
-          {resolution.candidates.map((candidate) => (
-            <div key={`${candidate.capabilityId}\u0000${candidate.accountId}`} className="rounded border border-border bg-surface p-2.5">
-              <div className="text-small font-medium text-fg">{candidate.label}</div>
-              <div className="break-all font-mono text-caption text-faint">account {candidate.accountId}</div>
-              <div className="break-all font-mono text-caption text-faint">capability {candidate.capabilityId}</div>
-              <Button className="mt-2" size="sm" disabled={globallyBusy} onClick={() => onResolve(candidate)}>
-                {busy ? 'Saving…' : `Use ${candidate.label}`}
-              </Button>
-            </div>
-          ))}
-          {resolution.choicesTruncated && <p className="text-caption text-warning">Showing {resolution.candidates.length} of {resolution.choiceTotal} exact choices. Connect fewer accounts or choose one shown here.</p>}
-        </div>
+    <DecisionFrame view={view} title={row.title || `${gate.workflow} needs you`} onBack={onBack}
+      actions={resolution.kind === 'choose_account' ? (
+        <Button disabled={globallyBusy || !choice} onClick={() => { if (choice) onResolve(choice); }}>
+          {busy ? 'Saving…' : `Use ${choice?.label ?? 'this account'} and resume`}
+        </Button>
       ) : resolution.kind === 'connect_and_retry' ? (
-        <div className="mt-3 flex flex-wrap items-center gap-2">
+        <>
           <Link to="/connect" className="rounded-md border border-border bg-surface px-3 py-1.5 text-small font-medium text-primary hover:bg-hover">Open Connections</Link>
-          <Button size="sm" disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Resuming…' : 'I connected it — resume this run'}</Button>
-        </div>
+          <Button disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Resuming…' : 'I connected it — resume'}</Button>
+        </>
       ) : resolution.kind === 'retry_exact_metadata' ? (
-        <div className="mt-3"><Button size="sm" disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Retrying…' : 'Retry exact metadata now'}</Button></div>
+        <Button disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Retrying…' : 'Retry now'}</Button>
       ) : (
-        <div className="mt-3">
-          <p role="status" className="text-small text-warning">{resolution.reason}</p>
-          <Link to="/automate" className="mt-2 inline-block font-medium text-primary hover:underline">Review the preserved run</Link>
-        </div>
+        <Link to="/automate" className="text-small font-medium text-primary hover:underline">Review the run</Link>
+      )}>
+      {row.body && <p className="whitespace-pre-wrap">{linkify(row.body)}</p>}
+      <p className="text-small text-muted">Nothing was sent through {gate.tool}. Steps that finished are kept, and the run resumes once.</p>
+      {resolution.kind === 'choose_account' && (
+        <fieldset className="space-y-1.5" aria-label={`${gate.toolkit} accounts`}>
+          <legend className="mb-1 text-label text-faint">Which {gate.toolkit} account?</legend>
+          {candidates.map((candidate, index) => (
+            <label key={`${candidate.capabilityId}\u0000${candidate.accountId}`}
+              className={cn('flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2', index === picked ? 'border-primary bg-primary-tint' : 'border-border hover:bg-hover')}>
+              <input type="radio" name={`account-${gate.notificationId}`} className="accent-primary" checked={index === picked} disabled={globallyBusy} onChange={() => setPicked(index)} />
+              <span className="text-small text-fg">{candidate.label}</span>
+            </label>
+          ))}
+          {resolution.choicesTruncated && <p className="text-caption text-muted">Showing {candidates.length} of {resolution.choiceTotal} accounts.</p>}
+        </fieldset>
       )}
-    </div>
+      {resolution.kind === 'review_run' && <p role="status" className="text-small text-muted">{resolution.reason}</p>}
+      <Disclosure summary="Technical details">
+        <div className="space-y-1 break-all font-mono text-caption text-muted">
+          <div>workflow {gate.workflow} · run {gate.runId} · step {gate.stepId}</div>
+          <div>tool {gate.tool} · {gate.reason}</div>
+          {candidates.map((candidate) => (
+            <div key={`${candidate.capabilityId}\u0000${candidate.accountId}`}>{candidate.label}: account {candidate.accountId} · capability {candidate.capabilityId}</div>
+          ))}
+        </div>
+      </Disclosure>
+    </DecisionFrame>
   );
 }
 
-function ApprovalCard({
-  row,
-  project,
-  selected,
-  checked,
-  decisionState,
-  disabled,
-  onToggleCheck,
-  onSelect,
-  onApprove,
-  onReject,
-}: {
-  row: ApprovalRow; project?: SessionProjectLabel; selected: boolean; checked: boolean; onToggleCheck: () => void;
-  decisionState?: RowDecisionState; disabled?: boolean;
-  onSelect: () => void; onApprove: () => void; onReject: (note?: string) => void;
+function TrustDetail({ row, view, busy, globallyBusy, onApprove, onDecline, onBack }: TrustHandlers & {
+  row: TrustProposalRow; view: NeedsYouRowView; onBack?: () => void;
 }) {
-  const queued = row.pendingAction;
-  const busy = disabled || decisionState?.busy === true;
-  // The draft the reviewer is deciding on. Long drafts fold; the first lines
-  // are always visible so "what am I approving?" is answered on the card.
-  const draft = row.contentPreview?.body?.trim() ?? '';
-  const [draftOpen, setDraftOpen] = useState(false);
-  const draftIsLong = draft.length > 420;
-  const shownDraft = draftIsLong && !draftOpen ? `${draft.slice(0, 419)}…` : draft;
-  // "Request changes": decline THIS draft and say what to change. The note
-  // rides with the rejection and reaches the conversation that owns the run.
-  const [changing, setChanging] = useState(false);
-  const [changeNote, setChangeNote] = useState('');
-  const isWorkflowGate = row.tool === 'workflow_approval_gate';
   return (
-    <div className={cn('rounded-md border px-3.5 py-3 transition-colors',
-      selected ? 'border-primary bg-primary-tint' : 'border-warning/40 bg-warning-tint')}>
-      <div className="flex w-full items-start gap-3">
-        <input type="checkbox" aria-label="Select for bulk action"
-          className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-primary"
-          disabled={busy}
-          checked={checked} onChange={onToggleCheck} onClick={(e) => e.stopPropagation()} />
-        <button type="button" onClick={onSelect} className="flex min-w-0 flex-1 items-start gap-3 text-left cursor-pointer">
-          <StatusPill tone="warning">{queued ? 'Ready' : 'Approve'}</StatusPill>
-          <span className="min-w-0 flex-1 text-body text-fg">{queued ? queued.title : row.subject}</span>
-          <span className="shrink-0 text-caption text-faint">{relativeTime(row.requestedAt)}</span>
-        </button>
-      </div>
-      {queued && (
-        <div className="mt-1 truncate text-caption text-muted">
-          {queued.toolName} · {queued.targetSummary || queued.kind} · hash {queued.payloadHash}
-        </div>
-      )}
-      <ProjectLabelTag label={project} link className="ml-7 mt-1.5" />
-      {draft && (
-        <div className="mt-2 rounded border border-border bg-surface px-3 py-2" aria-label="What you are approving">
-          <p className="text-caption font-semibold uppercase tracking-wider text-faint">Draft</p>
-          <pre className="mt-1 whitespace-pre-wrap break-words font-sans text-small text-fg">{shownDraft}</pre>
-          {draftIsLong && (
-            <button type="button" className="mt-1 text-caption font-medium text-primary hover:underline" onClick={() => setDraftOpen((open) => !open)}>
-              {draftOpen ? 'Show less' : 'Show the whole draft'}
-            </button>
-          )}
-        </div>
-      )}
-      <div className="mt-2.5 flex flex-wrap gap-2">
-        <Button size="sm" disabled={busy} onClick={onApprove}>
-          {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-          {decisionState?.busy && decisionState.intent === 'approve'
-            ? 'Approving…'
-            : queued ? 'Approve & continue' : 'Approve'}
-        </Button>
-        {isWorkflowGate && (
-          <Button size="sm" variant="secondary" disabled={busy} aria-expanded={changing} onClick={() => setChanging((open) => !open)}>
-            Request changes
-          </Button>
-        )}
-        <Button size="sm" variant="secondary" disabled={busy} onClick={() => onReject()}>
-          <X className="h-4 w-4" aria-hidden />
-          {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
-        </Button>
-      </div>
-      {isWorkflowGate && changing && (
-        <form
-          className="mt-2 flex flex-col gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!changeNote.trim()) return;
-            onReject(changeNote.trim());
-            setChanging(false);
-          }}
-        >
-          <textarea
-            value={changeNote}
-            onChange={(event) => setChangeNote(event.target.value)}
-            disabled={busy}
-            rows={3}
-            aria-label="What should change"
-            placeholder="What should change in this draft?"
-            className="w-full rounded-md border border-border bg-surface px-2.5 py-2 text-small text-fg outline-none placeholder:text-faint focus:border-border-strong disabled:opacity-50"
-          />
-          <div className="flex items-center gap-2">
-            <Button type="submit" size="sm" disabled={busy || !changeNote.trim()}>Send changes</Button>
-            <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setChanging(false)}>Cancel</Button>
-            <span className="text-caption text-faint">This stops the current draft and hands your note back to Clem to revise.</span>
-          </div>
-        </form>
-      )}
-      {decisionState?.notice && (
-        <p
-          role={decisionState.notice.tone === 'error' ? 'alert' : 'status'}
-          className={cn(
-            'mt-2 text-caption',
-            decisionState.notice.tone === 'error' ? 'text-danger' : 'text-success',
-          )}
-        >
-          {decisionState.notice.text}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function TrustProposalCard({ row, busy, globallyBusy, onApprove, onDecline }: {
-  row: TrustProposalRow; busy: boolean; globallyBusy: boolean; onApprove: () => void; onDecline: () => void;
-}) {
-  const scope = [
-    ...row.recipients,
-    ...(row.domains ?? []).map((d) => `anyone @${d}`),
-  ].join(', ');
-  return (
-    <div className="rounded-md border border-primary/40 bg-primary-tint/40 px-3.5 py-3">
-      <div className="flex w-full items-start gap-3">
-        <StatusPill tone="live">Suggestion</StatusPill>
-        <span className="min-w-0 flex-1 text-body text-fg">Send-trust: {scope}</span>
-        <span className="shrink-0 text-caption text-faint">{relativeTime(row.createdAt)}</span>
-      </div>
-      <div className="mt-1 text-caption text-muted">{row.rationale}</div>
-      <div className="mt-1 text-caption text-faint">
-        {row.evidence.cleanSendCount} clean sends over {row.evidence.distinctDays} days · via {row.toolkits.join(', ')}
-      </div>
-      <div className="mt-2.5 flex gap-2">
-        <Button size="sm" disabled={globallyBusy} onClick={onApprove}>
-          <Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve'}
-        </Button>
-        <Button size="sm" variant="secondary" disabled={globallyBusy} onClick={onDecline}>
-          <X className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Decline'}
-        </Button>
-      </div>
-    </div>
+    <DecisionFrame view={view} title={view.title} onBack={onBack}
+      actions={(
+        <>
+          <Button disabled={globallyBusy} onClick={onApprove}><Check className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Approve'}</Button>
+          <Button variant="secondary" disabled={globallyBusy} onClick={onDecline}><X className="h-4 w-4" aria-hidden /> {busy ? 'Saving…' : 'Decline'}</Button>
+        </>
+      )}>
+      {row.rationale && <p className="whitespace-pre-wrap">{row.rationale}</p>}
+      <p className="text-small text-muted">
+        {row.evidence.cleanSendCount} clean sends over {row.evidence.distinctDays} days · via {row.toolkits.join(', ')} · up to {row.maxRecipients} recipients
+      </p>
+    </DecisionFrame>
   );
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="mb-3">
+    <div>
       <div className="mb-1 text-label text-faint">{label}</div>
       <div className="text-body text-fg">{children}</div>
     </div>
@@ -1188,101 +988,126 @@ function Mono({ value }: { value: unknown }) {
   return <pre className="max-h-72 overflow-auto rounded-md bg-subtle p-3 font-mono text-caption text-muted">{text}</pre>;
 }
 
-function ApprovalDetail({
-  row,
-  project,
-  decisionState,
-  disabled,
-  onApprove,
-  onReject,
-}: {
-  row: ApprovalRow;
-  project?: SessionProjectLabel;
-  decisionState?: RowDecisionState;
-  disabled?: boolean;
-  onApprove: () => void;
-  onReject: () => void;
+/** What is being approved, in full, with the decision in the footer: the
+ *  draft and the call in words first; the exact payload behind a disclosure. */
+function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove, onReject, onBack }: ApprovalHandlers & {
+  row: ApprovalRow; view: NeedsYouRowView; project?: SessionProjectLabel; onBack?: () => void;
 }) {
   const queued = row.pendingAction;
   const busy = disabled || decisionState?.busy === true;
+  const draft = row.contentPreview?.body?.trim() ?? '';
+  const details = row.presentation?.details ?? [];
+  // "Request changes": decline THIS draft and say what to change. The note
+  // rides with the rejection and reaches the conversation that owns the run.
+  const [changing, setChanging] = useState(false);
+  const [changeNote, setChangeNote] = useState('');
+  const isWorkflowGate = row.tool === 'workflow_approval_gate';
+  const summary = queued?.summary || row.summary;
+  const title = queued?.title || row.presentation?.action || row.subject;
   return (
-    <div>
-      <h3 className="mb-3 text-h3 text-fg">{queued ? `Ready for approval: ${queued.title}` : row.subject}</h3>
-      {queued && <PendingActionDetail action={queued} />}
-      {project && <Field label="Project"><ProjectLabelTag label={project} link /></Field>}
-      <Field label="Action">{row.presentation?.action || row.tool || '—'}</Field>
-      {row.presentation?.app && <Field label="App">{row.presentation.app}{row.presentation.operation ? ` · ${row.presentation.operation}` : ''}</Field>}
-      <Field label="Requested">{relativeTime(row.requestedAt) || '—'}</Field>
-      {row.presentation && row.presentation.details.length > 0 ? (
-        <div className="mt-2 space-y-2" data-testid="approval-presentation">
-          {row.presentation.details.map((line) => (
+    <DecisionFrame view={view} title={title} onBack={onBack} notice={decisionState?.notice ?? null}
+      aside={project ? <ProjectLabelTag label={project} link /> : undefined}
+      actions={(
+        <>
+          <Button disabled={busy} onClick={onApprove}>
+            {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
+            {decisionState?.busy && decisionState.intent === 'approve' ? 'Approving…' : queued ? 'Approve & continue' : 'Approve'}
+          </Button>
+          {isWorkflowGate && (
+            <Button variant="secondary" disabled={busy} aria-expanded={changing} onClick={() => setChanging((open) => !open)}>
+              Request changes
+            </Button>
+          )}
+          <Button variant="secondary" disabled={busy} onClick={() => onReject()}>
+            <X className="h-4 w-4" aria-hidden />
+            {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
+          </Button>
+          {isWorkflowGate && changing && (
+            <form
+              className="flex basis-full flex-col gap-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!changeNote.trim()) return;
+                onReject(changeNote.trim());
+                setChanging(false);
+              }}
+            >
+              <textarea
+                value={changeNote}
+                onChange={(event) => setChangeNote(event.target.value)}
+                disabled={busy}
+                rows={3}
+                aria-label="What should change"
+                placeholder="What should change in this draft?"
+                className="w-full rounded-md border border-border bg-surface px-2.5 py-2 text-small text-fg outline-none placeholder:text-faint focus:border-border-strong disabled:opacity-50"
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <Button type="submit" size="sm" disabled={busy || !changeNote.trim()}>Send changes</Button>
+                <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => setChanging(false)}>Cancel</Button>
+                <span className="text-caption text-faint">The current draft stops and your note goes back to Clem to revise.</span>
+              </div>
+            </form>
+          )}
+        </>
+      )}>
+      {summary && summary !== title && <p className="text-muted">{summary}</p>}
+      {draft && (
+        <div aria-label="What you are approving">
+          <div className="mb-1 text-label text-faint">Draft</div>
+          <p className="whitespace-pre-wrap break-words rounded-md border border-border bg-surface px-3 py-2">{draft}</p>
+        </div>
+      )}
+      {queued?.targetSummary && <Field label="Goes to">{queued.targetSummary}</Field>}
+      {queued?.preview && !draft && <Field label="Preview"><span className="whitespace-pre-wrap">{queued.preview}</span></Field>}
+      {details.length > 0 ? (
+        <div className="space-y-3" data-testid="approval-presentation">
+          {details.map((line) => (
             line.long
               ? (
                 <div key={line.label}>
-                  <div className="text-label text-fg">{line.label}</div>
-                  <p className="whitespace-pre-wrap rounded-md border border-border bg-subtle px-3 py-2 text-body text-fg">{line.value}</p>
+                  <div className="mb-1 text-label text-faint">{line.label}</div>
+                  <p className="whitespace-pre-wrap rounded-md border border-border bg-subtle px-3 py-2">{line.value}</p>
                 </div>
               )
               : <Field key={line.label} label={line.label}>{line.value}</Field>
           ))}
         </div>
-      ) : (
+      ) : !draft && !queued ? (
         <Field label="Details"><Mono value={row.args} /></Field>
-      )}
-      <details className="mt-2 text-caption text-muted">
-        <summary className="cursor-pointer">Technical details</summary>
-        <div className="mt-1 text-fg">Tool: {row.tool || '—'}{row.sessionId ? ` · session ${row.sessionId}` : ''}</div>
+      ) : null}
+      {queued?.risk && <Field label="Risk">{queued.risk}</Field>}
+      {queued?.rollback && <Field label="If it goes wrong">{queued.rollback}</Field>}
+      <Disclosure summary="Technical details">
+        <div className="mb-2 text-caption text-muted">
+          {row.presentation?.app ? `${row.presentation.app}${row.presentation.operation ? ` · ${row.presentation.operation}` : ''} · ` : ''}
+          Tool: {queued?.toolName || row.tool || '—'}{row.sessionId ? ` · session ${row.sessionId}` : ''}
+        </div>
+        {queued && <PendingActionDetail action={queued} />}
         <Mono value={row.args} />
-      </details>
-      <div className="mt-4 flex gap-2">
-        <Button disabled={busy} onClick={onApprove}>
-          {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-          {decisionState?.busy && decisionState.intent === 'approve'
-            ? 'Approving…'
-            : queued ? 'Approve & continue' : 'Approve'}
-        </Button>
-        <Button variant="secondary" disabled={busy} onClick={onReject}>
-          <X className="h-4 w-4" aria-hidden />
-          {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
-        </Button>
-      </div>
-      {decisionState?.notice && (
-        <p
-          role={decisionState.notice.tone === 'error' ? 'alert' : 'status'}
-          className={cn(
-            'mt-2 text-small',
-            decisionState.notice.tone === 'error' ? 'text-danger' : 'text-success',
-          )}
-        >
-          {decisionState.notice.text}
-        </p>
-      )}
-    </div>
+      </Disclosure>
+    </DecisionFrame>
   );
 }
 
 function PendingActionDetail({ action }: { action: NonNullable<ApprovalRow['pendingAction']> }) {
   return (
-    <div className="mb-4 border-y border-border py-3">
-      <div className="mb-2 flex flex-wrap items-center gap-2">
-        <StatusPill tone="warning">{action.status}</StatusPill>
-        <span className="text-caption text-faint">{action.kind}</span>
-        <span className="text-caption text-faint">hash <span className="font-mono">{action.payloadHash}</span></span>
+    <div className="mb-2 space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-caption text-faint">
+        <span>{action.status}</span>
+        <span>{action.kind}</span>
+        <span>hash <span className="font-mono">{action.payloadHash}</span></span>
+        {action.idempotencyKey && <span>key <span className="font-mono">{action.idempotencyKey}</span></span>}
       </div>
-      {action.summary && <Field label="Summary">{action.summary}</Field>}
-      <Field label="Execution tool"><span className="font-mono">{action.toolName}</span></Field>
-      {action.targetSummary && <Field label="Target">{action.targetSummary}</Field>}
-      {action.preview && <Field label="Preview"><span className="whitespace-pre-wrap">{action.preview}</span></Field>}
-      {action.risk && <Field label="Risk">{action.risk}</Field>}
-      {action.rollback && <Field label="Rollback">{action.rollback}</Field>}
       <Field label="Exact queued payload"><Mono value={action.payload} /></Field>
-      {action.idempotencyKey && <Field label="Idempotency key"><span className="font-mono">{action.idempotencyKey}</span></Field>}
     </div>
   );
 }
 
-
-function NotifDetail({ row, onRead, onRetry }: { row: NotificationRow; onRead: () => void; onRetry: () => void }) {
+function NotifDetail({ row, view, destination, onRead, onRetry, onBack }: NotificationHandlers & {
+  row: NotificationRow; view?: Pick<NeedsYouRowView, 'state' | 'context' | 'at'>; onBack?: () => void;
+  /** Where the item is resolved, when the server's key names a place. */
+  destination?: { href: string; label: string };
+}) {
   const failed = notifFailed(row);
   // A workflow the system switched off is a decision, and the decision is one
   // switch. It belongs on the card that told the user about it — not in a
@@ -1306,30 +1131,29 @@ function NotifDetail({ row, onRead, onRetry }: { row: NotificationRow; onRead: (
       setEnableError(actionError(error, 'Could not switch that workflow on.'));
     }
   };
-  return (
-    <div>
-      <h3 className="mb-3 text-h3 text-fg">{row.title || 'Notification'}</h3>
-      <Field label="When">{relativeTime(row.createdAt) || '—'}</Field>
-      <Field label="Message"><span className="whitespace-pre-wrap">{row.body ? linkify(row.body) : '—'}</span></Field>
-      {row.deliveryError && <Field label="Delivery error"><span className="text-danger">{row.deliveryError}</span></Field>}
-      {enableGate && (
-        <div className="mt-4 rounded-md border border-border bg-subtle px-3 py-3">
-          <p className="text-small text-fg">{enableGate.reason}</p>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <Button size="sm" disabled={enableState !== 'idle'} onClick={() => { void onEnable(); }}>
-              {enableState === 'busy' ? 'Switching on…' : enableState === 'done' ? 'Switched on' : `Turn on ${enableGate.displayName}`}
-            </Button>
-            {enableState === 'done' && (
-              <span className="text-caption text-success">It runs on its schedule again.</span>
-            )}
-            {enableError && <span className="text-caption text-danger">{enableError}</span>}
-          </div>
-        </div>
+  const frameView = view ?? { state: notifTone(row), at: row.createdAt };
+  const actions = enableGate || !row.read || failed || destination ? (
+    <>
+      {destination && !enableGate && (
+        <Link to={destination.href} className="inline-flex h-11 items-center rounded-md bg-primary px-4 text-body font-medium text-primary-fg hover:bg-primary-hover active:bg-primary-press">
+          {destination.label}
+        </Link>
       )}
-      <div className="mt-4 flex gap-2">
-        {!row.read && <Button variant="secondary" size="sm" onClick={onRead}>Mark as read</Button>}
-        {failed && <Button size="sm" onClick={onRetry}><RefreshCw className="h-4 w-4" aria-hidden /> Retry</Button>}
-      </div>
-    </div>
+      {enableGate && (
+        <Button disabled={enableState !== 'idle'} onClick={() => { void onEnable(); }}>
+          {enableState === 'busy' ? 'Switching on…' : enableState === 'done' ? 'Switched on' : `Turn on ${enableGate.displayName}`}
+        </Button>
+      )}
+      {failed && <Button variant={enableGate || destination ? 'secondary' : 'primary'} onClick={onRetry}><RefreshCw className="h-4 w-4" aria-hidden /> Retry delivery</Button>}
+      {!row.read && <Button variant="secondary" onClick={onRead}>Mark as read</Button>}
+    </>
+  ) : undefined;
+  return (
+    <DecisionFrame view={frameView} title={row.title || 'Notification'} onBack={onBack} actions={actions}
+      notice={enableError ? { tone: 'error', text: enableError } : enableState === 'done' ? { tone: 'success', text: 'It runs on its schedule again.' } : null}>
+      {row.body ? <p className="whitespace-pre-wrap">{linkify(row.body)}</p> : null}
+      {enableGate && <p className="text-small text-muted">{enableGate.reason}</p>}
+      {row.deliveryError && <Field label="Delivery error"><span className="text-danger">{row.deliveryError}</span></Field>}
+    </DecisionFrame>
   );
 }

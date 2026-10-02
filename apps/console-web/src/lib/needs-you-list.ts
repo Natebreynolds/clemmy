@@ -1,0 +1,208 @@
+/**
+ * Needs you as one scannable list: every kind of decision becomes the same
+ * compact row (what, for what work, how current), and the full content, the
+ * form and the actions live only in the one selected detail. Pure; the screen
+ * supplies the rows it already polls. Order and membership follow the feeds
+ * exactly — this only decides how a row reads, never what counts.
+ */
+import type { Tone } from '@/components/ui/StatusPill';
+import {
+  attentionPill,
+  type ApprovalRow,
+  type CollapsedAttentionRow,
+  type InboxQuestionRow,
+  type NeedsYouSummary,
+  type PlanProposalRow,
+  type TrustProposalRow,
+  type WorkspaceDestinationChooser,
+} from './inbox';
+
+export type NeedsYouItem =
+  | { kind: 'workspace'; id: string; row: WorkspaceDestinationChooser }
+  | { kind: 'question'; id: string; row: InboxQuestionRow }
+  | { kind: 'plan'; id: string; row: PlanProposalRow }
+  | { kind: 'approval'; id: string; row: ApprovalRow; aged: boolean }
+  | { kind: 'trust'; id: string; row: TrustProposalRow }
+  | { kind: 'attention'; id: string; row: CollapsedAttentionRow['row']; collapsedCount: number }
+  | { kind: 'unlisted'; id: string; row: NeedsYouSummary['unlisted'][number] };
+
+export interface NeedsYouRowView {
+  id: string;
+  kind: NeedsYouItem['kind'];
+  /** One line: the decision itself. */
+  title: string;
+  /** One short line of what it is about; never a repeat of the title. */
+  preview?: string;
+  /** Who or what asked (an agent, a workflow, a check-in). */
+  context?: string;
+  at?: string;
+  state: { tone: Tone; label: string };
+  /** Approvals can be decided together; nothing else is batch-decidable. */
+  checkable: boolean;
+  /** Older approvals sit below the live decisions. */
+  aged: boolean;
+  /** Rows that are a link to where they are resolved, not a selection. */
+  href?: string;
+}
+
+const PREVIEW_MAX = 140;
+const TITLE_MAX = 160;
+
+/** Collapse markdown and whitespace into one readable line. */
+export function oneLine(text: string | null | undefined, max = PREVIEW_MAX): string {
+  const flat = String(text ?? '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[*_`#>]+/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (flat.length <= max) return flat;
+  const cut = flat.slice(0, max - 1);
+  const lastSpace = cut.lastIndexOf(' ');
+  return `${(lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+}
+
+/** A bare reference (`noticing:ntc-…`, a run id): no spaces, punctuation and
+ *  digits. It belongs behind a disclosure, never in the line a person reads. */
+export function isIdentifierLike(text: string | null | undefined): boolean {
+  const value = String(text ?? '').trim();
+  return value.length >= 8 && !/\s/.test(value) && /[:/_.-]/.test(value) && /\d/.test(value);
+}
+
+const HEADING_MAX = 140;
+
+/** A heading stays a heading: long text leads with its own first line or
+ *  first sentence and the rest moves into the body. Only when neither fits is
+ *  the lead cut at a word, and then the body keeps the whole text. */
+export function detailHeading(text: string, max = HEADING_MAX): { heading: string; body?: string } {
+  const trimmed = text.trim();
+  const flat = trimmed.replace(/\s+/g, ' ');
+  if (flat.length <= max) return { heading: flat };
+  const firstLine = trimmed.split(/\n/, 1)[0]!.trim();
+  if (firstLine.length >= 20 && firstLine.length <= max) {
+    return { heading: firstLine, body: trimmed.slice(trimmed.indexOf(firstLine) + firstLine.length).trim() };
+  }
+  const sentence = /^(.{20,}?[.?!])\s/.exec(flat)?.[1];
+  if (sentence && sentence.length <= max) return { heading: sentence, body: flat.slice(sentence.length).trim() };
+  // A little over is still one heading; a cut would leave a stub behind it.
+  if (flat.length <= max * 1.5) return { heading: flat };
+  // Cut at a word; the body continues exactly where the heading stops.
+  const cut = flat.slice(0, max - 1);
+  const lastSpace = cut.lastIndexOf(' ');
+  const lead = (lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd();
+  return { heading: `${lead}…`, body: `…${flat.slice(lead.length).trimStart()}` };
+}
+
+/** Where an attention item is resolved, from the server's own grouping key
+ *  (dashboard/needs-you.ts): a conversation, or a workflow. */
+export function attentionDestination(needsYouKey: string | null | undefined): { href: string; label: string } | undefined {
+  const key = needsYouKey ?? '';
+  if (key.startsWith('session:') && key.length > 'session:'.length) {
+    return { href: `/chat/${encodeURIComponent(key.slice('session:'.length))}`, label: 'Open the conversation' };
+  }
+  if (key.startsWith('flow:') && key.length > 'flow:'.length) {
+    return { href: `/automate?workflow=${encodeURIComponent(key.slice('flow:'.length))}`, label: 'Open the workflow' };
+  }
+  return undefined;
+}
+
+/** A preview only when it adds something the title does not already say. */
+function previewFor(title: string, candidates: Array<string | null | undefined>): string | undefined {
+  const normalizedTitle = title.toLowerCase().replace(/…$/, '');
+  for (const candidate of candidates) {
+    if (isIdentifierLike(candidate)) continue;
+    const line = oneLine(candidate);
+    if (!line) continue;
+    const normalized = line.toLowerCase().replace(/…$/, '');
+    if (normalized === normalizedTitle || normalizedTitle.startsWith(normalized) || normalized.startsWith(normalizedTitle)) continue;
+    return line;
+  }
+  return undefined;
+}
+
+function questionContext(row: InboxQuestionRow): string {
+  const source = row.source === 'workflow'
+    ? (row.workflowName ? `${row.workflowName} workflow` : 'Workflow')
+    : row.source === 'background_task' ? 'Background task' : 'Check-in';
+  return row.agentLabel && row.agentLabel !== source ? `${row.agentLabel} · ${source}` : source;
+}
+
+export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
+  const base = { id: item.id, kind: item.kind, checkable: false, aged: false } as const;
+  switch (item.kind) {
+    case 'workspace': {
+      const title = 'Where should these records live?';
+      return { ...base, title, preview: 'Choose a Workspace for the records Clem is preparing.',
+        at: item.row.createdAt, state: { tone: 'neutral', label: 'Choose' } };
+    }
+    case 'question': {
+      const title = oneLine(item.row.question, TITLE_MAX) || 'Clem has a question';
+      return { ...base, title, preview: previewFor(title, [item.row.context]),
+        context: questionContext(item.row), at: item.row.askedAt,
+        state: item.row.answerable ? { tone: 'neutral', label: 'Question' } : { tone: 'neutral', label: 'Answer elsewhere' } };
+    }
+    case 'plan': {
+      const needsInput = (item.row.plan.needsUserInput ?? []).some((q) => typeof q === 'string' && q.trim());
+      const title = oneLine(item.row.plan.objective || item.row.originatingRequest, TITLE_MAX) || 'Proposed plan';
+      return { ...base, title, preview: previewFor(title, [item.row.originatingRequest, item.row.context]),
+        at: item.row.proposedAt, state: needsInput ? { tone: 'neutral', label: 'Needs answers' } : { tone: 'neutral', label: 'Plan' } };
+    }
+    case 'approval': {
+      const queued = item.row.pendingAction;
+      const title = oneLine(queued?.title || item.row.presentation?.action || item.row.subject, TITLE_MAX) || 'Approval';
+      return { ...base, checkable: true, aged: item.aged, title,
+        preview: previewFor(title, [queued?.targetSummary, item.row.contentPreview?.body, item.row.summary, item.row.subject]),
+        context: item.row.presentation?.app, at: item.row.requestedAt,
+        state: item.aged ? { tone: 'neutral', label: 'Older' } : { tone: 'live', label: queued ? 'Ready' : 'Approve' } };
+    }
+    case 'trust': {
+      const scope = [...item.row.recipients, ...(item.row.domains ?? []).map((d) => `anyone @${d}`)].join(', ');
+      const title = oneLine(`Trust sends to ${scope}`, TITLE_MAX);
+      return { ...base, title, preview: previewFor(title, [item.row.rationale]),
+        at: item.row.createdAt, state: { tone: 'neutral', label: 'Suggestion' } };
+    }
+    case 'attention': {
+      const capability = item.row.workflowCapability;
+      const title = oneLine(item.row.title || item.row.body, TITLE_MAX) || 'Needs your attention';
+      const pill = attentionPill(item.row);
+      return { ...base, title, preview: previewFor(title, [item.row.body]),
+        context: capability ? `${capability.workflow} workflow` : undefined, at: item.row.createdAt,
+        state: capability ? { tone: 'warning', label: 'Stopped' }
+          : pill.label === 'Stopped' ? { tone: 'warning', label: 'Stopped' }
+          : pill.label === 'Reply' ? { tone: 'info', label: 'Reply' }
+          // "Needs you" inside Needs you says nothing; the row is an update to read.
+          : { tone: 'neutral', label: pill.label === 'Needs you' ? 'Update' : pill.label },
+        ...(item.collapsedCount > 0 ? { context: `${capability ? `${capability.workflow} workflow · ` : ''}+${item.collapsedCount} earlier` } : {}) };
+    }
+    case 'unlisted': {
+      const title = oneLine(item.row.title, TITLE_MAX) || 'Needs your attention';
+      const stopped = item.row.kind === 'workflow_binding' || item.row.kind === 'workflow_paused';
+      return { ...base, title, preview: previewFor(title, [item.row.detail]),
+        context: item.row.workflow ? `${item.row.workflow} workflow` : undefined,
+        state: stopped ? { tone: 'warning', label: item.row.kind === 'workflow_binding' ? 'Stopped' : 'Paused' } : { tone: 'neutral', label: 'Needs you' },
+        href: item.row.workflow ? `/automate?workflow=${encodeURIComponent(item.row.workflow)}` : '/chat' };
+    }
+  }
+}
+
+/** Every decision source in one order: live decisions first, older approvals last. */
+export function buildNeedsYouItems(input: {
+  workspaceChoosers: readonly WorkspaceDestinationChooser[];
+  questions: readonly InboxQuestionRow[];
+  plans: readonly PlanProposalRow[];
+  approvals: readonly ApprovalRow[];
+  trust: readonly TrustProposalRow[];
+  attention: readonly CollapsedAttentionRow[];
+  unlisted: NeedsYouSummary['unlisted'];
+}): NeedsYouItem[] {
+  return [
+    ...input.workspaceChoosers.map((row): NeedsYouItem => ({ kind: 'workspace', id: row.chooserId, row })),
+    ...input.questions.map((row): NeedsYouItem => ({ kind: 'question', id: row.id, row })),
+    ...input.plans.map((row): NeedsYouItem => ({ kind: 'plan', id: row.id, row })),
+    ...input.approvals.filter((row) => !row.stale).map((row): NeedsYouItem => ({ kind: 'approval', id: row.approvalId, row, aged: false })),
+    ...input.trust.map((row): NeedsYouItem => ({ kind: 'trust', id: row.id, row })),
+    ...input.attention.map(({ row, collapsedCount }): NeedsYouItem => ({ kind: 'attention', id: row.id, row, collapsedCount })),
+    ...input.unlisted.map((row): NeedsYouItem => ({ kind: 'unlisted', id: row.key, row })),
+    ...input.approvals.filter((row) => row.stale).map((row): NeedsYouItem => ({ kind: 'approval', id: row.approvalId, row, aged: true })),
+  ];
+}
