@@ -476,8 +476,55 @@ test(`call_tool carrying ${label === 'carried' ? 'a configured local write runs 
   } else {
     assert.equal(dispatches, 0, history);
     assert.throws(() => readFileSync(file, 'utf8'));
+    if (label === 'no-variant') {
+      // The refusal says what to correct, so the next try needs no search.
+      assert.match(history, /write_file arguments do not match its schema \(mode/);
+      assert.match(history, /no search is needed/);
+    }
   }
   assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM pending_approvals WHERE session_id = ?')
     .get(session.id) as { n: number }).n, 0);
 });
 }
+
+test('a work_call whose requirement id is just the operation name runs under its own definition in one round', async () => {
+  eventlog.resetEventLog();
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
+  const session = eventlog.createSession({ id: 'self-named-requirement', kind: 'chat', userId: 'native-fixture-owner' });
+  const file = path.join(TEST_HOME, 'self-named.md');
+  const prompt = `Write ${file} containing exactly: fixture note.`;
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: prompt, taskMode: { version: 1, kind: 'normal' } } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 };
+  const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
+  assert.ok(primed.ok);
+  if (!primed.ok) throw new Error(primed.reason);
+  const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({ requireHostPlan: true,
+    reachableBuiltinNames: new Set(['write_file']), firstClassNames: new Set(), catalogIdentifiers: ['write_file'],
+    settlementLane: 'byo', hostPlanningReady: () => true }) as never);
+  const model = stubModel([[toolCall('self-named', 'work_call', {
+    requirement_id: 'write_file', source_call_ids: null, source_record_ids: null,
+    universe_item_id: null, universe_selector: null, seal_amendment: null,
+    name: 'write_file', args_json: JSON.stringify({ path: file, content: 'fixture note\n', mode: 'create', append: null }),
+  })], [textMessage('Done.')]]);
+  const agent = { model, tools: [workCall] };
+  localPreparation.bindHostLocalCallPreparation(agent, { planning: primed.planning, configuredNames: new Set(['write_file']) });
+  const sealed = capabilityEnvelopes.sealAgentCapabilityUniverse({ sessionId: session.id,
+    universeTools: [workCall], activeToolNames: ['work_call'], policyHash: 'self-named-requirement',
+    budget: { maxUncachedTokens: 20_000, maxModelCalls: 4, maxToolCalls: 4, maxElapsedMs: 60_000 } });
+  assert.ok(sealed.ok);
+  if (!sealed.ok) throw new Error('native envelope unavailable');
+  capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+  capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
+  const result = await brackets.withHarnessRunContext({ ...identity, counter: new brackets.ToolCallsCounter(4),
+    behaviorScopeId: `${session.id}::turn:1` }, () => hostRunRunner(throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: prompt }] as never,
+    { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
+  const history = JSON.stringify(result.history);
+  assert.equal(model.calls(), 2, history);
+  assert.doesNotMatch(history, /work_contract_required|not yet published|tool_search/);
+  assert.equal(readFileSync(file, 'utf8'), 'fixture note\n');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
+    .get(session.id) as { n: number }).n, 1);
+});

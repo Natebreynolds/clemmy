@@ -98,7 +98,7 @@ import { approvalPrecheck } from './approval-precheck.js';
 import { removeReviewedClaims } from './reviewed-claim-removal.js';
 import { acceptedTaskIdFor, withLogicalToolCall } from './attempt-identity.js';
 import { persistHostCallCapabilityBinding } from './host-call-capability-binding.js';
-import { isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
+import { isRegistryDeclaredLocalPlanningCapability, isRegistryDeclaredNativePlanningRead, nominateDisclosedLocalPlanningDefinition } from './local-planning-capability.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 import {
   canonicalLogicalToolName,
@@ -3114,6 +3114,10 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
   // by call id, carried onto the exact local definition prepared before the
   // frame (the same definition a disclosure would have published).
   const unplannedNativeCarries = new Map<string, OffSurfaceDirectCarry>();
+  // The exact schema complaint for a carried local write whose arguments match
+  // no definition, so the refusal says what to correct instead of only that
+  // coverage was missing (which sent the model searching).
+  const carriedArgumentDiagnostics = new Map<string, string>();
   const selectedDirectCarry = (name: string, args: Record<string, unknown> | null, argumentsJson: string, callId?: string) => {
     const carrier = toolByName.get('work_call');
     if (!hostProduction || !carrier || !isHostPlanRequiredWorkCall(carrier)) return null;
@@ -3141,7 +3145,18 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
     if (!effective.args || typeof effective.args !== 'object' || Array.isArray(effective.args)) return;
     const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
     const requirement = await prepareDirectHostLocalCall(agent, { ...identity, operationId: name, args: effective.args });
-    if (!requirement) return;
+    if (!requirement) {
+      if (isRegistryDeclaredLocalPlanningCapability(name)) {
+        const { prepareNativeToolArguments } = await import('../../tools/call-tool.js');
+        const checked = await prepareNativeToolArguments(name, effective.args);
+        if (checked.status === 'invalid') {
+          carriedArgumentDiagnostics.set(call.callId, `Host refused ${call.name} before dispatch: the ${name} arguments `
+            + `do not match its schema (${checked.detail.slice(0, 300)}). Correct those arguments and call ${name} the same way again; `
+            + 'no search is needed.');
+        }
+      }
+      return;
+    }
     const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
     const prepared = await materializeLocalRuntimeToolArguments(name, effective.args);
     if (!prepared) return;
@@ -10164,6 +10179,27 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           continue;
         }
         const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
+        // A requirement id that is just the carried operation's own name is a
+        // label slip, not a different request: run the named operation under
+        // its own exact current definition, exactly as a direct call would.
+        if (args && typeof args.requirement_id === 'string' && typeof args.name === 'string'
+          && args.requirement_id.trim() === args.name.trim() && !actionExpectedWorkRequired(exactHostIdentity())) {
+          const selfNamed = unwrapRuntimeEffectiveToolIdentity(call.name, args);
+          if (selfNamed.toolName && selfNamed.args && typeof selfNamed.args === 'object' && !Array.isArray(selfNamed.args)) {
+            const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
+            const requirement = await prepareDirectHostLocalCall(agent, {
+              ...exactHostIdentity(), operationId: selfNamed.toolName, args: selfNamed.args,
+            });
+            const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
+            const prepared = requirement ? await materializeLocalRuntimeToolArguments(selfNamed.toolName, selfNamed.args) : null;
+            if (requirement && prepared) {
+              directLocalCallRequirements.set(call.callId, requirement);
+              localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
+                JSON.stringify({ ...args, requirement_id: requirement, args_json: JSON.stringify(prepared.args) }));
+            }
+          }
+          continue;
+        }
         if (!args || typeof args.requirement_id !== 'string' || !args.requirement_id.startsWith('cap:local:')) continue;
         const effective = unwrapRuntimeEffectiveToolIdentity(call.name, args);
         if (!effective.toolName || args.name !== effective.toolName) continue;
@@ -10931,7 +10967,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           if (consent?.status === 'repair') preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
           if (!preApprovalRepairDiagnostics.has(call.callId)) {
             preApprovalRepairDiagnostics.set(call.callId, {
-              diagnostic: `Host refused ${call.name} before dispatch (${consent?.reason ?? 'consent_preparation_unavailable'}).`,
+              diagnostic: carriedArgumentDiagnostics.get(call.callId)
+                ?? `Host refused ${call.name} before dispatch (${consent?.reason ?? 'consent_preparation_unavailable'}).`,
             });
           }
           preApprovalRefused = true;
@@ -10979,7 +11016,8 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
               preApprovalTypedRefusals.set(call.callId, 'repair_arguments');
             } else {
               preApprovalRepairDiagnostics.set(call.callId, {
-                diagnostic: `Host refused ${call.name} before dispatch (${consent.decision.reason}).`,
+                diagnostic: carriedArgumentDiagnostics.get(call.callId)
+                  ?? `Host refused ${call.name} before dispatch (${consent.decision.reason}).`,
               });
             }
             preApprovalRefused = true;
