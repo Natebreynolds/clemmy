@@ -2,7 +2,7 @@ import { DISCOVERY_REQUEST_CALLS_SCHEMA_V1 } from './discovery-request-identity.
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
-import { createAcceptedModelHistorySchema, registerAcceptedModelHistoryReader } from './accepted-model-history-store.js';
+import { createAcceptedModelHistorySchema, createAcceptedModelHistoryConversionSchema, registerAcceptedModelHistoryReader } from './accepted-model-history-store.js';
 import { SESSION_HISTORY_SEARCH_SCHEMA_V1 } from './session-history-search-schema.js';
 import { migrateRetainedSessionProofs } from './retained-session-proof-schema.js';
 import {
@@ -11371,6 +11371,7 @@ const MIGRATIONS: EventLogMigration[] = [
     },
   },
   { version: 89, sql: '', backfill: createAcceptedModelHistorySchema },
+  { version: 90, sql: '', backfill: createAcceptedModelHistoryConversionSchema },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
