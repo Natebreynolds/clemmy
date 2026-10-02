@@ -1547,7 +1547,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
   const run_shell_command = tool({
     name: 'run_shell_command',
     description: [
-      'Run a shell command in an allowed workspace directory. Requires per-call approval UNLESS the session has an open PlanScope. Has output and time limits.',
+      'Run a shell command in an allowed workspace directory. Ordinary commands, including local changes, run without asking. A destructive command, or one that changes something outside this machine, may first show the owner the exact command for a decision, depending on their Auto/Ask setting; a few dangerous commands are always refused. Has output and time limits.',
       '',
       'CWD GUIDANCE: leave `cwd` null unless you have a specific reason to be elsewhere. On macOS, paths under ~/Desktop, ~/Documents, ~/Downloads, and iCloud Drive are TCC-protected from sandboxed-app children: child Node CLIs (sf, npm, etc.) spawned there throw EPERM on getcwd. The default cwd (Clementine\'s base directory, which the daemon already has TCC access to) is safe and works for tool invocations that don\'t actually depend on file context (CLI calls, API queries, etc.). Pass an explicit `cwd` only when the command genuinely needs to run in a specific project directory configured in WORKSPACE_DIRS.',
     ].join('\n'),
