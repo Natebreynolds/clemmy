@@ -131,7 +131,9 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
                 <div class="brain-current-meta">{answeringAgent ? `${answeringAgent.agentName}’s own model` : sessionId ? 'Answers your next message' : 'Answers new conversations'}</div>
               </div>
             </div>
-            {settings.brain.inactiveBinding && settings.brain.inactiveBinding.modelId !== settings.brain.modelId ? (
+            {/* Which model stands in for the owner's is beside the point while
+                an agent's own model answers this conversation. */}
+            {!answeringAgent && settings.brain.inactiveBinding && settings.brain.inactiveBinding.modelId !== settings.brain.modelId ? (
               <p class="warning brain-honesty">
                 Saved {settings.brain.inactiveBinding.modelId} is unavailable — {settings.brain.modelId} answers instead.
               </p>

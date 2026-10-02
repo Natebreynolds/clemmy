@@ -262,4 +262,6 @@ test('an agent pinned to a model: the chat chip names it, and a pick in the conv
   assert.match(chat, /beforeChange=\{\(\) => applyAgentChoice\(/);
   assert.match(sheet, /await beforeChange\?\.\(\)[\s\S]{0,80}await setBrain\(value, sessionId\)/,
     'a pending agent switch lands before the pick, so the pick is the later choice');
+  assert.match(sheet, /\{!answeringAgent && settings\.brain\.inactiveBinding/,
+    'no "answers instead" note about the owner\'s model while the agent\'s own model answers');
 });
