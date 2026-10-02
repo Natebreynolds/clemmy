@@ -3,8 +3,8 @@
  *
  * The phone connects through the pinned-TLS direct-app door: the daemon opens
  * its own door at boot and the Clem app connects straight to this Mac —
- * nothing in between. Setup is: scan the code from the app. There is no
- * tunnel, no helper install, no third-party account.
+ * nothing in between on the LAN. Away from home, an encrypted relay carries
+ * the connection. Setup and verified remote reachability are distinct.
  *
  * The panel deliberately renders `data.setup`, a view derived once on the
  * server, rather than recomputing "what state are we in?" from raw status.
@@ -94,7 +94,8 @@ export function MobilePanel() {
     setError('');
     try {
       // Idempotent server-side, so this doubles as the retry action.
-      await setupMobileAccess();
+      const result = await setupMobileAccess();
+      if (!result.ok) setError(result.failure?.message ?? 'The connection check did not finish. Try again.');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -137,12 +138,12 @@ export function MobilePanel() {
           <h3 className="text-body font-semibold text-fg">{setup.headline}</h3>
           {setup.detail ? <p className="mt-1 text-small text-muted">{setup.detail}</p> : null}
         </div>
-        {phase === 'live' ? <StatusPill tone="success">Live</StatusPill> : null}
+        {setup.qrReady ? <StatusPill tone={setup.devices.length > 0 ? 'success' : 'neutral'}>{setup.devices.length > 0 ? 'Paired' : 'Ready to pair'}</StatusPill> : null}
       </header>
 
       {/* The single primary action. Same call in every non-live state, because
           ensureMobileAccess resumes from wherever setup actually is. */}
-      {phase !== 'live' ? (
+      {!setup.qrReady ? (
         <div className="flex flex-wrap items-center gap-2">
           <Button onClick={runSetup} disabled={busy}>
             {phase === 'error' ? (setup.failure?.remedy.label ?? 'Try again') : 'Check again'}
@@ -176,16 +177,30 @@ export function MobilePanel() {
       ) : null}
       {error ? <ActionNote tone="error">{error}</ActionNote> : null}
 
-      {phase === 'live' && setup.qrReady ? (
+      {setup.qrReady ? (
         <div className="flex flex-col items-center gap-3 rounded-md border border-border bg-canvas p-4">
           <img
             src={`${qrSrc()}${qrSrc().includes('?') ? '&' : '?'}v=${qrEpoch}`}
             alt="Pairing QR code"
             className="h-[280px] w-[280px] rounded bg-white p-2"
           />
-          <p className="text-small text-muted">Scan from the Clem app — not the camera app. The code stays fresh on its own.</p>
+          <p className="text-small text-muted">Use the scanner in the Clem app while both devices are on the same Wi-Fi. Allow Local Network access when asked.</p>
           {setup.url ? <code className="max-w-full truncate text-caption text-muted">{setup.url}</code> : null}
         </div>
+      ) : null}
+
+      {setup.qrReady ? (
+        <section aria-label="Remote connection" className="space-y-2">
+          <div className="flex items-center gap-2">
+            <h4 className="text-small font-semibold text-fg">Away from home</h4>
+            <StatusPill tone={setup.remote?.state === 'verified' ? 'success' : 'neutral'}>
+              {setup.remote?.state === 'verified' ? 'Route checked' : setup.remote?.state === 'unavailable' ? 'Unavailable' : 'Not checked'}
+            </StatusPill>
+          </div>
+          <p className="text-small text-muted">{setup.remote?.message ?? 'Check the encrypted route before relying on remote access.'}</p>
+          {setup.remote?.checkedAt ? <p className="text-caption text-muted">Checked {new Date(setup.remote.checkedAt).toLocaleString()}</p> : null}
+          <Button variant="ghost" onClick={runSetup} disabled={busy}>{busy ? 'Checking…' : 'Check connection'}</Button>
+        </section>
       ) : null}
 
       <section>
@@ -221,8 +236,8 @@ export function MobilePanel() {
           <div>
             <h5 className="text-small font-semibold text-fg">PIN fallback</h5>
             <p className="mt-1 text-small text-muted">
-              Optional. Lets you sign in from a new phone when you are away from this Mac and cannot
-              scan the code. At least 8 characters with a letter, a number, and a symbol.
+              Optional local sign-in fallback. Available only while your phone can reach this computer
+              on the local network; it cannot pair a new phone remotely. At least 8 characters with a letter, a number, and a symbol.
             </p>
             <form
               className="mt-3 flex flex-wrap items-end gap-2"

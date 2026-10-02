@@ -51,14 +51,17 @@ test('a closed direct-app door is an error with exactly one next action', () => 
   assert.doesNotMatch(view.headline, /tunnel|cloudflared|DNS|domain/i);
 });
 
-test('a ready direct-app QR is live and names the Clem app', () => {
+test('a scannable QR is ready to pair, never proof of a live phone or remote path', () => {
   const view = mobileSetupView(payload({
     target: { url: 'https://192.168.1.50:8421/m/', mode: 'direct-app', qrReady: true } as never,
   }));
-  assert.equal(view.phase, 'live');
+  assert.equal(view.phase, 'pairing-ready');
   assert.equal(view.qrReady, true);
   assert.equal(view.url, 'https://192.168.1.50:8421/m/');
-  assert.match(view.headline, /Clem app/i, 'direct-app QRs are scanned in the app, not the camera');
+  assert.match(view.detail ?? '', /Clem app/i);
+  assert.match(view.detail ?? '', /same Wi-Fi/);
+  assert.match(view.detail ?? '', /Local Network/);
+  assert.equal(view.remote?.state, 'unavailable');
   assert.doesNotMatch(view.detail ?? '', /cloudflare|tunnel/i);
 });
 
@@ -103,4 +106,57 @@ test('paired devices are surfaced for review', () => {
   assert.equal(view.devices[0]?.deviceLabel, 'iPhone');
   assert.equal(view.devices[0]?.pushSubscribed, true);
   assert.equal(view.devices[1]?.pushSubscribed, false);
+});
+
+const readyTarget = { url: 'https://192.168.1.50:8421/m/', mode: 'direct-app', qrReady: true } as Payload['target'];
+
+test('relay registration is not a verified remote connection', () => {
+  const view = mobileSetupView(payload({ target: readyTarget, relay: { state: 'connected', verification: { state: 'not-checked' } } }));
+  assert.equal(view.phase, 'pairing-ready');
+  assert.equal(view.remote?.state, 'not-checked');
+});
+
+test('paired and route-checked are separate facts; a dropped tunnel invalidates the latter', () => {
+  const paired = [{ deviceId: 'phone', createdAt: '', lastSeenAt: '', expiresAt: '', pushSubscribed: false }];
+  const verification = { state: 'verified' as const, checkedAt: '2026-10-01T00:00:00Z' };
+  const live = mobileSetupView(payload({ target: readyTarget, sessions: paired, relay: { state: 'connected', verification } }));
+  assert.equal(live.phase, 'paired');
+  assert.equal(live.remote?.state, 'verified');
+  assert.match(live.remote?.message ?? '', /test your phone on cellular/);
+  const dropped = mobileSetupView(payload({ target: readyTarget, sessions: paired, relay: { state: 'reconnecting', verification } }));
+  assert.equal(dropped.phase, 'paired');
+  assert.equal(dropped.remote?.state, 'unavailable');
+});
+
+test('security and reachability failures explain the cause without blocking local pairing', () => {
+  for (const reason of ['certificate-mismatch', 'unreachable', 'timeout', 'registration-refused'] as const) {
+    const view = mobileSetupView(payload({ target: readyTarget, relay: { state: 'reconnecting', reason, verification: { state: 'not-checked' } } }));
+    assert.equal(view.qrReady, true);
+    assert.equal(view.remote?.state, 'unavailable');
+    assert.doesNotMatch(JSON.stringify(view), /authToken|BEGIN.*PRIVATE KEY/);
+    if (reason === 'certificate-mismatch') assert.match(view.remote?.message ?? '', /security check/);
+  }
+});
+
+
+test('healthy loopback HTTP cannot qualify an unreachable phone pairing address', async () => {
+  const { ensureMobileAccess } = await import('./mobile-setup.js');
+  const { setDirectAppRuntime } = await import('../runtime/mobile-ingress.js');
+  setDirectAppRuntime({ port: 8421, fingerprint: 'controlled-local-pin' });
+  try {
+    let checks = 0;
+    const result = await ensureMobileAccess({
+      fetchImpl: async () => new Response('{}', { status: 200 }),
+      probeImpl: async (origin, pin) => {
+        checks++;
+        assert.match(origin, /^https:\/\//);
+        assert.equal(pin, 'controlled-local-pin');
+        return { state: 'failed', reason: 'unreachable' };
+      },
+    });
+    assert.equal(checks, 1);
+    assert.equal(result.ok, false);
+    assert.equal(result.failure?.code, 'LOCAL_UNREACHABLE');
+    assert.match(result.failure?.message ?? '', /Local Network access/);
+  } finally { setDirectAppRuntime(null); }
 });

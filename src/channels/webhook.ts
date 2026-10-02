@@ -3115,15 +3115,17 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         // The public TCP port is the relay endpoint's own port — DNS carries
         // only the name. Published to paired phones via GET /m/relay-info.
         const relayPublicPort = relayConfig.url.split(':')[1];
-        setMobileRelayRuntime({ origin: `https://${pairId}.${relayConfig.baseDomain}:${relayPublicPort}` });
-        startMobileRelayClient({
+        const relayOrigin = `https://${pairId}.${relayConfig.baseDomain}:${relayPublicPort}`;
+        const relayClient = startMobileRelayClient({
           config: relayConfig,
+          publicOrigin: relayOrigin,
           pairId,
           authToken: ensureRelayAuthToken(),
           localPort: relayListener.port,
           certPem: directApp.certPem,
           keyPem: directApp.keyPem,
         });
+        setMobileRelayRuntime({ origin: relayOrigin, status: relayClient.status, verify: () => relayClient.verify(relayOrigin) });
         logger.info({ relay: relayConfig.url, base: relayConfig.baseDomain }, 'Mobile relay tunnel starting');
       }
     } catch (err) {

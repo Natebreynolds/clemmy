@@ -21,15 +21,19 @@ import {
   getMobileAccessStatusPayload,
   type MobileAccessStatusPayload,
 } from './mobile-access.js';
+import { getMobileRelayRuntime } from '../runtime/mobile-relay.js';
+import { getDirectAppRuntime } from '../runtime/mobile-ingress.js';
+import { probeMobileRelay } from '../runtime/mobile-relay-health.js';
 import { WEBHOOK_PORT } from '../config.js';
 import { mobileAuthPosture } from '../runtime/mobile-auth-posture.js';
 
-export type MobileSetupPhase = 'not-set-up' | 'live' | 'error';
+export type MobileSetupPhase = 'not-set-up' | 'pairing-ready' | 'paired' | 'error';
 
 export type MobileFailureCode =
   | 'DOOR_CLOSED'
   | 'PORT_UNREACHABLE'
-  | 'AUTH_POSTURE';
+  | 'AUTH_POSTURE'
+  | 'LOCAL_UNREACHABLE';
 
 export interface MobileSetupRemedy {
   label: string;
@@ -57,11 +61,12 @@ export interface MobileSetupView {
   phase: MobileSetupPhase;
   headline: string;
   detail?: string;
-  /** Present only when phase === 'live'. */
+  /** A scannable local target, never proof that a phone is connected. */
   url?: string;
   qrReady: boolean;
   failure?: MobileSetupFailure;
   devices: MobileSetupDevice[];
+  remote?: { state: 'not-checked' | 'verified' | 'unavailable'; message: string; checkedAt?: string };
 }
 
 /**
@@ -78,6 +83,26 @@ export function mobileSetupView(payload: MobileAccessStatusPayload): MobileSetup
     pushSubscribed: session.pushSubscribed ?? false,
   }));
 
+  const relay = payload.relay;
+  const verified = relay?.state === 'connected' && relay.verification.state === 'verified';
+  const reason = relay?.verification.state === 'failed' ? relay.verification.reason : relay?.reason;
+  const remote: NonNullable<MobileSetupView['remote']> = {
+    state: verified ? 'verified' : relay?.state === 'connected' && relay.verification.state !== 'failed' ? 'not-checked' : 'unavailable',
+    message: verified
+      ? 'The encrypted route back to this computer passed its connection check. Pair here first, then test your phone on cellular.'
+      : reason === 'certificate-mismatch'
+        ? 'The connection failed its security check. Clementine refused the certificate; no sign-in details were sent.'
+        : reason === 'registration-refused'
+          ? 'The remote service did not accept this computer’s connection. Local pairing is still available.'
+          : reason === 'timeout' || reason === 'unreachable'
+            ? 'The remote service could not be reached. Local pairing is still available; check again when the connection returns.'
+            : relay?.state === 'connected' && relay.verification.state !== 'failed'
+              ? 'This computer connected to the remote service. Check the complete encrypted route before relying on access away from home.'
+              : relay?.verification.state === 'failed'
+                ? 'The remote route did not return a healthy response from this computer. Local pairing is still available.'
+                : 'Remote access is not connected. You can still pair and use your phone on the same local network.',
+    checkedAt: relay?.verification.checkedAt,
+  };
   const posture = mobileAuthPosture();
   const blocking = posture.gaps.find((gap) => gap.blocking);
   if (blocking) {
@@ -96,12 +121,13 @@ export function mobileSetupView(payload: MobileAccessStatusPayload): MobileSetup
 
   if (payload.target.qrReady) {
     return {
-      phase: 'live',
-      headline: 'Scan from the Clem app on your iPhone',
-      detail: 'Open the Clem app and point it at this code. The phone connects straight to this Mac — nothing in between.',
+      phase: devices.length > 0 ? 'paired' : 'pairing-ready',
+      headline: devices.length > 0 ? 'Your phone is paired' : 'Ready to pair your iPhone',
+      detail: 'For the first scan, keep this computer and your iPhone on the same Wi-Fi. Open the Clem app, allow Local Network access, and scan this code. The computer must stay awake with Clementine running.',
       url: payload.target.url,
       qrReady: true,
       devices,
+      remote,
     };
   }
 
@@ -150,6 +176,8 @@ async function localSurfaceReachable(opts?: { fetchImpl?: typeof fetch }): Promi
 export interface EnsureMobileAccessOptions {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Test seam for the pinned local check; production always probes TLS. */
+  probeImpl?: typeof probeMobileRelay;
   /** Test seam so polling does not really sleep. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -194,8 +222,23 @@ export async function ensureMobileAccess(
     ));
   }
 
-  const view = mobileSetupView(await getMobileAccessStatusPayload());
-  if (view.qrReady) return { ok: true, view };
+  const payload = await getMobileAccessStatusPayload();
+  const view = mobileSetupView(payload);
+  if (view.qrReady) {
+    const direct = getDirectAppRuntime();
+    const local = direct ? await (opts?.probeImpl ?? probeMobileRelay)(payload.target.url, direct.fingerprint) : null;
+    if (local?.state !== 'verified') return finish(failure(
+      'LOCAL_UNREACHABLE',
+      local?.reason === 'certificate-mismatch'
+        ? 'The local connection failed its security check. Reopen Clementine and scan a fresh code; do not bypass certificate checks.'
+        : 'This computer is not answering at its pairing address. Check its network and firewall, then try again. On the iPhone, allow Clem’s Local Network access and avoid guest Wi-Fi that separates devices.',
+      { label: 'Check again', action: 'retry' },
+    ));
+    // This public health check neither redeems a pairing token nor authenticates
+    // a phone. Remote failure does not block safe local pairing.
+    await getMobileRelayRuntime()?.verify?.();
+    return finish({ ok: true });
+  }
   if (view.failure) return { ok: false, failure: view.failure, view };
   return { ok: false, view };
 }

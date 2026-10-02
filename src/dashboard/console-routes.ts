@@ -8363,7 +8363,7 @@ export function registerConsoleRoutes(
     try {
       const { ensureMobileAccess } = await import('../integrations/mobile-setup.js');
       const result = await ensureMobileAccess();
-      res.status(result.ok ? 200 : 400).json(result);
+      res.status(result.ok ? 200 : 400).json({ ...result, ...(result.failure ? { error: result.failure.message } : {}) });
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }

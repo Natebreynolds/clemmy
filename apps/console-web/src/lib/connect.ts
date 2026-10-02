@@ -555,12 +555,13 @@ export interface MobileSetupFailure {
 }
 
 export interface MobileSetupView {
-  phase: 'not-set-up' | 'live' | 'error';
+  phase: 'not-set-up' | 'pairing-ready' | 'paired' | 'live' | 'error';
   headline: string;
   detail?: string;
   url?: string;
   qrReady: boolean;
   failure?: MobileSetupFailure;
+  remote?: { state: 'not-checked' | 'verified' | 'unavailable'; message: string; checkedAt?: string };
   devices: Array<{ deviceId: string; deviceLabel?: string; lastSeenAt: string; pushSubscribed: boolean }>;
 }
 export const setMobilePin = (pin: string) =>
