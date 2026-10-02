@@ -537,3 +537,7 @@ test('a judge or interpretation made inside a memory job stays on the job lane w
   assert.equal(rows.get('chat-judge')?.channel, 'judge:fixture');
   assert.equal(rows.get('chat-judge')?.role, 'reviewer');
 });
+
+test('a heartbeat scope is background usage, not unclassified', () => {
+  assert.deepEqual(resolveUsageKind('watch:work-review'), { kind: 'background', reason: 'prefix:watch:' });
+});

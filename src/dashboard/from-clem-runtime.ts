@@ -21,6 +21,7 @@ import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-sem
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { appendEvent, getSession, listEvents, updateSession } from '../runtime/harness/eventlog.js';
 import { HarnessSession } from '../runtime/harness/session.js';
+import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
 
 const logger = pino({ name: 'clementine.from-clem' });
 const VOICE_FILE = path.join(BASE_DIR, 'state', 'from-clem-voice.json');
@@ -28,6 +29,8 @@ const MAX_VOICES_PER_PASS = 4;
 const VOICE_PASS_MS = 60_000;
 const FIRST_VOICE_PASS_DELAY_MS = 45_000;
 const MAX_KEPT_VOICES = 300;
+/** Usage owner for her words: background work, never a chat turn's cost. */
+const FROM_CLEM_USAGE_SOURCE = 'background:from-clem';
 /** An item whose words could not be written waits before it is asked again. */
 const VOICE_RETRY_BASE_MS = 5 * 60_000;
 const VOICE_RETRY_MAX_MS = 6 * 60 * 60_000;
@@ -192,12 +195,12 @@ export async function voiceFromClemRows(
         logger.warn({ key: row.key, reason }, 'from clem: could not write the message; the item keeps its own words');
       };
       try {
-        const result = await port.voiceProactiveItem({
+        const result = await withOwnModelRequestAttribution({ sessionId: FROM_CLEM_USAGE_SOURCE }, () => port.voiceProactiveItem!({
           purpose: CLEM_VOICE_PURPOSE,
           item: { source: row.heartbeatTitle, title: row.text, detail: row.detail ?? '', waitingOnOwner: row.asks, at: row.at },
           now: new Date(nowMs).toISOString(),
           evidenceDigest: row.voiceDigest,
-        });
+        }));
         if (!result.message) { unsaid('no message'); continue; }
         file.entries[row.key] = {
           digest: row.voiceDigest, message: result.message.slice(0, 600), model: result.modelIdentity,
@@ -361,7 +364,10 @@ async function replyOnce(key: string, text: string, deps: FromClemReplyDeps, req
   const port = deps.port();
   if (!port?.readClemReply) return { outcome: 'unclear', decision: 'unclear' };
   const said = row.say ?? row.text;
-  const read = await port.readClemReply({ purpose: CLEM_REPLY_PURPOSE, said, facts: factsOf(row), reply, evidenceDigest: row.voiceDigest });
+  // Reading the owner's reply is work in her thread.
+  const read = await withOwnModelRequestAttribution({ sessionId: CLEM_THREAD_ID }, () => port.readClemReply!({
+    purpose: CLEM_REPLY_PURPOSE, said, facts: factsOf(row), reply, evidenceDigest: row.voiceDigest,
+  }));
   // Reading the reply took a while: act only on the item as it was read.
   const current = (await deps.read()).rows.find((candidate) => candidate.key === key);
   if (!current) return { outcome: 'gone' };

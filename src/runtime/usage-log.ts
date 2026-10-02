@@ -206,6 +206,8 @@ const PREFIX_KINDS: Array<[prefix: string, kind: UsageKind]> = [
   ['cron:', 'cron'], ['cron-', 'cron'],
   ['workflow:', 'workflow'], ['workflow-', 'workflow'],
   ['background:', 'background'], ['background-', 'background'], ['bg-', 'background'],
+  // A heartbeat's own scope (`watch:<heartbeat>`): background by construction.
+  ['watch:', 'background'],
   ['execution-controller:', 'controller'],
   ['execution:', 'controller'],
   ['agent:', 'autonomy'], ['agent-', 'autonomy'],

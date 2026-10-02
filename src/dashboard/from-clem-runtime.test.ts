@@ -19,6 +19,7 @@ test.after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const { buildFromClem } = await import('./from-clem.js');
 const { voiceFromClemRows, replyToFromClem } = await import('./from-clem-runtime.js');
+const { modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
 type FromClemReplyDeps = Parameters<typeof replyToFromClem>[2];
 
 const stream = (voiced?: (key: string, digest: string) => string | undefined, readIds: ReadonlySet<string> = new Set()) => buildFromClem({
@@ -283,4 +284,27 @@ test('a Noticing answer carries the reply id, so the check-in sees one answer', 
   const run = deps({ answerQuestion: (_id, _text, requestId) => { ids.push(requestId); return true; } });
   await replyToFromClem('noticing:p1', 'yes', run.all, { requestId: 'reply-cccccccc' });
   assert.deepEqual(ids, ['reply-cccccccc']);
+});
+
+test('her words are background usage and reading a reply is work in her thread, never unattributed', async () => {
+  const fs = await import('node:fs');
+  fs.rmSync(path.join(TMP, 'state', 'from-clem-voice.json'), { force: true });
+  const owners: string[] = [];
+  const port = () => ({
+    async voiceProactiveItem(call: { item: { title: string }; evidenceDigest: string }) {
+      owners.push(modelUsageAttributionStorage.getStore()?.sessionId ?? 'none');
+      return { message: `Clem: ${call.item.title}`, evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' };
+    },
+  });
+  await voiceFromClemRows(stream().rows.slice(0, 1), { port: port as never, max: 1, thread: null });
+  assert.deepEqual(owners, ['background:from-clem']);
+  let replyOwner = 'none';
+  const run = deps({ port: () => ({
+    async readClemReply(call) {
+      replyOwner = modelUsageAttributionStorage.getStore()?.sessionId ?? 'none';
+      return { decision: 'unclear', evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture-brain' } as never;
+    },
+  }) });
+  await replyToFromClem('notif:cal', 'hmm', run.all);
+  assert.equal(replyOwner, 'clem');
 });
