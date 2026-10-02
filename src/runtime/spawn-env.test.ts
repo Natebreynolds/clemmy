@@ -330,3 +330,33 @@ test('a malformed cli-env file is ignored rather than breaking every CLI spawn',
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("nvm's default install leads, not the highest-numbered one", () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'clem-spawn-nvm-default-'));
+  const v22 = path.join(home, '.nvm', 'versions', 'node', 'v22.12.0', 'bin');
+  const v24 = path.join(home, '.nvm', 'versions', 'node', 'v24.5.0', 'bin');
+  try {
+    mkdirSync(v22, { recursive: true });
+    mkdirSync(v24, { recursive: true });
+    mkdirSync(path.join(home, '.nvm', 'alias', 'lts'), { recursive: true });
+    // No default: newest first, as before.
+    let found = userManagedExecutableDirs(home);
+    assert.ok(found.indexOf(v24) < found.indexOf(v22));
+    // A major-version default ("22") picks that install first; v24 stays reachable after it.
+    writeFileSync(path.join(home, '.nvm', 'alias', 'default'), '22\n');
+    found = userManagedExecutableDirs(home);
+    assert.ok(found.indexOf(v22) < found.indexOf(v24), 'the default install leads');
+    assert.ok(found.includes(v24));
+    // An alias chain resolves too.
+    writeFileSync(path.join(home, '.nvm', 'alias', 'default'), 'lts/iron\n');
+    writeFileSync(path.join(home, '.nvm', 'alias', 'lts', 'iron'), 'v22.12.0\n');
+    found = userManagedExecutableDirs(home);
+    assert.ok(found.indexOf(v22) < found.indexOf(v24));
+    // A default naming no installed version changes nothing.
+    writeFileSync(path.join(home, '.nvm', 'alias', 'default'), '18\n');
+    found = userManagedExecutableDirs(home);
+    assert.ok(found.indexOf(v24) < found.indexOf(v22));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

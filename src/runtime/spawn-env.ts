@@ -23,6 +23,31 @@ function versionDirectories(root: string, suffix: string[] = []): string[] {
     .filter(existingDirectory);
 }
 
+/** The Node install nvm's own `default` alias names: the one the owner's
+ *  terminal runs. Sorting installs by number alone put a stale v24 (with a
+ *  month-old codex CLI on it) ahead of the owner's chosen v22. Follows alias
+ *  chains such as `lts/*`; null when no default resolves to an install. */
+function nvmDefaultBin(home: string): string | null {
+  const nvm = path.join(home, '.nvm');
+  let value: string;
+  try { value = readFileSync(path.join(nvm, 'alias', 'default'), 'utf8').trim(); } catch { return null; }
+  for (let hop = 0; hop < 3 && value && !/^v?\d/.test(value); hop += 1) {
+    try { value = readFileSync(path.join(nvm, 'alias', value), 'utf8').trim(); } catch { return null; }
+  }
+  if (!/^v?\d/.test(value)) return null;
+  const want = value.startsWith('v') ? value : `v${value}`;
+  const match = versionDirectories(path.join(nvm, 'versions', 'node'))
+    .find((dir) => { const name = path.basename(dir); return name === want || name.startsWith(`${want}.`); });
+  return match && existingDirectory(path.join(match, 'bin')) ? path.join(match, 'bin') : null;
+}
+
+/** nvm's default install first, then the rest newest-first. */
+function nvmExecutableDirs(home: string): string[] {
+  const all = versionDirectories(path.join(home, '.nvm', 'versions', 'node'), ['bin']);
+  const preferred = nvmDefaultBin(home);
+  return preferred ? [preferred, ...all.filter((dir) => dir !== preferred)] : all;
+}
+
 /**
  * Executable directories used by common user-level runtime managers. Discovery
  * is file-metadata-only: app startup never sources a login shell (which may be
@@ -37,7 +62,7 @@ export function userManagedExecutableDirs(home: string): string[] {
     path.join(home, '.mise', 'shims'),
     path.join(home, '.local', 'share', 'fnm', 'aliases', 'default', 'bin'),
     path.join(home, '.fnm', 'aliases', 'default', 'bin'),
-    ...versionDirectories(path.join(home, '.nvm', 'versions', 'node'), ['bin']),
+    ...nvmExecutableDirs(home),
     ...versionDirectories(path.join(home, '.local', 'share', 'fnm', 'node-versions'), ['installation', 'bin']),
     ...versionDirectories(path.join(home, '.fnm', 'node-versions'), ['installation', 'bin']),
   ];
