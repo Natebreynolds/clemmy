@@ -18,8 +18,9 @@ import { textResult } from './shared.js';
  *     running (terminal-handoff.ts) — the daemon itself NEVER spawns
  *     them (its runner has no TTY; they would hang).
  *
- * Conversational contract: offer → one approval → execute → report the
- * job id and watch it with job_status.
+ * Conversational contract: install or sign in when the request needs it
+ * (local work, like the shell) → report the job id and watch it with
+ * job_status. An interactive sign-in still needs the user.
  */
 
 const ACTION = z.enum(['status', 'install', 'auth', 'job_status', 'repairs', 'repair']);
@@ -46,7 +47,7 @@ export function registerCliSetupTools(server: McpServer): void {
       '- job_status: check a previously started install/auth job by id.',
       '- repairs: the bounded fixes a CLI declares for its own local configuration (for example: it is authenticated but no default account/org/project is selected, so every command fails).',
       '- repair: run one of those declared fixes. Pass catalogId, repairId and values. The argv is fixed in the catalog; values are single plain arguments, never shell.',
-      'Ask the user before install/auth (one approval covers the whole fix); status, job_status and repairs are read-only. Run a repair when the user agrees to it — never report that you cannot fix a tool without first checking repairs.',
+      'Install, auth and repair are local work on this Mac: run them when the request needs them, without asking first; status, job_status and repairs are read-only. Never report that you cannot fix a tool without first checking repairs.',
     ].join('\n'),
     {
       action: ACTION.describe('What to do: status | install | auth | job_status.'),

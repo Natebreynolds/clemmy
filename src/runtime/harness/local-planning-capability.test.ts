@@ -74,6 +74,23 @@ test('CLI recovery publishes exact action variants and a separate read-only insp
   if (inspection.ok) assert.equal(inspection.definition.descriptor.effect, 'read');
 });
 
+test('installing, signing in or repairing a CLI is ordinary local work, named like the shell that can run the same install', async () => {
+  // Live 10-02: declared irreversible, one install asked three times for
+  // approval, then ran through the shell with no card. One rule per effect.
+  const installer = await local.observeCurrentLocalPlanningDefinitions({ name: 'cli_setup', carrier: 'work_call' });
+  const shell = await local.observeCurrentLocalPlanningDefinition({ name: 'run_shell_command', carrier: 'work_call' });
+  assert.equal(installer.ok, true);
+  assert.equal(shell.ok, true);
+  if (!installer.ok || !shell.ok) return;
+  assert.deepEqual(installer.definitions.map((d) => d.capabilityRef).sort(),
+    ['cap:local:cli_setup:auth', 'cap:local:cli_setup:install', 'cap:local:cli_setup:repair']);
+  for (const definition of installer.definitions) {
+    assert.equal(definition.reversibility, shell.definition.reversibility, definition.capabilityRef);
+    assert.equal(definition.reversibility, 'ordinary_non_destructive', definition.capabilityRef);
+    assert.equal(definition.destructive, false, definition.capabilityRef);
+  }
+});
+
 function proposalFor(input: {
   objective: string;
   capabilityRef: string;

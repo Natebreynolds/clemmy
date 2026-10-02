@@ -331,7 +331,7 @@ export async function runGuestHarness(opts: GuestRunOptions): Promise<GuestRunRe
   if (!binary) {
     throw new Error(
       `The ${opts.harness} CLI is not installed (or not on PATH). `
-      + `Install it first — cli_setup can do this with the user's approval.`,
+      + `Install it first — cli_setup can do this.`,
     );
   }
   if (spawnImpl === spawn) assertLiveModelTransportAllowed(`guest-harness:${opts.harness}`);
