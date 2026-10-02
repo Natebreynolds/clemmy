@@ -235,7 +235,13 @@ export const __sessionBrainPinTest__ = {
 };
 
 /** Parse durable bindings from CLEMMY_MODEL_ROLES (JSON array). Unset/bad JSON ⇒
- *  [] ⇒ pure defaults (byte-identical to today). Never throws. */
+ *  [] ⇒ pure defaults (byte-identical to today). Never throws.
+ *
+ *  A saved `brain` entry is not read. The brain has one door, the active-brain
+ *  switch, and every door that writes this store refuses the brain, so an entry
+ *  an earlier version left behind can never route — it only surfaced as a false
+ *  "stand-in" / "unavailable" warning (live 10-02). Every write to this store
+ *  starts from this read, so the dead entry drops out on the next save. */
 export function readDurableBindings(): RoleBinding[] {
   if (!modelRolesRegistryEnabled()) return [];
   const raw = (getRuntimeEnv('CLEMMY_MODEL_ROLES', '') || '').trim();
@@ -247,8 +253,7 @@ export function readDurableBindings(): RoleBinding[] {
       (b): b is RoleBinding =>
         !!b &&
         typeof b === 'object' &&
-        ((b as RoleBinding).role === 'brain' ||
-          (b as RoleBinding).role === 'worker' ||
+        ((b as RoleBinding).role === 'worker' ||
           (b as RoleBinding).role === 'judge' ||
           (b as RoleBinding).role === 'writer' ||
           (b as RoleBinding).role === 'memory') &&
