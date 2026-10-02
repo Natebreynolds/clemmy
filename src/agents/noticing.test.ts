@@ -39,6 +39,7 @@ function harness(input: {
   cap?: number;
   rules?: string[];
   answered?: Record<string, { text: string; at: string }>;
+  closed?: string[];
 }) {
   let state = input.state ?? emptyNoticingState();
   const asked: string[] = [];
@@ -51,7 +52,8 @@ function harness(input: {
     observe: async () => OBSERVATION,
     propose: async ({ evidenceDigest }) => ({ answer: input.answer ? input.answer(evidenceDigest) : null, modelIdentity: 'fixture-brain' }),
     ask: async (record) => { asked.push(record.title); return { checkInId: `chk-${asked.length}` }; },
-    isAnswered: (checkInId) => input.answered?.[checkInId] ? { answered: true, ...input.answered[checkInId] } : { answered: false },
+    isAnswered: (checkInId) => input.answered?.[checkInId] ? { answered: true, ...input.answered[checkInId] }
+      : input.closed?.includes(checkInId) ? { answered: false, closed: true } : { answered: false },
     loadState: () => state,
     saveState: (next) => { state = next; },
   };
@@ -162,4 +164,14 @@ test('no model, a wrong digest, or a read failure is written down as such and pr
   const failed = await runNoticingTick(broken.deps);
   assert.match(failed.error ?? '', /could not read: store locked/);
   assert.equal(failed.quiet, true);
+});
+
+test('a proposal whose question was closed without an answer is settled on the next tick, not left asking', async () => {
+  const h = harness({ answer: (d) => proposal(d), closed: ['chk-1'] });
+  await runNoticingTick(h.deps);
+  const next = await runNoticingTick({ ...h.deps, tickId: 'tick-2', now: () => Date.parse('2026-10-01T16:00:00Z'), propose: async () => null });
+  const record = Object.values(h.state().proposals)[0]!;
+  assert.equal(record.status, 'retired');
+  assert.match(record.retiredReason ?? '', /closed without an answer/);
+  assert.equal(next.retired, 1);
 });

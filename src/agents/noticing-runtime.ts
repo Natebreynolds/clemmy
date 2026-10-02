@@ -232,9 +232,10 @@ export function runNoticingTickNow(options: { source: string } = { source: 'hear
     ask: askViaCheckIn,
     isAnswered: (checkInId) => {
       const row = getCheckIn(checkInId);
-      return row?.status === 'answered' && typeof row.answer === 'string'
-        ? { answered: true, text: row.answer, ...(row.answeredAt ? { at: row.answeredAt } : {}) }
-        : { answered: false };
+      if (row?.status === 'answered' && typeof row.answer === 'string') {
+        return { answered: true, text: row.answer, ...(row.answeredAt ? { at: row.answeredAt } : {}) };
+      }
+      return { answered: false, ...(row && row.status !== 'open' && row.status !== 'answered' ? { closed: true } : {}) };
     },
     loadState: loadNoticingState,
     saveState: saveNoticingState,

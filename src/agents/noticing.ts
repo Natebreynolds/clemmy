@@ -154,7 +154,9 @@ export interface NoticingTickDeps {
     => Promise<{ answer: NoticingAnswerV1 | null; modelIdentity?: string; error?: string } | null>;
   /** Open the question for the owner; returns ids the answer path needs. */
   ask: (proposal: NoticingProposalRecord) => Promise<{ checkInId: string; notificationId?: string }>;
-  isAnswered: (checkInId: string) => { answered: boolean; text?: string; at?: string };
+  /** `closed`: the question was dismissed or closed without an answer
+   *  (Needs you's Clean up, a reply elsewhere): the proposal is settled. */
+  isAnswered: (checkInId: string) => { answered: boolean; closed?: boolean; text?: string; at?: string };
   loadState: () => NoticingState;
   saveState: (state: NoticingState) => void;
 }
@@ -202,6 +204,12 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
       if (!record.answer) record.answer = { text: answered.text, decision: 'unclear', at: answered.at ?? nowIso };
       record.status = 'answered';
       state.metrics.itemsAcknowledged += 1;
+      continue;
+    }
+    // A question closed without an answer settles its proposal now; left
+    // open, it kept asking (as From Clem) about something already put away.
+    if (answered.closed) {
+      record.status = 'retired'; record.retiredReason = 'its question was closed without an answer'; retired += 1; state.metrics.itemsRetired += 1;
       continue;
     }
     if (startedAt - Date.parse(record.createdAt) > deps.config.openForMs) {
