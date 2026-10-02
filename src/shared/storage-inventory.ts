@@ -1,6 +1,6 @@
 /** Public metadata only. Storage readers never disclose local paths or data. */
 export type StorageCategory = 'conversations' | 'execution' | 'learning' | 'backups' | 'software' | 'files';
-export type StorageDatabaseStatus = { state: 'unavailable' | 'not_created' } | {
+export type StorageDatabaseStatus = { state: 'unavailable' } | { state: 'not_created' } | {
   state: 'measured';
   allocatedBytes: number;
   reusableBytes: number;

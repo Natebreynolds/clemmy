@@ -218,3 +218,38 @@ test('new foreground work yields between atomic rows without advancing the next 
     assert.equal(convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000 }).converted, 1);
   } finally { db.close(); }
 });
+
+test('disk reclamation preserves conversion cursors on composite-key source tables in the bundled SQLite', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-history-vacuum-'));
+  const filename = path.join(dir, 'fixture.db');
+  const db = new Database(filename);
+  try {
+    db.pragma('foreign_keys = ON');
+    db.exec(`CREATE TABLE accepted_model_batch_admissions (session_id TEXT, source_user_seq INTEGER, batch_ordinal INTEGER,
+      pre_history_json TEXT, pre_history_digest TEXT, pre_history_item_count INTEGER,
+      frame_history_json TEXT, frame_history_digest TEXT, frame_history_item_count INTEGER,
+      PRIMARY KEY(session_id, source_user_seq, batch_ordinal));
+      CREATE TABLE accepted_model_batch_checkpoints (session_id TEXT, source_user_seq INTEGER, batch_ordinal INTEGER,
+      history_json TEXT, history_digest TEXT, history_item_count INTEGER, PRIMARY KEY(session_id, source_user_seq, batch_ordinal));`);
+    registerAcceptedModelHistoryReader(db);
+    createAcceptedModelHistorySchema(db);
+    db.transaction(() => createAcceptedModelHistoryConversionSchema(db))();
+    const json = history('Retain the exact approved work after physical rebuild');
+    for (const id of [10, 20]) {
+      db.prepare(`INSERT INTO accepted_model_batch_checkpoints (rowid,session_id,source_user_seq,batch_ordinal,
+        history_json,history_digest,history_item_count) VALUES (?, 'controlled', 1, ?, ?, ?, 1)`).run(id, id, json, digest(json));
+    }
+    assert.equal(convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxRows: 1, maxDurationMs: 1_000 }).converted, 1);
+    const rowsBefore = db.prepare('SELECT rowid, session_id, source_user_seq, batch_ordinal FROM accepted_model_batch_checkpoints').all();
+    db.exec('CREATE TABLE temporary_bulk (data BLOB); INSERT INTO temporary_bulk VALUES (zeroblob(1000000)); DROP TABLE temporary_bulk;');
+    const pagesBefore = Number(db.pragma('page_count', { simple: true }));
+    db.exec('VACUUM'); // Disposable fixture only; no production cleanup command ships here.
+    assert.ok(Number(db.pragma('page_count', { simple: true })) < pagesBefore);
+    assert.deepEqual(db.prepare('SELECT rowid, session_id, source_user_seq, batch_ordinal FROM accepted_model_batch_checkpoints').all(), rowsBefore);
+    assert.equal(inspectAcceptedModelHistoryConversion(db, 'checkpoint').lastRowid, '10');
+    assert.equal(convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000 }).converted, 1);
+    assert.deepEqual(db.prepare('SELECT history_json AS json FROM accepted_model_batch_checkpoints_readable_v1').all(), [{ json }, { json }]);
+    assert.deepEqual(db.pragma('foreign_key_check'), []);
+    assert.equal(db.pragma('integrity_check', { simple: true }), 'ok');
+  } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+});

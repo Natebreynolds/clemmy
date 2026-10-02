@@ -108,3 +108,21 @@ and old/new exact history acceptance; long-task recovery/no completed-write
 replay; controlled legacy conversion; activation of idle scheduling; measured
 backlog conversion; separate qualified physical reclamation. Later dependency-
 aware retention must first preserve certified learning and exact receipt lookup.
+
+## Reclamation and build compatibility traps
+
+The bundled SQLite 3.53.2 preserved hidden rowids in the composite-primary-key
+source-table experiment, while a plain unindexed table's rowids changed during
+VACUUM. A disk-backed pin now checks a partially converted composite-key source
+through VACUUM, cursor continuation, exact restored bytes, foreign keys and
+integrity. This is not permission to vacuum the live DB: qualified physical
+cutover still must verify all durable cursor/table identities for the actual
+schema and native SQLite version, alongside task/receipt proof. If a future
+schema/library changes those rowids, reset/rebuild cursors through a sanctioned
+recoverable cutover before restarting maintenance. Never rely on a generic
+whole-DB vacuum as an untested shrinking shortcut.
+
+The first phone build rejected a discriminated union whose one arm grouped two
+state literals, although the root compiler accepted it. Split those literals
+into separate arms so both compiler versions narrow identically. Rebuild all
+artifacts after this fix; the earlier console-only pass is not a combined build.
