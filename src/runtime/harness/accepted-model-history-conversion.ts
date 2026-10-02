@@ -20,7 +20,7 @@ export interface HistoryConversionResult {
   inputBytes: number;
   inlineBytesRemoved: number;
   encodedBytesAdded: number;
-  state: 'caught_up' | 'budget_exhausted' | 'blocked';
+  state: 'caught_up' | 'budget_exhausted' | 'blocked' | 'deferred';
   blockedRowid: string | null;
   requiredInputBudget: number | null;
   durationMs: number;
@@ -50,6 +50,9 @@ function nextRow(db: Database.Database, lane: HistoryConversionLane, lastRowid: 
  * not silently skipped. Histories outside codec bounds remain inline. */
 export function convertAcceptedModelHistoryBatch(db: Database.Database, options: HistoryConversionBudget & {
   lane: HistoryConversionLane;
+  /** Rechecked under the SQLite writer lock before each row. False yields
+   * without advancing; no foreground task has to wait for a whole batch. */
+  shouldContinue?: () => boolean;
 }): HistoryConversionResult {
   const limits = budget(options);
   const [table, column] = LANES[options.lane];
@@ -65,6 +68,7 @@ export function convertAcceptedModelHistoryBatch(db: Database.Database, options:
     let candidateRowid: string | null = null;
     try {
       const step = db.transaction(() => {
+        if (options.shouldContinue && !options.shouldContinue()) return { kind: 'deferred' } as const;
         const position = cursor.get(options.lane) as { last_rowid: string | null } | undefined;
         if (!position) throw new Error('history conversion schema is not ready');
         const row = nextRow(db, options.lane, position.last_rowid);
@@ -100,6 +104,7 @@ export function convertAcceptedModelHistoryBatch(db: Database.Database, options:
         advance.run(row.rowid, converted, removed, added, new Date().toISOString(), options.lane);
         return { kind: 'scanned', converted, removed, added, input: eligible ? row.bytes : 0 } as const;
       }).immediate();
+      if (step.kind === 'deferred') { result.state = 'deferred'; break; }
       if (step.kind === 'done') { result.state = 'caught_up'; break; }
       if (step.kind === 'budget') { result.requiredInputBudget = step.required; break; }
       result.scanned += 1;

@@ -1,9 +1,10 @@
-/** Read-only file-size inventory. No SQLite scans, payload decryption or model
+/** Read-only file-size inventory. No SQLite history scans, payload decryption or model
  * calls: opening Settings must not compete with an executing conversation. */
 import { lstat, opendir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { BASE_DIR } from '../config.js';
+import { readStorageDatabaseStatus } from './storage-database-status.js';
 import type { StorageCategory, StorageInventory } from '../shared/storage-inventory.js';
 export type { StorageCategory, StorageInventory } from '../shared/storage-inventory.js';
 const CATEGORIES: StorageCategory[] = ['conversations', 'execution', 'learning', 'backups', 'software', 'files'];
@@ -108,6 +109,7 @@ export function createStorageInventoryReader(options: {
       }
       await Promise.all(batch.map(visit));
     }
+    result.database = await readStorageDatabaseStatus(root);
     result.complete = result.stopReason === null && result.unreadableEntries === 0;
     result.durationMs = Math.round(Math.max(0, clock() - started));
     result.measuredAt = new Date().toISOString();

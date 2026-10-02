@@ -1,4 +1,4 @@
-import { STORAGE_COPY, formatStorageBytes, type StorageInventory } from '@clem/chat-engine';
+import { STORAGE_COPY, formatStorageBytes, storageDatabaseSummary, type StorageInventory } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { api } from '@/lib/api';
 import { usePoll } from '@/lib/poll';
@@ -27,6 +27,7 @@ export function StorageCard() {
           </div>)}
         </dl>
         <div className="space-y-1 border-t border-border px-4 py-3 text-small text-muted">
+          {storageDatabaseSummary(data.database).map(line => <p key={line}>{line}</p>)}
           {!data.complete && <p role="status">Partial measurement: some files could not be counted within this scan. Totals are a lower bound.</p>}
           <p>File sizes, excluding filesystem overhead and linked folders. Measurements refresh at most every two minutes.</p>
           <p>Measured {new Date(data.measuredAt).toLocaleString()}. No history is deleted by this view.</p>

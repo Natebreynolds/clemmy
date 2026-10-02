@@ -203,3 +203,18 @@ test('cursor orders numeric rowids rather than their reporting text and never ju
     assert.equal((db.prepare('SELECT COUNT(*) AS n FROM accepted_model_batch_checkpoints WHERE history_object_digest IS NULL').get() as { n: number }).n, 0);
   } finally { db.close(); }
 });
+
+test('new foreground work yields between atomic rows without advancing the next history', () => {
+  const db = fixture();
+  try {
+    seed(db, 1); seed(db, 2);
+    let checks = 0;
+    const result = convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000,
+      shouldContinue: () => ++checks === 1 });
+    assert.equal(result.state, 'deferred');
+    assert.equal(result.converted, 1);
+    assert.equal(inspectAcceptedModelHistoryConversion(db, 'checkpoint').lastRowid, '1');
+    assert.equal((db.prepare('SELECT history_object_digest AS ref FROM accepted_model_batch_checkpoints WHERE id = 2').get() as { ref: string | null }).ref, null);
+    assert.equal(convertAcceptedModelHistoryBatch(db, { lane: 'checkpoint', maxDurationMs: 1_000 }).converted, 1);
+  } finally { db.close(); }
+});

@@ -1,4 +1,4 @@
-import { STORAGE_COPY, formatStorageBytes, type StorageInventory } from '@clem/chat-engine';
+import { STORAGE_COPY, formatStorageBytes, storageDatabaseSummary, type StorageInventory } from '@clem/chat-engine';
 import { api } from '../lib/api';
 import { useScreenData } from '../lib/use-screen-data';
 
@@ -16,6 +16,7 @@ export function StoragePage() {
         <dd>{!data.complete && '≥ '}{formatStorageBytes(row.bytes)}</dd>
       </div>)}</dl>
       {!data.complete && <p role="status" class="settings-caveat">Partial measurement: some files could not be counted within this scan. Totals are a lower bound.</p>}
+      {storageDatabaseSummary(data.database).map(line => <p key={line} class="settings-caveat">{line}</p>)}
       <p class="settings-caveat">File sizes on your computer, excluding filesystem overhead and linked folders. Measurements refresh at most every two minutes.</p>
       <p class="settings-caveat">Measured {new Date(data.measuredAt).toLocaleString()}. No history is deleted by this view.</p>
     </>}
