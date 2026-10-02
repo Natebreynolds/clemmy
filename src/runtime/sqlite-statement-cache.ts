@@ -44,8 +44,17 @@ export function prepareCached<
     statementsByConnection.set(db, statements);
   }
   const existing = statements.get(source);
-  if (existing) {
+  if (existing && !existing.busy) {
     return existing as unknown as PreparedStatementFor<BindParameters, Result>;
+  }
+  // An iterator or SQLite callback can re-enter the same SQL shape while its
+  // cached statement is executing. Preserve that continuation and its bound
+  // parameters; the nested operation gets a temporary independent statement.
+  if (existing) {
+    return db.prepare<BindParameters, Result>(source) as PreparedStatementFor<
+      BindParameters,
+      Result
+    >;
   }
   const prepared = db.prepare<BindParameters, Result>(source) as PreparedStatementFor<
     BindParameters,

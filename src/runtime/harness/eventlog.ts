@@ -868,6 +868,12 @@ const SESSION_COLUMNS_WITHOUT_STATE = `id, kind, channel, user_id, created_at, u
 
 let cached: Database.Database | null = null;
 
+// Stable event SQL only: reuse its compilation, never its rows, arguments or
+// authority decisions. Each operation still executes in its existing transaction.
+const EVENT_INSERT_SQL = `INSERT INTO events
+  (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+
 function ensureStateDir(): void {
   if (!existsSync(HARNESS_STATE_DIR)) {
     mkdirSync(HARNESS_STATE_DIR, { recursive: true });
@@ -1202,7 +1208,7 @@ export function createSession(input: CreateSessionInput): SessionRow {
     input.tokenBudget ?? null,
     JSON.stringify(input.metadata ?? {}),
   );
-  const row = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as RawSessionRow;
+  const row = prepareCached(db, 'SELECT * FROM sessions WHERE id = ?').get(id) as RawSessionRow;
   return rowToSession(row);
 }
 
@@ -1575,11 +1581,7 @@ export function insertInternalEventInTransaction(
   }
   const id = randomUUID();
   const now = nowIso();
-  db.prepare(
-    `INSERT INTO events
-       (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+  prepareCached(db, EVENT_INSERT_SQL).run(
     id,
     input.sessionId,
     input.turn,
@@ -1589,8 +1591,8 @@ export function insertInternalEventInTransaction(
     JSON.stringify(input.data ?? {}),
     now,
   );
-  db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
-  const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+  prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+  const row = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
   return rowToEvent(row);
 }
 
@@ -1816,7 +1818,7 @@ export function recordPrimaryModelPlanningCardSnapshotOnce(input: {
           (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
         VALUES (?, ?, ?, 'system', 'primary_model_planning_card_snapshot', ?, ?, ?)
       `).run(eventId, input.sessionId, source.row.turn, source.row.id, dataJson, now);
-      db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+      prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
       return readPrimaryModelPlanningCardSnapshotInTransaction(
         db,
         input.sessionId,
@@ -2651,7 +2653,7 @@ function assertHostTurnCallAuthorityTerminalWinner(
     if (row.state !== 'open') {
       if (event.data.connectionExecutionPause !== undefined || activation) {
         const closure = readConnectionExecutionClosure(db, { sessionId, executionSourceUserSeq });
-        const terminal = closure ? db.prepare('SELECT * FROM events WHERE id = ?').get(closure.terminalEventId) as RawEventRow | undefined : undefined;
+        const terminal = closure ? prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(closure.terminalEventId) as RawEventRow | undefined : undefined;
         if (closure && terminal && terminal.seq > event.seq) {
           validatePersistedTerminalPublicationWinner(db, terminal, sessionId, closure.deliverySourceUserSeq);
           return;
@@ -2923,7 +2925,7 @@ function terminalEventForAcceptedSource(
 
 function terminalEventForTaskAuthority(db: Database.Database, sessionId: string, sourceUserSeq: number): RawEventRow | undefined {
   const closure = readConnectionExecutionClosure(db, { sessionId, executionSourceUserSeq: sourceUserSeq });
-  return closure ? db.prepare('SELECT * FROM events WHERE id = ?').get(closure.terminalEventId) as RawEventRow | undefined
+  return closure ? prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(closure.terminalEventId) as RawEventRow | undefined
     : terminalEventForAcceptedSource(db, sessionId, sourceUserSeq);
 }
 
@@ -3329,11 +3331,7 @@ export function appendEvent(input: AppendEventInput): EventRow {
       }
     }
     const data = JSON.stringify(eventData);
-    db.prepare(
-      `INSERT INTO events
-         (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
+    prepareCached(db, EVENT_INSERT_SQL).run(
       id,
       input.sessionId,
       input.turn,
@@ -3438,7 +3436,7 @@ export function appendEvent(input: AppendEventInput): EventRow {
         });
       }
     }
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
   });
   try {
     // A deferred read-then-write transaction can lose a concurrent terminal
@@ -3457,7 +3455,7 @@ export function appendEvent(input: AppendEventInput): EventRow {
     }
     throw error;
   }
-  const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+  const row = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
   const event = rowToEvent(row);
   // Durable audit mirror (2026-07-20 attorney-bar B3): trust-relevant events
   // are cascade-DELETED with their session at the 14-day reap — the ledger
@@ -3647,7 +3645,7 @@ export function appendConversationCheckIn(
          (id, session_id, turn, role, type, parent_event_id, data_json, created_at)
        VALUES (?, ?, ?, 'Clem', 'conversation_check_in', ?, ?, ?)`,
     ).run(id, source.sessionId, source.turn, source.id, JSON.stringify(candidate), now);
-    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    const inserted = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
     return { event: rowToEvent(inserted), inserted: true };
   });
   return tx();
@@ -3816,8 +3814,8 @@ export function appendConversationPreambleOnce(
       JSON.stringify(candidate),
       now,
     );
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, source.sessionId);
-    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, source.sessionId);
+    const inserted = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
     return { event: rowToEvent(inserted), inserted: true };
   });
   const result = tx.immediate();
@@ -3931,8 +3929,8 @@ export function appendTurnGraphEventOnce(input: {
       JSON.stringify(input.data),
       now,
     );
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
-    const row = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    const row = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
     input.onFirstPersistInTransaction?.(db, rowToEvent(row));
     return { row, inserted: true };
   });
@@ -4036,9 +4034,9 @@ export function appendAsyncWorkDispatchBatchClosedOnce(input: {
       JSON.stringify(input.data),
       now,
     );
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
     return {
-      row: db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow,
+      row: prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow,
       inserted: true,
     };
   });
@@ -4148,9 +4146,9 @@ export function appendAsyncWorkDispatchedOnce(input: {
       JSON.stringify(input.data),
       now,
     );
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
     return {
-      row: db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow,
+      row: prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow,
       inserted: true,
     };
   });
@@ -4305,9 +4303,9 @@ export function acceptUserInputForRun(
       JSON.stringify(acceptedData),
       now,
     );
-    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    const inserted = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
     armAcceptedChat(inserted.seq);
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
+    prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, input.sessionId);
     return { event: rowToEvent(inserted), inserted: true };
   });
   const result = tx();
@@ -4511,12 +4509,12 @@ export function recordRunAttemptUserInput(
       data,
       now,
     );
-    const inserted = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
+    const inserted = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
     db.prepare(
       'UPDATE run_attempts SET source_user_seq = ? WHERE attempt_id = ? AND session_id = ?',
     ).run(inserted.seq, attempt.attemptId, attempt.sessionId);
     armAcceptedChat(inserted.seq);
-    db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, attempt.sessionId);
+    prepareCached(db, 'UPDATE sessions SET updated_at = ? WHERE id = ?').run(now, attempt.sessionId);
     return { event: rowToEvent(inserted), inserted: true };
   });
   const result = tx();
@@ -4859,7 +4857,7 @@ export function getLatestEventSeq(sessionId: string): number {
 
 export function getEvent(eventId: string): EventRow | null {
   const db = openEventLog();
-  const row = db.prepare('SELECT * FROM events WHERE id = ?').get(eventId) as
+  const row = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(eventId) as
     | RawEventRow
     | undefined;
   return row ? rowToEvent(row) : null;

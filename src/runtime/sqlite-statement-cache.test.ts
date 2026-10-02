@@ -75,3 +75,38 @@ test('prepareCached isolates handles and a reopened path gets fresh statements',
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an active iterator gets an independent statement without losing its scope or continuation', () => {
+  const db = new Database(':memory:');
+  try {
+    db.exec(`CREATE TABLE records(id INTEGER PRIMARY KEY, scope TEXT, value TEXT);
+      INSERT INTO records VALUES (1,'a','first'),(2,'b','other'),(3,'a','last');`);
+    const sql = 'SELECT * FROM records WHERE scope = ? ORDER BY id';
+    const original = prepareCached(db, sql);
+    const iterator = original.iterate('a');
+    try {
+      assert.deepEqual(iterator.next().value, { id:1, scope:'a', value:'first' });
+      assert.equal(original.busy, true);
+      const nested = prepareCached(db, sql);
+      assert.notStrictEqual(nested, original);
+      assert.deepEqual(nested.get('b'), { id:2, scope:'b', value:'other' });
+      assert.deepEqual(iterator.next().value, { id:3, scope:'a', value:'last' });
+    } finally { iterator.return?.(); }
+    assert.strictEqual(prepareCached(db, sql), original);
+  } finally { db.close(); }
+});
+
+test('cached SQL still reads current corrections and schema changes, rather than caching results', () => {
+  const db = new Database(':memory:');
+  try {
+    db.exec(`CREATE TABLE records(id INTEGER PRIMARY KEY, scope TEXT, value TEXT);
+      INSERT INTO records VALUES (1,'a','old'),(2,'b','other');`);
+    const sql = 'SELECT * FROM records WHERE id = ? AND scope = ?';
+    assert.deepEqual(prepareCached(db,sql).get(1,'a'), {id:1,scope:'a',value:'old'});
+    db.prepare('UPDATE records SET value = ? WHERE id = ?').run('corrected',1);
+    assert.deepEqual(prepareCached(db,sql).get(1,'a'), {id:1,scope:'a',value:'corrected'});
+    assert.equal(prepareCached(db,sql).get(1,'b'),undefined);
+    db.exec("ALTER TABLE records ADD COLUMN revision INTEGER NOT NULL DEFAULT 2");
+    assert.deepEqual(prepareCached(db,sql).get(1,'a'), {id:1,scope:'a',value:'corrected',revision:2});
+  } finally { db.close(); }
+});
