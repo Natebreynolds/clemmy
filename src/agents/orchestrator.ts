@@ -1472,6 +1472,15 @@ const APPROVAL_ASK_WORDS = /\b(approve|approval|permission|sign[-\s]?off|ok(?:ay
 const APPROVAL_ASK_LEADIN = /\b(should\s+i|shall\s+i|do\s+you\s+want\s+me\s+to|would\s+you\s+like\s+me\s+to|can\s+i|may\s+i|ok\s+to|okay\s+to)\b/i;
 const MUTATING_ACTION_WORD = /\b(send|sending|sent|draft|drafts|email|emails|update|post|posting|deploy|publish|write|create|submit)\b/i;
 
+/** A sign-off has two answers (go ahead / hold). More answers than that is a
+ *  choice between different ways forward, and that choice stays the owner's
+ *  under standing approval too. Live 10-02: a four-way "install the CLI / only
+ *  install it / skip CLIs / use the other provider's API" question was answered
+ *  for the owner, against what they had asked for. */
+function offersDifferentCourses(options: string[] | null | undefined): boolean {
+  return (options ?? []).filter((option) => option.trim()).length > 2;
+}
+
 function isApprovalShapedQuestion(question: string, options: string[] | null | undefined): boolean {
   try {
     const text = `${question} ${(options ?? []).join(' ')}`;
@@ -1625,7 +1634,7 @@ const askUserQuestionParams = z.object({
   purpose: z
     .enum(['clarification', 'approval'])
     .nullable()
-    .describe('"clarification" (pause for a fact only the user has) or "approval" (sign-off; auto-proceeds in autonomous mode); null if neither.'),
+    .describe('"clarification" (pause for a fact or a choice only the user has) or "approval" (a yes/no sign-off for work the user already asked for, at most two options; auto-proceeds in autonomous mode); null if neither.'),
 });
 
 export function buildAskUserQuestionTool() {
@@ -1637,8 +1646,9 @@ export function buildAskUserQuestionTool() {
       + 'boundary needs their decision — name the gap and the closest thing you CAN do. Never ask what you can find '
       + 'out yourself, what would not change the outcome, or what this session already settled. Do the unblocked part '
       + 'first; ask ONE targeted question with 2-5 concrete options, recommendation first, no "other" option; batch '
-      + 'independent questions. `purpose`: "clarification" = a fact only they have; "approval" = sign-off for '
-      + 'requested work (autonomous mode proceeds with your best default). Safety gates live elsewhere.',
+      + 'independent questions. `purpose`: "clarification" = a fact only they have, or a choice between different '
+      + 'ways forward; "approval" = a yes/no sign-off for requested work (autonomous mode proceeds with your best '
+      + 'default; more than two options always reaches the user). Safety gates live elsewhere.',
     parameters: askUserQuestionParams,
     execute: async (args, runContext) => {
       const sessionId = extractSessionId(runContext);
@@ -1673,6 +1683,7 @@ export function buildAskUserQuestionTool() {
         && isYoloAutoApprovalPolicy()
         && yoloNoApprovalHaltEnabled()
         && isApprovalPurpose
+        && !offersDifferentCourses(args.options)
       ) {
         try {
           appendEvent({

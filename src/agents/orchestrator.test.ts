@@ -3100,6 +3100,34 @@ test('parallel YOLO approval plus genuine clarification pauses only on the clari
   }
 });
 
+test('YOLO + purpose:"approval" with more than two ways forward still reaches the owner (live 10-02)', async () => {
+  resetEventLog();
+  saveProactivityPolicy({ autoApproveScope: 'yolo' });
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const t = buildAskUserQuestionTool();
+    const { terminal } = await invokeAskWithArbitration(
+      t,
+      {
+        question: 'Want me to install and authenticate the command-line tool locally?',
+        options: [
+          'Install and authenticate it now',
+          'Install it but stop before sign-in',
+          'Skip local tools and use the existing connection',
+          'Use the other provider\'s API instead',
+        ],
+        purpose: 'approval',
+      },
+      { sessionId: sess.id, turn: 1 },
+    );
+    assert.equal(terminal.isFinalOutput, true, 'a choice between courses halts for the owner');
+    assert.equal(listEvents(sess.id, { types: ['awaiting_user_input'] }).length, 1);
+    assert.equal(listEvents(sess.id, { types: ['autonomy_note'] }).length, 0, 'never answered for the owner');
+  } finally {
+    saveProactivityPolicy({ autoApproveScope: 'balanced' });
+  }
+});
+
 test('YOLO + purpose:"clarification" still HALTS even in YOLO (she can still ask)', async () => {
   resetEventLog();
   saveProactivityPolicy({ autoApproveScope: 'yolo' });
