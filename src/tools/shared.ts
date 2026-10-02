@@ -225,8 +225,38 @@ export function describeInvalidToolInput(
   const cause = issues.length > 0
     ? ` — ${issues.join('; ')}`
     : ' — the input was not parseable JSON (rebuild the arguments as ONE compact JSON object; escape embedded quotes/newlines once, not twice)';
+  // A field that takes a JSON-encoded string and was sent the object itself
+  // has one exact repair, built from what was sent. Named only, the model
+  // re-sent it encoded twice (live 10-02, call_tool args_json: {} then "\"{}\"").
+  const sent = (error as { toolInvocation?: { input?: unknown } }).toolInvocation?.input;
+  const repairs = Array.isArray(rawIssues)
+    ? (rawIssues as Array<{ path?: unknown; code?: unknown; expected?: unknown }>).slice(0, maxIssues).flatMap((issue) => {
+        if (issue.code !== 'invalid_type' || issue.expected !== 'string' || !Array.isArray(issue.path) || issue.path.length === 0) return [];
+        const value = invocationValueAt(sent, issue.path);
+        if (!value || typeof value !== 'object') return [];
+        const encoded = JSON.stringify(JSON.stringify(value));
+        const path = issue.path.join('.');
+        return [encoded.length <= 400
+          ? `${path} takes the object as one JSON-encoded string, encoded once: send ${path} as ${encoded}`
+          : `${path} takes the object as one JSON-encoded string, encoded once, not the object itself`];
+      })
+    : [];
   return `The arguments for ${toolName} did not match its schema${cause}. `
+    + (repairs.length > 0 ? `${repairs.join('. ')}. ` : '')
     + `Call tool_search with the exact query "${toolName}" to get the full input schema, then retry once with corrected arguments.`;
+}
+
+/** The value the model sent at one path, read from the invocation's own input. */
+function invocationValueAt(input: unknown, path: readonly unknown[]): unknown {
+  let value: unknown = input;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return undefined; }
+  }
+  for (const key of path) {
+    if (!value || typeof value !== 'object') return undefined;
+    value = (value as Record<string, unknown>)[String(key)];
+  }
+  return value;
 }
 
 export function isInvalidArgumentsTextResult(

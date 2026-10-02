@@ -102,6 +102,34 @@ test('invalid tool input returns the violated paths and a tool_search pointer, n
   );
   assert.ok(parseGuidance);
   assert.match(parseGuidance!, /not parseable JSON/);
+
+  // A string field sent an object gets the exact repair, built from what was
+  // sent and encoded once (live 10-02: args_json {} came back as "\"{}\"").
+  const carrierSchema = z.strictObject({ name: z.string(), args_json: z.string() });
+  for (const [sentArgs, expected] of [
+    [{}, '"{}"'],
+    [{ project: 'prj_1' }, '"{\\"project\\":\\"prj_1\\"}"'],
+  ] as const) {
+    const input = JSON.stringify({ name: 'project_get', args_json: sentArgs });
+    const carrierParsed = carrierSchema.safeParse(JSON.parse(input));
+    assert.equal(carrierParsed.success, false);
+    const repair = describeInvalidToolInput({
+      name: 'InvalidToolInputError',
+      originalError: carrierParsed.success ? undefined : carrierParsed.error,
+      toolInvocation: { input },
+    }, 'call_tool');
+    assert.ok(repair);
+    assert.ok(repair!.includes(`send args_json as ${expected}`), repair!);
+  }
+  // A string field sent a number names the path only; there is nothing to encode.
+  const numberParsed = carrierSchema.safeParse({ name: 'project_get', args_json: 3 });
+  const numberGuidance = describeInvalidToolInput({
+    name: 'InvalidToolInputError',
+    originalError: numberParsed.success ? undefined : numberParsed.error,
+    toolInvocation: { input: '{"name":"project_get","args_json":3}' },
+  }, 'call_tool');
+  assert.match(numberGuidance!, /args_json/);
+  assert.doesNotMatch(numberGuidance!, /encoded once/);
 });
 
 test('local tool catalog is the exact loaded surface without schemas', () => {
