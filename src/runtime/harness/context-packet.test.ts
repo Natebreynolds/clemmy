@@ -194,6 +194,29 @@ test('a saved agent the request names is in the context with how to hand it work
     assert.match(named.text, /Packet Design Studio/);
     assert.match(named.text, /runs on claude-opus-5-5/);
     assert.match(named.text, /call run_worker with agent set to its name/);
+    assert.match(named.text, /call dispatch_background_task with agent set to its name, and project set to the project it works in/);
+    assert.doesNotMatch(named.text, /works in project/, 'an agent with no project names none');
+
+    // An agent assigned to a project says which, so longer work is handed to
+    // it in that project.
+    const { createProject, saveAssignment, archiveProject } = await import('../../projects/project-record.js');
+    const project = createProject({ name: 'Packet Bakery Site', purpose: 'The bakery website.' });
+    assert.equal(project.ok, true);
+    if (project.ok && saved.ok) {
+      assert.equal(saveAssignment(project.project.id, { agentId: saved.agent.id, agentCreatedAt: saved.agent.createdAt,
+        agentName: saved.agent.name, responsibility: 'Designs the site.' }).ok, true);
+      const assigned = buildAgentContextPacket(
+        'Have Packet Design Studio redo the bakery landing page.',
+        { enabled: true, hitCount: 0, source: 'unified', injected: false },
+      );
+      assert.match(assigned.text, /Packet Design Studio: [^\n]*works in project Packet Bakery Site/);
+      archiveProject(project.project.id);
+      const archived = buildAgentContextPacket(
+        'Have Packet Design Studio redo the bakery landing page.',
+        { enabled: true, hitCount: 0, source: 'unified', injected: false },
+      );
+      assert.doesNotMatch(archived.text, /works in project Packet Bakery Site/, 'an archived project is not offered');
+    }
 
     const unrelated = buildAgentContextPacket(
       'What is on my calendar tomorrow morning?',

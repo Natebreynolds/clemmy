@@ -8,7 +8,8 @@ import {
   skillEligibleForAutomaticRecall,
 } from '../../memory/skill-store.js';
 import { listWorkflows } from '../../memory/workflow-store.js';
-import { listAgentRecords } from '../../agents/agent-record.js';
+import { listAgentRecords, type AgentRecord } from '../../agents/agent-record.js';
+import { getProject, listAssignmentsForAgent } from '../../projects/project-record.js';
 import { listWorkspaceProjects } from '../../tools/shared.js';
 import { listMcpServerHealth, type MCPServerHealthSnapshot } from '../mcp-namespace-shim.js';
 import { resolveMcpToolScope, type McpToolScope } from '../mcp-tool-scope.js';
@@ -386,6 +387,19 @@ export function knownPitfallLineForInput(input: string): string | null {
   }
 }
 
+/** The active projects an agent is assigned to, by name. An assignment made
+ *  for an earlier agent saved under the same name is not this agent's. */
+function assignedProjectNames(agent: AgentRecord): string[] {
+  try {
+    return listAssignmentsForAgent(agent.id)
+      .filter((row) => !row.agentCreatedAt || !agent.createdAt || row.agentCreatedAt === agent.createdAt)
+      .map((row) => getProject(row.projectId)?.name ?? '')
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 /** The owner's saved agents this request names or fits. A fresh chat had no
  *  way to know they existed short of a team_list it could miss: live 10-02,
  *  "hand Design Studio this brief" found no Design Studio and the handoff was
@@ -401,9 +415,10 @@ function rankSavedAgents(input: string): RankedContextCandidate[] {
           { text: agent.id, weight: 4 },
           { text: agent.handles, weight: 3 },
         ]);
+        const projects = assignedProjectNames(agent);
         return {
           name: agent.name,
-          description: clip(`${agent.handles || '(no description)'}${agent.model ? ` · runs on ${agent.model}` : ''}`, 200),
+          description: clip(`${agent.handles || '(no description)'}${agent.model ? ` · runs on ${agent.model}` : ''}${projects.length > 0 ? ` · works in project ${projects.join(', ')}` : ''}`, 260),
           score,
           reason: matched.length > 0 ? `matched ${matched.join(', ')}` : '',
           matchCount: matched.length,
@@ -932,7 +947,7 @@ export function buildAgentContextPacket(
     ...(suppressActionSemanticEnrichment
       ? []
       : renderCandidates('Likely workflows', workflows, 'Use these as reusable-process candidates. Shared names or keywords do not establish that a workflow fits the current task. If the user asks to run a saved workflow, call workflow_run with their exact phrasing; inspect its definition when needed to supply its inputs. Otherwise use workflow_get only when the workflow\'s purpose is relevant and its steps could help with the requested work. A candidate does not prove that its capabilities, accounts or arguments apply here. Continue directly when they do not fit. Do NOT auto-run a workflow the user did not ask to run.')),
-    ...renderCandidates('Saved agents', savedAgents, 'The owner\'s saved agents. To hand one of them work, call run_worker with agent set to its name: the work then runs as that agent, with its instructions and on its model. Credit a result to an agent only when run_worker ran as it, and say which model ran it when that matters.'),
+    ...renderCandidates('Saved agents', savedAgents, 'The owner\'s saved agents. To hand one of them a piece of work you wait on here, call run_worker with agent set to its name. To hand one longer, multi-step work that runs on its own and reports back here, call dispatch_background_task with agent set to its name, and project set to the project it works in when it has one. Either way the work runs as that agent, with its instructions and on its model. Credit a result to an agent only when the work ran as it, and say which model ran it when that matters.'),
     healthWarnings.length > 0
       ? `Health warnings:\n${healthWarnings.map((w) => `- ${w}`).join('\n')}`
       : '',
