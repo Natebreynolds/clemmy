@@ -3,6 +3,8 @@ import path from 'node:path';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { autonomyRunSlug, listAutonomyRuns } from '../agents/run-tracking.js';
 import { peerCommsEnabled } from '../agents/agent-comms.js';
+import { HOST_AGENT_ID } from '../agents/agent-record.js';
+import { readDurableBindings } from '../runtime/harness/model-roles.js';
 import { listSessions, listEvents, type EventRow } from '../runtime/harness/eventlog.js';
 import { readWorkflowEvents, type WorkflowEvent } from '../execution/workflow-events.js';
 import { listWorkflows } from '../memory/workflow-store.js';
@@ -45,8 +47,49 @@ interface TeamCommsRecord {
 interface AgentStateSnapshot {
   slug?: string;
   lastRunAt?: string;
+  lastWakeAt?: string;
   lastSummary?: string;
   lastError?: string;
+}
+
+/** How long an agent's own error, inbox item or run counts as current. The
+ *  team-agent loop that wrote these can go quiet for months; its last error
+ *  then read as "blocked" forever (live 10-02: an error from 08-13 held the
+ *  readiness score at 21/100 and Clem reported it as current). Older signals
+ *  stay on disk and in traces; they just stop counting. */
+const AGENT_SIGNAL_CURRENT_MS = 7 * 24 * 60 * 60_000;
+
+/** A signal with no readable time is treated as current. */
+function signalIsCurrent(...stamps: Array<string | undefined>): boolean {
+  const times = stamps
+    .map((stamp) => (stamp ? Date.parse(stamp) : Number.NaN))
+    .filter((time) => Number.isFinite(time));
+  if (times.length === 0) return true;
+  return Date.now() - Math.max(...times) <= AGENT_SIGNAL_CURRENT_MS;
+}
+
+function agentErrorIsCurrent(state: AgentStateSnapshot | null | undefined): boolean {
+  return Boolean(state?.lastError) && signalIsCurrent(state?.lastRunAt, state?.lastWakeAt);
+}
+
+function inboxRowIsPending(row: { status?: string; createdAt?: string }): boolean {
+  return row.status === 'pending' && signalIsCurrent(row.createdAt);
+}
+
+/** Peer comms matter only when an agent is set to message another agent
+ *  directly. A roster whose agents only talk through the host needs none. */
+function rosterHasPeerEdges(agents: ReturnType<typeof loadTeamAgents>): boolean {
+  return agents.some((agent) => agent.slug !== HOST_AGENT_ID
+    && agent.canMessage.some((target) => target && target !== agent.slug && target !== HOST_AGENT_ID));
+}
+
+/** Intent routing can only miss when the owner has routing rules to match. */
+function workerIntentRulesConfigured(): boolean {
+  try {
+    return readDurableBindings().some((binding) => binding.role === 'worker' && Boolean(binding.whenIntent?.trim()));
+  } catch {
+    return false;
+  }
 }
 
 interface ToolEventRecord {
@@ -338,17 +381,17 @@ function countPendingInboxItems(): number {
   if (!existsSync(AGENT_INBOX_DIR)) return 0;
   let total = 0;
   for (const file of readdirSync(AGENT_INBOX_DIR).filter((entry) => entry.endsWith('.json'))) {
-    const rows = readJsonFile<Array<{ status?: string }>>(path.join(AGENT_INBOX_DIR, file));
+    const rows = readJsonFile<Array<{ status?: string; createdAt?: string }>>(path.join(AGENT_INBOX_DIR, file));
     if (!Array.isArray(rows)) continue;
-    total += rows.filter((row) => row.status === 'pending').length;
+    total += rows.filter(inboxRowIsPending).length;
   }
   return total;
 }
 
 function countPendingInboxForAgent(slug: string): number {
-  const rows = readJsonFile<Array<{ status?: string }>>(path.join(AGENT_INBOX_DIR, `${slug}.json`));
+  const rows = readJsonFile<Array<{ status?: string; createdAt?: string }>>(path.join(AGENT_INBOX_DIR, `${slug}.json`));
   if (!Array.isArray(rows)) return 0;
-  return rows.filter((row) => row.status === 'pending').length;
+  return rows.filter(inboxRowIsPending).length;
 }
 
 function loadAgentState(slug: string): AgentStateSnapshot | null {
@@ -359,8 +402,8 @@ function countBlockedAgents(): number {
   if (!existsSync(AGENT_STATE_DIR)) return 0;
   let total = 0;
   for (const file of readdirSync(AGENT_STATE_DIR).filter((entry) => entry.endsWith('.json'))) {
-    const row = readJsonFile<{ lastError?: string }>(path.join(AGENT_STATE_DIR, file));
-    if (row?.lastError) total += 1;
+    const row = readJsonFile<AgentStateSnapshot>(path.join(AGENT_STATE_DIR, file));
+    if (agentErrorIsCurrent(row)) total += 1;
   }
   return total;
 }
@@ -456,6 +499,9 @@ function collectWorkerHarnessStats(): {
   let workerSessions = 0;
   let intentRoutes = 0;
   let intentMatches = 0;
+  // With no owner routing rules every worker runs on the default by design;
+  // its intent label has nothing to match, so it is not a miss.
+  const intentRulesConfigured = workerIntentRulesConfigured();
   let policyDecisions = 0;
   let fanoutOffered = 0;
   let fanoutBlockedByPolicy = 0;
@@ -472,8 +518,8 @@ function collectWorkerHarnessStats(): {
     incrementCounter(modelCounts, stringValue(event.data.modelId) ?? 'unknown');
     incrementCounter(providerCounts, stringValue(event.data.provider) ?? 'unknown');
     incrementCounter(transportCounts, stringValue(event.data.transport) ?? 'unknown');
-    if (stringValue(event.data.attemptedIntent)) intentRoutes += 1;
-    if (stringValue(event.data.matchedIntent)) intentMatches += 1;
+    if (intentRulesConfigured && stringValue(event.data.attemptedIntent)) intentRoutes += 1;
+    if (intentRulesConfigured && stringValue(event.data.matchedIntent)) intentMatches += 1;
   }
 
   function scanCap(event: EventRow): void {
@@ -649,6 +695,8 @@ function collectSwarmTopology(input: {
 function collectSwarmReadiness(input: {
   agents: ReturnType<typeof loadTeamAgents>;
   peerComms: boolean;
+  /** Peer comms are off while an agent is set to message another directly. */
+  peerCommsGap: boolean;
   pendingInboxItems: number;
   blockedAgents: number;
   topology: SwarmTopologySnapshot;
@@ -677,7 +725,7 @@ function collectSwarmReadiness(input: {
 
   if (input.peerComms) {
     strengths.push('Peer comms are enabled.');
-  } else if (input.agents.length > 1) {
+  } else if (input.peerCommsGap) {
     score -= 16;
     risks.push('Peer comms are disabled for a multi-agent roster.');
   }
@@ -816,6 +864,7 @@ function collectAgentScorecards(input: {
 }): AgentScorecard[] {
   const runsBySlug = new Map<string, ReturnType<typeof listAutonomyRuns>>();
   for (const run of input.autonomy) {
+    if (!signalIsCurrent(run.completedAt, run.updatedAt, run.createdAt)) continue;
     const slug = autonomyRunSlug(run);
     if (!slug) continue;
     const bucket = runsBySlug.get(slug) ?? [];
@@ -834,7 +883,7 @@ function collectAgentScorecards(input: {
     const received = input.comms.filter((row) => row.toAgent === agent.slug).length;
     const requests = input.comms.filter((row) => row.fromAgent === agent.slug && row.protocol === 'request').length;
     const responses = input.comms.filter((row) => row.fromAgent === agent.slug && row.protocol === 'response').length;
-    const blocked = Boolean(state?.lastError);
+    const blocked = agentErrorIsCurrent(state);
     const commsTotal = sent + received;
 
     let score = 70;
@@ -1469,6 +1518,7 @@ function collectAgentSystemTrend(current: AgentSystemTrendPoint): AgentSystemTre
 function collectCoordinationPolicy(input: {
   agentCount: number;
   peerComms: boolean;
+  peerCommsGap: boolean;
   loopEffectivenessScore: number;
   terminalRuns: number;
   itemFailed: number;
@@ -1539,7 +1589,7 @@ function collectCoordinationPolicy(input: {
   if (input.swarmReadiness.status === 'blocked' || (input.agentCount > 0 && input.swarmReadiness.score < 50)) {
     reasons.push(`Swarm readiness is ${input.swarmReadiness.score}/100.`);
     if (input.swarmReadiness.risks[0]) reasons.push(input.swarmReadiness.risks[0]);
-    if (input.agentCount > 1 && !input.peerComms) reasons.push('Peer communication is disabled.');
+    if (input.peerCommsGap) reasons.push('Peer communication is disabled.');
     guardrails.push('Keep orchestration centralized until blocked agents, broken message edges, or inbox backlog are cleared.');
     guardrails.push('Use specialist agents for review only after the top readiness risk is resolved.');
     return finish(
@@ -1648,6 +1698,7 @@ function collectCoordinationPolicy(input: {
 function buildRecommendations(input: {
   agentCount: number;
   peerComms: boolean;
+  peerCommsGap: boolean;
   comms24h: number;
   pendingInboxItems: number;
   blockedAgents: number;
@@ -1684,7 +1735,7 @@ function buildRecommendations(input: {
       href: '/agents',
       cta: 'Open agents',
     });
-  } else if (input.agentCount > 1 && !input.peerComms) {
+  } else if (input.peerCommsGap) {
     recs.push({
       id: 'swarm-enable-peer-comms',
       kind: 'swarm',
@@ -2012,6 +2063,7 @@ export function collectAgentSystemMetrics(): AgentSystemMetrics {
   const autonomyActive = autonomy.filter((run) => run.status === 'running' || run.status === 'queued' || run.status === 'received').length;
   const worker = collectWorkerHarnessStats();
   const peerComms = peerCommsEnabled();
+  const peerCommsGap = !peerComms && agents.length > 1 && rosterHasPeerEdges(agents);
   const pendingInboxItems = countPendingInboxItems();
   const blockedAgents = countBlockedAgents();
   const scorecards = collectAgentScorecards({ agents, comms, autonomy });
@@ -2019,6 +2071,7 @@ export function collectAgentSystemMetrics(): AgentSystemMetrics {
   const readiness = collectSwarmReadiness({
     agents,
     peerComms,
+    peerCommsGap,
     pendingInboxItems,
     blockedAgents,
     topology,
@@ -2080,6 +2133,7 @@ export function collectAgentSystemMetrics(): AgentSystemMetrics {
   const coordination = collectCoordinationPolicy({
     agentCount: agents.length,
     peerComms,
+    peerCommsGap,
     loopEffectivenessScore,
     terminalRuns: terminal.length,
     itemFailed: eventStats.itemFailed,
@@ -2093,13 +2147,14 @@ export function collectAgentSystemMetrics(): AgentSystemMetrics {
 
   const recentWarnings: AgentSystemMetrics['recentWarnings'] = [];
   if (worker.workerCapped > 0) recentWarnings.push({ kind: 'swarm', message: `${worker.workerCapped} worker run(s) hit their turn cap recently.` });
-  if (!peerComms && agents.length > 1) recentWarnings.push({ kind: 'swarm', message: 'Multiple agents exist, but peer comms are disabled.' });
+  if (peerCommsGap) recentWarnings.push({ kind: 'swarm', message: 'Agents are set to message each other, but peer comms are disabled.' });
   if (eventStats.itemFailed > 0) recentWarnings.push({ kind: 'loop', message: `${eventStats.itemFailed} forEach item failure(s) remain in recent workflow logs.` });
   if (goalEscalated > 0) recentWarnings.push({ kind: 'loop', message: `${goalEscalated} workflow goal validation(s) escalated instead of self-correcting.` });
   if (loopEffectivenessScore < 60 && terminal.length > 0) recentWarnings.push({ kind: 'loop', message: `Loop effectiveness score is ${loopEffectivenessScore}/100; repeated attempts may not be improving outcomes.` });
   const recommendations = buildRecommendations({
     agentCount: agents.length,
     peerComms,
+    peerCommsGap,
     comms24h: comms.length,
     pendingInboxItems,
     blockedAgents,
@@ -2152,7 +2207,7 @@ export function collectAgentSystemMetrics(): AgentSystemMetrics {
       scorecards,
       recommendation: worker.workerCapped > 0
         ? 'Raise worker budget or split capped worker prompts into smaller job packets.'
-        : agents.length > 1 && !peerComms
+        : peerCommsGap
           ? 'Enable peer comms before relying on multi-agent collaboration.'
           : 'Use fanout/review swarms for independent item work; keep single-orchestrator mode for tightly coupled tasks.',
     },

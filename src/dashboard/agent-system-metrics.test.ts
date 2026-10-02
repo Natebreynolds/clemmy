@@ -7,6 +7,8 @@ import os from 'node:os';
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-agent-system-metrics-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 process.env.CLEMMY_V2_PEER_COMMS = 'off';
+// The owner has one worker routing rule, so worker intent labels can match.
+process.env.CLEMMY_MODEL_ROLES = JSON.stringify([{ role: 'worker', modelId: 'gpt-5.6-terra', whenIntent: 'research' }]);
 
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
 const { writeWorkflow } = await import('../memory/workflow-store.js');
@@ -360,4 +362,69 @@ test('collectAgentSystemMetrics summarizes swarm and loop effectiveness from dur
   assert.ok(metrics.recommendations.every((rec) => rec.title && rec.action && rec.href && rec.cta));
   assert.ok(metrics.recommendations.some((rec) => rec.id === 'swarm-enable-peer-comms' && rec.href === '/advanced/developer'));
   assert.ok(metrics.recommendations.some((rec) => rec.id === 'loop-rerun-failed-items' && rec.href === '/automate'));
+});
+
+test('old team-agent errors and inbox items, hub-only rosters and unset routing rules are not reported as current risks', () => {
+  // Live 10-02: an autonomy-loop error from 08-13 and four inbox items from
+  // August held readiness at 21/100 for seven weeks, with peer comms counted
+  // as missing for a roster whose agents only talk through the host and
+  // intent routing counted as missing with no routing rules set. Clem then
+  // reported all of it as current.
+  const homeAgents = path.join(TMP_HOME, 'vault', '00-System', 'agents');
+  rmSync(homeAgents, { recursive: true, force: true });
+  rmSync(path.join(TMP_HOME, 'agents-state'), { recursive: true, force: true });
+  rmSync(path.join(TMP_HOME, 'agents-inbox'), { recursive: true, force: true });
+  rmSync(path.join(TMP_HOME, 'logs', 'team-comms.jsonl'), { force: true });
+  const priorRoles = process.env.CLEMMY_MODEL_ROLES;
+  delete process.env.CLEMMY_MODEL_ROLES;
+  try {
+    writeAgent('clementine', 'name: Clementine\ndescription: primary\nrole: orchestrator\ncanMessage:\n  - designer');
+    writeAgent('designer', 'name: Designer\ndescription: designs\ncanMessage:\n  - clementine');
+    writeAgent('auditor', 'name: Auditor\ndescription: audits\ncanMessage:\n  - clementine');
+    const old = new Date(Date.now() - 50 * 24 * 60 * 60_000).toISOString();
+    mkdirSync(path.join(TMP_HOME, 'agents-state'), { recursive: true });
+    writeFileSync(path.join(TMP_HOME, 'agents-state', 'clementine.json'), JSON.stringify({
+      slug: 'clementine', lastRunAt: old, lastWakeAt: old, lastError: 'Autonomy decision rejected: too many commitments',
+    }), 'utf-8');
+    mkdirSync(path.join(TMP_HOME, 'agents-inbox'), { recursive: true });
+    writeFileSync(path.join(TMP_HOME, 'agents-inbox', 'clementine.json'), JSON.stringify([
+      { id: 'i1', createdAt: old, status: 'pending', content: 'daily review' },
+      { id: 'i2', createdAt: old, status: 'pending', content: 'uncommitted changes' },
+    ]), 'utf-8');
+
+    const stale = collectAgentSystemMetrics();
+    assert.equal(stale.swarm.blockedAgents, 0, 'a 50-day-old error does not block an agent');
+    assert.equal(stale.swarm.pendingInboxItems, 0, '50-day-old inbox items are not pending work');
+    assert.equal(stale.swarm.effectiveness.intentRoutes, 0, 'no routing rules, so no intent can miss');
+    assert.notEqual(stale.swarm.readiness.status, 'blocked');
+    // What remains is only this home's current worker evidence.
+    assert.deepEqual(stale.swarm.readiness.risks.filter((risk) => !/fanout cap rate/i.test(risk)), []);
+    assert.ok(!stale.swarm.readiness.risks.some((risk) => /peer comms|blocked|inbox|intent routing/i.test(risk)),
+      stale.swarm.readiness.risks.join(' | '));
+    for (const id of ['swarm-enable-peer-comms', 'swarm-readiness-low', 'swarm-drain-inbox', 'swarm-intent-routing-miss', 'swarm-agent-scorecard-risk']) {
+      assert.ok(!stale.recommendations.some((rec) => rec.id === id), id);
+    }
+
+    // The same signals, recent, still count.
+    const now = new Date().toISOString();
+    writeFileSync(path.join(TMP_HOME, 'agents-state', 'clementine.json'), JSON.stringify({
+      slug: 'clementine', lastRunAt: now, lastError: 'tool auth expired',
+    }), 'utf-8');
+    writeFileSync(path.join(TMP_HOME, 'agents-inbox', 'clementine.json'), JSON.stringify([
+      { id: 'i3', createdAt: now, status: 'pending', content: 'review the draft' },
+    ]), 'utf-8');
+    const current = collectAgentSystemMetrics();
+    assert.equal(current.swarm.blockedAgents, 1);
+    assert.equal(current.swarm.pendingInboxItems, 1);
+    assert.ok(current.swarm.readiness.risks.some((risk) => /blocked/i.test(risk)));
+
+    // An agent set to message another agent directly does need peer comms.
+    writeAgent('designer', 'name: Designer\ndescription: designs\ncanMessage:\n  - auditor');
+    const peers = collectAgentSystemMetrics();
+    assert.ok(peers.swarm.readiness.risks.some((risk) => /peer comms/i.test(risk)));
+    assert.ok(peers.recommendations.some((rec) => rec.id === 'swarm-enable-peer-comms'));
+  } finally {
+    if (priorRoles === undefined) delete process.env.CLEMMY_MODEL_ROLES;
+    else process.env.CLEMMY_MODEL_ROLES = priorRoles;
+  }
 });
