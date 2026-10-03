@@ -27,6 +27,8 @@
   display:flex;
   align-items:center;
   gap:8px;
+  flex-shrink:0;
+  white-space:nowrap;
   color:var(--text);
   font-weight:600}
 .cloud-browser-strip button span {
