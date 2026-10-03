@@ -56,10 +56,21 @@ Status words: **installed** = hotpatched into the owner's app and serving;
     an answered card as the question it asked (7065076c3);
   - the dashboard script permission card asks in words, schedule in words
     (20d79d9c7).
-- **Proof:** approval-precheck, approval-card-voice, transcript and source-pin
-  tests; reopened Bland thread checked on the installed app (no rh_, apr- or
-  retained block; taps read "Yes, go ahead.").
-- **Status:** installed; a new card end to end is the next live test.
+  - the public preview projection carries her words, so the live card and a
+    reopened one both show them, and a still-pending card takes the place of
+    the reply that paused on it instead of asking twice (1c6674c32);
+  - Needs you lists the card by her question, previews her why, and answers
+    "Yes, go ahead" / "No, don't do that"; the phone card shows her why
+    (89e97b606).
+- **Proof:** approval-precheck, approval-card-voice, transcript, sessions-api
+  and source-pin tests. Live 10-02 19:03–19:30 PT on the installed app,
+  fixture `clem-fixture card check 2` (sess-desktop-d97945b8640886734f2426ec):
+  the checker wrote "Can I delete your clem-fixture-keychain-check workflow?"
+  / "This permanently removes the workflow and can't be undone."; desktop
+  card, phone card and Needs you all showed it with the tap answers; declined
+  with the card's answer; the workflow is untouched; reopened, the
+  conversation reads question → "No, don't do that." → Clem's reply.
+- **Status:** installed, live-proven.
 
 ## Approvals ask only when they should
 
@@ -83,8 +94,10 @@ Status words: **installed** = hotpatched into the owner's app and serving;
   the owner with one exact card in Auto and Ask and never runs it as a planning
   probe; unattended workflow steps still refuse it (f5f0ad9ac).
 - **Proof:** local-planning-capability, interactive-consent-policy,
-  door-census and authored-workflow acceptance tests.
-- **Status:** committed; install and live card test next.
+  door-census and authored-workflow acceptance tests. Live: the same request
+  paused on one card after 3 model calls and 29 s (before: 22 calls, 169 s,
+  no card).
+- **Status:** installed, live-proven.
 
 ## Prompt caching holds across turns
 
@@ -105,9 +118,8 @@ Status words: **installed** = hotpatched into the owner's app and serving;
 
 ## Open, in order
 
-1. Live: a new card in Clem's voice end to end (workflow delete fixture).
-2. Completion judge on trivial turns (side lanes ~22% of uncached chat input).
-3. Approval resumes rebuild the prompt (2–3k of 72–86k cached).
-4. `call_tool` arguments sent as an object cost a round.
-5. Compacted history is overwritten after a judge continuation.
-6. Adding an API server (MCP) from chat with a private key field.
+1. Completion judge on trivial turns (side lanes ~22% of uncached chat input).
+2. Approval resumes rebuild the prompt (2–3k of 72–86k cached).
+3. `call_tool` arguments sent as an object cost a round.
+4. Compacted history is overwritten after a judge continuation.
+5. Adding an API server (MCP) from chat with a private key field.
