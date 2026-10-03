@@ -295,3 +295,24 @@ brain choices are the sign-in's own catalog once it is known. Proof:
   BrainSheet):** the model chip's long label ("Codex — GPT 5…"), old approval
   cards that predate Clem's wording ("cli_setup: auth / Catalog id").
 - **Status:** committed, not installed.
+
+## Desktop at the phone's standard, and swipe on the phone
+
+- **Change:**
+  - desktop conversation list: the phone's live mark per chat (ring while
+    running — sessions-api `running` from open run attempts — dot for a reply
+    since you last looked, "Working…" in place of the preview); the seen rule
+    moved into @clem/chat-engine (chat-seen) so both apps share it; heads
+    in sentence case; New chat as an ink pill (5c53fc1c1);
+  - Needs you on desktop named in words (list and detail); a card's exact
+    details leave out content fingerprints (long hex digests, by shape) with
+    one line "Locked to this exact version" (both apps, 5c53fc1c1); Today
+    stays two columns until 1536 px and update titles wrap to two lines;
+  - phone: swipe a conversation left for Pin / Archive (6831476d6);
+  - desktop: Today's Needs-you rows drop the redundant "Approve:" before a
+    worded request; Running board workflow cards show names; agent models
+    read as names (f4815b17f).
+- **Proof:** needs-you-list pin (desktop), approval-presentation fingerprint
+  pin, chat-swipe tests + a driven touch swipe in the preview (opens, tap
+  closes, plain tap opens the thread), 620 desktop tests, 348 phone tests.
+- **Status:** committed, not installed.
