@@ -110,6 +110,59 @@ Status words: **installed** = hotpatched into the owner's app and serving;
   on the whole prefix it caches (6c7807248).
 - **Status:** installed, tested; measure on the next live day.
 
+## A judge retry sends the compacted conversation
+
+- **Problem (live 10-02, sess-desktop-c2d014f976a7282e1ac7e1c6, source
+  345440):** a judge retry compacted the conversation 71.8k → 30.3k tokens,
+  then sent ~83k on every frame of the retry. A same-source continuation runs
+  on the source's exact accepted history (it must stay byte-exact for the
+  accepted-batch chain), and that history begins with the conversation as it
+  stood before the compaction.
+- **Change:** the model-facing frame is projected: an input that begins with
+  exactly the pre-compaction conversation is sent with its compacted form,
+  recorded once as `condenser_applied` kind `continuation_projection`; the
+  accepted history and a fresh turn are untouched (1eeb97f63).
+- **Proof:** `continuation-compaction-projection.test.ts` fails on the old
+  loop; 671/671 across loop, host-turn-runner and compaction tests.
+- **Status:** installed (wave 37, 04:00Z 10-03), tested.
+
+## The goal reviewer reads the owner's standing instructions
+
+- **Problem (live 10-02, run trigger-572f895657a43e7bb043dfe0f5f61a14):** the
+  weekly snapshot's worker followed the owner's standing rule to leave one
+  person off weekly reports (in its memory packet, events 346166/346193/
+  346228); the goal reviewer never saw that rule, scored the omission
+  unsubstantiated against the saved workflow's older roster wording, and the
+  run's notice read "Workflow completed" with no attention flag while its body
+  asked the owner to look at a gap.
+- **Change (79733bdec):**
+  - the goal review receives the User Preferences and Standing Policies the
+    run's workers had in context, read from the run's own retained memory
+    packets (exact run scope, deduplicated, bounded), under one heading;
+  - both goal reviewers carry one precedence rule: an applicable standing
+    instruction is the owner's own; following it is not an invented
+    preference, departing from it is a gap; it never adds a deliverable,
+    reaches past its own scope or relaxes a user constraint;
+  - a goal gap after landed work keeps the run a success and its effect as
+    it is; its notice now reads "Done, with a gap: <workflow>", waits on
+    Needs you and is never folded into a step's own report. Success learning
+    already excluded a gap.
+- **Proof:** `workflow-goal-standing-instructions.integration.test.ts` runs a
+  real workflow through the runner and fails without the wiring;
+  `workflow-landed-writes.integration.test.ts` now pins the gap notice and
+  fails on the old runner with exactly "Workflow completed: …". 257/257 judge
+  and goal-review tests, 228/228 notification and outcome tests.
+- **Not done here:** the chat reviewer does not yet read the turn's standing
+  policies the same way (it needs an A/B first: judge accuracy is the owner's
+  priority). The Friday run was not resent and the rule was not touched.
+- **Status:** installed (wave 37, 04:00Z 10-03), tested.
+
+## Source comments state the rule
+
+- This weekend's commits had put dates, counts, record ids and a model name
+  into source comments, against the standing rule. b4018ab6b rewrote 26 of
+  them to state the rule only; provenance stays here and in test notes.
+
 ## Found and already fixed
 
 - "I could not reopen the saved checkpoint" after a successful file save
@@ -140,5 +193,19 @@ and desktop/mobile parity, (5) honest degraded states in background work,
 1. Completion judge on trivial turns (side lanes ~22% of uncached chat input).
 2. Approval resumes rebuild the prompt (2–3k of 72–86k cached).
 3. `call_tool` arguments sent as an object cost a round.
-4. Compacted history is overwritten after a judge continuation.
+4. ~~Compacted history is overwritten after a judge continuation.~~ The
+   model-facing frame is now projected (1eeb97f63); the snapshot overwrite
+   itself is deliberate.
 5. Adding an API server (MCP) from chat with a private key field.
+
+## Disk nearly full (10-02 20:50 PT)
+
+The wave 37 build failed with ENOSPC: 131 MB free of 460 GB. Freed without
+touching the live home, other agents' worktrees or personal files: eight
+leftover isolated test homes (~1.9 GB), superseded updater holds from the
+install recipes (~3.8 GB) and 35 old rollback copies (~400 MB). Free space then
+rose to 7.2 GB. The large consumers are outside this work and need the owner:
+`/private/var/userToRemove` (15 GB of root-owned Jamf MakeMeAnAdmin log
+archives), the live home's old backups (~6.5 GB across `backups/`,
+`state/backups`, `state/pre-v69-20260829`, `state/backup-pre63`,
+`state/dev-backups`) and stale worktrees (16 GB in `~/clem-worktrees`).
