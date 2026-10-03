@@ -185,6 +185,13 @@ Status words: **installed** = hotpatched into the owner's app and serving;
   connection-execution-closure all pass; the nested catalog settlement pair
   (3 s host deadline, 3.3 s even alone) failed once more under the same load
   and then passed 4/4. No regression attributed.
+- Full suite on `652329119` (all phone and desktop slices through the
+  desktop parity commit; run niced with the disk watchdog while two other
+  agents loaded the machine, load average up to 45): 19,617 passed, 1
+  failed, 8 skipped, 0 cancelled. The one failure is the same nested catalog
+  settlement test (3 s host deadline); alone at the same revision it passed
+  4/4. Commits after it (9f366b32e, 42c4c8830, 67933f9f0) are UI-only and
+  their app suites pass (620 desktop, 348 phone).
 
 ## Plan from the review handoff
 
