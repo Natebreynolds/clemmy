@@ -176,6 +176,7 @@ import { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.j
 import { formatComposioCliDefaultReadAccountRoute } from '../integrations/composio/account-route.js';
 import { normalizeProcedureAccountIdentity } from '../runtime/read-path/procedure-scope.js';
 import { isCurrentCallableCatalogEntry, peekHostCapabilityCatalogFactory } from '../runtime/harness/host-capability-catalog-factory.js';
+import { recordWorkerComposeOnly } from '../agents/worker-parent-actions.js';
 
 export { registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
 
@@ -2796,6 +2797,7 @@ function workerComposeOnlyComposioBlock(
 ): ComposioGatewayBlocked | null {
   const activeRun = harnessRunContextStorage.getStore();
   if (activeRun?.workerScope !== true || classifyComposioSlugEffect(toolSlug) === 'read') return null;
+  recordWorkerComposeOnly(toolSlug);
   const toolkit = registeredToolkitOfSlug(toolSlug);
   const message = [
     `WORKER_COMPOSE_ONLY: ${toolSlug} is a mutating Composio action, so this worker did not dispatch it.`,

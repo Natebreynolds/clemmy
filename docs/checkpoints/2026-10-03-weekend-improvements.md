@@ -603,3 +603,47 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   facts (compose-only refusals per worker run, across the host and Claude
   lanes); task sizing for large jobs; retained-result navigation for large
   MCP envelopes; the controlled Opus fixture run; the full mobile workflow.
+
+## Clem → lead agent → workers (10-03 13:00–14:00 PT, not installed yet)
+
+- **Owner ask:** "the brain should be able to fan out workers and an agent
+  should also be able to fan out workers … that agent is not just a worker. It
+  should be another brain." Decisions: Clem keeps chatting while the lead
+  works and checks in; the lead's messages show in the same chat, labeled;
+  projects name a lead (proposal-builder → Scorpion Audit).
+- **Map (three read-only investigations):** a delegated background task with
+  agent + project already runs a full brain as the agent (its model, the
+  project context, run_worker, own approvals, report-back); the audit used
+  run_worker instead, which runs the agent as a capped worker (8/12 turns,
+  18 for heavy intents) without project context, memory, workflows, planning
+  or questions. No depth guard existed; dispatch_background_task was not
+  blocked for workers; the Claude worker profile still had check_in and
+  notify_user.
+- **0842942d6:** project assignments carry `lead` (store v2, one per
+  project); with nobody named the lead takes a project's delegated job; the
+  project context tells Clem who leads (hand whole jobs via
+  dispatch_background_task, run_worker for one small item) and tells the lead
+  to plan and run its own workers; workers on both lanes get the project's
+  folder, procedures and accounts ("one item of a job"). Depth enforced where
+  work starts: a worker starts neither workers nor tasks; a lead running a
+  delegated job does not hand it on. Also fixes my 08289da60 regression: the
+  native catalog's names now apply the browser-backend rule, so the recorded
+  catalogCount matches the text again (fresh-native-read-catalog 7/7).
+- **391b94f28:** a delegated run's check_in is kept on the task (newest 20)
+  and published to the origin chat as delegated_task_state `check_in` with
+  the agent's name; the public stream admits it; the chat row shows the latest
+  note; desktop and phone task cards list the newest check-ins. check_in and
+  notify_user refuse under worker scope on every lane.
+- **Worker honesty (see the commit after 391b94f28):** compose-only refusals are recorded as
+  `worker_compose_only` where they happen (host runner, Composio gateway),
+  attributed per worker (Claude lane by tracker scope, host lane by child
+  session), and every worker result path appends a host line naming the
+  actions not done there. Status is not flipped to failed, so the designed
+  compose-then-parent-commit flow keeps working.
+- **Lean Rounds (owner asked for an explanation before the hotpatch):** the
+  journey ratchet fails 21 cases since be75a4c5c (other agent, 10-02 21:45,
+  typed local browser operations): round 1 +410 B in five scenarios from the
+  browser tool names in the native catalog; no case needs more rounds;
+  f_calendar_read_warm round 1 −11.7 KB and turn −23 KB. Not in the full
+  suite (journeys are not globbed), which is why it went unnoticed.
+  Re-baseline awaits the owner.

@@ -25,6 +25,7 @@ import {
   defaultToolCallsPerTurn, harnessRunContextStorage, ToolCallsCounter, withHarnessRunContext,
 } from './brackets.js';
 import pino from 'pino';
+import { workerComposeOnlyActions } from '../../agents/worker-parent-actions.js';
 
 const workerLogger = pino({ name: 'worker-host-runner' });
 
@@ -38,6 +39,8 @@ export async function runPacketWorkerWithHost(input: {
   mcpToolScope: McpToolScope | null;
   dispatchLease?: DispatchLeaseRef;
   signal?: AbortSignal;
+  /** Outside actions this worker was refused because only its parent may run them. */
+  onParentActions?: (tools: string[]) => void;
 }): Promise<string> {
   const parent = harnessRunContextStorage.getStore();
   const parentTaskId = acceptedTaskIdFor(input.parentSessionId, input.sourceUserSeq);
@@ -237,6 +240,7 @@ export async function runPacketWorkerWithHost(input: {
       }
       const text = normalizeWorkerOutput(outcome.finalOutput);
       completed = !/^\s*(?:ERROR|PARTIAL):/i.test(text);
+      input.onParentActions?.(workerComposeOnlyActions({ sessionId: session.id, sinceSeq: childSource.seq }));
       return text;
     }), { newlyAccepted: true });
   } catch (error) {

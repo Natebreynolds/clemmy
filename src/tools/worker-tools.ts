@@ -3,7 +3,7 @@ import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-o
 import { WorkerToolCallSchema, uniformFailureSignature, workerCallItems, workerPacketKey, workerResultIndicatesFailure, type WorkerToolCall, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { bindWorkerPacketExpectedWork } from '../runtime/harness/expected-work-admission.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
-import { runClaudeAgentSdkWorker } from '../runtime/harness/claude-agent-worker.js';
+import { runClaudeAgentSdkWorker, claudeWorkerScopeId } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot, workerBatchPoolWidth } from '../agents/worker-concurrency.js';
 import {
   completedWorkerBatchPacket,
@@ -49,6 +49,7 @@ import {
 import { evaluateQuantifiedWorkManifestGateWithArbitration } from '../runtime/harness/quantified-work-manifest.js';
 import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { WORKER_STARTS_NOTHING } from '../agents/delegation-depth.js';
+import { parentActionsNote, sessionHighWater, workerComposeOnlyActions } from '../agents/worker-parent-actions.js';
 
 /**
  * `run_worker` for the CLAUDE AGENT SDK BRAIN.
@@ -753,7 +754,8 @@ export function registerWorkerTools(server: McpServer): void {
         // cross-provider runner drags in the whole agent surface, so keep it out
         // of the module graph — mirrors inner-dispatch's runtime imports).
         assertWorkerMayStart();
-        const result: { text: string; model?: string } = route.claudeLane
+        const sinceSeq = route.claudeLane ? sessionHighWater(sessionId) : 0;
+        const result: { text: string; model?: string; parentActions?: string[] } = route.claudeLane
           ? await runClaudeAgentSdkWorker(
               input,
               workerModel,
@@ -776,6 +778,13 @@ export function registerWorkerTools(server: McpServer): void {
               );
             })();
         batchLease?.assertCurrent();
+        // Host facts: outside actions refused in this worker because only the
+        // parent may run them. The note says so whatever the worker wrote.
+        const parentActions = route.claudeLane
+          ? workerComposeOnlyActions({ sessionId, sinceSeq, scopeId: claudeWorkerScopeId(sessionId, input) })
+          : result.parentActions ?? [];
+        const parentNote = parentActionsNote(parentActions);
+        if (parentNote) result.text = `${result.text}\n\n${parentNote}`;
         const ok = !workerResultIndicatesFailure(result.text);
         // #6: the SDK-brain worker surfaces a turn-cap as ERROR text, but the
         // hooks.ts worker_capped emit only fires in the nested lane — so the

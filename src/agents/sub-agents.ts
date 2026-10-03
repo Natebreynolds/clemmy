@@ -434,6 +434,8 @@ export interface CrossProviderWorkerResult {
   text: string;
   model: string;
   toolUses: string[];
+  /** Outside actions refused in this worker because only its parent may run them. */
+  parentActions?: string[];
 }
 
 /**
@@ -469,13 +471,15 @@ export async function runCrossProviderWorker(
   if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
     return { text: 'ERROR: worker packet has no accepted parent source.', model: modelId, toolUses: [] };
   }
+  let parentActions: string[] = [];
   const text = await runPacketWorkerWithHost({
+    onParentActions: (tools) => { parentActions = tools; },
     input, modelId, parentSessionId: sessionId, sourceUserSeq: sourceUserSeq!, maxTurns,
     mcpToolScope: effectiveMcpToolScope ?? null, dispatchLease, signal: abortSignal,
     buildAgent: ({ delegatedExpectedWork, ...child }) => buildWorkerAgent({ model: modelId, workerInput: input,
       mcpToolScope: effectiveMcpToolScope, ...child, ...(delegatedExpectedWork ? { delegatedExpectedWork: true } : {}) }),
   });
-  return { text, model: modelId, toolUses: [] };
+  return { text, model: modelId, toolUses: [], ...(parentActions.length > 0 ? { parentActions } : {}) };
 }
 
 /**

@@ -713,6 +713,7 @@ import {
   invokeHostToolCall,
   workerMustComposeForParent,
 } from './host-tool-invocation.js';
+import { recordWorkerComposeOnly } from '../../agents/worker-parent-actions.js';
 import {
   committedMutationVerificationHoldForOwner,
   recoverCommittedMutationVerificationsForSource,
@@ -6371,6 +6372,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           identity: { toolName: exact.logicalToolName, args: exact.logicalArgs } as never,
           effect: exact.effect, boundary: exact.boundary,
         })) {
+          recordWorkerComposeOnly(exact.logicalToolName || name);
           return `WORKER_COMPOSE_ONLY: ${name} is an external mutation. Return its exact proposed payload to the parent; no provider dispatch or approval was started.`;
         }
         return undefined;
