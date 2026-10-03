@@ -47,3 +47,23 @@ test('a task Clem kept, a second task, and a state this surface does not know', 
   assert.deepEqual(rows.map((row) => row.label), ['Clem · Tidy the notes', 'Sales Assistant · Draft the weekly briefing']);
   assert.deepEqual(rows.map((row) => row.detail), ['Working', 'Working']);
 });
+
+test("the row shows the agent's latest check-in while it works, and an empty note changes nothing", () => {
+  const rows = fold([
+    ev({ taskId: 'lead-1', title: 'Fixture audit', phase: 'started', agentName: 'Fixture Lead' }),
+    ev({ taskId: 'lead-1', title: 'Fixture audit', phase: 'check_in', agentName: 'Fixture Lead', note: 'Plan: four workers.' }),
+    ev({ taskId: 'lead-1', title: 'Fixture audit', phase: 'check_in', agentName: 'Fixture Lead', note: '3 of 4 done; backlinks partial.' }),
+    ev({ taskId: 'lead-1', title: 'Fixture audit', phase: 'check_in', agentName: 'Fixture Lead', note: '' }),
+  ]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.label, 'Fixture Lead · Fixture audit');
+  assert.equal(rows[0]!.detail, '3 of 4 done; backlinks partial.');
+  assert.equal(rows[0]!.status, 'running');
+});
+
+test('a card shows the newest check-ins, oldest first, and an older Mac without them shows none', async () => {
+  const { delegatedTaskCheckIns } = await import('./delegated-task.js');
+  const many = Array.from({ length: 9 }, (_, i) => ({ at: `2026-10-03T12:0${i}:00Z`, note: `note ${i}` }));
+  assert.deepEqual(delegatedTaskCheckIns({ checkIns: many }).map((entry) => entry.note), ['note 3', 'note 4', 'note 5', 'note 6', 'note 7', 'note 8']);
+  assert.deepEqual(delegatedTaskCheckIns({}), []);
+});

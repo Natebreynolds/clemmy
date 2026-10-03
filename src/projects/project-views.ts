@@ -50,6 +50,8 @@ export interface DelegatedTaskView {
   resultPreview: string | null;
   resultPath: string | null;
   error: string | null;
+  /** What the agent said as it worked, newest last. */
+  checkIns: Array<{ at: string; note: string }>;
   originSessionId: string | null;
   runSessionId: string;
   createdAt: string;
@@ -110,6 +112,7 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     resultPreview: task.result ? task.result.slice(0, 1_200) : null,
     resultPath: task.resultPath ?? null,
     error: task.error ? task.error.slice(0, 600) : null,
+    checkIns: (task.checkIns ?? []).slice(-12).map((entry) => ({ at: entry.at, note: entry.note.slice(0, 600) })),
     originSessionId: task.originSessionId ?? null,
     runSessionId: task.runSessionId,
     createdAt: task.createdAt,

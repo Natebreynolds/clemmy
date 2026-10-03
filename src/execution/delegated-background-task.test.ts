@@ -311,3 +311,54 @@ test('work moved to the background from a project finds its agent once, when it 
   assert.match(delegatedWorkPointers(sibling.id), new RegExp(queued.id));
   assert.equal(delegatedWorkPointers(createSession({ id: 'promoted-outsider', kind: 'chat' }).id), '');
 });
+
+test('the agent running a delegated job checks in with the conversation that handed it over, under its own name', async () => {
+  const origin = createSession({ id: 'lead-check-in-origin', kind: 'chat' });
+  const task = tasks.createBackgroundTask({ title: 'Build the fixture audit', prompt: 'Objective: Build the fixture audit', originSessionId: origin.id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: sales.id, projectName: sales.name, assignedBy: 'owner' } });
+  // The run's own session carries the job it is doing.
+  const run = createSession({ id: 'background:lead-check-in-run', kind: 'execution', metadata: { delegatedTaskId: task.id } } as never);
+  const { registerAutonomyActionTools } = await import('../tools/autonomy-action-tools.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const handlers = new Map<string, (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>>();
+  registerAutonomyActionTools({ tool(name: string, _d: unknown, _s: unknown, handler: never) { handlers.set(name, handler); } } as never);
+  const posted = await withToolOutputContext({ sessionId: run.id }, () => handlers.get('check_in')!({ note: 'Plan: four workers — rankings, competitors, backlinks, site QA.' }));
+  assert.match(posted.content[0]!.text, /posted to the conversation that handed you this job/);
+  tasks.recordDelegatedCheckIn(task.id, '3 of 4 done; backlinks partial.');
+
+  const record = tasks.getBackgroundTask(task.id)!;
+  assert.deepEqual(record.checkIns?.map((entry) => entry.note), ['Plan: four workers — rankings, competitors, backlinks, site QA.', '3 of 4 done; backlinks partial.']);
+  const said = states(origin.id).filter((state) => state.phase === 'check_in');
+  assert.deepEqual(said.map((state) => [state.agentName, state.note]), [
+    ['Briefing Analyst', 'Plan: four workers — rankings, competitors, backlinks, site QA.'],
+    ['Briefing Analyst', '3 of 4 done; backlinks partial.'],
+  ]);
+  const projected = listEvents(origin.id, { types: ['delegated_task_state'] }).filter((event) => event.data.phase === 'check_in')
+    .map((event) => projectHarnessEventForPublic(event as never));
+  assert.equal((projected.at(-1) as { data?: { note?: string } } | null)?.data?.note ?? (projected.at(-1) as { note?: string } | null)?.note,
+    '3 of 4 done; backlinks partial.', 'the check-in reaches the apps through the public stream');
+  const { delegatedTaskView } = await import('../projects/project-views.js');
+  assert.deepEqual(delegatedTaskView(record).checkIns.map((entry) => entry.note).at(-1), '3 of 4 done; backlinks partial.');
+
+  const plain = tasks.createBackgroundTask({ title: 'Plain', prompt: 'do it', originSessionId: origin.id, source: 'desktop' });
+  assert.equal(tasks.recordDelegatedCheckIn(plain.id, 'note'), null, 'a task nobody was handed has no one to check in with');
+});
+
+test('a worker inside a lead run does not post check-ins or notifications; it returns what it found', async () => {
+  const origin = createSession({ id: 'worker-post-origin', kind: 'chat' });
+  const task = tasks.createBackgroundTask({ title: 'Lead job', prompt: 'Objective: lead job', originSessionId: origin.id, source: 'desktop',
+    delegation: { agentId: analyst.id, agentName: analyst.name, agentCreatedAt: analyst.createdAt, projectId: sales.id, projectName: sales.name, assignedBy: 'owner' } });
+  const run = createSession({ id: 'background:worker-post-run', kind: 'execution', metadata: { delegatedTaskId: task.id } } as never);
+  const { registerAutonomyActionTools } = await import('../tools/autonomy-action-tools.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
+  const handlers = new Map<string, (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>>();
+  registerAutonomyActionTools({ tool(name: string, _d: unknown, _s: unknown, handler: never) { handlers.set(name, handler); } } as never);
+  const asWorker = <T>(work: () => Promise<T>) => harnessRunContextStorage.run({ sessionId: run.id, workerScope: true } as never,
+    () => withToolOutputContext({ sessionId: run.id }, work) as Promise<T>);
+  const checkIn = await asWorker(() => handlers.get('check_in')!({ note: 'worker progress' }));
+  const notify = await asWorker(() => handlers.get('notify_user')!({ title: 'x', body: 'y' }));
+  for (const result of [checkIn, notify]) assert.match(result.content[0]!.text, /A worker does not post/);
+  assert.equal(tasks.getBackgroundTask(task.id)?.checkIns, undefined);
+  assert.deepEqual(states(origin.id).filter((state) => state.phase === 'check_in'), []);
+});

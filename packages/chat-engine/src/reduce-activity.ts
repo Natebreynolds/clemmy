@@ -693,6 +693,8 @@ function foldDelegatedTaskState(prev: ActivityItem[], d: Record<string, unknown>
     case 'finished': detail = `Finished${version}`; status = 'done'; tone = 'success'; break;
     case 'stopped': detail = 'Stopped'; status = 'interrupted'; tone = 'warning'; break;
     case 'failed': detail = firstLine(d.reason, 120) || 'Did not finish'; status = 'failed'; tone = 'danger'; break;
+    // The agent running it said where the work stands.
+    case 'check_in': detail = firstLine(d.note, 160); if (!detail) return prev; break;
     default: return prev;
   }
   const settled = status !== 'running';

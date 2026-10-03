@@ -15,7 +15,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, ChevronRight, CornerDownRight, Play, Square } from 'lucide-react';
 import {
-  delegatedTaskCard, delegatedTaskChosenBy, delegatedTaskCorrections, delegatedTaskFollowUps, delegatedTaskFollowsLine,
+  delegatedTaskCard, delegatedTaskCheckIns, delegatedTaskChosenBy, delegatedTaskCorrections, delegatedTaskFollowUps, delegatedTaskFollowsLine,
   type DelegatedTaskTone,
 } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
@@ -216,6 +216,18 @@ export function DelegatedTaskCard({
             ? 'Your correction started a new task, shown below. This one stays as it ended.'
             : `Your correction is carried by a new task: “${followUps[0].title}”.`}
         </p>
+      )}
+
+      {delegatedTaskCheckIns(shown).length > 0 && (
+        <ol className="mt-2.5 space-y-1.5 border-l-2 border-border pl-3" aria-label={`What ${card.owner} said as it worked`}>
+          {delegatedTaskCheckIns(shown).map((entry) => (
+            <li key={`${entry.at}-${entry.note.slice(0, 24)}`} className="text-small text-muted">
+              <span className="font-semibold text-fg">{card.owner}</span>
+              <span className="text-faint"> · {moment(entry.at)}</span>
+              <p className="mt-0.5 whitespace-pre-wrap break-words text-fg">{entry.note}</p>
+            </li>
+          ))}
+        </ol>
       )}
 
       {card.question && !hideQuestion && (
