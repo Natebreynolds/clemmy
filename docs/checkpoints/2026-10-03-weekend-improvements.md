@@ -391,3 +391,31 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   browser branch fails it alone too). Classified as reachable on intent
   (3e6903d6b, test-only, 78/78). A complete suite run is owed once the disk
   has headroom.
+
+## "Open a browser" from the phone ended in a generic error (10-03 07:33 PT)
+
+- **Live:** sess-mob-bc99dc237345df65af2f525ae43ddde4 (brain GPT 6.1 Sol, the
+  owner's pick at 07:32): `browser_open` (local Chrome) failed in 5 s, then
+  the turn ended "I could not reopen the saved checkpoint…" —
+  `exact_checkpoint_admission_exhausted` after five `evidence_unavailable`
+  finalizations.
+- **Cause 1 (8c9332292):** Chrome 154 listens on 9222 but the DevTools
+  handshake hangs (consistent with Chrome asking on the Mac to allow remote
+  debugging); the 5 s `TimeoutError` had an empty message, so the receipt
+  could not prove nothing changed and the open read "uncertain". Now a 15 s
+  handshake and a failure in words ("Chrome did not accept the connection…
+  allow it in Chrome, then try again"); a message-less exception names itself,
+  so a no-change failure is proven no change.
+- **Cause 2 (c2d23b478, diagnosed on an APFS clone of the live DB):** the
+  runner (09-08 rule) shows the model a local write's own result even when its
+  effect is uncertain; the checkpoint treated every uncertain write as needing
+  the effect-unknown marker the runner never writes for a local one, so the
+  batch could never be saved. One shared rule now (`reconciliation-stop.ts`):
+  only an external write or an admin action stops the turn; a returned local
+  write with an uncertain effect checkpoints ready — no success handle, no
+  replay. New checkpoint test fails on the old code; 562 neighbouring tests.
+- **Browserbase:** in this build it drives its cloud browser over CDP through
+  Browserbase's own connect URL (no local Chrome); it is not configured on
+  this Mac (`configured:false`), and its own record says live/cloud
+  acceptance is still owed.
+- **Status:** installing as wave 40.
