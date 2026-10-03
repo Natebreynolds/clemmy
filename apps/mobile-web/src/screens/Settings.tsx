@@ -154,15 +154,20 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         ) : section === 'accounts' ? (
           <UsageCard />
         ) : section === 'connections' ? (
-          <ConnectionsPage
-            rows={connections.data?.connections}
-            loading={connections.loading}
-            error={connections.error}
-            offline={connections.offline}
-            stale={connections.stale}
-            refreshing={connections.refreshing}
-            onRetry={() => void connections.refresh()}
-          />
+          <>
+            <ConnectionsPage
+              rows={connections.data?.connections}
+              loading={connections.loading}
+              error={connections.error}
+              offline={connections.offline}
+              stale={connections.stale}
+              refreshing={connections.refreshing}
+              onRetry={() => void connections.refresh()}
+            />
+            {/* Stateful, so it sits beside the stateless connections page
+                rather than inside it. */}
+            <BrowserbaseConnection />
+          </>
         ) : (
           <DevicesPage
             rows={devices.data?.devices}
@@ -902,7 +907,6 @@ export function ConnectionsPage({ rows, loading, error, offline, stale, refreshi
         </section>
       ) : null}
       {Boolean(rows?.length) && <p class="settings-foot">Other connections are managed on your Mac, in Connect.</p>}
-      <BrowserbaseConnection />
     </Fragment>
   );
 }

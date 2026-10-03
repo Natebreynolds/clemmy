@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import type { CloudBrowserStatus } from '@clem/chat-engine';
 import { cloudBrowser } from '../lib/cloud-browser';
-import './cloud-browser.css';
 export function BrowserbaseConnection() {
   const [status, setStatus] = useState<CloudBrowserStatus | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { flushSync } from 'preact/compat';
 import { browserElapsed, browserBoundInputAllowed, browserLiveUrl, browserResourceKey, browserStopMessage, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserView } from '@clem/chat-engine';
 import { cloudBrowser } from '../lib/cloud-browser';
-import './cloud-browser.css';
 const Globe = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" /></svg>;
 export function CloudBrowserDock({ conversationId }: { conversationId?: string }) {
   if (!conversationId) return null;
