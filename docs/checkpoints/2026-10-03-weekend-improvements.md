@@ -116,6 +116,25 @@ Status words: **installed** = hotpatched into the owner's app and serving;
   (07:53 and 09:50 PT 10-02) was the schema-91 receipt triggers; migration 92
   fixed it and it has not recurred.
 
+## Qualification receipts
+
+- Full suite on `20d79d9c7`: 19,593 passed, 0 failed, 8 skipped.
+- Full suite on `eb6cab5a2` (runtime/UI source `89e97b606`, run while live
+  checks and installs loaded the machine): 19,547 passed, 3 failed, 1 file
+  cancelled at its 600 s limit. All four — workflow-scheduler drain latency
+  (1.23 s against a 1 s bound), the nested catalog settlement pair (3 s host
+  deadline) and `loop.test.ts` — passed alone at the same revision: 291/291.
+- The `40765e31b` suite was stopped deliberately (superseded); it has no result.
+
+## Plan from the review handoff
+
+The review handoff `docs/checkpoints/2026-10-02-ui-harness-refinement-handoff.md`
+orders the remaining weekend work: (1) continuity through compaction and
+judge continuation, (2) one effective contract for execution and review,
+(3) recoverable replies, decisions and selected context, (4) command-center
+and desktop/mobile parity, (5) honest degraded states in background work,
+(6) complete-task efficiency, (7) storage lifecycle. Entries below follow it.
+
 ## Open, in order
 
 1. Completion judge on trivial turns (side lanes ~22% of uncached chat input).
