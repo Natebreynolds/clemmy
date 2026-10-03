@@ -454,3 +454,28 @@ verdicts from `goal_alignment_judged`. Settings backed up first
 - **Status:** wave 41 = 08289da60 installed 08:48 PT (build-info serves it;
   daemon, desk and phone bundles match; the installed build reads the live
   Browserbase setup: cloud offered, local not). Owner retest owed.
+
+## The cloud browser started, and Browserbase refused the key (10-03 08:51 PT)
+
+- **Live:** sess-desktop-0f85a0625277beaa2315068c on wave 41: the model used
+  only cloud tools (`cloud_browser_resources`, then `cloud_browser_start`),
+  and the turn kept going after the failure, as designed. Browserbase answered
+  the session create with an error; the record went `uncertain /
+  provider_refused` and the model said retrying was not safe.
+- **Cause:** a read-only project check with the saved key returned 401
+  Unauthorized; the saved key is not in Browserbase's key format (it does not
+  begin `bb_live_`). The owner re-saved, but the save never landed (store
+  unchanged since the failed start): `configure` refuses while any record is
+  live, and the refused start had left one `uncertain` with no provider
+  session, which maintenance skips, so it would have blocked every future
+  save.
+- **Fix (7d08ccc73):** a 4xx from Browserbase is a refusal before any effect
+  (`credential_rejected` 401/403, `provider_limit` 402/429, else
+  `provider_refused`; 408 and 5xx stay uncertain), so a refused start is
+  `stopped`. Saving the connection first reads the project with the key: a
+  rejected key or missing project is never saved; an unreachable Browserbase
+  does not block the save. Only a record holding a provider session blocks a
+  connection change; a record with no session expires once the provider's
+  session timeout has passed. The model reads the refusal in words.
+- **Status:** installing as wave 42. The owner's key still needs re-entering
+  (Browserbase dashboard → Settings → API Keys).
