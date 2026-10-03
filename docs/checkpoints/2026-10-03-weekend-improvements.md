@@ -221,8 +221,16 @@ wrong on that turn. Please try again" — not honest, not actionable, and
 retrying cannot help. The classifier reads the 400 as `runtime.unknown`; the
 host engine has no switch/ask recovery for it. The picker's OpenAI list is the
 union of API-key `/models` and the subscription catalog, so a model the
-subscription cannot run can still be offered as a brain. Fix in progress
-(framework only; the owner's brain choice is theirs and was not changed).
+subscription cannot run can still be offered as a brain. The owner's brain
+choice is theirs and was not changed.
+
+**Fixed (e1869de38, tested, not yet installed):** a provider 400/404 that
+names the requested model marks the error as a refusal of that model; the
+shared run-error handler stops both engines with a resumable block that names
+the model and says to pick another (one request, no quiet retry). The Codex
+brain choices are the sign-in's own catalog once it is known. Proof:
+`model-refused-turn.test.ts` (both engines fail without the new branch);
+128/128 model and discovery tests.
 
 ## Fixtures to show the owner before removal
 
