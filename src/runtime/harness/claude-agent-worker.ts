@@ -103,6 +103,11 @@ export interface ClaudeAgentSdkWorkerResult {
   modelRouteUsage?: ClaudeAgentSdkRouteUsage;
 }
 
+/** The scope a Claude-lane worker's tool calls run under in its parent session. */
+export function claudeWorkerScopeId(sessionId: string, input: WorkerToolInput): string {
+  return `${sessionId.trim()}::worker:${workerPacketKey(input)}`;
+}
+
 export async function runClaudeAgentSdkWorker(
   input: WorkerToolInput,
   modelId: string,
@@ -124,7 +129,7 @@ export async function runClaudeAgentSdkWorker(
   // Falls back to the base CLEMMY_CLAUDE_AGENT_SDK_WORKER_MAX_TURNS when the guard
   // is off or the intent is ordinary.
   const resolvedMaxTurns = guard ? resolveWorkerMaxTurns(input.intent, maxTurns()) : maxTurns();
-  const trackerScopeId = sid ? `${sid}::worker:${workerPacketKey(input)}` : undefined;
+  const trackerScopeId = sid ? claudeWorkerScopeId(sid, input) : undefined;
   // A child can narrow parent authority but never widen it. Broad parent
   // scopes (allowAll/fail-open) yield to the packet's exact resolved server;
   // concrete/local-only parent scopes remain the hard outer boundary.

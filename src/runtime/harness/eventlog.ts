@@ -689,6 +689,9 @@ export const EVENT_TYPES = [
   // written on the conversation that delegated it at each real transition of
   // the task record: who owns it, which version of the request it works to.
   'delegated_task_state',
+  // An outside action a worker was refused because only its parent may run
+  // it; the worker's result reports it as not done there.
+  'worker_compose_only',
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

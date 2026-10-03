@@ -204,6 +204,7 @@ import { projectHostOwnedAsyncReadRefinementTerminal } from '../runtime/harness/
 import { HarnessSession } from '../runtime/harness/session.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { toolNameOffered } from '../tools/browser-backend.js';
+import { parentActionsNote } from './worker-parent-actions.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -2893,12 +2894,16 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       runtimeScope: parent?.mcpToolScope, resolvedTools: packet.resolvedTools,
       externalMcpToolNames: packet.externalMcpToolNames }) ?? null;
     const signals = [signal, det?.signal].filter((entry): entry is AbortSignal => Boolean(entry));
-    return runPacketWorkerWithHost({
+    let parentActions: string[] = [];
+    const text = await runPacketWorkerWithHost({
       input: packet, modelId: model, parentSessionId: sessionId, sourceUserSeq, maxTurns: maxTurnsForItem,
       buildAgent: async (child) => (await workerAgentForPacket(packet, model, child)).agent,
       mcpToolScope: scope, dispatchLease: dispatchLeaseOverride ?? parent?.dispatchLease,
       ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
+      onParentActions: (tools) => { parentActions = tools; },
     });
+    const note = parentActionsNote(parentActions);
+    return note ? `${text}\n\n${note}` : text;
   };
 
   const runOneOrchestratorWorker = async (
