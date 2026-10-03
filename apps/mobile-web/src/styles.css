@@ -5679,3 +5679,37 @@ textarea.cz-input { resize: vertical; }
   font-size: var(--t-sm);
   font-weight: 600;
 }
+
+/* Swipe a conversation left: Pin and Archive sit behind it. The row slides
+   over them and follows the finger with no lag while it is held. */
+.chat-swipe { position: relative; overflow: hidden; border-radius: var(--r-md); }
+.chat-swipe-actions {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  width: 152px;
+}
+.chat-swipe-action {
+  flex: 1 1 0;
+  border: 0;
+  background: var(--bg-3);
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 650;
+}
+.chat-swipe-action:active { filter: brightness(0.95); }
+.chat-swipe-archive { background: var(--fg); color: #fffaf3; }
+.chat-swipe .chat-row {
+  position: relative;
+  background: var(--bg-0);
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+  transition: transform 0.24s var(--ease-out), background 0.16s ease;
+}
+.chat-swipe .chat-row.is-dragging { transition: none; }
+/* The actions exist only while a row is moving or open, so nothing peeks
+   past a resting row's rounded corners. */
+.chat-swipe:not(.is-open):not(.is-moving) .chat-swipe-actions { visibility: hidden; }
