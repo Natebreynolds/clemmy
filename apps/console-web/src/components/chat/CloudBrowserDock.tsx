@@ -22,6 +22,7 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
   const [recording, setRecording] = useState(false);
   const [recoveryId, setRecoveryId] = useState('');
   const [view, setView] = useState<(CloudBrowserView & { key: string }) | null>(null);
+  const [viewIssueKey, setViewIssueKey] = useState<string | null>(null);
   const [overview, setOverview] = useState<CloudBrowserOverview | null>(null);
   const [viewTick, setViewTick] = useState(0);
   const frame = useRef<HTMLIFrameElement>(null);
@@ -77,13 +78,14 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
   }, [visible, open, resourceKey, refresh]);
   useEffect(() => {
     if (!visible || !open || !resource || resource.state !== 'active' || resource.returnPending) return;
+    setViewIssueKey(null);
     const viewer = startBrowserViewLifecycle({
       resource, targetId: viewTarget, key: viewKey, client: cloudBrowser, leases: leases.current,
       uuid: () => crypto.randomUUID(),
       isCurrent: () => mounted.current && !document.hidden && viewContext.current.key === viewKey
         && viewContext.current.open && viewContext.current.visible,
       isBusy: () => viewContext.current.busy !== null,
-      show: (next) => setView(next),
+      show: (next) => { setView(next); setViewIssueKey(null); },
       remove: async (id) => {
         // Leave the effect stack before flushing. The old iframe must be gone
         // before its lease acknowledgment can permit an agent handoff.
@@ -91,6 +93,7 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
         if (mounted.current) flushSync(() => setView((shown) => shown?.viewerLeaseId === id ? null : shown));
       },
       issue: (kind) => {
+        setViewIssueKey(viewKey);
         setNotice(kind === 'cleanup' ? 'Closing the previous view was not confirmed. Choose Watch to retry.'
           : kind === 'binding' ? 'The browser view changed. Choose Watch after its status refreshes.'
           : 'The live view could not reconnect. Choose Watch to retry.');
@@ -215,7 +218,7 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
         {status?.configured && canStartBrowserInTask(scopedResources) ? <div className="cloud-browser-new"><label><input type="checkbox" checked={recording} onChange={(event) => setRecording(event.target.checked)} />Record the new session</label><button type="button" disabled={busy !== null} onClick={() => void start()}>{busy === 'start' ? 'Starting…' : 'Start new browser'}</button></div> : null}
         {resource.returnPending ? <button type="button" className="cloud-browser-close-views" disabled={busy !== null} onClick={() => void closePendingViews()}>{busy === 'detach' ? 'Closing views…' : 'Retry closing this device’s views'}</button> : null}
         <div className="cloud-browser-page">{browserFocusPage(resource)?.title || 'Browser session'}<span>{browserFocusPage(resource)?.url || (resource.state === 'starting' ? 'Starting the browser…' : '')}</span></div>
-        <div className="cloud-browser-view">{liveView ? <div className="cloud-browser-frame" ref={(element) => { if (element) element.inert = resource.controller !== 'human'; }}><iframe ref={frame} title="Conversation browser live view" src={liveView.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" tabIndex={resource.controller === 'human' ? 0 : -1} style={{ pointerEvents: resource.controller === 'human' ? 'auto' : 'none' }} /></div> : <p>{resource.returnPending ? 'Waiting for other open views to close. Return to Clem is pending; Stop remains available.' : active ? 'Connecting the live view…' : resource.state === 'uncertain' ? 'The browser state needs a fresh check. Refresh before continuing.' : `Browser ${resource.state}.`}</p>}</div>
+        <div className="cloud-browser-view">{liveView ? <div className="cloud-browser-frame" ref={(element) => { if (element) element.inert = resource.controller !== 'human'; }}><iframe ref={frame} title="Conversation browser live view" src={liveView.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" tabIndex={resource.controller === 'human' ? 0 : -1} style={{ pointerEvents: resource.controller === 'human' ? 'auto' : 'none' }} /></div> : <p>{resource.returnPending ? 'Waiting for other open views to close. Return to Clem is pending; Stop remains available.' : active ? viewIssueKey === viewKey ? 'The live view is unavailable. Choose Watch to retry.' : 'Connecting the live view…' : resource.state === 'uncertain' ? 'The browser state needs a fresh check. Refresh before continuing.' : `Browser ${resource.state}.`}</p>}</div>
         {resource.controller === 'agent' && active && !resource.returnPending ? <p className="cloud-browser-fine">Watching only. Take control to interact with the page.</p> : null}
         {resource.state === 'uncertain' && resource.providerSessionId === null ? <details className="cloud-browser-recovery"><summary>Recover a browser that may have started</summary><p>Find the session in your Browserbase project, then enter its session ID. Clem will verify it belongs to this conversation’s project before adopting it.</p><label>Browserbase session ID<input value={recoveryId} onChange={(event) => setRecoveryId(event.target.value)} autoComplete="off" /></label><button type="button" disabled={busy !== null || !recoveryId.trim()} onClick={() => void recover()}>{busy === 'recover' ? 'Checking session…' : 'Recover browser'}</button></details> : null}
       </>}

@@ -17,6 +17,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
   const [notice, setNotice] = useState(''); const [recording, setRecording] = useState(false);
   const [recoveryId, setRecoveryId] = useState('');
   const [view, setView] = useState<(CloudBrowserView & { key: string }) | null>(null);
+  const [viewIssueKey, setViewIssueKey] = useState<string | null>(null);
   const [overview, setOverview] = useState<CloudBrowserOverview | null>(null);
   const [viewTick, setViewTick] = useState(0); const [targetId, setTargetId] = useState(''); const [text, setText] = useState(''); const [key, setKey] = useState('Enter');
   const frame = useRef<HTMLIFrameElement>(null); const returnButton = useRef<HTMLButtonElement>(null); const trigger = useRef<HTMLButtonElement>(null);
@@ -56,13 +57,14 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
   useEffect(() => { if (open) returnButton.current?.focus(); }, [open]);
   useEffect(() => {
     if (!visible || !open || !resource || resource.state !== 'active' || resource.returnPending) return;
+    setViewIssueKey(null);
     const viewer = startBrowserViewLifecycle({
       resource, targetId: viewTarget, key: viewKey, client: cloudBrowser, leases: leases.current,
       uuid: () => crypto.randomUUID(),
       isCurrent: () => mounted.current && !document.hidden && viewContext.current.key === viewKey
         && viewContext.current.open && viewContext.current.visible,
       isBusy: () => viewContext.current.busy !== null,
-      show: (next) => setView(next),
+      show: (next) => { setView(next); setViewIssueKey(null); },
       remove: async (id) => {
         // Leave the effect stack before flushing. The old iframe must be gone
         // before its lease acknowledgment can permit an agent handoff.
@@ -70,6 +72,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
         if (mounted.current) flushSync(() => setView((shown) => shown?.viewerLeaseId === id ? null : shown));
       },
       issue: (kind) => {
+        setViewIssueKey(viewKey);
         setNotice(kind === 'cleanup' ? 'Closing the previous view was not confirmed. Choose Watch to retry.'
           : kind === 'binding' ? 'The browser view changed. Choose Watch after its status refreshes.'
           : 'The live view could not reconnect. Choose Watch to retry.');
@@ -186,7 +189,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
         {status?.configured && canStartBrowserInTask(resources) ? <div class="m-browser-new"><label><input type="checkbox" checked={recording} onChange={(event) => setRecording(event.currentTarget.checked)} />Record the new session</label><button type="button" disabled={busy !== null} onClick={() => void start()}>{busy === 'start' ? 'Starting…' : 'Start new browser'}</button></div> : null}
         {resource.returnPending ? <button type="button" class="m-browser-close-views" disabled={busy !== null} onClick={() => void closePendingViews()}>{busy === 'detach' ? 'Closing views…' : 'Retry closing this device’s views'}</button> : null}
         <p class="m-browser-page">{browserFocusPage(resource)?.title || 'Browser session'}<span>{browserFocusPage(resource)?.url || resource.state}</span></p>
-        <div class="m-browser-view">{liveView ? <div class="m-browser-frame" ref={(element) => { if (element) element.inert = resource.controller !== 'human'; }}><iframe ref={frame} src={liveView.url} title="Conversation browser live view" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerPolicy="no-referrer" tabIndex={resource.controller === 'human' ? 0 : -1} style={{ pointerEvents: resource.controller === 'human' ? 'auto' : 'none' }} /></div> : <p>{resource.returnPending ? 'Waiting for other open views to close. Return to Clem is pending; Stop remains available.' : active ? 'Connecting the live view…' : resource.state === 'uncertain' ? 'Browser state needs a fresh check. Refresh before continuing.' : `Browser ${resource.state}.`}</p>}</div>
+        <div class="m-browser-view">{liveView ? <div class="m-browser-frame" ref={(element) => { if (element) element.inert = resource.controller !== 'human'; }}><iframe ref={frame} src={liveView.url} title="Conversation browser live view" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerPolicy="no-referrer" tabIndex={resource.controller === 'human' ? 0 : -1} style={{ pointerEvents: resource.controller === 'human' ? 'auto' : 'none' }} /></div> : <p>{resource.returnPending ? 'Waiting for other open views to close. Return to Clem is pending; Stop remains available.' : active ? viewIssueKey === viewKey ? 'The live view is unavailable. Choose Watch to retry.' : 'Connecting the live view…' : resource.state === 'uncertain' ? 'Browser state needs a fresh check. Refresh before continuing.' : `Browser ${resource.state}.`}</p>}</div>
         {resource.controller === 'human' && active && !resource.returnPending ? <div class="m-browser-input"><p>Choose a page to load its verified live view. Tap the field there, then enter text or send a key below.</p><label>Page<select value={targetId} disabled={busy !== null} onChange={(event) => setTargetId(event.currentTarget.value)}><option value="">Choose a page</option>{resource.pages.map((page) => <option key={page.targetId} value={page.targetId}>{page.title || page.url || 'Untitled page'}</option>)}</select></label>{targetId && !inputAllowed ? <p role="status">Waiting for a verified view of this page. Input stays off until it is ready.</p> : null}<label>Text for the focused field<input value={text} disabled={busy !== null || !inputAllowed} onInput={(event) => setText(event.currentTarget.value)} autoComplete="off" maxLength={4096} /></label><button type="button" disabled={busy !== null || !text || !inputAllowed} onClick={() => void input('text')}>{busy === 'text' ? 'Entering…' : 'Enter text'}</button><div><label>Key<select value={key} disabled={busy !== null || !inputAllowed} onChange={(event) => setKey(event.currentTarget.value)}>{['Enter', 'Tab', 'Escape', 'Backspace'].map((value) => <option key={value}>{value}</option>)}</select></label><button type="button" disabled={busy !== null || !inputAllowed} onClick={() => void input('key')}>{busy === 'key' ? 'Sending…' : 'Send key'}</button></div></div> : active && !resource.returnPending ? <p class="m-browser-note">Watching only. Take control to interact. Return to chat for steering and approvals.</p> : null}
         {resource.state === 'uncertain' && resource.providerSessionId === null ? <details class="m-browser-recovery"><summary>Recover a browser that may have started</summary><p>Find the session ID in your Browserbase project. Clem verifies its project before adopting it.</p><label>Browserbase session ID<input value={recoveryId} onInput={(event) => setRecoveryId(event.currentTarget.value)} autoComplete="off" /></label><button type="button" disabled={busy !== null || !recoveryId.trim()} onClick={() => void recover()}>{busy === 'recover' ? 'Checking session…' : 'Recover browser'}</button></details> : null}
       </>}
