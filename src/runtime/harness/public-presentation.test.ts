@@ -998,3 +998,17 @@ test('structured grouped approval preserves exact members and rejects nested or 
   assert.equal(approvalPreviewProjection({ ...group, items: [{ ...item, items: [item] }, item] }), null);
   assert.equal(approvalPreviewProjection({ ...group, items: Array.from({ length: 101 }, () => item) }), null);
 });
+
+test('an answer to a card reaches every surface as the owner\'s words; the decision text stays exact', () => {
+  const approved = projectHarnessEventForPublic({ ...event('user_input_received', {
+    text: 'approve apr-fixture', approvalId: 'apr-fixture', decision: 'approve',
+  }), role: 'user' });
+  assert.equal(approved?.data.text, 'approve apr-fixture', 'the parser\'s words are unchanged');
+  assert.equal(approved?.data.displayText, 'Yes, go ahead.');
+  const declined = projectHarnessEventForPublic({ ...event('user_input_received', {
+    text: 'reject apr-fixture', approvalId: 'apr-fixture', decision: 'reject',
+  }), role: 'user' });
+  assert.equal(declined?.data.displayText, 'No, don’t do that.');
+  const typed = projectHarnessEventForPublic({ ...event('user_input_received', { text: 'approve the plan please' }), role: 'user' });
+  assert.equal(typed?.data.displayText, undefined, 'words the owner typed are shown as typed');
+});

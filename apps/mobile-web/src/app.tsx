@@ -674,13 +674,32 @@ export function App() {
               signal for screens that have no other way to show it — never on
               Home or Needs you, which say it in their own content. */}
           {headerChrome.needsPill ? (
+            // Live, it is a round door with its count; stale, the words come
+            // back so the age is still on screen.
             <button
               type="button"
-              class={`needs-pill${needsYou.stale ? ' needs-pill-stale' : ''}`}
+              class={`needs-pill${needsYou.stale ? ' needs-pill-stale' : ' needs-pill-round'}`}
               aria-label={needsYou.pillAriaLabel}
               onClick={() => { haptic('light'); navigateTo('inbox'); }}
             >
-              <span class="needs-pill-face" aria-hidden="true">{needsYou.pillText}</span>
+              {needsYou.stale ? (
+                <span class="needs-pill-face" aria-hidden="true">{needsYou.pillText}</span>
+              ) : (
+                <>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /></svg>
+                  <span class="needs-pill-face needs-pill-count" aria-hidden="true">{needsYou.badgeText}</span>
+                </>
+              )}
+            </button>
+          ) : null}
+          {tab === 'chats' && chatsListVisible ? (
+            <button
+              type="button"
+              class="header-round"
+              aria-label="New chat"
+              onClick={() => { haptic('light'); goToChat({}); }}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
             </button>
           ) : null}
           {door === 'direct' ? (

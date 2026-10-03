@@ -961,9 +961,16 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // and protocol checks; this projection re-checks the closed shape.
       return publicStreamTokenData(data);
     case 'user_input_received': {
+      // An answer to a card is shown as the owner's words ("Yes, go ahead."),
+      // read from the recorded decision; `text` stays exact for the parser.
+      const answerWords = (input: string) => {
+        const shown = ownerBubbleText(data);
+        return shown && shown !== input ? { displayText: shown } : {};
+      };
       const liveApprovalControl = publicLiveApprovalControl(event);
       if (liveApprovalControl) {
-        return { text: publicUserInputText(data), synthetic: true, liveApprovalControl };
+        const input = publicUserInputText(data);
+        return { text: input, ...answerWords(input), synthetic: true, liveApprovalControl };
       }
       if (data.synthetic === true) {
         if (data.source !== 'outcome') return null;
@@ -971,7 +978,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       }
       const input = publicUserInputText(data);
       const taskMode = publicTaskMode(data.taskMode);
-      return input ? { text: input, ...(taskMode ? { taskMode } : {}) } : null;
+      return input ? { text: input, ...answerWords(input), ...(taskMode ? { taskMode } : {}) } : null;
     }
     case 'plan_revision_published': {
       const ref = publicPlanArtifactRef(data.planArtifactRef);

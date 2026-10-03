@@ -5311,7 +5311,7 @@ textarea.cz-input { resize: vertical; }
 .settings-mode-seg { margin-bottom: var(--sp-1); }
 .settings-mode-seg button:disabled { opacity: 0.6; }
 
-/* ─── Conversations, everywhere (10-03) ─────────────────────────────────
+/* ─── Conversations, everywhere ───────────────────────────────────────────
    A conversation row is flat: title, one quiet line of who and when, and a
    single live mark at the end — a turning ring while work is in flight, a
    dot when a reply finished since the owner last looked. The same rows sit
@@ -5513,3 +5513,75 @@ textarea.cz-input { resize: vertical; }
 .drawer-quiet { margin-top: 0; padding-top: 0; border-top: 0; }
 .drawer .drawer-item-quiet .drawer-item-label { font-size: 17px; font-weight: 500; }
 .drawer .drawer-item-quiet svg { width: 21px; height: 21px; }
+
+/* Doors at the top of a screen are round, white and lifted a little off the
+   page — the menu, Needs you, a new chat; Back, the agent and the project in
+   a thread — so every one reads as something to press, at one size. */
+.menu-mark,
+.needs-pill-round,
+.header-round,
+.chat-back,
+.chat-header .project-chip.is-unset {
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--bg-0);
+  box-shadow: 0 4px 14px rgba(74, 46, 16, 0.08);
+}
+.menu-mark { margin-left: 0; }
+.menu-mark .brand-mark { width: 30px; height: 30px; }
+.menu-mark:active,
+.header-round:active,
+.needs-pill-round:active { transform: scale(0.94); background: var(--bg-2); }
+.header-round,
+.needs-pill-round {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 0;
+  color: var(--fg);
+  transition: transform 0.14s var(--ease-out), background 0.16s ease;
+}
+.header-round svg,
+.needs-pill-round svg { width: 20px; height: 20px; }
+.needs-pill-round .needs-pill-count {
+  position: absolute;
+  top: -4px;
+  right: -6px;
+  height: 20px;
+  min-width: 20px;
+  padding: 0 6px;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  box-shadow: 0 0 0 2px var(--bg-0);
+}
+.needs-pill-round:active .needs-pill-face { transform: none; }
+.chat-back { color: var(--fg); }
+.chat-header .agent-chip,
+.chat-header .project-chip.is-set {
+  min-height: 44px;
+  border: 1px solid var(--line);
+  background: var(--bg-0);
+  box-shadow: 0 4px 14px rgba(74, 46, 16, 0.08);
+  font-size: 13px;
+  letter-spacing: 0;
+}
+.chat-header .agent-chip { color: var(--fg); }
+.chat-header .agent-chip svg { color: var(--accent); }
+
+/* List heads speak in sentence case, like the menu's Recents. */
+.chat-list-head,
+.app-main h2.chat-list-head {
+  margin: var(--sp-4) 0 var(--sp-1);
+  font-family: var(--font-body);
+  letter-spacing: 0;
+  line-height: 1.3;
+  padding: 0 var(--sp-2);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--fg-3);
+}

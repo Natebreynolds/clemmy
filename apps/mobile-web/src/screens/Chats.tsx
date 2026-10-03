@@ -185,13 +185,6 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
 
   return (
     <div>
-      <button class="btn-new" onClick={() => setComposing({})}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-          <path d="M12 5v14M5 12h14" />
-        </svg>
-        New chat
-      </button>
-
       <label class="chats-search">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
         <input type="search" value={query} onInput={(event) => setQuery((event.currentTarget as HTMLInputElement).value)} placeholder={showArchived ? 'Search archived' : 'Search conversations'} aria-label="Search conversations" autocomplete="off" />
@@ -207,15 +200,15 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
         <div class="empty">
           <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
           <p class="empty-title">No conversations yet</p>
-          <p class="empty-body">Start one above — she picks up all the context from your Mac.</p>
+          <p class="empty-body">Ask below — she picks up all the context from your Mac.</p>
         </div>
       ) : null}
 
-      {arranged.pinned.length > 0 ? <h2 class="section-head pane-head">Pinned</h2> : null}
+      {arranged.pinned.length > 0 ? <h2 class="chat-list-head">Pinned</h2> : null}
       <div class="chat-list">
         {arranged.pinned.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
       </div>
-      {arranged.pinned.length > 0 && arranged.rest.length > 0 ? <h2 class="section-head pane-head">{showArchived ? 'Archived' : 'Recent'}</h2> : null}
+      {arranged.pinned.length > 0 && arranged.rest.length > 0 ? <h2 class="chat-list-head">{showArchived ? 'Archived' : 'Recent'}</h2> : null}
       <div class="chat-list">
         {arranged.rest.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
       </div>
