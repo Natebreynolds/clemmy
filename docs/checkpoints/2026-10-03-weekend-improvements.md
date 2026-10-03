@@ -329,3 +329,29 @@ brain choices are the sign-in's own catalog once it is known. Proof:
   (42c4c8830); the desktop's notification pills drop the universal green
   "Sent" and name the kind in the phone's words, only "Failed" stands out
   (67933f9f0). All tested (620 desktop, 348 phone); not installed.
+
+## Integration and install (wave 38), 10-03 ~01:00 PT
+
+- **Owner:** "Start merging all the other work and then hotpatching so we can
+  just start running tests … 3 tests … Opus 5.5, codex 6.1 and deepseek."
+- **Branch `claude/integration-1003`** from this branch's tip, merged:
+  `codex/browser-model-contracts` (Browserbase sessions, task browser docks,
+  exact model selection, routing truth; clean merge), `main` (website),
+  `codex/storage-efficiency` (history preparation + backlog inventory; nothing
+  scheduled), and the relay readiness commit 004cfd7e7 cherry-picked (both
+  sides of `mobile-relay.ts` kept: the heartbeat watchdog and the registration
+  timeout + readiness check; 23/23 relay tests).
+- **Held back:** `codex/storage-efficiency-with-cadence` — it schedules the
+  history conversion on the owner's live 6.4 GB database; that plan awaits
+  the owner's go. The stray "Release v3.18.26" commit on the relay branch
+  (not the published tag) was not taken.
+- **Merge fixes (e11c866c6):** the cloud browser stylesheet loads at the
+  phone app's entry (node tests cannot load .css) and its stateful panel sits
+  beside the stateless Connections page — 348 phone tests.
+- **Checks:** three type-checks; 620 desktop, 348 phone, 525 merge-touched
+  server tests; no schema change (92).
+- **Installed:** wave 38 = e11c866c6 at 08:22Z (01:22 PT), dist + both web
+  dists identical. Live: the picker's Codex list is the sign-in's own catalog
+  (gpt-5.2-codex no longer offered); on the refused brain a fixture turn read
+  "GPT 5.2 Codex isn't available on this sign-in, so I couldn't answer. Pick
+  another model…" (blocked, not "Something went wrong").
