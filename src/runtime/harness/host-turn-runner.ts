@@ -711,6 +711,7 @@ import {
 } from './accepted-turn-call-authority.js';
 import {
   invokeHostToolCall,
+  workerMustComposeForParent,
 } from './host-tool-invocation.js';
 import {
   committedMutationVerificationHoldForOwner,
@@ -6365,8 +6366,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         details,
       );
       if (exact) {
-        if (harnessRunContextStorage.getStore()?.workerScope
-          && (exact.effect === 'external_write' || exact.effect === 'admin')) {
+        // The worker's lease still bounds which tools it may call at all.
+        if (harnessRunContextStorage.getStore()?.workerScope && workerMustComposeForParent({
+          identity: { toolName: exact.logicalToolName, args: exact.logicalArgs } as never,
+          effect: exact.effect, boundary: exact.boundary,
+        })) {
           return `WORKER_COMPOSE_ONLY: ${name} is an external mutation. Return its exact proposed payload to the parent; no provider dispatch or approval was started.`;
         }
         return undefined;

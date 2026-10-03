@@ -422,3 +422,32 @@ test('a host-owned call of a learned shape is booked as a read: no write settlem
     assert.equal(gate.learnedReadRequest(OPERATION, LIVE_ARGS), false);
   });
 });
+
+test('a worker runs a request shape learned to only read; unknown shapes, writes and admin actions return to its parent', async () => {
+  const verdict = {
+    version: 1 as const, providerKind: 'native_mcp' as const, operationId: OPERATION, shape: LIVE_SHAPE, verdict: 'reads_only' as const,
+    evidenceDigest: sha('worker-evidence'),
+    screen: { model: 'jev-fixture', changeProbability: 0.02 },
+    confirm: { role: 'judge' as const, model: 'judge-fixture-model', changesProvider: 'no' as const, confidence: 0.95 },
+    learnedAt: new Date().toISOString(),
+  };
+  const call = (args: unknown, effect: 'external_write' | 'admin' | 'read' = 'external_write') => ({
+    identity: { toolName: OPERATION, args } as never, effect, boundary: 'host_owned_external' as const,
+  });
+  withCatalog([sealedMayWriteManifest({ readOnly: false, destructive: false })], () => {
+    assert.ok(store.rememberLearnedRequestEffect(verdict));
+    assert.equal(hostInvocation.workerMustComposeForParent(call(LIVE_ARGS)), false, 'the learned lookup runs in the worker');
+    assert.equal(hostInvocation.workerMustComposeForParent(call({ ...LIVE_ARGS, path: '/v3/serp/google/organic/task_post' })), true, 'an unlearned endpoint goes back to the parent');
+    assert.equal(hostInvocation.workerMustComposeForParent(call(LIVE_ARGS, 'admin')), true, 'an admin action always goes back');
+    assert.equal(hostInvocation.workerMustComposeForParent(call(LIVE_ARGS, 'read')), false);
+  });
+  withCatalog([sealedMayWriteManifest({ readOnly: false, destructive: true })], () => {
+    assert.equal(hostInvocation.workerMustComposeForParent(call(LIVE_ARGS)), true, 'a declared destructive tool is never a learned read');
+  });
+  // The worker lane's compose-only refusal asks this one rule, not its own copy.
+  const { readFileSync } = await import('node:fs');
+  const runner = readFileSync(new URL('./host-turn-runner.ts', import.meta.url), 'utf8');
+  const refusal = runner.indexOf('WORKER_COMPOSE_ONLY: ${name} is an external mutation');
+  assert.ok(refusal > 0);
+  assert.match(runner.slice(Math.max(0, refusal - 600), refusal), /workerScope && workerMustComposeForParent\(/);
+});

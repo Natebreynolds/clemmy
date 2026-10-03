@@ -625,6 +625,16 @@ export function hostCallAccounting(
   };
 }
 
+/** Whether a worker must hand this call back to its parent instead of
+ *  dispatching it: an external write or admin action. A request shape
+ *  learned to only read is a read here exactly as it is in the accounting
+ *  above, so a worker can run a lookup its parent could. */
+export function workerMustComposeForParent(
+  input: Pick<InvokeHostToolCallInput<unknown>, 'identity' | 'effect' | 'boundary'>,
+): boolean {
+  return (input.effect === 'external_write' || input.effect === 'admin') && !hostCallAccounting(input).learnedRead;
+}
+
 function invocationMutating(
   input: Pick<InvokeHostToolCallInput<unknown>, 'identity' | 'effect' | 'boundary' | 'consentBasis'>,
 ): boolean {
