@@ -101,7 +101,7 @@ export function WhileAwayPane({
                 {/* Title over meta: side by side in a third of the window,
                     the meta got two or three characters ("- cle…"). */}
                 <span className="flex min-w-0 flex-1 flex-col">
-                  <span className="truncate text-body font-medium text-fg" title={item.title}>
+                  <span className="line-clamp-2 text-body font-medium text-fg" title={item.title}>
                     {plainText(item.title, 160) || 'Update from Clem'}
                   </span>
                   {meta && <span className="truncate text-small text-muted" title={meta}>{plainText(meta, 200)}</span>}

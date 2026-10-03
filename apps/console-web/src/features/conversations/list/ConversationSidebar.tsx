@@ -1,3 +1,4 @@
+import { chatHasNews, chatSeenBaseline, markChatSeen } from '@clem/chat-engine';
 import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Search, Plus, Archive, X, PanelLeftClose } from 'lucide-react';
@@ -90,6 +91,17 @@ export function ConversationSidebar({
     [data, activeId],
   );
   const groups = useMemo(() => groupSessions(sessions, Date.now()), [sessions]);
+  // Which replies are news on this computer: the same rule as the phone.
+  const seenRows = useMemo(
+    () => sessions.map((s) => ({ id: s.id, updatedAt: Date.parse(s.updatedAt), running: s.running })),
+    [sessions],
+  );
+  const seen = chatSeenBaseline(seenRows);
+  // The thread on screen is read as it changes.
+  const open = seenRows.find((row) => row.id === activeId);
+  useEffect(() => {
+    if (open && !open.running) markChatSeen(open.id, open.updatedAt);
+  }, [open?.id, open?.updatedAt, open?.running]);
   const tags = useMemo(() => collectTags(sessions), [sessions]);
 
   const setParam = (key: string, value: string | null) => {
@@ -116,7 +128,7 @@ export function ConversationSidebar({
     >
       <div className="space-y-2 border-b border-border p-3">
         <div className="flex items-center gap-1.5">
-          <Button className="min-w-0 flex-1" onClick={() => navigate('/chat', { state: { newChat: Date.now() } })}>
+          <Button className="min-w-0 flex-1 rounded-full bg-fg text-canvas hover:bg-fg hover:opacity-90 active:bg-fg" onClick={() => navigate('/chat', { state: { newChat: Date.now() } })}>
             <Plus className="h-4 w-4" /> New chat
           </Button>
           {onCollapse && (
@@ -218,10 +230,15 @@ export function ConversationSidebar({
         ) : (
           groups.map((group) => (
             <div key={group.label} className="mb-3">
-              <div className="px-3 py-1 text-label uppercase tracking-wide text-faint">{group.label}</div>
+              <div className="px-3 py-1 text-caption font-semibold text-faint">{group.label}</div>
               <div className="space-y-0.5">
                 {group.items.map((s) => (
-                  <ConversationListItem key={s.id} session={s} actions={actions} />
+                  <ConversationListItem
+                    key={s.id}
+                    session={s}
+                    actions={actions}
+                    news={s.id !== activeId && chatHasNews({ id: s.id, updatedAt: Date.parse(s.updatedAt), running: s.running }, seen)}
+                  />
                 ))}
               </div>
             </div>

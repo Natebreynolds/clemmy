@@ -340,7 +340,7 @@ function LiveHome() {
   const dashboard = (
     <>
       {top.length > 0 && (
-        <div className={cn('grid items-start gap-5', top.length === 2 && 'lg:grid-cols-2', top.length >= 3 && 'lg:grid-cols-2 xl:grid-cols-3')}>
+        <div className={cn('grid items-start gap-5', top.length === 2 && 'lg:grid-cols-2', top.length >= 3 && 'lg:grid-cols-2 2xl:grid-cols-3')}>
           {top.map((pane, i) => <div key={i} className="min-w-0">{pane}</div>)}
         </div>
       )}

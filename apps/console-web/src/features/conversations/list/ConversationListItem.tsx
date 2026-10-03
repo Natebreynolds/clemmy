@@ -36,7 +36,18 @@ interface Actions {
   onDelete: (id: string) => void;
 }
 
-export function ConversationListItem({ session, actions }: { session: Session; actions: Actions }) {
+/** The one live mark a conversation row carries, the same as the phone's:
+ *  a turning ring while work is in flight, a dot for a reply that finished
+ *  since you last looked. */
+function ChatStateMark({ running, news }: { running?: boolean; news?: boolean }) {
+  if (running) {
+    return <span role="img" aria-label="Working" className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-border border-t-muted motion-reduce:animate-none" />;
+  }
+  if (news) return <span role="img" aria-label="New reply" className="h-2 w-2 shrink-0 rounded-full bg-primary ring-4 ring-primary-tint" />;
+  return null;
+}
+
+export function ConversationListItem({ session, actions, news = false }: { session: Session; actions: Actions; news?: boolean }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(session.title);
@@ -104,6 +115,7 @@ export function ConversationListItem({ session, actions }: { session: Session; a
               {session.title || (isRun ? 'Run' : 'New chat')}
             </span>
           )}
+          {!isRun ? <ChatStateMark running={session.running} news={news} /> : null}
           <span className="shrink-0 text-caption text-faint">
             {isRun ? timing.text : relativeTime(session.updatedAt)}
           </span>
@@ -116,7 +128,7 @@ export function ConversationListItem({ session, actions }: { session: Session; a
             </>
           ) : (
             <span className="min-w-0 flex-1 truncate text-caption text-muted">
-              {stripMarkdown(session.preview) || (session.origin !== 'desktop' ? meta.label : 'No messages yet')}
+              {session.running ? 'Working…' : stripMarkdown(session.preview) || (session.origin !== 'desktop' ? meta.label : 'No messages yet')}
             </span>
           )}
         </div>

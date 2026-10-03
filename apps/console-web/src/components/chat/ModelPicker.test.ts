@@ -75,5 +75,5 @@ test('an approval card reads like a question card: Clem\'s question, why, the ex
     assert.match(read(site), /displayText: APPROVAL_ANSWER_WORDS\[decision\]/, `${site} shows the owner's answer, not "approve apr-…"`);
   }
   assert.match(read('../../lib/useChat.ts'), /text: input\.displayText\?\.trim\(\) \|\| text/);
-  assert.match(read('../../screens/Inbox.tsx'), /row\.presentation\?\.ask \|\| row\.presentation\?\.action/);
+  assert.match(read('../../screens/Inbox.tsx'), /row\.presentation\?\.ask \|\| row\.subject \|\| row\.presentation\?\.action/);
 });

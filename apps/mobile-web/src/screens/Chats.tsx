@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useBackGesture } from '../lib/back-gesture';
 import { listChatSessions, patchChatSession, type ChatSession } from '../lib/api';
 import { arrangeChatList, cleanChatTitle } from '../lib/chat-list';
-import { chatHasNews, chatSeenBaseline, markChatSeen } from '../lib/chat-seen';
+import { chatHasNews, chatSeenBaseline, markChatSeen } from '@clem/chat-engine';
 import { ChatStateMark } from '../components/ChatStateMark';
 import { Sheet } from '../components/Sheet';
 import { haptic } from '../lib/native-bridge';

@@ -1007,8 +1007,9 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
   // the raw tool name the summary falls back to.
   const voiced = !queued && Boolean(row.presentation?.ask);
   const summary = voiced ? row.presentation?.why : queued?.summary || row.summary;
-  // Clem's own question when her checker wrote one; never an operation id.
-  const title = queued?.title || row.presentation?.ask || row.presentation?.action || row.subject;
+  // Clem's own question when her checker wrote one, then the request in
+  // words; the kind of action titles it only when nothing else does.
+  const title = queued?.title || row.presentation?.ask || row.subject || row.presentation?.action || 'Approval';
   return (
     <DecisionFrame view={view} title={title} onBack={onBack} notice={decisionState?.notice ?? null}
       aside={project ? <ProjectLabelTag label={project} link /> : undefined}

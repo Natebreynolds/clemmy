@@ -113,6 +113,11 @@ export function approvalQuestion(subject: string): string {
   return `I’m ready to ${action}. Should I go ahead?`;
 }
 
+/** A long hex digest, optionally named by its algorithm. Shape only. */
+function isContentFingerprint(value: unknown): boolean {
+  return typeof value === 'string' && /^(?:sha(?:1|256|384|512):)?[0-9a-f]{32,}$/i.test(value.trim());
+}
+
 export function approvalDetails(row: Pick<ApprovalRow, 'args'>): ApprovalDetailRow[] {
   if (!row.args || typeof row.args !== 'object' || Array.isArray(row.args)) {
     const value = displayValue(row.args);
@@ -121,8 +126,11 @@ export function approvalDetails(row: Pick<ApprovalRow, 'args'>): ApprovalDetailR
   const args = row.args as Record<string, unknown>;
   const keys: string[] = [];
   let omitted = false;
+  let fingerprinted = false;
   for (const key in args) {
     if (!Object.prototype.hasOwnProperty.call(args, key)) continue;
+    // A content fingerprint pins the exact bytes approved; it is not read.
+    if (isContentFingerprint(args[key])) { fingerprinted = true; continue; }
     if (keys.length >= MAX_DETAIL_FIELDS) {
       omitted = true;
       break;
@@ -143,6 +151,7 @@ export function approvalDetails(row: Pick<ApprovalRow, 'args'>): ApprovalDetailR
       long: ['body', 'message', 'text', 'content', 'prompt'].includes(lower) || value.length > 120,
     };
   });
+  if (fingerprinted) rows.push({ label: 'Version check', value: 'Locked to this exact version', long: false });
   if (omitted) rows.push({
     label: 'Additional fields',
     value: 'Additional details omitted on mobile. Review the full approval on the desktop if needed.',

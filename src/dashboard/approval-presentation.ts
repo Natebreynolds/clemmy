@@ -107,6 +107,16 @@ function valueText(value: unknown): string {
   try { return JSON.stringify(value, null, 2); } catch { return String(value); }
 }
 
+/** A content fingerprint (a long hex digest, optionally named by its
+ *  algorithm) pins the exact bytes the approval is bound to; it is not
+ *  something a person reads. Shape only, never a field name. */
+export function isContentFingerprint(value: unknown): boolean {
+  return typeof value === 'string' && /^(?:sha(?:1|256|384|512):)?[0-9a-f]{32,}$/i.test(value.trim());
+}
+
+/** Shown once, in place of every fingerprint the card left out. */
+export const FINGERPRINT_LINE = { label: 'Version check', value: 'Locked to this exact version' } as const;
+
 export function detailLinesFor(args: unknown): ApprovalDetailLine[] {
   const record = asRecord(args);
   if (!record) {
@@ -114,13 +124,16 @@ export function detailLinesFor(args: unknown): ApprovalDetailLine[] {
     return text ? [{ label: 'Details', value: text.slice(0, MAX_VALUE_CHARS), long: text.length > 120 }] : [];
   }
   const lines: ApprovalDetailLine[] = [];
+  let fingerprinted = false;
   for (const [key, raw] of Object.entries(record)) {
     if (lines.length >= MAX_LINES) break;
+    if (isContentFingerprint(raw)) { fingerprinted = true; continue; }
     const text = valueText(raw);
     if (!text) continue;
     const clipped = text.length > MAX_VALUE_CHARS ? `${text.slice(0, MAX_VALUE_CHARS)}…` : text;
     lines.push({ label: capitalize(words(key)), value: clipped, long: clipped.length > 120 || clipped.includes('\n') });
   }
+  if (fingerprinted && lines.length < MAX_LINES) lines.push({ ...FINGERPRINT_LINE, long: false });
   // The message itself reads best last and in full.
   lines.sort((a, b) => Number(a.long) - Number(b.long));
   return lines;

@@ -71,3 +71,11 @@ test('an attention item links to where it is resolved, by the server key alone',
   assert.equal(attentionDestination('calendar:abc'), undefined);
   assert.equal(attentionDestination(undefined), undefined);
 });
+
+test('an approval row is named in words: Clem\'s question, then the subject, never the kind of action', () => {
+  const named = (over: Partial<ApprovalRow>) => needsYouRowView({ kind: 'approval', id: 'a', row: approval('a', over), aged: false }).title;
+  const kind = { action: 'Workspace source script consent', details: [], unwrapped: false } as unknown as ApprovalRow['presentation'];
+  assert.equal(named({ subject: 'Allow the dashboard to refresh every weekday', presentation: kind }), 'Allow the dashboard to refresh every weekday');
+  assert.equal(named({ presentation: { ...kind!, ask: 'Can I keep your dashboard up to date?' } as ApprovalRow['presentation'] }), 'Can I keep your dashboard up to date?');
+  assert.equal(named({ subject: '', presentation: kind }), 'Workspace source script consent', 'the kind names it only when nothing else does');
+});

@@ -1,6 +1,6 @@
 import { listChatSessions, type ChatSession } from '../lib/api';
 import { arrangeChatList } from '../lib/chat-list';
-import { chatHasNews, chatSeenBaseline } from '../lib/chat-seen';
+import { chatHasNews, chatSeenBaseline } from '@clem/chat-engine';
 import { useScreenData } from '../lib/use-screen-data';
 import { haptic } from '../lib/native-bridge';
 import { ChatStateMark } from './ChatStateMark';

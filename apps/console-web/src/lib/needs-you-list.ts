@@ -94,10 +94,11 @@ export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
     }
     case 'approval': {
       const queued = item.row.pendingAction;
-      // Clem's own question and why when her checker wrote them; never an
-      // operation id.
+      // Clem's own question and why when her checker wrote them, then the
+      // subject in words; the kind of action names a row only when nothing
+      // else does. Never an operation id.
       const ask = item.row.presentation?.ask;
-      const title = oneLine(queued?.title || ask || item.row.presentation?.action || item.row.subject, TITLE_MAX) || 'Approval';
+      const title = oneLine(queued?.title || ask || item.row.subject || item.row.presentation?.action, TITLE_MAX) || 'Approval';
       return { ...base, checkable: true, aged: item.aged, title,
         preview: previewFor(title, ask && !queued
           ? [item.row.presentation?.why, item.row.contentPreview?.body]

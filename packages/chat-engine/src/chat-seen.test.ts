@@ -1,5 +1,5 @@
 /**
- * Run: npx tsx --test src/lib/chat-seen.test.ts   (from apps/mobile-web)
+ * Run: node scripts/run-tests-isolated.mjs packages/chat-engine/src/chat-seen.test.ts
  *
  * The conversation list marks a reply that finished while the owner was
  * somewhere else, and only that: never what was already there when the phone
@@ -7,16 +7,12 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chatHasNews, chatSeenBaseline, markChatSeen, readChatSeen } from './chat-seen';
+import { chatHasNews, chatSeenBaseline, markChatSeen, readChatSeen, type ChatSeenStorage } from './chat-seen.js';
 
-function memoryStore(): Storage {
+function memoryStore(): ChatSeenStorage {
   const map = new Map<string, string>();
   return {
-    get length() { return map.size; },
-    clear: () => map.clear(),
     getItem: (key) => map.get(key) ?? null,
-    key: (index) => [...map.keys()][index] ?? null,
-    removeItem: (key) => { map.delete(key); },
     setItem: (key, value) => { map.set(key, String(value)); },
   };
 }

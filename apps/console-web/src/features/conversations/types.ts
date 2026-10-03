@@ -30,6 +30,8 @@ export interface Session {
   /** Exact step sessions supplied by the backend for a collapsed run. */
   runSteps?: RunStep[];
   runCoverage?: RunSourceCoverage;
+  /** Work is in flight in it right now. Absent from an older Mac. */
+  running?: boolean;
 }
 
 export interface Turn {
