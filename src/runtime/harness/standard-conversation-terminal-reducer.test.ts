@@ -278,3 +278,23 @@ test('an exact-source advisory can supply a missing diagnostic without entering 
   assert.match(detail as string, /^latest detail /);
   assert.doesNotMatch(reduced.publicPresentation?.text ?? '', /latest detail/);
 });
+
+test('a job handed to an agent explains its stop in words too; a plain background run keeps the typed stop', async () => {
+  const run = async (sessionId: string, metadata: Record<string, unknown>) => {
+    eventlog.createSession({ id: sessionId, kind: 'execution', metadata } as never);
+    const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Do the delegated job.' } });
+    const stopped = { sessionId, turn: source.turn, status: 'blocked' as const, finalOutput: 'Stopped at: execution:policy_denial',
+      error: 'Stopped at: execution:policy_denial', blockedReason: 'control_no_progress_exhausted', blockedDetail: 'execution:policy_denial', toolCalls: 4 };
+    let calls = 0;
+    const explained = await modelCheckInForExhaustedTurn(stopped, { sessionId, sourceUserSeq: source.seq,
+      run: async () => { calls += 1; return { sessionId, turn: source.turn + 1, status: 'completed', finalOutput: 'I could not reach the data source, so the audit is not finished yet.', toolCalls: 0 }; } });
+    return { calls, explained };
+  };
+  const delegated = await run('background:explained-lead-job', { delegatedTaskId: 'task-explained' });
+  assert.equal(delegated.calls, 1);
+  assert.equal(delegated.explained.error, 'I could not reach the data source, so the audit is not finished yet.');
+  assert.equal(delegated.explained.status, 'blocked');
+  const plain = await run('background:plain-typed-stop', {});
+  assert.equal(plain.calls, 0);
+  assert.equal(plain.explained.error, 'Stopped at: execution:policy_denial');
+});

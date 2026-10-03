@@ -458,6 +458,7 @@ import {
   sameExactOriginDeliveryTarget,
 } from '../exact-origin-delivery.js';
 import pino from 'pino';
+import { sessionIsDelegatedJob } from '../../agents/delegation-depth.js';
 
 const logger = pino({ name: 'host-loop' });
 
@@ -1622,8 +1623,11 @@ export async function modelCheckInForExhaustedTurn(
   // to ask them a question buys nothing and a worker must never address the
   // user at all (its result goes to its parent). Those lanes keep the typed
   // stop, which their own runner already reports.
+  // A job Clem handed to an agent has a person adjacent too: its stop is
+  // reported in the conversation that handed it over, so it is explained in
+  // words, and a question it asks reaches that person as the task's question.
   try {
-    if (getSession(input.sessionId)?.kind !== 'chat') return turnResult;
+    if (getSession(input.sessionId)?.kind !== 'chat' && !sessionIsDelegatedJob(input.sessionId)) return turnResult;
   } catch {
     return turnResult;
   }
