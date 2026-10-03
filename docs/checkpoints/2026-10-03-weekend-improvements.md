@@ -695,3 +695,17 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   ran only in chat sessions, so the lead's stop reached the owner as
   "Execution evidence … Stopped at: execution:policy_denial". A delegated
   job now gets the same explanation (its stop is reported to a person).
+- **Commits:** 1481650a6 (owner's words decide connector consent in a
+  delegated job, resumed jobs included), 80a4dd7dd (shell safety refusal →
+  repair, not stop), eaf7616a3 (delegated stops explained in words), plus
+  the other agent's browser viewer renewal merged (8448052db: 176742a43,
+  79e20b415; their tests 58/58). Related tests 5374 pass / 0 fail;
+  continuity-resolver tests 173/173; tsc clean.
+- **Wave 50 = 8448052db INSTALLED 15:43 PT**, build-info + three dists
+  verified, schema 92.
+- **Live, same task resumed in place (owner's Resume route):** the lead's
+  scope is now "seo/web-audit intent …" with dataforseo allowed (was "user
+  excluded dataforseo"); mcp_list_tools shows the 4 tools; the lead's
+  dataforseo__api_request calls return status 20000 Ok. Note: the generic
+  request tool is classed external_write (POST), though these are search
+  reads; Auto runs them without cards.
