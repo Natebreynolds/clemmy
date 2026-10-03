@@ -762,3 +762,26 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   same stop still dedupes.
 - **Check-in length:** the tool description now names its 600-character cap
   (the lead learned it from a refused call).
+
+### The real billing cause (owner: "it could be how the requests are routed")
+
+- After wave 51 the resumed lead's FIRST request was refused again, and the
+  refusal carried only `overage-disabled-reason: out_of_credits`, no 5h/7d
+  headers: Claude had not counted it against the subscription at all.
+- Bisected live through Clem's own sign-in (decrypted the stored model
+  request snapshot, replayed it; refusals cost nothing): Clem's system prompt
+  alone bills the subscription; the real tool list alone is refused; tool by
+  tool, only `mcp_status`. Any tool definition named `mcp_…` (single
+  underscore) is billed as extra usage: `mcp_status`, `mcp_list_tools`,
+  `mcp_reconnect`, `mcp_add`, `mcp_lookup` refused; `server_status`,
+  `status_mcp`, `mcp-status`, `mcpstatus`, `MCP_status`, `mcp__status` bill
+  the subscription; a history tool_use or text naming `mcp_status` does not
+  trigger it. All 282 other registered tool names checked: none trigger it.
+- So every lead call that offered `mcp_status` first-class was extra usage
+  (why 5.3M Opus tokens left the 5h window at 9%), and it all stopped when
+  the extra-usage credit ran out.
+- **Fix d4c95ca3f:** the Claude wire spells an `mcp_` tool `mcp-` (history
+  tool_use and a forced tool_choice follow), and the model's calls come back
+  under the real name in streamed and whole replies. Live replay of the
+  refused lead request through the fixed code: 200, claim seven_day, and the
+  model's call returned as `mcp_status`. Tests 798/798 for the wire.
