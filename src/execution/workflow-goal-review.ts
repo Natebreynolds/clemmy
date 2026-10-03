@@ -1,6 +1,7 @@
 import { validateGoal, type ValidateGoalInput, type ValidateGoalDeps, type GoalValidationResult } from './goal-validate.js';
 import type { WorkflowTargetEvidence } from './workflow-target-evidence.js';
 import type { JudgeEvidenceSource } from '../runtime/harness/judge-evidence-tools.js';
+import { OWNER_STANDING_INSTRUCTIONS_HEADING } from '../runtime/harness/objective-judge.js';
 
 /** Output contracts prove their individual criteria, not the whole workflow.
  * Keep objective coverage in the same batched review as the parked criteria. */
@@ -29,6 +30,9 @@ export function workflowGoalExecutionEvidence(
   target: WorkflowTargetEvidence,
   definition: unknown,
   earlier?: WorkflowGoalEarlierAttempts,
+  /** The owner's standing instructions exactly as the run's workers had them
+   *  (workflow-worker-standing-instructions.ts). */
+  standingInstructions?: string | null,
 ): {
   summary: string; evidence: JudgeEvidenceSource;
 } {
@@ -68,13 +72,18 @@ export function workflowGoalExecutionEvidence(
       ...entries.slice(0, 40),
       ...(entries.length > 40 ? [`${entries.length - 40} additional tool/outcome groups are retained; omitted groups are not absent.`] : []),
       'Open workflow_execution for authenticated read AND write receipts, and workflow_contract for the saved workflow instructions and constraints. Output keys and a URL alone do not prove fulfillment or preservation of existing data.',
+      ...(standingInstructions
+        ? [`=== ${OWNER_STANDING_INSTRUCTIONS_HEADING} (owner_standing_instructions) ===`, standingInstructions]
+        : []),
       ...earlierLines,
     ].join('\n'),
     evidence: {
       refKind: 'the saved workflow contract, authenticated execution receipts, and retained result contents',
-      refs: () => ['workflow_contract', 'workflow_execution', ...earlierSummaries.keys(), ...earlierRetained.keys(), ...refs.keys()],
+      refs: () => ['workflow_contract', 'workflow_execution', ...(standingInstructions ? ['owner_standing_instructions'] : []),
+        ...earlierSummaries.keys(), ...earlierRetained.keys(), ...refs.keys()],
       resolve(ref) {
         if (ref === 'workflow_contract') return { text: JSON.stringify(definition), value: definition };
+        if (ref === 'owner_standing_instructions' && standingInstructions) return { text: standingInstructions };
         if (ref === 'workflow_execution') return { text: target.summary };
         const earlierTarget = earlierSummaries.get(ref);
         if (earlierTarget) return { text: earlierTarget.summary };

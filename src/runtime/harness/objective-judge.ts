@@ -41,6 +41,14 @@ export const JEV_HEDGE_DELAY_MS = 1_000;
 /** A verdict names every finding at once, numbered; this bounds that list. */
 const VERDICT_REASON_MAX_CHARS = 1_600;
 
+/** The heading under which review evidence carries the owner's standing
+ *  instructions exactly as the work had them in context. */
+export const OWNER_STANDING_INSTRUCTIONS_HEADING = "THE OWNER'S STANDING INSTRUCTIONS, AS THE WORK HAD THEM";
+
+/** One precedence rule for every reviewer that may see them. */
+export const OWNER_STANDING_INSTRUCTIONS_RUBRIC =
+  `- OWNER STANDING INSTRUCTIONS: evidence headed ${OWNER_STANDING_INSTRUCTIONS_HEADING} is the owner's own, exactly as the work had it in context. One that applies to this work carries the owner's authority: where it addresses this case more specifically than the objective or the saved instructions (an exception, an exclusion, a way to do it), following it fulfils the objective as the owner wants it and is not a gap, an omission or an invented preference, and a clear departure from it is a gap. Name the instruction when it decides a finding. It reaches only what it says: it never adds a deliverable, never authorizes work outside its own scope, and never relaxes a USER CONSTRAINT. A preference the work applied that appears in none of the objective, the saved instructions or these instructions is still unsupported.`;
+
 export const JUDGE_SYSTEM_PROMPT = [
   'You are a goal-completion judge. You receive (1) a user objective and (2) the most recent assistant response.',
   '',
@@ -56,6 +64,7 @@ export const JUDGE_SYSTEM_PROMPT = [
   '- Check factual claims and limitations against the supplied source evidence. A field omitted from a selected projection is not evidence that the provider omitted it. A result shown as a bounded view is what the assistant itself received of it. Inspect the evidence shown, including nested records, before accepting claims that data is absent, empty, unavailable or complete; such a claim resting on content outside the evidence shown is unverified unless other evidence shown covers it. Distinguish missing values from zero and from values the assistant did not inspect.',
   '- A saved artifact and matching readback prove persistence, not the correctness of its claims. Compare material conclusions, added specificity and claimed certainty against the actual source values and the adopted constraints or preferences. Plausible details unsupported by those sources are a gap. Interpretations of ambiguous data must remain labeled as interpretations, not promoted to confirmed facts or diagnoses.',
   '- USER CONSTRAINTS ARE IMMUTABLE: verification never grants authority to exceed a call/attempt limit, retry when retries were forbidden, use an excluded source/tool, or perform a write the user prohibited. If the permitted attempt produced a verified empty/negative result, that honest result is complete; do not demand an out-of-contract retry.',
+  OWNER_STANDING_INSTRUCTIONS_RUBRIC,
   '- Separate delivered content from private review evidence. Apply response-only constraints (format, brevity, omitted identifiers or metadata) to the candidate response, and to any actual deliverable the objective covers, not to tool results or diagnostic evidence supplied only for this review. Private evidence does not prove disclosure. Still use it to verify claims and enforce restrictions on what may be read, written, sent, or stored. When rejecting a response for disclosure, identify the offending text in that response or actual deliverable.',
   '- Quantity language such as "up to N", "at most N", "no more than N", and "maximum N" is a CEILING, not a minimum. Zero through N verified results satisfies that quantity. Never reinterpret an upper bound as a quota.',
   '- HONEST BLOCKER: if the response delivers the results it COULD produce AND explicitly names the specific part it could not, with a concrete reason that part is genuinely blocked (a named tool/endpoint unavailable, a record/field that does not exist, access denied), treat that as DONE — do NOT demand it retry a capability that is genuinely unavailable. Mark not-done ONLY when the assistant could plausibly still finish with the tools it has (it punted, guessed, promised, or stopped without actually trying).',
@@ -1505,6 +1514,7 @@ export const CRITERIA_JUDGE_SYSTEM_PROMPT = [
   '- A plan, intention, or "I will work on this next" is NOT met.',
   '- HONEST BLOCKER: if the evidence explicitly names why this specific criterion is genuinely blocked (a named tool/endpoint unavailable, a record that does not exist, access denied), treat it as MET rather than demanding a retry of an unavailable capability.',
   '- Judge ONLY the listed criteria. Do not invent extra requirements.',
+  OWNER_STANDING_INSTRUCTIONS_RUBRIC,
   '',
   'Reply with EXACTLY ONE LINE PER CRITERION, in order, numbered to match, and nothing else:',
   '  "<n>: MET: <short evidence>" or "<n>: UNMET: <short missing piece>".',

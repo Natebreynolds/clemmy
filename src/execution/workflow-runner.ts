@@ -1,3 +1,4 @@
+import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
 import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
@@ -16152,6 +16153,10 @@ async function processOneRunFile(
                 landedSummary: renderLandedWritesForFollowUp(earlierAttempts),
               }
             : undefined,
+          // The reviewer reads the owner's standing instructions exactly as the
+          // workers had them, so a rule the work followed is judged as the
+          // owner's own and not as an invented preference.
+          workerStandingInstructions(run.id),
         );
         goalVerdict = await validateWorkflowRunGoal({
           objective: runGoal.objective,
@@ -16840,8 +16845,12 @@ async function processOneRunFile(
       // dashboard-only (silent) to avoid the duplicate. The legacy echo rule
       // still delivers needs-attention; an exact v2 observer is the separate
       // authority that makes any global terminal card dashboard-only.
+      // A goal gap after landed work is not a failed run, but it is the owner's
+      // to decide: its notice asks them, so it is never folded into a step's
+      // own report and it waits on Needs you.
+      const outcomeAsksOwner = needsAttention || goalGap;
       const stepAlreadyNotified = shouldSilenceCompletionEcho({
-        needsAttention,
+        needsAttention: outcomeAsksOwner,
         runId: run.id,
         notifications: terminalNotifications,
       });
@@ -16923,7 +16932,9 @@ async function processOneRunFile(
               // so title it honestly.
               : needsAttention && blockedSteps.length === 0
                 ? `⚠️ Workflow needs attention: ${workflow.data.name}`
-                : outcome.title,
+                : goalGap && !needsAttention
+                  ? `Done, with a gap: ${workflow.data.name}`
+                  : outcome.title,
           // Send the full body. Discord delivery splits long content into
           // multiple messages; previous 2000-char slice cut off workflow
           // results above that length with no continuation. Quality advisories
@@ -16940,7 +16951,8 @@ async function processOneRunFile(
             workflow: workflow.data.name,
             runId: run.id,
             forEachFailures: hasFailures ? publicForEachFailures : undefined,
-            needsAttention: needsAttention || undefined,
+            needsAttention: outcomeAsksOwner || undefined,
+            ...(goalGap ? { goalOutcome: 'gap' } : {}),
             proposedFixId: proposedFix?.id,
             qualityAdvisories: hasAdvisories ? publicQualityAdvisories : undefined,
             ...(runIsNoOp ? { noOp: true, noOpReason: 'no new items' } : {}),

@@ -197,6 +197,15 @@ test('FRAMEWORK-TEST-landed-dataset: a gap after a landed, repeat-safe write re-
   assert.equal(reviewer.calls(), 2, 'the goal reviewer judged both attempts');
   const summaries = workflowEvents.readWorkflowEvents(persisted.name, followUp.id).filter((event) => event.kind === 'run_summary');
   assert.match(String(summaries.at(-1)?.meta?.because ?? ''), /finished, with a goal gap/, 'the run list summary names the gap');
+  // The gap is the owner's to decide: its notice says what it is and waits on
+  // Needs you, while the run itself stays a success.
+  const gapNotice = notifications.loadNotifications().find((row) => row.id === `workflow-${followUp.id}-completed`);
+  assert.ok(gapNotice, 'the gap has its own notice');
+  assert.equal(gapNotice!.title, `Done, with a gap: ${persisted.data.name}`);
+  assert.equal(gapNotice!.metadata?.needsAttention, true);
+  assert.equal(gapNotice!.metadata?.goalOutcome, 'gap');
+  assert.equal(notifications.isNeedsAttentionNotification(gapNotice!), true);
+  assert.doesNotMatch(gapNotice!.title, /completed|failed|couldn/i);
   const pausedNotices = notifications.loadNotifications()
     .filter((row) => String(row.body ?? '').includes('auto-heal is PAUSED'));
   assert.equal(pausedNotices.length, 0, 'self-healing never paused for landed work');
