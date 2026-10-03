@@ -14,8 +14,103 @@ const { createSession, appendEvent, getSessionTokensUsed, closeEventLog } = awai
 const { modelUsageAttributionStorage, withModelUsageAttribution, readUsageEventsForDate,
   observeModelUsageRecording, recordModelUsage } = await import('../usage-log.js');
 const { RouterModelProvider } = await import('../harness/router-model.js');
+const { readAcceptedSourceUsage } = await import('../accepted-source-usage.js');
 
 after(() => { setDefaultModelProvider(new RouterModelProvider()); closeEventLog(); rmSync(fixtureHome, { recursive: true, force: true }); });
+
+// Live mobile source346953: the clarification proposal reported 6,804 input
+// and111 output tokens, but preparation had not entered a turn usage scope.
+// The adapter's real row was anonymous and its receipt suppressed the port's
+// fallback row. The host source must own the request before the adapter runs.
+for (const adapterRecords of [false, true]) {
+  test(`clarification preparation books its exact host source once, adapter accounting=${adapterRecords}`, async () => {
+    const session = createSession({ kind: 'chat' });
+    const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'A new blank tab' } });
+    const other = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+      data: { text: 'An unrelated newer request' } });
+    const port = configuredBrainSemanticPort(async () => {
+      if (adapterRecords) recordModelUsage({ sessionId: 'unknown', model: 'fixture-proposal', cacheDialect: 'inclusive',
+        inputTokens: 6804, outputTokens: 111, responseId: `clarification-usage-${source.seq}` });
+      return { raw: {}, modelIdentity: 'fixture-proposal', inputTokens: 6804, outputTokens: 111,
+        latencyMs: 5, usageRecorded: adapterRecords };
+    });
+    await port.interpret({ acceptedText: 'A new blank tab', recentTurns: [],
+      host: { source: { sessionId: session.id, sourceUserSeq: source.seq }, policyRevision: 'fixture',
+        resumableGoals: [], openQuestions: [], catalog: { capabilities: [], capabilityIds: [], workflowIds: [] } },
+    } as never);
+    const rows = readUsageEventsForDate().filter(row => row.model === 'fixture-proposal'
+      && row.trace?.acceptedSource === `${session.id}:${source.seq}`);
+    assert.equal(rows.length, 1, 'one adapter response produces one exact-source row, without timestamp guessing');
+    assert.equal(rows[0]!.channel, 'semantic:turn_semantics');
+    assert.equal(rows[0]!.role, undefined, 'interpretation does not become an extra foreground brain frame');
+    const own = readAcceptedSourceUsage({ sessionId: session.id, sourceUserSeq: source.seq });
+    assert.equal(own?.totals.calls, 1);
+    assert.equal(own?.totals.promptTokens, 6804);
+    assert.equal(own?.totals.outputTokens, 111);
+    assert.equal(own?.totals.uncachedWorkTokens, 6915);
+    assert.equal(readAcceptedSourceUsage({ sessionId: session.id, sourceUserSeq: other.seq })?.totals.calls, 0,
+      'a newer input in the same conversation is not the attribution authority');
+    assert.equal(getSessionTokensUsed(session.id), 6915, 'the adapter receipt prevents a second budget debit');
+  });
+}
+
+test('a failed clarification adapter retains unknown cost on its exact source without a zero-cost repair row', async () => {
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'A new blank tab' } });
+  const port = configuredBrainSemanticPort(async () => {
+    recordModelUsage({ sessionId: 'unknown', model: 'fixture-proposal-failed', cacheDialect: 'inclusive',
+      inputTokens: 0, outputTokens: 0, totalTokens: 0, ok: false, failReason: 'fixture unavailable' });
+    throw new Error('fixture unavailable');
+  });
+  await assert.rejects(port.interpret({ acceptedText: 'A new blank tab', recentTurns: [],
+    host: { source: { sessionId: session.id, sourceUserSeq: source.seq }, policyRevision: 'fixture',
+      resumableGoals: [], openQuestions: [], catalog: { capabilities: [], capabilityIds: [], workflowIds: [] } },
+  } as never), /fixture unavailable/);
+  const own = readAcceptedSourceUsage({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.equal(own?.totals.calls, 1);
+  assert.equal(own?.totals.failedCalls, 1);
+  assert.equal(own?.totals.unknownCostCalls, 1);
+  assert.equal(own?.totals.uncertifiedCalls, 1);
+  const rows = readUsageEventsForDate().filter(row => row.model === 'fixture-proposal-failed');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.canonical?.certified, false, 'missing provider usage is not certified zero');
+  assert.equal(rows[0]!.trace?.acceptedSource, `${session.id}:${source.seq}`);
+});
+
+test('an exact clarification source cannot inherit another attempt or capture unrelated parallel usage', async () => {
+  const sourceOf = (text: string) => {
+    const session = createSession({ kind: 'chat' });
+    const event = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+    return { sessionId: session.id, sourceUserSeq: event.seq };
+  };
+  const outer = sourceOf('Unrelated work');
+  const answer = sourceOf('A new blank tab');
+  const port = configuredBrainSemanticPort(async () => {
+    await Promise.resolve();
+    recordModelUsage({ sessionId: 'unknown', model: 'fixture-scoped-proposal', cacheDialect: 'inclusive',
+      inputTokens: 100, outputTokens: 2 });
+    return { raw: {}, modelIdentity: 'fixture-scoped-proposal', inputTokens: 100, outputTokens: 2,
+      latencyMs: 1, usageRecorded: true };
+  });
+  await withModelUsageAttribution({ ...outer, attemptId: 'unrelated-attempt', role: 'brain' }, () => Promise.all([
+    port.interpret({ acceptedText: 'A new blank tab', host: { source: answer, policyRevision: 'fixture',
+      resumableGoals: [], openQuestions: [], catalog: { capabilities: [], capabilityIds: [], workflowIds: [] } },
+    } as never),
+    Promise.resolve().then(() => recordModelUsage({ sessionId: 'unknown', model: 'fixture-parallel-outside',
+      cacheDialect: 'inclusive', inputTokens: 200, outputTokens: 3 })),
+  ]));
+  const proposal = readUsageEventsForDate().find(row => row.model === 'fixture-scoped-proposal');
+  const unrelated = readUsageEventsForDate().find(row => row.model === 'fixture-parallel-outside');
+  assert.equal(proposal?.trace?.acceptedSource, `${answer.sessionId}:${answer.sourceUserSeq}`);
+  assert.equal(proposal?.trace?.attemptId, undefined, 'another source\'s attempt is not inherited');
+  assert.equal(unrelated?.trace?.acceptedSource, `${outer.sessionId}:${outer.sourceUserSeq}`);
+  assert.equal(unrelated?.trace?.attemptId, 'unrelated-attempt');
+  assert.equal(unrelated?.role, 'brain');
+  assert.equal(readAcceptedSourceUsage(answer)?.totals.calls, 1);
+  assert.equal(readAcceptedSourceUsage(outer)?.totals.calls, 1);
+});
 
 for (const adapterRecords of [false, true]) {
   test(`semantic completion records and debits once with adapter accounting=${adapterRecords}`, async () => {
