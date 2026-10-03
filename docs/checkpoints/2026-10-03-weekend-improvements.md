@@ -662,3 +662,36 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   Not exercised live: check_in (the job was too short to need one; covered by
   tests) and folder linking (the fixture folder is not among the owner's
   workspace folders, so the project context named it instead).
+
+## The Ward audit, run end to end on wave 49 (10-03 14:48 PT)
+
+- **Owner ask:** "have Clem run it for me so you can watch this framework end
+  to end", then "fix this at the framework level … Clem should be able to call
+  an agent in a project to get work like this done."
+- **Run:** chat sess-desktop-4b59322ffc57fd3583ec996b in proposal-builder
+  (prior ward-law-brief backed up to ~/clem-fixtures/backups/). Clem found
+  Brett's Slack request and handed the job to Scorpion Audit on Opus; the
+  lead recovered Brett's nine-area brief, checked the draft and research,
+  posted a clear check-in, ran two Apify scrapes, then stopped blocked at
+  ~8 min (task bg-musxdykf-1ec847). No workers yet.
+- **Root cause 1 (connector access read from Clem's text):** the lead's run
+  got no external MCP scope — reason "user excluded dataforseo". The job text
+  Clem wrote said "Use actual connected DataForSEO MCP (not Composio
+  DataForSEO)"; the access parser read "(not … DataForSEO)" as the owner
+  refusing DataForSEO, so mcp_list_tools showed 0 tools while the server
+  itself lists 4 (api_request among them). The owner's own message refuses
+  nothing. Fix: `ownerWords` on the MCP scope resolvers; in a delegated job
+  the owner's message (origin chat, originSourceUserSeq) alone decides access
+  and refusals (the constraint, the denied list and the local-only check);
+  the job text still decides relevance; an unreadable origin keeps the
+  ordinary reading so no owner refusal is lost.
+- **Root cause 2 (one shell refusal ended the job):** the lead tried to drive
+  the MCP server by hand through the shell; the shell safety rule refused it
+  correctly before running anything, but the stop projection treats a
+  host-crossed policy refusal as a factual stop. Fix: shell safety refusals
+  are marked `shell_policy` and close that route only (repair, not_started);
+  every other policy refusal (approvals included) keeps its stop.
+- **Root cause 3 (internal text in the chat):** the no-progress explanation
+  ran only in chat sessions, so the lead's stop reached the owner as
+  "Execution evidence … Stopped at: execution:policy_denial". A delegated
+  job now gets the same explanation (its stop is reported to a person).
