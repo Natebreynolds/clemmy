@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { parseBrowserOperationArguments, type BrowserOperationName } from '../tools/browser-operation-contract.js';
+import { browserBackendOffered, LOCAL_BROWSER_NOT_OFFERED } from '../tools/browser-backend.js';
 
 export interface BrowserProcessResult { code: number | null; stdout: string; stderr: string; termination?: 'timeout' | 'cancelled'; dispatched?: boolean; }
 export type BrowserOperationRunner = (code: string, sessionName: string, signal?: AbortSignal) => Promise<BrowserProcessResult>;
@@ -192,7 +193,10 @@ export async function executeBrowserOperation(operation: BrowserOperationName, a
   options: { runner?: BrowserOperationRunner; signal?: AbortSignal } = {}): Promise<Record<string, unknown>> {
   const parsed = parseBrowserOperationArguments(operation, args);
   const sessionName = typeof parsed.session_name === 'string' ? parsed.session_name : 'default';
-  const processResult = await (options.runner ?? runBrowserOperationProcess)(browserOperationScript(operation, parsed), sessionName, options.signal);
+  // The fallback browser never starts while a cloud browser is the browser.
+  const processResult: BrowserProcessResult = browserBackendOffered('local')
+    ? await (options.runner ?? runBrowserOperationProcess)(browserOperationScript(operation, parsed), sessionName, options.signal)
+    : { code: null, stdout: '', stderr: LOCAL_BROWSER_NOT_OFFERED, dispatched: false };
   const mutating = operation === 'browser_open' || operation === 'browser_navigate';
   const line = processResult.stdout.split('\n').reverse().find(line => line.startsWith(MARKER));
   let returned: Record<string, unknown> | undefined;

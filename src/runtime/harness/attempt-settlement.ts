@@ -1268,7 +1268,11 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
     // envelope merely says "not successful" has not proved that nothing landed
     // either. Both are uncertain until something observes the target. Treating
     // a returned failure as a clean miss is exactly how a send gets repeated.
-    const returnedFailure = extracted.envelopeSuccessful === false;
+    // A local tool's own typed non-write is exactly that proof: an in-process
+    // identity the tool mints only when it changed nothing, so the failure
+    // its returned text describes is not a write of unknown fate.
+    const returnedFailure = extracted.envelopeSuccessful === false
+      && !(input.thrown === undefined && localResultTypedNegative(input.result));
     if (input.thrown !== undefined || returnedFailure) extracted.acknowledged = false;
   }
   // THE PROVIDER'S OWN REPLY CONFIRMS A WRITE IT ACKNOWLEDGES. A returned

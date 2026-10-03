@@ -47,6 +47,7 @@ import type {
   AttestedTransportObservation,
   AttestedTransportReconcileResult,
 } from './implementation-artifacts/attested-transport.js';
+import { browserBackendOffered } from '../../tools/browser-backend.js';
 
 export const REVIEWED_LOCAL_PROVIDER_IDENTITY = 'local_registry' as const;
 export const REVIEWED_LOCAL_PROVIDER_VERSION = 'local-registry-v1' as const;
@@ -396,6 +397,7 @@ export function observeReviewedLocalTool(
   if (!name || name !== operationId) return null;
   const declaration = exactDeclaration(name);
   if (!declaration || !validExecutionContract(declaration.localExecution)) return null;
+  if (!browserBackendOffered(declaration.browserBackend)) return null;
   const schema = currentReviewedLocalSchema(declaration.localExecution, name);
   if (!schema) return null;
   const definition = deriveReviewedLocalDefinition({ declaration, schema });

@@ -3,6 +3,7 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, unlinkS
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import { browserbaseStoreFile } from './browserbase-setup.js';
 import { readSecret, writeSecret } from '../runtime/secrets/index.js';
 import { BrowserbaseApiClient, BrowserbaseClientError, type BrowserbaseSession } from './browserbase-client.js';
 import { BrowserbaseCdpClient, BrowserbaseCdpError, parseBrowserbaseOperation, type BrowserbaseOperation, type BrowserbasePage, type BrowserbaseCdpResult } from './browserbase-cdp.js';
@@ -62,7 +63,7 @@ export class BrowserbaseService {
   private keyRead?: Promise<string | undefined>;
   private readonly credentialTimeoutMs: number;
   constructor(private readonly dependencies: BrowserbaseDependencies = {}) {
-    this.directory = path.join(dependencies.baseDir ?? BASE_DIR, 'state', 'browserbase'); this.file = path.join(this.directory, 'resources.json');
+    this.file = browserbaseStoreFile(dependencies.baseDir ?? BASE_DIR); this.directory = path.dirname(this.file);
     this.now = dependencies.now ?? Date.now; this.uuid = dependencies.uuid ?? randomUUID;
     this.getKey = dependencies.getApiKey ?? (() => readSecret('browserbase_api_key'));
     this.setKey = dependencies.setApiKey ?? (value => writeSecret('browserbase_api_key', value));

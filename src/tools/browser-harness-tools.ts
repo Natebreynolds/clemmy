@@ -16,6 +16,7 @@ import { textResult, nonWriteTextResult } from './shared.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { BROWSER_OPERATION_PARAMETERS } from './browser-operation-contract.js';
 import { executeBrowserOperation, browserOperationProvesNoMutation } from '../integrations/browser-operation.js';
+import { browserBackendOffered, LOCAL_BROWSER_NOT_OFFERED } from './browser-backend.js';
 
 export function registerBrowserHarnessTools(server: McpServer): void {
   const descriptions = {
@@ -47,6 +48,7 @@ export function registerBrowserHarnessTools(server: McpServer): void {
       timeout_ms: z.number().min(10000).max(600000).optional().describe('How long to wait for an install. Default 300000 (5 min) — a cold install compiles Python deps.'),
     },
     async ({ action, timeout_ms }) => {
+      if (!browserBackendOffered('local')) return nonWriteTextResult('browser_not_offered', LOCAL_BROWSER_NOT_OFFERED);
       if (action === 'update') {
         const result = await runBrowserHarnessUpdate();
         const status = await getBrowserHarnessStatus();
@@ -149,6 +151,7 @@ export function registerBrowserHarnessTools(server: McpServer): void {
     ].join(' '),
     {},
     async () => {
+      if (!browserBackendOffered('local')) return textResult(LOCAL_BROWSER_NOT_OFFERED);
       const status = await getBrowserHarnessStatus();
       const next = browserHarnessNextAction(status);
       // A status that reports a problem without the action that fixes it is
@@ -177,6 +180,7 @@ export function registerBrowserHarnessTools(server: McpServer): void {
       bu_name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional().describe('Optional BU_NAME namespace for a separate daemon/session; it does not create a separate local browser profile.'),
     },
     async ({ code, timeout_ms, bu_name }) => {
+      if (!browserBackendOffered('local')) return nonWriteTextResult('browser_not_offered', LOCAL_BROWSER_NOT_OFFERED);
       const result = await runBrowserHarnessScript(code, { timeoutMs: timeout_ms, buName: bu_name });
       return textResult([
         `ok: ${result.ok}`,

@@ -24,16 +24,22 @@ const {
 const { recordToolHit, getHotSet, _resetHotSetForTest } = await import('./tool-hotset.js');
 const { TOOL_REGISTRY } = await import('../tools/tool-registry.js');
 const { TOOL_SEARCH_ALWAYS_LOADED } = await import('./tool-catalog.js');
+const { browserBackendOffered } = await import('../tools/browser-backend.js');
+// One browser per machine: the catalog carries every tool this machine offers.
+const OFFERED = TOOL_REGISTRY.filter((d) => browserBackendOffered(d.browserBackend));
+const offeredNames = () => new Set(OFFERED.map((d) => d.name));
 
 // ── catalog derives 1:1 from the registry ─────────────────────────────────────
 
-test('catalog lists every registry tool (reachability invariant)', () => {
+test('catalog lists every registry tool this machine offers (reachability invariant)', () => {
   const catalog = new Set(catalogEntries().map((e) => e.name));
-  const registry = allRegistryNames();
+  const registry = offeredNames();
   const missing = [...registry].filter((n) => !catalog.has(n)).sort();
   assert.deepEqual(missing, [], `registry tools missing from the catalog: ${missing.join(', ')}`);
   assert.equal(catalog.size, registry.size);
-  assert.equal(catalog.size, TOOL_REGISTRY.length);
+  const hidden = [...allRegistryNames()].filter((n) => !catalog.has(n));
+  assert.ok(hidden.every((n) => TOOL_REGISTRY.find((d) => d.name === n)?.browserBackend !== undefined),
+    `only the browser backend not offered here may be absent: ${hidden.join(', ')}`);
 });
 
 test('policy-allowed filter restricts the catalog to the lane surface', () => {
@@ -47,7 +53,7 @@ test('policy-allowed filter restricts the catalog to the lane surface', () => {
 test('buildToolCatalog renders "name — one-liner" lines and is non-trivial', () => {
   const text = buildToolCatalog();
   const lines = text.split('\n');
-  assert.equal(lines.length, TOOL_REGISTRY.length);
+  assert.equal(lines.length, OFFERED.length);
   const runBatch = lines.find((l) => l.startsWith('run_batch —'));
   assert.ok(runBatch && runBatch.length > 'run_batch — '.length, 'run_batch line should carry a summary');
 });
@@ -55,7 +61,7 @@ test('buildToolCatalog renders "name — one-liner" lines and is non-trivial', (
 test('compact catalog preserves every name without repeating descriptions', () => {
   const text = buildCompactToolCatalog();
   const tokens = new Set(text.split(/[^a-zA-Z0-9_]+/).filter(Boolean));
-  for (const name of allRegistryNames()) assert.ok(tokens.has(name), `${name} missing from compact index`);
+  for (const name of offeredNames()) assert.ok(tokens.has(name), `${name} missing from compact index`);
   assert.ok(text.length * 2 < buildToolCatalog().length, 'names-only index should materially reduce prompt bytes');
   assert.doesNotMatch(text, / — /, 'compact index carries names; tool_search supplies descriptions and schemas');
 });
@@ -257,7 +263,7 @@ test('rankCatalog ranks an on-topic tool above an unrelated one', async () => {
 
 test('rankCatalog returns all entries and never throws on empty query', async () => {
   const ranked = await rankCatalog('');
-  assert.equal(ranked.length, TOOL_REGISTRY.length);
+  assert.equal(ranked.length, OFFERED.length);
 });
 
 // ── execution-lane schema-on-demand admission ─────────────────────────────────

@@ -15,6 +15,7 @@
  */
 import { getRuntimeEnv } from '../config.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
+import { browserBackendOffered } from '../tools/browser-backend.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
@@ -271,7 +272,7 @@ function passesPolicy(name: string, allowedNames?: ReadonlySet<string>): boolean
  */
 export function catalogEntries(opts: { allowedNames?: ReadonlySet<string> } = {}): CatalogEntry[] {
   return TOOL_REGISTRY
-    .filter((d) => passesPolicy(d.name, opts.allowedNames))
+    .filter((d) => passesPolicy(d.name, opts.allowedNames) && browserBackendOffered(d.browserBackend))
     .map((d) => ({ name: d.name, oneLiner: (d.description ?? '').trim() }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }

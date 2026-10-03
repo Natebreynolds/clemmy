@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-cloud-tools-'));
 process.env.CLEMENTINE_HOME = home;
+// A set-up cloud browser is the browser these operations belong to.
+mkdirSync(path.join(home, 'state', 'browserbase'), { recursive: true });
+writeFileSync(path.join(home, 'state', 'browserbase', 'resources.json'), JSON.stringify({ version: 1, revision: 1, resources: [],
+  policy: { projectId: '00000000-0000-4000-8000-000000000001', idleSeconds: 300, sessionTimeoutSeconds: 1800 } }));
 test.after(() => rmSync(home, { recursive: true, force: true }));
 const { CLOUD_BROWSER_PARAMETERS, parseCloudBrowserArguments } = await import('./cloud-browser-contract.js');
 const reviewed = await import('../runtime/harness/reviewed-local-tool-transport.js');
