@@ -254,3 +254,45 @@ test('last-view detach survives a failed return observation and safely resumes t
     failed=false;const resumed=await t.service.get(r.id,'task-a');assert.equal(resumed.returnPending,false);assert.equal(resumed.controller,'agent');assert.equal(resumed.controlVersion,4);assert.equal(reads,3);assert.equal(t.counts().creates,1);
   }finally{t.close();}
 });
+test('a start Browserbase refuses created nothing: the record is stopped and the reason reads in words', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    t.api.create = async () => { throw new BrowserbaseClientError('credential_rejected', false, 401); };
+    await assert.rejects(t.service.create({ conversationId: 'task-a', requestId: 'refused' }),
+      error => error instanceof BrowserbaseServiceError && error.effect === 'none' && error.code === 'credential_rejected');
+    const [record] = await t.service.list('task-a');
+    assert.equal(record!.state, 'stopped'); assert.equal(record!.errorCode, 'credential_rejected');
+    await t.service.configure({ projectId: project, apiKey: 'replacement-key' });
+    const { browserbaseErrorText } = await import('./browserbase.js');
+    assert.match(browserbaseErrorText('credential_rejected'), /didn't accept the saved API key/);
+  } finally { t.close(); }
+});
+test('a key Browserbase rejects is never saved; an unreachable Browserbase does not block the save', async () => {
+  const t = setup(); try {
+    let saved = 0; const options = { ...t.options, setApiKey: async () => { saved++; } };
+    const verifying = (outcome: () => Promise<void>) => new BrowserbaseService({ ...options, api: { ...t.api, verifyProject: outcome } });
+    const rejected = verifying(async () => { throw new BrowserbaseClientError('credential_rejected', false, 401); });
+    await assert.rejects(rejected.configure({ projectId: project, apiKey: 'wrong-key' }), /credential_rejected/);
+    const missing = verifying(async () => { throw new BrowserbaseClientError('project_not_found', false, 404); });
+    await assert.rejects(missing.configure({ projectId: project, apiKey: 'right-key' }), /project_not_found/);
+    assert.equal(saved, 0, 'neither refused key reached the secret store');
+    const offline = verifying(async () => { throw new BrowserbaseClientError('transport_failed', true); });
+    assert.equal((await offline.configure({ projectId: project, apiKey: 'right-key' })).projectId, project);
+    assert.equal(saved, 1);
+    for (const service of [rejected, missing, offline]) service.dispose();
+  } finally { t.close(); }
+});
+test('an unanswered create holds no session: it never blocks a new connection and expires with the provider timeout', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    t.api.create = async () => { throw new BrowserbaseClientError('timeout', true); };
+    await assert.rejects(t.service.create({ conversationId: 'task-a', requestId: 'lost' }));
+    assert.equal((await t.service.list('task-a'))[0]!.state, 'uncertain');
+    await t.service.configure({ projectId: project, apiKey: 'replacement-key' });
+    await t.service.maintenance();
+    assert.equal((await t.service.list('task-a'))[0]!.state, 'uncertain', 'inside the provider timeout it stays uncertain');
+    t.advance(1800 * 1000);
+    await t.service.maintenance();
+    assert.equal((await t.service.list('task-a'))[0]!.state, 'expired');
+  } finally { t.close(); }
+});

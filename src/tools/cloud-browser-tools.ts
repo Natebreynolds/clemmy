@@ -6,7 +6,7 @@ import { textResult, nonWriteTextResult } from './shared.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
-import { getBrowserbaseService, BrowserbaseServiceError, type BrowserbaseResource } from '../integrations/browserbase.js';
+import { getBrowserbaseService, BrowserbaseServiceError, browserbaseErrorText, type BrowserbaseResource } from '../integrations/browserbase.js';
 import { hostPreDispatchRefusal } from '../runtime/harness/host-pre-dispatch-refusal.js';
 
 /** UI metadata belongs in the dock. Do not repeat every retained page beside
@@ -49,7 +49,7 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
     }, currentToolAbortSignal());
     return { ...response, resource: resourceForTool(response.resource) };
   } catch (error) {
-    if (error instanceof BrowserbaseServiceError && error.effect === 'none') throw hostPreDispatchRefusal(error.message);
+    if (error instanceof BrowserbaseServiceError && error.effect === 'none') throw hostPreDispatchRefusal(browserbaseErrorText(error.code));
     throw error;
   }
 }

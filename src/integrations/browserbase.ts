@@ -23,6 +23,18 @@ export interface BrowserbaseOperationResponse { resource: BrowserbaseResource; r
 export class BrowserbaseServiceError extends Error {
   constructor(public readonly code: string, public readonly effect: 'none' | 'uncertain' = 'none') { super(code); this.name = 'BrowserbaseServiceError'; }
 }
+const ERROR_TEXT: Record<string, string> = {
+  credential_rejected: "Browserbase didn't accept the saved API key, so no browser was started. Copy the API key from Browserbase (Settings → API Keys) and save it again in Clem's Browserbase connection.",
+  project_not_found: "Browserbase couldn't find that project for this API key. Check the project ID in Clem's Browserbase connection.",
+  provider_limit: 'Browserbase refused because of a plan or concurrency limit, so no browser was started. Check the Browserbase account, or close another browser, then try again.',
+  credential_missing: "No Browserbase API key is saved. Add it in Clem's Browserbase connection.",
+  configuration_missing: "Browserbase isn't set up. Add the project and API key in Clem's Browserbase connection.",
+  provider_refused: 'Browserbase refused the request, so nothing was started.',
+};
+/** What the owner and the model read for a refusal that changed nothing. */
+export function browserbaseErrorText(code: string): string {
+  return ERROR_TEXT[code] ?? `The cloud browser could not do that (${code}). Nothing was changed.`;
+}
 interface Policy { projectId: string; idleSeconds: number; sessionTimeoutSeconds: number; }
 interface PendingOperation { id: string; operation: string; targetId: string | null; controlVersion: number; startedAt: number; }
 interface PrivateResource extends Omit<BrowserbaseResource, 'elapsedSeconds'> {
@@ -34,6 +46,7 @@ interface PrivateResource extends Omit<BrowserbaseResource, 'elapsedSeconds'> {
 interface Store { version: 1; revision: number; policy: Policy | null; resources: PrivateResource[]; }
 interface Api {
   create: BrowserbaseApiClient['create']; retrieve: BrowserbaseApiClient['retrieve']; release: BrowserbaseApiClient['release']; liveView: BrowserbaseApiClient['liveView'];
+  verifyProject?: BrowserbaseApiClient['verifyProject'];
 }
 interface Cdp { execute: BrowserbaseCdpClient['execute']; humanText: BrowserbaseCdpClient['humanText']; }
 export interface BrowserbaseDependencies {
@@ -44,6 +57,8 @@ export interface BrowserbaseDependencies {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const nonterminal = (value: PrivateResource) => value.state !== 'stopped' && value.state !== 'expired';
+// A record with no provider session has nothing a credential change could strand.
+const holdsProviderSession = (value: PrivateResource) => nonterminal(value) && value.providerSessionId !== null;
 
 /** One owner task, one provider session. Durable reservations prevent unknown
  * create outcomes from silently producing a second paid browser. Pages are
@@ -205,10 +220,27 @@ export class BrowserbaseService {
       if (!UUID.test(input.projectId)) throw new BrowserbaseServiceError('invalid_project');
       const idleSeconds = input.idleSeconds ?? this.store.policy?.idleSeconds ?? 300, sessionTimeoutSeconds = input.sessionTimeoutSeconds ?? this.store.policy?.sessionTimeoutSeconds ?? 1800;
       if (!Number.isInteger(idleSeconds) || !Number.isInteger(sessionTimeoutSeconds) || idleSeconds < 60 || sessionTimeoutSeconds > 21600 || idleSeconds > sessionTimeoutSeconds) throw new BrowserbaseServiceError('invalid_lifetime_policy');
-      if (this.store.resources.some(nonterminal)) throw new BrowserbaseServiceError('configuration_has_live_resources');
-      if (input.apiKey !== undefined) { if (!input.apiKey.trim() || input.apiKey.length > 2000) throw new BrowserbaseServiceError('invalid_credential'); try { await this.setKey(input.apiKey.trim()); this.keyRead = undefined; } catch { throw new BrowserbaseServiceError('credential_save_failed'); } }
+      if (this.store.resources.some(holdsProviderSession)) throw new BrowserbaseServiceError('configuration_has_live_resources');
+      if (input.apiKey !== undefined && (!input.apiKey.trim() || input.apiKey.length > 2000)) throw new BrowserbaseServiceError('invalid_credential');
+      await this.verifyBeforeSave(input.apiKey?.trim(), input.projectId);
+      if (input.apiKey !== undefined) { try { await this.setKey(input.apiKey.trim()); this.keyRead = undefined; } catch { throw new BrowserbaseServiceError('credential_save_failed'); } }
       this.store.policy = { projectId: input.projectId, idleSeconds, sessionTimeoutSeconds }; this.persist(); return this.status();
     });
+  }
+  /** A key or project Browserbase itself refuses is never saved. When
+   *  Browserbase cannot be reached the save goes ahead unverified, and the
+   *  first browser start reports the provider's answer. */
+  private async verifyBeforeSave(candidateKey: string | undefined, projectId: string): Promise<void> {
+    let key = candidateKey;
+    if (key === undefined) { try { key = (await this.readKey())?.trim(); } catch { return; } }
+    if (!key) return;
+    const verifyKey = key;
+    const api = this.dependencies.api ?? new BrowserbaseApiClient({ getApiKey: async () => verifyKey });
+    if (!api.verifyProject) return;
+    try { await api.verifyProject(projectId); }
+    catch (error) {
+      if (error instanceof BrowserbaseClientError && (error.code === 'credential_rejected' || error.code === 'project_not_found')) throw new BrowserbaseServiceError(error.code);
+    }
   }
   async list(conversationId: string): Promise<BrowserbaseResource[]> {
     if (!conversationId || conversationId.length > 200) throw new BrowserbaseServiceError('invalid_conversation');
@@ -437,7 +469,13 @@ export class BrowserbaseService {
     for (const candidate of this.store.resources.filter(nonterminal)) {
       await this.serial(candidate.id, async () => {
         const resource = this.resource(candidate.id, candidate.conversationId);
-        if (!nonterminal(resource) || !resource.providerSessionId) return;
+        if (!nonterminal(resource)) return;
+        if (!resource.providerSessionId) {
+          // Nothing to observe without a session id; the provider's own
+          // session timeout bounds any session an unanswered create started.
+          if (this.now() >= resource.expiresAt) { resource.state = 'expired'; resource.pending = undefined; resource.updatedAt = this.iso(); this.persist(); }
+          return;
+        }
         if (resource.pending?.operation === 'stop') { try { const { api } = await this.api(resource); this.settleProvider(resource, await api.retrieve(resource.providerSessionId, resource.projectId)); this.persist(); } catch {} return; }
         if (this.now() - resource.lastActivityAt >= policy.idleSeconds * 1000 || this.now() >= resource.expiresAt) { try { await this.release(resource); } catch {} }
       });

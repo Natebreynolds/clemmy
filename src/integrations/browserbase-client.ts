@@ -14,7 +14,8 @@ export interface BrowserbaseSession {
   expiresAt?: string;
 }
 export type BrowserbaseClientErrorCode = 'invalid_request' | 'not_configured' | 'timeout' | 'transport_failed'
-  | 'redirect_refused' | 'provider_refused' | 'invalid_response' | 'identity_mismatch';
+  | 'redirect_refused' | 'provider_refused' | 'invalid_response' | 'identity_mismatch'
+  | 'credential_rejected' | 'provider_limit' | 'project_not_found';
 export class BrowserbaseClientError extends Error {
   readonly code: BrowserbaseClientErrorCode;
   readonly dispatched: boolean;
@@ -33,6 +34,15 @@ const MAX_RESPONSE_BYTES = 512 * 1024;
 const STATUSES = new Set<BrowserbaseSessionStatus>(['PENDING', 'RUNNING', 'ERROR', 'TIMED_OUT', 'COMPLETED']);
 const TERMINAL_STATUSES = new Set<BrowserbaseSessionStatus>(['ERROR', 'TIMED_OUT', 'COMPLETED']);
 function identity(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value); }
+/** A 4xx answer is the provider refusing the request before acting on it,
+ *  so nothing was created or changed; a 5xx may have acted. */
+function providerRefusal(status: number): BrowserbaseClientError {
+  const refusedBeforeEffect = status >= 400 && status < 500 && status !== 408;
+  const code: BrowserbaseClientErrorCode = status === 401 || status === 403 ? 'credential_rejected'
+    : status === 402 || status === 429 ? 'provider_limit'
+      : 'provider_refused';
+  return new BrowserbaseClientError(code, !refusedBeforeEffect, status);
+}
 function requireIdentity(value: unknown): asserts value is string {
   if (!identity(value)) throw new BrowserbaseClientError('invalid_request', false);
 }
@@ -124,7 +134,7 @@ export class BrowserbaseApiClient {
       const response = await Promise.race([this.fetcher(url, { method, headers, redirect: 'manual', signal: controller.signal,
         ...(body ? { body: JSON.stringify(body) } : {}) }), deadline]);
       if (response.redirected || (response.status >= 300 && response.status < 400) || (response.url && response.url !== url)) throw new BrowserbaseClientError('redirect_refused', true);
-      if (!response.ok) throw new BrowserbaseClientError('provider_refused', true, response.status);
+      if (!response.ok) throw providerRefusal(response.status);
       return await Promise.race([boundedJson(response), deadline]);
     } catch (error) {
       if (error instanceof BrowserbaseClientError) throw error;
@@ -140,6 +150,18 @@ export class BrowserbaseApiClient {
     const result = await this.request('POST', '/v1/sessions', { projectId: input.projectId, keepAlive: true, timeout,
       browserSettings: { logSession: false, recordSession: input.recording ?? false } });
     return parseSession(result, input.projectId, undefined, true) as BrowserbaseSession & { connectUrl: string };
+  }
+
+  /** Whether this key may use this project. A read with no effect. */
+  async verifyProject(projectId: string): Promise<void> {
+    requireIdentity(projectId);
+    let row: Record<string, unknown> | undefined;
+    try { row = object(await this.request('GET', `/v1/projects/${projectId}`)); }
+    catch (error) {
+      if (error instanceof BrowserbaseClientError && error.httpStatus === 404) throw new BrowserbaseClientError('project_not_found', false, 404);
+      throw error;
+    }
+    if (typeof row?.id === 'string' && row.id !== projectId) throw new BrowserbaseClientError('identity_mismatch', false);
   }
 
   async retrieve(sessionId: string, projectId: string): Promise<BrowserbaseSession> {

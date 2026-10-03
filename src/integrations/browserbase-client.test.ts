@@ -137,7 +137,7 @@ test('bad input and absent or failed credentials stay before HTTP; credential lo
 test('redirects, raw errors, provider refusals and uncertain timeout never leak secrets or retry', async () => {
   for (const [fetcher, code] of [
     [async () => new Response(secret, { status: 302, headers: { Location: 'https://evil.example/' + secret } }), 'redirect_refused'],
-    [async () => json({ error: 'provider-private ' + secret }, 429), 'provider_refused'],
+    [async () => json({ error: 'provider-private ' + secret }, 500), 'provider_refused'],
     [async () => { throw new Error('provider-private ' + connection); }, 'transport_failed'],
     [async () => new Response('{ provider-private ' + secret), 'invalid_response'],
     [async () => new Response('x'.repeat(512 * 1024 + 1)), 'invalid_response'],
@@ -149,4 +149,22 @@ test('redirects, raw errors, provider refusals and uncertain timeout never leak 
   let calls = 0;
   await assert.rejects(client(async (_url, init) => { calls++; return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new Error(connection)), { once: true })); }, { timeoutMs: 10 }).create({ projectId: project }), safeError('timeout', true));
   assert.equal(calls, 1);
+});
+
+test('a 4xx answer is a refusal before any effect, named for what Browserbase refused', async () => {
+  for (const [status, code] of [[401, 'credential_rejected'], [403, 'credential_rejected'], [402, 'provider_limit'], [429, 'provider_limit'], [400, 'provider_refused']] as Array<[number, string]>) {
+    await assert.rejects(client(async () => json({ error: 'provider-private ' + secret }, status)).create({ projectId: project }), safeError(code, false));
+  }
+  await assert.rejects(client(async () => json({ error: 'provider-private' }, 408)).create({ projectId: project }), safeError('provider_refused', true),
+    'a request timeout may have acted');
+});
+
+test('verifyProject reads the project with the key and names a rejected key or a missing project', async () => {
+  await client(async (url, init) => {
+    assert.equal(url, `https://api.browserbase.com/v1/projects/${project}`); assert.equal(init?.method, 'GET');
+    return json({ id: project, name: 'Fixture' });
+  }).verifyProject(project);
+  await assert.rejects(client(async () => json({ error: 'Unauthorized' }, 401)).verifyProject(project), safeError('credential_rejected', false));
+  await assert.rejects(client(async () => json({ error: 'Not found' }, 404)).verifyProject(project), safeError('project_not_found', false));
+  await assert.rejects(client(async () => json({ id: 'other-project' })).verifyProject(project), safeError('identity_mismatch', false));
 });
