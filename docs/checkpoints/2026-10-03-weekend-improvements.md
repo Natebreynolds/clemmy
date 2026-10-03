@@ -451,4 +451,6 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   navigation that timed out mid-flight) still stops the turn through the
   no-progress projection, which has no effect class to apply the shared rule;
   follow-up.
-- **Status:** installing as wave 41.
+- **Status:** wave 41 = 08289da60 installed 08:48 PT (build-info serves it;
+  daemon, desk and phone bundles match; the installed build reads the live
+  Browserbase setup: cloud offered, local not). Owner retest owed.
