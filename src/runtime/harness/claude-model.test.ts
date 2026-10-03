@@ -16,6 +16,7 @@ import {
   extractClaudeThinkingText,
   watchClaudeThinkingForLiveness,
   claudeStreamEventKind,
+  restoreClaudeWireToolNames,
 } from './claude-model.js';
 import { ClaudeHeadlessModel, setClaudeHeadlessCliAvailableForTest } from './claude-headless-model.js';
 import { resolveModelCapability } from './model-wire-registry.js';
@@ -541,4 +542,55 @@ test('Claude wire preserves tuple contracts in the required schema dialect', asy
     }
     assert.deepEqual(actual.examples, schema.examples, 'instance examples are data, not schemas');
   }
+});
+
+
+test('a tool named with the mcp_ prefix goes on the Claude wire as mcp- and its calls come back under the real name', async () => {
+  const request = {
+    model: 'claude-opus-5-5',
+    tools: [
+      { name: 'mcp_status', description: 'Status.', input_schema: { type: 'object' } },
+      { name: 'read_file', description: 'Read.', input_schema: { type: 'object' } },
+      { name: 'mcp_add', description: 'Add.', input_schema: { type: 'object' } },
+      { name: 'mcp-add', description: 'Already spelled that way.', input_schema: { type: 'object' } },
+    ],
+    tool_choice: { type: 'tool', name: 'mcp_status' },
+    messages: [
+      { role: 'user', content: 'Check.' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'mcp_status', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] },
+    ],
+  };
+  const { body, toolAliases } = applyClaudeEnvelope({ body: JSON.stringify(request) }, 'sk-ant-oat01-x');
+  const wire = JSON.parse(body as string);
+  assert.deepEqual(wire.tools.map((tool: { name: string }) => tool.name), ['mcp-status', 'read_file', 'mcp_add', 'mcp-add'],
+    'only an unclaimed mcp- spelling is used');
+  assert.equal(wire.tool_choice.name, 'mcp-status');
+  assert.equal(wire.messages[1].content[0].name, 'mcp-status');
+  assert.deepEqual([...toolAliases], [['mcp-status', 'mcp_status']]);
+  assert.equal(applyClaudeEnvelope({ body: JSON.stringify({ model: 'x', tools: [{ name: 'read_file' }], messages: [] }) }, 'sk-ant-oat01-x').toolAliases.size, 0);
+
+  // A streamed reply: the block start is split across chunks.
+  const events = [
+    'event: content_block_start',
+    'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"mcp-status","input":{}}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":\\"mcp-status\\"}"}}',
+    '',
+  ].join('\n');
+  const bytes = new TextEncoder().encode(events);
+  const streamed = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(bytes.slice(0, 70)); controller.enqueue(bytes.slice(70)); controller.close(); },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+  const restored = await restoreClaudeWireToolNames(streamed, toolAliases).text();
+  assert.match(restored, /"name":"mcp_status"/);
+  assert.doesNotMatch(restored, /"name":"mcp-status"/);
+  assert.match(restored, /partial_json/, 'other events pass through');
+  assert.match(restored, /mcp-status/, 'only the call name changes, not the arguments');
+
+  const whole = new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }, { type: 'tool_use', id: 'toolu_3', name: 'mcp-status', input: {} }] }),
+    { headers: { 'content-type': 'application/json' } });
+  const parsed = JSON.parse(await restoreClaudeWireToolNames(whole, toolAliases).text());
+  assert.equal(parsed.content[1].name, 'mcp_status');
 });

@@ -135,7 +135,7 @@ export function applyClaudeEnvelope(
   init: { headers?: HeadersInit; body?: BodyInit | null } | undefined,
   token: string,
   clientVersion = installedClaudeClientVersion(),
-): { headers: Headers; body: BodyInit | null | undefined } {
+): { headers: Headers; body: BodyInit | null | undefined; toolAliases: Map<string, string> } {
   const headers = new Headers(init?.headers);
   headers.delete('x-api-key'); // BILLING GUARD — never API-bill
   headers.set('authorization', `Bearer ${token}`);
@@ -145,6 +145,7 @@ export function applyClaudeEnvelope(
   headers.set('user-agent', `claude-cli/${clientVersion} (external, clementine)`);
 
   let body = init?.body;
+  let toolAliases = new Map<string, string>();
   if (typeof body === 'string') {
     try {
       const parsed = JSON.parse(body) as Record<string, unknown>;
@@ -196,12 +197,108 @@ export function applyClaudeEnvelope(
       // so the request is valid on every Claude model.
       ensureUserTerminalMessage(parsed);
       if (parsed.max_tokens == null) parsed.max_tokens = CLAUDE_DEFAULT_MAX_TOKENS;
+      toolAliases = aliasClaudeWireToolNames(parsed);
       body = JSON.stringify(parsed);
     } catch {
       // non-JSON body (shouldn't happen for Messages) — leave as-is
     }
   }
-  return { headers, body };
+  return { headers, body, toolAliases };
+}
+
+/** Claude bills a request whose tool definitions include a name beginning
+ * `mcp_` outside the subscription, as extra usage. Such a tool goes on the
+ * wire with the prefix spelled `mcp-` (the model's earlier calls and a forced
+ * tool choice follow it), and the model's calls come back under the real name.
+ * Returns wire name -> real name. A name whose wire spelling is already taken
+ * by another tool keeps its own. */
+export function aliasClaudeWireToolNames(parsed: Record<string, unknown>): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const tools = Array.isArray(parsed.tools) ? parsed.tools as Array<Record<string, unknown>> : [];
+  const taken = new Set(tools.map((tool) => (typeof tool?.name === 'string' ? tool.name : '')));
+  const toWire = new Map<string, string>();
+  for (const tool of tools) {
+    const name = typeof tool?.name === 'string' ? tool.name : '';
+    if (!name.startsWith('mcp_')) continue;
+    const wire = `mcp-${name.slice(4)}`;
+    if (taken.has(wire)) continue;
+    tool.name = wire;
+    taken.add(wire);
+    toWire.set(name, wire);
+    aliases.set(wire, name);
+  }
+  if (toWire.size === 0) return aliases;
+  const choice = parsed.tool_choice as Record<string, unknown> | undefined;
+  if (choice && typeof choice.name === 'string' && toWire.has(choice.name)) choice.name = toWire.get(choice.name);
+  for (const message of Array.isArray(parsed.messages) ? parsed.messages as Array<Record<string, unknown>> : []) {
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    for (const block of message.content as Array<Record<string, unknown>>) {
+      if (block?.type === 'tool_use' && typeof block.name === 'string' && toWire.has(block.name)) block.name = toWire.get(block.name);
+    }
+  }
+  return aliases;
+}
+
+/** The model's tool calls under their real names, for a response to a request
+ * whose tool names were aliased on the wire. Streams are rewritten line by
+ * line (a tool call's name arrives once, in its block start); a whole JSON
+ * reply is rewritten in place. Anything unparseable passes through. */
+export function restoreClaudeWireToolNames(res: Response, aliases: Map<string, string>): Response {
+  if (aliases.size === 0 || !res.body) return res;
+  const rename = (block: unknown): void => {
+    const row = block as Record<string, unknown> | null;
+    if (row && row.type === 'tool_use' && typeof row.name === 'string' && aliases.has(row.name)) row.name = aliases.get(row.name);
+  };
+  const contentType = res.headers.get('content-type') ?? '';
+  if (contentType.includes('text/event-stream')) {
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let carry = '';
+    const rewriteLine = (line: string): string => {
+      if (!line.startsWith('data:') || !line.includes('tool_use')) return line;
+      try {
+        const event = JSON.parse(line.slice(5).trim()) as Record<string, unknown>;
+        if (event.type !== 'content_block_start') return line;
+        rename(event.content_block);
+        return `data: ${JSON.stringify(event)}`;
+      } catch {
+        return line;
+      }
+    };
+    const stream = res.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        const text = carry + decoder.decode(chunk, { stream: true });
+        const lines = text.split('\n');
+        carry = lines.pop() ?? '';
+        if (lines.length > 0) controller.enqueue(encoder.encode(lines.map(rewriteLine).join('\n') + '\n'));
+      },
+      flush(controller) {
+        const rest = carry + decoder.decode();
+        if (rest) controller.enqueue(encoder.encode(rewriteLine(rest)));
+      },
+    }));
+    return new Response(stream, { status: res.status, statusText: res.statusText, headers: res.headers });
+  }
+  if (contentType.includes('application/json')) {
+    const body = res.body;
+    const restored = new Response(body).text().then((text) => {
+      try {
+        const parsed = JSON.parse(text) as { content?: unknown };
+        if (Array.isArray(parsed.content)) parsed.content.forEach(rename);
+        return JSON.stringify(parsed);
+      } catch {
+        return text;
+      }
+    });
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(new TextEncoder().encode(await restored));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: res.status, statusText: res.statusText, headers: res.headers });
+  }
+  return res;
 }
 
 /** Anthropic-valid conversations end with a user message on models without
@@ -673,7 +770,7 @@ export function makeClaudeFetch(): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     assertLiveModelTransportAllowed('Claude Messages API');
     const token = await freshClaudeToken();
-    const { headers, body } = applyClaudeEnvelope(init, token);
+    const { headers, body, toolAliases } = applyClaudeEnvelope(init, token);
     const dispatcher = modelParityEnabled() ? getClaudeDispatcher(claudeHeadersTimeoutMs(body)) : undefined;
     const debug = claudeWireDebugEnabled();
     if (debug) logClaudeRequestShape(body);
@@ -714,6 +811,7 @@ export function makeClaudeFetch(): typeof fetch {
     if (res.status >= 400) {
       void persistClaudeErrorTrace(res.clone(), body, res.status);
     }
+    if (res.ok) res = restoreClaudeWireToolNames(res, toolAliases);
     // Two independent readers may want this body: the liveness tap (always,
     // when a run context exists) and the wire-usage log (only under the debug
     // flag). They are teed together on purpose — an earlier version returned
