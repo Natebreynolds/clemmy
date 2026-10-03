@@ -248,3 +248,27 @@ brain choices are the sign-in's own catalog once it is known. Proof:
   fixture-rep-C off every clem-fixture weekly roster report", kind user, not a
   pinned policy) — captured from a P2 fixture message whose turn failed on the
   refused brain.
+
+## Phone: conversations in the menu, running work visible, round doors
+
+- **Ask (owner 10-02 ~21:30 PT, with Claude, Grok and Codex phone screenshots):**
+  a cleaner, more refined phone; running chats stay visible after you leave;
+  everything has its place; buttons make sense on a phone.
+- **Change:**
+  - the menu carries Recents (pinned, then latest) with one live mark per
+    row — a turning ring while work is in flight, a dot for a reply that
+    finished since you last looked — plus "All chats", the owner's initial
+    for Settings and a floating New chat pill (ef48aa487);
+  - the phone list reports `running` from the open run attempt; "news" is
+    kept per phone against the Mac's own times (first list = baseline; the
+    owner's own edits are not news) (ef48aa487);
+  - the full list is flat rows with the same mark; heads in sentence case;
+    the header doors (menu, Needs you with its count, New chat) and the
+    thread doors (Back, agent, project) are one round 44pt style; a stale
+    Needs-you count keeps its words and age (d9900bc42);
+  - a card answer reads "Yes, go ahead." on the phone and in the live echo,
+    from the recorded decision (d9900bc42).
+- **Proof:** chat-seen tests, mobile-chat-running-routes (route marks running
+  only while the attempt is open), public-presentation answer-words pin; 348
+  phone tests; previews on live data via route interception.
+- **Status:** committed, not installed (owner's other agent running).
