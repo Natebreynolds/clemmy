@@ -1,0 +1,45 @@
+.layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  background: #121310;
+}
+.poster,
+.video {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+}
+.poster {
+  opacity: 1;
+}
+.video {
+  opacity: 0;
+  transition: opacity 280ms ease-out;
+}
+.layer[data-video-ready="true"] .video {
+  opacity: 1;
+}
+.layer[data-film-state="error"] .video {
+  opacity: 0;
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .video {
+    display: none;
+    transition: none;
+  }
+}
+
+@media (max-width: 799px) {
+  .poster,
+  .video {
+    object-position: 74% center;
+  }
+}

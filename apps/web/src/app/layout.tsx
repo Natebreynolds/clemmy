@@ -2,14 +2,17 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Clementine — your always-on local AI",
+  title: "Clementine — an agent that grows with you",
   description:
-    "Persistent memory. Every tool you use. Runs in the background on your Mac. Clementine is a single-user AI assistant with one memory spine, one tool surface, and one trust policy.",
-  metadataBase: new URL("https://clementine.app"),
+    "An ever-learning, local-first AI agent for your Mac. Explore the agent loop, persistent memory, connected tools, projects, and model-pinned specialists.",
+  metadataBase: new URL(
+    process.env.NEXT_PUBLIC_SITE_URL ||
+      "https://clemmy-production.up.railway.app",
+  ),
   openGraph: {
-    title: "Clementine — your always-on local AI",
+    title: "Clementine — an agent that grows with you",
     description:
-      "Persistent memory. Every tool you use. Runs in the background on your Mac.",
+      "Your context, your tools, your way of working. One local-first AI agent that learns as you go.",
     images: [
       {
         url: "/og.png",
@@ -22,24 +25,28 @@ export const metadata: Metadata = {
   },
   twitter: {
     card: "summary_large_image",
-    title: "Clementine — your always-on local AI",
+    title: "Clementine — an agent that grows with you",
     description:
-      "Persistent memory. Every tool you use. Runs in the background on your Mac.",
+      "Your context, your tools, your way of working. One local-first AI agent that learns as you go.",
     images: ["/og.png"],
   },
   icons: { icon: [{ url: "/logo.png", type: "image/png" }] },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#faf7f2", // --bg, which is the console's --bg-canvas
+  themeColor: "#121310",
   width: "device-width",
   initialScale: 1,
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html lang="en">
-      <body className="antialiased font-sans grain">{children}</body>
+      <body className="antialiased">{children}</body>
     </html>
   );
 }
