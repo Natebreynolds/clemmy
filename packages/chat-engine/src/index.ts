@@ -36,3 +36,4 @@ export * from './decision-presentation.js';
 export * from './storage-presentation.js';
 export * from './brain-selection.js';
 export * from './cloud-browser.js';
+export * from './browser-view-lifecycle.js';

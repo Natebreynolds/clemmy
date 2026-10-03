@@ -22,7 +22,7 @@ const { isHostPreDispatchRefusal } = await import('../runtime/harness/host-pre-d
 const { registerToolSearchTool } = await import('./tool-search-tool.js');
 const { deriveOrchestratorDiscoveryNames, actionTopologyRoleFor } = await import('./tool-registry.js');
 
-test('ordinary cloud browser requests disclose exact task operations with usable work_call references', async () => {
+function cloudSearch() {
   let search!: (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
   registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, handler: typeof search) { search = handler; } } as never, {
     allowedNames: deriveOrchestratorDiscoveryNames(), candidateSources: [],
@@ -34,6 +34,11 @@ test('ordinary cloud browser requests disclose exact task operations with usable
       }));
     },
   });
+  return search;
+}
+
+test('ordinary cloud browser requests disclose exact task operations with usable work_call references', async () => {
+  const search = cloudSearch();
   for (const [query, expected] of [
     ['start a cloud browser', 'cloud_browser_start'],
     ['read cloud browser page', 'cloud_browser_read'],
@@ -51,6 +56,81 @@ test('ordinary cloud browser requests disclose exact task operations with usable
     assert.equal(row.example.args.requirement_id, row.capabilityRef);
     assert.ok(body.schemas[expected!], 'the first search page contains the callable schema');
   }
+});
+
+test('an ordinary open-website request finds the starter on a two-result page without displacing exact tools', async () => {
+  const search = cloudSearch();
+  for (const query of ['Can you open scorpion.co in the browser please', 'open example.com in browser']) {
+    const body = JSON.parse((await search({ query, role_key: null, limit: 2, cursor: null, account_selection: null })).content[0]!.text);
+    const starter = body.results.find((row: { name: string }) => row.name === 'cloud_browser_start');
+    assert.ok(starter, `${query}: ${body.results.map((row: { name: string }) => row.name).join(', ')}`);
+    assert.equal(starter.carrier, 'work_call');
+    assert.equal(starter.capabilityRef, 'cap:local:cloud_browser_start:create_session');
+    assert.ok(body.schemas.cloud_browser_start.properties.url, 'the first page carries the usable URL schema');
+  }
+  for (const name of ['cloud_browser_open', 'cloud_browser_navigate', 'cloud_browser_resources']) {
+    const body = JSON.parse((await search({ query: name, role_key: null, limit: 2, cursor: null, account_selection: null })).content[0]!.text);
+    assert.equal(body.results[0].name, name, 'explicit tool selection retains priority');
+  }
+});
+
+for (const rejoined of [false, true]) {
+  test(`start(url) returns post-navigation page handles from the same bounded receipt (${rejoined ? 'rejoined' : 'created'})`, async () => {
+    const pages = Array.from({ length: 12 }, (_, i) => ({ targetId: `page-${i}`, title: 'about:blank', url: 'about:blank' }));
+    const resource = { id: 'owned', providerSessionId: 'provider-owned', state: 'active', controller: 'agent',
+      controlVersion: 3, focusTargetId: 'page-4', pages };
+    const finalPage = { targetId: 'page-4', title: 'Observed destination', url: 'https://www.example.com/' };
+    const finalResource = { ...resource, pages: pages.map(page => page.targetId === finalPage.targetId ? finalPage : page) };
+    const receipt = { operation: 'navigate', effect: 'confirmed', targetId: 'page-4', controlVersion: 3 };
+    let creates = 0;
+    const dispatched: unknown[] = [];
+    const service = {
+      list: async () => rejoined ? [resource] : [],
+      create: async () => { creates++; return resource; },
+      agentOperation: async (id: string, conversationId: string, input: { operation: string; args: unknown; expectedVersion: number }) => {
+        dispatched.push({ id, conversationId, ...input });
+        return input.operation === 'tabs' ? { resource } : { resource: finalResource, result: finalPage, receipt };
+      },
+    };
+    const value = await withToolOutputContext({ sessionId: 'chat-a', sourceUserSeq: 7 }, () =>
+      executeCloudBrowserTool('cloud_browser_start', { url: 'https://example.com' }, service as never)) as {
+        pages: Array<{ target_id: string; title: string; url: string }>;
+        resource: { id: string; pageCount: number; pagesOmitted: boolean }; rejoined?: boolean;
+        navigated: { target_id: string; result: unknown; receipt: unknown };
+      };
+    assert.equal(creates, rejoined ? 0 : 1);
+    assert.deepEqual(dispatched, [
+      { id: 'owned', conversationId: 'chat-a', operation: 'tabs', expectedVersion: 3, args: {} },
+      { id: 'owned', conversationId: 'chat-a', operation: 'navigate', expectedVersion: 3, args: { targetId: 'page-4', url: 'https://example.com/' } },
+    ], 'one navigation uses the authenticated task and observed control version');
+    assert.equal(value.pages.length, 10);
+    assert.deepEqual(value.pages.find(page => page.target_id === 'page-4'), { target_id: 'page-4', title: finalPage.title, url: finalPage.url });
+    assert.equal(value.resource.pageCount, 12);
+    assert.equal(value.resource.pagesOmitted, true);
+    assert.equal(value.rejoined, rejoined ? true : undefined);
+    assert.deepEqual(value.navigated, { target_id: 'page-4', result: finalPage, receipt });
+  });
+}
+
+test('start(url) does not navigate under human control or replay an uncertain navigation', async () => {
+  const resource = { id: 'owned', providerSessionId: 'provider-owned', state: 'active', controller: 'human',
+    controlVersion: 3, pages: [{ targetId: 'exact-page', title: 'Original page', url: 'https://example.com/' }] };
+  let dispatches = 0;
+  const service = { list: async () => [resource],
+    agentOperation: async (_id: string, _conversationId: string, input: { operation: string }) => {
+      dispatches++;
+      if (input.operation === 'navigate') throw new Error('Lost acknowledgment');
+      return { resource };
+    } };
+  await withToolOutputContext({ sessionId: 'chat-a', sourceUserSeq: 7 }, () =>
+    executeCloudBrowserTool('cloud_browser_start', { url: 'https://example.com' }, service as never));
+  assert.equal(dispatches, 0);
+  resource.controller = 'agent';
+  const value = await withToolOutputContext({ sessionId: 'chat-a', sourceUserSeq: 7 }, () =>
+    executeCloudBrowserTool('cloud_browser_start', { url: 'https://example.com' }, service as never)) as { navigated: { ok: boolean; effect: string } };
+  assert.equal(dispatches, 2, 'one tabs observation and one attempted navigation, without replay');
+  assert.equal(value.navigated.ok, false);
+  assert.equal(value.navigated.effect, 'uncertain');
 });
 
 test('all cloud operations disclose an exact callable schema and nonreplayable mutation manifest', async () => {

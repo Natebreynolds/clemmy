@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { flushSync } from 'react-dom';
 import { Link } from 'react-router-dom';
 import { Globe, PanelRightClose, RefreshCw, Square, Hand, ArrowRight } from 'lucide-react';
-import { browserClosesText, browserElapsed, browserFocusPage, browserLiveUrl, browserResourceKey, browserStopMessage, browsersChipLabel, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserOpenBrowser, type CloudBrowserOverview, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserUnlinkedSession, type CloudBrowserView } from '@clem/chat-engine';
+import { browserClosesText, browserElapsed, browserFocusPage, browserViewTarget, browserCloseResultMessage, startBrowserViewLifecycle, browserResourceKey, browserStopMessage, browsersChipLabel, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserOpenBrowser, type CloudBrowserOverview, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserUnlinkedSession, type BrowserViewLifecycle, type CloudBrowserView } from '@clem/chat-engine';
 import { cloudBrowser } from '@/lib/cloud-browser';
 import './cloud-browser.css';
 
@@ -22,11 +22,12 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
   const [recording, setRecording] = useState(false);
   const [recoveryId, setRecoveryId] = useState('');
   const [view, setView] = useState<(CloudBrowserView & { key: string }) | null>(null);
+  const [viewIssueKey, setViewIssueKey] = useState<string | null>(null);
   const [overview, setOverview] = useState<CloudBrowserOverview | null>(null);
   const [viewTick, setViewTick] = useState(0);
   const frame = useRef<HTMLIFrameElement>(null);
   const leases = useRef(createBrowserViewerLeases(cloudBrowser));
-  const viewGeneration = useRef(0);
+  const lifecycle = useRef<BrowserViewLifecycle | null>(null);
   const requestId = useRef<string | null>(null);
   const mounted = useRef(true);
   const generation = useRef(0);
@@ -61,7 +62,10 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
   }, [refresh]);
   const resourceKey = resource ? browserResourceKey(resource) : '';
   // The view follows the page Clem is on, so a new page swaps the live view.
-  const viewKey = JSON.stringify([resourceKey, resource?.focusTargetId ?? null, viewTick]);
+  const viewTarget = resource ? browserViewTarget(resource) : undefined;
+  const viewKey = JSON.stringify([resourceKey, viewTarget ?? null, viewTick]);
+  const viewContext = useRef({ key: viewKey, open, visible, busy });
+  viewContext.current = { key: viewKey, open, visible, busy };
   useEffect(() => {
     if (!visible || !open || !resource || resource.state !== 'active' || resource.returnPending) return;
     const requested = resource;
@@ -73,31 +77,43 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
     return () => window.clearInterval(timer);
   }, [visible, open, resourceKey, refresh]);
   useEffect(() => {
-    setView(null);
-    const attempt = ++viewGeneration.current;
     if (!visible || !open || !resource || resource.state !== 'active' || resource.returnPending) return;
-    let cancelled = false;
-    const requested = resource;
-    const viewerLeaseId = crypto.randomUUID();
-    leases.current.remember(requested, { viewerLeaseId });
-    cloudBrowser.view(resource, undefined, viewerLeaseId).then((result) => {
-      const url = browserLiveUrl(result.url);
-      if (cancelled || attempt !== viewGeneration.current || !mounted.current || !current.current || browserResourceKey(current.current) !== resourceKey) { void leases.current.detach(viewerLeaseId).catch(() => {}); return; }
-      if (!url || result.viewerLeaseId !== viewerLeaseId || result.controlVersion !== requested.controlVersion || Date.parse(result.expiresAt) <= Date.now() || !Number.isFinite(Date.parse(result.expiresAt))) { setNotice('The browser view could not be verified. Refresh the view.'); void leases.current.detach(viewerLeaseId).catch(() => {}); return; }
-      setView({ ...result, key: viewKey, url });
-    }).catch(() => { void leases.current.detach(viewerLeaseId).catch(() => {}); if (!cancelled && mounted.current) setNotice('The live view could not connect. Refresh the view.'); });
-    // The render key removes the old frame before this passive cleanup acknowledges it.
-    return () => { cancelled = true; void leases.current.detach(viewerLeaseId).catch(() => {}); };
+    setViewIssueKey(null);
+    const viewer = startBrowserViewLifecycle({
+      resource, targetId: viewTarget, key: viewKey, client: cloudBrowser, leases: leases.current,
+      uuid: () => crypto.randomUUID(),
+      isCurrent: () => mounted.current && !document.hidden && viewContext.current.key === viewKey
+        && viewContext.current.open && viewContext.current.visible,
+      isBusy: () => viewContext.current.busy !== null,
+      show: (next) => { setView(next); setViewIssueKey(null); },
+      remove: async (id) => {
+        // Leave the effect stack before flushing. The old iframe must be gone
+        // before its lease acknowledgment can permit an agent handoff.
+        await Promise.resolve();
+        if (mounted.current) flushSync(() => setView((shown) => shown?.viewerLeaseId === id ? null : shown));
+      },
+      issue: (kind) => {
+        setViewIssueKey(viewKey);
+        setNotice(kind === 'cleanup' ? 'Closing the previous view was not confirmed. Choose Watch to retry.'
+          : kind === 'binding' ? 'The browser view changed. Choose Watch after its status refreshes.'
+          : 'The live view could not reconnect. Choose Watch to retry.');
+        void refresh();
+      },
+    });
+    lifecycle.current = viewer;
+    return () => { if (lifecycle.current === viewer) lifecycle.current = null; void viewer.stop(); };
   }, [visible, open, resourceKey, viewKey]);
+  useEffect(() => { if (busy === null) lifecycle.current?.resume(); }, [busy]);
   useEffect(() => {
     if (!view) return;
-    const timer = window.setTimeout(() => { setView(null); setNotice('This view expired. Refresh to keep watching.'); }, Math.max(0, Date.parse(view.expiresAt) - Date.now()));
-    const disconnected = (event: MessageEvent) => { if (isBrowserDisconnected(event, frame.current?.contentWindow ?? null, view.url)) { setView(null); setNotice('The browser disconnected. Refresh its status before continuing.'); void refresh(); } };
+    const disconnected = (event: MessageEvent) => {
+      if (isBrowserDisconnected(event, frame.current?.contentWindow ?? null, view.url)) lifecycle.current?.disconnected(view.viewerLeaseId);
+    };
     window.addEventListener('message', disconnected);
-    return () => { window.clearTimeout(timer); window.removeEventListener('message', disconnected); void leases.current.detach(view.viewerLeaseId).catch(() => {}); };
-  }, [view, refresh]);
+    return () => window.removeEventListener('message', disconnected);
+  }, [view]);
   useEffect(() => {
-    const closeViews = () => { const selected = current.current; viewGeneration.current++; flushSync(() => { setVisible(false); setView(null); }); if (selected) void leases.current.detachAll(selected).catch(() => {}); };
+    const closeViews = () => { const selected = current.current; void lifecycle.current?.stop(); flushSync(() => { setVisible(false); setView(null); }); if (selected) void leases.current.detachAll(selected).catch(() => {}); };
     const visibility = () => { if (document.hidden) closeViews(); else { setVisible(true); setViewTick((tick) => tick + 1); void refresh(); } };
     const pageShow = () => { if (!document.hidden) { setVisible(true); setViewTick((tick) => tick + 1); void refresh(); } };
     window.addEventListener('pagehide', closeViews); document.addEventListener('visibilitychange', visibility); window.addEventListener('pageshow', pageShow);
@@ -106,7 +122,7 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
   const change = async (kind: 'human' | 'agent' | 'stop') => {
     if (!resource || busy) return;
     const requested = resource;
-    setBusy(kind); setNotice(''); viewGeneration.current++; flushSync(() => setView(null));
+    setBusy(kind); setNotice(''); void lifecycle.current?.stop(); flushSync(() => setView(null));
     generation.current++; // invalidate a read that started before this control request
     try {
       // The local iframe is gone before the server can grant the agent its next epoch.
@@ -141,17 +157,17 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
   };
   const useHere = (browser: CloudBrowserOpenBrowser) => handToThisChat(async () => (await cloudBrowser.move(browser, conversationId!)).resource);
   const adoptHere = (session: CloudBrowserUnlinkedSession) => handToThisChat(async () => (await cloudBrowser.adoptUnlinked(session.providerSessionId, conversationId!)).resource);
-  const closeElsewhere = async (close: () => Promise<unknown>) => {
+  const closeElsewhere = async (close: () => Promise<Parameters<typeof browserCloseResultMessage>[0]>) => {
     if (busy) return;
     setBusy('close-other'); setNotice('');
-    try { await close(); if (mounted.current) setNotice('Closed that browser.'); }
+    try { const result = await close(); if (mounted.current) setNotice(browserCloseResultMessage(result)); }
     catch { if (mounted.current) setNotice('Closing was not confirmed. Refresh the list to check it.'); }
     finally { if (mounted.current) { setBusy(null); void loadOverview(); } }
   };
   const closePendingViews = async () => {
     if (!resource || busy) return;
     const requested = resource;
-    setBusy('detach'); setNotice(''); viewGeneration.current++; flushSync(() => setView(null)); generation.current++;
+    setBusy('detach'); setNotice(''); void lifecycle.current?.stop(); flushSync(() => setView(null)); generation.current++;
     try {
       const next = await leases.current.detachAll(requested);
       if (!mounted.current || !canApplyBrowserResponse(current.current, requested, next)) return;
@@ -189,7 +205,7 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
   return <div className={`cloud-browser-workspace${open ? ' is-open' : ''}`}>
     <div className="cloud-browser-conversation">
       {conversationId ? <div className="cloud-browser-strip">
-        <button type="button" onClick={() => setOpen(!open)} aria-expanded={open}><Globe size={16} aria-hidden />{browsersChipLabel(openCount)}{resource ? <span>{resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'Your control' : 'Clem has control' : resource.state}</span> : null}</button>
+        <button type="button" onClick={() => { if (open) void lifecycle.current?.stop(); setOpen(!open); }} aria-expanded={open}><Globe size={16} aria-hidden />{browsersChipLabel(openCount)}{resource ? <span>{resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'Your control' : 'Clem has control' : resource.state}</span> : null}</button>
         <span className="cloud-browser-strip-note">{open ? 'Chat and approvals stay here' : resource ? browserElapsed(resource.elapsedSeconds) : 'A browser for this conversation'}</span>
       </div> : null}
       <div className="cloud-browser-thread">{children}</div>
@@ -198,11 +214,11 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
       <header><div><h2>Browser</h2><p>{resource ? `${resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'You have control' : 'Clem has control' : resource.state} · ${browserElapsed(resource.elapsedSeconds)}${resource.recording ? ' · Recording on' : ''}${thisEntry ? ` · ${browserClosesText(thisEntry, now)}` : ''}` : 'Linked to this conversation'}</p></div><button type="button" aria-label="Hide browser, keep it running" onClick={() => setOpen(false)}><PanelRightClose size={18} aria-hidden /></button></header>
       {scopedResources.length > 1 ? <label className="cloud-browser-select">Browser session<select value={resource?.id ?? ''} onChange={(event) => { setSelectedId(event.target.value); setNotice(''); }}>{scopedResources.map((item) => <option key={item.id} value={item.id}>{browserFocusPage(item)?.title || 'Browser'} · {item.state} · {browserElapsed(item.elapsedSeconds)}</option>)}</select></label> : null}
       {!resource ? <div className="cloud-browser-empty"><Globe size={28} aria-hidden /><h3>Make room for the work</h3><p>Clem can browse while you stay in the conversation. Take over when a page needs your attention.</p>{status === null ? <><p>{statusFailed ? 'Connection status unavailable.' : 'Checking connection…'}</p>{statusFailed ? <button type="button" onClick={() => void refresh()}>Retry status</button> : null}</> : !status.configured ? <Link to="/connect">Connect Browserbase</Link> : <><label><input type="checkbox" checked={recording} onChange={(event) => setRecording(event.target.checked)} />Record this browser session</label><button className="cloud-browser-primary" type="button" disabled={busy !== null} onClick={() => void start()}>{busy === 'start' ? 'Starting…' : requestId.current ? 'Retry start' : 'Start browser'}</button><p className="cloud-browser-fine">Cloud usage is billed by your Browserbase account. Recording is off by default.</p></>}</div> : <>
-        <div className="cloud-browser-controls"><button type="button" disabled={!active || resource.returnPending || busy !== null} onClick={() => void change(resource.controller === 'human' ? 'agent' : 'human')}>{resource.controller === 'human' ? <ArrowRight size={16} aria-hidden /> : <Hand size={16} aria-hidden />}{busy === 'human' || busy === 'agent' ? 'Changing control…' : resource.controller === 'human' ? 'Return to Clem' : 'Take control'}</button><button type="button" disabled={busy !== null || resource.returnPending} onClick={() => { viewGeneration.current++; flushSync(() => setView(null)); setNotice(''); void refresh(); setViewTick((tick) => tick + 1); }}><RefreshCw size={16} aria-hidden />Watch</button><button type="button" disabled={busy !== null || resource.state === 'stopped' || resource.state === 'expired' || resource.state === 'stopping'} onClick={() => void change('stop')}><Square size={14} aria-hidden />{busy === 'stop' || resource.state === 'stopping' ? 'Stopping…' : 'Stop'}</button></div>
+        <div className="cloud-browser-controls"><button type="button" disabled={!active || resource.returnPending || busy !== null} onClick={() => void change(resource.controller === 'human' ? 'agent' : 'human')}>{resource.controller === 'human' ? <ArrowRight size={16} aria-hidden /> : <Hand size={16} aria-hidden />}{busy === 'human' || busy === 'agent' ? 'Changing control…' : resource.controller === 'human' ? 'Return to Clem' : 'Take control'}</button><button type="button" disabled={busy !== null || resource.returnPending} onClick={() => { void lifecycle.current?.stop(); flushSync(() => setView(null)); setNotice(''); void refresh(); setViewTick((tick) => tick + 1); }}><RefreshCw size={16} aria-hidden />Watch</button><button type="button" disabled={busy !== null || resource.state === 'stopped' || resource.state === 'expired' || resource.state === 'stopping'} onClick={() => void change('stop')}><Square size={14} aria-hidden />{busy === 'stop' || resource.state === 'stopping' ? 'Stopping…' : 'Stop'}</button></div>
         {status?.configured && canStartBrowserInTask(scopedResources) ? <div className="cloud-browser-new"><label><input type="checkbox" checked={recording} onChange={(event) => setRecording(event.target.checked)} />Record the new session</label><button type="button" disabled={busy !== null} onClick={() => void start()}>{busy === 'start' ? 'Starting…' : 'Start new browser'}</button></div> : null}
         {resource.returnPending ? <button type="button" className="cloud-browser-close-views" disabled={busy !== null} onClick={() => void closePendingViews()}>{busy === 'detach' ? 'Closing views…' : 'Retry closing this device’s views'}</button> : null}
         <div className="cloud-browser-page">{browserFocusPage(resource)?.title || 'Browser session'}<span>{browserFocusPage(resource)?.url || (resource.state === 'starting' ? 'Starting the browser…' : '')}</span></div>
-        <div className="cloud-browser-view">{liveView ? <div className="cloud-browser-frame" ref={(element) => { if (element) element.inert = resource.controller !== 'human'; }}><iframe ref={frame} title="Conversation browser live view" src={liveView.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" tabIndex={resource.controller === 'human' ? 0 : -1} style={{ pointerEvents: resource.controller === 'human' ? 'auto' : 'none' }} /></div> : <p>{resource.returnPending ? 'Waiting for other open views to close. Return to Clem is pending; Stop remains available.' : active ? 'Connecting the live view…' : resource.state === 'uncertain' ? 'The browser state needs a fresh check. Refresh before continuing.' : `Browser ${resource.state}.`}</p>}</div>
+        <div className="cloud-browser-view">{liveView ? <div className="cloud-browser-frame" ref={(element) => { if (element) element.inert = resource.controller !== 'human'; }}><iframe ref={frame} title="Conversation browser live view" src={liveView.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" tabIndex={resource.controller === 'human' ? 0 : -1} style={{ pointerEvents: resource.controller === 'human' ? 'auto' : 'none' }} /></div> : <p>{resource.returnPending ? 'Waiting for other open views to close. Return to Clem is pending; Stop remains available.' : active ? viewIssueKey === viewKey ? 'The live view is unavailable. Choose Watch to retry.' : 'Connecting the live view…' : resource.state === 'uncertain' ? 'The browser state needs a fresh check. Refresh before continuing.' : `Browser ${resource.state}.`}</p>}</div>
         {resource.controller === 'agent' && active && !resource.returnPending ? <p className="cloud-browser-fine">Watching only. Take control to interact with the page.</p> : null}
         {resource.state === 'uncertain' && resource.providerSessionId === null ? <details className="cloud-browser-recovery"><summary>Recover a browser that may have started</summary><p>Find the session in your Browserbase project, then enter its session ID. Clem will verify it belongs to this conversation’s project before adopting it.</p><label>Browserbase session ID<input value={recoveryId} onChange={(event) => setRecoveryId(event.target.value)} autoComplete="off" /></label><button type="button" disabled={busy !== null || !recoveryId.trim()} onClick={() => void recover()}>{busy === 'recover' ? 'Checking session…' : 'Recover browser'}</button></details> : null}
       </>}
@@ -210,7 +226,7 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
         <h3>Other open browsers</h3>
         <ul>
           {others.map((item) => <li key={item.id}>
-            <div><strong>{item.conversationTitle || 'Untitled chat'}</strong><span>{browserFocusPage(item)?.title || browserFocusPage(item)?.url || (item.state === 'active' ? 'Blank page' : item.state)} · {browserClosesText(item, now)}{item.usesProfile ? ' · Signed in' : ''}</span></div>
+            <div><strong>{item.conversationTitle || 'Untitled chat'}</strong><span>{browserFocusPage(item)?.title || browserFocusPage(item)?.url || (item.state === 'active' ? 'Blank page' : item.state)} · {browserClosesText(item, now)}{item.usesProfile ? ' · Saved profile' : ''}</span></div>
             <div className="cloud-browser-row-actions">
               <button type="button" disabled={busy !== null || !conversationId || item.state !== 'active'} onClick={() => void useHere(item)}>{busy === 'move' ? 'Moving…' : 'Use in this chat'}</button>
               <Link to={`/chat/${encodeURIComponent(`harness:${item.conversationId}`)}`}>Open chat</Link>

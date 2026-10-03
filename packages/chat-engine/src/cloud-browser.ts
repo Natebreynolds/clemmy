@@ -14,6 +14,14 @@ export function browserFocusPage(resource: Pick<CloudBrowserResource, 'pages' | 
 export interface CloudBrowserStatus { configured: boolean; projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number }
 export interface CloudBrowserView { url: string; expiresAt: string; targetId?: string; viewerLeaseId: string; controlVersion: number }
 export interface CloudBrowserInputResponse { resource: CloudBrowserResource; result: { ok: boolean }; receipt: unknown }
+export type CloudBrowserCloseResponse = { closed: true; status: 'closed' } | { closed: false; status: 'releasing' | 'unknown' };
+/** A release acknowledgment alone does not prove a paid browser has ended. */
+export function browserCloseResultMessage(result: CloudBrowserCloseResponse | { resource: CloudBrowserResource }): string {
+  if ('resource' in result) return browserStopMessage(result.resource);
+  return result.closed === true && result.status === 'closed' ? 'Browser stopped.'
+    : result.status === 'releasing' ? 'Stop requested. Waiting for the provider to confirm it ended.'
+    : 'Stopping was not confirmed. Refresh before trying again.';
+}
 type BrowserRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
 
 export function readBrowserResource(value: unknown, conversationId: string, id?: string): CloudBrowserResource {
@@ -90,7 +98,7 @@ export function createCloudBrowserClient(request: BrowserRequest, base: string) 
     overview: () => request<unknown>(`${base}/overview`).then(readOverview),
     move: (resource: CloudBrowserResource, toConversationId: string) => post<{ resource: unknown }>(`/resources/${encodeURIComponent(resource.id)}/move`, { conversationId: resource.conversationId, expectedVersion: resource.controlVersion, toConversationId }).then((result) => resourceResponse(result, toConversationId, resource.id)),
     adoptUnlinked: (providerSessionId: string, conversationId: string) => post<{ resource: unknown }>(`/unlinked/${encodeURIComponent(providerSessionId)}/adopt`, { conversationId }).then((result) => resourceResponse(result, conversationId)),
-    closeUnlinked: (providerSessionId: string) => post<{ closed: boolean }>(`/unlinked/${encodeURIComponent(providerSessionId)}/close`, {}),
+    closeUnlinked: (providerSessionId: string) => post<CloudBrowserCloseResponse>(`/unlinked/${encodeURIComponent(providerSessionId)}/close`, {}),
     detach: (resource: CloudBrowserResource, viewerLeaseId: string) => request<{ resource: unknown }>(`${base}/resources/${encodeURIComponent(resource.id)}/detach`, { method: 'POST', keepalive: true, body: JSON.stringify({ conversationId: resource.conversationId, viewerLeaseId }) }).then((result) => resourceResponse(result, resource.conversationId, resource.id)),
   };
 }
