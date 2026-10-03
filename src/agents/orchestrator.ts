@@ -205,6 +205,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { toolNameOffered } from '../tools/browser-backend.js';
 import { parentActionsNote } from './worker-parent-actions.js';
+import { delegatedJobOwnerWords } from '../projects/delegated-owner-words.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -2157,6 +2158,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     && (!declaresWorkflowDispatchReceipt(name) || planMode || taskMode?.kind === 'execute'
       || durableSelectedLocalPlanningNames.has(name))
   );
+  // In a job Clem handed to an agent, only the owner's own words allow or
+  // refuse a connector; the job text Clem wrote still decides relevance.
+  const delegatedOwnerWords = await delegatedJobOwnerWords(options.sessionId);
+  const ownerWordsScope = delegatedOwnerWords !== undefined ? { ownerWords: delegatedOwnerWords } : {};
   const mcpToolScope: McpToolScope = effectiveAllowedToolNames !== undefined
     ? {
         reason: declinedContinuation
@@ -2173,6 +2178,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         options.sessionId
           ? resolveMcpToolScopeWithRecall({
               userInput: scopeUserInput,
+              ...ownerWordsScope,
               priorUserInputs,
               standingCapabilityHints: composioStandingPolicyCapabilityHints(),
               configuredServerNames: enabledExternalServerNames(),
@@ -2198,6 +2204,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             })
           : resolveMcpToolScope({
               userInput: scopeUserInput,
+              ...ownerWordsScope,
               standingCapabilityHints: composioStandingPolicyCapabilityHints(),
             })
       );

@@ -951,3 +951,24 @@ test('task category contrasts do not revoke connector access', () => {
     'This is a local task, not a single call to external connectors.',
   ]) assert.equal(compileMcpAccessConstraint(userInput, []).mode, 'deny_all', userInput);
 });
+
+test("in a delegated job only the owner's own words allow or refuse a connector", () => {
+  const names = ['dataforseo', 'n8n'];
+  // The job text Clem wrote for the agent: it means "use the MCP server", but
+  // its parenthetical reads as a refusal when parsed as the owner's words.
+  const jobText = 'Pull missing SEO data. Use actual connected DataForSEO MCP (not Composio DataForSEO), approved Apify actors only.';
+  assert.equal(compileMcpAccessConstraint(jobText, names).mode, 'deny_set', 'read as the owner, the job text refuses the very tool it names');
+  const owner = "Find my teammate's audit request and have the project's lead build the full styled audit, pulling the data it needs.";
+  const scoped = resolveMcpToolScope({ userInput: jobText, ownerWords: owner, configuredServerNames: names });
+  assert.ok(!(scoped.deniedServerSlugs ?? []).includes('dataforseo'), JSON.stringify(scoped));
+  assert.notEqual(mcpToolScopeAuthority(scoped), 'none');
+  const viaRecall = resolveMcpToolScopeWithRecall({ userInput: jobText, ownerWords: owner, configuredServerNames: names, learnedMatches: [] });
+  assert.ok(!(viaRecall.deniedServerSlugs ?? []).includes('dataforseo'));
+  // A resumed job inherits the job text's relevance, still under the owner's words.
+  const resumed = resolveMcpToolScopeWithRecall({ userInput: 'continue', ownerWords: owner, priorUserInputs: [jobText], configuredServerNames: names, learnedMatches: [] });
+  assert.ok(!(resumed.deniedServerSlugs ?? []).includes('dataforseo'), JSON.stringify(resumed));
+  assert.notEqual(mcpToolScopeAuthority(resumed), 'none');
+  // A refusal the owner did give still holds, whatever the job text says.
+  const refused = resolveMcpToolScope({ userInput: 'Use DataForSEO for the rankings.', ownerWords: "Don't use DataForSEO for this one.", configuredServerNames: names });
+  assert.ok((refused.deniedServerSlugs ?? []).includes('dataforseo'), JSON.stringify(refused));
+});

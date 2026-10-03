@@ -121,6 +121,13 @@ export interface McpToolScope {
  */
 export interface ResolveMcpToolScopeOptions {
   userInput?: string | null;
+  /**
+   * The owner's own words, when the turn's input is not theirs (a job Clem
+   * wrote for an agent). Only these can allow or refuse a connector; the
+   * input still decides which tools are relevant. Absent: the input is the
+   * owner's words.
+   */
+  ownerWords?: string | null;
   configuredServerNames?: string[];
   /**
    * Adapter-compiled, provider-neutral advertisement hints from sealed
@@ -595,10 +602,11 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   // was never meant to mean "ignore the user when they say don't touch my
   // connectors", and letting a display flag revoke a refusal is not a tuning
   // decision, it is a consent bug.
-  const constraint = rawInput
-    ? compileMcpAccessConstraint(rawInput, options.configuredServerNames)
+  const consentText = options.ownerWords !== undefined ? options.ownerWords?.trim() : rawInput;
+  const constraint = consentText
+    ? compileMcpAccessConstraint(consentText, options.configuredServerNames)
     : { mode: 'none' as const, allow: [], deny: [] };
-  const constrained = constraintScope(constraint, rawInput ?? '');
+  const constrained = constraintScope(constraint, consentText ?? '');
   if (constrained) return constrained;
 
   if (scopingDisabled()) {
@@ -614,10 +622,11 @@ export function resolveMcpToolScope(options: ResolveMcpToolScopeOptions = {}): M
   const requestedEffectScope = requestedCapabilityEffectScope(input);
   // Resolved once and attached to every branch below: a refusal must survive
   // whichever route the turn takes through this resolver.
-  const deniedRaw = deniedServerSlugsFromInput(input, options.configuredServerNames);
+  // Refusals are the owner's: read from their own words (consentText).
+  const deniedRaw = consentText ? deniedServerSlugsFromInput(consentText, options.configuredServerNames) : [];
   const denied = deniedRaw.length > 0 ? { deniedServerSlugs: deniedRaw } : {};
-  if ((EXPLICIT_LOCAL_ONLY_RE.test(input) || EXPLICIT_NO_EXTERNAL_TOOLS_RE.test(input))
-    && !hasExplicitExternalException(input)) {
+  if (consentText && (EXPLICIT_LOCAL_ONLY_RE.test(consentText) || EXPLICIT_NO_EXTERNAL_TOOLS_RE.test(consentText))
+    && !hasExplicitExternalException(consentText)) {
     // The user prohibited external connectors. This is the real thing an empty
     // surface used to be confused with: a decision, not a budget.
     return {
@@ -958,6 +967,7 @@ export function isToolScopeContinuation(input?: string | null): boolean {
 export function resolveMcpToolScopeWithContinuity(
   options: {
     userInput?: string | null;
+    ownerWords?: string | null;
     priorUserInputs?: Array<string | null | undefined>;
     standingCapabilityHints?: McpStandingCapabilityHint[];
     configuredServerNames?: string[];
@@ -980,6 +990,7 @@ export function resolveMcpToolScopeWithContinuity(
   }
   const direct = resolveMcpToolScope({
     userInput: options.userInput,
+    ...(options.ownerWords !== undefined ? { ownerWords: options.ownerWords } : {}),
     standingCapabilityHints: options.standingCapabilityHints,
     configuredServerNames: options.configuredServerNames,
   });
@@ -1003,6 +1014,7 @@ export function resolveMcpToolScopeWithContinuity(
   for (const prior of options.priorUserInputs ?? []) {
     const inherited = resolveMcpToolScope({
       userInput: prior,
+      ...(options.ownerWords !== undefined ? { ownerWords: options.ownerWords } : {}),
       standingCapabilityHints: options.standingCapabilityHints,
       configuredServerNames: options.configuredServerNames,
     });
@@ -1088,6 +1100,7 @@ function explicitlyNamesLearnedServer(input: string, serverSlug: string): boolea
 export function resolveMcpToolScopeWithRecall(
   options: {
     userInput?: string | null;
+    ownerWords?: string | null;
     priorUserInputs?: Array<string | null | undefined>;
     learnedMatches?: StepToolChoiceMatch[];
     standingCapabilityHints?: McpStandingCapabilityHint[];
