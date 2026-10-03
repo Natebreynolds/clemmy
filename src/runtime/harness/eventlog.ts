@@ -3648,7 +3648,10 @@ export function appendConversationCheckIn(
     const inserted = prepareCached(db, 'SELECT * FROM events WHERE id = ?').get(id) as RawEventRow;
     return { event: rowToEvent(inserted), inserted: true };
   });
-  return tx();
+  const result = tx();
+  return result.inserted && result.event
+    ? { ...result, event: publishPersistedEvent(result.event) }
+    : result;
 }
 
 export interface AppendConversationPreambleOnceInput {

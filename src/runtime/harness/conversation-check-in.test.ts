@@ -21,6 +21,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-check-in\n', 'utf8');
 
 const eventlog = await import('./eventlog.js');
+const { actionBus } = await import('../action-bus.js');
 const { projectHarnessEventsForPublic } = await import('./public-presentation.js');
 
 test.after(() => {
@@ -36,6 +37,119 @@ function turn(text = 'reconcile the sheet') {
   });
   return { session, source };
 }
+
+function observeCheckIns(sessionId: string) {
+  const rows: Array<{
+    kind: 'harness.event' | 'harness.public_event';
+    event: import('./eventlog.js').EventRow;
+    inTransaction: boolean;
+    persisted: boolean;
+  }> = [];
+  const detach = actionBus.subscribe((signal) => {
+    if (
+      (signal.kind !== 'harness.event' && signal.kind !== 'harness.public_event')
+      || signal.sessionId !== sessionId
+      || signal.event.type !== 'conversation_check_in'
+    ) return;
+    rows.push({
+      kind: signal.kind,
+      event: signal.event,
+      inTransaction: eventlog.openEventLog().inTransaction,
+      persisted: eventlog.listEvents(sessionId, { types: ['conversation_check_in'] })
+        .some((event) => event.id === signal.event.id),
+    });
+  });
+  return { rows, detach };
+}
+
+test('a check-in publishes its exact source once per bus channel after commit', () => {
+  const { session, source } = turn();
+  // A later request in the reusable session must not take ownership of this note.
+  eventlog.appendEvent({
+    sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'a separate request' },
+  });
+  const observed = observeCheckIns(session.id);
+  try {
+    const result = eventlog.appendConversationCheckIn({
+      source,
+      text: 'Found three unmatched rows; checking their source records next.',
+    });
+    assert.ok(result.inserted && result.event);
+    assert.deepEqual(observed.rows.map(({ kind, event }) => [kind, event.id]), [
+      ['harness.event', result.event.id],
+      ['harness.public_event', result.event.id],
+    ]);
+    for (const row of observed.rows) {
+      assert.equal(row.inTransaction, false, 'listeners run only after the insert commits');
+      assert.equal(row.persisted, true, 'the published row can already be read');
+      assert.equal(row.event.sessionId, source.sessionId);
+      assert.equal(row.event.turn, source.turn);
+      assert.equal(row.event.parentEventId, row.kind === 'harness.event' ? source.id : null,
+        'the public projection keeps its existing private-parent redaction');
+      assert.equal(row.event.data.sourceUserSeq, source.seq);
+    }
+    assert.equal(eventlog.listEvents(session.id, { types: ['conversation_completed'] }).length, 0);
+  } finally {
+    observed.detach();
+  }
+});
+
+test('check-in publication follows the managed outer commit and discards rollback', () => {
+  const { session, source } = turn();
+  const observed = observeCheckIns(session.id);
+  try {
+    assert.throws(() => eventlog.withEventPublicationTransaction(() => {
+      eventlog.appendConversationCheckIn({ source, text: 'This transaction will roll back.' });
+      assert.equal(observed.rows.length, 0, 'no live prose before the outer commit');
+      throw new Error('roll back fixture');
+    }), /roll back fixture/);
+    assert.equal(observed.rows.length, 0);
+    assert.equal(eventlog.listEvents(session.id, { types: ['conversation_check_in'] }).length, 0);
+
+    const result = eventlog.withEventPublicationTransaction(() => {
+      const inserted = eventlog.appendConversationCheckIn({ source, text: 'The retained finding is ready.' });
+      assert.equal(observed.rows.length, 0, 'publication still waits for the outer commit');
+      return inserted;
+    });
+    assert.ok(result.event);
+    assert.deepEqual(observed.rows.map(({ kind, event }) => [kind, event.id]), [
+      ['harness.event', result.event.id],
+      ['harness.public_event', result.event.id],
+    ]);
+    assert.ok(observed.rows.every((row) => row.persisted && !row.inTransaction));
+  } finally {
+    observed.detach();
+  }
+});
+
+test('capped and rejected check-ins publish nothing', () => {
+  const { session, source } = turn();
+  for (let i = 0; i < eventlog.MAX_CONVERSATION_CHECK_INS_PER_TURN; i += 1) {
+    eventlog.appendConversationCheckIn({ source, text: `Existing note ${i}` });
+  }
+  const synthetic = eventlog.appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'CONTINUE', synthetic: true },
+  });
+  const observed = observeCheckIns(session.id);
+  try {
+    assert.deepEqual(eventlog.appendConversationCheckIn({ source, text: 'Overflow note' }), {
+      event: null, inserted: false, reason: 'cap_reached',
+    });
+    for (const invalidSource of [synthetic, { ...source, id: 'wrong-parent' }]) {
+      assert.throws(() => eventlog.appendConversationCheckIn({
+        source: invalidSource, text: 'Rejected source',
+      }), /exact real user source/);
+    }
+    assert.throws(() => eventlog.appendConversationCheckIn({ source, text: '   ' }), /not safe public text/);
+    assert.equal(observed.rows.length, 0);
+    assert.equal(eventlog.listEvents(session.id, { types: ['conversation_check_in'] }).length,
+      eventlog.MAX_CONVERSATION_CHECK_INS_PER_TURN);
+  } finally {
+    observed.detach();
+  }
+});
 
 test('a check-in lands in thread, authored by Clem and parented to its source', () => {
   const { session, source } = turn();
