@@ -316,3 +316,9 @@ brain choices are the sign-in's own catalog once it is known. Proof:
   pin, chat-swipe tests + a driven touch swipe in the preview (opens, tap
   closes, plain tap opens the thread), 620 desktop tests, 348 phone tests.
 - **Status:** committed, not installed.
+- Later the same night: Automate cards and Heartbeats' open items name
+  workflows in words (9f366b32e); the phone's Updates render their reports as
+  formatted Markdown that wraps inside the card, kinds as quiet words
+  (42c4c8830); the desktop's notification pills drop the universal green
+  "Sent" and name the kind in the phone's words, only "Failed" stands out
+  (67933f9f0). All tested (620 desktop, 348 phone); not installed.
