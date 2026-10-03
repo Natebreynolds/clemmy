@@ -15,6 +15,7 @@ import type { McpToolScope } from '../mcp-tool-scope.js';
 import {
   workerPacketMcpToolScope,
 } from '../../agents/external-mcp-scope-lock.js';
+import { projectContextForWorker } from '../../projects/project-binding.js';
 
 type ClaudeAgentSdkRunFn = (options: ClaudeAgentSdkRunOptions) => Promise<ClaudeAgentSdkRunResult>;
 let runClaudeAgentSdkImpl: ClaudeAgentSdkRunFn = runClaudeAgentSdk;
@@ -54,7 +55,7 @@ function thrashGuardOn(): boolean {
   return (getRuntimeEnv('CLEMMY_WORKER_THRASH_GUARD', 'on') ?? 'on').toLowerCase() !== 'off';
 }
 
-export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agentic = false): string {
+export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agentic = false, projectContext = ''): string {
   const boundary = agentic
     ? [
         'Current capability — you CAN use the gated tools for THIS item:',
@@ -87,6 +88,8 @@ export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agen
     // Running as a saved agent: its standing context joins the stable prefix,
     // so every item of the batch shares one wire.
     input.agent ? resolveAgentBinding(input.agent)?.context ?? '' : '',
+    // The project the parent works in: its folder, procedures and accounts.
+    projectContext,
   ].filter(Boolean).join('\n');
 }
 
@@ -136,7 +139,8 @@ export async function runClaudeAgentSdkWorker(
       prompt: buildWorkerJobPrompt(input),
       sessionId: sid,
       modelId,
-      systemAppend: renderClaudeAgentWorkerSystemAppend(input, agentic),
+      systemAppend: renderClaudeAgentWorkerSystemAppend(input, agentic,
+        projectContextForWorker(sid ?? null, input.agent ? resolveAgentBinding(input.agent)?.agent.id ?? null : null)),
       allowedLocalMcpTools: defaultClaudeAgentSdkAllowedLocalTools(agentic ? 'worker' : 'read_only'),
       // Scope the worker's NATIVE external MCP surface to exact parent-resolved
       // external MCP slugs only. "none needed", skill_read, read_file, and Composio

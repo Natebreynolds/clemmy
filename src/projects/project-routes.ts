@@ -263,6 +263,7 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
       ...(typeof input.context === 'string' ? { context: input.context } : {}),
       ...(Array.isArray(input.skills) ? { skills: strings(input.skills) } : {}),
       ...(typeof input.shareMethods === 'boolean' ? { shareMethods: input.shareMethods } : {}),
+      ...(typeof input.lead === 'boolean' ? { lead: input.lead } : {}),
     });
     if (!saved.ok) { refuse(res, saved.reason); return; }
     res.json({ overview: projectOverview(saved.assignment.projectId) });

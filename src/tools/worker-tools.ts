@@ -48,6 +48,7 @@ import {
 } from '../runtime/harness/work-manifest.js';
 import { evaluateQuantifiedWorkManifestGateWithArbitration } from '../runtime/harness/quantified-work-manifest.js';
 import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
+import { WORKER_STARTS_NOTHING } from '../agents/delegation-depth.js';
 
 /**
  * `run_worker` for the CLAUDE AGENT SDK BRAIN.
@@ -184,6 +185,7 @@ export function registerWorkerTools(server: McpServer): void {
     WorkerToolCallSchema.shape,
     async (callParams) => {
       if (!enabled()) return textResult('run_worker is disabled (CLEMMY_SDK_BRAIN_RUN_WORKER=off).');
+      if (harnessRunContextStorage.getStore()?.workerScope) return textResult(WORKER_STARTS_NOTHING);
       const call = callParams as WorkerToolCall;
       const callItems = workerCallItems(call);
       if (!callItems || callItems.length === 0) {

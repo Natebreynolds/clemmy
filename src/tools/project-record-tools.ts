@@ -49,6 +49,7 @@ function describeAssignment(row: ProjectAssignment): Record<string, unknown> {
     ...(row.context ? { context: row.context } : {}),
     ...(row.skills.length > 0 ? { skills: row.skills } : {}),
     sharesMethodsAcrossProjects: row.shareMethods,
+    ...(row.lead ? { lead: true } : {}),
   };
 }
 
@@ -137,6 +138,7 @@ export function registerProjectRecordTools(server: McpServer): void {
         context: z.string().nullable().optional().describe('Context that applies to this agent in this project only.'),
         skills: z.array(z.string()).nullable().optional().describe('Installed skills it should reach for in this project.'),
         share_methods: z.boolean().nullable().optional().describe('True only if the owner said what this agent learns here may be used in its other projects.'),
+        lead: z.boolean().nullable().optional().describe('True when the owner names this agent the project\'s lead: whole jobs in the project go to it, and it plans them and runs its own workers. One lead per project; naming one replaces the last.'),
         remove: z.boolean().nullable().optional().describe('True to take the agent off the project.'),
         create_if_missing: z.object({
           handles: z.string().min(1).describe('One line: what the new agent handles.'),
@@ -222,6 +224,7 @@ export function registerProjectRecordTools(server: McpServer): void {
           ...(typeof entry.context === 'string' ? { context: entry.context } : {}),
           ...(Array.isArray(entry.skills) ? { skills: entry.skills.filter((skill) => !missing.includes(skill)) } : {}),
           ...(typeof entry.share_methods === 'boolean' ? { shareMethods: entry.share_methods } : {}),
+          ...(typeof entry.lead === 'boolean' ? { lead: entry.lead } : {}),
         });
         if (!saved.ok) { notes.push(`${agent.name} was not assigned: ${saved.reason}.`); continue; }
         notes.push(saved.created ? `${agent.name} is assigned.` : `${agent.name}'s assignment was updated.`);

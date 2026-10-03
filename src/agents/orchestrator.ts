@@ -203,6 +203,7 @@ import {
 import { projectHostOwnedAsyncReadRefinementTerminal } from '../runtime/harness/async-read-refinement-terminal-projection.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
+import { toolNameOffered } from '../tools/browser-backend.js';
 
 /**
  * Clem (display name) — the top of the 0.3 harness. Internally the
@@ -3921,13 +3922,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             && !visibleFirstClassNames.has(name)
             && !lookupPresentationExcludes.has(name)
             && !isRegisteredDelegationPrimitive(name)
+            && toolNameOffered(name)
           )))
-        : discoverableNames;
+        : new Set([...discoverableNames].filter(toolNameOffered));
       const catalogText = buildCompactToolCatalog({ allowedNames: catalogNames });
       const nativeAuthoringNames = hostFreshPlanning
         ? new Set([...localPlanningCapabilityNames].filter(name => workCallBuiltinNames.has(name)
           && !isRegistryDeclaredRead(name)
-          && !visibleFirstClassNames.has(name)))
+          && !visibleFirstClassNames.has(name)
+          && toolNameOffered(name)))
         : new Set<string>();
       const nativeAuthoringCatalog = nativeAuthoringNames.size > 0
         ? '[native-authoring-catalog] Available native authoring tools. If an exact tool fits, use its known work_call contract or look up that exact name with tool_search for its schema and callable example. An exact native lookup stays local; describing it as a broad app search can return unrelated connectors.\n'

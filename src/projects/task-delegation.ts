@@ -21,7 +21,7 @@ import type { BackgroundTaskDelegation } from '../execution/background-tasks.js'
 import { getSession } from '../runtime/harness/eventlog.js';
 import { resolveRoleModel, type ModelRole } from '../runtime/harness/model-roles.js';
 import { selectAgentForTaskWithJev, type AgentSelectCandidate } from '../runtime/jev/control-plane.js';
-import { findProject, getAssignment, listAssignments, listProjects, type ProjectRecord } from './project-record.js';
+import { findProject, getAssignment, listAssignments, listProjects, projectLead, type ProjectRecord } from './project-record.js';
 import { sessionProjectState } from './session-project-state.js';
 
 export interface TaskDelegationRequest {
@@ -114,6 +114,17 @@ export async function resolveTaskDelegation(
     } else {
       return { kind: 'refuse', reason: `${name} is not assigned to the project ${project.name}, so no task started. `
         + `Assigned to it: ${assignedNames(project)}. Assign ${name} with project_save, or delegate to someone assigned.` };
+    }
+  }
+
+  // A project's lead takes its jobs when nobody else was named: the owner
+  // already chose it for this project.
+  if (project && !agentId) {
+    const lead = projectLead(project.id);
+    const leadAgent = lead ? getAgentRecord(lead.agentId) : null;
+    if (lead && leadAgent && !(lead.agentCreatedAt && leadAgent.createdAt && lead.agentCreatedAt !== leadAgent.createdAt)) {
+      agentId = leadAgent.id;
+      assignedBy = 'owner';
     }
   }
 

@@ -162,6 +162,8 @@ export interface AssignmentView {
   context: string;
   skills: string[];
   shareMethods: boolean;
+  /** Whole jobs in the project go to this agent. */
+  lead: boolean;
   revision: number;
   assignedAt: string;
 }
@@ -180,6 +182,7 @@ function assignmentView(row: ProjectAssignment): AssignmentView {
     context: row.context,
     skills: row.skills,
     shareMethods: row.shareMethods,
+    lead: row.lead,
     revision: row.revision,
     assignedAt: row.assignedAt,
   };

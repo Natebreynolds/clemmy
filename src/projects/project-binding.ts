@@ -22,6 +22,8 @@ import {
   getAssignment, getProject, listAssignments, listResources,
   type ProjectAssignment, type ProjectRecord, type ProjectResource,
 } from './project-record.js';
+import { sessionProjectState } from './session-project-state.js';
+import { getSession } from '../runtime/harness/eventlog.js';
 
 /** Bytes of skill text an assignment may pin into a prompt in total. */
 export const ASSIGNMENT_SKILL_CONTEXT_MAX_CHARS = 12_000;
@@ -71,7 +73,7 @@ function assignmentOf(projectId: string, agentId: string | null | undefined): Pr
   return assignment;
 }
 
-export function bindProject(project: ProjectRecord, options: { agentId?: string | null } = {}): ProjectBinding {
+export function bindProject(project: ProjectRecord, options: { agentId?: string | null; role?: 'worker' } = {}): ProjectBinding {
   const resources = listResources(project.id);
   const assignment = assignmentOf(project.id, options.agentId);
   const assigned = listAssignments(project.id);
@@ -96,6 +98,22 @@ export function bindProject(project: ProjectRecord, options: { agentId?: string 
       if (!name) continue;
       lines.push(`- ${name}${row.responsibility ? `: ${row.responsibility}` : ''}`);
     }
+  }
+
+  const lead = assigned.find((row) => row.lead);
+  const leadName = lead ? getAgentRecord(lead.agentId)?.name : undefined;
+  if (options.role === 'worker') {
+    lines.push('', 'You are doing one item of a job in this project. Use its folder, procedures and accounts above; '
+      + 'return your item to the run that started you.');
+  } else if (lead && leadName && lead.agentId === assignment?.agentId) {
+    lines.push('', '### You lead this project',
+      'Whole jobs here are yours to run. Plan the job, split it into pieces that each fit one worker, and run workers for '
+        + 'them with run_worker (several items at once where they are independent); give each worker the project files and '
+        + 'procedures it needs. Check in at real decisions and when a wave finishes, then deliver the finished work.');
+  } else if (lead && leadName) {
+    lines.push('', `### ${leadName} leads this project`,
+      `Hand a whole job in this project to ${leadName} with dispatch_background_task (agent ${leadName}, this project): `
+        + `${leadName} plans it, runs its own workers, and checks in here. Use run_worker only for one small, self-contained item.`);
   }
 
   const pinnedSkills: string[] = [];
@@ -139,4 +157,19 @@ export function resolveProjectBinding(
   const project = getProject(projectId);
   if (!project || project.status !== 'active') return null;
   return bindProject(project, options);
+}
+
+/**
+ * The project a worker's parent works in, as the worker's own context. A
+ * worker started by a project's lead, or by Clem inside a project, works with
+ * the same folder, procedures and accounts. Empty when the parent is in none.
+ */
+export function projectContextForWorker(parentSessionId: string | null | undefined, agentId: string | null | undefined): string {
+  if (!parentSessionId) return '';
+  try {
+    const { projectId } = sessionProjectState(getSession(parentSessionId)?.metadata ?? null);
+    const project = projectId ? getProject(projectId) : null;
+    if (!project || project.status !== 'active') return '';
+    return bindProject(project, { agentId: agentId ?? null, role: 'worker' }).context;
+  } catch { return ''; }
 }

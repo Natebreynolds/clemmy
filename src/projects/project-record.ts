@@ -99,6 +99,9 @@ export interface ProjectAssignment {
    * a project stays inside it.
    */
   shareMethods: boolean;
+  /** The project's lead: Clem hands its whole jobs to this agent, which
+   *  plans them and runs its own workers. At most one per project. */
+  lead: boolean;
   state: 'active' | 'removed';
   /** Rises on every change to the assignment. */
   revision: number;
@@ -114,6 +117,7 @@ export interface AssignmentDraft {
   context?: string;
   skills?: readonly string[];
   shareMethods?: boolean;
+  lead?: boolean;
 }
 
 export type ProjectResourceKind = 'account' | 'space' | 'workflow' | 'folder' | 'link';
@@ -163,7 +167,7 @@ export type SaveResourceResult =
   | { ok: false; reason: 'project_not_found' | 'project_archived' | 'resource_incomplete' | 'too_many_resources'
       | 'conflicting_account'; conflict?: ProjectResource };
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const RESOURCE_KINDS: ReadonlySet<string> = new Set(['account', 'space', 'workflow', 'folder', 'link']);
 
 let handle: Database.Database | null = null;
@@ -256,6 +260,14 @@ function migrate(conn: Database.Database): void {
           updated_at        TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS project_resources_by_project ON project_resources (project_id, state, kind);
+      `);
+    }
+    if (current < 2) {
+      // A project may name one lead: the agent its whole jobs go to.
+      conn.exec(`
+        ALTER TABLE project_agents ADD COLUMN lead INTEGER NOT NULL DEFAULT 0 CHECK (lead IN (0,1));
+        CREATE UNIQUE INDEX IF NOT EXISTS project_agents_one_lead
+          ON project_agents (project_id) WHERE lead = 1 AND state = 'active';
       `);
     }
     conn.pragma(`user_version = ${SCHEMA_VERSION}`);
@@ -354,7 +366,7 @@ function toProject(row: RawProject): ProjectRecord {
 interface RawAssignment {
   project_id: string; agent_id: string; agent_created_at: string | null; agent_name: string;
   responsibility: string; context: string;
-  skills_json: string; share_methods: number; state: 'active' | 'removed'; revision: number;
+  skills_json: string; share_methods: number; lead?: number; state: 'active' | 'removed'; revision: number;
   assigned_at: string; updated_at: string;
 }
 
@@ -362,7 +374,7 @@ function toAssignment(row: RawAssignment): ProjectAssignment {
   return {
     projectId: row.project_id, agentId: row.agent_id, agentCreatedAt: row.agent_created_at, agentName: row.agent_name,
     responsibility: row.responsibility, context: row.context, skills: parseList(row.skills_json),
-    shareMethods: row.share_methods === 1, state: row.state, revision: row.revision,
+    shareMethods: row.share_methods === 1, lead: row.lead === 1, state: row.state, revision: row.revision,
     assignedAt: row.assigned_at, updatedAt: row.updated_at,
   };
 }
@@ -501,6 +513,13 @@ export function listAssignments(projectId: string): ProjectAssignment[] {
   return rows.map(toAssignment);
 }
 
+/** The agent a project's whole jobs go to, when it has named one. */
+export function projectLead(projectId: string): ProjectAssignment | null {
+  const row = db().prepare("SELECT * FROM project_agents WHERE project_id = ? AND state = 'active' AND lead = 1")
+    .get(projectId) as RawAssignment | undefined;
+  return row ? toAssignment(row) : null;
+}
+
 /** The active projects an agent is assigned to, most recently changed first. */
 export function listAssignmentsForAgent(agentId: string): ProjectAssignment[] {
   const rows = db().prepare(`
@@ -538,26 +557,34 @@ export function saveAssignment(projectId: string, draft: AssignmentDraft): SaveA
       context: draft.context === undefined ? base?.context ?? '' : clean(draft.context, MAX_ASSIGNMENT_CONTEXT_CHARS),
       skills: draft.skills === undefined ? base?.skills ?? [] : boundedList(draft.skills, MAX_ASSIGNMENT_SKILLS, 120),
       shareMethods: draft.shareMethods === undefined ? base?.shareMethods ?? false : draft.shareMethods === true,
+      lead: draft.lead === undefined ? base?.lead ?? false : draft.lead === true,
     };
     if (base && agentName === base.agentName && next.responsibility === base.responsibility && next.context === base.context
-      && next.shareMethods === base.shareMethods && JSON.stringify(next.skills) === JSON.stringify(base.skills)) {
+      && next.shareMethods === base.shareMethods && next.lead === base.lead && JSON.stringify(next.skills) === JSON.stringify(base.skills)) {
       return { ok: true, assignment: base, created: false };
+    }
+    // Naming a lead hands the role over: the project keeps one.
+    if (next.lead) {
+      conn.prepare(`
+        UPDATE project_agents SET lead = 0, revision = revision + 1, updated_at = ?
+         WHERE project_id = ? AND agent_id <> ? AND lead = 1
+      `).run(at, projectId, agentId);
     }
     if (existing) {
       conn.prepare(`
         UPDATE project_agents SET agent_created_at = ?, agent_name = ?, responsibility = ?, context = ?, skills_json = ?,
-          share_methods = ?, state = 'active', revision = revision + 1,
+          share_methods = ?, lead = ?, state = 'active', revision = revision + 1,
           assigned_at = CASE WHEN ? THEN assigned_at ELSE ? END, updated_at = ?
         WHERE project_id = ? AND agent_id = ?
       `).run(agentCreatedAt, agentName, next.responsibility, next.context, JSON.stringify(next.skills),
-        next.shareMethods ? 1 : 0, sameAgent ? 1 : 0, at, at, projectId, agentId);
+        next.shareMethods ? 1 : 0, next.lead ? 1 : 0, sameAgent ? 1 : 0, at, at, projectId, agentId);
     } else {
       conn.prepare(`
         INSERT INTO project_agents (project_id, agent_id, agent_created_at, agent_name, responsibility, context, skills_json,
-          share_methods, state, revision, assigned_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)
+          share_methods, lead, state, revision, assigned_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)
       `).run(projectId, agentId, agentCreatedAt, agentName, next.responsibility, next.context, JSON.stringify(next.skills),
-        next.shareMethods ? 1 : 0, at, at);
+        next.shareMethods ? 1 : 0, next.lead ? 1 : 0, at, at);
     }
     conn.prepare('UPDATE projects SET updated_at = ? WHERE id = ?').run(at, projectId);
     return { ok: true, assignment: getAssignment(projectId, agentId)!, created: !sameAgent };
@@ -570,7 +597,7 @@ export function removeAssignment(projectId: string, agentId: string): boolean {
   const conn = db();
   return conn.transaction(() => {
     const changed = conn.prepare(`
-      UPDATE project_agents SET state = 'removed', revision = revision + 1, updated_at = ?
+      UPDATE project_agents SET state = 'removed', lead = 0, revision = revision + 1, updated_at = ?
        WHERE project_id = ? AND agent_id = ? AND state = 'active'
     `).run(at, projectId, agentId).changes === 1;
     if (changed) conn.prepare('UPDATE projects SET updated_at = ? WHERE id = ?').run(at, projectId);

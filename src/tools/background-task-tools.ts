@@ -34,6 +34,7 @@ import { publicConversationPreambleData } from '../runtime/harness/public-presen
 import { textResult } from './shared.js';
 import { resolveTaskDelegation } from '../projects/task-delegation.js';
 import { correctDelegatedTask } from '../projects/task-follow-up.js';
+import { LEAD_DOES_NOT_HAND_ON, WORKER_STARTS_NOTHING, sessionIsDelegatedJob } from '../agents/delegation-depth.js';
 
 /** Split an agreed plan (markdown bullets / numbered lines) into discrete next
  *  actions for the goal contract's step list. Best-effort + bounded. */
@@ -310,6 +311,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
     [
       'Hand an AGREED, multi-step task to the reliable background runner (fire-and-forget).',
       'Call this ONLY AFTER you and the user have aligned on what to do (CONVERSE FIRST) and they want it run in the background rather than waited-on here.',
+      'A whole job in a project that has a lead is handed to that lead this way once it is agreed: the owner chose that the project\'s jobs run under its lead, who plans the job, runs its own workers, and checks in here.',
       'It runs in the daemon — board-visible, survives a restart — and reports its outcome back to THIS chat automatically when it finishes (or if it gets stuck or needs your input).',
       'Pass the AGREED objective + the concrete steps you settled on (NOT the raw user message).',
       'After it returns: confirm to the user that it is running and that you will report back, then STOP — do NOT do the work yourself this turn, do NOT poll. The user is free to fire another task immediately.',
@@ -321,7 +323,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       success_criteria: z.array(z.string()).nullable().describe('Concrete done-checks; the run is complete only when all hold.'),
       context_refs: z.array(z.string()).nullable().describe('File paths, resource ids, or tool-call ids the worker should load first before producing artifacts.'),
       max_minutes: z.number().int().min(1).max(240).nullable().describe('Soft wall-clock budget; defaults to the policy long-task minutes.'),
-      agent: z.string().nullable().optional().describe('Saved agent to delegate this task to (its name). The task then runs as that agent, with its standing instructions and skills, and reports back here. Null or omitted: the agent this conversation is already in, otherwise the one assigned to the project that is responsible for this kind of work, otherwise none.'),
+      agent: z.string().nullable().optional().describe('Saved agent to delegate this task to (its name). The task then runs as that agent, with its standing instructions and skills, and reports back here. Null or omitted: the agent this conversation is already in, otherwise the project\'s lead, otherwise the one assigned to the project that is responsible for this kind of work, otherwise none. The agent runs the task as a full turn of its own: it plans the job, runs its own workers, and checks in here.'),
       project: z.string().nullable().optional().describe('Project the task belongs to (its name or id). Null or omitted: the project this conversation is in, if any. The task works with that project\'s context, accounts and learning, and nothing from any other project.'),
       artifact_destination: z.string().nullable().optional().describe('Where the owner asked for the result to be put, in their words (a folder, a document, "a draft here in chat"). Null when they did not say.'),
       manifest: z.object({
@@ -349,6 +351,8 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       if (!sessionId) {
         return textResult('I can only dispatch a background task from a live chat session (no session context here) — run the task directly instead.');
       }
+      if (harnessRunContextStorage.getStore()?.workerScope) return textResult(WORKER_STARTS_NOTHING);
+      if (sessionIsDelegatedJob(sessionId)) return textResult(LEAD_DOES_NOT_HAND_ON);
       void handoff_note; // consumed by the terminal reply renderer via output marker below
 
       // Boundary-tolerant wire, strict new admission. This tool creates only

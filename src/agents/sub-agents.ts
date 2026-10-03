@@ -47,6 +47,7 @@ import {
   sealAgentCapabilityUniverse,
   type SealableToolLike,
 } from './capability-envelope.js';
+import { projectContextForWorker } from '../projects/project-binding.js';
 
 /**
  * Sub-agents.
@@ -325,9 +326,11 @@ export async function buildWorkerAgent(options: {
   const planning = acceptedTaskMode(options.sessionId ?? undefined, options.sourceUserSeq ?? undefined)?.kind === 'plan';
   // Running as a saved agent: its standing context and pinned skills join the
   // instructions once, for every item of the batch.
-  const agentContext = options.workerInput?.agent
-    ? resolveAgentBinding(options.workerInput.agent)?.context ?? ''
-    : '';
+  const agentContext = [
+    options.workerInput?.agent ? resolveAgentBinding(options.workerInput.agent)?.context ?? '' : '',
+    // The project the parent works in: its folder, procedures and accounts.
+    projectContextForWorker(options.sessionId ?? null, options.workerInput?.agent ? resolveAgentBinding(options.workerInput.agent)?.agent.id ?? null : null),
+  ].filter(Boolean).join('\n\n');
   const instructionsWithCatalog = `${baseInstructions}${workerCatalogBlock}${agentContext ? `\n\n${agentContext}` : ''}${planning
     ? '\n\nYou are investigating part of a Plan. Explain the evidence, missing facts and relevant tool contracts that will make the parent’s execution plan useful. Distinguish observed facts from claims and inference. Return findings to the parent; do not execute the proposed business work.'
     : ''}`;
