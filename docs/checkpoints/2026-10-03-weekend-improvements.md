@@ -355,3 +355,31 @@ brain choices are the sign-in's own catalog once it is known. Proof:
   (gpt-5.2-codex no longer offered); on the refused brain a fixture turn read
   "GPT 5.2 Codex isn't available on this sign-in, so I couldn't answer. Pick
   another model…" (blocked, not "Something went wrong").
+
+## Three brains, three tests (live, 10-03 ~01:25–01:45 PT)
+
+Owner-requested measurement on the installed app, live home, real chat
+ingress (`scripts/live-ab/run.mjs`, one fresh session per test, one pass).
+Brain switched through the app's own active-brain route; every brain call's
+served model verified per session in `model-route-metrics.db`; reviewer
+verdicts from `goal_alignment_judged`. Settings backed up first
+(`.env.bak-brain-ab-1003`); the brain is left on DeepSeek V4.1 Flash.
+
+| test | Opus 5.5 | GPT 6.1 Sol (Codex) | DeepSeek V4.1 Flash |
+|---|---|---|---|
+| one-sentence (no tools) | 1 round, 16.1k prompt, 5.8 s | 2 rounds (1 tool), 26.3k, 16.7 s | 1 round, 10.4k, 2.5 s |
+| heartbeats-read | 4 rounds, 6 tools, 86.0k (39.9k uncached), 20.8 s, pass | 10 rounds, 10 tools, 121.0k (111.5k uncached), 58.8 s, pass | 4 rounds, 6 tools, 69.2k (29.0k uncached), 13.0 s, pass |
+| file-write-read | 5 rounds, 95.7k (28.8k uncached), 21.2 s, pass; 1 argument repair | 4 rounds, 48.0k (43.8k uncached), 24.2 s, pass | 5 rounds, 69.9k (20.9k uncached), 8.1 s, pass; 1 argument repair |
+| **total** | 10 rounds, 197.8k prompt / 84.8k uncached, 47.8 s | 16 rounds, 195.4k / 177.4k uncached, 99.7 s | 10 rounds, 149.5k / 60.4k uncached, 23.6 s |
+
+- Every reply was correct; the reviewer (Claude Sonnet 5) passed every tool
+  turn. With Opus as the brain that reviewer is the same family — not an
+  independent review.
+- **Found by the measurement and fixed (10becea4d, wave 39):** GPT 6.1 Sol
+  refused the `none` reasoning effort used for simple turns on every turn,
+  and the new refusal text misread it as "isn't available on this sign-in".
+  Now the adapter learns the efforts a model takes from the provider's own
+  error, retries once at the nearest one and clamps later requests; an error
+  naming a request parameter is no longer read as a refused model. Its first
+  run (wave 38) is superseded by the rerun above.
+- One pass each (n=1); machine load 2.3–3.4 throughout.
