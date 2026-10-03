@@ -421,3 +421,34 @@ verdicts from `goal_alignment_judged`. Settings backed up first
 - **Status:** wave 40 = c2d23b478 installed 07:51 PT (build-info serves it;
   daemon, desk and phone bundles match the build). Owner retest from the
   phone owed.
+
+## Browserbase set up, but "open a browser" still used local Chrome (10-03 08:30 PT)
+
+- **Live:** sess-desktop-49ef9f53e02ff150b0575b4f, after the owner saved
+  Browserbase credentials (status `configured:true`, key available). The
+  model searched the exact name `browser_open`, got only the local Chrome
+  tool, and opened it; Chrome refused (the wave 40 words came back, receipt
+  `effect: none`), and the turn still ended "The tool stopped after execution
+  may have begun…" (`tool_effect_uncertain`).
+- **Cause of the stop:** the local tool returned its typed non-write, but its
+  text is the browser receipt with `ok:false`; the settlement read that as a
+  returned failure of a mutation (`acknowledged=false` → `uncertain_write /
+  unacknowledged_mutation`), and the no-progress projection turns any
+  uncertain write into `reconcile`. Wave 40 fixed the checkpoint and the
+  runner's own flag, not this settlement step.
+- **Owner decision:** Browserbase is the browser; local Chrome is the fallback
+  (or hidden). Built as one browser per machine.
+- **Fix (08289da60):** each browser-driving tool declares `browserBackend`
+  (`local`: the typed operations + harness run/setup/status; `cloud`: every
+  `cloud_browser_*`). While a Browserbase project is set up (read from its
+  own store, no Keychain), only cloud tools are discoverable or runnable;
+  otherwise only local. A remembered local name refuses without starting
+  Chrome. Settlement: a local tool's typed non-write is the no-change proof,
+  so its `ok:false` text no longer makes it uncertain. Tests: new
+  browser-backend + browser-no-change-settlement (the settlement test fails
+  on the old code); 766 neighbouring tests and tsc clean.
+- **Not changed:** a genuinely uncertain local or cloud write (e.g. a
+  navigation that timed out mid-flight) still stops the turn through the
+  no-progress projection, which has no effect class to apply the shared rule;
+  follow-up.
+- **Status:** installing as wave 41.
