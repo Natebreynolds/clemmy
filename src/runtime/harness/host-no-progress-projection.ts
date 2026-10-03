@@ -1243,6 +1243,19 @@ function settlementConsequence(input: {
         recoveryToolNames: [call.name],
       });
     case 'policy_denial':
+      // Clem's own shell safety rule refused this one command before it ran.
+      // That closes the route, not the job: the model takes another way, and
+      // repeating the same command meets the same refusal and the same stop.
+      if (settlement.outcome_detail === 'shell_policy'
+        && settlement.execution_kind === 'refused_pre_dispatch'
+        && settlement.physical_crossing_count === 0) {
+        return createNoProgressConsequence({
+          stage: 'execution:shell_policy',
+          recovery: 'repair_model',
+          effectState: 'not_started',
+          recoveryToolNames: [call.name],
+        });
+      }
       // A policy-shaped refusal with no provider or host crossing is the
       // projector declining the prepared call, not a user/business terminal.
       // Keep the frozen carrier available so repaired host metadata can retry

@@ -211,6 +211,8 @@ export interface AttemptSignals {
   connectionMissing?: boolean;
   /** A local policy/approval layer refused (nominal). */
   policyRefused?: boolean;
+  /** The refusal was Clem's own shell safety rule, before anything ran. */
+  shellPolicyRefused?: boolean;
   /** The lane needs something only the user can give (nominal). */
   needsUserInput?: boolean;
   /** Argument validation failed before dispatch (nominal). */
@@ -296,7 +298,7 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       ? outcome('uncertain_write', 'nominal', 'cancelled_after_dispatch')
       : outcome('unknown', 'nominal', 'cancelled');
   }
-  if (signals.policyRefused) return outcome('policy_denial', 'nominal', 'policy');
+  if (signals.policyRefused) return outcome('policy_denial', 'nominal', signals.shellPolicyRefused ? 'shell_policy' : 'policy');
   if (signals.needsUserInput) return outcome('input_required', 'nominal', 'input');
   if (signals.connectionMissing) return outcome('auth_failure', 'nominal', 'connection');
   if (signals.argumentValidationFailed) {

@@ -712,6 +712,7 @@ function signalsFromThrown(thrown: unknown): AttemptSignals {
   if (signals.errorName === 'ShellPolicyDenialError') {
     signals.preDispatch = true;
     signals.policyRefused = true;
+    signals.shellPolicyRefused = true;
   }
   // The shipped invoke adapter refuses BEFORE any provider request when the
   // sealed manifest, binding, or call authority does not line up. That is a
@@ -1115,6 +1116,7 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   if (input.toolName === 'run_shell_command' && isShellPolicyDenialResult(input.result)) {
     extracted.preDispatch = true;
     extracted.policyRefused = true;
+    extracted.shellPolicyRefused = true;
   }
   // A `[provider-dispatch:not-started:*]` result is a TYPED pre-dispatch
   // refusal. The composio lane returns it as a class instance that its own

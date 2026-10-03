@@ -2897,3 +2897,22 @@ test('failed business reads spend the existing repair budget without gaining aut
     db.close();
   }
 });
+
+test("Clem's own shell safety refusal closes that route, not the job; other refusals still stop", () => {
+  const identity = accepted('shell-policy-route');
+  const db = settlementDb([
+    { callId: 'shell-refused', executionKind: 'refused_pre_dispatch', outcomeKind: 'policy_denial', outcomeDetail: 'shell_policy',
+      recoveryAction: 'stop_and_explain', businessCall: 1, physicalCrossingCount: 0, hostCrossingCount: 1 },
+    { callId: 'other-refused', executionKind: 'refused_pre_dispatch', outcomeKind: 'policy_denial', outcomeDetail: 'policy',
+      recoveryAction: 'stop_and_explain', businessCall: 1, physicalCrossingCount: 0, hostCrossingCount: 1 },
+  ], identity);
+  const shell = projectHostNoProgressAttempt({ ...identity, historyDelta: [call('shell-refused', 'work_call'), result('shell-refused', 'work_call')] }, db);
+  const other = projectHostNoProgressAttempt({ ...identity, historyDelta: [call('other-refused', 'work_call'), result('other-refused', 'work_call')] }, db);
+  db.close();
+  assert.equal(shell.status, 'ok'); assert.equal(other.status, 'ok');
+  if (shell.status !== 'ok' || other.status !== 'ok') return;
+  assert.equal(shell.consequence?.stage, 'execution:shell_policy');
+  assert.equal(shell.consequence?.recovery, 'repair_model');
+  assert.equal(shell.consequence?.effectState, 'not_started');
+  assert.equal(other.consequence?.recovery, 'stop_factual', 'a refusal that is not the shell rule keeps its stop');
+});
