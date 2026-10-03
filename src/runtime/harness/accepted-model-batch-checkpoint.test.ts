@@ -1641,6 +1641,39 @@ test('a returned unknown mutation cannot use a projection receipt to bypass reco
   leases.revokeDispatchLease(task.parentLease);
 });
 
+test('a local write whose own failure leaves its effect uncertain keeps the turn going; nothing replays it', async () => {
+  // The runner shows the model a local write's own result even when its
+  // effect is uncertain (reconciliation-stop.ts); the checkpoint accepts what
+  // the runner showed. The external twin above stays closed.
+  const task = fixture('Open one local browser tab whose effect is not acknowledged.');
+  const callId = 'call:local-uncertain-write';
+  const toolName = 'fixture_local_open';
+  const args = { url: 'about:blank' };
+  const admitted = checkpoints.admitAcceptedModelBatch({
+    sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+    preHistory: preHistory(task), frameHistory: openFrame({ callId, toolName, args }),
+  });
+  assert.equal(admitted.status, 'admitted');
+  if (admitted.status !== 'admitted') throw new Error(admitted.reason);
+  const payload = { ok: false, error: 'The local browser did not answer.' };
+  let bodies = 0;
+  const invoked = await runCall({
+    task, callId, toolName, args, effect: 'local_write', localEnvelope: true, boundary: 'host_owned_local',
+    invoke: async () => { bodies += 1; return payload; },
+  });
+  assert.equal(invoked.settlement.outcome.kind, 'uncertain_write');
+  const resultItem = projectedTextResult({ callId, toolName, value: payload });
+  recordLogicalResult(admitted.admission, resultItem);
+  const finalized = checkpoints.finalizeAcceptedModelBatch(admitted.admission, { committedResultItems: [resultItem] });
+  assert.ok(finalized.status === 'committed' || finalized.status === 'existing', JSON.stringify(finalized));
+  const recovered = checkpoints.recoverAcceptedModelBatchForRestart({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq });
+  assert.equal(recovered.status, 'ready');
+  assert.equal((eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM durable_result_handles WHERE session_id = ?').get(task.sessionId) as { n: number }).n, 0,
+    'an uncertain write never gets a success handle');
+  assert.equal(bodies, 1, 'and is never run again');
+  leases.revokeDispatchLease(task.parentLease);
+});
+
 test('an uncertain host-owned mutation with zero provider crossings checkpoints reconciliation', async () => {
   const task = fixture('Attempt one host-owned mutation whose effect is not acknowledged.', 'execute');
   const callId = 'call:host-owned-unknown-write';

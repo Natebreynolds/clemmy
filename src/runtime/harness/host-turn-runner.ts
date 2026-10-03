@@ -1,3 +1,4 @@
+import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
@@ -6991,7 +6992,7 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
           // rebuild, because the flag tripped for every effect class.
           settlementRequiresReconciliation =
             invoked.settlement.outcome.directive.requiresReconciliation === true
-            && (effect === 'external_write' || effect === 'admin');
+            && uncertainEffectStopsTurn(effect);
           if (
             preserveWorkCallCarrier
             && (effect === 'local_write' || effect === 'external_write' || effect === 'admin')
