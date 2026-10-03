@@ -189,6 +189,28 @@ export function claudeQuotaExhaustion(now: number = Date.now()): ClaudeQuotaExha
   }
 }
 
+/**
+ * PURE: does a fresh reading show room in every plan window? A capacity
+ * refusal that arrives while it does is a brief limit (a burst past a limit
+ * with no extra usage to spill into), not a used-up plan. A model-scoped cap
+ * is not consulted: the reading names its model only by display name.
+ */
+export function claudeUsageHasRoom(snapshot: ClaudeUsageSnapshot | null | undefined, now: number): boolean {
+  if (!snapshot) return false;
+  if (!(snapshot.capturedAt > 0) || now - snapshot.capturedAt > CLAUDE_QUOTA_SAMPLE_FRESH_MS) return false;
+  const windows = [snapshot.fiveHour, snapshot.weekly].filter((reading): reading is ClaudeUsageWindow => Boolean(reading));
+  return windows.length > 0 && windows.every((reading) => reading.usedPercent < 100);
+}
+
+/** The account's room as the usage meters read it. Never blocks, never throws. */
+export function claudeAccountHasRoom(now: number = Date.now()): boolean {
+  try {
+    return claudeUsageHasRoom(getClaudeUsageSnapshot(), now);
+  } catch {
+    return false;
+  }
+}
+
 /** Test-only: clear the cache + refresh gate. */
 export function __resetClaudeUsageForTests(): void {
   cache = null;

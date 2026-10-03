@@ -32,3 +32,14 @@ test('total: garbage input classifies short_reset, never throws', () => {
   assert.equal(capacityAdvice({ reason: '' }).shape, 'short_reset');
   assert.equal(capacityAdvice({ reason: undefined as unknown as string }).shape, 'short_reset');
 });
+
+test('a capacity refusal while the account shows room is a brief limit with a retry time, not a used-up plan', () => {
+  const reason = "You're out of extra usage. Add more and keep going.";
+  assert.equal(capacityAdvice({ reason }).shape, 'plan_limit');
+  const brief = capacityAdvice({ reason, accountHasRoom: true, retryAtIso: new Date(Date.now() + 120_000).toISOString() });
+  assert.equal(brief.shape, 'short_reset');
+  assert.match(brief.copy, /brief limit/);
+  assert.match(brief.copy, /retry automatically at about/);
+  assert.doesNotMatch(brief.copy, /may not reset for days/);
+  assert.match(capacityAdvice({ reason: '429 Too Many Requests', accountHasRoom: true }).copy, /temporary rate limit/);
+});

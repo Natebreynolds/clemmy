@@ -4605,3 +4605,48 @@ test('free auto-continues cover the granted minutes (no more time-arithmetic par
   assert.equal(freeAutoContinueCapForTask(240), 24, 'bounded by the hard self-resume ceiling');
   assert.equal(freeAutoContinueCapForTask(100000), 24, 'never exceeds the hard ceiling');
 });
+
+test('a job whose brain is turned away while its account shows room waits, retries and tells its chat; otherwise it stops in words', async () => {
+  const { __setClaudeUsageForTests } = await import('../runtime/harness/claude-usage.js');
+  const refusal = "You're out of extra usage. Add more at the provider's usage settings and keep going.";
+  const run = async (provider: string) => {
+    for (const existing of listBackgroundTasks({ includeArchived: true })) archiveBackgroundTask(existing.id);
+    const origin = createSession({ kind: 'chat', channel: 'desktop', title: `Refused brain ${provider}` });
+    const task = createBackgroundTask({ title: 'Market audit', prompt: 'run the market audit', originSessionId: origin.id,
+      delegation: { agentId: 'fixture-lead', agentName: 'Fixture Lead', agentCreatedAt: new Date().toISOString(), projectId: 'prj_fixture', projectName: 'Fixture', assignedBy: 'clem', originSourceUserSeq: 1 } });
+    const stubAssistant = {
+      getRuntime() { return {} as never; },
+      async respond(request: { sessionId: string }) {
+        // What the bridge leaves behind for a provider failure: the routed
+        // brain and a committed failed terminal, returned as a response.
+        appendEvent({ sessionId: request.sessionId, turn: 1, role: 'system', type: 'turn_model_routed', data: { model: 'fixture-model', provider } });
+        appendEvent({ sessionId: request.sessionId, turn: 1, role: 'system', type: 'conversation_completed', data: { failureDetail: refusal } });
+        return { text: 'The turn failed.', sessionId: request.sessionId, stoppedReason: 'error' as const };
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await processBackgroundTasks(stubAssistant as any, 1);
+    return { task: getBackgroundTask(task.id)!, origin };
+  };
+  try {
+    __setClaudeUsageForTests({ fiveHour: { usedPercent: 9 }, weekly: { usedPercent: 78 }, capturedAt: Date.now() });
+    const waiting = await run('claude');
+    assert.equal(waiting.task.status, 'pending', 'a brief limit is waited out, not reported as the result');
+    assert.equal(waiting.task.transientRetry?.attempts, 1);
+    assert.match(waiting.task.lastCheckInMessage ?? '', /brief limit/);
+    const checkIns = listEvents(waiting.origin.id).filter((event) => event.type === 'delegated_task_state' && event.data.phase === 'check_in');
+    assert.equal(checkIns.length, 1, 'the chat that handed the job over hears it is waiting');
+    assert.match(String(checkIns[0].data.note), /retry automatically/);
+
+    __setClaudeUsageForTests(null);
+    const unknown = await run('claude');
+    assert.equal(unknown.task.status, 'failed', 'without a reading that shows room the refusal stops the job');
+    assert.doesNotMatch(unknown.task.error ?? '', /Something went wrong/);
+
+    __setClaudeUsageForTests({ fiveHour: { usedPercent: 9 }, weekly: { usedPercent: 78 }, capturedAt: Date.now() });
+    const unread = await run('codex');
+    assert.equal(unread.task.status, 'failed', 'an account Clem cannot read keeps the plan-limit stop');
+  } finally {
+    __setClaudeUsageForTests(null);
+  }
+});

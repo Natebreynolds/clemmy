@@ -95,6 +95,10 @@ export interface DeliverContext {
   /** Optional durable outbox identity. Exact payload/session matching and a
    * database uniqueness constraint protect acknowledgement-gap recovery. */
   deliveryId?: string;
+  /** This stop of the source. A source resumed after reporting that stops
+   * again is a new stop and reports again; a replay of the same stop does
+   * not. Absent: one report per source. */
+  stopId?: string;
   /** Human title (workflow name, task title). */
   title?: string;
   /** How the agent fetches the full result, e.g. `background_task_status('id')`. */
@@ -264,10 +268,19 @@ function sessionStoreHasOutcome(store: SessionStore, sessionId: string, outcome:
 function harnessEventLogHasOutcome(sessionId: string, outcome: Outcome, ctx: DeliverContext, renderedText: string): boolean {
   try {
     return listEvents(sessionId, { types: ['user_input_received'], desc: true, limit: 200 })
-      .some((event) => typeof event.data?.text === 'string' && isDuplicateOutcomeText(event.data.text, outcome, ctx, renderedText));
+      .some((event) => typeof event.data?.text === 'string'
+        && isDuplicateOutcomeText(event.data.text, outcome, ctx, renderedText)
+        && sameOutcomeStop(event.data, ctx, renderedText));
   } catch {
     return false;
   }
+}
+
+/** An earlier report covers this one only when it reported the same stop (its
+ * recorded stop, or the very same words). */
+function sameOutcomeStop(data: Record<string, unknown>, ctx: DeliverContext, renderedText: string): boolean {
+  if (!ctx.stopId) return true;
+  return data.outcomeStopId === ctx.stopId || data.text === renderedText;
 }
 
 function hasExactOutcomeDelivery(sessionId: string, outcome: Outcome, ctx: DeliverContext, text: string): boolean {
@@ -586,6 +599,7 @@ export function deliverOutcomeWithAcknowledgement(
           status: outcome.status,
           deliveryPhase: 'passive',
           ...(ctx.deliveryId ? { outcomeDeliveryId: ctx.deliveryId } : {}),
+          ...(ctx.stopId ? { outcomeStopId: ctx.stopId } : {}),
           ...(outcome.evidence ? { evidence: outcome.evidence } : {}),
           ...(outcome.blocker ? { blocker: outcome.blocker } : {}),
           ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}),

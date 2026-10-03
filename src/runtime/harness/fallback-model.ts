@@ -695,8 +695,25 @@ export function markBrainRateLimited(label: string, err: unknown): void {
       retryAfterMs: cls.retryAfterMs,
       sameProviderRetryable: cls.sameProviderRetryable,
       errorDetail: redactSensitiveText(providerCapacityErrorText(err)).slice(0, 1000),
+      ...providerLimitHeadersField(err),
     }, 'brain temporarily unavailable — routing around it until the local cooldown expires');
   }
+}
+
+/** The provider's own limit headers on a refusal (which limit, its state and
+ * its reset), kept with the log line so the refusal can be explained later. */
+function providerLimitHeadersField(err: unknown): { providerLimits?: Record<string, string> } {
+  const sources = [err, (err as { lastError?: unknown } | null)?.lastError, (err as { cause?: unknown } | null)?.cause];
+  for (const source of sources) {
+    const headers = (source as { responseHeaders?: unknown } | null)?.responseHeaders;
+    if (!headers || typeof headers !== 'object') continue;
+    const picked: Record<string, string> = {};
+    for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
+      if (typeof value === 'string' && /ratelimit|overage|retry-after/i.test(name)) picked[name] = value.slice(0, 120);
+    }
+    if (Object.keys(picked).length > 0) return { providerLimits: picked };
+  }
+  return {};
 }
 
 export function isBrainRateLimited(label: string): boolean {

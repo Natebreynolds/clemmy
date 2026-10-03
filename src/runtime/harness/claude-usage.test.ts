@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CLAUDE_QUOTA_SAMPLE_FRESH_MS, claudeUsageExhaustion, parseClaudeUsage } from './claude-usage.js';
+import { CLAUDE_QUOTA_SAMPLE_FRESH_MS, claudeUsageExhaustion, claudeUsageHasRoom, parseClaudeUsage } from './claude-usage.js';
 
 // Verbatim shape from a live GET https://api.anthropic.com/api/oauth/usage.
 const LIVE_BODY = {
@@ -122,4 +122,15 @@ test('exhaustion: a model-scoped cap alone is left to the provider’s own refus
     scopedWeekly: { usedPercent: 100, resetAt: NOW + 50 * HOUR, active: true, modelLabel: 'Scoped' },
     capturedAt: NOW,
   }, NOW), null, 'the reading names the capped model only by display name');
+});
+
+test('room: only a fresh reading with every plan window under 100% shows room', () => {
+  const now = Date.now();
+  assert.equal(claudeUsageHasRoom({ fiveHour: { usedPercent: 9 }, weekly: { usedPercent: 78 }, capturedAt: now }, now), true);
+  assert.equal(claudeUsageHasRoom({ fiveHour: { usedPercent: 9 }, weekly: { usedPercent: 100 }, capturedAt: now }, now), false);
+  assert.equal(claudeUsageHasRoom({ fiveHour: { usedPercent: 9 }, weekly: { usedPercent: 78 }, capturedAt: now - CLAUDE_QUOTA_SAMPLE_FRESH_MS - 1 }, now), false, 'stale proves nothing');
+  assert.equal(claudeUsageHasRoom({ capturedAt: now }, now), false, 'no windows proves nothing');
+  assert.equal(claudeUsageHasRoom(null, now), false);
+  // A model-scoped cap is named only by display name, so it does not decide room.
+  assert.equal(claudeUsageHasRoom({ fiveHour: { usedPercent: 9 }, weekly: { usedPercent: 78 }, scopedWeekly: { usedPercent: 100, active: true, modelLabel: 'Other' }, capturedAt: now }, now), true);
 });

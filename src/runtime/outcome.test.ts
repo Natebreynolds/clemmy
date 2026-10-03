@@ -420,3 +420,23 @@ test('a needs_input outcome FIRES into a busy chat — a blocking question never
     setProactiveReportFireForTest(null);
   }
 });
+
+test('deliverOutcome: a source resumed after a stop that stops again reports again; a replay of a stop does not', () => {
+  const sessionId = 'sess-oc-resumed-stop';
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop', title: 'Resumed job' });
+  const first = ctx({ originSessionId: sessionId, sourceId: 'bg-resumed', stopId: 'blocked:2026-01-01T00:00:00.000Z' });
+  assert.equal(deliverOutcome({ status: 'blocked', detail: 'A data source refused the request.' }, first), true);
+  assert.equal(deliverOutcome({ status: 'blocked', detail: 'A data source refused the request.' }, first), false, 'replay of the same stop');
+  assert.equal(deliverOutcome({ status: 'blocked', detail: 'Reworded detail for the same stop.' }, first), false,
+    'the same stop is not reported twice even in other words');
+  const second = { ...first, stopId: 'blocked:2026-01-01T01:00:00.000Z' };
+  assert.equal(deliverOutcome({ status: 'blocked', detail: 'The model account is out of usage.' }, second), true, 'a later stop after a resume');
+  const reports = listEvents(sessionId, { types: ['user_input_received'] })
+    .filter((event) => typeof event.data?.text === 'string' && event.data.text.startsWith('[background task bg-resumed '));
+  assert.equal(reports.length, 2);
+  assert.equal(reports[1].data.outcomeStopId, second.stopId);
+  // A source with no stop identity keeps one report per source.
+  const plain = ctx({ originSessionId: sessionId, sourceId: 'bg-plain' });
+  assert.equal(deliverOutcome({ status: 'failed', detail: 'first' }, plain), true);
+  assert.equal(deliverOutcome({ status: 'failed', detail: 'second' }, plain), false);
+});

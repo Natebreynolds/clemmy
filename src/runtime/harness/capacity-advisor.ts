@@ -28,12 +28,16 @@ export function capacityAdvice(opts: {
   preparedNote?: string;
   /** Known retry time, if the provider said. */
   retryAtIso?: string;
+  /** The account's own usage reading shows room, so a capacity refusal is a
+   *  brief limit, not a used-up plan. */
+  accountHasRoom?: boolean;
 }): CapacityAdvice {
   const reason = (opts.reason ?? '').slice(0, 500);
   const prepared = opts.preparedNote?.trim()
     ? `${opts.preparedNote.trim()} Nothing was lost and nothing was sent. `
     : '';
-  if (isProviderCapacityExhausted(reason)) {
+  const capacityRefusal = isProviderCapacityExhausted(reason);
+  if (capacityRefusal && !opts.accountHasRoom) {
     return {
       shape: 'plan_limit',
       copy:
@@ -48,7 +52,10 @@ export function capacityAdvice(opts: {
   return {
     shape: 'short_reset',
     copy:
-      `${prepared}The AI provider hit a temporary rate limit. `
+      `${prepared}`
+      + (capacityRefusal
+        ? 'The AI provider turned a request away as over its allowance, though the account still shows room, so this looks like a brief limit. '
+        : 'The AI provider hit a temporary rate limit. ')
       + (when ? `I'll retry automatically at about ${when}.` : "I'll retry automatically in a few minutes."),
   };
 }

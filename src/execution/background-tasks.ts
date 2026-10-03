@@ -80,6 +80,8 @@ import { recordOperationalEvent, type OperationalEventSeverity } from '../runtim
 import { getWorkspaceDirs } from '../tools/shared.js';
 import { classifyModelError } from '../runtime/harness/resilient-model.js';
 import { capacityAdvice } from '../runtime/harness/capacity-advisor.js';
+import { claudeAccountHasRoom } from '../runtime/harness/claude-usage.js';
+import { publicProviderCapacityText } from '../runtime/harness/public-presentation.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { recordRunStrategy } from '../memory/run-strategy-store.js';
 import { updateLinkedFocusAction } from '../memory/focus.js';
@@ -2539,6 +2541,9 @@ function buildBackgroundTaskOutcomeEnvelope(
       originSessionId: task.originSessionId,
       sourceLabel: 'background task',
       sourceId: task.id,
+      // Each stop is its own report: a task resumed after a stop that stops
+      // again reports again.
+      ...(task.outcomeSnapshot ? { stopId: `${outcome}:${task.outcomeSnapshot.capturedAt}` } : {}),
       title: task.title,
       statusHint: `background_task_status('${task.id}')`,
       maxDetailChars: RESULT_TRUNCATE_CHARS,
@@ -5239,6 +5244,32 @@ export function transientRetryDelayMs(error: unknown, attempts: number): number 
   return [2 * 60_000, 5 * 60_000, 10 * 60_000][Math.min(attempts, 3) - 1] ?? 10 * 60_000;
 }
 
+/** The provider refusal behind this activation's failed terminal. The bridge
+ * reduces a provider failure into the committed terminal and returns that as
+ * an ordinary response, so the refusal is read back from the run's own
+ * record; only a terminal written by this activation counts. */
+function activationBrainRefusal(runSessionId: string, activationStartedAt: string): string | null {
+  try {
+    const terminal = listHarnessEventsForRefute(runSessionId, { types: ['conversation_completed'], desc: true, limit: 1 })[0];
+    if (!terminal || terminal.createdAt < activationStartedAt) return null;
+    const detail = terminal.data?.failureDetail;
+    return typeof detail === 'string' && isTransientBrainError(detail) ? detail : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether the account behind this run's brain has room by its own fresh
+ * usage reading. Only an account Clem can read can answer yes. */
+function brainAccountHasRoom(runSessionId: string): boolean {
+  try {
+    const routed = listHarnessEventsForRefute(runSessionId, { types: ['turn_model_routed'], desc: true, limit: 1 })[0];
+    return routed?.data?.provider === 'claude' && claudeAccountHasRoom();
+  } catch {
+    return false;
+  }
+}
+
 export function queueBackgroundTaskApprovalResolution(approvalId: string, approved: boolean): BackgroundTaskRecord | null {
   const task = getBackgroundTaskByApprovalId(approvalId);
   if (!task || task.status !== 'awaiting_approval') return null;
@@ -6232,6 +6263,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      let toolCountAtLastCap = 0; // Wave 3: tool activity at each budget cycle
 	      let response: AssistantResponse;
 	      let contractSuperseded = false;
+	      let activationStartedAt = nowIso();
 	      while (true) {
 	        // CANON-ONE-LOOP: background tasks (incl. the mobile chat lane) run the
 	        // gated harness loop; the test executor above defaults to this bridge.
@@ -6240,6 +6272,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        // kill switch and re-throws AgentRuntimeCancelledError on caller-driven
 	        // aborts. Kill-switch CLEMMY_HARNESS_BACKGROUND=off.
 	        const remainingWallMs = Math.max(1, wallClockDeadlineMs - Date.now());
+	        activationStartedAt = nowIso();
 	        const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
 	        const requestedModel = task.model ?? resolveRoleModel('brain').modelId;
 	        response = await backgroundResponseExecutor(assistant, {
@@ -6452,6 +6485,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      // Classify + record the result: pending-approval / awaiting-input (the
 	      // judge-gated check-in) / partial-coverage / blocked / done — all in the
 	      // shared helper so the fresh-run and input-resume paths agree.
+	      // A provider that turned the brain's request away is an outage, not
+	      // the task's result: it takes the brain-outage path below.
+	      const brainRefusal = response.stoppedReason === 'error'
+	        ? activationBrainRefusal(task.runSessionId, activationStartedAt)
+	        : null;
+	      if (brainRefusal) throw new Error(brainRefusal);
 	      await finishWorkerRun(task, run, response);
 	    } catch (error) {
 	      if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -6464,7 +6503,8 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        // once, honestly, in the user's language with the guided fix. The
 	        // card's Resume button is the "retry now". Short-reset shapes keep
 	        // the automatic requeue, with the same plain-words check-in.
-	        const advice = capacityAdvice({ reason: message, preparedNote: 'The work done so far is saved.' });
+	        const accountHasRoom = brainAccountHasRoom(task.runSessionId);
+	        const advice = capacityAdvice({ reason: message, preparedNote: 'The work done so far is saved.', accountHasRoom });
 	        if (advice.shape === 'plan_limit') {
 	          markBackgroundTaskFailed(task.id, advice.copy, 'failed');
 	          finishRun(run.id, { status: 'failed', message: advice.copy, error: message });
@@ -6479,9 +6519,14 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	            status: 'pending',
 	            transientRetry: { attempts, notBefore, lastError: clean(message, 400) },
 	            lastCheckInAt: nowIso(),
-	            lastCheckInMessage: capacityAdvice({ reason: message, retryAtIso: notBefore }).copy + ` (attempt ${attempts}/${TRANSIENT_BRAIN_RETRY_CAP})`,
+	            lastCheckInMessage: capacityAdvice({ reason: message, retryAtIso: notBefore, accountHasRoom }).copy + ` (attempt ${attempts}/${TRANSIENT_BRAIN_RETRY_CAP})`,
 	          });
 	          if (requeued) {
+	            // A job handed to an agent tells the conversation it came from that
+	            // it is waiting, not stopped.
+	            if (requeued.delegation) {
+	              recordDelegatedCheckIn(requeued.id, capacityAdvice({ reason: message, retryAtIso: notBefore, accountHasRoom }).copy);
+	            }
 	            finishRun(run.id, {
 	              status: 'failed',
 	              message: `Brain provider unavailable; task requeued (attempt ${attempts}/${TRANSIENT_BRAIN_RETRY_CAP}, retry after ${notBefore}).`,
@@ -6514,7 +6559,7 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	      }
 	      markBackgroundTaskFailed(
 	        task.id,
-	        cancelled ? latestTask?.cancellationReason ?? 'Cancelled by user.' : message,
+	        cancelled ? latestTask?.cancellationReason ?? 'Cancelled by user.' : publicProviderCapacityText(message) ?? message,
 	        cancelled ? 'aborted' : 'failed',
 	      );
 	      finishRun(run.id, {
