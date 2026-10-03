@@ -54,3 +54,18 @@ test('a project name, when the Mac says so, leads the context', () => {
   });
   assert.equal(row!.context, 'Research · Check-in');
 });
+
+test('a row speaks in words: Clem\'s question first, a workflow by its name', () => {
+  const asked = { ...approval, presentation: { action: 'Workspace source script consent', ask: 'Can I keep your dashboard up to date?', why: 'It refreshes from your CRM each weekday.', details: [], unwrapped: false } };
+  const rows = buildNeedsRows({
+    questions: [], trustProposals: [], workspaceChoosers: [], plans: [],
+    approvals: [asked, { ...approval, approvalId: 'a2', presentation: { action: 'Workspace source script consent', details: [], unwrapped: false } }],
+    unlisted: [{ key: 'u1', kind: 'workflow_binding', title: "end-of-week-team-sales-snapshot can't run on its schedule", detail: 'Pick the account it should use.', workflow: 'end-of-week-team-sales-snapshot' }],
+    attention: [],
+  });
+  assert.equal(rows[0]!.title, 'Can I keep your dashboard up to date?');
+  assert.equal(rows[0]!.preview, 'It refreshes from your CRM each weekday.');
+  assert.equal(rows[1]!.title, 'Send a message to the team channel', 'the subject in words before the kind of action');
+  assert.equal(rows[2]!.title, "End of Week Team Sales Snapshot can't run on its schedule");
+  assert.equal(rows[2]!.context, undefined, 'the name is not repeated as its own id');
+});

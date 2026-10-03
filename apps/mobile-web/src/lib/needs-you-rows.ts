@@ -6,7 +6,7 @@
  * unchanged — this only decides how a row reads. The reading rules are the
  * shared ones the desktop list uses.
  */
-import { decisionPreview, oneLine } from '@clem/chat-engine';
+import { decisionPreview, oneLine, workflowDisplayName } from '@clem/chat-engine';
 import type {
   ApprovalRow,
   InboxNotification,
@@ -47,6 +47,17 @@ function questionSource(question: InboxQuestion): string {
   if (question.source === 'workflow') return 'Workflow';
   if (question.source === 'background_task') return 'Task';
   return 'Check-in';
+}
+
+/** A workflow's id inside a line reads as its name ("end-of-week-team-sales-
+ *  snapshot" → "End of Week Team Sales Snapshot"); the id stays on its page. */
+function namedWorkflows(text: string, ...ids: Array<string | null | undefined>): string {
+  let out = text;
+  for (const id of ids) {
+    const slug = id?.trim();
+    if (slug && out.includes(slug)) out = out.split(slug).join(workflowDisplayName(slug));
+  }
+  return out;
 }
 
 export function buildNeedsRows(input: {
@@ -97,35 +108,37 @@ export function buildNeedsRows(input: {
     });
   }
   for (const approval of input.approvals) {
-    const title = oneLine(approval.presentation?.action || approval.subject, TITLE_MAX) || 'Approval';
+    // Clem's own question first, then the subject in words; the kind of
+    // action names a row only when nothing else does.
+    const title = oneLine(approval.presentation?.ask || approval.subject || approval.presentation?.action, TITLE_MAX) || 'Approval';
     rows.push({
       key: `approval:${approval.approvalId}`, kind: 'approval', title,
-      preview: decisionPreview(title, [approval.contentPreview?.body, approval.subject]),
+      preview: decisionPreview(title, [approval.presentation?.why, approval.contentPreview?.body, approval.subject]),
       context: joinContext(project('approval', approval), approval.presentation?.app),
       at: approval.requestedAt, label: 'Approve', urgent: false,
     });
   }
   for (const item of input.unlisted) {
     const stopped = item.kind === 'workflow_binding' || item.kind === 'workflow_paused';
-    const title = oneLine(item.title, TITLE_MAX) || 'Needs your attention';
+    const title = oneLine(namedWorkflows(item.title, item.workflow), TITLE_MAX) || 'Needs your attention';
     rows.push({
       key: `unlisted:${item.key}`, kind: 'unlisted', title,
-      preview: decisionPreview(title, [item.detail]),
-      context: joinContext(item.workflow),
+      preview: decisionPreview(title, [item.detail ? namedWorkflows(item.detail, item.workflow) : item.detail]),
+      context: joinContext(item.workflow && !title.includes(workflowDisplayName(item.workflow)) ? workflowDisplayName(item.workflow) : null),
       label: item.kind === 'workflow_binding' ? 'Stopped' : item.kind === 'workflow_paused' ? 'Paused' : 'Needs you',
       urgent: stopped,
     });
   }
   for (const { row, earlier } of input.attention) {
-    const title = oneLine(notificationTitle(row.title), TITLE_MAX) || 'I need your attention';
     const gate = row.workflowCapability;
+    const title = oneLine(namedWorkflows(notificationTitle(row.title), gate?.workflow), TITLE_MAX) || 'I need your attention';
     const cardLabel = needsYouCardLabel(row);
     // "Needs you" inside Needs you says nothing; the row is an update to read.
     const label = gate ? 'Stopped' : cardLabel === 'Update · needs you' ? 'Update' : cardLabel;
     rows.push({
       key: `notification:${row.id}`, kind: 'attention', title,
       preview: decisionPreview(title, [row.body]),
-      context: joinContext(project('attention', row), gate?.workflow, earlier > 0 ? `+${earlier} earlier` : null),
+      context: joinContext(project('attention', row), gate?.workflow && !title.includes(workflowDisplayName(gate.workflow)) ? workflowDisplayName(gate.workflow) : null, earlier > 0 ? `+${earlier} earlier` : null),
       at: row.createdAt, label,
       urgent: Boolean(gate) || label === 'Flow · stopped',
     });

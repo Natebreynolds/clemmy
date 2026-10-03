@@ -5665,3 +5665,5 @@ textarea.cz-input { resize: vertical; }
   font-size: 14px;
   font-weight: 600;
 }
+/* A row's kind is a quiet word, not a stamp. */
+.needs-row-label { text-transform: none; letter-spacing: 0; font-weight: 600; }
