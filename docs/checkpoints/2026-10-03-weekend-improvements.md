@@ -551,3 +551,20 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   neighbouring and app tests, both app builds and tsc clean.
 - **Status:** wave 45 = 2f74066c1 (with the chip one-line fix) installed
   09:49 PT; build-info serves it; bundles match. Owner retest owed.
+
+## Wave 46: the other agent's check-ins, combined (10-03 10:47 PT)
+
+- **Owner ask:** the other agent was preparing to hotpatch its combined code;
+  owner asked this session to install it so testing can continue.
+- **Candidate:** codex/mobile-checkin-hotpatch at ceff86213, which merged this
+  branch's tip (bf929221a, containing installed 2f74066c1). Its commits: live
+  check-ins published to subscribers and kept with their accepted task on
+  desktop and phone; Jev completion screening abstains when the task text is
+  clipped; approval-continuation completion measurement; session comparison
+  script. No migration. claude/integration-1003 fast-forwarded to it.
+- **Checks:** their tests plus chat-engine/Jev/event-log neighbours 894 pass,
+  1 deliberate skip, 0 fail; browser and app neighbours 818 pass; tsc and
+  both app builds clean.
+- **Status:** wave 46 = ceff86213 installed 10:47 PT; build-info serves it;
+  daemon, desk and phone bundles match; Browserbase still configured
+  (900/7200).
