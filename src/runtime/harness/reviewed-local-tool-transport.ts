@@ -1,5 +1,6 @@
 import { WORKSPACE_SCRIPT_PARAMETERS, workspaceScriptArguments, type WorkspaceScriptArguments } from '../../spaces/workspace-script-contract.js';
 import { READ_FILE_PARAMS } from '../../tools/local-file-read-contract.js';
+import { BROWSER_OPERATION_PARAMETERS, browserOperationName, parseBrowserOperationArguments, type BrowserOperationName } from '../../tools/browser-operation-contract.js';
 /**
  * Transport-only crossing for explicitly reviewed Clementine-local tools.
  *
@@ -78,6 +79,9 @@ function exactDeclaration(name: string): ToolDecl | null {
 function validExecutionContract(value: unknown): value is ReviewedLocalExecutionContractV1 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const contract = value as Partial<ReviewedLocalExecutionContractV1>;
+  if (contract.version === 1 && contract.adapter === 'browser_operation_v1') {
+    return (contract.idempotency === 'read_only' || contract.idempotency === 'never_redispatch') && contract.reconciliation === 'none';
+  }
   if (contract.version === 1 && contract.adapter === 'workspace_script_v1') {
     return contract.idempotency === 'never_redispatch' && contract.reconciliation === 'none';
   }
@@ -198,7 +202,13 @@ function deriveReviewedLocalReadDefinition(input: {
   if (!name || name !== row.name) return null;
   const capabilityRef = `cap:local:${name}:read`;
   const schemaFingerprint = stableJsonDigest(input.schema);
-  const registrySemanticsFingerprint = stableJsonDigest({
+  const browser = row.localExecution?.adapter === 'browser_operation_v1';
+  const readPurpose = row.description?.trim() || 'Read Clementine-local state.';
+  const registrySemanticsFingerprint = stableJsonDigest(browser ? {
+    version: 1, name, sideEffect: row.sideEffect, projectEffect: row.projectEffect, localPlanningRead: true,
+    runtimeEffect: row.runtimeEffect ?? null, actionTopologyRole: row.actionTopologyRole ?? 'business',
+    readOnly: { consequence: 'read', reversibility: 'read_only', destructive: false, purpose: readPurpose, destinationPosture: null },
+  } : {
     version: 1, name, sideEffect: row.sideEffect, localPlanningRead: true,
     localExecution: row.localExecution, runtimeEffect: row.runtimeEffect ?? null,
   });
@@ -212,13 +222,13 @@ function deriveReviewedLocalReadDefinition(input: {
     reversibility: 'read_only', destructive: false,
     accountIdentity: REVIEWED_LOCAL_ACCOUNT, safeMode: null,
     descriptor: {
-      id: capabilityRef, effect: 'read', purpose: row.description ?? 'Read local state.',
+      id: capabilityRef, effect: 'read', purpose: browser ? readPurpose : row.description ?? 'Read local state.',
       acceptedInputKinds: ['request', 'evidence'], producedOutputKinds: ['evidence'],
       applicableDeliverableKinds: ['evidence'], inputShape: 'request',
       outputShape: 'evidence', outputKind: 'evidence', deliverableKind: 'evidence',
       destinationPosture: null, evidenceKinds: ['tool_result'], handleRequired: false,
       readbackRequired: false, accountScope: REVIEWED_LOCAL_ACCOUNT,
-      manifestDigest: stableJsonDigest({ capabilityRef, envelopeFingerprint }),
+      manifestDigest: stableJsonDigest(browser ? { version: 1, provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, capabilityRef, envelopeFingerprint } : { capabilityRef, envelopeFingerprint }),
       advisoryRoles: ['source', 'collection', 'read'],
     },
   };
@@ -261,6 +271,13 @@ function deriveReviewedLocalDefinition(input: {
   schema: Record<string, unknown>;
 }): AuthorizedLocalPlanningDefinitionV1 | null {
   const name = input.declaration.name.trim();
+  if (input.declaration.localExecution?.adapter === 'browser_operation_v1') {
+    if (!browserOperationName(name)) return null;
+    const read = name === 'browser_tabs' || name === 'browser_read';
+    if (input.declaration.sideEffect !== (read ? 'read' : 'write')
+      || input.declaration.localExecution.idempotency !== (read ? 'read_only' : 'never_redispatch')) return null;
+    if (read) return deriveReviewedLocalReadDefinition(input);
+  }
   if (input.declaration.localExecution?.adapter === 'workspace_script_v1') return deriveReviewedScriptDefinition(input);
   if (input.declaration.localExecution?.adapter === 'local_file_read_v1') {
     return deriveReviewedLocalReadDefinition(input);
@@ -342,11 +359,14 @@ function deriveReviewedLocalDefinition(input: {
 
 function currentReviewedLocalSchema(
   execution: ReviewedLocalExecutionContractV1,
+  operationId: string,
 ): Record<string, unknown> | null {
   // work_call is the physical carrier for reviewed local mutations. Match its
   // current strict deferred schema bytes (Zod's 2020-12 projection), not the
   // separate first-class provider projection used by direct model calling.
-  const parametersShape = execution.adapter === 'workspace_script_v1' ? WORKSPACE_SCRIPT_PARAMETERS
+  if (execution.adapter === 'browser_operation_v1' && !browserOperationName(operationId)) return null;
+  const parametersShape = execution.adapter === 'browser_operation_v1' && browserOperationName(operationId) ? BROWSER_OPERATION_PARAMETERS[operationId]
+    : execution.adapter === 'workspace_script_v1' ? WORKSPACE_SCRIPT_PARAMETERS
     : execution.adapter === 'local_file_read_v1' ? READ_FILE_PARAMS
     : execution.adapter === 'artifact_bundle_v1'
     ? ARTIFACT_BUNDLE_TOOL_PARAMETERS
@@ -366,7 +386,7 @@ export function observeReviewedLocalTool(
   if (!name || name !== operationId) return null;
   const declaration = exactDeclaration(name);
   if (!declaration || !validExecutionContract(declaration.localExecution)) return null;
-  const schema = currentReviewedLocalSchema(declaration.localExecution);
+  const schema = currentReviewedLocalSchema(declaration.localExecution, name);
   if (!schema) return null;
   const definition = deriveReviewedLocalDefinition({ declaration, schema });
   if (!definition || definition.accountIdentity !== REVIEWED_LOCAL_ACCOUNT) return null;
@@ -424,7 +444,7 @@ export function reviewedLocalCapabilityManifest(
     accountId: REVIEWED_LOCAL_ACCOUNT,
     idempotency: descriptor.effect === 'read'
       ? { required: false, policy: 'none' } : { required: true, policy: 'key_before_dispatch' },
-    reconciliation: observed.execution.adapter === 'workspace_script_v1'
+    reconciliation: observed.execution.reconciliation === 'none' && descriptor.effect !== 'read'
       ? { supported: false, policy: 'uncertain_if_absent' }
       : descriptor.effect === 'read'
         ? { supported: false, policy: 'none' } : { supported: true, policy: 'exact_artifact' },
@@ -452,6 +472,10 @@ export function reviewedLocalToolArgumentsMatch(
   observed: ReviewedLocalToolObservation,
   args: Record<string, unknown>,
 ): boolean {
+  if (observed.execution.adapter === 'browser_operation_v1') {
+    if (!browserOperationName(observed.definition.name)) return false;
+    try { parseBrowserOperationArguments(observed.definition.name, args); return true; } catch { return false; }
+  }
   if (observed.execution.adapter === 'workspace_script_v1') return workspaceScriptArguments.safeParse(args).success;
   if (observed.execution.adapter === 'local_file_read_v1') {
     return z.strictObject(READ_FILE_PARAMS).safeParse({ ...args, max_chars: args.max_chars ?? null }).success;
@@ -483,6 +507,7 @@ export function reviewedLocalToolArgumentsMatch(
 }
 
 export type PreparedReviewedLocalToolExecution =
+  | { observed: ReviewedLocalToolObservation; adapter: 'browser_operation_v1'; operation: BrowserOperationName; args: Record<string, unknown> }
   | { observed: ReviewedLocalToolObservation; adapter: 'workspace_script_v1'; args: WorkspaceScriptArguments }
   | { observed: ReviewedLocalToolObservation; adapter: 'local_file_read_v1';
       args: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>> }
@@ -551,6 +576,11 @@ export function prepareReviewedLocalToolExecution(
   }
   if (!reviewedLocalToolArgumentsMatch(observed, call.args)) {
     throw new Error('reviewed local execution arguments exceed the declared safe mode');
+  }
+  if (observed.execution.adapter === 'browser_operation_v1') {
+    if (!browserOperationName(observed.definition.name)) throw new Error('Unknown reviewed browser operation');
+    return { observed, adapter: observed.execution.adapter, operation: observed.definition.name,
+      args: parseBrowserOperationArguments(observed.definition.name, call.args) };
   }
   if (observed.execution.adapter === 'workspace_script_v1') {
     return { observed, adapter: observed.execution.adapter, args: workspaceScriptArguments.parse(call.args) };

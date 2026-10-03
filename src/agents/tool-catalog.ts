@@ -563,7 +563,11 @@ export function rankCatalogEntriesLexically<T extends CatalogEntry>(
   const leadingActions = new Set(entries
     .map((entry) => lexicalTokens(openingPurpose(entry.oneLiner))[0])
     .filter((token): token is string => Boolean(token)));
-  const requestedActions = queryLead ? requestedActionsOf(requestBody, leadingActions) : [];
+  // A leading topic noun is not a requested verb merely because it occurs in
+  // many tool names. Apply action precedence only to an opening action the
+  // candidate corpus actually demonstrates; topic-led queries use full-query
+  // relevance so a family of generic tools cannot hide a specific operation.
+  const requestedActions = queryLead && leadingActions.has(queryLead) ? requestedActionsOf(requestBody, leadingActions) : [];
   // Learn informativeness from this same candidate corpus. Common connecting
   // words and generic verbs cannot outweigh a rare requested object/property;
   // no curated stop-word list, provider boost, or product-name alias is needed.
