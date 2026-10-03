@@ -272,3 +272,26 @@ brain choices are the sign-in's own catalog once it is known. Proof:
   only while the attempt is open), public-presentation answer-words pin; 348
   phone tests; previews on live data via route interception.
 - **Status:** committed, not installed (owner's other agent running).
+
+## Phone, continued: one line to type, worded lists, one kind of door
+
+- **Change:**
+  - the composer rests as one line ("+", words, mic, send) and opens into the
+    full card with its chips when touched; an empty send is grey; Today's
+    decisions answer with compact pills; Today's Recent shows running and
+    new-reply marks; section heads are sentence case (28761ca7b);
+  - Activity rows fit the screen (a run row is a button that sized to its
+    widest line) and are named by the work — never by a card answer
+    ("reject apr-…") or a machine input ("Calendar watch tick-…: read
+    OUTLOOK_…") (server `activityRunTitle`); New project and New agent are the
+    same round + header door as New chat; Flows lists read as names; an
+    agent's Message is a pill and its model reads as a name (1b9eee75b);
+  - Needs you rows lead with Clem's question, then the subject in words;
+    workflow ids read as names; kind tags are quiet words (03c957fa2);
+  - Settings groups and Today's eyebrows are sentence case (cef16db19).
+- **Proof:** activity title pin (webhook.test), worded-rows pin
+  (needs-you-rows.test); 349 phone tests; previews on live data.
+- **Deferred to after the other agent's merge (its branch edits Chat.tsx and
+  BrainSheet):** the model chip's long label ("Codex — GPT 5…"), old approval
+  cards that predate Clem's wording ("cli_setup: auth / Catalog id").
+- **Status:** committed, not installed.
