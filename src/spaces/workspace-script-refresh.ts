@@ -1,5 +1,6 @@
 /** Production owner for saved-script refreshes. The existing Space queue owns
  * serialization; the occurrence journal/kernel own execution and publication. */
+import { describeCron } from '../execution/workflow-describe.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { inspectResumableApproval, isExpired, onApprovalResolved, resolve,
   type PendingApprovalRow } from '../runtime/harness/approval-registry.js';
@@ -106,12 +107,14 @@ export async function refreshWorkspaceScriptSource(
           if (opts.cause !== undefined && opts.cause !== 'manual') return held(`Approval ${decision.row.approvalId} expired. Open this Workspace and request a refresh to review it again.`);
           if (decision.row.status === 'pending' && isExpired(decision.row)) resolve(decision.row.approvalId, 'expired', 'workspace-script:expiry');
         }
+        // The card asks in Clem's words, the schedule in words (live 10-02:
+        // "(0 7 * * 1-5, America/Los_Angeles)" on a card the owner had to act on).
         const schedule = scope.schedule.cron
-          ? `manually and on its saved schedule (${scope.schedule.cron}, ${scope.schedule.timeZone})`
-          : 'when you request a refresh';
+          ? `${describeCron(scope.schedule.cron)} (${scope.schedule.timeZone}) and whenever you ask`
+          : 'whenever you ask';
         const { row } = registerResumableApprovalCardAtomically({ sessionId: view.sessionId,
           tool: SAVED_SOURCE_SCRIPT_CONSENT_TOOL, args: scope, resumeKey,
-          subject: `Allow “${spaceStore.get(slug)?.title ?? slug}” to refresh “${source.id}” using data/${scope.runner} ${schedule}? This script can use your local credentials, network and live dependencies. Permission lasts until the script or source changes, or you revoke it.` });
+          subject: `Can I keep “${spaceStore.get(slug)?.title ?? slug}” up to date by running its ${source.id} script (data/${scope.runner}) ${schedule}? It can use your local credentials, network and live dependencies. Your yes lasts until the script or source changes, or you take it back.` });
         return { ...held(`Review approval ${row.approvalId} to run this saved source. Nothing has executed.`), pendingApprovalId: row.approvalId };
       }
       activateWorkspaceScriptOccurrenceWithGrant(view.key, grant.grantId);
