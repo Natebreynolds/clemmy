@@ -10,6 +10,7 @@ import { useDraggable } from '@dnd-kit/core';
 import { CSS } from '@dnd-kit/utilities';
 import { Radio, Archive, Check, X, RotateCcw, Play, ExternalLink } from 'lucide-react';
 import { cn } from '@/lib/cn';
+import { workflowDisplayName } from '@clem/chat-engine';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Button } from '@/components/ui/Button';
 import { relativeTime } from '@/lib/inbox';
@@ -132,7 +133,9 @@ export function BoardCard({
         <span className="text-caption text-faint">{relativeTime(card.updatedAt)}</span>
       </div>
 
-      <p className="mt-2 line-clamp-2 text-body font-medium text-fg">{card.title}</p>
+      <p className="mt-2 line-clamp-2 text-body font-medium text-fg">
+        {card.sourceKind === 'workflow' ? workflowDisplayName(card.title) : card.title}
+      </p>
 
       {card.progressHint && (
         <p className="mt-1 line-clamp-2 text-caption text-muted">{stripInlineMarkdown(card.progressHint)}</p>

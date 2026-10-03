@@ -460,7 +460,7 @@ test('Home names a carrier-wrapped approval by what it does, never by the carrie
     };
     const card = body.needsYou.find((item) => item.approvalId === approval.approvalId);
     assert.ok(card, 'the pending approval reaches Home');
-    assert.equal(card.title, 'Approve: Send Slack message');
+    assert.equal(card.title, 'Send Slack message', 'the request in its own words; the pane already says it needs you');
     assert.doesNotMatch(`${card.title} ${card.meta}`, /work_call|composio|execute_tool|apr-/i);
   } finally {
     await h.close();

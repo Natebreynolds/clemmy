@@ -14543,11 +14543,13 @@ export function registerConsoleRoutes(
           // subject, else the unwrapped provider call. Never the carrier.
           const presentation = presentApprovalForHumans({ tool: approval.tool, args: approval.args, subject: approval.subject,
             ...cardVoiceFields(approvalCardVoice(approval.sessionId, approval.approvalId)) });
-          const headline = approval.subject?.trim() || presentation.action;
+          const subject = approval.subject?.trim();
           return {
             kind: 'harness-approval',
-            // Clem's own question when her checker wrote one.
-            title: presentation.ask ?? `Approve: ${headline}`,
+            // Clem's own question when her checker wrote one, else the
+            // request in its own words — this pane is already "Needs you",
+            // so only a bare action label needs "Approve:" in front of it.
+            title: presentation.ask ?? (subject || `Approve: ${presentation.action}`),
             meta: [
               presentation.app ?? '',
               reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',
