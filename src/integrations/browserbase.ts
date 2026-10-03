@@ -97,6 +97,8 @@ export class BrowserbaseService {
   private storeUnavailable = false;
   private keyRead?: Promise<string | undefined>;
   private readonly credentialTimeoutMs: number;
+  /** The overview is polled; Browserbase's running list is asked at most this often. */
+  private running?: { at: number; projectId: string; rows: Promise<BrowserbaseRunningSession[]> };
   constructor(private readonly dependencies: BrowserbaseDependencies = {}) {
     this.file = browserbaseStoreFile(dependencies.baseDir ?? BASE_DIR); this.directory = path.dirname(this.file);
     this.now = dependencies.now ?? Date.now; this.uuid = dependencies.uuid ?? randomUUID;
@@ -323,7 +325,11 @@ export class BrowserbaseService {
       const { api } = await this.api();
       if (!api.listRunning) return { browsers, unlinked: [], unlinkedChecked: false };
       const held = new Set(open.map(resource => resource.providerSessionId).filter((value): value is string => Boolean(value)));
-      const unlinked = (await api.listRunning(policy.projectId)).filter(session => session.startedByClem && !held.has(session.sessionId))
+      if (!this.running || this.running.projectId !== policy.projectId || this.now() - this.running.at >= 20_000) {
+        const rows = api.listRunning(policy.projectId); this.running = { at: this.now(), projectId: policy.projectId, rows };
+        rows.catch(() => { if (this.running?.rows === rows) this.running = undefined; });
+      }
+      const unlinked = (await this.running.rows).filter(session => session.startedByClem && !held.has(session.sessionId))
         .map(session => ({ providerSessionId: session.sessionId, ...(session.createdAt ? { createdAt: session.createdAt } : {}), ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}) }));
       return { browsers, unlinked, unlinkedChecked: true };
     } catch { return { browsers, unlinked: [], unlinkedChecked: false }; }
@@ -356,7 +362,7 @@ export class BrowserbaseService {
         recording: false, pages: [], requestKey: hash(JSON.stringify(['adopted', input.providerSessionId, this.uuid()])), credentialIdentity,
         lastActivityAt: this.now(), expiresAt: observed.expiresAt ? Date.parse(observed.expiresAt) : this.now() + policy.sessionTimeoutSeconds * 1000,
         ownerResolution: { kind: 'owner_adopted_session', providerSessionId: input.providerSessionId, at: this.now(), originalCreateProof: 'unknown' } };
-      this.store.resources.push(resource); this.persist(); return this.public(resource);
+      this.store.resources.push(resource); this.running = undefined; this.persist(); return this.public(resource);
     }).catch(error => { throw this.serviceError(error); });
   }
   /** Closes a running session Clem started that no open record holds. A
@@ -371,6 +377,7 @@ export class BrowserbaseService {
       const running = (await api.listRunning(policy.projectId)).find(session => session.sessionId === providerSessionId);
       if (!running) return { closed: true };
       if (!running.startedByClem) throw new BrowserbaseServiceError('session_not_started_by_clem');
+      this.running = undefined;
       await api.release(providerSessionId, policy.projectId);
       return { closed: true };
     }).catch(error => { throw this.serviceError(error); });

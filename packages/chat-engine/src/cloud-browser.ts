@@ -25,6 +25,46 @@ export function readBrowserResource(value: unknown, conversationId: string, id?:
   return { ...row, pages: row.pages ?? [] } as CloudBrowserResource;
 }
 
+/** One open browser in the browsers sheet, from any conversation. */
+export interface CloudBrowserOpenBrowser extends CloudBrowserResource {
+  conversationTitle: string | null; idleClosesAt: string | null; endsAt: string; usesProfile: boolean;
+}
+export interface CloudBrowserUnlinkedSession { providerSessionId: string; createdAt?: string; expiresAt?: string }
+export interface CloudBrowserOverview { browsers: CloudBrowserOpenBrowser[]; unlinked: CloudBrowserUnlinkedSession[]; unlinkedChecked: boolean }
+
+function readOverview(value: unknown): CloudBrowserOverview {
+  const row = value as Partial<CloudBrowserOverview> | null;
+  if (!row || !Array.isArray(row.browsers) || !Array.isArray(row.unlinked)) throw new Error('The browser list was not confirmed. Refresh it.');
+  const browsers = row.browsers.map((item) => {
+    const browser = item as Partial<CloudBrowserOpenBrowser>;
+    const resource = readBrowserResource(item, String(browser.conversationId ?? ''));
+    if (typeof browser.endsAt !== 'string' || (browser.idleClosesAt !== null && typeof browser.idleClosesAt !== 'string')) throw new Error('The browser list was not confirmed. Refresh it.');
+    return { ...resource, conversationTitle: typeof browser.conversationTitle === 'string' ? browser.conversationTitle : null,
+      idleClosesAt: browser.idleClosesAt ?? null, endsAt: browser.endsAt, usesProfile: browser.usesProfile === true };
+  });
+  const unlinked = row.unlinked.filter((item): item is CloudBrowserUnlinkedSession => Boolean(item) && typeof (item as CloudBrowserUnlinkedSession).providerSessionId === 'string');
+  return { browsers, unlinked, unlinkedChecked: row.unlinkedChecked === true };
+}
+
+/** "Browsers · 2 open" on the chip; just "Browser" when none is open. */
+export function browsersChipLabel(openCount: number): string {
+  return openCount > 0 ? `Browsers · ${openCount} open` : 'Browser';
+}
+
+/** When an open browser closes, in the owner's words: the sooner of its idle
+ *  close and Browserbase's own end. */
+export function browserClosesText(browser: Pick<CloudBrowserOpenBrowser, 'idleClosesAt' | 'endsAt'>, now: number): string {
+  const ends = Date.parse(browser.endsAt);
+  const idle = browser.idleClosesAt ? Date.parse(browser.idleClosesAt) : Number.NaN;
+  const minutes = (at: number) => Math.max(0, Math.ceil((at - now) / 60000));
+  if (Number.isFinite(idle) && idle < ends) {
+    const left = minutes(idle);
+    return left <= 1 ? 'Closes in about a minute if left idle' : `Closes in ${left} min if left idle`;
+  }
+  const left = minutes(ends);
+  return left <= 1 ? 'Ends in about a minute' : left < 90 ? `Ends in ${left} min` : `Ends in ${Math.round(left / 60)} h`;
+}
+
 export function createCloudBrowserClient(request: BrowserRequest, base: string) {
   const post = <T>(path: string, body: unknown) => request<T>(`${base}${path}`, { method: 'POST', body: JSON.stringify(body) });
   const query = (conversationId: string) => `?conversationId=${encodeURIComponent(conversationId)}`;
@@ -41,6 +81,10 @@ export function createCloudBrowserClient(request: BrowserRequest, base: string) 
     stop: (resource: CloudBrowserResource) => post<{ resource: unknown }>(`/resources/${encodeURIComponent(resource.id)}/stop`, { conversationId: resource.conversationId, expectedVersion: resource.controlVersion }).then((result) => resourceResponse(result, resource.conversationId, resource.id)),
     touch: (resource: CloudBrowserResource) => post<{ resource: unknown }>(`/resources/${encodeURIComponent(resource.id)}/touch`, { conversationId: resource.conversationId, expectedVersion: resource.controlVersion }).then((result) => resourceResponse(result, resource.conversationId, resource.id)),
     recover: (resource: CloudBrowserResource, providerSessionId: string) => post<{ resource: unknown }>(`/resources/${encodeURIComponent(resource.id)}/recover`, { conversationId: resource.conversationId, expectedVersion: resource.controlVersion, providerSessionId }).then((result) => resourceResponse(result, resource.conversationId, resource.id)),
+    overview: () => request<unknown>(`${base}/overview`).then(readOverview),
+    move: (resource: CloudBrowserResource, toConversationId: string) => post<{ resource: unknown }>(`/resources/${encodeURIComponent(resource.id)}/move`, { conversationId: resource.conversationId, expectedVersion: resource.controlVersion, toConversationId }).then((result) => resourceResponse(result, toConversationId, resource.id)),
+    adoptUnlinked: (providerSessionId: string, conversationId: string) => post<{ resource: unknown }>(`/unlinked/${encodeURIComponent(providerSessionId)}/adopt`, { conversationId }).then((result) => resourceResponse(result, conversationId)),
+    closeUnlinked: (providerSessionId: string) => post<{ closed: boolean }>(`/unlinked/${encodeURIComponent(providerSessionId)}/close`, {}),
     detach: (resource: CloudBrowserResource, viewerLeaseId: string) => request<{ resource: unknown }>(`${base}/resources/${encodeURIComponent(resource.id)}/detach`, { method: 'POST', keepalive: true, body: JSON.stringify({ conversationId: resource.conversationId, viewerLeaseId }) }).then((result) => resourceResponse(result, resource.conversationId, resource.id)),
   };
 }

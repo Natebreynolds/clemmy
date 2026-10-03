@@ -125,3 +125,29 @@ test('a new browser is available after confirmed terminal sessions, never while 
   assert.equal(canStartBrowserInTask([{ ...resource, state: 'stopped' }, { ...resource, state: 'expired' }]), true);
   for (const state of ['starting', 'active', 'uncertain', 'stopping'] as const) assert.equal(canStartBrowserInTask([{ ...resource, state }]), false);
 });
+
+test('the browser chip counts every open browser, and each says when it closes in plain words', async () => {
+  const { browsersChipLabel, browserClosesText } = await import('./cloud-browser.js');
+  assert.equal(browsersChipLabel(0), 'Browser');
+  assert.equal(browsersChipLabel(2), 'Browsers · 2 open');
+  const now = Date.parse('2026-10-03T16:00:00Z');
+  assert.equal(browserClosesText({ idleClosesAt: '2026-10-03T16:12:00Z', endsAt: '2026-10-03T18:00:00Z' }, now), 'Closes in 12 min if left idle');
+  assert.equal(browserClosesText({ idleClosesAt: '2026-10-03T16:00:20Z', endsAt: '2026-10-03T18:00:00Z' }, now), 'Closes in about a minute if left idle');
+  assert.equal(browserClosesText({ idleClosesAt: '2026-10-03T17:59:00Z', endsAt: '2026-10-03T16:40:00Z' }, now), 'Ends in 40 min', 'the sooner of the two');
+  assert.equal(browserClosesText({ idleClosesAt: null, endsAt: '2026-10-03T18:00:00Z' }, now), 'Ends in 2 h');
+});
+
+test('the overview keeps each browser bound to its own conversation and refuses a malformed list', async () => {
+  const { createCloudBrowserClient } = await import('./cloud-browser.js');
+  const browser = { id: 'b1', conversationId: 'sess-a', provider: 'browserbase', providerSessionId: 's1', projectId: 'p', state: 'active', controller: 'agent', controlVersion: 2,
+    createdAt: '2026-10-03T16:00:00Z', updatedAt: '2026-10-03T16:00:00Z', recording: false, elapsedSeconds: 60, pages: [], conversationTitle: 'Pricing research',
+    idleClosesAt: '2026-10-03T16:15:00Z', endsAt: '2026-10-03T18:00:00Z', usesProfile: true };
+  const client = createCloudBrowserClient(async <T>(): Promise<T> => ({ browsers: [browser], unlinked: [{ providerSessionId: 's9' }], unlinkedChecked: true }) as T, '/api/cloud-browser');
+  const overview = await client.overview();
+  assert.equal(overview.browsers[0]!.conversationId, 'sess-a');
+  assert.equal(overview.browsers[0]!.conversationTitle, 'Pricing research');
+  assert.equal(overview.browsers[0]!.usesProfile, true);
+  assert.deepEqual(overview.unlinked.map((row) => row.providerSessionId), ['s9']);
+  const broken = createCloudBrowserClient(async <T>(): Promise<T> => ({ browsers: [{ ...browser, endsAt: 5 }], unlinked: [] }) as T, '/api/cloud-browser');
+  await assert.rejects(broken.overview(), /not confirmed/);
+});

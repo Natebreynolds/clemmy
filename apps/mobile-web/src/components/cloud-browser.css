@@ -212,3 +212,14 @@
 
 .m-browser-new {display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:0 16px 16px}
 .m-browser-new label {display:flex;align-items:center;gap:8px;font-size:13px}
+
+/* Every other open browser on this Mac, each with what you can do with it. */
+.m-browser-others {border-top:1px solid var(--bg-4);padding:14px 16px 6px}
+.m-browser-others h3 {margin:0 0 8px;font-size:13px;font-weight:600;color:var(--fg-2)}
+.m-browser-others ul {margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:10px}
+.m-browser-others li {display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--bg-4);border-radius:12px}
+.m-browser-others li > div:first-child {display:flex;flex-direction:column;gap:2px;min-width:0}
+.m-browser-others strong {font-size:15px;font-weight:600;overflow-wrap:anywhere}
+.m-browser-others span {font-size:13px;color:var(--fg-2);overflow-wrap:anywhere}
+.m-browser-row-actions {display:flex;flex-wrap:wrap;gap:8px}
+.m-browser-row-actions button {min-height:44px}
