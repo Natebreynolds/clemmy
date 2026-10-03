@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useBackGesture } from '../lib/back-gesture';
 import { listChatSessions, patchChatSession, type ChatSession } from '../lib/api';
 import { arrangeChatList, cleanChatTitle } from '../lib/chat-list';
-import { chatHasNews, chatSeenBaseline, markChatSeen } from '../lib/chat-seen';
+import { chatHasNews, chatSeenBaseline, markChatSeen } from '@clem/chat-engine';
 import { ChatStateMark } from '../components/ChatStateMark';
+import { SWIPE_ACTIONS_WIDTH, swipeIntent, swipeOffset, swipeSettles } from '../lib/chat-swipe';
 import { Sheet } from '../components/Sheet';
 import { haptic } from '../lib/native-bridge';
 import type { ChatAttachment } from '@clem/chat-engine';
@@ -67,6 +68,8 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   const [renaming, setRenaming] = useState<ChatSession | null>(null);
   const [renameText, setRenameText] = useState('');
   const [rowError, setRowError] = useState<string | null>(null);
+  // One row at most shows its swipe actions.
+  const [swipedId, setSwipedId] = useState<string | null>(null);
   // The list keeps polling and wake-refreshing only while it is the visible
   // surface — an open thread owns its own stream.
   const listVisible = !composing && !selectedId;
@@ -206,11 +209,11 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
 
       {arranged.pinned.length > 0 ? <h2 class="chat-list-head">Pinned</h2> : null}
       <div class="chat-list">
-        {arranged.pinned.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
+        {arranged.pinned.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSwipedId(null); setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} swipeOpen={swipedId === session.id} onSwipe={(open) => setSwipedId(open ? session.id : null)} onPin={() => { setSwipedId(null); void change(session, { pinned: !session.pinned }); }} onArchive={() => { setSwipedId(null); void change(session, { archived: !session.archived }); }} />)}
       </div>
       {arranged.pinned.length > 0 && arranged.rest.length > 0 ? <h2 class="chat-list-head">{showArchived ? 'Archived' : 'Recent'}</h2> : null}
       <div class="chat-list">
-        {arranged.rest.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
+        {arranged.rest.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSwipedId(null); setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} swipeOpen={swipedId === session.id} onSwipe={(open) => setSwipedId(open ? session.id : null)} onPin={() => { setSwipedId(null); void change(session, { pinned: !session.pinned }); }} onArchive={() => { setSwipedId(null); void change(session, { archived: !session.archived }); }} />)}
       </div>
       {!loading && sessions.length > 0 && arranged.pinned.length + arranged.rest.length === 0 ? (
         <p class="chats-none">Nothing matches “{query.trim()}”.</p>
@@ -258,27 +261,78 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
 }
 
 /** One conversation: its title, who and when on one quiet line, and its
- *  live state at the end. Flat on the page, like the menu's Recents. */
-function ChatRow({ session, news, onOpen, onMenu }: { session: ChatSession; news: boolean; onOpen: () => void; onMenu: () => void }) {
+ *  live state at the end. Flat on the page, like the menu's Recents. Swiped
+ *  left it shows Pin and Archive, the way a phone's own lists do; "…" keeps
+ *  the same choices (and Rename) one tap away. */
+function ChatRow({ session, news, onOpen, onMenu, swipeOpen, onSwipe, onPin, onArchive }: {
+  session: ChatSession; news: boolean; onOpen: () => void; onMenu: () => void;
+  swipeOpen: boolean; onSwipe: (open: boolean) => void; onPin: () => void; onArchive: () => void;
+}) {
   const who = [session.agentName, session.projectName].filter(Boolean).join(' · ');
   const ended = session.status === 'failed' || session.status === 'cancelled';
+  const rest = swipeOpen ? -SWIPE_ACTIONS_WIDTH : 0;
+  const [drag, setDrag] = useState<number | null>(null);
+  const touch = useRef<{ x: number; y: number; intent: 'horizontal' | 'vertical' | null; dragged: boolean } | null>(null);
+  const offset = drag ?? rest;
   return (
-    <div class={`chat-row${news ? ' chat-row-news' : ''}`}>
-      <button type="button" class="chat-row-main" onClick={onOpen}>
-        <span class="chat-row-title">{session.title || 'Untitled'}</span>
-        <span class="chat-row-meta">
-          {who ? <span class="chat-row-who">{who}</span> : null}
-          {session.running ? (
-            <span class="chat-row-working">Working…</span>
-          ) : ended ? (
-            <span><span class={`status-dot status-${session.status}`} aria-hidden="true" />{session.status} · {relativeTime(session.updatedAt)}</span>
-          ) : <span>{relativeTime(session.updatedAt)}</span>}
-        </span>
-      </button>
-      <ChatStateMark running={session.running} news={news} />
-      <button type="button" class="chat-row-more" aria-label={`More for ${session.title || 'this conversation'}`} onClick={onMenu}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1.2" /><circle cx="12" cy="12" r="1.2" /><circle cx="19" cy="12" r="1.2" /></svg>
-      </button>
+    <div class={`chat-swipe${swipeOpen ? ' is-open' : ''}${drag !== null ? ' is-moving' : ''}`}>
+      <div class="chat-swipe-actions" aria-hidden={!swipeOpen}>
+        <button type="button" class="chat-swipe-action" tabIndex={swipeOpen ? 0 : -1} onClick={onPin}>{session.pinned ? 'Unpin' : 'Pin'}</button>
+        <button type="button" class="chat-swipe-action chat-swipe-archive" tabIndex={swipeOpen ? 0 : -1} onClick={onArchive}>{session.archived ? 'Put back' : 'Archive'}</button>
+      </div>
+      <div
+        class={`chat-row${news ? ' chat-row-news' : ''}${drag !== null ? ' is-dragging' : ''}`}
+        style={{ transform: offset ? `translateX(${offset}px)` : undefined }}
+        onTouchStart={(event) => {
+          const t = event.touches[0];
+          touch.current = { x: t.clientX, y: t.clientY, intent: null, dragged: false };
+        }}
+        onTouchMove={(event) => {
+          const state = touch.current;
+          if (!state) return;
+          const t = event.touches[0];
+          const dx = t.clientX - state.x;
+          if (state.intent === null) state.intent = swipeIntent(dx, t.clientY - state.y);
+          if (state.intent !== 'horizontal') return;
+          state.dragged = true;
+          setDrag(swipeOffset(rest, dx));
+        }}
+        onTouchEnd={() => {
+          const state = touch.current;
+          if (state?.dragged && drag !== null) {
+            const open = swipeSettles(drag) === 'open';
+            if (open !== swipeOpen) haptic('light');
+            onSwipe(open);
+          }
+          setDrag(null);
+        }}
+        onTouchCancel={() => setDrag(null)}
+      >
+        <button
+          type="button"
+          class="chat-row-main"
+          onClick={(event) => {
+            // A drag is not a tap, and a tap on an open row closes it.
+            if (touch.current?.dragged) { touch.current = null; event.preventDefault(); return; }
+            if (swipeOpen) { onSwipe(false); return; }
+            onOpen();
+          }}
+        >
+          <span class="chat-row-title">{session.title || 'Untitled'}</span>
+          <span class="chat-row-meta">
+            {who ? <span class="chat-row-who">{who}</span> : null}
+            {session.running ? (
+              <span class="chat-row-working">Working…</span>
+            ) : ended ? (
+              <span><span class={`status-dot status-${session.status}`} aria-hidden="true" />{session.status} · {relativeTime(session.updatedAt)}</span>
+            ) : <span>{relativeTime(session.updatedAt)}</span>}
+          </span>
+        </button>
+        <ChatStateMark running={session.running} news={news} />
+        <button type="button" class="chat-row-more" aria-label={`More for ${session.title || 'this conversation'}`} onClick={onMenu}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1.2" /><circle cx="12" cy="12" r="1.2" /><circle cx="19" cy="12" r="1.2" /></svg>
+        </button>
+      </div>
     </div>
   );
 }

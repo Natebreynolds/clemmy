@@ -16,12 +16,15 @@ import { readFileSync } from 'node:fs';
 
 const SRC = readFileSync(new URL('./host-turn-runner.ts', import.meta.url), 'utf8');
 
-test('settlementRequiresReconciliation is gated on the irreversible boundary', () => {
+test('settlementRequiresReconciliation is gated on the irreversible boundary', async () => {
   assert.match(
     SRC,
-    /settlementRequiresReconciliation =\s*\n\s*invoked\.settlement\.outcome\.directive\.requiresReconciliation === true\s*\n\s*&& \(effect === 'external_write' \|\| effect === 'admin'\);/,
+    /settlementRequiresReconciliation =\s*\n\s*invoked\.settlement\.outcome\.directive\.requiresReconciliation === true\s*\n\s*&& uncertainEffectStopsTurn\(effect\);/,
     'a local write or read that may have started must not hard-block; only external_write/admin reconcile',
   );
+  // One rule, shared with the checkpoint that must accept what the runner showed.
+  const { uncertainEffectStopsTurn } = await import('./reconciliation-stop.js');
+  assert.deepEqual(['read', 'compute', 'local_write', 'external_write', 'admin'].filter(uncertainEffectStopsTurn), ['external_write', 'admin']);
 });
 
 test('after invocation the immutable settlement owns the crossing disposition; only a proven pre-dispatch refusal with zero crossings is zero-crossing', () => {

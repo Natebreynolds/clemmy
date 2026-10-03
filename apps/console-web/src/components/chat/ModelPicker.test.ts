@@ -35,7 +35,7 @@ test('keyboard and pointer: Escape returns focus to the chip; outside clicks and
 });
 
 test('a change is called saved only when the daemon reads back the same brain', () => {
-  assert.match(SOURCE, /brainMismatch = picked !== null && roles\.saved === 'brain' && !roles\.fetching && roles\.brainValue !== picked/);
+  assert.match(SOURCE, /brainMismatch = picked !== null && roles\.saved === 'brain' && !roles\.fetching && !answering\.isFetching && scopedValue !== picked/);
   assert.match(SOURCE, /That change didn’t take/);
   assert.doesNotMatch(SOURCE, /min-w-0 flex-1 truncate">\s*\{roles\.error/);
 });
@@ -50,9 +50,10 @@ test('the helper and checker stay native selects with a full-width label, in the
 
 test('an agent pinned to a model: the chip names it on every composer, and a pick in the conversation lands after the switch', () => {
   const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8');
-  assert.match(SOURCE, /getAnsweringModel\(sessionId, agentId \?\? null\)/, 'the chip asks the daemon what answers next');
-  assert.match(SOURCE, /const brain = agentModel\s*\?/, 'the chip names the agent\'s own model when it answers');
-  assert.match(SOURCE, /await applyAgent\?\.\(\);[\s\S]{0,160}await roles\.onBrain\(value\)/,
+  assert.match(SOURCE, /getNextAnsweringModel\(sessionId, agentId \?\? null\)/, 'the chip asks the daemon what answers next');
+  assert.match(SOURCE, /const brain = hasContext\s*\? nextModel/, 'the chip names the scoped next model, including an agent override');
+  assert.match(SOURCE, /roles\.onBrain\(value, sessionId \? applyAgent : undefined\)/);
+  assert.match(read('../../lib/model-roles.ts'), /await beforeChange\?\.\(\);[\s\S]{0,200}await setActiveBrain/,
     'a pending agent switch lands before the pick, so the pick is the later choice');
   assert.match(read('../../lib/model-roles.ts'), /invalidateQueries\(\{ queryKey: \['answering-model'\] \}\)/,
     'a pick re-reads what answers next');
@@ -75,5 +76,5 @@ test('an approval card reads like a question card: Clem\'s question, why, the ex
     assert.match(read(site), /displayText: APPROVAL_ANSWER_WORDS\[decision\]/, `${site} shows the owner's answer, not "approve apr-…"`);
   }
   assert.match(read('../../lib/useChat.ts'), /text: input\.displayText\?\.trim\(\) \|\| text/);
-  assert.match(read('../../screens/Inbox.tsx'), /row\.presentation\?\.ask \|\| row\.presentation\?\.action/);
+  assert.match(read('../../screens/Inbox.tsx'), /row\.presentation\?\.ask \|\| row\.subject \|\| row\.presentation\?\.action/);
 });

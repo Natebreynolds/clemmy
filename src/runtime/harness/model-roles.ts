@@ -206,6 +206,18 @@ export function pinnedBrainForSession(sessionId: string): SessionBrainPin | null
   return sessionBrainPins.get(sessionId) ?? null;
 }
 
+/** Read-only projection for a conversation's picker, outside a served turn.
+ * It uses the same pin/liveness rules without stamping or evicting affinity. */
+export function resolvedBrainForSession(sessionId?: string | null): ResolvedRoleModel {
+  const global = resolveRoleModel('brain');
+  if (!sessionId || !sessionBrainPinningEnabled() || (global.source !== 'default' && global.source !== 'session')) return global;
+  const pin = sessionBrainPins.get(sessionId.trim());
+  if (pin && sessionBrainPinValidator(pin.modelId, pin.provider)) {
+    return { modelId: pin.modelId, provider: pin.provider, source: 'session' };
+  }
+  return global;
+}
+
 /** Explicit per-session brain switch: resolve the CURRENT global choice and
  *  overwrite this session's pin with it. This is the seam the active-brain
  *  switch routes call with the requesting session's id so "applies to your

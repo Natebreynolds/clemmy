@@ -49,6 +49,9 @@ interface WindowObservation {
   cacheObservedCalls?: number;
   /** Smallest prompt seen WITH a cache read: the provider's practical floor. */
   smallestCachedPrompt?: number;
+  /** The reasoning efforts this model accepts, as its provider listed them
+   *  when it refused one. Absent until a provider says. */
+  supportedEfforts?: string[];
   updatedAt?: string;
 }
 
@@ -258,6 +261,33 @@ export function effectiveCacheMinTokens(modelId: string | undefined | null): num
     }
   } catch { /* seeded value stands */ }
   return seeded;
+}
+
+/** Record the reasoning efforts a model accepts, from its provider's own
+ *  refusal of another value. */
+export function recordSupportedEfforts(modelId: string, values: readonly string[]): void {
+  const id = cleanModelId(modelId);
+  const clean = [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  if (!id || clean.length === 0) return;
+  mutate(id, (prev) => ({ ...prev, supportedEfforts: clean }));
+}
+
+const EFFORT_ORDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+/**
+ * The effort to send this model: the one asked for when the model accepts it
+ * (or nothing is known), else the nearest it does accept at or above it — a
+ * turn never gets less thinking than it asked for — else its highest.
+ */
+export function effectiveReasoningEffort<T extends string | undefined>(modelId: string | undefined | null, requested: T): T | string {
+  if (!requested) return requested;
+  const supported = readObservations().entries[cleanModelId(modelId)]?.supportedEfforts;
+  if (!supported?.length || supported.includes(requested)) return requested;
+  const rank = (value: string) => EFFORT_ORDER.indexOf(value);
+  const known = supported.filter((value) => rank(value) >= 0).sort((a, b) => rank(a) - rank(b));
+  if (known.length === 0) return requested;
+  const wanted = rank(requested);
+  return known.find((value) => rank(value) >= wanted) ?? known[known.length - 1]!;
 }
 
 /** Test-only: reset the read cache (the state file is under a temp HOME in tests). */

@@ -77,9 +77,10 @@ import { replySpeakers } from '../lib/chat-speakers';
 import { refusalWords } from '../lib/project-words';
 import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
-import { getAnsweringModel, getModelSettings, type AnsweringAgentModel } from '../lib/api';
+import { getNextAnsweringModel, getModelSettings, type NextAnsweringModel, type BrainOptionRow } from '../lib/api';
 import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
+import { CloudBrowserDock } from '../components/CloudBrowserDock';
 import { Composer } from '../components/Composer';
 import { attachmentLabel, attachmentsSummary } from '../lib/attachments';
 import { ChatBackButton } from '../components/ChatBackButton';
@@ -171,17 +172,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [error, setError] = useState<string | null>(null);
   // §6a: a compact brain chip in the chat header — the same live catalog
   // sheet as Settings > Brain, mounted where the switch is most often wanted.
-  const [brainLabel, setBrainLabel] = useState('');
   const [brainOpen, setBrainOpen] = useState(false);
-  const loadBrain = () => {
-    void getModelSettings()
-      .then((data) => {
-        const current = data.options.find((option) => option.value === data.effectiveValue);
-        setBrainLabel(current?.label ?? data.brain.modelId);
-      })
-      .catch(() => setBrainLabel(''));
-  };
-  useEffect(loadBrain, []);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const dockRef = useRef<HTMLDivElement | null>(null);
@@ -289,16 +280,27 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // names it, read again whenever the agent, the conversation or the brain changes.
   const answeringSessionId = snapshot?.sessionId ?? initialSessionId ?? undefined;
   const answeringAgentId = takesAgent ? agent?.id ?? null : null;
-  const [agentModel, setAgentModel] = useState<AnsweringAgentModel | null>(null);
   const [brainTick, setBrainTick] = useState(0);
+  const [brainCatalog, setBrainCatalog] = useState<BrainOptionRow[]>([]);
   useEffect(() => {
-    if (!answeringAgentId) { setAgentModel(null); return; }
     let cancelled = false;
-    getAnsweringModel(answeringSessionId, answeringAgentId)
-      .then((result) => { if (!cancelled) setAgentModel(result); })
-      .catch(() => { if (!cancelled) setAgentModel(null); });
+    getModelSettings().then((settings) => { if (!cancelled) setBrainCatalog(settings.options); }).catch(() => {});
     return () => { cancelled = true; };
-  }, [answeringSessionId, answeringAgentId, brainTick]);
+  }, [brainTick]);
+  const modelReadKey = JSON.stringify([answeringSessionId ?? null, answeringAgentId, brainTick]);
+  const [modelRead, setModelRead] = useState<{ key: string; value: NextAnsweringModel | null; failed: boolean } | null>(null);
+  const currentModelRead = modelRead?.key === modelReadKey ? modelRead : null;
+  const agentModel = currentModelRead?.value?.agent ?? null;
+  const brainLabel = currentModelRead?.value
+    ? brainCatalog.find((option) => option.value === currentModelRead.value?.effectiveValue)?.label ?? currentModelRead.value.brain.modelId
+    : currentModelRead?.failed ? 'Model unavailable' : 'Checking model…';
+  useEffect(() => {
+    let cancelled = false;
+    getNextAnsweringModel(answeringSessionId, answeringAgentId)
+      .then((result) => { if (!cancelled) setModelRead({ key: modelReadKey, value: result, failed: false }); })
+      .catch(() => { if (!cancelled) setModelRead({ key: modelReadKey, value: null, failed: true }); });
+    return () => { cancelled = true; };
+  }, [answeringSessionId, answeringAgentId, modelReadKey]);
   const agentMarks = agentThreadMarks(messages, agent?.name ?? null);
   const speakers = replySpeakers(messages, agentMarks);
   // A Space dock works in its Space, never in a project.
@@ -611,9 +613,11 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         <BrainSheet
           open={brainOpen}
           onClose={() => setBrainOpen(false)}
-          onChanged={() => { loadBrain(); setBrainTick((n) => n + 1); }}
+          onChanged={() => { setBrainTick((n) => n + 1); }}
           sessionId={snapshot?.sessionId ?? initialSessionId ?? undefined}
           answeringAgent={agentModel}
+          answeringModel={currentModelRead?.value ?? null}
+          modelReadFailed={currentModelRead?.failed ?? false}
           beforeChange={() => applyAgentChoice(snapshot?.sessionId ?? initialSessionId ?? undefined)}
         />
         {connection === 'recovering' || connection === 'connecting' ? (
@@ -622,6 +626,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <div class="conn-pill conn-detached">catching up in the background</div>
         ) : null}
       </div>
+      <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} />
       <div
         class="chat-transcript"
         ref={scrollRef}
@@ -721,7 +726,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
                   title={agentModel ? `${agentModel.agentName} answers on its own model` : 'Does the work: the model that answers your next message'}
                   onClick={() => { haptic('light'); setBrainOpen(true); }}
                 >
-                  <span class="truncate">{modelDisplayName(agentModel?.modelId ?? brainLabel)}</span>
+                  <span class="truncate">{modelDisplayName(brainLabel)}</span>
                 </button>
               ) : null}
             </>

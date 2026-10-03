@@ -12,6 +12,7 @@ import {
   modelUsageAttributionStorage,
   observeModelUsageRecording,
   recordModelUsage,
+  withModelUsageAttribution,
   withOwnModelRequestAttribution,
   type UsageRequestRole,
 } from '../usage-log.js';
@@ -786,44 +787,68 @@ export function configuredBrainSemanticPort(
       };
     },
     async interpret(call: TurnSemanticModelCall): Promise<TurnSemanticModelResult> {
-      const started = Date.now();
-      const result = await complete({
-        purpose: 'turn_semantics',
-        system: SYSTEM,
-        user: JSON.stringify({
-          acceptedText: call.acceptedText,
-          recentTurns: (call.recentTurns ?? []).slice(-6),
-          host: {
-            source: call.host.source,
-            policyRevision: call.host.policyRevision,
-            resumableGoals: call.host.resumableGoals,
-            openQuestions: call.host.openQuestions,
-            capabilities: boundHostCapabilityDescriptors(call.host.catalog.capabilities ?? []),
-            capabilityIds: [...call.host.catalog.capabilityIds],
-            workflowIds: [...call.host.catalog.workflowIds],
-          },
-          repairHint: call.repairHint ?? null,
-        }),
-        schemaName: 'TurnSemanticProposalV1',
-      });
-      recordSemanticModelUsage({
-        sessionId: call.host.source.sessionId,
-        sourceUserSeq: call.host.source.sourceUserSeq,
-        purpose: result.purpose,
-        usageRecorded: result.usageRecorded,
-        modelIdentity: result.modelIdentity,
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-        cachedInputTokens: result.cachedInputTokens,
-        latencyMs: result.latencyMs || (Date.now() - started),
-      });
-      return {
-        raw: result.raw,
-        modelIdentity: result.modelIdentity,
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-        latencyMs: result.latencyMs || (Date.now() - started),
-      };
+      // Clarification preparation runs before the foreground runner's usage
+      // scope. Bind the host's exact accepted source before the adapter writes
+      // its row; a usageRecorded receipt cannot repair an anonymous row later.
+      // This scope grants no model routing or tool authority. Rowless memory
+      // jobs keep their existing job owner instead of gaining a guessed turn.
+      const source = call.host.source;
+      const inherited = modelUsageAttributionStorage.getStore();
+      const exactSource = source.sessionId && source.sessionId !== 'unknown'
+        && Number.isSafeInteger(source.sourceUserSeq) && source.sourceUserSeq > 0;
+      const sameSource = inherited?.sessionId === source.sessionId
+        && inherited.sourceUserSeq === source.sourceUserSeq;
+      const interpret = (): Promise<TurnSemanticModelResult> => withOwnModelRequestAttribution(
+        semanticUsageAttribution('turn_semantics'), async () => {
+          const started = Date.now();
+          const result = await complete({
+            purpose: 'turn_semantics',
+            system: SYSTEM,
+            user: JSON.stringify({
+              acceptedText: call.acceptedText,
+              recentTurns: (call.recentTurns ?? []).slice(-6),
+              host: {
+                source: call.host.source,
+                policyRevision: call.host.policyRevision,
+                resumableGoals: call.host.resumableGoals,
+                openQuestions: call.host.openQuestions,
+                capabilities: boundHostCapabilityDescriptors(call.host.catalog.capabilities ?? []),
+                capabilityIds: [...call.host.catalog.capabilityIds],
+                workflowIds: [...call.host.catalog.workflowIds],
+              },
+              repairHint: call.repairHint ?? null,
+            }),
+            schemaName: 'TurnSemanticProposalV1',
+          });
+          recordSemanticModelUsage({
+            sessionId: call.host.source.sessionId,
+            sourceUserSeq: call.host.source.sourceUserSeq,
+            purpose: result.purpose,
+            usageRecorded: result.usageRecorded,
+            modelIdentity: result.modelIdentity,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            cachedInputTokens: result.cachedInputTokens,
+            latencyMs: result.latencyMs || (Date.now() - started),
+          });
+          return {
+            raw: result.raw,
+            modelIdentity: result.modelIdentity,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            latencyMs: result.latencyMs || (Date.now() - started),
+          };
+        },
+      );
+      return exactSource
+        ? withModelUsageAttribution({
+          ...inherited,
+          sessionId: source.sessionId,
+          sourceUserSeq: source.sourceUserSeq,
+          // An attempt belongs to the whole tuple, never to the session alone.
+          attemptId: sameSource ? inherited?.attemptId : undefined,
+        }, interpret)
+        : interpret();
     },
     async judgeSourceEffect(call: SourceEffectJudgeCall): Promise<SourceEffectJudgeResult> {
       const started = Date.now();

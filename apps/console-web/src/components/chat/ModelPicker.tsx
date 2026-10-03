@@ -20,8 +20,8 @@ import { Link } from 'react-router-dom';
 import { ChevronUp, Info } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
-import { PROVIDER_LABEL, brainProvider, friendlyModelLabel, roleLabel, shortModelLabel, useModelRoles, type BrainChoice } from '@/lib/model-roles';
-import { getAnsweringModel } from '@/lib/agents';
+import { PROVIDER_LABEL, friendlyModelLabel, roleLabel, shortModelLabel, useModelRoles, type BrainChoice } from '@/lib/model-roles';
+import { getNextAnsweringModel } from '@/lib/agents';
 import { usePoll } from '@/lib/poll';
 import { ClaudeLoginForm } from '@/screens/settings/ClaudeLoginForm';
 import { placePopover } from '@/lib/popover-placement';
@@ -109,13 +109,15 @@ export function ModelPicker({ sessionId, agentId, applyAgent, className }: {
 }) {
   const roles = useModelRoles({ sessionId });
   const asksAgent = typeof agentId === 'string' && agentId.length > 0;
+  const hasContext = Boolean(sessionId) || asksAgent;
   const answering = usePoll(
     ['answering-model', sessionId ?? null, agentId ?? null],
-    () => getAnsweringModel(sessionId, agentId ?? null),
+    () => getNextAnsweringModel(sessionId, agentId ?? null),
     0,
-    { enabled: asksAgent },
+    { enabled: hasContext },
   );
-  const agentModel = asksAgent ? answering.data ?? null : null;
+  const nextModel = hasContext && !answering.isError ? answering.data ?? null : null;
+  const agentModel = nextModel?.agent ?? null;
   const [open, setOpen] = useState(false);
   const [roster, setRoster] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -188,27 +190,27 @@ export function ModelPicker({ sessionId, agentId, applyAgent, className }: {
   }, [open, close]);
 
   const mr = roles.mr;
+  const scopedValue = hasContext ? nextModel?.effectiveValue ?? '' : roles.brainValue;
   // Read-back of a brain change: compare what the daemon now reports.
-  const brainMismatch = picked !== null && roles.saved === 'brain' && !roles.fetching && roles.brainValue !== picked;
+  const brainMismatch = picked !== null && roles.saved === 'brain' && !roles.fetching && !answering.isFetching && scopedValue !== picked;
   useEffect(() => {
-    if (picked !== null && roles.saved === 'brain' && !roles.fetching && roles.brainValue === picked) setPicked(null);
-  }, [picked, roles.saved, roles.fetching, roles.brainValue]);
+    if (picked !== null && roles.saved === 'brain' && !roles.fetching && !answering.isFetching && scopedValue === picked) setPicked(null);
+  }, [picked, roles.saved, roles.fetching, answering.isFetching, scopedValue]);
+  useEffect(() => { setPicked(null); }, [sessionId, agentId]);
   if (!mr) return null;
   // The agent's own model answers: name it, from the roster when it is there.
-  const agentOption = agentModel ? (mr.brainOptions ?? []).find((o) => o.value.endsWith(`:${agentModel.modelId}`)) : undefined;
-  const brain = agentModel
-    ? shortModelLabel(friendlyModelLabel(agentOption?.label ?? agentModel.modelId))
+  const scopedOption = (mr.brainOptions ?? []).find((o) => o.value === scopedValue);
+  const brain = hasContext
+    ? nextModel ? shortModelLabel(friendlyModelLabel(scopedOption?.label ?? nextModel.brain.modelId))
+      : answering.isError ? 'Model unavailable' : 'Checking model…'
     : shortModelLabel(roleLabel(mr, 'brain'));
-  const brainProv = agentModel ? (agentOption ? brainProvider(agentOption.value) : 'unknown') : mr.roles.brain.provider;
-  const rosterValue = agentModel ? agentOption?.value ?? '' : roles.brainValue;
+  const brainProv = hasContext ? nextModel?.brain.provider ?? 'unknown' : mr.roles.brain.provider;
+  const rosterValue = scopedValue;
   const pickBrain = (value: string) => {
     setRoster(false);
     setPicked(value);
-    void (async () => {
-      // A pending agent switch lands first, so this pick is the later choice.
-      if (sessionId) { try { await applyAgent?.(); } catch { /* the next send applies it */ } }
-      await roles.onBrain(value);
-    })();
+    // A pending agent switch lands first, so this pick is the later choice.
+    void roles.onBrain(value, sessionId ? applyAgent : undefined);
   };
   const workerProv = mr.roles.worker.provider;
   const judgeProv = mr.roles.judge.provider;
@@ -277,8 +279,9 @@ export function ModelPicker({ sessionId, agentId, applyAgent, className }: {
           <div className="mt-1 flex items-start gap-2 border-t border-border px-4 pb-1 pt-2 text-caption text-faint">
             <Info className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
             {/* A failed change is said in full, never truncated to a line. */}
-            <span className="min-w-0 flex-1" role={roles.error || brainMismatch ? 'alert' : 'status'}>
+            <span className="min-w-0 flex-1" role={roles.error || brainMismatch || answering.isError ? 'alert' : 'status'}>
               {roles.error ? <span className="text-danger">{roles.error}</span>
+                : hasContext && answering.isError ? <span className="text-danger">Could not confirm this conversation’s model. Refresh or choose it again.</span>
                 : brainMismatch ? <span className="text-danger">That change didn’t take: Clem is still on {brain}. Try again, or check Settings.</span>
                 : roles.saved && !roles.fetching && !answering.isFetching ? (agentModel
                   // Saved as the owner's model, and the agent's own still answers here.

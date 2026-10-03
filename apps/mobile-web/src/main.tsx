@@ -3,6 +3,8 @@ import { App } from './app';
 import { ChatPreview } from './screens/ChatPreview';
 import { installNativeBridge } from './lib/native-bridge';
 import './styles.css';
+// Styles load once, here at the entry, so screens stay loadable in tests.
+import './components/cloud-browser.css';
 
 // Before first render so a native shell can hand in its APNs token whenever
 // it likes — including during the pairing load.

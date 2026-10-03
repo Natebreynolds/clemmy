@@ -168,6 +168,8 @@ export interface UnifiedSessionSummary {
   projectName?: string | null;
   /** Every saved agent that has answered here, oldest first. */
   agentIds?: string[];
+  /** Work is in flight in it right now (an open run attempt). */
+  running?: boolean;
 }
 
 /** A single normalized turn for rendering a conversation's history. */

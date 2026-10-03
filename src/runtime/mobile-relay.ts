@@ -20,7 +20,8 @@
  */
 import net from 'node:net';
 import tls from 'node:tls';
-import { createHash, createSign, randomBytes } from 'node:crypto';
+import { createHash, createSign, randomBytes, X509Certificate } from 'node:crypto';
+import { probeMobileRelay, type MobileRelayVerification } from './mobile-relay-health.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
@@ -217,9 +218,18 @@ export function loadRelayConfig(stateDir?: string, env: NodeJS.ProcessEnv = proc
 // (GET /m/relay-info), and only the boot wiring knows. Plain module state —
 // set once when the tunnel starts.
 
+export interface MobileRelayStatus {
+  state: 'unavailable' | 'connecting' | 'connected' | 'reconnecting' | 'stopped';
+  reason?: 'invalid-config' | 'certificate-mismatch' | 'registration-refused' | 'protocol-error' | 'unreachable' | 'timeout' | 'disconnected';
+  connectedAt?: string;
+  verification: MobileRelayVerification;
+}
+
 export interface MobileRelayRuntime {
   /** The origin the phone should use off-LAN, e.g. "https://<pairId>.r.example.com:53028". */
   origin: string;
+  status?: () => MobileRelayStatus;
+  verify?: () => Promise<MobileRelayVerification>;
 }
 
 let relayRuntime: MobileRelayRuntime | null = null;
@@ -230,6 +240,10 @@ export function setMobileRelayRuntime(runtime: MobileRelayRuntime | null): void 
 
 export function getMobileRelayRuntime(): MobileRelayRuntime | null {
   return relayRuntime;
+}
+
+export function getMobileRelayStatus(): MobileRelayStatus {
+  return relayRuntime?.status?.() ?? { state: 'unavailable', verification: { state: 'not-checked' } };
 }
 
 // ─── the supervised tunnel ──────────────────────────────────────────────────
@@ -246,6 +260,8 @@ export interface MobileRelayClient {
   stop(): void;
   /** Test seam: resolves once the current connection is registered. */
   connected(): boolean;
+  status(): MobileRelayStatus;
+  verify(origin: string): Promise<MobileRelayVerification>;
 }
 
 export interface StartRelayClientOptions {
@@ -261,21 +277,27 @@ export interface StartRelayClientOptions {
   /** Test seams for the heartbeat watchdog. */
   heartbeatDeadlineMs?: number;
   heartbeatCheckMs?: number;
+  /** Bounded registration, including TCP/TLS; does not cap established work. */
+  registrationTimeoutMs?: number;
+  /** The phone door to verify once after each successful registration. */
+  publicOrigin?: string;
 }
 
 export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRelayClient {
   const log = opts.logger ?? logger;
   const [host, portRaw] = opts.config.url.split(':');
   const relayPort = Number(portRaw);
-  if (!host || !Number.isFinite(relayPort)) {
+  if (!host || !Number.isInteger(relayPort) || relayPort < 1 || relayPort > 65535) {
     log.warn({ url: opts.config.url }, 'mobile-relay: invalid relay URL; tunnel disabled');
-    return { stop: () => {}, connected: () => false };
+    return { stop: () => {}, connected: () => false, status: () => ({ state: 'unavailable', reason: 'invalid-config', verification: { state: 'not-checked' } }), verify: async () => ({ state: 'failed', reason: 'unreachable' }) };
   }
 
   let stopped = false;
   let backoffMs = RECONNECT_BASE_MS;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let isConnected = false;
+  let status: MobileRelayStatus = { state: 'connecting', verification: { state: 'not-checked' } };
+  let verificationInFlight: Promise<MobileRelayVerification> | null = null;
   let activeSocket: tls.TLSSocket | null = null;
   let activeStreams = new Map<number, net.Socket>();
 
@@ -314,6 +336,13 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
     }, opts.heartbeatCheckMs ?? HEARTBEAT_CHECK_MS);
     heartbeatWatch.unref();
     socket.once('close', () => clearInterval(heartbeatWatch));
+    verificationInFlight = null;
+    status = { ...status, state: status.reason ? 'reconnecting' : 'connecting', verification: { state: 'not-checked' } };
+    const registrationTimer = setTimeout(() => {
+      status = { ...status, reason: 'timeout' };
+      socket.destroy();
+    }, opts.registrationTimeoutMs ?? 10_000);
+    registrationTimer.unref();
     const streams = new Map<number, net.Socket>();
     activeStreams = streams;
     const feed = frameReader();
@@ -322,6 +351,7 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
       const peerDer = socket.getPeerCertificate()?.raw;
       const fp = peerDer ? createHash('sha256').update(peerDer).digest('base64url') : '';
       if (fp !== opts.config.relayCertFp) {
+        status = { ...status, reason: 'certificate-mismatch' };
         log.error({ expected: opts.config.relayCertFp, got: fp }, 'mobile-relay: relay certificate pin mismatch — refusing');
         socket.destroy();
         return;
@@ -334,6 +364,7 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
       try {
         frames = feed(chunk);
       } catch (err) {
+        status = { ...status, reason: 'protocol-error' };
         log.error({ err }, 'mobile-relay: framing error; reconnecting');
         socket.destroy();
         return;
@@ -351,6 +382,7 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
           nonce = String((JSON.parse(frame.payload.toString('utf8')) as { nonce?: string }).nonce ?? '');
         } catch { /* handled by the empty check below */ }
         if (!nonce) {
+          status = { ...status, reason: 'protocol-error' };
           log.error('mobile-relay: relay sent no challenge nonce');
           socket.destroy();
           return;
@@ -359,19 +391,24 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
           const signature = createSign('sha256').update(nonce).sign(opts.keyPem).toString('base64url');
           socket.write(encodeFrame(FRAME.PROOF, 0, JSON.stringify({ certPem: opts.certPem, signature })));
         } catch (err) {
+          status = { ...status, reason: 'protocol-error' };
           log.error({ err }, 'mobile-relay: could not sign the relay challenge');
           socket.destroy();
         }
         return;
       }
       if (frame.type === FRAME.HELLO_OK) {
+        clearTimeout(registrationTimer);
         isConnected = true;
+        status = { state: 'connected', connectedAt: new Date().toISOString(), verification: { state: 'not-checked' } };
         backoffMs = RECONNECT_BASE_MS;
         log.info({ pairId: opts.pairId, relay: opts.config.url }, 'mobile-relay: tunnel registered');
+        if (opts.publicOrigin) void verify(opts.publicOrigin);
         return;
       }
       if (frame.type === FRAME.HELLO_ERR) {
-        log.error({ body: frame.payload.toString('utf8') }, 'mobile-relay: relay refused registration');
+        status = { ...status, reason: 'registration-refused' };
+        log.error('mobile-relay: relay refused registration');
         socket.destroy();
         return;
       }
@@ -441,17 +478,34 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
     }
 
     const dropAll = (): void => {
+      clearTimeout(registrationTimer);
       if (isConnected) log.warn('mobile-relay: tunnel lost; reconnecting with backoff');
       isConnected = false;
+      status = { state: stopped ? 'stopped' : 'reconnecting', reason: status.reason ?? 'disconnected', verification: { state: 'not-checked' } };
       for (const local of streams.values()) local.destroy();
       streams.clear();
       scheduleReconnect();
     };
     socket.once('close', dropAll);
     socket.on('error', (err) => {
+      if (!status.reason) status = { ...status, reason: 'unreachable' };
       log.warn({ err: err.message }, 'mobile-relay: connection error');
       socket.destroy();
     });
+  }
+
+  function verify(origin: string): Promise<MobileRelayVerification> {
+    if (!isConnected || stopped) return Promise.resolve({ state: 'failed', reason: 'unreachable' });
+    if (verificationInFlight) return verificationInFlight;
+    const checkedSocket = activeSocket;
+    const pin = createHash('sha256').update(new X509Certificate(opts.certPem).raw).digest('base64url');
+    const pending = probeMobileRelay(origin, pin).then((result): MobileRelayVerification => {
+      if (checkedSocket !== activeSocket || !isConnected || stopped) return { state: 'failed', reason: 'connection-changed' };
+      status = { ...status, verification: result };
+      return result;
+    }).finally(() => { if (verificationInFlight === pending) verificationInFlight = null; });
+    verificationInFlight = pending;
+    return pending;
   }
 
   connect();
@@ -459,10 +513,14 @@ export function startMobileRelayClient(opts: StartRelayClientOptions): MobileRel
   return {
     stop() {
       stopped = true;
+      isConnected = false;
+      status = { state: 'stopped', verification: { state: 'not-checked' } };
       if (reconnectTimer) clearTimeout(reconnectTimer);
       for (const local of activeStreams.values()) local.destroy();
       activeSocket?.destroy();
     },
     connected: () => isConnected,
+    status: () => ({ ...status, verification: { ...status.verification } }),
+    verify,
   };
 }

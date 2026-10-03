@@ -15,6 +15,7 @@
  */
 import { getRuntimeEnv } from '../config.js';
 import { TOOL_REGISTRY } from '../tools/tool-registry.js';
+import { browserBackendOffered } from '../tools/browser-backend.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
 import { getHotSet } from './tool-hotset.js';
@@ -271,7 +272,7 @@ function passesPolicy(name: string, allowedNames?: ReadonlySet<string>): boolean
  */
 export function catalogEntries(opts: { allowedNames?: ReadonlySet<string> } = {}): CatalogEntry[] {
   return TOOL_REGISTRY
-    .filter((d) => passesPolicy(d.name, opts.allowedNames))
+    .filter((d) => passesPolicy(d.name, opts.allowedNames) && browserBackendOffered(d.browserBackend))
     .map((d) => ({ name: d.name, oneLiner: (d.description ?? '').trim() }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -563,7 +564,11 @@ export function rankCatalogEntriesLexically<T extends CatalogEntry>(
   const leadingActions = new Set(entries
     .map((entry) => lexicalTokens(openingPurpose(entry.oneLiner))[0])
     .filter((token): token is string => Boolean(token)));
-  const requestedActions = queryLead ? requestedActionsOf(requestBody, leadingActions) : [];
+  // A leading topic noun is not a requested verb merely because it occurs in
+  // many tool names. Apply action precedence only to an opening action the
+  // candidate corpus actually demonstrates; topic-led queries use full-query
+  // relevance so a family of generic tools cannot hide a specific operation.
+  const requestedActions = queryLead && leadingActions.has(queryLead) ? requestedActionsOf(requestBody, leadingActions) : [];
   // Learn informativeness from this same candidate corpus. Common connecting
   // words and generic verbs cannot outweigh a rare requested object/property;
   // no curated stop-word list, provider boost, or product-name alias is needed.

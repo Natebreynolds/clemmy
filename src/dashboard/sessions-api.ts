@@ -24,6 +24,7 @@ import {
   updateSession as updateHarnessSession,
   type EventRow as HarnessEventRow,
   type SessionRow as HarnessSessionRow,
+  activeRunSessionIds,
 } from '../runtime/harness/eventlog.js';
 import { withSessionProofCascade } from '../runtime/harness/retained-session-proof-schema.js';
 import { isUserFacingSession, isInternalSessionId } from '../execution/scope.js';
@@ -192,6 +193,16 @@ function metaAgent(meta: Record<string, unknown> | undefined): {
   return { agentId, agentName, agentIds, projectId, projectName };
 }
 
+/** Sessions with work in flight, read at most once a second for a list. */
+let activeRunRead: { at: number; ids: Set<string> } | null = null;
+function sessionRunning(sessionId: string): boolean {
+  const now = Date.now();
+  if (!activeRunRead || now - activeRunRead.at > 1000) {
+    try { activeRunRead = { at: now, ids: activeRunSessionIds() }; } catch { activeRunRead = { at: now, ids: new Set() }; }
+  }
+  return activeRunRead.ids.has(sessionId);
+}
+
 function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): UnifiedSessionSummary {
   return {
     id: `${HARNESS_PREFIX}${row.id}`,
@@ -211,6 +222,7 @@ function summarizeHarness(row: HarnessSessionRow, titleOverride?: string): Unifi
     // unguarded and can re-fire tools — see plan).
     continuable: row.kind === 'chat',
     turnCount: 0,
+    running: sessionRunning(row.id),
     ...metaAgent(row.metadata),
   };
 }

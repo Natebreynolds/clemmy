@@ -1,4 +1,5 @@
 import { CliSessions } from '@/components/chat/CliSessions';
+import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
 import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
@@ -231,6 +232,7 @@ export function Chat() {
   }
 
   return (
+    <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? undefined}>
     <div className="flex h-full min-h-0 flex-col">
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
@@ -269,5 +271,6 @@ export function Chat() {
         <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} agentId={agent?.id ?? null} applyAgent={applyAgent} />
       </div>
     </div>
+    </CloudBrowserWorkspace>
   );
 }

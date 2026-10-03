@@ -17,6 +17,7 @@ import { SlackConnect } from '@/components/connect/SlackConnect';
 import { ProjectsPanel } from '@/components/connect/ProjectsPanel';
 import { CliTools } from '@/components/connect/CliTools';
 import { BrowserHarness } from '@/components/connect/BrowserHarness';
+import { BrowserbaseConnection } from '@/components/connect/BrowserbaseConnection';
 import { AppSetupFormView, type AppSetupForm } from '@/components/connect/AppConnectionSetup';
 import { usePoll } from '@/lib/poll';
 import { CodexReauth } from './settings/CodexLoginForm';
@@ -315,6 +316,7 @@ export function Connect() {
 
       {/* Browser harness — drive the user's real Chrome */}
       <BrowserHarness />
+      <BrowserbaseConnection />
 
       {/* Code folders (local code, not the Projects screen) */}
       <ProjectsPanel />

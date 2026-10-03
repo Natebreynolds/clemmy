@@ -13,6 +13,7 @@ import { registerAutonomyActionTools } from './autonomy-action-tools.js';
 import { registerBackgroundTaskTools } from './background-task-tools.js';
 import { registerProjectRecordTools } from './project-record-tools.js';
 import { registerBatchTools } from './batch-tools.js';
+import { registerCloudBrowserTools } from './cloud-browser-tools.js';
 import { registerBrowserHarnessTools } from './browser-harness-tools.js';
 import { registerCapabilityTools } from './capability-tools.js';
 import { registerCliTools } from './cli-tools.js';
@@ -347,6 +348,7 @@ function captureLocalTools(): CapturedLocalTool[] {
   registerSpaceTools(server);
   registerHomeTools(server);
   registerBrowserHarnessTools(server);
+  registerCloudBrowserTools(server);
   registerMcpStatusTools(server);
   registerHttpReadTools(server);
   registerMcpServerTools(server);

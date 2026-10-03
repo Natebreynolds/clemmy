@@ -57,7 +57,7 @@ import { approvalKindLabel, approvalQuestion, workspaceChoiceLayout, workspaceCh
 import { homeLead, homeNeedsYouPane, type NeedsYouPane } from '../lib/home-presentation';
 import { phoneVisiblePanes, useHomePreferences, type HomePaneId, type QuickAction } from '../lib/home-prefs';
 import { useWorkingNow } from '../lib/working-now';
-import { chatHasNews, chatSeenBaseline } from '../lib/chat-seen';
+import { chatHasNews, chatSeenBaseline } from '@clem/chat-engine';
 import { ChatStateMark } from '../components/ChatStateMark';
 import { HomeTiles } from '../components/HomeTiles';
 

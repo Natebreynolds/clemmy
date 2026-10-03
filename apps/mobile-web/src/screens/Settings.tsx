@@ -1,3 +1,4 @@
+import { BrowserbaseConnection } from '../components/BrowserbaseConnection';
 import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
 import { accountStatus, creditRefusalSentence, presentUsageMeters } from '@clem/chat-engine';
@@ -153,15 +154,20 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         ) : section === 'accounts' ? (
           <UsageCard />
         ) : section === 'connections' ? (
-          <ConnectionsPage
-            rows={connections.data?.connections}
-            loading={connections.loading}
-            error={connections.error}
-            offline={connections.offline}
-            stale={connections.stale}
-            refreshing={connections.refreshing}
-            onRetry={() => void connections.refresh()}
-          />
+          <>
+            <ConnectionsPage
+              rows={connections.data?.connections}
+              loading={connections.loading}
+              error={connections.error}
+              offline={connections.offline}
+              stale={connections.stale}
+              refreshing={connections.refreshing}
+              onRetry={() => void connections.refresh()}
+            />
+            {/* Stateful, so it sits beside the stateless connections page
+                rather than inside it. */}
+            <BrowserbaseConnection />
+          </>
         ) : (
           <DevicesPage
             rows={devices.data?.devices}
@@ -900,7 +906,7 @@ export function ConnectionsPage({ rows, loading, error, offline, stale, refreshi
           <div class="card settings-card">{list(tools)}</div>
         </section>
       ) : null}
-      {Boolean(rows?.length) && <p class="settings-foot">Connect or fix anything here on your Mac, in Connect.</p>}
+      {Boolean(rows?.length) && <p class="settings-foot">Other connections are managed on your Mac, in Connect.</p>}
     </Fragment>
   );
 }

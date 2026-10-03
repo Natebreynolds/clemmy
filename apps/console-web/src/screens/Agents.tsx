@@ -5,6 +5,7 @@
  * Drafts Clem proposed in conversation wait here until you create or dismiss
  * them.
  */
+import { modelDisplayName } from '@clem/chat-engine';
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
@@ -25,7 +26,7 @@ import {
 
 function modelLabel(catalog: AgentCatalog | undefined, model: string | null): string | null {
   if (!model) return null;
-  return catalog?.models?.find((m) => m.id === model)?.label ?? model;
+  return catalog?.models?.find((m) => m.id === model)?.label ?? modelDisplayName(model);
 }
 
 function AgentCard({ agent, catalog }: { agent: AgentRecord; catalog?: AgentCatalog }) {

@@ -185,6 +185,13 @@ Status words: **installed** = hotpatched into the owner's app and serving;
   connection-execution-closure all pass; the nested catalog settlement pair
   (3 s host deadline, 3.3 s even alone) failed once more under the same load
   and then passed 4/4. No regression attributed.
+- Full suite on `652329119` (all phone and desktop slices through the
+  desktop parity commit; run niced with the disk watchdog while two other
+  agents loaded the machine, load average up to 45): 19,617 passed, 1
+  failed, 8 skipped, 0 cancelled. The one failure is the same nested catalog
+  settlement test (3 s host deadline); alone at the same revision it passed
+  4/4. Commits after it (9f366b32e, 42c4c8830, 67933f9f0) are UI-only and
+  their app suites pass (620 desktop, 348 phone).
 
 ## Plan from the review handoff
 
@@ -295,3 +302,252 @@ brain choices are the sign-in's own catalog once it is known. Proof:
   BrainSheet):** the model chip's long label ("Codex — GPT 5…"), old approval
   cards that predate Clem's wording ("cli_setup: auth / Catalog id").
 - **Status:** committed, not installed.
+
+## Desktop at the phone's standard, and swipe on the phone
+
+- **Change:**
+  - desktop conversation list: the phone's live mark per chat (ring while
+    running — sessions-api `running` from open run attempts — dot for a reply
+    since you last looked, "Working…" in place of the preview); the seen rule
+    moved into @clem/chat-engine (chat-seen) so both apps share it; heads
+    in sentence case; New chat as an ink pill (5c53fc1c1);
+  - Needs you on desktop named in words (list and detail); a card's exact
+    details leave out content fingerprints (long hex digests, by shape) with
+    one line "Locked to this exact version" (both apps, 5c53fc1c1); Today
+    stays two columns until 1536 px and update titles wrap to two lines;
+  - phone: swipe a conversation left for Pin / Archive (6831476d6);
+  - desktop: Today's Needs-you rows drop the redundant "Approve:" before a
+    worded request; Running board workflow cards show names; agent models
+    read as names (f4815b17f).
+- **Proof:** needs-you-list pin (desktop), approval-presentation fingerprint
+  pin, chat-swipe tests + a driven touch swipe in the preview (opens, tap
+  closes, plain tap opens the thread), 620 desktop tests, 348 phone tests.
+- **Status:** committed, not installed.
+- Later the same night: Automate cards and Heartbeats' open items name
+  workflows in words (9f366b32e); the phone's Updates render their reports as
+  formatted Markdown that wraps inside the card, kinds as quiet words
+  (42c4c8830); the desktop's notification pills drop the universal green
+  "Sent" and name the kind in the phone's words, only "Failed" stands out
+  (67933f9f0). All tested (620 desktop, 348 phone); not installed.
+
+## Integration and install (wave 38), 10-03 ~01:00 PT
+
+- **Owner:** "Start merging all the other work and then hotpatching so we can
+  just start running tests … 3 tests … Opus 5.5, codex 6.1 and deepseek."
+- **Branch `claude/integration-1003`** from this branch's tip, merged:
+  `codex/browser-model-contracts` (Browserbase sessions, task browser docks,
+  exact model selection, routing truth; clean merge), `main` (website),
+  `codex/storage-efficiency` (history preparation + backlog inventory; nothing
+  scheduled), and the relay readiness commit 004cfd7e7 cherry-picked (both
+  sides of `mobile-relay.ts` kept: the heartbeat watchdog and the registration
+  timeout + readiness check; 23/23 relay tests).
+- **Held back:** `codex/storage-efficiency-with-cadence` — it schedules the
+  history conversion on the owner's live 6.4 GB database; that plan awaits
+  the owner's go. The stray "Release v3.18.26" commit on the relay branch
+  (not the published tag) was not taken.
+- **Merge fixes (e11c866c6):** the cloud browser stylesheet loads at the
+  phone app's entry (node tests cannot load .css) and its stateful panel sits
+  beside the stateless Connections page — 348 phone tests.
+- **Checks:** three type-checks; 620 desktop, 348 phone, 525 merge-touched
+  server tests; no schema change (92).
+- **Installed:** wave 38 = e11c866c6 at 08:22Z (01:22 PT), dist + both web
+  dists identical. Live: the picker's Codex list is the sign-in's own catalog
+  (gpt-5.2-codex no longer offered); on the refused brain a fixture turn read
+  "GPT 5.2 Codex isn't available on this sign-in, so I couldn't answer. Pick
+  another model…" (blocked, not "Something went wrong").
+
+## Three brains, three tests (live, 10-03 ~01:25–01:45 PT)
+
+Owner-requested measurement on the installed app, live home, real chat
+ingress (`scripts/live-ab/run.mjs`, one fresh session per test, one pass).
+Brain switched through the app's own active-brain route; every brain call's
+served model verified per session in `model-route-metrics.db`; reviewer
+verdicts from `goal_alignment_judged`. Settings backed up first
+(`.env.bak-brain-ab-1003`); the brain is left on DeepSeek V4.1 Flash.
+
+| test | Opus 5.5 | GPT 6.1 Sol (Codex) | DeepSeek V4.1 Flash |
+|---|---|---|---|
+| one-sentence (no tools) | 1 round, 16.1k prompt, 5.8 s | 2 rounds (1 tool), 26.3k, 16.7 s | 1 round, 10.4k, 2.5 s |
+| heartbeats-read | 4 rounds, 6 tools, 86.0k (39.9k uncached), 20.8 s, pass | 10 rounds, 10 tools, 121.0k (111.5k uncached), 58.8 s, pass | 4 rounds, 6 tools, 69.2k (29.0k uncached), 13.0 s, pass |
+| file-write-read | 5 rounds, 95.7k (28.8k uncached), 21.2 s, pass; 1 argument repair | 4 rounds, 48.0k (43.8k uncached), 24.2 s, pass | 5 rounds, 69.9k (20.9k uncached), 8.1 s, pass; 1 argument repair |
+| **total** | 10 rounds, 197.8k prompt / 84.8k uncached, 47.8 s | 16 rounds, 195.4k / 177.4k uncached, 99.7 s | 10 rounds, 149.5k / 60.4k uncached, 23.6 s |
+
+- Every reply was correct; the reviewer (Claude Sonnet 5) passed every tool
+  turn. With Opus as the brain that reviewer is the same family — not an
+  independent review.
+- **Found by the measurement and fixed (10becea4d, wave 39):** GPT 6.1 Sol
+  refused the `none` reasoning effort used for simple turns on every turn,
+  and the new refusal text misread it as "isn't available on this sign-in".
+  Now the adapter learns the efforts a model takes from the provider's own
+  error, retries once at the nearest one and clamps later requests; an error
+  naming a request parameter is no longer read as a refused model. Its first
+  run (wave 38) is superseded by the rerun above.
+- One pass each (n=1); machine load 2.3–3.4 throughout.
+- Full suite on `10becea4d` (wave 39): stopped by the disk watchdog at ~8,700
+  of ~19,700 tests when free space fell under 3 GB (suite temp homes plus a
+  system `log` collection run); the app was never at risk. One real failure
+  before the stop: the JIT classification guard — the browser work moved
+  `browser_harness_run` to discoverable while the rubric still names it (the
+  browser branch fails it alone too). Classified as reachable on intent
+  (3e6903d6b, test-only, 78/78). A complete suite run is owed once the disk
+  has headroom.
+
+## "Open a browser" from the phone ended in a generic error (10-03 07:33 PT)
+
+- **Live:** sess-mob-bc99dc237345df65af2f525ae43ddde4 (brain GPT 6.1 Sol, the
+  owner's pick at 07:32): `browser_open` (local Chrome) failed in 5 s, then
+  the turn ended "I could not reopen the saved checkpoint…" —
+  `exact_checkpoint_admission_exhausted` after five `evidence_unavailable`
+  finalizations.
+- **Cause 1 (8c9332292):** Chrome 154 listens on 9222 but the DevTools
+  handshake hangs (consistent with Chrome asking on the Mac to allow remote
+  debugging); the 5 s `TimeoutError` had an empty message, so the receipt
+  could not prove nothing changed and the open read "uncertain". Now a 15 s
+  handshake and a failure in words ("Chrome did not accept the connection…
+  allow it in Chrome, then try again"); a message-less exception names itself,
+  so a no-change failure is proven no change.
+- **Cause 2 (c2d23b478, diagnosed on an APFS clone of the live DB):** the
+  runner (09-08 rule) shows the model a local write's own result even when its
+  effect is uncertain; the checkpoint treated every uncertain write as needing
+  the effect-unknown marker the runner never writes for a local one, so the
+  batch could never be saved. One shared rule now (`reconciliation-stop.ts`):
+  only an external write or an admin action stops the turn; a returned local
+  write with an uncertain effect checkpoints ready — no success handle, no
+  replay. New checkpoint test fails on the old code; 562 neighbouring tests.
+- **Browserbase:** in this build it drives its cloud browser over CDP through
+  Browserbase's own connect URL (no local Chrome); it is not configured on
+  this Mac (`configured:false`), and its own record says live/cloud
+  acceptance is still owed.
+- **Status:** wave 40 = c2d23b478 installed 07:51 PT (build-info serves it;
+  daemon, desk and phone bundles match the build). Owner retest from the
+  phone owed.
+
+## Browserbase set up, but "open a browser" still used local Chrome (10-03 08:30 PT)
+
+- **Live:** sess-desktop-49ef9f53e02ff150b0575b4f, after the owner saved
+  Browserbase credentials (status `configured:true`, key available). The
+  model searched the exact name `browser_open`, got only the local Chrome
+  tool, and opened it; Chrome refused (the wave 40 words came back, receipt
+  `effect: none`), and the turn still ended "The tool stopped after execution
+  may have begun…" (`tool_effect_uncertain`).
+- **Cause of the stop:** the local tool returned its typed non-write, but its
+  text is the browser receipt with `ok:false`; the settlement read that as a
+  returned failure of a mutation (`acknowledged=false` → `uncertain_write /
+  unacknowledged_mutation`), and the no-progress projection turns any
+  uncertain write into `reconcile`. Wave 40 fixed the checkpoint and the
+  runner's own flag, not this settlement step.
+- **Owner decision:** Browserbase is the browser; local Chrome is the fallback
+  (or hidden). Built as one browser per machine.
+- **Fix (08289da60):** each browser-driving tool declares `browserBackend`
+  (`local`: the typed operations + harness run/setup/status; `cloud`: every
+  `cloud_browser_*`). While a Browserbase project is set up (read from its
+  own store, no Keychain), only cloud tools are discoverable or runnable;
+  otherwise only local. A remembered local name refuses without starting
+  Chrome. Settlement: a local tool's typed non-write is the no-change proof,
+  so its `ok:false` text no longer makes it uncertain. Tests: new
+  browser-backend + browser-no-change-settlement (the settlement test fails
+  on the old code); 766 neighbouring tests and tsc clean.
+- **Not changed:** a genuinely uncertain local or cloud write (e.g. a
+  navigation that timed out mid-flight) still stops the turn through the
+  no-progress projection, which has no effect class to apply the shared rule;
+  follow-up.
+- **Status:** wave 41 = 08289da60 installed 08:48 PT (build-info serves it;
+  daemon, desk and phone bundles match; the installed build reads the live
+  Browserbase setup: cloud offered, local not). Owner retest owed.
+
+## The cloud browser started, and Browserbase refused the key (10-03 08:51 PT)
+
+- **Live:** sess-desktop-0f85a0625277beaa2315068c on wave 41: the model used
+  only cloud tools (`cloud_browser_resources`, then `cloud_browser_start`),
+  and the turn kept going after the failure, as designed. Browserbase answered
+  the session create with an error; the record went `uncertain /
+  provider_refused` and the model said retrying was not safe.
+- **Cause:** a read-only project check with the saved key returned 401
+  Unauthorized; the saved key is not in Browserbase's key format (it does not
+  begin `bb_live_`). The owner re-saved, but the save never landed (store
+  unchanged since the failed start): `configure` refuses while any record is
+  live, and the refused start had left one `uncertain` with no provider
+  session, which maintenance skips, so it would have blocked every future
+  save.
+- **Fix (7d08ccc73):** a 4xx from Browserbase is a refusal before any effect
+  (`credential_rejected` 401/403, `provider_limit` 402/429, else
+  `provider_refused`; 408 and 5xx stay uncertain), so a refused start is
+  `stopped`. Saving the connection first reads the project with the key: a
+  rejected key or missing project is never saved; an unreachable Browserbase
+  does not block the save. Only a record holding a provider session blocks a
+  connection change; a record with no session expires once the provider's
+  session timeout has passed. The model reads the refusal in words.
+- **Status:** wave 42 = 7d08ccc73 installed 09:02 PT (build-info serves it;
+  bundles match). The owner's key still needs re-entering
+  (Browserbase dashboard → Settings → API Keys).
+
+## The key worked; Clem refused Browserbase's regional connect URL (10-03 09:05 PT)
+
+- **Live:** sess-desktop-9eba5cc092ee9ac627590974 after the owner re-saved the
+  key (now accepted: project check 200, concurrency 3). `cloud_browser_start`
+  created session f770961d (RUNNING, keepAlive, us-west-2), but the record
+  went `uncertain / invalid_response` and the model said retrying was unsafe.
+- **Cause:** Browserbase's create reply carries
+  `wss://connect.usw2.browserbase.com/?signingKey=…` (regional host, signing
+  key, no `sessionId`). The client's create parser and the CDP connection both
+  required `connect.browserbase.com` with a `sessionId` parameter, so a
+  started session was read as an invalid response and left running with no
+  record of its id (it times out on its own at 16:35Z). Checked against
+  Browserbase's create-session reference and the live session's own GET.
+- **Fix (f7053d535):** one shared connect-URL rule
+  (`browserbase-connect-url.ts`): `wss`, `connect.browserbase.com` or
+  `connect.<region>.browserbase.com`, path `/`, bound by the matching
+  `sessionId` or a non-empty `signingKey`; any other host, path, credentials
+  or session is refused. The installed predecessor rejects the exact reply
+  shape; the new build accepts it. 788 neighbouring tests and tsc clean.
+- **Status:** wave 43 = f7053d535 installed 09:12 PT (build-info serves it;
+  bundles match). Owner retest owed.
+- **Follow-up:** when a create reply is rejected but names a valid session id,
+  keep the id so the session can be released instead of orphaned.
+
+## Every open browser in one place; hand a browser to Clem (10-03 09:20 PT)
+
+- **Owner ask:** a spot listing current open browsers, open and close them
+  from Clem, navigate to a page and have Clem use it or continue a session.
+  Decisions: the Browser chip opens it; all three of hand-a-browser-to-Clem,
+  keep sign-ins, and longer lifetimes, but still time out to save usage.
+- **Built (206a65bc1 server, 7dfea5462 UI; chip wrap fix 4532dd948 not installed):**
+  `GET cloud-browser/overview` lists every open browser across chats (chat
+  title, page, `idleClosesAt`, `endsAt`, `usesProfile`) plus running sessions
+  Clem started that no record holds (sessions are tagged
+  `userMetadata.createdBy=clementine`; another tool's session is never listed
+  or closed; Browserbase's list is asked at most every 20 s). `move` hands a
+  browser to another chat under a new control epoch (old views detached);
+  `unlinked/:id/adopt|close`. One open browser at a time holds a saved
+  Browserbase context (`persist: true`) so sign-ins carry over; a second
+  simultaneous browser starts without it (Browserbase warns two sessions on
+  one context can log each other out). Idle close 15 min, max 2 h; setups
+  saved with the earlier 5/30 min defaults load with these. Desktop and phone
+  panels: chip "Browsers · N open"; "Other open browsers" with Use in this
+  chat (moves it and gives Clem control), Open chat (desktop), Close; lost
+  browsers with Use in this chat / Close; this chat's browser shows when it
+  closes. 796 neighbouring tests, 39 app tests, both app builds and tsc clean.
+- **Installed:** wave 44 = 7dfea5462 at 09:33 PT; live overview answered
+  (limits 900/7200); desktop panel captured read-only with no page errors.
+  The chip label wrapped to two lines; fixed in source, ships next install.
+
+## The live view showed a blank tab; opening a site took 7 rounds (10-03 09:38 PT)
+
+- **Live:** sess-branch-148d251f43ec8d12c57ed427afc7286d033bbe91 "Can you
+  open Facebook in a browser" (GPT 6.1 Sol): success in 54 s. Browserbase
+  work took ~3 s; seven model rounds took the rest (tool_search twice, a
+  resources check the start description demanded, start, open, navigate,
+  answer). The panel named Facebook but the live view area was empty.
+- **Cause (probed with a short fixture browser, then stopped):** the live view
+  loads and connects, but without a target it shows the browser's first tab.
+  Clem opened a second tab and navigated that one, so the owner watched the
+  untouched blank first tab.
+- **Fix (2f74066c1):** the service keeps the page Clem last acted on
+  (`focusTargetId`), serves the live view of that page by default (first page
+  if it has closed), and both panels name it and swap the view when it
+  changes. `cloud_browser_start` rejoins this chat's open browser, returns
+  page handles, and takes an optional `url` opened in the first page in the
+  same call; `cloud_browser_open` says it is only for a second tab. 838
+  neighbouring and app tests, both app builds and tsc clean.
+- **Status:** wave 45 = 2f74066c1 (with the chip one-line fix) installed
+  09:49 PT; build-info serves it; bundles match. Owner retest owed.

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { getSecretStore } from '../runtime/secrets/index.js';
 import { invalidateCachedScan as invalidateCliScan, resolveSafeCliProbe } from '../runtime/cli-discovery.js';
 import { augmentPath } from '../runtime/spawn-env.js';
+import { observeBrowserConnection, type BrowserConnectionObservation } from './browser-operation.js';
 
 export const BROWSER_HARNESS_REPO_URL = 'https://github.com/browser-use/browser-harness';
 export const BROWSER_HARNESS_DIR = path.join(os.homedir(), 'Developer', 'browser-harness');
@@ -24,6 +25,7 @@ export interface CommandResult {
 
 export interface BrowserHarnessStatus {
   installed: boolean;
+  connection?: BrowserConnectionObservation;
   commandPath?: string;
   version?: string;
   installDir: string;
@@ -74,8 +76,8 @@ function extraPath(): string {
 
 /**
  * Where a learned per-site playbook lives. The harness reads this directory
- * itself when BH_DOMAIN_SKILLS is on, so a skill written here is loaded by the
- * harness on the NEXT visit without Clementine having to recall or replay it.
+ * explicitly through browser_skill_list and read_file. Upstream hints are
+ * filenames, not evidence of body consumption or verified execution.
  */
 export const BROWSER_HARNESS_DOMAIN_SKILLS_DIR = path.join(
   BROWSER_HARNESS_DIR,
@@ -238,6 +240,7 @@ export async function getBrowserHarnessStatus(): Promise<BrowserHarnessStatus> {
   }
   return {
     installed: Boolean(command),
+    connection: await observeBrowserConnection(),
     commandPath: safeCommand?.path ?? command,
     version: safeCommand && !safeCommand.skipped ? commandVersion(safeCommand.command, ['--version']) : undefined,
     installDir: BROWSER_HARNESS_DIR,
@@ -580,11 +583,10 @@ export function writeBrowserDomainSkill(input: {
   }
   try {
     mkdirSync(path.dirname(target), { recursive: true });
-    // Stamp provenance. The community playbooks carry a field-tested date, and
-    // a reader deserves to know whether a step was proven or merely proposed.
+    // Saving caller prose is not a proof of execution.
     const stamped = body.startsWith('#')
-      ? `${body}\n\n_Learned by Clementine from a verified run on ${new Date().toISOString().slice(0, 10)}._\n`
-      : `# ${site} — ${task.replace(/-/g, ' ')}\n\n${body}\n\n_Learned by Clementine from a verified run on ${new Date().toISOString().slice(0, 10)}._\n`;
+      ? `${body}\n\n_Proposed playbook saved by Clementine on ${new Date().toISOString().slice(0, 10)}. Execution has not been attested._\n`
+      : `# ${site} — ${task.replace(/-/g, ' ')}\n\n${body}\n\n_Proposed playbook saved by Clementine on ${new Date().toISOString().slice(0, 10)}. Execution has not been attested._\n`;
     writeFileSync(target, stamped, 'utf-8');
     return { ok: true, path: target };
   } catch (err) {

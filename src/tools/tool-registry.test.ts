@@ -267,11 +267,11 @@ test('JIT core surface: mandated members present, JIT-able tools absent', () => 
   // was indexed and warm, but sat at tier 'discoverable' — reachable only through a
   // tool_search she had no reason to run, because she believed the capability was
   // remote. Finding earlier sessions is a North Star faculty, not a niche intent.
-  for (const n of ['focus_get', 'focus_set', 'focus_update', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'session_search', 'notify_user', 'browser_harness_run', 'goal_upsert']) {
+  for (const n of ['focus_get', 'focus_set', 'focus_update', 'memory_recall', 'composio_search_tools', 'composio_execute_tool', 'run_batch', 'run_worker', 'tool_search', 'session_search', 'notify_user', 'goal_upsert']) {
     assert.ok(core.has(n), `JIT core must include mandated ${n}`);
   }
   // These are intent-evident / discoverable — they must stay JIT-able, not core.
-  for (const n of ['workflow_run', 'space_save', 'delegate_task', 'convert_to_markdown', 'add_cron_job', 'focus_activate', 'focus_clear', 'focus_park', 'focus_touch']) {
+  for (const n of ['workflow_run', 'space_save', 'delegate_task', 'convert_to_markdown', 'add_cron_job', 'focus_activate', 'focus_clear', 'focus_park', 'focus_touch', 'browser_harness_run', 'browser_open', 'browser_read', 'browser_tabs', 'browser_navigate']) {
     assert.ok(!core.has(n), `JIT core must NOT include the JIT-able tool ${n}`);
   }
 });

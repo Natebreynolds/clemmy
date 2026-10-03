@@ -1,0 +1,225 @@
+.m-browser-dock {
+  flex:none;
+  border-bottom:1px solid var(--bg-4);
+  background:var(--bg-0)}
+.m-browser-trigger {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  width:100%;
+  min-height:44px;
+  padding:8px 20px;
+  color:var(--fg);
+  font-size:13px;
+  font-weight:600}
+.m-browser-trigger span:last-child {
+  margin-left:auto;
+  color:var(--fg-2);
+  font-size:12px;
+  font-weight:400}
+.m-browser-layer {
+  position:fixed;
+  inset:0;
+  z-index:75;
+  display:flex;
+  flex-direction:column;
+  overflow:auto;
+  background:var(--bg-0);
+  padding-top:env(safe-area-inset-top);
+  padding-bottom:env(safe-area-inset-bottom)}
+.m-browser-layer header {
+  display:flex;
+  flex:none;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:12px 16px;
+  border-bottom:1px solid var(--bg-4);
+  font-size:12px;
+  color:var(--fg-2)}
+.m-browser-layer button,.m-browser-connection button {
+  min-height:44px;
+  border-radius:9px;
+  background:var(--bg-2);
+  color:var(--fg);
+  padding:9px 12px;
+  font-size:13px;
+  font-weight:600}
+.m-browser-layer button:active,.m-browser-connection button:active {
+  background:var(--bg-3)}
+.m-browser-layer button:disabled,.m-browser-connection button:disabled {
+  opacity:.5;
+  cursor:not-allowed}
+.m-browser-layer :is(button,input,select):focus-visible,.m-browser-connection :is(button,input):focus-visible,.m-browser-trigger:focus-visible {
+  outline:2px solid var(--accent);
+  outline-offset:2px}
+.m-browser-controls {
+  display:flex;
+  flex:none;
+  flex-wrap:wrap;
+  gap:8px;
+  padding:12px 16px}
+.m-browser-page {
+  padding:0 16px 12px;
+  font-size:13px;
+  color:var(--fg);
+  overflow-wrap:anywhere}
+.m-browser-page span {
+  display:block;
+  font-size:12px;
+  color:var(--fg-2)}
+.m-browser-view {
+  min-height:260px;
+  flex:1;
+  background:var(--bg-2);
+  display:flex;
+  align-items:center;
+  justify-content:center}
+.m-browser-view iframe {
+  width:100%;
+  height:100%;
+  min-height:320px;
+  border:0;
+  flex:1}
+.m-browser-view p {
+  max-width:30ch;
+  padding:24px;
+  text-align:center;
+  font-size:14px;
+  color:var(--fg-2)}
+.m-browser-empty {
+  padding:32px 20px;
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:16px}
+.m-browser-empty h2 {
+  font-size:20px;
+  font-weight:600}
+.m-browser-empty p,.m-browser-input p,.m-browser-note,.m-browser-connection p {
+  font-size:13px;
+  line-height:1.6;
+  color:var(--fg-2)}
+.m-browser-empty label {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:13px}
+.m-browser-note,.m-browser-notice {
+  padding:12px 16px}
+.m-browser-notice {
+  font-size:13px;
+  line-height:1.6;
+  background:var(--bg-2);
+  color:var(--fg)}
+.m-browser-select {
+  padding:12px 16px;
+  font-size:13px}
+.m-browser-layer select,.m-browser-layer input:not([type=checkbox]),.m-browser-connection input {
+  width:100%;
+  min-height:44px;
+  margin-top:5px;
+  border:1px solid var(--bg-4);
+  border-radius:9px;
+  background:var(--bg-0);
+  color:var(--fg);
+  padding:9px 12px;
+  font-size:16px}
+.m-browser-input {
+  padding:16px;
+  display:flex;
+  flex:none;
+  flex-direction:column;
+  gap:12px;
+  border-top:1px solid var(--bg-4)}
+.m-browser-input label,.m-browser-connection label {
+  font-size:13px;
+  color:var(--fg);
+  display:block}
+.m-browser-input>div {
+  display:flex;
+  gap:12px;
+  align-items:flex-end}
+.m-browser-input>div label {
+  flex:1}
+.m-browser-connection {
+  margin-top:16px;
+  padding:16px}
+.m-browser-connection-head {
+  display:flex;
+  gap:12px;
+  justify-content:space-between;
+  align-items:center}
+.m-browser-connection h2 {
+  font-size:16px;
+  font-weight:600}
+.m-browser-connection form {
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+  margin-top:16px}
+.m-browser-connection>p {
+  margin-top:12px}
+.m-browser-layer .m-browser-primary,.m-browser-connection .m-browser-primary {
+  background:var(--clem-primary);
+  color:var(--clem-primary-fg)}
+@media(prefers-reduced-motion:reduce) {
+  .m-browser-layer * {
+  scroll-behavior:auto}
+}
+
+
+.m-browser-frame {
+  display:flex;
+  flex:1;
+  align-self:stretch;
+  min-width:0;
+  min-height:0}
+
+.m-browser-recovery {
+  margin:12px 20px;
+  padding:12px 0;
+  border-top:1px solid var(--border,var(--bg-4));
+  font-size:13px;
+  line-height:1.6}
+
+.m-browser-recovery summary {
+  cursor:pointer;
+  font-weight:600}
+
+.m-browser-recovery p {
+  margin:10px 0;
+  color:var(--text-muted,var(--fg-2))}
+
+.m-browser-recovery label {
+  display:block;
+  margin:12px 0}
+
+.m-browser-recovery input {
+  display:block;
+  width:100%;
+  min-height:44px;
+  margin-top:5px;
+  padding:9px 12px;
+  border:1px solid var(--border,var(--bg-4));
+  border-radius:8px;
+  background:var(--bg-surface,var(--bg-0));
+  color:var(--text,var(--fg));
+  font-size:16px}
+
+
+.m-browser-close-views { margin: 0 16px 12px; align-self: flex-start; }
+
+.m-browser-new {display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:0 16px 16px}
+.m-browser-new label {display:flex;align-items:center;gap:8px;font-size:13px}
+
+/* Every other open browser on this Mac, each with what you can do with it. */
+.m-browser-others {border-top:1px solid var(--bg-4);padding:14px 16px 6px}
+.m-browser-others h3 {margin:0 0 8px;font-size:13px;font-weight:600;color:var(--fg-2)}
+.m-browser-others ul {margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:10px}
+.m-browser-others li {display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--bg-4);border-radius:12px}
+.m-browser-others li > div:first-child {display:flex;flex-direction:column;gap:2px;min-width:0}
+.m-browser-others strong {font-size:15px;font-weight:600;overflow-wrap:anywhere}
+.m-browser-others span {font-size:13px;color:var(--fg-2);overflow-wrap:anywhere}
+.m-browser-row-actions {display:flex;flex-wrap:wrap;gap:8px}
+.m-browser-row-actions button {min-height:44px}

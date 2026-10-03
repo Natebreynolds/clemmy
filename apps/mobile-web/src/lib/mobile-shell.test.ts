@@ -256,13 +256,13 @@ test('an agent pinned to a model: the chat chip names it, and a pick in the conv
   const sheet = read('../components/BrainSheet.tsx');
   const api = read('./api.ts');
   assert.match(api, /\/m\/api\/chat\/answering-model\?/, 'the phone asks the daemon what answers next');
-  assert.match(chat, /getAnsweringModel\(answeringSessionId, answeringAgentId\)/);
-  assert.match(chat, /modelDisplayName\(agentModel\?\.modelId \?\? brainLabel\)/, 'the chip names the agent\'s own model when it answers');
+  assert.match(chat, /getNextAnsweringModel\(answeringSessionId, answeringAgentId\)/);
+  assert.match(chat, /modelDisplayName\(brainLabel\)/, 'the chip names the scoped model using its catalog label');
   assert.match(chat, /answeringAgent=\{agentModel\}/);
   assert.match(chat, /beforeChange=\{\(\) => applyAgentChoice\(/);
-  assert.match(sheet, /await beforeChange\?\.\(\)[\s\S]{0,80}await setBrain\(value, sessionId\)/,
+  assert.match(sheet, /await beforeChange\?\.\(\)[\s\S]{0,180}await setBrain\(value, sessionId\)/,
     'a pending agent switch lands before the pick, so the pick is the later choice');
-  assert.match(sheet, /\{!answeringAgent && settings\.brain\.inactiveBinding/,
+  assert.match(sheet, /\{!answering && answeringModel === undefined && settings\.brain\.inactiveBinding/,
     'no "answers instead" note about the owner\'s model while the agent\'s own model answers');
 });
 

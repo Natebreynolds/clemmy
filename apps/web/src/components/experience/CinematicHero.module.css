@@ -1,0 +1,350 @@
+.chapter {
+  position: relative;
+  height: 210svh;
+  background: #24150f;
+  color: #fff9ee;
+}
+.stage {
+  position: sticky;
+  top: 0;
+  height: 100svh;
+  min-height: 680px;
+  overflow: hidden;
+  isolation: isolate;
+}
+.film,
+.handoffFilm {
+  position: absolute;
+  inset: 0;
+  z-index: -3;
+}
+.film img,
+.film video,
+.handoffFilm video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+  object-position: 63% 50%;
+}
+.videoLayer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.copyShade {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(71, 24, 12, 0.28), transparent 66%);
+  z-index: -2;
+}
+.introduction {
+  position: absolute;
+  left: 7%;
+  top: 22%;
+  max-width: 48%;
+}
+.introduction h1 {
+  font-size: clamp(100px, 10.6vw, 160px);
+  font-weight: 520;
+  line-height: 0.86;
+  letter-spacing: -0.04em;
+}
+.introduction h1 span {
+  font-weight: 600;
+}
+.introduction p {
+  font-size: clamp(16px, 1.3vw, 20px);
+  line-height: 1.7;
+  margin-top: 35px;
+  letter-spacing: -0.015em;
+  color: #fff3e3;
+}
+.actions {
+  display: flex;
+  gap: 26px;
+  align-items: center;
+  margin-top: 30px;
+}
+.actions > a:first-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 17px 21px;
+  background: #fff7e9;
+  color: #4b2516;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 650;
+  transition: background 0.2s;
+}
+.actions > a:first-child:hover {
+  background: #fff;
+}
+.actions > a:first-child > svg:last-child {
+  margin-left: 14px;
+}
+.explore {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid #f3bb997d;
+}
+.availability {
+  display: block;
+  font-size: 10px;
+  color: #fae1ca;
+  margin-top: 18px;
+}
+.footer {
+  position: absolute;
+  left: 4.5%;
+  right: 4.5%;
+  bottom: 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 25px;
+  font-size: 10px;
+  color: #ffe1c8;
+}
+.footer > span {
+  line-height: 1.8;
+}
+.footer strong {
+  font-weight: 450;
+  color: #fff9ee;
+}
+.footer > span:last-child {
+  text-align: right;
+}
+.footer > a {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  font-size: 11px;
+}
+.footer > a svg {
+  animation: invitation 2.8s ease-in-out infinite;
+}
+.static .footer > a svg,
+.paused .footer > a svg {
+  animation: none;
+}
+@keyframes invitation {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(6px);
+  }
+}
+@media (max-width: 1100px) {
+  .introduction {
+    left: 6%;
+    top: 23%;
+  }
+  .introduction h1 {
+    font-size: 120px;
+  }
+  .actions {
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  .film img,
+  .film video,
+  .handoffFilm video {
+    object-position: 60% 50%;
+  }
+}
+@media (max-width: 799px) {
+  .stage {
+    height: 100svh;
+    min-height: 0;
+  }
+  .film img,
+  .film video,
+  .handoffFilm video {
+    height: 58%;
+    top: 42%;
+    object-position: 78% 50%;
+    mask-image: linear-gradient(to bottom, transparent, #000 8%);
+  }
+  .copyShade {
+    background: linear-gradient(
+      180deg,
+      #963716 0%,
+      #ad421f 33%,
+      transparent 60%
+    );
+  }
+  .introduction {
+    top: clamp(92px, 12svh, 128px);
+    left: 7%;
+    max-width: 86%;
+  }
+  .introduction h1 {
+    font-size: clamp(48px, 15.7vw, 78px);
+    line-height: 0.98;
+    white-space: nowrap;
+  }
+  .introduction h1 br { display: none; }
+  .introduction h1 span { margin-left: 0.13em; }
+  .introduction p {
+    font-size: 16px;
+    line-height: 1.65;
+    margin-top: 18px;
+  }
+  .actions {
+    gap: 18px;
+    margin-top: 21px;
+    flex-wrap: wrap;
+  }
+  .actions > a:first-child {
+    font-size: 13px;
+    min-height: 48px;
+    padding: 14px 16px;
+    gap: 9px;
+  }
+  .actions > a:first-child > svg:last-child {
+    margin-left: 2px;
+  }
+  .explore {
+    font-size: 13px;
+    gap: 6px;
+    min-height: 44px;
+  }
+  .availability {
+    font-size: 13px;
+    margin-top: 14px;
+  }
+  .footer {
+    bottom: 25px;
+    left: 7%;
+    right: 7%;
+    color: #fff2df;
+  }
+  .footer > span {
+    display: none;
+  }
+  .footer > a {
+    width: 100%;
+    justify-content: space-between;
+    font-size: 13px;
+    border-top: 1px solid #f4c5a17a;
+    padding-top: 17px;
+  }
+}
+@media (max-width: 420px) {
+  .introduction {
+    top: clamp(88px, 12svh, 110px);
+  }
+  .introduction p {
+    font-size: 15px;
+  }
+  .actions {
+    gap: 12px;
+  }
+  .actions > a:first-child {
+    padding: 14px 12px;
+    font-size: 13px;
+  }
+  .explore {
+    font-size: 13px;
+  }
+  .film img,
+  .film video,
+  .handoffFilm video {
+    object-position: 79% 50%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .footer > a svg {
+    animation: none;
+  }
+  .actions > a:first-child {
+    transition: none;
+  }
+}
+
+/* The paper is the same HTML artifact and geometry as the journey's first frame. */
+.handoffFilm { pointer-events: none; }
+.paper {
+  position: absolute;
+  right: 7%;
+  bottom: 16%;
+  width: 320px;
+  padding: 22px 24px;
+  background: #f2e5cf;
+  color: #523521;
+  box-shadow: 12px 24px 50px #0f070a66;
+  transform-origin: center;
+  border-radius: 2px;
+  font-size: 11px;
+  pointer-events: none;
+  will-change: transform;
+}
+.paperBody::before {
+  content: "";
+  position: absolute;
+  width: 32px;
+  height: 4px;
+  border: 1px solid #8e6546;
+  border-radius: 8px;
+  top: 13px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.paperHeader { display: flex; align-items: center; gap: 9px; padding-bottom: 13px; margin-top: 9px; border-bottom: 1px solid #bea98d; font-size: 11px; }
+.paperHeader > span:last-child { margin-left: auto; font-size: 9px; color: #795c44; }
+.paperRequest { font-size: 17px; line-height: 1.4; letter-spacing: -.02em; margin-top: 17px; font-weight: 500; }
+.paperContext { display: grid; grid-template-columns: 56px 1fr; gap: 8px; line-height: 1.5; margin-top: 18px; }
+.paperContext > span { color: #876549; font-size: 9px; padding-top: 2px; }
+.paperContext p { font-size: 10px; line-height: 1.6; }
+.paperStatus { display: flex; gap: 8px; align-items: flex-start; border-top: 1px solid #bea98d; margin-top: 18px; padding-top: 12px; color: #805b39; font-size: 10px; line-height: 1.5; }
+.paperStatus svg { margin-top: 1px; flex-shrink: 0; }
+.static { height: auto; }
+.static .stage { position: relative; }
+.static .paper { display: none; }
+@media (min-width: 1600px) { .paper { right: 10%; width: 355px; bottom: 19%; } }
+@media (max-width: 1100px) { .paper { right: 5%; width: 285px; padding: 20px; } }
+@media (max-width: 799px) {
+  .paper { right: 7%; top: 66px; bottom: auto; width: 190px; padding: 13px 16px; }
+  .paperBody::before { top: 6px; width: 23px; height: 3px; }
+  .paperHeader { font-size: 8px; margin-top: 4px; padding-bottom: 8px; gap: 6px; }
+  .paperHeader > span:last-child { font-size: 7px; }
+  .paperHeader svg { width: 12px; }
+  .paperRequest { font-size: 12px; margin-top: 9px; }
+  .paperContext { display: none; }
+  .paperStatus { font-size: 8px; margin-top: 10px; padding-top: 8px; }
+  .paperStatus svg { width: 11px; height: 11px; }
+  .static .stage { height: max(640px, 100svh); }
+}
+@media (max-height: 740px) and (max-width: 799px) {
+  .paper { top: 48px; width: 150px; }
+  .paperStatus { display: none; }
+  .introduction { top: 86px; }
+  .introduction p { margin-top: 14px; }
+}
+@media(max-width:799px){
+  .handoffFilm video{top:var(--handoff-top,0%);height:var(--handoff-height,100%);object-position:var(--handoff-position,72% 50%);mask-image:none}
+}
+
+/* Match the compact paper at the entrance to the short-screen reading layout. */
+@media (min-width: 800px) and (max-height: 759px) {
+  .stage { height: 100svh; min-height: 0; }
+  .paper { right: 7%; top: 100px; bottom: auto; width: 250px; padding: 13px 16px; }
+  .paperBody::before { top: 6px; width: 23px; height: 3px; }
+  .paperHeader { font-size: 8px; margin-top: 4px; padding-bottom: 8px; gap: 6px; }
+  .paperHeader > span:last-child { font-size: 7px; }
+  .paperHeader svg { width: 12px; }
+  .paperRequest { font-size: 12px; margin-top: 9px; }
+  .paperContext { display: none; }
+  .paperStatus { display: flex; font-size: 8px; margin-top: 10px; padding-top: 8px; }
+  .paperStatus svg { width: 11px; height: 11px; }
+}

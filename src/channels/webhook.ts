@@ -1399,6 +1399,9 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         // The view response and iframe independently force authored HTML into
         // an opaque-origin sandbox. Still blocks ALL cross-origin framing.
         "frame-ancestors 'self'",
+        // First-party task browser uses only provider-minted Browserbase views.
+        // Authored HTML retains its own independent frame-src 'none' sandbox.
+        "frame-src 'self' https://www.browserbase.com https://browserbase.com",
         "object-src 'none'",
         // Allow remote app/toolkit logos (Composio CDN, etc.) to load. Loopback
         // Electron surface — images are inert; this just stops broken-logo icons.
@@ -3112,15 +3115,17 @@ export async function startWebhookServer(assistant: ClementineAssistant): Promis
         // The public TCP port is the relay endpoint's own port — DNS carries
         // only the name. Published to paired phones via GET /m/relay-info.
         const relayPublicPort = relayConfig.url.split(':')[1];
-        setMobileRelayRuntime({ origin: `https://${pairId}.${relayConfig.baseDomain}:${relayPublicPort}` });
-        startMobileRelayClient({
+        const relayOrigin = `https://${pairId}.${relayConfig.baseDomain}:${relayPublicPort}`;
+        const relayClient = startMobileRelayClient({
           config: relayConfig,
+          publicOrigin: relayOrigin,
           pairId,
           authToken: ensureRelayAuthToken(),
           localPort: relayListener.port,
           certPem: directApp.certPem,
           keyPem: directApp.keyPem,
         });
+        setMobileRelayRuntime({ origin: relayOrigin, status: relayClient.status, verify: () => relayClient.verify(relayOrigin) });
         logger.info({ relay: relayConfig.url, base: relayConfig.baseDomain }, 'Mobile relay tunnel starting');
       }
     } catch (err) {

@@ -20,6 +20,7 @@ import type {
   HostLocalWriteStorageAdapter,
 } from './implementation-artifacts/host-local-write-carrier.js';
 import type { AttestedTransportCall, AttestedTransportReconcileResult } from './implementation-artifacts/attested-transport.js';
+import type { BrowserOperationRunner } from '../../integrations/browser-operation.js';
 import {
   observeReviewedLocalTool,
   prepareReviewedLocalToolExecution,
@@ -106,10 +107,48 @@ const workspaceScriptStorage: HostLocalWriteStorageAdapter = Object.freeze({
   async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
 });
 
+export function createReviewedBrowserStorageAdapter(runner?: BrowserOperationRunner): HostLocalWriteStorageAdapter {
+  return Object.freeze({
+  async execute(call: AttestedTransportCall): Promise<unknown> {
+    const prepared = prepareReviewedLocalToolExecution(call);
+    if (prepared.adapter !== 'browser_operation_v1') throw new Error('Not a reviewed browser operation');
+    const { executeBrowserOperation, browserOperationProvesNoMutation } = await import('../../integrations/browser-operation.js');
+    const { currentToolAbortSignal } = await import('../tool-abort-context.js');
+    const result = await executeBrowserOperation(prepared.operation, prepared.args, { signal: currentToolAbortSignal(), runner });
+    // Preserve structured uncertainty rather than manufacture a successful effect receipt.
+    if (result.ok !== true) {
+      if (browserOperationProvesNoMutation(result)) {
+        const { hostPreDispatchRefusal } = await import('./host-pre-dispatch-refusal.js');
+        throw hostPreDispatchRefusal(JSON.stringify(result));
+      }
+      throw Object.assign(new Error(JSON.stringify(result)), { browserReceipt: result.receipt });
+    }
+    return result;
+  },
+  async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
+  });
+}
+const browserStorage = createReviewedBrowserStorageAdapter();
+
+export function createReviewedCloudBrowserStorageAdapter(execute?: (operation: import('../../tools/cloud-browser-contract.js').CloudBrowserOperationName, args: Record<string, unknown>) => Promise<unknown>): HostLocalWriteStorageAdapter {
+  return Object.freeze({
+    async execute(call: AttestedTransportCall): Promise<unknown> {
+      const prepared = prepareReviewedLocalToolExecution(call);
+      if (prepared.adapter !== 'cloud_browser_operation_v1') throw new Error('Not a reviewed cloud browser operation');
+      const run = execute ?? (await import('../../tools/cloud-browser-tools.js')).executeCloudBrowserTool;
+      return run(prepared.operation, prepared.args);
+    },
+    async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
+  });
+}
+const cloudBrowserStorage = createReviewedCloudBrowserStorageAdapter();
+
 export const reviewedLocalStorageCarrier: HostLocalWriteCarrier = Object.freeze({
   select(input: { operationId: string; accountId: string }) {
     if (input.accountId !== REVIEWED_LOCAL_ACCOUNT) return null;
     const observed = observeReviewedLocalTool(input.operationId);
+    if (observed?.execution.adapter === 'cloud_browser_operation_v1') return cloudBrowserStorage;
+    if (observed?.execution.adapter === 'browser_operation_v1') return browserStorage;
     if (observed?.execution.adapter === 'workspace_script_v1') return workspaceScriptStorage;
     if (observed?.execution.adapter === 'local_file_read_v1') return localFileReadStorage;
     if (observed?.execution.adapter === 'local_file_revision_v1') return localFileStorage;

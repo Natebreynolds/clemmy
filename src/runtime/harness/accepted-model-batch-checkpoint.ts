@@ -1,3 +1,4 @@
+import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { createHash } from 'node:crypto';
 import type { AgentInputItem } from '@openai/agents';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
@@ -953,21 +954,22 @@ function settledNonSuccessProjectionDisposition(input: {
   ]).has(settlement.outcome_kind);
   // A local write that RETURNED its own result is a known outcome: a command
   // that exited non-zero, a local tool that reported failure, a coordinator
-  // whose children failed. The host settled it and showed the model those exact
-  // bytes, because a local change is correctable in place; its effect may be
-  // partial, so it gets no success handle, no replay and no completion
+  // whose children failed — even one whose effect is uncertain (it may have
+  // partly happened). The host settled it and showed the model those exact
+  // bytes, because a local change is correctable in place
+  // (reconciliation-stop.ts, the same rule the runner applies); its effect
+  // may be partial, so it gets no success handle, no replay and no completion
   // authority. Checkpointing those bytes keeps the turn going instead of
-  // dead-ending on a checkpoint that could never be written. External and admin
-  // writes, uncertain writes, catalog-bound calls and anything marked for
-  // reconciliation stay closed.
+  // dead-ending on a checkpoint that could never be written. External and
+  // admin writes, catalog-bound calls and anything that crossed a provider
+  // stay closed.
   let returnedLocalWrite = false;
-  if (settlement.outcome_kind === 'unknown'
+  if ((settlement.outcome_kind === 'unknown' || settlement.outcome_kind === 'uncertain_write')
     && settlement.execution_kind === 'local_execution'
     && settlement.mutating === 1
     && settlement.physical_crossing_count === 0
     && settlement.host_crossing_count === 1
     && settlement.nonreturned_crossing_count === 0
-    && settlement.requires_reconciliation === 0
     && input.hostClass === null) {
     const bound = loadHostCallCapabilityBinding({
       db: input.db, sessionId: input.row.session_id,
@@ -976,9 +978,10 @@ function settledNonSuccessProjectionDisposition(input: {
     returnedLocalWrite = bound.status === 'ok'
       && bound.binding.acceptedTaskId === input.row.accepted_task_id
       && bound.binding.bindingKind === 'local_envelope'
-      && bound.binding.effect === 'local_write';
+      && bound.binding.effect === 'local_write'
+      && !uncertainEffectStopsTurn(bound.binding.effect);
   }
-  const reconciliationRequired = settlement.requires_reconciliation === 1
+  const reconciliationRequired = !returnedLocalWrite && (settlement.requires_reconciliation === 1
     || settlement.outcome_kind === 'uncertain_write'
     || (
       settlement.mutating === 1
@@ -986,7 +989,7 @@ function settledNonSuccessProjectionDisposition(input: {
         settlement.nonreturned_crossing_count > 0
         || (!mutatingSafeFailure && !returnedLocalWrite)
       )
-    );
+    ));
   if (reconciliationRequired) {
     return input.hostClass === 'effect_unknown'
       ? 'reconciliation_required'

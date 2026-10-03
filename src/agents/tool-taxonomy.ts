@@ -76,6 +76,7 @@ export interface ClassifyOptions {
  * split it into a read+confirm pair.
  */
 const ALWAYS_ADMIN = new Set<string>([
+  'browser_harness_setup',
   // Internal saved-code execution has opaque effects; a digest is not a read proof.
   'workspace_source_script',
   'create_tool',
@@ -481,6 +482,10 @@ function classifyComposioSlug(slug: string): ToolKind {
 /** Public — used by every tool family's `needsApproval` factory. */
 export function classifyTool(name: string, options: ClassifyOptions = {}): ToolKind {
   if (options.kindHint) return options.kindHint;
+  // Fixed Chrome observation is a read; arbitrary scripts keep their own effect.
+  if (isPlainOrClementineLocalTool(name, 'browser_tabs')
+    || isPlainOrClementineLocalTool(name, 'cloud_browser_tabs')
+    || isPlainOrClementineLocalTool(name, 'cloud_browser_resources')) return 'read';
 
   // This foreground host control persists a reviewed local plan artifact. Its
   // name is not a remote publication verb, and foreign namespace lookalikes

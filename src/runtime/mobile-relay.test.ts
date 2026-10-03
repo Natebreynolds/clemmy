@@ -122,6 +122,8 @@ test('relay E2E: pinned TLS passes through untouched; routes and IP survive; pai
     // Wait for the tunnel to register.
     for (let i = 0; i < 100 && !client.connected(); i++) await new Promise((r) => setTimeout(r, 50));
     assert.ok(client.connected(), 'tunnel must register with the relay');
+    assert.equal(client.status().state, 'connected');
+    assert.equal(client.status().verification.state, 'not-checked', 'registration must not imply a phone route was verified');
     assert.equal(relay.tunnelCount(), 1);
 
     // Phone leg: TLS through the relay, SNI = <pairId>.r.test.local.
@@ -403,5 +405,32 @@ test('a relay that never sends heartbeats is not treated as dead', async () => {
   } finally {
     client.stop();
     await relay.close();
+  }
+});
+
+test('a silent relay registration times out, reports the cause, and stop clears connected state', async () => {
+  const peers = new Set<net.Socket>();
+  const server = net.createServer((socket) => { peers.add(socket); socket.on('close', () => peers.delete(socket)); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const identity = ensureMobileTlsIdentity({ stateDir: path.join(TMP_ROOT, 'silent-registration') });
+  const client = startMobileRelayClient({
+    config: { url: `127.0.0.1:${(server.address() as net.AddressInfo).port}`, baseDomain: 'r.test.local', relayCertFp: identity.fingerprint },
+    pairId: relayPairId(identity.certPem), authToken: 'controlled-fixture-token', localPort: 1,
+    certPem: identity.certPem, keyPem: identity.keyPem, registrationTimeoutMs: 60,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  try {
+    const deadline = Date.now() + 2000;
+    while (client.status().state !== 'reconnecting' && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(client.status().reason, 'timeout');
+    assert.equal(client.status().state, 'reconnecting');
+    assert.equal(client.connected(), false);
+    client.stop();
+    assert.equal(client.status().state, 'stopped');
+    assert.equal(client.status().verification.state, 'not-checked');
+  } finally {
+    client.stop();
+    for (const peer of peers) peer.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });

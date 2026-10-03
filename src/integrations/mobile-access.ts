@@ -9,7 +9,7 @@ import os from 'node:os';
 import QRCode from 'qrcode';
 import { WEBHOOK_HOST, WEBHOOK_PORT } from '../config.js';
 import { getDirectAppRuntime } from '../runtime/mobile-ingress.js';
-import { getMobileRelayRuntime } from '../runtime/mobile-relay.js';
+import { getMobileRelayRuntime, getMobileRelayStatus, type MobileRelayStatus } from '../runtime/mobile-relay.js';
 import { createMobilePairingCode } from '../runtime/mobile-pairing.js';
 import { setPin, hasPin, readPinMeta } from '../runtime/mobile-pin.js';
 import {
@@ -163,6 +163,7 @@ export interface MobileAccessStatusPayload {
   pin: { configured: boolean; updatedAt?: string };
   sessions: Array<Pick<MobileSessionRecord, 'deviceId' | 'deviceLabel' | 'createdAt' | 'lastSeenAt' | 'expiresAt' | 'pushSubscribed'>>;
   webhookBound: { host: string; port: number };
+  relay?: MobileRelayStatus;
   target: MobileAccessTarget;
   targetUrl?: string;
   targetMode?: 'public' | 'local-preview';
@@ -184,6 +185,7 @@ export async function getMobileAccessStatusPayload(): Promise<MobileAccessStatus
   const payload: MobileAccessStatusPayload = {
     pin: { configured: hasPin(), updatedAt: pinMeta?.updatedAt },
     sessions,
+    relay: getMobileRelayStatus(),
     webhookBound: { host: WEBHOOK_HOST, port: WEBHOOK_PORT },
     target,
     targetUrl: target.url,

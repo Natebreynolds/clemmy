@@ -136,3 +136,31 @@ test('the Codex brain choices are the sign-in\'s own catalog once it is known', 
   discovery._setDiscoveredModelsForTest({ openai: [{ id: REFUSED, label: 'Fixture API-key only' }] });
   assert.ok(codexChoices().some((m) => m.id === REFUSED), 'without the sign-in\'s catalog the list is unchanged');
 });
+
+const EFFORT_REFUSAL = JSON.stringify({ error: {
+  message: "Unsupported value: 'none' is not supported with the 'gpt-9.9-fixture' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
+  type: 'invalid_request_error', param: 'reasoning.effort', code: 'unsupported_value',
+} });
+
+test('a refused request setting is not a refused model, even when the error names the model', () => {
+  assert.equal(refusal.refusedModelFromProviderResponse(400, EFFORT_REFUSAL, 'gpt-9.9-fixture'), undefined);
+  assert.deepEqual(refusal.supportedValuesForRejectedParam(EFFORT_REFUSAL, 'reasoning.effort'), ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(refusal.supportedValuesForRejectedParam(EFFORT_REFUSAL, 'temperature'), null);
+  assert.equal(refusal.refusedModelFromProviderResponse(404, JSON.stringify({ error: { message: 'The model `gpt-9.9-fixture` does not exist', param: 'model' } }), 'gpt-9.9-fixture'),
+    'gpt-9.9-fixture', 'an error about the model parameter is about the model');
+});
+
+test('a model that refused an effort is sent the nearest one it takes, and that refusal is retried once', async () => {
+  const observations = await import('./model-window-observations.js');
+  const codex = await import('./codex-model.js');
+  observations._resetModelWindowObservationCacheForTests();
+  assert.equal(observations.effectiveReasoningEffort('gpt-9.9-fixture', 'none'), 'none', 'nothing known: sent as asked');
+  observations.recordSupportedEfforts('gpt-9.9-fixture', ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(observations.effectiveReasoningEffort('gpt-9.9-fixture', 'none'), 'low', 'never less thinking than asked, the nearest accepted');
+  assert.equal(observations.effectiveReasoningEffort('gpt-9.9-fixture', 'medium'), 'medium');
+  assert.equal(observations.effectiveReasoningEffort('another-fixture', 'none'), 'none', 'learned per model');
+  const body = codex.buildCodexRequestBody('gpt-9.9-fixture', { input: 'hi', tools: [], handoffs: [], modelSettings: { reasoning: { effort: 'none' } } } as never);
+  assert.equal(body.reasoning?.effort, 'low');
+  assert.equal(codex.transparentCodexRetryBudget(new codex.CodexModelError('reshaped', 400, undefined, true)), 1);
+  assert.equal(codex.transparentCodexRetryBudget(new codex.CodexModelError('refused', 400, 'gpt-9.9-fixture')), 0, 'a refused model is not retried');
+});

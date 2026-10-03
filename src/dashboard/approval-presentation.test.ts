@@ -36,3 +36,17 @@ test('a direct composio call and a local tool present too; unknown shapes fall b
   assert.deepEqual(odd.details, [{ label: 'Details', value: 'plain text', long: false }]);
   assert.deepEqual(unwrapApprovalCall('work_call', { name: 'read_file', args_json: '{"path":"/p"}' }), { tool: 'read_file', args: { path: '/p' }, unwrapped: true });
 });
+
+test('a content fingerprint is left out of the card; one plain line says the version is locked', async () => {
+  const { detailLinesFor } = await import('./approval-presentation.js');
+  const lines = detailLinesFor({
+    workspaceId: 'fixture-workspace',
+    runner: 'refresh.mjs',
+    sourceDigest: '8a0e902258ec55766e93f65a892f9360f2d47681f290ea9415a2f149c0ffee01',
+    scriptSha256: 'sha256:02a43064b823687f3695a795ef82823169e36bee267e9aa49eb1afc0ffee0123',
+  });
+  assert.equal(lines.some((line) => /[0-9a-f]{32}/i.test(line.value)), false, 'no digest is shown');
+  assert.deepEqual(lines.map((line) => line.label), ['Workspace id', 'Runner', 'Version check']);
+  assert.equal(lines.at(-1)?.value, 'Locked to this exact version');
+  assert.equal(detailLinesFor({ message: 'Hello' }).some((line) => line.label === 'Version check'), false, 'only when something was left out');
+});

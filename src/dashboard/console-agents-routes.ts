@@ -10,7 +10,7 @@ import {
 } from '../agents/agent-record.js';
 import { listSubagentRunsForAgent } from '../agents/subagent-runs.js';
 import { setSessionAgent } from '../agents/session-agent.js';
-import { nextAnsweringAgentModel } from '../agents/session-agent-model.js';
+import { nextAnsweringModel } from '../agents/next-answering-model.js';
 import { listSessionsForAgent } from './sessions-api.js';
 import { listActiveSkills } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
@@ -145,7 +145,7 @@ export function registerConsoleAgentsRoutes(
       const rawSession = typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : '';
       const sessionId = rawSession.startsWith('harness:') ? rawSession.slice('harness:'.length) : rawSession;
       const agentId = typeof req.query.agentId === 'string' ? req.query.agentId.trim() || null : undefined;
-      res.json({ agent: nextAnsweringAgentModel(sessionId || null, agentId) });
+      res.json(nextAnsweringModel(sessionId || null, agentId));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
