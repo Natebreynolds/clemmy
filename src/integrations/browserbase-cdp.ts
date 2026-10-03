@@ -1,6 +1,7 @@
 import { WebSocket } from 'undici';
 import { z } from 'zod';
 import { BROWSER_HTTP_URL } from '../tools/browser-operation-contract.js';
+import { browserbaseConnectUrlFor } from './browserbase-connect-url.js';
 
 export type BrowserbaseOperation = 'tabs' | 'read' | 'open' | 'navigate' | 'click' | 'fill' | 'key';
 export type BrowserbaseEffect = 'none' | 'confirmed' | 'uncertain';
@@ -60,8 +61,7 @@ export class BrowserbaseCdpClient {
     const args = parseBrowserbaseOperation(operation, input);
     let endpoint: URL;
     try { endpoint = new URL(connectUrl); } catch { throw new BrowserbaseCdpError('connection_unavailable', 'none'); }
-    if (endpoint.protocol !== 'wss:' || endpoint.hostname !== 'connect.browserbase.com' || endpoint.username || endpoint.password
-      || endpoint.port || endpoint.hash || endpoint.pathname !== '/' || endpoint.searchParams.getAll('sessionId').length !== 1 || endpoint.searchParams.get('sessionId') !== providerSessionId) throw new BrowserbaseCdpError('connection_identity_changed', 'none');
+    if (!browserbaseConnectUrlFor(endpoint.href, providerSessionId)) throw new BrowserbaseCdpError('connection_identity_changed', 'none');
     if (options.signal?.aborted) throw new BrowserbaseCdpError('cancelled', 'none');
     let mutated = false, sequence = 0, closed = false, socket: BrowserbaseSocket;
     const pending = new Map<number, { resolve: (value: Record<string, any>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();

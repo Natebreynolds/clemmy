@@ -3,6 +3,8 @@
  * exact task/account/session binding; this client verifies provider identities.
  * API contracts: docs.browserbase.com/reference/api/{create-a-session,
  * get-a-session,update-a-session,session-live-urls}. No automatic retry. */
+import { browserbaseConnectUrlFor } from './browserbase-connect-url.js';
+
 export type BrowserbaseSessionStatus = 'PENDING' | 'RUNNING' | 'ERROR' | 'TIMED_OUT' | 'COMPLETED';
 export interface BrowserbaseSession {
   sessionId: string;
@@ -55,14 +57,9 @@ function date(value: unknown): string | undefined {
   return value;
 }
 function connectUrl(value: unknown, sessionId: string): string {
-  try {
-    if (typeof value !== 'string' || value.length > 16384) throw new Error();
-    const url = new URL(value);
-    if (url.protocol !== 'wss:' || url.hostname !== 'connect.browserbase.com' || (url.port && url.port !== '443')
-      || url.username || url.password || url.hash || url.pathname !== '/'
-      || url.searchParams.getAll('sessionId').length !== 1 || url.searchParams.get('sessionId') !== sessionId) throw new Error();
-    return url.href;
-  } catch { throw new BrowserbaseClientError('invalid_response', true); }
+  const url = browserbaseConnectUrlFor(value, sessionId);
+  if (!url) throw new BrowserbaseClientError('invalid_response', true);
+  return url;
 }
 function parseSession(value: unknown, projectId: string, sessionId?: string, requireConnect = false): BrowserbaseSession {
   const row = object(value);
