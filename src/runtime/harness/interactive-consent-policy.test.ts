@@ -387,3 +387,21 @@ test('a planning source probes a carrier-bounded call once without coverage and 
   assert.deepEqual(evaluateInteractiveConsentV1(input(bounded, { coverage: null })), { kind: 'repair', reason: 'coverage_missing' });
   assert.equal((evaluateInteractiveConsentV1(input(bounded)) as { basis?: string }).basis, 'exact_carrier_bounded_work');
 });
+
+
+test('an exact destructive, irreversible local change always asks the owner, in Auto and Ask, and never runs as a planning probe', () => {
+  // Live 10-02: a workflow delete the owner asked for now reaches consent;
+  // what consent does with it is this: one exact approval, nothing silent.
+  const deletion = call({
+    operationId: 'workflow_delete',
+    destination: { digest: digest('d'), posture: 'named_existing' },
+    risk: { reversibility: 'irreversible', consequence: 'delete', destructive: true },
+  });
+  for (const mode of [undefined, 'ask'] as const) {
+    const decided = evaluateInteractiveConsentV1(input(deletion, mode ? { mode } : {}));
+    assert.equal(decided.kind, 'needs_user', String(mode));
+    if (decided.kind === 'needs_user') assert.equal(decided.need, 'approval');
+  }
+  assert.equal(evaluateInteractiveConsentV1(input(deletion, { preparationProbe: true })).kind, 'refuse');
+  assert.equal(evaluateInteractiveConsentV1(input(deletion, { coverage: null })).kind, 'repair', 'never without exact accepted work');
+});

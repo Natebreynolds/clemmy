@@ -382,8 +382,10 @@ test('registry semantics admit reversible local writes generically and refuse un
   assert.deepEqual(undeclaredRuntimeDefault, { ok: false, reason: 'safe_mode_not_structural' },
     'a registry row cannot claim null equivalence unless the exact current schema admits null');
 
+  // Live 10-02: deleting a workflow had no door; it now enters local planning
+  // so consent can ask the owner (one exact card), never run on its own.
+  assert.equal(local.isRegistryDeclaredLocalPlanningMutation('workflow_delete'), true);
   for (const [name, reason] of [
-    ['workflow_delete', 'destructive'],
     ['mcp_add', 'not_local_write'],
     ['mcp_configure', 'not_local_write'],
     ['task_add', 'not_declared'],
@@ -393,6 +395,19 @@ test('registry semantics admit reversible local writes generically and refuse un
     assert.equal(refused.ok, false, name);
     if (!refused.ok) assert.equal(refused.reason, reason, name);
   }
+});
+
+test('deleting a workflow has a door, declared irreversible and destructive, so consent asks the owner for it', async () => {
+  // Live 10-02: "delete my workflow" had no door — coverage_missing and
+  // not_reachable three times, 22 model calls, no card the owner could answer.
+  const observed = await local.observeCurrentLocalPlanningDefinition({ name: 'workflow_delete', carrier: 'work_call' });
+  assert.equal(observed.ok, true, JSON.stringify(observed));
+  if (!observed.ok) return;
+  assert.equal(observed.definition.reversibility, 'irreversible');
+  assert.equal(observed.definition.destructive, true);
+  assert.match(observed.definition.capabilityRef, /^cap:local:workflow_delete:/);
+  // Unknown reversibility still has no door.
+  assert.equal(local.isRegistryDeclaredLocalPlanningMutation('mcp_configure'), false);
 });
 
 test('reviewed project reads enter local planning generically without widening arbitrary reads or shell', async () => {
@@ -605,7 +620,7 @@ test('schema, registry, and invented-ref drift cannot replay a local definition'
   }
 });
 
-test('exact tool_search rows disclose bounded durable local refs; destructive and external rows stay unchanged', async () => {
+test('exact tool_search rows disclose bounded durable local refs; a destructive row carries its own confirmed ref and external rows stay unchanged', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
   manifestStores.installCapabilityManifestStore(manifestStores.createCapabilityManifestStore());
@@ -674,8 +689,15 @@ test('exact tool_search rows disclose bounded durable local refs; destructive an
   //     a work_call carrier, and therefore has no door on this turn — it keeps
   //     the original status. Were it ever to resolve to call_tool this
   //     assertion would fail, which is the point.
+  // Live 10-02: deleting a workflow had no door. It is now disclosed with its
+  // own confirmed ref and declared destructive, so a plan can name it and
+  // consent asks the owner before it runs (interactive-consent-policy.test).
+  {
+    const body = await searchExact(run.planning, allowed, 'workflow_delete');
+    const row = body.results.find((entry) => entry.name === 'workflow_delete');
+    assert.equal(row?.capabilityRef ?? row?.capabilityVariants?.[0]?.capabilityRef, 'cap:local:workflow_delete:confirmed', JSON.stringify(row));
+  }
   const EXPECTED_REFUSAL = {
-    workflow_delete: 'not_plannable_destructive',
     mcp_add: 'unsupported_unmaterialized',
   } as const;
   for (const [name, expected] of Object.entries(EXPECTED_REFUSAL)) {
@@ -693,8 +715,8 @@ test('exact tool_search rows disclose bounded durable local refs; destructive an
       : []);
   assert.equal(
     durable.length,
-    POSITIVE_NAMES.length + 2,
-    'write_file contributes create, append, and overwrite rows under one configured name',
+    POSITIVE_NAMES.length + 3,
+    'write_file contributes create, append, and overwrite rows under one configured name; workflow_delete its confirmed row',
   );
   for (const [name, ref] of refs) {
     const row = durable.find((entry) => entry.capabilityRef === ref);

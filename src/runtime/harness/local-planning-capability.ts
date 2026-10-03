@@ -304,12 +304,21 @@ function declarationCanEnterLocalPlanningMutation(declaration: ToolDecl): boolea
     && (semantics[0]!.reversibility === 'reversible'
       || semantics[0]!.reversibility === 'create_only'
       || semantics[0]!.reversibility === 'ordinary_non_destructive');
+  // A destructive or irreversible local change with fully declared semantics
+  // enters too: entry is routing, not permission. Consent decides at the write
+  // boundary, and a destructive or irreversible call always asks the owner
+  // (interactive-consent-policy: high consequence → one exact approval card);
+  // a planning probe never runs it. Live 10-02: "delete my workflow" had no
+  // door at all — refused as coverage_missing and not_reachable three times,
+  // 22 model calls, no card, nothing the owner could approve.
+  const declaredDestructive = semantics.length === 1
+    && semantics[0]!.reversibility === 'irreversible';
   const exactVariants = semantics.length > 1
     && explicitVariantSemanticsAreClosed(declaration)
     && semantics.every((variant) => variant.reversibility !== 'unknown' && variant.safeMode !== undefined);
   return declaration.sideEffect === 'write'
     && declaration.runtimeEffect !== 'host_only'
-    && (legacySafe || exactVariants);
+    && (legacySafe || exactVariants || declaredDestructive);
 }
 
 function declarationCanEnterLocalPlanningRead(declaration: ToolDecl): boolean {
@@ -718,12 +727,16 @@ export function deriveLocalPlanningDefinitions(input: {
   if (hasExplicitVariants && !explicitVariantSemanticsAreClosed(input.declaration)) {
     return { ok: false, reason: 'safe_mode_not_structural' };
   }
+  // A single fully declared irreversible change (workflow_delete) is admitted
+  // like an explicit high-risk variant: its definition exists so consent can
+  // ask the owner for it (declarationCanEnterLocalPlanningMutation).
+  const declaredIrreversible = semantics.length === 1 && semantics[0]!.reversibility === 'irreversible';
   const definitions: AuthorizedLocalPlanningDefinitionV1[] = [];
   for (const variant of semantics) {
     const result = deriveLocalPlanningDefinitionForSemantics({
       ...input,
       semantics: variant,
-      allowHighRiskVariant: hasExplicitVariants,
+      allowHighRiskVariant: hasExplicitVariants || declaredIrreversible,
     });
     if (!result.ok) return result;
     definitions.push(result.definition);

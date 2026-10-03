@@ -35,9 +35,6 @@ const MODEL_LANES = new Set(['orchestrator', 'sdk-brain']);
 const DOORLESS_BY_DESIGN: Record<string, string> = {
   // host_only never crosses, so consent proceeds on `no_effect` — no coverage needed.
   workflow_capability_resolve: 'runtimeEffect host_only takes the no-effect path',
-  // Destructive + irreversible is refused by derive on purpose; deletion is a
-  // human-approved act, not ordinary accepted work.
-  workflow_delete: 'destructive and irreversible by declaration',
   // Operate on an ACTIVE RUN from inside it; the run's own authority governs
   // them, not a chat turn's local-planning capability.
   workflow_reshape: 'in-run authority (workflow-step lane), not a chat-turn door',
