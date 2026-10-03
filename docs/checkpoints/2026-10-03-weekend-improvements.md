@@ -178,6 +178,13 @@ Status words: **installed** = hotpatched into the owner's app and serving;
   (1.23 s against a 1 s bound), the nested catalog settlement pair (3 s host
   deadline) and `loop.test.ts` — passed alone at the same revision: 291/291.
 - The `40765e31b` suite was stopped deliberately (superseded); it has no result.
+- Full suite on `79733bdec` (wave 37, run niced with a disk watchdog while
+  another agent loaded the machine, load average 13–27): 19,592 passed,
+  3 failed, 1 file cancelled, 8 skipped. Alone at the same revision: the
+  store cross-process test, the SIGKILL checkpoint resume and
+  connection-execution-closure all pass; the nested catalog settlement pair
+  (3 s host deadline, 3.3 s even alone) failed once more under the same load
+  and then passed 4/4. No regression attributed.
 
 ## Plan from the review handoff
 
