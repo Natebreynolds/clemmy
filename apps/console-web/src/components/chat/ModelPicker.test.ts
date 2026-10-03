@@ -61,3 +61,19 @@ test('an agent pinned to a model: the chip names it on every composer, and a pic
     assert.match(read(site), /agentId=\{/, `${site} tells the chip which agent answers`);
   }
 });
+
+test('an approval card reads like a question card: Clem\'s question, why, the exact content, answers to tap; the owner\'s bubble reads their answer', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  const bubble = read('./ChatBubble.tsx');
+  assert.match(bubble, /const voicedApproval = message\.status === 'awaiting-approval' && !pendingAction\s*&& Boolean\(message\.approval\?\.preview\?\.ask\)/);
+  assert.match(bubble, /\{message\.approval!\.preview!\.ask\}/);
+  assert.match(bubble, /Exactly what happens/);
+  assert.match(bubble, /voicedApproval \? \(\s*<ApprovalAnswers/);
+  assert.match(bubble, /APPROVAL_ANSWER_WORDS\.approve/);
+  assert.match(bubble, /Before you say yes/);
+  for (const site of ['../../features/conversations/chat/ConversationThread.tsx', '../../screens/Chat.tsx', '../../screens/AgentWorkspace.tsx']) {
+    assert.match(read(site), /displayText: APPROVAL_ANSWER_WORDS\[decision\]/, `${site} shows the owner's answer, not "approve apr-…"`);
+  }
+  assert.match(read('../../lib/useChat.ts'), /text: input\.displayText\?\.trim\(\) \|\| text/);
+  assert.match(read('../../screens/Inbox.tsx'), /row\.presentation\?\.ask \|\| row\.presentation\?\.action/);
+});

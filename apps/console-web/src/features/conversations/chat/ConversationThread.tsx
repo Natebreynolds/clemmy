@@ -11,7 +11,7 @@ import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
 import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
 import { ConversationTasks } from '@/components/chat/ConversationTasks';
-import { agentThreadMarks, projectThreadMarks } from '@clem/chat-engine';
+import { agentThreadMarks, projectThreadMarks, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
 import { useConversationAgent } from '@/lib/conversation-agent';
 import { useConversationProject } from '@/lib/conversation-project';
 import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
@@ -136,7 +136,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
     if (intent.kind === 'approval-reply') {
       // An answer to a waiting card resumes that reply; a pending agent
       // switch waits for the next new message.
-      await chat.send({ text: intent.text, attachmentIds: [], attachmentNames: [] });
+      await chat.send({ text: intent.text, displayText: APPROVAL_ANSWER_WORDS[decision], attachmentIds: [], attachmentNames: [] });
       return;
     }
     await decidePlanProposal(intent.planProposalId, intent.decision);

@@ -556,7 +556,8 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
 
   if (item.kind === 'approval') {
     const row = item.row;
-    title = approvalQuestion(row.subject);
+    // Clem's own question when her checker wrote one.
+    title = row.presentation?.ask ?? approvalQuestion(row.subject);
     note = `${approvalKindLabel(row.tool)} · ${relativeTime(row.requestedAt)}${row.resourceFingerprint?.warning ? ` · ${row.resourceFingerprint.warning}` : ''}`;
     actions = (
       <>

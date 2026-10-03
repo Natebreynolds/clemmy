@@ -53,6 +53,7 @@ import {
   workflowCardLevels,
   workflowCards,
   type WorkflowCardData,
+  APPROVAL_ANSWER_WORDS,
 } from '@clem/chat-engine';
 import {
   answerModelRuleOffer,
@@ -802,17 +803,27 @@ function MessageRow({
 
   if (message.approval) {
     const approvalId = message.approval.approvalId;
+    // Clem's own question, when her checker wrote one: the card reads like a
+    // question card — her words, why, the exact content, answers to tap.
+    const ask = message.approval.preview?.ask && !message.approval.preview.items ? message.approval.preview.ask : null;
     return (
-      <div class="turn turn-approval">
-        <div class="approval-head">{message.approval.preview?.items ? `Review ${message.approval.preview.items.length} actions` : `Waiting on you — ${message.approval.subject}`}</div>
-        {message.approval.reason ? <div class="approval-reason">{message.approval.reason}</div> : null}
+      <div class={`turn turn-approval${ask ? ' is-voiced' : ''}`}>
+        {ask ? (
+          <>
+            <div class="approval-ask">{ask}</div>
+            {message.approval.preview?.why ? <div class="approval-reason">{message.approval.preview.why}</div> : null}
+          </>
+        ) : (
+          <div class="approval-head">{message.approval.preview?.items ? `Review ${message.approval.preview.items.length} actions` : `Waiting on you — ${message.approval.subject}`}</div>
+        )}
+        {message.approval.reason && !ask ? <div class="approval-reason">{message.approval.reason}</div> : null}
         {message.approval.preview?.check?.status === 'conflicts' && message.approval.preview.check.conflicts?.length ? (
           <div class="approval-check approval-check-warn" role="note">
-            <div class="approval-check-title">Before you approve</div>
+            <div class="approval-check-title">Before you say yes</div>
             <ul>
               {message.approval.preview.check.conflicts.map((line) => <li key={line}>{line}</li>)}
             </ul>
-            <div class="approval-check-hint">Reply with a change, or approve it as it is.</div>
+            <div class="approval-check-hint">Reply with a change, or say yes as it is.</div>
           </div>
         ) : message.approval.preview?.check ? (
           <div class="approval-check">
@@ -820,6 +831,9 @@ function MessageRow({
               ? 'Checked against your standing rules — no conflicts.'
               : 'Couldn’t check this against your standing rules.'}
           </div>
+        ) : null}
+        {ask && message.approval.preview && message.approval.preview.fields.length > 0 ? (
+          <div class="approval-exact-label">Exactly what happens</div>
         ) : null}
         {message.approval.preview && !message.approval.preview.items && message.approval.preview.fields.length > 0 ? (
           // What approving would actually send, from the host's frozen call.
@@ -837,7 +851,19 @@ function MessageRow({
           </dl>
         ) : null}
         {message.approval.preview?.items && <ApprovalReview preview={message.approval.preview} />}
-        {approvalId && !approvalDecided ? (
+        {approvalId && !approvalDecided && ask ? (
+          <div class="answer-choices" role="group" aria-label="Your answer">
+            <button type="button" class="answer-choice" disabled={approvalActing !== null}
+              onClick={() => onApprovalAction(approvalId, 'approve')}>
+              {approvalActing === approvalId ? '…' : APPROVAL_ANSWER_WORDS.approve.replace(/\.$/, '')}
+            </button>
+            <button type="button" class="answer-choice" disabled={approvalActing !== null}
+              onClick={() => onApprovalAction(approvalId, 'reject')}>
+              {APPROVAL_ANSWER_WORDS.reject.replace(/\.$/, '')}
+            </button>
+            <div class="approval-check-hint">Or reply below to change it.</div>
+          </div>
+        ) : approvalId && !approvalDecided ? (
           <div class="plan-actions">
             <button
               class="approve"

@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { answerDraftStatus, renderMarkdown } from '@clem/chat-engine';
+import { answerDraftStatus, renderMarkdown, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -38,11 +38,11 @@ function ApprovalCheckNote({ check }: {
   if (check.status === 'conflicts' && check.conflicts?.length) {
     return (
       <div className="mt-2 rounded-md border border-warning bg-warning-tint px-2.5 py-2 text-caption" role="note">
-        <p className="font-semibold text-warning">Before you approve</p>
+        <p className="font-semibold text-warning">Before you say yes</p>
         <ul className="mt-1 list-disc space-y-0.5 pl-4 text-fg">
           {check.conflicts.map((line) => <li key={line}>{line}</li>)}
         </ul>
-        <p className="mt-1 text-muted">Reply with a change, or approve it as it is.</p>
+        <p className="mt-1 text-muted">Reply below with a change, or say yes as it is.</p>
       </div>
     );
   }
@@ -163,6 +163,38 @@ function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (te
         ))}
       </div>
       {error && <p role="alert" className="text-caption text-danger">{error}</p>}
+    </div>
+  );
+}
+
+/** An approval card's answers, in the question card's style: one tap, the
+ *  answer latches, and the owner's bubble reads the same words. Writing a
+ *  change below stays open. */
+function ApprovalAnswers({ chosen, disabled, onAnswer, onLater }: {
+  chosen: 'approve' | 'reject' | null;
+  disabled: boolean;
+  onAnswer: (decision: 'approve' | 'reject') => void;
+  onLater: () => void;
+}) {
+  const answer = (pressed: boolean) => cn(
+    'rounded-md border px-3.5 py-2 text-left text-small font-semibold transition-colors duration-fast active:scale-press',
+    pressed ? 'border-primary bg-primary-tint text-fg'
+      : 'border-border-strong bg-surface text-fg hover:border-primary hover:bg-primary-tint disabled:opacity-50',
+  );
+  return (
+    <div className="mt-3 flex flex-col gap-1.5">
+      <div role="group" aria-label="Your answer" className="flex flex-wrap gap-2">
+        <button type="button" className={answer(chosen === 'approve')} aria-pressed={chosen === 'approve'} disabled={disabled} onClick={() => onAnswer('approve')}>
+          {APPROVAL_ANSWER_WORDS.approve.replace(/\.$/, '')}
+        </button>
+        <button type="button" className={answer(chosen === 'reject')} aria-pressed={chosen === 'reject'} disabled={disabled} onClick={() => onAnswer('reject')}>
+          {APPROVAL_ANSWER_WORDS.reject.replace(/\.$/, '')}
+        </button>
+        <button type="button" className={answer(false)} disabled={disabled} onClick={onLater}>
+          Not now
+        </button>
+      </div>
+      <p className="text-caption text-muted">Or reply below to change it.</p>
     </div>
   );
 }
@@ -368,6 +400,10 @@ export function ChatBubble({
   // A decision needs somewhere to go. Without both handlers this thread is a
   // replay, and the card is a record rather than a control.
   const canDecide = Boolean(onApprove && onReject);
+  // A plain approval the checker wrote in Clem's words reads like a question
+  // card: her question, why, the exact content, and answers to tap.
+  const voicedApproval = message.status === 'awaiting-approval' && !pendingAction
+    && Boolean(message.approval?.preview?.ask) && !message.approval?.preview?.items;
   const stoppedPlaceholder = message.status === 'stopped' && message.text.trim() === STOPPED_PLACEHOLDER;
   // THE PLAN CARD IS THE REPLY.
   //
@@ -428,7 +464,15 @@ export function ChatBubble({
           )}
 
         {((message.status === 'awaiting-approval' && message.approval) || message.status === 'awaiting-plan') && (
-          <div className="rounded-md border border-warning/40 bg-warning-tint p-3">
+          <div className={cn('rounded-md border p-3', voicedApproval ? 'border-border bg-surface' : 'border-warning/40 bg-warning-tint')}>
+            {voicedApproval ? (
+              // Clem asks in her own words, like a question card (the checker
+              // wrote them from the exact call); the content below is exact.
+              <>
+                <p className="text-body text-fg">{message.approval!.preview!.ask}</p>
+                {message.approval!.preview!.why && <p className="mt-1 text-small text-muted">{message.approval!.preview!.why}</p>}
+              </>
+            ) : (
             <p className="text-small font-semibold text-fg">
               {message.status === 'awaiting-plan'
                 ? 'Approve this plan to continue?'
@@ -437,6 +481,7 @@ export function ChatBubble({
                   : message.approval?.preview?.items ? `Review ${message.approval.preview.items.length} actions`
                     : `Approve: ${message.approval?.subject ?? 'this action'}`}
             </p>
+            )}
             {pendingAction && (
               <div className="mt-1 space-y-0.5 text-caption text-muted">
                 <div>Tool: <span className="font-mono">{pendingAction.toolName}</span></div>
@@ -447,7 +492,7 @@ export function ChatBubble({
                 {pendingAction.payloadHash && <div>Payload hash: <span className="font-mono">{pendingAction.payloadHash}</span></div>}
               </div>
             )}
-            {message.approval?.reason && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
+            {message.approval?.reason && !voicedApproval && <p className="mt-0.5 text-caption text-muted">{message.approval.reason}</p>}
             {!pendingAction && message.approval?.preview?.check && (
               <ApprovalCheckNote check={message.approval.preview.check} />
             )}
@@ -455,6 +500,8 @@ export function ChatBubble({
               // What approving would actually send: each argument the tool
               // receives, from the host's frozen call, so the owner never
               // approves on an operation's name alone.
+              <>
+              {voicedApproval && <p className="mt-2.5 text-caption font-semibold uppercase tracking-wide text-faint">Exactly what happens</p>}
               <dl className="mt-2 space-y-1.5 text-caption">
                 {message.approval.preview.fields.map((field) => (
                   <div key={field.name}>
@@ -467,6 +514,7 @@ export function ChatBubble({
                   </div>
                 ))}
               </dl>
+              </>
             )}
             {!pendingAction && message.approval?.preview?.items && <ApprovalReview preview={message.approval.preview} />}
             {pendingAction && <PayloadPreview value={pendingAction.payload} />}
@@ -498,6 +546,13 @@ export function ChatBubble({
                   Decide now
                 </button>
               </p>
+            ) : voicedApproval ? (
+              <ApprovalAnswers
+                chosen={resolvedDecision ?? decisionBusy}
+                disabled={resolved || decisionBusy !== null}
+                onAnswer={(decision) => { void resolvePlainDecision(decision); }}
+                onLater={() => { void setAsideForLater(); }}
+              />
             ) : (
             <div className="mt-2.5 flex items-center gap-2">
               <Button

@@ -1003,7 +1003,8 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
   const [changeNote, setChangeNote] = useState('');
   const isWorkflowGate = row.tool === 'workflow_approval_gate';
   const summary = queued?.summary || row.summary;
-  const title = queued?.title || row.presentation?.action || row.subject;
+  // Clem's own question when her checker wrote one; never an operation id.
+  const title = queued?.title || row.presentation?.ask || row.presentation?.action || row.subject;
   return (
     <DecisionFrame view={view} title={title} onBack={onBack} notice={decisionState?.notice ?? null}
       aside={project ? <ProjectLabelTag label={project} link /> : undefined}

@@ -265,3 +265,13 @@ test('an agent pinned to a model: the chat chip names it, and a pick in the conv
   assert.match(sheet, /\{!answeringAgent && settings\.brain\.inactiveBinding/,
     'no "answers instead" note about the owner\'s model while the agent\'s own model answers');
 });
+
+test('the phone\'s approval card reads like a question card and Needs you is titled with Clem\'s question', () => {
+  const chat = read('../screens/Chat.tsx');
+  assert.match(chat, /const ask = message\.approval\.preview\?\.ask && !message\.approval\.preview\.items/);
+  assert.match(chat, /<div class="approval-ask">\{ask\}<\/div>/);
+  assert.match(chat, /approvalId && !approvalDecided && ask \? \(\s*<div class="answer-choices"/);
+  assert.match(chat, /APPROVAL_ANSWER_WORDS\.approve/);
+  assert.match(read('../screens/Home.tsx'), /title = row\.presentation\?\.ask \?\? approvalQuestion\(row\.subject\)/);
+  assert.match(read('../components/Approvals.tsx'), /row\.presentation\?\.ask \?\? approvalQuestion\(row\.subject\)/);
+});

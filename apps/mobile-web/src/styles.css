@@ -1460,6 +1460,9 @@ input, textarea, select { font: inherit; font-size: 16px; }
   margin-bottom: var(--sp-4);
 }
 .approval-head { font-size: var(--t-sm); font-weight: 600; color: var(--fg); }
+/* Clem asking in her own words, like a question card. */
+.approval-ask { font-size: var(--t-body); line-height: 1.45; color: var(--fg); }
+.approval-exact-label { margin-top: var(--sp-3); font-size: var(--t-xs); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-3); }
 .approval-reason { color: var(--fg-2); font-size: var(--t-sm); margin-top: 4px; }
 /* What approving would send: each argument the tool receives. */
 .approval-preview { margin: 8px 0 0; font-size: var(--t-sm); }

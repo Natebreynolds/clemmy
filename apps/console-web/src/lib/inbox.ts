@@ -20,6 +20,8 @@ export interface ApprovalRow {
    * own fields — never the carrier envelope. */
   presentation?: {
     action: string;
+    /** Clem's own question for the card, when her checker wrote one. */
+    ask?: string;
     app?: string;
     operation?: string;
     details: Array<{ label: string; value: string; long: boolean }>;

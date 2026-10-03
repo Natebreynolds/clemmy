@@ -1636,7 +1636,7 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string } }, retryRequest?: PendingChatPost) => {
+  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string } }, retryRequest?: PendingChatPost) => {
     if (busy && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
     const taskMode = snapshotTaskMode(input.connectionResume ? undefined : input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
@@ -1695,7 +1695,9 @@ export function useChat(options?: UseChatOptions) {
     activeAssistantId.current = assistantId;
     setMessages((prev) => [
       ...prev,
-      { id: userId, role: 'user', text, attachmentNames: input.attachmentNames, taskMode,
+      // The owner's bubble reads their own words (a card answer reads "Yes,
+      // go ahead."); `text` still travels to the host exactly.
+      { id: userId, role: 'user', text: input.displayText?.trim() || text, attachmentNames: input.attachmentNames, taskMode,
         ...(input.agentName !== undefined ? { agentName: input.agentName } : {}),
         ...(input.projectName !== undefined ? { projectName: input.projectName } : {}) },
       { id: assistantId, role: 'assistant', text: '', status: 'thinking', startedAt: Date.now(), taskMode, progress: taskMode?.kind === 'plan' ? 'Investigating with read-only tools…' : 'Starting up…' },
