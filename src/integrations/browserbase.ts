@@ -27,6 +27,7 @@ export interface BrowserbaseOpenBrowser extends BrowserbaseResource {
 }
 /** A running session Clem started that no open browser record holds. */
 export interface BrowserbaseUnlinkedSession { providerSessionId: string; createdAt?: string; expiresAt?: string }
+export type BrowserbaseCloseUnlinkedResult = { closed: true; status: 'closed' } | { closed: false; status: 'releasing' | 'unknown' };
 export interface BrowserbaseOverview { browsers: BrowserbaseOpenBrowser[]; unlinked: BrowserbaseUnlinkedSession[]; unlinkedChecked: boolean }
 export interface BrowserbaseOperationReceipt {
   version: 1; kind: 'browserbase_dispatch_receipt'; resourceId: string; provider: 'browserbase'; providerSessionId: string;
@@ -376,19 +377,33 @@ export class BrowserbaseService {
   }
   /** Closes a running session Clem started that no open record holds. A
    *  session another tool started in the project is never touched. */
-  async closeUnlinked(providerSessionId: string): Promise<{ closed: boolean }> {
-    return this.serial('configuration', async () => {
+  async closeUnlinked(providerSessionId: string): Promise<BrowserbaseCloseUnlinkedResult> {
+    return this.serial<BrowserbaseCloseUnlinkedResult>('configuration', async () => {
       if (!UUID.test(providerSessionId)) throw new BrowserbaseServiceError('invalid_arguments');
       const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
       if (this.store.resources.some(value => nonterminal(value) && value.providerSessionId === providerSessionId)) throw new BrowserbaseServiceError('session_already_owned');
       const { api } = await this.api();
       if (!api.listRunning) throw new BrowserbaseServiceError('browser_service_unavailable');
       const running = (await api.listRunning(policy.projectId)).find(session => session.sessionId === providerSessionId);
-      if (!running) return { closed: true };
-      if (!running.startedByClem) throw new BrowserbaseServiceError('session_not_started_by_clem');
+      if (running && running.projectId !== policy.projectId) throw new BrowserbaseServiceError('provider_identity_changed');
+      if (running && !running.startedByClem) throw new BrowserbaseServiceError('session_not_started_by_clem');
       this.running = undefined;
-      await api.release(providerSessionId, policy.projectId);
-      return { closed: true };
+      let releaseAcknowledged = false;
+      if (running) {
+        try { await api.release(providerSessionId, policy.projectId); releaseAcknowledged = true; }
+        catch (error) {
+          const failed = this.serviceError(error, 'uncertain');
+          if (failed.effect === 'none') throw failed;
+        }
+      }
+      // Neither absence from RUNNING nor a release acknowledgment proves the
+      // browser ended. Only an exact terminal observation can confirm closure.
+      try {
+        const observed = await api.retrieve(providerSessionId, policy.projectId);
+        if (observed.sessionId !== providerSessionId || observed.projectId !== policy.projectId) return { closed: false, status: 'unknown' };
+        if (['COMPLETED', 'ERROR', 'TIMED_OUT'].includes(observed.status)) return { closed: true, status: 'closed' };
+        return { closed: false, status: releaseAcknowledged ? 'releasing' : 'unknown' };
+      } catch { return { closed: false, status: 'unknown' }; }
     }).catch(error => { throw this.serviceError(error); });
   }
   async get(id: string, conversationId: string): Promise<BrowserbaseResource> {

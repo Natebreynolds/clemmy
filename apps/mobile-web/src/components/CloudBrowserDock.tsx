@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { flushSync } from 'preact/compat';
-import { browserClosesText, browserElapsed, browserFocusPage, browserBoundInputAllowed, browserLiveUrl, browserResourceKey, browserStopMessage, browsersChipLabel, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserOpenBrowser, type CloudBrowserOverview, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserUnlinkedSession, type CloudBrowserView } from '@clem/chat-engine';
+import { browserClosesText, browserElapsed, browserFocusPage, browserBoundInputAllowed, browserViewTarget, browserCloseResultMessage, startBrowserViewLifecycle, browserResourceKey, browserStopMessage, browsersChipLabel, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserOpenBrowser, type CloudBrowserOverview, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserUnlinkedSession, type BrowserViewLifecycle, type CloudBrowserView } from '@clem/chat-engine';
 import { cloudBrowser } from '../lib/cloud-browser';
 const Globe = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" /></svg>;
 export function CloudBrowserDock({ conversationId }: { conversationId?: string }) {
@@ -21,7 +21,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
   const [viewTick, setViewTick] = useState(0); const [targetId, setTargetId] = useState(''); const [text, setText] = useState(''); const [key, setKey] = useState('Enter');
   const frame = useRef<HTMLIFrameElement>(null); const returnButton = useRef<HTMLButtonElement>(null); const trigger = useRef<HTMLButtonElement>(null);
   const leases = useRef(createBrowserViewerLeases(cloudBrowser));
-  const viewGeneration = useRef(0);
+  const lifecycle = useRef<BrowserViewLifecycle | null>(null);
   const requestId = useRef<string | null>(null); const mounted = useRef(true); const generation = useRef(0);
   const resource = resources.find((item) => item.id === selectedId) ?? resources[0] ?? null;
   const current = useRef(resource); current.current = resource;
@@ -38,7 +38,10 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
   useEffect(() => { mounted.current = true; void refresh(); const timer = window.setInterval(() => { if (!document.hidden) void refresh(); }, 5000); return () => { mounted.current = false; generation.current++; window.clearInterval(timer); }; }, [refresh]);
   const resourceKey = resource ? browserResourceKey(resource) : '';
   // Without a chosen page, the view follows the page Clem is on.
-  const viewKey = JSON.stringify([resourceKey, targetId || resource?.focusTargetId || null, viewTick]);
+  const viewTarget = resource ? browserViewTarget(resource, targetId || undefined) : undefined;
+  const viewKey = JSON.stringify([resourceKey, viewTarget ?? null, viewTick]);
+  const viewContext = useRef({ key: viewKey, open, visible, busy });
+  viewContext.current = { key: viewKey, open, visible, busy };
   useEffect(() => {
     if (!visible || !open || !resource || resource.state !== 'active' || resource.returnPending) return;
     const requested = resource;
@@ -52,29 +55,41 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
   useEffect(() => { setTargetId(''); setText(''); }, [resource?.id, resource?.controlVersion]);
   useEffect(() => { if (open) returnButton.current?.focus(); }, [open]);
   useEffect(() => {
-    setView(null); const attempt = ++viewGeneration.current; if (!visible || !open || !resource || resource.state !== 'active' || resource.returnPending) return;
-    let cancelled = false;
-    const requested = resource;
-    const viewerLeaseId = crypto.randomUUID();
-    leases.current.remember(requested, { viewerLeaseId });
-    cloudBrowser.view(resource, targetId || undefined, viewerLeaseId).then((result) => {
-      const url = browserLiveUrl(result.url);
-      if (cancelled || attempt !== viewGeneration.current || !mounted.current || !current.current || browserResourceKey(current.current) !== resourceKey) { void leases.current.detach(viewerLeaseId).catch(() => {}); return; }
-      if (!url || result.viewerLeaseId !== viewerLeaseId || result.controlVersion !== requested.controlVersion || !Number.isFinite(Date.parse(result.expiresAt)) || Date.parse(result.expiresAt) <= Date.now() || (targetId && result.targetId !== targetId)) { setNotice('The selected page view could not be verified. Text entry stays off; refresh or choose another page.'); void leases.current.detach(viewerLeaseId).catch(() => {}); return; }
-      setView({ ...result, key: viewKey, url });
-    }).catch(() => { void leases.current.detach(viewerLeaseId).catch(() => {}); if (!cancelled && mounted.current) setNotice('The live view could not connect. Refresh the view.'); });
-    // The render key removes the old frame before this passive cleanup acknowledges it.
-    return () => { cancelled = true; void leases.current.detach(viewerLeaseId).catch(() => {}); };
-  }, [visible, open, resourceKey, viewTick, viewKey, targetId]);
+    if (!visible || !open || !resource || resource.state !== 'active' || resource.returnPending) return;
+    const viewer = startBrowserViewLifecycle({
+      resource, targetId: viewTarget, key: viewKey, client: cloudBrowser, leases: leases.current,
+      uuid: () => crypto.randomUUID(),
+      isCurrent: () => mounted.current && !document.hidden && viewContext.current.key === viewKey
+        && viewContext.current.open && viewContext.current.visible,
+      isBusy: () => viewContext.current.busy !== null,
+      show: (next) => setView(next),
+      remove: async (id) => {
+        // Leave the effect stack before flushing. The old iframe must be gone
+        // before its lease acknowledgment can permit an agent handoff.
+        await Promise.resolve();
+        if (mounted.current) flushSync(() => setView((shown) => shown?.viewerLeaseId === id ? null : shown));
+      },
+      issue: (kind) => {
+        setNotice(kind === 'cleanup' ? 'Closing the previous view was not confirmed. Choose Watch to retry.'
+          : kind === 'binding' ? 'The browser view changed. Choose Watch after its status refreshes.'
+          : 'The live view could not reconnect. Choose Watch to retry.');
+        void refresh();
+      },
+    });
+    lifecycle.current = viewer;
+    return () => { if (lifecycle.current === viewer) lifecycle.current = null; void viewer.stop(); };
+  }, [visible, open, resourceKey, viewKey]);
+  useEffect(() => { if (busy === null) lifecycle.current?.resume(); }, [busy]);
   useEffect(() => {
     if (!view) return;
-    const timer = window.setTimeout(() => { setView(null); setNotice('The view expired. Refresh to keep watching.'); }, Math.max(0, Date.parse(view.expiresAt) - Date.now()));
-    const disconnected = (event: MessageEvent) => { if (isBrowserDisconnected(event, frame.current?.contentWindow ?? null, view.url)) { setView(null); setNotice('The browser disconnected. Refresh before continuing.'); void refresh(); } };
+    const disconnected = (event: MessageEvent) => {
+      if (isBrowserDisconnected(event, frame.current?.contentWindow ?? null, view.url)) lifecycle.current?.disconnected(view.viewerLeaseId);
+    };
     window.addEventListener('message', disconnected);
-    return () => { window.clearTimeout(timer); window.removeEventListener('message', disconnected); void leases.current.detach(view.viewerLeaseId).catch(() => {}); };
-  }, [view, refresh]);
+    return () => window.removeEventListener('message', disconnected);
+  }, [view]);
   useEffect(() => {
-    const closeViews = () => { const selected = current.current; viewGeneration.current++; flushSync(() => { setVisible(false); setView(null); }); if (selected) void leases.current.detachAll(selected).catch(() => {}); };
+    const closeViews = () => { const selected = current.current; void lifecycle.current?.stop(); flushSync(() => { setVisible(false); setView(null); }); if (selected) void leases.current.detachAll(selected).catch(() => {}); };
     const visibility = () => { if (document.hidden) closeViews(); else { setVisible(true); setViewTick((tick) => tick + 1); void refresh(); } };
     const pageShow = () => { if (!document.hidden) { setVisible(true); setViewTick((tick) => tick + 1); void refresh(); } };
     window.addEventListener('pagehide', closeViews); document.addEventListener('visibilitychange', visibility); window.addEventListener('pageshow', pageShow);
@@ -82,7 +97,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
   }, [refresh]);
   const change = async (kind: 'human' | 'agent' | 'stop') => {
     if (!resource || busy) return; const requested = resource;
-    setBusy(kind); setNotice(''); viewGeneration.current++; flushSync(() => setView(null)); generation.current++;
+    setBusy(kind); setNotice(''); void lifecycle.current?.stop(); flushSync(() => setView(null)); generation.current++;
     try {
       let baseline = requested;
       if (kind !== 'stop') { await new Promise<void>((resolve) => { const timer = window.setTimeout(resolve, 50); window.requestAnimationFrame(() => { window.clearTimeout(timer); resolve(); }); }); baseline = await leases.current.detachAll(requested); }
@@ -110,17 +125,17 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
   };
   const useHere = (browser: CloudBrowserOpenBrowser) => handToThisChat(async () => (await cloudBrowser.move(browser, conversationId)).resource);
   const adoptHere = (session: CloudBrowserUnlinkedSession) => handToThisChat(async () => (await cloudBrowser.adoptUnlinked(session.providerSessionId, conversationId)).resource);
-  const closeElsewhere = async (closeIt: () => Promise<unknown>) => {
+  const closeElsewhere = async (closeIt: () => Promise<Parameters<typeof browserCloseResultMessage>[0]>) => {
     if (busy) return;
     setBusy('close-other'); setNotice('');
-    try { await closeIt(); if (mounted.current) setNotice('Closed that browser.'); }
+    try { const result = await closeIt(); if (mounted.current) setNotice(browserCloseResultMessage(result)); }
     catch { if (mounted.current) setNotice('Closing was not confirmed. Refresh the list to check it.'); }
     finally { if (mounted.current) { setBusy(null); void loadOverview(); } }
   };
   const closePendingViews = async () => {
     if (!resource || busy) return;
     const requested = resource;
-    setBusy('detach'); setNotice(''); viewGeneration.current++; flushSync(() => setView(null)); generation.current++;
+    setBusy('detach'); setNotice(''); void lifecycle.current?.stop(); flushSync(() => setView(null)); generation.current++;
     try {
       const next = await leases.current.detachAll(requested);
       if (!mounted.current || !canApplyBrowserResponse(current.current, requested, next)) return;
@@ -155,7 +170,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
     catch { if (mounted.current) { setNotice('Recovery was not confirmed. Check the session ID in your Browserbase project, then refresh.'); await refresh(); } }
     finally { if (mounted.current) setBusy(null); }
   };
-  const close = () => { setOpen(false); trigger.current?.focus(); };
+  const close = () => { void lifecycle.current?.stop(); setOpen(false); trigger.current?.focus(); };
   const others = (overview?.browsers ?? []).filter((item) => item.conversationId !== conversationId);
   const lost = overview?.unlinked ?? [];
   const openCount = (overview?.browsers.length ?? 0) + lost.length;
@@ -167,7 +182,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
       <header><button ref={returnButton} type="button" onClick={close}>Return to chat</button><span>{resource ? browserElapsed(resource.elapsedSeconds) : 'Browser'}{resource?.recording ? ' · Recording on' : ''}{thisEntry ? ` · ${browserClosesText(thisEntry, now)}` : ''}</span></header>
       {resources.length > 1 ? <label class="m-browser-select">Browser session<select value={resource?.id ?? ''} onChange={(event) => setSelectedId(event.currentTarget.value)}>{resources.map((item) => <option key={item.id} value={item.id}>{browserFocusPage(item)?.title || 'Browser'} · {item.state}</option>)}</select></label> : null}
       {!resource ? <div class="m-browser-empty"><Globe /><h2>A browser for the work</h2><p>Watch Clem browse, then take over when a page needs you. Your conversation stays open.</p>{status === null ? <><p>{statusFailed ? 'Connection status unavailable.' : 'Checking connection…'}</p>{statusFailed ? <button type="button" onClick={() => void refresh()}>Retry status</button> : null}</> : !status.configured ? <p>Connect Browserbase in Settings → Connections, then return here.</p> : <><label><input type="checkbox" checked={recording} onChange={(event) => setRecording(event.currentTarget.checked)} />Record this browser session</label><button class="m-browser-primary" type="button" disabled={busy !== null} onClick={() => void start()}>{busy === 'start' ? 'Starting…' : requestId.current ? 'Retry start' : 'Start browser'}</button><p>Cloud usage is billed by your Browserbase account. Recording is off by default.</p></>}</div> : <>
-        <div class="m-browser-controls"><button type="button" disabled={!active || resource.returnPending || busy !== null} onClick={() => void change(resource.controller === 'human' ? 'agent' : 'human')}>{busy === 'human' || busy === 'agent' ? 'Changing control…' : resource.controller === 'human' ? 'Return to Clem' : 'Take control'}</button><button type="button" disabled={busy !== null || resource.returnPending} onClick={() => { viewGeneration.current++; flushSync(() => setView(null)); setNotice(''); void refresh(); setViewTick((tick) => tick + 1); }}>Watch</button><button type="button" disabled={busy !== null || resource.state === 'stopped' || resource.state === 'expired' || resource.state === 'stopping'} onClick={() => void change('stop')}>{busy === 'stop' || resource.state === 'stopping' ? 'Stopping…' : 'Stop'}</button></div>
+        <div class="m-browser-controls"><button type="button" disabled={!active || resource.returnPending || busy !== null} onClick={() => void change(resource.controller === 'human' ? 'agent' : 'human')}>{busy === 'human' || busy === 'agent' ? 'Changing control…' : resource.controller === 'human' ? 'Return to Clem' : 'Take control'}</button><button type="button" disabled={busy !== null || resource.returnPending} onClick={() => { void lifecycle.current?.stop(); flushSync(() => setView(null)); setNotice(''); void refresh(); setViewTick((tick) => tick + 1); }}>Watch</button><button type="button" disabled={busy !== null || resource.state === 'stopped' || resource.state === 'expired' || resource.state === 'stopping'} onClick={() => void change('stop')}>{busy === 'stop' || resource.state === 'stopping' ? 'Stopping…' : 'Stop'}</button></div>
         {status?.configured && canStartBrowserInTask(resources) ? <div class="m-browser-new"><label><input type="checkbox" checked={recording} onChange={(event) => setRecording(event.currentTarget.checked)} />Record the new session</label><button type="button" disabled={busy !== null} onClick={() => void start()}>{busy === 'start' ? 'Starting…' : 'Start new browser'}</button></div> : null}
         {resource.returnPending ? <button type="button" class="m-browser-close-views" disabled={busy !== null} onClick={() => void closePendingViews()}>{busy === 'detach' ? 'Closing views…' : 'Retry closing this device’s views'}</button> : null}
         <p class="m-browser-page">{browserFocusPage(resource)?.title || 'Browser session'}<span>{browserFocusPage(resource)?.url || resource.state}</span></p>
@@ -179,7 +194,7 @@ function TaskBrowser({ conversationId }: { conversationId: string }) {
         <h3>Other open browsers</h3>
         <ul>
           {others.map((item) => <li key={item.id}>
-            <div><strong>{item.conversationTitle || 'Untitled chat'}</strong><span>{browserFocusPage(item)?.title || browserFocusPage(item)?.url || (item.state === 'active' ? 'Blank page' : item.state)} · {browserClosesText(item, now)}{item.usesProfile ? ' · Signed in' : ''}</span></div>
+            <div><strong>{item.conversationTitle || 'Untitled chat'}</strong><span>{browserFocusPage(item)?.title || browserFocusPage(item)?.url || (item.state === 'active' ? 'Blank page' : item.state)} · {browserClosesText(item, now)}{item.usesProfile ? ' · Saved profile' : ''}</span></div>
             <div class="m-browser-row-actions">
               <button type="button" disabled={busy !== null || item.state !== 'active'} onClick={() => void useHere(item)}>{busy === 'move' ? 'Moving…' : 'Use in this chat'}</button>
               <button type="button" disabled={busy !== null || item.state === 'stopping'} onClick={() => void closeElsewhere(() => cloudBrowser.stop(item))}>Close</button>

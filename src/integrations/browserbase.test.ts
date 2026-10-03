@@ -12,7 +12,7 @@ const { BrowserbaseCdpError } = await import('./browserbase-cdp.js');
 const project = '10000000-0000-4000-8000-000000000001', sessionId = '20000000-0000-4000-8000-000000000002';
 function setup() {
   const baseDir = mkdtempSync(path.join(os.tmpdir(), 'clem-browserbase-service-'));
-  let clock = Date.parse('2026-10-02T00:00:00Z'), status: 'RUNNING'|'COMPLETED'|'TIMED_OUT' = 'RUNNING', key = 'private-test-key';
+  let clock = Date.parse('2026-10-02T00:00:00Z'), status: 'RUNNING'|'COMPLETED'|'TIMED_OUT'|'ERROR' = 'RUNNING', key = 'private-test-key';
   let creates = 0, releases = 0, operations = 0, views = 0;
   const observed = () => ({ sessionId, projectId: project, status, connectUrl: `wss://connect.browserbase.com/?sessionId=${sessionId}&apiKey=never-public` });
   const api = {
@@ -338,6 +338,94 @@ test('a lost session Clem started can be taken into a conversation or closed; an
     await assert.rejects(t.service.adoptUnlinked({ providerSessionId: sessionId, conversationId: 'task-b' }), /session_already_owned/);
     await assert.rejects(t.service.closeUnlinked(foreignSession), /session_not_started_by_clem/);
     assert.equal(t.counts().releases, 0);
+  } finally { t.close(); }
+});
+test('an unlinked release acknowledgment stays releasing until the exact provider session is terminal', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    runningList(t, [{ id: sessionId, byClem: true }]);
+    let observations = 0;
+    const retrieve = t.api.retrieve;
+    t.api.retrieve = async (id, projectId) => { observations++; return retrieve(id, projectId); };
+    assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: false, status: 'releasing' });
+    assert.equal(t.counts().releases, 1);
+    assert.equal(observations, 1, 'release acknowledgment is followed by a separate exact-session observation');
+    runningList(t, []); t.setStatus('COMPLETED');
+    assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: true, status: 'closed' });
+    assert.equal(t.counts().releases, 1, 'confirming the now-absent session does not release again');
+  } finally { t.close(); }
+});
+test('an unlinked session is closed only on a matching terminal GET, including provider error and timeout', async () => {
+  for (const status of ['COMPLETED', 'ERROR', 'TIMED_OUT'] as const) {
+    const t = setup(); try {
+      await t.service.configure({ projectId: project });
+      runningList(t, [{ id: sessionId, byClem: true }]);
+      const release = t.api.release;
+      t.api.release = async (id, projectId) => { await release(id, projectId); t.setStatus(status); };
+      assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: true, status: 'closed' });
+      assert.equal(t.counts().releases, 1);
+    } finally { t.close(); }
+  }
+});
+test('absence from the running list is not unlinked close proof and does not authorize release', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project }); runningList(t, []);
+    assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: false, status: 'unknown' });
+    t.api.retrieve = async () => { throw new BrowserbaseClientError('provider_refused', false, 404); };
+    assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: false, status: 'unknown' });
+    assert.equal(t.counts().releases, 0);
+  } finally { t.close(); }
+});
+test('an unlinked close waits for its exact observation and does not turn an unavailable observation into closure', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project }); runningList(t, [{ id: sessionId, byClem: true }]);
+    let entered!: () => void, confirm!: () => void;
+    const atObservation = new Promise<void>(resolve => { entered = resolve; });
+    const confirmation = new Promise<void>(resolve => { confirm = resolve; });
+    const retrieve = t.api.retrieve;
+    t.api.retrieve = async (id, projectId) => { entered(); await confirmation; return retrieve(id, projectId); };
+    let settled = false;
+    const closing = t.service.closeUnlinked(sessionId).then(result => { settled = true; return result; });
+    await Promise.race([atObservation, closing]);
+    assert.equal(settled, false);
+    t.setStatus('COMPLETED'); confirm();
+    assert.deepEqual(await closing, { closed: true, status: 'closed' });
+    t.api.retrieve = async () => { throw new BrowserbaseClientError('timeout', true); };
+    assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: false, status: 'unknown' });
+  } finally { t.close(); }
+});
+test('an uncertain unlinked release requires terminal proof while a proven refusal remains an error', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project }); runningList(t, [{ id: sessionId, byClem: true }]);
+    t.api.release = async () => { throw new BrowserbaseClientError('timeout', true); };
+    assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: false, status: 'unknown' });
+    t.setStatus('COMPLETED');
+    assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: true, status: 'closed' });
+    t.api.release = async () => { throw new BrowserbaseClientError('credential_rejected', false, 401); };
+    await assert.rejects(t.service.closeUnlinked(sessionId), error => error instanceof BrowserbaseServiceError && error.code === 'credential_rejected' && error.effect === 'none');
+  } finally { t.close(); }
+});
+test('unlinked close refuses a foreign running session before any release or exact observation', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project }); runningList(t, [{ id: sessionId, byClem: false }]);
+    let observations = 0;
+    t.api.retrieve = async () => { observations++; throw new Error('must not observe a foreign session'); };
+    await assert.rejects(t.service.closeUnlinked(sessionId), /session_not_started_by_clem/);
+    assert.equal(t.counts().releases, 0); assert.equal(observations, 0);
+  } finally { t.close(); }
+});
+test('unlinked close checks the configured project before release and rejects mismatched terminal proof', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    (t.api as Record<string, unknown>).listRunning = async () => [{ sessionId, projectId: otherSession, status: 'RUNNING', startedByClem: true }];
+    await assert.rejects(t.service.closeUnlinked(sessionId), /provider_identity_changed/);
+    assert.equal(t.counts().releases, 0);
+    runningList(t, [{ id: sessionId, byClem: true }]);
+    const retrieve = t.api.retrieve;
+    for (const mismatch of [{ sessionId: otherSession }, { projectId: otherSession }]) {
+      t.api.retrieve = async (id, projectId) => ({ ...await retrieve(id, projectId), ...mismatch, status: 'COMPLETED' });
+      assert.deepEqual(await t.service.closeUnlinked(sessionId), { closed: false, status: 'unknown' });
+    }
   } finally { t.close(); }
 });
 test('one open browser holds the saved sign-in profile; a later browser reuses it once that one is closed', async () => {
