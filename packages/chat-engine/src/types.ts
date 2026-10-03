@@ -37,7 +37,20 @@ export interface ApprovalPreview {
   fields: Array<{ name: string; value: string; label?: string }>;
   /** The pre-send check of this content against the owner's standing rules. */
   check?: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
+  /** The card in Clem's words: her question to the owner and why a yes is
+   *  needed. Display only; the fields above are still the exact content. */
+  ask?: string;
+  why?: string;
 }
+
+/** What the owner's answer to an approval card reads as in the conversation,
+ *  on every surface. The decision itself travels as `approve apr-…` for the
+ *  host's parser; a person reads their own words. Live 10-02: the owner's
+ *  bubbles read "approve apr-7rqj". */
+export const APPROVAL_ANSWER_WORDS = {
+  approve: 'Yes, go ahead.',
+  reject: 'No, don’t do that.',
+} as const;
 
 export type ApprovalResolution = 'approved' | 'declined' | 'changed' | 'expired';
 
@@ -84,11 +97,18 @@ export function approvalPreviewFrom(value: unknown): ApprovalPreview | undefined
     }
     if (JSON.stringify(items).length > 256_000) return undefined;
   }
+  const line = (value: unknown, max: number): string | undefined => (
+    typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : undefined
+  );
+  const ask = line(record.ask, 200);
+  const why = line(record.why, 260);
   return {
     operation: record.operation,
     fields,
     ...(items ? { items } : {}),
     ...(status ? { check: { status, ...(conflicts.length ? { conflicts } : {}) } } : {}),
+    ...(ask ? { ask } : {}),
+    ...(why ? { why } : {}),
   };
 }
 

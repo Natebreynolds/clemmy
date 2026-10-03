@@ -36,6 +36,10 @@ export interface ApprovalCallPreview {
   items?: ApprovalCallPreview[];
   /** The pre-send check against the owner's standing rules, when one ran. */
   check?: { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
+  /** The card in Clem's words (the checker wrote them): her question to the
+   *  owner and why a yes is needed. Display only. */
+  ask?: string;
+  why?: string;
 }
 
 const APPROVAL_PREVIEW_MAX_FIELDS = 16;
@@ -109,6 +113,8 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
             status: info.previewCheck.status,
             ...(info.previewCheck.conflicts?.length ? { conflicts: [...info.previewCheck.conflicts] } : {}),
           },
+          ...(info.previewCheck.ask ? { ask: info.previewCheck.ask } : {}),
+          ...(info.previewCheck.why ? { why: info.previewCheck.why } : {}),
         }
       : {}),
   };

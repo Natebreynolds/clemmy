@@ -18,6 +18,9 @@ export interface ApprovalDetailLine {
 export interface ApprovalPresentation {
   /** "Send a message via Slack", "Write a file", … */
   action: string;
+  /** Clem's own question for the card, when its checker wrote one: the
+   *  title a person reads ("Can I post this to #sales?"). */
+  ask?: string;
   app?: string;
   operation?: string;
   details: ApprovalDetailLine[];
@@ -121,13 +124,14 @@ export function detailLinesFor(args: unknown): ApprovalDetailLine[] {
   return lines;
 }
 
-export function presentApprovalForHumans(input: { tool?: string | null; args?: unknown; subject?: string }): ApprovalPresentation {
+export function presentApprovalForHumans(input: { tool?: string | null; args?: unknown; subject?: string; ask?: string | null }): ApprovalPresentation {
   const call = unwrapApprovalCall(input.tool, input.args);
   const app = appLabel(call.operation, call.tool);
   const phrase = operationPhrase(call.operation, call.tool, app);
   const action = capitalize(app ? `${phrase} via ${app}` : phrase || (input.subject ?? 'approve this action'));
   return {
     action,
+    ...(input.ask?.trim() ? { ask: input.ask.trim() } : {}),
     ...(app ? { app } : {}),
     ...(call.operation ? { operation: call.operation } : {}),
     details: detailLinesFor(call.args),

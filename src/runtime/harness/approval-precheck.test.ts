@@ -62,7 +62,7 @@ test('the owner\'s checker reads the exact content, the recent asks and the rule
   assert.equal(typeof seen[0]!.ownerRules, 'string');
 });
 
-test('a clean check says so, a failed check says it could not check, and id-only calls are not checked', async () => {
+test('a clean check says so, a failed check says it could not check, and no call means no check', async () => {
   const where = conversation();
   _setApprovalPrecheckRunForTests(async () => '{"conflicts": []}');
   assert.deepEqual(await approvalPrecheck({ ...where, preview: email }), { status: 'clear' });
@@ -70,10 +70,48 @@ test('a clean check says so, a failed check says it could not check, and id-only
   assert.deepEqual(await approvalPrecheck({ ...where, preview: email }), { status: 'unavailable' });
   _setApprovalPrecheckRunForTests(async () => 'not json at all');
   assert.deepEqual(await approvalPrecheck({ ...where, preview: email }), { status: 'unavailable' });
-  let ran = false;
-  _setApprovalPrecheckRunForTests(async () => { ran = true; return { conflicts: [] }; });
-  assert.equal(await approvalPrecheck({ ...where, preview: { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1' }] } }), undefined);
-  assert.equal(ran, false, 'nothing to read in an id-only call');
+  assert.equal(await approvalPrecheck({ ...where, preview: null }), undefined, 'no call, nothing to read');
+});
+
+// Live 10-02: cards read "Approve: cli_setup: install" over raw argument names;
+// the question card, in Clem's own words, was the one the owner loved.
+test('the checker writes the card in Clem\'s words for every card, from the exact call and the consent facts', async () => {
+  const where = conversation();
+  const seen: Array<Record<string, unknown>> = [];
+  _setApprovalPrecheckRunForTests(async (input) => {
+    seen.push(input as unknown as Record<string, unknown>);
+    return {
+      ask: 'Can I install Vapi\'s command-line tool on your Mac?',
+      why: 'It changes your Mac, and you asked me to wire up the API, not install a tool.',
+      conflicts: [{ problem: 'You asked me to wire the API into Settings, not install a command-line tool.' }],
+    };
+  });
+  const install = { operation: 'cli_setup', fields: [{ name: 'action', value: 'install' }, { name: 'command', value: 'npm install -g @vapi-ai/cli' }] };
+  const result = await approvalPrecheck({ ...where, preview: install,
+    consent: { effect: 'local_write', consequence: 'update', reversibility: 'ordinary_non_destructive', destructive: false } });
+  assert.deepEqual(result, {
+    status: 'conflicts',
+    conflicts: ['You asked me to wire the API into Settings, not install a command-line tool.'],
+    ask: 'Can I install Vapi\'s command-line tool on your Mac?',
+    why: 'It changes your Mac, and you asked me to wire up the API, not install a tool.',
+  });
+  assert.deepEqual(seen[0]!.consent, { effect: 'local_write', consequence: 'update', reversibility: 'ordinary_non_destructive', destructive: false });
+  // An id-only call is read too: its card still needs Clem's question.
+  _setApprovalPrecheckRunForTests(async () => ({ ask: 'Can I open a direct message with Dana?', why: '', conflicts: [] }));
+  assert.deepEqual(await approvalPrecheck({ ...where, preview: { operation: 'Open Slack dm', fields: [{ name: 'users', value: 'U0FIXTURE1' }] } }),
+    { status: 'clear', ask: 'Can I open a direct message with Dana?' });
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /Never use tool names, operation ids, field names, JSON or record ids/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /to the owner as "you"/);
+});
+
+test('the card\'s words are bounded and optional', async () => {
+  const where = conversation();
+  _setApprovalPrecheckRunForTests(async () => ({ ask: `Can I ${'really '.repeat(60)}do it?`, conflicts: [] }));
+  const result = await approvalPrecheck({ ...where, preview: email });
+  assert.ok((result?.ask ?? '').length <= 160);
+  assert.equal(result?.why, undefined);
+  _setApprovalPrecheckRunForTests(async () => '{"conflicts": []}');
+  assert.deepEqual(await approvalPrecheck({ ...where, preview: email }), { status: 'clear' }, 'an older reply shape still works');
 });
 
 test('conflict lines are bounded to three short sentences', () => {

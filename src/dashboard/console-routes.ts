@@ -1,3 +1,4 @@
+import { approvalCardAsk } from '../runtime/harness/approval-card-voice.js';
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
@@ -12071,7 +12072,8 @@ export function registerConsoleRoutes(
           tool: r.tool,
           args: r.args,
           // What will happen, where, through which app — never the carrier envelope.
-          presentation: presentApprovalForHumans({ tool: r.tool, args: r.args, subject: r.subject }),
+          presentation: presentApprovalForHumans({ tool: r.tool, args: r.args, subject: r.subject,
+            ask: approvalCardAsk(r.sessionId, r.approvalId) }),
           status: r.status,
           resolution: r.resolution,
           resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {
@@ -14534,11 +14536,13 @@ export function registerConsoleRoutes(
           const previewMeta = typeof preview?.count === 'number' ? `${preview.count} item${preview.count === 1 ? '' : 's'}` : '';
           // The same words Needs you and the phone use: the request's own
           // subject, else the unwrapped provider call. Never the carrier.
-          const presentation = presentApprovalForHumans({ tool: approval.tool, args: approval.args, subject: approval.subject });
+          const presentation = presentApprovalForHumans({ tool: approval.tool, args: approval.args, subject: approval.subject,
+            ask: approvalCardAsk(approval.sessionId, approval.approvalId) });
           const headline = approval.subject?.trim() || presentation.action;
           return {
             kind: 'harness-approval',
-            title: `Approve: ${headline}`,
+            // Clem's own question when her checker wrote one.
+            title: presentation.ask ?? `Approve: ${headline}`,
             meta: [
               presentation.app ?? '',
               reason ? `why: ${trimConsoleTitle(reason, 90)}` : '',

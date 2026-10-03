@@ -1,3 +1,4 @@
+import { approvalCardAsk } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { nextAnsweringAgentModel, recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
@@ -522,7 +523,8 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
 } {
   return {
     kind: 'harness',
-    presentation: presentApprovalForHumans({ tool: row.tool, args: row.args, subject: row.subject }),
+    presentation: presentApprovalForHumans({ tool: row.tool, args: row.args, subject: row.subject,
+      ask: approvalCardAsk(row.sessionId, row.approvalId) }),
     contentPreview: extractApprovalContentPreview(row.tool, row.args ?? undefined),
     approvalId: row.approvalId,
     sessionId: row.sessionId,

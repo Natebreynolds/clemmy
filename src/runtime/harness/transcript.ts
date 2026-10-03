@@ -17,6 +17,7 @@ import {
   publicCompletionText,
   publicReplyText,
   publicUserInputText,
+  ownerBubbleText,
   validTypedCompletionPresentation,
   publicPlanArtifactRef,
   publicTaskMode,
@@ -75,9 +76,32 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
       'workflow_saved',
       // What she raised on her own, in her own conversation.
       'clem_message',
+      // A card she asked, so a reopened approval reads as her question.
+      'approval_requested',
     ],
     limit,
   });
+  const approvalAsks = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== 'approval_requested' || typeof event.data.approvalId !== 'string') continue;
+    const preview = event.data.preview && typeof event.data.preview === 'object' && !Array.isArray(event.data.preview)
+      ? event.data.preview as Record<string, unknown>
+      : null;
+    const ask = typeof preview?.ask === 'string' ? preview.ask.trim() : '';
+    const subject = typeof event.data.subject === 'string' ? event.data.subject.trim() : '';
+    approvalAsks.set(event.data.approvalId, ask || (subject ? `I asked before going ahead: ${subject}.` : ''));
+  }
+  // The host's own words for a turn that paused on a card ("Approval required
+  // for X. Review apr-… to continue.") are the card's stand-in, not a reply;
+  // reopened, the turn reads as the question the card asked.
+  const reopenedApprovalText = (presentation: { kind: string; text: string; approvalId?: string }): string => {
+    const id = presentation.approvalId;
+    if (presentation.kind !== 'approval' || !id) return presentation.text;
+    const filler = (presentation.text.startsWith('Approval required for ') && presentation.text.endsWith(`. Review ${id} to continue.`))
+      || (/^\d+ approvals are waiting, starting with /.test(presentation.text)
+        && presentation.text.endsWith(`(${id}). Approve or reject each and I'll continue.`));
+    return filler ? approvalAsks.get(id) || presentation.text : presentation.text;
+  };
   // Pair each `conversation_superseded` marker with the nearest preceding
   // un-claimed no_structured_output completion (the marker is appended right
   // after its apology, before the recovery hop). Only that specific apology is
@@ -122,7 +146,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     sources.set(key, {
       key,
       event,
-      userText: event.data.synthetic === true ? '' : publicUserInputText(event.data),
+      userText: event.data.synthetic === true ? '' : ownerBubbleText(event.data),
     });
   }
 
@@ -221,7 +245,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         // which is record counts and handle ids kept for the model. Live
         // 10-02: every reopened question and approval ended in that block.
         text: presentation.status === 'needs_input'
-          ? withoutRetainedWorkCheckpoint(presentation.text)
+          ? reopenedApprovalText({ ...presentation, text: withoutRetainedWorkCheckpoint(presentation.text) })
           : presentation.text,
         createdAt: event.createdAt,
         planProposalId: planProposalIdFrom(event.data),
@@ -357,7 +381,7 @@ export function harnessPreview(sessionId: string): string {
   const latest = events[0];
   if (!latest) return '';
   if (latest.type === 'user_input_received') {
-    return publicUserInputText(latest.data);
+    return ownerBubbleText(latest.data);
   }
   if (latest.type === 'clem_message') return typeof latest.data.text === 'string' ? latest.data.text.trim() : '';
   return humanHarnessText(latest.data, '');

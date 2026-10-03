@@ -97,6 +97,32 @@ test('a reopened question or approval reads as it did live, without the retained
   assert.match(finished?.text ?? '', /Retained work/, 'a finished or failed reply still discloses it');
 });
 
+test('a reopened approval reads as the question the card asked, and the owner\'s tap as their answer', () => {
+  const session = createSession({ kind: 'chat', title: 'reopened approval' });
+  const ask = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Wire up the API.' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested', data: {
+    tool: 'work_call', subject: 'cli_setup: install', approvalId: 'apr-abcd',
+    preview: { operation: 'cli_setup', fields: [{ name: 'command', value: 'npm install -g @vapi-ai/cli' }],
+      ask: 'Can I install Vapi\'s command-line tool on your Mac?' },
+  } });
+  const filler = 'Approval required for cli_setup: install. Review apr-abcd to continue.';
+  const card = typedTerminalData({ sessionId: session.id, sourceUserSeq: ask.seq,
+    text: `${filler}\n\nRetained work (durable checkpoint):\n- Source/tool cli_inspect: completed result retained as rh_0123456789abcdef0123456789abcdef.` });
+  const presentation = card.presentation as Record<string, unknown>;
+  Object.assign(presentation, { status: 'needs_input', kind: 'approval', resumable: true, needs: { kind: 'approval' }, approvalId: 'apr-abcd' });
+  card.turnOutcome = { version: 2, id: presentation.outcomeId, status: 'needs_input', resumable: true, needs: { kind: 'approval' } };
+  card.awaitingUser = true;
+  card.reason = 'awaiting_approval';
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'conversation_completed', data: card });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'approve apr-abcd', displayText: 'approve apr-abcd', approvalId: 'apr-abcd', decision: 'approve', source: 'desktop_approval' } });
+  const turns = reconstructHarnessTranscript(session.id);
+  assert.ok(turns.some((turn) => turn.role === 'assistant' && turn.text === 'Can I install Vapi\'s command-line tool on your Mac?'),
+    JSON.stringify(turns.map((turn) => turn.text)));
+  assert.ok(!turns.some((turn) => /apr-abcd|Retained work|cli_setup/.test(turn.text)), JSON.stringify(turns.map((turn) => turn.text)));
+  assert.ok(turns.some((turn) => turn.role === 'user' && turn.text === 'Yes, go ahead.'));
+});
+
 test('humanHarnessText unwraps strings, JSON strings, and objects', () => {
   assert.equal(humanHarnessText('plain text'), 'plain text');
   assert.equal(humanHarnessText({ reply: 'hi there' }), 'hi there');
@@ -405,4 +431,10 @@ test('a workflow the reply saved rides on that reply, newest save per workflow, 
     ['user', undefined],
     ['assistant', undefined],
   ]);
+});
+
+test('the owner\'s card answers read the same on the daemon and in the shared chat engine', async () => {
+  const daemon = await import('./public-presentation.js');
+  const engine = await import('../../../packages/chat-engine/src/types.js');
+  assert.deepEqual(daemon.APPROVAL_ANSWER_WORDS, engine.APPROVAL_ANSWER_WORDS);
 });

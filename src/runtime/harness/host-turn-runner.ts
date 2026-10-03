@@ -11197,6 +11197,14 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             sessionId: approvalIdentity.sessionId,
             sourceUserSeq: approvalIdentity.sourceUserSeq,
             preview,
+            ...(pending.consentCall ? {
+              consent: {
+                effect: pending.consentCall.effect,
+                consequence: pending.consentCall.risk?.consequence,
+                reversibility: pending.consentCall.risk?.reversibility,
+                destructive: pending.consentCall.risk?.destructive,
+              },
+            } : {}),
           }).catch(() => undefined),
         ]);
         return {

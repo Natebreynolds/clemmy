@@ -332,10 +332,34 @@ function text(value: unknown): string {
 /** Accepted turns may carry a model-facing expansion (`text`) plus the exact
  * human-authored display form. Never replay continuation directives or folded
  * attachment contents when `displayText` is available. */
+/** What the owner's answer to an approval card reads as (the same words as
+ *  @clem/chat-engine's APPROVAL_ANSWER_WORDS). The decision travels as
+ *  `approve apr-…` for the parser; live 10-02 the owner's own bubbles read
+ *  exactly that. */
+export const APPROVAL_ANSWER_WORDS = {
+  approve: 'Yes, go ahead.',
+  reject: 'No, don’t do that.',
+} as const;
+
 export function publicUserInputText(value: unknown): string {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
   const data = value as Record<string, unknown>;
   return text(data.displayText) || text(data.text ?? data.message);
+}
+
+/** The owner's message as a reopened conversation shows it. Display only —
+ *  replay and resume compare the recorded text through publicUserInputText.
+ *  A card answer (a button, not written words) reads as the owner's answer;
+ *  a written change keeps the owner's own words. */
+export function ownerBubbleText(value: unknown): string {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const data = value as Record<string, unknown>;
+    if (typeof data.approvalId === 'string' && data.changeRequested !== true) {
+      if (data.decision === 'approve' || data.decision === 'approve_with_edits') return APPROVAL_ANSWER_WORDS.approve;
+      if (data.decision === 'reject') return APPROVAL_ANSWER_WORDS.reject;
+    }
+  }
+  return publicUserInputText(value);
 }
 
 function compactKey(value: string): string {
