@@ -272,6 +272,11 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  /** Durable task placement, learned from a real accepted user event. */
+  acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
+  /** Ambient progress, never a terminal reply or a completed work receipt. */
+  checkIn?: true;
+  checkInSeq?: number;
   /** What the person attached with this message. */
   attachments?: ChatAttachment[];
   status?: MessageStatus;

@@ -95,6 +95,12 @@ export interface ActivityItem {
   workflow?: WorkflowCardData;
 }
 
+export interface AcceptedChatSource {
+  sessionId: string;
+  sourceUserSeq: number;
+  turn: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -161,6 +167,9 @@ export interface ChatMessage {
    *  still running so someone who walks away can reopen the session and read
    *  what happened. Rendered as an aside, never as the answer. */
   checkIn?: boolean;
+  /** Durable ownership; never inferred from the currently streaming reply. */
+  acceptedSource?: AcceptedChatSource;
+  checkInSeq?: number;
   /** A question's suggested answers, offered as one-tap replies. */
   options?: string[];
   /** When a reopened turn was written, for display only. Live turns show
@@ -224,17 +233,51 @@ export function chatDecisionIntent(
 export function appendCheckIn(
   messages: readonly ChatMessage[],
   event: HarnessEvent,
-  liveAssistantId: string,
+  _liveAssistantId?: string,
 ): ChatMessage[] {
   const d = (event.data ?? {}) as Record<string, unknown>;
   const text = typeof d.text === 'string' ? d.text.trim() : '';
-  if (!text) return messages as ChatMessage[];
+  if (event.type !== 'conversation_check_in' || event.role !== 'Clem'
+    || d.version !== 1 || d.kind !== 'check_in' || !text || text.length > 600
+    || !event.sessionId || !Number.isSafeInteger(event.turn) || event.turn < 0
+    || typeof d.sourceUserSeq !== 'number' || !Number.isSafeInteger(d.sourceUserSeq) || d.sourceUserSeq <= 0
+    || !Number.isSafeInteger(event.seq) || event.seq <= d.sourceUserSeq) return messages as ChatMessage[];
+  const source: AcceptedChatSource = { sessionId: event.sessionId, sourceUserSeq: d.sourceUserSeq, turn: event.turn };
+  const owns = (message: ChatMessage) => message.acceptedSource?.sessionId === source.sessionId
+    && message.acceptedSource.sourceUserSeq === source.sourceUserSeq && message.acceptedSource.turn === source.turn;
+  const ownerAt = messages.findIndex((message) => message.role === 'assistant' && !message.checkIn && owns(message));
+  // An unbound historical bubble is not permission to put an old note beside
+  // the current task. The durable transcript remains the recovery path.
+  if (ownerAt < 0) return messages as ChatMessage[];
   const id = `check-in-${event.seq}`;
   if (messages.some((message) => message.id === id)) return messages as ChatMessage[];
-  const entry: ChatMessage = { id, role: 'assistant', text, status: 'complete', checkIn: true };
-  const liveAt = messages.findIndex((message) => message.id === liveAssistantId);
-  if (liveAt < 0) return [...messages, entry];
-  return [...messages.slice(0, liveAt), entry, ...messages.slice(liveAt)];
+  const entry: ChatMessage = { id, role: 'assistant', text, checkIn: true, acceptedSource: source, checkInSeq: event.seq };
+  const laterNoteAt = messages.findIndex((message) => message.checkIn && owns(message)
+    && typeof message.checkInSeq === 'number' && message.checkInSeq > event.seq);
+  const insertAt = laterNoteAt >= 0 ? Math.min(laterNoteAt, ownerAt) : ownerAt;
+  return [...messages.slice(0, insertAt), entry, ...messages.slice(insertAt)];
+}
+
+function acceptedChatSource(event: HarnessEvent, sessionId: string): AcceptedChatSource | null {
+  if (event.type !== 'user_input_received' || event.role !== 'user' || event.data?.synthetic === true
+    || (event.sessionId && event.sessionId !== sessionId) || !sessionId
+    || !Number.isSafeInteger(event.seq) || event.seq <= 0
+    || !Number.isSafeInteger(event.turn) || event.turn < 0) return null;
+  return { sessionId, sourceUserSeq: event.seq, turn: event.turn };
+}
+
+/** The accepted stream's first real source binds its reply once. Its receipt
+ * cursor excludes earlier requests; subsequent sources cannot steal the reply. */
+export function bindAcceptedChatSource(
+  messages: readonly ChatMessage[], event: HarnessEvent, assistantId: string,
+  boundary: { sessionId: string; afterSeq: number },
+): ChatMessage[] {
+  const source = acceptedChatSource(event, boundary.sessionId);
+  if (!source || !Number.isSafeInteger(boundary.afterSeq) || boundary.afterSeq < 0
+    || source.sourceUserSeq <= boundary.afterSeq) return messages as ChatMessage[];
+  const index = messages.findIndex(message => message.id === assistantId && message.role === 'assistant' && !message.checkIn);
+  if (index < 0 || messages[index].acceptedSource) return messages as ChatMessage[];
+  return messages.map((message, i) => i === index ? { ...message, acceptedSource: source } : message);
 }
 
 /** Record how an approval card was answered, so a replaced or decided card
@@ -1179,7 +1222,7 @@ export function activeTurnTaskMode(
 export async function readReattachTurn(sessionId: string, input: {
   fetchPage(url: string): Promise<RecentEventsPage>;
   active(): boolean;
-}): Promise<{ sourceUserSeq: number; taskMode?: TaskMode } | null> {
+}): Promise<{ sourceUserSeq: number; taskMode?: TaskMode; acceptedSource?: AcceptedChatSource } | null> {
   const cursor: { scanSeq: number; snapshotSeq?: number } = { scanSeq: 0 };
   // Retain only the newest source and its terminal, never the whole tool
   // trajectory. A page boundary is not evidence that a turn is still live.
@@ -1202,7 +1245,9 @@ export async function readReattachTurn(sessionId: string, input: {
     // An active turn's stream resumes from its source and catches those events.
     if (page.page ? !page.page.hasMore : continuation.complete) {
       const sourceUserSeq = inFlightTurnSince(boundary);
-      return sourceUserSeq === null ? null : { sourceUserSeq, taskMode: activeTurnTaskMode(boundary, sourceUserSeq) };
+      const source = boundary[0] ? acceptedChatSource(boundary[0], sessionId) : null;
+      return sourceUserSeq === null ? null : { sourceUserSeq, taskMode: activeTurnTaskMode(boundary, sourceUserSeq),
+        ...(source ? { acceptedSource: source } : {}) };
     }
     if (!continuation.more) throw new Error('The conversation history could not be fully checked.');
   }
@@ -1384,6 +1429,7 @@ export function useChat(options?: UseChatOptions) {
           status: 'thinking' as const,
           progress: 'Reconnecting to the run…',
           taskMode: active.taskMode,
+          acceptedSource: active.acceptedSource,
         }]);
         const handle = runHarnessStream(sid, { sinceSeq: lastUserSeq, onEvent: (ev) => applyEvent(assistantId, ev) });
         streamRef.current = handle;
@@ -1491,9 +1537,12 @@ export function useChat(options?: UseChatOptions) {
     }, noteDelegatedTask);
   }, [busy, noteDelegatedTask]);
 
-  const applyEvent = useCallback((assistantId: string, ev: HarnessEvent) => {
+  const applyEvent = useCallback((assistantId: string, ev: HarnessEvent, sourceBoundary?: { sessionId: string; afterSeq: number }) => {
     if (ev.type === 'delegated_task_state') noteDelegatedTask();
     const d = (ev.data ?? {}) as Record<string, unknown>;
+    if (ev.type === 'user_input_received' && sourceBoundary) {
+      setMessages(previous => bindAcceptedChatSource(previous, ev, assistantId, sourceBoundary));
+    }
     if (readLiveApprovalControl(ev)) {
       if (ev.sessionId && ev.sessionId !== sessionIdRef.current) return;
       if (ev.type === 'conversation_completed') setMessages(previous => {
@@ -1578,7 +1627,7 @@ export function useChat(options?: UseChatOptions) {
     } else if (ev.type === 'approval_requested') {
       setMessages((prev) => appendLiveApprovalCard(prev, ev));
     } else if (ev.type === 'conversation_check_in') {
-      setMessages((prev) => appendCheckIn(prev, ev, assistantId));
+      setMessages((prev) => appendCheckIn(prev, ev));
     } else if (ev.type === 'conversation_preamble') {
       const text = typeof d.text === 'string' ? d.text.trim() : '';
       if (text) {
@@ -1743,9 +1792,12 @@ export function useChat(options?: UseChatOptions) {
         pendingBackgroundRef.current = null;
         if (await handoffAcceptedRun(body, assistantId)) return;
       }
+      const sourceBoundary = body.sinceSeq === undefined
+        ? undefined
+        : { sessionId: body.sessionId, afterSeq: body.sinceSeq };
       const handle = runHarnessStream(body.sessionId, {
         sinceSeq: body.sinceSeq ?? 0,
-        onEvent: (ev) => applyEvent(assistantId, ev),
+        onEvent: (ev) => applyEvent(assistantId, ev, sourceBoundary),
       });
       streamRef.current = handle;
       const result = await handle.promise;
@@ -1761,12 +1813,12 @@ export function useChat(options?: UseChatOptions) {
         // auto-resume) — keep a slow watch on the session and deliver the real
         // result over the "stopped" note instead of stranding a completed run.
         // (Any prior watch was cancelled at the top of this send.)
-        lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev), { replayCursor: handle.getReplayCursor() });
+        lateWatchRef.current = watchForLateCompletion(body.sessionId, handle.getLastSeq(), (ev) => applyEvent(assistantId, ev, sourceBoundary), { replayCursor: handle.getReplayCursor() });
       } else if (awaitingWorkflowReportRef.current) {
         lateWatchRef.current = watchForLateCompletion(
           body.sessionId,
           handle.getLastSeq(),
-          (ev) => applyEvent(assistantId, ev),
+          (ev) => applyEvent(assistantId, ev, sourceBoundary),
           { intervalMs: 8_000, maxAttempts: 180 },
         );
       }

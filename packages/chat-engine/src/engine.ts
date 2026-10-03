@@ -21,6 +21,7 @@ import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation } from './terminal-presentation.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
+import { acceptedConversationSource, appendConversationCheckIn } from './conversation-check-in.js';
 
 export interface SendResult {
   sessionId: string;
@@ -233,7 +234,7 @@ export class ChatEngine {
     const { events, latestSeq } = await this.api.loadSession(this.sessionId);
     if (this.disposed) return;
     const unacknowledged = this.messages.filter(message => message.role === 'user' && message.pending);
-    this.messages = [...foldTranscript(events), ...unacknowledged];
+    this.messages = [...foldTranscript(events, this.sessionId), ...unacknowledged];
     this.cursor = latestSeq;
     // A turn may still be in flight (user sent from another surface, or the
     // app was reopened mid-run): if the last user input has no terminal after
@@ -245,7 +246,8 @@ export class ChatEngine {
       this.activeSourceUserSeq = inFlightSince + 1;
       this.ensureActiveAssistant();
       const source = events.find(event => event.type === 'user_input_received' && event.seq === inFlightSince + 1);
-      this.updateActive(message => ({ ...message, taskMode: readTaskMode(source?.data?.taskMode) }));
+      this.updateActive(message => ({ ...message, taskMode: readTaskMode(source?.data?.taskMode),
+        acceptedSource: source ? acceptedConversationSource(source, this.sessionId) : undefined }));
       this.attachStream(inFlightSince);
     } else if (events.length > 0 || latestSeq > 0) {
       // Delegated work releases the composer, but its durable running card is
@@ -618,11 +620,19 @@ export class ChatEngine {
         this.updateActive((m) => (m.text.trim() ? m : { ...m, text }));
         break;
       }
+      case 'conversation_check_in': {
+        const messages = appendConversationCheckIn(this.messages, event, this.sessionId);
+        if (messages === this.messages) return;
+        this.messages = messages;
+        break;
+      }
       case 'user_input_received': {
+        if (event.sessionId && event.sessionId !== this.sessionId) return;
         // What the person typed is the bubble; `text` may carry folded
         // attachment contents meant for the model, never for the screen.
         const text = userVisibleText(d);
         if (!text) return;
+        const acceptedSource = acceptedConversationSource(event, this.sessionId);
         if (
           this.busy
           && this.activeAssistantId
@@ -631,12 +641,24 @@ export class ChatEngine {
         ) {
           this.activeSourceUserSeq = event.seq;
         }
+        if (acceptedSource && this.activeSourceUserSeq === event.seq && this.activeAssistantId) {
+          this.updateActive(message => ({ ...message, acceptedSource }));
+        }
         // Confirm the local echo; a foreign-surface send appends as its own row.
-        const pendingIndex = this.messages.findIndex((m) => m.role === 'user' && m.pending === 'sending' && m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)));
+        const alreadyAccepted = acceptedSource && this.messages.some(message => message.role === 'user'
+          && message.acceptedSource?.sessionId === acceptedSource.sessionId
+          && message.acceptedSource.sourceUserSeq === event.seq);
+        const pendingIndex = alreadyAccepted || (acceptedSource && this.activeSourceUserSeq !== event.seq)
+          ? -1
+          : this.messages.findIndex((m) => m.role === 'user' && !m.steer
+            && (m.pending === 'sending' || (acceptedSource && !m.acceptedSource && m.idempotencyKey === this.inFlightKey))
+            && m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)));
         if (pendingIndex >= 0) {
-          this.messages = this.messages.map((m, i) => (i === pendingIndex ? { ...m, pending: undefined } : m));
-        } else if (!this.messages.some((m) => m.role === 'user' && m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)) && m.pending === undefined)) {
-          this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode) }];
+          this.messages = this.messages.map((m, i) => (i === pendingIndex ? { ...m, pending: undefined, acceptedSource } : m));
+        } else if (!this.messages.some((m) => m.role === 'user' && (acceptedSource
+          ? m.acceptedSource?.sourceUserSeq === event.seq && m.acceptedSource.sessionId === acceptedSource.sessionId
+          : m.text === text && sameTaskMode(m.taskMode, readTaskMode(d.taskMode)) && m.pending === undefined))) {
+          this.messages = [...this.messages, { id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode), acceptedSource }];
         }
         break;
       }
@@ -878,7 +900,7 @@ export function inFlightTurnSince(events: readonly HarnessEvent[]): number | nul
 
 /** Rebuild a message list from a session's persisted, public-projected
  *  events — the transcript a reopened chat renders instantly. */
-export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
+export function foldTranscript(events: readonly HarnessEvent[], sessionId?: string | null): ChatMessage[] {
   const messages: ChatMessage[] = [];
   let activity: ChatMessage['activity'] = [];
   let opening = '';
@@ -903,7 +925,8 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
     switch (event.type) {
       case 'user_input_received': {
         const text = userVisibleText(d);
-        if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode) });
+        if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode),
+          acceptedSource: acceptedConversationSource(event, sessionId) });
         currentSourceUserSeq = event.seq;
         const mode = readTaskMode(d.taskMode);
         if (mode) taskModesBySource.set(event.seq, mode);
@@ -917,6 +940,9 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
         if (text) opening = text;
         break;
       }
+      // Fold after the source/answer groups exist: inserting an older note
+      // here would shift the source-bound terminal index maps below.
+      case 'conversation_check_in': break;
       case 'plan_revision_published': {
         const ref = readPlanRevisionRef(d.planArtifactRef ?? d.artifact);
         const source = sourceUserSeqOf(event) ?? currentSourceUserSeq;
@@ -1119,5 +1145,6 @@ export function foldTranscript(events: readonly HarnessEvent[]): ChatMessage[] {
       }
     }
   }
-  return messages;
+  return events.reduce((current, event) => event.type === 'conversation_check_in'
+    ? appendConversationCheckIn(current, event, sessionId) : current, messages);
 }

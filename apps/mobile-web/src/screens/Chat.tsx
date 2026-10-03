@@ -798,6 +798,15 @@ function MessageRow({
     );
   }
 
+  if (message.checkIn) {
+    return (
+      <div class="turn turn-assistant" aria-label="Progress update">
+        {speaker ? <div class="reply-speaker">{speaker}</div> : null}
+        <div class="reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text) }} />
+      </div>
+    );
+  }
+
   const thinking = message.status === 'thinking';
   const draftStatus = thinking ? answerDraftStatus(message.answerDraft) : null;
   const activity = narrateActivity(message.activity ?? [], { live: thinking });

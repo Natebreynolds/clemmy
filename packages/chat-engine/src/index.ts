@@ -11,6 +11,7 @@ export * from './terminal-presentation.js';
 export * from './stream.js';
 export * from './answer-stream.js';
 export * from './engine.js';
+export * from './conversation-check-in.js';
 export * from './markdown.js';
 export * from './turn-receipt.js';
 export * from './model-name.js';

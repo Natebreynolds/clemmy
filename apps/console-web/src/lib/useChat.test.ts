@@ -6,6 +6,8 @@ import {
   activeTurnTaskMode,
   inFlightTurnSince,
   readReattachTurn,
+  appendCheckIn,
+  bindAcceptedChatSource,
   appendLiveApprovalCard,
   applyApprovalResolution,
   applyBridgedWorkflowActivity,
@@ -40,6 +42,93 @@ function ev(type: string, data: Record<string, unknown>): HarnessEvent {
   seq += 1;
   return { seq, turn: 0, role: 'Clem', type, data };
 }
+
+const checkInSourceA = { sessionId: 'check-in-chat', sourceUserSeq: 10, turn: 1 };
+const checkInSourceB = { sessionId: 'check-in-chat', sourceUserSeq: 20, turn: 2 };
+function checkInMessages(): ChatMessage[] {
+  return [
+    { id: 'user-a', role: 'user', text: 'Audit A' },
+    { id: 'answer-a', role: 'assistant', text: 'A result', status: 'complete', acceptedSource: checkInSourceA },
+    { id: 'user-b', role: 'user', text: 'Audit B' },
+    { id: 'answer-b', role: 'assistant', text: '', status: 'thinking', acceptedSource: checkInSourceB },
+  ] as ChatMessage[];
+}
+function checkInEvent(overrides: Partial<HarnessEvent> = {}): HarnessEvent {
+  return {
+    seq: 30, sessionId: 'check-in-chat', turn: 1, role: 'Clem', type: 'conversation_check_in',
+    data: { version: 1, kind: 'check_in', sourceUserSeq: 10, text: 'A finding' },
+    ...overrides,
+  };
+}
+
+test('desktop check-in for older A stays with A while B is active', () => {
+  const before = checkInMessages();
+  const next = appendCheckIn(before, checkInEvent(), 'answer-b');
+  assert.deepEqual(next.map(message => message.id), ['user-a', 'check-in-30', 'answer-a', 'user-b', 'answer-b']);
+  assert.deepEqual(next.find(message => message.id === 'answer-b'), before[3]);
+  assert.equal(next.find(message => message.id === 'check-in-30')?.checkIn, true);
+  assert.equal(next.find(message => message.id === 'check-in-30')?.status, undefined);
+});
+
+test('desktop check-in rejects missing, foreign, or mismatched ownership instead of using the active reply', () => {
+  const before = checkInMessages();
+  const invalid = [
+    checkInEvent({ sessionId: 'other-chat' }),
+    checkInEvent({ sessionId: undefined }),
+    checkInEvent({ turn: 2 }),
+    checkInEvent({ seq: 10 }),
+    checkInEvent({ role: 'user' }),
+    checkInEvent({ data: { version: 1, kind: 'check_in', text: 'No source' } }),
+    checkInEvent({ data: { version: 1, kind: 'check_in', sourceUserSeq: 999, text: 'Unknown source' } }),
+  ];
+  for (const event of invalid) assert.equal(appendCheckIn(before, event, 'answer-b'), before);
+  const unbound = [{ id: 'answer-b', role: 'assistant', text: '', status: 'thinking' }] as ChatMessage[];
+  assert.equal(appendCheckIn(unbound, checkInEvent(), 'answer-b'), unbound);
+});
+
+test('desktop check-in reconnect deduplicates notes and keeps independent updates ordered', () => {
+  const first = appendCheckIn(checkInMessages(), checkInEvent(), 'answer-b');
+  assert.equal(appendCheckIn(first, checkInEvent(), 'answer-b'), first);
+  const later = appendCheckIn(first, checkInEvent({ seq: 32 }), 'answer-b');
+  const earlier = appendCheckIn(later, checkInEvent({ seq: 31 }), 'answer-b');
+  assert.deepEqual(earlier.filter(message => message.checkIn).map(message => message.id),
+    ['check-in-30', 'check-in-31', 'check-in-32']);
+  assert.equal(earlier.find(message => message.id === 'answer-b')?.status, 'thinking');
+});
+
+test('desktop check-in ownership binds from its accepted source once, never from a note or a later request', () => {
+  const before: ChatMessage[] = [{ id: 'answer-a', role: 'assistant', text: '', status: 'thinking' }];
+  const boundary = { sessionId: 'check-in-chat', afterSeq: 9 };
+  const accepted: HarnessEvent = { seq: 10, sessionId: 'check-in-chat', turn: 1, role: 'user',
+    type: 'user_input_received', data: { text: 'Audit A' } };
+  for (const invalid of [
+    checkInEvent(),
+    { ...accepted, seq: 9 },
+    { ...accepted, sessionId: 'other-chat' },
+    { ...accepted, data: { synthetic: true, text: 'CONTINUE' } },
+  ]) assert.equal(bindAcceptedChatSource(before, invalid, 'answer-a', boundary), before);
+  const bound = bindAcceptedChatSource(before, accepted, 'answer-a', boundary);
+  assert.deepEqual(bound[0].acceptedSource, checkInSourceA);
+  assert.equal(bindAcceptedChatSource(bound, { ...accepted, seq: 20, turn: 2 }, 'answer-a', boundary), bound);
+  assert.equal(appendCheckIn(bound, checkInEvent()).length, 2);
+  assert.equal(bound[0].status, 'thinking', 'binding and notes do not settle the running reply');
+});
+
+test('desktop check-in reattach restores source session, seq, and turn from the accepted event', async () => {
+  const active = await readReattachTurn('check-in-chat', {
+    active: () => true,
+    fetchPage: async () => ({ latestSeq: 30, events: [
+      { seq: 10, sessionId: 'check-in-chat', turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Audit A' } },
+      checkInEvent(),
+    ], page: { version: 1, scannedThroughSeq: 30, snapshotSeq: 30, hasMore: false } }),
+  });
+  assert.deepEqual(active?.acceptedSource, checkInSourceA);
+  const messages: ChatMessage[] = [{ id: 'reattached-a', role: 'assistant', text: '', status: 'thinking',
+    acceptedSource: active?.acceptedSource }];
+  const next = appendCheckIn(messages, checkInEvent());
+  assert.deepEqual(next.map(message => message.id), ['check-in-30', 'reattached-a']);
+  assert.equal(appendCheckIn(next, checkInEvent()), next);
+});
 
 test('empty or reason-only conversation completion never fabricates Done or success', () => {
   const empty = terminalCompletionPresentation({}, '');
