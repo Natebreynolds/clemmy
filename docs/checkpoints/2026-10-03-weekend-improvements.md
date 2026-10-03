@@ -646,4 +646,4 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   browser tool names in the native catalog; no case needs more rounds;
   f_calendar_read_warm round 1 −11.7 KB and turn −23 KB. Not in the full
   suite (journeys are not globbed), which is why it went unnoticed.
-  Re-baseline awaits the owner.
+  The owner accepted the measured table as the new baseline (27/27 pass).
