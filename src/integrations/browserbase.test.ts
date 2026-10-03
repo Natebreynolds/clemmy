@@ -232,6 +232,15 @@ test('hung credential lookup is bounded and deduplicated, never dispatching a pa
     await bounded.status();assert.equal(reads,1);bounded.dispose();
   }finally{t.close();}
 });
+test('passive unconfigured health polls do not read secrets or infer missing credentials',async()=>{
+  const t=setup();try{
+    let reads=0;const passive=new BrowserbaseService({...t.options,getApiKey:async()=>{reads++;return 'a-configured-vault-key';}});
+    for(let poll=0;poll<5;poll++){
+      const status=await passive.status();assert.equal(status.configured,false);assert.equal(status.projectId,null);assert.equal(status.credentialStatus,'not_checked');
+    }
+    assert.equal(reads,0);assert.equal(t.counts().creates,0);passive.dispose();
+  }finally{t.close();}
+});
 test('last-view detach survives a failed return observation and safely resumes through later read polling',async()=>{
   const t=setup();try{
     await t.service.configure({projectId:project});const r=await t.service.create({conversationId:'task-a',requestId:'source'});

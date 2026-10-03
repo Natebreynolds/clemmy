@@ -187,7 +187,12 @@ export class BrowserbaseService {
     if (error instanceof BrowserbaseClientError) return new BrowserbaseServiceError(error.code, error.dispatched && effect === 'uncertain' ? 'uncertain' : 'none');
     return new BrowserbaseServiceError('browser_service_unavailable', effect);
   }
-  async status(): Promise<{ configured: boolean; credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable'; projectId: string | null; idleSeconds: number; sessionTimeoutSeconds: number; activeResources: number; privacy: { logSession: false; recordSession: false } }> {
+  async status(): Promise<{ configured: boolean; credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId: string | null; idleSeconds: number; sessionTimeoutSeconds: number; activeResources: number; privacy: { logSession: false; recordSession: false } }> {
+    // Chat docks poll this passive health surface. An unconfigured integration
+    // must not touch Keychain merely because an ordinary conversation is open.
+    if (!this.store.policy) return { configured: false, credentialConfigured: false, credentialStatus: 'not_checked', projectId: null,
+      idleSeconds: 300, sessionTimeoutSeconds: 1800, activeResources: this.store.resources.filter(nonterminal).length,
+      privacy: { logSession: false, recordSession: false } };
     let credentialConfigured = false, credentialStatus: 'available' | 'missing' | 'unavailable' = 'missing';
     try { credentialConfigured = Boolean((await this.readKey())?.trim()); credentialStatus = credentialConfigured ? 'available' : 'missing'; } catch { credentialStatus = 'unavailable'; }
     return { configured: Boolean(this.store.policy && credentialConfigured), credentialConfigured, credentialStatus, projectId: this.store.policy?.projectId ?? null,

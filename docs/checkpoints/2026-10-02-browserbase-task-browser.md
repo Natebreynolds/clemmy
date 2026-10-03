@@ -84,6 +84,10 @@ commit needs a fresh combined build before installation.
   documented provider maximum. Visible viewers send explicit activity; merely
   polling a resource does not keep an abandoned browser running. Startup
   initializes maintenance without requiring a viewer to open.
+- An unconfigured browser health poll never reads credentials. Configured
+  credential reads have a bounded deadline and share an outstanding Keychain
+  lookup, so an unavailable native credential store cannot hold the browser
+  queue indefinitely or start accumulating duplicate lookups.
 
 ## What this does not certify
 
@@ -177,11 +181,11 @@ the exact HTTPS origin guard. A synthetic test URL is not a live API receipt.
 
 ## Validation receipt
 
-Frozen-source qualification: **151/151 deterministic tests passed** across the
+Frozen-source qualification: **152/152 deterministic tests passed** across the
 new service, REST/CDP clients, authenticated routes, shared UI contracts and
 discovery, plus existing local-browser, registry/taxonomy, model-selection,
 reviewed storage carrier, transport/invoke artifact closure and thread-parity
-checks. The backend service/client subset is 32 tests; shared UI helpers are 14.
+checks. The backend service/client subset is 33 tests; shared UI helpers are 14.
 The named run log is `/tmp/clem-browserbase-qualification.log`.
 
 Backend, console and mobile typechecks passed. Public hygiene, operation identity
