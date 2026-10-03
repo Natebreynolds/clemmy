@@ -5585,3 +5585,60 @@ textarea.cz-input { resize: vertical; }
   font-weight: 600;
   color: var(--fg-3);
 }
+
+/* The resting composer: one slim line — "+", the words, the mic, send — the
+   chips wait inside until the field is touched. Same markup as the full
+   card; the row's children simply join the line. */
+.composer.composer-slim {
+  flex-direction: row;
+  align-items: center;
+  gap: 2px;
+  padding: 5px;
+  border-radius: 999px;
+}
+.composer-slim .composer-row { display: contents; }
+.composer-slim .composer-attach { order: -1; }
+.composer-slim .composer-chips,
+.composer-slim .composer-spacer { display: none; }
+.composer-slim .composer-input,
+.composer-slim .composer-input:focus,
+.composer-slim .composer-input:focus-visible {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  min-height: 40px;
+  max-height: 40px;
+  padding: 9px 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.composer-slim .chat-send,
+.composer-slim .chat-stop { width: 40px; height: 40px; }
+/* Nothing to send yet: a quiet grey disc, not a faded citrus one. */
+.composer .chat-send:disabled { opacity: 1; background: var(--bg-3); color: var(--fg-3); }
+
+/* Section heads speak in sentence case everywhere, quiet and small: a
+   label for what follows, never a shout above it. */
+.pane-head, .app-main h2.pane-head, .app-main h3.pane-head {
+  font-family: var(--font-body);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* A decision on Today answers with two compact pills, the way the question
+   card does — not two slabs that outweigh the question above them. */
+.home-row-needs .home-row-actions { gap: 8px; }
+.home-row-needs .home-btn {
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 0 18px;
+  border-radius: 999px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  font-weight: 600;
+}
+.home-row-needs .home-btn:not(.home-btn-primary) { background: var(--bg-0); border-color: var(--line-strong); }
+.home-row-needs > .home-row-title { -webkit-line-clamp: 2; }
+.home-row-needs { gap: 6px; padding: 14px 16px; }

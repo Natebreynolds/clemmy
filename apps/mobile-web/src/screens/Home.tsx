@@ -57,6 +57,8 @@ import { approvalKindLabel, approvalQuestion, workspaceChoiceLayout, workspaceCh
 import { homeLead, homeNeedsYouPane, type NeedsYouPane } from '../lib/home-presentation';
 import { phoneVisiblePanes, useHomePreferences, type HomePaneId, type QuickAction } from '../lib/home-prefs';
 import { useWorkingNow } from '../lib/working-now';
+import { chatHasNews, chatSeenBaseline } from '../lib/chat-seen';
+import { ChatStateMark } from '../components/ChatStateMark';
 import { HomeTiles } from '../components/HomeTiles';
 
 const POLL_MS = 6_000;
@@ -162,16 +164,14 @@ export function Home({
   const { data, loading, error, offline, refresh } = useScreenData(loadHome, { intervalMs: POLL_MS });
   const { approvals, plans, workspaceChoosers, questions, notifications, reminders } = data ?? lastGood.current;
 
-  // Recent conversations: read once per open, never polled (the Chats screen
-  // owns the live list). A failure leaves the stack out; nothing else moves.
-  const [recent, setRecent] = useState<ChatSession[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    void listChatSessions().then((r) => {
-      if (!cancelled) setRecent(r.sessions.filter((x) => x.kind === 'chat' || x.kind === 'agent').slice(0, MAX_RECENT_ROWS));
-    }).catch(() => { /* the stack stays out */ });
-    return () => { cancelled = true; };
-  }, []);
+  // Recent conversations, read while Today is on screen so one that is still
+  // working shows it, and one that finished since you looked says so. A
+  // failure leaves the stack out; nothing else moves.
+  const recentData = useScreenData(() => listChatSessions(), { intervalMs: 10_000, resourceKey: 'home-recent' });
+  const recent: ChatSession[] = (recentData.data?.sessions ?? [])
+    .filter((x) => x.kind === 'chat' || x.kind === 'agent')
+    .slice(0, MAX_RECENT_ROWS);
+  const recentSeen = chatSeenBaseline(recentData.data?.sessions ?? []);
 
   // The once-a-day line: what happened since you last looked. Bookkeeping is
   // per device and best effort; without storage the line simply never shows.
@@ -292,9 +292,12 @@ export function Home({
             <button key={session.id} type="button" class="home-row home-row-tap" onClick={() => { haptic('light'); onOpenChat(session); }}>
               <div class="min-w-0" style={{ flex: '1 1 auto' }}>
                 <div class="home-row-title truncate">{session.title || 'Conversation'}</div>
-                {session.agentName ? <div class="home-row-note truncate">{session.agentName}</div> : null}
+                {session.running ? <div class="home-row-note truncate">Working…</div>
+                  : session.agentName ? <div class="home-row-note truncate">{session.agentName}</div> : null}
               </div>
-              <span class="today-recent-when">{relativeTime(new Date(session.updatedAt).toISOString())}</span>
+              {session.running || chatHasNews(session, recentSeen)
+                ? <ChatStateMark running={session.running} news={chatHasNews(session, recentSeen)} />
+                : <span class="today-recent-when">{relativeTime(new Date(session.updatedAt).toISOString())}</span>}
             </button>
           ))}
         </div>

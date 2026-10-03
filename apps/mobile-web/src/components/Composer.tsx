@@ -109,6 +109,22 @@ export function Composer(props: ComposerProps) {
   useEffect(() => { autoresize(textareaRef.current); }, [value]);
   useEffect(() => () => { for (const s of staged) if (s.previewUrl) URL.revokeObjectURL(s.previewUrl); }, []);
 
+  // Resting, empty and untouched, the card is one slim line: "+", the words,
+  // the mic and send. Touching it opens the full card with its chips. Leaving
+  // waits a beat before it folds, so a tap on a chip lands on the chip.
+  const [focused, setFocused] = useState(false);
+  const foldTimer = useRef<number | null>(null);
+  const onFieldFocus = () => {
+    if (foldTimer.current !== null) { window.clearTimeout(foldTimer.current); foldTimer.current = null; }
+    setFocused(true);
+  };
+  const onFieldBlur = () => {
+    if (foldTimer.current !== null) window.clearTimeout(foldTimer.current);
+    foldTimer.current = window.setTimeout(() => { foldTimer.current = null; setFocused(false); }, 240);
+  };
+  useEffect(() => () => { if (foldTimer.current !== null) window.clearTimeout(foldTimer.current); }, []);
+  const slim = !focused && !value.trim() && staged.length === 0 && !listening && !transcribing && !voiceNote;
+
   const ready = staged.filter((s) => !s.uploading && !s.error);
   const uploading = staged.some((s) => s.uploading);
   const canSend = !disabled && !uploading && (value.trim().length > 0 || ready.length > 0);
@@ -163,7 +179,7 @@ export function Composer(props: ComposerProps) {
   const onFiles = (event: Event) => { void pick((event.currentTarget as HTMLInputElement).files); (event.currentTarget as HTMLInputElement).value = ''; };
 
   return (
-    <form class={`composer${compact ? ' composer-compact' : ''}${listening ? ' listening' : ''}`} onSubmit={submit}>
+    <form class={`composer${compact ? ' composer-compact' : ''}${slim ? ' composer-slim' : ''}${listening ? ' listening' : ''}`} onSubmit={submit}>
       {staged.length > 0 ? (
         <div class="composer-attachments" aria-label="Attachments">
           {staged.map((s) => (
@@ -192,6 +208,8 @@ export function Composer(props: ComposerProps) {
         enterkeyhint="send"
         autocomplete="off"
         disabled={disabled}
+        onFocus={onFieldFocus}
+        onBlur={onFieldBlur}
         onInput={(event) => onChange((event.currentTarget as HTMLTextAreaElement).value)}
         onKeyDown={(event) => {
           if (event.isComposing) return;
