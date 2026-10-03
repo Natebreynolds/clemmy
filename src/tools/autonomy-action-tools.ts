@@ -217,7 +217,7 @@ export function registerAutonomyActionTools(server: McpServer): void {
     'check_in',
     [
       'Tell the user what you found or are doing, mid-task, WITHOUT stopping — it lands in the conversation for whenever they come back.',
-      'Use it when the picture changes (a first finding, a surprise, slow work, a judgement call); one or two sentences in your own words.',
+      'Use it when the picture changes (a first finding, a surprise, slow work, a judgement call); one or two sentences in your own words, at most 600 characters.',
       'Not a question (ask_user_question) and not an alert (notify_user); nothing waits on it.',
     ].join(' '),
     { note: z.string().min(1).max(600) },
