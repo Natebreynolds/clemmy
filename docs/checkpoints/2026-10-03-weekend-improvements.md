@@ -568,3 +568,38 @@ verdicts from `goal_alignment_judged`. Settings backed up first
 - **Status:** wave 46 = ceff86213 installed 10:47 PT; build-info serves it;
   daemon, desk and phone bundles match; Browserbase still configured
   (900/7200).
+
+## The mobile audit failure handoff: first fixes (10-03 12:00–12:36 PT)
+
+- **Handoff:** the other agent's 2026-10-03 mobile audit failure handoff
+  (Brett → Ward Law audit; parent sess-mob-2738af7e1d2f603518d234981db69eff).
+  Owner decisions: Scorpion Audit on Opus 5.5; install the small explanation
+  fix now, batch the worker fixes; "we can't have workers blocked by things
+  like that".
+- **Wave 47 = dda4c87a2** (12:19 PT): the other agent's fix — a completed
+  no-progress explanation replaces the internal error in the blocked terminal.
+- **Scorpion Audit model:** saved `claude-opus-5-5` through
+  `PATCH /api/console/agents/scorpion-audit` (file reads it back). Proof of
+  saved = requested = served on a fixture run still owed.
+- **Worker blocked on reads (7851a5786):** worker 349137 was leased
+  `dataforseo__api_request`, the same tool the parent had just run; its four
+  `/live` POSTs were refused `WORKER_COMPOSE_ONLY` although all four shapes
+  were learned `reads_only` on 09-29 (judge-confirmed). The host worker check
+  used the sealed manifest effect alone; it now asks
+  `workerMustComposeForParent`, the same learned-read rule as the parent's
+  `hostCallAccounting`. Unknown shapes, writes, admin and declared-destructive
+  tools still compose to the parent. Pin proves the runner uses it.
+- **Shell false positive (4ad0ef94b):** worker 349282's `sqlite3 … ".tables"
+  2>&1 | …` was refused as an authorization-state write. Descriptor
+  duplication is no longer a write signal; the sqlite3 database is a target
+  only when the command changes it (also fixes `SELECT … 2>/dev/null`). Gaps
+  closed in the same pass: `>& file`, sqlite3 `.import/.restore`, VACUUM,
+  REINDEX, `PRAGMA x =`, and `.backup/.save/.clone/.output/.once FILE`.
+- **Checks:** 4,622 tests across 163 shell/worker/learned-read files pass;
+  tsc and both app builds clean.
+- **Wave 48 = 4ad0ef94b** installed 12:36 PT; build-info serves it; bundles
+  match.
+- **Still open from the handoff:** worker honesty as a typed outcome from host
+  facts (compose-only refusals per worker run, across the host and Claude
+  lanes); task sizing for large jobs; retained-result navigation for large
+  MCP envelopes; the controlled Opus fixture run; the full mobile workflow.
