@@ -94,9 +94,14 @@ export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
     }
     case 'approval': {
       const queued = item.row.pendingAction;
-      const title = oneLine(queued?.title || item.row.presentation?.action || item.row.subject, TITLE_MAX) || 'Approval';
+      // Clem's own question and why when her checker wrote them; never an
+      // operation id ("Workflow delete / workflowdelete", live 10-02).
+      const ask = item.row.presentation?.ask;
+      const title = oneLine(queued?.title || ask || item.row.presentation?.action || item.row.subject, TITLE_MAX) || 'Approval';
       return { ...base, checkable: true, aged: item.aged, title,
-        preview: previewFor(title, [queued?.targetSummary, item.row.contentPreview?.body, item.row.summary, item.row.subject]),
+        preview: previewFor(title, ask && !queued
+          ? [item.row.presentation?.why, item.row.contentPreview?.body]
+          : [queued?.targetSummary, item.row.contentPreview?.body, item.row.summary, item.row.subject]),
         context: item.row.presentation?.app, at: item.row.requestedAt,
         state: item.aged ? { tone: 'neutral', label: 'Older' } : { tone: 'live', label: queued ? 'Ready' : 'Approve' } };
     }

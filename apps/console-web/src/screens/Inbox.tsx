@@ -1,3 +1,4 @@
+import { APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -1002,7 +1003,10 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
   const [changing, setChanging] = useState(false);
   const [changeNote, setChangeNote] = useState('');
   const isWorkflowGate = row.tool === 'workflow_approval_gate';
-  const summary = queued?.summary || row.summary;
+  // With Clem's question as the title, her why is the line under it — never
+  // the raw tool name the summary falls back to.
+  const voiced = !queued && Boolean(row.presentation?.ask);
+  const summary = voiced ? row.presentation?.why : queued?.summary || row.summary;
   // Clem's own question when her checker wrote one; never an operation id.
   const title = queued?.title || row.presentation?.ask || row.presentation?.action || row.subject;
   return (
@@ -1012,7 +1016,7 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
         <>
           <Button disabled={busy} onClick={onApprove}>
             {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-            {decisionState?.busy && decisionState.intent === 'approve' ? 'Approving…' : queued ? 'Approve & continue' : 'Approve'}
+            {decisionState?.busy && decisionState.intent === 'approve' ? 'Approving…' : queued ? 'Approve & continue' : voiced ? APPROVAL_ANSWER_WORDS.approve.replace(/\.$/, '') : 'Approve'}
           </Button>
           {isWorkflowGate && (
             <Button variant="secondary" disabled={busy} aria-expanded={changing} onClick={() => setChanging((open) => !open)}>
@@ -1021,7 +1025,7 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
           )}
           <Button variant="secondary" disabled={busy} onClick={() => onReject()}>
             <X className="h-4 w-4" aria-hidden />
-            {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : 'Decline'}
+            {decisionState?.busy && decisionState.intent === 'reject' ? 'Declining…' : voiced ? APPROVAL_ANSWER_WORDS.reject.replace(/\.$/, '') : 'Decline'}
           </Button>
           {isWorkflowGate && changing && (
             <form

@@ -7,6 +7,11 @@ import { openEventLog } from './eventlog.js';
  * only; one session-scoped read per pending card.
  */
 export function approvalCardAsk(sessionId: string, approvalId: string): string | null {
+  return approvalCardVoice(sessionId, approvalId)?.ask ?? null;
+}
+
+/** The card's question and why, as its approval_requested event carries them. */
+export function approvalCardVoice(sessionId: string, approvalId: string): { ask: string; why?: string } | null {
   try {
     const rows = openEventLog().prepare(`
       SELECT data_json AS dataJson FROM events
@@ -19,7 +24,8 @@ export function approvalCardAsk(sessionId: string, approvalId: string): string |
       ? data.preview as Record<string, unknown>
       : null;
     const ask = typeof preview?.ask === 'string' ? preview.ask.trim() : '';
-    return ask ? ask.slice(0, 200) : null;
+    const why = typeof preview?.why === 'string' ? preview.why.trim() : '';
+    return ask ? { ask: ask.slice(0, 200), ...(why ? { why: why.slice(0, 260) } : {}) } : null;
   } catch {
     return null;
   }

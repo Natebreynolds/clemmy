@@ -21,6 +21,8 @@ export interface ApprovalPresentation {
   /** Clem's own question for the card, when its checker wrote one: the
    *  title a person reads ("Can I post this to #sales?"). */
   ask?: string;
+  /** Why a yes is needed, in her words, alongside `ask`. */
+  why?: string;
   app?: string;
   operation?: string;
   details: ApprovalDetailLine[];
@@ -124,7 +126,7 @@ export function detailLinesFor(args: unknown): ApprovalDetailLine[] {
   return lines;
 }
 
-export function presentApprovalForHumans(input: { tool?: string | null; args?: unknown; subject?: string; ask?: string | null }): ApprovalPresentation {
+export function presentApprovalForHumans(input: { tool?: string | null; args?: unknown; subject?: string; ask?: string | null; why?: string | null }): ApprovalPresentation {
   const call = unwrapApprovalCall(input.tool, input.args);
   const app = appLabel(call.operation, call.tool);
   const phrase = operationPhrase(call.operation, call.tool, app);
@@ -132,6 +134,7 @@ export function presentApprovalForHumans(input: { tool?: string | null; args?: u
   return {
     action,
     ...(input.ask?.trim() ? { ask: input.ask.trim() } : {}),
+    ...(input.ask?.trim() && input.why?.trim() ? { why: input.why.trim() } : {}),
     ...(app ? { app } : {}),
     ...(call.operation ? { operation: call.operation } : {}),
     details: detailLinesFor(call.args),

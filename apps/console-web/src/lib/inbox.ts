@@ -22,6 +22,8 @@ export interface ApprovalRow {
     action: string;
     /** Clem's own question for the card, when her checker wrote one. */
     ask?: string;
+    /** Why a yes is needed, in her words, alongside `ask`. */
+    why?: string;
     app?: string;
     operation?: string;
     details: Array<{ label: string; value: string; long: boolean }>;

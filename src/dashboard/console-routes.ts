@@ -1,4 +1,4 @@
-import { approvalCardAsk } from '../runtime/harness/approval-card-voice.js';
+import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
@@ -2815,6 +2815,11 @@ function expandCronDow(field: string): number[] | null {
 
 function formatLocalDate(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+/** Clem's question and why for a card, as presentApprovalForHumans takes them. */
+function cardVoiceFields(voice: { ask: string; why?: string } | null): { ask?: string; why?: string } {
+  return voice ? { ask: voice.ask, ...(voice.why ? { why: voice.why } : {}) } : {};
 }
 
 export function upcomingWorkflowOccurrences(
@@ -12073,7 +12078,7 @@ export function registerConsoleRoutes(
           args: r.args,
           // What will happen, where, through which app — never the carrier envelope.
           presentation: presentApprovalForHumans({ tool: r.tool, args: r.args, subject: r.subject,
-            ask: approvalCardAsk(r.sessionId, r.approvalId) }),
+            ...cardVoiceFields(approvalCardVoice(r.sessionId, r.approvalId)) }),
           status: r.status,
           resolution: r.resolution,
           resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {
@@ -14537,7 +14542,7 @@ export function registerConsoleRoutes(
           // The same words Needs you and the phone use: the request's own
           // subject, else the unwrapped provider call. Never the carrier.
           const presentation = presentApprovalForHumans({ tool: approval.tool, args: approval.args, subject: approval.subject,
-            ask: approvalCardAsk(approval.sessionId, approval.approvalId) });
+            ...cardVoiceFields(approvalCardVoice(approval.sessionId, approval.approvalId)) });
           const headline = approval.subject?.trim() || presentation.action;
           return {
             kind: 'harness-approval',

@@ -388,7 +388,7 @@ export interface ApprovalRow {
   subject: string;
   tool: string | null;
   args: unknown;
-  presentation?: { action: string; ask?: string; app?: string; operation?: string; details: Array<{ label: string; value: string; long: boolean }>; unwrapped: boolean };
+  presentation?: { action: string; ask?: string; why?: string; app?: string; operation?: string; details: Array<{ label: string; value: string; long: boolean }>; unwrapped: boolean };
   /** The draft being approved; shown on the card before the buttons. */
   contentPreview?: { body?: string; imageUrl?: string };
   status: 'pending' | 'resolved' | 'expired' | 'cancelled';

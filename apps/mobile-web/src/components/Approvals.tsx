@@ -321,6 +321,7 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply, project }:
       </header>
       {project ? <span class="chip chip-project inbox-project">{project}</span> : null}
       <h2 class="card-title">{row.presentation?.ask ?? approvalQuestion(row.subject)}</h2>
+      {row.presentation?.ask && row.presentation.why ? <p class="card-note">{row.presentation.why}</p> : null}
       {row.resourceFingerprint?.warning ? (
         <p class="card-warn">{row.resourceFingerprint.warning}</p>
       ) : null}

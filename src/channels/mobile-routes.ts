@@ -1,4 +1,4 @@
-import { approvalCardAsk } from '../runtime/harness/approval-card-voice.js';
+import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { nextAnsweringAgentModel, recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
@@ -212,6 +212,11 @@ import {
   projectForegroundWorkingNowSnapshot,
   projectWorkingNowSnapshot,
 } from '../dashboard/activity-projection.js';
+
+/** Clem's question and why for a card, as presentApprovalForHumans takes them. */
+function cardVoiceFields(voice: { ask: string; why?: string } | null): { ask?: string; why?: string } {
+  return voice ? { ask: voice.ask, ...(voice.why ? { why: voice.why } : {}) } : {};
+}
 
 export const MOBILE_SESSION_COOKIE = 'clem_mobile_session';
 const COOKIE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -524,7 +529,7 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
   return {
     kind: 'harness',
     presentation: presentApprovalForHumans({ tool: row.tool, args: row.args, subject: row.subject,
-      ask: approvalCardAsk(row.sessionId, row.approvalId) }),
+      ...cardVoiceFields(approvalCardVoice(row.sessionId, row.approvalId)) }),
     contentPreview: extractApprovalContentPreview(row.tool, row.args ?? undefined),
     approvalId: row.approvalId,
     sessionId: row.sessionId,
