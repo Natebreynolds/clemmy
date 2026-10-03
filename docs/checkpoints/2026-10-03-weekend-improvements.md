@@ -418,4 +418,6 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   Browserbase's own connect URL (no local Chrome); it is not configured on
   this Mac (`configured:false`), and its own record says live/cloud
   acceptance is still owed.
-- **Status:** installing as wave 40.
+- **Status:** wave 40 = c2d23b478 installed 07:51 PT (build-info serves it;
+  daemon, desk and phone bundles match the build). Owner retest from the
+  phone owed.
