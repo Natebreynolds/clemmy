@@ -5642,3 +5642,26 @@ textarea.cz-input { resize: vertical; }
 .home-row-needs .home-btn:not(.home-btn-primary) { background: var(--bg-0); border-color: var(--line-strong); }
 .home-row-needs > .home-row-title { -webkit-line-clamp: 2; }
 .home-row-needs { gap: 6px; padding: 14px 16px; }
+
+/* A run row is a button; a button sizes to its widest line unless told
+   otherwise, which pushed long titles past the card's edge. It takes the
+   card's width, and a title made of one long token still wraps. */
+.run-open { display: block; width: 100%; overflow: hidden; }
+.run-open .card-title-sm { overflow-wrap: anywhere; }
+/* A flow's description is a preview in the list: two lines. */
+.workflow-row .workflow-row-desc { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+/* Message an agent: a small pill inside its card, not a walled-off column. */
+.agent-card { align-items: center; }
+.agent-card .agent-edit {
+  min-width: 0;
+  height: 36px;
+  margin-right: var(--sp-3);
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-left: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--bg-0);
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+}

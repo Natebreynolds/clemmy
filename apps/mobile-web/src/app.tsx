@@ -87,6 +87,8 @@ export function App() {
   /** The project and the agent a URL addresses; each tab owns its own view. */
   const [projectId, setProjectId] = useState<string | null>(() => projectFromSearch(window.location.search));
   const [agentId, setAgentId] = useState<string | null>(() => agentFromSearch(window.location.search));
+  // The header's "+" door asks the open list screen to start a new one.
+  const [createRequest, setCreateRequest] = useState(0);
   // The title is the navigator: tapping it opens the switcher sheet. The
   // full section menu (the left drawer) stays behind "More".
   // A rightward swipe across the header opens the menu.
@@ -692,6 +694,16 @@ export function App() {
               )}
             </button>
           ) : null}
+          {(tab === 'projects' && !projectId) || (tab === 'agents' && !agentId) ? (
+            <button
+              type="button"
+              class="header-round"
+              aria-label={tab === 'projects' ? 'New project' : 'New agent'}
+              onClick={() => { haptic('light'); setCreateRequest((n) => n + 1); }}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+            </button>
+          ) : null}
           {tab === 'chats' && chatsListVisible ? (
             <button
               type="button"
@@ -903,9 +915,11 @@ export function App() {
               onOpenAgent={(id) => navigateTo('agents', { agentId: id })}
               onOpenNeedsYou={() => navigateTo('inbox')}
               onDecided={() => recountNeedsYou.current()}
+              createRequest={createRequest}
             />
           ) : tab === 'agents' ? (
             <Agents
+              createRequest={createRequest}
               initialAgentId={agentId}
               onAgentChange={(id) => navigateTo('agents', { agentId: id })}
               onOpenProject={(id) => navigateTo('projects', { projectId: id })}

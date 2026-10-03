@@ -70,7 +70,7 @@ export function Workflows() {
               {workflowRowStatus(wf).label}
             </span>
           </div>
-          {workflowCaption(wf.name, wf.description) ? <div class="workflow-row-slug">{wf.name}</div> : null}
+          {/* The list reads as names; the workflow's id stays on its own page. */}
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}
           <div class="workflow-row-meta">
             <span>{wf.stepCount} {wf.stepCount === 1 ? 'step' : 'steps'}</span>

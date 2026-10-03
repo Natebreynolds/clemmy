@@ -35,9 +35,11 @@ interface Props {
   onOpenNeedsYou: () => void;
   /** A decision was settled here, so the Needs-you count is read again. */
   onDecided: () => void;
+  /** Bumped by the header's "+" door: start a new project. */
+  createRequest?: number;
 }
 
-export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpenRun, onOpenAgent, onOpenNeedsYou, onDecided }: Props) {
+export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpenRun, onOpenAgent, onOpenNeedsYou, onDecided, createRequest }: Props) {
   const [openId, setOpenId] = useState<string | null>(initialProjectId ?? null);
   useBackGesture(openId !== null, () => { setOpenId(null); onProjectChange?.(null); });
   // The URL is the source of truth for which project is open.
@@ -45,6 +47,13 @@ export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpen
 
   const [showArchived, setShowArchived] = useState(false);
   const [creating, setCreating] = useState(false);
+  // Only a request made while this screen is open starts one.
+  const seenCreate = useRef(createRequest);
+  useEffect(() => {
+    if (createRequest === seenCreate.current) return;
+    seenCreate.current = createRequest;
+    setCreating(true);
+  }, [createRequest]);
   const { data, loading, error, offline, refresh } = useScreenData(
     async () => {
       try {
@@ -84,13 +93,6 @@ export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpen
 
   return (
     <div>
-      <button class="btn-new" type="button" onClick={() => { haptic('light'); setCreating(true); }}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-          <path d="M12 5v14M5 12h14" />
-        </svg>
-        New project
-      </button>
-
       <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={projects.length > 0} />
 
       {loading && projects.length === 0 ? (

@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'preact/hooks';
+import { modelDisplayName } from '@clem/chat-engine';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import {
   createAgent,
@@ -30,10 +31,19 @@ interface Props {
   onOpenProject?: (projectId: string) => void;
   onOpenRun?: (runSessionId: string) => void;
   onOpenNeedsYou?: () => void;
+  /** Bumped by the header's "+" door: make a new agent. */
+  createRequest?: number;
 }
 
-export function Agents({ onMessage, initialAgentId, onAgentChange, onOpenProject, onOpenRun, onOpenNeedsYou }: Props) {
+export function Agents({ onMessage, initialAgentId, onAgentChange, onOpenProject, onOpenRun, onOpenNeedsYou, createRequest }: Props) {
   const [editing, setEditing] = useState<MobileAgent | 'new' | null>(null);
+  // Only a request made while this screen is open starts one.
+  const seenCreate = useRef(createRequest);
+  useEffect(() => {
+    if (createRequest === seenCreate.current) return;
+    seenCreate.current = createRequest;
+    setEditing('new');
+  }, [createRequest]);
   // An agent's own screen is depth under the list; its editor is depth under that.
   const [viewingId, setViewingId] = useState<string | null>(initialAgentId ?? null);
   useBackGesture(viewingId !== null, () => { setViewingId(null); onAgentChange?.(null); });
@@ -98,14 +108,6 @@ export function Agents({ onMessage, initialAgentId, onAgentChange, onOpenProject
 
   return (
     <div class="screen-pad">
-      <button
-        class="agent-new"
-        type="button"
-        onClick={() => { haptic('light'); setEditing('new'); }}
-      >
-        + New agent
-      </button>
-
       {agents.length === 0 ? (
         <p class="agent-empty">
           No agents yet. An agent is a name plus the skills and workflows it should reach for
@@ -127,7 +129,7 @@ export function Agents({ onMessage, initialAgentId, onAgentChange, onOpenProject
               <span class="agent-pins">
                 {agent.skills.length > 0 ? <span>{agent.skills.length} skills</span> : null}
                 {agent.workflows.length > 0 ? <span>{agent.workflows.length} workflows</span> : null}
-                {agent.model ? <span>{agent.model}</span> : null}
+                {agent.model ? <span title={agent.model}>{modelDisplayName(agent.model)}</span> : null}
               </span>
             </button>
             {/* Messaging was the row's own tap before an agent had a screen of

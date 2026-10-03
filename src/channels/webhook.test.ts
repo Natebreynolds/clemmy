@@ -412,3 +412,13 @@ test('JSON run cancellation contract preserves missing-run failure status', () =
   assert.equal(result.httpStatus, 404);
   assert.match(result.message, /Run not found/);
 });
+
+test('an Activity row is named by the work, never by a card answer or a machine-made input', () => {
+  const session = { id: 's', kind: 'chat', channel: null, title: 'Delete the fixture workflow', objective: null, metadata: {} } as unknown as SessionRow;
+  assert.equal(__test__.activityRunTitle(session, { text: 'Summarize my week' }, 'Summarize my week'), 'Summarize my week');
+  assert.equal(__test__.activityRunTitle(session, { text: 'reject apr-fixture', approvalId: 'apr-fixture', decision: 'reject' }, 'reject apr-fixture'),
+    'Delete the fixture workflow');
+  const watch = { ...session, title: null } as unknown as SessionRow;
+  assert.equal(__test__.activityRunTitle(watch, { text: 'Calendar watch tick-1: read FIXTURE_OP on ca_1', synthetic: true, source: 'calendar_watch' }, 'Calendar watch tick-1: read FIXTURE_OP on ca_1'),
+    'Calendar watch');
+});

@@ -713,9 +713,7 @@ function computeHarnessSessionActivityRun(session: HarnessSessionRow, latestSeq:
     userId: session.userId ?? undefined,
     channel: session.channel ?? undefined,
     source: harnessSource(session),
-    title: currentInput
-      ? (currentInput.length > 100 ? `${currentInput.slice(0, 97)}...` : currentInput)
-      : session.title || session.objective || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine session'),
+    title: activityRunTitle(session, latestInputData, currentInput),
     input: currentInput || session.objective || session.title || '',
     status,
     createdAt: session.createdAt,
@@ -755,6 +753,23 @@ const harnessActivityProjectionCache = new Map<string, {
  * one indexed latest-seq read—not five queries plus repeated JSON decoding.
  * Every append changes latestSeq; lifecycle-only session changes are covered by
  * status/updatedAt. The small LRU-like cap prevents long-lived daemon growth. */
+/**
+ * What names a run in Activity. The latest request names the work — but a
+ * card answer ("reject apr-…") or a machine-made input is not a request, so
+ * it never names the row: the conversation's own title does, or the system
+ * that started it, in words.
+ */
+function activityRunTitle(session: HarnessSessionRow, latestInput: Record<string, unknown>, currentInput: string): string {
+  const inputNamesWork = latestInput.synthetic !== true
+    && !(typeof latestInput.approvalId === 'string' && typeof latestInput.decision === 'string');
+  if (currentInput && inputNamesWork) return currentInput.length > 100 ? `${currentInput.slice(0, 97)}...` : currentInput;
+  const systemSource = latestInput.synthetic === true && typeof latestInput.source === 'string'
+    ? latestInput.source.replace(/[_-]+/g, ' ').trim().replace(/^./, (c) => c.toUpperCase())
+    : '';
+  return session.title || session.objective || systemSource
+    || (isDiscordHarnessSession(session) ? 'Discord conversation' : 'Clementine session');
+}
+
 function harnessSessionAsActivityRun(session: HarnessSessionRow): HarnessActivityProjection {
   const latestSeq = harnessGetLatestEventSeq(session.id);
   // Active sessions have a time-based idle projection even without new events.
@@ -1074,6 +1089,7 @@ function collectRecentActivityRuns(limit: number) {
 }
 
 export const __test__ = {
+  activityRunTitle,
   apiMessageDurableIdentity,
   apiMessageIdempotencyKey,
   claimApiMessageRequest,
