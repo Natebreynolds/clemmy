@@ -71,6 +71,32 @@ function appendTypedTerminal(
   });
 }
 
+test('a reopened question or approval reads as it did live, without the retained-work checkpoint', () => {
+  const session = createSession({ kind: 'chat', title: 'waiting replies' });
+  const ask = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Set up the assistant.' } });
+  const question = typedTerminalData({
+    sessionId: session.id,
+    sourceUserSeq: ask.seq,
+    text: 'Which platform should I build it on?\n\nRetained work (durable checkpoint):\n- Source/tool list_numbers: 3 records (unknown) retained as rh_0123456789abcdef0123456789abcdef. External write state: no settled external-write attempt is recorded.',
+  });
+  const presentation = question.presentation as Record<string, unknown>;
+  presentation.status = 'needs_input';
+  presentation.kind = 'question';
+  presentation.resumable = true;
+  presentation.needs = { kind: 'input' };
+  question.turnOutcome = { version: 2, id: presentation.outcomeId, status: 'needs_input', resumable: true, needs: { kind: 'input' } };
+  question.awaitingUser = true;
+  question.reason = 'awaiting_user_input';
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'conversation_completed', data: question });
+  const done = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Vapi.' } });
+  appendTypedTerminal(session.id, done.seq, 'Built it.\n\nRetained work (durable checkpoint):\n- kept for a finished reply');
+  const turns = reconstructHarnessTranscript(session.id);
+  const reopened = turns.find((turn) => turn.role === 'assistant' && turn.text.startsWith('Which platform'));
+  assert.equal(reopened?.text, 'Which platform should I build it on?');
+  const finished = turns.find((turn) => turn.role === 'assistant' && turn.text.startsWith('Built it.'));
+  assert.match(finished?.text ?? '', /Retained work/, 'a finished or failed reply still discloses it');
+});
+
 test('humanHarnessText unwraps strings, JSON strings, and objects', () => {
   assert.equal(humanHarnessText('plain text'), 'plain text');
   assert.equal(humanHarnessText({ reply: 'hi there' }), 'hi there');

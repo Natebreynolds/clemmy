@@ -11,6 +11,7 @@ import type { WorkflowSavedEventData } from '../../execution/workflow-saved-even
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
 import { assertPublicPresentationText } from './turn-outcome.js';
+import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
   publicCompletionText,
@@ -215,7 +216,13 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     if (!prior || event.seq < prior.seq) {
       assistantBySource.set(key, {
         seq: event.seq,
-        text: presentation.text,
+        // A reply that waited on the owner (a question, an approval) reopens
+        // as they read it live: without the host's retained-work checkpoint,
+        // which is record counts and handle ids kept for the model. Live
+        // 10-02: every reopened question and approval ended in that block.
+        text: presentation.status === 'needs_input'
+          ? withoutRetainedWorkCheckpoint(presentation.text)
+          : presentation.text,
         createdAt: event.createdAt,
         planProposalId: planProposalIdFrom(event.data),
         planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
