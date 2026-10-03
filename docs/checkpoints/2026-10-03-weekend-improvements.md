@@ -530,3 +530,24 @@ verdicts from `goal_alignment_judged`. Settings backed up first
 - **Installed:** wave 44 = 7dfea5462 at 09:33 PT; live overview answered
   (limits 900/7200); desktop panel captured read-only with no page errors.
   The chip label wrapped to two lines; fixed in source, ships next install.
+
+## The live view showed a blank tab; opening a site took 7 rounds (10-03 09:38 PT)
+
+- **Live:** sess-branch-148d251f43ec8d12c57ed427afc7286d033bbe91 "Can you
+  open Facebook in a browser" (GPT 6.1 Sol): success in 54 s. Browserbase
+  work took ~3 s; seven model rounds took the rest (tool_search twice, a
+  resources check the start description demanded, start, open, navigate,
+  answer). The panel named Facebook but the live view area was empty.
+- **Cause (probed with a short fixture browser, then stopped):** the live view
+  loads and connects, but without a target it shows the browser's first tab.
+  Clem opened a second tab and navigated that one, so the owner watched the
+  untouched blank first tab.
+- **Fix (2f74066c1):** the service keeps the page Clem last acted on
+  (`focusTargetId`), serves the live view of that page by default (first page
+  if it has closed), and both panels name it and swap the view when it
+  changes. `cloud_browser_start` rejoins this chat's open browser, returns
+  page handles, and takes an optional `url` opened in the first page in the
+  same call; `cloud_browser_open` says it is only for a second tab. 838
+  neighbouring and app tests, both app builds and tsc clean.
+- **Status:** wave 45 = 2f74066c1 (with the chip one-line fix) installed
+  09:49 PT; build-info serves it; bundles match. Owner retest owed.
