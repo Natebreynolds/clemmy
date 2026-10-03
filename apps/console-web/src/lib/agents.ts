@@ -128,13 +128,26 @@ export const setConversationAgent = (sessionId: string, agentId: string | null) 
 /** An agent's own model, when it answers the next message. */
 export interface AnsweringAgentModel { modelId: string; agentId: string; agentName: string }
 
+export interface NextAnsweringModel {
+  agent: AnsweringAgentModel | null;
+  brain: { modelId: string; provider: string; source: string };
+  effectiveValue: string;
+}
+
 /** Whether the next message is answered on an agent's own model: `agentId` is
  *  the agent chip's choice (null = Clem), applied on send like the switch. */
 export const getAnsweringModel = (sessionId: string | undefined, agentId: string | null) => {
+  return getNextAnsweringModel(sessionId, agentId).then((r) => r.agent);
+};
+
+export const getNextAnsweringModel = (sessionId: string | undefined, agentId: string | null): Promise<NextAnsweringModel> => {
   const query = new URLSearchParams();
   if (sessionId) query.set('sessionId', sessionId);
   query.set('agentId', agentId ?? '');
-  return apiGet<{ agent: AnsweringAgentModel | null }>(`/api/console/answering-model?${query}`).then((r) => r.agent ?? null);
+  return apiGet<NextAnsweringModel>(`/api/console/answering-model?${query}`).then((r) => {
+    if (!r?.brain?.modelId || !r.brain.provider || !r.effectiveValue) throw new Error('The conversation model is unavailable.');
+    return r;
+  });
 };
 
 /** The chips a roster card shows: what the agent reaches for first. */

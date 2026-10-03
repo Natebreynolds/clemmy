@@ -7,7 +7,7 @@
  * no per-session scope for them), and the UI says so rather than pretending.
  */
 import { MEMORY_ROLE_WORDS, modelDisplayName } from '@clem/chat-engine';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePoll } from './poll';
 import {
@@ -138,6 +138,12 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [claudeSignInFor, setClaudeSignInFor] = useState<string | null>(null);
+  const generation = useRef(0);
+  useEffect(() => {
+    generation.current += 1;
+    setBusy(null); setError(null); setSaved(null); setClaudeSignInFor(null);
+    return () => { generation.current += 1; };
+  }, [opts.sessionId]);
 
   useEffect(() => {
     if (!mr?.discovery?.refreshing) return;
@@ -152,27 +158,28 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     void qc.invalidateQueries({ queryKey: ['answering-model'] });
   };
   const run = async (key: string, fn: () => Promise<unknown>) => {
+    const current = ++generation.current;
     setBusy(key); setError(null); setSaved(null);
-    try { await fn(); setSaved(key); refresh(); }
+    try { await fn(); if (current === generation.current) { setSaved(key); refresh(); } }
     catch (err) {
-      const e = err as { status?: number; body?: { needsLogin?: boolean; error?: string }; message?: string };
-      setError(e?.body?.needsLogin || e?.status === 409
-        ? (e?.body?.error && /expired/i.test(e.body.error)
-            ? 'Your Claude sign-in has expired. Sign in again and the switch to Claude completes on its own.'
-            : 'Switching to Claude needs a Claude (Max/Pro) sign-in first. Sign in and the switch completes on its own.')
-        : (e?.message ?? String(err)));
-    } finally { setBusy(null); }
+      if (current !== generation.current) return;
+      const e = err as { body?: { error?: string }; message?: string };
+      setError(e?.body?.error ?? e?.message ?? String(err));
+    } finally { if (current === generation.current) setBusy(null); }
   };
 
-  const onBrain = (value: string) => run('brain', async () => {
+  const onBrain = (value: string, beforeChange?: () => Promise<unknown>) => run('brain', async () => {
+    const current = generation.current;
     const wantsClaude = brainProvider(value) === 'claude';
     try {
+      await beforeChange?.();
+      if (current !== generation.current) return;
       const call = brainCall(value);
       await setActiveBrain(call.brain, call.modelId, opts.sessionId);
-      setClaudeSignInFor(null);
+      if (current === generation.current) setClaudeSignInFor(null);
     } catch (err) {
       const e = err as { status?: number; body?: { needsLogin?: boolean } };
-      if (wantsClaude && (e?.body?.needsLogin || e?.status === 409)) setClaudeSignInFor(value);
+      if (current === generation.current && wantsClaude && e?.body?.needsLogin) setClaudeSignInFor(value);
       throw err;
     }
   });

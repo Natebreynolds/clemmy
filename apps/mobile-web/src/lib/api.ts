@@ -16,6 +16,7 @@ import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.j
 import { signProof, deviceKeySupported, exportPublicJwk } from './device-key.js';
 import { connectionDoor, reportConnectionLost, setConnectionDoor } from './native-bridge.js';
 import { LAST_GOOD_HEADER, clearLastGood, noteLastGood } from './last-good.js';
+import { readBrainSelectionResponse, type BrainSelectionResponse } from '@clem/chat-engine';
 
 /**
  * The current session's fingerprint, which every proof is signed over.
@@ -994,15 +995,26 @@ export async function switchChatAgent(sessionId: string, agentId: string | null)
 /** An agent's own model, when it answers the next message. */
 export interface AnsweringAgentModel { modelId: string; agentId: string; agentName: string }
 
+export interface NextAnsweringModel {
+  agent: AnsweringAgentModel | null;
+  brain: ResolvedBrain;
+  effectiveValue: string;
+}
+
 /** Whether the next message is answered on an agent's own model:
  *  `agentId` is the agent chip's choice, applied on send like the
  *  switch itself; null = Clem. The desktop chip reads the same answer. */
 export async function getAnsweringModel(sessionId: string | undefined, agentId: string | null): Promise<AnsweringAgentModel | null> {
+  return (await getNextAnsweringModel(sessionId, agentId)).agent;
+}
+
+export async function getNextAnsweringModel(sessionId: string | undefined, agentId: string | null): Promise<NextAnsweringModel> {
   const query = new URLSearchParams();
   if (sessionId) query.set('sessionId', sessionId);
   query.set('agentId', agentId ?? '');
-  const result = await api<{ agent: AnsweringAgentModel | null }>(`/m/api/chat/answering-model?${query}`);
-  return result.agent ?? null;
+  const result = await api<NextAnsweringModel>(`/m/api/chat/answering-model?${query}`);
+  if (!result?.brain?.modelId || !result.brain.provider || !result.effectiveValue) throw new Error('The conversation model is unavailable.');
+  return result;
 }
 
 export async function getChatSession(id: string): Promise<{ session: ChatSession; events: ChatEvent[]; latestSeq: number }> {
@@ -1927,11 +1939,12 @@ export async function getUsageStatus(): Promise<UsageStatus> {
  *  the global flip alone only steers NEW conversations — sending the sessionId
  *  makes the daemon re-pin that conversation so "applies to your next message"
  *  stays true where the sheet promises it. */
-export async function setBrain(value: string, sessionId?: string): Promise<{ ok: boolean; brain: ResolvedBrain; effectiveValue: string }> {
-  return api('/m/api/settings/models/brain', {
+export async function setBrain(value: string, sessionId?: string): Promise<BrainSelectionResponse<ResolvedBrain>> {
+  const result = await api<unknown>('/m/api/settings/models/brain', {
     method: 'POST',
     body: JSON.stringify(sessionId ? { value, sessionId } : { value }),
   });
+  return readBrainSelectionResponse<ResolvedBrain>(result, value, sessionId);
 }
 
 /** Bind a role to an exact connected model id, or null to go back to

@@ -1,6 +1,7 @@
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
-import { nextAnsweringAgentModel, recordBrainChosenForSession } from '../agents/session-agent-model.js';
+import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
+import { nextAnsweringModel } from '../agents/next-answering-model.js';
 import { registerCliSessionRoutes } from '../runtime/cli-session-routes.js';
 import { getStorageInventory } from '../runtime/storage-inventory.js';
 import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
@@ -14,6 +15,7 @@ import { createMobileChatAdmission, prepareAndDispatchMobileChat } from './mobil
 import { registerMobileMemoryWorkRoutes } from './mobile-memory-work-routes.js';
 import { completionReviewEnabled } from '../runtime/harness/respond-bridge.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { BrainSelectionError, CODEX_BRAIN_SLOTS, codexBrainSlotUpdates, brainSelectionReceipt, type CodexBrainSlot } from '../runtime/harness/brain-selection.js';
 import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { updateEnvKey } from '../tools/shared.js';
 import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
@@ -3826,7 +3828,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     try {
       const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : '';
       const agentId = typeof req.query.agentId === 'string' ? req.query.agentId.trim() || null : undefined;
-      res.json({ agent: nextAnsweringAgentModel(sessionId || null, agentId) });
+      res.json(nextAnsweringModel(sessionId || null, agentId));
     } catch {
       res.status(500).json({ error: 'ANSWERING_MODEL_FAILED' });
     }
@@ -6154,6 +6156,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // phone and the desktop can never disagree about what a switch means.
       const brain = option.id;
       const brainModelId = option.modelId ?? '';
+      const codexUpdates = brain === 'codex_oauth' ? codexBrainSlotUpdates(brainModelId,
+        Object.fromEntries(CODEX_BRAIN_SLOTS.map((key) => [key, (getRuntimeEnv(key, '') || '').trim()])) as Record<CodexBrainSlot, string>,
+        resolveProvider, DEFAULT_CODEX_MODEL) : [];
       if (brain === 'api_key') {
         if (!getByoBackendConfig().configured) {
           res.status(409).json({
@@ -6181,17 +6186,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
           process.env.MODEL_ROUTING_MODE = 'off';
         }
         if (brain === 'codex_oauth') {
-          // Honor the exact picked gpt-5.x model and scrub any foreign model
-          // id that leaked into the OPENAI_MODEL_* slots from a prior BYO
-          // brain — otherwise "Codex" would still route to the BYO endpoint.
-          const wantedPrimary = /^gpt-5/i.test(brainModelId) ? brainModelId : '';
-          for (const key of ['OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_FAST', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER'] as const) {
-            const cur = (getRuntimeEnv(key, '') || '').trim();
-            const polluted = cur !== '' && resolveProvider(cur) !== 'codex';
-            const next = key === 'OPENAI_MODEL_PRIMARY' && wantedPrimary
-              ? wantedPrimary
-              : (polluted ? DEFAULT_CODEX_MODEL : cur);
-            if (next && next !== cur) { updateEnvKey(key, next); process.env[key] = next; }
+          for (const { key, value: next } of codexUpdates) {
+            updateEnvKey(key, next);
+            process.env[key] = next;
           }
         }
       }
@@ -6232,22 +6229,33 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       // Re-pin the conversation the switch was made from (after the env writes
       // + cache resets, so the pin stamps the NEW global resolution). No
       // sessionId ⇒ no pin is touched: other live conversations keep theirs.
+      let sessionPin = null;
       if (switchSessionId) {
         const { pinSessionBrain } = await import('../runtime/harness/model-roles.js');
-        try { pinSessionBrain(switchSessionId); } catch { /* pin is affinity, never a switch blocker */ }
+        sessionPin = pinSessionBrain(switchSessionId);
         // The owner chose this conversation's model: it now answers over an
         // agent's pinned model (session-agent-model.ts).
-        try { recordBrainChosenForSession(switchSessionId); } catch { /* never a switch blocker */ }
+        recordBrainChosenForSession(switchSessionId);
       }
 
+      const resolvedBrain = resolveRoleModel('brain');
+      const effectiveValue = effectiveBrainValue();
+      const selection = brainSelectionReceipt({
+        requestedValue: value, effectiveValue, brain: resolvedBrain,
+        ...(switchSessionId ? { sessionId: switchSessionId, sessionPin } : {}),
+      });
       res.json({
         ok: true,
-        brain: resolveRoleModel('brain'),
-        effectiveValue: effectiveBrainValue(),
+        brain: resolvedBrain,
+        effectiveValue,
+        selection,
         activeBrain: getActiveAuthMode(),
       });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(err instanceof BrainSelectionError ? err.status : 500).json({
+        error: err instanceof Error ? err.message : String(err),
+        ...(err instanceof BrainSelectionError ? { code: err.code } : {}),
+      });
     }
   });
 
