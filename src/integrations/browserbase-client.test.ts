@@ -95,11 +95,11 @@ test('live URL minting has bounded TTL, trusted HTTPS origin and no key in the r
     assert.equal(url, `https://api.browserbase.com/v1/sessions/${sid}/debug?expiresIn=120`);
     assert.equal(init?.method, 'GET'); assert.equal(init?.redirect, 'manual');
     assert.doesNotMatch(String(url), /private-fixture/);
-    return json({ debuggerFullscreenUrl: 'https://www.browserbase.com/devtools-fullscreen/?token=private-viewer' });
+    return json({ debuggerFullscreenUrl: 'https://www.browserbase.com/devtools-fullscreen/?token=synthetic-private-viewer' });
   }, { now: () => Date.parse('2026-10-02T00:00:00Z') });
   assert.deepEqual(await api.liveView(sid, { expiresIn: 120 }), {
-    url: 'https://www.browserbase.com/devtools-fullscreen/?token=private-viewer', expiresAt: '2026-10-02T00:02:00.000Z' });
-  for (const url of ['http://www.browserbase.com/view', 'https://browserbase.com.evil.example/view', 'https://user:pass@www.browserbase.com/view']) {
+    url: 'https://www.browserbase.com/devtools-fullscreen/?token=synthetic-private-viewer', expiresAt: '2026-10-02T00:02:00.000Z' });
+  for (const url of ['http://www.browserbase.com/view', 'https://browserbase.com.evil.example/view', 'https://user:placeholder@www.browserbase.com/view']) {
     await assert.rejects(client(async () => json({ debuggerFullscreenUrl: url })).liveView(sid), safeError('invalid_response', true));
   }
 });

@@ -19,7 +19,7 @@ function setup() {
     async create(input: { projectId: string; recording?: boolean; timeoutSeconds?: number }) { creates++; assert.equal(input.recording, false); return observed(); },
     async retrieve(id: string, p: string) { assert.equal(id, sessionId); assert.equal(p, project); return observed(); },
     async release(id: string, p: string) { assert.equal(id, sessionId); assert.equal(p, project); releases++; },
-    async liveView(_id: string, options: { targetId?: string } = {}) { views++; return { url: 'https://www.browserbase.com/devtools?token=private-view', expiresAt: new Date(clock+60000).toISOString(), ...(options.targetId ? { targetId: options.targetId } : {}) }; },
+    async liveView(_id: string, options: { targetId?: string } = {}) { views++; return { url: 'https://www.browserbase.com/devtools?token=synthetic-private-view', expiresAt: new Date(clock+60000).toISOString(), ...(options.targetId ? { targetId: options.targetId } : {}) }; },
   };
   const cdp = {
     async execute(_url: string, _session: string, operation: string, args: unknown, options?: { beforeMutation?: () => Promise<void> }) {

@@ -4,7 +4,7 @@ import { browserLiveUrl, isBrowserDisconnected, browserResourceKey, canApplyBrow
 const resource: CloudBrowserResource = { id: 'r', conversationId: 'c', provider: 'browserbase', providerSessionId: 'ps', projectId: 'p', state: 'active', controller: 'agent', controlVersion: 2, createdAt: '', updatedAt: '', recording: false, elapsedSeconds: 10, pages: [{ targetId: 'page-a', title: 'Page', url: 'https://example.org' }] };
 test('provider-returned live bearer URLs accept only approved HTTPS origins without inventing a path', () => {
   assert.ok(browserLiveUrl('https://www.browserbase.com/live?session=secret'));
-  assert.ok(browserLiveUrl('https://browserbase.com/devtools-fullscreen/?token=secret'));
+  assert.ok(browserLiveUrl('https://browserbase.com/devtools-fullscreen/?token=synthetic-secret'));
   for (const url of ['http://www.browserbase.com/live', 'https://www.browserbase.com.evil.test/live', 'https://www.browserbase.com:444/live', 'https://user@www.browserbase.com/live', 'https://www.browserbase.com/live#secret', 'javascript:alert(1)']) assert.equal(browserLiveUrl(url), null);
 });
 test('release requested is not provider-confirmed stopped', () => {
@@ -52,7 +52,7 @@ test('old start responses normalize absent pages and reject a different task or 
   assert.throws(() => readBrowserResource(resource, 'other'));
   assert.throws(() => readBrowserResource(resource, 'c', 'other'));
 });
-const view: CloudBrowserView = { url: 'https://www.browserbase.com/live?token=test', expiresAt: '2999-01-01T00:00:00Z', viewerLeaseId: 'lease-a', controlVersion: 2, targetId: 'page-a' };
+const view: CloudBrowserView = { url: 'https://www.browserbase.com/live?token=synthetic-test', expiresAt: '2999-01-01T00:00:00Z', viewerLeaseId: 'lease-a', controlVersion: 2, targetId: 'page-a' };
 test('mobile bridge requires the exact minted page and epoch and blocks a pending return', () => {
   const human = { ...resource, controller: 'human' as const };
   assert.equal(browserBoundInputAllowed(human, 'page-a', view), true);
