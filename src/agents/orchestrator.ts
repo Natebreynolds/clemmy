@@ -79,7 +79,7 @@ import {
   ORCHESTRATOR_BEHAVIOR_NATIVE,
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet } from './tool-catalog.js';
+import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet, steadySessionPromotions } from './tool-catalog.js';
 import { renderDeskNamesLine, resolveTurnDesk, type TurnDeskDecision } from './turn-desk.js';
 import { bindSessionWireOrder } from '../runtime/harness/advertised-tool-wire.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
@@ -3687,7 +3687,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         lane: 'chat',
         availableNames,
         excludeNames: excludes,
-        promotedNames: hot,
+        // Steady within the conversation, so the cached prompt prefix holds
+        // from turn to turn (tool-catalog.ts steadySessionPromotions).
+        promotedNames: steadySessionPromotions(options.sessionId, hot, (name) => policyAllowed.has(name)),
         // The explicit local-memory scope intentionally suppresses call_tool,
         // so every policy-allowed memory tool must stay directly reachable.
         // General turns have the dispatcher and can safely defer.

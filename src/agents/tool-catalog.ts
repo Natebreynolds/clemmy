@@ -212,6 +212,49 @@ const MAX_SESSION_PROMOTIONS = 3;
 /** Proven choices help skip discovery, but must not rebuild a giant surface. */
 const MAX_RECALL_PROMOTIONS = 3;
 
+/**
+ * KEEP THE TOOL LIST STEADY WITHIN A CONVERSATION.
+ *
+ * Every tool schema the model sees is part of the prompt prefix a provider
+ * caches. A tool promoted on one turn and dropped on the next re-bills the
+ * whole prefix after it: live 10-02 one conversation's list went
+ * 10→15→15→13→14→13→14 tools, and 23 frames lost ~714k cacheable tokens in a
+ * day. A tool promoted earlier in a conversation stays promoted while the
+ * turn's own policy allows it, in the order it first appeared, at most
+ * STICKY_PROMOTIONS of them; past that a new promotion is this turn's only,
+ * as before. Discovery doors are never kept (they stay deferred unless named).
+ * Schema visibility only: what may be called is decided elsewhere.
+ */
+const STICKY_PROMOTIONS = 8;
+const STICKY_SESSIONS = 200;
+const stickyBySession = new Map<string, string[]>();
+
+export function steadySessionPromotions(
+  sessionId: string | undefined | null,
+  promoted: ReadonlySet<string>,
+  allowed: (name: string) => boolean,
+): Set<string> {
+  const result = new Set(promoted);
+  if (!sessionId) return result;
+  const ledger = stickyBySession.get(sessionId) ?? [];
+  for (const name of promoted) {
+    if (ledger.length >= STICKY_PROMOTIONS) break;
+    if (TOOL_SEARCH_ALWAYS_LOADED.has(name) || DISCOVERY_SIBLING_DOORS.has(name) || ledger.includes(name)) continue;
+    ledger.push(name);
+  }
+  stickyBySession.delete(sessionId);
+  stickyBySession.set(sessionId, ledger);
+  if (stickyBySession.size > STICKY_SESSIONS) {
+    const oldest = stickyBySession.keys().next().value;
+    if (oldest !== undefined) stickyBySession.delete(oldest);
+  }
+  for (const name of ledger) if (allowed(name)) result.add(name);
+  return result;
+}
+
+/** Test seam: forget every conversation's steady promotions. */
+export function _resetSteadySessionPromotionsForTests(): void { stickyBySession.clear(); }
+
 /** Every registry tool name (the reachable built-in universe). */
 export function allRegistryNames(): Set<string> {
   return new Set(TOOL_REGISTRY.map((d) => d.name));
