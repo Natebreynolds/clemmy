@@ -1033,8 +1033,28 @@ export async function tryJevCompletionVerdict(
       instructions: 'Does response report that the work cannot be done with the tools or access available?',
     },
   };
-  const request = clipMiddle(objective.trim(), COMPLETION_REQUEST_CHARS).text;
-  const response = clipMiddle(assistantResponse.trim(), COMPLETION_RESPONSE_CHARS).text;
+  const requestView = clipMiddle(objective.trim(), COMPLETION_REQUEST_CHARS);
+  const responseView = clipMiddle(assistantResponse.trim(), COMPLETION_RESPONSE_CHARS);
+  const taskViewComplete = !requestView.clipped && !responseView.clipped;
+  const taskViewDetail = {
+    ...(requestView.clipped ? { requestClipped: true } : {}),
+    ...(responseView.clipped ? { responseClipped: true } : {}),
+  };
+  // A receipt cannot establish a requirement or claim Jev never saw. Such a
+  // screen cannot settle DONE or AWAITING, so the configured reviewer starts
+  // without paying for it. The late, reviewer-unavailable path may still use
+  // a negative reading, but cannot certify this partial task view either.
+  if (opts?.screening && !taskViewComplete) {
+    recordJevSkip({
+      lane: 'jev-completion',
+      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+      reason: 'task_text_clipped',
+      context: taskViewDetail,
+    });
+    return null;
+  }
+  const request = requestView.text;
+  const response = responseView.text;
   const receipts = (opts?.coverage?.outcomeEvidence ?? []).map((row) => ({
     tool: row.toolName,
     outcome: row.outcome,
@@ -1112,12 +1132,12 @@ export async function tryJevCompletionVerdict(
   const sure = (value: number | null): boolean => value !== null && value >= COMPLETION_SURE;
   const sureNot = (value: number | null): boolean => value !== null && value <= 1 - COMPLETION_SURE;
   let verdict: Omit<JevCompletionVerdict, 'judgeModelId'> | null = null;
-  if (sure(asksUser)) {
+  if (taskViewComplete && sure(asksUser)) {
     verdict = { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting, choice: 'awaiting', confidence: asksUser! };
   } else if (
     sure(delivered) && sureNot(unaddressed)
     && unsupported !== null && unsupported <= COMPLETION_UNSUPPORTED_MAX
-    && !evidence.clipped && !sure(computed)
+    && taskViewComplete && !evidence.clipped && !sure(computed)
   ) {
     verdict = {
       done: true,
@@ -1142,6 +1162,7 @@ export async function tryJevCompletionVerdict(
     };
   }
   noteJevDecisionOutcome(result.decisionId, verdict ? verdict.choice ?? 'read' : 'abstained', {
+    ...taskViewDetail,
     ...(evidence.clipped ? { evidenceClipped: true } : {}),
   });
   if (!verdict) return null;

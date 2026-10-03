@@ -479,6 +479,47 @@ test('Jev DONE after discovery-only execution is not accepted as completion', as
   assert.notEqual(v.judgeModelId, 'jev-1.13.0');
 });
 
+for (const clippedPart of ['objective', 'reply'] as const) {
+  test(`a clipped Jev ${clippedPart} keeps the configured reviewer authoritative`, async () => {
+    _setTypesafeKeyForTests('ts_test');
+    _setSystemOneFetchForTests(async () => ({ status: 200, ok: true,
+      text: async () => JSON.stringify(jevCompletionReading('done')) }));
+    const padding = 'Retained report context. '.repeat(clippedPart === 'objective' ? 150 : 600);
+    const hidden = clippedPart === 'objective'
+      ? 'Also report the unresolved appendix exception.'
+      : 'Every appendix exception was resolved.';
+    const clipped = `${padding}\n${hidden}\n${padding}`;
+    const objective = clippedPart === 'objective' ? clipped : 'Summarize the report.';
+    const reply = clippedPart === 'reply' ? clipped : 'The report is ready.';
+    let reviewerCalls = 0;
+    for (const available of [true, false]) {
+      _setCompletionJudgeForTests(async (receivedObjective, receivedReply) => {
+        reviewerCalls += 1;
+        assert.equal(receivedObjective, objective, 'the reviewer receives the whole objective');
+        assert.equal(receivedReply, reply, 'the reviewer receives the whole reply');
+        return available
+          ? { verdict: { done: false, reason: 'The unresolved appendix exception is missing or misstated.' }, failure: null }
+          : unavailableSettingsJudge();
+      });
+      const verdict = await judgeObjectiveComplete(objective, reply, {
+        sessionId: `probe-clipped-${clippedPart}-${available}`, skills: [], reviewStakes: 'read',
+        toolCallSummary: 'read_report succeeded: one appendix exception remains unresolved.',
+        verifiedReadResults: [{ toolName: 'read_report', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' }],
+      });
+      assert.notEqual(verdict.fast, true, 'a clipped fast view cannot certify the answer');
+      assert.notEqual(verdict.judgeModelId, 'jev-1.13.0');
+      if (available) {
+        assert.equal(verdict.done, false, 'the configured reviewer decides');
+        assert.match(verdict.reason, /appendix exception/);
+      } else {
+        assert.equal(verdict.failedOpen, true, 'an unavailable reviewer remains unreviewed');
+        assert.equal(verdict.reviewFailure, 'unavailable');
+      }
+    }
+    assert.equal(reviewerCalls, 2, 'both paths reach the configured reviewer exactly once');
+  });
+}
+
 // Jev is there to save the reviewer call. A NOT-DONE on its word alone buys
 // another model round, and on finished work the reviewer overruled it nearly
 // every time, so it is never final. Where Jev cannot settle a reply it is not

@@ -419,6 +419,78 @@ test('a completion check over clipped evidence never settles on support', async 
   assert.equal(clipped, null, 'content Jev did not see may be what a specific rests on, so the reviewer decides');
 });
 
+for (const clippedPart of ['request', 'response'] as const) {
+  for (const decision of ['done', 'awaiting'] as const) test(`a completion check cannot certify ${decision} with a clipped ${clippedPart}`, async () => {
+    _setTypesafeKeyForTests('ts_test');
+    let posted: Record<string, any> = {};
+    const answers = completionAnswers(decision === 'done'
+      ? { delivered: 0.95, unaddressed: 0.05, unsupported: 0.05 }
+      : { asksUser: 0.95 });
+    _setSystemOneFetchForTests(async (_url, init) => {
+      posted = JSON.parse(String(init.body));
+      return { status: 200, ok: true, text: async () => answers };
+    });
+    const hidden = clippedPart === 'request'
+      ? 'Also report the unresolved exception in the appendix.'
+      : 'The appendix confirms that every exception was resolved.';
+    const padding = 'Report context. '.repeat(clippedPart === 'request' ? 200 : 800);
+    const clipped = `${padding}\n${hidden}\n${padding}`;
+    const objective = clippedPart === 'request' ? clipped : 'Summarize the report.';
+    const response = clippedPart === 'response' ? clipped : 'The report is ready.';
+    const ask = () => tryJevCompletionVerdict(objective, response, {
+      toolCallSummary: 'read_report succeeded: the report is ready; one appendix exception remains unresolved.',
+      coverage: { complete: true, outcomeEvidence: [{ toolName: 'read_report', outcome: 'succeeded', contentComplete: true }] },
+    });
+    const verdict = await ask();
+    assert.match(posted.state[clippedPart], /middle elided for length/);
+    assert.ok(!posted.state[clippedPart].includes(hidden), 'the unchecked requirement or claim is actually outside Jev\'s view');
+    assert.equal(posted.state.evidenceNote, undefined, 'the source evidence itself is complete');
+    assert.equal(verdict, null, 'complete receipts or a question cannot certify task text Jev did not see');
+  });
+}
+
+test('a clipped completion screen skips Jev so the configured reviewer can start immediately', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let calls = 0;
+  _setSystemOneFetchForTests(async () => {
+    calls += 1;
+    return { status: 200, ok: true, text: async () => completionAnswers({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.05 }) };
+  });
+  for (const [objective, response] of [
+    ['Read the report. '.repeat(300), 'The report is ready.'],
+    ['Read the report.', 'The report is ready. '.repeat(800)],
+  ]) {
+    assert.equal(await tryJevCompletionVerdict(objective, response, { screening: true }), null);
+  }
+  assert.equal(calls, 0, 'a screen known to be incomplete spends no Jev call');
+});
+
+test('completion keeps positive decisions at the full request and response size limits', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  let posted: Record<string, any> = {};
+  let answers = completionAnswers({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.05 });
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted = JSON.parse(String(init.body));
+    return { status: 200, ok: true, text: async () => answers };
+  });
+  const objective = 'Summarize this report: '.padEnd(3_000, 'r');
+  const response = 'The report says: '.padEnd(12_000, 'r');
+  assert.equal((await tryJevCompletionVerdict(objective, response))?.done, true);
+  assert.equal(posted.state.request, objective);
+  assert.equal(posted.state.response, response);
+  answers = completionAnswers({ asksUser: 0.95 });
+  assert.equal((await tryJevCompletionVerdict(objective, response))?.awaitingUser, true);
+});
+
+test('a clipped task still retains a negative reading for unavailable-review recovery', async () => {
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async () => ({ status: 200, ok: true,
+    text: async () => completionAnswers({ delivered: 0.1, unaddressed: 0.95 }) }));
+  const verdict = await tryJevCompletionVerdict('Read the report. '.repeat(300), 'I will read it next.');
+  assert.equal(verdict?.done, false);
+  assert.equal(verdict?.choice, 'incomplete');
+});
+
 test('completion sends an identical embedded read block once without dropping distinct evidence', async () => {
   _setTypesafeKeyForTests('ts_test');
   let posted: Record<string, any> = {};
