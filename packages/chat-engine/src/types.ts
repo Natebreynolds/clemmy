@@ -45,8 +45,7 @@ export interface ApprovalPreview {
 
 /** What the owner's answer to an approval card reads as in the conversation,
  *  on every surface. The decision itself travels as `approve apr-…` for the
- *  host's parser; a person reads their own words. Live 10-02: the owner's
- *  bubbles read "approve apr-7rqj". */
+ *  host's parser; a person reads their own words, never a record id. */
 export const APPROVAL_ANSWER_WORDS = {
   approve: 'Yes, go ahead.',
   reject: 'No, don’t do that.',

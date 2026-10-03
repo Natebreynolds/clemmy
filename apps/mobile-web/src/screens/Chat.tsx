@@ -285,7 +285,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const takesAgent = !(snapshot?.sessionId ?? initialSessionId ?? '').startsWith('space-');
   const showAgentChip = takesAgent && (Boolean(agent) || (agentChoices?.length ?? 0) > 0);
   const agentLabel = agent?.name || (agent ? 'Agent' : 'Clem');
-  // An agent pinned to a model answers on it (owner, 10-02): the model chip
+  // An agent pinned to a model answers on it: the model chip
   // names it, read again whenever the agent, the conversation or the brain changes.
   const answeringSessionId = snapshot?.sessionId ?? initialSessionId ?? undefined;
   const answeringAgentId = takesAgent ? agent?.id ?? null : null;
@@ -354,8 +354,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   /** Tell the daemon about the agent chip. Only when the chip changed: a
    *  plain follow-up must never wait on, or fail on, a switch to what the
-   *  conversation already has (live 09-26: that call failed and every
-   *  follow-up in an existing thread was silently dropped). */
+   *  conversation already has: a failed switch must not drop the follow-up. */
   async function applyAgentChoice(sessionId: string | null | undefined) {
     const wanted = agent?.id ?? null;
     if (!sessionId || busy || !takesAgent || wanted === sessionAgentId.current) return;

@@ -132,9 +132,8 @@ export function buildFromClem(input: FromClemInput): FromClem {
     return { ...row, voiceDigest, ...(say ? { say } : {}) };
   });
   // A check that failed says when it looked, never what went wrong: the
-  // reason is the heartbeat's own page's to explain, in its own words. Live
-  // 10-02: another owner's home page read "Read failed: calendar read not
-  // learned…" and "Could not finish: …" as Clem's latest word.
+  // reason is the heartbeat's own page's to explain, in its own words, and a
+  // raw failure is never Clem's latest word on Home.
   const pulses = input.heartbeats.map((row) => ({
     heartbeat: row.id, title: row.title, enabled: row.enabled,
     ...(row.lastFinding ? { lastAt: row.lastFinding.at, ...(row.lastFinding.failed ? {} : { summary: row.lastFinding.summary }) } : {}),

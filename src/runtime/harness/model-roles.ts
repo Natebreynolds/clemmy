@@ -240,7 +240,7 @@ export const __sessionBrainPinTest__ = {
  *  A saved `brain` entry is not read. The brain has one door, the active-brain
  *  switch, and every door that writes this store refuses the brain, so an entry
  *  an earlier version left behind can never route — it only surfaced as a false
- *  "stand-in" / "unavailable" warning (live 10-02). Every write to this store
+ *  "stand-in" / "unavailable" warning. Every write to this store
  *  starts from this read, so the dead entry drops out on the next save. */
 export function readDurableBindings(): RoleBinding[] {
   if (!modelRolesRegistryEnabled()) return [];

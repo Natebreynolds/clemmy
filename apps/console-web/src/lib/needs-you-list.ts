@@ -95,7 +95,7 @@ export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
     case 'approval': {
       const queued = item.row.pendingAction;
       // Clem's own question and why when her checker wrote them; never an
-      // operation id ("Workflow delete / workflowdelete", live 10-02).
+      // operation id.
       const ask = item.row.presentation?.ask;
       const title = oneLine(queued?.title || ask || item.row.presentation?.action || item.row.subject, TITLE_MAX) || 'Approval';
       return { ...base, checkable: true, aged: item.aged, title,

@@ -107,8 +107,8 @@ export async function refreshWorkspaceScriptSource(
           if (opts.cause !== undefined && opts.cause !== 'manual') return held(`Approval ${decision.row.approvalId} expired. Open this Workspace and request a refresh to review it again.`);
           if (decision.row.status === 'pending' && isExpired(decision.row)) resolve(decision.row.approvalId, 'expired', 'workspace-script:expiry');
         }
-        // The card asks in Clem's words, the schedule in words (live 10-02:
-        // "(0 7 * * 1-5, America/Los_Angeles)" on a card the owner had to act on).
+        // The card asks in Clem's words, the schedule in words, never as a
+        // cron expression.
         const schedule = scope.schedule.cron
           ? `${describeCron(scope.schedule.cron)} (${scope.schedule.timeZone}) and whenever you ask`
           : 'whenever you ask';

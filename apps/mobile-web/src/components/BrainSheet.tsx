@@ -27,7 +27,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
    *  switch really applies to its next message; without it the switch is
    *  global-only and steers new conversations. */
   sessionId?: string;
-  /** An agent's own model answers the next message (owner, 10-02); a pick
+  /** An agent's own model answers the next message; a pick
    *  here in the conversation answers it instead. */
   answeringAgent?: { modelId: string; agentName: string } | null;
   /** Apply the chat's pending agent choice first, so the pick is the later one. */

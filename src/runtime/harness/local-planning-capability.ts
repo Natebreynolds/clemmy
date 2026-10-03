@@ -308,9 +308,8 @@ function declarationCanEnterLocalPlanningMutation(declaration: ToolDecl): boolea
   // enters too: entry is routing, not permission. Consent decides at the write
   // boundary, and a destructive or irreversible call always asks the owner
   // (interactive-consent-policy: high consequence → one exact approval card);
-  // a planning probe never runs it. Live 10-02: "delete my workflow" had no
-  // door at all — refused as coverage_missing and not_reachable three times,
-  // 22 model calls, no card, nothing the owner could approve.
+  // a planning probe never runs it. Without a door, a change the owner asked
+  // for could only be refused, with nothing for the owner to approve.
   const declaredDestructive = semantics.length === 1
     && semantics[0]!.reversibility === 'irreversible';
   const exactVariants = semantics.length > 1

@@ -719,8 +719,8 @@ async function runCronJob(
   const startedAt = new Date().toISOString();
   const startMs = Date.now();
   // A scheduled run on a home with no model set up waits instead of failing:
-  // every default job used to post "Cron job failed: …" with a raw error on
-  // a fresh install (live 10-02). The boot setup notice already says what to
+  // a fresh install must not post "Cron job failed: …" with a raw error for
+  // every default job. The boot setup notice already says what to
   // set up once a day. A run the owner starts by hand still runs and shows
   // its real result.
   if (source === 'schedule' && !scheduledRunHasAModel()) {

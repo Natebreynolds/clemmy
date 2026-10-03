@@ -4,8 +4,8 @@
  * write the same setting mobile's chip writes and re-pin THIS conversation;
  * workers and judge are global today and the popover says so.
  *
- * An agent the owner pinned a model to answers on that model from the switch
- * (owner, 10-02); the chip names it, and a model picked here afterwards
+ * An agent the owner pinned a model to answers on that model from the switch;
+ * the chip names it, and a model picked here afterwards
  * answers this conversation instead. The agent chip's choice is applied first
  * so the pick lands after the switch.
  *

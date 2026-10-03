@@ -2,10 +2,10 @@
  * The model a conversation answers on while it is switched to a saved agent
  * the owner pinned a model to.
  *
- * Owner, 10-02: switching to an agent set to Claude Opus should answer on
- * Opus, not on the model the owner happens to use elsewhere. The agent's
- * model applies from the switch until the owner picks a model for this
- * conversation on the model chip; the later choice wins. A pinned model whose
+ * Switching to an agent set to a model answers on that model, not on the
+ * model the owner happens to use elsewhere. The agent's model applies from
+ * the switch until the owner picks a model for this conversation on the
+ * model chip; the later choice wins. A pinned model whose
  * provider is not signed in right now is not used: the conversation answers
  * on the owner's model, exactly as before.
  */

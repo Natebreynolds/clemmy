@@ -101,7 +101,7 @@ export function approvalPreviewProjection(value: unknown): { preview: ApprovalPr
   }
   // The card in Clem's words (approval-precheck): carried on every public
   // surface, or the live card and the reopened one both fall back to the
-  // operation name (live 10-02: the projection dropped them).
+  // operation name.
   const line = (value: unknown, max: number): string | undefined => (
     typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : undefined
   );
@@ -343,8 +343,7 @@ function text(value: unknown): string {
  * attachment contents when `displayText` is available. */
 /** What the owner's answer to an approval card reads as (the same words as
  *  @clem/chat-engine's APPROVAL_ANSWER_WORDS). The decision travels as
- *  `approve apr-…` for the parser; live 10-02 the owner's own bubbles read
- *  exactly that. */
+ *  `approve apr-…` for the parser; the owner's bubble never reads as that. */
 export const APPROVAL_ANSWER_WORDS = {
   approve: 'Yes, go ahead.',
   reject: 'No, don’t do that.',

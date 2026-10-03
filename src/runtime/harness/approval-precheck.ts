@@ -10,12 +10,11 @@ import { withSessionMemoryScope } from '../../memory/memory-scope.js';
  * Check an outgoing action against the owner's standing rules before its
  * approval card is shown, and write the card in Clem's own words.
  *
- * Live 10-02: cards read "Approve: cli_setup: install" over raw argument
- * names, while the question card — Clem asking in her own words with answers
- * to tap — was the one the owner loved. The same checker that reads the exact
- * content now also writes the card's question and why, from the exact call,
- * the consent facts and what the owner asked; the content itself is still
- * shown exactly. Display only: it never changes what is approved.
+ * A card reads like Clem's question card — her own words with answers to
+ * tap — never an operation name over raw argument names. The same checker
+ * that reads the exact content also writes the card's question and why, from
+ * the exact call, the consent facts and what the owner asked; the content
+ * itself is still shown exactly. Display only: it never changes what is approved.
  *
  * A rule already in Clem's context can still be broken by the content she
  * drafts, and a card showing only a subject and recipients leaves the owner

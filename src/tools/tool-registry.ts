@@ -363,9 +363,8 @@ export interface ToolDecl {
  * the sources above and locked by tool-registry.test.ts.
  */
 // Installing, signing in or repairing a CLI on this Mac is local work, named
-// as what it is — the same as the shell that can run the same install. Live
-// 10-02: declared irreversible, it asked three times for one install that then
-// ran through the shell with no card. One rule per kind of effect.
+// as what it is — the same as the shell that can run the same install. One
+// rule per kind of effect.
 function cliSetupSemantics(action: 'auth' | 'install' | 'repair'): LocalPlanningSemantics {
   return {
     consequence: 'runtime_configuration', reversibility: 'ordinary_non_destructive', destructive: false,

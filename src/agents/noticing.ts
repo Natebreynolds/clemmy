@@ -236,8 +236,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
   // 4. Think, unless there is nothing to read or no room to speak.
   let answer: NoticingAnswerV1 | null = null;
   // No model signed in yet is a home that is not set up, not a failure:
-  // the tick is quiet and says so plainly (live 10-02: a fresh install's
-  // home page read "Could not finish: no model is available to think with").
+  // the tick is quiet and says so plainly, never as "Could not finish".
   let waitingForModel = false;
   if (observation && !capped) {
     const evidenceDigest = observationDigest(observation, deps.rules);

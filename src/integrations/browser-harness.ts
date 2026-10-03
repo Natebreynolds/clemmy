@@ -347,8 +347,8 @@ export function validateInstallCommand(command: string): { ok: true; normalized:
 /** The environment an approved install runs in: the owner's own toolchain
  *  first (their Node manager's default npm — nvm, volta, fnm — ahead of a
  *  root-owned system npm), the same order Clem's CLI scan reads, so what is
- *  installed is what Clem then finds. Live 10-02: `npm install -g` resolved
- *  /usr/local's root-owned npm and failed with EACCES. */
+ *  installed is what Clem then finds, and a global install never resolves a
+ *  root-owned npm it cannot write to. */
 export function installCommandEnv(): NodeJS.ProcessEnv {
   const env = browserHarnessEnv();
   return { ...env, PATH: augmentPath(env.PATH) };

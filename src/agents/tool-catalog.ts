@@ -217,11 +217,10 @@ const MAX_RECALL_PROMOTIONS = 3;
  *
  * Every tool schema the model sees is part of the prompt prefix a provider
  * caches. A tool promoted on one turn and dropped on the next re-bills the
- * whole prefix after it: live 10-02 one conversation's list went
- * 10→15→15→13→14→13→14 tools, and 23 frames lost ~714k cacheable tokens in a
- * day. A tool promoted earlier in a conversation stays promoted while the
- * turn's own policy allows it, in the order it first appeared, at most
- * STICKY_PROMOTIONS of them; past that a new promotion is this turn's only,
+ * whole prefix after it, so a list that changes turn to turn loses the cache
+ * on every frame. A tool promoted earlier in a conversation stays promoted
+ * while the turn's own policy allows it, in the order it first appeared, at
+ * most STICKY_PROMOTIONS of them; past that a new promotion is this turn's only,
  * as before. Discovery doors are never kept (they stay deferred unless named).
  * Schema visibility only: what may be called is decided elsewhere.
  */

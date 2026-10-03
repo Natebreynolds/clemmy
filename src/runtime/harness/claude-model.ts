@@ -464,9 +464,8 @@ function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapabilit
   //
   // The breakpoint caches the whole prefix before it (tools, system, the
   // transcript), so that is what must clear the provider's minimum. Gated on
-  // the messages alone, a worker with a 3k-token tool list and a few thousand
-  // tokens of transcript never cached: live 10-02 an Opus worker sent 10 calls,
-  // 121k prompt tokens, 0 cached.
+  // the messages alone, a worker with a large tool list and a short
+  // transcript would never cache at all.
   if (cap.supportsPromptCache && breakpoints < 4) {
     const messages = Array.isArray(parsed.messages) ? (parsed.messages as Array<Record<string, unknown>>) : [];
     const prefixTokens = toolsTokens + estimateTokens(JSON.stringify(parsed.system ?? ''))

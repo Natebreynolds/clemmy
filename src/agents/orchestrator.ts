@@ -1474,9 +1474,8 @@ const MUTATING_ACTION_WORD = /\b(send|sending|sent|draft|drafts|email|emails|upd
 
 /** A sign-off has two answers (go ahead / hold). More answers than that is a
  *  choice between different ways forward, and that choice stays the owner's
- *  under standing approval too. Live 10-02: a four-way "install the CLI / only
- *  install it / skip CLIs / use the other provider's API" question was answered
- *  for the owner, against what they had asked for. */
+ *  under standing approval too: standing approval says yes to a sign-off, it
+ *  never picks a course for the owner. */
 function offersDifferentCourses(options: string[] | null | undefined): boolean {
   return (options ?? []).filter((option) => option.trim()).length > 2;
 }

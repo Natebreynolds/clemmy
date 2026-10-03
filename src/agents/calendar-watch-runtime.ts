@@ -823,9 +823,8 @@ export function runCalendarWatchTick(options: { source: string; force?: boolean 
     // Until a calendar has been found among the connected apps, trouble
     // finding one is Clem's own work, not a calendar of the owner's that
     // failed: it is logged, the tick stays quiet and the normal cadence
-    // holds. Live 10-02: a home with Gmail and Slack connected but no
-    // calendar showed "Read failed: calendar read not learned…" on its home
-    // page and was re-checked every five minutes.
+    // holds. A home with other apps connected and no calendar shows no
+    // failure and is not re-checked early.
     if (connectedCalendarOperations().length === 0) {
       if (learningNotes.length > 0) logger.info({ notes: learningNotes }, 'calendar watch: no calendar read learned yet');
       const state = loadCalendarWatchState();

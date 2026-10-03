@@ -11354,9 +11354,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
   // accepted-batch chain digests it — so the snapshot compaction below cannot
   // shrink what the continuation sends. The model-facing frame is projected
   // instead: an input that begins with exactly the pre-compaction conversation
-  // is sent with its compacted form; the accepted history is untouched. Live
-  // 10-02: a judge retry compacted 71.8k → 30.3k tokens, then sent ~83k on
-  // every frame of the retry.
+  // is sent with its compacted form; the accepted history is untouched.
   let continuationHistoryProjection: ((input: AgentInputItem[]) => AgentInputItem[]) | undefined;
   let continuationHistorySavings: { beforeTokens: number; afterTokens: number } | undefined;
   let continuationHistoryReported = false;

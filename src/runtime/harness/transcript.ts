@@ -242,8 +242,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         seq: event.seq,
         // A reply that waited on the owner (a question, an approval) reopens
         // as they read it live: without the host's retained-work checkpoint,
-        // which is record counts and handle ids kept for the model. Live
-        // 10-02: every reopened question and approval ended in that block.
+        // which is record counts and handle ids kept for the model.
         text: presentation.status === 'needs_input'
           ? reopenedApprovalText({ ...presentation, text: withoutRetainedWorkCheckpoint(presentation.text) })
           : presentation.text,

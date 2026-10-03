@@ -994,8 +994,8 @@ export async function switchChatAgent(sessionId: string, agentId: string | null)
 /** An agent's own model, when it answers the next message. */
 export interface AnsweringAgentModel { modelId: string; agentId: string; agentName: string }
 
-/** Whether the next message is answered on an agent's own model (owner,
- *  10-02): `agentId` is the agent chip's choice, applied on send like the
+/** Whether the next message is answered on an agent's own model:
+ *  `agentId` is the agent chip's choice, applied on send like the
  *  switch itself; null = Clem. The desktop chip reads the same answer. */
 export async function getAnsweringModel(sessionId: string | undefined, agentId: string | null): Promise<AnsweringAgentModel | null> {
   const query = new URLSearchParams();
