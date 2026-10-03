@@ -439,13 +439,17 @@ export function statusTone(status?: string): { tone: Tone; label: string } {
   return { tone: 'neutral', label: status || 'Unknown' };
 }
 
-/** Notification pill derived from real delivery fields (no `status` exists). */
+/** Notification pill derived from real delivery fields (no `status` exists).
+ *  A delivery that went through is the normal case, not news: the pill says
+ *  what kind of update it is, and only a failed delivery stands out. */
 export function notifTone(n: NotificationRow): { tone: Tone; label: string } {
   if (notifFailed(n)) return { tone: 'danger', label: 'Failed' };
-  if (n.deliveredAt) return { tone: 'success', label: 'Sent' };
+  // The same words the phone uses for the same kinds; never an engine name.
   const kind = (n.kind ?? '').toLowerCase();
-  if (kind === 'approval') return { tone: 'warning', label: 'Approval' };
-  if (kind) return { tone: 'neutral', label: kind.charAt(0).toUpperCase() + kind.slice(1) };
+  if (kind === 'approval') return { tone: 'warning', label: n.read ? 'Handled' : 'Approval' };
+  if (kind === 'workflow') return { tone: 'neutral', label: 'Flow' };
+  if (kind === 'cron') return { tone: 'neutral', label: 'Scheduled update' };
+  if (kind === 'execution') return { tone: 'neutral', label: 'Work update' };
   return { tone: 'neutral', label: 'Update' };
 }
 
