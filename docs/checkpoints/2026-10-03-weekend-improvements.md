@@ -477,5 +477,6 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   does not block the save. Only a record holding a provider session blocks a
   connection change; a record with no session expires once the provider's
   session timeout has passed. The model reads the refusal in words.
-- **Status:** installing as wave 42. The owner's key still needs re-entering
+- **Status:** wave 42 = 7d08ccc73 installed 09:02 PT (build-info serves it;
+  bundles match). The owner's key still needs re-entering
   (Browserbase dashboard → Settings → API Keys).
