@@ -461,9 +461,17 @@ function applyClaudeCaching(parsed: Record<string, unknown>, cap: ModelCapabilit
   // Gap #1 — transcript caching. Only when it's big enough to be worth a breakpoint
   // and we have budget. Caches tools+system+transcript-so-far; the next turn / the
   // sibling fusion sub-calls read it instead of re-billing.
+  //
+  // The breakpoint caches the whole prefix before it (tools, system, the
+  // transcript), so that is what must clear the provider's minimum. Gated on
+  // the messages alone, a worker with a 3k-token tool list and a few thousand
+  // tokens of transcript never cached: live 10-02 an Opus worker sent 10 calls,
+  // 121k prompt tokens, 0 cached.
   if (cap.supportsPromptCache && breakpoints < 4) {
     const messages = Array.isArray(parsed.messages) ? (parsed.messages as Array<Record<string, unknown>>) : [];
-    if (messages.length > 0 && estimateTokens(JSON.stringify(messages)) >= cap.cacheMinTokens) {
+    const prefixTokens = toolsTokens + estimateTokens(JSON.stringify(parsed.system ?? ''))
+      + (messages.length > 0 ? estimateTokens(JSON.stringify(messages)) : 0);
+    if (messages.length > 0 && prefixTokens >= cap.cacheMinTokens) {
       const lastMsg = messages[messages.length - 1];
       if (lastMsg && typeof lastMsg === 'object') breakpointLastMessage(lastMsg);
     }

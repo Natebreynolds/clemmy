@@ -335,6 +335,31 @@ test('transcript caching: a SMALL transcript is NOT breakpointed (below cacheMin
   assert.equal(last.content, 'hi');
 });
 
+test('transcript caching: the whole prefix clears the minimum, not the messages alone (worker with tools + short transcript)', () => {
+  // Live 10-02: an Opus worker sent 10 calls, 121k prompt tokens, 0 cached:
+  // its ~3k-token tool list and short transcript each fell under the minimum
+  // while the prefix the breakpoint caches (tools + system + messages) did not.
+  const tools = Array.from({ length: 12 }, (_, i) => ({
+    name: `tool_${i}`,
+    description: 'Reads one record from the project store and returns its fields. '.repeat(14),
+    input_schema: { type: 'object', properties: { id: { type: 'string', description: 'record id '.repeat(10) } } },
+  }));
+  const parsed = envelopeBody({
+    model: 'claude-opus-4-8',
+    system: 'You are a worker. '.repeat(220),
+    tools,
+    messages: [{ role: 'user', content: 'Do the task: '.repeat(450) }],
+    max_tokens: 100,
+  });
+  // Each part is under Opus's 4,096-token minimum on its own; together they are not.
+  assert.ok(JSON.stringify(parsed.tools).length / 4 < 4096 && JSON.stringify(parsed.messages).length / 4 < 4096);
+  const last = (parsed.messages as Array<Record<string, unknown>>).at(-1)!;
+  assert.ok(Array.isArray(last.content), 'the transcript breakpoint is placed');
+  assert.deepEqual((last.content as Array<Record<string, unknown>>).at(-1)!.cache_control, { type: 'ephemeral' });
+  const markers = JSON.stringify(parsed).split('"cache_control"').length - 1;
+  assert.ok(markers >= 1 && markers <= 4, `Anthropic allows at most 4 markers, got ${markers}`);
+});
+
 void ID;
 
 // The router's contract, unit-level: tools → raw adapter; text-only → headless.
