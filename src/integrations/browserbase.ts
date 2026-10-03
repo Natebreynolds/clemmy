@@ -5,7 +5,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 import { browserbaseStoreFile } from './browserbase-setup.js';
 import { readSecret, writeSecret } from '../runtime/secrets/index.js';
-import { BrowserbaseApiClient, BrowserbaseClientError, type BrowserbaseSession } from './browserbase-client.js';
+import { BrowserbaseApiClient, BrowserbaseClientError, type BrowserbaseSession, type BrowserbaseRunningSession } from './browserbase-client.js';
 import { BrowserbaseCdpClient, BrowserbaseCdpError, parseBrowserbaseOperation, type BrowserbaseOperation, type BrowserbasePage, type BrowserbaseCdpResult } from './browserbase-cdp.js';
 
 export interface BrowserbaseResource {
@@ -14,6 +14,18 @@ export interface BrowserbaseResource {
   createdAt: string; updatedAt: string; recording: boolean; elapsedSeconds: number; pages: BrowserbasePage[]; errorCode?: string;
   returnPending?: boolean;
 }
+/** One open browser as the owner's browsers sheet shows it. */
+export interface BrowserbaseOpenBrowser extends BrowserbaseResource {
+  /** When it closes if nothing happens in it; null until it has a session. */
+  idleClosesAt: string | null;
+  /** When Browserbase ends it regardless of activity. */
+  endsAt: string;
+  /** Whether it holds the saved sign-in profile. */
+  usesProfile: boolean;
+}
+/** A running session Clem started that no open browser record holds. */
+export interface BrowserbaseUnlinkedSession { providerSessionId: string; createdAt?: string; expiresAt?: string }
+export interface BrowserbaseOverview { browsers: BrowserbaseOpenBrowser[]; unlinked: BrowserbaseUnlinkedSession[]; unlinkedChecked: boolean }
 export interface BrowserbaseOperationReceipt {
   version: 1; kind: 'browserbase_dispatch_receipt'; resourceId: string; provider: 'browserbase'; providerSessionId: string;
   projectId: string; operation: string; targetId: string | null; controlVersion: number; effect: 'none' | 'confirmed'; at: string;
@@ -35,18 +47,26 @@ const ERROR_TEXT: Record<string, string> = {
 export function browserbaseErrorText(code: string): string {
   return ERROR_TEXT[code] ?? `The cloud browser could not do that (${code}). Nothing was changed.`;
 }
-interface Policy { projectId: string; idleSeconds: number; sessionTimeoutSeconds: number; }
+interface Policy { projectId: string; idleSeconds: number; sessionTimeoutSeconds: number; contextId?: string; }
+/** Long enough to hand a page back and forth; short enough not to leave a
+ * forgotten browser running. Browserbase ends a session at its timeout. */
+const DEFAULT_IDLE_SECONDS = 900, DEFAULT_SESSION_TIMEOUT_SECONDS = 7200;
+/** Values earlier builds wrote for every setup; no surface let an owner choose them. */
+const EARLIER_DEFAULTS = { idleSeconds: 300, sessionTimeoutSeconds: 1800 };
 interface PendingOperation { id: string; operation: string; targetId: string | null; controlVersion: number; startedAt: number; }
 interface PrivateResource extends Omit<BrowserbaseResource, 'elapsedSeconds'> {
   requestKey: string; credentialIdentity: string; lastActivityAt: number; expiresAt: number; pending?: PendingOperation;
   lastEffect?: { operation: string; effect: 'confirmed' | 'uncertain'; targetId: string | null; at: number };
   viewerLeases?: Array<{ id: string; targetId: string | null; controlVersion: number; expiresAt: number; mode: 'human' | 'watch'; detached: boolean }>;
   ownerResolution?: { kind: 'owner_adopted_session'; providerSessionId: string; at: number; originalCreateProof: 'unknown' };
+  usesProfile?: boolean;
 }
 interface Store { version: 1; revision: number; policy: Policy | null; resources: PrivateResource[]; }
 interface Api {
   create: BrowserbaseApiClient['create']; retrieve: BrowserbaseApiClient['retrieve']; release: BrowserbaseApiClient['release']; liveView: BrowserbaseApiClient['liveView'];
   verifyProject?: BrowserbaseApiClient['verifyProject'];
+  listRunning?: (projectId: string) => Promise<BrowserbaseRunningSession[]>;
+  createContext?: (projectId: string) => Promise<string>;
 }
 interface Cdp { execute: BrowserbaseCdpClient['execute']; humanText: BrowserbaseCdpClient['humanText']; }
 export interface BrowserbaseDependencies {
@@ -114,6 +134,10 @@ export class BrowserbaseService {
           || (resource.pages !== undefined && (!Array.isArray(resource.pages) || resource.pages.length > 100 || resource.pages.some(page => typeof page.targetId !== 'string' || !page.targetId || page.targetId.length > 128 || typeof page.title !== 'string' || page.title.length > 1000 || typeof page.url !== 'string' || page.url.length > 2000)))
           || (resource.returnPending !== undefined && typeof resource.returnPending !== 'boolean')
           || (resource.viewerLeases !== undefined && (!Array.isArray(resource.viewerLeases) || resource.viewerLeases.some(lease => !UUID.test(lease.id) || !Number.isSafeInteger(lease.controlVersion) || lease.controlVersion < 1 || !Number.isFinite(lease.expiresAt) || !['watch','human'].includes(lease.mode) || typeof lease.detached !== 'boolean' || (lease.targetId !== null && (typeof lease.targetId !== 'string' || !lease.targetId || lease.targetId.length > 128))))))) throw new Error();
+      if (value.policy?.contextId !== undefined && (typeof value.policy.contextId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value.policy.contextId))) throw new Error('invalid profile');
+      if (value.policy && value.policy.idleSeconds === EARLIER_DEFAULTS.idleSeconds && value.policy.sessionTimeoutSeconds === EARLIER_DEFAULTS.sessionTimeoutSeconds) {
+        value.policy = { ...value.policy, idleSeconds: DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: DEFAULT_SESSION_TIMEOUT_SECONDS };
+      }
       return value;
     } catch { throw new BrowserbaseServiceError('resource_store_invalid'); }
   }
@@ -207,24 +231,25 @@ export class BrowserbaseService {
     // Chat docks poll this passive health surface. An unconfigured integration
     // must not touch Keychain merely because an ordinary conversation is open.
     if (!this.store.policy) return { configured: false, credentialConfigured: false, credentialStatus: 'not_checked', projectId: null,
-      idleSeconds: 300, sessionTimeoutSeconds: 1800, activeResources: this.store.resources.filter(nonterminal).length,
+      idleSeconds: DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: DEFAULT_SESSION_TIMEOUT_SECONDS, activeResources: this.store.resources.filter(nonterminal).length,
       privacy: { logSession: false, recordSession: false } };
     let credentialConfigured = false, credentialStatus: 'available' | 'missing' | 'unavailable' = 'missing';
     try { credentialConfigured = Boolean((await this.readKey())?.trim()); credentialStatus = credentialConfigured ? 'available' : 'missing'; } catch { credentialStatus = 'unavailable'; }
     return { configured: Boolean(this.store.policy && credentialConfigured), credentialConfigured, credentialStatus, projectId: this.store.policy?.projectId ?? null,
-      idleSeconds: this.store.policy?.idleSeconds ?? 300, sessionTimeoutSeconds: this.store.policy?.sessionTimeoutSeconds ?? 1800,
+      idleSeconds: this.store.policy?.idleSeconds ?? DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: this.store.policy?.sessionTimeoutSeconds ?? DEFAULT_SESSION_TIMEOUT_SECONDS,
       activeResources: this.store.resources.filter(nonterminal).length, privacy: { logSession: false, recordSession: false } };
   }
   async configure(input: { apiKey?: string; projectId: string; idleSeconds?: number; sessionTimeoutSeconds?: number }): Promise<Awaited<ReturnType<BrowserbaseService['status']>>> {
     return this.serial('configuration', async () => {
       if (!UUID.test(input.projectId)) throw new BrowserbaseServiceError('invalid_project');
-      const idleSeconds = input.idleSeconds ?? this.store.policy?.idleSeconds ?? 300, sessionTimeoutSeconds = input.sessionTimeoutSeconds ?? this.store.policy?.sessionTimeoutSeconds ?? 1800;
+      const idleSeconds = input.idleSeconds ?? this.store.policy?.idleSeconds ?? DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds = input.sessionTimeoutSeconds ?? this.store.policy?.sessionTimeoutSeconds ?? DEFAULT_SESSION_TIMEOUT_SECONDS;
       if (!Number.isInteger(idleSeconds) || !Number.isInteger(sessionTimeoutSeconds) || idleSeconds < 60 || sessionTimeoutSeconds > 21600 || idleSeconds > sessionTimeoutSeconds) throw new BrowserbaseServiceError('invalid_lifetime_policy');
       if (this.store.resources.some(holdsProviderSession)) throw new BrowserbaseServiceError('configuration_has_live_resources');
       if (input.apiKey !== undefined && (!input.apiKey.trim() || input.apiKey.length > 2000)) throw new BrowserbaseServiceError('invalid_credential');
       await this.verifyBeforeSave(input.apiKey?.trim(), input.projectId);
       if (input.apiKey !== undefined) { try { await this.setKey(input.apiKey.trim()); this.keyRead = undefined; } catch { throw new BrowserbaseServiceError('credential_save_failed'); } }
-      this.store.policy = { projectId: input.projectId, idleSeconds, sessionTimeoutSeconds }; this.persist(); return this.status();
+      const contextId = this.store.policy?.projectId === input.projectId ? this.store.policy.contextId : undefined;
+      this.store.policy = { projectId: input.projectId, idleSeconds, sessionTimeoutSeconds, ...(contextId ? { contextId } : {}) }; this.persist(); return this.status();
     });
   }
   /** A key or project Browserbase itself refuses is never saved. When
@@ -254,13 +279,16 @@ export class BrowserbaseService {
       if (prior) { if (prior.recording !== Boolean(input.recording)) throw new BrowserbaseServiceError('request_conflict'); return this.public(prior); }
       const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
       const { api, credentialIdentity } = await this.api();
+      // One open browser at a time holds the saved sign-in profile: two
+      // sessions on one Browserbase context can log each other out.
+      const contextId = this.store.resources.some(value => value.usesProfile && (holdsProviderSession(value) || value.state === 'starting')) ? undefined : await this.profile(api, policy);
       const resource: PrivateResource = { id: this.uuid(), conversationId: input.conversationId, provider: 'browserbase', providerSessionId: null,
         projectId: policy.projectId, state: 'starting', controller: 'agent', controlVersion: 1, createdAt: this.iso(), updatedAt: this.iso(),
         recording: Boolean(input.recording), pages: [], requestKey, credentialIdentity, lastActivityAt: this.now(), expiresAt: this.now() + policy.sessionTimeoutSeconds * 1000,
-        pending: { id: this.uuid(), operation: 'create', targetId: null, controlVersion: 1, startedAt: this.now() } };
+        pending: { id: this.uuid(), operation: 'create', targetId: null, controlVersion: 1, startedAt: this.now() }, ...(contextId ? { usesProfile: true } : {}) };
       this.store.resources.push(resource); this.persist(); // Must land before POST.
       try {
-        const created = await api.create({ projectId: resource.projectId, recording: resource.recording, timeoutSeconds: policy.sessionTimeoutSeconds });
+        const created = await api.create({ projectId: resource.projectId, recording: resource.recording, timeoutSeconds: policy.sessionTimeoutSeconds, ...(contextId ? { contextId } : {}) });
         if (!UUID.test(created.sessionId) || created.projectId !== resource.projectId) throw new BrowserbaseServiceError('provider_identity_changed', 'uncertain');
         resource.providerSessionId = created.sessionId; resource.pending = undefined; this.settleProvider(resource, created); this.persist('uncertain'); return this.public(resource);
       } catch (error) {
@@ -270,6 +298,82 @@ export class BrowserbaseService {
         this.persist(failed.effect); throw failed;
       }
     });
+  }
+  /** The saved sign-in profile, created on first use. A browser starts
+   *  without one rather than not at all. */
+  private async profile(api: Api, policy: Policy): Promise<string | undefined> {
+    if (policy.contextId) return policy.contextId;
+    if (!api.createContext) return undefined;
+    try {
+      const contextId = await api.createContext(policy.projectId);
+      if (this.store.policy?.projectId !== policy.projectId) return undefined;
+      this.store.policy = { ...this.store.policy, contextId }; this.persist(); return contextId;
+    } catch { return undefined; }
+  }
+  /** Every open browser on this machine, across conversations, and the
+   *  running sessions Clem started that no open record holds. */
+  async overview(): Promise<BrowserbaseOverview> {
+    const policy = this.store.policy;
+    const open = this.store.resources.filter(nonterminal);
+    const browsers = open.map((resource): BrowserbaseOpenBrowser => ({ ...this.public(resource),
+      idleClosesAt: resource.providerSessionId && policy ? new Date(Math.min(resource.lastActivityAt + policy.idleSeconds * 1000, resource.expiresAt)).toISOString() : null,
+      endsAt: new Date(resource.expiresAt).toISOString(), usesProfile: Boolean(resource.usesProfile) }));
+    if (!policy) return { browsers, unlinked: [], unlinkedChecked: false };
+    try {
+      const { api } = await this.api();
+      if (!api.listRunning) return { browsers, unlinked: [], unlinkedChecked: false };
+      const held = new Set(open.map(resource => resource.providerSessionId).filter((value): value is string => Boolean(value)));
+      const unlinked = (await api.listRunning(policy.projectId)).filter(session => session.startedByClem && !held.has(session.sessionId))
+        .map(session => ({ providerSessionId: session.sessionId, ...(session.createdAt ? { createdAt: session.createdAt } : {}), ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}) }));
+      return { browsers, unlinked, unlinkedChecked: true };
+    } catch { return { browsers, unlinked: [], unlinkedChecked: false }; }
+  }
+  /** The owner moves an open browser into another conversation. A new control
+   *  epoch: views and proposals from the conversation it left are refused. */
+  async move(id: string, conversationId: string, input: { expectedVersion: number; toConversationId: string }): Promise<BrowserbaseResource> {
+    return this.serial(id, async () => {
+      const resource = this.resource(id, conversationId); this.version(resource, input.expectedVersion); this.live(resource);
+      if (!input.toConversationId || input.toConversationId.length > 200) throw new BrowserbaseServiceError('invalid_conversation');
+      if (resource.pending) throw new BrowserbaseServiceError('operation_in_flight');
+      if (input.toConversationId === conversationId) return this.public(resource);
+      resource.conversationId = input.toConversationId; resource.returnPending = false; resource.controlVersion++;
+      resource.viewerLeases = (resource.viewerLeases ?? []).map(lease => ({ ...lease, detached: true }));
+      resource.lastActivityAt = this.now(); resource.updatedAt = this.iso(); this.persist(); return this.public(resource);
+    }).catch(error => { throw this.serviceError(error); });
+  }
+  /** The owner takes a running session Clem started, and lost, into a
+   *  conversation. It arrives under the owner's control. */
+  async adoptUnlinked(input: { providerSessionId: string; conversationId: string }): Promise<BrowserbaseResource> {
+    return this.serial('configuration', async () => {
+      if (!UUID.test(input.providerSessionId) || !input.conversationId || input.conversationId.length > 200) throw new BrowserbaseServiceError('invalid_arguments');
+      const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
+      if (this.store.resources.some(value => nonterminal(value) && value.providerSessionId === input.providerSessionId)) throw new BrowserbaseServiceError('session_already_owned');
+      const { api, credentialIdentity } = await this.api();
+      const observed = await api.retrieve(input.providerSessionId, policy.projectId);
+      if (observed.status !== 'RUNNING') throw new BrowserbaseServiceError('resource_not_ready');
+      const resource: PrivateResource = { id: this.uuid(), conversationId: input.conversationId, provider: 'browserbase', providerSessionId: input.providerSessionId,
+        projectId: policy.projectId, state: 'active', controller: 'human', controlVersion: 1, createdAt: observed.createdAt ?? this.iso(), updatedAt: this.iso(),
+        recording: false, pages: [], requestKey: hash(JSON.stringify(['adopted', input.providerSessionId, this.uuid()])), credentialIdentity,
+        lastActivityAt: this.now(), expiresAt: observed.expiresAt ? Date.parse(observed.expiresAt) : this.now() + policy.sessionTimeoutSeconds * 1000,
+        ownerResolution: { kind: 'owner_adopted_session', providerSessionId: input.providerSessionId, at: this.now(), originalCreateProof: 'unknown' } };
+      this.store.resources.push(resource); this.persist(); return this.public(resource);
+    }).catch(error => { throw this.serviceError(error); });
+  }
+  /** Closes a running session Clem started that no open record holds. A
+   *  session another tool started in the project is never touched. */
+  async closeUnlinked(providerSessionId: string): Promise<{ closed: boolean }> {
+    return this.serial('configuration', async () => {
+      if (!UUID.test(providerSessionId)) throw new BrowserbaseServiceError('invalid_arguments');
+      const policy = this.store.policy; if (!policy) throw new BrowserbaseServiceError('configuration_missing');
+      if (this.store.resources.some(value => nonterminal(value) && value.providerSessionId === providerSessionId)) throw new BrowserbaseServiceError('session_already_owned');
+      const { api } = await this.api();
+      if (!api.listRunning) throw new BrowserbaseServiceError('browser_service_unavailable');
+      const running = (await api.listRunning(policy.projectId)).find(session => session.sessionId === providerSessionId);
+      if (!running) return { closed: true };
+      if (!running.startedByClem) throw new BrowserbaseServiceError('session_not_started_by_clem');
+      await api.release(providerSessionId, policy.projectId);
+      return { closed: true };
+    }).catch(error => { throw this.serviceError(error); });
   }
   async get(id: string, conversationId: string): Promise<BrowserbaseResource> {
     return this.serial(id, async () => {

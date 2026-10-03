@@ -14,10 +14,11 @@ const owned = { conversationId: conversation, expectedVersion: version };
  * execution authority for an old task. */
 export function registerCloudBrowserRoutes(
   router: Pick<Router, 'get' | 'post'>, guard: RequestHandler, prefix: string,
-  dependencies: { service?: ReturnType<typeof getBrowserbaseService>; hasConversation?: (id: string) => boolean } = {},
+  dependencies: { service?: ReturnType<typeof getBrowserbaseService>; hasConversation?: (id: string) => boolean; conversationTitle?: (id: string) => string | null } = {},
 ): void {
   const service = () => dependencies.service ?? getBrowserbaseService();
   const hasConversation = dependencies.hasConversation ?? (id => Boolean(getSession(id)));
+  const conversationTitle = dependencies.conversationTitle ?? (id => getSession(id)?.title ?? null);
   const noStore: RequestHandler = (_req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -83,6 +84,23 @@ export function registerCloudBrowserRoutes(
       key: z.enum(['Enter', 'Tab', 'Escape', 'Backspace', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']).optional() })
       .refine(v => (v.text !== undefined) !== (v.key !== undefined))) as { conversationId: string; expectedVersion: number; viewerLeaseId: string; targetId: string; text?: string; key?: string };
     res.json(await service().humanInput(String(req.params.id), input.conversationId, input));
+  }));
+  // The owner's browsers sheet: every open browser across conversations.
+  router.get(`${path}/overview`, guard, noStore, handler(async (_req, res) => {
+    const overview = await service().overview();
+    res.json({ ...overview, browsers: overview.browsers.map(browser => ({ ...browser, conversationTitle: conversationTitle(browser.conversationId) })) });
+  }));
+  router.post(`${path}/resources/:id/move`, guard, noStore, handler(async (req, res) => {
+    const input = bound(req, z.strictObject({ ...owned, toConversationId: conversation })) as { conversationId: string; expectedVersion: number; toConversationId: string };
+    if (!hasConversation(input.toConversationId)) throw new Error('missing_conversation');
+    res.json({ resource: await service().move(String(req.params.id), input.conversationId, input) });
+  }));
+  router.post(`${path}/unlinked/:sessionId/adopt`, guard, noStore, handler(async (req, res) => {
+    const input = bound(req, z.strictObject({ conversationId: conversation })) as { conversationId: string };
+    res.json({ resource: await service().adoptUnlinked({ providerSessionId: z.uuid().parse(req.params.sessionId), conversationId: input.conversationId }) });
+  }));
+  router.post(`${path}/unlinked/:sessionId/close`, guard, noStore, handler(async (req, res) => {
+    res.json(await service().closeUnlinked(z.uuid().parse(req.params.sessionId)));
   }));
   for (const action of ['stop', 'touch'] as const) {
     router.post(`${path}/resources/:id/${action}`, guard, noStore, handler(async (req, res) => {

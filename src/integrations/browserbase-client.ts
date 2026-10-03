@@ -15,6 +15,10 @@ export interface BrowserbaseSession {
   createdAt?: string;
   expiresAt?: string;
 }
+/** Marks the sessions Clem starts, so Clem never lists or closes a session
+ *  another tool started in the same Browserbase project. */
+export const CLEM_SESSION_METADATA = { createdBy: 'clementine' } as const;
+export interface BrowserbaseRunningSession extends BrowserbaseSession { startedByClem: boolean }
 export type BrowserbaseClientErrorCode = 'invalid_request' | 'not_configured' | 'timeout' | 'transport_failed'
   | 'redirect_refused' | 'provider_refused' | 'invalid_response' | 'identity_mismatch'
   | 'credential_rejected' | 'provider_limit' | 'project_not_found';
@@ -140,13 +144,37 @@ export class BrowserbaseApiClient {
     } finally { clearTimeout(timer); controller.abort(); }
   }
 
-  async create(input: { projectId: string; recording?: boolean; timeoutSeconds?: number }): Promise<BrowserbaseSession & { connectUrl: string }> {
+  async create(input: { projectId: string; recording?: boolean; timeoutSeconds?: number; contextId?: string }): Promise<BrowserbaseSession & { connectUrl: string }> {
     requireIdentity(input.projectId);
+    if (input.contextId !== undefined) requireIdentity(input.contextId);
     const timeout = input.timeoutSeconds ?? 900;
     if (!Number.isInteger(timeout) || timeout < 60 || timeout > 21600 || (input.recording !== undefined && typeof input.recording !== 'boolean')) throw new BrowserbaseClientError('invalid_request', false);
     const result = await this.request('POST', '/v1/sessions', { projectId: input.projectId, keepAlive: true, timeout,
-      browserSettings: { logSession: false, recordSession: input.recording ?? false } });
+      browserSettings: { logSession: false, recordSession: input.recording ?? false,
+        ...(input.contextId ? { context: { id: input.contextId, persist: true } } : {}) },
+      userMetadata: CLEM_SESSION_METADATA });
     return parseSession(result, input.projectId, undefined, true) as BrowserbaseSession & { connectUrl: string };
+  }
+
+  /** The project's running sessions, each marked by whether Clem started it. */
+  async listRunning(projectId: string): Promise<BrowserbaseRunningSession[]> {
+    requireIdentity(projectId);
+    const rows = await this.request('GET', '/v1/sessions?status=RUNNING');
+    if (!Array.isArray(rows) || rows.length > 500) throw new BrowserbaseClientError('invalid_response', false);
+    return rows.flatMap((row) => {
+      const record = object(row);
+      if (!record || record.projectId !== projectId) return [];
+      const session = parseSession({ ...record, connectUrl: undefined }, projectId);
+      return [{ ...session, startedByClem: object(record.userMetadata)?.createdBy === CLEM_SESSION_METADATA.createdBy }];
+    });
+  }
+
+  /** A saved browser profile (Browserbase context) that keeps sign-ins. */
+  async createContext(projectId: string): Promise<string> {
+    requireIdentity(projectId);
+    const id = object(await this.request('POST', '/v1/contexts', { projectId }))?.id;
+    if (!identity(id)) throw new BrowserbaseClientError('invalid_response', true);
+    return id;
   }
 
   /** Whether this key may use this project. A read with no effect. */

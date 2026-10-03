@@ -30,7 +30,7 @@ test('create uses exact documented endpoint, privacy defaults, bounded lifetime 
     assert.equal(init?.method, 'POST'); assert.equal(init?.redirect, 'manual');
     assert.equal(new Headers(init?.headers).get('X-BB-API-Key'), secret);
     assert.deepEqual(JSON.parse(String(init?.body)), { projectId: project, keepAlive: true, timeout: 900,
-      browserSettings: { logSession: false, recordSession: false } });
+      browserSettings: { logSession: false, recordSession: false }, userMetadata: { createdBy: 'clementine' } });
     return json(session, 201);
   });
   assert.deepEqual(await api.create({ projectId: project }), { sessionId: sid, projectId: project, status: 'RUNNING', connectUrl: connection,
@@ -167,4 +167,25 @@ test('verifyProject reads the project with the key and names a rejected key or a
   await assert.rejects(client(async () => json({ error: 'Unauthorized' }, 401)).verifyProject(project), safeError('credential_rejected', false));
   await assert.rejects(client(async () => json({ error: 'Not found' }, 404)).verifyProject(project), safeError('project_not_found', false));
   await assert.rejects(client(async () => json({ id: 'other-project' })).verifyProject(project), safeError('identity_mismatch', false));
+});
+
+test('a saved profile rides the create; running sessions say whether Clem started them; a profile is created by POST', async () => {
+  await client(async (_url, init) => {
+    assert.deepEqual(JSON.parse(String(init?.body)).browserSettings.context, { id: 'profile-1', persist: true });
+    return json(session, 201);
+  }).create({ projectId: project, contextId: 'profile-1' });
+  const running = await client(async (url, init) => {
+    assert.equal(url, 'https://api.browserbase.com/v1/sessions?status=RUNNING'); assert.equal(init?.method, 'GET');
+    return json([
+      { id: sid, projectId: project, status: 'RUNNING', userMetadata: { createdBy: 'clementine' } },
+      { id: 'session-2', projectId: project, status: 'RUNNING' },
+      { id: 'session-3', projectId: 'another-project', status: 'RUNNING', userMetadata: { createdBy: 'clementine' } },
+    ]);
+  }).listRunning(project);
+  assert.deepEqual(running.map((row) => [row.sessionId, row.startedByClem]), [[sid, true], ['session-2', false]]);
+  assert.equal(await client(async (url, init) => {
+    assert.equal(url, 'https://api.browserbase.com/v1/contexts'); assert.equal(init?.method, 'POST');
+    assert.deepEqual(JSON.parse(String(init?.body)), { projectId: project });
+    return json({ id: 'profile-9', publicKey: 'k' }, 201);
+  }).createContext(project), 'profile-9');
 });

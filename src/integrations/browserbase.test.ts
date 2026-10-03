@@ -291,8 +291,77 @@ test('an unanswered create holds no session: it never blocks a new connection an
     await t.service.configure({ projectId: project, apiKey: 'replacement-key' });
     await t.service.maintenance();
     assert.equal((await t.service.list('task-a'))[0]!.state, 'uncertain', 'inside the provider timeout it stays uncertain');
-    t.advance(1800 * 1000);
+    t.advance((await t.service.status()).sessionTimeoutSeconds * 1000);
     await t.service.maintenance();
     assert.equal((await t.service.list('task-a'))[0]!.state, 'expired');
+  } finally { t.close(); }
+});
+const otherSession = '20000000-0000-4000-8000-000000000003', foreignSession = '20000000-0000-4000-8000-000000000004';
+function runningList(t: ReturnType<typeof setup>, rows: Array<{ id: string; byClem: boolean }>) {
+  (t.api as Record<string, unknown>).listRunning = async () => rows.map(row => ({ sessionId: row.id, projectId: project, status: 'RUNNING' as const, startedByClem: row.byClem }));
+}
+test('the browsers overview lists every open browser across conversations with its closing times, and only lost sessions Clem started', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    await t.service.create({ conversationId: 'task-a', requestId: 'source' });
+    runningList(t, [{ id: sessionId, byClem: true }, { id: otherSession, byClem: true }, { id: foreignSession, byClem: false }]);
+    const overview = await t.service.overview();
+    assert.equal(overview.browsers.length, 1);
+    assert.equal(overview.browsers[0]!.conversationId, 'task-a');
+    assert.equal(overview.browsers[0]!.idleClosesAt, new Date(Date.parse('2026-10-02T00:00:00Z') + 900_000).toISOString(), 'idle closes after 15 minutes');
+    assert.equal(overview.browsers[0]!.endsAt, new Date(Date.parse('2026-10-02T00:00:00Z') + 7_200_000).toISOString(), 'ends after 2 hours');
+    assert.deepEqual(overview.unlinked.map(row => row.providerSessionId), [otherSession], 'held and foreign sessions are not offered');
+    assert.equal(overview.unlinkedChecked, true);
+  } finally { t.close(); }
+});
+test('moving a browser hands it to another conversation under a new control epoch', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    const r = await t.service.create({ conversationId: 'task-a', requestId: 'source' });
+    const human = await t.service.control(r.id, 'task-a', { expectedVersion: r.controlVersion, controller: 'human' });
+    await t.service.view(r.id, 'task-a', { viewerLeaseId: randomUUID(), expectedVersion: human.controlVersion });
+    const moved = await t.service.move(r.id, 'task-a', { expectedVersion: human.controlVersion, toConversationId: 'task-b' });
+    assert.equal(moved.conversationId, 'task-b'); assert.ok(moved.controlVersion > human.controlVersion);
+    await assert.rejects(t.service.get(r.id, 'task-a'), /resource_not_found/);
+    await assert.rejects(t.service.move(r.id, 'task-b', { expectedVersion: human.controlVersion, toConversationId: 'task-c' }), /control_version_changed/);
+    const clem = await t.service.control(r.id, 'task-b', { expectedVersion: moved.controlVersion, controller: 'agent' });
+    assert.equal(clem.controller, 'agent', 'the old view no longer holds the return');
+    assert.equal(clem.returnPending, false);
+  } finally { t.close(); }
+});
+test('a lost session Clem started can be taken into a conversation or closed; another tool\'s session is never closed', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    runningList(t, [{ id: sessionId, byClem: true }, { id: foreignSession, byClem: false }]);
+    const adopted = await t.service.adoptUnlinked({ providerSessionId: sessionId, conversationId: 'task-a' });
+    assert.equal(adopted.providerSessionId, sessionId); assert.equal(adopted.controller, 'human');
+    await assert.rejects(t.service.adoptUnlinked({ providerSessionId: sessionId, conversationId: 'task-b' }), /session_already_owned/);
+    await assert.rejects(t.service.closeUnlinked(foreignSession), /session_not_started_by_clem/);
+    assert.equal(t.counts().releases, 0);
+  } finally { t.close(); }
+});
+test('one open browser holds the saved sign-in profile; a later browser reuses it once that one is closed', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    let contexts = 0; const used: Array<string | undefined> = [];
+    (t.api as Record<string, unknown>).createContext = async () => { contexts++; return 'profile-1'; };
+    const create = t.api.create; t.api.create = async (input: { projectId: string; recording?: boolean; timeoutSeconds?: number; contextId?: string }) => { used.push(input.contextId); return create(input); };
+    const first = await t.service.create({ conversationId: 'task-a', requestId: 'one' });
+    await t.service.create({ conversationId: 'task-b', requestId: 'two' });
+    assert.deepEqual(used, ['profile-1', undefined], 'a second browser at the same time starts without the profile');
+    t.setStatus('COMPLETED'); await t.service.stop(first.id, 'task-a', { expectedVersion: first.controlVersion }); t.setStatus('RUNNING');
+    const overview = await t.service.overview();
+    assert.equal(overview.browsers.some(browser => browser.usesProfile), false);
+    await t.service.create({ conversationId: 'task-c', requestId: 'three' });
+    assert.equal(used.at(-1), 'profile-1'); assert.equal(contexts, 1, 'the profile is created once');
+  } finally { t.close(); }
+});
+test('setups saved with the earlier defaults load with the longer, still bounded ones', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project, idleSeconds: 300, sessionTimeoutSeconds: 1800 });
+    const restarted = new BrowserbaseService(t.options);
+    const status = await restarted.status();
+    assert.equal(status.idleSeconds, 900); assert.equal(status.sessionTimeoutSeconds, 7200);
+    restarted.dispose();
   } finally { t.close(); }
 });
