@@ -8,6 +8,8 @@ import { getSession } from '../runtime/harness/eventlog.js';
 
 export const WORKER_STARTS_NOTHING = 'A worker does its one item and does not start other workers or tasks. '
   + 'Finish the item and return what is left to the run that started you.';
+export const WORKER_DOES_NOT_POST = 'A worker does not post to the conversation or send notifications. '
+  + 'Put what you found in your result; the run that started you decides what to say.';
 export const LEAD_DOES_NOT_HAND_ON = 'You are leading a job handed to you, so you do not hand it on to another task. '
   + 'Split it into items and run them with run_worker instead.';
 
@@ -18,4 +20,13 @@ export function sessionIsDelegatedJob(sessionId: string | null | undefined): boo
     const metadata = getSession(sessionId)?.metadata as Record<string, unknown> | null | undefined;
     return typeof metadata?.delegatedTaskId === 'string' && metadata.delegatedTaskId.length > 0;
   } catch { return false; }
+}
+
+/** The delegated task a run is doing, when it is one. */
+export function delegatedTaskIdOf(sessionId: string | null | undefined): string | null {
+  if (!sessionId) return null;
+  try {
+    const id = (getSession(sessionId)?.metadata as Record<string, unknown> | null | undefined)?.delegatedTaskId;
+    return typeof id === 'string' && id ? id : null;
+  } catch { return null; }
 }

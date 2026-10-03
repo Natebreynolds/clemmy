@@ -38,6 +38,8 @@ export interface DelegatedTask {
   resultPreview: string | null;
   resultPath: string | null;
   error: string | null;
+  /** What the agent said as it worked, newest last. Absent from older Macs. */
+  checkIns?: Array<{ at: string; note: string }>;
   originSessionId: string | null;
   runSessionId: string;
   /** The ended task this one carries a correction to; null when it follows none. */
@@ -225,4 +227,9 @@ export function delegatedTaskCorrections(task: Pick<DelegatedTask, 'revisions'>)
 export function orderDelegatedTasks<T extends Pick<DelegatedTask, 'phase' | 'updatedAt'>>(tasks: readonly T[]): T[] {
   const rank = (task: T): number => (task.phase === 'needs_you' ? 0 : delegatedTaskOpen(task) ? 1 : 2);
   return [...tasks].sort((a, b) => rank(a) - rank(b) || b.updatedAt.localeCompare(a.updatedAt));
+}
+
+/** The check-ins a card shows: the newest few, oldest first. */
+export function delegatedTaskCheckIns(task: Pick<DelegatedTask, 'checkIns'>, limit = 6): Array<{ at: string; note: string }> {
+  return (task.checkIns ?? []).filter((entry) => typeof entry?.note === 'string' && entry.note.trim()).slice(-limit);
 }

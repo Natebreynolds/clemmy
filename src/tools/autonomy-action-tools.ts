@@ -13,6 +13,8 @@ import { PlanSchema, type Plan } from '../agents/planner.js';
 import { textResult } from './shared.js';
 import { getRuntimeEnv } from '../config.js';
 import { readWorkflowRunOriginRecords } from './workflow-run-queue.js';
+import { WORKER_DOES_NOT_POST, delegatedTaskIdOf } from '../agents/delegation-depth.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 
 function planCritiqueEnabled(): boolean {
   return (getRuntimeEnv('CLEMMY_PLAN_CRITIQUE', 'on') ?? 'on').trim().toLowerCase() !== 'off';
@@ -175,6 +177,7 @@ export function registerAutonomyActionTools(server: McpServer): void {
       kind: z.enum(['system', 'approval', 'execution', 'workflow', 'cron']).optional(),
     },
     async ({ title, body, kind }) => {
+      if (harnessRunContextStorage.getStore()?.workerScope) return textResult(WORKER_DOES_NOT_POST);
       const id = `${Date.now()}-tool-notify`;
       const notificationKind = kind === 'approval' || kind === 'execution' || kind === 'workflow' || kind === 'cron'
         ? kind
@@ -219,9 +222,19 @@ export function registerAutonomyActionTools(server: McpServer): void {
     ].join(' '),
     { note: z.string().min(1).max(600) },
     async ({ note }) => {
+      if (harnessRunContextStorage.getStore()?.workerScope) return textResult(WORKER_DOES_NOT_POST);
       const ctx = getToolOutputContext();
       const sessionId = ctx?.sessionId;
       const sourceUserSeq = ctx?.sourceUserSeq;
+      // An agent running a job handed to it checks in with the conversation
+      // that handed it over, under its own name.
+      const delegatedTaskId = delegatedTaskIdOf(sessionId);
+      if (delegatedTaskId) {
+        const { recordDelegatedCheckIn } = await import('../execution/background-tasks.js');
+        return textResult(recordDelegatedCheckIn(delegatedTaskId, note)
+          ? 'Check-in posted to the conversation that handed you this job.'
+          : 'Check-in not posted: this job has no conversation to tell.');
+      }
       if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) {
         // Outside a turn there is no thread to speak into. Say so plainly
         // rather than inventing a destination.

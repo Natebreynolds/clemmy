@@ -9,7 +9,7 @@
  * own route, and settles to the task the Mac answers with.
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { delegatedTaskCard, delegatedTaskCorrection, delegatedTaskFollowsLine, type DelegatedTask } from '@clem/chat-engine';
+import { delegatedTaskCard, delegatedTaskCheckIns, delegatedTaskCorrection, delegatedTaskFollowsLine, type DelegatedTask } from '@clem/chat-engine';
 import { answerDelegatedTask, refusedTask, steerDelegatedTask } from '../lib/project-api';
 import { refusalIsStale, refusalWords } from '../lib/project-words';
 import { haptic } from '../lib/native-bridge';
@@ -142,6 +142,18 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
           {request ? <span class="task-request-mark">{request}</span> : null}
           {view.correction ? <span>{view.correction}</span> : null}
         </p>
+      ) : null}
+
+      {delegatedTaskCheckIns(task).length > 0 ? (
+        <ol class="task-checkins" aria-label={`What ${view.owner} said as it worked`}>
+          {delegatedTaskCheckIns(task).map((entry) => (
+            <li key={`${entry.at}-${entry.note.slice(0, 24)}`}>
+              <span class="task-checkin-who">{view.owner}</span>
+              <time class="task-checkin-when" dateTime={entry.at}> · {relativeTime(entry.at)}</time>
+              <p class="task-checkin-note">{entry.note}</p>
+            </li>
+          ))}
+        </ol>
       ) : null}
 
       {view.question ? (

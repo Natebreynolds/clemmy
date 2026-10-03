@@ -753,7 +753,7 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
 const PUBLIC_TOOL_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/;
 
 const DELEGATED_TASK_PHASES: ReadonlySet<string> = new Set([
-  'dispatched', 'started', 'revised', 'needs_you', 'parked', 'finished', 'stopped', 'failed',
+  'dispatched', 'started', 'revised', 'needs_you', 'parked', 'finished', 'stopped', 'failed', 'check_in',
 ]);
 
 /**
@@ -777,6 +777,7 @@ function publicDelegatedTaskState(data: Record<string, unknown>): Record<string,
     ...text('instruction', 400),
     ...text('reason', 400),
     ...text('question', 400),
+    ...text('note', 600),
   };
 }
 

@@ -5721,3 +5721,9 @@ textarea.cz-input { resize: vertical; }
 .inbox-card-body.bubble-md { min-width: 0; overflow-wrap: anywhere; }
 .inbox-card-body.bubble-md code { white-space: normal; overflow-wrap: anywhere; }
 .inbox-card-body.bubble-md pre { max-width: 100%; overflow-x: auto; }
+
+/* What the agent running a delegated task said as it worked, newest last. */
+.task-checkins { list-style: none; margin: var(--sp-3) 0 0; padding: 0 0 0 var(--sp-3); border-left: 2px solid var(--bg-4); display: flex; flex-direction: column; gap: var(--sp-2); }
+.task-checkin-who { font-weight: 600; font-size: 13px; color: var(--fg); }
+.task-checkin-when { font-size: 12px; color: var(--fg-3, var(--fg-2)); }
+.task-checkin-note { margin: 2px 0 0; font-size: 14px; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }

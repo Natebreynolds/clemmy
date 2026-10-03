@@ -343,6 +343,9 @@ export interface BackgroundTaskRecord {
    * auth-recovery sweep resumes ONLY tagged tasks. */
   blockedOnCli?: string;
   pendingQuestion?: string;
+  /** What the agent running a delegated job told the conversation that
+   *  handed it over, as it worked. The newest last; bounded. */
+  checkIns?: Array<{ at: string; note: string }>;
   /** Exact choices attached to the parked question, when the question tool
    * supplied them. Kept separate from rendered/numbered question text so a
    * reply such as `Production` or `2` can be bound deterministically. */
@@ -684,7 +687,7 @@ function ensureDelegatedRunSession(task: BackgroundTaskRecord): void {
 }
 
 export type DelegatedTaskPhase =
-  | 'dispatched' | 'started' | 'revised' | 'needs_you' | 'parked' | 'finished' | 'stopped' | 'failed';
+  | 'dispatched' | 'started' | 'revised' | 'needs_you' | 'parked' | 'finished' | 'stopped' | 'failed' | 'check_in';
 
 /**
  * Say in the conversation that delegated it what state a delegated task is
@@ -695,7 +698,7 @@ export type DelegatedTaskPhase =
 function publishDelegatedTaskState(
   task: BackgroundTaskRecord,
   phase: DelegatedTaskPhase,
-  detail: { instruction?: string; evidencePolicy?: string; reason?: string } = {},
+  detail: { instruction?: string; evidencePolicy?: string; reason?: string; note?: string } = {},
 ): void {
   const delegation = task.delegation;
   if (!delegation || !task.originSessionId || task.internal) return;
@@ -720,12 +723,32 @@ function publishDelegatedTaskState(
         ...(detail.instruction ? { instruction: clean(detail.instruction, 400) } : {}),
         ...(detail.evidencePolicy ? { evidencePolicy: detail.evidencePolicy } : {}),
         ...(detail.reason ? { reason: clean(detail.reason, 400) } : {}),
+        ...(detail.note ? { note: clean(detail.note, 600) } : {}),
         ...(delegation.followsTaskId ? { followsTaskId: delegation.followsTaskId } : {}),
         ...(phase === 'needs_you' && task.pendingQuestion ? { question: clean(task.pendingQuestion, 400) } : {}),
         ...(phase === 'needs_you' ? cardApprovalId(task.pendingApprovalId) : {}),
       },
     });
   } catch { /* the task record is the authority; the projection is best-effort */ }
+}
+
+const MAX_DELEGATED_CHECK_INS = 20;
+
+/**
+ * A check-in from the agent running a delegated job: kept on the task and
+ * said in the conversation that handed the job over, under the agent's name.
+ * Null when the task is not a delegated one with a conversation to tell.
+ */
+export function recordDelegatedCheckIn(taskId: string, note: string): BackgroundTaskRecord | null {
+  const text = note.replace(/\s+/g, ' ').trim().slice(0, 600);
+  const task = getBackgroundTask(taskId);
+  if (!text || !task?.delegation || !task.originSessionId) return null;
+  const updated = updateBackgroundTask(taskId, {
+    checkIns: [...(task.checkIns ?? []), { at: new Date().toISOString(), note: text }].slice(-MAX_DELEGATED_CHECK_INS),
+  });
+  if (!updated) return null;
+  publishDelegatedTaskState(updated, 'check_in', { note: text });
+  return updated;
 }
 
 /** The id of an approval that is decided on a card. One asked in the
