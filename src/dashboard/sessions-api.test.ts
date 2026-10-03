@@ -867,3 +867,43 @@ test('search reuses the lightweight session snapshot for every workflow member',
       'search must not reload full model/recovery metadata per session or workflow');
   } finally { db.prepare = prepare; }
 });
+
+// Live 10-02: a reopened conversation showed Clem's question, then the pending
+// card under it asking again — and the card had lost her words (the public
+// preview projection dropped them). The card replaces its paused turn and
+// keeps her question; once answered, the turn reads as the question it asked.
+test('a still-pending card in Clem\'s words takes its paused turn\'s place on reopen', async () => {
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const origin = createSession({ kind: 'chat', channel: 'desktop', title: 'voiced reopen' });
+  const ask = appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'delete my fixture workflow' } });
+  const row = approvalRegistry.register({
+    sessionId: origin.id, subject: 'workflow_delete: fixture', tool: 'work_call',
+    args: { name: 'workflow_delete', args_json: '{"name":"fixture","confirm":true}' }, ttlMs: 60_000,
+  });
+  const question = 'Can I delete your fixture workflow?';
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'Clem', type: 'approval_requested', data: {
+    tool: 'work_call', subject: 'workflow_delete: fixture', approvalId: row.approvalId,
+    preview: { operation: 'workflow_delete', fields: [{ name: 'name', value: 'fixture' }], check: { status: 'clear' },
+      ask: question, why: 'This permanently removes the workflow.' },
+  } });
+  const outcomeId = `turn:${ask.seq}`;
+  const filler = `Approval required for workflow_delete: fixture. Review ${row.approvalId} to continue.`;
+  appendEvent({ sessionId: origin.id, turn: 1, role: 'Clem', type: 'conversation_completed', data: {
+    terminalKey: outcomeId, sourceUserSeq: ask.seq, logicalTerminalVersion: 1, awaitingUser: true, reason: 'awaiting_approval',
+    presentation: { version: 1, id: `${outcomeId}:presentation`, outcomeId, audience: 'user', phase: 'final',
+      identity: { sessionId: origin.id, turn: 1, sourceUserSeq: ask.seq }, status: 'needs_input', kind: 'approval',
+      text: filler, resumable: true, needs: { kind: 'approval' }, approvalId: row.approvalId },
+    turnOutcome: { version: 2, id: outcomeId, status: 'needs_input', resumable: true, needs: { kind: 'approval' } },
+    reply: filler,
+  } });
+
+  const detail = getUnifiedSessionDetail(`harness:${origin.id}`);
+  const assistantTurns = detail!.turns.filter((t) => t.role === 'assistant');
+  assert.equal(assistantTurns.length, 1, JSON.stringify(detail!.turns.map((t) => [t.text, Boolean(t.approval)])));
+  assert.equal(assistantTurns[0]!.approval?.approvalId, row.approvalId);
+  assert.equal(assistantTurns[0]!.approval?.preview?.ask, question, 'the card keeps Clem\'s question');
+
+  approvalRegistry.resolve(row.approvalId, 'approved', 'voiced-reopen-test');
+  const after = getUnifiedSessionDetail(`harness:${origin.id}`);
+  assert.deepEqual(after!.turns.filter((t) => t.role === 'assistant').map((t) => t.text), [question]);
+});

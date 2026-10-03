@@ -52,7 +52,7 @@ import {
 /** The host-built approval preview (operation + argument values the owner is
  * approving), admitted only in its exact bounded shape. */
 type ApprovalPreviewField = { name: string; value: string; label?: string };
-type ApprovalPreview = { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck; items?: ApprovalPreview[] };
+type ApprovalPreview = { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck; items?: ApprovalPreview[]; ask?: string; why?: string };
 type ApprovalPreviewCheck = { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 
 function approvalPreviewCheck(value: unknown): ApprovalPreviewCheck | null | undefined {
@@ -99,7 +99,16 @@ export function approvalPreviewProjection(value: unknown): { preview: ApprovalPr
       items.push(admitted.preview);
     }
   }
-  return { preview: { operation: record.operation, fields, ...(check ? { check } : {}), ...(items ? { items } : {}) } };
+  // The card in Clem's words (approval-precheck): carried on every public
+  // surface, or the live card and the reopened one both fall back to the
+  // operation name (live 10-02: the projection dropped them).
+  const line = (value: unknown, max: number): string | undefined => (
+    typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : undefined
+  );
+  const ask = line(record.ask, 200);
+  const why = line(record.why, 260);
+  return { preview: { operation: record.operation, fields, ...(check ? { check } : {}), ...(items ? { items } : {}),
+    ...(ask ? { ask } : {}), ...(why ? { why } : {}) } };
 }
 
 export function publicPlanArtifactRef(value: unknown): PlanRevisionRef | undefined {

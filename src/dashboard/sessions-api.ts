@@ -601,6 +601,11 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
         });
         continue;
       }
+      // The reply that paused on this card already reads as its question;
+      // the still-pending card takes that turn's place rather than asking
+      // twice (live 10-02: the question, then the card, one under the other).
+      const paused = turns.findIndex((turn) => turn.role === 'assistant' && turn.pausedOnApprovalId === approvalId && !turn.approval);
+      if (paused >= 0) turns.splice(paused, 1);
       turns.push({
         role: 'assistant',
         text: '',

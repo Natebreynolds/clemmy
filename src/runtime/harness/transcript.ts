@@ -124,7 +124,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef'] };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -250,6 +250,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
         createdAt: event.createdAt,
         planProposalId: planProposalIdFrom(event.data),
         planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
+        ...(presentation.kind === 'approval' && presentation.approvalId ? { pausedOnApprovalId: presentation.approvalId } : {}),
       });
     }
   }
@@ -351,6 +352,7 @@ export function reconstructHarnessTranscript(sessionId: string, limit = 1000): U
             createdAt: assistant.createdAt,
             planProposalId: assistant.planProposalId,
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
+            ...(assistant.pausedOnApprovalId ? { pausedOnApprovalId: assistant.pausedOnApprovalId } : {}),
           }),
         ]),
       });

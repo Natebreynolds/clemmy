@@ -195,6 +195,9 @@ export interface UnifiedSessionTurn {
   /** Workflows this reply created or changed, as saved, so a reopened
    *  conversation shows the same card the live reply did. */
   workflows?: import('./execution/workflow-saved-event.js').WorkflowSavedEventData[];
+  /** The approval a reply paused on, when it did: a still-pending card for
+   *  the same id takes this turn's place on reopen instead of repeating it. */
+  pausedOnApprovalId?: string;
   /** A2 (v2.3.0): a STILL-PENDING approval attached to this turn, so a
    *  reopened chat renders the actionable approve/execute card — not just
    *  the prose that told the user a card exists somewhere else. */
