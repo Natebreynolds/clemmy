@@ -709,3 +709,56 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   dataforseo__api_request calls return status 20000 Ok. Note: the generic
   request tool is classed external_write (POST), though these are search
   reads; Auto runs them without cards.
+
+### Second stop of the resumed audit (22:53Z) and its root cause
+
+- **What happened:** after a good first checkpoint (Miami's local-trust edge,
+  NYC demand ~5x Miami, thin Spanish organic), the lead hit the 64-call
+  activation cap, auto-resumed, and its next Opus request was refused: HTTP
+  400 invalid_request_error "You're out of extra usage" (req_011Cfg8F1TmQKs…).
+- **Not a used-up plan (owner was right):** probes through Clem's own sign-in
+  30 min later served claude-opus-5-5 normally, with every request shape
+  (identity only, custom system, tools, large system). Claude's unified
+  headers on those replies: 5h 0.09 allowed, 7d 0.78 allowed_warning,
+  representative claim seven_day — Clem's host lane bills the subscription.
+  Overage status rejected, reason out_of_credits. The "Fable" 100% on the
+  meter is its own bucket (7d_oi 0.99, Fable only), not Opus. So one Opus
+  request briefly passed a subscription limit during the lead's burst
+  (~3.1M input tokens in 9 min) and, with no extra-usage credit to spill
+  into, was refused. My first reading (a model weekly cap) was wrong.
+- **Why it stopped instead of waiting:** the bridge reduces a provider failure
+  into the committed terminal and returns it as an ordinary response, so the
+  background runner never saw the refusal and its brain-outage retry never
+  ran; and even thrown, the plan-limit wording skipped the retry without
+  consulting Clem's own usage reading.
+- **Root cause (framework):** the lead ran the data gathering itself on its
+  own pinned premium model. Two runs, 66 calls, 5.29M prompt tokens (4.80M
+  cache reads), ~80K tokens per call, zero run_worker calls; every other
+  Claude use in two days is under 240K. The fan-out directive it was given
+  (14 items detected, wave size 8) says "same-shape reads → PARALLEL tool
+  calls in one response", which pulls every raw SERP/keyword payload into the
+  lead's context for every later call. Workers could have done it: they get
+  the lead's resolved tools, and the DataForSEO request shapes were learned
+  as reads during the run (10 verdicts).
+- **Fix (retry):** the runner reads the refusal back from the activation's
+  own terminal and takes the brain-outage path; when the brain's account has
+  room by a fresh reading (every plan window under 100%), a capacity refusal
+  is a brief limit: the job waits (2/5/10 min, 3 attempts), says so in its
+  check-in and in the chat that handed it over, and retries on the same
+  model. Without such a reading (or for an account Clem cannot read) the
+  plan-limit stop stays, now in plain words. The refusal's limit headers are
+  now logged with the cooldown line.
+- **Fix (burst):** in a delegated job the fan-out directive (both the packet and the
+  Claude brain lanes) sends the items, gathering included, to run_worker; the
+  agent's own calls are planning, checking and the final write-up. The lead's
+  project text says the same.
+- **Stop words:** a failed turn whose provider says the account is out of
+  usage/credit now says so, quotes a short plain provider sentence, and names
+  the two fixes (add usage / choose another model, then resume) instead of
+  "Something went wrong … try again".
+- **Missing chat report:** the report-back dedupe was once per task, so a
+  resumed task's second stop was swallowed as "already reported". Reports now
+  carry the stop's identity (`outcome:snapshot.capturedAt`); a replay of the
+  same stop still dedupes.
+- **Check-in length:** the tool description now names its 600-character cap
+  (the lead learned it from a refused call).
