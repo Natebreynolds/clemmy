@@ -383,3 +383,11 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   naming a request parameter is no longer read as a refused model. Its first
   run (wave 38) is superseded by the rerun above.
 - One pass each (n=1); machine load 2.3–3.4 throughout.
+- Full suite on `10becea4d` (wave 39): stopped by the disk watchdog at ~8,700
+  of ~19,700 tests when free space fell under 3 GB (suite temp homes plus a
+  system `log` collection run); the app was never at risk. One real failure
+  before the stop: the JIT classification guard — the browser work moved
+  `browser_harness_run` to discoverable while the rubric still names it (the
+  browser branch fails it alone too). Classified as reachable on intent
+  (3e6903d6b, test-only, 78/78). A complete suite run is owed once the disk
+  has headroom.
