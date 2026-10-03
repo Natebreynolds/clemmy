@@ -591,6 +591,9 @@ test('JIT classification guard: every rubric-named built-in is consciously CORE 
   // background / app status / cache forget), so semantic retrieval surfaces them.
   const JITABLE_ALLOWED = new Set<string>([
     'workflow_create', 'workflow_run', 'workflow_run_status', 'workflow_update', 'workflow_schedule',
+    // The user's own browser runs an opaque script: discoverable, reached when
+    // the request is about their logged-in browser ("log into my…").
+    'browser_harness_run',
     // Durable-opportunity capture is conditional on explicit schedule/reuse/
     // recovery evidence in the request; it persists review bytes only.
     'automation_opportunity_propose',
