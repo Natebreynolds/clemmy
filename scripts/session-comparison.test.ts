@@ -6,12 +6,16 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 import {
   compareAcceptedTurns,
+  compareAcceptedTasks,
   compareSessions,
   formatAcceptedTurnComparison,
+  formatAcceptedTaskComparison,
   formatSessionComparison,
   measureAcceptedTurn,
+  measureAcceptedTask,
   measureSession,
   parseAcceptedTurnComparisonArgs,
+  parseMeasurementComparisonArgs,
   parseSessionComparisonArgs,
 } from './session-comparison.js';
 
@@ -411,4 +415,231 @@ test('causally owned background memory after delivery is included exactly once i
     assert.equal(after.outputTokens - before.outputTokens, 7);
     assert.equal(after.usageRecords - before.usageRecords, 1);
   } finally { rmSync(fixture.home, {recursive:true, force:true}); }
+});
+
+function approvalTaskFixture(): ReturnType<typeof fixtureHome> {
+  const fixture = fixtureHome();
+  const db = new Database(fixture.dbPath);
+  db.exec(`CREATE TABLE pending_approvals (
+    approval_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, status TEXT NOT NULL,
+    resolution TEXT, requested_at TEXT, resolved_at TEXT
+  )`);
+  seedSession(db, 'task', [
+    { seq: 501, type: 'user_input_received', at: '2026-08-08T07:00:00.000Z' },
+    { seq: 502, type: 'turn_model_routed', at: '2026-08-08T07:00:01.000Z', data: { sourceUserSeq: 501, attemptId: 'task-root' } },
+    { seq: 503, type: 'tool_called', at: '2026-08-08T07:00:02.000Z', data: { tool: 'fixture_read', callId: 'root-call', accounting: 'top_level' } },
+    { seq: 504, type: 'conversation_completed', at: '2026-08-08T07:00:05.000Z', data: typedTerminal('task', 501, 1) },
+    { seq: 510, type: 'user_input_received', at: '2026-08-08T07:00:10.000Z', data: { approvalId: 'apr-one', decision: 'approve', source: 'desktop_approval' } },
+    { seq: 511, type: 'run_resumed', at: '2026-08-08T07:00:10.100Z', data: { approvalId: 'apr-one', decision: 'approve', deliverySourceUserSeq: 510, executionSourceUserSeq: 501, reviewContinuationVersion: 1 } },
+    { seq: 512, type: 'turn_model_routed', at: '2026-08-08T07:00:11.000Z', data: { sourceUserSeq: 501, attemptId: 'task-control-one' } },
+    { seq: 513, type: 'tool_called', at: '2026-08-08T07:00:12.000Z', data: { tool: 'fixture_write', callId: 'control-call', accounting: 'top_level' } },
+    { seq: 514, type: 'conversation_completed', at: '2026-08-08T07:00:15.000Z', data: typedTerminal('task', 510, 1) },
+    // A normal human message between approvals is not part of this task.
+    { seq: 515, type: 'user_input_received', at: '2026-08-08T07:00:16.000Z' },
+    { seq: 516, type: 'tool_called', at: '2026-08-08T07:00:16.100Z', data: { tool: 'unrelated_tool', callId: 'unrelated-call', accounting: 'top_level' } },
+    { seq: 517, type: 'conversation_completed', at: '2026-08-08T07:00:17.000Z', data: typedTerminal('task', 515, 1) },
+    // Synthetic control inputs are admitted only through the durable proof.
+    { seq: 520, type: 'user_input_received', at: '2026-08-08T07:00:20.000Z', data: { approvalId: 'apr-two', decision: 'approve', source: 'approval_resume', synthetic: true } },
+    { seq: 521, type: 'run_resumed', at: '2026-08-08T07:00:20.100Z', data: { approvalId: 'apr-two', decision: 'approve', deliverySourceUserSeq: 520, executionSourceUserSeq: 510, reviewContinuationVersion: 1 } },
+    { seq: 522, type: 'turn_model_routed', at: '2026-08-08T07:00:21.000Z', data: { sourceUserSeq: 501, attemptId: 'task-control-two' } },
+    { seq: 523, type: 'tool_called', at: '2026-08-08T07:00:22.000Z', data: { tool: 'fixture_verify', callId: 'verify-call', accounting: 'top_level' } },
+    { seq: 524, type: 'conversation_completed', at: '2026-08-08T07:00:25.000Z', data: typedTerminal('task', 520, 1) },
+    // Exact post-closeout route must not require a timestamp-window guess.
+    { seq: 525, type: 'turn_model_routed', at: '2026-08-08T07:00:25.101Z', data: { sourceUserSeq: 501, attemptId: 'task-control-two' } },
+  ]);
+  const attempt = db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)');
+  attempt.run('task-root', 'task', '2026-08-08T07:00:00.000Z', '2026-08-08T07:00:05.100Z', 'interrupted', 501);
+  attempt.run('task-control-one', 'task', '2026-08-08T07:00:10.000Z', '2026-08-08T07:00:15.100Z', 'interrupted', 510);
+  attempt.run('task-unrelated', 'task', '2026-08-08T07:00:16.000Z', '2026-08-08T07:00:17.000Z', 'completed', 515);
+  attempt.run('task-control-two', 'task', '2026-08-08T07:00:20.000Z', '2026-08-08T07:00:25.100Z', 'completed', 520);
+  const approval = db.prepare('INSERT INTO pending_approvals VALUES (?, ?, ?, ?, ?, ?)');
+  approval.run('apr-one', 'task', 'resolved', 'approved', '2026-08-08T07:00:03.000Z', '2026-08-08T07:00:10.000Z');
+  approval.run('apr-two', 'task', 'resolved', 'approved', '2026-08-08T07:00:12.000Z', '2026-08-08T07:00:20.000Z');
+  db.close();
+  const row = (seq: number, attemptId: string, at: string, inputTokens: number, cachedInputTokens: number, outputTokens: number, cacheDialect = 'inclusive') => ({
+    at: `2026-08-08T07:00:${at}Z`, source: 'auxiliary-worker', kind: 'chat', model: 'fixture-model',
+    trace: { acceptedSource: `task:${seq}`, logicalTurnId: `turn:${seq}`, attemptId },
+    inputTokens, cachedInputTokens, outputTokens, cacheDialect,
+  });
+  const rows = [
+    row(501, 'task-root', '04.000', 100, 30, 5),
+    row(501, 'task-control-one', '14.000', 200, 50, 6),
+    row(510, 'task-control-one', '14.500', 10, 20, 2, 'exclusive'),
+    row(501, 'task-control-two', '24.000', 300, 100, 8),
+    row(520, 'task-control-two', '30.000', 40, 10, 2),
+    row(515, 'task-unrelated', '16.500', 999, 0, 99),
+  ];
+  writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+  return fixture;
+}
+
+test('task scope unions proved approval descendants and their own reviews without changing single-turn totals', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const beforeDb = readFileSync(fixture.dbPath);
+    const beforeUsage = readFileSync(fixture.usageFile);
+    const initial = measureAcceptedTurn(fixture.home, 'task', 501);
+    assert.equal(initial.usageRecords, 1);
+    assert.equal(initial.promptTokens, 100);
+    assert.equal(initial.turnWallMs, 5_000);
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.deepEqual(task.sourceUserSeqs, [501, 510, 520]);
+    assert.equal(task.approvalContinuations.length, 2);
+    assert.deepEqual(task.approvalContinuations.map(link => link.executionSourceUserSeq), [501, 510]);
+    assert.equal(task.usageRecords, 5, 'root trace, control traces, and late auxiliary each counted once');
+    assert.equal(task.promptTokens, 670, 'exclusive cache rows use the canonical normalizer');
+    assert.equal(task.cachedInputTokens, 210);
+    assert.equal(task.uncachedInputTokens, 460);
+    assert.equal(task.outputTokens, 23);
+    assert.equal(task.canonicalTopLevelToolCalls, 3, 'unrelated intervening turn excluded');
+    assert.equal(task.perTool.unrelated_tool, undefined);
+    assert.equal(task.attemptCount, 3);
+    assert.equal(task.modelRouteEvents, 4, 'includes exact route emitted after attempt closeout');
+    assert.equal(task.taskWallMs, 25_000);
+    assert.equal(task.segmentWallMs, 15_300);
+    assert.equal(task.recordedApprovalWaitMs, 15_000);
+    assert.equal(task.turnWallMs, null, 'task wall is explicit, never the last segment mislabeled');
+    assert.equal(task.usageAttributionCertified, true);
+    assert.deepEqual(task.usageCertificationIssues, []);
+    assert.deepEqual(measureAcceptedTurn(fixture.home, 'task', 501), initial);
+    assert.deepEqual(readFileSync(fixture.dbPath), beforeDb);
+    assert.deepEqual(readFileSync(fixture.usageFile), beforeUsage);
+    assert.throws(() => measureAcceptedTurn(fixture.home, 'task', 520), /not an accepted human/);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('ambiguous or missing approval proof cannot certify a cheaper task and preserves excluded candidate cost', () => {
+  const corruptions = [
+    "UPDATE pending_approvals SET resolution = 'rejected' WHERE approval_id = 'apr-one'",
+    "UPDATE events SET data_json = json_set(data_json, '$.decision', 'reject') WHERE seq = 511",
+    "UPDATE events SET data_json = json_set(data_json, '$.reviewContinuationVersion', 2) WHERE seq = 511",
+    "UPDATE events SET data_json = '{bad json' WHERE seq = 511",
+    'DROP TABLE pending_approvals',
+    `INSERT INTO events VALUES (509, 'task', 1, 'user', 'user_input_received', '{"approvalId":"apr-one","decision":"approve"}', '2026-08-08T07:00:09.000Z')`,
+    `INSERT INTO events VALUES (519, 'task', 1, 'system', 'run_resumed', '{"approvalId":"apr-one","decision":"approve","deliverySourceUserSeq":510,"executionSourceUserSeq":515,"reviewContinuationVersion":1}', '2026-08-08T07:00:19.000Z')`,
+  ];
+  for (const sql of corruptions) {
+    const fixture = approvalTaskFixture();
+    try {
+      const db = new Database(fixture.dbPath); db.exec(sql); db.close();
+      const task = measureAcceptedTask(fixture.home, 'task', 501);
+      assert.deepEqual(task.sourceUserSeqs, [501], sql);
+      assert.equal(task.usageAttributionCertified, false, sql);
+      const unreadableEdge = sql.includes('{bad json');
+      assert.equal(task.unprovenUsage.usageRecords, unreadableEdge ? 2 : 4,
+        'readable claimed descendants preserve their own review cost too; unreadable edges cannot invent links');
+      assert.equal(task.unprovenUsage.promptTokens, unreadableEdge ? 500 : 570);
+      assert.ok(task.usageCertificationIssues.includes('unproved_usage_attribution'));
+      const text = formatAcceptedTaskComparison({ home: fixture.home, baseline: task, candidate: task });
+      assert.match(text, /UNCERTIFIED lower bound/);
+      assert.match(text, /Unproven candidate prompt tokens \(excluded\).*5[07]0/);
+      assert.match(text, /not comparable whole-task cost/);
+    } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+  }
+});
+
+test('task attribution rejects mismatched logical identities and ancestor direction without deduplicating legitimate calls', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const row = { at: '2026-08-08T07:00:24.000Z', source: 'judge', kind: 'chat', model: 'fixture',
+      trace: { acceptedSource: 'task:501', logicalTurnId: 'turn:501', attemptId: 'task-control-two' },
+      cacheDialect: 'inclusive', inputTokens: 20, outputTokens: 2 };
+    const rows = [row, row,
+      { ...row, trace: { ...row.trace, logicalTurnId: 'turn:510' } },
+      { ...row, trace: { ...row.trace, attemptId: 'task-unrelated' } },
+      { ...row, trace: { acceptedSource: 'task:510', logicalTurnId: 'turn:510', attemptId: 'task-root' } },
+    ];
+    writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(task.usageRecords, 7, 'equal payloads are distinct physical calls, not member-sum duplicates');
+    assert.equal(task.promptTokens, 710);
+    assert.equal(task.unprovenUsage.usageRecords, 3);
+    assert.equal(task.unprovenUsage.promptTokens, 60);
+    assert.equal(task.usageAttributionCertified, false);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('missing terminal, unfinished attempt, and unknown approval wait remain explicitly incomplete', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.exec("DELETE FROM events WHERE seq = 524; UPDATE run_attempts SET finished_at = NULL WHERE attempt_id = 'task-control-two'; UPDATE pending_approvals SET resolved_at = NULL WHERE approval_id = 'apr-two'");
+    db.close();
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(task.usageRecords, 5, 'partial completion does not hide already incurred exact cost');
+    assert.equal(task.taskWallMs, null);
+    assert.equal(task.recordedApprovalWaitMs, null);
+    assert.equal(task.unfinishedAttempts, 1);
+    assert.equal(task.usageAttributionCertified, false);
+    assert.ok(task.usageCertificationIssues.includes('missing_terminal:520'));
+    assert.ok(task.usageCertificationIssues.includes('unfinished_source_attempt:520'));
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('task scope requires explicit CLI opt-in and reports linked totals separately', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const base = ['--baseline-session', 'task', '--baseline-source', '501', '--candidate-session', 'task', '--candidate-source', '501', '--home', fixture.home];
+    assert.deepEqual(parseMeasurementComparisonArgs(base), parseAcceptedTurnComparisonArgs(base));
+    const args = parseMeasurementComparisonArgs([...base, '--scope', 'task']);
+    if ('help' in args) assert.fail('unexpected help');
+    assert.equal(args.scope, 'task');
+    const text = formatAcceptedTaskComparison(compareAcceptedTasks(args));
+    assert.match(text, /sources 501, 510, 520/);
+    assert.match(text, /Proven task usage records.*5\s+5/);
+    assert.match(text, /Recorded approval request → decision wait/);
+    assert.throws(() => parseMeasurementComparisonArgs([...base, '--scope', 'everything']), /--scope must be/);
+    assert.throws(() => parseMeasurementComparisonArgs([...base, '--scope', 'task', '--scope', 'turn']), /only be supplied once/);
+    assert.deepEqual(parseMeasurementComparisonArgs(['--help']), { help: true });
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('approval wait timing is independently unknown when old columns are absent, and overlapping waits are unioned', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const db = new Database(fixture.dbPath);
+    db.exec("UPDATE pending_approvals SET requested_at = '2026-08-08T07:00:04.000Z' WHERE approval_id = 'apr-two'");
+    db.close();
+    assert.equal(measureAcceptedTask(fixture.home, 'task', 501).recordedApprovalWaitMs, 17_000);
+    const oldDb = new Database(fixture.dbPath);
+    oldDb.exec('ALTER TABLE pending_approvals DROP COLUMN requested_at; ALTER TABLE pending_approvals DROP COLUMN resolved_at');
+    oldDb.close();
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(task.usageRecords, 5);
+    assert.equal(task.usageAttributionCertified, true, 'missing timing is not missing identity');
+    assert.equal(task.recordedApprovalWaitMs, null);
+    assert.equal(task.approvalWaitIssues.length, 2);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('exact foreign-source usage never becomes a same-session legacy row through time adjacency', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const row = { at: '2026-08-08T07:00:24.000Z', source: 'task', kind: 'other', model: 'unrelated',
+      trace: { acceptedSource: 'task:515', logicalTurnId: 'turn:515', attemptId: 'task-unrelated' },
+      cacheDialect: 'inclusive', inputTokens: 999, outputTokens: 99 };
+    writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + JSON.stringify(row) + '\n');
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(task.promptTokens, 670);
+    assert.equal(task.legacyWindowUsageRecords, 0);
+    assert.equal(task.unscopedWindowUsageRecords, 0);
+    assert.equal(task.usageAttributionCertified, true);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('malformed foreign-looking traces remain visible instead of certifying a cheaper task', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const rows = ['garbage', 'task:515'].map(acceptedSource => ({
+      at: '2026-08-08T07:00:24.000Z', source: 'task', kind: 'chat', model: 'unproved',
+      trace: { acceptedSource, logicalTurnId: 'turn:not-a-source' },
+      cacheDialect: 'inclusive', inputTokens: 99, outputTokens: 9,
+    }));
+    writeFileSync(fixture.usageFile, readFileSync(fixture.usageFile, 'utf8') + rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    assert.equal(task.promptTokens, 670);
+    assert.equal(task.legacyWindowUsageRecords, 2);
+    assert.equal(task.usageAttributionCertified, false);
+    assert.ok(task.usageCertificationIssues.includes('excluded_legacy_window_usage'));
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
 });

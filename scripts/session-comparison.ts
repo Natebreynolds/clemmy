@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import { canonicalCacheAccounting, type UsageEvent } from '../src/runtime/usage-log.js';
 import { projectCanonicalTopLevelToolEvents } from '../src/runtime/harness/tool-effect.js';
 import { presentationEventFromCompletionData } from '../src/runtime/harness/turn-outcome.js';
+import { readApprovalExecutionSource } from '../src/runtime/harness/approval-execution-source.js';
 
 /**
  * Read-only accounting for one dedicated harness session.
@@ -127,6 +128,55 @@ export interface AcceptedTurnComparisonArgs {
   candidateSource: number;
   home: string;
 }
+
+export interface ApprovalContinuationMeasurement {
+  approvalId: string;
+  controlSourceUserSeq: number;
+  executionSourceUserSeq: number;
+  resumeEventSeqs: number[];
+  requestedAt: string | null;
+  resolvedAt: string | null;
+}
+
+export interface AcceptedTaskMeasurement extends SessionMeasurement {
+  scope: 'task';
+  rootSourceUserSeq: number;
+  acceptedSource: string;
+  sourceUserSeqs: number[];
+  approvalContinuations: ApprovalContinuationMeasurement[];
+  lineageIssues: string[];
+  exactUsageRecords: number;
+  /** Exact-looking rows whose attempt/lineage cannot be proved. Kept visible,
+   * never silently folded into either proven totals or zero-cost claims. */
+  unprovenUsage: Pick<SessionMeasurement,
+    'usageRecords' | 'promptTokens' | 'cachedInputTokens' | 'uncachedInputTokens' | 'outputTokens'>;
+  legacyWindowUsageRecords: number;
+  unscopedWindowUsageRecords: number;
+  usageAttributionCertified: boolean;
+  usageCertificationIssues: string[];
+  modelRouteEvents: number;
+  attemptCount: number;
+  unfinishedAttempts: number;
+  terminalSeq: number | null;
+  terminalStatus: string | null;
+  /** Root acceptance to the last linked delivery; includes approval waits.
+   * Null when a linked segment has no proved terminal. */
+  taskWallMs: number | null;
+  /** Union of accepted-input → terminal/attempt-closeout spans, not CPU time. */
+  segmentWallMs: number | null;
+  /** Union of durable card requested_at → resolved_at spans, clipped to the
+   * task wall. Includes delivery/decision time, not a claim of human CPU time. */
+  recordedApprovalWaitMs: number | null;
+  approvalWaitIssues: string[];
+}
+
+export interface AcceptedTaskComparison {
+  home: string;
+  baseline: AcceptedTaskMeasurement;
+  candidate: AcceptedTaskMeasurement;
+}
+
+export type MeasurementComparisonArgs = AcceptedTurnComparisonArgs & { scope?: 'turn' | 'task' };
 
 function finiteNonNegative(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
@@ -612,6 +662,47 @@ function timestampValue(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function ownedTerminal(
+  sessionId: string,
+  source: SessionEvent,
+  events: readonly SessionEvent[],
+  required: boolean,
+): SessionEvent | null {
+  const terminalCandidates: SessionEvent[] = [];
+  for (const event of events) {
+    if (event.seq <= source.seq || event.type !== 'conversation_completed') continue;
+    const owner = terminalOwnerClaims(event.data);
+    let presentation: ReturnType<typeof presentationEventFromCompletionData> = null;
+    try {
+      presentation = presentationEventFromCompletionData(event.data);
+    } catch {
+      if (owner.claims.has(source.seq)) {
+        throw new Error(`Terminal ${event.seq} has a corrupt typed projection for ${sessionId}:${source.seq}`);
+      }
+      continue;
+    }
+    if (
+      !presentation
+      || presentation.identity.sessionId !== sessionId
+      || presentation.identity.sourceUserSeq !== source.seq
+      || presentation.identity.turn !== source.turn
+    ) {
+      if (owner.claims.has(source.seq)) {
+        throw new Error(`Terminal ${event.seq} has contradictory ownership for ${sessionId}:${source.seq}`);
+      }
+      continue;
+    }
+    terminalCandidates.push(event);
+  }
+  if (required && terminalCandidates.length === 0) {
+    throw new Error(`No owned conversation_completed terminal for ${sessionId}:${source.seq}`);
+  }
+  if (terminalCandidates.length > 1) {
+    throw new Error(`Ambiguous terminals for ${sessionId}:${source.seq}: ${terminalCandidates.map((event) => event.seq).join(', ')}`);
+  }
+  return terminalCandidates[0] ?? null;
+}
+
 /**
  * Measure one exact accepted human turn in a reusable session. Event/tool work
  * is bounded by the accepted row and its owned terminal. Usage follows the
@@ -635,39 +726,7 @@ export function measureAcceptedTurn(
     throw new Error(`${sessionId}:${sourceUserSeq} is not an accepted human user input`);
   }
 
-  const terminalCandidates: SessionEvent[] = [];
-  for (const event of sessionRead.events) {
-    if (event.seq <= source.seq || event.type !== 'conversation_completed') continue;
-    const owner = terminalOwnerClaims(event.data);
-    let presentation: ReturnType<typeof presentationEventFromCompletionData> = null;
-    try {
-      presentation = presentationEventFromCompletionData(event.data);
-    } catch {
-      if (owner.claims.has(sourceUserSeq)) {
-        throw new Error(`Terminal ${event.seq} has a corrupt typed projection for ${sessionId}:${sourceUserSeq}`);
-      }
-      continue;
-    }
-    if (
-      !presentation
-      || presentation.identity.sessionId !== sessionId
-      || presentation.identity.sourceUserSeq !== sourceUserSeq
-      || presentation.identity.turn !== source.turn
-    ) {
-      if (owner.claims.has(sourceUserSeq)) {
-        throw new Error(`Terminal ${event.seq} has contradictory ownership for ${sessionId}:${sourceUserSeq}`);
-      }
-      continue;
-    }
-    terminalCandidates.push(event);
-  }
-  if (terminalCandidates.length === 0) {
-    throw new Error(`No owned conversation_completed terminal for ${sessionId}:${sourceUserSeq}`);
-  }
-  if (terminalCandidates.length > 1) {
-    throw new Error(`Ambiguous terminals for ${sessionId}:${sourceUserSeq}: ${terminalCandidates.map((event) => event.seq).join(', ')}`);
-  }
-  const terminal = terminalCandidates[0];
+  const terminal = ownedTerminal(sessionId, source, sessionRead.events, true)!;
   const attempts = readAttemptsForSource(dbPath, sessionId, sourceUserSeq);
   const attemptCloseoutMs = timestampValue(attempts.closeoutAt ?? '');
   const terminalMs = timestampValue(terminal.createdAt);
@@ -777,6 +836,256 @@ export function measureAcceptedTurn(
   };
 }
 
+function intervalUnionMs(intervals: readonly [number, number][]): number {
+  let total = 0;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const [start, finish] of [...intervals].sort((a, b) => a[0] - b[0])) {
+    total += Math.max(0, finish - Math.max(start, end));
+    end = Math.max(end, finish);
+  }
+  return total;
+}
+
+/**
+ * Explicit whole-task scope. Only host-validated, durable approval execution
+ * edges extend the root; adjacent turns, matching text, and timestamps never
+ * establish parentage. Each NDJSON row is selected once across the entire
+ * lineage. This deliberately does not sum overlapping accepted-turn totals.
+ * Unproved candidate cost is reported separately, not discarded as free work.
+ */
+export function measureAcceptedTask(
+  home: string,
+  sessionId: string,
+  rootSourceUserSeq: number,
+): AcceptedTaskMeasurement {
+  if (!Number.isSafeInteger(rootSourceUserSeq) || rootSourceUserSeq <= 0) {
+    throw new Error('rootSourceUserSeq must be a positive event sequence');
+  }
+  const dbPath = path.join(home, 'state', 'harness.db');
+  const sessionRead = readSessionEvents(dbPath, sessionId);
+  const inputs = sessionRead.events.filter((event) => event.type === 'user_input_received');
+  const root = inputs.find((event) => event.seq === rootSourceUserSeq);
+  if (!root || root.role !== 'user' || root.data.synthetic === true) {
+    throw new Error(`${sessionId}:${rootSourceUserSeq} is not an accepted human user input`);
+  }
+  const members = new Map<number, SessionEvent>([[root.seq, root]]);
+  // A readable claim is enough to keep possible cost visible, never enough to
+  // admit a source to the authoritative lineage used for proven totals.
+  const claimedMembers = new Map<number, SessionEvent>([[root.seq, root]]);
+  const parentBySource = new Map<number, number>();
+  const approvalContinuations: ApprovalContinuationMeasurement[] = [];
+  const lineageIssues = new Set<string>();
+  const resumes = sessionRead.events.filter((event) => event.type === 'run_resumed' && event.role === 'system');
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
+  try {
+    db.pragma('query_only = ON');
+    // Parents always precede their controls, so the ordered input scan also
+    // handles a continuation whose execution source is an earlier control.
+    for (const source of inputs) {
+      if (source.seq <= root.seq || source.role !== 'user') continue;
+      const claims = resumes.filter((event) => event.data.deliverySourceUserSeq === source.seq);
+      const related = claims.some((event) => {
+        const parent = positiveEventSeq(event.data.executionSourceUserSeq);
+        return parent !== null && parent < source.seq && claimedMembers.has(parent);
+      });
+      if (!related) continue;
+      claimedMembers.set(source.seq, source);
+      let parent: number | null = null;
+      try {
+        parent = readApprovalExecutionSource(db, { sessionId, sourceUserSeq: source.seq });
+      } catch {
+        // Old schemas and corrupt payloads cannot manufacture lineage.
+      }
+      const approvalId = typeof source.data.approvalId === 'string' ? source.data.approvalId : '';
+      const duplicateControls = inputs.filter((event) => event.data.approvalId === approvalId).length;
+      const conflictingClaim = claims.some((event) => (
+        event.data.reviewContinuationVersion !== 1
+        || event.data.executionSourceUserSeq !== parent
+        || event.data.approvalId !== approvalId
+        || event.data.decision !== source.data.decision
+        || event.seq <= source.seq
+      ));
+      if (parent === null || !members.has(parent) || duplicateControls !== 1 || conflictingClaim) {
+        lineageIssues.add(`unproved_approval_continuation:${source.seq}`);
+        continue;
+      }
+      let card: { requested_at?: unknown; resolved_at?: unknown } | undefined;
+      try {
+        card = db.prepare('SELECT requested_at, resolved_at FROM pending_approvals WHERE session_id = ? AND approval_id = ?')
+          .get(sessionId, approvalId) as typeof card;
+      } catch { /* Old timing columns are unknown; identity proof is separate. */ }
+      members.set(source.seq, source);
+      parentBySource.set(source.seq, parent);
+      approvalContinuations.push({
+        approvalId,
+        controlSourceUserSeq: source.seq,
+        executionSourceUserSeq: parent,
+        resumeEventSeqs: claims.map((event) => event.seq),
+        requestedAt: typeof card?.requested_at === 'string' ? card.requested_at : null,
+        resolvedAt: typeof card?.resolved_at === 'string' ? card.resolved_at : null,
+      });
+    }
+  } finally {
+    db.close();
+  }
+  for (const resume of resumes) {
+    if (members.has(Number(resume.data.executionSourceUserSeq)) && !members.has(Number(resume.data.deliverySourceUserSeq))) {
+      lineageIssues.add(`unproved_approval_resume:${resume.seq}`);
+    }
+  }
+
+  const issues = new Set<string>(lineageIssues);
+  const attemptsBySource = new Map<number, AttemptRead>();
+  const sourceByAttempt = new Map<string, number>();
+  const terminals = new Map<number, SessionEvent>();
+  const eventSeqs = new Set<number>();
+  const windows: [number, number][] = [];
+  let unfinishedAttempts = 0;
+  for (const source of members.values()) {
+    const terminal = ownedTerminal(sessionId, source, sessionRead.events, false);
+    if (terminal) terminals.set(source.seq, terminal);
+    else issues.add(`missing_terminal:${source.seq}`);
+    const attempts = readAttemptsForSource(dbPath, sessionId, source.seq);
+    attemptsBySource.set(source.seq, attempts);
+    for (const id of attempts.ids) sourceByAttempt.set(id, source.seq);
+    unfinishedAttempts += attempts.unfinished;
+    if (attempts.unfinished > 0) issues.add(`unfinished_source_attempt:${source.seq}`);
+    const start = timestampMs(source);
+    const end = Math.max(timestampMs(terminal ?? undefined) ?? 0, timestampValue(attempts.closeoutAt ?? '') ?? 0);
+    const nextInput = inputs.find((event) => event.seq > source.seq);
+    if (start !== null && end >= start) windows.push([start, end]);
+    else issues.add(`unbounded_source_window:${source.seq}`);
+    for (const event of sessionRead.events) {
+      if (event.seq < source.seq || (nextInput && event.seq >= nextInput.seq)) continue;
+      const at = timestampMs(event);
+      if (at !== null && (!end || at <= end)) eventSeqs.add(event.seq);
+    }
+  }
+  const events = sessionRead.events.filter((event) => eventSeqs.has(event.seq));
+  const acceptedSource = `${sessionId}:${root.seq}`;
+  const sourceByAccepted = new Map([...members.keys()].map((seq) => [`${sessionId}:${seq}`, seq]));
+  const claimedAccepted = new Set([...claimedMembers.keys()].map((seq) => `${sessionId}:${seq}`));
+  const claimedAttemptIds = new Set(sourceByAttempt.keys());
+  for (const source of claimedMembers.keys()) {
+    if (!members.has(source)) {
+      for (const id of readAttemptsForSource(dbPath, sessionId, source).ids) claimedAttemptIds.add(id);
+    }
+  }
+  const isAncestor = (ancestor: number, descendant: number): boolean => {
+    let current: number | undefined = descendant;
+    while (current !== undefined) {
+      if (current === ancestor) return true;
+      current = parentBySource.get(current);
+    }
+    return false;
+  };
+  const usageRead = readUsageEvents(path.join(home, 'state', 'token-usage'));
+  const exactUsage: UsageEvent[] = [];
+  const unprovenUsage: UsageEvent[] = [];
+  const usageAttemptIds = new Set<string>();
+  let legacyWindowUsageRecords = 0;
+  let unscopedWindowUsageRecords = 0;
+  for (const event of usageRead.events) {
+    const traceSource = sourceByAccepted.get(event.trace?.acceptedSource ?? '');
+    const attemptId = event.trace?.attemptId;
+    const attemptSource = typeof attemptId === 'string' ? sourceByAttempt.get(attemptId) : undefined;
+    if (traceSource !== undefined || attemptSource !== undefined
+      || claimedAccepted.has(event.trace?.acceptedSource ?? '')
+      || (typeof attemptId === 'string' && claimedAttemptIds.has(attemptId))) {
+      if (traceSource !== undefined && attemptSource !== undefined
+        && event.trace?.logicalTurnId === `turn:${traceSource}` && isAncestor(traceSource, attemptSource)) {
+        exactUsage.push(event);
+        usageAttemptIds.add(attemptId!);
+      } else {
+        unprovenUsage.push(event);
+        issues.add('unproved_usage_attribution');
+      }
+      continue;
+    }
+    // A different exact source is not a legacy same-session row just because
+    // its asynchronous work happened during a member's wall-time window.
+    const foreignIdentity = typeof event.trace?.acceptedSource === 'string'
+      ? /^(.+):([1-9]\d*)$/.exec(event.trace.acceptedSource) : null;
+    if (foreignIdentity && positiveEventSeq(Number(foreignIdentity[2])) !== null
+      && event.trace?.logicalTurnId === `turn:${foreignIdentity[2]}`) continue;
+    const at = timestampValue(event.at);
+    if (at === null || !windows.some(([start, end]) => at >= start && at <= end)) continue;
+    if (event.source === sessionId || event.trace?.acceptedSource === sessionId) legacyWindowUsageRecords += 1;
+    else if (event.source === 'unknown' || event.kind === 'other') unscopedWindowUsageRecords += 1;
+  }
+  if (legacyWindowUsageRecords > 0) issues.add('excluded_legacy_window_usage');
+  if (unscopedWindowUsageRecords > 0) issues.add('unscoped_window_usage');
+  if (sessionRead.malformedEventPayloads > 0) issues.add('malformed_session_events');
+  const routes = sessionRead.events.filter((event) => {
+    if (event.type !== 'turn_model_routed') return false;
+    const attemptId = typeof event.data.attemptId === 'string' ? event.data.attemptId : '';
+    const owner = sourceByAttempt.get(attemptId);
+    const traceSource = positiveEventSeq(event.data.sourceUserSeq);
+    if (owner !== undefined && traceSource !== null && isAncestor(traceSource, owner)) {
+      if (!usageAttemptIds.has(attemptId)) issues.add(`model_route_without_exact_usage:${owner}`);
+      return true;
+    }
+    if (eventSeqs.has(event.seq) && traceSource === null) {
+      const segment = [...members.keys()].reverse().find((seq) => seq < event.seq);
+      if (segment !== undefined && ![...(attemptsBySource.get(segment)?.ids ?? [])].some((id) => usageAttemptIds.has(id))) {
+        issues.add(`model_route_without_exact_usage:${segment}`);
+      }
+      return true;
+    }
+    return false;
+  });
+  const measured = measureRows({ sessionId, events, usageEvents: exactUsage,
+    malformedEventPayloads: sessionRead.malformedEventPayloads, malformedUsageLines: usageRead.malformedUsageLines });
+  const unproven = measureRows({ sessionId, events: [], usageEvents: unprovenUsage,
+    malformedEventPayloads: 0, malformedUsageLines: 0 });
+  const lastSource = [...members.keys()].at(-1)!;
+  const terminal = terminals.get(lastSource);
+  const startMs = timestampMs(root);
+  const endMs = timestampMs(terminal);
+  const taskWallMs = lineageIssues.size === 0 && terminals.size === members.size && startMs !== null && endMs !== null && endMs >= startMs
+    ? endMs - startMs : null;
+  const approvalWaitIssues: string[] = lineageIssues.size > 0 ? ['unproved_approval_lineage'] : [];
+  const waits: [number, number][] = [];
+  for (const link of approvalContinuations) {
+    const requested = timestampValue(link.requestedAt ?? '');
+    const resolved = timestampValue(link.resolvedAt ?? '');
+    if (taskWallMs === null || startMs === null || endMs === null || requested === null || resolved === null
+      || resolved < requested || requested < startMs || resolved > endMs) {
+      approvalWaitIssues.push(`unbounded_approval_wait:${link.approvalId}`);
+    } else {
+      waits.push([requested, resolved]);
+    }
+  }
+  return {
+    ...measured,
+    // SessionMeasurement's wall helper means one turn; never relabel its last
+    // segment as the whole task. Explicit task/segment timings follow below.
+    turnWallMs: null,
+    scope: 'task', rootSourceUserSeq, acceptedSource,
+    sourceUserSeqs: [...members.keys()], approvalContinuations, lineageIssues: [...lineageIssues],
+    exactUsageRecords: exactUsage.length,
+    unprovenUsage: { usageRecords: unproven.usageRecords, promptTokens: unproven.promptTokens,
+      cachedInputTokens: unproven.cachedInputTokens, uncachedInputTokens: unproven.uncachedInputTokens, outputTokens: unproven.outputTokens },
+    legacyWindowUsageRecords, unscopedWindowUsageRecords,
+    usageAttributionCertified: issues.size === 0,
+    usageCertificationIssues: [...issues],
+    modelRouteEvents: routes.length,
+    attemptCount: sourceByAttempt.size, unfinishedAttempts,
+    terminalSeq: terminal?.seq ?? null,
+    terminalStatus: terminal ? terminalStatus(terminal.data) : null,
+    taskWallMs,
+    segmentWallMs: windows.length === members.size ? intervalUnionMs(windows) : null,
+    recordedApprovalWaitMs: approvalWaitIssues.length === 0 ? intervalUnionMs(waits) : null,
+    approvalWaitIssues,
+  };
+}
+
+export function compareAcceptedTasks(args: AcceptedTurnComparisonArgs): AcceptedTaskComparison {
+  const home = resolveClementineHome(args.home);
+  return { home, baseline: measureAcceptedTask(home, args.baselineSession, args.baselineSource),
+    candidate: measureAcceptedTask(home, args.candidateSession, args.candidateSource) };
+}
+
 export function compareSessions(args: SessionComparisonArgs): SessionComparison {
   const home = resolveClementineHome(args.home);
   return {
@@ -867,6 +1176,23 @@ export function parseAcceptedTurnComparisonArgs(
     throw new Error('--baseline-session, --baseline-source, --candidate-session, and --candidate-source are required');
   }
   return { baselineSession, baselineSource, candidateSession, candidateSource, home };
+}
+
+/** Opt-in CLI scope; the historical accepted-turn parser/API stay unchanged. */
+export function parseMeasurementComparisonArgs(argv: readonly string[]): MeasurementComparisonArgs | { help: true } {
+  if (argv.includes('--help') || argv.includes('-h')) return { help: true };
+  const rest: string[] = [];
+  let scope: 'turn' | 'task' | undefined;
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] !== '--scope') { rest.push(argv[i]); continue; }
+    if (scope !== undefined) throw new Error('--scope may only be supplied once');
+    const value = requireValue(argv, i, '--scope');
+    if (value !== 'turn' && value !== 'task') throw new Error('--scope must be turn or task');
+    scope = value;
+    i += 1;
+  }
+  const parsed = parseAcceptedTurnComparisonArgs(rest);
+  return 'help' in parsed || scope === undefined ? parsed : { ...parsed, scope };
 }
 
 function integer(value: number | null): string {
@@ -1042,5 +1368,57 @@ export function formatAcceptedTurnComparison(comparison: AcceptedTurnComparison)
     }
   }
   if (warnings.length > 0) lines.push('', 'Warnings', ...warnings.map((warning) => `  - ${warning}`));
+  return `${lines.join('\n')}\n`;
+}
+
+export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison): string {
+  const { baseline: b, candidate: c } = comparison;
+  const lines = [
+    'Clementine approval-linked task comparison (read-only; explicit task scope)',
+    `home:      ${comparison.home}`,
+    `baseline:  ${b.acceptedSource}; sources ${b.sourceUserSeqs.join(', ')}`,
+    `candidate: ${c.acceptedSource}; sources ${c.sourceUserSeqs.join(', ')}`,
+    `usage:     ${b.usageAttributionCertified ? 'certified' : 'UNCERTIFIED lower bound'} → ${c.usageAttributionCertified ? 'certified' : 'UNCERTIFIED lower bound'}`,
+    '',
+    'Metric                                                               Baseline      Candidate                  Delta',
+    row('Proved approval continuations', b.approvalContinuations.length, c.approvalContinuations.length),
+    row('Durable attempts', b.attemptCount, c.attemptCount),
+    row('Unfinished attempts', b.unfinishedAttempts, c.unfinishedAttempts),
+    row('Model routes', b.modelRouteEvents, c.modelRouteEvents),
+    row('Canonical tool calls (no mirrors)', b.canonicalTopLevelToolCalls, c.canonicalTopLevelToolCalls),
+    row('Discovery operations', b.discoveryOperations, c.discoveryOperations),
+    row('Proven task usage records (union, not summed turns)', b.exactUsageRecords, c.exactUsageRecords),
+    row('Proven task prompt tokens', b.promptTokens, c.promptTokens),
+    row('Cached input tokens', b.cachedInputTokens, c.cachedInputTokens),
+    row('Uncached input tokens', b.uncachedInputTokens, c.uncachedInputTokens),
+    row('Output tokens', b.outputTokens, c.outputTokens),
+    row('Unproven candidate usage records (excluded)', b.unprovenUsage.usageRecords, c.unprovenUsage.usageRecords),
+    row('Unproven candidate prompt tokens (excluded)', b.unprovenUsage.promptTokens, c.unprovenUsage.promptTokens),
+    row('Unproven candidate output tokens (excluded)', b.unprovenUsage.outputTokens, c.unprovenUsage.outputTokens),
+    row('Legacy window usage records (excluded)', b.legacyWindowUsageRecords, c.legacyWindowUsageRecords),
+    row('Unscoped window usage records (excluded)', b.unscopedWindowUsageRecords, c.unscopedWindowUsageRecords),
+    row('Root acceptance → last linked delivery (includes waits)', b.taskWallMs, c.taskWallMs, duration),
+    row('Accepted segment/attempt wall spans (union)', b.segmentWallMs, c.segmentWallMs, duration),
+    row('Recorded approval request → decision wait (union)', b.recordedApprovalWaitMs, c.recordedApprovalWaitMs, duration),
+    row('Summed SDK latency', b.sdkDurationMs, c.sdkDurationMs, duration),
+    row('Summed provider latency', b.providerDurationMs, c.providerDurationMs, duration),
+    '', 'Usage records by model', ...keyedRows(b.usageRecordsByModel, c.usageRecordsByModel),
+  ];
+  const warnings: string[] = [];
+  for (const measurement of [b, c]) {
+    if (!measurement.usageAttributionCertified) {
+      warnings.push(`${measurement.acceptedSource}: incomplete attribution; proven totals are a lower bound, not comparable whole-task cost. ${measurement.usageCertificationIssues.join(', ')}.`);
+    }
+    if (measurement.uncertifiedUsageCalls > 0 || measurement.invalidUsageCalls > 0) {
+      warnings.push(`${measurement.acceptedSource}: ${measurement.uncertifiedUsageCalls} uncertified and ${measurement.invalidUsageCalls} invalid cache-accounting sample(s).`);
+    }
+    if (measurement.approvalWaitIssues.length > 0) warnings.push(`${measurement.acceptedSource}: ${measurement.approvalWaitIssues.join(', ')}.`);
+    if (measurement.malformedEventPayloads > 0 || measurement.malformedUsageLines > 0) {
+      warnings.push(`${measurement.acceptedSource}: ${measurement.malformedEventPayloads} malformed session event(s); ${measurement.malformedUsageLines} malformed usage line(s) in the shared log.`);
+    }
+  }
+  if (warnings.length > 0) lines.push('', 'Warnings', ...warnings.map((warning) => `  - ${warning}`));
+  lines.push('', 'Task scope follows proved approval continuations only; unrelated follow-up turns are excluded.',
+    'Wall spans and approval waits may overlap; do not add them. Unrecorded waits remain unknown.');
   return `${lines.join('\n')}\n`;
 }
