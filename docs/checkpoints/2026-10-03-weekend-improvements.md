@@ -504,3 +504,29 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   bundles match). Owner retest owed.
 - **Follow-up:** when a create reply is rejected but names a valid session id,
   keep the id so the session can be released instead of orphaned.
+
+## Every open browser in one place; hand a browser to Clem (10-03 09:20 PT)
+
+- **Owner ask:** a spot listing current open browsers, open and close them
+  from Clem, navigate to a page and have Clem use it or continue a session.
+  Decisions: the Browser chip opens it; all three of hand-a-browser-to-Clem,
+  keep sign-ins, and longer lifetimes, but still time out to save usage.
+- **Built (206a65bc1 server, 7dfea5462 UI, 0b-chip fix pending install):**
+  `GET cloud-browser/overview` lists every open browser across chats (chat
+  title, page, `idleClosesAt`, `endsAt`, `usesProfile`) plus running sessions
+  Clem started that no record holds (sessions are tagged
+  `userMetadata.createdBy=clementine`; another tool's session is never listed
+  or closed; Browserbase's list is asked at most every 20 s). `move` hands a
+  browser to another chat under a new control epoch (old views detached);
+  `unlinked/:id/adopt|close`. One open browser at a time holds a saved
+  Browserbase context (`persist: true`) so sign-ins carry over; a second
+  simultaneous browser starts without it (Browserbase warns two sessions on
+  one context can log each other out). Idle close 15 min, max 2 h; setups
+  saved with the earlier 5/30 min defaults load with these. Desktop and phone
+  panels: chip "Browsers · N open"; "Other open browsers" with Use in this
+  chat (moves it and gives Clem control), Open chat (desktop), Close; lost
+  browsers with Use in this chat / Close; this chat's browser shows when it
+  closes. 796 neighbouring tests, 39 app tests, both app builds and tsc clean.
+- **Installed:** wave 44 = 7dfea5462 at 09:33 PT; live overview answered
+  (limits 900/7200); desktop panel captured read-only with no page errors.
+  The chip label wrapped to two lines; fixed in source, ships next install.
