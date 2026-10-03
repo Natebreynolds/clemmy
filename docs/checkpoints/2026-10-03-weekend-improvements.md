@@ -209,3 +209,27 @@ rose to 7.2 GB. The large consumers are outside this work and need the owner:
 archives), the live home's old backups (~6.5 GB across `backups/`,
 `state/backups`, `state/pre-v69-20260829`, `state/backup-pre63`,
 `state/dev-backups`) and stale worktrees (16 GB in `~/clem-worktrees`).
+
+## Found live: a brain the account refuses reads as "Something went wrong"
+
+At 20:40 PT 10-02 the active brain became GPT-5.2 Codex (a settings write;
+no harness event, before the wave 37 install). The owner's Codex sign-in is a
+ChatGPT account, and the provider refuses that model for it: `400 … The
+'gpt-5.2-codex' model is not supported when using Codex with a ChatGPT
+account.` Every chat turn on the host engine then ends as "Something went
+wrong on that turn. Please try again" — not honest, not actionable, and
+retrying cannot help. The classifier reads the 400 as `runtime.unknown`; the
+host engine has no switch/ask recovery for it. The picker's OpenAI list is the
+union of API-key `/models` and the subscription catalog, so a model the
+subscription cannot run can still be offered as a brain. Fix in progress
+(framework only; the owner's brain choice is theirs and was not changed).
+
+## Fixtures to show the owner before removal
+
+- workflow `clem-fixture-keychain-check`;
+- agent `clem-fixture-pinned-model` and session sess-desktop-0a6b2325050cc3f818b1f066;
+- sessions "clem-fixture card check" (×2), sess-desktop-c1f4fd9b4a714b2e8e5dd593;
+- session sess-desktop-c064398279b2106370cc3a43 and memory fact 4370 ("leave
+  fixture-rep-C off every clem-fixture weekly roster report", kind user, not a
+  pinned policy) — captured from a P2 fixture message whose turn failed on the
+  refused brain.
