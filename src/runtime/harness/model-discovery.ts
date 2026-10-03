@@ -20,7 +20,13 @@ import { getRuntimeEnv, getOpenAiApiKey } from '../../config.js';
 import { getStoredClaudeTokens, loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getStoredCodexOAuthTokens } from '../auth-store.js';
 
-export interface DiscoveredModel { id: string; label: string }
+export interface DiscoveredModel {
+  id: string;
+  label: string;
+  /** Listed by the Codex subscription catalog: a model the ChatGPT sign-in
+   *  itself can run. Codex dispatch always uses that sign-in. */
+  subscription?: true;
+}
 
 const TTL_MS = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 8_000;
@@ -245,19 +251,29 @@ async function discoverCodexSubscription(): Promise<DiscoveredModel[]> {
     'user-agent': `Codex/${CODEX_MODEL_CATALOG_CLIENT_VERSION}`,
     accept: 'application/json',
   }) as { models?: CodexCatalogModel[] };
-  return filterCodexCatalogModels(body.models ?? []);
+  return filterCodexCatalogModels(body.models ?? []).map((model) => ({ ...model, subscription: true as const }));
 }
 
 /** OpenAI choices are the union of what an API key can see and what a Codex
  *  subscription can run; each source fails open on its own so one outage
  *  never hides the other's models. */
+/** One list from both sources, in source order; a model the subscription
+ *  catalog lists keeps that mark even when the API key lists it first. */
+export function mergeOpenAiDiscovery(...sources: ReadonlyArray<readonly DiscoveredModel[]>): DiscoveredModel[] {
+  const merged: DiscoveredModel[] = [];
+  for (const source of sources) {
+    for (const model of source) {
+      const index = merged.findIndex((m) => m.id === model.id);
+      if (index < 0) merged.push(model);
+      else if (model.subscription && !merged[index]!.subscription) merged[index] = { ...merged[index]!, subscription: true };
+    }
+  }
+  return merged;
+}
+
 async function discoverOpenAi(): Promise<DiscoveredModel[]> {
   const settled = await Promise.allSettled([discoverOpenAiViaApiKey(), discoverCodexSubscription()]);
-  const merged: DiscoveredModel[] = [];
-  for (const result of settled) {
-    if (result.status !== 'fulfilled') continue;
-    for (const model of result.value) if (!merged.some((m) => m.id === model.id)) merged.push(model);
-  }
+  const merged = mergeOpenAiDiscovery(...settled.map((result) => result.status === 'fulfilled' ? result.value : []));
   if (merged.length === 0 && settled.some((r) => r.status === 'rejected')) {
     throw (settled.find((r) => r.status === 'rejected') as PromiseRejectedResult).reason;
   }

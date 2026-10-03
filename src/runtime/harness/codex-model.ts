@@ -36,6 +36,7 @@
  * codex-client.ts (the OAuth wallet); this file just consumes it.
  */
 
+import { refusedModelFromProviderResponse } from './model-refusal.js';
 import { Usage } from '@openai/agents-core';
 import { createHash } from 'node:crypto';
 import type {
@@ -1001,6 +1002,7 @@ export class CodexResponsesModel implements Model {
         throw new CodexModelError(
           `Codex /responses returned ${res.status} ${res.statusText}${detail ? ': ' + detail : ''}`,
           res.status,
+          refusedModelFromProviderResponse(res.status, detail, this.modelId),
         );
       }
       if (!res.body) {
@@ -1046,7 +1048,9 @@ export class CodexModelProvider implements ModelProvider {
 }
 
 export class CodexModelError extends Error {
-  constructor(message: string, readonly status?: number) {
+  /** Set when the provider refused the requested model itself for this
+   *  sign-in (model-refusal.ts). */
+  constructor(message: string, readonly status?: number, readonly refusedModelId?: string) {
     super(message);
     this.name = 'CodexModelError';
   }

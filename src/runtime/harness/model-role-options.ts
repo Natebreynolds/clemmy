@@ -24,7 +24,7 @@ import {
   type ByoProviderSnapshot,
   type ByoRoutingSnapshot,
 } from './byo-providers.js';
-import { discoveredModels, labelForModelId, modelDiscoveryStatus, type ModelDiscoveryPhase } from './model-discovery.js';
+import { discoveredModels, labelForModelId, modelDiscoveryStatus, type DiscoveredModel, type ModelDiscoveryPhase } from './model-discovery.js';
 import { readJudgeFallbackSetting } from './judge-fallback-policy.js';
 
 export interface AvailableModelGroup {
@@ -149,8 +149,17 @@ function addSavedRoleModelsWhileCatalogUncertain(
   }
 }
 
-function codexBrainModelChoices(): Array<{ id: string; label: string }> {
+/** A Codex brain always answers through the ChatGPT sign-in, so once that
+ *  sign-in's own catalog is known, a model only an API key can see is not
+ *  offered: the provider would refuse it on every turn. */
+function codexRunnableDiscoveredModels(): DiscoveredModel[] {
   const live = discoveredModels().openai;
+  const runnable = live.filter((model) => model.subscription);
+  return runnable.length > 0 ? runnable : live;
+}
+
+function codexBrainModelChoices(): Array<{ id: string; label: string }> {
+  const live = codexRunnableDiscoveredModels();
   if (modelDiscoveryStatus().providers.openai.phase === 'ready' && live.length > 0) {
     return live.map((model) => ({ id: model.id, label: model.label }));
   }
@@ -165,7 +174,7 @@ function codexBrainModelChoices(): Array<{ id: string; label: string }> {
   // Live discovery: any additional gpt/o/codex-class model the user's OpenAI
   // credentials can see (providers' /v1/models) — a NEW model shows up in the
   // picker without a Clementine release. Presets stay first (curated labels win).
-  for (const m of discoveredModels().openai) pushUnique(models, m.id, m.label);
+  for (const m of codexRunnableDiscoveredModels()) pushUnique(models, m.id, m.label);
   addSavedRoleModelsWhileCatalogUncertain(models, 'codex', modelDiscoveryStatus().providers.openai.phase);
   return models;
 }

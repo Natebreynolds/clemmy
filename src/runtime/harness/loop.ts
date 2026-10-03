@@ -1,3 +1,4 @@
+import { MODEL_REFUSED_BLOCKED_REASON, refusedModelPublicText, refusedRequestedModel } from './model-refusal.js';
 import './memory-scope-binding.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, readSourceSessionContext } from './source-session-context.js';
@@ -16056,6 +16057,23 @@ function handleRunError(
   }
 
   const message = normalizeError(err);
+
+  // The provider refused the requested model for this sign-in. Retrying the
+  // same model cannot help and a generic "something went wrong" hides the one
+  // thing that does: the owner picks another model. Both engines stop here
+  // with that in words; the source stays resumable on the next model.
+  const refusedModel = refusedRequestedModel(err);
+  if (refusedModel) {
+    bumpTurnNumber(sessionId, turn);
+    return {
+      sessionId,
+      turn,
+      status: 'blocked',
+      error: refusedModelPublicText(refusedModel),
+      blockedReason: MODEL_REFUSED_BLOCKED_REASON,
+      blockedDetail: clip(message, 300),
+    };
+  }
 
   // A raw provider error thrown LATE in a model stream (after content was
   // committed, so resilient-model re-throws it raw) arrives here as a plain
