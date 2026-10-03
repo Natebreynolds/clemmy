@@ -647,3 +647,18 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   f_calendar_read_warm round 1 −11.7 KB and turn −23 KB. Not in the full
   suite (journeys are not globbed), which is why it went unnoticed.
   The owner accepted the measured table as the new baseline (27/27 pass).
+- **Wave 49 = 0bf7977d9** installed 14:05 PT (build-info serves it; bundles
+  match). proposal-builder's lead set to Scorpion Audit through the app route
+  (`lead: true` read back).
+- **Controlled live proof (fixture project "Clem fixture: lead run",
+  prj_4a7jbfpqaz2b5y; agent "Clem Fixture Lead" on claude-opus-5-5; chat
+  sess-desktop-df1f6ce3e859e4e8abb3860d):** Clem (GPT 6.1 Sol) handed the
+  job to the lead via dispatch_background_task in ~20 s; the lead run routed
+  to claude-opus-5-5, read the project CLAUDE.md, fanned out three workers in
+  one run_worker batch (DeepSeek V4.1 Flash, the worker default; 7 s), read
+  every file back, wrote INDEX.md, and finished at 70 s; the origin chat got
+  dispatched / started / finished under the lead's name and the lead's report
+  as the report-back message. All four files follow the procedure exactly.
+  Not exercised live: check_in (the job was too short to need one; covered by
+  tests) and folder linking (the fixture folder is not among the owner's
+  workspace folders, so the project context named it instead).
