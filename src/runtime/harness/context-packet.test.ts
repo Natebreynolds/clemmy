@@ -1384,3 +1384,17 @@ test('project commands remain contextual procedures, not forced execution routes
   assert.doesNotMatch(line!, /project_run|real deliverable route|Do NOT rebuild/);
   assert.equal(projectCommandsLineForInput('What is the capital of France?'), null);
 });
+
+test('in a job handed to an agent the items, gathering included, are worker work; elsewhere same-shape reads may run in parallel here', () => {
+  const many = { isMultiItem: true, itemCount: 14, itemKind: 'markets', sameShapeWork: true, explicitParallelRequest: false } as const;
+  const few = { ...many, itemCount: 3 };
+  for (const intent of [many, few]) {
+    const job = fanoutDirectiveLine(intent, 8, { delegatedJob: true });
+    assert.match(job, /run_worker with the full \d+-item `items` array/);
+    assert.match(job, /gathering/);
+    assert.doesNotMatch(job, /PARALLEL tool calls/, 'a delegated job does not pull the items into its own context');
+    assert.match(fanoutDirectiveLine(intent, 8), /PARALLEL tool calls/, 'an ordinary run keeps the in-context read lane');
+  }
+  assert.match(fanoutDirectiveLine({ ...many, itemCount: 300 }, 8, { delegatedJob: true }), /workflow.*forEach/i,
+    'above the worker limit the durable workflow lane still applies');
+});

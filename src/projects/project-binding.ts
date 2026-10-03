@@ -109,7 +109,9 @@ export function bindProject(project: ProjectRecord, options: { agentId?: string 
     lines.push('', '### You lead this project',
       'Whole jobs here are yours to run. Plan the job, split it into pieces that each fit one worker, and run workers for '
         + 'them with run_worker (several items at once where they are independent); give each worker the project files and '
-        + 'procedures it needs. Check in at real decisions and when a wave finishes, then deliver the finished work.');
+        + 'procedures it needs. Gathering is worker work too: searches, data pulls and scrapes run in workers, so the raw data '
+        + 'stays out of your context and your own calls go to planning, checking what comes back and the final write-up. '
+        + 'Check in at real decisions and when a wave finishes, then deliver the finished work.');
   } else if (lead && leadName) {
     lines.push('', `### ${leadName} leads this project`,
       `Hand a whole job in this project to ${leadName} with dispatch_background_task (agent ${leadName}, this project): `

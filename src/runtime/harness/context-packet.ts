@@ -1,4 +1,5 @@
 import { existsSync, statfsSync } from 'node:fs';
+import { sessionIsDelegatedJob } from '../../agents/delegation-depth.js';
 import path from 'node:path';
 import { BASE_DIR, getOpenAiApiKey } from '../../config.js';
 import { getFocusSnapshot } from '../../memory/focus.js';
@@ -210,10 +211,22 @@ function rankingSignalText(text: string): string {
  * imperative "do NOT serialize" + a one-line forEach-workflow suggestion (P2);
  * 3<=N<8 gets a soft offer that leaves the model's per-item judgment intact.
  */
-export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8): string {
+export function fanoutDirectiveLine(intent: MultiItemIntent, waveSize = 8, opts: { delegatedJob?: boolean } = {}): string {
   const kind = intent.itemKind ? ` ${intent.itemKind}` : ' items';
   const n = intent.itemCount;
   const cappedWaveSize = Math.max(1, Math.min(8, Math.round(waveSize || 8)));
+  if (opts.delegatedJob && n <= 256) {
+    // A job handed to an agent has workers on their own model. Issuing the
+    // items' reads in the agent's own context carries every raw result into
+    // each later call of the agent's model; workers keep that volume apart.
+    return (
+      `${n >= 8 ? 'Fan-out directive' : 'Fan-out hint'}: this job names ${n} independent same-shape${kind}. `
+      + 'You are running a job handed to you: your own calls are for planning, checking what comes back and the final write-up; the items are worker work, '
+      + 'including the gathering each one needs (searches, lookups, data pulls), so their raw data stays with the workers. '
+      + `Call run_worker with the full ${n}-item \`items\` array and a workManifest declaring that canonical universe (parallel waves of up to ${cappedWaveSize}). `
+      + 'Use run_batch only for writes whose exact arguments you can bake now.'
+    );
+  }
   if (n > 256) {
     return (
       `Fan-out directive: this turn names ${n} independent same-shape${kind}, above run_worker's 256-item structural limit. `
@@ -862,7 +875,7 @@ export function buildAgentContextPacket(
   const parallelismLine = opts?.sessionKind === 'workflow'
     ? WORKFLOW_PARALLELISM_LINE
     : offerFanout
-      ? fanoutDirectiveLine(multiItem, recommendedWorkerWaveSize)
+      ? fanoutDirectiveLine(multiItem, recommendedWorkerWaveSize, { delegatedJob: sessionIsDelegatedJob(opts?.sessionId) })
       : fanoutBlockedByPolicy
         ? fanoutPolicyLine(multiItem, agentSystem)
         : '';

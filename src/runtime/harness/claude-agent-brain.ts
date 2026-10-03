@@ -1,4 +1,5 @@
 import './memory-scope-binding.js';
+import { sessionIsDelegatedJob } from '../../agents/delegation-depth.js';
 import { renderCanonicalMemoryContext } from './canonical-context.js';
 import { acceptedPlanOwnerScopeInput } from './accepted-plan-execution.js';
 import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
@@ -1379,7 +1380,7 @@ async function buildClaudeAgentBrainTurnContext(
     // "No" must never inherit the parent request's action classification or
     // fan-out directive merely because A/Q/B are present in taskInput.
     const multi = detectMultiItemIntent(authorityInput);
-    if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi);
+    if (multi.isMultiItem) fanoutDirective = fanoutDirectiveLine(multi, 8, { delegatedJob: sessionIsDelegatedJob(request.sessionId) });
     preflight = classifyTurnPreflight({
       message: authorityInput,
       sessionId: request.sessionId,
