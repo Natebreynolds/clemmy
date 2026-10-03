@@ -13,7 +13,22 @@ export const MODEL_REFUSED_BLOCKED_REASON = 'model_refused_for_account';
 
 const MODEL_REFUSAL_STATUSES = new Set([400, 404]);
 
-/** The requested model when a provider's error response refuses it. */
+/** The request parameter a provider's structured error names, if any. */
+function rejectedParam(detail: string | undefined): { param: string; message: string } | null {
+  try {
+    const body = JSON.parse(detail ?? '') as { error?: { param?: unknown; message?: unknown } };
+    const param = body?.error?.param;
+    return typeof param === 'string' && param.trim()
+      ? { param: param.trim(), message: typeof body.error?.message === 'string' ? body.error.message : '' }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The requested model when a provider's error response refuses it. An error
+ *  that names a request parameter (an effort the model does not take, say) is
+ *  about that parameter, not the model, even when it names the model too. */
 export function refusedModelFromProviderResponse(
   status: number | undefined,
   detail: string | undefined,
@@ -21,7 +36,20 @@ export function refusedModelFromProviderResponse(
 ): string | undefined {
   const model = requestedModelId?.trim();
   if (!model || typeof status !== 'number' || !MODEL_REFUSAL_STATUSES.has(status)) return undefined;
+  const param = rejectedParam(detail);
+  if (param && param.param !== 'model') return undefined;
   return detail?.toLowerCase().includes(model.toLowerCase()) ? model : undefined;
+}
+
+/** The values a provider says it accepts for a parameter it refused
+ *  (`error.param` names it; its message lists them quoted). Null otherwise. */
+export function supportedValuesForRejectedParam(detail: string | undefined, param: string): string[] | null {
+  const rejected = rejectedParam(detail);
+  if (!rejected || rejected.param !== param) return null;
+  const listed = rejected.message.split(/supported values? (?:are|is)\s*:?/i)[1];
+  if (!listed) return null;
+  const values = [...listed.matchAll(/'([^']+)'/g)].map((match) => match[1]!.trim()).filter(Boolean);
+  return values.length > 0 ? values : null;
 }
 
 /** The refused model a thrown provider error carries, through its causes. */

@@ -36,7 +36,8 @@
  * codex-client.ts (the OAuth wallet); this file just consumes it.
  */
 
-import { refusedModelFromProviderResponse } from './model-refusal.js';
+import { refusedModelFromProviderResponse, supportedValuesForRejectedParam } from './model-refusal.js';
+import { effectiveReasoningEffort, recordSupportedEfforts } from './model-window-observations.js';
 import { Usage } from '@openai/agents-core';
 import { createHash } from 'node:crypto';
 import type {
@@ -397,6 +398,7 @@ export function isRetryableCodexRateLimit(err: unknown): boolean {
  *     fail fast or need the backoff to clear, so they keep the full ceiling.
  */
 export function transparentCodexRetryBudget(err: unknown): number {
+  if (err instanceof CodexModelError && err.requestReshaped === true) return 1;
   if (isRetryableCodexRateLimit(err)) return CODEX_TRANSPARENT_MAX_RETRIES;
   if (!isTransparentCodexRetryError(err)) return 0;
   const undiciCode = (err as BoundaryError).context?.undiciCode;
@@ -999,10 +1001,15 @@ export class CodexResponsesModel implements Model {
           const retryAfterSec = Number.parseInt(res.headers.get('retry-after') ?? '', 10);
           recordCodexUsageExhausted(Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : undefined);
         }
+        // A model that refuses an effort lists the ones it takes: learn them,
+        // and the transparent retry sends the nearest one.
+        const acceptedEfforts = res.status === 400 ? supportedValuesForRejectedParam(detail, 'reasoning.effort') : null;
+        if (acceptedEfforts) recordSupportedEfforts(this.modelId, acceptedEfforts);
         throw new CodexModelError(
           `Codex /responses returned ${res.status} ${res.statusText}${detail ? ': ' + detail : ''}`,
           res.status,
           refusedModelFromProviderResponse(res.status, detail, this.modelId),
+          acceptedEfforts ? true : undefined,
         );
       }
       if (!res.body) {
@@ -1048,9 +1055,11 @@ export class CodexModelProvider implements ModelProvider {
 }
 
 export class CodexModelError extends Error {
-  /** Set when the provider refused the requested model itself for this
-   *  sign-in (model-refusal.ts). */
-  constructor(message: string, readonly status?: number, readonly refusedModelId?: string) {
+  /** `refusedModelId`: the provider refused the requested model itself for
+   *  this sign-in (model-refusal.ts). `requestReshaped`: it refused a request
+   *  setting and said what it accepts, which is now learned, so the same
+   *  request can be sent once more as it will be accepted. */
+  constructor(message: string, readonly status?: number, readonly refusedModelId?: string, readonly requestReshaped?: boolean) {
     super(message);
     this.name = 'CodexModelError';
   }
@@ -1257,7 +1266,9 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
   }
   if (request.modelSettings?.reasoning?.effort || request.modelSettings?.reasoning?.summary) {
     body.reasoning = {
-      effort: request.modelSettings.reasoning.effort ?? undefined,
+      // An effort this model has told us it does not take is sent as the
+      // nearest one it does (model-window-observations).
+      effort: (effectiveReasoningEffort(modelId, request.modelSettings.reasoning.effort ?? undefined) as typeof request.modelSettings.reasoning.effort) ?? undefined,
       summary: request.modelSettings.reasoning.summary ?? 'auto',
     };
   }
