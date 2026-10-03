@@ -1,3 +1,4 @@
+import { BrowserbaseConnection } from '../components/BrowserbaseConnection';
 import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
 import { accountStatus, creditRefusalSentence, presentUsageMeters } from '@clem/chat-engine';
@@ -900,7 +901,8 @@ export function ConnectionsPage({ rows, loading, error, offline, stale, refreshi
           <div class="card settings-card">{list(tools)}</div>
         </section>
       ) : null}
-      {Boolean(rows?.length) && <p class="settings-foot">Connect or fix anything here on your Mac, in Connect.</p>}
+      {Boolean(rows?.length) && <p class="settings-foot">Other connections are managed on your Mac, in Connect.</p>}
+      <BrowserbaseConnection />
     </Fragment>
   );
 }

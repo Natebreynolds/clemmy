@@ -1,0 +1,217 @@
+.cloud-browser-workspace {
+  display:flex;
+  flex:1;
+  min-height:0;
+  min-width:0;
+  height:100%}
+.cloud-browser-conversation {
+  display:flex;
+  flex:1;
+  min-width:0;
+  min-height:0;
+  flex-direction:column}
+.cloud-browser-thread {
+  display:flex;
+  flex:1;
+  min-height:0;
+  flex-direction:column}
+.cloud-browser-strip {
+  display:flex;
+  align-items:center;
+  gap:16px;
+  padding:8px 20px;
+  border-bottom:1px solid var(--border);
+  color:var(--text-muted);
+  font-size:12px}
+.cloud-browser-strip button {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  color:var(--text);
+  font-weight:600}
+.cloud-browser-strip button span {
+  color:var(--text-muted);
+  font-weight:400}
+.cloud-browser-strip-note {
+  margin-left:auto}
+.cloud-browser-panel {
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+  width:46%;
+  min-width:340px;
+  background:var(--bg-surface);
+  border-left:1px solid var(--border);
+  overflow:auto}
+.cloud-browser-panel header {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:18px 20px}
+.cloud-browser-panel h2 {
+  font-size:17px;
+  font-weight:600}
+.cloud-browser-panel header p,.cloud-browser-fine {
+  font-size:12px;
+  line-height:1.6;
+  color:var(--text-muted)}
+.cloud-browser-panel button,.cloud-browser-panel select,.cloud-browser-empty a {
+  min-height:36px;
+  border-radius:8px;
+  padding:7px 10px;
+  font-size:13px;
+  color:var(--text);
+  background:var(--bg-subtle)}
+.cloud-browser-panel button:hover {
+  background:var(--bg-hover)}
+.cloud-browser-panel button:disabled {
+  opacity:.5;
+  cursor:not-allowed}
+.cloud-browser-panel button:focus-visible,.cloud-browser-strip button:focus-visible,.cloud-browser-panel input:focus-visible,.cloud-browser-panel select:focus-visible,.cloud-browser-empty a:focus-visible {
+  outline:2px solid var(--ring);
+  outline-offset:3px}
+.cloud-browser-controls {
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  padding:0 20px 14px}
+.cloud-browser-controls button {
+  display:flex;
+  align-items:center;
+  gap:6px}
+.cloud-browser-page {
+  padding:10px 20px;
+  border-block:1px solid var(--border);
+  font-size:13px;
+  overflow-wrap:anywhere}
+.cloud-browser-page span {
+  display:block;
+  color:var(--text-muted);
+  font-size:12px}
+.cloud-browser-view {
+  flex:1;
+  min-height:320px;
+  background:var(--bg-subtle);
+  display:flex;
+  align-items:center;
+  justify-content:center}
+.cloud-browser-view iframe {
+  width:100%;
+  height:100%;
+  min-height:420px;
+  border:0;
+  flex:1}
+.cloud-browser-view p {
+  max-width:32ch;
+  padding:24px;
+  text-align:center;
+  font-size:14px;
+  color:var(--text-muted)}
+.cloud-browser-fine,.cloud-browser-notice {
+  padding:12px 20px}
+.cloud-browser-notice {
+  font-size:13px;
+  line-height:1.5;
+  background:var(--info-tint);
+  color:var(--info)}
+.cloud-browser-select {
+  padding:0 20px 14px;
+  font-size:12px;
+  color:var(--text-muted)}
+.cloud-browser-select select {
+  display:block;
+  width:100%;
+  margin-top:5px}
+.cloud-browser-empty {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:16px;
+  padding:32px 24px;
+  max-width:48ch}
+.cloud-browser-empty h3 {
+  font-weight:600;
+  font-size:18px}
+.cloud-browser-empty p {
+  font-size:14px;
+  line-height:1.7;
+  color:var(--text-muted)}
+.cloud-browser-empty label {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:13px}
+.cloud-browser-empty .cloud-browser-primary {
+  background:var(--primary);
+  color:var(--primary-fg);
+  font-weight:600}
+.cloud-browser-empty .cloud-browser-primary:hover {
+  background:var(--primary-hover)}
+.cloud-browser-empty .cloud-browser-fine {
+  padding:0;
+  font-size:12px}
+@media(max-width:950px) {
+  .cloud-browser-workspace.is-open {
+  flex-direction:column}
+.cloud-browser-panel {
+  width:100%;
+  min-width:0;
+  max-height:55%;
+  border-left:0;
+  border-top:1px solid var(--border)}
+.cloud-browser-view {
+  min-height:200px}
+.cloud-browser-view iframe {
+  min-height:240px}
+.cloud-browser-strip-note {
+  display:none}
+}
+@media(prefers-reduced-motion:reduce) {
+  .cloud-browser-panel * {
+  scroll-behavior:auto}
+}
+
+
+.cloud-browser-frame {
+  display:flex;
+  flex:1;
+  align-self:stretch;
+  min-width:0;
+  min-height:0}
+
+.cloud-browser-recovery {
+  margin:12px 20px;
+  padding:12px 0;
+  border-top:1px solid var(--border,var(--bg-4));
+  font-size:13px;
+  line-height:1.6}
+
+.cloud-browser-recovery summary {
+  cursor:pointer;
+  font-weight:600}
+
+.cloud-browser-recovery p {
+  margin:10px 0;
+  color:var(--text-muted,var(--fg-2))}
+
+.cloud-browser-recovery label {
+  display:block;
+  margin:12px 0}
+
+.cloud-browser-recovery input {
+  display:block;
+  width:100%;
+  min-height:44px;
+  margin-top:5px;
+  padding:9px 12px;
+  border:1px solid var(--border,var(--bg-4));
+  border-radius:8px;
+  background:var(--bg-surface,var(--bg-0));
+  color:var(--text,var(--fg));
+  font-size:16px}
+
+
+.cloud-browser-close-views { margin: 0 16px 12px; align-self: flex-start; }
+
+.cloud-browser-new {display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:0 16px 16px}
+.cloud-browser-new label {display:flex;align-items:center;gap:8px;font-size:13px}

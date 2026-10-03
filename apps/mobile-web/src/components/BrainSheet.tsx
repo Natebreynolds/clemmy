@@ -4,6 +4,7 @@ import {
   setBrain,
   type ApiError,
   type ModelSettings,
+  type NextAnsweringModel,
 } from '../lib/api';
 import { ROLE_COPY } from '../lib/model-roles';
 import { haptic } from '../lib/native-bridge';
@@ -17,7 +18,7 @@ import { haptic } from '../lib/native-bridge';
  * connecting a new brain is the Mac's job. Mirrors the console's no-restart
  * contract: a switch applies to your next message.
  */
-export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent, beforeChange }: {
+export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent, answeringModel, modelReadFailed, beforeChange }: {
   open: boolean;
   onClose: () => void;
   /** Fired after a successful switch so hosts can refresh their own view. */
@@ -30,19 +31,27 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
   /** An agent's own model answers the next message; a pick
    *  here in the conversation answers it instead. */
   answeringAgent?: { modelId: string; agentName: string } | null;
+  /** null means this conversation's read is pending/unavailable; undefined is
+   * Settings, where the global new-conversation default is the right scope. */
+  answeringModel?: NextAnsweringModel | null;
+  modelReadFailed?: boolean;
   /** Apply the chat's pending agent choice first, so the pick is the later one. */
   beforeChange?: () => Promise<void>;
 }) {
   const [settings, setSettings] = useState<ModelSettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyValue, setBusyValue] = useState<string | null>(null);
-  const [switched, setSwitched] = useState<string | null>(null);
+  const [switched, setSwitched] = useState<{ label: string; effectiveValue: string; scope: 'conversation' | 'new_conversations' } | null>(null);
   const [switchError, setSwitchError] = useState<string | null>(null);
   const sheetRef = useRef<HTMLElement | null>(null);
   const closeRef = useRef<HTMLButtonElement | null>(null);
+  const selectionGeneration = useRef(0);
 
   useEffect(() => {
     if (!open) return;
+    selectionGeneration.current += 1;
+    setBusyValue(null);
+    setSettings(null);
     setSwitched(null);
     setSwitchError(null);
     let cancelled = false;
@@ -50,8 +59,8 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
     getModelSettings()
       .then((data) => { if (!cancelled) setSettings(data); })
       .catch((err) => { if (!cancelled) setLoadError((err as Error).message ?? 'Could not load the model catalog'); });
-    return () => { cancelled = true; };
-  }, [open]);
+    return () => { cancelled = true; selectionGeneration.current += 1; };
+  }, [open, sessionId]);
 
   // Same dialog contract as the running-tasks sheet: Escape closes, focus
   // lands inside on open and is trapped while open.
@@ -81,31 +90,44 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
 
   if (!open) return null;
 
-  const pick = async (value: string, label: string) => {
+  const pick = async (value: string) => {
+    const generation = ++selectionGeneration.current;
     setBusyValue(value);
     setSwitchError(null);
     setSwitched(null);
     try {
-      if (sessionId) await beforeChange?.().catch(() => undefined);
-      await setBrain(value, sessionId);
+      if (sessionId) await beforeChange?.();
+      if (generation !== selectionGeneration.current) return;
+      const receipt = await setBrain(value, sessionId);
+      if (generation !== selectionGeneration.current) return;
       haptic('light');
-      setSwitched(label);
-      setSettings(await getModelSettings().catch(() => settings));
+      setSwitched({
+        label: settings?.options.find((option) => option.value === receipt.effectiveValue)?.label ?? receipt.brain.modelId,
+        effectiveValue: receipt.effectiveValue,
+        scope: receipt.selection.scope,
+      });
+      setSettings((previous) => previous ? {
+        ...previous, brain: receipt.brain, effectiveValue: receipt.effectiveValue, activeBrain: receipt.activeBrain,
+      } : previous);
       onChanged?.();
     } catch (err) {
+      if (generation !== selectionGeneration.current) return;
       const apiErr = err as ApiError;
       const body = apiErr.body as { message?: string } | null;
       setSwitchError(body?.message || apiErr.message || 'Could not switch brains');
     } finally {
-      setBusyValue(null);
+      if (generation === selectionGeneration.current) setBusyValue(null);
     }
   };
 
   // The agent's own model, when it answers, is the current one here.
-  const agentOption = answeringAgent ? settings?.options.find((o) => o.value.endsWith(`:${answeringAgent.modelId}`)) : undefined;
-  const currentValue = answeringAgent ? agentOption?.value ?? '' : settings?.effectiveValue;
+  const answering = switched?.scope === 'conversation' ? null : answeringAgent;
+  const currentValue = answering && answeringModel
+    ? answeringModel.effectiveValue
+    : switched?.effectiveValue ?? (answeringModel !== undefined ? answeringModel?.effectiveValue ?? '' : settings?.effectiveValue);
   const current = settings?.options.find((o) => o.value === currentValue);
-  const currentLabel = answeringAgent ? agentOption?.label ?? answeringAgent.modelId : current?.label ?? settings?.brain.modelId ?? '';
+  const currentLabel = (answering ? current?.label ?? answering.modelId : switched?.label) ?? current?.label ?? answeringModel?.brain.modelId
+    ?? (answeringModel !== undefined ? modelReadFailed ? 'Model unavailable' : 'Checking model…' : settings?.brain.modelId ?? '');
 
   return (
     <div class="brain-layer" role="dialog" aria-modal="true" aria-labelledby="brain-sheet-title">
@@ -128,12 +150,12 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
               <span class="brain-dot ok" aria-hidden="true" />
               <div class="min-w-0">
                 <div class="brain-current-name truncate">{currentLabel}</div>
-                <div class="brain-current-meta">{answeringAgent ? `${answeringAgent.agentName}’s own model` : sessionId ? 'Answers your next message' : 'Answers new conversations'}</div>
+                <div class="brain-current-meta">{answering ? `${answering.agentName}’s own model` : sessionId ? 'Answers your next message' : 'Answers new conversations'}</div>
               </div>
             </div>
             {/* Which model stands in for the owner's is beside the point while
                 an agent's own model answers this conversation. */}
-            {!answeringAgent && settings.brain.inactiveBinding && settings.brain.inactiveBinding.modelId !== settings.brain.modelId ? (
+            {!answering && answeringModel === undefined && settings.brain.inactiveBinding && settings.brain.inactiveBinding.modelId !== settings.brain.modelId ? (
               <p class="warning brain-honesty">
                 Saved {settings.brain.inactiveBinding.modelId} is unavailable — {settings.brain.modelId} answers instead.
               </p>
@@ -150,7 +172,7 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
                     class={`brain-row${isCurrent ? ' current' : ''}`}
                     disabled={!option.available || busyValue !== null || isCurrent}
                     aria-current={isCurrent ? 'true' : undefined}
-                    onClick={() => void pick(option.value, option.label)}
+                    onClick={() => void pick(option.value)}
                   >
                     <span class={`brain-dot ${option.available ? 'ok' : 'off'}`} aria-hidden="true" />
                     <span class="brain-row-label truncate">{option.label}</span>
@@ -166,18 +188,18 @@ export function BrainSheet({ open, onClose, onChanged, sessionId, answeringAgent
 
             {switched ? (
               <p class="brain-note switched">
-                Switched to {switched}. {sessionId ? 'Applies to your next message.'
-                  : answeringAgent ? `Applies to new conversations; ${answeringAgent.agentName} answers this one on its own model.`
+                Switched to {switched.label}. {switched.scope === 'conversation' ? 'Applies to your next message.'
+                  : answering ? `Applies to new conversations; ${answering.agentName} answers this one on its own model.`
                   : 'Applies to new conversations.'}
               </p>
             ) : null}
             {switchError ? <p class="error brain-note">{switchError}</p> : null}
             {!switched && !switchError ? (
               <p class="brain-note muted">
-                {answeringAgent
+                {answering
                   ? (sessionId
-                    ? `${answeringAgent.agentName} answers on its own model. Pick another to use it in this conversation.`
-                    : `${answeringAgent.agentName} answers on its own model. Once the conversation starts, you can pick another for it here.`)
+                    ? `${answering.agentName} answers on its own model. Pick another to use it in this conversation.`
+                    : `${answering.agentName} answers on its own model. Once the conversation starts, you can pick another for it here.`)
                   : sessionId
                   ? 'Switching applies to your next message. No restart needed.'
                   : 'Switching applies to new conversations. A conversation already underway keeps its model unless you switch from inside it.'}

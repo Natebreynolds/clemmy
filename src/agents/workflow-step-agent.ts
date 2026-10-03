@@ -115,6 +115,7 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // approved conversational act (cli_setup's contract), never a side effect
   // of a workflow step grinding through its prompt.
   'cli_setup',
+  'browser_harness_setup',
   // Coding agents in the user's projects: dispatching one is a user-approved
   // conversational act, and a step has no way yet to park on a run that can
   // outlive its wall clock — letting it launch open-ended agents is unbounded

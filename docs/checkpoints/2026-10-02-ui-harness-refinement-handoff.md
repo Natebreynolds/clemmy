@@ -54,7 +54,7 @@ Those are dated continuity sources. Verify present settings, branches and runtim
 | Layer | Evidence at review time | Meaning |
 |---|---|---|
 | Main | `4c3a9e4217cd8c57499c9ec960c8c2335e752acc`, tag `v3.18.26` | This tag already exists. The weekend work is newer. |
-| Active app/framework lane | `claude/blank-state-quiet`, `/Users/nathan.reynolds/clem-worktrees/blank-state-quiet` | Start by inspecting this lane, not an obsolete earlier branch. |
+| Active app/framework lane | `claude/blank-state-quiet`, `$HOME/clem-worktrees/blank-state-quiet` | Start by inspecting this lane, not an obsolete earlier branch. |
 | Latest source observed | `eb6cab5a2be1e6a2ba584ffa631c31dcd9f7bb02` | Latest commit updates the weekend evidence record; runtime/UI source is its parent `89e97b606`. |
 | Served installed source | `89e97b606630e9b04c6adee11f03db1423f18f95` | Authenticated build-info from the installed app. |
 | Served fingerprint | `274132ed4e18ec220515488cdf38c15c1405702986bd4f5d3a6c7ea23140a23c` | Bind acceptance to this identity, or freshly record its replacement. |
@@ -79,7 +79,7 @@ This review did not change runtime/settings, launch model tests, hotpatch, commi
 - Schema 92 lets large shared-history frames support exact host/logical result receipts through verified readable views.
 - Exact history preparation and the read-only learning census are merged. They retain proof and do not authorize history deletion.
 
-Primary newer work record: [Weekend improvements](../../clem-worktrees/blank-state-quiet/docs/checkpoints/2026-10-03-weekend-improvements.md). Because this relative link depends on checkout location, the authoritative local path is `/Users/nathan.reynolds/clem-worktrees/blank-state-quiet/docs/checkpoints/2026-10-03-weekend-improvements.md`.
+Primary newer work record: [Weekend improvements](../../clem-worktrees/blank-state-quiet/docs/checkpoints/2026-10-03-weekend-improvements.md). Because this relative link depends on checkout location, the authoritative local path is `$HOME/clem-worktrees/blank-state-quiet/docs/checkpoints/2026-10-03-weekend-improvements.md`.
 
 ## 4. Evidence from recent owner and controlled runs
 

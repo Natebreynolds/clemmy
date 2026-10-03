@@ -1,3 +1,4 @@
+import { registerCloudBrowserRoutes } from '../channels/cloud-browser-routes.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -486,6 +487,7 @@ const CONSOLE_PROCESS_IDENTITY = Object.freeze({
 /** The xAI OpenAI-compatible endpoint the OAuth grant is minted against. */
 const XAI_BASE_URL = 'https://api.x.ai/v1';
 import { resolveRoleModel, readDurableBindings, pinSessionBrain } from '../runtime/harness/model-roles.js';
+import { BrainSelectionError, CODEX_BRAIN_SLOTS, codexBrainSlotUpdates, brainSelectionReceipt, type CodexBrainSlot } from '../runtime/harness/brain-selection.js';
 import { memoryRoleSettingsView } from '../memory/memory-model-route.js';
 import { isBindableModelRole, ModelRoleSettingError, persistModelRoleSetting } from '../runtime/harness/model-role-settings.js';
 import { judgeFallbackSettingsSnapshot, JudgeFallbackSettingError, persistJudgeFallbackSetting } from '../runtime/harness/judge-fallback-settings.js';
@@ -9840,6 +9842,11 @@ export function registerConsoleRoutes(
     res.status(410).json({ error: 'run limits are fixed; there is nothing to set' });
   });
 
+  registerCloudBrowserRoutes(app, (req, res, next) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    next();
+  }, '/api/console');
+
   registerCliSessionRoutes(app, (req, res, next) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     next();
@@ -16363,6 +16370,11 @@ export function registerConsoleRoutes(
       // session and stays global-only (new sessions + unpinned resolutions).
       const switchSessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
 
+      // Validate the selected model before moving any routing state.
+      const codexUpdates = brain === 'codex_oauth' ? codexBrainSlotUpdates(brainModelId,
+        Object.fromEntries(CODEX_BRAIN_SLOTS.map((key) => [key, (getRuntimeEnv(key, '') || '').trim()])) as Record<CodexBrainSlot, string>,
+        resolveProvider, DEFAULT_CODEX_MODEL) : [];
+
       // A BYO brain runs all-in (every role on the BYO backend unless a role is
       // bound elsewhere); a Codex/Claude brain cannot coexist with all-in, so step
       // it down to 'off' (BYO providers stay connected and routable via role pins).
@@ -16408,22 +16420,9 @@ export function registerConsoleRoutes(
           process.env.MODEL_ROUTING_MODE = 'off';
         }
         if (brain === 'codex_oauth') {
-          // A Codex brain orchestrates with a gpt-5.x model. Two jobs:
-          //  (1) honor an explicit model pick from the brain dropdown
-          //      (value `codex_oauth:<id>` → brainModelId), e.g. gpt-5.5; and
-          //  (2) SCRUB any BYO model id that leaked into the OPENAI_MODEL_* slots
-          //      (e.g. glm-5.2 from a prior BYO brain) back to the Codex default —
-          //      otherwise the "Codex" brain resolves to (and the router sends it to)
-          //      the BYO endpoint, or codexSafePrimary pins it to the gpt-5.4 fallback
-          //      forever. A valid gpt-5.x slot is left exactly as-is.
-          const wantedPrimary = brainModelId && resolveProvider(brainModelId) === 'codex' ? brainModelId : '';
-          for (const key of ['OPENAI_MODEL_PRIMARY', 'OPENAI_MODEL_FAST', 'OPENAI_MODEL_DEEP', 'OPENAI_MODEL_WORKER'] as const) {
-            const cur = (getRuntimeEnv(key, '') || '').trim();
-            const polluted = cur !== '' && resolveProvider(cur) !== 'codex';
-            const next = key === 'OPENAI_MODEL_PRIMARY' && wantedPrimary
-              ? wantedPrimary
-              : (polluted ? DEFAULT_CODEX_MODEL : cur);
-            if (next && next !== cur) { updateEnvKey(key, next); process.env[key] = next; }
+          for (const { key, value: next } of codexUpdates) {
+            updateEnvKey(key, next);
+            process.env[key] = next;
           }
         }
       }
@@ -16473,16 +16472,28 @@ export function registerConsoleRoutes(
       // Re-pin the conversation the switch was made from (after the env writes
       // + cache resets above, so the pin stamps the NEW global resolution). No
       // sessionId ⇒ no pin is touched: other live conversations keep theirs.
+      let sessionPin = null;
       if (switchSessionId) {
-        try { pinSessionBrain(switchSessionId); } catch { /* pin is affinity, never a switch blocker */ }
+        sessionPin = pinSessionBrain(switchSessionId);
         // The owner chose this conversation's model: it now answers over an
         // agent's pinned model (session-agent-model.ts).
-        try { recordBrainChosenForSession(switchSessionId); } catch { /* never a switch blocker */ }
+        recordBrainChosenForSession(switchSessionId);
       }
 
-      res.json({ activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot() });
+      const resolvedBrain = resolveRoleModel('brain');
+      const effectiveValue = effectiveBrainValue();
+      const selection = brainSelectionReceipt({
+        requestedValue: brainModelId ? `${brain}:${brainModelId}` : brain,
+        effectiveValue, brain: resolvedBrain,
+        ...(switchSessionId ? { sessionId: switchSessionId, sessionPin } : {}),
+      });
+      res.json({ ok: true, activeBrain: getActiveAuthMode(), claudeAuth: getClaudeAuthSnapshot(),
+        brain: resolvedBrain, effectiveValue, selection });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(err instanceof BrainSelectionError ? err.status : 500).json({
+        error: err instanceof Error ? err.message : String(err),
+        ...(err instanceof BrainSelectionError ? { code: err.code } : {}),
+      });
     }
   });
 
