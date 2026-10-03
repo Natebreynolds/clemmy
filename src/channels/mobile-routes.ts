@@ -1,3 +1,4 @@
+import { registerCloudBrowserRoutes } from './cloud-browser-routes.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -2946,6 +2947,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // hides /api/console/*, so approval actions cannot depend on desktop routes.
 
   registerCliSessionRoutes(router, requireMobileSession, '/api');
+  registerCloudBrowserRoutes(router, requireMobileSession, '/api');
   registerConnectionSetupRoutes(router, requireMobileSession, '/api', { requireContext: true });
 
   router.get('/api/approvals', requireMobileSession, (_req, res) => {

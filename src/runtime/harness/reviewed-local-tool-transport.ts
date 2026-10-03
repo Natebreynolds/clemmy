@@ -1,3 +1,4 @@
+import { CLOUD_BROWSER_PARAMETERS, cloudBrowserOperationName, parseCloudBrowserArguments, type CloudBrowserOperationName } from '../../tools/cloud-browser-contract.js';
 import { WORKSPACE_SCRIPT_PARAMETERS, workspaceScriptArguments, type WorkspaceScriptArguments } from '../../spaces/workspace-script-contract.js';
 import { READ_FILE_PARAMS } from '../../tools/local-file-read-contract.js';
 import { BROWSER_OPERATION_PARAMETERS, browserOperationName, parseBrowserOperationArguments, type BrowserOperationName } from '../../tools/browser-operation-contract.js';
@@ -79,7 +80,7 @@ function exactDeclaration(name: string): ToolDecl | null {
 function validExecutionContract(value: unknown): value is ReviewedLocalExecutionContractV1 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const contract = value as Partial<ReviewedLocalExecutionContractV1>;
-  if (contract.version === 1 && contract.adapter === 'browser_operation_v1') {
+  if (contract.version === 1 && (contract.adapter === 'browser_operation_v1' || contract.adapter === 'cloud_browser_operation_v1')) {
     return (contract.idempotency === 'read_only' || contract.idempotency === 'never_redispatch') && contract.reconciliation === 'none';
   }
   if (contract.version === 1 && contract.adapter === 'workspace_script_v1') {
@@ -202,7 +203,7 @@ function deriveReviewedLocalReadDefinition(input: {
   if (!name || name !== row.name) return null;
   const capabilityRef = `cap:local:${name}:read`;
   const schemaFingerprint = stableJsonDigest(input.schema);
-  const browser = row.localExecution?.adapter === 'browser_operation_v1';
+  const browser = row.localExecution?.adapter === 'browser_operation_v1' || row.localExecution?.adapter === 'cloud_browser_operation_v1';
   const readPurpose = row.description?.trim() || 'Read Clementine-local state.';
   const registrySemanticsFingerprint = stableJsonDigest(browser ? {
     version: 1, name, sideEffect: row.sideEffect, projectEffect: row.projectEffect, localPlanningRead: true,
@@ -271,6 +272,13 @@ function deriveReviewedLocalDefinition(input: {
   schema: Record<string, unknown>;
 }): AuthorizedLocalPlanningDefinitionV1 | null {
   const name = input.declaration.name.trim();
+  if (input.declaration.localExecution?.adapter === 'cloud_browser_operation_v1') {
+    if (!cloudBrowserOperationName(name)) return null;
+    const read = name === 'cloud_browser_tabs' || name === 'cloud_browser_read' || name === 'cloud_browser_status' || name === 'cloud_browser_resources';
+    if (input.declaration.sideEffect !== (read ? 'read' : 'write')
+      || input.declaration.localExecution.idempotency !== (read ? 'read_only' : 'never_redispatch')) return null;
+    if (read) return deriveReviewedLocalReadDefinition(input);
+  }
   if (input.declaration.localExecution?.adapter === 'browser_operation_v1') {
     if (!browserOperationName(name)) return null;
     const read = name === 'browser_tabs' || name === 'browser_read';
@@ -365,7 +373,9 @@ function currentReviewedLocalSchema(
   // current strict deferred schema bytes (Zod's 2020-12 projection), not the
   // separate first-class provider projection used by direct model calling.
   if (execution.adapter === 'browser_operation_v1' && !browserOperationName(operationId)) return null;
-  const parametersShape = execution.adapter === 'browser_operation_v1' && browserOperationName(operationId) ? BROWSER_OPERATION_PARAMETERS[operationId]
+  if (execution.adapter === 'cloud_browser_operation_v1' && !cloudBrowserOperationName(operationId)) return null;
+  const parametersShape = execution.adapter === 'cloud_browser_operation_v1' && cloudBrowserOperationName(operationId) ? CLOUD_BROWSER_PARAMETERS[operationId]
+    : execution.adapter === 'browser_operation_v1' && browserOperationName(operationId) ? BROWSER_OPERATION_PARAMETERS[operationId]
     : execution.adapter === 'workspace_script_v1' ? WORKSPACE_SCRIPT_PARAMETERS
     : execution.adapter === 'local_file_read_v1' ? READ_FILE_PARAMS
     : execution.adapter === 'artifact_bundle_v1'
@@ -472,6 +482,10 @@ export function reviewedLocalToolArgumentsMatch(
   observed: ReviewedLocalToolObservation,
   args: Record<string, unknown>,
 ): boolean {
+  if (observed.execution.adapter === 'cloud_browser_operation_v1') {
+    if (!cloudBrowserOperationName(observed.definition.name)) return false;
+    try { parseCloudBrowserArguments(observed.definition.name, args); return true; } catch { return false; }
+  }
   if (observed.execution.adapter === 'browser_operation_v1') {
     if (!browserOperationName(observed.definition.name)) return false;
     try { parseBrowserOperationArguments(observed.definition.name, args); return true; } catch { return false; }
@@ -507,6 +521,7 @@ export function reviewedLocalToolArgumentsMatch(
 }
 
 export type PreparedReviewedLocalToolExecution =
+  | { observed: ReviewedLocalToolObservation; adapter: 'cloud_browser_operation_v1'; operation: CloudBrowserOperationName; args: Record<string, unknown> }
   | { observed: ReviewedLocalToolObservation; adapter: 'browser_operation_v1'; operation: BrowserOperationName; args: Record<string, unknown> }
   | { observed: ReviewedLocalToolObservation; adapter: 'workspace_script_v1'; args: WorkspaceScriptArguments }
   | { observed: ReviewedLocalToolObservation; adapter: 'local_file_read_v1';
@@ -576,6 +591,11 @@ export function prepareReviewedLocalToolExecution(
   }
   if (!reviewedLocalToolArgumentsMatch(observed, call.args)) {
     throw new Error('reviewed local execution arguments exceed the declared safe mode');
+  }
+  if (observed.execution.adapter === 'cloud_browser_operation_v1') {
+    if (!cloudBrowserOperationName(observed.definition.name)) throw new Error('Unknown cloud browser operation');
+    return { observed, adapter: observed.execution.adapter, operation: observed.definition.name,
+      args: parseCloudBrowserArguments(observed.definition.name, call.args) };
   }
   if (observed.execution.adapter === 'browser_operation_v1') {
     if (!browserOperationName(observed.definition.name)) throw new Error('Unknown reviewed browser operation');

@@ -131,6 +131,14 @@ export const SECRET_DESCRIPTORS: readonly SecretDescriptor[] = [
     keyUrl: 'https://cloud.browser-use.com/new-api-key',
   },
   {
+    name: 'browserbase_api_key',
+    description: 'Browserbase API key — optional task-owned cloud browser with live viewing and explicit human takeover.',
+    envVarName: 'BROWSERBASE_API_KEY',
+    required: false,
+    setupHint: 'Create an API key and project at https://www.browserbase.com/settings. Cloud browser sessions have their own privacy and lifetime policy.',
+    keyUrl: 'https://www.browserbase.com/settings',
+  },
+  {
     name: 'typesafe_api_key',
     description: 'TypeSafe Jev API key — fast typed decisions (Choice / Score / Noul) that skip the Settings judge on confident completion, ranking, and primer questions.',
     envVarName: 'TYPESAFE_API_KEY',

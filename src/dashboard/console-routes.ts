@@ -1,3 +1,4 @@
+import { registerCloudBrowserRoutes } from '../channels/cloud-browser-routes.js';
 import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
@@ -9840,6 +9841,11 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     res.status(410).json({ error: 'run limits are fixed; there is nothing to set' });
   });
+
+  registerCloudBrowserRoutes(app, (req, res, next) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    next();
+  }, '/api/console');
 
   registerCliSessionRoutes(app, (req, res, next) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }

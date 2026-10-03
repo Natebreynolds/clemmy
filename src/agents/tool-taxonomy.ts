@@ -483,7 +483,9 @@ function classifyComposioSlug(slug: string): ToolKind {
 export function classifyTool(name: string, options: ClassifyOptions = {}): ToolKind {
   if (options.kindHint) return options.kindHint;
   // Fixed Chrome observation is a read; arbitrary scripts keep their own effect.
-  if (isPlainOrClementineLocalTool(name, 'browser_tabs')) return 'read';
+  if (isPlainOrClementineLocalTool(name, 'browser_tabs')
+    || isPlainOrClementineLocalTool(name, 'cloud_browser_tabs')
+    || isPlainOrClementineLocalTool(name, 'cloud_browser_resources')) return 'read';
 
   // This foreground host control persists a reviewed local plan artifact. Its
   // name is not a remote publication verb, and foreign namespace lookalikes

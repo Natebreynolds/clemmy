@@ -9,6 +9,7 @@ import { startDiscordBot } from './channels/discord.js';
 import { startSlackBot } from './channels/slack.js';
 import { SLACK_APP_MANIFEST_YAML } from './channels/slack-manifest.js';
 import { startWebhookServer } from './channels/webhook.js';
+import { startBrowserbaseMaintenance } from './integrations/browserbase.js';
 import { startChatCli } from './cli/chat.js';
 import { startSupervisorIpcHeartbeat } from './daemon/phase.js';
 import { startDaemon } from './daemon/runner.js';
@@ -847,6 +848,10 @@ async function main(): Promise<void> {
         } else {
           logger.info('Skipping webhook (WEBHOOK_ENABLED=false)');
         }
+        // Recover task-owned cloud-browser leases even when no viewer is open.
+        // A damaged browser store must not prevent the rest of Clem starting.
+        const cloudBrowserMaintenance = startBrowserbaseMaintenance();
+        if (!cloudBrowserMaintenance.started) logger.warn({ code: cloudBrowserMaintenance.code }, 'Cloud browser maintenance could not start');
         // Outbound sessions to third parties: started in the BACKGROUND, never
         // awaited. Measured on a live 3.18.1 boot: the listeners were bound and
         // every reconciliation finished at 16.5s, then onReady sat here for

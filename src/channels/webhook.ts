@@ -1383,6 +1383,9 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
         // The view response and iframe independently force authored HTML into
         // an opaque-origin sandbox. Still blocks ALL cross-origin framing.
         "frame-ancestors 'self'",
+        // First-party task browser uses only provider-minted Browserbase views.
+        // Authored HTML retains its own independent frame-src 'none' sandbox.
+        "frame-src 'self' https://www.browserbase.com https://browserbase.com",
         "object-src 'none'",
         // Allow remote app/toolkit logos (Composio CDN, etc.) to load. Loopback
         // Electron surface — images are inert; this just stops broken-logo icons.
