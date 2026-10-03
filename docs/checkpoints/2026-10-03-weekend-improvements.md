@@ -511,7 +511,7 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   from Clem, navigate to a page and have Clem use it or continue a session.
   Decisions: the Browser chip opens it; all three of hand-a-browser-to-Clem,
   keep sign-ins, and longer lifetimes, but still time out to save usage.
-- **Built (206a65bc1 server, 7dfea5462 UI, 0b-chip fix pending install):**
+- **Built (206a65bc1 server, 7dfea5462 UI; chip wrap fix 4532dd948 not installed):**
   `GET cloud-browser/overview` lists every open browser across chats (chat
   title, page, `idleClosesAt`, `endsAt`, `usesProfile`) plus running sessions
   Clem started that no record holds (sessions are tagged
