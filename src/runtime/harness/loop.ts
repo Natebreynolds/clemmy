@@ -11348,6 +11348,18 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
   const sessionItems = preparedConversation.providerHistory;
   let compactedItems = sessionItems;
   let layer3WarningInjected = false;
+  // A same-source continuation (a judge retry, a resumed activation) runs on
+  // the source's exact accepted history, which begins with the conversation as
+  // it stood before this compaction. That history stays byte-exact — the
+  // accepted-batch chain digests it — so the snapshot compaction below cannot
+  // shrink what the continuation sends. The model-facing frame is projected
+  // instead: an input that begins with exactly the pre-compaction conversation
+  // is sent with its compacted form; the accepted history is untouched. Live
+  // 10-02: a judge retry compacted 71.8k → 30.3k tokens, then sent ~83k on
+  // every frame of the retry.
+  let continuationHistoryProjection: ((input: AgentInputItem[]) => AgentInputItem[]) | undefined;
+  let continuationHistorySavings: { beforeTokens: number; afterTokens: number } | undefined;
+  let continuationHistoryReported = false;
   // Compaction budget from the ROUTED model's real context window (the fixed
   // 200K assumption overflowed small-window BYO models before Layer 3 could
   // fork, and clipped 1M-window models at 60K with huge headroom — see
@@ -11378,6 +11390,11 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     const last = Date.parse(session.lastActivityAt());
     if (Number.isFinite(last)) idleMs = Math.max(0, Date.now() - last);
   } catch { /* no idle signal → no idle trigger (byte-identical to before) */ }
+  // Layer 1 clips old results IN PLACE, so the conversation the continuation's
+  // exact history begins with is captured before compaction runs.
+  const preCompactionContinuationItems = options.hostOwnedContinuation === true || adoptedCheckpointContinuation
+    ? JSON.parse(JSON.stringify(sessionItems)) as AgentInputItem[]
+    : undefined;
   try {
     const { result, nextItems, forkRequest } = workflowReplay
       ? { result: { modified: false }, nextItems: sessionItems, forkRequest: undefined }
@@ -11386,6 +11403,10 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     markTurnClock(options.sessionId, 'compaction_done');
     if (result.modified) {
       session.updateConversationSnapshot(compactedItems);
+      if (preCompactionContinuationItems) {
+        continuationHistoryProjection = retainedHistoryPrefixProjection(preCompactionContinuationItems, nextItems);
+        continuationHistorySavings = { beforeTokens: result.beforeTokens ?? 0, afterTokens: result.afterTokens ?? 0 };
+      }
     }
     if (forkRequest) {
       // Layer 3 fire — inject a one-shot system message at the head of
@@ -11953,6 +11974,19 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     const requestToolComponents = toolComponentsOf(requestToolSurface);
     const publishPromptComponents = <T extends { input: AgentInputItem[]; instructions?: string }>(value: T): T => {
       try {
+        const projectedContinuationInput = continuationHistoryProjection?.(value.input);
+        if (projectedContinuationInput && projectedContinuationInput !== value.input) {
+          value = { ...value, input: projectedContinuationInput };
+          if (typeof promptComponents.history === 'number' && continuationHistorySavings) {
+            promptComponents.history = Math.max(0, promptComponents.history
+              - (continuationHistorySavings.beforeTokens - continuationHistorySavings.afterTokens));
+          }
+          if (!continuationHistoryReported && continuationHistorySavings) {
+            continuationHistoryReported = true;
+            safeAppend({ sessionId: options.sessionId, turn, role: 'system', type: 'condenser_applied',
+              data: { sourceUserSeq, kind: 'continuation_projection', ...continuationHistorySavings } });
+          }
+        }
         const projectedExecuteInput = executeHistoryProjection?.(value.input);
         if (projectedExecuteInput && projectedExecuteInput !== value.input) {
           value = { ...value, input: projectedExecuteInput };
