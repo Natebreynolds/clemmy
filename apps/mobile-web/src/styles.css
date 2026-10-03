@@ -5713,3 +5713,11 @@ textarea.cz-input { resize: vertical; }
 /* The actions exist only while a row is moving or open, so nothing peeks
    past a resting row's rounded corners. */
 .chat-swipe:not(.is-open):not(.is-moving) .chat-swipe-actions { visibility: hidden; }
+/* A card's kind reads as a word, not a stamp. */
+.inbox-card-meta > span { text-transform: none; letter-spacing: 0; font-weight: 650; }
+/* A report inside a card wraps within the card: a long path or token never
+   widens the page. */
+.inbox-card { min-width: 0; max-width: 100%; }
+.inbox-card-body.bubble-md { min-width: 0; overflow-wrap: anywhere; }
+.inbox-card-body.bubble-md code { white-space: normal; overflow-wrap: anywhere; }
+.inbox-card-body.bubble-md pre { max-width: 100%; overflow-x: auto; }

@@ -1,3 +1,4 @@
+import { renderMarkdown } from '@clem/chat-engine';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   answerInboxQuestion,
@@ -884,7 +885,10 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
               >
                 <CardMeta label={notificationLabel(row)} at={row.createdAt} unread={!row.read} />
                 <h2>{notificationTitle(row.title) || 'Update from Clem'}</h2>
-                {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
+                {/* A report is written in Markdown; it reads as formatted text,
+                    never as asterisks and backticks. Safe by construction:
+                    renderMarkdown escapes all input before formatting it. */}
+                {row.body ? <div class="inbox-card-body bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(row.body) }} /> : null}
                 {row.deliveryError ? <p class="inbox-delivery-error">Delivery issue: {row.deliveryError}</p> : null}
                 {!row.read || runTarget ? (
                   <div class="inbox-card-actions">
