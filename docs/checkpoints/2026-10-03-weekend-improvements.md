@@ -480,3 +480,27 @@ verdicts from `goal_alignment_judged`. Settings backed up first
 - **Status:** wave 42 = 7d08ccc73 installed 09:02 PT (build-info serves it;
   bundles match). The owner's key still needs re-entering
   (Browserbase dashboard → Settings → API Keys).
+
+## The key worked; Clem refused Browserbase's regional connect URL (10-03 09:05 PT)
+
+- **Live:** sess-desktop-9eba5cc092ee9ac627590974 after the owner re-saved the
+  key (now accepted: project check 200, concurrency 3). `cloud_browser_start`
+  created session f770961d (RUNNING, keepAlive, us-west-2), but the record
+  went `uncertain / invalid_response` and the model said retrying was unsafe.
+- **Cause:** Browserbase's create reply carries
+  `wss://connect.usw2.browserbase.com/?signingKey=…` (regional host, signing
+  key, no `sessionId`). The client's create parser and the CDP connection both
+  required `connect.browserbase.com` with a `sessionId` parameter, so a
+  started session was read as an invalid response and left running with no
+  record of its id (it times out on its own at 16:35Z). Checked against
+  Browserbase's create-session reference and the live session's own GET.
+- **Fix (f7053d535):** one shared connect-URL rule
+  (`browserbase-connect-url.ts`): `wss`, `connect.browserbase.com` or
+  `connect.<region>.browserbase.com`, path `/`, bound by the matching
+  `sessionId` or a non-empty `signingKey`; any other host, path, credentials
+  or session is refused. The installed predecessor rejects the exact reply
+  shape; the new build accepts it. 788 neighbouring tests and tsc clean.
+- **Status:** wave 43 = f7053d535 installed 09:12 PT (build-info serves it;
+  bundles match). Owner retest owed.
+- **Follow-up:** when a create reply is rejected but names a valid session id,
+  keep the id so the session can be released instead of orphaned.
