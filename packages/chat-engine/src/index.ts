@@ -33,3 +33,4 @@ export * from "./approval-review.js";
 export * from './decision-presentation.js';
 export * from './storage-presentation.js';
 export * from './brain-selection.js';
+export * from './cloud-browser.js';

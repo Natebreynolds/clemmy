@@ -80,6 +80,7 @@ import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { getNextAnsweringModel, getModelSettings, type NextAnsweringModel, type BrainOptionRow } from '../lib/api';
 import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
+import { CloudBrowserDock } from '../components/CloudBrowserDock';
 import { Composer } from '../components/Composer';
 import { attachmentLabel, attachmentsSummary } from '../lib/attachments';
 import { ChatBackButton } from '../components/ChatBackButton';
@@ -625,6 +626,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <div class="conn-pill conn-detached">catching up in the background</div>
         ) : null}
       </div>
+      <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} />
       <div
         class="chat-transcript"
         ref={scrollRef}
