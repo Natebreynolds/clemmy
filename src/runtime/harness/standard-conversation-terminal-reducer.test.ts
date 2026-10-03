@@ -298,3 +298,24 @@ test('a job handed to an agent explains its stop in words too; a plain backgroun
   assert.equal(plain.calls, 0);
   assert.equal(plain.explained.error, 'Stopped at: execution:policy_denial');
 });
+
+test('a model account out of usage or credit is named, with the provider words; other failures stay generic', () => {
+  const reduceFailed = (sessionId: string, error: string) => {
+    const source = acceptedSource(sessionId);
+    return reduceStandardConversationTerminal({ sourceUserSeq: source.sourceUserSeq,
+      result: { sessionId, status: 'failed', steps: 1, lastTurn: source.turn, error } }).publicPresentation?.text ?? '';
+  };
+  const usage = reduceFailed('capacity-usage', "You're out of extra usage. Add more at the provider's usage settings and keep going.");
+  assert.match(usage, /used up its usage/);
+  assert.match(usage, /Its provider said: “You're out of extra usage\./);
+  assert.match(usage, /saved/);
+  assert.doesNotMatch(usage, /Something went wrong/);
+  const credit = reduceFailed('capacity-credit', 'Your credit balance is too low to access the API.');
+  assert.match(credit, /out of credit/);
+  const shaped = reduceFailed('capacity-shaped', '400 {"type":"error","error":{"message":"usage_limit_reached"}}');
+  assert.match(shaped, /used up its usage/);
+  assert.doesNotMatch(shaped, /provider said|usage_limit_reached|\{/, 'a structured payload is not quoted');
+  const other = reduceFailed('capacity-other', 'socket hang up');
+  assert.match(other, /Something went wrong/);
+  assert.doesNotMatch(other, /socket/);
+});

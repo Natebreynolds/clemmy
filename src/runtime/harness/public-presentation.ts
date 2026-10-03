@@ -28,6 +28,7 @@ import {
   type PresentationEvent,
 } from './turn-outcome.js';
 import { looksLikeToolCallShape, looksLikeToolCallShapeStreaming } from './tool-narration-shapes.js';
+import { isProviderCapacityExhausted, isProviderCreditRefusal } from '../../shared/provider-capacity.js';
 import {
   looksLikeCompactDecisionProtocol,
   stripLeakedDecisionAssignment,
@@ -153,6 +154,30 @@ const SAFE_TERMINAL_FALLBACK =
  *  "Something went wrong" while the only trace was a boot-time warning. */
 export const PUBLIC_VAULT_NOT_READY_TEXT = 'Clementine\'s local vault isn\'t ready, so no model request can start. Quit and reopen Clementine; if this keeps happening, tell me and I\'ll walk you through repairing the home folder.';
 export const PUBLIC_RUN_FAILURE_TEXT = 'Something went wrong on that turn. Please try again; the technical details are available in the activity log.';
+/**
+ * A model account that has used up its allowance or credit is not a mystery
+ * failure: its owner can fix it, and trying again unchanged meets the same
+ * refusal. Says so, and quotes the provider's own words when they are one
+ * short plain sentence (they usually name where to add more). Null for any
+ * other failure, which keeps the generic text and its diagnostic private.
+ */
+export function publicProviderCapacityText(error: unknown): string | null {
+  const raw = typeof error === 'string' ? error.replace(/\s+/g, ' ').trim() : '';
+  if (!raw) return null;
+  const credit = isProviderCreditRefusal(undefined, raw);
+  if (!credit && !isProviderCapacityExhausted(raw)) return null;
+  const quotable = raw.length <= 240 && !/[{}[\]<>"]/.test(raw);
+  return [
+    credit
+      ? 'The model account this work runs on is out of credit, so I stopped here.'
+      : 'The model account this work runs on has used up its usage, so I stopped here.',
+    quotable ? `Its provider said: “${raw}”` : '',
+    credit
+      ? 'Add credit on that account or choose a different model for this work, then resume or ask again.'
+      : 'Add usage on that account (or wait for its limit to reset) or choose a different model for this work, then resume or ask again.',
+    'The work done so far is saved.',
+  ].filter(Boolean).join(' ');
+}
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
   'I could not start this turn because no model runtime is connected. Open Settings > Models, connect a model, and try again.';
 

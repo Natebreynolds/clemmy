@@ -159,6 +159,7 @@ import {
   approvalPreviewProjection,
   PUBLIC_RUN_FAILURE_TEXT,
   PUBLIC_VAULT_NOT_READY_TEXT,
+  publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
   publicReplyText,
 } from './public-presentation.js';
@@ -1341,7 +1342,7 @@ function reduceStandardConversationTerminal(input: {
           kind: 'error',
           text: /authority_seal_key_missing|authority seal key is missing/.test(String(result.error ?? ''))
             ? PUBLIC_VAULT_NOT_READY_TEXT
-            : PUBLIC_RUN_FAILURE_TEXT,
+            : publicProviderCapacityText(result.error) ?? PUBLIC_RUN_FAILURE_TEXT,
         },
       };
       legacyReason = 'failed';
