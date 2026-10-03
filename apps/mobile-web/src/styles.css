@@ -5667,3 +5667,15 @@ textarea.cz-input { resize: vertical; }
 }
 /* A row's kind is a quiet word, not a stamp. */
 .needs-row-label { text-transform: none; letter-spacing: 0; font-weight: 600; }
+/* Group labels and eyebrows speak in sentence case too: "You", "Came back". */
+.settings-group-label,
+.app-main h2.settings-group-label,
+.settings-card-title,
+.today-row-eyebrow,
+.approval-exact-label {
+  text-transform: none;
+  letter-spacing: 0;
+  font-family: var(--font-body);
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
