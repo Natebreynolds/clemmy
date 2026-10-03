@@ -151,3 +151,11 @@ test('the overview keeps each browser bound to its own conversation and refuses 
   const broken = createCloudBrowserClient(async <T>(): Promise<T> => ({ browsers: [{ ...browser, endsAt: 5 }], unlinked: [] }) as T, '/api/cloud-browser');
   await assert.rejects(broken.overview(), /not confirmed/);
 });
+
+test('the panel names the page Clem is on, else the first page', async () => {
+  const { browserFocusPage } = await import('./cloud-browser.js');
+  const pages = [{ targetId: 'a', title: 'Blank', url: 'about:blank' }, { targetId: 'b', title: 'Facebook', url: 'https://www.facebook.com/' }];
+  assert.equal(browserFocusPage({ pages, focusTargetId: 'b' })?.title, 'Facebook');
+  assert.equal(browserFocusPage({ pages, focusTargetId: 'closed' })?.title, 'Blank');
+  assert.equal(browserFocusPage({ pages: [] }), undefined);
+});

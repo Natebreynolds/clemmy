@@ -365,3 +365,38 @@ test('setups saved with the earlier defaults load with the longer, still bounded
     restarted.dispose();
   } finally { t.close(); }
 });
+test('the live view shows the page Clem last worked on, and the first page once that page has closed', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    const r = await t.service.create({ conversationId: 'task-a', requestId: 'source' });
+    const viewed: Array<string | undefined> = [];
+    const liveView = t.api.liveView; t.api.liveView = async (id: string, options: { targetId?: string } = {}) => { viewed.push(options.targetId); return liveView(id, options); };
+    await t.service.agentOperation(r.id, 'task-a', { operation: 'tabs', args: {}, expectedVersion: 1 });
+    const opened = await t.service.agentOperation(r.id, 'task-a', { operation: 'open', args: {}, expectedVersion: 1 });
+    assert.equal(opened.resource.focusTargetId, 'new-target', 'the page Clem opened is the page it is on');
+    let pages = [{ targetId: 'page-a', title: 'First', url: 'https://example.com/' }, { targetId: 'new-target', title: 'Facebook', url: 'https://www.facebook.com/' }];
+    const cdp = t.cdp.execute; t.cdp.execute = async (url: string, session: string, operation: string, args: unknown, options?: { beforeMutation?: () => Promise<void> }) =>
+      operation === 'tabs' ? { result: { ok: true }, effect: 'none' as const, targetId: null, pages } : cdp(url, session, operation, args, options);
+    await t.service.view(r.id, 'task-a', { viewerLeaseId: randomUUID(), expectedVersion: 1 });
+    assert.equal(viewed.at(-1), 'new-target', 'the view shows that page, not the first tab');
+    pages = pages.slice(0, 1);
+    await t.service.view(r.id, 'task-a', { viewerLeaseId: randomUUID(), expectedVersion: 1 });
+    assert.equal(viewed.at(-1), undefined, 'a closed page falls back to the browser\'s first page');
+  } finally { t.close(); }
+});
+test('starting with a website opens it in the first page, and a second start in the chat rejoins the open browser', async () => {
+  const t = setup(); try {
+    await t.service.configure({ projectId: project });
+    const { executeCloudBrowserTool } = await import('../tools/cloud-browser-tools.js');
+    const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+    const operations: string[] = [];
+    const cdp = t.cdp.execute; t.cdp.execute = async (url: string, session: string, operation: string, args: unknown, options?: { beforeMutation?: () => Promise<void> }) => { operations.push(operation); return cdp(url, session, operation, args, options); };
+    const first = await withToolOutputContext({ sessionId: 'task-a', sourceUserSeq: 7 }, () => executeCloudBrowserTool('cloud_browser_start', { url: 'https://www.facebook.com' }, t.service)) as { pages: Array<{ target_id: string }>; navigated: { target_id: string }; rejoined?: boolean };
+    assert.deepEqual(operations, ['tabs', 'navigate'], 'no extra blank tab is opened');
+    assert.equal(first.navigated.target_id, first.pages[0]!.target_id);
+    assert.equal(first.rejoined, undefined);
+    const second = await withToolOutputContext({ sessionId: 'task-a', sourceUserSeq: 9 }, () => executeCloudBrowserTool('cloud_browser_start', {}, t.service)) as { rejoined?: boolean; pages: unknown[] };
+    assert.equal(second.rejoined, true);
+    assert.equal(t.counts().creates, 1, 'a later request in the same chat does not buy a second browser');
+  } finally { t.close(); }
+});

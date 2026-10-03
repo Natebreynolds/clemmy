@@ -106,7 +106,7 @@ test('cloud task binding comes from the host and repeated start rejoins the same
   const created: unknown[] = [];
   const dispatched: unknown[] = [];
   const resource = { id: 'owned', pages: Array.from({ length: 100 }, (_, i) => ({ targetId: `page-${i}`, title: 'Retained display metadata '.repeat(20), url: 'https://example.com/' })) };
-  const service = { create: async (input: unknown) => { created.push(input); return resource; }, agentOperation: async (...input: unknown[]) => { dispatched.push(input); return { resource, result: { text: 'exact requested page evidence' }, receipt: { targetId: 'exact-page' } }; } };
+  const service = { list: async () => [], create: async (input: unknown) => { created.push(input); return resource; }, agentOperation: async (...input: unknown[]) => { dispatched.push(input); return { resource, result: { text: 'exact requested page evidence' }, receipt: { targetId: 'exact-page' } }; } };
   await assert.rejects(executeCloudBrowserTool('cloud_browser_start', {}, service as never), isHostPreDispatchRefusal);
   await withToolOutputContext({ sessionId: 'chat-a', sourceUserSeq: 7, callId: 'first' }, () => executeCloudBrowserTool('cloud_browser_start', {}, service as never));
   await withToolOutputContext({ sessionId: 'chat-a', sourceUserSeq: 7, callId: 'repair' }, () => executeCloudBrowserTool('cloud_browser_start', {}, service as never));

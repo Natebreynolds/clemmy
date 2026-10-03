@@ -4,6 +4,12 @@ export interface CloudBrowserResource {
   state: 'starting' | 'active' | 'stopping' | 'stopped' | 'expired' | 'uncertain'; controller: 'agent' | 'human';
   controlVersion: number; createdAt: string; updatedAt: string; recording: boolean; elapsedSeconds: number;
   pages: Array<{ targetId: string; title: string; url: string }>; errorCode?: string; returnPending?: boolean;
+  /** The page Clem last worked on; the live view shows it unless another is chosen. */
+  focusTargetId?: string;
+}
+/** The page the panel names and shows: the one Clem is on, else the first. */
+export function browserFocusPage(resource: Pick<CloudBrowserResource, 'pages' | 'focusTargetId'>): CloudBrowserResource['pages'][number] | undefined {
+  return resource.pages.find((page) => page.targetId === resource.focusTargetId) ?? resource.pages[0];
 }
 export interface CloudBrowserStatus { configured: boolean; projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number }
 export interface CloudBrowserView { url: string; expiresAt: string; targetId?: string; viewerLeaseId: string; controlVersion: number }

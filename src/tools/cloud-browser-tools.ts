@@ -38,7 +38,31 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
       // One start per accepted source; a repaired/repeated tool call rejoins the
       // reserved resource instead of paying for another session.
       const requestId = createHash('sha256').update(`${conversationId}:${source}:cloud-browser`).digest('hex');
-      return { resource: resourceForTool(await service.create({ conversationId, requestId, recording: false })) };
+      // This chat's open browser is rejoined, never bought twice.
+      const open = (await service.list(conversationId)).find((item) => item.providerSessionId && (item.state === 'active' || item.state === 'starting'));
+      const resource = open ?? await service.create({ conversationId, requestId, recording: false });
+      if (resource.state !== 'active' || resource.controller !== 'agent' || resource.returnPending) {
+        return { resource: resourceForTool(resource), ...(open ? { rejoined: true } : {}),
+          ...(resource.controller === 'human' ? { note: 'The owner has control of this browser. Wait until they return it to Clem.' } : {}) };
+      }
+      // The page handle comes back with the browser, so the next step can act
+      // on it directly; a url opens there in the same call.
+      const tabs = await service.agentOperation(resource.id, conversationId, { operation: 'tabs', args: {}, expectedVersion: resource.controlVersion }, currentToolAbortSignal());
+      const pages = tabs.resource.pages;
+      const page = pages.find((item) => item.targetId === tabs.resource.focusTargetId) ?? pages[0];
+      const handles = { resource: resourceForTool(tabs.resource), ...(open ? { rejoined: true } : {}),
+        pages: pages.slice(0, 10).map((item) => ({ target_id: item.targetId, title: item.title, url: item.url })) };
+      if (!args.url || !page) return handles;
+      try {
+        const navigated = await service.agentOperation(resource.id, conversationId, { operation: 'navigate', args: { targetId: page.targetId, url: args.url },
+          expectedVersion: tabs.resource.controlVersion }, currentToolAbortSignal());
+        return { ...handles, resource: resourceForTool(navigated.resource), navigated: { target_id: page.targetId, result: navigated.result, receipt: navigated.receipt } };
+      } catch (error) {
+        // The browser started either way; the navigation's own outcome is reported, not hidden.
+        const failure = error instanceof BrowserbaseServiceError ? error : null;
+        return { ...handles, navigated: { target_id: page.targetId, ok: false, effect: failure?.effect ?? 'uncertain',
+          error: failure && failure.effect === 'none' ? browserbaseErrorText(failure.code) : 'The navigation did not settle. Check the page with cloud_browser_tabs before trying again.' } };
+      }
     }
     if (name === 'cloud_browser_status') return { resource: resourceForTool(await service.get(String(args.resource_id), conversationId)) };
     const operation = name.slice('cloud_browser_'.length) as 'tabs' | 'read' | 'open' | 'navigate';
@@ -56,12 +80,12 @@ export async function executeCloudBrowserTool(name: CloudBrowserOperationName, r
 
 export function registerCloudBrowserTools(server: McpServer): void {
   const descriptions: Record<CloudBrowserOperationName, string> = {
-    cloud_browser_start: 'Start or rejoin one Browserbase cloud browser owned by this task. First use cloud_browser_resources to find a browser the user already opened. Requires a configured account; returns exact resource id, controlVersion and page handles. Cloud usage is billed by the connected provider. This tool keeps logging and recording off; recording is an owner choice in the UI. No local-browser fallback or extra planning model.',
+    cloud_browser_start: 'Start the cloud browser for this chat, or rejoin the one already open here (including one the owner opened or handed over). Pass url to open a website in its first page in the same call. Returns the resource id, controlVersion and page handles (target_id) to read or navigate directly, so no separate open call is needed. Cloud usage is billed by the connected provider; recording stays off.',
     cloud_browser_resources: 'List the recent cloud browser resources already owned by this task, including one the user started in the UI. Read this when you do not have a resource id; use its exact resource and controlVersion rather than buying another session for discovery.',
     cloud_browser_status: 'Observe this exact task-owned cloud browser and its current controlVersion. Use after a handoff or a stale-version refusal. Reports pending or uncertain effects honestly; does not replay actions or grant control. Page metadata is omitted here; cloud_browser_tabs provides fresh exact handles.',
     cloud_browser_tabs: 'Freshly observe pages in this exact task-owned cloud browser. Returns current targetId handles. Refuses while the user has control or the controlVersion changed; never substitutes another session.',
     cloud_browser_read: 'Read bounded visible text from the exact task-owned cloud browser page. Uses a fixed observation, no caller script. Requires its current controlVersion and targetId. Refuses during human control.',
-    cloud_browser_open: 'Open one blank page in the exact task-owned cloud browser and return its targetId. Uses the current controlVersion; refuses during human control. Does not click, submit or send.',
+    cloud_browser_open: 'Open an additional blank page in this chat\'s cloud browser and return its targetId. cloud_browser_start already returns a first page; use this only when a second tab is needed. Uses the current controlVersion; refuses during human control. Does not click, submit or send.',
     cloud_browser_navigate: 'Navigate this exact task-owned cloud browser target to an http(s) URL without embedded credentials. Returns observed page and effect receipt; never retries an uncertain navigation. Does not click, fill, submit or send.',
   };
   for (const name of Object.keys(CLOUD_BROWSER_PARAMETERS) as CloudBrowserOperationName[]) {

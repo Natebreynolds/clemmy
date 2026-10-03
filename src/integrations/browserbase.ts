@@ -13,6 +13,8 @@ export interface BrowserbaseResource {
   state: 'starting' | 'active' | 'stopped' | 'expired' | 'uncertain'; controller: 'agent' | 'human'; controlVersion: number;
   createdAt: string; updatedAt: string; recording: boolean; elapsedSeconds: number; pages: BrowserbasePage[]; errorCode?: string;
   returnPending?: boolean;
+  /** The page Clem last worked on; the live view shows it by default. */
+  focusTargetId?: string;
 }
 /** One open browser as the owner's browsers sheet shows it. */
 export interface BrowserbaseOpenBrowser extends BrowserbaseResource {
@@ -60,6 +62,7 @@ interface PrivateResource extends Omit<BrowserbaseResource, 'elapsedSeconds'> {
   viewerLeases?: Array<{ id: string; targetId: string | null; controlVersion: number; expiresAt: number; mode: 'human' | 'watch'; detached: boolean }>;
   ownerResolution?: { kind: 'owner_adopted_session'; providerSessionId: string; at: number; originalCreateProof: 'unknown' };
   usesProfile?: boolean;
+  focusTargetId?: string;
 }
 interface Store { version: 1; revision: number; policy: Policy | null; resources: PrivateResource[]; }
 interface Api {
@@ -184,7 +187,13 @@ export class BrowserbaseService {
       projectId: resource.projectId, state: resource.state, controller: resource.controller, controlVersion: resource.controlVersion,
       createdAt: resource.createdAt, updatedAt: resource.updatedAt, recording: resource.recording,
       elapsedSeconds: Math.max(0, Math.floor(((nonterminal(resource) ? this.now() : Date.parse(resource.updatedAt)) - Date.parse(resource.createdAt)) / 1000)),
-      pages: (resource.pages ?? []).map(page => ({ ...page })), returnPending: Boolean(resource.returnPending), ...(resource.errorCode ? { errorCode: resource.errorCode } : {}) };
+      pages: (resource.pages ?? []).map(page => ({ ...page })), returnPending: Boolean(resource.returnPending), ...(resource.errorCode ? { errorCode: resource.errorCode } : {}),
+      ...(this.focus(resource) ? { focusTargetId: this.focus(resource) } : {}) };
+  }
+  /** The page Clem last worked on, while it is still one of the browser's pages. */
+  private focus(resource: PrivateResource): string | undefined {
+    const id = resource.focusTargetId;
+    return id && (resource.pages ?? []).some(page => page.targetId === id) ? id : undefined;
   }
   private async api(resource?: PrivateResource): Promise<{ api: Api; credentialIdentity: string }> {
     let key: string | undefined;
@@ -419,27 +428,33 @@ export class BrowserbaseService {
     return this.serial(id, async () => {
       const resource = this.resource(id, conversationId); this.version(resource, input.expectedVersion); this.live(resource);
       if (resource.returnPending) throw new BrowserbaseServiceError('control_return_pending');
+      // Without a chosen page, the view shows the page Clem is working on.
+      let targetId = input.targetId ?? this.focus(resource);
       if (!UUID.test(input.viewerLeaseId)) throw new BrowserbaseServiceError('invalid_viewer_lease');
-      if (input.targetId !== undefined && (typeof input.targetId !== 'string' || !input.targetId || input.targetId.length > 128)) throw new BrowserbaseServiceError('invalid_viewer_target');
+      if (targetId !== undefined && (typeof targetId !== 'string' || !targetId || targetId.length > 128)) throw new BrowserbaseServiceError('invalid_viewer_target');
       const mode = resource.controller === 'human' ? 'human' : 'watch';
       let lease = resource.viewerLeases?.find(lease => lease.id === input.viewerLeaseId);
       if (lease?.detached) throw new BrowserbaseServiceError('viewer_lease_detached');
-      if (lease && (lease.controlVersion !== resource.controlVersion || lease.targetId !== (input.targetId ?? null) || lease.mode !== mode)) throw new BrowserbaseServiceError('viewer_request_conflict');
+      if (lease && (lease.controlVersion !== resource.controlVersion || lease.targetId !== (targetId ?? null) || lease.mode !== mode)) throw new BrowserbaseServiceError('viewer_request_conflict');
       if (!lease) {
         if (this.store.resources.some(value => value.id !== resource.id && value.viewerLeases?.some(other => other.id === input.viewerLeaseId))) throw new BrowserbaseServiceError('viewer_request_conflict');
-        lease = { id: input.viewerLeaseId, targetId: input.targetId ?? null, controlVersion: resource.controlVersion, mode, expiresAt: 0, detached: false };
+        lease = { id: input.viewerLeaseId, targetId: targetId ?? null, controlVersion: resource.controlVersion, mode, expiresAt: 0, detached: false };
         resource.viewerLeases = [...(resource.viewerLeases ?? []), lease]; this.persist(); // Caller knows the id even if this HTTP response is lost.
       }
       const { api } = await this.api(resource); const observed = await api.retrieve(resource.providerSessionId!, resource.projectId); this.settleProvider(resource, observed);
       if (!nonterminal(resource)) { this.persist(); throw new BrowserbaseServiceError('resource_unavailable'); }
-      if (input.targetId !== undefined) {
-        if (typeof input.targetId !== 'string' || !input.targetId || input.targetId.length > 128 || !observed.connectUrl) throw new BrowserbaseServiceError('invalid_viewer_target');
+      if (targetId !== undefined) {
+        if (typeof targetId !== 'string' || !targetId || targetId.length > 128 || !observed.connectUrl) throw new BrowserbaseServiceError('invalid_viewer_target');
         const tabs = await this.cdp.execute(observed.connectUrl, resource.providerSessionId!, 'tabs', {});
-        if (!tabs.pages?.some(page => page.targetId === input.targetId)) throw new BrowserbaseServiceError('viewer_target_unavailable');
         resource.pages = tabs.pages ?? [];
+        if (!tabs.pages?.some(page => page.targetId === targetId)) {
+          if (input.targetId !== undefined) throw new BrowserbaseServiceError('viewer_target_unavailable');
+          // The page Clem was on has closed; the browser's first page is shown.
+          targetId = undefined; lease.targetId = null;
+        }
       }
-      const view = await api.liveView(resource.providerSessionId!, { expiresIn: 60, ...(input.targetId ? { targetId: input.targetId } : {}) });
-      if (input.targetId && view.targetId !== input.targetId) throw new BrowserbaseServiceError('viewer_target_unavailable');
+      const view = await api.liveView(resource.providerSessionId!, { expiresIn: 60, ...(targetId ? { targetId: targetId } : {}) });
+      if (targetId && view.targetId !== targetId) throw new BrowserbaseServiceError('viewer_target_unavailable');
       // URL expiry does not prove an already-connected iframe detached.
       lease.expiresAt = Date.parse(view.expiresAt);
       resource.lastActivityAt = this.now(); resource.updatedAt = this.iso(); this.persist(); return { ...view, controlVersion: resource.controlVersion, controller: resource.controller, viewerLeaseId: lease.id };
@@ -565,6 +580,7 @@ export class BrowserbaseService {
       resource.lastActivityAt = this.now(); resource.updatedAt = this.iso();
       if (value.pages) { const retained = new Map((resource.pages ?? []).map(page => [page.targetId, page])); for (const page of value.pages) retained.set(page.targetId, page); resource.pages = operation === 'tabs' ? value.pages : Array.from(retained.values()).slice(0,100); }
       if (crossed) { resource.pending = undefined; resource.state = 'active'; resource.errorCode = undefined; resource.lastEffect = { operation, effect: 'confirmed', targetId: value.targetId, at: this.now() }; }
+      if (value.targetId && operation !== 'tabs') resource.focusTargetId = value.targetId;
       this.persist(crossed ? 'uncertain' : 'none');
       return { resource: this.public(resource), result: value.result, receipt: { version: 1, kind: 'browserbase_dispatch_receipt', resourceId: resource.id, provider: 'browserbase',
         providerSessionId: resource.providerSessionId!, projectId: resource.projectId, operation, targetId: value.targetId, controlVersion: resource.controlVersion, effect: value.effect, at: this.iso() } };

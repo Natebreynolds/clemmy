@@ -7,7 +7,7 @@ const target = z.string().min(1).max(128).describe('Exact targetId from this res
 export const CLOUD_BROWSER_PARAMETERS = {
   // Recording is an explicit owner choice in the authenticated UI, never a
   // model-selected option on a routine browsing request.
-  cloud_browser_start: {},
+  cloud_browser_start: { url: BROWSER_HTTP_URL.nullable().optional().describe('A website to open in the browser\'s first page, so no separate open or navigate call is needed.') },
   cloud_browser_resources: {},
   cloud_browser_status: { resource_id: resource },
   cloud_browser_tabs: { resource_id: resource, expected_version: version },
@@ -22,6 +22,6 @@ export function cloudBrowserOperationName(value: string): value is CloudBrowserO
 }
 export function parseCloudBrowserArguments(name: CloudBrowserOperationName, args: unknown): Record<string, unknown> {
   const parsed: Record<string, unknown> = z.strictObject(CLOUD_BROWSER_PARAMETERS[name]).parse(args);
-  if (name === 'cloud_browser_navigate') parsed.url = BROWSER_HTTP_URL.parse(new URL(String(parsed.url)).href);
+  if (name === 'cloud_browser_navigate' || (name === 'cloud_browser_start' && parsed.url != null)) parsed.url = BROWSER_HTTP_URL.parse(new URL(String(parsed.url)).href);
   return parsed;
 }
