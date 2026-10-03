@@ -94,7 +94,10 @@ async def main():
         return ExactLocalConnection(url, **kwargs)
     cdp_client.websockets.connect = connect_local
     client = CDPClient(endpoint)
-    await asyncio.wait_for(client.start(), timeout=5)
+    try:
+      await asyncio.wait_for(client.start(), timeout=15)
+    except asyncio.TimeoutError:
+      raise RuntimeError('Chrome did not accept the connection. It may be asking on the Mac to allow remote debugging: allow it in Chrome, then try again.')
     op = p['operation']
     if op == 'browser_tabs':
         pages = [t for t in (await cdp('Target.getTargets'))['targetInfos'] if t.get('type') == 'page']
@@ -135,7 +138,7 @@ async def main():
             except Exception: pass
     print('${MARKER}'+json.dumps({'ok':True,'result':result,'target_id':target,'browser_id':browser_id,'effect':'confirmed' if mutation else 'none'}, ensure_ascii=False))
   except Exception as e:
-    print('${MARKER}'+json.dumps({'ok':False,'error':str(e)[:4000],'target_id':target,'browser_id':browser_id,'effect':'uncertain' if mutation else 'none'}, ensure_ascii=False))
+    print('${MARKER}'+json.dumps({'ok':False,'error':(str(e) or type(e).__name__)[:4000],'target_id':target,'browser_id':browser_id,'effect':'uncertain' if mutation else 'none'}, ensure_ascii=False))
     sys.exit(1)
   finally:
     if client is not None:

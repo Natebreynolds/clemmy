@@ -172,3 +172,16 @@ sys.modules['websockets.asyncio.client'] = websocket_client
   assert.match(String(changed.error), /Browser identity changed/);
   assert.equal(browserOperationProvesNoMutation(changed), true);
 });
+
+test('a Chrome that never accepts the connection is a plain, proven no-change failure', async () => {
+  const script = browserOperationScript('browser_open', parseBrowserOperationArguments('browser_open', {}));
+  assert.match(script, /except asyncio\.TimeoutError:/);
+  assert.match(script, /allow remote debugging/);
+  assert.match(script, /str\(e\) or type\(e\)\.__name__/, 'an exception without a message still says what it was');
+  const marker = `CLEM_BROWSER_OPERATION_V1:${JSON.stringify({ ok: false, error: 'Chrome did not accept the connection. It may be asking on the Mac to allow remote debugging: allow it in Chrome, then try again.', target_id: null, browser_id: browserId, effect: 'none' })}`;
+  const value = await executeBrowserOperation('browser_open', {}, { runner: async () => ({ code: 1, stdout: `${marker}\n`, stderr: '', dispatched: true }) });
+  assert.equal(value.ok, false);
+  assert.equal((value.receipt as { effect: string }).effect, 'none', 'no tab was opened, and the receipt says so');
+  assert.match(String(value.error), /allow remote debugging/);
+  assert.equal(browserOperationProvesNoMutation(value), true);
+});
