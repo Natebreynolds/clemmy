@@ -1,3 +1,4 @@
+import { workflowDisplayName } from '@clem/chat-engine';
 import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
@@ -296,9 +297,9 @@ export function Automate() {
                         <Card key={w.name} className="flex flex-col p-5">
                           <div className="mb-2 flex items-start justify-between gap-3">
                             <button type="button" onClick={() => openWorkflow(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
-                              {w.name}
+                              {workflowDisplayName(w.name, w.description)}
                             </button>
-                            <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${w.name}`} />
+                            <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${workflowDisplayName(w.name, w.description)}`} />
                           </div>
                           <button type="button" onClick={() => openWorkflow(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
                           <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
