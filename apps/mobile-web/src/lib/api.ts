@@ -961,6 +961,8 @@ export interface ChatSession {
   pinned?: boolean;
   /** Out of the list until restored; the conversation itself is kept. */
   archived?: boolean;
+  /** Work is in flight in it right now. Absent on a Mac that does not say. */
+  running?: boolean;
 }
 
 export interface ChatEvent {

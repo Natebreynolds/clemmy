@@ -82,7 +82,7 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   // Seven places (Projects joined them 2026-09-29), two quiet doors, Settings
   // at the foot.
   assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'\];/);
-  assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['chats', 'activity'\];/);
+  assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['activity'\];/);
   assert.match(app, /class="drawer-quiet"/);
   assert.match(css, /\.drawer \{[\s\S]*?width: min\(82vw, 320px\)/);
   assert.match(css, /\.drawer \{[\s\S]*?env\(safe-area-inset-left\)/);

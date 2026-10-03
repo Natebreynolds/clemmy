@@ -2202,7 +2202,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 }
 .memory-clear { margin-top: var(--sp-3); text-decoration: underline; }
 
-.memory-hit, .workflow-row, .chat-row,
+.memory-hit, .workflow-row,
 .run-card, .approval-card {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 46%), var(--bg-1);
   border: 1px solid var(--line);
@@ -2314,8 +2314,8 @@ input, textarea, select { font: inherit; font-size: 16px; }
 
 /* ── workflows + activity ───────────────────────────────────────── */
 
-.workflow-row, .chat-row { width: 100%; text-align: left; transition: transform 0.16s var(--ease-out), border-color 0.16s ease; }
-.workflow-row:active, .chat-row:active { transform: scale(0.985); border-color: var(--line-strong); }
+.workflow-row { width: 100%; text-align: left; transition: transform 0.16s var(--ease-out), border-color 0.16s ease; }
+.workflow-row:active { transform: scale(0.985); border-color: var(--line-strong); }
 .workflow-row-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-3); }
 .workflow-row-name, .chat-row-title { font-weight: 650; }
 .workflow-row-status {
@@ -2347,8 +2347,6 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .workflow-row-status.status-ready,
 .workflow-row-status.status-off { background: var(--bg-2) !important; color: var(--fg-3); }
 .workflow-row-slug { margin-top: 2px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--t-xs); color: var(--fg-3); overflow-wrap: anywhere; }
-.chat-row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-row-meta { font-size: var(--t-xs); color: var(--fg-3); margin-top: 3px; display: flex; gap: var(--sp-2); }
 /* "needs input" / "needs binding" are asks, not successes: warning tone, and
    at the type floor rather than 10px. */
 .workflow-row-tag {
@@ -5312,3 +5310,206 @@ textarea.cz-input { resize: vertical; }
 .settings-mode { gap: var(--sp-2); }
 .settings-mode-seg { margin-bottom: var(--sp-1); }
 .settings-mode-seg button:disabled { opacity: 0.6; }
+
+/* ─── Conversations, everywhere (10-03) ─────────────────────────────────
+   A conversation row is flat: title, one quiet line of who and when, and a
+   single live mark at the end — a turning ring while work is in flight, a
+   dot when a reply finished since the owner last looked. The same rows sit
+   in the menu's Recents and in the full list, so work that kept going after
+   the owner left a thread is visible from anywhere. */
+.chat-state { flex: 0 0 auto; display: inline-block; }
+.chat-state-running {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--fg-2);
+  border-radius: 50%;
+  animation: chat-state-turn 0.9s linear infinite;
+}
+.chat-state-news {
+  width: 9px;
+  height: 9px;
+  margin: 0 3px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+@keyframes chat-state-turn { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .chat-state-running { animation: none; border-top-color: var(--line-strong); border-right-color: var(--fg-2); }
+}
+
+.chat-list { display: flex; flex-direction: column; }
+.chat-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 60px;
+  border-radius: var(--r-md);
+  transition: background 0.16s ease;
+}
+.chat-row:active { background: var(--bg-2); }
+.chat-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 0 10px var(--sp-2);
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.chat-row-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-body);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+}
+.chat-row-news .chat-row-title { font-weight: 750; }
+.chat-row-meta {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: var(--t-sm);
+  color: var(--fg-3);
+}
+.chat-row-who { overflow: hidden; text-overflow: ellipsis; color: var(--fg-2); font-weight: 600; }
+.chat-row-who + span::before { content: '·'; margin-right: 6px; }
+.chat-row-working { color: var(--fg-2); font-weight: 600; }
+.chat-row-more {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--fg-3);
+}
+.chat-row-more svg { width: 18px; height: 18px; }
+.chat-row-more:active { background: var(--bg-3); }
+
+/* The menu's Recents: under the places, above the foot. */
+.drawer-recents { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line); }
+.drawer-recents-head {
+  margin: 0 0 var(--sp-1);
+  padding: 0 var(--sp-3);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--fg-3);
+}
+.drawer-recent {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 44px;
+  padding: 8px var(--sp-3);
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  transition: background 0.16s ease, transform 0.14s var(--ease-out);
+}
+.drawer-recent:active { background: var(--bg-2); transform: scale(0.98); }
+.drawer-recent-icon { flex: 0 0 auto; display: inline-flex; width: 20px; justify-content: center; color: var(--fg-3); line-height: 0; }
+.drawer-recent-icon svg { width: 19px; height: 19px; }
+.drawer-recent-initial {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--bg-3);
+  color: var(--fg-2);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+.drawer-recent-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 500;
+}
+.drawer-recent-all { color: var(--fg-2); }
+.drawer-recent-all .drawer-recent-title { font-size: 14px; font-weight: 600; }
+.drawer-recent-all svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--fg-3); }
+
+/* The foot floats over the scrolling menu: the owner's initial (Settings)
+   at the left, the one way to start a new chat at the right. */
+.drawer-foot {
+  position: sticky;
+  bottom: calc(-1 * max(var(--sp-4), env(safe-area-inset-bottom)));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-top: auto;
+  padding: var(--sp-4) var(--sp-1) max(var(--sp-4), env(safe-area-inset-bottom));
+  border-top: 0;
+  background: linear-gradient(to bottom, rgba(255, 253, 248, 0), rgba(255, 253, 248, 0.96) 38%);
+}
+.drawer-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--bg-0);
+  box-shadow: 0 4px 14px rgba(74, 46, 16, 0.10);
+  color: var(--fg);
+  font-size: 17px;
+  font-weight: 700;
+  transition: transform 0.14s var(--ease-out);
+}
+.drawer-avatar svg { width: 20px; height: 20px; }
+.drawer-avatar:active { transform: scale(0.94); }
+.drawer-avatar[aria-current='page'] { border-color: var(--line-hot); color: var(--accent); }
+.drawer-new-chat {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 0 var(--sp-5);
+  border: 0;
+  border-radius: 999px;
+  background: var(--fg);
+  color: #fffaf3;
+  box-shadow: 0 8px 22px rgba(43, 31, 20, 0.22);
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  transition: transform 0.14s var(--ease-out);
+}
+.drawer-new-chat svg { width: 17px; height: 17px; }
+.drawer-new-chat:active { transform: scale(0.96); }
+
+/* The menu reads like a list of places, not buttons: ink labels at a
+   regular weight, line icons, one quiet separator before Recents. */
+.drawer .drawer-item { color: var(--fg); }
+.drawer .drawer-item-label { font-family: var(--font-body); font-size: 17px; font-weight: 500; letter-spacing: -0.01em; }
+.drawer .drawer-item svg { stroke-width: 1.6; color: var(--fg-2); }
+.drawer .drawer-item[aria-current='page'] { color: var(--accent); }
+.drawer .drawer-item[aria-current='page'] svg { color: var(--accent); }
+.drawer .drawer-item[aria-current='page'] .drawer-item-label { font-weight: 600; }
+.drawer-quiet { margin-top: 0; padding-top: 0; border-top: 0; }
+.drawer .drawer-item-quiet .drawer-item-label { font-size: 17px; font-weight: 500; }
+.drawer .drawer-item-quiet svg { width: 21px; height: 21px; }

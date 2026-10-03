@@ -96,6 +96,8 @@ import { relayClientIp } from '../runtime/mobile-ingress.js';
 import { markPushSubscribed } from '../runtime/mobile-sessions.js';
 import { atomicJsonMutate } from '../runtime/atomic-json.js';
 import {
+  activeRunSessionIds,
+  getActiveRunAttempt,
   getLatestRunAttempt as getLatestHarnessRunAttempt,
   claimHarnessChatRequest,
   claimRunAttemptLease,
@@ -349,7 +351,7 @@ function settleMobileApprovalAttempt(
  * + plan-id fields the phone doesn't render. Title falls back to
  * objective then a kind-aware default, matching the dashboard.
  */
-function serializeSessionForMobile(session: HarnessSessionRow): {
+function serializeSessionForMobile(session: HarnessSessionRow, activeRuns?: ReadonlySet<string>): {
   id: string;
   title: string;
   kind: HarnessSessionRow['kind'];
@@ -363,6 +365,9 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
   projectName: string | null;
   pinned: boolean;
   archived: boolean;
+  /** Work is in flight in this conversation right now, wherever it started:
+   *  the list shows it running after the owner has left the thread. */
+  running: boolean;
 } {
   const title = session.title?.trim()
     || (session.objective ? session.objective.slice(0, 80) : '')
@@ -379,6 +384,7 @@ function serializeSessionForMobile(session: HarnessSessionRow): {
     })(),
     pinned: session.metadata?.pinned === true,
     archived: session.metadata?.archived === true,
+    running: activeRuns ? activeRuns.has(session.id) : getActiveRunAttempt(session.id) !== null,
     kind: session.kind,
     channel: session.channel,
     status: session.status,
@@ -3771,8 +3777,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // list on skeletons for 7+ s on 2026-09-22). ?archived=1 lists what was
     // put away instead.
     const archived = req.query.archived === '1' || req.query.archived === 'true';
+    const activeRuns = activeRunSessionIds();
     const sessions = harnessListSessions({ limit: 80, archived, kind: 'chat', withoutConversationState: true })
-      .map(serializeSessionForMobile);
+      .map((session) => serializeSessionForMobile(session, activeRuns));
     res.json({ sessions });
   });
 

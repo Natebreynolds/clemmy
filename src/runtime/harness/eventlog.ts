@@ -5225,6 +5225,14 @@ export function finishRunAttempt(
   tx();
 }
 
+/** The sessions with a run attempt still in flight, in one read. */
+export function activeRunSessionIds(): Set<string> {
+  const rows = openEventLog().prepare(
+    'SELECT DISTINCT session_id AS sessionId FROM run_attempts WHERE finished_at IS NULL',
+  ).all() as Array<{ sessionId: string }>;
+  return new Set(rows.map((row) => row.sessionId));
+}
+
 export function getActiveRunAttempt(sessionId: string): RunAttemptRef | null {
   const row = openEventLog().prepare(
     `SELECT attempt_id, run_id, started_at

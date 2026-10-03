@@ -63,6 +63,8 @@ import { Settings } from './screens/Settings';
 import { describeThisDevice } from './lib/device-name';
 import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
+import { DrawerRecents } from './components/DrawerRecents';
+import { greetingName } from './lib/greeting';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 import { AskCapsule } from './components/AskCapsule';
 import { CustomizeSheet } from './components/CustomizeSheet';
@@ -554,6 +556,8 @@ export function App() {
     }
   };
 
+  const ownerInitial = greetingName(name).trim().charAt(0).toUpperCase();
+
   const goToChat = (payload: ChatHandoff) => {
     setHandoff(payload);
     navigateTo('chats');
@@ -793,11 +797,19 @@ export function App() {
                 ))}
               </div>
             </nav>
+            <DrawerRecents
+              open={drawerOpen && !drawerClosing}
+              onOpen={(session) => { goToChat({ session, sessionId: session.id, title: session.title }); closeDrawer(false); }}
+              onAll={() => { navigateTo('chats'); closeDrawer(false); }}
+            />
             {/* Settings rides the bottom of the menu (owner IA): the pocket
-                end of trust minted on the Mac — quiet, always reachable. */}
+                end of trust minted on the Mac — quiet, always reachable — as
+                the owner's initial, beside the one way to start a new chat. */}
             <div class="drawer-foot">
               <button
-                class="drawer-item"
+                class="drawer-avatar"
+                type="button"
+                aria-label="Settings"
                 aria-current={tab === 'settings' ? 'page' : undefined}
                 onClick={() => {
                   if (tab !== 'settings') haptic('light');
@@ -805,13 +817,20 @@ export function App() {
                   closeDrawer(false);
                 }}
               >
-                <span class="drawer-item-icon">
+                {ownerInitial ? <span aria-hidden="true">{ownerInitial}</span> : (
                   <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
                     <circle cx="12" cy="12" r="3" />
                     <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
                   </svg>
-                </span>
-                <span class="drawer-item-label">Settings</span>
+                )}
+              </button>
+              <button
+                class="drawer-new-chat"
+                type="button"
+                onClick={() => { haptic('light'); goToChat({}); closeDrawer(false); }}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+                New chat
               </button>
             </div>
           </aside>
@@ -965,7 +984,8 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 
 /** The places (owner 09-26, Projects added 09-29): everything else is reached from inside them or from the quiet rows. */
 const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'];
-const QUIET_TABS: ReadonlyArray<Tab> = ['chats', 'activity'];
+// Conversations live in the menu's Recents, with the full list one tap away.
+const QUIET_TABS: ReadonlyArray<Tab> = ['activity'];
 
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Today',

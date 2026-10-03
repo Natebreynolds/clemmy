@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { useBackGesture } from '../lib/back-gesture';
 import { listChatSessions, patchChatSession, type ChatSession } from '../lib/api';
 import { arrangeChatList, cleanChatTitle } from '../lib/chat-list';
+import { chatHasNews, chatSeenBaseline, markChatSeen } from '../lib/chat-seen';
+import { ChatStateMark } from '../components/ChatStateMark';
 import { Sheet } from '../components/Sheet';
 import { haptic } from '../lib/native-bridge';
 import type { ChatAttachment } from '@clem/chat-engine';
@@ -46,7 +48,11 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
   const [selectedTitle, setSelectedTitle] = useState<string | undefined>();
+  // The thread the owner just left: marked read once the list shows how it
+  // stands, unless work is still running in it (its reply is then news).
+  const leftRef = useRef<string | null>(null);
   const closeSelected = () => {
+    leftRef.current = selectedId;
     setSelectedId(null);
     setSelectedDraft(undefined);
     setSelectedTitle(undefined);
@@ -70,11 +76,28 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   );
   const sessions = data?.sessions ?? [];
   const arranged = arrangeChatList(sessions, query);
+  const seen = chatSeenBaseline(sessions);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const open = sessions.find((s) => s.id === selectedId);
+    if (open) markChatSeen(open.id, open.updatedAt);
+  }, [selectedId]);
+  useEffect(() => {
+    const left = leftRef.current;
+    if (!left || !data) return;
+    leftRef.current = null;
+    const row = data.sessions.find((s) => s.id === left);
+    if (row && !row.running) markChatSeen(row.id, row.updatedAt);
+  }, [data]);
 
   const change = async (session: ChatSession, patch: { title?: string; pinned?: boolean; archived?: boolean }) => {
     setRowError(null);
     try {
-      await patchChatSession(session.id, patch);
+      const hadNews = chatHasNews(session, seen);
+      const { session: saved } = await patchChatSession(session.id, patch);
+      // The owner's own edit is not news.
+      if (!hadNews && saved) markChatSeen(saved.id, saved.updatedAt);
       haptic('success');
       void refresh();
     } catch (err) {
@@ -189,12 +212,12 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
       ) : null}
 
       {arranged.pinned.length > 0 ? <h2 class="section-head pane-head">Pinned</h2> : null}
-      <div class="stack">
-        {arranged.pinned.map((session, i) => <ChatRow key={session.id} session={session} index={i} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
+      <div class="chat-list">
+        {arranged.pinned.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
       </div>
       {arranged.pinned.length > 0 && arranged.rest.length > 0 ? <h2 class="section-head pane-head">{showArchived ? 'Archived' : 'Recent'}</h2> : null}
-      <div class="stack">
-        {arranged.rest.map((session, i) => <ChatRow key={session.id} session={session} index={i} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
+      <div class="chat-list">
+        {arranged.rest.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} />)}
       </div>
       {!loading && sessions.length > 0 && arranged.pinned.length + arranged.rest.length === 0 ? (
         <p class="chats-none">Nothing matches “{query.trim()}”.</p>
@@ -241,29 +264,26 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   );
 }
 
-function ChatRow({ session, index, onOpen, onMenu }: { session: ChatSession; index: number; onOpen: () => void; onMenu: () => void }) {
+/** One conversation: its title, who and when on one quiet line, and its
+ *  live state at the end. Flat on the page, like the menu's Recents. */
+function ChatRow({ session, news, onOpen, onMenu }: { session: ChatSession; news: boolean; onOpen: () => void; onMenu: () => void }) {
+  const who = [session.agentName, session.projectName].filter(Boolean).join(' · ');
+  const ended = session.status === 'failed' || session.status === 'cancelled';
   return (
-    <div class="card card-tap rise chat-card" style={{ '--i': index }}>
-      <button type="button" class="chat-card-main" onClick={onOpen}>
-        <div class="min-w-0">
-          <div class="card-title-sm truncate">{session.title || 'Untitled'}</div>
-          {session.agentName || session.projectName ? (
-            <span class="chat-card-chips">
-              {session.agentName ? <span class="chip chip-agent">{session.agentName}</span> : null}
-              {session.projectName ? <span class="chip chip-project">{session.projectName}</span> : null}
-            </span>
-          ) : null}
-          <div class="card-when">
-            {session.status === 'failed' || session.status === 'cancelled' ? (
-              <>
-                <span class={`status-dot status-${session.status}`} aria-hidden="true" />
-                {session.status.replace(/_/g, ' ')} · {relativeTime(session.updatedAt)}
-              </>
-            ) : relativeTime(session.updatedAt)}
-          </div>
-        </div>
+    <div class={`chat-row${news ? ' chat-row-news' : ''}`}>
+      <button type="button" class="chat-row-main" onClick={onOpen}>
+        <span class="chat-row-title">{session.title || 'Untitled'}</span>
+        <span class="chat-row-meta">
+          {who ? <span class="chat-row-who">{who}</span> : null}
+          {session.running ? (
+            <span class="chat-row-working">Working…</span>
+          ) : ended ? (
+            <span><span class={`status-dot status-${session.status}`} aria-hidden="true" />{session.status} · {relativeTime(session.updatedAt)}</span>
+          ) : <span>{relativeTime(session.updatedAt)}</span>}
+        </span>
       </button>
-      <button type="button" class="chat-card-menu" aria-label={`More for ${session.title || 'this conversation'}`} onClick={onMenu}>
+      <ChatStateMark running={session.running} news={news} />
+      <button type="button" class="chat-row-more" aria-label={`More for ${session.title || 'this conversation'}`} onClick={onMenu}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1.2" /><circle cx="12" cy="12" r="1.2" /><circle cx="19" cy="12" r="1.2" /></svg>
       </button>
     </div>
