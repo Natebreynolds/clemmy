@@ -1686,8 +1686,9 @@ export async function modelCheckInForExhaustedTurn(
   const { blockedReason: _reason, blockedDetail: _detail, blockedResumable: _resumable, error: _error, ...rest } = turnResult;
   if (!asks) {
     // She explained the stop in her own words; the typed stop (and its retained
-    // work) stands so recovery stays honest.
-    return { ...turnResult, finalOutput: reply };
+    // work) stands so recovery stays honest. The blocked terminal presents error,
+    // so carry the completed explanation through that text handoff as well.
+    return { ...turnResult, finalOutput: reply, error: reply };
   }
   appendEvent({
     sessionId: input.sessionId,

@@ -11,6 +11,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const eventlog = await import('./eventlog.js');
 const {
   _testOnly_reduceStandardConversationTerminal: reduceStandardConversationTerminal,
+  modelCheckInForExhaustedTurn,
 } = await import('./loop.js');
 const { MISSING_REPLY_USER_FALLBACK } = await import('./turn-decision.js');
 
@@ -114,6 +115,70 @@ test('an internal no-progress stop cannot become a resumable user continuation',
   const outcome = terminal.data.turnOutcome as { status?: string; resumable?: boolean };
   assert.equal(outcome.status, 'blocked');
   assert.equal(outcome.resumable, false);
+});
+
+for (const blockedResumable of [false, undefined] as const) {
+  test(`a completed explanatory check-in reaches the blocked terminal without changing resumability (${blockedResumable !== false})`, async () => {
+    const sessionId = `explained-no-progress-${blockedResumable !== false}`;
+    const source = acceptedSource(sessionId);
+    const explanation = 'The helper stopped before returning a usable result. The earlier findings are retained, but the requested audit is incomplete.';
+    const stopped = {
+      sessionId, turn: source.turn, status: 'blocked' as const,
+      finalOutput: 'Stopped at: execution:unknown',
+      error: 'Stopped at: execution:unknown',
+      blockedReason: 'control_no_progress_exhausted', blockedDetail: 'execution:unknown',
+      ...(blockedResumable === false ? { blockedResumable } : {}),
+      toolCalls: 3,
+    };
+    let calls = 0;
+    const explained = await modelCheckInForExhaustedTurn(stopped, {
+      sessionId, sourceUserSeq: source.sourceUserSeq,
+      run: async () => {
+        calls += 1;
+        return { sessionId, turn: source.turn + 1, status: 'completed', finalOutput: explanation, toolCalls: 0 };
+      },
+    });
+    assert.equal(calls, 1);
+    assert.deepEqual({ ...explained, finalOutput: stopped.finalOutput, error: stopped.error }, stopped,
+      'only public wording changes; the original stop and retained state remain intact');
+    const reduced = reduceStandardConversationTerminal({
+      sourceUserSeq: source.sourceUserSeq,
+      result: {
+        sessionId, status: explained.status, steps: 1, lastTurn: explained.turn,
+        error: explained.error, blockedReason: explained.blockedReason,
+        blockedDetail: explained.blockedDetail, blockedResumable: explained.blockedResumable,
+        lastDecision: { summary: explanation, reply: explanation, done: false, nextAction: 'abandoned', reason: explained.error ?? null },
+      },
+    });
+    assert.equal(reduced.publicPresentation?.text, explanation,
+      'the reducer must publish the completed explanation rather than the retained machine error');
+    assert.equal(reduced.status, 'blocked');
+    const terminals = eventlog.listEvents(sessionId, { types: ['conversation_completed'] });
+    assert.equal(terminals.length, 1);
+    const terminal = terminals[0]!;
+    assert.equal(terminal.data.reply, explanation);
+    assert.equal(terminal.data.reason, 'blocked');
+    assert.equal(terminal.data.blockedReason, stopped.blockedReason);
+    assert.equal(terminal.data.blockedDetail, stopped.blockedDetail);
+    const outcome = terminal.data.turnOutcome as { status: string; resumable: boolean };
+    assert.equal(outcome.status, 'blocked');
+    assert.equal(outcome.resumable, blockedResumable !== false);
+    const presentation = terminal.data.presentation as { identity: { sessionId: string; sourceUserSeq: number; turn: number } };
+    assert.deepEqual(presentation.identity, { sessionId, sourceUserSeq: source.sourceUserSeq, turn: source.turn });
+    assert.equal(eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).length, 0);
+  });
+}
+
+test('an unfinished or empty explanatory check-in leaves the original blocked text intact', async () => {
+  for (const [status, finalOutput] of [['blocked', 'An unfinished explanation.'], ['completed', '']] as const) {
+    const sessionId = `unusable-explanation-${status}`;
+    const source = acceptedSource(sessionId);
+    const stopped = { sessionId, turn: source.turn, status: 'blocked' as const, finalOutput: 'Original stop.',
+      error: 'Original stop.', blockedReason: 'control_no_progress_exhausted', blockedDetail: 'execution:unknown' };
+    const result = await modelCheckInForExhaustedTurn(stopped, { sessionId, sourceUserSeq: source.sourceUserSeq,
+      run: async () => ({ sessionId, turn: source.turn, status, finalOutput, toolCalls: 0 }) });
+    assert.equal(result, stopped);
+  }
 });
 
 test('a host blocked terminal persists its machine reason and bounded detail, not the literal "blocked" (say why)', () => {
