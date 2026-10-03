@@ -171,3 +171,36 @@ test('GUARD end-to-end: an interpreter write into pending-action authority is de
   await invokeShell({ command: `node -e ${JSON.stringify(program)}` });
   assert.equal(existsSync(target), false, 'the protected file must never be created');
 });
+
+test('merging error output (2>&1) is not a write: a read-only database inspection pipeline is allowed', () => {
+  const harnessDb = path.join(BASE_DIR, 'state', 'harness.db');
+  const db = JSON.stringify(harnessDb);
+  // The exact refused shape: schema listing piped through filters.
+  assert.equal(shellMutatesAuthorizationState(`sqlite3 ${db} ".tables" 2>&1 | tr ' ' '\\n' | grep -i -E 'result|tool|call' | head -40`, BASE_DIR), false);
+  assert.equal(shellMutatesAuthorizationState(`sqlite3 ${db} "SELECT count(*) FROM events" 2>/dev/null >&2`, BASE_DIR), false, 'redirects to streams and /dev/null name no protected file');
+  assert.equal(shellMutatesAuthorizationState(`sqlite3 ${db} ".schema events" 2>&-`, BASE_DIR), false);
+});
+
+test('GUARD: every real write to the protected database is still refused, with or without 2>&1', () => {
+  const harnessDb = path.join(BASE_DIR, 'state', 'harness.db');
+  const db = JSON.stringify(harnessDb);
+  for (const command of [
+    `sqlite3 ${db} "UPDATE pending_approvals SET status='resolved'" 2>&1`,
+    `sqlite3 ${db} "DELETE FROM events" 2>&1 | head`,
+    `sqlite3 ${db} ".import /tmp/rows.csv events" 2>&1`,
+    `sqlite3 ${db} ".restore /tmp/other.db"`,
+    `sqlite3 ${db} "VACUUM"`,
+    `sqlite3 ${db} "REINDEX"`,
+    `sqlite3 ${db} "PRAGMA journal_mode = DELETE"`,
+    `echo x 2>&1 > ${db}`,
+    `echo x 2>&1>${db}`,
+    `echo x &> ${db}`,
+    `echo x >& ${db}`,
+    `sqlite3 /tmp/scratch.db ".backup ${db}"`,
+    `sqlite3 /tmp/scratch.db ".save '${harnessDb}'"`,
+    `sqlite3 /tmp/scratch.db ".output ${db}" "SELECT 1"`,
+  ]) assert.equal(shellMutatesAuthorizationState(command, BASE_DIR), true, command);
+  assert.equal(shellMutatesAuthorizationState(`sqlite3 ${db} "SELECT count(*) FROM events" 2>/dev/null`, BASE_DIR), false, 'silencing errors does not make a read a write');
+  assert.equal(shellMutatesAuthorizationState(`sqlite3 ${db} ".backup /tmp/copy.db"`, BASE_DIR), false, 'backing the database up elsewhere reads it');
+  assert.equal(shellMutatesAuthorizationState(`sqlite3 ${db} "PRAGMA table_info(events)"`, BASE_DIR), false, 'a pragma read stays legal');
+});

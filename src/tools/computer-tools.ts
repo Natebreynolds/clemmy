@@ -552,7 +552,16 @@ export function writeTargetsAuthorizationState(resolvedPath: string): boolean {
 }
 
 const AUTHORIZATION_STATE_MUTATION =
-  /(?:^|[\s;&|])(?:rm|rmdir|unlink|trash|mv|cp|install|touch|mkdir|truncate|chmod|chown|chgrp|ln|dd)\b|(?:^|[^<])>{1,2}\s*|\|\s*tee\b|\b(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync|writeFile|appendFile|createWriteStream)\s*\(|\bopen\s*\([^)]*,\s*['"][wax+][^'"]*['"]|\b(?:update|delete\s+from|insert\s+into|replace\s+into|drop\s+table|alter\s+table|create\s+table|truncate)\b/i;
+  /(?:^|[\s;&|])(?:rm|rmdir|unlink|trash|mv|cp|install|touch|mkdir|truncate|chmod|chown|chgrp|ln|dd)\b|(?:^|[^<])>{1,2}\s*|\|\s*tee\b|\b(?:writeFileSync|appendFileSync|createWriteStream|copyFileSync|renameSync|rmSync|unlinkSync|mkdirSync|writeFile|appendFile|createWriteStream)\s*\(|\bopen\s*\([^)]*,\s*['"][wax+][^'"]*['"]|\b(?:update|delete\s+from|insert\s+into|replace\s+into|drop\s+table|alter\s+table|create\s+table|truncate|vacuum|reindex)\b|\bpragma\s+[\w.]+\s*=|(?:^|[\s'"])\.(?:import|restore|backup|save|clone|output|once)\b/i;
+/** A database write inside a sqlite3 command: SQL that changes it, or a
+ *  dot-command that loads data into it. */
+const SQLITE_DATABASE_WRITE = /\b(?:update|delete\s+from|insert\s+into|replace\s+into|drop\s+table|alter\s+table|create\s+table|truncate|vacuum|reindex)\b|\bpragma\s+[\w.]+\s*=|(?:^|[\s'"])\.(?:import|restore)\b/i;
+/** sqlite3 dot-commands that write the file they name. */
+const SQLITE_FILE_WRITE = /(?:^|[\s'"])\.(?:backup|save|clone|output|once)\s+(?:main\s+)?(?:"([^"]+)"|'([^']+)'|([^\s'";]+))/gi;
+/** Descriptor duplication or closing (2>&1, >&2, 2>&-) moves output between
+ *  streams and writes no file, so it is not evidence of a write. A redirect
+ *  to a file (> file, &> file, >& file) still is. */
+const DESCRIPTOR_DUPLICATION = /\d*>&(?:\d+|-)(?=$|[\s;&|)])/g;
 
 /** Pure shell-side twin of writeTargetsAuthorizationState. It recognizes both
  * direct shell file verbs/redirection and common interpreter/database write
@@ -560,7 +569,7 @@ const AUTHORIZATION_STATE_MUTATION =
 export function shellMutatesAuthorizationState(rawCommand: unknown, cwdInput?: string): boolean {
   if (typeof rawCommand !== 'string') return false;
   const command = rawCommand.trim();
-  if (!command || !AUTHORIZATION_STATE_MUTATION.test(command)) return false;
+  if (!command || !AUTHORIZATION_STATE_MUTATION.test(command.replace(DESCRIPTOR_DUPLICATION, ' '))) return false;
   const cwd = path.resolve(expandHome(cwdInput || BASE_DIR));
   if (writeTargetsAuthorizationState(cwd)) return true;
 
@@ -583,8 +592,14 @@ export function shellMutatesAuthorizationState(rawCommand: unknown, cwdInput?: s
       }
     }
     if (binary === 'sqlite3') {
+      // The database is a write target only when the command changes it; a
+      // redirect elsewhere in the pipeline does not write the database.
       const database = tokens.slice(index + 1).find((operand) => !operand.startsWith('-'));
-      if (database) targets.add(database);
+      if (database && SQLITE_DATABASE_WRITE.test(command)) targets.add(database);
+      for (const match of command.matchAll(SQLITE_FILE_WRITE)) {
+        const named = match[1] ?? match[2] ?? match[3];
+        if (named) targets.add(named);
+      }
     }
   }
 
@@ -838,6 +853,9 @@ function outputRedirectionTargets(command: string): string[] {
 
     i += 1;
     if (command[i] === '>') i += 1;
+    // >& word redirects to a file; >&2 and >&- only move or close a stream.
+    const ampersand = command[i] === '&';
+    if (ampersand) i += 1;
     while (i < command.length && /\s/.test(command[i])) i += 1;
     if (i >= command.length) break;
 
@@ -856,7 +874,7 @@ function outputRedirectionTargets(command: string): string[] {
         target += targetCh;
       }
     }
-    if (target) targets.push(target);
+    if (target && !(ampersand && /^(?:\d+|-)$/.test(target))) targets.push(target);
   }
 
   return targets;
