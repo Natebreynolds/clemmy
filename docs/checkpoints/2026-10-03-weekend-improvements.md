@@ -935,3 +935,15 @@ learned) proving workers run it and the type becomes a learned read.
 - Open: model fit for heavy research as a setting (intent → worker model);
   Jev/judge check of worker claims vs the record (later layer); SDK worker
   lane gets the same record.
+- WAVE 57 = 069613588 (workers act with the lead's authority), WAVE 58 =
+  3b4d754e8 (host record on worker results; unbacked successes not banked;
+  sibling item facts), WAVE 59 = 9e14f2c02 (check-in questions lose the
+  ASK:/CONTINUE: marker — e47e4fef0; paused job cards show why, without
+  retained-work handles — 8f62ed938; quit-step deadlines in the desktop shell
+  — 9e14f2c02, ships with the next signed release, desktop tsc clean).
+- Model fit for heavy research needs no code: saved worker intent rules
+  ("helpers for <kind of work> use <model>", worker-model-route.ts) apply
+  only with model routing on; the owner's routing mode is off.
+- Ward audit: lead finished 03:24Z — "built and passed local QA", index.html
+  159 KB, nothing deployed; gap = 6/7 on-page URLs + NY Lighthouse (workers
+  were compose-only for those request types, fixed by wave 57).
