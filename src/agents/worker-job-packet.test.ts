@@ -218,3 +218,17 @@ test('a contracted packet renders the exact bound work_call rule; an ordinary pa
   const plain = buildWorkerJobPrompt(base as never);
   assert.doesNotMatch(plain, /CONTRACTED ITEM/, 'uncontracted packets must not carry contract-speak');
 });
+
+test('a worker whose item names a sibling item by id gets that item\'s facts too', async () => {
+  const { workerContextForItem } = await import('./worker-job-packet.js');
+  const contexts = new Map([
+    ['serps-miami', 'Run these five queries in Miami: a, b, c, d, e.'],
+    ['serps-orlando', 'Same five-query set and rules as serps-miami, for Orlando.'],
+    ['lighthouse', 'Run Lighthouse on the home page.'],
+  ]);
+  const orlando = workerContextForItem('Shared facts.', contexts, 'serps-orlando');
+  assert.match(orlando, /Item context:\nSame five-query set/);
+  assert.match(orlando, /Item context of serps-miami \(referenced above\):\nRun these five queries in Miami/);
+  assert.doesNotMatch(orlando, /Lighthouse/, 'only the referenced sibling comes along');
+  assert.equal(workerContextForItem('Shared facts.', contexts, 'lighthouse'), 'Shared facts.\n\nItem context:\nRun Lighthouse on the home page.');
+});

@@ -180,9 +180,16 @@ export function workerItemContexts(items: readonly string[], rows: WorkerToolCal
   return contexts;
 }
 
+/** A worker sees only its own packet. When its item's facts name another
+ * item of the same batch by its exact id ("same as <id>"), that item's facts
+ * come along, one level deep, so the worker never has to go looking. */
 export function workerContextForItem(shared: string, contexts: ReadonlyMap<string, string>, item: string): string {
   const own = contexts.get(item);
-  return own === undefined ? shared : `${shared}\n\nItem context:\n${own}`;
+  if (own === undefined) return shared;
+  const referenced = [...contexts.entries()]
+    .filter(([other]) => other !== item && own.includes(other))
+    .map(([other, facts]) => `Item context of ${other} (referenced above):\n${facts}`);
+  return [`${shared}\n\nItem context:\n${own}`, ...referenced].join('\n\n');
 }
 
 /** A model can serialize an absent item as the LITERAL string "null" (the
