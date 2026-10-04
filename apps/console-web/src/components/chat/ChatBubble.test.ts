@@ -21,7 +21,7 @@ test('live with no tokens does not render a hollow reply', () => {
 });
 
 test('the answer is typeset by the shared escaping renderer, never boxed', () => {
-  assert.match(SOURCE, /renderMarkdown\(text, \{ workspaceLinks: false \}\)/);
+  assert.match(SOURCE, /renderMarkdown\(text, \{ workspaceLinks: false, appPlaceLinks: 'desktop' \}\)/);
   assert.doesNotMatch(SOURCE, /rounded-tl-sm border border-border bg-surface/,
     'the reply card is back: Clem\'s answer sits in a box again');
 });
