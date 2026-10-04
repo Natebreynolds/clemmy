@@ -11,7 +11,7 @@ process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-worker-ca
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
 const { appendEvent, createSession } = await import('./eventlog.js');
-const { workerCallRecord, renderWorkerCallRecord } = await import('./worker-call-record.js');
+const { workerCallRecord, workerScopeCallRecord, renderWorkerCallRecord } = await import('./worker-call-record.js');
 
 test('the host record says which business calls ran, failed or never reached the provider', () => {
   const session = createSession({ kind: 'agent', title: 'record fixture' });
@@ -46,4 +46,19 @@ test('a worker that ran no business tool is recorded as such', () => {
   assert.equal(record.businessCallSucceeded, false);
   assert.equal(record.businessCallAttempted, false, 'a worker that needed no tool attempted none');
   assert.match(renderWorkerCallRecord(record), /No business tool ran\./);
+});
+
+test('an agent-SDK worker gets the same record from its scoped calls in the parent session', () => {
+  const session = createSession({ kind: 'chat', title: 'sdk worker fixture' });
+  const scope = `${session.id}::worker:fixture-packet`;
+  const before = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Fan out.' } });
+  const returned = (data: Record<string, unknown>) => appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'tool_returned', data });
+  returned({ runScopeId: scope, accounting: 'top_level', topologyRole: 'business', tool: 'call_tool', effectiveTool: 'fixture__api_request', ok: false });
+  returned({ runScopeId: scope, accounting: 'transport_mirror', tool: 'fixture__api_request', ok: false });
+  returned({ runScopeId: scope, accounting: 'top_level', topologyRole: 'control', tool: 'tool_search' });
+  returned({ runScopeId: `${session.id}::worker:other`, accounting: 'top_level', topologyRole: 'business', effectiveTool: 'write_file', ok: true });
+  const record = workerScopeCallRecord(session.id, scope, before.seq);
+  assert.deepEqual(record.byTool, { fixture__api_request: { succeeded: 0, failed: 1, refusedBeforeDispatch: 0 } });
+  assert.equal(record.businessCallSucceeded, false);
+  assert.equal(record.businessCallAttempted, true, 'tried business work that never succeeded');
 });

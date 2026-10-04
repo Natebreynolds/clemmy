@@ -1,4 +1,6 @@
 import { buildWorkerJobPrompt, resolveWorkerMaxTurns, workerPacketKey, type WorkerToolInput } from '../../agents/worker-job-packet.js';
+import { listEvents } from './eventlog.js';
+import { workerScopeCallRecord, type WorkerCallRecord } from './worker-call-record.js';
 import { resolveAgentBinding } from '../../agents/agent-binding.js';
 import { getRuntimeEnv } from '../../config.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
@@ -95,6 +97,8 @@ export function renderClaudeAgentWorkerSystemAppend(input: WorkerToolInput, agen
 
 export interface ClaudeAgentSdkWorkerResult {
   text: string;
+  /** The host's record of the worker's business calls. */
+  callRecord?: WorkerCallRecord;
   sdkSessionId?: string;
   model?: string;
   toolUses: string[];
@@ -174,6 +178,8 @@ export async function runClaudeAgentSdkWorker(
       } : {}),
       ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0 ? { sourceUserSeq } : {}),
     };
+    // The host's record of this run starts after everything already logged.
+    const recordAfterSeq = sid ? (listEvents(sid, { desc: true, limit: 1 })[0]?.seq ?? 0) : 0;
     const result = await runClaudeAgentSdkRouteAttempt(
       runClaudeAgentSdkImpl,
       sdkOptions,
@@ -201,8 +207,14 @@ export async function runClaudeAgentSdkWorker(
           result.text.trim() ? ` Partial: ${result.text.trim()}` : ''
         }`
       : (result.text.trim() || 'ERROR: Claude SDK worker produced no output.');
+    // The host's record of what the worker did travels beside its reply.
+    let callRecord: WorkerCallRecord | undefined;
+    try {
+      if (sid && trackerScopeId) callRecord = workerScopeCallRecord(sid, trackerScopeId, recordAfterSeq);
+    } catch { callRecord = undefined; }
     return {
       text: cappedText,
+      ...(callRecord ? { callRecord } : {}),
       sdkSessionId: result.sessionId,
       model: result.model,
       toolUses: result.toolUses,

@@ -297,7 +297,7 @@ test('guard OFF: byte-identical rollback — friendly text verbatim + base cap r
       return { text: 'I reached the turn budget. Say "continue" to keep going.', limitHit: true, toolUses: [] };
     });
     const r = await runClaudeAgentSdkWorker(researchPacket, 'claude-opus-4-8', 'sess-off');
-    assert.equal(r.text, 'I reached the turn budget. Say "continue" to keep going.', 'friendly text verbatim');
+    assert.equal(r.text.split('\n\n[Host record')[0], 'I reached the turn budget. Say "continue" to keep going.', 'friendly text verbatim');
     assert.doesNotMatch(r.text, /^ERROR:/);
     assert.equal(captured.maxTurns, 12, 'no intent widening when the guard is off');
     assert.equal(captured.workerScope, true, 'compose-only authority survives the thrash-guard rollback');

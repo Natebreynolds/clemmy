@@ -205,7 +205,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { toolNameOffered } from '../tools/browser-backend.js';
 import { parentActionsNote } from './worker-parent-actions.js';
-import type { WorkerCallRecord } from '../runtime/harness/worker-call-record.js';
+import { renderWorkerCallRecord, type WorkerCallRecord } from '../runtime/harness/worker-call-record.js';
 import { delegatedJobOwnerWords } from '../projects/delegated-owner-words.js';
 
 /**
@@ -3072,7 +3072,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       // ~8 results in a fan-out window, a compact parked digest replaces the
       // verbatim payload and shard summaries ride along in-band; small
       // fan-outs and ERROR results are byte-identical to today.
-      const reduceReturn = async (output: unknown, reuseParkedOutput = false): Promise<string> => {
+      const reduceReturn = async (output: unknown, reuseParkedOutput = false, callRecord?: WorkerCallRecord): Promise<string> => {
         const text = typeof output === 'string' ? output : String(output ?? '');
         const reduced = await buildWorkerReturn({
           sessionId,
@@ -3085,7 +3085,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         const receipt = sessionId ? executedWorkerRoute(sessionId, input.item, { packetKey, parentLogicalCallId }).executionReceipt : undefined;
         // Append outside the reducer so compact digests retain host attribution.
         // Keep ERROR/PARTIAL prefixes intact and distinguish cached reuse.
-        return receipt ? `${reduced}\n[Host execution receipt${reuseParkedOutput ? ' for reused result' : ''}: completed model response ${JSON.stringify(receipt)}.]` : reduced;
+        const withReceipt = receipt ? `${reduced}\n[Host execution receipt${reuseParkedOutput ? ' for reused result' : ''}: completed model response ${JSON.stringify(receipt)}.]` : reduced;
+        // The host's record of the worker's calls rides beside its reply, like
+        // the receipt, so the stored reply stays the worker's own words.
+        return callRecord ? `${withReceipt}\n\n${renderWorkerCallRecord(callRecord)}` : withReceipt;
       };
       const appendWorkerResultFromOutput = (
         output: unknown,
@@ -3347,8 +3350,11 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             model: sdkResult.model ?? workerModel,
             toolUses: sdkResult.toolUses,
             tokens: workerResultTokens(sdkResult.usage),
+            ...(sdkResult.callRecord
+              ? { backedByWork: sdkResult.callRecord.businessCallSucceeded || !sdkResult.callRecord.businessCallAttempted }
+              : {}),
           });
-          return await reduceReturn(sdkResult.text ?? '');
+          return await reduceReturn(sdkResult.text ?? '', false, sdkResult.callRecord);
         } catch (err) {
           if (isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
           // Claude SDK worker overloaded OR its auth expired BEFORE committing
@@ -3436,7 +3442,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           toolUses: callRecord ? Object.keys(callRecord.byTool).filter((tool) => (callRecord!.byTool[tool]?.succeeded ?? 0) > 0) : [],
           ...(callRecord ? { backedByWork: callRecord.businessCallSucceeded || !callRecord.businessCallAttempted } : {}),
         });
-        return await reduceReturn(output);
+        return await reduceReturn(output, false, callRecord);
       } catch (err) {
         if (isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;
         appendWorkerResult({ item: input.item, ok: false, model: workerModel, toolUses: [], reason: workerResultReason(err) });

@@ -1,5 +1,5 @@
 import { withAcceptedSourceSessionContext } from './source-session-context.js';
-import { renderWorkerCallRecord, workerCallRecord, type WorkerCallRecord } from './worker-call-record.js';
+import { workerCallRecord, type WorkerCallRecord } from './worker-call-record.js';
 import { parseTaskMode } from './task-mode.js';
 import { creditDelegatedExpectedWork, delegableExpectedWorkForItem, delegateExpectedWorkToChild, type DelegableExpectedWork } from './expected-work-delegation.js';
 import { discoveryGovernor } from './discovery-governor.js';
@@ -238,15 +238,13 @@ export async function runPacketWorkerWithHost(input: {
           } });
         }
       } catch { /* attribution is best-effort telemetry, never a result */ }
-      // The worker's reply travels with the host's record of what it did.
+      // The host's record of what the worker did goes to the caller, which
+      // sets it beside the reply; the reply itself stays the worker's own.
       const withCallRecord = (reply: string): string => {
         try {
-          const record = workerCallRecord(session.id, childSource.seq);
-          input.onCallRecord?.(record);
-          return `${reply}\n\n${renderWorkerCallRecord(record)}`;
-        } catch {
-          return reply;
-        }
+          input.onCallRecord?.(workerCallRecord(session.id, childSource.seq));
+        } catch { /* the record is evidence beside the reply, never the reply */ }
+        return reply;
       };
       if (outcome.hold || outcome.hasInterruptions || outcome.terminal) {
         return withCallRecord(`ERROR: worker ${input.input.item}: ${outcome.terminal?.reason ?? outcome.hold?.reason ?? 'worker_requires_parent_action'}. ${String(outcome.finalOutput ?? '')}`);

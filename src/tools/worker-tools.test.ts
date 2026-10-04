@@ -201,7 +201,7 @@ test('Claude-lane guard: a genuine answer passes through verbatim and the ok-gat
     async () => ({ text: answer, toolUses: [] }),
     () => runClaudeAgentSdkWorker(packet('Acme LLP — acme.example'), 'claude-sonnet-5', 'sess-ok'),
   );
-  assert.equal(r.text, answer, 'a real success is handed back unchanged');
+  assert.equal(r.text.split('\n\n[Host record')[0], answer, 'a real success is handed back unchanged');
   assert.equal(handlerOkGate(r.text), true);
 });
 
@@ -355,7 +355,7 @@ test('SDK-brain handler reuses a completed logical manifest item when the resume
           sessionId, callId: firstCallId, toolName: 'run_worker', settlementNonce: randomUUID(),
         }, () => handler(initial));
         assert.ok(first.content[0].text.length < 65_537, 'model-facing tool context stays bounded');
-        assert.equal(getToolOutput(sessionId, firstCallId)?.output, largeResult, 'the bounded return has a lossless exact-output handle');
+        assert.equal(String(getToolOutput(sessionId, firstCallId)?.output).split('\n\n[Host record')[0], largeResult, 'the bounded return has a lossless exact-output handle');
 
         const resumed = {
           ...initial,

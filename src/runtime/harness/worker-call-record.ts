@@ -63,6 +63,31 @@ export function workerCallRecord(sessionId: string, sourceUserSeq: number): Work
   return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0 };
 }
 
+/**
+ * The same record for a worker whose loop runs outside the host (an agent
+ * SDK child): its business calls land in the parent's session under the
+ * worker's run scope, each with the host's returned outcome. A call that did
+ * not succeed is counted as failed; the SDK lane does not separate a refusal.
+ */
+export function workerScopeCallRecord(sessionId: string, runScopeId: string, afterSeq: number): WorkerCallRecord {
+  const byTool: Record<string, WorkerToolTally> = {};
+  let businessCallSucceeded = false;
+  for (const event of listEvents(sessionId, { sinceSeq: afterSeq, types: ['tool_returned'] })) {
+    const data = event.data;
+    if (data.runScopeId !== runScopeId || data.accounting !== 'top_level' || data.topologyRole !== 'business') continue;
+    const tool = typeof data.effectiveTool === 'string' ? data.effectiveTool : typeof data.tool === 'string' ? data.tool : '';
+    if (!tool) continue;
+    const tally = (byTool[tool] ??= { succeeded: 0, failed: 0, refusedBeforeDispatch: 0 });
+    if (data.ok === false) {
+      tally.failed += 1;
+    } else {
+      tally.succeeded += 1;
+      businessCallSucceeded = true;
+    }
+  }
+  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0 };
+}
+
 /** The record as the parent reads it beside the worker's own reply. */
 export function renderWorkerCallRecord(record: WorkerCallRecord): string {
   const lines = Object.entries(record.byTool).map(([tool, t]) => {
