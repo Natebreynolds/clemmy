@@ -28,6 +28,7 @@ import pino from 'pino';
 import { createHash } from 'node:crypto';
 import { commitTurnOutcome } from './harness/delivery-committer.js';
 import { turnOutcomeId, type TurnOutcome } from './harness/turn-outcome.js';
+import { RETAINED_WORK_TERMINAL_HEADER } from './harness/retained-work-checkpoint.js';
 
 const logger = pino({ name: 'clementine-next.outcome' });
 
@@ -178,7 +179,9 @@ function boundedText(value: string | undefined, max: number): string {
   return (value ?? '').trim().slice(0, max);
 }
 
-function renderOutcomeEvidence(evidence: OutcomeEvidence | undefined): string {
+/** The run's progress facts. The model's report also carries the last raw
+ * tool failure; the owner's says what got done, in plain words. */
+function renderOutcomeEvidence(evidence: OutcomeEvidence | undefined, audience: 'model' | 'owner' = 'model'): string {
   if (!evidence) return '';
   const lines: string[] = [];
   for (const work of (evidence.work ?? []).slice(0, 4)) {
@@ -200,12 +203,21 @@ function renderOutcomeEvidence(evidence: OutcomeEvidence | undefined): string {
     const count = Math.max(0, Math.trunc(evidence.committedExternalActions));
     lines.push(`- ${count} committed external action receipt${count === 1 ? '' : 's'}`);
   }
-  const failureSummary = boundedText(evidence.lastToolFailure?.summary, 700);
+  const failureSummary = audience === 'model' ? boundedText(evidence.lastToolFailure?.summary, 700) : '';
   if (failureSummary) {
     const tool = boundedText(evidence.lastToolFailure?.tool, 120);
     lines.push(`- Last concrete tool failure${tool ? ` (${tool})` : ''}: ${failureSummary}`);
   }
-  return lines.length > 0 ? `Execution evidence:\n${lines.join('\n')}` : '';
+  if (lines.length === 0) return '';
+  return `${audience === 'owner' ? 'Done so far:' : 'Execution evidence:'}\n${lines.join('\n')}`;
+}
+
+/** Owner-facing words from a run's report text: the retained-work handle
+ * listing is for the model that resumes the work, not for the owner. */
+function ownerFacingText(text: string | undefined): string {
+  const trimmed = (text ?? '').trim();
+  const cut = trimmed.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+  return (cut >= 0 ? trimmed.slice(0, cut) : trimmed).trim();
 }
 
 /** Render the canonical report-back text. The head + prefix are stable (UI and
@@ -425,17 +437,17 @@ export function publishProactiveOutcome(sessionId: string, outcome: Outcome, ctx
  * Large results already carry their durable file reference in the outbox. */
 export function renderPublicOutcomeText(outcome: Outcome, ctx: DeliverContext): string {
   const parts: string[] = [];
-  const evidence = renderOutcomeEvidence(outcome.evidence);
+  const evidence = renderOutcomeEvidence(outcome.evidence, 'owner');
+  const summary = ownerFacingText(outcome.summary);
+  const detail = ownerFacingText(outcome.detail);
+  const blocker = ownerFacingText(outcome.blocker);
+  const nextAction = ownerFacingText(outcome.nextAction);
   if (outcome.status !== 'done' && evidence) parts.push(evidence);
-  if (outcome.summary?.trim()) parts.push(outcome.summary.trim());
-  if (outcome.detail?.trim() && outcome.detail.trim() !== outcome.summary?.trim()) parts.push(outcome.detail.trim());
+  if (summary) parts.push(summary);
+  if (detail && detail !== summary) parts.push(detail);
   if (outcome.status === 'done' && evidence) parts.push(evidence);
-  if (outcome.blocker?.trim() && !parts.some(part => part.includes(outcome.blocker!.trim()))) {
-    parts.push(outcome.blocker.trim());
-  }
-  if (outcome.nextAction?.trim() && !parts.some(part => part.includes(outcome.nextAction!.trim()))) {
-    parts.push(outcome.nextAction.trim());
-  }
+  if (blocker && !parts.some(part => part.includes(blocker))) parts.push(blocker);
+  if (nextAction && !parts.some(part => part.includes(nextAction))) parts.push(nextAction);
   return parts.join('\n\n') || `${ctx.title || ctx.sourceLabel}: ${DEFAULT_HEAD_WORDS[outcome.status]}.`;
 }
 

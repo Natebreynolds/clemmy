@@ -440,3 +440,26 @@ test('deliverOutcome: a source resumed after a stop that stops again reports aga
   assert.equal(deliverOutcome({ status: 'failed', detail: 'first' }, plain), true);
   assert.equal(deliverOutcome({ status: 'failed', detail: 'second' }, plain), false);
 });
+
+test('the owner-facing report says what got done and what is next, without raw tool failures or retained-work handles', () => {
+  const lead = 'This task reached its configured active-time limit. Completed work is saved.\n\nRetained work (durable checkpoint):\n- Source/tool list_files: completed result retained as rh_0123456789abcdef.';
+  const outcome = {
+    status: 'blocked' as const,
+    detail: lead,
+    evidence: {
+      artifacts: [{ kind: 'local file', ref: '/workspace/audit/draft.html', verified: true }],
+      lastToolFailure: { tool: 'file_query', summary: 'ERROR: stored output for call id "toolu_01X" cannot be used.' },
+    },
+    blocker: 'The step budget ran out.',
+    nextAction: 'Resume to keep going.',
+  };
+  const owner = renderPublicOutcomeText(outcome, ctx({ sourceId: 'bg-owner-words' }));
+  assert.match(owner, /^Done so far:\n- Saved local file: \/workspace\/audit\/draft\.html \(read back\)/);
+  assert.match(owner, /Completed work is saved\./);
+  assert.match(owner, /Resume to keep going\./);
+  assert.doesNotMatch(owner, /Execution evidence|Last concrete tool failure|toolu_|Retained work|rh_0123/);
+  // The model-facing report keeps every diagnostic for the model that resumes.
+  const model = renderOutcomeText(outcome, ctx({ sourceId: 'bg-owner-words' }));
+  assert.match(model, /Last concrete tool failure \(file_query\)/);
+  assert.match(model, /Retained work/);
+});
