@@ -1,4 +1,5 @@
 import { withAcceptedSourceSessionContext } from './source-session-context.js';
+import { renderWorkerCallRecord, workerCallRecord, type WorkerCallRecord } from './worker-call-record.js';
 import { parseTaskMode } from './task-mode.js';
 import { creditDelegatedExpectedWork, delegableExpectedWorkForItem, delegateExpectedWorkToChild, type DelegableExpectedWork } from './expected-work-delegation.js';
 import { discoveryGovernor } from './discovery-governor.js';
@@ -41,6 +42,8 @@ export async function runPacketWorkerWithHost(input: {
   signal?: AbortSignal;
   /** Outside actions this worker was refused because only its parent may run them. */
   onParentActions?: (tools: string[]) => void;
+  /** The host's record of the calls this worker made, once it has run. */
+  onCallRecord?: (record: WorkerCallRecord) => void;
 }): Promise<string> {
   const parent = harnessRunContextStorage.getStore();
   const parentTaskId = acceptedTaskIdFor(input.parentSessionId, input.sourceUserSeq);
@@ -235,13 +238,23 @@ export async function runPacketWorkerWithHost(input: {
           } });
         }
       } catch { /* attribution is best-effort telemetry, never a result */ }
+      // The worker's reply travels with the host's record of what it did.
+      const withCallRecord = (reply: string): string => {
+        try {
+          const record = workerCallRecord(session.id, childSource.seq);
+          input.onCallRecord?.(record);
+          return `${reply}\n\n${renderWorkerCallRecord(record)}`;
+        } catch {
+          return reply;
+        }
+      };
       if (outcome.hold || outcome.hasInterruptions || outcome.terminal) {
-        return `ERROR: worker ${input.input.item}: ${outcome.terminal?.reason ?? outcome.hold?.reason ?? 'worker_requires_parent_action'}. ${String(outcome.finalOutput ?? '')}`;
+        return withCallRecord(`ERROR: worker ${input.input.item}: ${outcome.terminal?.reason ?? outcome.hold?.reason ?? 'worker_requires_parent_action'}. ${String(outcome.finalOutput ?? '')}`);
       }
       const text = normalizeWorkerOutput(outcome.finalOutput);
       completed = !/^\s*(?:ERROR|PARTIAL):/i.test(text);
       input.onParentActions?.(workerComposeOnlyActions({ sessionId: session.id, sinceSeq: childSource.seq }));
-      return text;
+      return withCallRecord(text);
     }), { newlyAccepted: true });
   } catch (error) {
     // A child failure is an item result, never an exception that can poison

@@ -205,6 +205,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 import { pendingActionRequiresHumanApproval } from '../runtime/harness/pending-action-policy.js';
 import { toolNameOffered } from '../tools/browser-backend.js';
 import { parentActionsNote } from './worker-parent-actions.js';
+import type { WorkerCallRecord } from '../runtime/harness/worker-call-record.js';
 import { delegatedJobOwnerWords } from '../projects/delegated-owner-words.js';
 
 /**
@@ -2892,6 +2893,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     maxTurnsForItem: number,
     dispatchLeaseOverride?: DispatchLeaseRef,
     signal?: AbortSignal,
+    onCallRecord?: (record: WorkerCallRecord) => void,
   ): Promise<unknown> => {
     const parent = harnessRunContextStorage.getStore();
     const sessionId = parent?.sessionId ?? extractSessionId(ctx) ?? '';
@@ -2908,6 +2910,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       mcpToolScope: scope, dispatchLease: dispatchLeaseOverride ?? parent?.dispatchLease,
       ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
       onParentActions: (tools) => { parentActions = tools; },
+      ...(onCallRecord ? { onCallRecord } : {}),
     });
     const note = parentActionsNote(parentActions);
     return note ? `${text}\n\n${note}` : text;
@@ -3023,9 +3026,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         reason?: string;
         preRun?: boolean;
         checkpointManifest?: boolean;
+        /** From the host's record: false when the worker tried business work
+         * and none of it succeeded. */
+        backedByWork?: boolean;
       }): void => {
         if (!sessionId) return;
-        const { preRun, checkpointManifest = true, ...eventData } = data;
+        const { preRun, checkpointManifest = true, backedByWork, ...eventData } = data;
+        // A success whose business calls all failed or never ran is the
+        // worker's account alone; it is not kept for reuse, so a rerun redoes it.
+        const banked = data.ok && backedByWork !== false;
         let resultEvent: ReturnType<typeof appendEvent> | undefined;
         batchLease?.assertCurrent();
         try {
@@ -3038,13 +3047,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
               sessionId,
               manifestBinding,
               input.item,
-              data.ok ? 'succeeded' : 'failed',
+              banked ? 'succeeded' : 'failed',
               {
                 attemptId: batchLease ? `${batchLease.generationId}:${packetKey}` : toolCallId ?? packetKey,
-                ...(data.ok && resultEvent
+                ...(banked && resultEvent
                   ? { evidence: [{ kind: 'worker_result', ref: `event:${resultEvent.seq}` }] }
                   : {}),
-                ...(data.reason ? { reason: data.reason } : {}),
+                ...(data.reason ? { reason: data.reason }
+                  : data.ok && !banked ? { reason: 'none of the worker\'s business calls succeeded; its account is unverified' } : {}),
               },
             );
           } catch { /* manifest visibility is best-effort */ }
@@ -3079,7 +3089,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       };
       const appendWorkerResultFromOutput = (
         output: unknown,
-        data: { model?: string | null; toolUses?: string[]; tokens?: number } = {},
+        data: { model?: string | null; toolUses?: string[]; tokens?: number; backedByWork?: boolean } = {},
       ): void => {
         const text = typeof output === 'string' ? output : String(output ?? '');
         const ok = !workerResultIndicatesFailure(text);
@@ -3408,6 +3418,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (!runContext) throw new Error('run_worker requires an SDK run context');
       try {
         assertWorkerMayStart();
+        let callRecord: WorkerCallRecord | undefined;
         const output = await invokeWorkerWithOwnBudget(
           input,
           workerModel,
@@ -3416,10 +3427,15 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           resolveWorkerMaxTurns(input.intent, workerMaxTurns),
           batchLease?.dispatchLease,
           batchLease?.signal,
+          (record) => { callRecord = record; },
         );
         batchLease?.assertCurrent();
         recordWorkerSubagent(typeof output === 'string' ? output : String(output ?? ''), workerModel);
-        appendWorkerResultFromOutput(output, { model: workerModel, toolUses: [] });
+        appendWorkerResultFromOutput(output, {
+          model: workerModel,
+          toolUses: callRecord ? Object.keys(callRecord.byTool).filter((tool) => (callRecord!.byTool[tool]?.succeeded ?? 0) > 0) : [],
+          ...(callRecord ? { backedByWork: callRecord.businessCallSucceeded || !callRecord.businessCallAttempted } : {}),
+        });
         return await reduceReturn(output);
       } catch (err) {
         if (isWorkerBatchGenerationCancellation(err, batchLease?.signal)) throw err;

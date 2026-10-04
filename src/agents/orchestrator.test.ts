@@ -922,7 +922,8 @@ test('run_worker invokes the host Worker on the routed intent model (offline pro
       },
     )), Date.now() + 300_000);
 
-    assert.equal(result, 'worker finished on routed model');
+    assert.equal(String(result).split('\n\n[Host record')[0], 'worker finished on routed model');
+    assert.match(String(result), /\[Host record of this worker's calls — written by Clementine, not the worker\]/);
     assert.ok(requestedModels.includes('minimax-01'), `expected nested Worker to request minimax-01, got ${requestedModels.join(', ')}`);
     const routed = listEvents(session.id, { types: ['worker_model_routed'] });
     assert.equal(routed.length, 1);
@@ -1137,7 +1138,8 @@ test('run_worker route and result telemetry use the effective post-repair BYO mo
       },
     ));
 
-    assert.equal(result, 'worker finished after route repair');
+    assert.equal(String(result).split('\n\n[Host record')[0], 'worker finished after route repair');
+    assert.match(String(result), /\[Host record of this worker's calls — written by Clementine, not the worker\]/);
     assert.deepEqual(requestedModels, ['glm-5.2']);
 
     const started = listEvents(session.id, { types: ['worker_started'] });
@@ -1266,7 +1268,8 @@ test('a Claude brain executes a durable Codex worker binding on the host worker 
       },
     ));
 
-    assert.equal(result, 'codex worker completed under claude brain');
+    assert.equal(String(result).split('\n\n[Host record')[0], 'codex worker completed under claude brain');
+    assert.match(String(result), /\[Host record of this worker's calls — written by Clementine, not the worker\]/);
     assert.deepEqual(requestedModels, ['gpt-5.4']);
     const started = listEvents(session.id, { types: ['worker_started'] });
     assert.equal((started[0]?.data as { model?: string }).model, 'gpt-5.4');
@@ -1396,7 +1399,8 @@ test('a Plan delegates Claude investigation through the host with inherited high
       },
     ));
 
-    assert.equal(result, 'planning worker completed under claude brain');
+    assert.equal(String(result).split('\n\n[Host record')[0], 'planning worker completed under claude brain');
+    assert.match(String(result), /\[Host record of this worker's calls — written by Clementine, not the worker\]/);
     assert.deepEqual(requestedModels, ['claude-sonnet-5']);
     const started = listEvents(session.id, { types: ['worker_started'] });
     assert.equal((started[0]?.data as { model?: string }).model, 'claude-sonnet-5');
@@ -1477,7 +1481,8 @@ test('fresh-host run_worker invokes a host-owned child before any plan is compil
     const input = JSON.stringify(packet);
     const result = await withAnchoredDispatch(session.id, anchor, () => runWorker.invoke(runContext, input,
       { toolCall: { name: 'run_worker', callId: 'fresh-host-worker', arguments: input } }));
-    assert.equal(result, nonce);
+    assert.equal(String(result).split('\n\n[Host record')[0], nonce);
+    assert.match(String(result), /\[Host record of this worker's calls — written by Clementine, not the worker\]/);
     assert.equal(modelCalls, 2);
     assert.match(requests[1]!, new RegExp(nonce), 'the actual tool result reaches the child');
     const routed = listEvents(session.id, { types: ['worker_model_routed'] });
