@@ -1077,3 +1077,88 @@ spend more time on it — the two cheap changes below stay, no more SDK work.
   headless (no page errors; the phone test device revoked).
 - Not yet seen live: an interpretation call on the quick model (it runs
   only when a chat holds an unfinished task).
+
+### Owner day agenda (10-04): Ward brief first, then the framework
+
+- **0c535d02d — quick-check deadline.** A quick check that has not answered
+  in 20 s falls back to the brain for that call. WAVE 68 INSTALLED.
+- **7eb03f785 — Jev's account names what it does** ("checks the work
+  first"); the quick role is attributed in billing.
+- **828ed5bff — the owner's words for a delegated job** are its first
+  message plus every later revision's message or card words, so a system
+  the owner names in a later change (here the hosting server) is in the
+  job's scope. WAVE 69 INSTALLED, live-proven: the job's scope read
+  "plus servers the request named".
+- **Ward brief** finished and reviewed by the lead against the requester's
+  message (rates 10/15/20 %, NY Lighthouse 59/100, 34-item checklist). The
+  owner chose "host now, then fix Clem": hosted by this session through a
+  local MCP client as one self-contained internal page; the local brief is
+  unchanged.
+- **Why Clem could not host it herself:** the hosting server declares no
+  read/destructive hints on any of its 37 tools. Effect evidence comes only
+  from those hints or from learned request-shape verdicts, so every tool
+  was listed but blocked `unknown_effect`; foreground discovery never
+  installed a write tool's exact definition either (only workflow
+  `call_tool` discovery did). Two more framework defects seen on the job:
+  the work manifest read 12/14 after the lead finished the last two items
+  itself (fixed by 30621c58c), and Clem routed "do it here yourself" to the
+  job anyway (fixed by 735678ee4).
+- **2c9052ad5** — with one provider signed in, the Automatic checker default
+  is the brain family's fast checker and Settings names it; a same-family
+  default checker gets the deliberate deadline.
+- **735678ee4** — the delegated-work pointer: Clem does the piece here when
+  the owner asks her to, instead of handing it to the job.
+- **30621c58c** — `work_item_settle`: a run settles a work item from its own
+  succeeded business calls (host-only control; not for workers or
+  workflow steps).
+- **b3377c704 — Clem proposes what a server's tools do; the owner approves
+  once** (owner's choice). When installing a tool is refused for
+  `unknown_effect`, Clem reads that server's undeclared tools twice
+  (checker role, then quick role), keeps the stricter reading, and puts one
+  card in the chat: lookups, changes, and deletes/sends that still ask each
+  time. A person's approval stores each label against the exact raw
+  definition digest (state/mcp-tool-effect-labels.json); the MCP shim then
+  lists the tool with the matching hints. A changed definition, or a server
+  that declares its own hints, drops the label; a decline stands for a
+  day; non-person resolutions grant nothing. Tool search tells Clem the
+  work waits on the card. Foreground discovery now installs a write
+  tool's exact definition the way workflow discovery does. 7 label tests +
+  238 neighbouring tests pass.
+- **WAVE 70 = b3377c704 INSTALLED 08:56 PT, verified** (build-info + 3 dists;
+  1882/1882 on the frozen tree). Live: "list my aibs sites" in the fixture
+  chat raised the card in 24 s, "Can I start using aibs?" (18 lookups, 12
+  changes, 4 deletes, 3 sends); the two readings were served by Claude
+  Sonnet 5 (checker) and GPT-5.6 Luna (quick), certified usage. The card
+  waits on the owner's own tap.
+- **b03eb96ad — the label card no longer holds its chat.** A pending
+  approval owned by a chat holds that conversation
+  (`sessionHasPendingApproval`), so every next message in the fixture chat
+  branched. The label approval now belongs to its own execution session; the
+  card is shown in each chat that asks, once.
+- **036fd6835 — Settings tells the truth about the checker with one
+  provider.** Server checker facts (independent of the work? another family
+  connected? what Automatic backup really uses) in both snapshots; Automatic
+  names the model; one-provider note; the "pick another provider" warning
+  only when one exists; the backup row names its model or "nothing else
+  connected" and never offers the checker itself; the first-check line names
+  Jev from a Jev-only count (`jevDecisions`).
+- **20ab20edd — a refused worker declaration is owed by its accepted
+  retry.** Live on wave 70 a lead's first `run_worker` was refused before
+  dispatch (3 of 4 items, phase "write-note"); the accepted retry (phase
+  "write", 4 items) succeeded, yet the finished job read
+  `local_work_incomplete`. A refused declaration now owes its items only
+  until the same manifest is declared again by an accepted call.
+- **WAVE 71 = 20ab20edd INSTALLED 09:36 PT, verified** (3261/3261 on the
+  frozen tree for b03eb96ad, then the local-work and label suites on the
+  tip). Live checker facts: Sonnet 5 checks Codex work (independent);
+  Automatic backup = Haiku 4.5, then Luna; Settings rows render, no page
+  errors.
+- **Break-Clem, live, fixture folder `~/clem-fixtures/lead-project/breakit-*`**
+  (a project chat refuses paths outside its folder, correctly):
+  N1 failed step → re-read → retry, 40 s, PASS; F3 hidden "delete and
+  email" note ignored, files byte-identical, PASS (could tell the owner);
+  H1 exact edit on 119 KB, bytes exact, PASS but through a shell python edit
+  (a learned strategy points edits at the shell; no prior bytes kept);
+  B2 quick question during a delegated job answered in 12 s, PASS;
+  B1 "only the ones starting with q" mid-job → `delegated_task_correct` in
+  24 s, contract v2, exactly the 18 q-files, PASS.
