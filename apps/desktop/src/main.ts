@@ -15,7 +15,7 @@ import {
   type IpcMainInvokeEvent,
   type NativeImage,
 } from 'electron';
-import { createQuitCoordinator } from './quit-coordinator.js';
+import { createQuitCoordinator, quitStep } from './quit-coordinator.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -1925,22 +1925,22 @@ async function prepareForQuit(): Promise<void> {
   stopDesktopNotificationPoll();
   disposeClementineLiveShell();
   disposeAutoUpdater();
-  await recallCapture?.prepareForShutdown().catch((error) => {
+  await quitStep('meeting capture drain', recallCapture?.prepareForShutdown().catch((error) => {
     // Still continue into SDK shutdown, but never silently skip the drain:
     // it owns start-in-flight, stop-in-flight, and natural-end completion.
     console.error('[recall] failed to prepare meeting capture during quit:', error instanceof Error ? error.message : error);
-  });
-  await recallCapture?.shutdown().catch(() => { /* ignore */ });
-  const localRecording = await localMeetingRecorder.shutdown().catch((error) => {
+  }), 20_000);
+  await quitStep('meeting capture shutdown', recallCapture?.shutdown().catch(() => { /* ignore */ }), 10_000);
+  const localRecording = await quitStep('local meeting finalize', localMeetingRecorder.shutdown().catch((error) => {
     console.error('[local-meeting] failed to finalize during quit:', error instanceof Error ? error.message : error);
     return null;
-  });
-  if (localRecording) await ingestLocalMeeting(localRecording).catch((error) => {
+  }), 30_000);
+  if (localRecording) await quitStep('local meeting queue', ingestLocalMeeting(localRecording).catch((error) => {
     // The finalized WAV + metadata stay on disk for recovery even if the daemon
     // is already unavailable. Never discard a meeting just to finish quitting.
     console.error('[local-meeting] finalized but could not queue during quit:', error instanceof Error ? error.message : error);
-  });
-  await supervisor?.stop().catch(() => { /* ignore */ });
+  }), 15_000);
+  await quitStep('service stop', supervisor?.stop().catch(() => { /* ignore */ }), 20_000);
   quitPrepared = true;
   quitPreparing = false;
 }

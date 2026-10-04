@@ -60,3 +60,21 @@ export function createQuitCoordinator(deps: {
     get prepared() { return prepared; },
   };
 }
+
+/** A quit step that never settles must not keep the app open: past its
+ * deadline the quit moves on and says which step did not finish. */
+export async function quitStep<T>(label: string, work: Promise<T> | undefined, ms: number): Promise<T | undefined> {
+  if (!work) return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => {
+      console.error(`[quit] ${label} did not finish within ${Math.round(ms / 1000)}s; quitting without it`);
+      resolve(undefined);
+    }, ms);
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

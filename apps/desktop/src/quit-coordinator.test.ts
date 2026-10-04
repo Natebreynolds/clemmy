@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { EventEmitter } from 'node:events';
-import { createQuitCoordinator } from './quit-coordinator.js';
+import { createQuitCoordinator, quitStep } from './quit-coordinator.js';
 
 /** An app whose quit() emits before-quit synchronously, as Electron's does. */
 function fakeApp(prepareMs: number) {
@@ -64,4 +64,21 @@ test('a preparation step that throws still lets the app exit', async () => {
   app.quit();
   await coordinator.quitCleanly().catch(() => undefined);
   assert.equal(app.exited, true);
+});
+
+test('a quit step that never settles stops holding the quit at its deadline', async () => {
+  const errors: unknown[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.join(' ')); };
+  try {
+    const hung = new Promise<string>(() => { /* never settles */ });
+    const started = Date.now();
+    assert.equal(await quitStep('meeting capture drain', hung, 50), undefined);
+    assert.ok(Date.now() - started < 1000, 'the quit moved on at the deadline');
+    assert.match(String(errors[0]), /meeting capture drain did not finish/);
+    assert.equal(await quitStep('service stop', Promise.resolve('stopped'), 50), 'stopped', 'a step that settles keeps its result');
+    assert.equal(await quitStep('absent step', undefined, 50), undefined);
+  } finally {
+    console.error = original;
+  }
 });
