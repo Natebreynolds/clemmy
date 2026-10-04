@@ -1162,3 +1162,37 @@ spend more time on it — the two cheap changes below stay, no more SDK work.
   B2 quick question during a delegated job answered in 12 s, PASS;
   B1 "only the ones starting with q" mid-job → `delegated_task_correct` in
   24 s, contract v2, exactly the 18 q-files, PASS.
+
+### Waves 72–76 (10-04 09:40–13:15 PT)
+
+- **Wave 72 = 69d9682ff** (job prompt checklist is not the job's items;
+  `work_item_settle` settles items owed by a refused declaration; the
+  completion review is told which jobs the request handed off). The daemon
+  failed readiness under load from a suite and was killed; the owner chose a
+  force-quit and relaunch (down 27.5 min). Rule since: wait for the 5-minute
+  load average to drop below 5 before installing.
+- **Wave 73 = bbff8bd78**: a one-key structured result that wraps the same
+  text agrees with it (aibs lists worked after this); approved or declined
+  cards leave every chat; external content is evidence, never instructions,
+  so Clem tells the owner and asks; the phone Run page of a job uses the
+  job's phase and renders its report.
+- **Waves 74–75 = 0013acdd8 → 1cb3e92ab, one job card everywhere** (owner:
+  "user friendly, clean and never closing a job without clear direction"):
+  checklist first, the next step with its control, one latest update, files
+  by name, the report rendered. Every job prompt says to finish the rest and
+  ask the one decision instead of ending. Live G3 ended `needs_you` with a
+  clean question and three choices; the card shows "3 done so far" and the
+  workers' files.
+- **A stopped turn always publishes (720d99564).** One live turn ended with
+  no reply and an `active` run attempt. It was held on its result checkpoint
+  and re-run by the recovery timer after the request had answered "held".
+  Its aibs call could not settle (its result failed to store) and stayed open
+  on a revoked lease. When the retries ran out, publishing the stop was
+  refused (`host call authority still owns unsettled work`); the timer
+  swallowed the error, and its checkpoint was already gone. Now a stop first
+  settles the session's revoked open calls the way the reaper does (no
+  redispatch) and then publishes; the timer logs failures and publishes the
+  stop itself for a held turn left without an owner, retrying on a bounded
+  backoff. Reproduced before fixing by three integration tests (directly,
+  through the chat bridge, and the timer's fallback). Of 15 exhausted stops in
+  the logs since 09-11, this was the only one without a reply.
