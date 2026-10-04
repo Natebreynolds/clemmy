@@ -947,3 +947,38 @@ learned) proving workers run it and the type becomes a learned read.
 - Ward audit: lead finished 03:24Z — "built and passed local QA", index.html
   159 KB, nothing deployed; gap = 6/7 on-page URLs + NY Lighthouse (workers
   were compose-only for those request types, fixed by wave 57).
+
+### Owner: "are all these fixes across all lanes?" — extend them to every lane
+
+Lanes: the host harness (Clem's loop) runs every brain and host-lane worker;
+the Claude Agent SDK brain lane is retired in production; workflow runs ride
+the host loop. The Claude SDK WORKER lane only takes a Claude worker whose
+parent turn did NOT come from the host planner (`!hostFreshPlanning &&
+!planMode`); every production chat and delegated job comes from the host
+planner, so a Claude user's workers run on the host harness too. Live home:
+the SDK worker lane last ran 09-21 (11 events in 30 days). Owner: don't
+spend more time on it — the two cheap changes below stay, no more SDK work.
+
+- **Worker honesty record on the SDK worker lane — de7d3a7d0.** An SDK
+  worker's business calls land in the parent session under its run scope
+  (`<session>::worker:<packetKey>`, `tool_returned`, top-level business);
+  `workerScopeCallRecord` reads them, the result carries the same host record
+  and the plan banks it only when backed by work. The record now rides
+  BESIDE the reply (after the execution receipt) on both lanes, not inside
+  it: inside it, a long reply lost its raw tail in the lossless store (the
+  100-item journey: 101 of 102 raw outputs; wave 58 shipped that regression
+  on the host lane — this fixes it). Tests 131/131 incl. the journey.
+- **One rule for worker authority — 12834f75d.** `workerMayActAsLead` +
+  `ownerRunsInAutoMode` live in `worker-lead-authority.ts`, called by every
+  lane; a leased tool matches by canonical identity (`mcp__` carrier and case
+  no longer matter; alias-confusable servers still do not match). The SDK
+  approval gate no longer raises a card for a worker: a call that needs the
+  owner returns WORKER_COMPOSE_ONLY to the parent, recorded under the
+  worker's scope. Native external MCP calls in the SDK lane are refused
+  before any gate (FOREIGN_MCP_DIRECT_EXECUTION_DENIED) — outside calls go
+  through the local work_call/call_tool carrier.
+- **Bridge thrown capacity error — 88bfe95f4.** A chat turn that dies on a
+  provider capacity refusal stores the owner-facing capacity text.
+- **Workflow report-back: not a gap.** A run's report envelope is immutable
+  for the run's life (one terminal report per run); parks go through the
+  awaiting-input question path; a re-run is a new run with its own report.
