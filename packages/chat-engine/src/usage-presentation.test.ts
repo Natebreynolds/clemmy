@@ -142,7 +142,7 @@ test('a readable balance becomes the meter line; the OpenAI key and Jev get mete
     codex: { connected: false },
     claude: { connected: false },
     openai: { connected: true, billing: { url: 'https://openai.example/billing', kind: 'prepaid', roles: ['memory_search'] } },
-    jev: { connected: true, billing: { url: 'https://typesafe.example/billing', kind: 'prepaid', roles: ['quick_checks'] } },
+    jev: { connected: true, billing: { url: 'https://typesafe.example/billing', kind: 'prepaid', roles: ['first_checks'] } },
     byoProviders: [{ id: 'moonshot', label: 'Moonshot', connected: true, billing: { balance: { amount: 49.5, currency: 'USD', capturedAt: now } } }],
     spendToday: { date: '2026-09-24', byProvider: { jev: { tokens: 90_000, calls: 300 } } },
   });

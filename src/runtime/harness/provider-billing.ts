@@ -38,7 +38,7 @@ export interface AccountBilling {
   /** What the provider has billed this calendar month, in its own figures. */
   monthSpend?: MoneyReading;
   /** Jobs this account is doing now: brain, writer, judge, worker, memory,
-   *  quick_checks, memory_search. */
+   *  first_checks, memory_search. */
   roles?: string[];
 }
 
@@ -243,7 +243,7 @@ function rolesByAccountNow(): Map<string, string[]> {
     if (!list.includes(role)) list.push(role);
     out.set(account, list);
   };
-  for (const role of ['brain', 'worker', 'judge'] as const) {
+  for (const role of ['brain', 'worker', 'judge', 'quick'] as const) {
     try { add(accountForModel(resolveRoleModel(role).modelId), role); } catch { /* unresolved role names no account */ }
   }
   try { add(accountForModel(boundWriterModel()?.modelId ?? ''), 'writer'); } catch { /* no writer bound */ }
@@ -308,7 +308,7 @@ export function buildAccountBilling(now = Date.now()): Record<string, AccountBil
   // memory runs on the local model by default (owner 09-26).
   const openAiRoles = activeEmbeddingProviderName() === 'openai' ? ['memory_search'] : [];
   out[OPENAI_KEY_ACCOUNT_ID] = assemble(OPENAI_KEY_ACCOUNT_ID, BY_ACCOUNT[OPENAI_KEY_ACCOUNT_ID], openAiRoles);
-  out[JEV_ACCOUNT_ID] = assemble(JEV_ACCOUNT_ID, BY_ACCOUNT[JEV_ACCOUNT_ID], ['quick_checks']);
+  out[JEV_ACCOUNT_ID] = assemble(JEV_ACCOUNT_ID, BY_ACCOUNT[JEV_ACCOUNT_ID], ['first_checks']);
   return out;
 }
 

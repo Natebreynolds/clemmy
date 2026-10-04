@@ -14,6 +14,7 @@
  * key read it, and what the account is doing for Clem right now.
  */
 import { MEMORY_ROLE_WORDS } from './memory-work.js';
+import { QUICK_ROLE_WORDS } from './model-role-words.js';
 
 export interface UsageWindowLike { usedPercent: number; resetAt?: number; windowMinutes?: number }
 export interface UsageLimitLike { limit: number; remaining: number; resetAt?: number }
@@ -22,7 +23,7 @@ export interface UsageSpendLike { tokens: number; calls: number }
 
 /** An account's money side, as the daemon reports it. `roles` are the jobs
  *  the account is doing right now (brain, writer, judge, worker, memory,
- *  quick_checks, memory_search). */
+ *  first_checks, memory_search). */
 export interface UsageBillingLike {
   url?: string;
   kind?: 'prepaid' | 'plan';
@@ -152,7 +153,9 @@ const ROLE_WORDS: Record<string, string> = {
   worker: 'helps in parallel',
   // The memory role's own title, in the same lower-case voice as its siblings.
   memory: MEMORY_ROLE_WORDS.title.toLowerCase(),
-  quick_checks: 'quick checks',
+  quick: QUICK_ROLE_WORDS.title.toLowerCase(),
+  // Jev answers a finished-work review first; the checker decides the rest.
+  first_checks: 'checks the work first',
   memory_search: 'memory search',
 };
 
