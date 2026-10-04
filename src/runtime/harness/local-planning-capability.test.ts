@@ -677,6 +677,14 @@ test('exact tool_search rows disclose bounded durable local refs; a destructive 
           destructive: false,
           destinationPosture: 'named_existing',
         },
+        {
+          variantId: 'replace',
+          capabilityRef: 'cap:local:write_file:replace',
+          effect: 'local_write',
+          reversibility: 'reversible',
+          destructive: false,
+          destinationPosture: 'named_existing',
+        },
       ], 'tool_search must disclose all frozen choices before work_call arguments');
     }
   }
@@ -715,8 +723,8 @@ test('exact tool_search rows disclose bounded durable local refs; a destructive 
       : []);
   assert.equal(
     durable.length,
-    POSITIVE_NAMES.length + 3,
-    'write_file contributes create, append, and overwrite rows under one configured name; workflow_delete its confirmed row',
+    POSITIVE_NAMES.length + 4,
+    'write_file contributes create, append, overwrite, and replace rows under one configured name; workflow_delete its confirmed row',
   );
   for (const [name, ref] of refs) {
     const row = durable.find((entry) => entry.capabilityRef === ref);

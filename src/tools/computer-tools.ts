@@ -1356,6 +1356,9 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
   if (writeTargetsAuthorizationState(filePath) || writeTargetsAuthorizationState(canonicalTarget)) {
     return `Refused to write ${filePath}: Clementine authorization state cannot be mutated through write_file. Use the purpose-built approval, pending-action, workflow, or settings tools instead.`;
   }
+  if (input.mode === 'replace' && input.append != null) {
+    return new InvalidArgumentsPreDispatchResult('mode="replace" changes one passage and takes no append flag; leave append null. No file content was changed.') as unknown as string;
+  }
   // The explicit `append` flag wins over `mode`: true → append (create if
   // absent), false → overwrite (start a fresh chunked file). null → use `mode`.
   const mode = input.append === true ? 'append'
@@ -1376,6 +1379,7 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
       ? (value: Parameters<typeof commitLocalFileRevision>[0]) => recoverLocalFileRevision({ ...value, operationKey: options.operationKey! })
       : commitLocalFileRevision;
     revision = revise({ target: canonicalTarget, content: input.content, mode, expectedContentDigest,
+      ...(mode === 'replace' ? { find: input.find ?? '' } : {}),
       ...(options?.operationKey ? { operationKey: options.operationKey } : {}) });
   }
   catch (error) {
@@ -1387,7 +1391,9 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
   const notice = workspaceAuthoringNotice(filePath);
   const text = revision.unchanged
     ? `No changes needed for ${filePath} (${input.content.length} chars already present).`
-    : `${mode === 'append' ? 'Appended' : mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
+    : mode === 'replace'
+      ? `Replaced one passage in ${filePath} (${(input.find ?? '').length} chars → ${input.content.length} chars); the rest of the file is unchanged.`
+      : `${mode === 'append' ? 'Appended' : mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
   return withHostLocalWriteCommitFromFile({ ...revision,
     result: [text, revision.previousPath ? `Previous bytes retained at ${revision.previousPath}.` : null, notice].filter(Boolean).join('\n\n') });
 }
@@ -1558,6 +1564,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       'Missing parent directories are created automatically inside the allowed workspace; a separate directory-creation step is unnecessary.',
       'mode=append appends content to the existing file, adding a newline boundary when needed.',
       'mode=overwrite replaces the entire file; use only when the user asks to replace it or after reading the current file and preparing the full replacement.',
+      'mode=replace changes one passage of an existing file: `find` is the exact text, which must appear exactly once, and `content` replaces it; the rest of the file is kept. Prefer it to overwrite for an edit to part of a file. Several edits are several calls.',
       'A successful write retains the prior bytes for recovery and returns a receipt for the committed file. Send the complete content when it fits your response budget; append is available when you need to continue a large file.',
       'append:true appends content (creating the file if absent); append:false replaces it. Leave append null to use mode.',
       'Installed skill source files under ~/.clementine-next/skills/<skill>/ are read-only; generated artifacts belong under output/, outputs/, runs/, artifacts/, reports/, or tmp/.',

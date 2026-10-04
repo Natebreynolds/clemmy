@@ -138,3 +138,23 @@ test('an admitted correction checks prior bytes under the file lock and preserve
   assert.equal(readFileSync(revised.previousPath!, 'utf8'), 'First draft\n');
   assert.equal(readFileSync(target, 'utf8'), 'Correction\n');
 });
+
+test('replace changes one passage under the lock, keeps the preimage, and a replay recovers instead of editing again', () => {
+  const target = path.join(workspace, 'brief.html');
+  writeFileSync(target, '<p>alpha</p>\n<p>beta</p>\n');
+  const input = { target, mode: 'replace' as const, find: '<p>beta</p>', content: '<p>gamma</p>', operationKey: 'replace-op-1' };
+  const first = files.commitLocalFileRevision(input);
+  assert.equal(first.unchanged, false);
+  assert.equal(readFileSync(target, 'utf8'), '<p>alpha</p>\n<p>gamma</p>\n');
+  assert.ok(first.previousPath && readFileSync(first.previousPath, 'utf8') === '<p>alpha</p>\n<p>beta</p>\n',
+    'the bytes before the edit are retained for recovery');
+  // The same occurrence again (a crash replay): the passage is gone now, but the
+  // recorded operation answers it; nothing is edited twice.
+  const replay = files.recoverLocalFileRevision(input);
+  assert.equal(replay.unchanged, true);
+  assert.equal(readFileSync(target, 'utf8'), '<p>alpha</p>\n<p>gamma</p>\n');
+  // A new request for the vanished passage is refused before any change.
+  assert.throws(() => files.commitLocalFileRevision({ ...input, operationKey: 'replace-op-2' }),
+    (error: unknown) => error instanceof files.LocalFileRevisionConflict && /was not found/.test((error as Error).message));
+  assert.equal(readFileSync(target, 'utf8'), '<p>alpha</p>\n<p>gamma</p>\n');
+});

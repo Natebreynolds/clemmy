@@ -86,7 +86,9 @@ type Revision = {
 type LocalFileRevisionInput = {
   target: string;
   content: string;
-  mode: 'create' | 'append' | 'overwrite';
+  mode: 'create' | 'append' | 'overwrite' | 'replace';
+  /** For replace: the exact text that must appear once; `content` replaces it. */
+  find?: string;
   expectedContentDigest?: string;
   /** Host-owned occurrence identity, never a model-supplied write argument. */
   operationKey?: string;
@@ -121,7 +123,8 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
   const current = path.join(dir, 'current.json');
   return withFileLockSyncStrict(current, () => {
     const requestDigest = digest(JSON.stringify({ target, content: input.content,
-      mode: input.mode, expectedContentDigest: input.expectedContentDigest ?? null }));
+      mode: input.mode, expectedContentDigest: input.expectedContentDigest ?? null,
+      ...(input.mode === 'replace' ? { find: input.find ?? null } : {}) }));
     const operationFile = input.operationKey
       ? path.join(dir, `operation-${digest(input.operationKey)}.json`) : null;
     if (operationFile && existsSync(operationFile)) {
@@ -159,7 +162,9 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
     }
     if (input.mode === 'create' && prior) throw new LocalFileCreateConflict(`Refused to overwrite existing file: ${target}. Use mode="append" or mode="overwrite" for a requested revision.`);
     const content = input.content.endsWith('\n') ? input.content : `${input.content}\n`;
-    const bytes = input.mode === 'append' && prior
+    const bytes = input.mode === 'replace'
+      ? replacedBytes(target, prior?.bytes ?? null, input.find ?? '', input.content)
+      : input.mode === 'append' && prior
       ? Buffer.concat([prior.bytes, Buffer.from(prior.bytes.length && prior.bytes.at(-1) !== 10 ? '\n' : ''), Buffer.from(content)])
       : Buffer.from(content);
     const revisionId = randomUUID();
@@ -188,6 +193,24 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
     writeDurable(current, encoded, 0o600);
     return { createdId, committedPath: current, previousPath, unchanged };
   });
+}
+
+/** The file with one exact passage changed. The passage must appear exactly
+ * once, so the change lands where it was meant and nowhere else. */
+function replacedBytes(target: string, prior: Buffer | null, find: string, replacement: string): Buffer {
+  if (!prior) throw new LocalFileRevisionConflict(`File does not exist: ${target}. Nothing to replace; create it instead. No file content was changed.`);
+  if (!find) throw new LocalFileRevisionConflict('mode="replace" needs `find`: the exact text to change. No file content was changed.');
+  const text = prior.toString('utf8');
+  const first = text.indexOf(find);
+  if (first < 0) {
+    throw new LocalFileRevisionConflict(`The text to replace was not found in ${target}. Re-read the file and copy the passage exactly as it appears. No file content was changed.`);
+  }
+  if (text.indexOf(find, first + 1) >= 0) {
+    let count = 0;
+    for (let at = text.indexOf(find); at >= 0; at = text.indexOf(find, at + 1)) count += 1;
+    throw new LocalFileRevisionConflict(`The text to replace appears ${count} times in ${target}. Include enough surrounding text to match exactly one place. No file content was changed.`);
+  }
+  return Buffer.from(text.slice(0, first) + replacement + text.slice(first + find.length), 'utf8');
 }
 
 export function isLocalFileRevisionHandle(handle: string): boolean {

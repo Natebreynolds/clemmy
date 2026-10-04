@@ -153,7 +153,7 @@ function writeTool(): Extract<ReturnType<typeof getComputerTools>[number], { nam
   return getComputerTools().find((tool) => tool.name === 'write_file') as Extract<ReturnType<typeof getComputerTools>[number], { name: 'write_file' }>;
 }
 
-async function invokeWrite(input: { path: string; content: string; mode?: 'create' | 'append' | 'overwrite' | null; append?: boolean | null }): Promise<string> {
+async function invokeWrite(input: { path: string; content: string; mode?: 'create' | 'append' | 'overwrite' | 'replace' | null; append?: boolean | null; find?: string | null }): Promise<string> {
   const tool = writeTool() as unknown as {
     invoke: (runContext: unknown, input: string, details: unknown) => Promise<string>;
   };
@@ -211,6 +211,31 @@ test('write_file overwrite is a no-op when content is already identical', async 
     `No changes needed for ${file} (4 chars already present).`,
   );
   assert.equal(readFileSync(file, 'utf-8'), 'same\n');
+});
+
+test('write_file replace changes one exact passage and keeps the rest of the file', async () => {
+  const file = path.join(tmpHome, 'brief.html');
+  const page = '<h1>Brief</h1>\n<p>Miami has 5,896 reviews.</p>\n<footer>keep me</footer>';
+  await invokeWrite({ path: file, content: page, mode: null });
+  assert.equal(
+    await invokeWrite({ path: file, find: 'Miami has 5,896 reviews.', content: 'Miami has 6,012 reviews.', mode: 'replace' }),
+    `Replaced one passage in ${file} (24 chars → 24 chars); the rest of the file is unchanged.`,
+  );
+  assert.equal(readFileSync(file, 'utf-8'), '<h1>Brief</h1>\n<p>Miami has 6,012 reviews.</p>\n<footer>keep me</footer>\n');
+});
+
+test('write_file replace refuses a passage that is missing or ambiguous, changing nothing', async () => {
+  const file = path.join(tmpHome, 'ambiguous.md');
+  await invokeWrite({ path: file, content: 'row\nrow\nend', mode: null });
+  assert.match(String(await invokeWrite({ path: file, find: 'row', content: 'line', mode: 'replace' })),
+    /appears 2 times .* Include enough surrounding text/);
+  assert.match(String(await invokeWrite({ path: file, find: 'absent', content: 'x', mode: 'replace' })),
+    /was not found .* copy the passage exactly/);
+  assert.match(String(await invokeWrite({ path: path.join(tmpHome, 'nope.md'), find: 'a', content: 'b', mode: 'replace' })),
+    /File does not exist/);
+  assert.match(String(await invokeWrite({ path: file, find: 'end', content: 'fin', mode: 'replace', append: true })),
+    /takes no append flag/);
+  assert.equal(readFileSync(file, 'utf-8'), 'row\nrow\nend\n');
 });
 
 test('write_file append creates a missing file', async () => {

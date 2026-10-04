@@ -16,6 +16,7 @@ test('chat publishes exact file modes while workflow freezes the full revision a
   if (!chat.ok) return;
   assert.deepEqual(chat.definitions.map(d => d.capabilityRef), [
     'cap:local:write_file:create', 'cap:local:write_file:append', 'cap:local:write_file:overwrite',
+    'cap:local:write_file:replace',
   ]);
   assert.equal(observed.definition.capabilityRef, 'cap:local:write_file:reversible');
   assert.deepEqual(observed.definition.descriptor.destinationPostures, ['create_new', 'named_existing']);
@@ -29,6 +30,13 @@ test('chat publishes exact file modes while workflow freezes the full revision a
       .map(d => d.capabilityRef), [`cap:local:write_file:${expected}`]);
     assert.equal(reviewedLocalToolArgumentsMatch(observed, args), true);
   }
+  // One exact passage of a named file: its own choice, and only with no append flag.
+  const replace = { path: '/tmp/contract-only-no-write.txt', content: 'new', find: 'old', mode: 'replace', append: null };
+  assert.deepEqual(chat.definitions.filter(d => localPlanningArgumentsMatch(d, replace))
+    .map(d => d.capabilityRef), ['cap:local:write_file:replace']);
+  assert.equal(reviewedLocalToolArgumentsMatch(observed, replace), true);
+  assert.deepEqual(chat.definitions.filter(d => localPlanningArgumentsMatch(d, { ...replace, append: true }))
+    .map(d => d.capabilityRef), [], 'a replace with an append flag is no choice; the write refuses it too');
   for (const args of [null, {mode:'delete'}, {mode:'append', append:'true'}]) {
     assert.equal(chat.definitions.some(d => localPlanningArgumentsMatch(d, args)), false);
     assert.equal(reviewedLocalToolArgumentsMatch(observed, args), false);
