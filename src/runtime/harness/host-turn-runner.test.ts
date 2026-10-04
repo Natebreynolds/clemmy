@@ -9893,6 +9893,23 @@ test('a run settles a work item it finished itself only from its own successful 
   assert.equal(again.ok, false, 'a complete item is not settled twice');
 });
 
+test('the review is told which background jobs this request started, and no others', async () => {
+  const { delegatedJobsStartedBy } = await import('./host-turn-runner.js');
+  const { appendEvent } = await import('./eventlog.js');
+  const run = acceptJudgedSource('handoff-review', 'TEST FIXTURE: hand this to the lead');
+  const sessionId = run.session.id;
+  const sourceUserSeq = run.context.sourceUserSeq;
+  for (const phase of ['dispatched', 'started']) {
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'delegated_task_state',
+      data: { taskId: 'bg-fixture-1', title: 'Write the fixture notes', phase, agentName: 'Fixture Lead', sourceUserSeq } });
+  }
+  appendEvent({ sessionId, turn: 0, role: 'system', type: 'delegated_task_state',
+    data: { taskId: 'bg-fixture-old', title: 'An earlier job', phase: 'started', sourceUserSeq: sourceUserSeq - 1 } });
+  assert.deepEqual(delegatedJobsStartedBy({ sessionId, sourceUserSeq }), [
+    { taskId: 'bg-fixture-1', phase: 'started', title: 'Write the fixture notes', agentName: 'Fixture Lead' },
+  ]);
+});
+
 test('a run settles an item owed by a declaration that never started, and is shown its calls to cite', async () => {
   const { summarizeWorkManifests, settleWorkItemFromOwnCalls } = await import('./work-manifest.js');
   const run = acceptJudgedSource('settle-owed-item', 'TEST FIXTURE: write two briefs');
