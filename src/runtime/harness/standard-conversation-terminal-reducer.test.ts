@@ -319,3 +319,17 @@ test('a model account out of usage or credit is named, with the provider words; 
   assert.match(other, /Something went wrong/);
   assert.doesNotMatch(other, /socket/);
 });
+
+test('a stop explained as a question reaches the owner without the decision marker', async () => {
+  const sessionId = 'check-in-ask-marker';
+  eventlog.createSession({ id: sessionId, kind: 'chat' } as never);
+  const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Pull the remaining data.' } });
+  const stopped = { sessionId, turn: source.turn, status: 'blocked' as const, finalOutput: 'Stopped', error: 'Stopped',
+    blockedReason: 'control_no_progress_exhausted', blockedDetail: 'execution:refused', toolCalls: 3 };
+  const asked = await modelCheckInForExhaustedTurn(stopped, { sessionId, sourceUserSeq: source.seq,
+    run: async () => ({ sessionId, turn: source.turn + 1, status: 'completed', finalOutput: 'ASK: Can I run the remaining pulls myself?', toolCalls: 0 }) });
+  assert.equal(asked.status, 'awaiting_user_input');
+  assert.equal(asked.finalOutput, 'Can I run the remaining pulls myself?');
+  const question = eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).at(-1)?.data.question;
+  assert.equal(question, 'Can I run the remaining pulls myself?');
+});

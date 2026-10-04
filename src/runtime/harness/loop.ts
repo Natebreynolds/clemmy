@@ -1670,9 +1670,11 @@ export async function modelCheckInForExhaustedTurn(
     logger.warn({ err: error, sessionId: input.sessionId, sourceUserSeq }, 'no-progress check-in: activation threw — typed stop stands');
     return turnResult;
   }
-  // The human text, not the decision envelope a brain may wrap it in.
-  const reply = publicReplyText(checkIn.finalOutput, '').trim();
-  const asks = /\?/.test(reply);
+  // The human text, not the decision envelope a brain may wrap it in, and not
+  // the ASK:/CONTINUE: marker the decision contract puts in front of it.
+  const decision = toOrchestratorDecision(checkIn.finalOutput);
+  const reply = publicReplyText(decision?.reply ?? checkIn.finalOutput, '').trim();
+  const asks = decision?.nextAction === 'awaiting_user_input' || /\?/.test(reply);
   appendEvent({
     sessionId: input.sessionId,
     turn: checkIn.turn,
