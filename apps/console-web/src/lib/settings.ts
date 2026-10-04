@@ -181,7 +181,7 @@ export const patchDeveloperFlags = (p: { devMode?: boolean; key?: string; value?
 // Role→model registry: which model serves each role (brain/worker/judge/writer/
 // memory), the source of that choice, and the models available grouped by
 // CONNECTED provider.
-export type ModelRoleName = 'brain' | 'worker' | 'judge' | 'writer' | 'memory';
+export type ModelRoleName = 'brain' | 'worker' | 'judge' | 'writer' | 'memory' | 'quick';
 export interface ResolvedRole {
   modelId: string;
   provider: 'codex' | 'claude' | 'byo';
@@ -206,8 +206,8 @@ export type MemoryResolvedRole = ResolvedRole & {
 };
 export interface ModelRolesSnapshot {
   judgeFallback?: JudgeFallbackSetting;
-  // writer and memory are absent on daemons that predate those roles.
-  roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole; writer?: ResolvedRole; memory?: MemoryResolvedRole };
+  // writer, memory and quick are absent on daemons that predate those roles.
+  roles: { brain: ResolvedRole; worker: ResolvedRole; judge: ResolvedRole; writer?: ResolvedRole; memory?: MemoryResolvedRole; quick?: ResolvedRole };
   bindings: { role: ModelRoleName; modelId: string; whenIntent?: string; source: string }[];
   available: { provider: string; label: string; models: { id: string; label: string }[] }[];
   roleOptions?: {
@@ -215,6 +215,7 @@ export interface ModelRolesSnapshot {
     judge: { provider: string; label: string; models: { id: string; label: string }[] }[];
     writer?: { provider: string; label: string; models: { id: string; label: string }[] }[];
     memory?: { provider: string; label: string; models: { id: string; label: string }[] }[];
+    quick?: { provider: string; label: string; models: { id: string; label: string }[] }[];
   };
   // The brain picker: Codex / Claude / every connected BYO model, each flagged by
   // availability. `value` is the unique selector (BYO models = `api_key:<modelId>`).
@@ -244,10 +245,10 @@ export interface ModelRolesSnapshot {
     };
   };
 }
-// Set (or clear) a worker/judge/writer/memory role model. Brain is a provider
-// login switch (setActiveBrain). Applies on the next message (memory: the next
-// memory job), no restart.
-export const patchModelRole = (p: { role: 'worker' | 'judge' | 'writer' | 'memory'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
+// Set (or clear) a worker/judge/writer/memory/quick role model. Brain is a
+// provider login switch (setActiveBrain). Applies on the next message (memory:
+// the next memory job), no restart.
+export const patchModelRole = (p: { role: 'worker' | 'judge' | 'writer' | 'memory' | 'quick'; modelId?: string; whenIntent?: string; clear?: boolean }) =>
   patch<{ modelRoles: ModelRolesSnapshot }>('/api/console/settings/models/roles', p);
 
 export interface JudgeFallbackSetting {

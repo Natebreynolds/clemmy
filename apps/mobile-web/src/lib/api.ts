@@ -1823,8 +1823,9 @@ export interface CodexRescueSettings {
 }
 
 /** The roles the phone can bind to a model. The brain has its own switch.
- *  `memory` (Keeps your memory) runs in the background, not in a request. */
-export type ModelRoleName = 'writer' | 'judge' | 'worker' | 'memory';
+ *  `memory` (Keeps your memory) runs in the background, not in a request;
+ *  `quick` (Quick checks) reads a message before work starts. */
+export type ModelRoleName = 'writer' | 'judge' | 'worker' | 'memory' | 'quick';
 
 /** Connected models that can fill a role, grouped by provider, straight from
  *  the daemon catalog desktop Settings renders. */

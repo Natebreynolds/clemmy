@@ -624,7 +624,7 @@ function ModelsCard({ loaded, onRefresh }: {
             warning={inactiveNote(settings.brain, settings)}
             onOpen={() => setBrainOpen(true)}
           />
-          {(['writer', 'judge', 'worker', 'memory'] as const).map((role) => settings.roles?.[role] ? (
+          {(['writer', 'judge', 'worker', 'memory', 'quick'] as const).map((role) => settings.roles?.[role] ? (
             <Fragment key={role}>
               <RoleRow
                 title={ROLE_COPY[role].title}

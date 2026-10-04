@@ -584,12 +584,12 @@ test('the phone asks the daemon for memory work at the one route, and undo is a 
   const api = read('./api.ts');
   assert.match(api, /api<MemoryWorkSnapshot>\('\/m\/api\/memory\/work'\)/);
   assert.match(api, /`\/m\/api\/memory\/work\/\$\{encodeURIComponent\(eventId\)\}\/undo`, \{ method: 'POST' \}/);
-  assert.match(api, /export type ModelRoleName = 'writer' \| 'judge' \| 'worker' \| 'memory';/);
+  assert.match(api, /export type ModelRoleName = 'writer' \| 'judge' \| 'worker' \| 'memory' \| 'quick';/);
 });
 
 test('Settings lists the memory row, and the picker warns about providers only for checker and writer', () => {
   const settingsSource = read('../screens/Settings.tsx');
-  assert.match(settingsSource, /\(\['writer', 'judge', 'worker', 'memory'\] as const\)\.map\(\(role\) => settings\.roles\?\.\[role\]/,
+  assert.match(settingsSource, /\(\['writer', 'judge', 'worker', 'memory', 'quick'\] as const\)\.map\(\(role\) => settings\.roles\?\.\[role\]/,
     'a daemon that does not offer the role hides the row');
   assert.match(settingsSource, /note=\{role === 'judge' && reviewOff \? 'Review of finished work is off\.' : roleNote\(role, settings\)\}/,
     'the memory row says whose model Automatic borrows, from the daemon');

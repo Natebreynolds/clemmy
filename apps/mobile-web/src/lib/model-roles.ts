@@ -1,4 +1,4 @@
-import { MEMORY_ROLE_WORDS, memoryModelUnavailableText, memoryRoleAutomaticText } from '@clem/chat-engine';
+import { MEMORY_ROLE_WORDS, QUICK_ROLE_WORDS, memoryModelUnavailableText, memoryRoleAutomaticText } from '@clem/chat-engine';
 import { clockText } from './memory-work';
 import type { JudgeFallbackSelection, JudgeFallbackSetting, ModelRoleName, ModelSettings, ResolvedBrain, RoleModelGroup } from './api';
 
@@ -69,6 +69,12 @@ export const ROLE_COPY: Record<ModelsRow, {
     automatic: MEMORY_ROLE_WORDS.automaticNone,
     saved: 'Saved. The next memory job uses it.',
   },
+  // The desktop's words too (@clem/chat-engine).
+  quick: {
+    title: QUICK_ROLE_WORDS.title,
+    explain: QUICK_ROLE_WORDS.explain,
+    automatic: QUICK_ROLE_WORDS.automatic,
+  },
 };
 
 const PROVIDER_NAME: Record<string, string> = { codex: 'Codex', claude: 'Claude', byo: 'API key' };
@@ -107,7 +113,8 @@ export function describeModel(
 
 function catalogGroups(settings: ModelSettings): RoleModelGroup[] {
   const options = settings.roleOptions ?? {};
-  return [...(options.writer ?? []), ...(options.judge ?? []), ...(options.worker ?? []), ...(options.memory ?? [])];
+  return [...(options.writer ?? []), ...(options.judge ?? []), ...(options.worker ?? []), ...(options.memory ?? []),
+    ...(options.quick ?? [])];
 }
 
 function describe(modelId: string, provider: string | undefined, settings: ModelSettings): string {

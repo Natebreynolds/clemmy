@@ -6,7 +6,7 @@
  * re-pins THAT conversation; worker and judge are global today (the daemon has
  * no per-session scope for them), and the UI says so rather than pretending.
  */
-import { MEMORY_ROLE_WORDS, modelDisplayName } from '@clem/chat-engine';
+import { MEMORY_ROLE_WORDS, QUICK_ROLE_WORDS, modelDisplayName } from '@clem/chat-engine';
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePoll } from './poll';
@@ -41,6 +41,7 @@ export const ROLE_WORDS = {
   // The memory words are the shared contract's, so the phone's Models card and
   // the Memory tab say exactly this.
   memory: { title: MEMORY_ROLE_WORDS.title, hint: MEMORY_ROLE_WORDS.explain },
+  quick: { title: QUICK_ROLE_WORDS.title, hint: QUICK_ROLE_WORDS.explain },
 } as const;
 
 const ID_SHAPED = /^[A-Za-z0-9][A-Za-z0-9_.:-]*(?:\/[A-Za-z0-9][A-Za-z0-9_.:-]*)?$/;
@@ -191,7 +192,7 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claudeAuth?.configured, claudeAuth?.degraded]);
-  const onRole = (role: 'worker' | 'judge' | 'writer' | 'memory', v: string) =>
+  const onRole = (role: 'worker' | 'judge' | 'writer' | 'memory' | 'quick', v: string) =>
     run(role, async () => {
       await patchModelRole(v === '__default__' ? { role, clear: true } : { role, modelId: v });
       // The Memory tab names the memory model; let it say the new one now.
@@ -217,6 +218,8 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     // Only the daemon's own memory catalog: a daemon without one predates the
     // role, and the row is not shown at all.
     memories: mr ? flatChoices(mr.roleOptions?.memory) : [],
+    // Only the daemon's own quick-check catalog, for the same reason.
+    quicks: mr ? flatChoices(mr.roleOptions?.quick) : [],
   };
 }
 

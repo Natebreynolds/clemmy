@@ -5,7 +5,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
-import { memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
+import { QUICK_ROLE_WORDS, memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
 import { memoryTimeFormat } from '@/lib/memory-work';
 import { Field, Select, Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -144,6 +144,8 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   // The memory route never substitutes a pick: an unavailable pick means
   // learning waits (the daemon then names no model).
   const memoryWaits = Boolean(memory?.inactiveBinding && !memory.modelId);
+  // "Quick checks": Settings-only, shown when the daemon knows the role.
+  const quick = mr.roles.quick;
   const onCodexRescue = (value: string) => r.run('codex-rescue', () => patchCodexRescueModel(value === '__primary__' ? { clear: true } : { modelId: value }));
   const workerIntents = mr.bindings.filter((b) => b.role === 'worker' && b.whenIntent);
   const modelLabel = (id: string) => workerFlat.find((m) => m.id === id)?.label ?? id;
@@ -173,7 +175,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   // "inactive" whenever the active-brain switch owns the choice — even when
   // both name the same model, which read "Saved grok-4.6 is unavailable" over
   // a grok-4.6 brain.
-  const inactive = (role: 'brain' | 'worker' | 'judge' | 'writer') => {
+  const inactive = (role: 'brain' | 'worker' | 'judge' | 'writer' | 'quick') => {
     const resolved = mr.roles[role];
     return resolved?.inactiveBinding && resolved.inactiveBinding.modelId !== resolved.modelId && (
       <div className="mt-1 flex items-center gap-1.5 text-caption text-warning" title={resolved.inactiveBinding.reason}>
@@ -278,6 +280,11 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
             </div>
           </div>
         )}
+        {quick && row(ROLE_WORDS.quick.title, ROLE_WORDS.quick.hint,
+          <Select disabled={busy === 'quick'} value={quick.source === 'default' ? '__default__' : quick.modelId} onChange={(e) => void r.onRole('quick', e.target.value)} aria-label="Model for quick checks">
+            <option value="__default__">{QUICK_ROLE_WORDS.automatic}{quick.source === 'default' && quick.modelId ? ` · ${modelDisplayName(quick.modelId)}` : ''}</option>
+            {r.quicks.map((m) => <option key={`q-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
+          </Select>, inactive('quick'))}
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
