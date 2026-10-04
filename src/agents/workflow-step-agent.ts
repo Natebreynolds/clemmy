@@ -126,6 +126,7 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   // workflow step must not revise the contract of a sibling/parent run.
   'background_task_revise',
   'delegated_task_correct',
+  'work_item_settle',
   // Pilot projection and carrier-reference issuance belong to the accepted
   // origin chat. A workflow step cannot manufacture a new approval boundary.
   'automation_read_pilot_acquisition_list',

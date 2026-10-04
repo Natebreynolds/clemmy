@@ -272,6 +272,9 @@ const ALWAYS_READ = new Set<string>([
   // owner's correction is the consent, and what the task then does is gated
   // inside the task.
   'delegated_task_correct',
+  // Settling the run's own work list from its own proven calls is host
+  // bookkeeping; the calls it cites were gated when they ran.
+  'work_item_settle',
   // dispatch_background_task is a WRITE (it queues autonomous work), but the
   // user just AGREED to it in conversation — the conversation IS the consent, so
   // it must not re-prompt for approval (same rationale as execution_create /

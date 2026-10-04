@@ -111,7 +111,8 @@ export function bindProject(project: ProjectRecord, options: { agentId?: string 
         + 'them with run_worker (several items at once where they are independent); give each worker the project files and '
         + 'procedures it needs. Gathering is worker work too: searches, data pulls and scrapes run in workers, so the raw data '
         + 'stays out of your context and your own calls go to planning, checking what comes back and the final write-up. '
-        + 'Check in at real decisions and when a wave finishes, then deliver the finished work.');
+        + 'Check in at real decisions and when a wave finishes, then deliver the finished work. '
+        + 'An item you finish yourself instead of through a worker is settled with work_item_settle, citing your own calls that did it.');
   } else if (lead && leadName) {
     lines.push('', `### ${leadName} leads this project`,
       'Do quick work yourself: answer, look something up, or make a small change to a file. '

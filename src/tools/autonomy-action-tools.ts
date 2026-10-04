@@ -214,6 +214,32 @@ export function registerAutonomyActionTools(server: McpServer): void {
   );
 
   server.tool(
+    'work_item_settle',
+    [
+      'Settle one item of your work list (declared with run_worker\'s workManifest) that you finished yourself instead of through a worker.',
+      'Name the item and cite the call ids of your own successful calls that did it; the host checks each one settled successfully in this run.',
+      'An item you finished outside the work list otherwise stays open, and your run reads as unfinished.',
+    ].join(' '),
+    {
+      item: z.string().min(1).max(500),
+      call_ids: z.array(z.string().min(1).max(200)).min(1).max(20),
+      note: z.string().max(600).nullable().optional(),
+    },
+    async ({ item, call_ids, note }) => {
+      if (harnessRunContextStorage.getStore()?.workerScope) {
+        return textResult('A worker returns its item to the run that started it; that run settles it.');
+      }
+      const sessionId = getToolOutputContext()?.sessionId;
+      if (!sessionId) return textResult('No run is open to settle work in; nothing was settled.');
+      const { settleWorkItemFromOwnCalls } = await import('../runtime/harness/work-manifest.js');
+      const settled = settleWorkItemFromOwnCalls({ sessionId, item, callIds: call_ids, ...(note ? { note } : {}) });
+      return textResult(settled.ok
+        ? `Settled "${settled.label}" (${settled.phases.join(', ') || 'no open phase'}) from ${call_ids.length} of your own calls.`
+        : settled.reason);
+    },
+  );
+
+  server.tool(
     'check_in',
     [
       'Tell the user what you found or are doing, mid-task, WITHOUT stopping — it lands in the conversation for whenever they come back.',

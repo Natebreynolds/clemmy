@@ -1,4 +1,4 @@
-import { appendEvent, getSession, listEvents, type EventRow } from './eventlog.js';
+import { appendEvent, getSession, listEvents, openEventLog, type EventRow } from './eventlog.js';
 
 export type WorkItemStatus =
   | 'pending'
@@ -731,6 +731,74 @@ export function checkpointWorkItem(input: CheckpointWorkItemInput): EventRow {
       ...(input.reason?.trim() ? { reason: input.reason.trim().slice(0, 1_000) } : {}),
     },
   });
+}
+
+export type SettleOwnWorkItemResult =
+  | { ok: true; manifestId: string; itemId: string; label: string; phases: string[] }
+  | { ok: false; reason: string };
+
+/**
+ * One item of a run's work list, settled from the run's own calls when the
+ * run did the item itself instead of through a worker. Every cited call must
+ * be a business call of this run that settled succeeded; nothing else counts
+ * as evidence. The item's open phases under the current contract take those
+ * calls as their evidence. An item finished outside the work list otherwise
+ * stays open, and the run reads as unfinished however complete it is.
+ */
+export function settleWorkItemFromOwnCalls(input: {
+  sessionId: string;
+  item: string;
+  callIds: readonly string[];
+  note?: string;
+}): SettleOwnWorkItemResult {
+  const wanted = input.item.trim().toLowerCase();
+  if (!wanted) return { ok: false, reason: 'Name the work item to settle.' };
+  const manifests = summarizeWorkManifests(input.sessionId);
+  if (manifests.length === 0) return { ok: false, reason: 'This run has no work list to settle.' };
+  const matches = manifests.flatMap((manifest) => manifest.items
+    .filter((item) => [item.id, item.label, ...item.aliases].some((name) => name.trim().toLowerCase() === wanted))
+    .map((item) => ({ manifest, item })));
+  if (matches.length === 0) {
+    const open = manifests.flatMap((manifest) => manifest.items.filter((item) => !item.complete).map((item) => item.label || item.id));
+    return { ok: false, reason: `No work item is named "${input.item.trim()}". Open items: ${open.slice(0, 10).join('; ') || 'none'}.` };
+  }
+  if (matches.length > 1) return { ok: false, reason: `"${input.item.trim()}" names more than one work item; use its exact id.` };
+  const { manifest, item } = matches[0]!;
+  if (item.complete) return { ok: false, reason: `"${item.label || item.id}" is already complete.` };
+  const callIds = [...new Set(input.callIds.map((id) => id.trim()).filter(Boolean))].slice(0, 20);
+  if (callIds.length === 0) return { ok: false, reason: 'Cite the call ids of your own calls that did this item.' };
+  const settled = new Map<string, { outcome: string; business: number }>();
+  const read = openEventLog().prepare(`
+    SELECT logical_tool_call_id AS id, outcome_kind AS outcome, business_call AS business
+      FROM logical_call_settlements
+     WHERE session_id = ? AND logical_tool_call_id = ?
+  `);
+  for (const id of callIds) {
+    const row = read.get(input.sessionId, id) as { id: string; outcome: string; business: number } | undefined;
+    if (row) settled.set(id, { outcome: row.outcome, business: row.business });
+  }
+  const unproven = callIds.filter((id) => {
+    const row = settled.get(id);
+    return !row || row.outcome !== 'succeeded' || row.business !== 1;
+  });
+  if (unproven.length > 0) {
+    return { ok: false, reason: `These calls are not successful work calls of this run: ${unproven.join(', ')}. Nothing was settled.` };
+  }
+  const phases = manifest.phases.map((phase) => phase.id).filter((phase) => item.phases[phase]?.status !== 'succeeded');
+  const evidence = callIds.map((id) => ({ kind: 'tool_result' as const, ref: id }));
+  for (const phase of phases) {
+    checkpointWorkItem({
+      sessionId: input.sessionId,
+      manifestId: manifest.manifestId,
+      contractVersion: manifest.contractVersion,
+      phase,
+      itemId: item.id,
+      status: 'succeeded',
+      evidence,
+      reason: input.note?.trim() || 'Done by the run itself, from its own calls.',
+    });
+  }
+  return { ok: true, manifestId: manifest.manifestId, itemId: item.id, label: item.label || item.id, phases };
 }
 
 export function reviseWorkContract(input: ReviseWorkContractInput): EventRow {

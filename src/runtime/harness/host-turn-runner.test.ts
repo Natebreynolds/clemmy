@@ -9856,6 +9856,43 @@ test('the full review guards writes that reached outside or cannot be restored; 
   assert.equal(sourceWritesAtStake(post.context), 1, 'an outside write is always reviewed in full');
 });
 
+test('a run settles a work item it finished itself only from its own successful calls', async () => {
+  const { declareWorkManifest, checkpointWorkItem, summarizeWorkManifests, settleWorkItemFromOwnCalls } = await import('./work-manifest.js');
+  const run = acceptJudgedSource('settle-own-item', 'TEST FIXTURE: gather two evidence blocks');
+  const sessionId = run.session.id;
+  declareWorkManifest({ sessionId, manifestId: 'fixture-evidence', contractVersion: 1,
+    phases: [{ id: 'gather' }], items: [{ id: 'a', label: 'block a' }, { id: 'b', label: 'block b' }] });
+  checkpointWorkItem({ sessionId, manifestId: 'fixture-evidence', contractVersion: 1, phase: 'gather', itemId: 'a',
+    status: 'succeeded', evidence: [{ kind: 'worker_result', ref: 'worker-a' }] });
+  checkpointWorkItem({ sessionId, manifestId: 'fixture-evidence', contractVersion: 1, phase: 'gather', itemId: 'b',
+    status: 'failed', reason: 'the worker could not reach the source' });
+
+  // A call that did not succeed, or is not this run's, is no evidence.
+  settleFixtureCall({ ...run.context, turn: 1 }, 'settle-failed-call', {
+    tool: 'fixture__lookup', execution: 'provider_execution', mutating: false, succeeded: false });
+  for (const callIds of [['logical:settle-failed-call'], ['logical:no-such-call']]) {
+    const refused = settleWorkItemFromOwnCalls({ sessionId, item: 'block b', callIds });
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.match(refused.reason, /not successful work calls of this run/);
+  }
+  const unknown = settleWorkItemFromOwnCalls({ sessionId, item: 'block z', callIds: ['logical:settle-failed-call'] });
+  assert.equal(unknown.ok, false);
+  if (!unknown.ok) assert.match(unknown.reason, /No work item is named "block z"\. Open items: block b\./);
+  assert.equal(summarizeWorkManifests(sessionId)[0]!.remaining, 1, 'nothing was settled by a refusal');
+
+  // The run's own successful call settles the item, and the run is complete.
+  settleFixtureCall({ ...run.context, turn: 1 }, 'settle-own-call', {
+    tool: 'fixture__lookup', execution: 'provider_execution', mutating: false, succeeded: true });
+  const settled = settleWorkItemFromOwnCalls({ sessionId, item: 'block b', callIds: ['logical:settle-own-call'] });
+  assert.equal(settled.ok, true, settled.ok ? '' : settled.reason);
+  const [manifest] = summarizeWorkManifests(sessionId);
+  assert.equal(manifest!.remaining, 0);
+  assert.deepEqual(manifest!.items.find((item) => item.id === 'b')!.phases.gather!.evidence,
+    [{ kind: 'tool_result', ref: 'logical:settle-own-call' }]);
+  const again = settleWorkItemFromOwnCalls({ sessionId, item: 'b', callIds: ['logical:settle-own-call'] });
+  assert.equal(again.ok, false, 'a complete item is not settled twice');
+});
+
 test('a review protects what the turn did: a write it tried, a plan, or a read-only answer', async () => {
   const { completionReviewStakes, settledSourceArtifacts } = await import('./host-turn-runner.js');
   const { sourceAttemptedWrites } = await import('./host-completion-work.js');
