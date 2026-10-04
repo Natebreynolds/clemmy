@@ -534,6 +534,22 @@ test('gated permission: a DESTRUCTIVE shell command registers + AWAITS + ALLOWS 
   assert.deepEqual(res.updatedInput, { command: 'git push origin main' }, 'human-approved allow must echo updatedInput too');
 });
 
+test('gated permission: a worker hands a call that needs the owner back to its parent, with no card', async () => {
+  const sess = createSession({ kind: 'chat' });
+  const scopeId = `${sess.id}::worker:fixture-item`;
+  const perm = buildGatedToolPermission(sess.id, ['memory_read'], { composeForParent: { scopeId } }) as unknown as Perm;
+  const res = await perm('mcp__clementine-local__run_shell_command', { command: 'git push origin main' }, opts());
+  assert.equal(res.behavior, 'deny');
+  assert.equal(res.interrupt, false, 'the worker keeps its turn to return the payload');
+  assert.match(res.message ?? '', /^WORKER_COMPOSE_ONLY: \S*run_shell_command needs the owner's approval/);
+  assert.equal(approvalRegistry.listPending({ sessionId: sess.id }).length, 0, 'no card in front of the owner');
+  const refused = listEvents(sess.id, { types: ['worker_compose_only'] });
+  assert.equal(refused.length, 1, 'the hand-back is a host fact the worker result reports');
+  assert.equal(refused[0]?.data.scopeId, scopeId);
+  const read = await perm('mcp__clementine-local__memory_read', { query: 'x' }, opts());
+  assert.equal(read.behavior, 'allow', 'what needs no owner still runs in the worker');
+});
+
 test('WAIT approval is consumed before the live destructive call can execute', async () => {
   process.env.CLEMMY_APPROVAL_WAIT_PARK_MS = '0';
   try {

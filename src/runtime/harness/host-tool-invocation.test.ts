@@ -3209,4 +3209,9 @@ test('a worker acts as its lead only for an exactly leased external write while 
   assert.equal(workerMayActAsLead({ ...base, scope: { ...lease, authority: 'catalog' as const } as never }), false, 'only an exact lease');
   assert.equal(workerMayActAsLead({ ...base, scope: undefined }), false, 'no lease, no authority');
   assert.equal(workerMayActAsLead({ ...base, boundary: 'host_local' }), false, 'only a host-owned external call');
+  assert.equal(workerMayActAsLead({ ...base, toolName: 'mcp__fixture__api_request' }), true,
+    'the SDK transport carrier spelling is the same leased tool');
+  assert.equal(workerMayActAsLead({ ...base, toolName: 'Fixture__API_Request' }), true, 'case is not identity');
+  assert.equal(workerMayActAsLead({ ...base, toolName: 'fixture-mcp__api_request' }), false,
+    'an alias-confusable server is not the leased one');
 });

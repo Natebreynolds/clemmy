@@ -72,7 +72,7 @@ import {
 } from './capability-manifest.js';
 import { loadExpectedWorkCallBindingState } from './expected-work-admission.js';
 import { hasApprovedWriteKind, recordApprovedWriteKind } from '../../agents/plan-scope.js';
-import { loadProactivityPolicy } from '../../agents/proactivity-policy.js';
+import { ownerRunsInAutoMode } from './worker-lead-authority.js';
 import {
   loadHostCallCapabilityBinding,
   hostCallCapabilityBindingMatchesAttestation,
@@ -1162,16 +1162,14 @@ function planPreparationProbe(identity: { sessionId: string; sourceUserSeq: numb
   return acceptedTaskMode(identity.sessionId, identity.sourceUserSeq ?? undefined)?.kind === 'plan';
 }
 
+export { ownerRunsInAutoMode };
+
 /** Pause and resume reduce the same exact evidence and durable approval. */
 /**
  * The owner's mode and, in Ask mode, whether this kind of connected-app
  * change was approved before. Local work never consults it. The scope value
  * stays as stored: Auto is the widest scope, everything narrower is Ask.
  */
-export function ownerRunsInAutoMode(): boolean {
-  try { return loadProactivityPolicy().autoApproveScope === 'yolo'; } catch { return true; }
-}
-
 function consentModeForCall(call: CapabilityRiskAttestationV1): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean } {
   const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
   if (mode === 'auto' || call.effect !== 'external_write') return { mode, learnedExternalWrite: false };

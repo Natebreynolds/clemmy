@@ -2268,6 +2268,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         approvalMode: options.approvalMode,
         sourceUserSeq: options.sourceUserSeq,
         onApprovalBoundary: (boundary) => { approvalBoundary = boundary; },
+        ...(options.workerScope === true ? { composeForParent: { scopeId: trackerScopeId } } : {}),
       })
     : buildAllowOnlyToolsPermission(allowed);
   // ALWAYS wrap (even with the ceiling off) so approval-wait time is metered into

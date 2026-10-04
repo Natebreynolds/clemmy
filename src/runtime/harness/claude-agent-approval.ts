@@ -27,6 +27,7 @@ import {
 } from '../../agents/tool-invocation.js';
 import { redactSensitiveText } from '../security.js';
 import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
+import { recordWorkerComposeOnly } from '../../agents/worker-parent-actions.js';
 
 /** The execution trio must run the SAME per-call approval logic the Codex lane
  *  uses (smart shell deny-list, sensitive-path write checks, composio read/write
@@ -379,6 +380,9 @@ export interface GatedToolPermissionOptions {
   /** Exact accepted channel source that owns this permission boundary. */
   sourceUserSeq?: number;
   onApprovalBoundary?: (boundary: ClaudeAgentApprovalBoundary) => void;
+  /** Set for a worker: a call that needs the owner goes back to the parent to
+   * propose, recorded under the worker's scope, instead of raising a card. */
+  composeForParent?: { scopeId?: string };
 }
 
 function canonicalJson(value: unknown): string {
@@ -488,6 +492,21 @@ export function buildGatedToolPermission(
             isDestructiveHint: destructiveExternalCall,
           }).needsApproval;
       if (!needsApproval) return { behavior: 'allow', updatedInput: args } as PermissionResult;
+    }
+
+    // A worker never puts a card in front of the owner: a call that needs the
+    // owner goes back to the parent to propose.
+    if (gateOptions.composeForParent) {
+      recordWorkerComposeOnly(bare, {
+        sessionId,
+        scopeId: gateOptions.composeForParent.scopeId,
+        sourceUserSeq: gateOptions.sourceUserSeq,
+      });
+      return {
+        behavior: 'deny',
+        interrupt: false,
+        message: `WORKER_COMPOSE_ONLY: ${bare} needs the owner's approval. Return its exact proposed payload to the parent; nothing was sent.`,
+      } as PermissionResult;
     }
 
     let approvalId: string;

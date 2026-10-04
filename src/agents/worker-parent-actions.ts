@@ -8,14 +8,22 @@ import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 
 const EVENT = 'worker_compose_only';
 
-export function recordWorkerComposeOnly(tool: string): void {
+/** Recorded under the active worker run, or under the worker named by a gate
+ *  that runs outside that run (an agent SDK permission callback). */
+export function recordWorkerComposeOnly(
+  tool: string,
+  worker?: { sessionId: string; scopeId?: string; sourceUserSeq?: number },
+): void {
   const run = harnessRunContextStorage.getStore();
-  if (!run?.workerScope || !run.sessionId) return;
+  const at = worker ?? (run?.workerScope && run.sessionId
+    ? { sessionId: run.sessionId, scopeId: run.behaviorScopeId, sourceUserSeq: run.sourceUserSeq }
+    : null);
+  if (!at?.sessionId) return;
   try {
-    appendEvent({ sessionId: run.sessionId, turn: 0, role: 'system', type: EVENT, data: {
+    appendEvent({ sessionId: at.sessionId, turn: 0, role: 'system', type: EVENT, data: {
       tool: tool.slice(0, 160),
-      ...(run.behaviorScopeId ? { scopeId: run.behaviorScopeId } : {}),
-      ...(run.sourceUserSeq ? { sourceUserSeq: run.sourceUserSeq } : {}),
+      ...(at.scopeId ? { scopeId: at.scopeId } : {}),
+      ...(at.sourceUserSeq ? { sourceUserSeq: at.sourceUserSeq } : {}),
     } });
   } catch { /* the refusal itself stands; this record is what the result reports */ }
 }
