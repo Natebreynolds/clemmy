@@ -4046,6 +4046,23 @@ test('a corrupt typed terminal rolls back atomically and recovery publishes one 
   assert.doesNotMatch(JSON.stringify(terminals[0]?.data), /PRIVATE INVALID|provider failure/i);
 });
 
+test('a provider usage refusal thrown mid-turn is named to the owner and kept for the job that waits it out', async () => {
+  const sessionId = 'bridge-thrown-capacity-refusal';
+  _setBridgeImplsForTests({
+    configure: okConfigure,
+    buildAgent: fakeAgentBuilder,
+    runConversation: (async () => {
+      throw new Error("You're out of extra usage. Add more at the provider's usage settings and keep going.");
+    }) as never,
+  });
+  const response = await respondViaHarness('webhook', { message: 'run once', sessionId });
+  assert.equal(response.stoppedReason, 'error');
+  assert.match(response.text, /used up its usage/);
+  assert.doesNotMatch(response.text, /Something went wrong/);
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
+  assert.match(String(terminal?.data.failureDetail), /out of extra usage/, 'the refusal is readable by the job runner');
+});
+
 test('respondViaHarness: completed maps to AssistantResponse with reply preferred over summary', async () => {
   _setBridgeImplsForTests({
     configure: okConfigure,

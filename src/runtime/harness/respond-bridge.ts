@@ -1,4 +1,6 @@
 import './memory-scope-binding.js';
+import { providerCapacityErrorText } from '../../shared/provider-capacity.js';
+import { redactSensitiveText } from '../security.js';
 import { withAcceptedSourceSessionContext } from './source-session-context.js';
 import { admitPlanExecutionBridgeSource } from './plan-execution-bridge.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
@@ -127,6 +129,7 @@ import type { AssistantRequest, AssistantResponse, AssistantRouteDiagnostics, To
 import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import {
   PUBLIC_RUN_FAILURE_TEXT,
+  publicProviderCapacityText,
   publicAsyncWorkDispatchedData,
   publicCompletionText,
   publicReplyText,
@@ -1413,7 +1416,14 @@ function commitBridgeFailedTerminal(input: {
   turn: AcceptedRecoveryTurn;
   reason: string;
   transport: string;
+  /** The thrown failure: a provider's usage or credit refusal is named to
+   * the owner instead of the generic failure. */
+  error?: unknown;
 }): EventRow {
+  const detail = input.error === undefined
+    ? ''
+    : redactSensitiveText(providerCapacityErrorText(input.error)).replace(/\s+/g, ' ').trim().slice(0, 300);
+  const capacityText = detail ? publicProviderCapacityText(detail) : null;
   const identity = logicalTurnIdentity({
     sessionId: input.request.sessionId,
     sourceUserSeq: input.turn.sourceUserSeq,
@@ -1425,10 +1435,13 @@ function commitBridgeFailedTerminal(input: {
     identity,
     status: 'failed',
     resumable: false,
-    presentation: { kind: 'error', text: PUBLIC_RUN_FAILURE_TEXT },
+    presentation: { kind: 'error', text: capacityText ?? PUBLIC_RUN_FAILURE_TEXT },
   }, {
     legacyReason: input.reason,
-    metadata: { transport: input.transport },
+    // Raw exception text stays in the private logs; only a provider's usage
+    // or credit refusal is kept, so the turn's owner can be told and a job
+    // can wait it out.
+    metadata: { transport: input.transport, ...(capacityText ? { failureDetail: detail } : {}) },
   });
   return committed.event;
 }
@@ -2327,6 +2340,7 @@ export async function respondViaHarness(
         },
         reason: 'bridge_runtime_failed',
         transport: 'host_harness',
+        error: err,
       });
       const response = responseForCommittedTerminal(terminal, {
         failure: 'bridge_runtime_failed',
@@ -2613,6 +2627,7 @@ async function respondPreferHarnessOnce(
           turn,
           reason: 'claude_brain_failed',
           transport: 'claude_agent_sdk_brain',
+          error: err,
         });
         const response = responseForCommittedTerminal(terminal, {
           failure: 'claude_brain_failed',
