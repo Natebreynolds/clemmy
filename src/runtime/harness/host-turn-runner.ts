@@ -711,6 +711,7 @@ import {
 } from './accepted-turn-call-authority.js';
 import {
   invokeHostToolCall,
+  workerMayActAsLead,
   workerMustComposeForParent,
 } from './host-tool-invocation.js';
 import { recordWorkerComposeOnly } from '../../agents/worker-parent-actions.js';
@@ -779,6 +780,7 @@ import {
   evaluateUncoveredHostMutationConsent,
   durableHostApprovalResolutionMatches,
   hostInteractiveConsentApprovalResumeKey,
+  ownerRunsInAutoMode,
   parseHostInteractiveConsentSubjectV1,
   type HostInteractiveConsentSubjectV1,
 } from './host-interactive-consent.js';
@@ -6367,10 +6369,15 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         details,
       );
       if (exact) {
-        // The worker's lease still bounds which tools it may call at all.
-        if (harnessRunContextStorage.getStore()?.workerScope && workerMustComposeForParent({
+        // The worker's lease still bounds which tools it may call at all; a
+        // leased tool's external write proceeds as its lead's would.
+        const workerStore = harnessRunContextStorage.getStore();
+        if (workerStore?.workerScope && workerMustComposeForParent({
           identity: { toolName: exact.logicalToolName, args: exact.logicalArgs } as never,
           effect: exact.effect, boundary: exact.boundary,
+        }) && !workerMayActAsLead({
+          toolName: exact.logicalToolName, effect: exact.effect, boundary: exact.boundary,
+          scope: workerStore.mcpToolScope, ownerAutoMode: ownerRunsInAutoMode(),
         })) {
           recordWorkerComposeOnly(exact.logicalToolName || name);
           return `WORKER_COMPOSE_ONLY: ${name} is an external mutation. Return its exact proposed payload to the parent; no provider dispatch or approval was started.`;
@@ -11030,6 +11037,16 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
             }
             break;
           case 'needs_user':
+            // A worker never puts a card in front of the owner: a call that
+            // needs the owner goes back to the parent to propose.
+            if (harnessRunContextStorage.getStore()?.workerScope) {
+              preApprovalRepairDiagnostics.set(call.callId, {
+                diagnostic: `WORKER_COMPOSE_ONLY: ${call.name} needs the owner's approval. Return its exact proposed payload to the parent; nothing was sent.`,
+              });
+              recordWorkerComposeOnly(call.name);
+              preApprovalRefused = true;
+              break;
+            }
             if (consent.decision.need !== 'approval' || !consent.consentSubject) {
               preApprovalRefused = true;
               break;

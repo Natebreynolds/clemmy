@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { McpToolScope } from '../mcp-tool-scope.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import pino from 'pino';
 import {
@@ -629,6 +630,25 @@ export function hostCallAccounting(
  *  dispatching it: an external write or admin action. A request shape
  *  learned to only read is a read here exactly as it is in the accounting
  *  above, so a worker can run a lookup its parent could. */
+/**
+ * A worker may make an external write its lead could make without asking:
+ * only on a tool its parent leased it exactly, never an admin effect, and only
+ * while the owner runs in Auto. The consent evaluation that follows still
+ * decides the call; anything that needs the owner goes back to the parent.
+ */
+export function workerMayActAsLead(input: {
+  toolName: string;
+  effect: string | undefined;
+  boundary: string | undefined;
+  scope: McpToolScope | null | undefined;
+  ownerAutoMode: boolean;
+}): boolean {
+  if (!input.ownerAutoMode) return false;
+  if (input.effect !== 'external_write' || input.boundary !== 'host_owned_external') return false;
+  const scope = input.scope;
+  return scope?.authority === 'exact' && (scope.allowedToolNames ?? []).includes(input.toolName);
+}
+
 export function workerMustComposeForParent(
   input: Pick<InvokeHostToolCallInput<unknown>, 'identity' | 'effect' | 'boundary'>,
 ): boolean {

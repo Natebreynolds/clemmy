@@ -3196,3 +3196,17 @@ test('no-op provider success survives replay without claiming a write or replayi
   assert.equal(eventlog.listEvents(task.sessionId, { types: ['external_write_succeeded'] }).length, 1);
   leases.revokeDispatchLease(task.parentLease);
 });
+
+test('a worker acts as its lead only for an exactly leased external write while the owner runs in Auto', async () => {
+  const { workerMayActAsLead } = await import('./host-tool-invocation.js');
+  const lease = { reason: 'worker typed exact external MCP lease', authority: 'exact' as const,
+    allowedServerSlugs: ['fixture'], allowedToolNames: ['fixture__api_request'], maxTools: 1 };
+  const base = { toolName: 'fixture__api_request', effect: 'external_write', boundary: 'host_owned_external', scope: lease, ownerAutoMode: true };
+  assert.equal(workerMayActAsLead(base), true, 'a leased external write in Auto acts as the lead');
+  assert.equal(workerMayActAsLead({ ...base, ownerAutoMode: false }), false, 'in Ask the call goes back to the lead');
+  assert.equal(workerMayActAsLead({ ...base, effect: 'admin' }), false, 'an admin effect never');
+  assert.equal(workerMayActAsLead({ ...base, toolName: 'fixture__other' }), false, 'only a leased tool');
+  assert.equal(workerMayActAsLead({ ...base, scope: { ...lease, authority: 'catalog' as const } as never }), false, 'only an exact lease');
+  assert.equal(workerMayActAsLead({ ...base, scope: undefined }), false, 'no lease, no authority');
+  assert.equal(workerMayActAsLead({ ...base, boundary: 'host_local' }), false, 'only a host-owned external call');
+});

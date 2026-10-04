@@ -1168,9 +1168,12 @@ function planPreparationProbe(identity: { sessionId: string; sourceUserSeq: numb
  * change was approved before. Local work never consults it. The scope value
  * stays as stored: Auto is the widest scope, everything narrower is Ask.
  */
+export function ownerRunsInAutoMode(): boolean {
+  try { return loadProactivityPolicy().autoApproveScope === 'yolo'; } catch { return true; }
+}
+
 function consentModeForCall(call: CapabilityRiskAttestationV1): { mode: 'auto' | 'ask'; learnedExternalWrite: boolean } {
-  let mode: 'auto' | 'ask' = 'auto';
-  try { mode = loadProactivityPolicy().autoApproveScope === 'yolo' ? 'auto' : 'ask'; } catch { mode = 'auto'; }
+  const mode: 'auto' | 'ask' = ownerRunsInAutoMode() ? 'auto' : 'ask';
   if (mode === 'auto' || call.effect !== 'external_write') return { mode, learnedExternalWrite: false };
   let learned = false;
   try { learned = hasApprovedWriteKind(call.operationId, call.accountId); } catch { learned = false; }
