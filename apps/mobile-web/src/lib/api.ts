@@ -1,4 +1,4 @@
-import { readCompletionReviewResponse, type CheckerFacts, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
+import { readCompletionReviewResponse, type CheckerFacts, type DelegatedTask, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
  * Minimal fetch wrapper. All requests go same-origin (the PWA is
@@ -805,6 +805,8 @@ export interface RunDetail {
   id: string;
   title: string;
   status: string;
+  /** For a job handed to an agent: the job itself, whose state is the run's. */
+  delegatedTask?: DelegatedTask;
   kind: string;
   createdAt: string;
   updatedAt: string;

@@ -188,6 +188,10 @@ function renderOutcomeEvidence(evidence: OutcomeEvidence | undefined, audience: 
     const label = boundedText(work.label, 160) || 'Logical work';
     const completed = Math.max(0, Math.trunc(work.completed));
     const total = Math.max(0, Math.trunc(work.total));
+    if (audience === 'owner') {
+      lines.push(`- ${label}: ${completed} of ${total} done`);
+      continue;
+    }
     const refs = typeof work.evidenceCount === 'number'
       ? ` · ${Math.max(0, Math.trunc(work.evidenceCount))} evidence reference${Math.trunc(work.evidenceCount) === 1 ? '' : 's'}`
       : '';
@@ -196,6 +200,11 @@ function renderOutcomeEvidence(evidence: OutcomeEvidence | undefined, audience: 
   for (const artifact of (evidence.artifacts ?? []).slice(0, 8)) {
     const ref = boundedText(artifact.ref, 500);
     if (!ref) continue;
+    // The owner reads the file's name; where it lives is on the run's page.
+    if (audience === 'owner') {
+      lines.push(`- Saved ${ref.split(/[\\/]/).filter(Boolean).at(-1) ?? ref}`);
+      continue;
+    }
     const kind = boundedText(artifact.kind, 80) || 'artifact';
     lines.push(`- Saved ${kind}: ${ref}${artifact.verified ? ' (read back)' : ''}`);
   }

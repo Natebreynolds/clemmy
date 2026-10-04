@@ -454,7 +454,8 @@ test('the owner-facing report says what got done and what is next, without raw t
     nextAction: 'Resume to keep going.',
   };
   const owner = renderPublicOutcomeText(outcome, ctx({ sourceId: 'bg-owner-words' }));
-  assert.match(owner, /^Done so far:\n- Saved local file: \/workspace\/audit\/draft\.html \(read back\)/);
+  assert.match(owner, /^Done so far:\n- Saved draft\.html\n/, 'the file by name; where it lives is on the run page');
+  assert.doesNotMatch(owner, /local file|\/workspace\//);
   assert.match(owner, /Completed work is saved\./);
   assert.match(owner, /Resume to keep going\./);
   assert.doesNotMatch(owner, /Execution evidence|Last concrete tool failure|toolu_|Retained work|rh_0123/);

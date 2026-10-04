@@ -167,6 +167,7 @@ import { resolveAgentBinding } from '../agents/agent-binding.js';
 import { setSessionAgent } from '../agents/session-agent.js';
 import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { sessionProjectState } from '../projects/session-project-state.js';
+import { delegatedTaskById } from '../projects/project-views.js';
 import { getProject as getProjectRecord } from '../projects/project-record.js';
 import { listFactsByScope, scopeFilterFromQuery, withScopeViews } from '../projects/memory-scope-views.js';
 import { planArtifactResponse } from '../dashboard/plan-artifacts-api.js';
@@ -4880,10 +4881,17 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
       const firstEvent = shaped[0];
       const lastEvent = shaped[shaped.length - 1];
+      // A job's conversation record stays open after the job stops; the job's
+      // own state says whether it is working, waiting on the owner or done.
+      const backgroundPrefix = 'background:';
+      const delegatedTask = session.id.startsWith(backgroundPrefix)
+        ? delegatedTaskById(session.id.slice(backgroundPrefix.length))
+        : null;
       res.json({
         id: session.id,
         title: session.title,
         status: session.status,
+        ...(delegatedTask ? { delegatedTask } : {}),
         kind: session.kind,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,

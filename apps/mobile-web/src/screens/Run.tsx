@@ -22,6 +22,8 @@ import {
   foldWriteLedger,
   readLiveApprovalControl,
   narrateActivity,
+  renderMarkdown,
+  delegatedTaskCard,
   reduceActivity,
   writeReversibilityLabel,
   writeRowIsChange,
@@ -57,10 +59,15 @@ export function Run({ sessionId, onBack }: Props) {
   const stampedAt = lastGoodAt(runDetailPath(sessionId));
   // Status alone never certifies liveness: a remembered copy of a running run
   // still says "running". See lib/run-liveness.ts.
+  // A job handed to an agent is described by the job, the same card the chat
+  // shows: its conversation record stays open after the job has stopped.
+  const job = run?.delegatedTask ? delegatedTaskCard(run.delegatedTask) : null;
   const live = runIsLive({ status: run?.status, stampedAt, stale: stale || offline || Boolean(error) });
+  // A job is live only while it is working: waiting on the owner or stopped is not.
+  const working = live && (!job || run?.delegatedTask?.phase === 'working');
   const controllable = runCanBeControlled({ status: run?.status, stampedAt, stale: stale || offline || Boolean(error) });
   const elapsedLabel = run
-    ? runElapsedLabel({ startedAt: run.startedAt, lastEventAt: run.lastEventAt, live, nowMs: Date.now() })
+    ? runElapsedLabel({ startedAt: run.startedAt, lastEventAt: run.lastEventAt, live: working, nowMs: Date.now() })
     : null;
   /**
    * What changed out there, folded from the events rather than the route's
@@ -81,8 +88,8 @@ export function Run({ sessionId, onBack }: Props) {
     for (const event of run.events) {
       acc = reduceActivity(acc, event as HarnessEvent);
     }
-    return narrateActivity(acc, { live });
-  }, [run, live]);
+    return narrateActivity(acc, { live: working });
+  }, [run, working]);
 
   const reply = useMemo(() => {
     if (!run) return '';
@@ -118,8 +125,8 @@ export function Run({ sessionId, onBack }: Props) {
               <span class="card-when">
                 {/* Status is not a liveness certificate: active reads active,
                     but only the server's liveness may animate a pulse. */}
-                {live ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
-                {runStateLabel({ status: run.status })}
+                {working ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
+                {job ? job.phase.label : runStateLabel({ status: run.status })}
                 {/* No end point, no number: a remembered copy of an active run
                     must not tick a clock up from a start time days old. */}
                 {elapsedLabel ? ` · ${elapsedLabel}` : ''}
@@ -162,13 +169,14 @@ export function Run({ sessionId, onBack }: Props) {
             {reply ? (
               <section class="home-section">
                 <h2 class="section-head">What it reported</h2>
-                <p class="run-reply">{reply}</p>
+                {/* The report is written in markdown, the same as a chat reply. */}
+                <div class="run-reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(reply) }} />
               </section>
             ) : null}
 
-            <details class="wf-raw-log" open={live}>
+            <details class="wf-raw-log" open={working}>
               <summary class="wf-steps-summary">
-                {live ? 'Working' : 'How it went'} · {activity.length} {activity.length === 1 ? 'step' : 'steps'}
+                {working ? 'Working' : 'How it went'} · {activity.length} {activity.length === 1 ? 'step' : 'steps'}
               </summary>
               <div class="work-detail run-timeline">
                 {activity.map((item) => (
