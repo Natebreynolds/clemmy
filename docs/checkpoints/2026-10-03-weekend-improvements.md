@@ -1022,3 +1022,30 @@ spend more time on it — the two cheap changes below stay, no more SDK work.
   verified.
 - Clem (gpt-6.1-sol) did not choose write_file replace in either run; shell
   edits work but keep no recoverable prior bytes.
+
+### Owner: SDK lanes question, then "agree with the rest"
+
+- **What the Claude SDK lanes ran (live home):** brain 150 turns, last
+  08-20; workflow steps 45, 08-14..08-25; workers 17 ever vs 2,453 on the
+  host — the last real one 08-12 ("What's in my rep risk workspace"); the
+  September ones were framework tests (09-05 "harmless test email drafts",
+  09-06 "fictional Cedar account portfolio", 09-20 fallback-model check).
+  STILL USED and staying: coding agents (Claude Code via the Agent SDK,
+  last run 09-25), model discovery, the Claude client version. Recommended:
+  freeze the dormant brain/worker/workflow-step paths now, remove later in
+  one revertible commit — owner decision pending.
+- **74c308741 — recovery admits a local re-read.** A failed non-mutating
+  command says "check the current state"; recovery now always admits reads
+  of a local path (`readRevision: local_path` — read_file, list_files);
+  writes, external reads and controls stay out. ffffd502f updates the held-
+  reply pins on the bridge and Discord (wave 63 shipped with those two
+  pins stale). 1,452 recovery/no-progress tests pass. WAVE 64 = ffffd502f
+  INSTALLED 06:41 PT, verified.
+- **Live rerun on wave 64** ("Market note 8", also matches 80-89): 20 s
+  total, pre-work 5 ms, one exact shell edit (learned strategy), Jev
+  completion check 4 s, bytes exact. The failure path was not hit live;
+  the recovery change is proven by tests.
+- **#2 re-scoped by data (last 7 days):** continuity check 4 runs (5–43 s);
+  completion check 312 runs, median ~9 s from last work to verdict, p90
+  ~60 s; depth full 189 / fast 68; judges Sonnet 5 164, GLM 68, Grok 31,
+  Jev 27. Proposal to owner: review depth by stakes + a quick-check role.
