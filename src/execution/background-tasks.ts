@@ -439,6 +439,10 @@ export interface BackgroundTaskContractRevision {
   evidencePolicy: 'preserve' | 'revalidate' | 'invalidate';
   queuedAt: string;
   appliedAt?: string;
+  /** The owner's message, in the task's origin conversation, that asked for this revision. */
+  sourceUserSeq?: number;
+  /** The owner's own words, when they made the change on the task itself. */
+  ownerWords?: string;
 }
 
 export interface CreateBackgroundTaskInput {
@@ -2140,6 +2144,8 @@ export function reviseBackgroundTaskContract(
   input: {
     instruction: string;
     evidencePolicy?: BackgroundTaskContractRevision['evidencePolicy'];
+    sourceUserSeq?: number;
+    ownerWords?: string;
   },
 ): BackgroundTaskRecord | null {
   const instruction = clean(input.instruction ?? '', RESULT_TRUNCATE_CHARS);
@@ -2158,6 +2164,8 @@ export function reviseBackgroundTaskContract(
         instruction,
         evidencePolicy,
         queuedAt,
+        ...(typeof input.sourceUserSeq === 'number' && input.sourceUserSeq > 0 ? { sourceUserSeq: input.sourceUserSeq } : {}),
+        ...(input.ownerWords?.trim() ? { ownerWords: clean(input.ownerWords, RESULT_TRUNCATE_CHARS) } : {}),
       };
       const requeueParked = ['blocked', 'awaiting_approval', 'awaiting_input', 'awaiting_continue']
         .includes(task.status);

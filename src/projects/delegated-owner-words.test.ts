@@ -30,3 +30,23 @@ test("a delegated job reads the owner's own message from the conversation that h
   const unknown = createSession({ id: 'background:unknown-job', kind: 'execution', metadata: { delegatedTaskId: 'no-such-task' } } as never);
   assert.equal(await delegatedJobOwnerWords(unknown.id), undefined, 'an unreadable origin keeps the ordinary reading');
 });
+
+test("a change the owner asked for later is the owner's words too: a system named there is named", async () => {
+  const { correctDelegatedTask } = await import('./task-follow-up.js');
+  const origin = createSession({ id: 'owner-words-later', kind: 'chat' });
+  const asked = appendEvent({ sessionId: origin.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Have the lead build the audit, not with Fixturemail.' } });
+  const task = tasks.createBackgroundTask({ title: 'Audit', prompt: 'Build the audit.', originSessionId: origin.id, source: 'desktop',
+    delegation: { agentId: 'lead', agentName: 'Lead', agentCreatedAt: null, projectId: null, projectName: null, assignedBy: 'owner', originSourceUserSeq: asked.seq } });
+  const later = appendEvent({ sessionId: origin.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Now host it to Fixturehost and send me the link.' } });
+  // Clem relays the owner's message to the task it belongs to.
+  const relayed = correctDelegatedTask(task.id, { instruction: 'Host the finished audit to Fixturehost.', by: 'clem', sourceUserSeq: later.seq });
+  assert.equal(relayed.kind, 'revised');
+  // The owner changes it again from the task's own card.
+  const fromCard = correctDelegatedTask(task.id, { instruction: 'Make the site internal only.', by: 'owner' });
+  assert.equal(fromCard.kind, 'revised');
+  assert.equal(await delegatedJobOwnerWords(task.runSessionId),
+    'Have the lead build the audit, not with Fixturemail.\n\nNow host it to Fixturehost and send me the link.\n\nMake the site internal only.',
+    'the first message, then each later change in order: the refusal still stands and the later system is named');
+});

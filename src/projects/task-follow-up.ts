@@ -92,7 +92,9 @@ export function correctDelegatedTask(
   if (UNFINISHED.has(target.status)) {
     if (input.by !== 'owner') return { kind: 'refused', reason: 'resume_first' };
     if (!resumeBackgroundTask(target.id)) return { kind: 'refused', reason: 'not_resumable' };
-    const revised = reviseBackgroundTaskContract(target.id, { instruction, evidencePolicy });
+    const revised = reviseBackgroundTaskContract(target.id, { instruction, evidencePolicy,
+      ...(typeof input.sourceUserSeq === 'number' ? { sourceUserSeq: input.sourceUserSeq } : {}),
+      ...(input.by === 'owner' ? { ownerWords: instruction } : {}) });
     if (!revised) return { kind: 'refused', reason: 'not_resumable' };
     return target.id === named.id
       ? { kind: 'revised', task: revised, resumed: true }
@@ -100,7 +102,9 @@ export function correctDelegatedTask(
   }
 
   if (target.status !== 'done') {
-    const revised = reviseBackgroundTaskContract(target.id, { instruction, evidencePolicy });
+    const revised = reviseBackgroundTaskContract(target.id, { instruction, evidencePolicy,
+      ...(typeof input.sourceUserSeq === 'number' ? { sourceUserSeq: input.sourceUserSeq } : {}),
+      ...(input.by === 'owner' ? { ownerWords: instruction } : {}) });
     if (!revised) return { kind: 'refused', reason: 'stopping' };
     return target.id === named.id
       ? { kind: 'revised', task: revised, resumed: false }
