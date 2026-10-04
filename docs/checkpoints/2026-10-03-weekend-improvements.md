@@ -833,3 +833,12 @@ verdicts from `goal_alignment_judged`. Settings backed up first
 - Fix: worker tool_search gets buildAuthorizedToolSearchCandidateSources
   over exactly the leased scope (carrier = the worker's door). Worker and
   discovery tests 553/553.
+- Wave 54 = d62fbbd3a installed 19:02 PT (normal quit worked this time).
+  Answering the lead's question (owner chose: retry the failed pulls via
+  workers) failed the turn in 7 s: `model request provenance refused:
+  accepted_input_not_visible`. The accepted input of an answer-resume is
+  `prompt + "\n\n" + answer`, but buildWorkerInputResumePrompt put the
+  answer first and the prompt last, so the exact text never appeared — every
+  answered background question failed. Fix: the resume message carries the
+  accepted input verbatim after "Original request:". Test pins it (fails on
+  the old layout).
