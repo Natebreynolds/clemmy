@@ -70,7 +70,7 @@ export function delegatedWorkPointers(sessionId: string | null | undefined, now 
       .slice(0, SHOWN);
     if (tasks.length === 0) return '';
     return [
-      '[DELEGATED WORK: each task below has an owner. When the owner of this conversation changes or corrects one, hand the change to the task: delegated_task_correct with id (the task id below) and instruction (the change). Its owner applies it, starting from what is already done. Do not redo a task\'s work in the conversation. A question about a result is answered from the result.]',
+      '[DELEGATED WORK: each task below has an owner. When the owner of this conversation changes or corrects one, hand the change to the task: delegated_task_correct with id (the task id below) and instruction (the change). Its owner applies it, starting from what is already done. Do not redo a task\'s work in the conversation unless the owner asks you to do it here yourself; then do it here. A question about a result is answered from the result.]',
       ...tasks.map(line),
     ].join('\n');
   } catch {
