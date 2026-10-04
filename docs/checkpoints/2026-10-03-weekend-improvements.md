@@ -842,3 +842,15 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   answered background question failed. Fix: the resume message carries the
   accepted input verbatim after "Original request:". Test pins it (fails on
   the old layout).
+- Wave 55 live re-run (02:11Z): 11 workers, 0 DataForSEO successes, 43
+  pre-dispatch refusals, discovery `sources: []` — 19f995527 never took
+  effect: slim workers keep tool_search off the first-class surface, so the
+  model reached discovery via call_tool's built-in tool_search (no sources).
+  Fix: a worker with a planning context and a parent lease keeps its
+  leased-source tool_search first-class (door = work_call for contracted
+  action items, call_tool otherwise). Sub-agents 17/17, worker tests 554/554.
+- The lead then asked the owner to top up DataForSEO for "402 Payment
+  Required" — fabricated by DeepSeek workers in their output files; no
+  DataForSEO request had run (all refused pre-dispatch). Open: host-written
+  facts beside a worker result (which calls ran / were refused) so a lead
+  cannot be misled by a worker's prose.
