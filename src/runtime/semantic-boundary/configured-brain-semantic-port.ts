@@ -254,6 +254,25 @@ const CALENDAR_READ_OPERATION_SYSTEM = [
   'Return only a CalendarReadOperationsV1 JSON object with one entry per provider.',
 ].join(' ');
 
+/** How long a quick check may take before it falls back to the brain. */
+export const QUICK_CHECK_DEADLINE_MS = 20_000;
+let quickCheckDeadlineMs = QUICK_CHECK_DEADLINE_MS;
+
+/** Tests only: a shorter deadline; null restores the default. */
+export function _setQuickCheckDeadlineMsForTests(ms: number | null): void {
+  quickCheckDeadlineMs = ms ?? QUICK_CHECK_DEADLINE_MS;
+}
+
+/** The work, or the deadline's reason once it passes, whichever comes first,
+ *  so a client that ignores the abort cannot hold the turn. */
+function withinDeadline<T>(work: Promise<T>, deadline: AbortController | null): Promise<T> {
+  if (!deadline) return work;
+  return Promise.race([work, new Promise<never>((_, reject) => {
+    if (deadline.signal.aborted) reject(deadline.signal.reason);
+    deadline.signal.addEventListener('abort', () => reject(deadline.signal.reason), { once: true });
+  })]);
+}
+
 export function semanticModelRoleForPurpose(
   purpose: ConfiguredSemanticPurpose,
 ): ModelRole {
@@ -302,7 +321,9 @@ async function completeStructured(input: {
   const wantedRole = semanticModelRoleForPurpose(input.purpose);
   const reasoning = semanticReasoningForPurpose(input.purpose);
   const firstRole = resolveRoleModel(wantedRole);
-  return runOnRole(firstRole).catch(async (error) => {
+  // A quick check that runs long is no quicker than the brain: past its
+  // deadline it is cancelled and the call falls back like any other failure.
+  return runOnRole(firstRole, wantedRole === 'quick' ? quickCheckDeadlineMs : undefined).catch(async (error) => {
     // The judge role is cross-family by default, so it can be bound to a model
     // whose sign-in is expired or whose provider is down while the brain that
     // is running this very turn is fine. A review that cannot run is not a
@@ -323,8 +344,11 @@ async function completeStructured(input: {
     return runOnRole(brain);
   });
 
-  async function runOnRole(role: ReturnType<typeof resolveRoleModel>) {
+  async function runOnRole(role: ReturnType<typeof resolveRoleModel>, deadlineMs?: number) {
   const started = Date.now();
+  const deadline = deadlineMs ? new AbortController() : null;
+  const timer = deadline ? setTimeout(() => deadline.abort(new Error(`quick check passed its ${deadlineMs} ms deadline`)), deadlineMs) : null;
+  try {
   const agent = new Agent({
     name: input.purpose === 'turn_semantics'
       ? 'turn-semantics'
@@ -351,7 +375,7 @@ async function completeStructured(input: {
         instructions: estimateTokens(input.system),
         history: estimateTokens(input.user),
       },
-    }, () => runner.run(agent, input.user, { maxTurns: 1 })),
+    }, () => withinDeadline(runner.run(agent, input.user, { maxTurns: 1, ...(deadline ? { signal: deadline.signal } : {}) }), deadline)),
   );
   const tokens = tokensFromAgentRun(result);
   const latencyMs = Date.now() - started;
@@ -382,6 +406,9 @@ async function completeStructured(input: {
     latencyMs,
     usageRecorded,
   };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   }
 }
 

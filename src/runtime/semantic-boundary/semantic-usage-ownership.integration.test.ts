@@ -323,3 +323,35 @@ test('the fallback row for an unrecorded interpretation inside a memory job stay
   assert.equal(rows[0]!.role, 'memory');
   assert.equal(rows[0]!.inputTokens, 300);
 });
+
+test('a quick check that passes its deadline is cancelled and that one call falls back to the brain', async () => {
+  const { resolveRoleModel } = await import('../harness/model-roles.js');
+  const { _setQuickCheckDeadlineMsForTests } = await import('./configured-brain-semantic-port.js');
+  const quickId = resolveRoleModel('quick').modelId;
+  const brainId = resolveRoleModel('brain').modelId;
+  assert.notEqual(quickId, brainId, 'the quick-check model is not the brain');
+  const asked: string[] = [];
+  setDefaultModelProvider({
+    getModel: async (name?: string) => ({
+      async getResponse() {
+        asked.push(String(name));
+        // The quick model never answers; the brain answers at once.
+        if (name === quickId) return new Promise(() => {});
+        return { responseId: 'brain-answer', usage: new Usage({ inputTokens: 10, outputTokens: 2, totalTokens: 12, requests: 1 }),
+          output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
+            text: '{}', providerData: {} }] }] } as never;
+      },
+      async *getStreamedResponse() { throw new Error('not streaming'); },
+    }) as never,
+  });
+  _setQuickCheckDeadlineMsForTests(50);
+  try {
+    const started = Date.now();
+    await completeViaConfiguredBrain({ purpose: 'turn_semantics', system: 'fixture', user: '{}',
+      schemaName: 'TurnSemanticProposalV1' }).catch(() => undefined);
+    assert.ok(Date.now() - started < 5_000, 'a hung quick model does not hold the turn');
+    assert.deepEqual(asked, [quickId, brainId], 'the quick model was asked first, then the brain once');
+  } finally {
+    _setQuickCheckDeadlineMsForTests(null);
+  }
+});
