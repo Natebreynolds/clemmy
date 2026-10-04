@@ -122,19 +122,22 @@ export function Run({ sessionId, onBack }: Props) {
 
         {run ? (
           <>
+            {/* A job's card says where it stands and holds its controls. */}
+            {!run.delegatedTask ? (
             <div class="run-status-row">
-              <span class="card-when">
-                {/* Status is not a liveness certificate: active reads active,
-                    but only the server's liveness may animate a pulse. */}
-                {working ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
-                {job ? job.phase.label : runStateLabel({ status: run.status })}
-                {/* No end point, no number: a remembered copy of an active run
-                    must not tick a clock up from a start time days old. */}
-                {elapsedLabel ? ` · ${elapsedLabel}` : ''}
-              </span>
-              {/* Waiting work retains its exact Stop control, but a failed or cached read cannot claim a current target. */}
-              {controllable ? <RunControl key={run.id} target={{ kind: 'run', runId: run.id }} onChanged={() => void refresh()} /> : null}
-            </div>
+                <span class="card-when">
+                  {/* Status is not a liveness certificate: active reads active,
+                      but only the server's liveness may animate a pulse. */}
+                  {working ? <span class="running-task-state" style={{ background: 'var(--accent)' }} aria-hidden="true" /> : <span class={`status-dot status-${run.status}`} aria-hidden="true" />}
+                  {job ? job.phase.label : runStateLabel({ status: run.status })}
+                  {/* No end point, no number: a remembered copy of an active run
+                      must not tick a clock up from a start time days old. */}
+                  {elapsedLabel ? ` · ${elapsedLabel}` : ''}
+                </span>
+                {/* Waiting work retains its exact Stop control, but a failed or cached read cannot claim a current target. */}
+                {controllable ? <RunControl key={run.id} target={{ kind: 'run', runId: run.id }} onChanged={() => void refresh()} /> : null}
+              </div>
+            ) : null}
 
             {/* A job is its card: where it stands, what moves it on, what it
                 made and what it reported, the same card the chat shows. */}
