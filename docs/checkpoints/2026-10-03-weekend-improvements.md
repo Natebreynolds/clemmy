@@ -910,3 +910,28 @@ learned) proving workers run it and the type becomes a learned read.
   Learning unchanged (observeSettledRequestEffect runs for any session).
   Tests: predicate matrix + 1606 consent/host-runner/worker tests (0 fail).
   Live proof pending (needs an unlearned read-shaped request in a worker).
+
+### Owner: "make sure the models can't lie" and "is running out of turns DeepSeek or workers?"
+
+- **Turn exhaustion (data, 14 days):** DeepSeek V4.1 Flash 104 runs, 71% ok,
+  13% max_turns; other worker models 98–100% ok but on small, non-comparable
+  items. The Ward serps max_turns came from the LEAD's packets: "Same 5-query
+  set and rules as serps-miami" — workers never see sibling packets, so the
+  worker spent 16 shell calls hunting, reached DataForSEO on turn 18 and hit
+  the 18-turn research budget. Packets with the specifics succeeded (4 and 8
+  DataForSEO calls). DeepSeek's share: it ignored "work only inside" and
+  "fail fast". Verdict: worker-general (packet design) with a model
+  discipline factor; not enough data to call it DeepSeek-only.
+- **Fix 110797dba:** an item's facts that name another item of the same batch
+  by exact id bring that item's facts along (one level).
+- **Fix 1685c56d0 (models can't lie about what they did):** every host-lane
+  worker result ends with the host's record of its business calls
+  (succeeded / failed / refused before dispatch — "no request reached the
+  provider"); where the worker's account disagrees, the record is right and
+  the parent reruns. The work plan no longer banks a success whose business
+  calls all failed or never ran (the serps-miami empty "ok" that was reused
+  four times); a worker that needed no business tool keeps its result.
+  Tests: record + banking + 2807 worker/orchestrator/Lean Rounds pass.
+- Open: model fit for heavy research as a setting (intent → worker model);
+  Jev/judge check of worker claims vs the record (later layer); SDK worker
+  lane gets the same record.
