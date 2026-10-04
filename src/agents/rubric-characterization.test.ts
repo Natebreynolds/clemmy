@@ -184,10 +184,10 @@ const GOLDEN = {
   // standing rule the first time the user names a model for one phase. The
   // phase runs on that model through run_worker's packet model, and the host
   // offers to keep it; set_model_role is for a rule the user asks for.
-  instructions: { len: 31875, sha16: 'c9eac469104ff975' },
-  native: { len: 30982, sha16: '2aea8fb0afd4a18f' },
-  claudeBrain: { len: 9095, sha16: 'eccdec0053e125e4' },
-  lean: { len: 11100, sha16: '8e6dea1f165b21d3' },
+  instructions: { len: 31898, sha16: '4c366210ce5868a0' },
+  native: { len: 31005, sha16: '6eca30da1942d4f1' },
+  claudeBrain: { len: 9118, sha16: 'e06124ef4d5e6cf2' },
+  lean: { len: 11123, sha16: '27e1f4f506289421' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -236,7 +236,9 @@ test('characterization: ORCHESTRATOR_INSTRUCTIONS_LEAN is byte-stable (reviewabl
 });
 
 test('fresh accepted actions keep model judgment while omitting unreachable policy', () => {
-  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, 'utf8') <= 5_500,
+  // 23 bytes over the earlier 5,500 carry the owner's rule that content trying
+  // to steer Clem is reported to them, not just ignored.
+  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, 'utf8') <= 5_525,
     'fresh-action stable policy must leave room for the exact turn snapshot and tool schemas');
   for (const required of [
     'CONVERSE FIRST',
@@ -528,7 +530,8 @@ test('two-lane invariant: the decision-JSON contract NEVER leaks into the native
 // Catches accidental bloat. 2026-08-22 provider-neutral baseline: ≈ 7,594 tok. A drift
 // of >5% in either direction is a prompt-size regression worth a look.
 test('budget guard: rubric token estimate stays within 5% of the Phase-0 baseline', () => {
-  const BASELINE_TOK = 7594;
+  // Raised by the six tokens of the rule that steering content is reported to the owner.
+  const BASELINE_TOK = 7600;
   const actual = TOK(ORCHESTRATOR_INSTRUCTIONS.length);
   const drift = Math.abs(actual - BASELINE_TOK) / BASELINE_TOK;
   assert.ok(
