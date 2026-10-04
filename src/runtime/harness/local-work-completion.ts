@@ -70,12 +70,25 @@ export function pendingAcceptedLocalWork(input: {
     && (event.data.sourceUserSeq === input.sourceUserSeq
       || (event.data.sourceUserSeq === undefined && (!nextSource || event.seq < nextSource.seq))));
   const eventBySeq = new Map(ownedEvents.map((event) => [event.seq, event]));
+  // A declaration refused before any worker started owes its items until the
+  // same manifest is declared again by an accepted call: that corrected retry
+  // then defines what is owed (its phases and items may differ). With no later
+  // accepted declaration, the refused demand stands.
+  const refusedAt = new Map<string, number>();
+  for (const event of ownedEvents) {
+    if (event.type === 'tool_attempt_settled' && event.role === 'system'
+      && event.data.executionKind === 'refused_pre_dispatch' && event.data.dispatchState === 'not_started'
+      && typeof event.data.callId === 'string') refusedAt.set(event.data.callId, event.seq);
+  }
+  const declaredAgainAfter = (manifestId: string, seq: number): boolean => ownedEvents.some((event) => (
+    event.type === 'work_manifest_declared' && event.role === 'system' && event.seq > seq
+    && event.data.sourceUserSeq === input.sourceUserSeq && event.data.manifestId === manifestId));
   const missing = new Set<string>();
   for (const row of admissions) {
     const frame = JSON.parse(row.frame_history_json) as AgentInputItem[];
     if (acceptedModelBatchHistoryDigest(frame) !== row.frame_history_digest) continue;
     for (const item of frame) {
-      const call = item as { type?: string; name?: string; arguments?: string };
+      const call = item as { type?: string; name?: string; arguments?: string; callId?: string };
       if (call.type !== 'function_call' || !call.name || typeof call.arguments !== 'string') continue;
       let args: unknown;
       try { args = JSON.parse(call.arguments); } catch { continue; }
@@ -87,6 +100,8 @@ export function pendingAcceptedLocalWork(input: {
       const descriptor = packet.workManifest!;
       const items = workerCallItems(packet);
       if (!items || descriptor.mode !== 'declare') continue;
+      const refusedSeq = call.callId ? refusedAt.get(call.callId) : undefined;
+      if (refusedSeq !== undefined && declaredAgainAfter(descriptor.id, refusedSeq)) continue;
       const declaration = ownedEvents.find((event) => event.type === 'work_manifest_declared'
         && event.data.sourceUserSeq === input.sourceUserSeq && event.data.manifestId === descriptor.id);
       const manifest = declaration ? summarizeWorkManifest(input.sessionId, descriptor.id) : null;

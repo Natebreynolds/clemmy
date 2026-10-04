@@ -124,6 +124,37 @@ test('the production host completion and public boundary preserve the captured p
   }
 });
 
+test('a refused declaration is owed by its accepted retry, not on top of it', async () => {
+  const { pendingAcceptedLocalWork } = await import('./local-work-completion.js');
+  const identity = fixture();
+  const packet = JSON.parse(CAPTURED_ARGUMENTS);
+  // The settlement ledger's record that the declaration started no worker.
+  events.appendEvent({ ...identity, role: 'system', type: 'tool_attempt_settled', data: {
+    sourceUserSeq: identity.sourceUserSeq, callId: CALL_ID, tool: 'run_worker',
+    executionKind: 'refused_pre_dispatch', dispatchState: 'not_started',
+  } });
+  assert.equal(pendingAcceptedLocalWork(identity)?.missing.length, 8, 'a refusal alone still owes its items');
+  // The corrected retry declares the same manifest under its own phase and
+  // finishes every item it declared.
+  manifests.declareWorkManifest({
+    ...identity, manifestId: packet.workManifest.id, contractVersion: '1',
+    phases: [{ id: 'retry_phase' }], items: [{ id: 'only-item' }],
+  });
+  const returned = events.appendEvent({
+    ...identity, role: 'system', type: 'tool_returned', data: {
+      sourceUserSeq: identity.sourceUserSeq, accounting: 'top_level',
+      successfulBusinessResult: true, tool: 'read_file', callId: 'retry-only-item', effect: 'read', result: 'done',
+    },
+  });
+  manifests.checkpointWorkItem({
+    sessionId: identity.sessionId, manifestId: packet.workManifest.id, contractVersion: '1',
+    phase: 'retry_phase', itemId: 'only-item', status: 'succeeded',
+    evidence: [{ kind: 'tool_result', ref: `event:${returned.seq}` }],
+  });
+  assert.equal(pendingAcceptedLocalWork(identity), null);
+  assert.equal(publish(identity, 'The retry finished its one item.').presentation.status, 'done');
+});
+
 test('an unrelated later successful read cannot discharge the accepted item demand', () => {
   const identity = fixture();
   preflight(identity);
