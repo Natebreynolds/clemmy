@@ -1,6 +1,7 @@
 import { buildPlanningDisclosure } from './worker-planning-disclosure.js';
 import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
 import { buildScopedLocalToolSearch } from '../tools/local-runtime-tools.js';
+import { buildAuthorizedToolSearchCandidateSources } from '../tools/tool-search-provider-sources.js';
 import type { HostFreshPlanningContextV1 } from '../runtime/semantic-boundary/admit-and-compile-accepted-source.js';
 import { Agent } from '@openai/agents';
 import type { Handoff, Tool } from '@openai/agents';
@@ -301,8 +302,14 @@ export async function buildWorkerAgent(options: {
     // own accepted source and disclosed as executable refs for work_call.
     const names = new Set(tools.map((toolRef) => (toolRef as { name?: string }).name ?? '').filter(Boolean));
     const disclosure = buildPlanningDisclosure(options.hostFreshPlanning);
+    // The external tools the parent leased this worker are discoverable here
+    // through the same provider sources the parent's discovery uses, so the
+    // worker can prove and call them; the lease bounds what it can find.
+    const leasedSources = externalMcpScope
+      ? buildAuthorizedToolSearchCandidateSources(externalMcpScope, options.hostFreshPlanning.identity, actionWork ? 'work_call' : 'call_tool')
+      : undefined;
     tools = tools.map((toolRef) => ((toolRef as { name?: string }).name === 'tool_search'
-      ? buildScopedLocalToolSearch(names, 'work_call', undefined, undefined, disclosure)
+      ? buildScopedLocalToolSearch(names, 'work_call', undefined, leasedSources, disclosure)
       : toolRef));
   }
 
