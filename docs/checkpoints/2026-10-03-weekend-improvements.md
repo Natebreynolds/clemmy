@@ -868,3 +868,33 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   parent's own calls); (b) DeepSeek serps workers spent 18 responses with
   one tool call → max_turns (model/item sizing); (c) manifest resume reuses
   "ok" items whose output holds no real data (worker honesty).
+
+### Next: workers act with the lead's authority for leased tools (owner approved, option 2)
+
+Owner decision (10-03 ~19:50 PT): a worker may make the same external calls
+its lead could, for the tools the lead leased it, with guardrails — leased
+tools only; external_write only (never admin); same write-boundary gates and
+irreversible-send floor; in Ask mode the call goes back to the lead; learning
+still runs. Design (mapped, not built):
+1. Gate — host-turn-runner.ts ~6371 (inside `if (exact)`): skip the
+   WORKER_COMPOSE_ONLY return when `workerMayActAsLead`: store.workerScope;
+   exact.effect === 'external_write' && exact.boundary ===
+   'host_owned_external'; store.mcpToolScope.authority === 'exact' and its
+   allowedToolNames include exact.logicalToolName; Auto mode
+   (`loadProactivityPolicy().autoApproveScope === 'yolo'`,
+   host-interactive-consent.ts ~1172).
+2. Coverage — a worker source has no exact work coverage for an external
+   write (consent → repair coverage_missing, interactive-consent-policy.ts
+   ~496). Extend delegateExpectedWorkToChild (expected-work-delegation.ts)
+   so a leased external operation gets a child contract derived from the
+   lead's proven requirement, as local writes already do.
+3. Hand-back — at the consent `needs_user` branch (host-turn-runner.ts
+   ~11032), a workerScope run returns the WORKER_COMPOSE_ONLY hand-back
+   instead of recording an approval nobody sees (always-ask classes and Ask
+   mode fall back to the lead).
+Learning: already scheduled for any session's settled write
+(logical-call-settlement-store.ts ~651 observeSettledRequestEffect).
+Tests to write: gate predicate (lease/effect/mode matrix), child coverage
+for a leased external op, needs_user hand-back in a worker, and a controlled
+live fixture (a generic read-shaped request tool leased to workers, never
+learned) proving workers run it and the type becomes a learned read.
