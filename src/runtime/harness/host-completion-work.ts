@@ -4,7 +4,7 @@ import { isToolMediaImageBlock } from './tool-media-content.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
 import { redeemSuccessfulSettlementResultForHost, redeemedReadIsExhausted } from './result-handle.js';
-import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
+import { TOOL_REGISTRY, toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
 import { discoveryNavigation } from './discovered-tool-context.js';
 import { PROMPT_INLINE_RECALLABLE_RESULT_CHARS, answererViewBudgetFor, presentationBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
@@ -54,6 +54,55 @@ export function sourceAttemptedWrites(input: {
     return row?.n ?? 0;
   } catch {
     // Unknown is read as a write: the full review is the safe side.
+    return 1;
+  }
+}
+
+/** Whether a write only changed a local file the owner can get back: the way
+ *  it ran (its capability's variant, or every way the tool may run) is a
+ *  non-destructive local artifact write. */
+export function undoableLocalArtifactWrite(toolName: string, requirementId: string | null): boolean {
+  const row = TOOL_REGISTRY.find((entry) => entry.name === toolName);
+  if (!row) return false;
+  const ways = [row.localPlanning, ...(row.localPlanningVariants ?? [])]
+    .filter((semantics): semantics is NonNullable<typeof semantics> => Boolean(semantics));
+  if (ways.length === 0) return false;
+  const ref = requirementId?.match(/^cap:local:([^:]+):(.+)$/);
+  const named = ref && ref[1] === toolName ? ways.filter((semantics) => semantics.safeMode?.id === ref[2]) : [];
+  return (named.length > 0 ? named : ways).every((semantics) => semantics.consequence === 'local_artifact'
+    && !semantics.destructive
+    && (semantics.reversibility === 'reversible' || semantics.reversibility === 'create_only'));
+}
+
+/**
+ * The writes of this source that call for the full completion review:
+ * anything that reached outside the machine, failed or was refused, or
+ * changed local state that cannot simply be restored. A local file write
+ * that succeeded and kept the file's earlier bytes is not among them. An
+ * unreadable ledger counts as one, so the full review is the safe side.
+ */
+export function sourceWritesAtStake(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+}): number {
+  try {
+    const rows = openEventLog().prepare(`
+      SELECT s.execution_kind AS executionKind, s.outcome_kind AS outcomeKind,
+             s.requirement_id AS requirementId, l.tool_name AS toolName
+        FROM logical_call_settlements s
+        LEFT JOIN logical_tool_calls l
+          ON l.session_id = s.session_id
+         AND l.source_user_seq = s.source_user_seq
+         AND l.logical_tool_call_id = s.logical_tool_call_id
+       WHERE s.session_id = ? AND s.source_user_seq = ? AND s.mutating = 1
+    `).all(input.sessionId, input.sourceUserSeq) as Array<{
+      executionKind: string | null; outcomeKind: string | null; requirementId: string | null; toolName: string | null;
+    }>;
+    return rows.filter((row) => !(row.executionKind === 'local_execution'
+      && row.outcomeKind === 'succeeded'
+      && row.toolName
+      && undoableLocalArtifactWrite(row.toolName, row.requirementId))).length;
+  } catch {
     return 1;
   }
 }

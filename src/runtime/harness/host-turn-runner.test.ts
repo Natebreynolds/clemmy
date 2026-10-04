@@ -9805,6 +9805,57 @@ function settleFixtureBusinessCall(input: { sessionId: string; sourceUserSeq: nu
   assert.equal(committed.status, 'committed', JSON.stringify(committed));
 }
 
+/** Records one settled call with its executing tool and capability, as the ledger does. */
+function settleFixtureCall(input: { sessionId: string; sourceUserSeq: number; turn: number }, label: string, call: {
+  tool: string; execution: 'provider_execution' | 'local_execution'; mutating: boolean; succeeded: boolean; requirementId?: string;
+}) {
+  const task = { ...input, acceptedTaskId: identities.acceptedTaskIdFor(input.sessionId, input.sourceUserSeq) };
+  shadow.recordTurnGraphShadow({ identity: task });
+  const logicalToolCallId = `logical:${label}`;
+  const opened = dispatch.beginPhysicalDispatch({
+    identity: { ...task, logicalToolCallId, physicalDispatchId: `dispatch:${label}`, ordinal: 0 },
+    tool: call.tool, args: { label },
+    ...(call.execution === 'local_execution' ? { executionSite: 'host' as const } : {}),
+  });
+  assert.equal(opened.status, 'inserted', JSON.stringify(opened));
+  if (opened.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+  dispatch.settlePhysicalDispatch({ identity: opened.identity, tool: call.tool, outcome: 'returned' });
+  const committed = settlements.commitLogicalCallSettlement({
+    identity: { ...task, logicalToolCallId },
+    contract: { toolName: call.tool, args: { label } },
+    execution: { kind: call.execution },
+    result: { payload: call.succeeded ? { successful: true, data: {} } : { successful: false, error: { code: 'UPSTREAM_FAILURE' } } },
+    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: call.succeeded }),
+    recovery: { businessCall: true, mutating: call.mutating, ...(call.requirementId ? { requirementId: call.requirementId } : {}) },
+    observer: { lane: call.execution === 'local_execution' ? 'byo' : 'composio', turn: task.turn },
+  } as never);
+  assert.equal(committed.status, 'committed', JSON.stringify(committed));
+}
+
+test('the full review guards writes that reached outside or cannot be restored; an undoable local file edit takes the read depth', async () => {
+  const { sourceAttemptedWrites, sourceWritesAtStake, undoableLocalArtifactWrite } = await import('./host-completion-work.js');
+  assert.equal(undoableLocalArtifactWrite('write_file', 'cap:local:write_file:replace'), true);
+  assert.equal(undoableLocalArtifactWrite('write_file', null), true, 'every way write_file runs keeps the earlier bytes');
+  assert.equal(undoableLocalArtifactWrite('run_shell_command', 'cap:local:run_shell_command:ordinary'), false, 'a shell edit keeps nothing to restore');
+  assert.equal(undoableLocalArtifactWrite('cloud_browser_start', null), false, 'a cloud browser session is not a local file');
+
+  const edit = acceptJudgedSource('stakes-local-edit', 'TEST FIXTURE: change one sentence in the brief');
+  settleFixtureCall({ ...edit.context, turn: 1 }, 'stakes-local-edit', {
+    tool: 'write_file', execution: 'local_execution', mutating: true, succeeded: true, requirementId: 'cap:local:write_file:replace' });
+  assert.equal(sourceAttemptedWrites(edit.context), 1, 'it is still a write');
+  assert.equal(sourceWritesAtStake(edit.context), 0, 'but one the owner can get back, so it is reviewed at the read depth');
+
+  const failedEdit = acceptJudgedSource('stakes-failed-local-edit', 'TEST FIXTURE: change one sentence in the brief');
+  settleFixtureCall({ ...failedEdit.context, turn: 1 }, 'stakes-failed-local-edit', {
+    tool: 'write_file', execution: 'local_execution', mutating: true, succeeded: false, requirementId: 'cap:local:write_file:replace' });
+  assert.equal(sourceWritesAtStake(failedEdit.context), 1, 'a write that did not land keeps the full review: the answer must not claim it');
+
+  const post = acceptJudgedSource('stakes-outside-write', 'TEST FIXTURE: post the summary to the channel');
+  settleFixtureCall({ ...post.context, turn: 1 }, 'stakes-outside-write', {
+    tool: 'slack_send_message', execution: 'provider_execution', mutating: true, succeeded: true });
+  assert.equal(sourceWritesAtStake(post.context), 1, 'an outside write is always reviewed in full');
+});
+
 test('a review protects what the turn did: a write it tried, a plan, or a read-only answer', async () => {
   const { completionReviewStakes, settledSourceArtifacts } = await import('./host-turn-runner.js');
   const { sourceAttemptedWrites } = await import('./host-completion-work.js');

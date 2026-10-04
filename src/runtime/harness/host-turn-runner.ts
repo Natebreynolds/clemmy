@@ -176,7 +176,7 @@ import {
 import { objectiveMayRequireMultipleResults } from './tool-evidence.js';
 import { conversationalReviewSkipRecord } from './completion-review-skip.js';
 import {
-  acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceAttemptedWrites, sourceEvidenceLookup,
+  acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
   earlierTurnsEvidence,
 } from './host-completion-work.js';
@@ -4471,9 +4471,11 @@ const runHostTurn: RunRunnerFn = async (runner, agent, itemsOrState, opts) => {
         sessionId: identity.sessionId,
         ...(agentInstructions ? { agentInstructions } : {}),
         ...(planCandidate ? { reviewsPlan: true } : {}),
+        // The full review guards what reached outside or cannot be restored;
+        // a local file write that kept its earlier bytes takes the read depth.
         reviewStakes: completionReviewStakes({
           plan: Boolean(planCandidate),
-          attemptedWrites: Math.max(settled.count, sourceAttemptedWrites(identity)),
+          attemptedWrites: sourceWritesAtStake(identity),
         }),
         verifiedReads: readEvidence.summary,
         verifiedReadResults: readEvidence.results,
