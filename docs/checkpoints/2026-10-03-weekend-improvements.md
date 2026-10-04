@@ -785,3 +785,31 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   under the real name in streamed and whole replies. Live replay of the
   refused lead request through the fixed code: 200, claim seven_day, and the
   model's call returned as `mcp_status`. Tests 798/798 for the wire.
+
+### After wave 52: the job ran on the subscription, then three more framework gaps
+
+- 23:57 the scheduled retry ran on wave 52 and was accepted (billing fixed);
+  the lead worked ~10 min (evidence review check-in posted first try) and
+  stopped at 00:07 "This task reached its configured active-time limit".
+- **Per-step budget parked the job.** The background runner gives each
+  activation a 10-min active budget (BACKGROUND_STEP_WALL_CLOCK_MS); the host
+  reports it as a blocked terminal (blockedReason wall_clock), which the
+  runner parked as a stop — a 240-min job needing a manual Resume every ten
+  minutes. A loop-level remap broke the connection-execution closure tests
+  (a reviewed source's spent budget must stay a stop), so the fix is in the
+  runner: a step whose own active-time budget ran out continues as a new
+  source (max-turns-with-grace path, inside the task limit and caps).
+- **Owner chat report showed internal text.** publishProactiveOutcome posts
+  renderPublicOutcomeText, which led with "Execution evidence" incl. the
+  newest raw tool failure in the run (an hour-old, recovered file_query
+  refusal) and pasted the lead's retained-work handle list. The owner-facing
+  text now says "Done so far" (progress facts), drops the raw tool failure and
+  the retained-work section; the model-facing report keeps everything.
+- **The lead never fanned out, though the guidance reached it** (verified in
+  the stored request: lead text + delegated directive present). Cause: the
+  dispatch wrapper "Agreed plan (execute these steps … do NOT re-derive a
+  different approach)" plus Clem's plan "Own this entire job end to end"
+  forbade the lead from splitting the work. A job handed to an agent now gets
+  "Agreed plan (its scope, sources and limits were settled with the user —
+  keep to them; how you split the work across your workers is yours to
+  decide)"; an ordinary background job keeps the strict wrapper.
