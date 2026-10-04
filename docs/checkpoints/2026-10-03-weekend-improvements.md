@@ -990,3 +990,35 @@ spend more time on it — the two cheap changes below stay, no more SDK work.
   guard. Verified here: 21 tests, desktop + preload typecheck, the Electron
   smoke script (7/7). Blocker: a signed build needs ~15 GB free; the disk
   has ~1.9 GB and deletions need the owner's go.
+
+### Owner: "get going on these improvements and think big picture"
+
+- **3dd7447c1 + 6a63ad817 — write_file mode=replace.** `find` (exact text,
+  must appear once) + `content` (replacement); computed under the revision
+  lock from the bytes it replaces; prior bytes kept; a replay recovers its
+  receipt instead of editing twice; missing/ambiguous/append-flagged
+  requests refused before any change; planners see `cap:local:write_file:
+  replace` (reversible, named existing). Tests: 3,516 write_file-touching
+  tests (3 pins updated) + 217 registry/planning/Lean Rounds.
+- **eb75cf549 — delegated-work lines name a paused job's output** ("Its
+  output goes to: … (may be partial)") and why it stopped, without the
+  saved-work handles. WAVE 61 = 6a63ad817 INSTALLED, verified.
+- **Live fixture (project "Clem fixture: lead run", edit-check.html, 45 KB),
+  wave 61:** one-sentence edit → correct bytes, but 93 s: 43 s in the
+  continuity check (an old unfinished task in the chat sends the next
+  message through turn semantics on the BRAIN model, gpt-6.1-sol; 4 such
+  checks since 09-27, DeepSeek ones ~5 s), then the brain sent the edit to a
+  worker on the lead's Opus — my 0842942d6 guidance said "use run_worker
+  for one small item" and never "do it yourself".
+- **9d3b2fb4d — in a project with a lead, Clem does quick work herself.**
+  WAVE 62 INSTALLED. Live rerun: no worker; Clem edited directly (shell
+  python with an exactly-one assertion — "Market note 7" also matched
+  70-79, so it correctly refused), then the recovery surface refused her
+  natural repair twice (read_file, then work_call), the turn went `held`
+  and the chat endpoint answered "still owned by Clem's recovery system";
+  the work finished correctly 36 s later (byte-exact) with a proper answer.
+- **4e4bdb4c4 — the held reply is plain words** ("I'm still working on this
+  and will post the result here when it's done."). WAVE 63 INSTALLED,
+  verified.
+- Clem (gpt-6.1-sol) did not choose write_file replace in either run; shell
+  edits work but keep no recoverable prior bytes.
