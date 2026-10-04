@@ -813,3 +813,23 @@ verdicts from `goal_alignment_judged`. Settings backed up first
   "Agreed plan (its scope, sources and limits were settled with the user —
   keep to them; how you split the work across your workers is yours to
   decide)"; an ordinary background job keeps the strict wrapper.
+
+### Wave 53 live: the lead fanned out, and the workers could not use DataForSEO
+
+- 01:43Z the steered job (request v2: hand gathering/sections to workers)
+  resumed on Opus; 01:48:56 the lead declared work manifest
+  "ward-law-audit-wave2" and started 12 (then 14) DeepSeek workers — the
+  Clem → lead → workers chain on a real job.
+- 3 ok / 11 failed (7 control_no_progress_exhausted, 4 max_turns). Every
+  worker DataForSEO call refused pre-dispatch
+  `catalog_entry_or_manifest_missing:candidates=0:proven=none`; the "ok"
+  serps item had also been refused and returned text with no tool use.
+- Cause: the lease (externalMcpToolNames) reached the worker scope, but the
+  worker's tool_search was built with no provider candidate sources
+  (sub-agents.ts), so the leased tool was never discoverable/provable.
+- The lead then asked the owner "the DataForSEO connection dropped — can you
+  reconnect?" (false: the server is fine; also an "ASK:" marker leaked into
+  the question text — open).
+- Fix: worker tool_search gets buildAuthorizedToolSearchCandidateSources
+  over exactly the leased scope (carrier = the worker's door). Worker and
+  discovery tests 553/553.
