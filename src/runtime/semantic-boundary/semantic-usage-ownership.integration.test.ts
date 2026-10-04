@@ -269,13 +269,17 @@ test('interpretation inside a brain turn declares no role, and the brain round i
           schemaName: 'TurnSemanticProposalV1' }).catch(() => undefined);
       }));
   const rows = readUsageEventsForDate().filter(row => row.source === session.id);
-  assert.equal(rows.length, 2);
+  // The brain round, the quick-check model's attempt at interpretation, and
+  // (the fixture's reply fails the schema) its one fallback to the brain.
+  assert.equal(rows.length, 3);
   assert.equal(rows[0]!.role, 'brain', 'the brain round keeps its role');
   assert.equal(rows[0]!.promptComponents?.toolSchemas, 40_000, 'and its measured composition');
-  assert.equal(rows[1]!.role, undefined, 'interpretation is not a brain round');
-  assert.equal(rows[1]!.roleReason, 'unset');
-  assert.equal(rows[1]!.channel, 'semantic:turn_semantics');
-  assert.equal(rows[1]!.promptComponents?.toolSchemas, undefined);
+  for (const interpretation of rows.slice(1)) {
+    assert.equal(interpretation.role, undefined, 'interpretation is not a brain round');
+    assert.equal(interpretation.roleReason, 'unset');
+    assert.equal(interpretation.channel, 'semantic:turn_semantics');
+    assert.equal(interpretation.promptComponents?.toolSchemas, undefined);
+  }
 });
 
 // The port's own fallback row (the adapter did not record the response) used to

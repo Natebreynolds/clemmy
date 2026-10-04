@@ -487,17 +487,13 @@ export function tokensFromAgentRun(result: unknown): { inputTokens: number; outp
 }
 
 /** The usage role and channel a semantic call records: a judge purpose is a
- *  review, a quick check is a quick check; Clem's own thinking is not a brain
- *  round and declares no role. */
+ *  review; interpretation is not a brain round and declares no role. */
 export function semanticUsageAttribution(
   purpose: ConfiguredSemanticPurpose,
 ): { role?: UsageRequestRole; channel: string } {
-  const role = semanticModelRoleForPurpose(purpose);
-  return role === 'judge'
+  return semanticModelRoleForPurpose(purpose) === 'judge'
     ? { role: 'reviewer', channel: `judge:${purpose}` }
-    : role === 'quick'
-      ? { role: 'quick', channel: `quick:${purpose}` }
-      : { channel: `semantic:${purpose}` };
+    : { channel: `semantic:${purpose}` };
 }
 
 function recordSemanticModelUsage(input: {
